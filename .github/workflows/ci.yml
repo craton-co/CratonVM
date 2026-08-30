@@ -276,7 +276,8 @@ jobs:
       # the whole workspace run would panic on all 16 at once, which is a red
       # nobody can clear, and a permanently-red job is a job nobody reads.
       #
-      # THIS LIST IS A RATCHET, and its ordering rule is the one section 3.1 of
+      # THE LIST LIVES IN `tools/e2e-ratchet.txt`, and its ordering rule is the
+      # one section 3.1 of
       # that record had to learn the hard way: a target goes on this list only
       # AFTER someone has run it against a real CratonVM binary. Scheduling an
       # unverified one manufactures either a red nobody trusts or — worse — a
@@ -296,9 +297,21 @@ jobs:
         env:
           CRATONVM_REQUIRE_E2E: 1
         run: |
-          cargo test -p cratonvm-vm --test wave2_chm
-          cargo test -p cratonvm-vm --test wave4_a_atomic
-          cargo test -p cratonvm-vm --test wave3_console_module
+          # The list moved to tools/e2e-ratchet.txt on 2026-08-30. Three
+          # targets were seeded here on 2026-08-12 and it had not grown
+          # since, while 95 of the 174 files in vm/tests use the helper that
+          # turns a missing prerequisite into a silent `ok`. A survey against
+          # a real binary (tools/e2e-ratchet-survey.sh) found 73 that RUN,
+          # so they are ratcheted here; the 19 whose green IS the skip are
+          # named in that file rather than left invisible.
+          fail=0
+          while read -r t; do
+            case "$t" in ''|'#'*) continue ;; esac
+            echo "::group::$t"
+            cargo test -p cratonvm-vm --test "$t" || fail=1
+            echo "::endgroup::"
+          done < tools/e2e-ratchet.txt
+          exit $fail
 
       # Exact synthetic-stub ratchet. The committed baseline is intentionally
       # slack-free, so newly introduced application-visible stubs fail CI.

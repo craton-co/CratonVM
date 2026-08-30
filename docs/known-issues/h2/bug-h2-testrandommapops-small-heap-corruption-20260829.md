@@ -19,6 +19,52 @@ load ~3** — against the inherited base rate of "roughly one in three runs of
 lever is host quietness, not a flag, and it is the difference between a defect
 nobody could bisect and one anybody can.
 
+## ADDENDUM 2026-08-30 (L7 corpus lane): it is NOT a small-heap defect — 4g fails too
+
+The `--jdk-only` corpus run hit this class at `--Xmx 1g` and could not attribute
+it, which sent me here. Measuring the heap axis says the title's premise is too
+narrow. Compatible mode, default collector, release binary, host at load 3-7:
+
+```text
+ 256m   FAIL      38s   NullPointerException                       <- this page's case
+   1g   FAIL     173s   AssertionError: Expected: 247 actual: 198
+   1g   FAIL     181s   AssertionError: Expected: 57  actual: 55
+   1g   FAIL     372s   NullPointerException
+   1g   FAIL     480s   (the corpus run that started this)
+   2g   TIMEOUT 1300s   no failure within the cap -- and NOT a pass
+   4g   FAIL    1053s   AssertionError: Expected: 300 actual: 291
+```
+
+**The 256m row is a positive control and it reproduced**, so this is the same
+binary and setup this page describes, not a different experiment.
+
+Three things follow.
+
+**1. Heap sets the LATENCY, not the occurrence.** 38 s at 256m, 173-480 s at 1g,
+1053 s at 4g. Sixteen times the heap buys about twenty-five times the runway and
+then it fails anyway. `2g` timing out at 1300 s fits that curve rather than
+contradicting it — the run was still short of where 4g failed.
+
+**2. At 1g and above the dominant face is a WRONG ANSWER, not a crash.**
+`AssertionError: Expected: 247 actual: 198` at `TestRandomMapOps.testOps:162` is
+the map reporting fewer entries than were put into it. Three of the six failures
+above are that shape, at three different heaps and three different magnitudes
+(247/198, 57/55, 300/291). Silent data loss is a worse failure mode than the
+NPE this page opens with, and it is the one that scales UP with heap.
+
+**3. There is still no passing CratonVM run at any heap.** `2g` did not pass; it
+ran out of clock. So nothing here supplies the negative control this page's
+`Next` section wants, and in particular:
+
+**A caution about the `G30` coercion guard.** It fires in EVERY run above,
+256m and 4g alike, ~21-24 log lines each. Its `occurrence=` values are exact
+powers of two (131072, 262144, 524288) because the guard reports at doubling
+intervals — that is its own sampling, not a severity measure. With no passing
+run to compare against, neither its presence nor its counts discriminate
+anything here, and I am recording it as an observation rather than a lead.
+
+Everything below this section predates the addendum and is unchanged.
+
 ## The three faces
 
 All on the post-`COLL-REFRESH`-fix binary, default collector (ZGC),
@@ -285,6 +331,134 @@ The contract block above that function states obligation 3 as
 *"`frame_slot_offsets` naming every frame slot that holds a live reference"*.
 That is the obligation not being met; the code checks a narrower property and
 reports it under the wider name.
+
+## 2026-08-30: FIXED (fail-closed), with a measured cost and a named follow-up
+
+`jit/src/x64/safepoint.rs` maintains `map_incomplete` in seven places while
+building a safepoint's slot list — an oop still in a register, a stack, local,
+staged-argument or inline-local offset that will not fit `i16`, inexact stack
+marks, and *"a reference staged somewhere no map can name it ... **Fail
+closed**"*. It fed exactly one consumer: `mapped_safepoint_pcs`, i.e.
+`fully_oop_covered`, i.e. whether the CONSERVATIVE backstop stays on.
+
+**It never reached `moving_young_coverage_complete`, which is the flag
+relocation is gated on.** That was sound while the backstop was the whole
+story — a conservative sweep MARKS what the map missed, so nothing is lost
+when nothing moves. Relocation must REWRITE the slot, and a conservative scan
+cannot. So a map this function had already judged short went to the collector
+labelled complete, and `remap_one_jit_frame` rewrote what it named and left
+the rest pointing into from-space. The author's stated fail-closed intent was
+never wired to the gate; the fix is that wire, extracted as a pure
+`relocation_coverage_complete(shadow_complete, map_incomplete)` with a truth
+table, a can-only-subtract property, and a source witness that
+`map_incomplete` actually reaches the push.
+
+### Which of the seven fired
+
+`CRATONVM_DBG_OOPCOV=1` on a 40-line reproducer:
+
+```text
+causes(marks_inexact=0 oop_in_reg=0 stack_deep=0 local_deep=0
+       staged_deep=0 staged_unmappable=19)
+frameslot-detail method=java/lang/String.substring:(II)…
+       safepoints=6 mapped=3 unmapped_pcs=[1, 28, 41] … staged_unmappable=13
+```
+
+**One cause, `staged_unmappable`** — a reference staged into the native-ABI
+outgoing-argument area, a direct-call service slot, or an inlined callee's
+parameter locals. 13 of the 19 in `substring(II)` alone, whose unmapped
+safepoints `[1, 28, 41]` contain safepoint 41 — the witness this page already
+had.
+
+### Verification
+
+`TestRandomMapOps`, `--Xmx 256m`, 900 s cap, fixed binary and the `dev` binary
+**interleaved on the same host in the same window**:
+
+| pair | fixed | `dev` |
+|---|---|---|
+| 1 | **clean, 900 s**, `arena=0` | `rc=1` **NullPointerException at 286 s** |
+| 2 | **clean, 900 s**, `arena=2` | `rc=1` **`AssertionError: Expected: 221 actual: 214` at 77 s** |
+| 3 | **clean, 900 s**, `arena=0` | `rc=1` **NullPointerException at 50 s** |
+| (4th fixed run) | **clean, 900 s**, `arena=2` | — |
+
+**Fixed 4/4 clean across 3 600 s; `dev` 3/3 failed in 413 s combined.**
+
+Pair 2 is worth its own line: `Expected: 221 actual: 214` is a **silent wrong
+answer**, a fourth face beyond the three this page lists. A stale reference
+that happens to land on a valid-but-wrong object does not crash.
+
+### The cost, measured rather than asserted
+
+The same probe, `CRATONVM_GC_STATS=1`, both binaries, identical workload:
+
+| arm | `compaction_cycles` | `objects_relocated` | `relocation_skipped_jit` |
+|---|---:|---:|---:|
+| `dev` | 26 | 145 | 0 |
+| fixed | **0** | **0** | **26** |
+
+**On String-heavy code the fix stops relocation entirely** — every cycle that
+meets a live compiled frame now declines. That is a real loss of the
+defragmentation the arena depends on, taken in exchange for not corrupting the
+heap, and it is the trade the codebase's fail-closed discipline prescribes.
+
+It is *not* as blunt as `CRATONVM_ZGC_RELOCATE=0`: on H2 the fixed arm held
+`arena=0/2/0/2` where the wholesale switch showed `arena=8/9/10`. The likely
+reason is that this declines only cycles that meet a live compiled frame with
+a short map, while the switch declines all of them — **not directly measured**,
+and worth confirming before it is repeated as fact.
+
+### The regression this causes, and the switch that exists for it
+
+That cost lands somewhere real. `org.h2.test.store.TestMVStoreTool` is an
+already-open ZGC fragmentation OOM, and it now arrives about **ten times
+sooner**:
+
+| arm | rep 1 | rep 2 |
+|---|---|---|
+| `dev` | `rc=1` at **581 s** | — |
+| fixed | `rc=1` at **61 s** | `rc=1` at **57 s** |
+
+Same failure either way (`OutOfMemoryError: Java heap space`, `anewarray`), so
+this is not a new defect — it is the known one reached faster, exactly as the
+engagement census predicts once relocation stops defragmenting.
+
+So the coupling ships behind **`CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE`**,
+default ON, `=0` restoring the pre-fix behaviour in one binary. Default ON
+because publishing a map the compiler has already judged short is heap
+corruption and the wrong-answer face is silent; a switch rather than a
+constant because the trade is real, because the ZGC lane needs something to
+bisect against, and because whoever hits the fragmentation side needs a lever
+that is not "turn off relocation entirely".
+
+### The switch, verified in both directions
+
+One binary, one workload, the flag the only difference:
+
+| `CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE` | `compaction_cycles` | `objects_relocated` | `relocation_skipped_jit` | **LIVE stale words** |
+|---|---:|---:|---:|---:|
+| ON (default) | 0 | 0 | 26 | **0** |
+| `=0` (pre-fix) | 26 | 154 | 0 | **33** |
+
+That is the causal chain end to end and in a single binary: turn the gate off,
+relocation runs under short maps and live stale words come back; turn it on,
+they are gone and relocation declines instead. It also means neither arm of
+this page's trade can be claimed without the other being measurable.
+
+### The follow-up that removes the cost
+
+All three `staged_unmappable` sites are the same shape in
+`x64/bytecode_walk.rs` (7631, 8083, 10506): after `pop_invoke_args(n)`, if any
+popped argument is an oop, declare the staging unmappable. But the comment
+immediately above one of them records that *"every `arg_slots` entry stays
+live until `emit_stack_arg_setup` marshals it into the entry ABI far below"* —
+so in that window the references sit in nameable frame slots, and the existing
+Stage-3 `pending_staged_arg_oops` mechanism already knows how to name slots by
+offset. Naming them there would restore relocation without restoring the
+defect. The hazard, and the reason it is not done here: after marshalling, the
+live copy is in the outgoing ABI area and the original slot is dead, so naming
+it past that point would have the collector rewrite a word that no longer owns
+the reference — trading this defect for its mirror image.
 
 ### Next, in order
 

@@ -4948,12 +4948,152 @@ pub(crate) fn native_system_init_phase1(
         }
     }
 
+
+    /// Give `System.out`/`System.err` the three stream fields the REAL
+    /// `PrintStream` bytecode needs.
+    ///
+    /// The synthetic `PrintStream` this VM mints for the system streams has
+    /// only `charset` and `autoFlush` populated. MEASURED against HotSpot with
+    /// `--add-opens java.base/java.io=ALL-UNNAMED` and reflection on the live
+    /// object:
+    ///
+    /// ```text
+    ///               HotSpot                  this VM (before)
+    ///   out         BufferedOutputStream     NULL
+    ///   charOut     OutputStreamWriter       NULL
+    ///   textOut     BufferedWriter           NULL
+    ///   charset     sun.nio.cs.UTF_8         sun.nio.cs.UTF_8
+    /// ```
+    ///
+    /// Nothing notices while this VM's own `PrintStream` natives answer: they
+    /// write to the host stream directly and never read these fields. The
+    /// moment the real bytecode runs, `PrintStream.writeln` calls
+    /// `ensureOpen()`, finds `out == null`, throws `IOException`, and catches
+    /// it into `trouble = true`:
+    ///
+    /// ```text
+    ///   CRATONVM_ENFORCE_NATIVE_SHADOW=java/io/PrintStream
+    ///     System.out.println("A")        prints NOTHING, checkError() == true
+    ///     new PrintStream(new FileOutputStream(FileDescriptor.out), true)
+    ///                                    prints normally
+    /// ```
+    ///
+    /// **Every write is discarded and the VM exits 0.** That took out twelve of
+    /// this lane's thirteen probes at once when the shadow dial was armed over
+    /// `java/io/` — each reported `lines=0` and a clean exit, which reads as a
+    /// probe that passed. The dial is a supported mode and the retirement
+    /// instrument for this whole campaign, so a family that cannot survive
+    /// being armed cannot be adjudicated at all.
+    ///
+    /// Built from the real constructors rather than by hand, so the objects are
+    /// whatever the running JDK's own classes are. Every step is defensive: if
+    /// anything here is not ready this early in `initPhase1`, the repair is
+    /// skipped and the stream is exactly as it was before.
+    fn install_real_stream_fields(ctx: &mut dyn NativeContext, stream: ObjectRef, fd_name: &str) {
+        // Already wired (a real-JDK-constructed stream, or a second call).
+        if matches!(ctx.get_field_by_name(stream, "out"), Value::Object(Some(_))) {
+            return;
+        }
+        // `FileDescriptor.out` / `.err` — the same descriptor a hand-written
+        // `new FileOutputStream(FileDescriptor.out)` uses, which is the form
+        // measured to work under the armed dial.
+        let fd = match ctx.ensure_class_initialized("java/io/FileDescriptor") {
+            Ok(cid) => match ctx.static_field_index_by_name(cid, fd_name) {
+                Some(idx) => match ctx.get_static_field(cid, idx) {
+                    Value::Object(Some(fd)) => fd,
+                    _ => return,
+                },
+                None => return,
+            },
+            Err(_) => return,
+        };
+        let charset = match ctx.get_field_by_name(stream, "charset") {
+            Value::Object(Some(cs)) => cs,
+            _ => return,
+        };
+
+        // Each `new_object` can move the heap, so everything live across one is
+        // pinned and re-read (the native stale-local family).
+        let stream_pin = ctx.pin_native_root(stream);
+        let fd_pin = ctx.pin_native_root(fd);
+        let cs_pin = ctx.pin_native_root(charset);
+
+        let built = (|| -> Option<()> {
+            let fos = match ctx.new_object("java/io/FileOutputStream") {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                _ => return None,
+            };
+            let fos_pin = ctx.pin_native_root(fos);
+            let fd_now = ctx.read_native_pin(fd_pin, fd);
+            let fos_now = ctx.read_native_pin(fos_pin, fos);
+            ctx.invoke(
+                "java/io/FileOutputStream",
+                "<init>",
+                "(Ljava/io/FileDescriptor;)V",
+                &[Value::Object(Some(fos_now)), Value::Object(Some(fd_now))],
+            )
+            .ok()?;
+
+            let osw = match ctx.new_object("java/io/OutputStreamWriter") {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                _ => return None,
+            };
+            let osw_pin = ctx.pin_native_root(osw);
+            let fos_now = ctx.read_native_pin(fos_pin, fos);
+            let cs_now = ctx.read_native_pin(cs_pin, charset);
+            let osw_now = ctx.read_native_pin(osw_pin, osw);
+            ctx.invoke(
+                "java/io/OutputStreamWriter",
+                "<init>",
+                "(Ljava/io/OutputStream;Ljava/nio/charset/Charset;)V",
+                &[
+                    Value::Object(Some(osw_now)),
+                    Value::Object(Some(fos_now)),
+                    Value::Object(Some(cs_now)),
+                ],
+            )
+            .ok()?;
+
+            let bw = match ctx.new_object("java/io/BufferedWriter") {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                _ => return None,
+            };
+            let bw_pin = ctx.pin_native_root(bw);
+            let osw_now = ctx.read_native_pin(osw_pin, osw);
+            let bw_now = ctx.read_native_pin(bw_pin, bw);
+            ctx.invoke(
+                "java/io/BufferedWriter",
+                "<init>",
+                "(Ljava/io/Writer;)V",
+                &[Value::Object(Some(bw_now)), Value::Object(Some(osw_now))],
+            )
+            .ok()?;
+
+            // Publish only once all three exist: a half-wired stream (an `out`
+            // with no `textOut`) would turn today's silent discard into an NPE
+            // inside `writeln`, which is worse than either endpoint.
+            let stream_now = ctx.read_native_pin(stream_pin, stream);
+            let fos_now = ctx.read_native_pin(fos_pin, fos);
+            let osw_now = ctx.read_native_pin(osw_pin, osw);
+            let bw_now = ctx.read_native_pin(bw_pin, bw);
+            ctx.set_field_by_name(stream_now, "out", Value::Object(Some(fos_now)));
+            ctx.set_field_by_name(stream_now, "charOut", Value::Object(Some(osw_now)));
+            ctx.set_field_by_name(stream_now, "textOut", Value::Object(Some(bw_now)));
+            Some(())
+        })();
+        let _ = built;
+
+        ctx.unpin_native_roots(stream_pin);
+    }
+
     if let Some(out_stream) = ctx.get_system_stream("out") {
         install_charset(ctx, out_stream);
+        install_real_stream_fields(ctx, out_stream, "out");
         ctx.set_static_field_by_name("java/lang/System", "out", Value::Object(Some(out_stream)));
     }
     if let Some(err_stream) = ctx.get_system_stream("err") {
         install_charset(ctx, err_stream);
+        install_real_stream_fields(ctx, err_stream, "err");
         ctx.set_static_field_by_name("java/lang/System", "err", Value::Object(Some(err_stream)));
     }
     // S110 вЂ” System.in: wire up to OS stdin (fd id 0 in our FileDescriptorTable,

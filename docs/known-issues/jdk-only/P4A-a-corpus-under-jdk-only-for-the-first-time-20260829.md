@@ -284,10 +284,16 @@ neither belongs to this lane:
 
 * **`org.h2.test.db.TestOpenClose`** — fails in both modes after ~350–450 s,
   against an 18 s HotSpot pass. The 20x wall-clock gap is its own question.
-* **`org.h2.test.store.TestRandomMapOps`** — compatible mode dies with a
-  reproducible seed, which is the useful part:
-  `seed:3698333351056078266 op:1571 java.lang.NullPointerException`. That is an
-  MVStore random-operation fuzz with the seed printed, so it replays.
+* **`org.h2.test.store.TestRandomMapOps`** — compatible mode dies with
+  `seed:3698333351056078266 op:1571 java.lang.NullPointerException`.
+  **Already owned:** `h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`,
+  whose own history records that the printed seeds do NOT replay, so that number
+  is not the lead it looks like. What this lane's measurement did add is on that
+  page as an addendum: the defect is **not** confined to the small heap the page
+  studies — 1g fails 4 of 4 and **4g fails too**, heap buying latency rather than
+  safety, and at 1g and above the dominant face is a WRONG ANSWER
+  (`Expected: 247 actual: 198`, a map short of entries) rather than the crash the
+  page opens with.
 
 ### The 21 that still do not finish
 
@@ -297,6 +303,89 @@ rather than as failures. The re-run itself ran under a host load between 12 and
 box at load 27 is not the same instrument as a 600 s cap on an idle one. What
 can be said is that they are the slow tail §5 predicted from the ratio data, and
 that nothing in the 17 that did resolve turned out to be a `--jdk-only` defect.
+
+## 7. The 21, given an ORACLE first — and the one strict-only failure was my own harness
+
+§6 left 21 vectors capped at 600 s and called them unmeasured. Raising the cap
+again would have been the obvious next move and would have been wrong for a
+third of them, because **seven of the 21 had no HotSpot verdict either** — they
+were `TIMEOUT` at 90 s on the oracle side too, and §6 had just finished
+recording that a capped oracle is an ABSENT oracle, not a failing one.
+
+### Step 1 — buy an oracle before spending anything on the subject
+
+HotSpot, 1800 s, on the seven:
+
+```text
+TestLob          PASS  138s     TestKill         TIMEOUT 1800s
+TestBenchmark    PASS  158s     TestPowerOffFs   TIMEOUT 1801s
+TestSimpleIndex  PASS  111s     TestPowerOffFs2  TIMEOUT 1802s
+                                TestSynth        TIMEOUT 1801s
+```
+
+Three were ordinary HotSpot passes hidden by the 90 s cap. **Four do not finish
+on HotSpot at twenty times that cap**, so no CratonVM verdict on them can mean
+anything, at any cap, ever. They are not slow-under-CratonVM; they are long.
+
+That leaves the set worth spending time on: **15 vectors with a HotSpot PASS**
+(12 already had one, plus the three just bought). The other six are 4 with no
+oracle and 2 that FAIL on HotSpot.
+
+### Step 2 — `--jdk-only` on the 15, at 1800 s
+
+```text
+PASS 5     TestLob 774s · TestKillProcessWhileWriting 456s
+           TestMVStoreCachePerformance 911s · TestBtreeIndex 479s · TestPerfectHash 249s
+FAIL 2     TestCachedQueryResults 1365s · TestMVStoreTool 160s
+TIMEOUT 8
+```
+
+### Step 3 — and this is where the corpus nearly got its first strict-only defect
+
+`TestMVStoreTool` failed under `--jdk-only` and PASSED in compatible mode, both
+at `--Xmx 1g`, against a 32 s HotSpot pass. That is the exact shape §3 says does
+not exist in this corpus, and it would have falsified the headline.
+
+**It does not reproduce.** Re-run alone on a quiet box:
+
+```text
+sharded, 3 concurrent shards   strict 1g   FAIL 160s   OutOfMemoryError: Java heap space
+alone                          strict 1g   PASS 704s
+alone                          strict 2g   PASS 708s
+alone                          compat 1g   PASS 557s
+```
+
+The failure was `OutOfMemoryError`, and the harness was running **three shards
+of `--Xmx 1g` concurrently** while other lanes used the same 31 GB box. Under
+that pressure the OOM landed on the strict arm; on a quiet box the same command
+passes with the same heap. **My own runner manufactured a mode-specific failure,
+for the second time in this page** — §5 was an `ENOSPC` from a working directory
+on the wrong filesystem, and this is the same species: a harness artefact that
+wears a defect's clothes and points at the mode you are studying.
+
+The rule this earns: **a candidate mode-specific failure is re-run ALONE before
+it is believed.** Concurrency is fine for finding candidates and worthless for
+confirming them, because the resource that decides the verdict is shared and the
+arm it lands on is luck.
+
+`TestCachedQueryResults` got the same treatment and is real, but not
+`--jdk-only`'s: **compat FAILs it too**, in 1078 s, so it is a mode-independent
+CratonVM defect on a class HotSpot passes in 9 s.
+
+### Where the corpus stands, complete
+
+```text
+                 PASS   FAIL   unresolved
+--jdk-only        185     19       14        = 218
+```
+
+The 14 unresolved are **8 that exceed 1800 s under `--jdk-only`, 4 that exceed
+1800 s on HOTSPOT as well, and 2 that HotSpot FAILs** — and only the first eight
+are a statement about this VM at all.
+
+**Across every vector this corpus can adjudicate, `--jdk-only` still produces
+zero failures that compatible mode does not.** The one candidate was the
+measuring instrument.
 
 ## Reproduce
 

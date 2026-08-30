@@ -1855,7 +1855,11 @@ fn unsafe_static_field_targets() -> &'static UnsafeShardedMap<usize, UnsafeStati
     T.get_or_init(new_unsafe_sharded_map)
 }
 
-fn remember_unsafe_static_field_offset(offset: usize, class_id: ClassId, field_index: usize) {
+pub(crate) fn remember_unsafe_static_field_offset(
+    offset: usize,
+    class_id: ClassId,
+    field_index: usize,
+) {
     lock_unsafe_shard_usize(unsafe_static_field_targets(), offset).insert(
         offset,
         UnsafeStaticFieldTarget {
@@ -1905,20 +1909,67 @@ fn remember_unsafe_static_field_offset(offset: usize, class_id: ClassId, field_i
 /// Used only by [`note_unsafe_side_store_offset`]'s rate-limited warn, so the
 /// frame walk is paid once per power of two and never on a dispatch path.
 fn ctx_caller_name(ctx: &mut dyn NativeContext) -> Option<String> {
-    for cid in ctx.frame_class_ids() {
-        let name = ctx.class_name_of_id(cid)?;
-        if name == "sun/misc/Unsafe" || name == "jdk/internal/misc/Unsafe" {
-            continue;
+    // `capture_stack_trace`, not `frame_class_ids`: the latter carries only a
+    // ClassId, and the open question is which FIELD's offset resolved to 0 --
+    // which needs the method and the bci. Captured without retaining (its own
+    // doc), and only ever from the powers-of-two warn below.
+    //
+    // Three frames, not one. The innermost non-Unsafe frame is often a JDK
+    // accessor (a VarHandle, an Atomic*) that is the same for every caller;
+    // the frames above it are what distinguish call sites.
+    let frames = ctx.capture_stack_trace(0);
+    let total = frames.len();
+    // REVERSED. `capture_stack_trace` returns outermost-first -- measured, see
+    // this function's history: reading the front gave `main -> testFromMain ->
+    // test` for every single call site, i.e. the stack's floor. Note this is
+    // the OPPOSITE order from `frame_class_ids` ("innermost first" by its own
+    // doc), which is why the two instruments named different callers for the
+    // same event.
+    let mut out: Vec<String> = vec![format!("frames={total}")];
+    for f in frames.into_iter().rev() {
+        // NO Unsafe filter. It used to skip `sun/misc/Unsafe` and
+        // `jdk/internal/misc/Unsafe` as uninformative, but the 40-line R5
+        // repro came back `frames=4` with exactly ONE printed frame -- the
+        // other three were Unsafe and were hidden. `invokeCleaner` is a native
+        // shim in this VM that never runs the Java cleaner, so the frame that
+        // issues the access is one of the hidden ones. The method names
+        // distinguish them, which is more than the skip ever removed.
+        out.push(format!(
+            "{}.{}+{}",
+            f.class_name, f.method_name, f.byte_code_index
+        ));
+        if out.len() == 7 {
+            break;
         }
-        return Some(name);
     }
-    None
+    if out.len() <= 1 {
+        out.clear();
+    }
+    if out.is_empty() {
+        // Fall back to the ClassId walk, which needs no line tables.
+        // `continue` on an unresolvable frame -- the `?` that used to be here
+        // propagated None out of the whole walk, so ONE bad frame blanked the
+        // attribution and printed as "<no java frame>": an absence that reads
+        // as a measurement.
+        for cid in ctx.frame_class_ids() {
+            let Some(name) = ctx.class_name_of_id(cid) else {
+                continue;
+            };
+            if name == "sun/misc/Unsafe" || name == "jdk/internal/misc/Unsafe" {
+                continue;
+            }
+            return Some(name);
+        }
+        return None;
+    }
+    Some(out.join(" <- "))
 }
 
 pub(crate) fn note_unsafe_side_store_offset(
     ctx: &mut dyn NativeContext,
     offset: usize,
     site: u32,
+    nargs: usize,
 ) {
     use std::sync::atomic::{AtomicU64, Ordering};
     if crate::unsafe_arena_addr_is_tagged(offset as i64)
@@ -1947,6 +1998,10 @@ pub(crate) fn note_unsafe_side_store_offset(
             // together are what a fix needs. `line!()` at the call site, so it
             // costs nothing and cannot drift from the arm it names.
             site_line = site,
+            // >= 3 means the arguments ARRIVED and the offset is really 0;
+            // < 3 means they did not, and `offset` is 0 by ABSENCE. The two
+            // are indistinguishable without this.
+            nargs,
             "UNCLASSIFIED-NULL-BASE: an Unsafe access with a null base whose              offset is neither an arena handle, nor a synthetic offset, nor a              registered static field. HotSpot reads this as an absolute address              and faults; here it lands in a private side store, so a CAS can              report success having written nowhere a reader can see. L1 R5."
         );
     }
@@ -2565,7 +2620,7 @@ pub(crate) fn native_unsafe_cas_int(
             if let Some(ok) = unsafe_static_cas(ctx, offset, expected, new_val) {
                 return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let cur = *map.entry(offset).or_insert(0);
             let ex = if let Value::Int(e) = expected { e } else { 0 };
@@ -2619,7 +2674,7 @@ pub(crate) fn native_unsafe_cas_long(
                 }
                 return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let cur = *map.entry(offset).or_insert(0);
             let ex = if let Value::Long(e) = expected { e } else { 0 };
@@ -2775,7 +2830,7 @@ pub(crate) fn native_unsafe_cas_object(
             if let Some(ok) = unsafe_static_cas(ctx, offset, expected, new_val) {
                 return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             let mut map = lock_unsafe_shard_usize(static_obj_store(), offset);
             let cur = *map.entry(offset).or_insert(None);
             let ex = if let Value::Object(e) = expected {
@@ -2866,7 +2921,7 @@ pub(crate) fn native_unsafe_get_int_volatile(
                     _ => Value::Int(0),
                 }));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             let map = lock_unsafe_shard_usize(static_int_store(), offset);
             return Ok(Some(Value::Int(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -2900,7 +2955,7 @@ pub(crate) fn native_unsafe_put_int_volatile(
             if unsafe_static_put(ctx, offset, Value::Int(v)) {
                 return Ok(None);
             }
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             lock_unsafe_shard_usize(static_int_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -2935,7 +2990,7 @@ pub(crate) fn native_unsafe_get_long_volatile(
                     _ => Value::Long(0),
                 }));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             let map = lock_unsafe_shard_usize(static_long_store(), offset);
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -2970,7 +3025,7 @@ pub(crate) fn native_unsafe_put_long_volatile(
             if unsafe_static_put(ctx, offset, Value::Long(v)) {
                 return Ok(None);
             }
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -3001,7 +3056,7 @@ fn native_unsafe_get_object_volatile(
             if let Some(v) = unsafe_static_get(ctx, offset) {
                 return Ok(Some(recover_object_arg(v)));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             let map = lock_unsafe_shard_usize(static_obj_store(), offset);
             return Ok(Some(Value::Object(
                 map.get(&offset).copied().unwrap_or(None),
@@ -3038,7 +3093,7 @@ fn native_unsafe_put_object_volatile(
             if unsafe_static_put(ctx, offset, Value::Object(v)) {
                 return Ok(None);
             }
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             lock_unsafe_shard_usize(static_obj_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -3069,7 +3124,7 @@ pub(crate) fn native_unsafe_get_object(
             if let Some(v) = unsafe_static_get(ctx, offset) {
                 return Ok(Some(recover_object_arg(v)));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             let map = lock_unsafe_shard_usize(static_obj_store(), offset);
             return Ok(Some(Value::Object(
                 map.get(&offset).copied().unwrap_or(None),
@@ -3104,7 +3159,7 @@ pub(crate) fn native_unsafe_put_object(
             if unsafe_static_put(ctx, offset, Value::Object(v)) {
                 return Ok(None);
             }
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             lock_unsafe_shard_usize(static_obj_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -3424,7 +3479,7 @@ pub(crate) fn native_unsafe_get_int(
                     _ => Value::Int(0),
                 }));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             let map = lock_unsafe_shard_usize(static_int_store(), offset);
             return Ok(Some(Value::Int(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -3458,7 +3513,7 @@ pub(crate) fn native_unsafe_put_int(
             if unsafe_static_put(ctx, offset, Value::Int(v)) {
                 return Ok(None);
             }
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             lock_unsafe_shard_usize(static_int_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -3601,7 +3656,7 @@ pub(crate) fn native_unsafe_get_long(
                     _ => Value::Long(0),
                 }));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             let map = lock_unsafe_shard_usize(static_long_store(), offset);
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -3643,7 +3698,7 @@ pub(crate) fn native_unsafe_put_long(
             if unsafe_static_put(ctx, offset, Value::Long(v)) {
                 return Ok(None);
             }
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -3818,7 +3873,7 @@ pub(crate) fn native_unsafe_get_and_add_int(
             if let Some(old) = unsafe_static_get_and_add_int(ctx, offset, delta) {
                 return Ok(Some(Value::Int(old)));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let slot = map.entry(offset).or_insert(0);
             let old = *slot;
@@ -3885,7 +3940,7 @@ fn native_unsafe_get_and_set_int(ctx: &mut dyn NativeContext, args: &[Value]) ->
             if let Some(prev) = unsafe_static_get_and_set_int(ctx, offset, nv) {
                 return Ok(Some(Value::Int(prev)));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(0);
             return Ok(Some(Value::Int(prev)));
@@ -4259,7 +4314,7 @@ fn native_unsafe_get_and_add_long(ctx: &mut dyn NativeContext, args: &[Value]) -
             // Static-field semantics (null receiver). Maintain a per-offset
             // counter so callers like Thread$ThreadIdentifiers.next() get
             // monotonically-increasing values rather than a VM panic.
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let slot = map.entry(offset).or_insert(0);
             let old = *slot;
@@ -4324,7 +4379,7 @@ fn native_unsafe_get_and_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -
             if let Some(prev) = unsafe_static_get_and_set_long(ctx, offset, nv) {
                 return Ok(Some(Value::Long(prev)));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(0);
             return Ok(Some(Value::Long(prev)));
@@ -4374,7 +4429,7 @@ fn native_unsafe_get_and_set_object(
             if let Some(prev) = unsafe_static_get_and_set_object(ctx, offset, nv) {
                 return Ok(Some(Value::Object(prev)));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!());
+            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
             let mut map = lock_unsafe_shard_usize(static_obj_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(None);
             return Ok(Some(Value::Object(prev)));
@@ -6080,7 +6135,7 @@ mod unsafe_static_field_offset_tests {
         let offset = thread_next_tid_offset();
         // `&mut ctx`: this test OWNS its MockNativeContext, unlike the 21
         // production call sites which already hold a `&mut dyn NativeContext`.
-        note_unsafe_side_store_offset(&mut ctx, offset, line!());
+        note_unsafe_side_store_offset(&mut ctx, offset, line!(), 3);
         lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, 1);
 
         let first = native_unsafe_get_and_add_long(

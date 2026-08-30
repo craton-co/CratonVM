@@ -2030,7 +2030,15 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         return Ok(Some(Value::Object(Some(obj?))));
     }
     ctx.unpin_native_roots(loader_pin.unwrap_or(obj_pin));
-    let exc = try_alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8)?;
+    // 3, not 8. All four sites here write exactly one field --
+    // `detailMessage`, which the throwable name map puts in slot 0 -- and
+    // the synthetic table gives every unclaimed `*Exception` three slots
+    // (`detailMessage`, `cause`, `suppressedExceptions`). Asking for 8 did
+    // not widen the table; it only made the factory and the table disagree,
+    // which is what `t9c_synthetic_field_tables_cover_their_factories`
+    // reports. The JDK's own `className`/`key` fields are never populated
+    // by any of these sites, so there is nothing for the extra five to hold.
+    let exc = try_alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 3)?;
     let msg = ctx.create_string(&format!(
         "Can't find bundle for base name {bundle_name}, locale {lang}"
     ));
@@ -2219,7 +2227,7 @@ fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             // Key absent: throw MissingResourceException — ResourceBundle.getObject's
             // contract, and jakarta.el.ResourceBundleELResolver.getValue catches it
             // to produce the "???key???" sentinel.
-            let exc = try_alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8)?;
+            let exc = try_alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 3)?;
             let msg = ctx.create_string(&format!(
                 "Can't find resource for key {}",
                 key_str.unwrap_or_default()
@@ -2260,7 +2268,7 @@ fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 &[Value::Object(Some(parent)), Value::Object(Some(key))],
             );
         }
-        let exc = try_alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8)?;
+        let exc = try_alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 3)?;
         let msg = ctx.create_string(&format!(
             "Can't find resource for key {}",
             key_str.unwrap_or_default()
@@ -2298,7 +2306,7 @@ fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 );
             }
             let key_str = ctx.read_string(key);
-            let exc = try_alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8)?;
+            let exc = try_alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 3)?;
             let msg = ctx.create_string(&format!(
                 "Can't find resource for key {}",
                 key_str.unwrap_or_default()

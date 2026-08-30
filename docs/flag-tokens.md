@@ -570,7 +570,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-249 tokens.
+250 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -664,6 +664,7 @@ export inherited from a parent shell.
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
 | `ir-reloc-emit` | `CRATONVM_JIT_IR_RELOC_EMIT` |
+| `reloc-gate-map-incomplete` | `CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE` |
 | `ir-selfrec-direct` | `CRATONVM_JIT_IR_SELFREC_DIRECT` |
 | `nested-trace-frames` | `CRATONVM_JIT_NO_NESTED_TRACE_FRAMES` |
 | `osr-frame-dedupe` | `CRATONVM_JIT_NO_OSR_FRAME_DEDUPE` |

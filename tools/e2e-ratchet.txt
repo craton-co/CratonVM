@@ -1,0 +1,128 @@
+# Targets in vm/tests that RUN when their prerequisites are present.
+#
+# `vm/tests/common/mod.rs` turns a missing `cratonvm` binary, JDK or Java
+# fixture into an `eprintln!` + `return`, at which point cargo prints
+# `test ... ok`. A whole suite can report green while executing none of its
+# assertions -- and 95 of the 174 files in vm/tests use that helper.
+#
+# CRATONVM_REQUIRE_E2E=1 turns every such skip into a panic. The CI step that
+# sets it iterates THIS file, and ci.yml's rule for joining is that a target
+# is listed only after someone has run it against a real CratonVM binary.
+#
+# Regenerate with:
+#   CRATONVM_BIN=<binary> JAVA_HOME=<jdk> bash tools/e2e-ratchet-survey.sh
+# and move any target the survey reports as RUNS into the list below.
+#
+# Surveyed 2026-08-30 against a release `cratonvm` and Temurin/TornadoVM
+# JDK 25.0.3: 73 RUNS, 19 VACUOUS, 3 RED out of 95.
+abstract_collection_to_array_typed
+al_itr_lastret_slot_regression
+annotation_class_element_null
+annotation_loader_isolation
+array_receiver_dispatch
+arraylist_reverse_list_iterator
+block_2b_logmanager_factory
+class_loader_unload_regression
+clinit_first_call_compile_order
+collection_view_gated_surface
+conscrypt_logger_dispatch
+es_segalloc_arena_dispatch
+fjp_recursive
+getclass_concrete_class
+hib_dev_05_private_abstract_dispatch
+inet_socket_address_port_only
+inputstream_super_read_probe
+instant_real_jdk_factory_tostring
+intrinsic_diff
+jit_cold_new_cp
+jit_collection_ctor_identity
+jit_cov06_array_allocation
+jit_interp_differential
+jit_ir_athrow_dispatch
+jit_ir_exception_stub_throw_bci
+jit_null_receiver_npe
+jit_osr_athrow_lift
+jit_osr_throw_outside_try
+map_view_remove_if
+native_alloc_oom_catchable
+native_io_dis_read_fully_pin
+native_io_dis_shared_stream
+nio_selector_build_set_gc
+plain_server_socket_contract
+private_invokevirtual_shadow
+probe_compile_guard
+probe_fixture_census
+rbigdec1_arithmetic
+rbigdec1_full_arithmetic
+real_net_ssl_factory_registry
+reflective_annotation_array_component
+require_e2e_gate
+rfjp1_recursive
+rslf4j1_get_resources
+runtime_halt
+sb_count_slot_guard_regression
+scheduled_executor_cancel_shutdown_regression
+server_socket_adaptor_accept
+socket_input_stream_timeout
+spring_io_enumset_regression
+sslserversocket_accept_echo
+stackwalker_reflect_gc
+sublist_view_regression
+synchronized_wrapper_mutex
+synthetic_diff
+threadpoolexecutor_prestart_regression
+unmodifiable_list_get_nonarraylist_backing
+url_classloader_resource_delegation
+wave1_a_jmx_mxbeans
+wave1_b2_bootloader_resources
+wave1_c_executor
+wave1b_get_resource_consistency
+wave2_c_methodhandles
+wave2_chm
+wave3_b2_dispatch
+wave3_c_selector
+wave3_console_module
+wave4_a_atomic
+wildcard_bind_under_gc_stress
+wp1_9_stackwalker
+wp2_5_proxy
+writer_flush_real
+
+# ---------------------------------------------------------------------------
+# NOT ratcheted: these pass plain and FAIL under CRATONVM_REQUIRE_E2E, so
+# their green is the skip rather than the assertions. Listed here because the
+# alternative is that they stay invisible -- which is how they got here.
+# Each needs its missing prerequisite restored (usually a fixture under the
+# gitignored `apps/`, which is why it vanished for everyone but its author).
+# Moving one up into the list above is the fix; deleting it from here is not.
+#   cluster_a_aqs_chm
+#   cluster_b_collection_tostring
+#   cluster_c_constructor
+#   wave1_d_xml_stax
+#   wave2_a_class_getdeclared
+#   wave2_bc_probe
+#   wave2_bytebuddy
+#   wave2_cleaner
+#   wave2_h2_connection
+#   wave2_string_decode
+#   wave2_string_indexof
+#   wave3_scanner
+#   wave3_spring_boot_fatjar
+#   wildfly_jboss_module_service_leak
+#   wp2_1_reflect
+#   wp2_2_method_invoke_matrix
+#   wp2_6_constructor_edges
+#   wp2_7_annotation_proxy
+#   wp2_9_findspecial
+
+# ---------------------------------------------------------------------------
+# NOT ratcheted: FLAKY. Passes and fails with the same binary and the same
+# prerequisites, so listing it would make this step red at random -- and a
+# step that is red at random is a step nobody reads, which is the failure
+# this whole list exists to avoid.
+#
+#   vthread_probe_regression   3 of 4 runs failed on 2026-08-30. The failing
+#                              runs take 60.0s and the passing one 1.7s, so
+#                              it is a timeout being hit, not an assertion
+#                              disagreeing. Diagnose the 60s wait before
+#                              ratcheting it.

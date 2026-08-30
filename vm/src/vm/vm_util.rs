@@ -2750,6 +2750,45 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
         false
     };
 
+    // Write ONLY a slot that still holds zero.
+    //
+    // `set_static_by_name` below writes unconditionally, so a count of
+    // repairs made with it reports "fields found", not "fields that were
+    // broken" -- and it would overwrite a correct value if the underlying
+    // ordering were ever fixed. Reading first makes the per-arm `n/total`
+    // warning a measurement: `19/19` means nineteen really were zero, and a
+    // later `0/19` means the arm has become dead weight and can go.
+    let set_static_if_zero = |field_name: &str, value: Value| {
+        let idx = {
+            let cm = shared.classes.class_manager.read();
+            cm.get_class(class_id).and_then(|cls| {
+                let mut static_idx = 0usize;
+                for f in &cls.fields {
+                    if f.is_static() {
+                        if &*f.name == field_name {
+                            return Some(static_idx);
+                        }
+                        static_idx += 1;
+                    }
+                }
+                None
+            })
+        };
+        let Some(static_idx) = idx else {
+            return false;
+        };
+        let current = super::vm_object::get_static_shared(shared, class_id, static_idx);
+        let is_zero = matches!(
+            current,
+            Value::Int(0) | Value::Long(0) | Value::Object(None)
+        );
+        if !is_zero {
+            return false;
+        }
+        set_static_by_name(field_name, value)
+    };
+
+
     match class_name {
         "jdk/internal/misc/UnsafeConstants" => {
             // Inject the platform constants HotSpot would set natively at
@@ -2832,6 +2871,113 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             );
         }
         "sun/misc/Unsafe" => {
+            // L1-R5-20260830: the LEGACY spelling's own 18 array constants and
+            // `ADDRESS_SIZE` latch at 0 for exactly the reason the
+            // `jdk/internal/misc/Unsafe` arm above documents
+            // (ES-FAIL-FAMILY-20260710): `<clinit>` computes them through
+            // natives that are not registered this early in boot, and an
+            // unregistered native silently returns its return type's zero
+            // rather than throwing. `sun.misc.Unsafe.<clinit>` copies them
+            // from `jdk/internal/misc/Unsafe` at bci 43..157 and reads
+            // `addressSize()` at bci 166 -- all before that sibling arm has
+            // run -- so it copies zeros.
+            //
+            // MEASURED on JDK 25, --jdk-only, diffed against HotSpot
+            // 25.0.4+7: `ARRAY_OBJECT_INDEX_SCALE non-zero` and
+            // `ADDRESS_SIZE non-zero` were both FALSE here and both true on
+            // HotSpot. Same silent-corruption shape: a library following the
+            // documented `ARRAY_<T>_BASE_OFFSET + index` protocol through the
+            // legacy spelling gets an offset short by 16, with no exception.
+            //
+            // Values are the sibling arm's, unchanged.
+            let mut legacy = 0;
+            for name in [
+                "ARRAY_BOOLEAN_BASE_OFFSET",
+                "ARRAY_BYTE_BASE_OFFSET",
+                "ARRAY_SHORT_BASE_OFFSET",
+                "ARRAY_CHAR_BASE_OFFSET",
+                "ARRAY_INT_BASE_OFFSET",
+                "ARRAY_LONG_BASE_OFFSET",
+                "ARRAY_FLOAT_BASE_OFFSET",
+                "ARRAY_DOUBLE_BASE_OFFSET",
+                "ARRAY_OBJECT_BASE_OFFSET",
+            ] {
+                legacy += set_static_if_zero(name, Value::Int(16)) as i32;
+            }
+            for (name, scale) in [
+                ("ARRAY_BOOLEAN_INDEX_SCALE", 1),
+                ("ARRAY_BYTE_INDEX_SCALE", 1),
+                ("ARRAY_SHORT_INDEX_SCALE", 2),
+                ("ARRAY_CHAR_INDEX_SCALE", 2),
+                ("ARRAY_INT_INDEX_SCALE", 4),
+                ("ARRAY_LONG_INDEX_SCALE", 8),
+                ("ARRAY_FLOAT_INDEX_SCALE", 4),
+                ("ARRAY_DOUBLE_INDEX_SCALE", 8),
+                ("ARRAY_OBJECT_INDEX_SCALE", 8),
+            ] {
+                legacy += set_static_if_zero(name, Value::Int(scale)) as i32;
+            }
+            // `size_of::<usize>()`, matching `native_unsafe_address_size` and
+            // the `ADDRESS_SIZE0` backfill earlier in this file.
+            legacy += set_static_if_zero("ADDRESS_SIZE", Value::Int(8)) as i32;
+            tracing::warn!(
+                "Post-clinit fixup: sun.misc.Unsafe ARRAY_*/ADDRESS_SIZE populated ({legacy}/19)"
+            );
+
+            // The memory-access warning latch (`<clinit>` bci 185/195). Same
+            // root cause, and the last of L1 R5: `staticFieldBase` and
+            // `staticFieldOffset` were unregistered when `<clinit>` called
+            // them, so they returned `null` and `0L` without throwing, and
+            // every legacy Unsafe access since has run its latch against an
+            // offset no side table can resolve -- landing in a private store
+            // where a CAS reports success having written nowhere a reader can
+            // see (513+ times in one H2 full-text vector).
+            //
+            // Mint through the SAME call the `<clinit>` would have made, so
+            // the offset is REGISTERED and not merely numbered: an
+            // unregistered offset moves the defect instead of fixing it.
+            let warned_idx = {
+                let cm = shared.classes.class_manager.read();
+                cm.get_class(class_id).and_then(|cls| {
+                    let mut static_idx = 0usize;
+                    for f in &cls.fields {
+                        if f.is_static() {
+                            if &*f.name == "memoryAccessWarned" {
+                                return Some(static_idx);
+                            }
+                            static_idx += 1;
+                        }
+                    }
+                    None
+                })
+            };
+            if let Some(widx) = warned_idx {
+                let offset = cratonvm_native_builtins::register_static_field_offset(
+                    "sun/misc/Unsafe",
+                    "memoryAccessWarned",
+                    class_id,
+                    widx,
+                );
+                // The class mirror is what `native_unsafe_static_field_base`
+                // answers for a static field on this VM, and `StaticBaseProbe`
+                // proved that shape round-trips byte-identically to HotSpot.
+                let mirror = super::get_or_create_class_mirror(shared, class_id);
+                let mut latch = 0;
+                latch += set_static_if_zero("MEMORY_ACCESS_WARNED_OFFSET", Value::Long(offset))
+                    as i32;
+                latch += set_static_if_zero(
+                    "MEMORY_ACCESS_WARNED_BASE",
+                    Value::Object(Some(mirror)),
+                ) as i32;
+                tracing::warn!(
+                    "Post-clinit fixup: sun.misc.Unsafe memory-access latch repaired ({latch}/2)"
+                );
+            } else {
+                tracing::warn!(
+                    "Post-clinit fixup: sun.misc.Unsafe memoryAccessWarned not found —                      latch NOT repaired"
+                );
+            }
+
             // JDK 25's `Unsafe.<clinit>` stores the result of
             // `MemoryAccessOption.value()` in MEMORY_ACCESS_OPTION. In a
             // real-JDK CratonVM boot, that particular static store can remain
