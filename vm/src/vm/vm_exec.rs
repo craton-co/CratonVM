@@ -16609,6 +16609,38 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
         }
     }
 
+    /// CUDA graphs — open an argument-update pass over a captured graph.
+    fn gpu_graph_begin_replay(&mut self, stream_handle: u64, graph_handle: u64) -> bool {
+        #[cfg(feature = "gpu-offload")]
+        {
+            self.shared
+                .offload_registry
+                .get_or_create(self.shared.config.gpu_device_ordinal, &self.shared.config)
+                .graph_begin_replay(stream_handle, graph_handle)
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = (stream_handle, graph_handle);
+            false
+        }
+    }
+
+    /// CUDA graphs — close the pass and submit the graph once.
+    fn gpu_graph_end_replay(&mut self, stream_handle: u64) -> u64 {
+        #[cfg(feature = "gpu-offload")]
+        {
+            self.shared
+                .offload_registry
+                .get_or_create(self.shared.config.gpu_device_ordinal, &self.shared.config)
+                .graph_end_replay(stream_handle)
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = stream_handle;
+            0
+        }
+    }
+
     /// CUDA graphs — node count, or `-1` for an unknown handle.
     fn gpu_graph_node_count(&self, graph_handle: u64) -> i32 {
         #[cfg(feature = "gpu-offload")]
