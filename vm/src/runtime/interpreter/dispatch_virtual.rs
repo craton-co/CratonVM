@@ -1557,6 +1557,60 @@ pub(super) fn execute_invokevirtual_cached(
                     .evict(caller_class_id, cp_index, is_special);
                 return Ok(CachedCallResult::CacheMiss);
             }
+            // ...AND WHEN THE REDEFINED CLASS IS AN ANCESTOR OF THE RECEIVER.
+            //
+            // The exact-class test above is the whole check a `VirtualNative`
+            // shadow ever got at HIT time, and it cannot see the shape Mockito
+            // produces for an ABSTRACT class: the inline mock maker weaves
+            // advice into the class itself (`java.io.InputStream`) and hands
+            // back a generated SUBCLASS that overrides only the abstract
+            // methods and the identity plumbing. The receiver is that subclass,
+            // whose redefine generation is and stays 0, while the class whose
+            // bytecode the native shadows is its superclass.
+            //
+            // `populate_virtual_invoke_cache`'s own comment already names this
+            // ("`execute_invokevirtual_cached`'s eviction check only inspects
+            // the RECEIVER class's redefine generation ... so it never catches
+            // a shadow whose declaring class is an ancestor") and concludes
+            // "the fix has to be here, where the entry is created". Guarding
+            // creation is necessary and is not sufficient: an entry created or
+            // PROMOTED (`insert_promoted_invoke` publishes to sibling threads)
+            // before the agent retransformed the ancestor is never revisited,
+            // because nothing at hit time asks the ancestor's generation.
+            //
+            // Measured 2026-08-30 on
+            // `org.springframework.http.client.SimpleClientHttpResponseTests`.
+            // A backtrace from inside the `transferTo` native named this door:
+            // `execute_invokevirtual_cached` -> `invoke_cached_native_callback`
+            // -> `safe_native_call_impl`. The buffer size settles which body
+            // ran without a debugger -- CratonVM's native copies through
+            // 16 MiB, the JDK body through 16384, and the mock saw 16777216 on
+            // every call where HotSpot saw 16384.
+            //
+            // `hierarchy_was_redefined` is the question, and it already existed
+            // in `redefine_state` with no callers. It is behind
+            // `any_class_redefined()` twice over (here and in its own first
+            // line), so a process with no agent pays one relaxed atomic load
+            // and never walks a chain.
+            //
+            // The immunity allowlists are consulted exactly as the `Native` arm
+            // below consults them, and for the same reason: without them,
+            // mocking one `StringBuilder` (or one of the synthetic collections)
+            // anywhere in the process would evict a native shadow that the real
+            // JDK bytecode cannot replace, because CratonVM's instances do not
+            // carry the layout that bytecode assumes.
+            if crate::runtime::redefine_state::hierarchy_was_redefined(shared, cid) {
+                let immune = resolve_method_ref(shared, caller_class_id, cp_index)
+                    .is_ok_and(|(mcn, mn, desc, _)| {
+                        redefine_immune_forced_native(&mcn, &mn, &desc)
+                    });
+                if !immune {
+                    thread
+                        .invoke_cache
+                        .evict(caller_class_id, cp_index, is_special);
+                    return Ok(CachedCallResult::CacheMiss);
+                }
+            }
         }
         // `Native` (the invokespecial/invokestatic direct-callback target --
         // see "Static cache entries: invokespecial uses Bytecode/Native"
