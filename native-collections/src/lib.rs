@@ -40165,7 +40165,44 @@ const RND_FIELD_SEED: usize = 0;
 /// slot reads back `Object(None)` by index) means "empty".
 const RND_FIELD_NEXT_GAUSSIAN: usize = 1;
 
+/// `CRATONVM_JDK_RANDOM=1` — retire this synthetic `java.util.Random` on a real
+/// JDK. OFF by default and slower when on; see
+/// `native-builtins/src/securerandom.rs::jdk_random_enabled`, which owns the
+/// flag and carries the measurement. This is the second of the two registration
+/// sites it has to reach.
+fn jdk_random_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JDK_RANDOM").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+
 fn register_random_natives(registry: &mut NativeMethodRegistry) {
+    // THIS SHAPE IS SYNTHETIC-JDK ONLY, and on a real JDK it is actively wrong.
+    //
+    // It keeps the seed in FIELD 0 of the receiver (`RND_FIELD_SEED`), which is
+    // what the synthetic `java/util/Random` layout declares. The REAL
+    // `java.util.Random` has `private final AtomicLong seed` in that slot — an
+    // object reference, not a long — so these bodies read and write the wrong
+    // thing and every draw comes back 0.
+    //
+    // That never showed because `securerandom.rs` registers the same ten
+    // triples afterwards and registration is LAST-WRITE-WINS, so this bridge
+    // was dead in compatible mode. Retiring THAT shadow uncovered this one:
+    // `--dump-native-registry` on the first attempt showed `nextInt()I` served
+    // by `kind: "bridge"`, `registered_by: native-collections/src/lib.rs`,
+    // `invocations: 7` — and `RandomSpec` printing eight rows of zeros while
+    // `AtomicLongSpec` proved the CAS loop underneath was byte-identical to
+    // HotSpot.
+    //
+    // So both sites take the same gate. On a real JDK with the flag on, neither
+    // registers and `java.util.Random`'s own bytecode runs.
+    if registry.real_jdk() && jdk_random_enabled() {
+        return;
+    }
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/Random";

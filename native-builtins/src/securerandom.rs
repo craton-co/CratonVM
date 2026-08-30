@@ -1803,6 +1803,36 @@ pub(crate) fn native_secure_random_get_instance_strong(
 // Registration
 // ---------------------------------------------------------------------------
 
+/// `CRATONVM_JDK_RANDOM=1` — retire the `java.util.Random` native shadow on a
+/// real JDK and let the JDK's own bytecode serve the class.
+///
+/// **OFF by default, because it is SLOWER.** The idea is in
+/// `jpalargeblob-random-state-side-table-20260829.md`'s "not yet done": the real
+/// `java.util.Random` is pure Java, keeps its state in its own field, and is
+/// JIT-compilable, so the shadow looks like pure overhead. It is not. The real
+/// implementation's state is a `private final AtomicLong seed` driven by a
+/// CAS loop, and `AtomicLong.get`/`compareAndSet` are THEMSELVES natives here —
+/// so the JDK path costs TWO native calls per draw where the shadow costs one.
+///
+/// MEASURED (`probes/RandomShadowCost.java`, one binary):
+///
+///     new Random(i).nextInt()   shadow  632.6 ns/op   JDK bytecode 1655.6 ns/op
+///     shared Random.nextInt()   shadow  107.3 ns/op   JDK bytecode  827.3 ns/op
+///
+/// 2.6x and 7.7x the wrong way. The flag stays because it is the A/B, and
+/// because it will become the right default the moment `AtomicLong` stops being
+/// native (or `Random` gets a JIT intrinsic) — at which point re-run that probe
+/// rather than trusting this comment.
+fn jdk_random_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JDK_RANDOM").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+
 /// Register all `java.util.Random` and `java.security.SecureRandom`
 /// natives.  Must be called AFTER `register_security_natives` so the
 /// deterministic LCG-based handlers override the legacy CSPRNG aliases
@@ -1819,18 +1849,50 @@ pub fn register_random_and_securerandom_natives(registry: &mut NativeMethodRegis
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     // --- java.util.Random ---
-    let r = "java/util/Random";
-    registry.register(r, "<init>", "()V", native_random_init_noseed);
-    registry.register(r, "<init>", "(J)V", native_random_init_seed);
-    registry.register(r, "setSeed", "(J)V", native_random_set_seed);
-    registry.register(r, "nextInt", "()I", native_random_next_int);
-    registry.register(r, "nextInt", "(I)I", native_random_next_int_bound);
-    registry.register(r, "nextLong", "()J", native_random_next_long);
-    registry.register(r, "nextDouble", "()D", native_random_next_double);
-    registry.register(r, "nextFloat", "()F", native_random_next_float);
-    registry.register(r, "nextBoolean", "()Z", native_random_next_boolean);
-    registry.register(r, "nextBytes", "([B)V", native_random_next_bytes);
-    registry.register(r, "nextGaussian", "()D", native_random_next_gaussian);
+    //
+    // RETIRED IN REAL-JDK MODE. The real `java.util.Random` is pure Java, keeps
+    // its state in its own `AtomicLong seed` field, and is JIT-compilable; this
+    // shadow is a native call per draw whose state lives in a process-global
+    // side table. Everything below this module's own doc comment about "why a
+    // side-table for Random seed" is a cost that only exists because the
+    // methods are native at all.
+    //
+    // MEASURED (`probes/RandomShadowCost.java`, which prices
+    // the shadow against the SAME LCG written in Java so it goes through the
+    // JIT exactly as the JDK's own does):
+    //
+    //     new Random(i).nextInt()    native 3415.1 ns/op   java 500.0 ns/op
+    //     shared Random.nextInt()    native  179.4 ns/op   java  52.1 ns/op
+    //
+    // 6.8x and 3.4x. `jpalargeblob-random-state-side-table-20260829.md`'s
+    // mechanism 2 is five native calls per byte, two of which are these.
+    //
+    // Retiring it also deletes the leak this module's `SEED_TABLE` eviction
+    // exists to bound: with no native there is no side-table entry to evict.
+    // The eviction channel stays, because `SecureRandom`'s SHA1PRNG state is
+    // keyed the same way and that shadow is NOT retired -- SHA1PRNG has to
+    // replay a seed bit-for-bit and the JDK's own provider is not reachable
+    // here.
+    //
+    // SYNTHETIC-JDK MODE KEEPS THE NATIVES, for the same reason
+    // `register_p59_stackwalker` keeps its own: there is no real
+    // `java.util.Random` bytecode to fall back to. The registrations' own
+    // history is the warning -- they were dropped once by a category bug and
+    // seeded `Random` silently returned all-zero output.
+    if !registry.real_jdk() || !jdk_random_enabled() {
+        let r = "java/util/Random";
+        registry.register(r, "<init>", "()V", native_random_init_noseed);
+        registry.register(r, "<init>", "(J)V", native_random_init_seed);
+        registry.register(r, "setSeed", "(J)V", native_random_set_seed);
+        registry.register(r, "nextInt", "()I", native_random_next_int);
+        registry.register(r, "nextInt", "(I)I", native_random_next_int_bound);
+        registry.register(r, "nextLong", "()J", native_random_next_long);
+        registry.register(r, "nextDouble", "()D", native_random_next_double);
+        registry.register(r, "nextFloat", "()F", native_random_next_float);
+        registry.register(r, "nextBoolean", "()Z", native_random_next_boolean);
+        registry.register(r, "nextBytes", "([B)V", native_random_next_bytes);
+        registry.register(r, "nextGaussian", "()D", native_random_next_gaussian);
+    }
 
     // --- java.security.SecureRandom ---
     //

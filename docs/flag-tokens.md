@@ -1043,7 +1043,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-18 tokens.
+19 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1062,6 +1062,7 @@ export inherited from a parent shell.
 | `mh-strict-invokeexact` | `CRATONVM_MH_STRICT_INVOKEEXACT` |
 | `mockito-legacy-selectors` | `CRATONVM_MOCKITO_LEGACY_SELECTORS` |
 | `stackwalker-jdk-walk` | `CRATONVM_SW_JDK_WALK` |
+| `jdk-random` | `CRATONVM_JDK_RANDOM` |
 | `strict-swallows` | `CRATONVM_STRICT_SWALLOWS` |
 | `tomcat-mapper-natives` | `CRATONVM_TOMCAT_MAPPER_NATIVES` |
 | `vh-strict-reference-return` | `CRATONVM_VH_STRICT_REFERENCE_RETURN` |
