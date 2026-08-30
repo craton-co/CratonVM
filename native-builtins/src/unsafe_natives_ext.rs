@@ -1855,7 +1855,11 @@ fn unsafe_static_field_targets() -> &'static UnsafeShardedMap<usize, UnsafeStati
     T.get_or_init(new_unsafe_sharded_map)
 }
 
-fn remember_unsafe_static_field_offset(offset: usize, class_id: ClassId, field_index: usize) {
+pub(crate) fn remember_unsafe_static_field_offset(
+    offset: usize,
+    class_id: ClassId,
+    field_index: usize,
+) {
     lock_unsafe_shard_usize(unsafe_static_field_targets(), offset).insert(
         offset,
         UnsafeStaticFieldTarget {
