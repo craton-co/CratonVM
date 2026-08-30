@@ -5542,7 +5542,7 @@ pub(crate) fn is_datagram_channel_open_native_override(
 /// from 32 broken operations to 18 rather than to 0, because the cache sites
 /// re-assembled their own chain and never saw it.
 /// `layout_immunity_is_not_open_coded` keeps the two in step.
-pub(super) fn redefine_immune_forced_native(
+pub(crate) fn redefine_immune_forced_native(
     class_name: &str,
     method_name: &str,
     method_descriptor: &str,

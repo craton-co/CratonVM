@@ -210,6 +210,21 @@ fn reject_missing_implementation(
 /// probe never got there.
 static CHECK_OVERRIDE_REACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CHECK_OVERRIDE_TRUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Times a `check_override` NAME disjunct was dropped because an agent had
+/// redefined the declaring class, so its woven bytecode is authoritative.
+///
+/// Counted rather than silent for the reason every other engagement counter in
+/// this tree is: the fix is invisible in a passing run, and "the guard is
+/// there" and "the guard fires" are different claims. A run of
+/// `SimpleClientHttpResponseTests` reads non-zero here; a run with no agent
+/// reads zero, which is what says the ordinary path is untouched.
+static CHECK_OVERRIDE_REDEFINE_SUPPRESSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read [`CHECK_OVERRIDE_REDEFINE_SUPPRESSED`].
+pub fn check_override_redefine_suppressed() -> u64 {
+    CHECK_OVERRIDE_REDEFINE_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Record a `--jdk-only` refusal of the §8 interface substitution.
 ///
@@ -355,10 +370,11 @@ pub fn dump_check_override_census() {
     }
     let c = check_override_census().lock();
     eprintln!(
-        "[CHECK_OVERRIDE_CENSUS] rows={} reached={} chain_true={}",
+        "[CHECK_OVERRIDE_CENSUS] rows={} reached={} chain_true={} redefine_suppressed={}",
         c.len(),
         CHECK_OVERRIDE_REACHED.load(std::sync::atomic::Ordering::Relaxed),
         CHECK_OVERRIDE_TRUE.load(std::sync::atomic::Ordering::Relaxed),
+        CHECK_OVERRIDE_REDEFINE_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed),
     );
     for ((cls, m, d), (n, abstract_only)) in c.iter() {
         eprintln!(
@@ -26888,8 +26904,63 @@ fn invoke_on_class_shared_inner(
                                     | ("flush", "()V")
                                     | ("close", "()V")
                             ));
-                    let check_override =
-                        method.is_abstract() || (!jdk_only_strict && name_override);
+                    // JVMTI REDEFINE GUARD -- the one native-shadow door that
+                    // did not have one.
+                    //
+                    // Every other gate that prefers a registered native over a
+                    // class's own bytecode already cedes to an agent's woven
+                    // bytecode: `execute_invokevirtual_vtable_fast` and
+                    // `populate_virtual_invoke_cache` (both in
+                    // `dispatch_virtual.rs`), the hierarchy walk in
+                    // `invoke.rs`, and `should_force_registered_native_over_bytecode`.
+                    // This chain -- reached by REFLECTIVE dispatch, i.e.
+                    // `Method.invoke` -- did not, so a native kept winning on
+                    // exactly the path an instrumentation agent uses to call the
+                    // real method.
+                    //
+                    // Measured 2026-08-30 on
+                    // `org.springframework.http.client.SimpleClientHttpResponseTests`,
+                    // which had been open for a day as a GC fragmentation bug and
+                    // is not one. Mockito's inline mock maker weaves advice into
+                    // `java.io.InputStream`; `willCallRealMethod` then reaches the
+                    // real `transferTo` through `Method.invoke`, which landed HERE
+                    // and ran CratonVM's registered `transferTo` native instead of
+                    // the woven body. Two consequences, and the second is the hang:
+                    //
+                    //   * the advice never re-entered, so Mockito's `SelfCallInfo`
+                    //     self-call grant was never consumed and leaked one step --
+                    //     the NEXT intercepted call (`read([BII)`) was swallowed as
+                    //     a self-call and ran the real JDK body;
+                    //   * that real `InputStream.read(byte[],int,int)` loops on
+                    //     `read()`, which the mock answers with an unstubbed
+                    //     default 0, so it fills the buffer and reports progress
+                    //     forever. `transferTo` never terminates: rc=124 at the
+                    //     500 s cap, with the stubbed exception never thrown.
+                    //
+                    // `method.is_abstract()` is deliberately NOT guarded: an
+                    // abstract method has no `Code`, so the registered native is
+                    // the only body there is and redefinition changes nothing
+                    // about that (contract §7 step 3b).
+                    //
+                    // `native_shadow_suppressed_in` rather than the `_by_redefine`
+                    // wrapper, because the `cm` read guard is still held here and a
+                    // nested read self-deadlocks under parking_lot's
+                    // writer-preferring fairness once any writer is queued.
+                    let name_override_suppressed_by_redefine = name_override
+                        && crate::runtime::redefine_state::native_shadow_suppressed_in(
+                            &cm, class_name,
+                        )
+                        && !crate::runtime::interpreter::redefine_immune_forced_native(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        );
+                    if name_override_suppressed_by_redefine {
+                        CHECK_OVERRIDE_REDEFINE_SUPPRESSED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let check_override = method.is_abstract()
+                        || (!jdk_only_strict && name_override && !name_override_suppressed_by_redefine);
                     // A name disjunct wanted this native and strict policy said
                     // no. Record it where every other §1.4 observation goes, so
                     // `--jdk-only-report` names the triple instead of leaving a
