@@ -2,7 +2,13 @@
 
 ## Status
 
-**OPEN BUT NOT REPRODUCED 2026-08-29**, split out from
+**OPEN BUT NOT REPRODUCED, 2026-08-29/30.** See "2026-08-30: 50 clean runs"
+below before spending another run on blind repetition: relocation has never
+been observed to engage on this workload at any tried heap size, which
+argues for chasing this as a JIT-only (no-GC) concurrency defect next, or
+checking whether it already closed as a side effect of an unrelated fix.
+
+Split out from
 `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`, which tracked
 this class only because it was watching it for a fragmentation defect that is
 now closed. This is not that defect: it failed with **no `OutOfMemoryError` and
@@ -69,6 +75,85 @@ entirely)?
 `CRATONVM_ZGC_RELOCATE=0` is the cheap first bisect — it restores non-moving
 behaviour byte for byte, so a failure that survives it is not a relocation
 defect.
+
+## 2026-08-30: 50 clean runs, and the working hypothesis needs correcting
+
+Fifty more attempts, zero reproductions, and one finding that redirects where
+to look next.
+
+### The runs
+
+| batch | heap sizes | `CRATONVM_ZGC_CONC_START` | runs | outcome |
+|---|---|---|---:|---|
+| 1 | 1g | default (0) | 2 | clean |
+| 2 | 300-500m | default (0) | 8 | 2 legitimate `OutOfMemoryError` (too small a heap for the 80 MB working set — `Capacity: 4718592` at 500m, a 10001-length reference array at 300m), 6 clean. Neither failure names `Page` or `PageReference`. |
+| 3 | 700-1050m | default (0) | 25 | clean |
+| 4 | 750-1050m | **60** (forces concurrent marking on — the default is 0, "never") | 15 | clean |
+
+Zero occurrences of `NoSuchMethodError` naming `Page` or `PageReference` in any
+of the 50. `CRATONVM_DBG_CCE_BT=1` was armed for every run in batches 1, 3 and
+4 and never fired.
+
+### The working hypothesis this corrects
+
+The page's own reasoning pointed at ZGC relocation as the likely site
+("this run does not even exercise the relocation path a wrong-receiver defect
+would most likely live on"). Batch 4 tested that directly: forcing concurrent
+marking on (`CRATONVM_ZGC_CONC_START=60`, the value the sibling ZGC pages use
+for measurement, against a default of 0 -- concurrent marking never starts at
+all otherwise) changes the collection count (`relocation_skipped_jit` drops
+from 41 at the default to 9-15 with it on -- concurrent marking is doing real
+work, reclaiming enough that fewer STW cycles are needed) but **still never
+produces a single compaction**:
+
+```
+[GC] zgc-features: … compaction_cycles=0 objects_relocated=0
+                      relocation_skipped_jit=10 relocation_on_proven_jit=0 …
+```
+
+`compaction_cycles=0` and `relocation_on_proven_jit=0` on every one of the
+25 + 15 = 40 GC-stats-instrumented runs across this session and the
+2026-08-29 session's own 1g run. **This workload has never been observed to
+relocate a single object, at any heap size from 300m to 1050m, with or
+without concurrent marking forced on.** Whatever produced the recorded
+signature either does not require a relocation cycle at all, or requires a
+condition none of these 50 runs hit (a specific commit's binary, a specific
+concurrent interleaving among the up-to-100 reader threads, or a heap
+pressure shape a fixed-size synthetic sweep does not reproduce).
+
+**This does not rule out the wrong-receiver family diagnosis** — `Page` and
+`Page$PageReference` are still allocated in lockstep, `PageReference.page`
+(slot 1 of 3) is still the field that would produce exactly this signature,
+and the parent page's own G1/OSR-coverage fixes are proof that this codebase
+has more than one way to hand a JIT-compiled frame or a GC cycle a stale
+reference. It narrows where the NEXT session should look: not "run it again
+and hope for a relocation cycle", since 40 instrumented attempts say that
+cycle essentially does not happen on this workload's shape. The two
+directions this leaves:
+
+1. **A JIT-only mechanism, no GC required.** `PageReference.getPage()` is a
+   one-line accessor (`return page;`) hit constantly by up to 100 concurrent
+   reader threads inside `NonLeaf.getChildPage(i)` — exactly the shape a
+   polymorphic inline-cache race under heavy concurrent first-compile
+   pressure would need. If an inline cache's target can be corrupted between
+   two racing installs (one thread's write half-lands over another's), a
+   monomorphic hit for the wrong receiver type would produce this exact
+   symptom with no GC involvement at all. Nothing in this page's evidence
+   argues against it, and it would explain why relocation-forcing changed
+   nothing.
+2. **The historical binary is not the current one.** The original signature
+   was recorded once, and every fix landed on `dev` since then (including the
+   G1/OSR-coverage repairs this page's own parent chases) changes what a
+   4-year-old-in-VM-time class actually exercises. Worth checking whether the
+   commit the original signature was seen on is still an ancestor of current
+   `dev`, or whether something upstream of this page already closed it as a
+   side effect the way `bug-h2-testkillprocess-…-FIXED-20260829.md` records
+   for four *other* classes' fragmentation crashes.
+
+Neither is confirmed. Both are cheaper to chase than a sixth batch of blind
+repetition: (1) is a standalone JIT concurrency probe (many threads, one
+polymorphic getter, no H2 needed); (2) is a `git bisect`-shaped question, not
+a repro-shaped one.
 
 ## Reproducing
 
