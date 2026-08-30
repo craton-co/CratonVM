@@ -3141,7 +3141,33 @@ pub struct ZgcRealHeap {
     /// `TestMVStoreTool` is the case: 2 888 live bytes in 49 runs standing
     /// between a 262 160-byte request and 266 104 contiguous bytes, in a cycle
     /// that relocated 1 817 474 objects by that ranking and left those 34.
-    compaction_target: Mutex<Option<(usize, usize)>>,
+    /// `(start, end, gc_count_when_recorded)`.
+    ///
+    /// The generation stamp is what stops the target LATCHING. It is
+    /// consume-once, so an outstanding one used to suppress every later
+    /// re-derivation for the rest of the process -- and if no cycle ever
+    /// reaches [`Self::take_compaction_target_pages`] (the relocation gate
+    /// declines, which on `DefaultCatalogAndSchemaTest` it does on 13 of 14
+    /// cycles), the FIRST failure's window is the only one the selector is
+    /// ever offered. Measured 2026-08-30: one `[zgc-target] recorded` line,
+    /// zero `consumed`, across four `OutOfMemoryError`s.
+    ///
+    /// That is also the wrong window to keep. The allocator runs a
+    /// try/GC/try/reclaim/try ladder, so failure #1 profiles the
+    /// PRE-collection arena and the post-GC one is the only view that says
+    /// what survives a collection -- the same argument
+    /// [`Self::frag_report_once`] makes for reporting twice rather than once.
+    compaction_target: Mutex<Option<(usize, usize, usize)>>,
+    /// Windows an allocation failure named for the next collection to empty.
+    ///
+    /// `forwarding::targeted_pages_selected()` alone cannot be acted on: it
+    /// reads 0 both when no failure ever named a window and when every named
+    /// window went unconsumed because no cycle relocated. Those want opposite
+    /// repairs, and telling them apart was the whole of the 2026-08-30
+    /// `DefaultCatalogAndSchemaTest` reading.
+    compaction_targets_recorded: AtomicUsize,
+    /// ...and how many a collection actually picked up.
+    compaction_targets_consumed: AtomicUsize,
     /// Addresses this barrier has published since the cycle began. Telemetry
     /// for the adoption work — it is how you tell "the barrier is wired" from
     /// "the barrier is wired and the workload actually overwrites references",
@@ -3613,6 +3639,8 @@ impl ZgcRealHeap {
             high_objects_relocated: AtomicUsize::new(0),
             high_bytes_copied: AtomicUsize::new(0),
             compaction_target: Mutex::new(None),
+            compaction_targets_recorded: AtomicUsize::new(0),
+            compaction_targets_consumed: AtomicUsize::new(0),
             headroom_low: AtomicBool::new(false),
             gc_count: AtomicUsize::new(0),
             gc_log_enabled: AtomicBool::new(false),
@@ -4339,6 +4367,15 @@ impl ZgcRealHeap {
     /// coverage proof. See the field doc for why a zero here is informative.
     pub fn relocation_on_proven_jit(&self) -> usize {
         self.relocation_on_proven_jit.load(Ordering::Relaxed)
+    }
+
+    /// Windows an allocation failure named, and windows a collection actually
+    /// consumed. See [`Self::compaction_targets_recorded`].
+    pub fn compaction_target_engagement(&self) -> (usize, usize) {
+        (
+            self.compaction_targets_recorded.load(Ordering::Relaxed),
+            self.compaction_targets_consumed.load(Ordering::Relaxed),
+        )
     }
 
     /// Per-term census of the relocation refusal — see
@@ -7734,13 +7771,24 @@ impl ZgcRealHeap {
     /// Takes the arena lock itself: the caller dropped it before logging, and
     /// this must not extend that critical section.
     fn record_compaction_target(&self, request: usize) {
+        let gc_now = self.gc_count.load(Ordering::Relaxed);
         {
             let cur = self.compaction_target.lock();
-            if cur.is_some() {
-                // A target is already outstanding and no cycle has consumed it
-                // yet. Re-deriving it now would sort the free list again for an
-                // answer nothing has acted on.
-                return;
+            // A target outstanding from THIS collection generation stands: the
+            // caller's try/GC/try ladder can fail several times inside one
+            // generation, and re-deriving per attempt would sort the free list
+            // again for an answer nothing has acted on. That is the whole of
+            // the original early return and it is kept.
+            //
+            // A target outstanding from an EARLIER generation does not. A
+            // collection has since run and declined to consume it, so it now
+            // describes an arena that no longer exists -- and keeping it makes
+            // the feature latch: the first failure's window becomes the only
+            // one the selector is ever offered, for the life of the process.
+            if let Some((_, _, recorded_at)) = *cur {
+                if recorded_at == gc_now {
+                    return;
+                }
             }
         }
         let window = {
@@ -7767,7 +7815,9 @@ impl ZgcRealHeap {
                     w.end <= used_low
                 );
             }
-            *self.compaction_target.lock() = Some((w.start, w.end));
+            *self.compaction_target.lock() = Some((w.start, w.end, gc_now));
+            self.compaction_targets_recorded
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -7777,7 +7827,9 @@ impl ZgcRealHeap {
     /// not that cycle managed to evacuate it, so a stale window cannot pin the
     /// selector to one part of the arena forever.
     fn take_compaction_target_pages(&self) -> Option<(u64, u64)> {
-        let (start, end) = self.compaction_target.lock().take()?;
+        let (start, end, _recorded_at) = self.compaction_target.lock().take()?;
+        self.compaction_targets_consumed
+            .fetch_add(1, Ordering::Relaxed);
         if end <= start {
             return None;
         }
@@ -16659,6 +16711,73 @@ pub(crate) mod tests {
             on_largest > off_largest,
             "and the reason must be a bigger CONTIGUOUS block, not luck: \
              on={on_largest} off={off_largest}"
+        );
+    }
+
+    /// A compaction target must not LATCH across collections.
+    ///
+    /// `record_compaction_target` returns early while one is outstanding, so a
+    /// storm of failures inside one try/GC/try ladder does not re-sort the free
+    /// list per attempt. That early return used to have no generation stamp, so
+    /// a target nothing ever consumed suppressed every later re-derivation for
+    /// the life of the process -- and on `DefaultCatalogAndSchemaTest`
+    /// (2026-08-30) nothing ever did consume one: the relocation gate declined
+    /// 13 of 14 cycles, and the run logged one `recorded` line, zero
+    /// `consumed`, across four `OutOfMemoryError`s.
+    ///
+    /// Both halves are asserted, because only asserting the second would pass
+    /// on a patch that simply deleted the early return.
+    #[test]
+    fn a_compaction_target_is_not_latched_across_collections() {
+        let heap = ZgcRealHeap::new();
+        // Make the arena fragmented enough that `frag_profile` names a window
+        // at all -- without one, `record_compaction_target` stores nothing and
+        // the test would pass vacuously in both directions.
+        {
+            let mut arena = heap.arena.lock();
+            let base = arena.base_ptr() as usize;
+            let mut offsets = Vec::new();
+            for _ in 0..128 {
+                let p = arena.alloc(2048, 8).expect("fresh arena has room");
+                offsets.push(p as usize - base);
+            }
+            // Free every other block: a live/dead mosaic whose cheapest window
+            // is two holes walled by one survivor, which is the shape the
+            // targeted selector exists for.
+            for (i, off) in offsets.iter().enumerate() {
+                if i % 2 == 0 {
+                    arena.add_free_block(*off, 2048);
+                }
+            }
+        }
+        heap.record_compaction_target(4096);
+        let (recorded_1, _) = heap.compaction_target_engagement();
+        assert_eq!(
+            recorded_1, 1,
+            "the first failure must name a window, or the rest proves nothing"
+        );
+
+        // SAME generation: the ladder's later rungs must not re-derive.
+        heap.record_compaction_target(4096);
+        let (recorded_same_gen, _) = heap.compaction_target_engagement();
+        assert_eq!(
+            recorded_same_gen, 1,
+            "a second failure inside ONE collection generation must reuse the              outstanding target -- re-sorting the free list per attempt is what              the early return exists to prevent"
+        );
+
+        // A collection has now run and did NOT consume the target (the
+        // relocation gate declined). The next failure must be allowed to
+        // replace it: the old window describes an arena that no longer exists.
+        heap.gc_count.fetch_add(1, Ordering::Relaxed);
+        heap.record_compaction_target(4096);
+        let (recorded_next_gen, consumed) = heap.compaction_target_engagement();
+        assert_eq!(
+            recorded_next_gen, 2,
+            "a failure in a LATER generation must re-derive the window;              otherwise the first failure's target latches for the life of the              process and the selector is never offered another"
+        );
+        assert_eq!(
+            consumed, 0,
+            "nothing consumed a target here, which is exactly the state the              latch used to make permanent"
         );
     }
 

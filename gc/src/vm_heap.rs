@@ -2697,14 +2697,23 @@ impl VmHeap {
             // rules out is a good one, and the next reader should not have to
             // re-derive it.
             let tlab_skipped = h.tlab_retire_skipped();
+            // `targeted_pages=0` on its own is two different facts: no
+            // allocation failure ever named a window, or every named window
+            // went unconsumed because no cycle relocated. On
+            // `DefaultCatalogAndSchemaTest` (2026-08-30) it was the second --
+            // one window recorded, zero consumed, across four
+            // `OutOfMemoryError`s -- and the two want opposite repairs.
+            let (targets_recorded, targets_consumed) = h.compaction_target_engagement();
             eprintln!(
                 "[GC] zgc-features: parallel_mark_cycles={par_cycles} \
                  driver_passes={driver_passes} mark_fallbacks={mark_fallbacks} \
                  compaction_cycles={compactions} objects_relocated={relocated} \
                  relocation_skipped_jit={skipped_jit} \
                  relocation_on_proven_jit={proven_jit} \
-                 tlab_retire_skipped={tlab_skipped}                  targeted_pages={targeted_pages}",
+                 tlab_retire_skipped={tlab_skipped}                  targeted_pages={targeted_pages}                  targets_recorded={targets_recorded} targets_consumed={targets_consumed}",
                 targeted_pages = crate::zgc::forwarding::targeted_pages_selected(),
+                targets_recorded = targets_recorded,
+                targets_consumed = targets_consumed,
             );
             // WHICH of the five terms refused, and — when it was the coverage
             // proof — which obligation. `relocation_skipped_jit` is a count of
