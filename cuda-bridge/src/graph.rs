@@ -49,7 +49,7 @@
 //! that packing rather than a second copy of it. Capture and replay do not
 //! need it, and capture and replay are what has to be proven first.
 
-use crate::{DeviceContext, DeviceError, Result, Stream};
+use crate::{DeviceContext, DeviceError, Event, Result, Stream};
 
 /// What a capture does to work submitted on *other* threads' streams.
 ///
@@ -87,6 +87,9 @@ pub struct Graph {
     raw: cudarc::driver::sys::CUgraph,
     #[cfg(feature = "cuda")]
     device: std::sync::Arc<cudarc::driver::safe::CudaDevice>,
+    /// The `last_write` slots of every buffer the capture named as a
+    /// kernel argument. See [`GraphExec::launch`].
+    slots: Vec<crate::LastWriteSlot>,
 }
 
 // SAFETY: mirrors `EventCuda`. The handle is only ever touched after
@@ -135,6 +138,7 @@ impl Graph {
         Ok(GraphExec {
             raw: exec,
             device: self.device.clone(),
+            slots: self.slots.clone(),
         })
     }
 
@@ -167,6 +171,8 @@ pub struct GraphExec {
     raw: cudarc::driver::sys::CUgraphExec,
     #[cfg(feature = "cuda")]
     device: std::sync::Arc<cudarc::driver::safe::CudaDevice>,
+    /// Carried from the [`Graph`]; stamped on every replay.
+    slots: Vec<crate::LastWriteSlot>,
 }
 
 // SAFETY: as `Graph`.
@@ -187,12 +193,35 @@ impl Drop for GraphExec {
 
 #[cfg(feature = "cuda")]
 impl GraphExec {
-    /// Submit every launch in the graph onto `stream`.
+    /// Submit every launch in the graph onto `stream`, and answer the
+    /// event that fires when they are all done.
     ///
-    /// Asynchronous, exactly like a single launch: the call returns once the
-    /// work is queued. Ordinary stream ordering applies, so the usual
-    /// `Stream::synchronize` or an event says when it finished.
-    pub fn launch(&self, stream: &Stream) -> Result<()> {
+    /// Asynchronous, exactly like a single launch: the call returns once
+    /// the work is queued.
+    ///
+    /// # Why it records an event rather than leaving that to the caller
+    ///
+    /// The returned event is not a convenience. Every buffer this graph
+    /// names as a kernel argument had its `last_write` slot emptied when
+    /// the launch was captured -- an event recorded on a capturing
+    /// stream lives inside the graph and no other stream can wait on it,
+    /// so there was nothing valid to leave there. This stamps all of
+    /// them with the event below, which restores the invariant the rest
+    /// of the crate depends on: a buffer's `last_write` names the work
+    /// that most recently wrote it, and any stream that later reads the
+    /// buffer waits on that.
+    ///
+    /// Without this, a replay's writes would be invisible to every
+    /// stream except the one it ran on. The caller awaiting its own
+    /// submission covers the single-stream case, which is the only one
+    /// the VM uses today -- but "correct as long as nobody uses a second
+    /// stream" is not a property worth shipping when one event fixes it.
+    ///
+    /// Stamping inputs as well as outputs is deliberate and matches
+    /// `launch_raw_on_stream_inner` exactly: it cannot tell which
+    /// arguments the kernel wrote, so it treats every device-pointer
+    /// argument as written. Conservative, never wrong.
+    pub fn launch(&self, ctx: &DeviceContext, stream: &Stream) -> Result<std::sync::Arc<Event>> {
         self.device
             .bind_to_thread()
             .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
@@ -202,9 +231,20 @@ impl GraphExec {
         if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
             return Err(DeviceError::Driver(format!("cuGraphLaunch: {status:?}")));
         }
-        Ok(())
+        let done = std::sync::Arc::new(Event::new(ctx)?);
+        stream.record_event(&done)?;
+        for slot in &self.slots {
+            *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(done.clone());
+        }
+        Ok(done)
     }
 
+    /// How many buffers a replay re-stamps. Exposed so a test can assert
+    /// the capture actually took custody of them: a graph that collected
+    /// none would replay, write, and leave every reader unsynchronised.
+    pub fn tracked_buffer_count(&self) -> usize {
+        self.slots.len()
+    }
 }
 
 /// One node of a capture, as reported by [`Stream::capturing_node`].
@@ -280,6 +320,7 @@ impl Stream {
         Ok(Graph {
             raw,
             device: ctx.inner().device().clone(),
+            slots: self.take_captured_slots(),
         })
     }
 
@@ -371,8 +412,17 @@ impl Graph {
 #[cfg(not(feature = "cuda"))]
 impl GraphExec {
     /// Always [`DeviceError::NoDriver`]: there is nothing to launch.
-    pub fn launch(&self, _stream: &Stream) -> Result<()> {
+    pub fn launch(
+        &self,
+        _ctx: &DeviceContext,
+        _stream: &Stream,
+    ) -> Result<std::sync::Arc<Event>> {
         Err(DeviceError::NoDriver)
+    }
+
+    /// Always zero: nothing was captured, so nothing is tracked.
+    pub fn tracked_buffer_count(&self) -> usize {
+        0
     }
 }
 

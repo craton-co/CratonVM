@@ -719,21 +719,20 @@ impl OffloadCache {
             return 0;
         };
         let Some(ctx) = self.device() else { return 0 };
-        if let Err(e) = exec.launch(&stream) {
-            tracing::warn!("gpu graph: replay of handle {graph_handle} failed: {e}");
-            return 0;
-        }
-        let event = match cuda_bridge::Event::new(ctx) {
-            Ok(e) => std::sync::Arc::new(e),
+        // `launch` records the completion event itself, because it also
+        // stamps it into the `last_write` slot of every buffer the graph
+        // writes -- see its doc comment. Using that same event as the
+        // submission's is not a shortcut: two events would mean the
+        // submission and the buffers were waiting on different points in
+        // the same stream, which is one more thing to get wrong for no
+        // benefit.
+        let event = match exec.launch(ctx, &stream) {
+            Ok(ev) => ev,
             Err(e) => {
-                tracing::warn!("gpu graph: Event::new after replay: {e}");
+                tracing::warn!("gpu graph: replay of handle {graph_handle} failed: {e}");
                 return 0;
             }
         };
-        if let Err(e) = stream.record_event(&event) {
-            tracing::warn!("gpu graph: record_event after replay: {e}");
-            return 0;
-        }
         // Every array the captured launches write is now ahead of its
         // host mirror. Marking is a bit each; the download happens only
         // if Java asks for one of them.

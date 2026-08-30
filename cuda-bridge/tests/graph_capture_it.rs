@@ -131,12 +131,12 @@ fn a_captured_graph_replays_453_launches_for_less_than_issuing_them() {
     let exec = graph.instantiate().expect("instantiate");
 
     // Warm the replay path the same way the launch path was warmed.
-    exec.launch(&stream).expect("warmup replay");
+    exec.launch(&ctx, &stream).expect("warmup replay");
     stream.synchronize().expect("warmup replay drain");
 
     // ── Arm B: replay them. ──
     let t1 = std::time::Instant::now();
-    exec.launch(&stream).expect("replay");
+    exec.launch(&ctx, &stream).expect("replay");
     let replay_host = t1.elapsed();
     stream.synchronize().expect("replay drain");
     let replay_total = t1.elapsed();
@@ -276,14 +276,14 @@ fn a_replay_sees_a_scalar_written_through_the_captured_pointer() {
     let mut host = vec![0i32; n as usize];
 
     // k == 1: three launches add 1 each.
-    exec.launch(&stream).expect("replay 1");
+    exec.launch(&ctx, &stream).expect("replay 1");
     stream.synchronize().expect("drain 1");
     out.to_host(&mut host).expect("read 1");
     assert_eq!(host[0], 3, "three launches of +1 should total 3");
 
     // Now change k in place and replay the SAME graph.
     k.copy_from_host(&[10i32]).expect("copy_from_host");
-    exec.launch(&stream).expect("replay 2");
+    exec.launch(&ctx, &stream).expect("replay 2");
     stream.synchronize().expect("drain 2");
     out.to_host(&mut host).expect("read 2");
     assert_eq!(
@@ -300,5 +300,85 @@ fn a_replay_sees_a_scalar_written_through_the_captured_pointer() {
     assert!(
         k.copy_from_host(&[1i32, 2i32]).is_err(),
         "a length mismatch must fail rather than write what fits"
+    );
+}
+
+/// A replay's writes must be visible to a stream that did not run it.
+///
+/// # The bug this is the regression test for
+///
+/// Capture cannot leave a useful `last_write` event on the buffers it
+/// touches: an event recorded on a capturing stream lives inside the
+/// graph and no other stream can wait on it. The first version of this
+/// feature therefore cleared those slots and left them cleared, which is
+/// correct for exactly one usage pattern -- one stream, and a caller who
+/// awaits the replay before reading. Any read from a SECOND stream was
+/// released with nothing to wait on, and would see whatever was in the
+/// buffer before the replay.
+///
+/// That is invisible to every other test here, because they all read
+/// back on the stream that replayed. This one deliberately does not: it
+/// reads through `to_host_async` on a different stream, which is exactly
+/// the path that consults `last_write`.
+#[test]
+fn a_replay_is_visible_to_a_stream_that_did_not_run_it() {
+    let Ok(ctx) = DeviceContext::new(0) else {
+        eprintln!("no CUDA device; skipping");
+        return;
+    };
+    let module = DeviceModule::from_ptx(&ctx, PTX, &["bump"]).expect("load PTX");
+    let capture_stream = Stream::new(&ctx).expect("capture stream");
+    let reader_stream = Stream::new(&ctx).expect("reader stream");
+    let n: i32 = 4096;
+    let out: DeviceBuffer<i32> = DeviceBuffer::zeros(&ctx, n as usize).expect("alloc");
+    let cfg = LaunchConfig::elementwise(n as u32);
+
+    // Enough launches that the device is still working on the graph when
+    // the host reaches the read below. One launch would very likely pass
+    // even with the ordering removed, which would make this test a
+    // decoration rather than a check.
+    const BUMPS: usize = 400;
+    capture_stream
+        .begin_capture(CaptureMode::ThreadLocal)
+        .expect("begin capture");
+    for _ in 0..BUMPS {
+        module
+            .launch_on_stream(
+                &ctx,
+                "bump",
+                &cfg,
+                KernelArgs::new().push_device_ptr(&out).push_i32(n),
+                &capture_stream,
+            )
+            .expect("captured launch");
+    }
+    let graph = capture_stream.end_capture(&ctx).expect("end capture");
+    let exec = graph.instantiate().expect("instantiate");
+
+    // The capture must have taken custody of the buffer, or the stamping
+    // below has nothing to stamp and the assertion that follows would
+    // pass for the wrong reason.
+    assert!(
+        exec.tracked_buffer_count() >= 1,
+        "the capture should have collected the argument buffer's last_write slot"
+    );
+
+    exec.launch(&ctx, &capture_stream).expect("replay");
+
+    // Read on the OTHER stream, without synchronising the one that
+    // replayed. Correct only because the replay stamped the buffer's
+    // `last_write` and `to_host_async` waits on it.
+    let mut host = vec![0i32; n as usize];
+    out.to_host_async(&mut host, &reader_stream)
+        .expect("async read on a second stream");
+    reader_stream.synchronize().expect("drain reader");
+
+    assert_eq!(
+        host[0], BUMPS as i32,
+        "a read on a second stream must see the whole replay ({BUMPS} bumps);          seeing 0 or a partial count means the replay left no last_write for          that stream to wait on"
+    );
+    assert!(
+        host.iter().all(|&v| v == BUMPS as i32),
+        "every element should have been bumped {BUMPS} times"
     );
 }
