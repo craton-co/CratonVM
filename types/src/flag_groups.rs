@@ -1072,6 +1072,17 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-long", on_key: Some("CRATONVM_JIT_IR_LONG"), off_key: None, off_word: None },
     // Default-ON A/B lever: `ir_lower::reloc_emit_enabled` reads `0`/`false`.
     E { group: Group::JIT, token: "ir-reloc-emit", on_key: Some("CRATONVM_JIT_IR_RELOC_EMIT"), off_key: None, off_word: Some("0") },
+    // Declared 2026-08-30 with the relocation-gate coupling. Default-ON, so a
+    // KILL SWITCH: `=0` restores the pre-fix behaviour in which a safepoint map
+    // `record_oop_map` had ALREADY judged short was still published as
+    // `moving_young_coverage_complete`, so relocation rewrote the slots it
+    // named and left the rest pointing into from-space. Kept because the fix
+    // has a measured cost -- on String-heavy code every cycle meeting a live
+    // compiled frame now declines to relocate -- and that cost reaches
+    // `org.h2.test.store.TestMVStoreTool`, an already-open fragmentation OOM,
+    // about 10x sooner. This is the same-binary A/B for both halves of that
+    // trade. See `x64::safepoint::relocation_coverage_complete`.
+    E { group: Group::JIT, token: "reloc-gate-map-incomplete", on_key: Some("CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "ir-selfrec-direct", on_key: Some("CRATONVM_JIT_IR_SELFREC_DIRECT"), off_key: None, off_word: None },
     // Default-ON: `conservative_roots::nested_trace_frames_enabled` treats the
     // key's PRESENCE as "restore the one-frame-per-chain-entry answer".

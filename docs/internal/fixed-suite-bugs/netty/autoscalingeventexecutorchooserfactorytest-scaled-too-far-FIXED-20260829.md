@@ -27,6 +27,17 @@ netty slice (every
 post-branch binaries: identical, except `ProxyHandlerTest` going 8 failures to
 0 (its own page).
 
+**The class can still appear in `others.txt`, on a DIFFERENT assertion.** The
+2026-08-29 full-suite `categorize` run failed it once on `"Should not scale
+back down while load is high"` — `testScaleUpDoesNotExceedMaxThreads`, and the
+opposite symptom to this page's: the group shed a thread the load should have
+kept. Re-run on that same binary it did not reproduce in 18 targeted runs —
+quiet 8/8, six-way self-contended 6/6 on BOTH VMs, 24 CPU spinners 4/4 on both
+— so it is a low-rate flake under a six-shard load profile, not a regression of
+the fix below. Do not read this class's presence in that column as this page
+reopening; check WHICH assertion first. See
+`known-issues/netty/full-suite-refresh-20260829.md`.
+
 Superseded page:
 `known-issues/netty/autoscalingeventexecutorchooserfactorytest-scaled-too-far-20260829.md`.
 

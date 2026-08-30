@@ -5205,6 +5205,27 @@ fn report_remap_residue(
 ) {
     let frame_size = cm.osr_frame_size;
     let mut hits = 0usize;
+    // A raw `stale_words` count is an UPPER BOUND and cannot be acted on. The
+    // spill cursor "reclaims by moving, it does not clear" (see
+    // `OopMapEntry::live_frame_hi`), so a word above the live bound still holds
+    // whatever reference last occupied it — a from-space address there is DEAD
+    // and rewriting it would be pointless, not a missed root. Only a stale word
+    // BELOW the bound is a live reference the map failed to name, and only that
+    // number says whether `moving_young_coverage_complete` is lying.
+    //
+    // `live_frame_hi == 0` means "unknown" (the same sentinel the band verifier
+    // reads), so those are counted separately rather than being silently folded
+    // into either answer.
+    let live_hi = cm
+        .oop_maps
+        .iter()
+        .filter(|m| m.bytecode_pc == sp_id)
+        .map(|m| m.live_frame_hi)
+        .max()
+        .unwrap_or(0);
+    let mut stale_live = 0usize;
+    let mut stale_dead = 0usize;
+    let mut stale_unknown = 0usize;
     let mut detail = String::new();
     if frame_size > 0 && (frame_size as usize) <= 1024 * 1024 && (frame_size as usize) <= rbp {
         let frame_size = frame_size as usize;
@@ -5215,12 +5236,23 @@ fn report_remap_residue(
             let w = unsafe { (addr as *const usize).read() };
             if let Some(&new) = pointer_map.get(&w) {
                 hits += 1;
-                if hits <= 12 {
+                let off = rbp - addr;
+                let class = if live_hi <= 0 {
+                    stale_unknown += 1;
+                    "unknown"
+                } else if (off as i64) < live_hi as i64 {
+                    stale_live += 1;
+                    "LIVE"
+                } else {
+                    stale_dead += 1;
+                    "dead"
+                };
+                // The LIVE ones are the finding; spend the detail budget on
+                // them rather than on whichever happen to come first.
+                if stale_live <= 12 && class == "LIVE" {
                     detail.push_str(&format!(
-                        " [off={} stale=0x{:x}->0x{:x}]",
-                        rbp - addr,
-                        w,
-                        new
+                        " [LIVE off={} stale=0x{:x}->0x{:x}]",
+                        off, w, new
                     ));
                 }
             }
@@ -5239,11 +5271,12 @@ fn report_remap_residue(
         mapped_desc.push_str(&format!(" {}=0x{:x}", off, v));
     }
     eprintln!(
-        "[remap-frame] method={} sp_id={} frame_size={} cov_complete={} mapped=[{}] rewritten={} inlined={:?} stale_words={}{}",
+        "[remap-frame] method={} sp_id={} frame_size={} cov_complete={} live_hi={} mapped=[{}] rewritten={} inlined={:?} stale_words={} stale_live={} stale_dead={} stale_unknown={}{}",
         cm.method_label,
         sp_id,
         frame_size,
         coverage_complete,
+        live_hi,
         mapped_desc,
         rewritten,
         cm.inlined_methods
@@ -5251,6 +5284,9 @@ fn report_remap_residue(
             .map(|(c, m, d)| format!("{c}.{m}{d}"))
             .collect::<Vec<_>>(),
         hits,
+        stale_live,
+        stale_dead,
+        stale_unknown,
         detail,
     );
 }

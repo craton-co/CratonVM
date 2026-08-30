@@ -372,6 +372,8 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
     registry.register(KLASS, "graphBeginCapture", "(J)Z", builtin_graph_begin_capture);
     registry.register(KLASS, "graphEndCapture", "(J)J", builtin_graph_end_capture);
     registry.register(KLASS, "graphReplay", "(JJ)J", builtin_graph_replay);
+    registry.register(KLASS, "graphBeginReplay", "(JJ)Z", builtin_graph_begin_replay);
+    registry.register(KLASS, "graphEndReplay", "(J)J", builtin_graph_end_replay);
     registry.register(KLASS, "graphNodeCount", "(J)I", builtin_graph_node_count);
     registry.register(KLASS, "releaseGraph", "(J)V", builtin_release_graph);
     registry.set_category(__prev_cat);
@@ -448,6 +450,42 @@ fn builtin_graph_replay(
     let graph = arg_long(args, 1) as u64;
     let submission = match resolve_or_create_default_stream(ctx, exec) {
         Some(stream) => ctx.gpu_graph_replay(stream, graph),
+        None => 0,
+    };
+    Ok(Some(Value::Long(submission as i64)))
+}
+
+/// `Native.graphBeginReplay(long execHandle, long graphHandle) -> boolean`
+///
+/// Opens an argument-update pass. Between this and `graphEndReplay` the
+/// caller re-issues the dispatch sequence it captured, and each dispatch
+/// rewrites one node's arguments instead of launching.
+#[cfg(feature = "gpu-offload")]
+fn builtin_graph_begin_replay(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let exec = arg_long(args, 0) as u64;
+    let graph = arg_long(args, 1) as u64;
+    let ok = match resolve_or_create_default_stream(ctx, exec) {
+        Some(stream) => ctx.gpu_graph_begin_replay(stream, graph),
+        None => false,
+    };
+    Ok(Some(Value::Int(i32::from(ok))))
+}
+
+/// `Native.graphEndReplay(long execHandle) -> long`
+///
+/// The submission handle for the one launch the whole pass produces, or
+/// `0` if the caller's sequence did not match the captured one.
+#[cfg(feature = "gpu-offload")]
+fn builtin_graph_end_replay(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let exec = arg_long(args, 0) as u64;
+    let submission = match resolve_or_create_default_stream(ctx, exec) {
+        Some(stream) => ctx.gpu_graph_end_replay(stream),
         None => 0,
     };
     Ok(Some(Value::Long(submission as i64)))

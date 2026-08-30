@@ -1164,7 +1164,13 @@ mod tests {
         // constant pool must share its `Arc<str>` allocation with every
         // other pool entry holding the same content — and with every
         // matching string returned by `cratonvm_types::intern_arc`.
-        let class_bytes = include_bytes!("../../test_classes/HelloWorld.class");
+        // `reader/tests/fixtures/`, not `test_classes/`: `.gitignore`
+        // ignores `test_classes/**/*.class`, so the fixture this used to
+        // name was never actually committed and this test could only
+        // compile on a machine where someone had run `javac` by hand.
+        // Every other crate's binary fixtures already live under
+        // `<crate>/tests/fixtures/`, which no ignore rule covers.
+        let class_bytes = include_bytes!("../tests/fixtures/HelloWorld.class");
         let class_file = read_class(class_bytes).expect("HelloWorld.class must parse");
 
         // Collect all Utf8 entries so we can inspect their Arc<str> pointers.

@@ -21,9 +21,14 @@ pub(crate) fn p67_layout_object(
     byte_size: i64,
     byte_alignment: i64,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, class_name, 4)?;
-    ctx.set_field(obj, 0, Value::Long(byte_size));
-    ctx.set_field(obj, 1, Value::Long(byte_alignment));
+    // The REAL class where there is one. `try_alloc_concurrent_synthetic` takes
+    // the larger of this request and the loaded class's own field count, so the
+    // 4 is a floor and a real `OfIntImpl` still gets its six.
+    let minted = p67_value_layout_impl(class_name).unwrap_or(class_name);
+    let obj = try_alloc_concurrent_synthetic(ctx, minted, 4)?;
+    let slots = p67_layout_slots_for_mint(ctx, obj, 3);
+    ctx.set_field(obj, slots.byte_size, Value::Long(byte_size));
+    ctx.set_field(obj, slots.byte_alignment, Value::Long(byte_alignment));
     // Slot 2 is the little-endian flag, and every `java.lang.foreign` layout
     // this factory stands in for is built by the JDK from
     // `ByteOrder.nativeOrder()`. It used to be a hard-coded `Int(0)` — "big
@@ -34,12 +39,9 @@ pub(crate) fn p67_layout_object(
     // `probes/W2ValueLayoutProbe` the moment that preseed stopped running:
     // every constant reported `order() == BIG_ENDIAN` while
     // `ByteOrder.nativeOrder()` two lines above answered LITTLE_ENDIAN.
-    ctx.set_field(
-        obj,
-        2,
-        Value::Int(i32::from(cfg!(target_endian = "little"))),
-    );
-    ctx.set_field(obj, 3, Value::Object(None));
+    ctx.set_field(obj, slots.name, Value::Object(None));
+    // LAST, because the real arm allocates and can move `obj`.
+    let obj = p67_layout_set_order(ctx, obj, cfg!(target_endian = "little"))?;
     Ok(obj)
 }
 
@@ -64,15 +66,194 @@ pub(crate) fn p67_optional(
     Ok(opt)
 }
 
-pub(crate) fn p67_layout_name_value(ctx: &dyn NativeContext, layout: ObjectRef) -> Value {
-    if matches!(ctx.get_field(layout, 0), Value::Int(_)) {
-        if ctx.object_num_fields(layout) > 2 {
-            ctx.get_field(layout, 2)
-        } else {
-            Value::Object(None)
+/// Where a layout carrier keeps the three fields EVERY `MemoryLayout` has.
+///
+/// `jdk.internal.foreign.layout.AbstractLayout` declares `byteSize`,
+/// `byteAlignment` and `name`, and every real layout class extends it -- value,
+/// struct, sequence, union, padding. So one resolver serves all of them, which
+/// is what makes moving thirteen carriers onto their real classes a change to
+/// the mint sites rather than to every reader.
+///
+/// The carriers this file fabricates declare no fields at all, and for those the
+/// map is the one `p67_layout_object` writes. Asked by NAME, never by width or
+/// by the type that happens to be in a slot: guessing the shape is what made
+/// `Arena.allocate` throw `Arena is closed` on 199 of 199 rows when the arena
+/// carrier's width changed.
+pub(crate) struct P67LayoutSlots {
+    pub(crate) byte_size: usize,
+    pub(crate) byte_alignment: usize,
+    pub(crate) name: usize,
+    pub(crate) order: P67LayoutOrder,
+    /// Where an address layout keeps its target. `None` when the class declares
+    /// no such field AND the carrier is too narrow to have one.
+    pub(crate) target: usize,
+    /// The group carriers' payload: a struct's or union's member array
+    /// (`elements` on the real `AbstractGroupLayout`), or a sequence's
+    /// `elementLayout`. A class has at most one of the two, so one slot serves
+    /// both and the fabricated carriers keep it at 2.
+    pub(crate) payload: usize,
+    /// A sequence's stored element count (`elemCount`), 4 on the fabricated
+    /// carrier.
+    pub(crate) element_count: usize,
+}
+
+/// How a carrier records byte order -- the one place the two conventions are
+/// genuinely different rather than merely differently indexed.
+pub(crate) enum P67LayoutOrder {
+    /// A real value layout declares `order`, a `java.nio.ByteOrder` REFERENCE.
+    Object(usize),
+    /// A fabricated carrier keeps a bare little-endian flag instead.
+    Flag(usize),
+}
+
+/// [`p67_layout_slots`] for a carrier that is still being FILLED IN.
+///
+/// The fallback map's `name` index cannot be derived from slot 0 here, because
+/// slot 0 has not been written yet and an unwritten slot reads back as
+/// `Int(0)` — which is exactly the `Int` the derivation looks for. Every mint in
+/// this file writes the four-or-five slot map with `name` last, so they pass 3;
+/// asking the half-built object instead put `name` on top of the member array
+/// and cost `byteOffset(groupElement(..))` its members.
+pub(crate) fn p67_layout_slots_for_mint(
+    ctx: &dyn NativeContext,
+    layout: ObjectRef,
+    fabricated_name: usize,
+) -> P67LayoutSlots {
+    p67_layout_slots_inner(ctx, layout, Some(fabricated_name))
+}
+
+pub(crate) fn p67_layout_slots(ctx: &dyn NativeContext, layout: ObjectRef) -> P67LayoutSlots {
+    p67_layout_slots_inner(ctx, layout, None)
+}
+
+fn p67_layout_slots_inner(
+    ctx: &dyn NativeContext,
+    layout: ObjectRef,
+    fabricated_name: Option<usize>,
+) -> P67LayoutSlots {
+    let class_id = ctx.class_id_of_object(layout);
+    if let (Some(byte_size), Some(byte_alignment), Some(name)) = (
+        ctx.resolve_field_index_by_class_id(class_id, "byteSize"),
+        ctx.resolve_field_index_by_class_id(class_id, "byteAlignment"),
+        ctx.resolve_field_index_by_class_id(class_id, "name"),
+    ) {
+        return P67LayoutSlots {
+            byte_size,
+            byte_alignment,
+            name,
+            order: match ctx.resolve_field_index_by_class_id(class_id, "order") {
+                // A group layout (struct, union, padding, sequence) declares no
+                // `order` at all and has no byte order to record; the flag slot
+                // is never read for one, so the fabricated index is harmless.
+                Some(i) => P67LayoutOrder::Object(i),
+                None => P67LayoutOrder::Flag(2),
+            },
+            target: ctx
+                .resolve_field_index_by_class_id(class_id, "targetLayout")
+                .unwrap_or(4),
+            payload: ctx
+                .resolve_field_index_by_class_id(class_id, "elements")
+                .or_else(|| ctx.resolve_field_index_by_class_id(class_id, "elementLayout"))
+                .unwrap_or(2),
+            element_count: ctx
+                .resolve_field_index_by_class_id(class_id, "elemCount")
+                .unwrap_or(4),
+        };
+    }
+    // The fabricated map. `name` sits at 2 on the group carriers (struct, union,
+    // padding: slot 2 is their member list and slot 3 the name) and at 3 on the
+    // value carriers -- the historical test for which is "does slot 0 hold an
+    // Int", kept verbatim so this arm answers exactly what the open-coded
+    // readers answered.
+    let name = match fabricated_name {
+        Some(slot) => slot,
+        None => {
+            if matches!(ctx.get_field(layout, 0), Value::Int(_)) {
+                2
+            } else {
+                3
+            }
         }
-    } else if ctx.object_num_fields(layout) > 3 {
-        ctx.get_field(layout, 3)
+    };
+    P67LayoutSlots {
+        byte_size: 0,
+        byte_alignment: 1,
+        name,
+        order: P67LayoutOrder::Flag(2),
+        target: 4,
+        payload: 2,
+        element_count: 4,
+    }
+}
+
+/// The real JDK class behind a `java.lang.foreign` VALUE layout interface, or
+/// `None` for anything this does not name -- the group layouts, and the impl
+/// names themselves, which arrive here when a `withX` copy re-mints a carrier
+/// from its own class name.
+pub(crate) fn p67_value_layout_impl(class_name: &str) -> Option<&'static str> {
+    Some(match class_name {
+        "java/lang/foreign/ValueLayout$OfBoolean" => {
+            "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl"
+        }
+        "java/lang/foreign/ValueLayout$OfByte" => {
+            "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl"
+        }
+        "java/lang/foreign/ValueLayout$OfChar" => {
+            "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl"
+        }
+        "java/lang/foreign/ValueLayout$OfShort" => {
+            "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl"
+        }
+        "java/lang/foreign/ValueLayout$OfInt" => {
+            "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl"
+        }
+        "java/lang/foreign/ValueLayout$OfLong" => {
+            "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl"
+        }
+        "java/lang/foreign/ValueLayout$OfFloat" => {
+            "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl"
+        }
+        "java/lang/foreign/ValueLayout$OfDouble" => {
+            "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl"
+        }
+        "java/lang/foreign/AddressLayout" => {
+            "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl"
+        }
+        _ => return None,
+    })
+}
+
+/// Record `little` on `layout`, in whichever way its carrier records it.
+///
+/// The real arm ALLOCATES a `ByteOrder`, which can move `layout` -- the native
+/// stale-local family -- so the carrier is pinned across it.
+pub(crate) fn p67_layout_set_order(
+    ctx: &mut dyn NativeContext,
+    layout: ObjectRef,
+    little: bool,
+) -> Result<ObjectRef, MethodCallFailed> {
+    match p67_layout_slots(ctx, layout).order {
+        P67LayoutOrder::Flag(slot) => {
+            if ctx.object_num_fields(layout) > slot {
+                ctx.set_field(layout, slot, Value::Int(i32::from(little)));
+            }
+            Ok(layout)
+        }
+        P67LayoutOrder::Object(slot) => {
+            let pin = ctx.pin_native_root(layout);
+            let order = p67_byte_order_object(ctx, little)?;
+            let layout = ctx.read_native_pin(pin, layout);
+            ctx.unpin_native_roots(pin);
+            ctx.set_field(layout, slot, Value::Object(Some(order)));
+            Ok(layout)
+        }
+    }
+}
+
+pub(crate) fn p67_layout_name_value(ctx: &dyn NativeContext, layout: ObjectRef) -> Value {
+    let slots = p67_layout_slots(ctx, layout);
+    if ctx.object_num_fields(layout) > slots.name {
+        ctx.get_field(layout, slots.name)
     } else {
         Value::Object(None)
     }
@@ -152,11 +333,9 @@ pub(crate) fn p67_layout_with_name(
         .class_name_of_id(ctx.class_id_of_object(this))
         .unwrap_or_else(|| "java/lang/foreign/MemoryLayout".to_string());
     let field_count = ctx.object_num_fields(this);
-    let name_slot = if matches!(ctx.get_field(this, 0), Value::Int(_)) {
-        2
-    } else {
-        3
-    };
+    // Through the resolver, not a second copy of the rule: the open-coded
+    // version here answered 3 for a real value layout, which is `carrier`.
+    let name_slot = p67_layout_slots(ctx, this).name;
     let clone_fields = std::cmp::max(field_count, name_slot + 1);
     let this_pin = ctx.pin_native_root(this);
     let name_pin = match name {
@@ -265,7 +444,8 @@ pub(crate) fn p67_layout_with_byte_alignment(
         ctx.set_field(cloned, i, ctx.get_field(this, i));
     }
     ctx.unpin_native_roots(this_pin);
-    ctx.set_field(cloned, 1, Value::Long(alignment));
+    let alignment_slot = p67_layout_slots(ctx, cloned).byte_alignment;
+    ctx.set_field(cloned, alignment_slot, Value::Long(alignment));
     Ok(Some(Value::Object(Some(cloned))))
 }
 
@@ -274,8 +454,9 @@ pub(crate) fn p67_address_layout_target_layout(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let target = if ctx.object_num_fields(this) > 4 {
-        ctx.get_field(this, 4)
+    let target_slot = p67_layout_slots(ctx, this).target;
+    let target = if ctx.object_num_fields(this) > target_slot {
+        ctx.get_field(this, target_slot)
     } else {
         Value::Object(None)
     };
@@ -292,6 +473,8 @@ pub(crate) fn p67_address_layout_with_target_layout(
         .class_name_of_id(ctx.class_id_of_object(this))
         .unwrap_or_else(|| "java/lang/foreign/AddressLayout".to_string());
     let field_count = ctx.object_num_fields(this);
+    // At least 5 for the fabricated carrier; a real `OfAddressImpl` declares
+    // seven fields and `field_count` already reflects that.
     let clone_fields = std::cmp::max(field_count, 5);
     let this_pin = ctx.pin_native_root(this);
     let target_pin = match target {
@@ -311,7 +494,8 @@ pub(crate) fn p67_address_layout_with_target_layout(
         }
         None => Value::Object(None),
     };
-    ctx.set_field(cloned, 4, target);
+    let target_slot = p67_layout_slots(ctx, cloned).target;
+    ctx.set_field(cloned, target_slot, target);
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(cloned))))
 }
@@ -441,12 +625,13 @@ pub(crate) fn p67_value_layout_clinit(
 /// alignment fallback is `size` because that is what a `ValueLayout`'s natural
 /// alignment is; a zero would make the rounding below divide by zero.
 pub(crate) fn p67_layout_size_align(ctx: &mut dyn NativeContext, layout: ObjectRef) -> (i64, i64) {
-    let size = match ctx.get_field(layout, 0) {
+    let slots = p67_layout_slots(ctx, layout);
+    let size = match ctx.get_field(layout, slots.byte_size) {
         Value::Long(v) => v,
         Value::Int(v) => i64::from(v),
         _ => 0,
     };
-    let align = match ctx.get_field(layout, 1) {
+    let align = match ctx.get_field(layout, slots.byte_alignment) {
         Value::Long(v) if v > 0 => v,
         Value::Int(v) if v > 0 => i64::from(v),
         _ => size.max(1),
@@ -459,7 +644,8 @@ pub(crate) fn p67_layout_byte_size(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    Ok(Some(ctx.get_field(this, 0)))
+    let slots = p67_layout_slots(ctx, this);
+    Ok(Some(ctx.get_field(this, slots.byte_size)))
 }
 
 pub(crate) fn p67_layout_byte_alignment(
@@ -467,10 +653,11 @@ pub(crate) fn p67_layout_byte_alignment(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let value = ctx.get_field(this, 1);
+    let slots = p67_layout_slots(ctx, this);
+    let value = ctx.get_field(this, slots.byte_alignment);
     match value {
         Value::Long(_) => Ok(Some(value)),
-        _ => Ok(Some(ctx.get_field(this, 0))),
+        _ => Ok(Some(ctx.get_field(this, slots.byte_size))),
     }
 }
 
@@ -655,27 +842,25 @@ pub(crate) fn p67_layout_with_order(
     let class_name = ctx
         .class_name_of_id(ctx.class_id_of_object(this))
         .unwrap_or_else(|| "java/lang/foreign/ValueLayout".to_string());
-    let byte_size = match ctx.get_field(this, 0) {
+    let slots = p67_layout_slots(ctx, this);
+    let byte_size = match ctx.get_field(this, slots.byte_size) {
         Value::Long(v) => v,
         Value::Int(v) => v as i64,
         _ => 1,
     };
-    let byte_alignment = match ctx.get_field(this, 1) {
+    let byte_alignment = match ctx.get_field(this, slots.byte_alignment) {
         Value::Long(v) => v,
         Value::Int(v) => v as i64,
         _ => byte_size,
     };
+    let little = vh_byte_order_is_little(ctx, args.get(1));
+    let inherited_name = p67_layout_name_value(ctx, this);
     let obj = p67_layout_object(ctx, &class_name, byte_size, byte_alignment)?;
-    ctx.set_field(
-        obj,
-        2,
-        Value::Int(if vh_byte_order_is_little(ctx, args.get(1)) {
-            1
-        } else {
-            0
-        }),
-    );
-    ctx.set_field(obj, 3, p67_layout_name_value(ctx, this));
+    // `p67_layout_object` has already stamped the HOST's order; this is the
+    // caller's, which is the whole point of `withOrder`.
+    let obj = p67_layout_set_order(ctx, obj, little)?;
+    let name_slot = p67_layout_slots(ctx, obj).name;
+    ctx.set_field(obj, name_slot, inherited_name);
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -1437,9 +1622,10 @@ fn p67_session_add_action_synthetic(
 }
 
 pub(crate) fn p67_layout_width_obj(ctx: &dyn NativeContext, layout: ObjectRef) -> i32 {
-    match ctx.get_field(layout, 0) {
+    let slots = p67_layout_slots(ctx, layout);
+    match ctx.get_field(layout, slots.byte_size) {
         Value::Long(v) if (1..=8).contains(&v) => v as i32,
-        Value::Int(_) => match ctx.get_field(layout, 1) {
+        Value::Int(_) => match ctx.get_field(layout, slots.byte_alignment) {
             Value::Int(v) if (1..=8).contains(&v) => v,
             Value::Long(v) if (1..=8).contains(&v) => v as i32,
             _ => 1,
@@ -1498,7 +1684,7 @@ pub(crate) fn p67_layout_named_member(
     layout: ObjectRef,
     target_name: &str,
 ) -> Option<ObjectRef> {
-    let members = match ctx.get_field(layout, 2) {
+    let members = match ctx.get_field(layout, p67_layout_slots(ctx, layout).payload) {
         Value::Object(Some(arr)) => arr,
         _ => return None,
     };
@@ -1543,9 +1729,10 @@ pub(crate) fn p67_layout_named_member(
 /// `jdk.internal.foreign.layout.AbstractLayout` declares `byteSize` first, so
 /// the slot-0 `Long` read covers it too.
 pub(crate) fn p67_layout_size_of(ctx: &dyn NativeContext, layout: ObjectRef) -> i64 {
-    match ctx.get_field(layout, 0) {
+    let slots = p67_layout_slots(ctx, layout);
+    match ctx.get_field(layout, slots.byte_size) {
         Value::Long(v) => v,
-        _ => match ctx.get_field(layout, 1) {
+        _ => match ctx.get_field(layout, slots.byte_alignment) {
             Value::Long(v) => v,
             Value::Int(v) => v as i64,
             _ => 0,
@@ -1556,7 +1743,8 @@ pub(crate) fn p67_layout_size_of(ctx: &dyn NativeContext, layout: ObjectRef) -> 
 /// A layout's byte alignment, defaulting to its size (which is what every
 /// value layout uses) when the carrier does not record one separately.
 pub(crate) fn p67_layout_align_of(ctx: &dyn NativeContext, layout: ObjectRef) -> i64 {
-    let by_slot = match ctx.get_field(layout, 1) {
+    let slots = p67_layout_slots(ctx, layout);
+    let by_slot = match ctx.get_field(layout, slots.byte_alignment) {
         Value::Long(v) if v > 0 => v,
         _ => 0,
     };
@@ -1604,11 +1792,12 @@ pub(crate) fn p67_layout_align_of(ctx: &dyn NativeContext, layout: ObjectRef) ->
 ///
 /// Deliberately has no default arm. See the banner above.
 fn p67_member_size_align(ctx: &dyn NativeContext, member: ObjectRef) -> Option<(i64, i64)> {
-    let size = match ctx.get_field(member, 0) {
+    let slots = p67_layout_slots(ctx, member);
+    let size = match ctx.get_field(member, slots.byte_size) {
         Value::Long(v) => v,
         _ => return None,
     };
-    let align = match ctx.get_field(member, 1) {
+    let align = match ctx.get_field(member, slots.byte_alignment) {
         Value::Long(v) if v > 0 => v,
         // A carrier with a size but no recorded alignment is a value layout
         // whose alignment equals its size — the JDK's own rule for every
@@ -1648,7 +1837,8 @@ pub(crate) fn p67_layout_render(ctx: &dyn NativeContext, layout: ObjectRef) -> S
     let base = if class_name.contains("PaddingLayout") {
         format!("x{size}")
     } else if class_name.contains("SequenceLayout") {
-        let elem = match ctx.get_field(layout, 2) {
+        let slots = p67_layout_slots(ctx, layout);
+        let elem = match ctx.get_field(layout, slots.payload) {
             Value::Object(Some(e)) => p67_layout_render(ctx, e),
             _ => String::new(),
         };
@@ -1657,11 +1847,12 @@ pub(crate) fn p67_layout_render(ctx: &dyn NativeContext, layout: ObjectRef) -> S
         // is wrong whenever the element's byteSize is 0: the oracle renders
         // `sequenceLayout(3, structLayout())` as `[3:[]]`, and the division
         // would print `[0:[]]`.
-        let stored = if ctx.object_num_fields(layout) > 4 {
-            // Read slot 4 only AFTER the width check — a four-slot carrier has
-            // no slot 4 to read, and asking for one is the out-of-bounds field
-            // access this file's carrier notes keep warning about.
-            match ctx.get_field(layout, 4) {
+        let stored = if ctx.object_num_fields(layout) > slots.element_count {
+            // Read the count slot only AFTER the width check — a four-slot
+            // carrier has no slot 4 to read, and asking for one is the
+            // out-of-bounds field access this file's carrier notes keep
+            // warning about.
+            match ctx.get_field(layout, slots.element_count) {
                 Value::Long(count) => Some(count),
                 _ => None,
             }
@@ -1670,7 +1861,7 @@ pub(crate) fn p67_layout_render(ctx: &dyn NativeContext, layout: ObjectRef) -> S
         };
         let count = match stored {
             Some(count) => count,
-            None => match ctx.get_field(layout, 2) {
+            None => match ctx.get_field(layout, slots.payload) {
                 Value::Object(Some(e)) => {
                     let es = p67_layout_size_of(ctx, e);
                     if es > 0 {
@@ -1692,7 +1883,7 @@ pub(crate) fn p67_layout_render(ctx: &dyn NativeContext, layout: ObjectRef) -> S
         } else {
             ""
         };
-        let parts = match ctx.get_field(layout, 2) {
+        let parts = match ctx.get_field(layout, p67_layout_slots(ctx, layout).payload) {
             Value::Object(Some(arr)) => (0..ctx.array_length(arr))
                 .map(|i| match ctx.get_array_element(arr, i) {
                     Value::Object(Some(m)) => p67_layout_render(ctx, m),
@@ -1803,7 +1994,7 @@ pub(crate) fn p67_classify_path_element(
 
 /// The member layouts of a group layout (slot 2), if it has any.
 fn p67_group_members(ctx: &dyn NativeContext, layout: ObjectRef) -> Option<ObjectRef> {
-    match ctx.get_field(layout, 2) {
+    match ctx.get_field(layout, p67_layout_slots(ctx, layout).payload) {
         Value::Object(Some(arr)) if ctx.array_length(arr) > 0 => Some(arr),
         _ => None,
     }
@@ -1878,7 +2069,7 @@ fn p67_sequence_element_layout(ctx: &dyn NativeContext, layout: ObjectRef) -> Op
     if !class_name.contains("SequenceLayout") {
         return None;
     }
-    match ctx.get_field(layout, 2) {
+    match ctx.get_field(layout, p67_layout_slots(ctx, layout).payload) {
         Value::Object(Some(e)) => Some(e),
         _ => None,
     }
@@ -2893,11 +3084,42 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/foreign/Arena;",
         |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false)?)))),
     );
+    // `Arena.global()` IS A SINGLETON. The JDK's is
+    // `MemorySessionImpl.GLOBAL_SESSION` -- one object for the life of the VM,
+    // and `Arena.global() == Arena.global()` is `true` on HotSpot. This minted
+    // a fresh arena on every call, in BOTH modes, so the identity was wrong and
+    // so was every per-arena table but the last: state recorded against one
+    // global arena was invisible to the next caller's.
+    //
+    // MEASURED by `apps/probes/FfmCarrierProbe.java`. The memo lives here
+    // because this registrar OWNS the slot -- `--dump-native-registry` says
+    // `owns_slot=true` here and `panama.rs`'s `register_pe_arena` owns none of
+    // the four factories, so the first version of this fix, written there, was
+    // inert and the row stayed red while the nine beside it went green.
     r.register(
         arena,
         "global",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena_kind(ctx, false, false)?)))),
+        |ctx, _args| {
+            if let Some(existing) = crate::panama::global_arena_handle()
+                .and_then(|h| ctx.resolve_global_root(h))
+            {
+                return Ok(Some(Value::Object(Some(existing))));
+            }
+            let a = p67_new_arena_kind(ctx, false, false)?;
+            // A global root: the global arena outlives every native call and
+            // must survive a moving collection.
+            let handle = ctx.add_global_root(a);
+            match crate::panama::claim_global_arena(handle) {
+                None => Ok(Some(Value::Object(Some(a)))),
+                // Lost the race -- drop ours and answer with theirs.
+                Some(published) => {
+                    ctx.remove_global_root(handle);
+                    let winner = ctx.resolve_global_root(published).unwrap_or(a);
+                    Ok(Some(Value::Object(Some(winner))))
+                }
+            }
+        },
     );
     r.register(
         arena,
@@ -3672,6 +3894,24 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         r.register(class, "name", "()Ljava/util/Optional;", p67_layout_name);
         r.register(class, "carrier", "()Ljava/lang/Class;", p67_layout_carrier);
         r.register(class, "order", "()Ljava/nio/ByteOrder;", p67_layout_order);
+        // The four the interface loop has and this one did not. A value layout
+        // is minted as the impl class since 2026-08-29 and native dispatch is
+        // keyed on the receiver's class, so without these the JDK's own
+        // bytecode -- reading fields this VM does not populate -- serves them.
+        r.register(class, "byteSize", "()J", p67_layout_byte_size);
+        r.register(class, "byteAlignment", "()J", p67_layout_byte_alignment);
+        r.register(
+            class,
+            "byteOffset",
+            "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
+            p67_layout_byte_offset,
+        );
+        r.register(
+            class,
+            "varHandle",
+            "()Ljava/lang/invoke/VarHandle;",
+            |ctx, args| Ok(Some(p67_var_handle(ctx, args)?)),
+        );
     }
     r.register(
         "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
@@ -3797,12 +4037,13 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 max_align = max_align.max(member_align);
             }
             let members_pin = ctx.pin_native_root(members);
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/StructLayout", 4)?;
+            let obj = try_alloc_concurrent_synthetic(ctx, "jdk/internal/foreign/layout/StructLayoutImpl", 4)?;
+            let slots = p67_layout_slots_for_mint(ctx, obj, 3);
             let members = ctx.read_native_pin(members_pin, members);
-            ctx.set_field(obj, 0, Value::Long(size));
-            ctx.set_field(obj, 1, Value::Long(max_align));
-            ctx.set_field(obj, 2, Value::Object(Some(members)));
-            ctx.set_field(obj, 3, Value::Object(None));
+            ctx.set_field(obj, slots.byte_size, Value::Long(size));
+            ctx.set_field(obj, slots.byte_alignment, Value::Long(max_align));
+            ctx.set_field(obj, slots.payload, Value::Object(Some(members)));
+            ctx.set_field(obj, slots.name, Value::Object(None));
             ctx.unpin_native_roots(members_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -3929,13 +4170,14 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             // carrier F16 removed: that one put the ELEMENT at slot 4, where
             // the walk expects it at slot 2.
             let element_pin = ctx.pin_native_root(element);
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/SequenceLayout", 5)?;
-            ctx.set_field(obj, 0, Value::Long(total));
-            ctx.set_field(obj, 1, Value::Long(elem_align.max(1)));
+            let obj = try_alloc_concurrent_synthetic(ctx, "jdk/internal/foreign/layout/SequenceLayoutImpl", 5)?;
+            let slots = p67_layout_slots_for_mint(ctx, obj, 3);
+            ctx.set_field(obj, slots.byte_size, Value::Long(total));
+            ctx.set_field(obj, slots.byte_alignment, Value::Long(elem_align.max(1)));
             let element = ctx.read_native_pin(element_pin, element);
-            ctx.set_field(obj, 2, Value::Object(Some(element)));
-            ctx.set_field(obj, 3, Value::Object(None));
-            ctx.set_field(obj, 4, Value::Long(count));
+            ctx.set_field(obj, slots.payload, Value::Object(Some(element)));
+            ctx.set_field(obj, slots.name, Value::Object(None));
+            ctx.set_field(obj, slots.element_count, Value::Long(count));
             ctx.unpin_native_roots(element_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -4002,12 +4244,13 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             // it. Minting one through `p67_layout_object` answers the right
             // byteSize and then loses every member.
             let members_pin = ctx.pin_native_root(members);
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/UnionLayout", 4)?;
+            let obj = try_alloc_concurrent_synthetic(ctx, "jdk/internal/foreign/layout/UnionLayoutImpl", 4)?;
+            let slots = p67_layout_slots_for_mint(ctx, obj, 3);
             let members = ctx.read_native_pin(members_pin, members);
-            ctx.set_field(obj, 0, Value::Long(size));
-            ctx.set_field(obj, 1, Value::Long(max_align));
-            ctx.set_field(obj, 2, Value::Object(Some(members)));
-            ctx.set_field(obj, 3, Value::Object(None));
+            ctx.set_field(obj, slots.byte_size, Value::Long(size));
+            ctx.set_field(obj, slots.byte_alignment, Value::Long(max_align));
+            ctx.set_field(obj, slots.payload, Value::Object(Some(members)));
+            ctx.set_field(obj, slots.name, Value::Object(None));
             ctx.unpin_native_roots(members_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -4051,16 +4294,17 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             // `p67_layout_object` stamps the VALUE-layout endian flag there.
             // Padding has no payload, so the slot is explicitly null rather
             // than an `Int` that a payload reader could mistake for one.
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/PaddingLayout", 4)?;
-            ctx.set_field(obj, 0, Value::Long(size));
+            let obj = try_alloc_concurrent_synthetic(ctx, "jdk/internal/foreign/layout/PaddingLayoutImpl", 4)?;
+            let slots = p67_layout_slots_for_mint(ctx, obj, 3);
+            ctx.set_field(obj, slots.byte_size, Value::Long(size));
             // Padding has no alignment constraint of its own — the JDK's
             // `PaddingLayoutImpl` is byte-aligned. This is the slot whose
             // absence made `structLayout(JAVA_BYTE, paddingLayout(3), JAVA_INT)`
             // answer 12 where the oracle answers 8: with no slot 1 to read, the
             // member decode fell back to "alignment = size".
-            ctx.set_field(obj, 1, Value::Long(1));
-            ctx.set_field(obj, 2, Value::Object(None));
-            ctx.set_field(obj, 3, Value::Object(None));
+            ctx.set_field(obj, slots.byte_alignment, Value::Long(1));
+            ctx.set_field(obj, slots.payload, Value::Object(None));
+            ctx.set_field(obj, slots.name, Value::Object(None));
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4105,6 +4349,14 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "java/lang/foreign/UnionLayout",
         "java/lang/foreign/SequenceLayout",
         "java/lang/foreign/PaddingLayout",
+        // The real classes these carriers are minted as since 2026-08-30.
+        // Native dispatch is keyed on the receiver's CLASS, so a registration
+        // left only on the interface hands the call to JDK bytecode reading
+        // fields this VM does not populate.
+        "jdk/internal/foreign/layout/StructLayoutImpl",
+        "jdk/internal/foreign/layout/UnionLayoutImpl",
+        "jdk/internal/foreign/layout/SequenceLayoutImpl",
+        "jdk/internal/foreign/layout/PaddingLayoutImpl",
         "java/lang/foreign/AddressLayout",
         "java/lang/foreign/ValueLayout",
         "java/lang/foreign/ValueLayout$OfByte",
@@ -4161,7 +4413,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/foreign/MemoryLayout;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 2)))
+            Ok(Some(ctx.get_field(this, p67_layout_slots(ctx, this).payload)))
         },
     );
     // `elementCount()` reads the STORED count (slot 4), falling back to the
@@ -4175,13 +4427,107 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
     // still answers what it used to instead of reading past its own end.
     r.register(seq_layout, "elementCount", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > 4 {
-            if let Value::Long(count) = ctx.get_field(this, 4) {
+        let slots = p67_layout_slots(ctx, this);
+        if ctx.object_num_fields(this) > slots.element_count {
+            if let Value::Long(count) = ctx.get_field(this, slots.element_count) {
                 return Ok(Some(Value::Long(count)));
             }
         }
         let total = p67_layout_size_of(ctx, this);
-        let elem = match ctx.get_field(this, 2) {
+        let elem = match ctx.get_field(this, slots.payload) {
+            Value::Object(Some(e)) => p67_layout_size_of(ctx, e),
+            _ => 0,
+        };
+        Ok(Some(Value::Long(if elem > 0 { total / elem } else { 0 })))
+    });
+    // The same five on the class a sequence is actually minted as. The loops
+    // above cover its `byteSize`, `byteAlignment` and `byteOffset`; these are
+    // the ones registered against the bare `seq_layout` constant.
+    // `toString()` on every class a layout is now minted as.
+    //
+    // It was registered on nothing at all. While the carrier was the INTERFACE
+    // that fell through to `Object.toString` and printed an identity string --
+    // wrong against HotSpot's `[3:i4]`, and untested. On the real class the
+    // JDK's own `toString` runs instead and dereferences `carrier`, a field
+    // this VM does not populate: NPE. `p67_layout_render` is the rendering the
+    // oracle produces, and until now it was only ever used inside error
+    // messages.
+    for impl_class in [
+        "jdk/internal/foreign/layout/StructLayoutImpl",
+        "jdk/internal/foreign/layout/UnionLayoutImpl",
+        "jdk/internal/foreign/layout/SequenceLayoutImpl",
+        "jdk/internal/foreign/layout/PaddingLayoutImpl",
+        "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl",
+        "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl",
+        "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl",
+        "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl",
+        "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+        "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+        "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl",
+        "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl",
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+    ] {
+        r.register(
+            impl_class,
+            "toString",
+            "()Ljava/lang/String;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let rendered = p67_layout_render(ctx, this);
+                Ok(Some(Value::Object(Some(ctx.create_string(&rendered)))))
+            },
+        );
+    }
+
+    // Padding's two, for the same reason. The census diff (impl class against
+    // its interface) is what named them; the registrars are too spread out to
+    // read for this.
+    let pad_impl = "jdk/internal/foreign/layout/PaddingLayoutImpl";
+    r.register(pad_impl, "name", "()Ljava/util/Optional;", p67_layout_name);
+    r.register(
+        pad_impl,
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+        p67_layout_with_name,
+    );
+    let seq_impl = "jdk/internal/foreign/layout/SequenceLayoutImpl";
+    r.register(
+        seq_impl,
+        "name",
+        "()Ljava/util/Optional;",
+        p67_layout_name,
+    );
+    r.register(
+        seq_impl,
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+        p67_layout_with_name,
+    );
+    r.register(
+        seq_impl,
+        "varHandle",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;",
+        p67_memory_layout_var_handle,
+    );
+    r.register(
+        seq_impl,
+        "elementLayout",
+        "()Ljava/lang/foreign/MemoryLayout;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, p67_layout_slots(ctx, this).payload)))
+        },
+    );
+    r.register(seq_impl, "elementCount", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let slots = p67_layout_slots(ctx, this);
+        if ctx.object_num_fields(this) > slots.element_count {
+            if let Value::Long(count) = ctx.get_field(this, slots.element_count) {
+                return Ok(Some(Value::Long(count)));
+            }
+        }
+        let total = p67_layout_size_of(ctx, this);
+        let elem = match ctx.get_field(this, slots.payload) {
             Value::Object(Some(e)) => p67_layout_size_of(ctx, e),
             _ => 0,
         };
@@ -4194,6 +4540,8 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "java/lang/foreign/StructLayout",
         "java/lang/foreign/GroupLayout",
         "java/lang/foreign/UnionLayout",
+        "jdk/internal/foreign/layout/StructLayoutImpl",
+        "jdk/internal/foreign/layout/UnionLayoutImpl",
     ] {
         r.register(
             group_class,
@@ -4228,6 +4576,10 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "java/lang/foreign/SequenceLayout",
         "java/lang/foreign/PaddingLayout",
         "java/lang/foreign/UnionLayout",
+        "jdk/internal/foreign/layout/StructLayoutImpl",
+        "jdk/internal/foreign/layout/UnionLayoutImpl",
+        "jdk/internal/foreign/layout/SequenceLayoutImpl",
+        "jdk/internal/foreign/layout/PaddingLayoutImpl",
     ] {
         r.register(layout_class, "byteSize", "()J", p67_layout_byte_size);
         r.register(
@@ -4249,19 +4601,24 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
 
     // Linker
     let gl = "java/lang/foreign/GroupLayout";
-    for layout_class in [gl, "java/lang/foreign/StructLayout"] {
+    for layout_class in [
+        gl,
+        "java/lang/foreign/StructLayout",
+        "jdk/internal/foreign/layout/StructLayoutImpl",
+        "jdk/internal/foreign/layout/UnionLayoutImpl",
+    ] {
         r.register(
             layout_class,
             "memberLayouts",
             "()Ljava/util/List;",
             |ctx, args| {
                 let members =
-                    match obj_arg(args, 0)
-                        .ok()
-                        .and_then(|this| match ctx.get_field(this, 2) {
+                    match obj_arg(args, 0).ok().and_then(|this| {
+                        match ctx.get_field(this, p67_layout_slots(ctx, this).payload) {
                             Value::Object(Some(arr)) => Some(arr),
                             _ => None,
-                        }) {
+                        }
+                    }) {
                         Some(arr) => arr,
                         None => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
                     };
@@ -4982,6 +5339,36 @@ fn register_p67_segment_surface(r: &mut NativeMethodRegistry, ms: &str) {
             _ => false,
         };
         Ok(Some(Value::Int(i32::from(same_address && same_base))))
+    });
+    // `hashCode` OVER THE SAME PAIR `equals` USES. Registering one without the
+    // other is the classic split: `s.asSlice(0, s.byteSize()).equals(s)` is
+    // true and the two hashed differently, so a `HashSet<MemorySegment>` held
+    // the same place twice and a de-duplicating caller never saw it.
+    //
+    // The answer was already recorded in `equals`'s own comment above --
+    // `s.asSlice(0, 16).hashCode() == s.hashCode()` is `true` on HotSpot --
+    // three lines from the registration that was never written. Without this,
+    // real `AbstractMemorySegmentImpl.hashCode` runs and reads
+    // `length`/`readOnly`/`scope`, which this carrier does not have.
+    //
+    // The VALUE is not compared against HotSpot's and must not be: the JDK
+    // hashes `unsafeGetBase()` and `unsafeGetOffset()`, and an identity hash of
+    // a base array is not reproducible across VMs. What IS comparable, and what
+    // the contract requires, is that equal segments hash equal -- MEASURED by
+    // `apps/probes/FfmMsgProbe.java`.
+    r.register(ms, "hashCode", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let address = crate::panama_libffi::segment_address(&*ctx, this);
+        let base = p67_segment_heap_base_slot(ctx, this)
+            .map(|b| ctx.identity_hash_code(b))
+            .unwrap_or(0);
+        // `Objects.hash(base, offset)`'s shape: the JDK's own combiner, so two
+        // segments differing in either half are unlikely to collide.
+        let h = 31i32
+            .wrapping_mul(31i32.wrapping_add(base))
+            .wrapping_add(address as i32)
+            ^ ((address >> 32) as i32);
+        Ok(Some(Value::Int(h)))
     });
     r.register(
         ms,

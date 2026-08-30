@@ -352,7 +352,7 @@ This Part is the highest risk for coupling. The implementation MUST:
 - [classloading/src/bytecode_verifier.rs](classloading/src/bytecode_verifier.rs) — reusable type-flow analyser
 - [reader/src/stack_map.rs](reader/src/stack_map.rs) — verification frames for Part D's analyser
 - [types/src/value.rs](types/src/value.rs) — `Value`, `ObjectRef`
-- [test_classes/HelloWorld.java](test_classes/HelloWorld.java) — pattern to mirror for new fixtures
+- [reader/tests/fixtures/HelloWorld.java](reader/tests/fixtures/HelloWorld.java) — pattern to mirror for new fixtures (a fixture the crate that reads it owns, where no `.gitignore` rule can swallow the `.class`)
 
 ## Non-goals (explicit)
 

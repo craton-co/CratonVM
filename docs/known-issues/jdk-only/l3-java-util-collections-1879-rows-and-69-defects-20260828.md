@@ -680,6 +680,108 @@ the dormant `PriorityQueue$Itr` registration in §6.1 was; here the class name i
 a label over an identical object and the natives cannot tell the producers
 apart, because there is nothing to tell apart.
 
+## 6b. The coverage sweep, and the twelve spliterator cells it found
+
+**Written after the residuals closed, from the registry rather than from a
+hypothesis.** A dump taken DURING all sixteen probes, merged, says the corpus
+reaches 445 of the 602 owning `java.util` registrations that sit over a real JDK
+body. The other 157 were never invoked.
+
+The first reading of that number is "retirement candidates". It is not: the
+never-invoked set is almost entirely the NavigableSet surface of
+`TreeMap.keySet()` (18 rows), HashMap's conditional mutators on the plain
+family (11), and the sublist `ListIterator` (7) — **a coverage gap in the
+probes, not dead code**. That is `a-zero-invocation-count-is-evidence-about-a-
+counter` in its exact shape: `invocations` is a floor.
+
+`apps/probes/UtilCoverageSweep` closes it — 141 rows over precisely those
+registrations — and found a defect on its first run.
+
+### The spliterator characteristics matrix — 12 cells
+
+§3's spliterator work moved the characteristics mask into the object and gave
+three producers their own answer. It was right about those three, because the
+probe that drove it asked about three receivers. Asking all twenty-eight:
+
+```text
+                 keySet   values   entrySet    standalone
+  HashMap           65       64       65             65
+  LinkedHashMap  16465    16464    16465          16465
+  TreeMap           85       80       85             85
+  Hashtable      16449    16448    16449             --
+  Properties      4353     4352    16449             --
+```
+
+**Twelve of those cells were wrong** — every map view, plus the standalone
+`LinkedHashSet`. Every ArrayList-shaped view took the list default, so
+`HashMap.values()` claimed an encounter order it does not have and
+`TreeMap.entrySet()` claimed neither the DISTINCT nor the SORTED it does; every
+set-shaped view took the plain `HashSet` cell, so `LinkedHashMap.keySet()` lost
+both ORDERED and SUBSIZED.
+
+Three things in the matrix are not derivable, which is why it is measured and
+not computed:
+
+* **`values` is never DISTINCT**, and for `HashMap` not ORDERED either. A values
+  view can repeat, and a hash map has no encounter order. `TreeMap`'s values are
+  ORDERED but not SORTED — the sort is on the keys.
+* **`SUBSIZED` follows the JDK's CONSTRUCTION, not the container.** The
+  `LinkedHashMap` and `Hashtable` families go through
+  `Spliterators.spliterator(Collection, ..)`, which adds `SIZED | SUBSIZED`;
+  `HashMap`'s and `TreeMap`'s have hand-written spliterator classes that do not.
+  That is the whole reason `LinkedHashSet` is 16465 and `HashSet` is 65 despite
+  being the same shape of container.
+* **`Properties` is CONCURRENT | NONNULL and NOT SIZED** — JDK 25 backs it with
+  a `ConcurrentHashMap`, the same fact behind §6.6 — and its `entrySet` takes
+  the `Hashtable` cell rather than the concurrent one. That asymmetry is
+  HotSpot's, and a derived table would have smoothed it away.
+
+These are not cosmetic: a stream pipeline reads DISTINCT to decide it may skip a
+`distinct()`, SORTED to skip a sort, and SIZED/SUBSIZED to decide how to split
+in parallel.
+
+### The immutable factories, compatible mode only — 4 of 8 closed
+
+```text
+                       HotSpot   was    now
+  Set.of("a")            17745    65   17745
+  Set.of()               16449    65   16449
+  Set.of("a","b")        16449    65   16449
+  Set.of x3 (SetN)       16449    65   16449
+  List.of("a")           17745  16464  16464   <- open
+  Map.of().keySet()      16449    65     65    <- open
+  Map.of().values()      16448    64     64    <- open
+  Map.of().entrySet()    17745    65     65    <- open
+```
+
+**The discriminator is SIZE, not class**, which is what the whole shape of this
+row turns on. Every 17745 is a size-1 immutable — `Set.of("a")`, `List.of("a")`,
+a one-entry `entrySet`, and `Collections.singleton`, which this VM already
+answered correctly and is the control that names the rule. The JDK routes those
+to `Collections.singletonSpliterator` (the `Collections$2` a strict run reports)
+and everything else to `Spliterators.spliterator(collection, flags)`, which adds
+`SIZED | SUBSIZED` on top of the family's own bits. `unmodifiableSet(hashSet)`
+is 65 on both VMs and is the other control: the JDK's WRAPPER really does hand
+back the backing's spliterator, so that arm must keep delegating.
+
+The four `Set.of` cells are closed by
+`native_unmod_spliterator` answering the family's own bits when
+`unmod_is_immutable`, including a widen for the three-field spliterator shape,
+which has no characteristics slot to write into.
+
+Four remain, and they are diagnosed rather than guessed: `List.of` reaches the
+same native (`cratonvm/internal/UnmodifiableList`, 5 invocations in the probe
+run) and still answers the list default, so its immutable flag or its size is
+not reading as expected there; `Map.of`'s three views never reach it at all —
+they are set-shaped views resolved through `view_spliterator_characteristics`,
+which classifies by SOURCE family and has no immutable branch. Both need one
+more diagnostic cycle.
+
+**All of this is compatible mode only.** Strict is 0-diff on all 153 rows of
+this probe: it refuses `cratonvm/internal/Unmodifiable*` and runs java.base's
+own bodies. The tenth row in this campaign where `--jdk-only` is the more
+correct mode.
+
 ## 7. The final verification, and where the residuals ended
 
 Every number here was RE-TAKEN at the end, on a binary built from the merge of

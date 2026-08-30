@@ -56,22 +56,40 @@ fn compact_ws(src: &str) -> String {
     src.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-/// Byte offsets of every `register(` **call site** for this triple in the
-/// whitespace-free source. Each offset points at the `r` of `register(`.
+/// The registration forms this scanner recognises.
 ///
-/// The `register(` prefix is load-bearing: `native-builtins/src/lib.rs` also
+/// `register_with_kind` is not a variant spelling — it is how 230 of the
+/// registrations in `native-builtins/src/lib.rs` are written, against
+/// 1207 plain ones. Recognising only `register(` is why this gate went
+/// red claiming `java/lang/System::setIn0` was missing: it is registered,
+/// eleven thousand lines into that file, with a `NativeKind` attached.
+///
+/// A scanner that reports a live registration as missing is worse than
+/// one that is merely wrong, because the obvious response is to go and
+/// "add" a native that is already there.
+const REGISTER_FORMS: &[&str] = &["register(", "register_with_kind("];
+
+/// Byte offsets of every registration **call site** for this triple in the
+/// whitespace-free source. Each offset points at the `r` of `register`.
+///
+/// The `register` prefix is load-bearing: `native-builtins/src/lib.rs` also
 /// contains unit tests that assert on the same triples via
 /// `registry.find("class", "method", "descriptor")`, and matching the bare
 /// tuple would let one of those satisfy `registers()` even after the real
-/// registration was deleted.
+/// registration was deleted. Both forms below keep that property — neither
+/// `find(` nor anything else that takes the same triple ends in
+/// `register(` or `register_with_kind(`.
 fn register_sites(compact: &str, class: &str, method: &str, desc: &str) -> Vec<usize> {
-    let needle = format!("register(\"{class}\",\"{method}\",\"{desc}\"");
     let mut out = Vec::new();
-    let mut from = 0usize;
-    while let Some(rel) = compact[from..].find(&needle) {
-        out.push(from + rel);
-        from += rel + 1;
+    for form in REGISTER_FORMS {
+        let needle = format!("{form}\"{class}\",\"{method}\",\"{desc}\"");
+        let mut from = 0usize;
+        while let Some(rel) = compact[from..].find(&needle) {
+            out.push(from + rel);
+            from += rel + 1;
+        }
     }
+    out.sort_unstable();
     out
 }
 
@@ -356,13 +374,6 @@ fn t14_gated_registrations_are_declared() {
                      where it would shadow real provider selection.",
         },
         Allowed {
-            cfg: "#[cfg(feature = \"experimental-serialization\")]",
-            target: "serialization::register_serialization_natives(registry);",
-            reason: "The synthetic ObjectInputStream/ObjectOutputStream \
-                     implementation. Real-JDK mode owns those classes as \
-                     bytecode; this is the synthetic replacement.",
-        },
-        Allowed {
             cfg: "#[cfg(feature = \"management\")]",
             target: "register_jmx_natives(registry);",
             reason: "`management` is a DEFAULT feature of cratonvm-vm, so it is                      ON in both the -p cratonvm-cli and --workspace resolves.                      It is opt-OUT (for musl / minimal builds via                      --no-default-features), not opt-in, so it cannot fork CI                      from a suite build the way the experimental-* features do.",
@@ -393,6 +404,12 @@ fn t14_gated_registrations_are_declared() {
 
     let mut undeclared: Vec<String> = Vec::new();
     let mut declared = 0usize;
+    // Which allow-list rows were actually used. A bare count says a row is
+    // dead but not which one, and finding it by hand means re-deriving the
+    // whole scan by inspection -- which is what the
+    // `serialization::register_serialization_natives` row cost, and it had
+    // been ungated deliberately and at length.
+    let mut matched = vec![false; allowed.len()];
 
     for (i, line) in lines.iter().enumerate() {
         let cfg = line.trim();
@@ -417,8 +434,12 @@ fn t14_gated_registrations_are_declared() {
         if !is_registration {
             continue;
         }
-        if allowed.iter().any(|a| a.cfg == cfg && a.target == target) {
+        if let Some(k) = allowed
+            .iter()
+            .position(|a| a.cfg == cfg && a.target == target)
+        {
             declared += 1;
+            matched[k] = true;
             continue;
         }
         undeclared.push(format!("line {}: {cfg}  ->  {target}", i + 1));
@@ -438,13 +459,20 @@ fn t14_gated_registrations_are_declared() {
 
     // Every allow-list entry must still correspond to real source. A stale
     // entry would let a future gate of the same shape pass unnoticed.
-    assert_eq!(
-        declared,
-        allowed.len(),
-        "T14: matched {declared} gated registrations but the allow-list has {}. \
-         An entry no longer matches any source line — delete it, or fix its \
-         `cfg`/`target` text to match.",
-        allowed.len(),
+    let dead: Vec<String> = allowed
+        .iter()
+        .zip(&matched)
+        .filter(|(_, &m)| !m)
+        .map(|(a, _)| format!("  {}  ->  {}", a.cfg, a.target))
+        .collect();
+    assert!(
+        dead.is_empty(),
+        "T14: {} allow-list entr{} no longer matching any source line. The gate \
+         each excuses is gone, so it would silently excuse the next gate of \
+         the same shape. Delete them, or fix their `cfg`/`target` text:\n{}",
+        dead.len(),
+        if dead.len() == 1 { "y" } else { "ies" },
+        dead.join("\n"),
     );
     eprintln!("[T14.3c] \u{2713} All {declared} gated native registrations are declared");
 }
