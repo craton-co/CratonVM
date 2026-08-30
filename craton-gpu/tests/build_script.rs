@@ -45,8 +45,29 @@ mod build_script {
             root.join("CratonVM").join("craton-gpu")
         }
 
+        /// The pre-aggregator layout: `<checkout>/src/main/java`.
+        ///
+        /// Still one of the two the resolver accepts, and the one it picks
+        /// when that directory actually exists — which is why the tests
+        /// that CREATE it expect this.
         fn documented_java_src(root: &Path) -> PathBuf {
             root.join("craton-gpu-java")
+                .join("src")
+                .join("main")
+                .join("java")
+        }
+
+        /// The layout gpu-java has had since it became a Maven aggregator
+        /// on 2026-08-28: `<checkout>/craton-gpu/src/main/java`.
+        ///
+        /// `first_existing_layout` returns this one when NEITHER layout is
+        /// present, deliberately, so that the `cargo:warning` names the
+        /// path a current checkout would use rather than a path no
+        /// checkout has had for months. A test for the nothing-exists case
+        /// therefore expects this, not [`documented_java_src`].
+        fn aggregator_java_src(root: &Path) -> PathBuf {
+            root.join("craton-gpu-java")
+                .join("craton-gpu")
                 .join("src")
                 .join("main")
                 .join("java")
@@ -123,7 +144,9 @@ mod build_script {
         fn missing_non_windows_sources_fall_back_to_documented_sibling_path() {
             let temp = TempDir::new("missing");
             let manifest = manifest_dir(temp.path());
-            let expected = documented_java_src(temp.path());
+            // Nothing is created, so neither layout exists and the resolver
+            // names the current one. See `aggregator_java_src`.
+            let expected = aggregator_java_src(temp.path());
             fs::create_dir_all(&manifest).expect("create manifest dir");
 
             let resolution = resolve_java_root_from(None, &manifest, false);

@@ -1,5 +1,12 @@
 # INDEX — every record in `docs/known-issues/jdk-only/`
 
+> **STARTING A LANE? The operating rules are not in this directory.**
+> [`../../contributing/jdk-only-lane-operations.md`](../../contributing/jdk-only-lane-operations.md)
+> holds the method, the `owns_slot` and identity traps, the probe-hygiene list,
+> the landing protocol and what "done" means. It is permanent; the records here
+> are dated. Added 2026-08-29, when `HANDOFF-20260828-SCOPE.md` §3/§5/§6 moved
+> there so that page could retire without taking the rules out of circulation.
+
 **Built by lane C18, 2026-08-13.** Snapshot: `ls docs/known-issues/jdk-only/*.md`
 taken at **00:07 local on 2026-08-13**, **155 files** including this one, on
 branch `claude/jdk-only-mode-completion-1351c0` at `HEAD = 7c00dee66`
