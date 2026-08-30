@@ -204,19 +204,35 @@ fn wp7_3_sqlTime_millis_roundtrip() {
 fn wp7_3_jdbc_essential_natives_registered() {
     let mut r = NativeMethodRegistry::new();
     cratonvm_native_builtins::register_essential_natives(&mut r);
-    // ServiceLoader.load(Class) is the entrypoint a JDBC driver
-    // discovery walk routes through; if WP7.1's `register_jdbc_driver_natives`
-    // is silently dropped from the essential-natives bundle the SQL
-    // types path still compiles but the driver discovery breaks.
+    // INVERTED 2026-08-30. `register_service_loader_natives`' body is
+    // `#[cfg(feature = "synthetic-jdk")]`, and its header explains why: in a
+    // real-JDK build `java.util.ServiceLoader` is pure Java that the VM
+    // already runs, and these natives were a shadow over it that got it
+    // WRONG -- `iterator()` answered `java.util.ArrayList$Itr` where HotSpot
+    // answers `java.util.ServiceLoader$2` (MEASURED,
+    // `probes/DodServiceLoaderSweep`), losing the lazy iterator's semantics
+    // so a `ServiceConfigurationError` surfaced at `load` instead of at the
+    // offending provider.
+    //
+    // The removal is measured, not assumed: `--jdk-only` refuses every
+    // SyntheticStub and has been running the real `ServiceLoader` all along,
+    // HotSpot-identically on both SPIs, with `jdbc` 92/92 and `h2jdbc` 12/12
+    // -- the latter's `DriverManager` discovery being
+    // `ServiceLoader.load(java.sql.Driver.class)`, the exact case this test
+    // was written for.
+    //
+    // So the assertion is now that the shadow is ABSENT. Asserting it present
+    // asserted the pre-removal contract, and would pass again only by putting
+    // the wrong iterator back.
     assert!(
         r.find(
             "java/util/ServiceLoader",
             "load",
             "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
         )
-        .is_some(),
-        "register_essential_natives must wire ServiceLoader.load(Class) — \
-         WP7.3 SQL types depend on the WP7.1 driver discovery surface."
+        .is_none(),
+        "a real-JDK essential-natives bundle must NOT shadow \
+         ServiceLoader.load(Class): the bytecode is correct, the native was not."
     );
 }
 
