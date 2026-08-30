@@ -1416,3 +1416,58 @@ genuinely unclassified offset. R5 is closed because nothing in the JDK reaches
 that path any more — not because the path became safe. The instrument stays,
 and it is now quiet enough that a future occurrence is a signal rather than
 noise.
+
+## 20. The vector that should have caught this, and did not
+
+`RUnsafeArrayBase` is a core regression vector, on every arm, specifically
+about `sun.misc.Unsafe` array-base addressing. It was green for the entire life
+of the defect.
+
+The reason is one word: it calls
+
+```java
+long base = u.arrayBaseOffset(byte[].class);   // the METHOD — always worked
+```
+
+and never reads `sun.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET` — **the CONSTANT**,
+which is where the defect lived. A vector named for the exact surface can miss
+the exact defect by asking the wrong one of two sources that are supposed to be
+the same number.
+
+That is also why the campaign's other instruments were quiet: the natives were
+always right. Only the `<clinit>`-copied constants were zero, and nothing
+compared the two.
+
+### 20.1 The guard
+
+Nineteen agreement assertions plus the documented-protocol read, on the same
+VM-independent invariant §18.1 used — the constant and the native are one
+number by the JDK's own construction, so no value that legitimately differs
+between VMs is pinned.
+
+They are written as **"declared implies agrees"**, not "declared". That keeps
+the printed check count identical in every mode, which matters twice over: the
+suite compares this VM's stdout against HotSpot's, and `--synthetic-jdk` is not
+compiled into the binary this lane can build — a mode-dependent count would be
+an untestable change to another lane's arm. In every real-JDK mode the
+constants are declared and the guard bites.
+
+### 20.2 Proven live in both directions
+
+Asserting that a new test passes says nothing about whether it can fail.
+
+| | HotSpot | CratonVM |
+| --- | --- | --- |
+| unmodified | `PASS RUnsafeArrayBase (364 checks)` | `PASS RUnsafeArrayBase (364 checks)` |
+| one constant made to disagree | `AssertionError`, rc=1 | `AssertionError`, rc=1 |
+
+Identical check counts, so no stdout diff. And the negative control's message
+is the one a future reader needs:
+
+```text
+sun.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET agrees with the native:
+constant says 16, native says 0
+ -- a zero here means <clinit> latched an unregistered native's zero return
+```
+
+The defect can now only recur loudly.

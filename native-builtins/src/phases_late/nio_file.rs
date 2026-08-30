@@ -1680,7 +1680,28 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // throws `UnsupportedOperationException` on a null result) always
             // threw on Linux too — see
             // docs/known-issues/h2-suite-bugs/bug-h2-files-setposixfilepermissions-unsupported.md.
-            let is_posix = !cfg!(windows) && view_name.ends_with("PosixFileAttributeView");
+            let is_posix = !cfg!(windows)
+                && (view_name.ends_with("PosixFileAttributeView")
+                    // `PosixFileAttributeView extends FileOwnerAttributeView`,
+                    // so on a posix host asking for the OWNER view must resolve
+                    // to the same object. It resolved to null, and real
+                    // `Files.getOwner` is
+                    //
+                    //   FileOwnerAttributeView view =
+                    //       getFileAttributeView(path, FileOwnerAttributeView.class, options);
+                    //   if (view == null) throw new UnsupportedOperationException();
+                    //
+                    // so every `Files.getOwner` answered UOE on Linux once the
+                    // real bytecode ran -- including for a path that does not
+                    // exist, where the owed answer is `NoSuchFileException`.
+                    //
+                    //   Files.getOwner(<a real file>)   HotSpot an owner, this VM UOE
+                    //   Files.getOwner(<missing>)       HotSpot NoSuchFile,  this VM UOE
+                    //
+                    // MEASURED with the dial armed over `java/nio/file/Files`.
+                    // Same omission the posix view itself had before
+                    // `bug-h2-files-setposixfilepermissions-unsupported.md`.
+                    || view_name.ends_with("FileOwnerAttributeView"));
             let supported = is_dos || is_basic || is_posix;
             if crate::nbflags().dbg_fsp {
                 eprintln!(
@@ -6065,6 +6086,26 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                         .into());
                     }
                 }
+            }
+            // A NULL `Class` IS AN NPE. The JDK reaches
+            // `type == BasicFileAttributes.class` and then `type ==
+            // PosixFileAttributes.class` before falling through to
+            // `throw new UnsupportedOperationException()`, and every route
+            // there dereferences the argument -- `readAttributes(p, null)`
+            // raises `NullPointerException`, it does not quietly answer the
+            // basic view.
+            //
+            // Answering something for a caller who asked for nothing is the
+            // fabricated-success shape this lane keeps finding: the caller gets
+            // attributes it never requested a type for, and learns nothing
+            // about its own bug.
+            //
+            // The `#[cfg(windows)]` block above deliberately treats an ABSENT
+            // or UNNAMEABLE class as "no request"; an EXPLICIT null is a
+            // different thing and is refused here. MEASURED with the dial armed
+            // over `java/nio/file/Files`.
+            if matches!(args.get(2), Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
             }
             let path_obj = obj_arg(args, 1)?;
             let options = args.get(3).copied().unwrap_or(Value::Object(None));
