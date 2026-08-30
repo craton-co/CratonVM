@@ -1273,7 +1273,44 @@ use cratonvm_types::compat::CompatibilityMode;
 /// individually rather than inferred from the column, which is the only way to
 /// tell a relabel from an addition while the tree is moving for other reasons —
 /// the lesson of the 2026-08-29 entry directly above.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1601;
+/// # 1601 -> 1602 (management), 1590 -> 1591 (default), 2026-08-30 (Phase 2, one triple)
+///
+/// **One, and it is a relabel: the totals do not move.** Measured beside the
+/// +8 immutable-serialization re-freeze above, which landed on `dev` while this
+/// was being built — both accounts are kept, and neither absorbs the other.
+/// This lane's delta is the single triple below; the eight above it are not
+/// this lane's and are not folded in here.
+///
+/// The triple is `sun/nio/ch/FileChannelImpl.truncate(J)`, added to
+/// `RETIRED_SHADOW_PHASE2_TRIPLES`. `register()`'s retired-shadow arm lands it
+/// on `SyntheticStub`, so `--jdk-only` refuses it and the real JDK validation
+/// runs: `FileChannel.truncate(-1)` answers `Negative size` as HotSpot does
+/// instead of this VM's `Negative size: -1`. Measured on two binaries from one
+/// tree differing only by this entry — `L4Diag` 4 diffs from HotSpot -> 0,
+/// every other probe in the tree delta 0, full corpus 118/118 on both, and the
+/// total registration count unchanged, which is case (b) above and the
+/// signature a retirement is supposed to have.
+///
+/// # The third arm had no baseline, and that is what its nine-row gap was
+///
+/// `--features synthetic-jdk --tests` had been red since that arm entered the
+/// landing protocol on 2026-08-29, and the obvious reading — drift nobody
+/// re-froze — is wrong. The default resolve measured its baseline exactly. The
+/// gap is the synthetic-jdk resolve's OWN registrars: that arm compiles
+/// registrars the other two do not, and it had no constant of its own, because
+/// `BASELINE_SYNTHETIC_STUBS` branched on `feature = "management"` and nothing
+/// else. A third configuration was being adjudicated against the first one's
+/// number.
+///
+/// That also defeated the label beside it. `MEASURED_CONFIG` exists, in its own
+/// words, "so a baseline cannot be re-frozen from a run of the other
+/// configuration" — and a synthetic-jdk run printed `no-management` and named
+/// `BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT` as the constant to paste into.
+/// Doing that would have admitted the whole gap to the default arm silently,
+/// which is this file's 1038-vs-1032 story told again.
+/// [`BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK`] closes both halves.
+///
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1602;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1290,7 +1327,29 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1601;
 /// above the truth for a week.
 /// Re-frozen 2026-08-29 with [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]; the
 /// account for both is on that constant.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1590;
+/// **+1 on 2026-08-30** for the Phase 2 retirement, on top of the same
+/// day's +8 re-freeze; the account is on
+/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1591;
+
+/// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
+///
+/// **FIRST FREEZE, AND NOT AN ADJUDICATION.** This arm has been in the landing
+/// protocol since 2026-08-29 (`docs/contributing/jdk-only-lane-operations.md`
+/// §5) and red the whole time, because it had no constant of its own and was
+/// scored against the default resolve's. This number is simply what it
+/// measures today.
+///
+/// **The rows by which it exceeds the default resolve have never been
+/// classified.** They are the registrars the `synthetic-jdk` feature adds, and
+/// nothing here says whether they are legitimate stand-ins or fakes that crept
+/// in while no gate could see them. Freezing turns a permanently-red gate into
+/// a working ratchet from today forward, which is strictly better than a red
+/// everyone routes around; it does not bless them. Classify them with the same
+/// three cases the sibling constants use — the recount command prints
+/// `... out of {total} total`, and a stub rise with a flat total is a relabel,
+/// not a new fake.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1600;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -1360,7 +1419,9 @@ const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_NO_MANA
 
 #[cfg(feature = "management")]
 const BASELINE_SYNTHETIC_STUBS: usize = BASELINE_SYNTHETIC_STUBS_MANAGEMENT;
-#[cfg(not(feature = "management"))]
+#[cfg(all(not(feature = "management"), feature = "synthetic-jdk"))]
+const BASELINE_SYNTHETIC_STUBS: usize = BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK;
+#[cfg(all(not(feature = "management"), not(feature = "synthetic-jdk")))]
 const BASELINE_SYNTHETIC_STUBS: usize = BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT;
 
 /// Which registry this build measures, printed beside every number so a
@@ -1374,7 +1435,9 @@ const BASELINE_SYNTHETIC_STUBS: usize = BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT;
 /// number is how that survives.
 #[cfg(feature = "management")]
 const MEASURED_CONFIG: &str = "management (the shipping cratonvm-cli registry)";
-#[cfg(not(feature = "management"))]
+#[cfg(all(not(feature = "management"), feature = "synthetic-jdk"))]
+const MEASURED_CONFIG: &str = "synthetic-jdk (registrars the other two arms do not compile)";
+#[cfg(all(not(feature = "management"), not(feature = "synthetic-jdk")))]
 const MEASURED_CONFIG: &str = "no-management (ten jmx registrars short of shipping)";
 
 /// Name of the constant a run of THIS build should be pasted into. Emitted as
@@ -1382,7 +1445,9 @@ const MEASURED_CONFIG: &str = "no-management (ten jmx registrars short of shippi
 /// slot.
 #[cfg(feature = "management")]
 const BASELINE_CONST: &str = "BASELINE_SYNTHETIC_STUBS_MANAGEMENT";
-#[cfg(not(feature = "management"))]
+#[cfg(all(not(feature = "management"), feature = "synthetic-jdk"))]
+const BASELINE_CONST: &str = "BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK";
+#[cfg(all(not(feature = "management"), not(feature = "synthetic-jdk")))]
 const BASELINE_CONST: &str = "BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT";
 
 /// Slack added on top of the observed count when (re)freezing the baseline.

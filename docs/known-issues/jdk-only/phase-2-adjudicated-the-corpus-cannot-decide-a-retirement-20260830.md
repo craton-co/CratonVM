@@ -312,7 +312,103 @@ across the change; an armed run cannot warn them.
 
 ---
 
-## 7. What Phase 2's answer is
+## 7. One triple retired, and the two false starts that cost more than it did
+
+The five improving families were the only positive leads. Attributed one class
+at a time, two produced a real signal:
+
+```text
+sun/nio/ch/FileChannelImpl      L4Diag                 4 -> 0   (9/9 yields)
+jdk/internal/foreign/ArenaImpl  AbstractReceiverSweep 12 -> 6            (13/13 yields)
+```
+
+### `ArenaImpl` — rejected, and it settles the FFM carrier question
+
+Armed, `Arena.allocate()` returns the real
+`jdk.internal.foreign.NativeMemorySegmentImpl` instead of this VM's carrier.
+The class name becomes right. Precondition 2 killed it:
+
+```text
+FfmSegmentSweep    40 -> 181 diffs, DIED at row  18 of 199
+FfmCarrierProbe     0 ->   6 diffs, DIED at row 104 of 106
+FfmMsgProbe         2 ->   7 diffs
+```
+
+The name becomes right and the segment surface stops working, because the real
+implementation needs real state this VM does not keep. That is a second,
+independent confirmation of
+[`the-ffm-carrier-is-the-vms-own-allocation-shape-20260829.md`](the-ffm-carrier-is-the-vms-own-allocation-shape-20260829.md):
+the carrier is this VM's own allocation shape, and matching the JDK's class
+name is not a thing to fix — not by fabricating a name, and **not by retirement
+either**. That closes the residual which was recorded as needing a fabricated
+`LayoutImpl` carrier.
+
+### The `open` false start — precondition 4 reading the wrong workload
+
+`sun/nio/ch/FileChannelImpl` passed all three parts of the test: L4Diag 4 → 0,
+every other probe delta 0, full corpus 118/118. Choosing WHICH of its triples
+to retire then fell to precondition 4 — observed as `native-won` in the unarmed
+corpus — and the corpus offers exactly one triple on that class: `open`. So
+`open` was retired, built and measured:
+
+```text
+L4Diag  d(hs, control) = 4    d(hs, retired) = 4    delta 0
+every other probe                                   delta 0
+```
+
+**A whole build to move nothing.** The registry says why, in the column
+precondition 4 never consults: in an L4Diag run `truncate(J)` has
+`invocations: 2` and image `has_code: true`, while `open` has `invocations: 0`.
+**The corpus never calls `FileChannel.truncate(-1)`; the probe does.** Filtering
+candidates by what the CORPUS dispatched discards precisely the triple whose
+retirement the PROBE measured — the two preconditions were reading different
+workloads, and only one of them was the workload the evidence came from.
+
+This is §3's own finding turned on its author. The dial arms a PREFIX, so
+"arming `sun/nio/ch/FileChannelImpl` fixes L4Diag" is a claim about every
+triple on that receiver, and picking one from it is a guess unless the
+per-triple evidence is consulted.
+
+**So precondition 4 is really: observed by the instrument that produced the
+improvement, per triple, read as `invocations > 0` in that instrument's own
+run — not membership in a corpus census.**
+
+### What landed
+
+`sun/nio/ch/FileChannelImpl.truncate(J)Ljava/nio/channels/FileChannel;`, in a
+new `RETIRED_SHADOW_PHASE2_TRIPLES` table. Measured on two binaries built from
+one tree differing only by that entry, nothing armed:
+
+```text
+L4Diag                4 diffs from HotSpot -> 0
+all 77 other probes   delta 0
+full corpus           118 passed / 0 failed on BOTH binaries
+stub ratchet          1591 -> 1592 out of 13555 total UNCHANGED = a relabel
+```
+
+`FileChannel.truncate(-1)` now answers `Negative size`, as HotSpot does,
+instead of this VM's `Negative size: -1` — §1.4's remedy rather than
+maintaining message parity by hand in a native that should not stand in front
+of that bytecode.
+
+**And the dial did not predict this.** The dial declines at DISPATCH when the
+shadowed method has bytecode; the table re-tags at REGISTRATION and
+`--jdk-only` refuses the row outright. A dial result is evidence for TRYING the
+table. It is not the table's result, and the `open` build is what that costs
+when it is treated as one.
+
+### One probe row that is not evidence
+
+`JdkOnlyPlatformProbe` reported +2 against the retirement. It is a
+virtual-thread `handoffs=` counter, and five runs of the CONTROL binary give
+55, 55, 58, 55, 58 — nondeterministic scheduling, not a regression. Every other
+field on that line is identical. **A differential probe with a nondeterministic
+row cannot be used as an oracle**, and this one was quietly contributing noise
+to the whole-set battery in §5 too.
+
+---
+
+## 8. What Phase 2's answer is
 
 **Adjudicated: the surface is 1477 triples over 270 classes; 34 classes are
 demonstrably load-bearing; the other 236 are candidates, and not one of them is
@@ -330,8 +426,11 @@ A retirement wave needs, per family, all four of:
 3. **Image bytecode to yield to** — `image_declaring_method` `has_code`,
    declared or inherited and not abstract. Retiring a triple without it trades
    a shadow for an `UnsatisfiedLinkError`.
-4. **A dispatch observed in the unarmed corpus**, so the entry rests on a
-   measurement rather than on a registration nobody exercises.
+4. **A dispatch observed by the instrument that produced the improvement** —
+   `invocations > 0` for that TRIPLE in that instrument's own run. Not
+   membership in a corpus census: §7 records a whole build spent retiring the
+   one triple the corpus had seen, while the triple the probe had actually
+   exercised sat one row away with `invocations: 2`.
 
 Applying 3 and 4 to the sweep's own output, on this binary:
 
@@ -349,18 +448,26 @@ Note the funnel needs `--explain-jdk-only`: without it every
 all 3340 rows** — a field that is false everywhere is a broken reader, not a
 fact about the JDK.
 
-## 8. What is fixed here
+## 9. What is fixed here
 
-Nothing is retired, and that is the result. The eleven-triple hold list in
+**One triple of 1477 is retired** — `sun/nio/ch/FileChannelImpl.truncate(J)`,
+§7 — and that ratio is the result. The eleven-triple hold list in
 `retired_shadow.rs` is **confirmed correct**, against a sweep that said
 otherwise, and extended with the CHM view family and the reason. The next
 reader who arms the dial and sees 236 green rows has this page to stop at, and
 a test that will fail if they act on them anyway.
 
-The five improving families are the only positive retirement leads this
-adjudication produced, and they are worth a wave on their own terms.
+Also fixed on the way past: `--features synthetic-jdk --tests` had been red
+since it entered the landing protocol on 2026-08-29, at 1591 against 1582. It
+was not drift. That arm compiles registrars the other two do not and had **no
+baseline of its own** — `BASELINE_SYNTHETIC_STUBS` branched on
+`feature = "management"` and nothing else, so a third configuration was being
+scored against the first one's number, and its failure line named the DEFAULT
+constant as the one to paste into. `BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK`
+closes both halves; the nine rows by which that resolve exceeds the default are
+frozen, explicitly not blessed, and flagged for classification.
 
-## 9. Load-bearing, for whoever takes a family
+## 10. Load-bearing, for whoever takes a family
 
 Classes where arming alone breaks vectors; the failing set names the reason.
 
