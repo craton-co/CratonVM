@@ -2127,7 +2127,26 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
         registry.register(cls, "findAll", "()Ljava/util/Set;", |ctx, _args| {
             let mut module_refs = Vec::new();
             let mut first_pin = None;
-            for module_name in ["java.base", "java.xml"] {
+            // ASK THE REGISTRY, do not carry a list. This was hardcoded to
+            // `["java.base", "java.xml"]`, so `ModuleFinder.ofSystem()
+            // .findAll()` answered TWO modules where HotSpot answers ~70 --
+            // and `Java9.<clinit>` builds its CONCEALED/EXPORTED
+            // `PACKAGES_TO_OPEN` maps by walking exactly this set, so a short
+            // answer is a Groovy that silently cannot open packages it needs.
+            //
+            // Third instance of one shape today: a hand-maintained table
+            // standing in front of the VM's own `ModuleRegistry`, which knows
+            // the answer (`module_package_names` and the `getPackages()`/
+            // `getDescriptor().packages()` split were the other two). The
+            // registry is the source; the literal pair is the floor for an
+            // image that somehow registers nothing.
+            let registered = ctx.module_names();
+            let names: Vec<String> = if registered.is_empty() {
+                vec!["java.base".to_string(), "java.xml".to_string()]
+            } else {
+                registered
+            };
+            for module_name in names.iter().map(String::as_str) {
                 let name = ctx.create_string(module_name);
                 let name_pin = ctx.pin_native_root(name);
                 first_pin = Some(first_pin.map_or(name_pin, |pin: usize| pin.min(name_pin)));
@@ -2140,10 +2159,38 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
                 let mref_pin = ctx.pin_native_root(mref);
                 first_pin = Some(first_pin.map_or(mref_pin, |pin: usize| pin.min(mref_pin)));
 
-                let md =
-                    try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16)?;
+                // BUILD THE WHOLE DESCRIPTOR, not just its name.
+                //
+                // This used to allocate a 16-slot `ModuleDescriptor` and set
+                // ONLY `name`, leaving `packages`, `exports`, `opens`,
+                // `requires`, `provides`, `uses` and `modifiers` NULL. Every
+                // one of those accessors is specified never to return null.
+                //
+                // In compatible mode a registered native answered them, so the
+                // nulls were invisible. Under `--jdk-only` the real JDK
+                // bytecode runs -- `return packages;` -- and hands back the
+                // null, which is how ALL OF GROOVY died:
+                //
+                //   org/codehaus/groovy/vmplugin/v9/Java9.<clinit>
+                //     NPE: Cannot invoke "java.util.Set.forEach(..)"
+                //   -> VMPluginFactory.getPlugin() == null
+                //   -> GroovySystem.<clinit> NPE
+                //   -> NoClassDefFoundError: groovy/lang/GroovySystem   x18 classes
+                //
+                // `Java9`'s initialiser walks `ModuleFinder.ofSystem()
+                // .findAll()` and asks each descriptor about its opens and
+                // exports; a null Set two frames down is reported three frames
+                // up as a missing Groovy class.
+                //
+                // `build_module_descriptor` is the same builder
+                // `Module.getDescriptor()` uses and reads the VM's own
+                // `ModuleRegistry`, so the finder's answer and the module
+                // mirror's answer are now the SAME answer -- which is the
+                // defect this campaign keeps finding in the other direction
+                // (two producers of one concept that disagree).
                 let name = ctx.read_native_pin(name_pin, name);
-                ctx.set_field_by_name(md, "name", Value::Object(Some(name)));
+                let md = crate::jboss_jdkspecific::build_module_descriptor(ctx, module_name)?;
+                let _ = name;
                 let mref = ctx.read_native_pin(mref_pin, mref);
                 ctx.set_field_by_name(mref, "descriptor", Value::Object(Some(md)));
                 module_refs.push((mref_pin, mref));
@@ -2198,8 +2245,11 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
             // detects the null supplier and builds a SystemModuleReader.
             let mref =
                 try_alloc_concurrent_synthetic(ctx, "jdk/internal/module/ModuleReferenceImpl", 8)?;
-            let md = try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16)?;
-            ctx.set_field_by_name(md, "name", Value::Object(Some(name)));
+            // The same whole-descriptor rule as `findAll` above: a descriptor
+            // carrying only its name answers null from every collection
+            // accessor, and null is what those accessors are specified never to
+            // return.
+            let md = crate::jboss_jdkspecific::build_module_descriptor(ctx, &name_text)?;
             ctx.set_field_by_name(mref, "descriptor", Value::Object(Some(md)));
             ctx.invoke(
                 "java/util/Optional",
