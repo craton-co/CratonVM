@@ -21,9 +21,14 @@ pub(crate) fn p67_layout_object(
     byte_size: i64,
     byte_alignment: i64,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, class_name, 4)?;
-    ctx.set_field(obj, 0, Value::Long(byte_size));
-    ctx.set_field(obj, 1, Value::Long(byte_alignment));
+    // The REAL class where there is one. `try_alloc_concurrent_synthetic` takes
+    // the larger of this request and the loaded class's own field count, so the
+    // 4 is a floor and a real `OfIntImpl` still gets its six.
+    let minted = p67_value_layout_impl(class_name).unwrap_or(class_name);
+    let obj = try_alloc_concurrent_synthetic(ctx, minted, 4)?;
+    let slots = p67_layout_slots(ctx, obj);
+    ctx.set_field(obj, slots.byte_size, Value::Long(byte_size));
+    ctx.set_field(obj, slots.byte_alignment, Value::Long(byte_alignment));
     // Slot 2 is the little-endian flag, and every `java.lang.foreign` layout
     // this factory stands in for is built by the JDK from
     // `ByteOrder.nativeOrder()`. It used to be a hard-coded `Int(0)` — "big
@@ -34,12 +39,9 @@ pub(crate) fn p67_layout_object(
     // `probes/W2ValueLayoutProbe` the moment that preseed stopped running:
     // every constant reported `order() == BIG_ENDIAN` while
     // `ByteOrder.nativeOrder()` two lines above answered LITTLE_ENDIAN.
-    ctx.set_field(
-        obj,
-        2,
-        Value::Int(i32::from(cfg!(target_endian = "little"))),
-    );
-    ctx.set_field(obj, 3, Value::Object(None));
+    ctx.set_field(obj, slots.name, Value::Object(None));
+    // LAST, because the real arm allocates and can move `obj`.
+    let obj = p67_layout_set_order(ctx, obj, cfg!(target_endian = "little"))?;
     Ok(obj)
 }
 
@@ -64,15 +66,148 @@ pub(crate) fn p67_optional(
     Ok(opt)
 }
 
-pub(crate) fn p67_layout_name_value(ctx: &dyn NativeContext, layout: ObjectRef) -> Value {
-    if matches!(ctx.get_field(layout, 0), Value::Int(_)) {
-        if ctx.object_num_fields(layout) > 2 {
-            ctx.get_field(layout, 2)
-        } else {
-            Value::Object(None)
+/// Where a layout carrier keeps the three fields EVERY `MemoryLayout` has.
+///
+/// `jdk.internal.foreign.layout.AbstractLayout` declares `byteSize`,
+/// `byteAlignment` and `name`, and every real layout class extends it -- value,
+/// struct, sequence, union, padding. So one resolver serves all of them, which
+/// is what makes moving thirteen carriers onto their real classes a change to
+/// the mint sites rather than to every reader.
+///
+/// The carriers this file fabricates declare no fields at all, and for those the
+/// map is the one `p67_layout_object` writes. Asked by NAME, never by width or
+/// by the type that happens to be in a slot: guessing the shape is what made
+/// `Arena.allocate` throw `Arena is closed` on 199 of 199 rows when the arena
+/// carrier's width changed.
+pub(crate) struct P67LayoutSlots {
+    pub(crate) byte_size: usize,
+    pub(crate) byte_alignment: usize,
+    pub(crate) name: usize,
+    pub(crate) order: P67LayoutOrder,
+    /// Where an address layout keeps its target. `None` when the class declares
+    /// no such field AND the carrier is too narrow to have one.
+    pub(crate) target: usize,
+}
+
+/// How a carrier records byte order -- the one place the two conventions are
+/// genuinely different rather than merely differently indexed.
+pub(crate) enum P67LayoutOrder {
+    /// A real value layout declares `order`, a `java.nio.ByteOrder` REFERENCE.
+    Object(usize),
+    /// A fabricated carrier keeps a bare little-endian flag instead.
+    Flag(usize),
+}
+
+pub(crate) fn p67_layout_slots(ctx: &dyn NativeContext, layout: ObjectRef) -> P67LayoutSlots {
+    let class_id = ctx.class_id_of_object(layout);
+    if let (Some(byte_size), Some(byte_alignment), Some(name)) = (
+        ctx.resolve_field_index_by_class_id(class_id, "byteSize"),
+        ctx.resolve_field_index_by_class_id(class_id, "byteAlignment"),
+        ctx.resolve_field_index_by_class_id(class_id, "name"),
+    ) {
+        return P67LayoutSlots {
+            byte_size,
+            byte_alignment,
+            name,
+            order: match ctx.resolve_field_index_by_class_id(class_id, "order") {
+                // A group layout (struct, union, padding, sequence) declares no
+                // `order` at all and has no byte order to record; the flag slot
+                // is never read for one, so the fabricated index is harmless.
+                Some(i) => P67LayoutOrder::Object(i),
+                None => P67LayoutOrder::Flag(2),
+            },
+            target: ctx
+                .resolve_field_index_by_class_id(class_id, "targetLayout")
+                .unwrap_or(4),
+        };
+    }
+    // The fabricated map. `name` sits at 2 on the group carriers (struct, union,
+    // padding: slot 2 is their member list and slot 3 the name) and at 3 on the
+    // value carriers -- the historical test for which is "does slot 0 hold an
+    // Int", kept verbatim so this arm answers exactly what the open-coded
+    // readers answered.
+    let name = if matches!(ctx.get_field(layout, 0), Value::Int(_)) {
+        2
+    } else {
+        3
+    };
+    P67LayoutSlots {
+        byte_size: 0,
+        byte_alignment: 1,
+        name,
+        order: P67LayoutOrder::Flag(2),
+        target: 4,
+    }
+}
+
+/// The real JDK class behind a `java.lang.foreign` VALUE layout interface, or
+/// `None` for anything this does not name -- the group layouts, and the impl
+/// names themselves, which arrive here when a `withX` copy re-mints a carrier
+/// from its own class name.
+pub(crate) fn p67_value_layout_impl(class_name: &str) -> Option<&'static str> {
+    Some(match class_name {
+        "java/lang/foreign/ValueLayout$OfBoolean" => {
+            "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl"
         }
-    } else if ctx.object_num_fields(layout) > 3 {
-        ctx.get_field(layout, 3)
+        "java/lang/foreign/ValueLayout$OfByte" => {
+            "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl"
+        }
+        "java/lang/foreign/ValueLayout$OfChar" => {
+            "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl"
+        }
+        "java/lang/foreign/ValueLayout$OfShort" => {
+            "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl"
+        }
+        "java/lang/foreign/ValueLayout$OfInt" => {
+            "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl"
+        }
+        "java/lang/foreign/ValueLayout$OfLong" => {
+            "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl"
+        }
+        "java/lang/foreign/ValueLayout$OfFloat" => {
+            "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl"
+        }
+        "java/lang/foreign/ValueLayout$OfDouble" => {
+            "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl"
+        }
+        "java/lang/foreign/AddressLayout" => {
+            "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl"
+        }
+        _ => return None,
+    })
+}
+
+/// Record `little` on `layout`, in whichever way its carrier records it.
+///
+/// The real arm ALLOCATES a `ByteOrder`, which can move `layout` -- the native
+/// stale-local family -- so the carrier is pinned across it.
+pub(crate) fn p67_layout_set_order(
+    ctx: &mut dyn NativeContext,
+    layout: ObjectRef,
+    little: bool,
+) -> Result<ObjectRef, MethodCallFailed> {
+    match p67_layout_slots(ctx, layout).order {
+        P67LayoutOrder::Flag(slot) => {
+            if ctx.object_num_fields(layout) > slot {
+                ctx.set_field(layout, slot, Value::Int(i32::from(little)));
+            }
+            Ok(layout)
+        }
+        P67LayoutOrder::Object(slot) => {
+            let pin = ctx.pin_native_root(layout);
+            let order = p67_byte_order_object(ctx, little)?;
+            let layout = ctx.read_native_pin(pin, layout);
+            ctx.unpin_native_roots(pin);
+            ctx.set_field(layout, slot, Value::Object(Some(order)));
+            Ok(layout)
+        }
+    }
+}
+
+pub(crate) fn p67_layout_name_value(ctx: &dyn NativeContext, layout: ObjectRef) -> Value {
+    let slots = p67_layout_slots(ctx, layout);
+    if ctx.object_num_fields(layout) > slots.name {
+        ctx.get_field(layout, slots.name)
     } else {
         Value::Object(None)
     }
@@ -152,11 +287,9 @@ pub(crate) fn p67_layout_with_name(
         .class_name_of_id(ctx.class_id_of_object(this))
         .unwrap_or_else(|| "java/lang/foreign/MemoryLayout".to_string());
     let field_count = ctx.object_num_fields(this);
-    let name_slot = if matches!(ctx.get_field(this, 0), Value::Int(_)) {
-        2
-    } else {
-        3
-    };
+    // Through the resolver, not a second copy of the rule: the open-coded
+    // version here answered 3 for a real value layout, which is `carrier`.
+    let name_slot = p67_layout_slots(ctx, this).name;
     let clone_fields = std::cmp::max(field_count, name_slot + 1);
     let this_pin = ctx.pin_native_root(this);
     let name_pin = match name {
@@ -265,7 +398,8 @@ pub(crate) fn p67_layout_with_byte_alignment(
         ctx.set_field(cloned, i, ctx.get_field(this, i));
     }
     ctx.unpin_native_roots(this_pin);
-    ctx.set_field(cloned, 1, Value::Long(alignment));
+    let alignment_slot = p67_layout_slots(ctx, cloned).byte_alignment;
+    ctx.set_field(cloned, alignment_slot, Value::Long(alignment));
     Ok(Some(Value::Object(Some(cloned))))
 }
 
@@ -274,8 +408,9 @@ pub(crate) fn p67_address_layout_target_layout(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let target = if ctx.object_num_fields(this) > 4 {
-        ctx.get_field(this, 4)
+    let target_slot = p67_layout_slots(ctx, this).target;
+    let target = if ctx.object_num_fields(this) > target_slot {
+        ctx.get_field(this, target_slot)
     } else {
         Value::Object(None)
     };
@@ -292,6 +427,8 @@ pub(crate) fn p67_address_layout_with_target_layout(
         .class_name_of_id(ctx.class_id_of_object(this))
         .unwrap_or_else(|| "java/lang/foreign/AddressLayout".to_string());
     let field_count = ctx.object_num_fields(this);
+    // At least 5 for the fabricated carrier; a real `OfAddressImpl` declares
+    // seven fields and `field_count` already reflects that.
     let clone_fields = std::cmp::max(field_count, 5);
     let this_pin = ctx.pin_native_root(this);
     let target_pin = match target {
@@ -311,7 +448,8 @@ pub(crate) fn p67_address_layout_with_target_layout(
         }
         None => Value::Object(None),
     };
-    ctx.set_field(cloned, 4, target);
+    let target_slot = p67_layout_slots(ctx, cloned).target;
+    ctx.set_field(cloned, target_slot, target);
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(cloned))))
 }
@@ -441,12 +579,13 @@ pub(crate) fn p67_value_layout_clinit(
 /// alignment fallback is `size` because that is what a `ValueLayout`'s natural
 /// alignment is; a zero would make the rounding below divide by zero.
 pub(crate) fn p67_layout_size_align(ctx: &mut dyn NativeContext, layout: ObjectRef) -> (i64, i64) {
-    let size = match ctx.get_field(layout, 0) {
+    let slots = p67_layout_slots(ctx, layout);
+    let size = match ctx.get_field(layout, slots.byte_size) {
         Value::Long(v) => v,
         Value::Int(v) => i64::from(v),
         _ => 0,
     };
-    let align = match ctx.get_field(layout, 1) {
+    let align = match ctx.get_field(layout, slots.byte_alignment) {
         Value::Long(v) if v > 0 => v,
         Value::Int(v) if v > 0 => i64::from(v),
         _ => size.max(1),
@@ -459,7 +598,8 @@ pub(crate) fn p67_layout_byte_size(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    Ok(Some(ctx.get_field(this, 0)))
+    let slots = p67_layout_slots(ctx, this);
+    Ok(Some(ctx.get_field(this, slots.byte_size)))
 }
 
 pub(crate) fn p67_layout_byte_alignment(
@@ -467,10 +607,11 @@ pub(crate) fn p67_layout_byte_alignment(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let value = ctx.get_field(this, 1);
+    let slots = p67_layout_slots(ctx, this);
+    let value = ctx.get_field(this, slots.byte_alignment);
     match value {
         Value::Long(_) => Ok(Some(value)),
-        _ => Ok(Some(ctx.get_field(this, 0))),
+        _ => Ok(Some(ctx.get_field(this, slots.byte_size))),
     }
 }
 
@@ -655,27 +796,25 @@ pub(crate) fn p67_layout_with_order(
     let class_name = ctx
         .class_name_of_id(ctx.class_id_of_object(this))
         .unwrap_or_else(|| "java/lang/foreign/ValueLayout".to_string());
-    let byte_size = match ctx.get_field(this, 0) {
+    let slots = p67_layout_slots(ctx, this);
+    let byte_size = match ctx.get_field(this, slots.byte_size) {
         Value::Long(v) => v,
         Value::Int(v) => v as i64,
         _ => 1,
     };
-    let byte_alignment = match ctx.get_field(this, 1) {
+    let byte_alignment = match ctx.get_field(this, slots.byte_alignment) {
         Value::Long(v) => v,
         Value::Int(v) => v as i64,
         _ => byte_size,
     };
+    let little = vh_byte_order_is_little(ctx, args.get(1));
+    let inherited_name = p67_layout_name_value(ctx, this);
     let obj = p67_layout_object(ctx, &class_name, byte_size, byte_alignment)?;
-    ctx.set_field(
-        obj,
-        2,
-        Value::Int(if vh_byte_order_is_little(ctx, args.get(1)) {
-            1
-        } else {
-            0
-        }),
-    );
-    ctx.set_field(obj, 3, p67_layout_name_value(ctx, this));
+    // `p67_layout_object` has already stamped the HOST's order; this is the
+    // caller's, which is the whole point of `withOrder`.
+    let obj = p67_layout_set_order(ctx, obj, little)?;
+    let name_slot = p67_layout_slots(ctx, obj).name;
+    ctx.set_field(obj, name_slot, inherited_name);
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -1437,9 +1576,10 @@ fn p67_session_add_action_synthetic(
 }
 
 pub(crate) fn p67_layout_width_obj(ctx: &dyn NativeContext, layout: ObjectRef) -> i32 {
-    match ctx.get_field(layout, 0) {
+    let slots = p67_layout_slots(ctx, layout);
+    match ctx.get_field(layout, slots.byte_size) {
         Value::Long(v) if (1..=8).contains(&v) => v as i32,
-        Value::Int(_) => match ctx.get_field(layout, 1) {
+        Value::Int(_) => match ctx.get_field(layout, slots.byte_alignment) {
             Value::Int(v) if (1..=8).contains(&v) => v,
             Value::Long(v) if (1..=8).contains(&v) => v as i32,
             _ => 1,
@@ -1543,9 +1683,10 @@ pub(crate) fn p67_layout_named_member(
 /// `jdk.internal.foreign.layout.AbstractLayout` declares `byteSize` first, so
 /// the slot-0 `Long` read covers it too.
 pub(crate) fn p67_layout_size_of(ctx: &dyn NativeContext, layout: ObjectRef) -> i64 {
-    match ctx.get_field(layout, 0) {
+    let slots = p67_layout_slots(ctx, layout);
+    match ctx.get_field(layout, slots.byte_size) {
         Value::Long(v) => v,
-        _ => match ctx.get_field(layout, 1) {
+        _ => match ctx.get_field(layout, slots.byte_alignment) {
             Value::Long(v) => v,
             Value::Int(v) => v as i64,
             _ => 0,
@@ -1556,7 +1697,8 @@ pub(crate) fn p67_layout_size_of(ctx: &dyn NativeContext, layout: ObjectRef) -> 
 /// A layout's byte alignment, defaulting to its size (which is what every
 /// value layout uses) when the carrier does not record one separately.
 pub(crate) fn p67_layout_align_of(ctx: &dyn NativeContext, layout: ObjectRef) -> i64 {
-    let by_slot = match ctx.get_field(layout, 1) {
+    let slots = p67_layout_slots(ctx, layout);
+    let by_slot = match ctx.get_field(layout, slots.byte_alignment) {
         Value::Long(v) if v > 0 => v,
         _ => 0,
     };
@@ -3672,6 +3814,24 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         r.register(class, "name", "()Ljava/util/Optional;", p67_layout_name);
         r.register(class, "carrier", "()Ljava/lang/Class;", p67_layout_carrier);
         r.register(class, "order", "()Ljava/nio/ByteOrder;", p67_layout_order);
+        // The four the interface loop has and this one did not. A value layout
+        // is minted as the impl class since 2026-08-29 and native dispatch is
+        // keyed on the receiver's class, so without these the JDK's own
+        // bytecode -- reading fields this VM does not populate -- serves them.
+        r.register(class, "byteSize", "()J", p67_layout_byte_size);
+        r.register(class, "byteAlignment", "()J", p67_layout_byte_alignment);
+        r.register(
+            class,
+            "byteOffset",
+            "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
+            p67_layout_byte_offset,
+        );
+        r.register(
+            class,
+            "varHandle",
+            "()Ljava/lang/invoke/VarHandle;",
+            |ctx, args| Ok(Some(p67_var_handle(ctx, args)?)),
+        );
     }
     r.register(
         "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",

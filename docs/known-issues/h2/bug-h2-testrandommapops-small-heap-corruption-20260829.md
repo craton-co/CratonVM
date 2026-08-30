@@ -114,6 +114,129 @@ what the section below was waiting for. `CRATONVM_ZGC_RELOCATE=0` is the first
 arm to run: it restores non-moving behaviour byte for byte, so a failure that
 survives it is not a relocation defect at all.
 
+## 2026-08-29 (later): the first arm this page names has been RUN — it IS a relocation defect
+
+`CRATONVM_ZGC_RELOCATE=0` was this page's own prescribed first arm, on the rule
+that *"a failure that survives it is not a relocation defect at all"*. It does
+not survive it.
+
+Azure Linux, `--Xmx 256m`, 900 s cap, interleaved base/norelo, one binary
+(`dev@a94842f04`), load recorded on every run as this page requires:
+
+| arm | rep | rc | secs | load0 | `oom` | `arena` | signature |
+|---|---|---:|---:|---:|---:|---:|---|
+| base | 1 | 1 | **122** | 23.1 | 0 | 0 | `NullPointerException` |
+| `ZGC_RELOCATE=0` | 1 | 124 (cap) | 900 | 17.1 | 0 | 10 | — none — |
+| base | 2 | 1 | **786** | 21.3 | 0 | 0 | `NullPointerException` |
+| `ZGC_RELOCATE=0` | 2 | 124 (cap) | 900 | 19.9 | 0 | 9 | — none — |
+| base | 3 | 1 | **64** | 12.0 | 0 | 0 | `NullPointerException` |
+| `ZGC_RELOCATE=0` | 3 | 124 (cap) | 900 | 16.0 | 0 | 10 | — none — |
+
+**base 3/3 fail; `ZGC_RELOCATE=0` 3/3 clean to the cap.** The cap is
+7-14x the base median, so a clean arm here carries information by this page's
+own standard.
+
+The `arena` column is the confirmation that the switch ENGAGED rather than
+silently doing nothing: with relocation off the arena fragments and reports
+9-10 allocation failures, which is exactly what relocation exists to prevent.
+A clean arm with `arena=0` would have meant the flag was inert.
+
+So the defect is in relocation, and the remaining question is *which* relocation
+obligation is unmet. `relocate_stw`'s own doc names the shortlist and says the
+audit is unfinished:
+
+> The returned `PointerMap` is **non-empty** ... Every consumer of a raw heap
+> address outside this heap — JIT frame maps, monitor tables, external root
+> providers, native side tables — must be remapped through it ... **Auditing
+> those arms is the reason this stays behind a default-off flag**
+
+It is no longer behind a default-off flag. `CRATONVM_ZGC_RELOCATE` and
+`CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT` both default ON.
+
+### What was checked and came back CLEAN
+
+The native side-table arm of that shortlist was audited by diffing every
+`gc_scan_*` root provider against its remap counterpart across
+`native-builtins`, `native-io`, `native-collections`, `native-api`,
+`native-awt` and the crypto/security crates. **32 scans, 32 updates, all
+paired and all wired post-GC.** Four looked unpaired at first
+(`gc_scan_selector_roots`, `gc_scan_channel_roots`,
+`gc_scan_ssc_socket_cache_roots`, `gc_scan_ss_back_ref_roots`) — they use the
+other naming convention, `*_update_after_gc`, and are called. That is a
+negative result, and it removes the cheapest hypothesis rather than
+supporting it.
+
+### It narrows once more, and then the instrument names it
+
+`CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` — **2/2 clean to the 900 s cap**
+(`arena=10`, `arena=8`). That switch restores the older refusal that fires on
+the mere existence of a compiled frame, so for a JIT-active workload it is
+close to `ZGC_RELOCATE=0`; the value of the arm is that it places the defect in
+**relocation while a compiled frame is live**, not in relocation generally.
+
+`CRATONVM_DBG_REMAP_RESIDUE=1` on a failing base run then says what is wrong
+with those frames. The instrument walks a live JIT frame looking for words that
+are still **keys** in the pointer map — pre-move addresses nothing rewrote —
+and one failing run (`rc=1`, 286 s, the usual `NullPointerException`) reports:
+
+```text
+rep 1 (rc=1, 286 s)      frames=235  with_stale=228 (97%)
+                           cov_complete TRUE=228  false=0
+                           mapped slots on stale frames: min=1 max=13 avg=4.5
+                           stale_words: min=1 max=33 total=2844
+rep 2 (rc=1,  99 s)      frames=54   with_stale=54 (100%)
+                           cov_complete TRUE=54   false=0
+                           mapped slots on stale frames: min=1 max=11 avg=5.2
+                           stale_words: min=1 max=36 total=701
+```
+
+**Across two independent failing runs, every single frame that still held a
+pre-move address had declared `cov_complete=true` — 282 of them, and not one
+reporting incomplete coverage.** A representative line:
+
+```text
+[remap-frame] method=java/lang/StringLatin1.newString:([BII)Ljava/lang/String;
+  sp_id=7 frame_size=912 cov_complete=true
+  mapped=[ 8=0x20012279570] rewritten=1
+  inlined=["java/lang/String.<init>([BB)V"]
+  stale_words=12 [off=888 stale=0x200137528b8->0x20012279848]
+                 [off=688 stale=0x20013752590->0x20012279520] ...
+```
+
+A 912-byte frame, an oop map naming **one** slot, one slot rewritten — and
+twelve other words in that same frame holding addresses the collector has a
+forwarding entry for. The relocation moved those objects; the frame kept the
+old pointers; a later read through one of them is the `NullPointerException`,
+and reading through a slot whose old cell has since been REUSED is this page's
+`NoSuchMethodError: '<unknown class 2460030832>'` and its SIGSEGV. **Three
+faces, one cause.**
+
+So the defect is not "the heap is fragmented" and not the allocator: **the
+per-frame coverage proof reports complete while the frame demonstrably retains
+unrewritten references, and relocation trusts it.**
+
+Inlining is present in only 45 of 228 and 9 of 54 (20% and 17%), so a spliced
+callee's unnamed locals are *a* contributor and not the whole of it — the average stale frame
+names 4.5 slots and carries several more live from-addresses than that.
+
+**Caveat, stated because the count is a heuristic**: `stale_words` counts frame
+words whose value is a pointer-map key. A dead slot or a spilled non-reference
+integer that happens to equal a moved object's old address would be counted
+too. At 228 frames of 235 and 2 844 words that is not a coincidence budget
+anyone can spend, but the *exact* count is an upper bound, not a proof of 2 844
+live misses.
+
+### Next, in order
+
+1. **Find why `coverage_complete` is true here.** It is the claim that is
+   demonstrably false, and it is what relocation is gated on. The
+   `scauses(...)` census on the sibling ZGC page
+   (`dataflow=151 marks=83 inline_scope=5`) is the compile-time half of the
+   same question.
+2. Whether the map is *incomplete* or the *rewrite* skips slots it named —
+   `mapped=[…] rewritten=N` versus `stale_words` in one line separates those,
+   and above they disagree in the same frame.
+
 ## Why "repro and dump" WAS the wrong instrument
 
 One failure in three, twenty minutes a run, and a different symptom each time
