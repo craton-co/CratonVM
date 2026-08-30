@@ -113,8 +113,30 @@ a poor bisect subject, and the searchable signature is preserved here instead:
 JdbcSQLNonTransientException: General error: "java.lang.NullPointerException"
 ```
 
+### The synthetic layer is eliminated for the three that still fail
+
+Each was re-run under `--jdk-only` with its own census attached, which is the
+step that turned "it survives strict" into an elimination for `TestOpenClose`:
+
+```text
+TestWeb          mode=jdk-only  compatibility_classes=0  synthetic_stub_invocations=0
+TestBnf          mode=jdk-only  compatibility_classes=0  synthetic_stub_invocations=0
+TestTransaction  mode=jdk-only  compatibility_classes=0  synthetic_stub_invocations=0
+                 all three: partial none, truncated false, dropped 0 -- totals, not floors
+```
+
+All three fail with **nothing fabricated and no synthetic stub invoked**, so none
+of them is a fabricated-carrier or synthetic-stub defect. Whatever they are, they
+live in the path both modes share. That is worth having on record for whoever
+picks them up, because it is the cheapest question to ask and the most annoying
+one to leave open.
+
 Two smaller notes. `TestDiskFull`'s message moved from `Chunk 4 not found` to
-`Chunk 3 not found`, so that row is not deterministic in its detail. And of the
+`Chunk 3 not found`, so that row is not deterministic in its detail. **Neither is
+`TestWeb`'s** — §3 quotes it as `1#_ROWID_#_ROWID_ does not contain: column_name`
+and a later run of the same class in the same mode produced
+` does not contain: '`. Two runs, two different assertion bodies, so no single
+message from this class should be treated as its signature. And of the
 five, **`TestSQLXML` was the only one with no page anywhere** — the other four
 are already carried by `h2/nonpassed-40-census-20260818.md`,
 `h2/correctness-issues-consolidated.md`, and in `TestDiskFull`'s case its own

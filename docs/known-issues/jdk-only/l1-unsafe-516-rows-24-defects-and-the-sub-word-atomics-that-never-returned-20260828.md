@@ -301,7 +301,7 @@ this family will meet it again.
 
 ```text
 HotSpot    NoClassDefFoundError: java/lang/InvalidClassException
-CratonVM   1  and  16
+CratonVM   0  and  16      <- scale was 1 when this was written; see below
 ```
 
 Already adjudicated on 2026-08-26 in
@@ -315,11 +315,23 @@ This lane adds four rows to that record — `arrayIndexScale(int.class)` and
 `arrayIndexScale(Iface.class)` answer `1` too, so the catch-all covers
 primitives and interfaces as well as ordinary classes.
 
-**The prior adjudication stands.** Returning `0` (what the long-standing
-`sun.misc` javadoc specifies, and what callers guard on with
-`if (scale == 0) throw`) is defensible and is what I would change it to — but it
-is a behaviour change whose blast radius across JCTools-shaped consumers is
-unmeasured, the oracle cannot referee it, and a prior session weighed the same
+**UPDATED 2026-08-30 — the scale half of this was changed, and this section
+did not say so.** `array_index_scale_for_name` now returns `0` for a non-array,
+not `1`: exactly the value the paragraph below argued for, landed during this
+campaign while the text kept describing the old behaviour. All four scale rows
+(`String.class`, `int.class`, `Iface.class`, and the internal spelling) answer
+`0` today, so a caller following the documented
+`if (scale == 0) throw` guard now gets the refusal it is looking for.
+
+`arrayBaseOffset` on a non-array still answers `16`. There is no
+"`0` means invalid" convention for a base offset, no oracle can referee it —
+HotSpot's own refusal is the broken one described above — and nothing has been
+measured that would justify inventing one. That half of the prior adjudication
+stands.
+
+The original reasoning, kept because it is why the change was slow rather than
+skipped: returning `0` is a behaviour change whose blast radius across
+JCTools-shaped consumers was unmeasured, and a prior session weighed the same
 evidence and declined. Changing an adjudicated decision without new evidence is
 not a repair.
 
@@ -368,6 +380,10 @@ and refuse the fourth case with the `IllegalArgumentException` that
 `setMemory`/`copyMemory` at address 0 already produce (rows 27 and 28 of the
 null probe, where CratonVM is already correct and HotSpot SIGSEGVs). The
 prerequisite is a count of what reaches the fallback on a real workload.
+**That count exists now — see §21.** It is 0 across 116 regression vectors,
+both H2 vectors, Spring Boot and Tomcat+SSL, with a positive control that
+fires; and it is NOT yet available for the WildFly and Keycloak paths this
+section cites, which is why the refusal is still not made.
 
 ### 4.6 Nine registrations for methods this JDK image does not declare
 
@@ -1471,3 +1487,71 @@ constant says 16, native says 0
 ```
 
 The defect can now only recur loudly.
+
+## 21. §4.5's prerequisite, discharged — the fallback is reached by nothing
+
+§4.5 declined to refuse the unclassified null-base access and named exactly what
+would unblock the decision:
+
+> **The prerequisite is a count of what reaches the fallback on a real
+> workload.**
+
+Here is that count. Every row has a positive control, because every zero in this
+section is load-bearing.
+
+| population | vectors | hits |
+| --- | --- | --- |
+| regression vectors, `--jdk-only` | 116 completed rc=0 | **0** |
+| `org.h2.test.db.TestFullText` | 1 | **0** (was 11, occurrence → 513) |
+| `org.h2.test.unit.TestRecovery` | 1 | **0** (was 6) |
+| Spring Boot smoke test (`DOD RESULT OK`) | 1 | **0** |
+| Tomcat + SSL smoke test (`DOD RESULT OK`) | 1 | **0** |
+| `UnmapHackProbe` | 1 | **0** (was 3) |
+| **`NullBaseControl` (positive control)** | 1 | **2** |
+
+### 21.1 The three arms cannot answer this, and nearly said they could
+
+The obvious way to count is to grep the arm logs. It gives 0, and that 0 is
+**void**: `run.sh` captures each vector's output into a shell variable and
+passes it through `extract` before comparing, so VM chatter is discarded. The
+tell is that the arm logs contain **zero cratonvm `WARN` lines of any kind** —
+not zero of this one. A vector can warn on every call and still pass.
+
+So the sweep drives the vectors directly against the suite's own compiled
+classes with stderr kept, and runs `NullBaseControl` **in the same loop, through
+the same capture**. It reports 2. Without that row the whole table would be
+a mute instrument reported as a clean result — which this lane has now been
+caught by four times.
+
+The two DoD workloads carry their own denominator: each `.err` holds **6
+`Post-clinit fixup` lines**, so warns from this build demonstrably reach those
+files.
+
+**Caveat, stated because it bounds the claim:** the sweep runs vectors without
+their per-vector flags and classpath entries, so 4 of 120 exited non-zero and
+exercised less than the suite gives them.
+
+### 21.2 What this does and does not license
+
+**Discharged for four workload families**: the regression corpus, H2, Spring
+Boot and Tomcat+SSL. Nothing in any of them reaches the fallback, and the
+`compareAndSwapInt` that returns `true` having written nowhere is unreachable
+from real code in those populations.
+
+**NOT discharged for the rest.** §4.5's own justification cites the WildFly and
+Keycloak lazy-init paths, and those workloads are other lanes' — they are not
+checked out here and this lane cannot run them. The refusal §4.5 specifies
+(classify the offset; refuse the fourth case with the
+`IllegalArgumentException` that `setMemory`/`copyMemory` at address 0 already
+produce) is now **evidence-backed but not evidence-complete**, and flipping a
+shared path on partial evidence is the overlap this lane is supposed to avoid.
+
+So this stays a measured finding rather than a speculative repair — which is
+what the lane brief asks for, and I am saying which I did. Whoever owns WildFly
+or Keycloak can discharge the remainder with one run: the instrument is in the
+tree, `NullBaseControl` is the control, and the bar is the table above.
+
+**What changed underneath it:** §4.5 was written when the JDK itself reached
+this path 513+ times per H2 vector. §19 removed that consumer. The residual is
+no longer "a rescue something depends on" — it is a path nothing measured
+reaches, kept because the measurement does not yet cover everything.

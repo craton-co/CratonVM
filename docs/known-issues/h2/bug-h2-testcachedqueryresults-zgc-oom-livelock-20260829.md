@@ -1,5 +1,63 @@
 # `TestCachedQueryResults` — a ZGC `OutOfMemoryError` LIVELOCK, thousands per run, not a single failure
 
+
+## ADDENDUM 2026-08-30 (L7 corpus lane): the shortfall accounts EXACTLY, and three alternatives are eliminated
+
+The `--jdk-only` corpus hit this class, so it got the three arms. Both CratonVM
+modes fail with the *same* assertion, HotSpot passes:
+
+```text
+HotSpot          PASS     9s
+CratonVM compat  FAIL  1078s   AssertionError: Expected: 100000 actual: 98304
+CratonVM strict  FAIL  1365s   AssertionError: Expected: 100000 actual: 98304
+```
+
+### The 1696 missing entries are accounted for, to the unit
+
+```text
+100000 - 98304                                    = 1696
+OutOfMemoryError (length=65536) raised in tasks   = 1691
+SQLException caught by the callable and printed   =    5
+                                                    ----
+                                                    1696
+```
+
+**That is why this page's OOM framing is right, and it also explains the thing
+an OOM does not obviously explain — why the symptom is a WRONG ANSWER instead of
+a crash.** The callable catches `SQLException` only. An `OutOfMemoryError` is an
+`Error`, so it goes straight past that `catch`, is captured by the `FutureTask`
+`invokeAll` created for it, and **the test never calls `get()` on any of the
+futures it gets back**. 1691 tasks therefore die completely silently, each one
+simply never reaching `concurrentSet.add(countAfter)`, and the only trace is the
+final count.
+
+### Three things it is NOT, each checked rather than assumed
+
+* **Not `ConcurrentHashMap.newKeySet()` losing entries.**
+  `apps/probes/ChmKeySetGrowth.java` — 5 threads, 100000 distinct adds, the same
+  shape the test uses — reports `adds-returned-true 100000`, `size 100000`,
+  `contains-misses 0` on CratonVM. Identical to HotSpot.
+* **Not `ExecutorService.invokeAll` dropping tasks**, which was a live suspicion
+  because `docs/known-issues/` records an `invokeAll` that copied 3 of 8 on a
+  ForkJoinTask arm. `apps/probes/InvokeAllCount.java` submits 100000 callables
+  through `invokeAll` on a 5-thread pool: `futures 100000`, `done 100000`,
+  `executed 100000`. Identical to HotSpot.
+* **Not a lost update, and not this VM mishandling `FOR UPDATE`** — which the
+  assertion's own shape suggests, since the set holds distinct COUNTER VALUES
+  and `add` returning false is the test's lost-update detector. The run printed
+  **zero** `LOST UPDATE!` lines and **zero** `countAfter != countAtLock` lines.
+  `TestBase.println` is NOT gated behind a verbosity flag — it goes straight to
+  `System.out` — so those absences are evidence rather than silence. Every task
+  that reached the lock saw a value no other task had seen.
+
+### One thing retracted
+
+`98304 == 131072 - (131072 >>> 2)` is exactly `ConcurrentHashMap`'s resize
+threshold for a 131072-bucket table, and the same number appearing in two
+independent runs in two modes made a deterministic growth failure look likely.
+Both probes above refute it. The resemblance is a coincidence, and it is
+recorded here so the next reader does not spend the same hour on it.
+
 ## Status
 
 **OPEN, and the chain is now traced to one frame — see §"2026-08-29 (second)".**
@@ -212,15 +270,75 @@ So the one lead has become two, with very different sizes and repairs:
   discharged is a real question: its java locals hold incoming arguments, so a
   relocation still has to rewrite them, and with no map the shadow stack is the
   only channel that could. **Start here — it is 77 % of the refusals.**
-* **3 of 13 — an oop AT `sp_id_off`.** A store whose offset lands in the
-  reserved-locals tail. Small, and a genuine codegen defect: nothing may write a
-  Java reference into a slot the frame layout reserved for the safepoint id.
-  Print the storing method (`cm.method_label` is already on the line) and look
-  at what it compiles at that offset.
+* ~~**3 of 13 — an oop AT `sp_id_off`.** A store whose offset lands in the
+  reserved-locals tail … a genuine codegen defect~~ — **WRONG, see §4a.** There
+  is no store. The slot was never initialised, so it read whatever the previous
+  frame at that stack depth left; zeroing it in the prologue takes this
+  population to 0 in both measured rounds.
+
+### 4a. 2026-08-27 — it is ONE defect, not two: the sp-id slot is never initialised
+
+The split above is wrong, and the correction is a one-line fix.
+
+**Nothing writes an oop into the reserved slot. Nothing writes the slot at
+all** until the first safepoint. `emit_prologue` zeroes
+`shadow_thread_slot_off` and `shadow_savetop_slot_off` — with a comment giving
+exactly the reason, *"it must read 0, not uninitialised stack. The single-pass
+backend zero-initialises for exactly this reason"* — and does **not** zero
+`sp_id_slot_off` beside them. Ids start at 1 precisely so `0` can mean "no
+safepoint reached" (the slot's own allocation comment says so), but the
+prologue never established the sentinel.
+
+So both populations are the same thing, read at two different pieces of stack:
+`0` where the region happened to be clean, a stale oop where a previous frame
+at that depth had left one. Not "a store whose offset lands in the
+reserved-locals tail".
+
+**MEASURED**, same class, one binary, `CRATONVM_JIT_ZERO_SPID` as the A/B, two
+rounds — the census split by what sits in the slot:
+
+| arm | `no-map-for-id` | `sp_id == 0` | sp-id out of range (a stale word) |
+|---|---:|---:|---:|
+| OFF (today) | 22 | 1 | **9** |
+| ON | 20 | 10 | **0** |
+| OFF (today) | 16 | 1 | **7** |
+| ON | 6 | 3 | **0** |
+
+The out-of-range population goes to **zero and stays there**, and the frames
+reappear in the `sp_id == 0` bucket. That is the predicted signature of
+uninitialised stack and not of a stray store.
+
+**The hazard this closes is worse than the refusal it was found through.**
+Safepoint ids are small consecutive integers, so a stale word can equal a
+*valid* id for that method — and then `find_oop_map_for_safepoint_id` matches
+the map for a DIFFERENT program point and relocation rewrites against it. A
+silent wrong answer, not a refused cycle. The 13-frame census only ever showed
+the loud half.
+
+**It does NOT fix this class.** `xt_cov` still reads `accepted=0` on both arms
+(refused 22/35 and 30/28 over 300 s), because a zeroed slot fails closed
+exactly as a garbage one did. What it does is remove the corruption hazard and
+collapse the two populations into one, so the remaining question is single and
+clean: **can a frame that has taken no safepoint be discharged?** That is now
+100 % of `no-map-for-id`, not 77 %.
+
+**Caveat on the single-pass backend, not fixed here.** `x64/safepoint.rs` stores
+`cur_bc_pc` as the id, and **bytecode pc 0 is legal** — so for those frames `0`
+is ambiguous between "at bci 0" and "never stored", and zeroing the prologue
+slot there could make an unsafepointed frame match the bci-0 map. The IR
+backend has no such ambiguity (ids start at 1), which is why the fix is scoped
+to it. Giving the single-pass backend a +1-encoded id would remove the
+ambiguity and let it take the same repair.
+
+**And this class's own symptom did not reproduce here**: `oom=0` on both arms
+at a 300 s cap on an idle host, against the page's `oom=2990` at 900 s. Either
+the cap or the load matters; the band census above is what the A/B rests on,
+not an OOM rate.
 
 ### 5. What to do next, in order
 
-1. **Take the `sp_id == 0` population first** — 10 of 13, and the question is
+1. **Take the `sp_id == 0` population first** — now 100 % of `no-map-for-id`
+   after §4a removed the stale-word half, and the question is
    whether a frame that has taken no safepoint can be discharged at all rather
    than refusing every cycle it is live for.
 2. Only then look at the `operand-spill` words. Four of the seven are on the
