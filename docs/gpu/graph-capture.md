@@ -39,18 +39,54 @@ round, on a host gated quiet by `bench-gpu/wait-for-quiet.sh`
 
 | arm | best tok/s | rounds |
 |---|---:|---|
-| `base` — per-token scalars as kernel arguments | 16.68 | 8.68 7.71 16.68 14.08 14.93 |
-| `scalars` — those two ints device-resident, graph off | 15.14 | 9.21 15.14 14.21 14.94 13.60 |
-| `graph` — the same, graph on | **31.43** | 15.09 27.74 30.19 31.43 30.86 |
+| `base` — per-token scalars as kernel arguments | 16.94 | 16.16 14.45 15.54 14.37 16.94 |
+| `scalars` — those two ints device-resident, graph off | 15.10 | 14.54 14.35 14.62 13.50 15.10 |
+| `graph` — the same, graph on | **30.51** | 30.51 28.84 30.35 29.68 29.02 |
+| `nodeupd` — `base`'s kernels, arguments re-supplied per node | 21.29 | 20.85 21.29 21.25 20.43 20.41 |
 
-**2.05x**, and all three arms produce byte-identical text. `submit_ms`
-per token falls from ~117 ms to 0.5–0.8 ms. The first round of every arm
-is cold, which is why the rounds are printed rather than only a mean.
+All four produce byte-identical text.
 
-The middle arm is there because it is the one that could have gone
-wrong: moving the position and the token id into device memory adds a
-global load per thread to six kernels, and if that cost anything the
-graph would have been paying for it. It does not.
+**`graph` is 2.02x `scalars`**, and `submit_ms` per token falls from
+~117 ms to 0.5–0.8 ms. The `scalars` arm exists because it is the one
+that could have gone wrong: moving the position and the token id into
+device memory adds a global load per thread to six kernels, and if that
+cost anything the graph would have been paying for it. It does not.
+
+**`nodeupd` is 1.26x `base`** and changes no kernel at all — see
+"Two ways to feed a replay" below. It is also by far the steadiest arm,
+4% across its five rounds against 18% for `base`: it hands the driver
+one submission instead of 453, so there is much less host work for host
+jitter to land on.
+
+## Two ways to feed a replay
+
+A graph bakes each argument VALUE into its nodes, so any value that
+changes between replays is exactly what stops a sequence being
+replayable. There are two answers, and the right one depends on whether
+you can change the code being captured.
+
+**Move the changing values into device memory.** The kernels read them
+from a resident `GpuArray`, the host writes through a pointer the graph
+already holds (`GpuArray.copyFromHost`), and the graph itself never
+changes: one tiny H2D copy and one `cuGraphLaunch` per iteration. This
+is the fast path — 2.02x here — and it needs six kernel signatures and
+every call site changed.
+
+**Re-supply the arguments per node.** Re-issue the same dispatch
+sequence between `beginReplay` and `endReplay`; each dispatch rewrites
+the arguments of the node it corresponds to
+(`cuGraphExecKernelNodeSetParams`) instead of launching, and `endReplay`
+submits the graph once. No kernel changes at all — 1.26x here. The cost
+is a driver call per updated node plus the caller's own per-dispatch
+work, which is why it lands between "issue the launches" and "replay a
+graph that does not change".
+
+The sequence must match the captured one: same kernels, same order, same
+count. The VM records the kernel identity per node and refuses a
+mismatch rather than submitting, because replaying a partially-updated
+graph would run some nodes with this iteration's arguments and the rest
+with the previous iteration's — a plausible wrong answer rather than a
+failure.
 
 ## Why the scalars had to move
 
@@ -135,8 +171,29 @@ and, if so:
   before this graph, so a download released by it would be correctly
   ordered against the wrong thing.
 
-Ordering across a replay is therefore the caller's wait on the replay's
-submission handle, which is why `replay` returns one.
+`GraphExec::launch` then records a completion event and stamps it into
+the `last_write` slot of every buffer the graph names, which restores
+the invariant: a buffer's `last_write` names the work that most recently
+wrote it. Without that, a replay's writes are visible only to the stream
+that ran it, and a read from any other stream is released with nothing
+to wait on — it sees the buffer as it was before the replay. The window
+in which these buffers have no `last_write` is now exactly the window in
+which nothing has written them, because a capture runs nothing.
+
+## Node handles belong to the graph, not the exec
+
+The driver permits destroying a graph after instantiating it, and the
+exec stays valid — so `end_capture(&ctx)?.instantiate()?`, the obvious
+way to write it, drops the graph as a temporary and works fine right up
+until you keep a node handle.
+
+`GraphNode`s belong to the graph. With the graph gone they dangle, and
+the driver does not say so: `cuGraphKernelNodeGetParams` on a destroyed
+graph's node returns `CUDA_SUCCESS` and an all-zero struct, so the
+failure surfaces one call later as `CUDA_ERROR_INVALID_VALUE` from
+`cuGraphExecKernelNodeSetParams` and points nowhere near the cause.
+`instantiate` therefore consumes the graph and the exec owns it, which
+makes the mistake unrepresentable rather than documented.
 
 ## Using it
 
@@ -153,8 +210,17 @@ for (int i = 0; i < many; i++) {
 exec.releaseGraph(g);
 ```
 
+Or, without touching the kernels:
+
+```java
+exec.beginReplay(g);
+for (Step s : steps) s.dispatch();          // rewrites args, runs nothing
+exec.awaitSubmission(exec.endReplay());     // one submission, all of them
+```
+
 `craton_gpu` natives: `graphBeginCapture(J)Z`, `graphEndCapture(J)J`,
-`graphReplay(JJ)J`, `graphNodeCount(J)I`, `releaseGraph(J)V`, and
+`graphReplay(JJ)J`, `graphBeginReplay(JJ)Z`, `graphEndReplay(J)J`,
+`graphNodeCount(J)I`, `releaseGraph(J)V`, and
 `arrayCopyFromHost(JLjava/lang/Object;)Z`. The first three take the
 *executor* handle — a capture belongs to the stream every dispatch on
 that executor lands on.

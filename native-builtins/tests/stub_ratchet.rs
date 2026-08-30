@@ -1195,7 +1195,47 @@ use cratonvm_types::compat::CompatibilityMode;
 /// Not attributable to this branch, and not this branch's win either; it is
 /// recorded here because the ratchet has zero slack and a merged tree has to be
 /// accounted for by whoever lands it.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1587;
+/// RE-FROZEN 2026-08-29, +6 net, and BOTH directions are cause (b).
+///
+/// **16 added — the Permission family, relabelled rather than written.**
+/// `java/security/Permission`, `java/security/BasicPermission`,
+/// `java/lang/RuntimePermission` and `java/util/PropertyPermission`, each
+/// `<init>()V`, `<init>(String)V`, `<init>(String,String)V` and `getName()`.
+/// Every one of those triples was ALREADY registered at the commit that set the
+/// previous baseline — verified by reading `native-builtins/src/lib.rs` at that
+/// commit, where the same five-class loop sits outside any `with_category`
+/// block. What changed is the KIND: the loop is now wrapped in
+/// `SyntheticStub`, so `real_protected_stub_class` hands each call back to the
+/// real body whenever the real class is loaded.
+///
+/// That is the good direction, and the registrar measured what the shadow was
+/// costing before it moved:
+///
+/// ```text
+/// new PropertyPermission("a.b.*", "read,write")
+///   HotSpot   mask=3  path="a.b.*"  getActions()="read,write"
+///   CratonVM  mask=0  path=null     getActions()=""
+/// ```
+///
+/// — because `permission_init` wrote `name` and returned, so
+/// `BasicPermission.<init>`'s `init(name)` and `PropertyPermission.<init>`'s
+/// `init(getMask(actions))` never ran. `implies()` then NPEd on a null
+/// `that.path` and a serialization round trip died in `readObject`.
+///
+/// **10 removed — nine `java/util/ServiceLoader` stubs and one
+/// `AtomicReference.compareAndSet`.** The `ServiceLoader` family is gone
+/// outright; the `AtomicReference` row is the same deletion accounted for in
+/// `registrar_drift.rs`'s `FIXED_NOT_DRIFTING`.
+///
+/// **On the second column, and how I read it wrong first.** Totals moved
+/// 13407 -> 13415 (no-management) and 13775 -> 13783 (management), +8 each,
+/// against a +6 stub delta — which the classifier reads as "new fakes". It is
+/// not: the +8 is dev's other work across the same 27 commits, and the 16 stub
+/// rows are relabels of registrations that were already there. The
+/// registration site's own comment settles it, which is why this gate tells you
+/// to read that BEFORE assuming (a). I assumed (a) from the column alone and
+/// had to correct it.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1593;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1210,7 +1250,9 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1587;
 /// the delta is the same −7 in both — but measure it, do not derive it: this
 /// constant's own history has a case of one derived from the other sitting six
 /// above the truth for a week.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1576;
+/// Re-frozen 2026-08-29 with [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]; the
+/// account for both is on that constant.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1582;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -1260,13 +1302,13 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1576;
 /// `cratonvm/internal/ArrayListViewItr` rows), and the other three accumulated
 /// across merges nobody had to re-freeze for. An ungated constant used to
 /// classify a gated one is worth only as much as its last refresh.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13775;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13783;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
 /// for the reason given on [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].**
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13407;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13415;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;

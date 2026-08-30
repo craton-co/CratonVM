@@ -999,3 +999,116 @@ design rather than my care:
 Third instance in this lane of the same shape — §9.4's mute instrument, §12's
 corpus blindness, and now this. **A zero is a claim about a run, and the run has
 to be shown to have happened first.**
+
+---
+
+## 14. R1 CLOSED — the mint is unreachable through its own documented consumers
+
+§13 left R1 open on one name: WildFly, which is not checked out on this host.
+It is closed now, and not by finding WildFly — by characterising the consumer
+surface instead of sampling it.
+
+The mint fires only when `Unsafe.objectFieldOffset(Class, String)` cannot find
+the named field. Its registrar comment names two consumers. Asked of JDK 25
+directly, with `javap`:
+
+* **`java.lang.Class$Atomic`** resolves exactly **three** names, all on
+  `java.lang.Class`, in a single `<clinit>`:
+  `reflectionData`, `annotationType`, `annotationData`. That `<clinit>` runs in
+  any VM that touches reflection at all.
+* **`jdk.internal.loader.AbstractClassLoaderValue`** references `Unsafe`
+  **zero times** on JDK 25. **That half of the citation is stale** — whatever it
+  did when the comment was written, it does not reach this path now.
+
+So the documented surface is three field lookups on one class, once per process
+— not a workload-dependent population. **WildFly reaches the mint only through
+the same `<clinit>`, which every measured workload already runs.** Its absence
+stopped mattering once the surface was characterised rather than sampled.
+
+Measured with `probes/MintReachProbe.java`, which leads with a positive control
+because this lane has been caught three times by a zero from an instrument that
+could not fire:
+
+```text
+                                          compatible   --jdk-only
+CONTROL objectFieldOffset(X, "noSuchField20260829")   mints      mints
+CONTROL a second bogus name, distinct offset          mints      mints
+Class.reflectionData   resolves non-zero                yes        yes
+Class.annotationType   resolves non-zero                yes        yes
+Class.annotationData   resolves non-zero                yes        yes
+two passes of getDeclaredFields / getDeclaredMethods /
+getAnnotations over seven classes
+  additional mints                                        0          0
+  TOTAL mint warns                                        2          2
+```
+
+Two warns, both the controls. The instrument fires exactly when it should and
+never otherwise.
+
+**Adjudicated: deliberate, and unreachable through its documented consumers.**
+Matching HotSpot's `InternalError` is now known to be a no-op on every measured
+path, so it is *available* to anyone who wants contract fidelity — but it should
+not be taken alone. The registrar comment names a second scenario the probe
+cannot reach: `ConcurrentHashMap.table` *"when the populator failed to wire the
+`rj_slot` metadata"*. That is a VM fragility the mint papers over, not a caller
+error, and removing a rescue before showing the fragility is gone is the mistake
+§12 records. **Precondition stated; row closed.**
+
+---
+
+## 15. R5 diagnosed to the caller and the native — and two hypotheses died
+
+§12 named the next measurement: the instrument records the offset but not the
+caller. It does now, and the answer took two wrong guesses on the way.
+
+```text
+org.h2.test.db.TestFullText, --jdk-only, PASSES rc=0
+  11 warn lines, occurrence reaching 513, every one:
+      offset = 0x0
+      caller = org/apache/lucene/store/MappedByteBufferIndexInputProvider
+      native = getIntVolatile   x10
+               compareAndSwapInt x1
+```
+
+`org.h2.test.unit.TestRecovery` is the same caller and offset, 6 lines.
+**One caller, one offset, two natives, across both classes.**
+
+### 15.1 Two hypotheses that died, and why saying so matters
+
+* **"Lucene is unmapping through `invokeCleaner`."** `javap` on Lucene 9.7's
+  `MappedByteBufferIndexInputProvider` shows exactly that — `unmapHackImpl()`
+  looks up `sun.misc.Unsafe`, `theUnsafe` and `invokeCleaner` and builds a
+  MethodHandle. It is the obvious answer and it is not this one: the natives
+  actually reached are `getIntVolatile` and `compareAndSwapInt`.
+* **"This VM answers a mapped buffer's address as 0, and Lucene reads through
+  it."** That was the §12 hypothesis, and it is REFUTED —
+  `probes/MappedAddrProbe.java` reports a non-zero address for a
+  `FileChannel.map` buffer, its duplicate and its slice, and for
+  `allocateDirect`, **identically on HotSpot and CratonVM in strict mode**. It
+  went into §12 as a suggestion; it would have gone into this section as a fact.
+
+### 15.2 What the evidence actually says
+
+`getIntVolatile(null, 0)` followed by `compareAndSwapInt(null, 0, ...)` is the
+shape of a **CAS on a field whose offset resolved to 0**, with the base null —
+not of an unmapping call. It is the same "offset 0 aliases slot 0" hazard the
+`objectFieldOffset1` comment describes, on the static path, being silently
+rescued by the side store. The side store is what makes that CAS loop terminate,
+which is why H2 passes and why refusing here would hang or break it.
+
+**A caveat on the attribution, stated because it changes what the name means.**
+This VM's MethodHandle dispatch does not create intermediate frames, so the
+innermost Java frame is the nearest *real* frame, not necessarily the literal
+caller. `MappedByteBufferIndexInputProvider` is where to start looking, not
+proof that Lucene's own bytecode issues the call.
+
+### 15.3 What would close it
+
+The remaining question is one field: **which field's offset resolved to 0.**
+Method-level attribution (the frame walk already added here returns only the
+class) or a targeted Lucene repro would name it. The fix then belongs at
+whatever produced the 0 — and NOT at the fallback, which §12 established and
+this section confirms: 513+ rescued calls in a vector that passes.
+
+Both instruments stay in the tree (`note_unsafe_side_store_offset` now reports
+`caller` and `site_line`), so the next measurement costs a run and no probe.
