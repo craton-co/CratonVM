@@ -4262,6 +4262,105 @@ fn selfrec_int_direct_call_executes_correctly() {
     }
 }
 
+/// A self-recursive method with MORE ARGUMENTS THAN THE ENTRY REGISTER FILE.
+///
+/// `ir_lower::emit_self_recursive_call` marshals the hidden VM context pointer
+/// plus every Java argument into an entry-ABI register — `abi[0]` for the
+/// context, `abi[1 + i]` for arg `i`. That file is FOUR registers on Win64
+/// (RCX, RDX, R8, R9) and SIX on SysV, so the direct route can carry at most 3
+/// Java arguments on Windows and 5 on Linux. Nothing checked the arity, and
+/// compiling a 4-arg self-recursive method on Windows PANICKED the lowerer:
+///
+///   index out of bounds: the len is 4 but the index is 4
+///
+/// In the VM that panic lands on the BACKGROUND COMPILER THREAD, which does not
+/// come back — so the first such method silently drops the whole process to the
+/// interpreter for the rest of its life. MEASURED with
+/// `CRATONVM_DBG_JIT_COMPILED=1` on `probes/SelfRecArgs.java`: f1, f2 and f3
+/// compile, f4 panics, and then nothing compiles at all — not f5, not f6, not
+/// `main`'s OSR. It reached a real workload as a HANG, Hibernate's
+/// `DefaultCatalogAndSchemaTest` running to a 600 s timeout interpreted.
+///
+/// # Why this asserts the COMPILE and not the call
+///
+/// Both arities below are refused the direct route on at least one supported
+/// platform, and a refused self-call routes its recursive edge through
+/// `jit_invoke_dispatch` — which this file stubs with a panic on purpose (see
+/// `dummy_helpers`: "no runtime helper reachable" is this harness's contract).
+/// So `try_call_with_context` cannot run them here, and asserting it would test
+/// the harness. The defect was a COMPILE-TIME panic, and "it compiles" is the
+/// invariant that regressed.
+///
+/// Two arities rather than one so the test is not silently vacuous on either
+/// platform: 4 args is over the limit on Win64 only, 6 is over it on BOTH, so
+/// the second row still asks a real question on a six-register host.
+#[test]
+fn selfrec_more_args_than_entry_regs_still_compiles() {
+    cratonvm_jit::x64::set_moving_young_override(Some(false));
+    struct ResetOverride;
+    impl Drop for ResetOverride {
+        fn drop(&mut self) {
+            cratonvm_jit::__set_selfrec_direct_override(None);
+        }
+    }
+    let _guard = ResetOverride;
+    // ON, because the guard being tested lives on the enabled path: with the
+    // direct route off there is nothing to run off the end of.
+    cratonvm_jit::__set_selfrec_direct_override(Some(true));
+
+    let helpers = dummy_helpers();
+
+    // static int fN(int a, int b, ...) { return a > 0 ? fN(a-1, b, ...) + 1 : b; }
+    // Built for an arbitrary arity so the two rows share one shape.
+    for arity in [4usize, 6usize] {
+        let mut code: Vec<u8> = vec![
+            0x1a, // 0  iload_0
+            0x9d, 0x00, 0x05, // 1  ifgt -> 6
+            0x1b, // 4  iload_1
+            0xac, // 5  ireturn
+            0x1a, // 6  iload_0
+            0x04, // 7  iconst_1
+            0x64, // 8  isub
+        ];
+        // The remaining arguments, forwarded unchanged: locals 1..arity.
+        for local in 1..arity {
+            // iload <n> — iload_1/2/3 have short forms, the rest take `iload n`.
+            match local {
+                1 => code.push(0x1b),
+                2 => code.push(0x1c),
+                3 => code.push(0x1d),
+                n => {
+                    code.push(0x15);
+                    code.push(n as u8);
+                }
+            }
+        }
+        code.extend_from_slice(&[0xb8, 0x00, 0x02]); // invokestatic #2
+        code.extend_from_slice(&[0x04, 0x60, 0xac]); // iconst_1; iadd; ireturn
+
+        let name = format!("f{arity}");
+        let descriptor = format!("({})I", "I".repeat(arity));
+        let cm = cached(
+            &name,
+            &descriptor,
+            code,
+            arity as u16,
+            arity as u16,
+        );
+        let (rname, rdesc) = (name.clone(), descriptor.clone());
+        let resolver = move |cp: u16| -> Option<(String, String, String)> {
+            if cp == 2 {
+                Some(("Corpus".into(), rname.clone(), rdesc.clone()))
+            } else {
+                None
+            }
+        };
+        compile_with_dispatch(&cm, &helpers, &resolver).unwrap_or_else(|| {
+            panic!("{arity}-arg self-recursive method must compile by whichever route fits")
+        });
+    }
+}
+
 #[test]
 fn selfrec_long_direct_call_executes_correctly() {
     // This test exercises the optimizing IR pipeline, which is gated off
