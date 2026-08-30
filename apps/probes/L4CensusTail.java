@@ -4,6 +4,7 @@ import java.nio.*;
 import java.nio.channels.FileChannel;
 import java.nio.file.*;
 import java.nio.file.attribute.*;
+import java.nio.file.spi.FileSystemProvider;
 import java.time.Instant;
 import java.util.*;
 
@@ -348,6 +349,32 @@ public class L4CensusTail {
         p("FileTime.from(Instant) equals millis-built",
           ft.equals(FileTime.fromMillis(1234567890000L)));
         t("FileTime.from(null)", () -> FileTime.from((Instant) null));
+
+        // The provider's own refusals, BY TYPE. `Files.createDirectories`
+        // walks parents with `catch (NoSuchFileException)`, so a supertype
+        // instance here breaks a caller three frames up rather than at the
+        // throw -- assert the class, never just that something was thrown.
+        FileSystemProvider prov = FileSystems.getDefault().provider();
+        t("provider.checkAccess(missing)", () -> prov.checkAccess(dir.resolve("nope")));
+        t("provider.checkAccess(present)", () -> prov.checkAccess(file));
+        t("provider.readAttributes(missing)",
+          () -> prov.readAttributes(dir.resolve("nope"), BasicFileAttributes.class));
+        t("Files.readAttributes(missing)",
+          () -> Files.readAttributes(dir.resolve("nope"), BasicFileAttributes.class));
+        t("Files.createDirectory on an existing dir", () -> Files.createDirectory(dir));
+        // The multi-level create is the caller that the type above breaks.
+        Path deep = dir.resolve("d1/d2/d3");
+        pt("createDirectories(3 levels)", () -> {
+            Path r = Files.createDirectories(deep);
+            return Files.isDirectory(r);
+        });
+        pt("createDirectories again is a no-op", () -> {
+            Path r = Files.createDirectories(deep);
+            return Files.isDirectory(r);
+        });
+        Files.deleteIfExists(deep);
+        Files.deleteIfExists(deep.getParent());
+        Files.deleteIfExists(deep.getParent().getParent());
 
         // FileStore.getBlockSize and the two ClassLoader newFileSystem overloads
         pt("FileStore.getBlockSize > 0", () -> Files.getFileStore(file).getBlockSize() > 0);
