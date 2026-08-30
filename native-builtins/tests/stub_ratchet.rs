@@ -1235,7 +1235,45 @@ use cratonvm_types::compat::CompatibilityMode;
 /// registration site's own comment settles it, which is why this gate tells you
 /// to read that BEFORE assuming (a). I assumed (a) from the column alone and
 /// had to correct it.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1593;
+///
+/// # Re-frozen 2026-08-30, +8: the immutable-collection SERIALIZATION family
+///
+/// Cause (b) again, and this time the relabel is the fix for a strict-mode
+/// crash rather than only an honesty improvement.
+///
+/// All eight rows come from `register_immutable_serialization_natives`, which
+/// set `Bridge` for its whole window. Named, by `dump_synthetic_stubs`, and
+/// exactly eight:
+///
+/// ```text
+/// java/util/CollSer.readResolve()Ljava/lang/Object;
+/// java/util/Collections$UnmodifiableRandomAccessList.writeReplace()Ljava/lang/Object;
+/// java/util/ImmutableCollections$List12.writeReplace()Ljava/lang/Object;
+/// java/util/ImmutableCollections$ListN.writeReplace()Ljava/lang/Object;
+/// java/util/ImmutableCollections$Map1.writeReplace()Ljava/lang/Object;
+/// java/util/ImmutableCollections$MapN.writeReplace()Ljava/lang/Object;
+/// java/util/ImmutableCollections$Set12.writeReplace()Ljava/lang/Object;
+/// java/util/ImmutableCollections$SetN.writeReplace()Ljava/lang/Object;
+/// ```
+///
+/// `Bridge` asserts "no working real-bytecode fallback exists". Under
+/// `--jdk-only` that was not merely wrong but FATAL: `CollSer.readResolve`
+/// rebuilds through `of_list`, which freezes into a
+/// `cratonvm/internal/Unmodifiable*` that strict refuses to fabricate, so
+/// deserializing ANY `List.of`/`Set.of`/`Map.of` died with
+/// `NoClassDefFoundError: cratonvm/internal/UnmodifiableList`. Writing worked
+/// and produced the same 59 bytes HotSpot writes; only the read side failed.
+/// Six rows of `apps/probes/UtilCoverage4Sweep`, now 0-diff in both modes.
+///
+/// **On the second column.** Totals moved 13415 -> 13511 (no-management) and
+/// 13783 -> 13879 (management), +96 each, against a +8 stub delta. The
+/// classifier's "total UP by roughly the stub delta means new fakes" does not
+/// apply: 96 is twelve times 8, and the 96 is dev's other work across the
+/// commits merged since the last freeze. The eight rows above are named
+/// individually rather than inferred from the column, which is the only way to
+/// tell a relabel from an addition while the tree is moving for other reasons —
+/// the lesson of the 2026-08-29 entry directly above.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1601;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1252,7 +1290,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1593;
 /// above the truth for a week.
 /// Re-frozen 2026-08-29 with [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]; the
 /// account for both is on that constant.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1582;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1590;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -1302,13 +1340,13 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1582;
 /// `cratonvm/internal/ArrayListViewItr` rows), and the other three accumulated
 /// across merges nobody had to re-freeze for. An ungated constant used to
 /// classify a gated one is worth only as much as its last refresh.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13783;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13879;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
 /// for the reason given on [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].**
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13415;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13511;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;

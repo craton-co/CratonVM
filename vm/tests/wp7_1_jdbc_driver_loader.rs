@@ -186,14 +186,25 @@ fn jdbc_driver_natives_export_service_loader() {
     use cratonvm_native_api::NativeMethodRegistry;
     let mut r = NativeMethodRegistry::new();
     cratonvm_native_builtins::jdbc::register_jdbc_driver_natives(&mut r);
+    // INVERTED 2026-08-30, same reason as the sibling assertions in
+    // `wp7_3_sql_types_datetime` and `wp8_11_ejbca_bootstrap_smoke`:
+    // `register_service_loader_natives`' body is
+    // `#[cfg(feature = "synthetic-jdk")]` because in a real-JDK build these
+    // natives shadowed correct bytecode with a WRONG iterator
+    // (`ArrayList$Itr` for HotSpot's `ServiceLoader$2`, losing laziness).
+    //
+    // What this test still guards is real and unchanged: the registrar must
+    // wire its OWN fixture helper. That is the regression the doc comment
+    // above describes -- `lib.rs` dropping the registration call -- and it
+    // is now checked by the one triple this registrar actually owns.
     assert!(
         r.find(
             "java/util/ServiceLoader",
             "iterator",
             "()Ljava/util/Iterator;",
         )
-        .is_some(),
-        "register_jdbc_driver_natives must wire ServiceLoader.iterator"
+        .is_none(),
+        "ServiceLoader.iterator must NOT be shadowed in a real-JDK build"
     );
     assert!(
         r.find(
@@ -201,8 +212,8 @@ fn jdbc_driver_natives_export_service_loader() {
             "load",
             "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
         )
-        .is_some(),
-        "register_jdbc_driver_natives must wire ServiceLoader.load(Class)"
+        .is_none(),
+        "ServiceLoader.load(Class) must NOT be shadowed in a real-JDK build"
     );
     assert!(
         r.find(

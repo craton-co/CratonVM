@@ -1628,20 +1628,34 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for size"))?;
         match &*entry {
+            // SIZE BY `fstat`, NOT BY SEEKING TO THE END. `lseek(fd, 0,
+            // SEEK_END)` on a DIRECTORY returns `LONG_MAX` on Linux, and this
+            // handed that straight back:
+            //
+            //   Files.newByteChannel(<a directory>).size()
+            //     HotSpot   4096              this VM   9223372036854775807
+            //   Files.readAllBytes(<a directory>)
+            //     HotSpot   IOException       this VM   OutOfMemoryError
+            //
+            // `readAllBytes` sizes its buffer from `channel.size()`, so the
+            // VM tried to allocate eight exabytes and died with an error the
+            // caller cannot meaningfully catch. HotSpot's `nd.size(fd)` is an
+            // `fstat`, which is what `metadata()` is here.
+            //
+            // Better for the non-directory case too: the seek dance moved the
+            // file position and put it back, which is three syscalls, is not
+            // atomic against a concurrent reader of the same fd, and fails
+            // outright on a non-seekable fd.
+            //
+            // MEASURED with the shadow dial armed over `java/nio/file/Files`,
+            // which is what makes the real `readAllBytes` bytecode run.
             FileEntry::FileReadWrite(file) => {
-                let mut f = file.lock();
-                let saved = f.stream_position()?;
-                let size = f.seek(SeekFrom::End(0))?;
-                f.seek(SeekFrom::Start(saved))?;
-                Ok(size)
+                let f = file.lock();
+                Ok(f.metadata()?.len())
             }
             FileEntry::FileRead(reader) => {
-                let mut r = reader.lock();
-                let inner = r.get_mut();
-                let saved = inner.stream_position()?;
-                let size = inner.seek(SeekFrom::End(0))?;
-                inner.seek(SeekFrom::Start(saved))?;
-                Ok(size)
+                let r = reader.lock();
+                Ok(r.get_ref().metadata()?.len())
             }
             // `FileChannel.size()` on a `FileOutputStream`-backed channel —
             // also the `position()` path for an *append*-mode channel, which

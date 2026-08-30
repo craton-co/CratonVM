@@ -122,7 +122,7 @@ The bar is `docs/feature-designs/jdk-only-completion-roadmap.md` §6:
 | phase | status |
 | --- | --- |
 | **Phase 1** — fabricated receiver kills its caller | **CLOSED 2026-08-29 — all nine lanes.** A/B/D/G/I by `Phase1Sweep` (80 rows); C/E/F/H by `probes/P1RemainingSweep.java` (29 rows, 0 differing both modes, **0 PHASE1-KILL**), each exercised through the payload the roadmap names and with all four mint sites still LIVE. Record: `phase-1-is-closed-the-last-four-lanes-measured-20260829.md`. It means the stated MECHANISM no longer fires on the nine — not that no fabricated class can kill a caller: `RJdkEnumerations` was exactly that and the CORPUS found it, not a Phase 1 probe. |
-| **Phase 2** — retire the shadows | **the bulk of the remaining work.** §2 below. |
+| **Phase 2** — retire the shadows | **ADJUDICATED 2026-08-30 (L2). 34 of 270 classes are demonstrably load-bearing; the other 236 are candidates and NOT ONE is retirable on corpus evidence.** The 14-vector corpus passes `ConcurrentHashMap` 14/14; retiring it empties `Properties.keySet()` and kills the probe. §2 below and [`phase-2-adjudicated-the-corpus-cannot-decide-a-retirement-20260830.md`](phase-2-adjudicated-the-corpus-cannot-decide-a-retirement-20260830.md). |
 | **Phase 3** — correctness gaps no census sees | **CLOSED.** 35 rows, 0 differences, both modes, including the `aastore` covariance check the page still calls its one live red. |
 | **Phase 4** — the evidence base | **CLOSED 2026-08-29 (L7).** All three workloads ARE checked out on `azure-host-2` — the blocker was a host, not an absence. Five arms, `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on every one, every fabrication request named with its requester `file:line`. **P4-A and P4-B are now done too:** a 218-class corpus under `--jdk-only` against HotSpot — fully adjudicated at 185/19/14, 0 strict-only failures, worklist 1065 not 334 — and `--features synthetic-jdk` compiled and run for the first time (49 vectors: 1 pass, 48 fail, 53 distinct missing natives with callers). **Two methodology results worth more than the counts:** buy the ORACLE before raising your own cap (4 of the slowest 21 do not finish on HotSpot at 1800 s either, so no CratonVM verdict on them can mean anything), and confirm any mode-specific failure ALONE — sharding manufactured one here, as a working directory on the wrong filesystem manufactured another. |
 
@@ -255,6 +255,76 @@ were, over and over:
   level of the call chain; twelve rows across three signals meant one line.
 * **Deferrals that were requests for a measurement.** Two of them, both closed:
   the `URI` recomposition row and the `System.Logger` `OFF` arm.
+
+### Adjudicated, 2026-08-30 — and the instrument matters more than the answer
+
+Full record: [`phase-2-adjudicated-the-corpus-cannot-decide-a-retirement-20260830.md`](phase-2-adjudicated-the-corpus-cannot-decide-a-retirement-20260830.md).
+
+`CRATONVM_ENFORCE_NATIVE_SHADOW=<class>`, one class at a time, 270 classes,
+14-vector smoke set, one pinned binary: **34 LOAD-BEARING, 236 RETIRE-SAFE.**
+
+**Do not use that RETIRE-SAFE column as a retirement list.** Arming all 236 at
+once, on the same binary whose unarmed baseline is 118/118:
+
+```text
+armed --jdk-only    64 passed, 54 failed     (reproduced in two independent runs)
+armed SUITE=all    118 passed,  0 failed     <- the dial is inert outside --jdk-only
+armed SUITE=core    78 passed,  0 failed
+enforcement_dial  reached 14 123 530  yielded 14 055 769  LEAK 0
+```
+
+Fourteen million dispatches yielded to real bytecode, zero leaks — the
+retirement was COMPLETE — and the corpus still failed 54 vectors. It also broke
+**35 of 78 probe families and killed 20**, several byte-identical to HotSpot
+before the retirement.
+
+Each of those 236 classes passes 14/14 alone. **A per-class sweep cannot
+predict a set**, and four more full-corpus runs say why it is both reach and
+combination: `ConcurrentHashMap` passes the 14-vector smoke set 14/14 and fails
+**seven** full-corpus vectors, while `Locale` alone fails none — so no single
+class accounts for the 54.
+
+Three further checks, each cheaper than the sweep that produced it:
+
+* **146 of the 236 greens were never asked anything.** The smoke set dispatches
+  a shadowed native on only 120 of the 270 classes; for the rest, arming
+  changed nothing because nothing was called. Check
+  `enforcement_dial.reached > 0`, not a passing vector.
+* **A row does not measure the class it names.** `EnforceShadowScope::covers`
+  is `starts_with`, so `java/io/File` also armed `FileInputStream`, and
+  `java/util/HashMap` also armed `$KeyIterator`. A retirement is per-TRIPLE;
+  the dial is per-PREFIX — a fourth difference on top of the three the flag
+  documents.
+* **It would have re-retired six triples `retired_shadow.rs` deliberately holds
+  back**, reason "needs-VM-support: state is not real".
+
+Re-asking that hold list with the families' CONTENT probes — armed against
+unarmed on one binary, `yielded/reached` printed so an unasked dial could not
+pass as an answer — found the hold list correct and the corpus wrong:
+
+```text
+                         corpus (14 vectors)   own content probe        another family's probe
+ConcurrentHashMap        14/14 PASS            0 changed / 39 357 y     died 261/302, 53 changed
+```
+
+The rows it breaks are `java.util.Properties`', not ConcurrentHashMap's: JDK
+25's `Properties` delegates its `Hashtable` methods to an internal
+`ConcurrentHashMap`, so `keySet()` comes back `[]` on a three-entry table and
+the run dies in `ConcurrentHashMap$KeyIterator.next`. **A retirement's blast
+radius is its class's USERS**, and the family's own probe being clean is the
+trap rather than the reassurance.
+
+Guarded in code, not only here: `the_held_collection_families_are_not_retired`
+now carries the measurement and holds the CHM view/iterator classes too.
+
+**If you take a family, it needs all four:** a dispatch proven by
+`reached > 0`; content probes of the family AND of every family that embeds it;
+image bytecode to yield to (`image_declaring_method` `has_code`, declared or
+inherited, not abstract — 262 candidate triples fail this and would trade a
+shadow for an `UnsatisfiedLinkError`); and a dispatch actually observed in the
+unarmed corpus (1357 fail this).
+
+---
 
 ### What is NOT closed
 
