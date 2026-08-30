@@ -1568,6 +1568,14 @@ fn native_input_stream_transfer_to(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // TEMP DIAG: name the dispatch door that selected this native.
+    if std::env::var_os("CRATONVM_DBG_TRANSFERTO_DOOR").is_some() {
+        eprintln!(
+            "[transferTo-door] native selected
+{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+    }
     let (input, output) = match (args.first(), args.get(1)) {
         (Some(Value::Object(Some(input))), Some(Value::Object(Some(output)))) => (*input, *output),
         _ => return Ok(Some(Value::Long(0))),
