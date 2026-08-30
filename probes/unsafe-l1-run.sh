@@ -20,7 +20,16 @@ P=/data/l1u-probes
 CV=/data/l1u-target/release/cratonvm
 JH=/data/toolchain/jdk-25
 XP="--add-exports java.base/jdk.internal.misc=ALL-UNNAMED"
-QUIET="-XX:-CreateCoredumpOnCrash -XX:ErrorFile=/dev/null"
+# `-XX:-UseCompressedOops`: configure the ORACLE like the VM under test.
+# CratonVM does not use compressed oops, so a default HotSpot reports
+# `arrayIndexScale` = 4 on every reference array where CratonVM reports 8,
+# and three rows of this lane's residual were that and nothing else.
+# MEASURED 2026-08-30: with this flag the oracle reports 8 on all three,
+# the sweep diff falls from 20 changed lines to 14, and no new difference
+# appears anywhere in the 457 rows. A differential whose oracle is
+# configured unlike the VM under test reports its own configuration as a
+# defect, forever, in a column readers have to be told to ignore.
+QUIET="-XX:-CreateCoredumpOnCrash -XX:ErrorFile=/dev/null -XX:-UseCompressedOops"
 export CRATONVM_DISABLE_DEFAULT_WATCHDOG=1
 WHAT=${1:-all}
 cd "$P" || { echo GAVEUP; exit 1; }
