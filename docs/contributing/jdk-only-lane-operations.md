@@ -239,8 +239,30 @@ THAT with `origin/dev`.** Two worked examples:
   `dev`, and `git log` found the commit that collapsed it.
 
 A red you can attribute in one `git diff` is a red you do not have to bisect.
-When the check's input is the whole registry rather than one file, fall back to
-running the same gate on a pristine `origin/dev` worktree before blaming yours.
+
+**When the check's input is the whole registry, substitute instead of
+comparing.** A stub-ratchet count is a property of every registrar at once, so
+no single file is identical-or-not in a way that settles it. What settles it in
+one build is checking out `origin/dev`'s version of *every file your branch
+touched*, running the gate, and putting yours back:
+
+```bash
+for f in <your changed files>; do cp $f /tmp/$(basename $f).mine; git checkout origin/dev -- $f; done
+cargo test -p cratonvm-native-builtins --features synthetic-jdk --test stub_ratchet
+# ...then copy the .mine files back
+```
+
+That is a controlled experiment rather than an argument, and it is much cheaper
+than a second worktree. It was worth doing: a `synthetic-jdk` stub ratchet red
+survived the substitution unchanged at 1591 against a baseline of 1582 — so it
+was `dev`'s, and the two intuitions that pointed at my own change (a new
+keystore SPI class, seventeen new registrations) were both wrong. All seventeen
+classified as `Bridge`, not `SyntheticStub`.
+
+**Run the feature arms, not just the default one.** That red is reachable only
+under `--features synthetic-jdk`; the default and `management` arms were green
+on the same tree, because the third arm compiles registrars the other two do
+not. A baseline re-freeze taken from the default arm alone leaves it behind.
 
 **A red that moves with load is not automatically a flake.** A TLS vector looked
 exactly like one — green, red, green across three solo runs, and failing on the
