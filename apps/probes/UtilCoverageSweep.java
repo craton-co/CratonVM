@@ -316,8 +316,25 @@ public class UtilCoverageSweep {
         p("spl EnumSet-like Arrays.asList", Arrays.asList("a", "b").spliterator().characteristics());
         p("spl List.of", List.of("a", "b").spliterator().characteristics());
         p("spl Set.of", Set.of("a").spliterator().characteristics());
+        // Every immutable shape, so the fix is one measured rule and not one
+        // measured cell: Set12 vs SetN, List12 vs ListN, the map views, and the
+        // empty singletons.
+        p("spl Set.of()", Set.of().spliterator().characteristics());
+        p("spl Set.of(1,2)", Set.of("a", "b").spliterator().characteristics());
+        p("spl Set.of x3 (SetN)", Set.of("a", "b", "c").spliterator().characteristics());
+        p("spl List.of()", List.of().spliterator().characteristics());
+        p("spl List.of(1)", List.of("a").spliterator().characteristics());
+        p("spl List.of x3", List.of("a", "b", "c").spliterator().characteristics());
+        p("spl Map.of keySet", Map.of("a", 1).keySet().spliterator().characteristics());
+        p("spl Map.of values", Map.of("a", 1).values().spliterator().characteristics());
+        p("spl Map.of entrySet", Map.of("a", 1).entrySet().spliterator().characteristics());
+        p("spl Collections.singleton", Collections.singleton("a").spliterator().characteristics());
+        p("spl Collections.emptySet", Collections.emptySet().spliterator().characteristics());
+        p("spl unmodifiableSet", Collections.unmodifiableSet(
+                new HashSet<>(Arrays.asList("a"))).spliterator().characteristics());
+        p("spl unmodifiableList", Collections.unmodifiableList(
+                new ArrayList<>(Arrays.asList("a"))).spliterator().characteristics());
         p("Set.of class", Set.of("a").getClass().getName());
-        p("Set.of spl class", Set.of("a").spliterator().getClass().getName());
         p("List.of class", List.of("a").getClass().getName());
         p("spl Collections.emptyList", Collections.emptyList().spliterator().characteristics());
 
