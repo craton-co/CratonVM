@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-506 tokens.
+507 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -198,6 +198,7 @@ export inherited from a parent shell.
 | `fullstack-scan` | `CRATONVM_DBG_FULLSTACK_SCAN` |
 | `fwdwalk` | `CRATONVM_DBG_FWDWALK` |
 | `fwdguard` | `CRATONVM_DBG_FWDGUARD` |
+| `g1-dbg-gray-prov` | `CRATONVM_G1_DBG_GRAY_PROV` |
 | `g1-dbg-headers` | `CRATONVM_G1_DBG_HEADERS` |
 | `g1-dbg-pins` | `CRATONVM_G1_DBG_PINS` |
 | `g1-dbg-reach` | `CRATONVM_G1_DBG_REACH` |
@@ -572,7 +573,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-251 tokens.
+253 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -826,14 +827,17 @@ export inherited from a parent shell.
 | `xt-jit-root-scan` | `CRATONVM_XT_JIT_ROOT_SCAN` |
 | `xt-peer-deadline-ms` | `CRATONVM_XT_PEER_DEADLINE_MS` |
 | `xt-peer-total-ms` | `CRATONVM_XT_PEER_TOTAL_MS` |
+| `direct-call-arg-maps` | `CRATONVM_JIT_DIRECT_CALL_ARG_MAPS` |
+| `ir-gc-point-maps` | `CRATONVM_JIT_IR_GC_POINT_MAPS` |
 | `zero-spid` | `CRATONVM_JIT_ZERO_SPID` |
 
 ## `CRATONVM_GC`
 
-83 tokens.
+84 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `g1-mark-oob-failsafe` | `CRATONVM_G1_MARK_OOB_FAILSAFE` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `moving-young-bounds-guard` | `CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD` |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
