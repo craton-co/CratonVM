@@ -73,3 +73,44 @@ machinery rather than at netty or at the test's own frame.
 
 None of these. It is `CRATONVM_BG_COMPILE=0` against the six tests in
 isolation: 0 failed becomes 6 failed on one binary.
+
+---
+
+## 2026-08-30 — CLOSED, and the section above is wrong
+
+"**The failure cannot be reproduced outside JUnit**" was the conclusion these
+probes supported, and it was an artefact of how they were run. See
+`fixed-suite-bugs/netty/finalizers-never-run-once-the-collecting-loop-is-compiled-FIXED-20260830.md`.
+
+The defect is one deferral in `run_finalizers` that never un-defers once the
+loop asking for the collection is compiled, so **every object with a
+`finalize()` override is immortal** — nothing to do with Threads, the Recycler,
+or JUnit.
+
+### Why these probes said "collects"
+
+`ThreadCollectProbe` is structurally identical to `ThreadRetainMin.java`, which
+reproduces. It passed because it was not run at the failing JIT dose, and it
+*could not be*: every arm collects on the first iteration, so its loop never
+gets hot, so it is never compiled, so the bug never appears. The probe's own
+success prevented the compilation that causes the failure. Add
+`CRATONVM_BG_COMPILE=0` and it fails — the same lever the page had already
+identified as the one that turns the netty test.
+
+Verified both ways on one binary: at the stock dose `ThreadRetainMin` collects
+on all five arms; with `CRATONVM_BG_COMPILE=0` its three finalizable arms never
+collect.
+
+### The probes added here
+
+* `ThreadRetainMin.java` (kept in `probes/` at the repo root, since it needs
+  only a stock JDK) — five arms that isolate the ingredient. It is the
+  `finalize()` override, not the Thread: a plain `new Object(){ finalize(){} }`
+  retains, and a started+joined Thread WITHOUT the override collects.
+* `ThreadFinalizeJUnitProbe.java` — netty's shape under JUnit plus a
+  `WeakReference` witness. The test's assertion cannot tell "still reachable"
+  from "collected but never finalized"; the weak ref can. It is genuine
+  retention.
+* `ThreadRetainMatrix.java` — the same body invoked five ways (plain `main`,
+  `@Test`, `@Timeout`, `@ParameterizedTest`, and netty's exact combination).
+  All five retain, which is what removed JUnit from the picture entirely.

@@ -2844,7 +2844,6 @@ pub(super) fn force_native_over_real_jdk_bytecode(
             // `native_pq_iterator` are the only mint sites, and both families'
             // `iterator()` is itself overridden, so no bytecode path can
             // present an object of either class to these natives.
-            | "java/util/ArrayDeque$DeqIterator"
             | "java/util/PriorityQueue$Itr"
     ) && matches!(method_name, "hasNext" | "next" | "remove")
     {

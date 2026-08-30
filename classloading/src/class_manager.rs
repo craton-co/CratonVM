@@ -15758,6 +15758,50 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // arrayMapping.
         "com/sun/jmx/mbeanserver/MappedMXBeanType" => instance_fields(4),
 
+        // `java.nio.file.FileSystemException` and the six subclasses CratonVM
+        // throws by hand. The Throwable-family fallback below would give these
+        // three slots, but `p57_no_such_file` and its five siblings in
+        // `native-builtins::phases_late::nio_file` allocate FOUR and then do
+        // `set_field_by_name(exc, "file", path)` -- and `file` is not in
+        // `synthetic_throwable_slot`'s map (`detailMessage`, `cause`,
+        // `suppressedExceptions`), so on a synthesized instance that write has
+        // nowhere to go and is dropped.
+        //
+        // That matters because `FileSystemException.getMessage()` is BUILT from
+        // `file`; the factories deliberately leave `detailMessage` null to
+        // avoid a doubled "<path>: <path>". So a dropped write is not a missing
+        // detail, it is an exception with no message at all.
+        //
+        // Named rather than padded, and all three of the real class's own
+        // fields rather than just the one in use, because the whole point of a
+        // named slot is that `set_field_by_name` finds it -- a fourth anonymous
+        // `_f3` would satisfy the width gate and still drop the write.
+        //
+        // Not reachable in the default real-JDK mode, where the genuine
+        // `java.nio.file.*` classes load and this table is never consulted:
+        // measured on 2026-08-30, CratonVM and Temurin 25 both answer
+        // `getMessage() == "definitely-absent-file.txt"`. It is the synthesized
+        // path this repairs.
+        "java/nio/file/FileSystemException"
+        | "java/nio/file/NoSuchFileException"
+        | "java/nio/file/AccessDeniedException"
+        | "java/nio/file/DirectoryNotEmptyException"
+        | "java/nio/file/FileAlreadyExistsException"
+        | "java/nio/file/NotDirectoryException"
+        | "java/nio/file/NotLinkException" => vec![
+            // Indices 0..2 are the throwable slots `synthetic_throwable_slot`
+            // maps by name, kept in that exact order. Naming them (rather
+            // than the anonymous `_fN` the fallback uses) costs nothing and
+            // lets a by-name write resolve directly instead of falling
+            // through to that map.
+            named_field("detailMessage", "Ljava/lang/String;"),
+            named_field("cause", "Ljava/lang/Throwable;"),
+            named_field("suppressedExceptions", "Ljava/util/List;"),
+            named_field("file", "Ljava/lang/String;"),
+            named_field("other", "Ljava/lang/String;"),
+            named_field("reason", "Ljava/lang/String;"),
+        ],
+
         // Throwable-family fallback: the three slots every Throwable native in
         // `native-builtins::lang_misc` addresses when a synthetic receiver
         // resolves neither a cached field index nor a field NAME —

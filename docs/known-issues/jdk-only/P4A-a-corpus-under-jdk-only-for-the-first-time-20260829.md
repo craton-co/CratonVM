@@ -84,6 +84,65 @@ they belong to whoever owns those families, not to this lane. `TestSQLXML` and
 `TestDiskFull` surface as an internal `NullPointerException` and a missing MVStore
 chunk, which are the two worth a look first.
 
+### RE-CHECKED 2026-08-30 — four of the five still reproduce, and one is GONE
+
+That list was a day and ~150 `dev` commits old, so it was re-run rather than
+quoted. One execution per arm:
+
+```text
+TestWeb          compat FAIL   14s    strict FAIL     25s
+TestBnf          compat FAIL    8s    strict FAIL     11s
+TestTransaction  compat FAIL   10s    strict FAIL     11s
+TestDiskFull     compat FAIL    8s    strict TIMEOUT 600s
+TestSQLXML       compat PASS    3s    strict PASS      3s     <- no longer reproduces
+```
+
+**Four still fail, and still fail in COMPAT**, so §3's attribution holds for
+them unchanged: none is a `--jdk-only` defect.
+
+**`TestSQLXML` no longer reproduces at all.** 44 further runs say so — 20 solo
+(10 per mode) and **24 under six-way contention at load 11-15** — every one a
+pass. The contention arm is there deliberately: concurrency has manufactured two
+failures in this very record (§5's `ENOSPC`, §7's OOM), so "it only failed in the
+sharded corpus run" was the first alternative to rule out, and it is ruled out.
+
+It was NOT bisected across the ~150 commits. A defect that will not reproduce is
+a poor bisect subject, and the searchable signature is preserved here instead:
+
+```text
+JdbcSQLNonTransientException: General error: "java.lang.NullPointerException"
+```
+
+### The synthetic layer is eliminated for the three that still fail
+
+Each was re-run under `--jdk-only` with its own census attached, which is the
+step that turned "it survives strict" into an elimination for `TestOpenClose`:
+
+```text
+TestWeb          mode=jdk-only  compatibility_classes=0  synthetic_stub_invocations=0
+TestBnf          mode=jdk-only  compatibility_classes=0  synthetic_stub_invocations=0
+TestTransaction  mode=jdk-only  compatibility_classes=0  synthetic_stub_invocations=0
+                 all three: partial none, truncated false, dropped 0 -- totals, not floors
+```
+
+All three fail with **nothing fabricated and no synthetic stub invoked**, so none
+of them is a fabricated-carrier or synthetic-stub defect. Whatever they are, they
+live in the path both modes share. That is worth having on record for whoever
+picks them up, because it is the cheapest question to ask and the most annoying
+one to leave open.
+
+Two smaller notes. `TestDiskFull`'s message moved from `Chunk 4 not found` to
+`Chunk 3 not found`, so that row is not deterministic in its detail. **Neither is
+`TestWeb`'s** — §3 quotes it as `1#_ROWID_#_ROWID_ does not contain: column_name`
+and a later run of the same class in the same mode produced
+` does not contain: '`. Two runs, two different assertion bodies, so no single
+message from this class should be treated as its signature. And of the
+five, **`TestSQLXML` was the only one with no page anywhere** — the other four
+are already carried by `h2/nonpassed-40-census-20260818.md`,
+`h2/correctness-issues-consolidated.md`, and in `TestDiskFull`'s case its own
+`repros/h2-testdiskfull-livelock/` directory. So the one this lane could have
+adopted is the one that stopped failing.
+
 ## 4. The census, unioned over 181 reports
 
 ```text
@@ -284,10 +343,16 @@ neither belongs to this lane:
 
 * **`org.h2.test.db.TestOpenClose`** — fails in both modes after ~350–450 s,
   against an 18 s HotSpot pass. The 20x wall-clock gap is its own question.
-* **`org.h2.test.store.TestRandomMapOps`** — compatible mode dies with a
-  reproducible seed, which is the useful part:
-  `seed:3698333351056078266 op:1571 java.lang.NullPointerException`. That is an
-  MVStore random-operation fuzz with the seed printed, so it replays.
+* **`org.h2.test.store.TestRandomMapOps`** — compatible mode dies with
+  `seed:3698333351056078266 op:1571 java.lang.NullPointerException`.
+  **Already owned:** `h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`,
+  whose own history records that the printed seeds do NOT replay, so that number
+  is not the lead it looks like. What this lane's measurement did add is on that
+  page as an addendum: the defect is **not** confined to the small heap the page
+  studies — 1g fails 4 of 4 and **4g fails too**, heap buying latency rather than
+  safety, and at 1g and above the dominant face is a WRONG ANSWER
+  (`Expected: 247 actual: 198`, a map short of entries) rather than the crash the
+  page opens with.
 
 ### The 21 that still do not finish
 

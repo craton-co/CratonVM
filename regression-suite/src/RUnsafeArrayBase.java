@@ -66,6 +66,49 @@ public class RUnsafeArrayBase {
         }
     }
 
+    /**
+     * The `ARRAY_*` CONSTANT, if this image declares it. `null` when absent.
+     *
+     * <p>Read reflectively rather than referenced directly so the vector keeps
+     * one check count in every mode: a mode whose `sun.misc.Unsafe` does not
+     * declare these still runs -- and passes -- the same number of assertions.
+     */
+    static Long constant(String name) {
+        try {
+            Field f = sun.misc.Unsafe.class.getDeclaredField(name);
+            f.setAccessible(true);
+            return ((Number) f.get(null)).longValue();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * A declared constant must equal what the native answers.
+     *
+     * <p>They are ONE NUMBER by the JDK's own construction -- `<clinit>` fills
+     * the constant from the native -- so this holds on HotSpot and on CratonVM
+     * without pinning a value that legitimately differs between them (this VM
+     * uses a uniform 16-byte header and no compressed oops).
+     *
+     * <p>MEASURED 2026-08-30: every one of these nineteen constants was ZERO
+     * on CratonVM while `arrayBaseOffset()` answered correctly, because
+     * `sun.misc.Unsafe.<clinit>` computes them through natives that are not
+     * registered that early in boot and an unregistered native returns its
+     * return type's zero instead of throwing. Any consumer following the
+     * documented `ARRAY_<T>_BASE_OFFSET + index * ARRAY_<T>_INDEX_SCALE`
+     * protocol read bytes 16 short, silently. This vector called the method
+     * and never the constant, so it stayed green throughout.
+     */
+    static void agrees(String name, long fromNative) {
+        Long c = constant(name);
+        ck("sun.misc.Unsafe." + name + " agrees with the native",
+                c == null || c.longValue() == fromNative,
+                "constant says " + c + ", native says " + fromNative
+                        + " -- a zero here means <clinit> latched an unregistered"
+                        + " native's zero return");
+    }
+
     public static void main(String[] args) throws Exception {
         sun.misc.Unsafe u = unsafe();
 
@@ -183,6 +226,39 @@ public class RUnsafeArrayBase {
         checkGuard("sentinel after an out-of-range Unsafe write", sentinel, 33);
         eq("small[0] untouched", small[0], 0.0f);
         eq("small[1] untouched", small[1], 0.0f);
+
+        // The CONSTANTS, not just the method. See `agrees` for what this
+        // caught and why this vector missed it for as long as it existed.
+        agrees("ARRAY_BOOLEAN_BASE_OFFSET", u.arrayBaseOffset(boolean[].class));
+        agrees("ARRAY_BYTE_BASE_OFFSET", u.arrayBaseOffset(byte[].class));
+        agrees("ARRAY_SHORT_BASE_OFFSET", u.arrayBaseOffset(short[].class));
+        agrees("ARRAY_CHAR_BASE_OFFSET", u.arrayBaseOffset(char[].class));
+        agrees("ARRAY_INT_BASE_OFFSET", u.arrayBaseOffset(int[].class));
+        agrees("ARRAY_LONG_BASE_OFFSET", u.arrayBaseOffset(long[].class));
+        agrees("ARRAY_FLOAT_BASE_OFFSET", u.arrayBaseOffset(float[].class));
+        agrees("ARRAY_DOUBLE_BASE_OFFSET", u.arrayBaseOffset(double[].class));
+        agrees("ARRAY_OBJECT_BASE_OFFSET", u.arrayBaseOffset(Object[].class));
+        agrees("ARRAY_BOOLEAN_INDEX_SCALE", u.arrayIndexScale(boolean[].class));
+        agrees("ARRAY_BYTE_INDEX_SCALE", u.arrayIndexScale(byte[].class));
+        agrees("ARRAY_SHORT_INDEX_SCALE", u.arrayIndexScale(short[].class));
+        agrees("ARRAY_CHAR_INDEX_SCALE", u.arrayIndexScale(char[].class));
+        agrees("ARRAY_INT_INDEX_SCALE", u.arrayIndexScale(int[].class));
+        agrees("ARRAY_LONG_INDEX_SCALE", u.arrayIndexScale(long[].class));
+        agrees("ARRAY_FLOAT_INDEX_SCALE", u.arrayIndexScale(float[].class));
+        agrees("ARRAY_DOUBLE_INDEX_SCALE", u.arrayIndexScale(double[].class));
+        agrees("ARRAY_OBJECT_INDEX_SCALE", u.arrayIndexScale(Object[].class));
+        agrees("ADDRESS_SIZE", u.addressSize());
+
+        // And the access the zeroed constants silently broke: element 2 of a
+        // byte[] addressed through the CONSTANTS rather than the method.
+        Long cb = constant("ARRAY_BYTE_BASE_OFFSET");
+        Long cs = constant("ARRAY_BYTE_INDEX_SCALE");
+        byte[] viaConst = new byte[8];
+        viaConst[2] = (byte) 0x5A;
+        ck("the documented protocol reads the right byte through the constants",
+                cb == null || cs == null
+                        || u.getByte(viaConst, cb.longValue() + 2L * cs.longValue()) == (byte) 0x5A,
+                "base=" + cb + " scale=" + cs);
 
         System.out.println("PASS RUnsafeArrayBase (" + checks + " checks)");
     }

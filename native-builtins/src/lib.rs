@@ -5818,14 +5818,36 @@ fn native_heap_byte_buffer_init_array_offset_len(
     let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(array_len);
     let limit64 = offset as i64 + len as i64;
     if offset < 0 || len < 0 || limit64 < 0 || limit64 > array_len as i64 {
-        let index = if offset < 0 {
-            offset
-        } else if len < 0 {
-            len
-        } else {
-            limit64.min(i32::MAX as i64) as i32
-        };
-        return Err(RuntimeError::aioobe_index_only(index).into());
+        // ILLEGAL ARGUMENT, not out-of-bounds, because that is what the class
+        // above this one raises. The real chain is
+        //
+        //   HeapByteBuffer(buf, off, len, seg) -> ByteBuffer -> Buffer(mark,pos,lim,cap)
+        //       createCapacityException / createLimitException / createPositionException
+        //       ... all IllegalArgumentException
+        //
+        // and `ByteBuffer.wrap` is written to convert it:
+        //
+        //   try { return new HeapByteBuffer(array, offset, length, null); }
+        //   catch (IllegalArgumentException x) { throw new IndexOutOfBoundsException(); }
+        //
+        // Raising `ArrayIndexOutOfBoundsException` here skipped that catch, so
+        // the real `wrap` bytecode propagated OUR class instead of its own:
+        //
+        //   ByteBuffer.wrap(b, -1, 2)
+        //     HotSpot   IndexOutOfBoundsException
+        //     this VM   ArrayIndexOutOfBoundsException
+        //
+        // A subclass, so `catch (IndexOutOfBoundsException)` still matched and
+        // nothing failed loudly -- the same shape as `Buffer.reset` in part
+        // three. MEASURED with the dial armed over `java/nio/ByteBuffer`; this
+        // constructor is `invocations: 0` unarmed, because `servlet.rs`'s
+        // `wrap` owns that slot and never calls it.
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!(
+                "offset {offset}, length {len}, array length {array_len}"
+            ),
+        }
+        .into());
     }
     let limit = limit64 as i32;
     let segment = args.get(4).copied().unwrap_or(Value::Object(None));
@@ -30189,6 +30211,30 @@ pub(crate) fn is_synthetic_offset(off: usize) -> bool {
 /// allocations (the string pool returns an existing Arc on hit).  The
 /// map is sharded across `UNSAFE_SHARDS` parking_lot mutexes to avoid
 /// the single-mutex contention point under concurrent <clinit> traffic.
+/// Mint and register a static field's `Unsafe` offset, exactly as
+/// `Unsafe.staticFieldOffset(Field)` does.
+///
+/// Exists for `post_clinit_fixup`. `sun.misc.Unsafe.<clinit>` calls
+/// `staticFieldBase`/`staticFieldOffset` for its memory-access warning latch
+/// before either native is registered, so both return their return type's zero
+/// -- `null` and `0L` -- with no exception, and the latch's accesses then miss
+/// the static-field side table entirely.
+///
+/// The REGISTRATION is the load-bearing half: an offset that
+/// `unsafe_static_field_target` cannot resolve routes a null-base access into
+/// a private side store instead of the real static slot. Minting the number
+/// without registering it would move the defect rather than fix it.
+pub fn register_static_field_offset(
+    class_name: &str,
+    field_name: &str,
+    class_id: ClassId,
+    field_index: usize,
+) -> i64 {
+    let offset = synthetic_offset_for(class_name, &format!("static:{field_name}"));
+    crate::unsafe_natives_ext::remember_unsafe_static_field_offset(offset, class_id, field_index);
+    offset as i64
+}
+
 fn synthetic_offset_for(class_name: &str, field_name: &str) -> usize {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;

@@ -1645,6 +1645,44 @@ mod tests {
     ///
     /// `Arrays.copyOf` is in the list for the opposite reason: it is the one
     /// triple the five `ArrayList` retirements DEPEND on staying a `Bridge`.
+    ///
+    /// # RE-ASKED 2026-08-30, and the hold is CORRECT
+    ///
+    /// A hold list is a hypothesis with a date on it. Seven lanes had since
+    /// made these classes' state more real, which is this module's own stated
+    /// precondition for retiring a shadow, so the list was re-measured rather
+    /// than assumed. It survived — but only because it was asked with the
+    /// right instrument, and the wrong one said the opposite:
+    ///
+    /// ```text
+    ///   14-vector regression corpus, ConcurrentHashMap armed   14/14 PASS
+    ///   ChmShadowSweep, the family's OWN content probe         0 changed rows
+    ///                                                          over 39 357 yields
+    ///   MapViewsShadowSweep, ANOTHER family's probe            died at 261/302,
+    ///                                                          53 rows changed
+    /// ```
+    ///
+    /// **The rows it breaks are `java.util.Properties`', not
+    /// `ConcurrentHashMap`'s.** JDK 25's `Properties` holds a
+    /// `private transient volatile ConcurrentHashMap<Object,Object> map` and
+    /// delegates its `Hashtable` methods to it, so retiring CHM's natives puts
+    /// real CHM bytecode under a map whose state this VM keeps in a side
+    /// table. Every `Properties` view empties out — `keySet()` returns `[]` on
+    /// a three-entry table, and `keySet().remove` writes through to nothing —
+    /// and the run then dies inside `ConcurrentHashMap$KeyIterator.next`.
+    /// Silent data loss for forty rows before anything throws.
+    ///
+    /// So the entries below are held for a reason wider than the one above
+    /// them: not only "this family's own collections empty out", but **a
+    /// retirement's blast radius is its class's USERS**. The family's own
+    /// probe being clean is the trap and not the reassurance — it asks about
+    /// the operations the family declares, and a view is another class's
+    /// method returning another class's object.
+    ///
+    /// The view and iterator classes are listed explicitly for the same
+    /// reason `Logger.log`'s eighth overload is: a per-class sweep called all
+    /// five CHM classes RETIRE-SAFE, and nothing but an entry here records
+    /// that they were considered and rejected.
     #[test]
     fn the_held_collection_families_are_not_retired() {
         for (c, m, d) in [
@@ -1685,6 +1723,36 @@ mod tests {
                 "java/util/Arrays",
                 "copyOf",
                 "([Ljava/lang/Object;I)[Ljava/lang/Object;",
+            ),
+            // 2026-08-30: the CHM VIEW surface, held for the Properties
+            // coupling in this test's doc comment. `keySet`/`values` hand out
+            // the object the view classes below then iterate, so the producer
+            // and the consumers have to be held together or the survivor is
+            // handed a receiver the retired half built.
+            (
+                "java/util/concurrent/ConcurrentHashMap",
+                "keySet",
+                "()Ljava/util/Set;",
+            ),
+            (
+                "java/util/concurrent/ConcurrentHashMap",
+                "values",
+                "()Ljava/util/Collection;",
+            ),
+            (
+                "java/util/concurrent/ConcurrentHashMap$KeyIterator",
+                "next",
+                "()Ljava/lang/Object;",
+            ),
+            (
+                "java/util/concurrent/ConcurrentHashMap$KeyIterator",
+                "hasNext",
+                "()Z",
+            ),
+            (
+                "java/util/concurrent/ConcurrentHashMap$ValueIterator",
+                "next",
+                "()Ljava/lang/Object;",
             ),
         ] {
             assert!(
