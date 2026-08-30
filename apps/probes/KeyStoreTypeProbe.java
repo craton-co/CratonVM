@@ -105,7 +105,14 @@ public class KeyStoreTypeProbe {
                 back.load(new ByteArrayInputStream(out.toByteArray()), PW);
                 return back.size();
             });
-            p("[" + t + "] stored magic", () -> {
+            // THE FORMAT, NOT THE BYTES. The first four bytes of a PKCS#12
+            // file are a DER `SEQUENCE` tag followed by a LENGTH, and two
+            // stores holding different numbers of bytes differ there for a
+            // reason that is not a defect -- HotSpot writes `30650201` here
+            // and a correct CratonVM writes `30780201`. What the row is for is
+            // that a PKCS12 store is not secretly a JKS file, so it names the
+            // format instead, in the terms the formats define themselves.
+            p("[" + t + "] stored format", () -> {
                 KeyStore ks = KeyStore.getInstance(t);
                 ks.load(null, PW);
                 ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -114,7 +121,18 @@ public class KeyStoreTypeProbe {
                 if (b.length < 4) {
                     return "short:" + b.length;
                 }
-                return String.format("%02x%02x%02x%02x", b[0], b[1], b[2], b[3]);
+                int magic = ((b[0] & 0xff) << 24) | ((b[1] & 0xff) << 16)
+                        | ((b[2] & 0xff) << 8) | (b[3] & 0xff);
+                if (magic == 0xFEEDFEED) {
+                    return "JKS";
+                }
+                if (magic == 0xCECECECE) {
+                    return "JCEKS";
+                }
+                if ((b[0] & 0xff) == 0x30) {
+                    return "DER-SEQUENCE";
+                }
+                return String.format("unknown:%02x%02x%02x%02x", b[0], b[1], b[2], b[3]);
             });
             p("[" + t + "] cert round trip", () -> {
                 Certificate c = sampleCert();

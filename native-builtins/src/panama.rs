@@ -818,7 +818,7 @@ fn register_pe_value_layout(r: &mut NativeMethodRegistry) {
 /// outside this lock's scope, which is the property L0 states and the order
 /// checker enforces -- a lock in this crate held across a VM call is a cycle
 /// through the heap and class-manager locks.
-fn global_arena_cell(
+pub(crate) fn global_arena_cell(
 ) -> &'static cratonvm_types::lock_order::OrderedPlMutex<Option<usize>> {
     use cratonvm_types::lock_order::{LockLevel, OrderedPlMutex};
     static CELL: std::sync::OnceLock<OrderedPlMutex<Option<usize>>> = std::sync::OnceLock::new();
@@ -827,12 +827,12 @@ fn global_arena_cell(
 
 /// The published handle, if any. A function so the guard cannot outlive the
 /// map read -- see the note in `shared_secrets_bridge::owner_singleton_handle`.
-fn global_arena_handle() -> Option<usize> {
+pub(crate) fn global_arena_handle() -> Option<usize> {
     *global_arena_cell().lock()
 }
 
 /// Publish `handle` unless someone already did; returns the winner if not ours.
-fn claim_global_arena(handle: usize) -> Option<usize> {
+pub(crate) fn claim_global_arena(handle: usize) -> Option<usize> {
     let mut cell = global_arena_cell().lock();
     match *cell {
         Some(existing) => Some(existing),
@@ -855,6 +855,12 @@ pub(crate) fn register_pe_arena(r: &mut NativeMethodRegistry) {
     //
     // MEASURED by `apps/probes/FfmCarrierProbe.java`, the one row that differs
     // in compatible mode as well as strict.
+    // The singleton memo is NOT here: `--dump-native-registry` says
+    // `phases_late/foreign_ffm.rs` owns all four `Arena` factories and this
+    // registrar owns none of them, so a memo added here is inert. It lives at
+    // the owning site, and `global_arena_handle`/`claim_global_arena` below are
+    // shared with it rather than duplicated -- two copies of one rule is how
+    // two registrars come to disagree.
     r.register(arena, "global", "()Ljava/lang/foreign/Arena;", |ctx, _| {
         if let Some(existing) = global_arena_handle().and_then(|h| ctx.resolve_global_root(h)) {
             return Ok(Some(Value::Object(Some(existing))));

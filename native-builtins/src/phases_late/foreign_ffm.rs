@@ -2865,11 +2865,42 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/foreign/Arena;",
         |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false)?)))),
     );
+    // `Arena.global()` IS A SINGLETON. The JDK's is
+    // `MemorySessionImpl.GLOBAL_SESSION` -- one object for the life of the VM,
+    // and `Arena.global() == Arena.global()` is `true` on HotSpot. This minted
+    // a fresh arena on every call, in BOTH modes, so the identity was wrong and
+    // so was every per-arena table but the last: state recorded against one
+    // global arena was invisible to the next caller's.
+    //
+    // MEASURED by `apps/probes/FfmCarrierProbe.java`. The memo lives here
+    // because this registrar OWNS the slot -- `--dump-native-registry` says
+    // `owns_slot=true` here and `panama.rs`'s `register_pe_arena` owns none of
+    // the four factories, so the first version of this fix, written there, was
+    // inert and the row stayed red while the nine beside it went green.
     r.register(
         arena,
         "global",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena_kind(ctx, false, false)?)))),
+        |ctx, _args| {
+            if let Some(existing) = crate::panama::global_arena_handle()
+                .and_then(|h| ctx.resolve_global_root(h))
+            {
+                return Ok(Some(Value::Object(Some(existing))));
+            }
+            let a = p67_new_arena_kind(ctx, false, false)?;
+            // A global root: the global arena outlives every native call and
+            // must survive a moving collection.
+            let handle = ctx.add_global_root(a);
+            match crate::panama::claim_global_arena(handle) {
+                None => Ok(Some(Value::Object(Some(a)))),
+                // Lost the race -- drop ours and answer with theirs.
+                Some(published) => {
+                    ctx.remove_global_root(handle);
+                    let winner = ctx.resolve_global_root(published).unwrap_or(a);
+                    Ok(Some(Value::Object(Some(winner))))
+                }
+            }
+        },
     );
     r.register(
         arena,
