@@ -212,15 +212,75 @@ So the one lead has become two, with very different sizes and repairs:
   discharged is a real question: its java locals hold incoming arguments, so a
   relocation still has to rewrite them, and with no map the shadow stack is the
   only channel that could. **Start here — it is 77 % of the refusals.**
-* **3 of 13 — an oop AT `sp_id_off`.** A store whose offset lands in the
-  reserved-locals tail. Small, and a genuine codegen defect: nothing may write a
-  Java reference into a slot the frame layout reserved for the safepoint id.
-  Print the storing method (`cm.method_label` is already on the line) and look
-  at what it compiles at that offset.
+* ~~**3 of 13 — an oop AT `sp_id_off`.** A store whose offset lands in the
+  reserved-locals tail … a genuine codegen defect~~ — **WRONG, see §4a.** There
+  is no store. The slot was never initialised, so it read whatever the previous
+  frame at that stack depth left; zeroing it in the prologue takes this
+  population to 0 in both measured rounds.
+
+### 4a. 2026-08-27 — it is ONE defect, not two: the sp-id slot is never initialised
+
+The split above is wrong, and the correction is a one-line fix.
+
+**Nothing writes an oop into the reserved slot. Nothing writes the slot at
+all** until the first safepoint. `emit_prologue` zeroes
+`shadow_thread_slot_off` and `shadow_savetop_slot_off` — with a comment giving
+exactly the reason, *"it must read 0, not uninitialised stack. The single-pass
+backend zero-initialises for exactly this reason"* — and does **not** zero
+`sp_id_slot_off` beside them. Ids start at 1 precisely so `0` can mean "no
+safepoint reached" (the slot's own allocation comment says so), but the
+prologue never established the sentinel.
+
+So both populations are the same thing, read at two different pieces of stack:
+`0` where the region happened to be clean, a stale oop where a previous frame
+at that depth had left one. Not "a store whose offset lands in the
+reserved-locals tail".
+
+**MEASURED**, same class, one binary, `CRATONVM_JIT_ZERO_SPID` as the A/B, two
+rounds — the census split by what sits in the slot:
+
+| arm | `no-map-for-id` | `sp_id == 0` | sp-id out of range (a stale word) |
+|---|---:|---:|---:|
+| OFF (today) | 22 | 1 | **9** |
+| ON | 20 | 10 | **0** |
+| OFF (today) | 16 | 1 | **7** |
+| ON | 6 | 3 | **0** |
+
+The out-of-range population goes to **zero and stays there**, and the frames
+reappear in the `sp_id == 0` bucket. That is the predicted signature of
+uninitialised stack and not of a stray store.
+
+**The hazard this closes is worse than the refusal it was found through.**
+Safepoint ids are small consecutive integers, so a stale word can equal a
+*valid* id for that method — and then `find_oop_map_for_safepoint_id` matches
+the map for a DIFFERENT program point and relocation rewrites against it. A
+silent wrong answer, not a refused cycle. The 13-frame census only ever showed
+the loud half.
+
+**It does NOT fix this class.** `xt_cov` still reads `accepted=0` on both arms
+(refused 22/35 and 30/28 over 300 s), because a zeroed slot fails closed
+exactly as a garbage one did. What it does is remove the corruption hazard and
+collapse the two populations into one, so the remaining question is single and
+clean: **can a frame that has taken no safepoint be discharged?** That is now
+100 % of `no-map-for-id`, not 77 %.
+
+**Caveat on the single-pass backend, not fixed here.** `x64/safepoint.rs` stores
+`cur_bc_pc` as the id, and **bytecode pc 0 is legal** — so for those frames `0`
+is ambiguous between "at bci 0" and "never stored", and zeroing the prologue
+slot there could make an unsafepointed frame match the bci-0 map. The IR
+backend has no such ambiguity (ids start at 1), which is why the fix is scoped
+to it. Giving the single-pass backend a +1-encoded id would remove the
+ambiguity and let it take the same repair.
+
+**And this class's own symptom did not reproduce here**: `oom=0` on both arms
+at a 300 s cap on an idle host, against the page's `oom=2990` at 900 s. Either
+the cap or the load matters; the band census above is what the A/B rests on,
+not an OOM rate.
 
 ### 5. What to do next, in order
 
-1. **Take the `sp_id == 0` population first** — 10 of 13, and the question is
+1. **Take the `sp_id == 0` population first** — now 100 % of `no-map-for-id`
+   after §4a removed the stale-word half, and the question is
    whether a frame that has taken no safepoint can be discharged at all rather
    than refusing every cycle it is live for.
 2. Only then look at the `operand-spill` words. Four of the seven are on the

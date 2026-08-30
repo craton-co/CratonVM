@@ -1978,6 +1978,35 @@ impl<'a> Lowerer<'a> {
             self.emit_zero_frame_slot(self.shadow_thread_slot_off);
             self.emit_zero_frame_slot(self.shadow_savetop_slot_off);
         }
+        // And the safepoint-id slot, for the SAME reason and on its own gate:
+        // `active_safepoint_id` reads `[rbp - sp_id_slot_off]` on any live
+        // frame, including one stopped BEFORE its first safepoint, and until
+        // that first `emit_safepoint_map` store the word is whatever the
+        // previous frame at this stack depth left behind.
+        //
+        // Ids start at 1 precisely so 0 can mean "no safepoint reached" (see
+        // the slot's allocation above), but nothing was writing the 0. The
+        // sentinel was a convention the prologue never established.
+        //
+        // MEASURED, `TestCachedQueryResults` (H2), 13 frames the band verifier
+        // reported as `no-map-for-id`: 10 read `0` and 3 read a HEAP POINTER at
+        // `sp_id_off`. That was diagnosed as two defects -- "has not reached a
+        // safepoint" and "something stored an oop into the reserved slot". It
+        // is one: uninitialised stack, reading as zero where the region happened
+        // to be clean and as a stale oop where it did not.
+        //
+        // Refusing the cycle is the benign outcome. The hazard this closes is
+        // that safepoint ids are small consecutive integers, so a stale word
+        // can equal a VALID id for this method -- and then
+        // `find_oop_map_for_safepoint_id` matches the map for a DIFFERENT
+        // program point and relocation rewrites against it. That is a silent
+        // wrong answer, not a refusal.
+        //
+        // `CRATONVM_JIT_ZERO_SPID=0` restores the uninitialised read: the
+        // one-binary A/B, and the kill switch.
+        if self.sp_id_slot_off > 0 && Self::zero_sp_id_slot_enabled() {
+            self.emit_zero_frame_slot(self.sp_id_slot_off);
+        }
         self.emit_frame_record();
         self.fetch_current_thread();
         self.zero_ref_phi_slots();
@@ -2925,6 +2954,20 @@ impl<'a> Lowerer<'a> {
     }
 
     /// `MOV qword [rbp - off], 0` (mod=10 disp32, /0).
+    /// `CRATONVM_JIT_ZERO_SPID` — default ON. Off restores the pre-fix
+    /// behaviour (the safepoint-id slot reads uninitialised stack until the
+    /// first safepoint stores an id), so the repair can be A/B'd on one binary.
+    fn zero_sp_id_slot_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            !matches!(
+                cratonvm_types::flags::runtime_var("CRATONVM_JIT_ZERO_SPID").as_deref(),
+                Ok("0") | Ok("false") | Ok("FALSE")
+            )
+        })
+    }
+
     fn emit_zero_frame_slot(&mut self, off: i32) {
         self.buf.emit(&[0x48, 0xC7, 0x85]);
         self.buf.emit(&(-off).to_le_bytes());
