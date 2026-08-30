@@ -297,6 +297,12 @@ self-consistent, and it is — the sweep round-trips every width through
 **Legal disagreement, not a defect.** Recorded because a future reader diffing
 this family will meet it again.
 
+**PROVEN 2026-08-30, having been asserted here since 2026-08-28.** Running the
+oracle as `java -XX:-UseCompressedOops` makes all three rows report `8`,
+matching CratonVM exactly, and drops the sweep diff from 20 changed lines to 14
+with no new difference in 457 rows. The probe runner now passes that flag --
+see §22.1. These three rows are gone from the residual.
+
 ### 4.3 `arrayIndexScale` / `arrayBaseOffset` on a NON-array (6 rows)
 
 ```text
@@ -1555,3 +1561,96 @@ tree, `NullBaseControl` is the control, and the bar is the table above.
 this path 513+ times per H2 vector. §19 removed that consumer. The residual is
 no longer "a rescue something depends on" — it is a path nothing measured
 reaches, kept because the measurement does not yet cover everything.
+
+## 22. Taking on the residual itself
+
+The residual had been *characterised* — every row explained — but three of its
+explanations were assertions nobody had tested, and one was a decision nobody
+had re-costed. Taking it on means testing the explanations.
+
+### 22.1 The compressed-oops rows: asserted for four sessions, now proven
+
+§4.2 said `Object[]`, `String[]` and `int[][]` report 8 here and 4 on HotSpot
+because HotSpot runs with compressed oops and CratonVM does not. Every session
+that met those rows repeated it and moved on. **It was never tested**, and it
+costs one flag:
+
+```text
+java                            sun scale [Ljava.lang.Object; |4|
+java -XX:-UseCompressedOops     sun scale [Ljava.lang.Object; |8|   <- CratonVM: 8
+```
+
+All three rows match exactly, and the sweep diff falls from **20 changed lines
+to 14** — precisely those three rows, with no new difference anywhere in 457.
+
+The fix is in the runner, not the VM: **a differential whose oracle is
+configured unlike the VM under test reports its own configuration as a defect,
+permanently, in a column readers have to be told to ignore.**
+`unsafe-l1-run.sh` now passes `-XX:-UseCompressedOops`. This does not claim
+CratonVM matches a default-configured HotSpot — it claims those three rows are
+the oops mode and nothing else, which is now measured rather than assumed.
+
+### 22.2 The mint row: measured to zero, and NOT changed — here is why
+
+`objectFieldOffset(Class, String)` for a name the class does not have: HotSpot
+throws `InternalError`, CratonVM mints a synthetic offset and routes it through
+a per-object side store.
+
+Reachability, using the per-vector captures already on disk:
+
+| population | mints |
+| --- | --- |
+| 120 regression vectors | **0** |
+| Spring Boot / Tomcat+SSL (DoD) | **0** / **0** |
+| H2 `TestFullText` / `TestRecovery` | **0** / **0** |
+| `MintReachProbe` (positive control) | **2** |
+
+And the mint's own comment names its two consumers — WildFly's
+`Class$Atomic.casReflectionData` and Spring Boot's
+`AbstractClassLoaderValue.putIfAbsent`. §14 measured **both away**:
+`Class$Atomic` resolves its three real names on JDK 25, and
+`AbstractClassLoaderValue` references `Unsafe` zero times. A program that
+"works" through the mint is running a lazy-init guard against a phantom field,
+so it is already wrong.
+
+The case for matching HotSpot is therefore strong. **It is still not made**,
+and the blocker is neither evidence nor appetite:
+
+* `RuntimeError` has **no `InternalError` variant**, and no by-name throw is
+  available to a native — `MethodCallFailed::InternalError` is documented as
+  the UNCATCHABLE form and is not a Java throwable, so it is a different
+  behaviour, not this one.
+* Adding a variant means editing a shared error enum that is matched
+  exhaustively across the VM. That is a cross-cutting change to shared code for
+  one probe row that nothing measured depends on — and this lane's remaining
+  budget is better spent not destabilising seven other lanes.
+
+Recorded with the measurement attached so whoever adds that variant for another
+reason can close this row in the same commit.
+
+### 22.3 The non-array rows: half already correct
+
+Four of the six are `arrayIndexScale`, and they answer `0` — the documented
+sentinel, which callers test with `if (scale == 0) throw`. That half is
+arguably *better* than the oracle, whose refusal is the JDK bug described in
+§4.3. The two `arrayBaseOffset` rows answer `16`; there is no sentinel
+convention for a base offset and no oracle can referee it, so they stay.
+
+### 22.4 The residual after this section
+
+```text
+sweep  14 changed lines (7 rows)   was 20 (10 rows)
+null   20 changed lines (10 rows)  unchanged
+subword 0                          unchanged
+mode drift 0 on all three          unchanged
+```
+
+**Sweep (7 rows):** 1 mint row (§22.2, measured to zero, blocked on a shared
+enum) + 6 non-array rows (§22.3, four of them already the documented answer).
+
+**Null (10 rows):** 5 where CratonVM throws NPE/IAE and HotSpot SIGSEGVs —
+CratonVM is better and stays — and the 5 null-base rows of §21, reached by
+nothing measured and left to whoever can run WildFly.
+
+Nothing in the residual is now an unexplained difference, and nothing in it is
+explained by an untested assertion.
