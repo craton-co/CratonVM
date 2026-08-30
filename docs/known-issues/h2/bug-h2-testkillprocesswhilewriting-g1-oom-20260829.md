@@ -117,17 +117,22 @@ scanning a COMPACT object's reference fields, reachable only from a full VM run.
 refuted, and it fails in the direction that rules the hypothesis out rather
 than merely failing to confirm it:**
 
-| arm | rc | secs | `V7b` dangling refs |
-|---|---:|---:|---:|
-| `-XX:+UseG1GC` (parallel evac ON, default) | 124 / 1 | 900 / 120 | 48 617 / 129 |
-| `-XX:+UseG1GC` `CRATONVM_G1_PARALLEL_EVAC=0` | **139 (SIGSEGV)** | 652 | **95 332** |
+| arm | rep | rc | secs | `V7b` dangling refs | real OOM |
+|---|---|---:|---:|---:|---:|
+| parallel evac ON (default) | 1-4 | 124/1/124/1 | 900/120/900/749 | 48 617 / 129 / 50 747 / 275 | 0/4/0/4 |
+| `CRATONVM_G1_PARALLEL_EVAC=0` | 1 | **139 (SIGSEGV)** | 652 | **95 332** | 0 |
+| `CRATONVM_G1_PARALLEL_EVAC=0` | 2 | 1 (OOM) | 508 | 23 276 | 4 |
 
-Turning the parallel evacuator OFF roughly **doubles** the dangling-reference
-count and adds a hard segfault — the third face this family is known for. So
-the incomplete remembered set is not the parallel evacuator's compact-object
-stride: it is in the path both evacuators share. The guard's own wording is
-the thing to take literally — *"incomplete remembered set"* — and the RSet is
-built before either evacuator runs.
+**2/2 still corrupt with the parallel evacuator off**, one of them with a hard
+segfault — the third face this family is known for. The dangling-reference
+count does not drop into the noise; it stays in the same 10⁴-10⁵ band the
+default arm produces (95 332 and 23 276 against 48 617 and 50 747), so the
+counts are not a discriminator in either direction and only the pass/fail is.
+
+So the incomplete remembered set is not the parallel evacuator's
+compact-object stride: it is in the path both evacuators share. The guard's
+own wording is the thing to take literally — *"incomplete remembered set"* —
+and the RSet is built before either evacuator runs.
 
 That also retires the `G1-9` resemblance. The signature matches; the cause
 does not.

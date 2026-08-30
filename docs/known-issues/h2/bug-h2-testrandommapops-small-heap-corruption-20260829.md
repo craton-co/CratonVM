@@ -180,15 +180,19 @@ are still **keys** in the pointer map — pre-move addresses nothing rewrote —
 and one failing run (`rc=1`, 286 s, the usual `NullPointerException`) reports:
 
 ```text
-frames=235  with_stale=228 (97%)
-  cov_complete TRUE=228   cov_complete=false 0
-  mapped slots on stale frames: min=1 max=13 avg=4.5
-  stale_words: min=1 max=33 total=2844
+rep 1 (rc=1, 286 s)      frames=235  with_stale=228 (97%)
+                           cov_complete TRUE=228  false=0
+                           mapped slots on stale frames: min=1 max=13 avg=4.5
+                           stale_words: min=1 max=33 total=2844
+rep 2 (rc=1,  99 s)      frames=54   with_stale=54 (100%)
+                           cov_complete TRUE=54   false=0
+                           mapped slots on stale frames: min=1 max=11 avg=5.2
+                           stale_words: min=1 max=36 total=701
 ```
 
-**Every one of the 228 frames that still held a pre-move address had declared
-`cov_complete=true`.** Not one reported incomplete coverage. A representative
-line:
+**Across two independent failing runs, every single frame that still held a
+pre-move address had declared `cov_complete=true` — 282 of them, and not one
+reporting incomplete coverage.** A representative line:
 
 ```text
 [remap-frame] method=java/lang/StringLatin1.newString:([BII)Ljava/lang/String;
@@ -211,8 +215,8 @@ So the defect is not "the heap is fragmented" and not the allocator: **the
 per-frame coverage proof reports complete while the frame demonstrably retains
 unrewritten references, and relocation trusts it.**
 
-Inlining is present in only 45 of the 228 (20%), so a spliced callee's unnamed
-locals are *a* contributor and not the whole of it — the average stale frame
+Inlining is present in only 45 of 228 and 9 of 54 (20% and 17%), so a spliced
+callee's unnamed locals are *a* contributor and not the whole of it — the average stale frame
 names 4.5 slots and carries several more live from-addresses than that.
 
 **Caveat, stated because the count is a heuristic**: `stale_words` counts frame
