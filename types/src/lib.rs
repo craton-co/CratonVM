@@ -23,6 +23,7 @@ pub mod flags;
 pub mod float_format;
 pub mod handle;
 mod heap_types;
+pub mod identity_side_tables;
 pub mod intern;
 pub mod jfp;
 pub mod jit_activation;

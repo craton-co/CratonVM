@@ -4414,7 +4414,54 @@ fn warn_cross_thread_jit_gap() {
 /// dereference the read qword as a Rust reference; it is treated as an
 /// opaque address until validated.
 #[inline(always)]
+/// `CRATONVM_DBG_NO_JIT_ROOT_SCAN=1` — skip the conservative JIT frame scan
+/// UNCONDITIONALLY. **Diagnostic only, and unsound**: a JIT-held object whose
+/// only reference is a register or spill slot stops being a root at all, so a
+/// moving cycle will relocate it under the running frame. Never ship a run with
+/// this set.
+///
+/// It exists because the two levers that LOOK like they answer "is the
+/// conservative scan what retains this object?" do not:
+///
+/// * `CRATONVM_GC_PRECISE_ONLY_ROOTS` suppresses the scan only when the
+///   coverage proof passes, and its own doc records that firing on **~0.1 % of
+///   collections** (2 of 14 420, 31 of 46 135, 84 of 70 144). A run with it set
+///   still scans conservatively on 999 collections in 1000, so a null result
+///   from it is a vacuous zero, not evidence.
+/// * `CRATONVM_NO_CONSERVATIVE_LOCALS` gates the INTERPRETER's local scan,
+///   which is a different path.
+///
+/// The gate lives HERE and not at a call site because there are THREE doors
+/// into this function — `memory::roots::collect_roots` (gc-roots),
+/// `vm_exec`'s safepoint deposit, and `interpreter::gc_and_alloc`'s
+/// blocked-deposit. Gating only the first leaves the other two publishing
+/// conservative roots, which is a lever that reads as "no effect" while never
+/// having been applied.
+fn dbg_no_jit_root_scan() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_NO_JIT_ROOT_SCAN").is_some()
+    })
+}
+
+/// How many times [`dbg_no_jit_root_scan`] actually suppressed a scan.
+/// Reported at exit so the arm cannot be read as "no effect" when it was in
+/// fact "never engaged" — the failure mode this whole flag exists to avoid.
+pub static NO_JIT_ROOT_SCAN_SUPPRESSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
+    if dbg_no_jit_root_scan() {
+        let n = NO_JIT_ROOT_SCAN_SUPPRESSED
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if n == 1 {
+            eprintln!(
+                "[jitrootscan] CRATONVM_DBG_NO_JIT_ROOT_SCAN engaged                  -- conservative JIT frame roots are NOT being published (UNSOUND)"
+            );
+        }
+        return;
+    }
     // Capture the scanner's own SP at the call site (inlined into the
     // caller). Every active JIT spill region has its *lowest* address at
     // or above this value (the Rust stack grows downward on every supported
