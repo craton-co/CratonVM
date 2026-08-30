@@ -21,7 +21,7 @@ been removed again.
 | **L5 reflection & class metadata** | **COMPLETE 2026-08-29** — dispatch worklist 483 rows / 20 fixed, PLUS its two recorded-open items and five more the probe found: 125 rows, **28 defects over 608 rows**, 1 residual (`invoke`'s reference-argument cast). Records: `L5-reflection-lane-complete-20260828.md` and `L5-residuals-module-packages-and-invokeexact-20260828.md` | `C:\craton\cratonvm\.claude\worktrees\h2-known-issues-206dee` | `claude/jdk-only-mode-handoff-09b48c` |
 | **L2 StringBuilder / StringBuffer / AbstractStringBuilder** | **DONE 2026-08-29** — 118 native-won triples, 747 probe rows 0-diff in BOTH modes, 18 defects in 5 root causes, 62 `StringBuffer` shadows retired to the class's own synchronized bodies. Closes `WORKER-3-NOTE-3` N1 and N2 and refutes its §5. The `StringBuilder` retirement is SIMULATED green (armed corpus 111/112, armed probe 0-diff) and priced at **2.0x-3.4x**, so it is declined with a number. Lane doc retired to `internal/jdk-only/`; record is `l2-strings-eighteen-defects-five-root-causes-and-the-writer-half-20260828.md` | `/data/cvm-l2s-20260828` (Linux build host) | `claude/l2-strings-20260828` |
 | **L4 `java.io` / `java.nio`** | **COMPLETE 2026-08-28** — 199 native-won triples, **1616 probe rows, 1615 identical in both modes**; 52 defects fixed and 8 shadows retired; 1 recorded residual (`FileInputStream.skip`, a resolution finding no registrar edit can move). Lane doc retired to `internal/jdk-only/`; record is `L4-the-io-and-nio-worklist-49-defects-and-a-bounds-check-that-killed-the-vm-20260828.md` | `/data/cvm-l4io-20260828` (Linux build host) | `claude/l4-io-nio-20260828` |
-| **L7 definition of done** | **DONE 2026-08-29** — all three workloads run to completion under `--jdk-only`; `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on five arms and on **181 H2 test classes**. Four VM fixes, none of them a `--jdk-only` defect. All 4 residuals discharged: 2 fixed, 1 verified will-not-fix, 1 measured at 7 sites and handed on as a lane. Then the two Phase 4 items nobody had run: **P4-A** a corpus (218 classes, both arms) — **zero failures `--jdk-only` produces that compatible mode does not**, and Phase 2's worklist is **1065** native-won triples, not the 334 five probes saw; **P4-B** `--features synthetic-jdk` built and run for the first time. Instrument gap closed: 53 classes handed back that `new` could not produce, on runs reporting `compatibility_classes: 0`. Lane doc retired to `internal/jdk-only/`; records are `the-definition-of-done-run-on-the-three-real-workloads-20260828.md`, `the-four-residuals-two-closed-one-was-a-family-of-thirty-and-one-is-a-lane-20260829.md`, `P4A-a-corpus-under-jdk-only-for-the-first-time-20260829.md` and `P4B-synthetic-jdk-mode-run-for-the-first-time-20260829.md` | `/data/cvm-l7dod-20260828` (Linux build host) | `claude/l7-dod-20260828` |
+| **L7 definition of done** | **DONE 2026-08-29** — all three workloads run to completion under `--jdk-only`; `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on five arms and on **181 H2 test classes**. Four VM fixes, none of them a `--jdk-only` defect. All 4 residuals discharged: 2 fixed, 1 verified will-not-fix, 1 measured at 7 sites and handed on as a lane. Then the two Phase 4 items nobody had run: **P4-A** a corpus (218 classes, both arms), now FULLY ADJUDICATED — **185 pass / 19 fail / 14 unresolved**, and **zero failures `--jdk-only` produces that compatible mode does not**; the single candidate for one was the harness (three concurrent `--Xmx 1g` shards OOM'd the strict arm; alone it passes). Phase 2's worklist is **1065** native-won triples, not the 334 five probes saw; **P4-B** `--features synthetic-jdk` built and run for the first time. Instrument gap closed: 53 classes handed back that `new` could not produce, on runs reporting `compatibility_classes: 0`. Lane doc retired to `internal/jdk-only/`; records are `the-definition-of-done-run-on-the-three-real-workloads-20260828.md`, `the-four-residuals-two-closed-one-was-a-family-of-thirty-and-one-is-a-lane-20260829.md`, `P4A-a-corpus-under-jdk-only-for-the-first-time-20260829.md` and `P4B-synthetic-jdk-mode-run-for-the-first-time-20260829.md` | `/data/cvm-l7dod-20260828` (Linux build host) | `claude/l7-dod-20260828` |
 | **L1 `Unsafe`** | **DONE 2026-08-28** — 516 probe rows, 24 defects fixed, 5 recorded residual categories. Lane doc retired to `internal/jdk-only/`; record is `l1-unsafe-516-rows-24-defects-and-the-sub-word-atomics-that-never-returned-20260828.md` | `/data/cvm-l1u-20260828` (Linux build host) | `claude/l1-unsafe-20260828` |
 | **L6 concurrency & threads** | **DONE 2026-08-29** — 109 native-won triples, 546 probe rows, 33 defects fixed, 0 residuals of its own. Lane doc retired to `internal/jdk-only/`; record is `L6-concurrency-lane-complete-20260828.md` | `/data/cvm-l6cc-20260828` (Linux build host) | `claude/l6-concurrency-20260828` |
 | **L3 `java.util` collections** | **DONE 2026-08-29** — 609 owning rows across 56 classes, 1879 probe rows in twelve probes, 69 defects fixed, 8 recorded residuals. Lane doc retired to `internal/jdk-only/`; records are `l3-java-util-collections-1879-rows-and-69-defects-20260828.md` and `a-bound-method-reference-is-a-different-dispatch-door-20260828.md` | `/data/cvm-l3u-20260828` (Linux build host) | `claude/l3-util-collections-20260828` |
@@ -124,7 +124,7 @@ The bar is `docs/feature-designs/jdk-only-completion-roadmap.md` §6:
 | **Phase 1** — fabricated receiver kills its caller | **CLOSED 2026-08-29 — all nine lanes.** A/B/D/G/I by `Phase1Sweep` (80 rows); C/E/F/H by `probes/P1RemainingSweep.java` (29 rows, 0 differing both modes, **0 PHASE1-KILL**), each exercised through the payload the roadmap names and with all four mint sites still LIVE. Record: `phase-1-is-closed-the-last-four-lanes-measured-20260829.md`. It means the stated MECHANISM no longer fires on the nine — not that no fabricated class can kill a caller: `RJdkEnumerations` was exactly that and the CORPUS found it, not a Phase 1 probe. |
 | **Phase 2** — retire the shadows | **the bulk of the remaining work.** §2 below. |
 | **Phase 3** — correctness gaps no census sees | **CLOSED.** 35 rows, 0 differences, both modes, including the `aastore` covariance check the page still calls its one live red. |
-| **Phase 4** — the evidence base | **CLOSED 2026-08-29 (L7).** All three workloads ARE checked out on `azure-host-2` — the blocker was a host, not an absence. Five arms, `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on every one, every fabrication request named with its requester `file:line`. **P4-A and P4-B are now done too:** a 218-class corpus under `--jdk-only` against HotSpot (0 strict-only failures; the worklist is 1065, not 334) and `--features synthetic-jdk` compiled and run for the first time (49 vectors: 1 pass, 48 fail, 53 distinct missing natives with callers). |
+| **Phase 4** — the evidence base | **CLOSED 2026-08-29 (L7).** All three workloads ARE checked out on `azure-host-2` — the blocker was a host, not an absence. Five arms, `compatibility_classes: 0` and `synthetic_stub_invocations: 0` on every one, every fabrication request named with its requester `file:line`. **P4-A and P4-B are now done too:** a 218-class corpus under `--jdk-only` against HotSpot — fully adjudicated at 185/19/14, 0 strict-only failures, worklist 1065 not 334 — and `--features synthetic-jdk` compiled and run for the first time (49 vectors: 1 pass, 48 fail, 53 distinct missing natives with callers). **Two methodology results worth more than the counts:** buy the ORACLE before raising your own cap (4 of the slowest 21 do not finish on HotSpot at 1800 s either, so no CratonVM verdict on them can mean anything), and confirm any mode-specific failure ALONE — sharding manufactured one here, as a working directory on the wrong filesystem manufactured another. |
 
 ### The finding that reframes the work
 
@@ -316,53 +316,11 @@ round closed — worth knowing if you take another `java.lang.invoke` slice.
 
 ---
 
-## 3. The method — four families in, it is mechanical
+## 3. The method
 
-Five families are done this way: **993 probed rows, 48 defects, 48 fixed.**
+**Moved, in full, to [`../../contributing/jdk-only-lane-operations.md`](../../contributing/jdk-only-lane-operations.md) §1.** The six steps, the aim-at-edges finding and the probe-hygiene list are process rather than campaign material: they were true before this page and are true after it.
 
-1. **Take your families' `native-won` triples from the report.** Do not pick
-   methods by hand and do not probe what the report says already loses.
-2. **Write ONE differential probe per family group**, asking the CONTRACT EDGES.
-3. **Run it in BOTH modes** against HotSpot 25.0.3+9 as oracle.
-4. **Check `owns_slot` BEFORE editing** (§5).
-5. **Fix, rebuild, RE-RUN THE PROBE.** Never conclude from reading.
-6. Record what you found AND what passed.
-
-### Aim at edges, not the happy path
-
-**All 48 defects so far are on contract edges. Not one was a wrong answer to an
-ordinary call, in any of five independent families.** Nulls, bounds, refusal
-types, constructor validation, naming special cases, callback boundaries.
-
-Two consequences:
-
-* it predicts where your rows will yield;
-* **a probe that exercises only the happy path will report your family clean when
-  it is not.** That is how a shim's middle stays correct while its perimeter
-  rots unnoticed.
-
-Concretely, from the four done: every `ByteArrayOutputStream` bounds row already
-passed *including* `off + len` overflowing to a negative int — the case a check
-written `off + len > b.length` gets wrong while looking right. The bounds logic
-was correct; it never ran, because a null buffer returned before it.
-
-### Probe hygiene, each learned by getting it wrong
-
-* **stdout only** (`2>/dev/null`). `2>&1` puts VM tracing in the diff; the
-  asymmetric version of that mistake invented four phantom differences.
-* **Print no value the two VMs may choose independently** — identity hashes,
-  addresses, thread names, timings, iteration order of a hash container,
-  a resolver's answer. Four harness artefacts came from exactly this.
-* **Check the ROW COUNT before reading the diff.** A run that died partway
-  produces a short file whose missing tail `diff` reports as ordinary `<` lines.
-  That hid a whole probe section once and 128 of 160 rows in another the same
-  day. `probes/…Sweep` runners print `rows N/M` for this reason.
-* **A crash early in a probe masks every later defect.** Fixing it usually
-  uncovers more work rather than finishing it.
-
-Working runner: `probes/dodscreen.sh`, and the sweep runner pattern in any of
-`ArraysHashSetShadowSweep` / `HashMapShadowSweep` / `ClassShadowSweep` /
-`BaosCollectionsShadowSweep`.
+The finding worth keeping in front of anyone sizing a lane: **of the first 48 defects, not one was a wrong answer to an ordinary call**, across five independent families. The seven later batches came out the same way — `java.security` had 1313 of 1333 rows already correct and every one of its twenty differences on a refusal path. Aim at the edges.
 
 ---
 
@@ -431,118 +389,13 @@ planning:
 
 ---
 
-## 5. Rules that keep seven lanes from colliding
+## 5. Rules that keep lanes from colliding
 
-### Worktrees and branches
+**Moved, in full, to [`../../contributing/jdk-only-lane-operations.md`](../../contributing/jdk-only-lane-operations.md).** Worktrees and branches, the shared registrar files, `owns_slot` before editing, the identity and field-slot traps, the instrument traps, the landing protocol and what "done" means for a lane are all there, with the cost each was learned for.
 
-Work in **your own worktree on your own branch**. Land by pushing to `dev`.
+**Read §5 of that page before your first landing.** The gate set changed on 2026-08-29 — it names no `--test` targets any more, because `native-builtins/tests/` holds ten and the hand-written list named seven. A gate script copied from an earlier lane is a script that runs 7 of 10.
 
-### The big registrar files are shared
-
-`native-collections/src/lib.rs` is **74 570 lines** and hosts many families;
-`native-builtins/src/lib.rs` is 47 708. L3, L4 and L6 will all touch
-`native-collections`. This is survivable — different functions are different
-hunks and git merges them — but only if you **merge `origin/dev` often**, not
-once at the end.
-
-### `owns_slot` before editing — this costs a build if you skip it
-
-A method can be registered by several files and only one wins.
-
-```bash
-cratonvm --java-home "$JDK" --dump-native-registry C:/windows/shaped/reg.json -cp probes/out YourProbe
-# then read, for your (class, name, descriptor):  owns_slot, invocations
-```
-
-`owns_slot: false` means **your edit is inert**. `invocations: 0` on the winner
-means your probe never reached it and the diff proves nothing either way.
-
-I lost a 33-minute build to this today on `Arrays.fill` — fixed the
-`phases_early.rs` registration, and `native-collections` owned the slot. The same
-dump showed the *winning* `copyOf` already carried the guards I was about to
-write while its losing twin still had the broken body: **a duplicate pair can sit
-half-fixed indefinitely**, and nothing fails until registration order changes.
-
-### The VM sometimes lies about identity
-
-`List.of(..).getClass().getName()` reports `java.util.ImmutableCollections$List12`.
-The receiver's real class is `cratonvm/internal/Unmodifiable*` — this VM funnels
-every unmodifiable view through seven synthetic classes and fakes `getClass()`
-via `getclass_immutable_marker`. **A guard written against the name your probe
-prints can never fire.** That was the second inert fix of the day, and unlike the
-`owns_slot` one, nothing you can READ will reveal it. Re-measure, never re-read.
-
-### Instrument traps, all still live
-
-* a dump/report flag placed **after** the main class is silently ignored — no
-  file, no warning, exit 0;
-* the report path must be **Windows-shaped** on this host, or the VM prints
-  `os error 3`, continues, and the file never appears;
-* the report is **not written when the program calls `System.exit`**;
-* `tools/flag-census/render-inventory.sh` **REFUSES** to run when
-  `flag-surface.txt` disagrees with `INVENTORY`. **Never chain it with
-  `render-tokens.sh`** — its refusal scrolls past, one doc regenerates, the other
-  silently does not, and the gate stays red for a reason nothing states. Run it
-  alone and read its three lines; the `only in INVENTORY:` line names the flag to
-  add.
-
-### Landing protocol
-
-```bash
-# 1. gate  (this is the whole set; do not shorten it)
-cargo test -p cratonvm-types
-# Name NOTHING by hand here. `ls native-builtins/tests/` is the authority and it
-# GROWS; the hand-written list this replaced named 7 of the 10 that exist.
-cargo test -p cratonvm-native-builtins --tests
-cargo test -p cratonvm-native-builtins --features management --tests
-cargo test -p cratonvm-native-builtins --features synthetic-jdk --tests
-# plus --lib for any crate you changed
-
-# 2. the three arms, on a RELEASE build of the merged tree
-CRATONVM_ARGS=--jdk-only bash regression-suite/run.sh
-SUITE=all                bash regression-suite/run.sh
-SUITE=core               bash regression-suite/run.sh
-
-# 3. push, in its OWN command, keyed on the gate RESULT
-git push origin HEAD:dev
-```
-
-**Do not chain the push behind the gates.** I landed a red `doc_citation_paths`
-on `dev` earlier in this campaign by keying the conditional on `behind=0` instead
-of on the test result.
-
-**Why the gate list stopped naming targets (2026-08-29, L7).** It used to name
-seven `--test` targets. `native-builtins/tests/` holds **ten**, and the three it
-omitted were `lock_discipline_ratchet`, `eintr_ratchet` and `aes_gcm_kat`. The
-first is not a rounding error: it holds this crate to a raw-lock-construction
-baseline because **this crate re-enters the VM** — a native callback calls back
-into Java, which takes the heap and L10 class-manager locks — so a `Mutex` here
-with no `LockLevel` is a deadlock the order checker cannot see. It caught
-exactly that in L7's own instrument, on a commit whose other nine gates were
-green. A lane following the old list, on its promise of being "the whole set",
-would have landed it.
-
-**An unknown `--test` name exits 101, the same code a panicking test gives.**
-Seven "failing ratchets" in L7's landing script were seven stale names, and the
-output — tail-truncated — was cargo listing the targets that DO exist, which
-reads as a list of failures. If a sweep of unrelated guards goes red
-identically, suspect the invocation before the tree, and read the FIRST line of
-the output rather than the last.
-
-`--features synthetic-jdk` is in the set as well: that mode builds and runs
-again as of 2026-08-29
-(`P4B-synthetic-jdk-mode-run-for-the-first-time-20260829.md`), and a
-`#[cfg(feature = "synthetic-jdk")]` module that nothing compiles rots silently.
-
-Two consequences of `--tests`, both measured on 2026-08-29 rather than inferred:
-
-* **It subsumes `--lib`**, so the line under it is redundant for this crate —
-  and the known-red `properties_sidetable` guard two sections down now shows up
-  in the gate command itself, `rc=101`, on every branch. Read that section
-  before you bisect it.
-* **The feature arms genuinely cover more**, which is the argument for running
-  all three: 4176 tests on default, 4208 under `management`, 4352 under
-  `synthetic-jdk`. The third arm alone compiles 176 tests nothing else does.
+What remains below is DATED: which vectors were red on which day, and which lane fixed what. It decays, and it is kept here rather than moved because a permanent page should not carry a list that is wrong in a week.
 
 ### Known-red vectors, so you can tell yours from theirs
 
@@ -720,14 +573,34 @@ while asserting nothing — 33 assertions went dark. Restored:
 selector}_probe/`, `apps/lm_subclass/`. `probe_fixture_census` is the instrument
 that catches this and it was correctly red the whole time.
 
-**OPEN, unowned, and worth someone's morning:**
-`warm_null_receiver_invokes_throw_npe_jit` — once its inline cache is warm,
-`invokespecial` on a NULL receiver does not throw, and the callee runs with
-`this == null`. JVMS §6.5, and the test names the consequence it was written
-for: the bogus `Cannot read field "interfaces" because "rd" is null` at
-`Class.java:1217`. Reproduced identically on four binaries spanning this
-session, so it is not recent. `invokevirtual` and `invokeinterface` both throw
-correctly; only `invokespecial` is wrong.
+**~~OPEN, unowned, and worth someone's morning:~~ FIXED 2026-08-30.**
+`warm_null_receiver_invokes_throw_npe_jit` — `invokespecial` on a NULL receiver
+did not throw once warm, and the callee ran with `this == null`. JVMS §6.5, and
+the mechanism behind the bogus `Cannot read field "interfaces" because "rd" is
+null` at `Class.java:1217`.
+
+**It was not the inline cache.** `invokevirtual`/`invokeinterface` were right
+only incidentally — their cache tests the receiver's CLASS, so a null fails
+every guard. `invokespecial` is statically bound, and both of the emitters that
+bind it jump straight into the compiled callee. The only thing left to raise the
+NPE was the callee body faulting on its own, which it does only if it
+dereferences `this`:
+
+```text
+  private callee body     HotSpot   --nojit   jit (before)
+  return 3;               NPE       NPE       NO-THROW(3)
+  return this.x;          NPE       NPE       NPE
+  return helper();        NPE       NPE       NO-THROW(5)
+```
+
+**Two emitters, and the first fix went to a third that was not involved.** The
+single-pass direct call (`x64/bytecode_walk.rs`) and the optimizing tier's
+`emit_direct_cross_call` (`ir_lower.rs`) both needed the check; which one runs
+depends on the callee, so `return 3;` and `return helper();` were fixed by
+different patches. `CRATONVM_DBG_IR_COMPILES` and `CRATONVM_DBG_JIT_GEN` name
+the tier and the path — reach for them before patching an emitter, because the
+disassembly of the *caller* is what proves the callee was not inlined.
+`apps/probes/NrpVariants.java` is the three-body probe.
 
 ### dev's tip is frequently red
 
@@ -740,16 +613,4 @@ fix it, because a red gate blocks every lane.
 
 ## 6. What "done" means for a lane
 
-Not "my probe is green". A lane is done when:
-
-1. every `native-won` triple in its families is covered by a differential probe,
-2. the probe is 0-diff in both modes, or each residual row has a record naming
-   the measurement and why it was not fixed,
-3. the record says what PASSED as well as what failed — that is what tells the
-   next person where the work is not,
-4. gates and the three arms are green on a merged tree, and it is pushed.
-
-A 0-diff probe is a **precondition** for retiring a shadow, never a
-justification on its own: a native may exist because the bytecode path was
-measured slower, or because it was measured WRONG once and the native is the fix.
-Read the registrar's history and count invocations before proposing a retirement.
+**Moved to [`../../contributing/jdk-only-lane-operations.md`](../../contributing/jdk-only-lane-operations.md) §7**, including the rule that matters most for Phase 2: a 0-diff probe is a PRECONDITION for retiring a shadow and never a justification on its own.

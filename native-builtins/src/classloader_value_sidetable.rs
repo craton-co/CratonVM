@@ -321,6 +321,32 @@ fn native_aclv_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(val))
 }
 
+/// `removeAll(ClassLoader)V` -- drop every mapping this value holds for `cl`.
+///
+/// The fifth operation on the side table, and left to real bytecode until now
+/// for the same reason `remove` was: no row asked. Real
+/// `AbstractClassLoaderValue.removeAll` walks the REAL map, which these natives
+/// never populate, so it removed nothing a caller could observe and the
+/// mapping stayed readable through `get`.
+///
+/// **The JDK also removes the values of this value's DESCENDANTS** ("this
+/// ClassLoaderValue or any of its descendants"), which are `ClassLoaderValue
+/// .Sub` instances chained off it. This side table is keyed by
+/// `(loader, this)` and models no parent/child relationship between values, so
+/// the descendant half is NOT reproduced -- a `Sub`'s own mappings survive a
+/// `removeAll` on its parent. Stated rather than silently approximated: the
+/// direct half is what every measured caller uses, and inventing a parent link
+/// here would be a guess about a structure this table does not have.
+fn native_aclv_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let key = key_for_loader(ctx, args.get(1), this);
+    table().lock().remove(&key);
+    Ok(None)
+}
+
 /// Register the AbstractClassLoaderValue natives on the abstract base class
 /// itself. JDK subclasses (`Sub`, `ServicesCatalog$ProvidersCache`,
 /// `ArchivedClassLoaders.RESOURCES_CACHE` etc.) inherit these methods, so
@@ -355,6 +381,14 @@ pub fn register_classloader_value_sidetable(registry: &mut NativeMethodRegistry)
         "remove",
         "(Ljava/lang/ClassLoader;Ljava/lang/Object;)Z",
         native_aclv_remove,
+    );
+    // ...and the fifth. `removeAll` was recorded as a residual beside `remove`
+    // because no probe row asked it; the row exists now.
+    registry.register(
+        class,
+        "removeAll",
+        "(Ljava/lang/ClassLoader;)V",
+        native_aclv_remove_all,
     );
     registry.set_category(__prev_cat);
 }

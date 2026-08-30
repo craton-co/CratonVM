@@ -21211,6 +21211,27 @@ fn try_compile_inner(
                         // still choose a different route.
                         let selfrec_fits =
                             desc_args + 1 <= crate::ir_lower::incoming_abi_reg_capacity();
+                        // CENSUS, on the existing compile-reporting flag rather
+                        // than a new one: this refusal is INVISIBLE from Java —
+                        // the method still runs and still answers correctly, it
+                        // just takes a slower route — so without a line here
+                        // "how much code does this guard turn away" has no
+                        // answer at all. Before the guard existed the same
+                        // population panicked the compiler thread instead, and
+                        // that was invisible too, which is how it survived to
+                        // reach a suite. One line per refused SITE; the reader
+                        // counts distinct methods.
+                        if is_self_recursive
+                            && !selfrec_fits
+                            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_COMPILED")
+                                .is_some()
+                        {
+                            eprintln!(
+                                "CRATONVM_DBG_JIT_COMPILED: selfrec-refused {cn}.{mn}{desc} \
+                                 args={desc_args} entry_regs={}",
+                                crate::ir_lower::incoming_abi_reg_capacity()
+                            );
+                        }
                         // Integer and reference self-recursion has the same direct-call
                         // ABI as the already-supported wide-return path. Void calls have
                         // no result slot for `emit_self_recursive_call` to fill.

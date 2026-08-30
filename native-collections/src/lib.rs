@@ -20051,12 +20051,25 @@ fn native_hs_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     ctx.set_field(spl, 0, Value::Object(Some(arr)));
     ctx.set_field(spl, 1, Value::Int(0));
     ctx.set_field(spl, 2, Value::Int(len as i32));
-    // DISTINCT, and ORDERED only for a `LinkedHashSet`: a hash set has no
-    // encounter order to claim, and a stream pipeline reads that bit.
-    let spl_chars = if hs_is_insertion_ordered(&*ctx, this) {
-        SPL_LINKED_SET
-    } else {
-        SPL_HASH_SET
+    // A VIEW answers its SOURCE family's cell; a standalone set answers its
+    // own. The two used to collapse into one binary choice on
+    // `hs_is_insertion_ordered`, which gave `LinkedHashMap.keySet()` and
+    // `.entrySet()` the plain `HashSet` cell -- they are 16465, not 65 -- and
+    // gave a standalone `LinkedHashSet` 81 where the JDK's construction adds
+    // SUBSIZED for 16465.
+    let spl_chars = match view_backing_source(&*ctx, backing) {
+        Some(src) => {
+            // `view_backing_kind`, the marker the backing already carries,
+            // rather than a fresh element-class guess: it is what every other
+            // consumer of these views reads.
+            let kind = match view_backing_kind(&*ctx, backing) {
+                VIEW_KIND_ENTRYSET | VIEW_KIND_ENTRYSET_STATIC => SplViewKind::Entries,
+                _ => SplViewKind::Keys,
+            };
+            view_spliterator_characteristics(&*ctx, src, kind)
+        }
+        None if hs_is_insertion_ordered(&*ctx, this) => SPL_LINKED_SET,
+        None => SPL_HASH_SET,
     };
     ctx.set_field(spl, SPL_FIELD_CHARACTERISTICS, Value::Int(spl_chars));
     ctx.unpin_native_roots(backing_pin);
@@ -29243,13 +29256,31 @@ fn native_al_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     for (i, element) in elements.iter().enumerate().take(len) {
         ctx.set_array_element(arr, i, *element);
     }
-    let spl = try_alloc_synthetic(ctx, "java/util/Spliterator", 3)?;
+    // A VIEW answers its source family's cell; an ordinary list keeps the
+    // three-field shape and [`SPL_LIST_DEFAULT`]. Every ArrayList-shaped map
+    // view used to take the list default, which is why `HashMap.values()`
+    // claimed ORDERED and SUBSIZED it does not have and `TreeMap.entrySet()`
+    // claimed neither DISTINCT nor SORTED that it does -- four of the twelve
+    // cells `apps/probes/UtilCoverageSweep` found wrong.
+    let this = ctx.read_native_pin(this_pin, this);
+    let view_chars = values_view_source(&*ctx, this).map(|src| {
+        let kind = if al_view_holds_entries(&*ctx, this) {
+            SplViewKind::Entries
+        } else {
+            SplViewKind::Values
+        };
+        view_spliterator_characteristics(&*ctx, src, kind)
+    });
+    let n_fields = if view_chars.is_some() { 4 } else { 3 };
+    let spl = try_alloc_synthetic(ctx, "java/util/Spliterator", n_fields)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(spl, 0, Value::Object(Some(arr)));
     ctx.set_field(spl, 1, Value::Int(0));
     ctx.set_field(spl, 2, Value::Int(len as i32));
+    if let Some(chars) = view_chars {
+        ctx.set_field(spl, SPL_FIELD_CHARACTERISTICS, Value::Int(chars));
+    }
     ctx.unpin_native_roots(this_pin);
-    ctx.unpin_native_roots(arr_pin);
     Ok(Some(Value::Object(Some(spl))))
 }
 
@@ -65577,7 +65608,118 @@ fn native_unmod_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     unmod_delegate(ctx, args, "stream", "()Ljava/util/stream/Stream;")
 }
 
+/// `Spliterator.characteristics()` for an IMMUTABLE collection, measured across
+/// every shape the factories produce.
+///
+/// The backing's own answer is wrong for these because the JDK does not ask the
+/// backing: `ImmutableCollections` builds its spliterator with its own flags,
+/// and the size-1 shapes take `Collections.singletonSpliterator` instead.
+/// MEASURED against HotSpot 25.0.4+7 (`apps/probes/UtilCoverageSweep`):
+///
+/// ```text
+///   Set.of("a")            17745      List.of("a")           17745
+///   Set.of()               16449      List.of()              16464
+///   Set.of("a","b")        16449      List.of x3             16464
+///   Set.of x3 (SetN)       16449      Map.of().entrySet()    17745  (size 1)
+///   Map.of().keySet()      16449      Map.of().values()      16448
+/// ```
+///
+/// **The discriminator is SIZE, not class.** Every 17745 is a size-1 immutable
+/// -- `Set.of("a")`, `List.of("a")`, a one-entry `entrySet`, and
+/// `Collections.singleton`, which this VM already answered correctly and is the
+/// control that names the rule. The JDK routes those to
+/// `Collections.singletonSpliterator` (the `Collections$2` a strict-mode run
+/// reports); everything else goes through
+/// `Spliterators.spliterator(collection, flags)`, which contributes
+/// `SIZED | SUBSIZED` on top of the family's own bits.
+///
+/// COMPATIBLE MODE ONLY. Strict refuses `cratonvm/internal/Unmodifiable*` and
+/// runs java.base's own bodies, which is why it was already 0-diff on all of
+/// these -- the tenth row in this campaign where `--jdk-only` is the more
+/// correct mode.
+const SPL_IMMUTABLE_SINGLETON: i32 =
+    SPL_SIZED | SPL_DISTINCT | SPL_ORDERED | SPL_NONNULL | 0x0400 | SPL_SUBSIZED;
+
+fn immutable_spliterator_characteristics(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    size: i32,
+) -> i32 {
+    // Size first: it outranks the carrier, and it is the whole reason
+    // `Set.of("a")` and `List.of("a")` agree at 17745 while their two- and
+    // three-element siblings do not.
+    if size == 1 {
+        return SPL_IMMUTABLE_SINGLETON;
+    }
+    match ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(this))
+        .as_deref()
+    {
+        // A list keeps its encounter order and is not distinct.
+        Some("cratonvm/internal/UnmodifiableList") => SPL_SIZED | SPL_ORDERED | SPL_SUBSIZED,
+        // A values view is neither distinct nor ordered.
+        Some("cratonvm/internal/UnmodifiableCollection") => SPL_SIZED | SPL_SUBSIZED,
+        // Sets, keySets and entrySets: distinct, no encounter order.
+        _ => SPL_SIZED | SPL_DISTINCT | SPL_SUBSIZED,
+    }
+}
+
 fn native_unmod_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // An IMMUTABLE receiver answers its own family's bits; an unmodifiable
+    // WRAPPER delegates, because the JDK's wrapper really does hand back the
+    // backing's spliterator (`unmodifiableSet(hashSet)` is 65 on both VMs, and
+    // that row is the control for leaving this arm alone).
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if unmod_is_immutable(&*ctx, *this) {
+            let spl = unmod_delegate(ctx, args, "spliterator", "()Ljava/util/Spliterator;")?;
+            // ONLY a spliterator THIS CRATE MINTED may be written to. The
+            // backing's `spliterator()` is not guaranteed to reach
+            // `native_al_spliterator`: for a `List.of` the delegate lands on
+            // java.base's own `ArrayList.spliterator()` bytecode and hands back
+            // a REAL `ArrayList$ArrayListSpliterator`, whose slot 3 is its
+            // `this$0`. Writing a characteristics mask there clobbered it, and
+            // the next `estimateSize()` died in `getFence` with "Cannot read
+            // field modCount because this.this$0 is null" -- which is how this
+            // was found, one probe row after the change that caused it.
+            //
+            // `two-producers-of-one-carrier-class` again, in its most direct
+            // form: the synthetic `java/util/Spliterator` and the JDK's own
+            // classes both arrive here, and only one of them has a slot 3 that
+            // means what this code thinks it means.
+            let spl_is_ours = matches!(spl, Some(Value::Object(Some(o)))
+                if ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref()
+                    == Some("java/util/Spliterator"));
+            if let (true, Some(Value::Object(Some(spl_obj)))) = (spl_is_ours, spl) {
+                let this = *this;
+                let size = match ctx.get_field(spl_obj, 2) {
+                    Value::Int(n) => n,
+                    _ => -1,
+                };
+                let chars = immutable_spliterator_characteristics(&*ctx, this, size);
+                if ctx.object_num_fields(spl_obj) > SPL_FIELD_CHARACTERISTICS {
+                    ctx.set_field(spl_obj, SPL_FIELD_CHARACTERISTICS, Value::Int(chars));
+                } else {
+                    // The backing handed back the THREE-field shape, which has
+                    // no characteristics slot and therefore reads as
+                    // `SPL_LIST_DEFAULT` however the mask is computed. Widen it:
+                    // copy the array, cursor and length across and add the slot.
+                    // Missing this is what left `List.of("a")` at 16464 after
+                    // the set shapes were already right -- the rule was correct
+                    // and had nowhere to be written.
+                    let arr = ctx.get_field(spl_obj, 0);
+                    let cursor = ctx.get_field(spl_obj, 1);
+                    let len = ctx.get_field(spl_obj, 2);
+                    let wide = try_alloc_synthetic(ctx, "java/util/Spliterator", 4)?;
+                    ctx.set_field(wide, 0, arr);
+                    ctx.set_field(wide, 1, cursor);
+                    ctx.set_field(wide, 2, len);
+                    ctx.set_field(wide, SPL_FIELD_CHARACTERISTICS, Value::Int(chars));
+                    return Ok(Some(Value::Object(Some(wide))));
+                }
+            }
+            return Ok(spl);
+        }
+    }
     unmod_delegate(ctx, args, "spliterator", "()Ljava/util/Spliterator;")
 }
 
@@ -68401,11 +68543,117 @@ const SPL_LIST_DEFAULT: i32 = SPL_ORDERED | SPL_SIZED | SPL_SUBSIZED;
 /// encounter order a hash container does not have is what a stream pipeline
 /// reads to decide it may skip a sort.
 const SPL_HASH_SET: i32 = SPL_SIZED | SPL_DISTINCT;
-/// `LinkedHashMap`'s: the same plus the encounter order it does have.
-const SPL_LINKED_SET: i32 = SPL_SIZED | SPL_DISTINCT | SPL_ORDERED;
+const SPL_NONNULL: i32 = 0x0100;
+const SPL_CONCURRENT: i32 = 0x1000;
+
+/// THE CHARACTERISTICS MATRIX, measured cell by cell rather than derived.
+///
+/// The first version of this file's spliterator work carried three constants
+/// and got three cells right, because the probe that drove it asked about three
+/// receivers. `apps/probes/UtilCoverageSweep`'s matrix asks all twenty-eight and
+/// found TWELVE wrong — every map VIEW, and the standalone `LinkedHashSet`. The
+/// numbers below are HotSpot 25.0.4+7's own answers:
+///
+/// ```text
+///                  keySet   values   entrySet    standalone set
+///   HashMap           65       64       65             65
+///   LinkedHashMap  16465    16464    16465          16465
+///   TreeMap           85       80       85             85
+///   Hashtable      16449    16448    16449             --
+///   Properties      4353     4352    16449             --
+/// ```
+///
+/// Three things in there are not guessable from the interface:
+///
+/// * **`values` is never DISTINCT** and, for `HashMap`, not `ORDERED` either --
+///   a values view can repeat and a hash map has no encounter order. `TreeMap`'s
+///   values ARE ordered but not SORTED: the sort is on the keys.
+/// * **`SUBSIZED` follows the JDK's construction, not the container.** The
+///   `LinkedHashMap` and `Hashtable` families go through
+///   `Spliterators.spliterator(Collection, ..)`, which adds `SIZED | SUBSIZED`;
+///   `HashMap`'s and `TreeMap`'s have hand-written spliterator classes that do
+///   not claim it. That is why `LinkedHashSet` is 16465 and `HashSet` is 65
+///   despite being the same shape of container.
+/// * **`Properties` is CONCURRENT | NONNULL and NOT SIZED**, because JDK 25
+///   backs it with a `ConcurrentHashMap` -- the same fact behind this record's
+///   §6.6 -- and its `entrySet` is the `Hashtable` cell rather than the
+///   concurrent one. That asymmetry is HotSpot's; it is recorded here because
+///   it is exactly the kind of thing a derived table would smooth over.
+const SPL_LINKED_SET: i32 = SPL_SIZED | SPL_DISTINCT | SPL_ORDERED | SPL_SUBSIZED;
+/// `LinkedHashMap.values()` -- ordered, sized, splittable, and not distinct.
+/// Numerically [`SPL_LIST_DEFAULT`]; kept as its own name so the matrix reads
+/// as a matrix and a later change to one cell cannot silently move the other.
+const SPL_LINKED_VALUES: i32 = SPL_SIZED | SPL_ORDERED | SPL_SUBSIZED;
+/// `HashMap.values()` -- sized and nothing else.
+const SPL_HASH_VALUES: i32 = SPL_SIZED;
 /// `TreeMap.KeySpliterator`: `SIZED | DISTINCT | SORTED | ORDERED`. No
 /// `SUBSIZED` — the JDK's does not claim it either.
 const SPL_TREE_SET: i32 = SPL_SIZED | SPL_DISTINCT | SPL_SORTED | SPL_ORDERED;
+/// `TreeMap.values()` -- ordered by the keys, so ORDERED but not SORTED, and
+/// not DISTINCT.
+const SPL_TREE_VALUES: i32 = SPL_SIZED | SPL_ORDERED;
+/// `Hashtable`'s views, which take the `Spliterators.spliterator(Collection..)`
+/// construction and so claim `SUBSIZED`, but have no encounter order.
+const SPL_HASHTABLE_SET: i32 = SPL_SIZED | SPL_DISTINCT | SPL_SUBSIZED;
+const SPL_HASHTABLE_VALUES: i32 = SPL_SIZED | SPL_SUBSIZED;
+/// `Properties`' key and value views, which are a `ConcurrentHashMap`'s.
+const SPL_CHM_SET: i32 = SPL_DISTINCT | SPL_CONCURRENT | SPL_NONNULL;
+const SPL_CHM_VALUES: i32 = SPL_CONCURRENT | SPL_NONNULL;
+
+/// Which of the three views a spliterator is being taken over.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SplViewKind {
+    Keys,
+    Values,
+    Entries,
+}
+
+/// The measured characteristics for a view over `source`. See the matrix on
+/// [`SPL_LINKED_SET`] for where every number comes from.
+fn view_spliterator_characteristics(
+    ctx: &dyn NativeContext,
+    source: ObjectRef,
+    kind: SplViewKind,
+) -> i32 {
+    let values = kind == SplViewKind::Values;
+    let name = ctx.class_name_arc_of_id(ctx.class_id_of_object(source));
+    // `Properties` before the Hashtable test it would otherwise satisfy: it
+    // extends `Hashtable` and is backed by a `ConcurrentHashMap`, and only the
+    // key and value views take the concurrent cell.
+    if name.as_deref() == Some("java/util/Properties") {
+        return match kind {
+            SplViewKind::Keys => SPL_CHM_SET,
+            SplViewKind::Values => SPL_CHM_VALUES,
+            SplViewKind::Entries => SPL_HASHTABLE_SET,
+        };
+    }
+    if is_tree_map_receiver(ctx, source) {
+        return if values {
+            SPL_TREE_VALUES
+        } else {
+            SPL_TREE_SET
+        };
+    }
+    if is_lhm_receiver(ctx, source) {
+        return if values {
+            SPL_LINKED_VALUES
+        } else {
+            SPL_LINKED_SET
+        };
+    }
+    if is_hashtable_receiver(ctx, source) {
+        return if values {
+            SPL_HASHTABLE_VALUES
+        } else {
+            SPL_HASHTABLE_SET
+        };
+    }
+    if values {
+        SPL_HASH_VALUES
+    } else {
+        SPL_HASH_SET
+    }
+}
 /// The slot a synthetic spliterator keeps its characteristics in. Absent on the
 /// three-field shape, which keeps [`SPL_LIST_DEFAULT`].
 const SPL_FIELD_CHARACTERISTICS: usize = 3;
