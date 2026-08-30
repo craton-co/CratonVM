@@ -26273,6 +26273,19 @@ fn stream_is_linked(ctx: &dyn NativeContext, stream: ObjectRef) -> bool {
     matches!(ctx.get_field(stream, STREAM_FIELD_LINKED), Value::Int(1))
 }
 
+/// Whether `stream` is the synthetic REFERENCE-stream carrier -- the one shape
+/// `stream_link_or_consume` may be applied to.
+///
+/// The primitive carriers are excluded for the reason
+/// `stream_link_or_consume` records: they reach the funnel through
+/// `int_stream_elements`, which is infallible at 25 call sites, so a throw
+/// there would be swallowed and silently degrade the stream to empty.
+fn stream_is_reference_carrier(ctx: &dyn NativeContext, stream: ObjectRef) -> bool {
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(stream))
+        .as_deref()
+        == Some("java/util/stream/Stream")
+}
+
 /// Set the linked-or-consumed flag. No-op on a stream with no slot for it.
 fn stream_mark_linked(ctx: &mut dyn NativeContext, stream: ObjectRef) {
     if ctx.object_num_fields(stream) <= STREAM_FIELD_LINKED {
@@ -26858,6 +26871,42 @@ fn stream_make_lazy_derived(
         return Ok(None);
     }
     let src_cur = ctx.read_native_pin(src_pin, src);
+    // W7-65: LINK the source.
+    //
+    // `stream_link_or_consume`'s doc argues the JDK's eight flag sites collapse
+    // onto the one funnel in `stream_elements`, because every operation reads
+    // the element snapshot through it. That is true of every EAGER operation
+    // and false of a lazy one: a lazy intermediate op appends to the op chain
+    // and never drains, so it never reached the funnel and never marked its
+    // source. Two of the JDK's eight sites are the intermediate-stage
+    // constructors, and this function is both of them.
+    //
+    // MEASURED, `apps/probes/StreamReuseProbe`, compatible mode:
+    //
+    // ```text
+    //   ref filter then filter second     HotSpot IllegalStateException   was ok
+    //   ref map then map second           HotSpot IllegalStateException   was ok
+    //   ref parent after child linked     HotSpot IllegalStateException   was 3
+    // ```
+    //
+    // AFTER THE `--jdk-only` REFUSAL ARM, NOT BEFORE IT, and that is the whole
+    // of why this is here rather than at the top. Strict mode DOES reach this
+    // function; it is refused a few lines up, returns `Ok(None)`, and the
+    // caller falls back to real java.base bytecode. Marking the source ahead of
+    // that refusal armed a stream this VM was about to hand back to the JDK's
+    // own pipeline, which then refused the caller's next use of it. Measured as
+    // `RJdkCollections` and `RJdkJmx` failing in the `--jdk-only` arm ONLY,
+    // 117/119, with both other arms green -- the signature of a change that
+    // fires on the strict path and nowhere else.
+    //
+    // On the error path the pin has to be released by hand: `src_pin` is this
+    // frame's base, and `?` here would strand it and everything above it.
+    if stream_is_reference_carrier(&*ctx, src_cur) {
+        if let Err(e) = stream_link_or_consume(ctx, src_cur) {
+            ctx.unpin_native_roots(src_pin);
+            return Err(e);
+        }
+    }
     // FIX (stream-eager-drain-20260715): do NOT eagerly materialize `src`
     // here. A `src` that still holds a live, undrained lazy spliterator
     // (STREAM_FIELD_LAZY_SPLITERATOR, slot 2 -- from
