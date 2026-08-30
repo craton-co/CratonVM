@@ -145,24 +145,44 @@ fn wp8_11_service_loader_iterator_registered_for_resteasy() {
     let mut r = NativeMethodRegistry::new();
     cratonvm_native_builtins::jdbc::register_jdbc_driver_natives(&mut r);
 
+    // INVERTED 2026-08-30. `register_service_loader_natives`' body is
+    // `#[cfg(feature = "synthetic-jdk")]`, and its header explains why: in a
+    // real-JDK build `java.util.ServiceLoader` is pure Java that the VM
+    // already runs, and these natives were a shadow over it that got it
+    // WRONG -- `iterator()` answered `java.util.ArrayList$Itr` where HotSpot
+    // answers `java.util.ServiceLoader$2` (MEASURED,
+    // `probes/DodServiceLoaderSweep`), losing the lazy iterator's semantics
+    // so a `ServiceConfigurationError` surfaced at `load` instead of at the
+    // offending provider.
+    //
+    // The removal is measured, not assumed: `--jdk-only` refuses every
+    // SyntheticStub and has been running the real `ServiceLoader` all along,
+    // HotSpot-identically on both SPIs, with `jdbc` 92/92 and `h2jdbc` 12/12
+    // -- the latter's `DriverManager` discovery being
+    // `ServiceLoader.load(java.sql.Driver.class)`, the exact case this test
+    // was written for.
+    //
+    // So the assertion is now that the shadow is ABSENT. Asserting it present
+    // asserted the pre-removal contract, and would pass again only by putting
+    // the wrong iterator back.
     assert!(
         r.find(
             "java/util/ServiceLoader",
             "load",
-            "(Ljava/lang/Class;)Ljava/util/ServiceLoader;"
+            "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
         )
-        .is_some(),
-        "ServiceLoader.load(Class) must be registered (RESTEasy + JBoss-Logging \
-         + Hibernate persistence-provider discovery all funnel through here)"
+        .is_none(),
+        "ServiceLoader.load(Class) must NOT be shadowed in a real-JDK build"
     );
     assert!(
         r.find(
             "java/util/ServiceLoader",
             "iterator",
-            "()Ljava/util/Iterator;"
+            "()Ljava/util/Iterator;",
         )
-        .is_some(),
-        "ServiceLoader.iterator must be registered"
+        .is_none(),
+        "ServiceLoader.iterator must NOT be shadowed: the native returned an \
+         ArrayList$Itr where HotSpot returns ServiceLoader$2"
     );
 }
 

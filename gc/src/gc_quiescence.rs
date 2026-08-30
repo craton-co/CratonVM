@@ -937,6 +937,25 @@ pub fn moving_young_incomplete_reason() -> usize {
     incomplete_reason_get()
 }
 
+/// EVERY reason recorded this cycle, as a bitmask over [`incomplete_reason`].
+///
+/// [`moving_young_incomplete_reason`] is first-wins — it names what forced the
+/// decision — so it cannot answer "which obligation did THIS proof add?". The
+/// mask can, by diffing it around a single call, and that is what the
+/// cross-thread handshake's peer diagnostic needs: a peer whose own proof
+/// returns false is the shortfall that refuses a whole cycle, and the six ways
+/// it can say no want six different repairs.
+///
+/// Do NOT use the per-reason COUNTERS for that question. `bump_reason_count`
+/// has exactly one caller, `record_moving_young_coverage_fallback`, which is
+/// the generational collector's per-cycle accounting — so on ZGC those counters
+/// never move at all and a diff of them reads `none` for every failure. That
+/// mistake cost a build.
+#[inline]
+pub fn moving_young_incomplete_reason_mask() -> usize {
+    incomplete_reason_mask_get()
+}
+
 /// Whether the current collection has observed an incomplete moving-young JIT
 /// frame/safepoint coverage proof.
 #[inline]

@@ -5,7 +5,18 @@ import java.util.function.BiFunction;
  *  `util.Preconditions` (3).
  *
  *  These are not application API and the probe reaches them the only way anyone
- *  can, through `--add-exports`; both VMs are given the same flags. That is
+ *  can, through `--add-exports`; both VMs are given the same flags:
+ *
+ *    --add-exports java.base/jdk.internal.misc=ALL-UNNAMED
+ *    --add-exports java.base/jdk.internal.access=ALL-UNNAMED
+ *    --add-exports java.base/jdk.internal.loader=ALL-UNNAMED
+ *    --add-exports java.base/jdk.internal.util=ALL-UNNAMED
+ *
+ *  ON `javac` AS WELL AS `java`. Without them this file does not compile -- 74
+ *  errors -- and a harness that diffs the two runs anyway compares an empty
+ *  output against an empty output and reports 0 differing lines. That false
+ *  green is why the flags are written out here rather than left to the reader:
+ *  check the ROW COUNT (123) before believing a clean diff. That is
  *  itself part of what is measured — a VM that does not honour `--add-exports`
  *  fails every row here at once with `IllegalAccessError`, which is a different
  *  and larger finding than any individual row.
@@ -264,6 +275,35 @@ public class JdkInternalSweep {
                 new jdk.internal.loader.ClassLoaderValue<>();
             v.putIfAbsent(null, "boot");
             return v.get(null) + "/" + v.get(cl);
+        });
+        p("removeAll then get", () -> {
+            jdk.internal.loader.ClassLoaderValue<String> v =
+                new jdk.internal.loader.ClassLoaderValue<>();
+            v.putIfAbsent(cl, "one");
+            v.removeAll(cl);
+            return String.valueOf(v.get(cl));
+        });
+        p("removeAll leaves another loader's mapping", () -> {
+            jdk.internal.loader.ClassLoaderValue<String> v =
+                new jdk.internal.loader.ClassLoaderValue<>();
+            v.putIfAbsent(cl, "app");
+            v.putIfAbsent(null, "boot");
+            v.removeAll(cl);
+            return String.valueOf(v.get(cl)) + "/" + String.valueOf(v.get(null));
+        });
+        p("removeAll on an empty value", () -> {
+            jdk.internal.loader.ClassLoaderValue<String> v =
+                new jdk.internal.loader.ClassLoaderValue<>();
+            v.removeAll(cl);
+            return "no throw";
+        });
+        p("removeAll twice", () -> {
+            jdk.internal.loader.ClassLoaderValue<String> v =
+                new jdk.internal.loader.ClassLoaderValue<>();
+            v.putIfAbsent(cl, "one");
+            v.removeAll(cl);
+            v.removeAll(cl);
+            return String.valueOf(v.get(cl));
         });
         p("remove then get", () -> {
             jdk.internal.loader.ClassLoaderValue<String> v =

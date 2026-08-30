@@ -1195,7 +1195,85 @@ use cratonvm_types::compat::CompatibilityMode;
 /// Not attributable to this branch, and not this branch's win either; it is
 /// recorded here because the ratchet has zero slack and a merged tree has to be
 /// accounted for by whoever lands it.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1587;
+/// RE-FROZEN 2026-08-29, +6 net, and BOTH directions are cause (b).
+///
+/// **16 added — the Permission family, relabelled rather than written.**
+/// `java/security/Permission`, `java/security/BasicPermission`,
+/// `java/lang/RuntimePermission` and `java/util/PropertyPermission`, each
+/// `<init>()V`, `<init>(String)V`, `<init>(String,String)V` and `getName()`.
+/// Every one of those triples was ALREADY registered at the commit that set the
+/// previous baseline — verified by reading `native-builtins/src/lib.rs` at that
+/// commit, where the same five-class loop sits outside any `with_category`
+/// block. What changed is the KIND: the loop is now wrapped in
+/// `SyntheticStub`, so `real_protected_stub_class` hands each call back to the
+/// real body whenever the real class is loaded.
+///
+/// That is the good direction, and the registrar measured what the shadow was
+/// costing before it moved:
+///
+/// ```text
+/// new PropertyPermission("a.b.*", "read,write")
+///   HotSpot   mask=3  path="a.b.*"  getActions()="read,write"
+///   CratonVM  mask=0  path=null     getActions()=""
+/// ```
+///
+/// — because `permission_init` wrote `name` and returned, so
+/// `BasicPermission.<init>`'s `init(name)` and `PropertyPermission.<init>`'s
+/// `init(getMask(actions))` never ran. `implies()` then NPEd on a null
+/// `that.path` and a serialization round trip died in `readObject`.
+///
+/// **10 removed — nine `java/util/ServiceLoader` stubs and one
+/// `AtomicReference.compareAndSet`.** The `ServiceLoader` family is gone
+/// outright; the `AtomicReference` row is the same deletion accounted for in
+/// `registrar_drift.rs`'s `FIXED_NOT_DRIFTING`.
+///
+/// **On the second column, and how I read it wrong first.** Totals moved
+/// 13407 -> 13415 (no-management) and 13775 -> 13783 (management), +8 each,
+/// against a +6 stub delta — which the classifier reads as "new fakes". It is
+/// not: the +8 is dev's other work across the same 27 commits, and the 16 stub
+/// rows are relabels of registrations that were already there. The
+/// registration site's own comment settles it, which is why this gate tells you
+/// to read that BEFORE assuming (a). I assumed (a) from the column alone and
+/// had to correct it.
+///
+/// # Re-frozen 2026-08-30, +8: the immutable-collection SERIALIZATION family
+///
+/// Cause (b) again, and this time the relabel is the fix for a strict-mode
+/// crash rather than only an honesty improvement.
+///
+/// All eight rows come from `register_immutable_serialization_natives`, which
+/// set `Bridge` for its whole window. Named, by `dump_synthetic_stubs`, and
+/// exactly eight:
+///
+/// ```text
+/// java/util/CollSer.readResolve()Ljava/lang/Object;
+/// java/util/Collections$UnmodifiableRandomAccessList.writeReplace()Ljava/lang/Object;
+/// java/util/ImmutableCollections$List12.writeReplace()Ljava/lang/Object;
+/// java/util/ImmutableCollections$ListN.writeReplace()Ljava/lang/Object;
+/// java/util/ImmutableCollections$Map1.writeReplace()Ljava/lang/Object;
+/// java/util/ImmutableCollections$MapN.writeReplace()Ljava/lang/Object;
+/// java/util/ImmutableCollections$Set12.writeReplace()Ljava/lang/Object;
+/// java/util/ImmutableCollections$SetN.writeReplace()Ljava/lang/Object;
+/// ```
+///
+/// `Bridge` asserts "no working real-bytecode fallback exists". Under
+/// `--jdk-only` that was not merely wrong but FATAL: `CollSer.readResolve`
+/// rebuilds through `of_list`, which freezes into a
+/// `cratonvm/internal/Unmodifiable*` that strict refuses to fabricate, so
+/// deserializing ANY `List.of`/`Set.of`/`Map.of` died with
+/// `NoClassDefFoundError: cratonvm/internal/UnmodifiableList`. Writing worked
+/// and produced the same 59 bytes HotSpot writes; only the read side failed.
+/// Six rows of `apps/probes/UtilCoverage4Sweep`, now 0-diff in both modes.
+///
+/// **On the second column.** Totals moved 13415 -> 13511 (no-management) and
+/// 13783 -> 13879 (management), +96 each, against a +8 stub delta. The
+/// classifier's "total UP by roughly the stub delta means new fakes" does not
+/// apply: 96 is twelve times 8, and the 96 is dev's other work across the
+/// commits merged since the last freeze. The eight rows above are named
+/// individually rather than inferred from the column, which is the only way to
+/// tell a relabel from an addition while the tree is moving for other reasons —
+/// the lesson of the 2026-08-29 entry directly above.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1601;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1210,7 +1288,9 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1587;
 /// the delta is the same −7 in both — but measure it, do not derive it: this
 /// constant's own history has a case of one derived from the other sitting six
 /// above the truth for a week.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1576;
+/// Re-frozen 2026-08-29 with [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]; the
+/// account for both is on that constant.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1590;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -1260,13 +1340,13 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1576;
 /// `cratonvm/internal/ArrayListViewItr` rows), and the other three accumulated
 /// across merges nobody had to re-freeze for. An ungated constant used to
 /// classify a gated one is worth only as much as its last refresh.
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13775;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13879;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
 /// for the reason given on [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].**
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13407;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13511;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;

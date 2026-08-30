@@ -745,6 +745,9 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "promo-seed", on_key: Some("CRATONVM_DBG_PROMO_SEED"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "proxy", on_key: Some("CRATONVM_DBG_PROXY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "prune", on_key: None, off_key: Some("CRATONVM_DBG_NO_PRUNE"), off_word: None },
+    E { group: Group::DBG, token: "jit-root-scan", on_key: None, off_key: Some("CRATONVM_DBG_NO_JIT_ROOT_SCAN"), off_word: None },
+    E { group: Group::DBG, token: "fincand", on_key: Some("CRATONVM_DBG_FINCAND"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "forced-finalizers", on_key: Some("CRATONVM_FORCED_FINALIZERS"), off_key: None, off_word: Some("0") },
     // The named-writer arm of the punned-reference counter: on a NON-ZERO
     // payload word under a non-`Object` tag, print the class and field so the
     // writer can be found rather than inferred. Diagnostic only -- the counter
@@ -905,6 +908,11 @@ pub const INVENTORY: &[E] = &[
     // pair, so one binary can sweep the curve -- picking that number by
     // rebuilding once per point is not possible on a host that moves 2x
     // between two runs.
+    // Declared 2026-08-29 with the per-call-site dispatch memo in
+    // `vm/src/runtime/offload.rs`. DEFAULT-ON with a "0" off-word: the memo
+    // has no observable semantics, so the only honest way to price it is one
+    // binary run both ways in the same minutes.
+    E { group: Group::JIT, token: "gpu-dispatch-memo", on_key: Some("CRATONVM_GPU_DISPATCH_MEMO"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "gpu-if-convert", on_key: Some("CRATONVM_GPU_IF_CONVERT"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "gpu-if-convert-max-ops", on_key: Some("CRATONVM_GPU_IF_CONVERT_MAX_OPS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-ic-deny", on_key: Some("CRATONVM_JIT_SP_IC_DENY"), off_key: None, off_word: None },
@@ -1067,6 +1075,17 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-long", on_key: Some("CRATONVM_JIT_IR_LONG"), off_key: None, off_word: None },
     // Default-ON A/B lever: `ir_lower::reloc_emit_enabled` reads `0`/`false`.
     E { group: Group::JIT, token: "ir-reloc-emit", on_key: Some("CRATONVM_JIT_IR_RELOC_EMIT"), off_key: None, off_word: Some("0") },
+    // Declared 2026-08-30 with the relocation-gate coupling. Default-ON, so a
+    // KILL SWITCH: `=0` restores the pre-fix behaviour in which a safepoint map
+    // `record_oop_map` had ALREADY judged short was still published as
+    // `moving_young_coverage_complete`, so relocation rewrote the slots it
+    // named and left the rest pointing into from-space. Kept because the fix
+    // has a measured cost -- on String-heavy code every cycle meeting a live
+    // compiled frame now declines to relocate -- and that cost reaches
+    // `org.h2.test.store.TestMVStoreTool`, an already-open fragmentation OOM,
+    // about 10x sooner. This is the same-binary A/B for both halves of that
+    // trade. See `x64::safepoint::relocation_coverage_complete`.
+    E { group: Group::JIT, token: "reloc-gate-map-incomplete", on_key: Some("CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "ir-selfrec-direct", on_key: Some("CRATONVM_JIT_IR_SELFREC_DIRECT"), off_key: None, off_word: None },
     // Default-ON: `conservative_roots::nested_trace_frames_enabled` treats the
     // key's PRESENCE as "restore the one-frame-per-chain-entry answer".
@@ -1391,6 +1410,12 @@ pub const INVENTORY: &[E] = &[
     // so there is no off state to spell.
     E { group: Group::JIT, token: "xt-peer-deadline-ms", on_key: Some("CRATONVM_XT_PEER_DEADLINE_MS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "xt-peer-total-ms", on_key: Some("CRATONVM_XT_PEER_TOTAL_MS"), off_key: None, off_word: None },
+    // `zero-spid` is default ON and `CRATONVM_JIT_ZERO_SPID=0` restores the
+    // pre-fix behaviour, so `off_word` is exactly `"0"` -- the same shape as
+    // `verify-ir` above. `zero_sp_id_slot_enabled` reads the key and treats
+    // `0`/`false`/`FALSE` as off; only `"0"` is spellable as a group token, and
+    // the other two spellings keep working through the key itself.
+    E { group: Group::JIT, token: "zero-spid", on_key: Some("CRATONVM_JIT_ZERO_SPID"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "card-metrics", on_key: Some("CRATONVM_GC_CARD_METRICS"), off_key: None, off_word: None },
     // NOTE: `CRATONVM_DBG_MAPGEN` and `CRATONVM_DBG_VACATED_FRAMES` are declared
     // in the DBG group, which is where their names say they belong and which is
@@ -1817,6 +1842,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::COMPAT, token: "stackwalker-jdk-walk", on_key: Some("CRATONVM_SW_JDK_WALK"), off_key: None, off_word: None },
     E { group: Group::GC, token: "stream-refresh-each", on_key: Some("CRATONVM_GC_STREAM_REFRESH_EACH"), off_key: None, off_word: None },
     E { group: Group::GC, token: "noflag-deposit-skip-jit-scan", on_key: Some("CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "identity-hash-evict", on_key: Some("CRATONVM_IDENTITY_HASH_EVICT"), off_key: None, off_word: Some("0") },
     E { group: Group::COMPAT, token: "strict-swallows", on_key: Some("CRATONVM_STRICT_SWALLOWS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "tomcat-mapper-natives", on_key: Some("CRATONVM_TOMCAT_MAPPER_NATIVES"), off_key: None, off_word: Some("0") },
     // Default-ON, off for the exact untrimmed string `0` only — the

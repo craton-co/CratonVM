@@ -9,12 +9,23 @@
 > across and dropped others.
 
 
-**Status: the lane is closed except for the residuals in §6, each of which has
-its measurement here.** Twelve differential probes, 1879 rows, against HotSpot
-25.0.4+7, run in BOTH modes on every one of five builds. Six of the twelve are
-0-diff in both modes; the other six carry only the eight residual rows of §6 and
-the thirteen of the companion dispatch-door record (those thirteen are
-CLOSED as of 2026-08-29 — see §6.5).
+**Status: CLOSED 2026-08-30. Every residual in §6 and §6b is fixed, and the
+`java.util` corpus is 0-diff against HotSpot in both modes.** Twenty-three
+differential probes, 2530 rows, against HotSpot 25.0.4+7, run in BOTH modes on
+one build. Twenty-two are 0-diff in both modes; the twenty-third,
+`ImmutableSplProbe`, is 0-diff on every characteristics row and differs only on
+class-IDENTITY rows, which belong to a carrier this lane does not own — see
+§6d.
+
+The last three rounds are worth reading even though they are closed, because
+each one closed by finding that the recorded diagnosis was wrong rather than
+incomplete:
+
+| round | the record said | what it was |
+| --- | --- | --- |
+| §6.1 `ArrayDeque` | "needs a generation counting structural GROWTH, which the deque has no field to hold" | it needs no counter at all; the fail-fast is the ring buffer's LAYOUT, and the shadow was the thing preventing it |
+| §6b immutable spliterators | "the discriminator is SIZE, not class" | the discriminator is the CLASS; size only decides which class the factory built |
+| §6c serialization | not recorded — no probe had ever asked | `--jdk-only` could not DESERIALIZE any `List.of`/`Set.of`/`Map.of` at all |
 
 Lane brief: `HANDOFF-20260828-L3-util-collections.md` (retired). Method:
 `HANDOFF-20260828-SCOPE.md` §3.
@@ -435,27 +446,85 @@ iterator arrived at natives expecting a snapshot block and walked to `[]` — th
 `al_itr_alt_base` width test is now EXACT rather than a bound, and
 `al_itr_delegate_foreign` sends anything that is not ours to its own bytecode.
 
-#### The ArrayDeque row that is still open, and why it is not a size check
+#### The ArrayDeque row — CLOSED 2026-08-30, by DELETING four registrations
 
 ```text
 apps/probes/DequeListShadowSweep
-  81 ad fail fast on ADD during iteration      HotSpot CME        here no-throw
-  82 ad fail fast on REMOVE during iteration   HotSpot no-throw   here no-throw
+  81 ad fail fast on ADD during iteration      HotSpot CME        was no-throw
+  82 ad fail fast on REMOVE during iteration   HotSpot no-throw   was no-throw
 ```
 
-**HotSpot's `ArrayDeque` is fail-fast on one and not the other.** `DeqIterator`
-detects a modification only when the ring buffer shifts under the cursor, which
-an `add` that wraps does and a `remove` from the far end does not. It also
-declares no `expectedModCount` for the third door to seed.
+**HotSpot's `ArrayDeque` is fail-fast on one and not the other**, and the
+previous entry here concluded that closing row 81 "needs a generation counting
+structural GROWTH, which the deque has no field to hold". That is true and it is
+the wrong question. `DeqIterator` declares no `expectedModCount` because the
+JDK's fail-fast here is not a counter at all: the iterator holds a PHYSICAL
+index into the ring buffer, and `nonNullElementAt` reports any null it reads as
+a `ConcurrentModificationException`. It fires exactly when a mutation moves the
+elements out from under that index. An `add` that fills the buffer grows it, and
+`grow` slides the first leg to the far end and nulls the slots it came from,
+straight under a cursor that has already advanced; a `remove` from the head
+moves `head` PAST the cursor and nulls nothing the cursor will read. No
+generation reproduces that asymmetry, which is why seeding one closed 81 and
+opened 82.
 
-Giving it one was tried: its `remaining` slot is free (every declared field on a
-carrier this crate mints is unused, since the mint writes only the three
-snapshot fields past them), seeded from the source's SIZE. That closed row 81
-and OPENED row 82, because size moves for both — one wrong row traded for
-another, in the worse direction, since a spurious
-`ConcurrentModificationException` is the failure this file has already paid for
-once. Reverted. Closing row 81 needs a generation counting structural GROWTH
-rather than size, and the deque has no field to hold one.
+**The control that settled it was already in the tree.** `descendingIterator()`
+was never registered, so it ALREADY ran real JDK bytecode over our array —
+whatever it answered was what a retired `iterator()` would answer.
+`apps/probes/AdRetireProbe` asked it, and the answer was not the one either
+diagnosis predicted:
+
+```text
+  fields after remove   HotSpot  cap=4 head=0 tail=2 es=[a, b, null, null]
+                        CratonVM cap=4 head=0 tail=2 es=[a, b, null, null]
+  size()                HotSpot  2         CratonVM 3
+  toString()            HotSpot  [a, b]    CratonVM [a, b, null]
+```
+
+The buffer was byte-for-byte right and only the COUNT was wrong — and a null was
+leaking out of the deque into `toString`, `toArray`, `stream` and a re-walk. It
+also killed compatible mode outright at row 13 of that probe. `ad_refuse_null`'s
+own doc explains the cost: the JDK's `nonNullElementAt` reads such a null as
+"another thread mutated me" and kills the next iteration.
+
+The cause is that slot 3 held the element count. The real `java.util.ArrayDeque`
+declares only `elements`/`head`/`tail`, so every real JDK body that touches the
+buffer desynced us. `native_ad_remove_first_occurrence` carries the scar in its
+doc comment — it exists to keep real `delete` bytecode away from the deque,
+after that desync stranded H2's `waitingSessions` queue and dead-ended every
+later DDL in "Timeout trying to lock table SYS". **Shadowing every mutator is
+the wrong level to fix that at, because the leak is any real body at all**, and
+`DeqIterator.remove()` is the proof.
+
+The fix made the representation the JDK's, in three parts, and only then stood
+aside:
+
+* `ad_state` DERIVES the count from `head`/`tail`, as `size()` does. Slot 3 is
+  no longer written by anything.
+* `ad_grow` is a port of `ArrayDeque.grow` — `Arrays.copyOf` slot-for-slot plus
+  the wrap-slide, where we used to normalise to `head = 0`. `addFirst`/`addLast`
+  store BEFORE growing, as the JDK does, which also retires the Family-1
+  pin/refresh dance rather than maintaining it.
+* `ad_remove_at_logical` is a port of `ArrayDeque.delete` — close the gap from
+  the NEARER end. We always slid backwards, which yields the same deque and a
+  different layout: invisible to every accessor of ours, and not to a physical
+  cursor.
+
+`apps/probes/AdFieldProbe` reads `elements`/`head`/`tail` back through
+reflection (it needs `--add-opens java.base/java.util=ALL-UNNAMED`) and the
+deque is now byte-identical to HotSpot's through growth, both `delete` branches
+and a wrapped buffer. `ArrayDeque.iterator()` and `ArrayDeque$DeqIterator`'s
+`hasNext`/`next`/`remove` are then RETIRED, and `ArrayDeque` leaves
+`VALUES_ITR_CARRIERS`: a snapshot could carry the right class name but never the
+fail-fast.
+
+`DequeListShadowSweep` and `AdRetireProbe` are 0-diff in both modes.
+
+**The general shape, which is the reason this entry is long.** The count was a
+DERIVED quantity that had been stored, and storing it made a workaround
+necessary — one that then outlived any chance of being complete, because you
+cannot register every real body. The 2026-08-29 entry above it treated the
+symptom the workaround produced.
 
 #### A FOURTH cost, found 2026-08-29 after the lane landed: one unit test left red, and the mock hole under it
 
@@ -680,19 +749,265 @@ the dormant `PriorityQueue$Itr` registration in §6.1 was; here the class name i
 a label over an identical object and the natives cannot tell the producers
 apart, because there is nothing to tell apart.
 
-## 7. The final verification, and where the residuals ended
+## 6b. The coverage sweep, and the twelve spliterator cells it found
 
-Every number here was RE-TAKEN at the end, on a binary built from the merge of
-all seven lanes plus the release-day reorganisation, `cargo fmt` and the GPU
-work — a tree that differs from the one the fixes were written against by far
-more than this lane contributed. Sixteen probes recompiled from source and
-re-run, both modes, one run:
+**Written after the residuals closed, from the registry rather than from a
+hypothesis.** A dump taken DURING all sixteen probes, merged, says the corpus
+reaches 445 of the 602 owning `java.util` registrations that sit over a real JDK
+body. The other 157 were never invoked.
+
+The first reading of that number is "retirement candidates". It is not: the
+never-invoked set is almost entirely the NavigableSet surface of
+`TreeMap.keySet()` (18 rows), HashMap's conditional mutators on the plain
+family (11), and the sublist `ListIterator` (7) — **a coverage gap in the
+probes, not dead code**. That is `a-zero-invocation-count-is-evidence-about-a-
+counter` in its exact shape: `invocations` is a floor.
+
+`apps/probes/UtilCoverageSweep` closes it — 141 rows over precisely those
+registrations — and found a defect on its first run.
+
+### The spliterator characteristics matrix — 12 cells
+
+§3's spliterator work moved the characteristics mask into the object and gave
+three producers their own answer. It was right about those three, because the
+probe that drove it asked about three receivers. Asking all twenty-eight:
+
+```text
+                 keySet   values   entrySet    standalone
+  HashMap           65       64       65             65
+  LinkedHashMap  16465    16464    16465          16465
+  TreeMap           85       80       85             85
+  Hashtable      16449    16448    16449             --
+  Properties      4353     4352    16449             --
+```
+
+**Twelve of those cells were wrong** — every map view, plus the standalone
+`LinkedHashSet`. Every ArrayList-shaped view took the list default, so
+`HashMap.values()` claimed an encounter order it does not have and
+`TreeMap.entrySet()` claimed neither the DISTINCT nor the SORTED it does; every
+set-shaped view took the plain `HashSet` cell, so `LinkedHashMap.keySet()` lost
+both ORDERED and SUBSIZED.
+
+Three things in the matrix are not derivable, which is why it is measured and
+not computed:
+
+* **`values` is never DISTINCT**, and for `HashMap` not ORDERED either. A values
+  view can repeat, and a hash map has no encounter order. `TreeMap`'s values are
+  ORDERED but not SORTED — the sort is on the keys.
+* **`SUBSIZED` follows the JDK's CONSTRUCTION, not the container.** The
+  `LinkedHashMap` and `Hashtable` families go through
+  `Spliterators.spliterator(Collection, ..)`, which adds `SIZED | SUBSIZED`;
+  `HashMap`'s and `TreeMap`'s have hand-written spliterator classes that do not.
+  That is the whole reason `LinkedHashSet` is 16465 and `HashSet` is 65 despite
+  being the same shape of container.
+* **`Properties` is CONCURRENT | NONNULL and NOT SIZED** — JDK 25 backs it with
+  a `ConcurrentHashMap`, the same fact behind §6.6 — and its `entrySet` takes
+  the `Hashtable` cell rather than the concurrent one. That asymmetry is
+  HotSpot's, and a derived table would have smoothed it away.
+
+These are not cosmetic: a stream pipeline reads DISTINCT to decide it may skip a
+`distinct()`, SORTED to skip a sort, and SIZED/SUBSIZED to decide how to split
+in parallel.
+
+### The immutable factories — 8 of 8 closed 2026-08-30
+
+```text
+                       HotSpot   was     now
+  Set.of("a")            17745    65    17745
+  Set.of()               16449    65    16449
+  Set.of("a","b")        16449    65    16449
+  Set.of x3 (SetN)       16449    65    16449
+  List.of("a")           17745  16464   17745
+  Map.of().keySet()      16449    65    16449
+  Map.of().values()      16448    64    16448
+  Map.of().entrySet()    17745    65    17745
+```
+
+**The discriminator is the CLASS, not the size** — and the previous entry here
+said the opposite, which is why the first fix closed four cells and left four.
+"A size-1 immutable routes to `Collections.singletonSpliterator`" explains
+`Set.of("a")`, `List.of("a")` and a one-entry `entrySet`, and is then flatly
+contradicted by the SAME map:
+
+```text
+  Set.of("a")              17745  ImmutableCollections$Set12 / Collections$2
+  Map.of("a",1).entrySet() 17745  ImmutableCollections$Set12 / Collections$2
+  Map.of("a",1).keySet()   16449  AbstractMap$1 / Spliterators$IteratorSpliterator
+  Map.of("a",1).values()   16448  AbstractMap$2 / Spliterators$IteratorSpliterator
+```
+
+`apps/probes/ImmutableSplProbe` asks all four factories at sizes 0, 1, 2 and 3
+and prints the CLASS of the view and of the spliterator beside every mask. That
+column is the rule. Every 17745 is `Collections$2`, reached when the factory
+built a `List12`/`Set12` whose second slot is the empty sentinel — so "size 1"
+is right, but only for a collection of that shape. A `Map.of`'s keySet and
+values are not: they are the anonymous `AbstractMap$1`/`$2` views, which carry
+no immutable bits at ANY size. `entrySet` is the odd one only because
+`Map1.entrySet()` is literally `Set.of(entry)`; a two-entry map's `MapN$1`
+entrySet drops back to 16449.
+
+Two changes. `native_unmod_spliterator` now MINTS a spliterator when the
+delegate returns one of the JDK's own — the `List.of` cell, where the delegate
+lands on java.base's `ArrayList.spliterator()`, whose answer is right for the
+`ArrayList` behind the wrapper and wrong for a `List12`, and which we may not
+write into. And map VIEWS carry a marker saying the map they view came from an
+immutable factory, deliberately NOT the existing `UNMOD_FIELD_IMMUTABLE`: that
+slot is a cross-crate contract with `getclass_immutable_marker`, which uses it
+to choose between two class names, and a `Map.of` keySet is NEITHER of them on
+HotSpot.
+
+**A defect this lane SHIPPED and then caught, one commit later.** The first
+attempt wrote the mask into slot 3 of whatever `spliterator()` returned. For
+`List.of` that is java.base's real `ArrayList$ArrayListSpliterator`, whose slot
+3 is its `this$0`; the write clobbered it and the next `estimateSize()` died in
+`getFence` with `NullPointerException: Cannot read field "modCount" because
+"this.this$0" is null`. It reached `dev` and stood for one commit. What found it
+was the next probe row written for an unrelated reason — `estimateSize` — which
+killed the compatible run at row 30 of 160. `two-producers-of-one-carrier-class`
+in its most direct form, and the third time this lane met that family.
+
+## 6c. The fourth coverage round, and the crash under it
+
+The 45 registrations no probe had reached were not a long tail of singletons.
+They were five CLUSTERS, and four had never been asked at all:
+
+```text
+  java.util.Date, deprecated instance surface   19 rows
+  serialization: writeReplace / read+writeObject 11 rows
+  the views' own toArray(T[]) and forEach         8 rows
+  OptionalInt / OptionalLong / OptionalDouble     7 rows
+  Locale / TimeZone / ResourceBundle display     20 rows
+```
+
+`apps/probes/UtilCoverage4Sweep` asks them. 152 rows, now 0-diff in both modes,
+and two defects on the way there.
+
+### `--jdk-only` could not DESERIALIZE any immutable collection
+
+```text
+  ser List.of(1)   HotSpot ImmutableCollections$List12 [a]
+                   strict  THREW java.lang.NoClassDefFoundError
+                           cratonvm/internal/UnmodifiableList
+```
+
+— and the same for `List.of(3)`, `Set.of(1)`, `Set.of(3)`, `Map.of(1)` and
+`Map.of(3)`. WRITING worked and produced the same 59 bytes HotSpot writes; the
+READ side reached `native_collser_read_resolve`, which rebuilds through
+`of_list` and freezes into a `cratonvm/internal/Unmodifiable*` — a class strict
+mode refuses to fabricate, by design.
+
+Every producer of that carrier is supposed to be dropped under `--jdk-only`, and
+`alloc_immutable_wrapper`'s doc says so and enumerates them. This one was missed
+because it is registered from a DIFFERENT registrar than the factories it
+mirrors, and that registrar sets `Bridge` for its whole window. `Bridge` asserts
+"no working real-bytecode fallback exists" — for this family, a compatible-mode
+claim wearing a mode-independent tag.
+
+The reason the native exists is real, and recorded at
+`native_collser_read_resolve`: the JDK's own body rebuilds maps through real
+`ImmutableCollections` constructors, producing a `table`-backed object this
+crate's map natives read as empty. True in COMPATIBLE mode, where those natives
+run; exactly false under `--jdk-only`, where they are dropped and a real `Map1`
+is the only right answer. The family is `SyntheticStub` now: compatible mode
+unchanged, strict drops all eight rows and agrees with HotSpot down to the class
+name.
+
+### A `Locale` variant BCP-47 cannot carry went out raw, in both modes
+
+```text
+  new Locale("de","AT","x").toLanguageTag()
+    HotSpot   de-AT-x-lvariant-x
+    CratonVM  de-AT-x
+```
+
+`de-AT-x` is not merely different, it is malformed — a bare `x` singleton with
+nothing after it — and `forLanguageTag` read the variant back as EMPTY where
+HotSpot recovers `"x"`. Measured across eleven shapes rather than fixed from the
+one that failed, because the rule has an end no one would guess:
+
+```text
+  POSIX       de-AT-POSIX                  5 alphanum: a subtag
+  1234        de-AT-1234                   4, digit-first: a subtag
+  x           de-AT-x-lvariant-x           1 char: private use
+  POSIX_WIN   de-AT-POSIX-x-lvariant-WIN   split at the first ill-formed one
+  x_POSIX     de-AT-x-lvariant-x-POSIX     ill-formed first: all of it
+  abcdefghi   de-AT                        9 chars: DROPPED ENTIRELY
+```
+
+The last row is the end of the rule: a private-use subtag is itself 1-8
+alphanumerics, so a 9-character variant does not fit there either and the whole
+sequence is dropped. The locale has no tag that can express it.
+
+**Two producers, and the first fix moved nothing.** `locale_tag` builds the tag
+twice — once from the `locale_populate` side table the constructors fill, once
+from a real `baseLocale` — and the side-table branch RETURNS FIRST for anything
+built by `new Locale(..)`. Fixing the `baseLocale` branch alone changed not one
+probe row across a full build. Both call one `append_locale_variant` now.
+
+### A probe bug that read as a coverage gap
+
+`UtilCoverage3Sweep` asks for a view's typed `toArray` as
+`new TreeSet<>(m.keySet()).toArray(new String[0])`. The copy was there to make
+the order deterministic, and it silently retargeted every row in the block to
+`TreeSet.toArray` — which is why eight view registrations read as unreachable
+for two rounds. Round 4 asks the view directly and sorts the RESULT instead.
+
+## 6d. What is left, and why it is not more probe rows
+
+Coverage ended at **566 of 586** owning registrations with a real body. The
+remaining 20 do not want another sweep, because most of them are not reachable
+at all.
+
+`apps/probes/DeadDoorProbe` calls each one with the most favourable receiver
+available and then reads the registry back. They stay at `invocations = 0`:
+
+```text
+  AbstractCollection.toArray()      AbstractSet.hashCode()
+  Collection.stream()               Collection.toArray(IntFunction)
+  Map.forEach(BiConsumer)           SequencedMap.pollFirst/LastEntry
+  TimeZone.getOffset(J)             TimeZone.getDisplayName() x2
+  TimeZone.getOffsets(J[I)          TimeZone.setDefaultZone()
+```
+
+**An instance-method registration on an abstract class or an interface is
+unreachable by every door.** `dispatch_virtual` probes the registry with the
+RECEIVER's runtime class, and the lambda and stackless paths probe with the
+DECLARING class of the resolved method — which for `plain.forEach` is
+`AbstractMap`, never `Map`. The probe tests both, including bound method
+references, which is the door that reaches a declaring class. The CONTROL is in
+the same dump: `TimeZone.getTimeZone` (inv=4) and `TimeZone.getDefault` (inv=1)
+fire normally, because a STATIC call names the class directly.
+
+For `TimeZone` the point is sharper still — no factory ever returns a
+`java.util.TimeZone`. `getTimeZone`, `getDefault` and `getTimeZone("UTC")` all
+hand back `sun.util.calendar.ZoneInfo`, and `TimeZone` is abstract, so no
+instance of the registered class can exist.
+
+**This is a retirement work-list, not a coverage gap, and it needs per-row
+evidence rather than the rule.** The exception proves why: registrations on
+`java/util/Spliterator` ARE reached, because this crate mints its spliterator as
+a concrete object whose class name is the interface — the corpus exercises one
+of that class's two rows. So "registered on an interface" does not imply "dead";
+it implies "dead unless something produces a carrier with that name", and that
+question is per-row.
+
+The rest of the 20 are `ResourceBundle` (needs a real bundle on the classpath,
+which no probe here supplies), the `readObject`/`writeObject` pair on `HashMap`
+and `TreeSet` (serialization round-trips correctly, so the reflective path that
+runs them does not consult the registry), and a handful of constructors and
+`<clinit>`.
+
+## 7. The final verification
+
+Every number re-taken at the end, on one binary built from the merge of this
+lane with `dev`. Twenty-three probes recompiled from source and re-run, both
+modes, one run:
 
 | probe | rows (HotSpot / compat / strict) | differing rows compat / strict |
 | --- | --- | --- |
 | `PropertiesShadowSweep` | 182 / 182 / 182 | 0 / 0 |
 | `TreeShadowSweep` | 232 / 232 / 232 | 0 / 0 |
-| `DequeListShadowSweep` | 172 / 172 / 172 | **1 / 1** |
+| `DequeListShadowSweep` | 172 / 172 / 172 | 0 / 0 |
 | `HashtableVectorShadowSweep` | 136 / 136 / 136 | 0 / 0 |
 | `ArrayListShadowSweep` | 164 / 164 / 164 | 0 / 0 |
 | `LinkedSequencedShadowSweep` | 102 / 102 / 102 | 0 / 0 |
@@ -701,45 +1016,62 @@ re-run, both modes, one run:
 | `LocaleDateTzShadowSweep` | 123 / 123 / 123 | 0 / 0 |
 | `MapViewsShadowSweep` | 300 / 300 / 300 | 0 / 0 |
 | `UtilTailShadowSweep` | 146 / 146 / 146 | 0 / 0 |
+| `UtilTail2Sweep` | 87 / 87 / 87 | 0 / 0 |
+| `UtilCoverageSweep` | 160 / 160 / 160 | 0 / 0 |
+| `UtilCoverage3Sweep` | 75 / 75 / 75 | 0 / 0 |
+| `UtilCoverage4Sweep` | 152 / 152 / 152 | 0 / 0 |
 | `MethodRefDoorProbe` | 25 / 25 / 25 | 0 / 0 |
 | `FailFastShapeProbe` | 12 / 12 / 12 | 0 / 0 |
 | `ItrClassNameProbe` | 12 / 12 / 12 | 0 / 0 |
 | `CurrencyNameProbe` | 27 / 27 / 27 | 0 / 0 |
 | `PqItrProbe` | 11 / 11 / 11 | 0 / 0 |
+| `AdRetireProbe` | 28 / 28 / 28 | 0 / 0 |
+| `DeadDoorProbe` | 29 / 29 / 29 | 0 / 0 |
+| `ImmutableSplProbe` | 58 / 58 / 58 | **15 / 2** |
 
-Row counts equal and the trailing `DONE` present on all forty-eight runs, so no
-run is a truncated tail reading as clean.
+2530 rows. Row counts equal and the trailing `DONE` present on all sixty-nine
+runs, so no run is a truncated tail reading as clean.
 
-**One differing row is left in the whole corpus**: `ArrayDeque`'s fail-fast on
-`add`, §6.1, which stays open because HotSpot is fail-fast on an `ArrayDeque`
-`add` and NOT on a remove and a size-based generation cannot tell those apart.
+**Every differing row is a class NAME, and every characteristics row matches.**
+They belong to a carrier this lane does not own, and are carried forward in
+`l3-followups-the-carrier-identity-and-the-dead-registrations-20260830.md`.
 
-The residuals as first recorded were 8 rows plus the companion record's 13. Of
-those 21, **20 are closed** — and four of them were closed by finding that the
-first diagnosis pointed at the wrong thing:
+The residuals as first recorded were 8 rows plus the companion record's 13. All
+21 are closed, and five of them closed by finding that the first diagnosis
+pointed at the wrong thing:
 
 | residual | the first reading | what it actually was |
 | --- | --- | --- |
 | §6.5 dispatch door | "the MethodHandle path does not consult the force-native gate" | it consults it about the DECLARING class where virtual dispatch uses the RECEIVER's |
 | §6.4 currency name | "the CLDR bundle is not reachable" | the data was already there under the lowercase key; the plumbing was missing |
-| §6.1 fail-fast | "the check has nowhere to run" | four iterator-CLASS differences, of which fail-fast was the shadow |
+| §6.1 fail-fast | "the check has nowhere to run", then "needs a growth counter the deque has no field for" | the fail-fast is the ring buffer's LAYOUT, and the shadow was what prevented it |
 | §6.4b bundle | "the VM's own shims consume these, so it cannot refuse" | the shims and the application are different CALLERS, and the VM could already tell them apart |
+| §6b spliterators | "the discriminator is SIZE, not class" | the CLASS; size only decides which class the factory built |
 
-Gates on that tree: all six RC=0. Arms: 115/115 under `--jdk-only`, 115/115
-`SUITE=all`, 75/75 `SUITE=core`.
+Gates: all six RC=0. Arms: 118/118 under `--jdk-only`, 118/118 `SUITE=all`,
+78/78 `SUITE=core`.
 
 ## 8. Reproduce
 
 ```bash
 CV=target/release/cratonvm
-# The twelve sources live in `apps/probes/`; the repo moved `probes/` there on
-# 2026-08-29 and this block is written for the layout after that move.
-"$JDK/bin/javac" -d apps/probes/out apps/probes/*ShadowSweep.java apps/probes/MethodRefDoorProbe.java
+"$JDK/bin/javac" -d apps/probes/out \
+    apps/probes/*ShadowSweep.java apps/probes/UtilTail2Sweep.java \
+    apps/probes/UtilCoverageSweep.java apps/probes/UtilCoverage3Sweep.java \
+    apps/probes/UtilCoverage4Sweep.java apps/probes/MethodRefDoorProbe.java \
+    apps/probes/FailFastShapeProbe.java apps/probes/ItrClassNameProbe.java \
+    apps/probes/CurrencyNameProbe.java apps/probes/PqItrProbe.java \
+    apps/probes/ImmutableSplProbe.java apps/probes/AdRetireProbe.java \
+    apps/probes/DeadDoorProbe.java
 for C in PropertiesShadowSweep TreeShadowSweep DequeListShadowSweep \
          HashtableVectorShadowSweep ArrayListShadowSweep \
          LinkedSequencedShadowSweep PqOptionalShadowSweep \
          CollectionsShadowSweep LocaleDateTzShadowSweep \
-         MapViewsShadowSweep UtilTailShadowSweep MethodRefDoorProbe; do
+         MapViewsShadowSweep UtilTailShadowSweep UtilTail2Sweep \
+         UtilCoverageSweep UtilCoverage3Sweep UtilCoverage4Sweep \
+         MethodRefDoorProbe FailFastShapeProbe ItrClassNameProbe \
+         CurrencyNameProbe PqItrProbe ImmutableSplProbe AdRetireProbe \
+         DeadDoorProbe; do
   "$JDK/bin/java" -cp apps/probes/out "$C" > /tmp/$C.hs 2>/dev/null
   "$CV" --java-home "$JDK"            -cp apps/probes/out "$C" > /tmp/$C.compat 2>/dev/null
   "$CV" --java-home "$JDK" --jdk-only -cp apps/probes/out "$C" > /tmp/$C.strict 2>/dev/null
@@ -747,6 +1079,10 @@ for C in PropertiesShadowSweep TreeShadowSweep DequeListShadowSweep \
 done
 ```
 
+`apps/probes/AdFieldProbe` is run separately: it reads `ArrayDeque`'s private
+fields back through reflection and needs
+`--add-opens java.base/java.util=ALL-UNNAMED` on all three arms.
+
 Check the ROW COUNT and the trailing `DONE <probe>` line before reading any
 diff: a run that died partway produces a short file whose missing tail `diff`
-reports as ordinary `<` lines, and this lane hit exactly that twice.
+reports as ordinary `<` lines, and this lane hit exactly that three times.

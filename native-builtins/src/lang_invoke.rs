@@ -352,10 +352,21 @@ pub(crate) struct VarHandleMeta {
 // on real-JDK VarHandle, see WP4.2 comment above).
 //
 // The fix: use `NativeContext::identity_hash_code(vh)` as the key.
-// `identity_hash_code` is GC-stable — see `gc/src/compact_header.rs`
-// (HashCodeTable::update_after_gc remaps after compaction). All meta
-// accessors therefore take `&mut dyn NativeContext` so they can compute
-// the key.
+// `identity_hash_code` is GC-stable because it lives in the object's MARK
+// WORD (`ObjectHeader::mark_word_identity_hash`), and every mover copies the
+// header verbatim. NOT, as this said until 2026-08-30, because
+// `HashCodeTable::update_after_gc` remaps it: that table has no production
+// consumer at all (see its own doc comment). All meta accessors therefore
+// take `&mut dyn NativeContext` so they can compute the key.
+//
+// This table is deliberately NOT wired to
+// `cratonvm_types::identity_side_tables`, which evicts the entries of
+// reclaimed objects for the `java.util.Random` tables. It would never fire:
+// `vh_meta_put` below registers every VarHandle as a PERMANENT GC root, so
+// no VarHandle is ever reclaimed and the collector has nothing to report.
+// The entries do accumulate, but the root is what retains them and the root
+// is load-bearing (B-J) — so that is a separate question about VarHandle
+// lifetime, not something an eviction hook can answer.
 static VH_META_TABLE: std::sync::OnceLock<
     parking_lot::Mutex<rustc_hash::FxHashMap<i32, Arc<VarHandleMeta>>>,
 > = std::sync::OnceLock::new();
@@ -727,14 +738,12 @@ fn layout_vh_access(
         return Ok(None);
     };
     // GC-safety: the scope check runs `Scope.checkValidState()` bytecode, which
-    // can collect and relocate the segment. Pin it across the call and re-read
-    // the (possibly forwarded) reference before touching its fields — and
-    // release the pin BEFORE propagating a closed-scope failure.
-    let seg_pin = ctx.pin_native_root(seg);
-    let checked = crate::phases_late::foreign_ffm::p67_segment_check_scope(ctx, seg);
-    let seg = ctx.read_native_pin(seg_pin, seg);
-    ctx.unpin_native_roots(seg_pin);
-    checked?;
+    // can collect and relocate the segment. The pin and the re-read live inside
+    // `p67_segment_check_scope` now — it takes its receiver by `&mut` and hands
+    // back the forwarded reference — so this call site cannot get it wrong, and
+    // neither can the three that never had the hand-written pin this replaces.
+    let mut seg = seg;
+    crate::phases_late::foreign_ffm::p67_segment_check_scope(ctx, &mut seg)?;
     let long_at = |i: usize| -> i64 {
         match args.get(i) {
             Some(Value::Long(v)) => *v,

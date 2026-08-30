@@ -1750,9 +1750,20 @@ impl RuntimeError {
             RuntimeError::IndexOutOfBoundsException { message } => {
                 ("java/lang/IndexOutOfBoundsException", message.as_deref())
             }
-            RuntimeError::ClassCastException { message } => {
-                ("java/lang/ClassCastException", Some(message.as_str()))
-            }
+            RuntimeError::ClassCastException { message } => (
+                "java/lang/ClassCastException",
+                // An EMPTY message is NO message, the marker
+                // `IllegalArgumentException` and `EOFException` carry. HotSpot's
+                // `AtomicReferenceFieldUpdater.newUpdater` with a mismatched
+                // `vclass` raises this with a null message (measured); a
+                // `Some("")` would build it with a non-null empty string, which
+                // a caller printing `getMessage()` can tell apart.
+                if message.is_empty() {
+                    None
+                } else {
+                    Some(message.as_str())
+                },
+            ),
             // As above: the message is synthesised from `size`, not absent.
             RuntimeError::NegativeArraySizeException { size: _ } => {
                 ("java/lang/NegativeArraySizeException", None)
@@ -1773,7 +1784,18 @@ impl RuntimeError {
             }
             RuntimeError::IllegalMonitorStateException { message } => (
                 "java/lang/IllegalMonitorStateException",
-                Some(message.as_str()),
+                // An EMPTY message is NO message, the same marker
+                // `IllegalArgumentException` and `EOFException` carry above.
+                // HotSpot's `StampedLock.unlock*(badStamp)` and
+                // `Object.wait()`-off-monitor raise this with a null message;
+                // `Some("")` would build it with a non-null empty string, which
+                // a caller printing `getMessage()` can tell apart. No site in
+                // the workspace passes a deliberate empty IMSE message.
+                if message.is_empty() {
+                    None
+                } else {
+                    Some(message.as_str())
+                },
             ),
             RuntimeError::StringIndexOutOfBoundsException { message, .. } => (
                 "java/lang/StringIndexOutOfBoundsException",

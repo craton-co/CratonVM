@@ -167,15 +167,16 @@ fn t15_array_new_array_registered() {
 
 #[test]
 fn t15_vm_uid_gid_registered() {
-    let lib = read_ws("native-builtins/src/lib.rs");
+    // Whitespace-free, not line-by-line. These are registered with
+    // `register_with_kind`, which rustfmt splits across four lines, so the
+    // class literal and the method name are never on the same one and a
+    // per-line scan reports every one of them missing. They are all there.
+    let compact = compact_ws(&read_ws("native-builtins/src/lib.rs"));
     let required = ["getuid", "geteuid", "getgid", "getegid"];
     let mut missing: Vec<&str> = Vec::new();
 
     for method in &required {
-        let found = lib.lines().any(|line| {
-            line.contains("\"jdk/internal/misc/VM\"") && line.contains(&format!("\"{}\"", method))
-        });
-        if !found {
+        if !compact.contains(&format!("\"jdk/internal/misc/VM\",\"{method}\"")) {
             missing.push(method);
         }
     }
@@ -310,18 +311,23 @@ fn t15_unit_tests_exist() {
 
 #[test]
 fn t15_define_class_not_stub() {
-    let lib = read_ws("native-builtins/src/lib.rs");
+    // Compacted for the same reason as `t15_vm_uid_gid_registered`: the
+    // registration spans lines, so "the line holding both strings" does not
+    // exist. The stub check then runs over a bounded window after the
+    // class+method key rather than over one line -- see `wired`, which
+    // already does this and explains why the window cannot end at `;`.
+    let compact = compact_ws(&read_ws("native-builtins/src/lib.rs"));
 
     for method in &["defineClass0", "defineClass1"] {
-        let line = lib
-            .lines()
-            .find(|l| {
-                l.contains("\"java/lang/ClassLoader\"") && l.contains(&format!("\"{}\"", method))
-            })
+        let key = format!("\"java/lang/ClassLoader\",\"{method}\"");
+        let at = compact
+            .find(&key)
             .unwrap_or_else(|| panic!("defineClass registration not found for {method}"));
+        let end = (at + 400).min(compact.len());
+        let line = &compact[at..end];
 
         assert!(
-            !line.contains("|_ctx, _args|"),
+            !line.contains("|_ctx,_args|"),
             "T15: ClassLoader.{method} still uses inline stub: {}",
             line.trim(),
         );

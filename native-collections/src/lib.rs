@@ -20051,12 +20051,25 @@ fn native_hs_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     ctx.set_field(spl, 0, Value::Object(Some(arr)));
     ctx.set_field(spl, 1, Value::Int(0));
     ctx.set_field(spl, 2, Value::Int(len as i32));
-    // DISTINCT, and ORDERED only for a `LinkedHashSet`: a hash set has no
-    // encounter order to claim, and a stream pipeline reads that bit.
-    let spl_chars = if hs_is_insertion_ordered(&*ctx, this) {
-        SPL_LINKED_SET
-    } else {
-        SPL_HASH_SET
+    // A VIEW answers its SOURCE family's cell; a standalone set answers its
+    // own. The two used to collapse into one binary choice on
+    // `hs_is_insertion_ordered`, which gave `LinkedHashMap.keySet()` and
+    // `.entrySet()` the plain `HashSet` cell -- they are 16465, not 65 -- and
+    // gave a standalone `LinkedHashSet` 81 where the JDK's construction adds
+    // SUBSIZED for 16465.
+    let spl_chars = match view_backing_source(&*ctx, backing) {
+        Some(src) => {
+            // `view_backing_kind`, the marker the backing already carries,
+            // rather than a fresh element-class guess: it is what every other
+            // consumer of these views reads.
+            let kind = match view_backing_kind(&*ctx, backing) {
+                VIEW_KIND_ENTRYSET | VIEW_KIND_ENTRYSET_STATIC => SplViewKind::Entries,
+                _ => SplViewKind::Keys,
+            };
+            view_spliterator_characteristics(&*ctx, src, kind)
+        }
+        None if hs_is_insertion_ordered(&*ctx, this) => SPL_LINKED_SET,
+        None => SPL_HASH_SET,
     };
     ctx.set_field(spl, SPL_FIELD_CHARACTERISTICS, Value::Int(spl_chars));
     ctx.unpin_native_roots(backing_pin);
@@ -20232,7 +20245,7 @@ const AL_ITR_PLAIN_MAX_FIELDS: usize = 4;
 /// pair beside the `elements()` registration. Without it the enumeration is
 /// EMPTY, which is a quieter wrong answer than the non-terminating one.
 const VALUES_ITR_CARRIERS: &[(&str, &str)] = &[
-    // THE THREE COLLECTION FAMILIES, added 2026-08-29 with L3 residual 6.1.
+    // TWO COLLECTION FAMILIES, added 2026-08-29 with L3 residual 6.1.
     //
     // Not "values views" -- a `TreeSet`, an `ArrayDeque` and a `PriorityQueue`
     // are sources in their own right -- but they want exactly what this table
@@ -20250,8 +20263,13 @@ const VALUES_ITR_CARRIERS: &[(&str, &str)] = &[
     // Each replaces a FABRICATION -- `java/util/TreeSet$Itr`,
     // `java/util/ArrayDeque$Itr` -- that `--jdk-only` refused and landed off,
     // so this retires two stand-ins rather than adding any.
+    //
+    // ARRAYDEQUE LEFT THIS TABLE ON 2026-08-30, one family further along the
+    // same road: its iterator is not minted here at all now, real or
+    // fabricated. A snapshot could carry the class name but never the
+    // fail-fast, because `DeqIterator`'s is the ring buffer's layout rather
+    // than a counter. Making the layout faithful and standing aside got both.
     ("java/util/TreeSet", "java/util/TreeMap$KeyIterator"),
-    ("java/util/ArrayDeque", "java/util/ArrayDeque$DeqIterator"),
     ("java/util/PriorityQueue", "java/util/PriorityQueue$Itr"),
     (
         "java/util/HashMap$Values",
@@ -20556,15 +20574,16 @@ fn al_itr_sync_mod_count(ctx: &mut dyn NativeContext, itr: ObjectRef, list: Obje
 /// `ConcurrentModificationException`. An iterator minted on a path that does
 /// not seed reads **0**, and 0 is a perfectly legal generation, so the raw
 /// value cannot distinguish "unseeded" from "the source is on generation 0".
-/// NO ALTERNATE GENERATION SLOT FOR `ArrayDeque$DeqIterator`, and the reason is
-/// a measurement rather than a limitation.
+/// NO ALTERNATE GENERATION SLOT FOR `ArrayDeque$DeqIterator`, because there is
+/// no longer an `ArrayDeque$DeqIterator` this crate mints. That family was
+/// RETIRED on 2026-08-30 and real `ArrayDeque.iterator()` bytecode runs.
 ///
-/// It declares no `expectedModCount` -- the JDK's own is fail-fast off
-/// `cursor`/`remaining` arithmetic against the live ring buffer, not off a
-/// counter -- so the third door has nowhere to write, and its `remaining` slot
-/// is free for the purpose (every declared field on a carrier THIS crate mints
-/// is unused; the mint writes only the three snapshot fields past them). That
-/// was tried, on 2026-08-29, and it is wrong:
+/// It is worth keeping why, because the wrong answer was reached twice here.
+/// `DeqIterator` declares no `expectedModCount`; the JDK's fail-fast is a
+/// PHYSICAL index into the ring buffer, and `nonNullElementAt` reporting any
+/// null it reads as a `ConcurrentModificationException`. So the check fires
+/// exactly when a mutation moves the elements out from under that index, and
+/// that is a property of the LAYOUT, not of any counter:
 ///
 /// ```text
 /// apps/probes/DequeListShadowSweep
@@ -20572,18 +20591,20 @@ fn al_itr_sync_mod_count(ctx: &mut dyn NativeContext, itr: ObjectRef, list: Obje
 ///   82 ad fail fast on REMOVE during iteration   HotSpot no-throw
 /// ```
 ///
-/// **HotSpot's `ArrayDeque` is fail-fast on one and not the other**, because
-/// `DeqIterator` detects a modification only when the ring buffer shifts under
-/// the cursor -- which an `add` that wraps does and a `remove` from the far end
-/// does not. `family_snapshot_generation`'s size CANNOT tell the two apart: it
-/// moves for both, so seeding it closed row 81 and opened row 82. One wrong row
-/// traded for another, and in the worse direction, since a spurious
-/// `ConcurrentModificationException` is the failure this file has already paid
-/// for once (see below).
+/// An `add` that fills the buffer grows it, and the JDK's `grow` slides the
+/// first leg to the far end and nulls the slots it came from -- straight under
+/// a cursor that has already advanced. A `remove` from the head moves `head`
+/// past the cursor instead and nulls nothing the cursor will read. Any
+/// generation counter moves for both, which is why seeding one closed row 81
+/// and opened row 82: one wrong row traded for another.
 ///
-/// Row 81 stays open in the L3 record. Closing it needs a generation that
-/// counts STRUCTURAL GROWTH rather than size, which the deque has no field to
-/// hold.
+/// What closed both was making the layout faithful and then standing aside --
+/// `ad_state` derives the element count instead of storing it, and `ad_grow`
+/// and `ad_remove_at_logical` are ports of `ArrayDeque.grow` and
+/// `ArrayDeque.delete`. `apps/probes/AdFieldProbe` reads `elements`, `head` and
+/// `tail` back through reflection and the deque is byte-identical to HotSpot's
+/// through growth and both `delete` branches, so the real iterator is fail-fast
+/// for the real reason.
 fn al_view_itr_expected_slot(ctx: &dyn NativeContext, itr: ObjectRef) -> Option<usize> {
     let base = al_itr_alt_base(ctx, itr)?;
     let cid = ctx.class_id_of_object(itr);
@@ -20612,11 +20633,13 @@ fn al_view_generation(ctx: &dyn NativeContext, list: ObjectRef) -> Option<i32> {
 /// The generation of a source that is one of the three snapshot-iterator
 /// COLLECTION families rather than a map: its SIZE.
 ///
-/// `map_itr_mod_count` answers `None` for all three. `TreeSet` and `ArrayDeque`
-/// declare no `modCount` at all -- the JDK's own `DeqIterator` is fail-fast off
-/// `head`/`tail` arithmetic, not a counter -- and `PriorityQueue` declares one
-/// that this crate's natives never move. Size is the generation that is
-/// actually available for all three.
+/// `map_itr_mod_count` answers `None` for both. `TreeSet` declares no `modCount`
+/// at all, and `PriorityQueue` declares one that this crate's natives never
+/// move. Size is the generation that is actually available for either.
+///
+/// `ArrayDeque` was the third and is gone: its iterator is real JDK bytecode
+/// now, fail-fast off the ring buffer's layout, which a size cannot model in
+/// either direction. See `al_view_itr_expected_slot` for the measurement.
 ///
 /// SIZE CAN ONLY MISS, NEVER FALSELY FIRE, and that direction is the whole
 /// reason it is acceptable here. A structural change moves the size, so every
@@ -20652,7 +20675,6 @@ fn family_snapshot_generation(ctx: &dyn NativeContext, src: ObjectRef) -> Option
     }
     let name = ctx.class_name_arc_of_id(ctx.class_id_of_object(src))?;
     match &*name {
-        "java/util/ArrayDeque" => Some(ad_state(ctx, src).3),
         "java/util/PriorityQueue" => Some(pq_state(ctx, src).1),
         _ => None,
     }
@@ -26069,7 +26091,37 @@ fn of_list_allowing_nulls(
 /// what those factories produce.
 fn register_immutable_serialization_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // `SyntheticStub`, not `Bridge`, so `--jdk-only` DROPS the whole family and
+    // real bytecode runs.
+    //
+    // `Bridge` asserts "no working real-bytecode fallback exists". For this
+    // family that is a compatible-mode claim wearing a mode-independent tag,
+    // and under `--jdk-only` it was not merely unnecessary but FATAL:
+    //
+    // ```text
+    // apps/probes/UtilCoverage4Sweep, --jdk-only
+    //   48 ser List.of(1)  THREW java.lang.NoClassDefFoundError
+    //   ...
+    //   java.lang.NoClassDefFoundError: cratonvm/internal/UnmodifiableList
+    // ```
+    //
+    // -- every `List.of`/`Set.of`/`Map.of` failed to DESERIALIZE. Writing
+    // worked and produced the same 59 bytes HotSpot writes; the read side then
+    // reached `native_collser_read_resolve`, which rebuilds through `of_list`
+    // and `freeze_result` into a `cratonvm/internal/Unmodifiable*` that strict
+    // mode refuses to fabricate. The producers this carrier has are supposed to
+    // be dropped in strict -- `alloc_immutable_wrapper`'s doc says so and lists
+    // them -- and this one was missed because it is registered from a DIFFERENT
+    // registrar than the factories it mirrors, under this `Bridge` window.
+    //
+    // The reason the native exists at all is in `native_collser_read_resolve`:
+    // the real body rebuilds maps through real `ImmutableCollections` ctors,
+    // producing a `table`-backed object that this crate's map natives read as
+    // empty. That is true in COMPATIBLE mode, where those natives run. It is
+    // exactly false under `--jdk-only`, where they are dropped and a real
+    // `Map1` is the right answer and the only one -- which is why the strict
+    // rows now agree with HotSpot down to the class name.
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     for c in [
         "java/util/ImmutableCollections$List12",
         "java/util/ImmutableCollections$ListN",
@@ -29243,13 +29295,31 @@ fn native_al_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     for (i, element) in elements.iter().enumerate().take(len) {
         ctx.set_array_element(arr, i, *element);
     }
-    let spl = try_alloc_synthetic(ctx, "java/util/Spliterator", 3)?;
+    // A VIEW answers its source family's cell; an ordinary list keeps the
+    // three-field shape and [`SPL_LIST_DEFAULT`]. Every ArrayList-shaped map
+    // view used to take the list default, which is why `HashMap.values()`
+    // claimed ORDERED and SUBSIZED it does not have and `TreeMap.entrySet()`
+    // claimed neither DISTINCT nor SORTED that it does -- four of the twelve
+    // cells `apps/probes/UtilCoverageSweep` found wrong.
+    let this = ctx.read_native_pin(this_pin, this);
+    let view_chars = values_view_source(&*ctx, this).map(|src| {
+        let kind = if al_view_holds_entries(&*ctx, this) {
+            SplViewKind::Entries
+        } else {
+            SplViewKind::Values
+        };
+        view_spliterator_characteristics(&*ctx, src, kind)
+    });
+    let n_fields = if view_chars.is_some() { 4 } else { 3 };
+    let spl = try_alloc_synthetic(ctx, "java/util/Spliterator", n_fields)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(spl, 0, Value::Object(Some(arr)));
     ctx.set_field(spl, 1, Value::Int(0));
     ctx.set_field(spl, 2, Value::Int(len as i32));
+    if let Some(chars) = view_chars {
+        ctx.set_field(spl, SPL_FIELD_CHARACTERISTICS, Value::Int(chars));
+    }
     ctx.unpin_native_roots(this_pin);
-    ctx.unpin_native_roots(arr_pin);
     Ok(Some(Value::Object(Some(spl))))
 }
 
@@ -45540,10 +45610,43 @@ fn ad_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
         Value::Int(v) => v,
         _ => 0,
     };
-    let size = match ctx.get_field(this, AD_FIELD_SIZE) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    // `size` is DERIVED from `head`/`tail`, never read back from slot 3.
+    //
+    // Slot 3 is ours -- the real `java.util.ArrayDeque` declares exactly
+    // `elements`/`head`/`tail`, and `synthetic_stub_fields` pads the class to
+    // four so a count could live there. Storing the count there made every real
+    // JDK body that mutates the buffer a corruption: `delete(i)` moves `head`
+    // or `tail` and cannot know slot 3 exists. `native_ad_remove_first_occurrence`
+    // carries the scar -- it exists only to keep real `delete` bytecode away
+    // from the deque, after that desync stranded H2's `waitingSessions` queue.
+    //
+    // Shadowing every mutator is the wrong level to fix that at: the leak is
+    // any real body at all, and we cannot register them all. `DeqIterator.remove()`
+    // is the proof. Measured 2026-08-30 on `descendingIterator()`, which we do
+    // not register and so already ran real bytecode:
+    //
+    // ```text
+    //   fields after remove   HotSpot  cap=4 head=0 tail=2 es=[a, b, null, null]
+    //                         CratonVM cap=4 head=0 tail=2 es=[a, b, null, null]
+    //   size()                HotSpot  2
+    //                         CratonVM 3
+    //   toString()            HotSpot  [a, b]
+    //                         CratonVM [a, b, null]
+    // ```
+    //
+    // -- the buffer was byte-for-byte right and only the count was wrong, and a
+    // null then leaked out of the deque into `toString`, `toArray`, `stream`
+    // and a re-walk. `ad_refuse_null`'s doc explains what a null inside an
+    // `ArrayDeque` costs: the JDK's own `nonNullElementAt` reads it as
+    // "another thread mutated me" and kills the next iteration.
+    //
+    // The JDK derives its count the same way (`size()` is
+    // `sub(tail, head, elements.length)`), which is why it has no such field to
+    // desync. Deriving here makes our natives and every real body agree by
+    // construction. It is only unambiguous because the buffer is never full --
+    // see `ad_ensure_capacity` for why that spare slot is load-bearing.
+    let cap = data.map_or(0, |d| ctx.array_length(d)) as i32;
+    let size = if cap <= 0 { 0 } else { (tail - head).rem_euclid(cap) };
     (data, head, tail, size)
 }
 
@@ -45586,36 +45689,64 @@ fn ad_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
 /// is why it was found at all — an empty collection reads as a pass at every
 /// caller that only iterates, so the probe that caught this prints element
 /// CONTENT for every member rather than a verdict.
-fn ad_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usize) {
-    let (data, head, _tail, size) = ad_state(ctx, this);
-    let old_cap = data.map_or(0, |d| ctx.array_length(d));
-    // `<`, not `<=`: an array of exactly `min_cap` slots is full at `min_cap`
-    // elements, and full is what we must never be.
-    if min_cap < old_cap {
+fn ad_grow(ctx: &mut dyn NativeContext, this: ObjectRef, needed: i32) {
+    let (data, head, _tail, _size) = ad_state(ctx, this);
+    let Some(old_buf) = data else {
+        return;
+    };
+    let old_cap = ctx.array_length(old_buf) as i32;
+    if old_cap <= 0 {
         return;
     }
-    let new_cap = std::cmp::max(old_cap * 2, min_cap + 1);
+    let jump = if old_cap < 64 { old_cap + 2 } else { old_cap >> 1 };
+    let new_cap = old_cap + if jump < needed { needed } else { jump };
+
     // GC-safety: the allocation can complete a moving young GC; `this` and the
     // old buffer are both bare Rust locals used below. See `rooted_across`.
     let mut this = this;
-    let mut old = data.unwrap_or(this);
+    let mut old = old_buf;
     let new_buf = rooted_across(ctx, &mut [&mut this, &mut old], |ctx| {
-        alloc_ref_array(ctx, new_cap)
+        alloc_ref_array(ctx, new_cap as usize)
     });
-    let data = data.map(|_| old);
-    // Copy elements in order: head..end, then 0..wrap
-    if let Some(old_buf) = data {
-        let s = size as usize;
-        let h = head as usize;
-        for i in 0..s {
-            let idx = (h + i) % old_cap;
-            let val = ctx.get_array_element(old_buf, idx);
-            ctx.set_array_element(new_buf, i, val);
-        }
+
+    // `Arrays.copyOf` -- SLOT FOR SLOT, not head-first. The old code normalised
+    // instead, copying the elements in logical order and resetting
+    // `head = 0`/`tail = size`. That is a legal deque and every accessor of
+    // ours agreed with it, which is why it stood; it is not the JDK's, and the
+    // difference is visible to any real body that holds a PHYSICAL index --
+    // which `DeqIterator` does.
+    for k in 0..old_cap as usize {
+        let v = ctx.get_array_element(old, k);
+        ctx.set_array_element(new_buf, k, v);
     }
     ctx.set_field(this, AD_FIELD_DATA, Value::Object(Some(new_buf)));
-    ctx.set_field(this, AD_FIELD_HEAD, Value::Int(0));
-    ctx.set_field(this, AD_FIELD_TAIL, Value::Int(size));
+
+    // The wrap-slide. When the elements straddle the end of the buffer, the
+    // first leg has to stay flush against the end, so it moves up by exactly
+    // the space gained and `head` follows it. `tail == head` is ambiguous
+    // between full and empty, and the JDK disambiguates it the same way we do
+    // everywhere else -- by looking at whether the head slot holds anything.
+    let tail = match ctx.get_field(this, AD_FIELD_TAIL) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let head_occupied = matches!(
+        ctx.get_array_element(new_buf, head as usize),
+        Value::Object(Some(_))
+    );
+    if tail < head || (tail == head && head_occupied) {
+        let new_space = new_cap - old_cap;
+        // `System.arraycopy(es, head, es, head + newSpace, oldCapacity - head)`.
+        // The regions overlap and move UP, so this walks from the top down.
+        for k in (0..(old_cap - head) as usize).rev() {
+            let v = ctx.get_array_element(new_buf, head as usize + k);
+            ctx.set_array_element(new_buf, (head + new_space) as usize + k, v);
+        }
+        for k in head..(head + new_space) {
+            ctx.set_array_element(new_buf, k as usize, Value::Object(None));
+        }
+        ctx.set_field(this, AD_FIELD_HEAD, Value::Int(head + new_space));
+    }
 }
 
 fn register_array_deque_natives(r: &mut NativeMethodRegistry) {
@@ -45692,7 +45823,15 @@ fn register_array_deque_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(c, "clear", "()V", native_ad_clear);
     r.register(c, "toArray", "()[Ljava/lang/Object;", native_ad_to_array);
-    r.register(c, "iterator", "()Ljava/util/Iterator;", native_ad_iterator);
+    // NO `iterator` REGISTRATION. Real `ArrayDeque.iterator()` bytecode runs,
+    // and that is the fix for the fail-fast row this family carried, not a
+    // concession. The JDK's `DeqIterator` is fail-fast off a PHYSICAL index
+    // into the ring buffer -- `nonNullElementAt` reports any null it reads as a
+    // `ConcurrentModificationException` -- so it is exactly as fail-fast as the
+    // buffer's layout, and no counter reproduces it. `ad_state` derives the
+    // element count and `ad_grow`/`ad_remove_at_logical` reproduce the JDK's
+    // own layout byte for byte, so there is nothing left for a shadow to
+    // protect. See `native_ad_iterator`'s removal in the same commit.
     r.register(c, "toString", "()Ljava/lang/String;", native_ad_to_string);
     r.register(
         c,
@@ -45721,7 +45860,6 @@ fn native_ad_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     ctx.set_field(this, AD_FIELD_DATA, Value::Object(Some(buf)));
     ctx.set_field(this, AD_FIELD_HEAD, Value::Int(0));
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(0));
-    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(0));
     Ok(None)
 }
 
@@ -45763,7 +45901,6 @@ fn native_ad_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     ctx.set_field(this, AD_FIELD_DATA, Value::Object(Some(buf)));
     ctx.set_field(this, AD_FIELD_HEAD, Value::Int(0));
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(0));
-    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(0));
     Ok(None)
 }
 
@@ -45791,28 +45928,33 @@ fn native_ad_add_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(None),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
-    // Before anything is pinned or grown: see `ad_refuse_null`.
+    // Before anything is stored or grown: see `ad_refuse_null`.
     ad_refuse_null(elem)?;
-    // Family-1 stale-at-store fix (cce0079): `ad_ensure_capacity` reallocates
-    // the ring buffer on grow (GC-capable) — pin `this` and `elem` across it
-    // and refresh both, otherwise the store below writes a pre-GC element
-    // address into the fresh buffer and the head/size fields of a stale
-    // receiver. (`data` is safe: `ad_state` re-reads it afterwards.)
-    let this_pin = ctx.pin_native_root(this);
-    let eh = pin_value(ctx, elem);
-    let (_, _, _, size) = ad_state(ctx, this);
-    ad_ensure_capacity(ctx, this, (size + 1) as usize);
-    let this = ctx.read_native_pin(this_pin, this);
-    let elem = read_pinned_elem(ctx, eh, elem);
-    ctx.unpin_native_roots(this_pin);
-    let (data, head, _tail, size) = ad_state(ctx, this);
+    // The store comes FIRST, exactly as `ArrayDeque.addFirst` does it:
+    //
+    //     es[head = dec(head, es.length)] = e;
+    //     if (head == tail) grow(1);
+    //
+    // Growing first and storing after is what this used to do, and it made the
+    // element a bare Rust local across a GC-capable allocation -- hence the
+    // pin/refresh dance that used to stand here (Family-1 stale-at-store,
+    // cce0079). Storing first retires the dance rather than maintaining it: the
+    // element is reachable from the buffer before anything can allocate, and
+    // `ad_grow` moves it through `get_array_element`/`set_array_element`, which
+    // the collector understands.
+    let (data, head, tail, _size) = ad_state(ctx, this);
     let cap = data.map_or(0, |d| ctx.array_length(d)) as i32;
+    if cap <= 0 {
+        return Ok(None);
+    }
     let new_head = (head - 1 + cap) % cap;
     if let Some(buf) = data {
         ctx.set_array_element(buf, new_head as usize, elem);
     }
     ctx.set_field(this, AD_FIELD_HEAD, Value::Int(new_head));
-    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size + 1));
+    if new_head == tail {
+        ad_grow(ctx, this, 1);
+    }
     Ok(None)
 }
 
@@ -45822,26 +45964,24 @@ fn native_ad_add_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(None),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
-    // Before anything is pinned or grown: see `ad_refuse_null`.
+    // Before anything is stored or grown: see `ad_refuse_null`.
     ad_refuse_null(elem)?;
-    // Family-1 stale-at-store fix (cce0079): same shape as
-    // `native_ad_add_first` — pin `this`/`elem` across the GC-capable ring
-    // buffer grow and refresh both before the store.
-    let this_pin = ctx.pin_native_root(this);
-    let eh = pin_value(ctx, elem);
-    let (_, _, _, size) = ad_state(ctx, this);
-    ad_ensure_capacity(ctx, this, (size + 1) as usize);
-    let this = ctx.read_native_pin(this_pin, this);
-    let elem = read_pinned_elem(ctx, eh, elem);
-    ctx.unpin_native_roots(this_pin);
-    let (data, _head, tail, size) = ad_state(ctx, this);
+    // Store first, then advance, then grow if the buffer just filled -- the
+    // shape of `ArrayDeque.addLast`. See `native_ad_add_first` for why the
+    // order matters to the collector as well as to the layout.
+    let (data, head, tail, _size) = ad_state(ctx, this);
     let cap = data.map_or(0, |d| ctx.array_length(d)) as i32;
+    if cap <= 0 {
+        return Ok(None);
+    }
     if let Some(buf) = data {
         ctx.set_array_element(buf, tail as usize, elem);
     }
     let new_tail = (tail + 1) % cap;
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(new_tail));
-    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size + 1));
+    if head == new_tail {
+        ad_grow(ctx, this, 1);
+    }
     Ok(None)
 }
 
@@ -45895,7 +46035,6 @@ fn native_ad_remove_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     }
     let new_head = (head + 1) % cap;
     ctx.set_field(this, AD_FIELD_HEAD, Value::Int(new_head));
-    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size - 1));
     Ok(Some(elem))
 }
 
@@ -45923,14 +46062,36 @@ fn native_ad_remove_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         ctx.set_array_element(buf, new_tail as usize, Value::Object(None));
     }
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(new_tail));
-    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size - 1));
     Ok(Some(elem))
 }
 
-/// Remove the element at *logical* index `k` (0 = head) from the circular
-/// buffer: shift the elements after it one position back toward the head,
-/// clear the vacated last slot, and decrement `tail`/`size`. `head` is left
-/// unchanged. Used by the object-removal natives below.
+/// Delete the element at *logical* index `k` (0 = head), leaving the buffer in
+/// the state `ArrayDeque.delete` would have left it in.
+///
+/// The JDK closes the gap from whichever END is nearer and moves that end's
+/// index: fewer elements before the hole, and it slides them forward and
+/// advances `head`; otherwise it slides the ones after it back and retracts
+/// `tail`. This used to always slide backwards and always retract `tail`, which
+/// produces a deque holding the same elements in the same order -- so every
+/// accessor of ours agreed, and it stood.
+///
+/// It is still wrong, and the reason is the same one that makes `ad_grow`'s
+/// normalisation wrong: a PHYSICAL index into the buffer is a thing real JDK
+/// bodies hold, and `DeqIterator` holds one. Deleting the head of `[a, b, c]`
+/// with an iterator open one step in:
+///
+/// ```text
+///   HotSpot   head=1 tail=3 es=[null, b, c, null]   cursor 1 -> reads "b"
+///   was       head=0 tail=2 es=[b, c, null, null]   cursor 1 -> reads "c"
+/// ```
+///
+/// -- the same deque, and an iterator that skips an element and then reads a
+/// null, which `nonNullElementAt` reports as a `ConcurrentModificationException`
+/// against a caller that did nothing wrong.
+///
+/// The JDK's segmented `System.arraycopy` calls are written here as modular
+/// loops. They say the same thing: the array is circular, and the JDK only
+/// splits the copy because `arraycopy` is not.
 fn ad_remove_at_logical(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -45940,20 +46101,29 @@ fn ad_remove_at_logical(
     cap: i32,
     k: usize,
 ) {
-    let size_u = size as usize;
-    for j in k..(size_u - 1) {
-        let from = ((head + j as i32 + 1) % cap) as usize;
-        let to = ((head + j as i32) % cap) as usize;
-        let v = ctx.get_array_element(buf, from);
-        ctx.set_array_element(buf, to, v);
+    let front = k as i32;
+    let back = size - front - 1;
+    if front < back {
+        // Slide the elements BEFORE the hole one place forward, then drop the
+        // old head slot. Ties go to the other branch, as in the JDK.
+        for j in (0..front).rev() {
+            let v = ctx.get_array_element(buf, ((head + j) % cap) as usize);
+            ctx.set_array_element(buf, ((head + j + 1) % cap) as usize, v);
+        }
+        ctx.set_array_element(buf, head as usize, Value::Object(None));
+        ctx.set_field(this, AD_FIELD_HEAD, Value::Int((head + 1) % cap));
+    } else {
+        // Slide the elements AFTER the hole one place back, then drop the slot
+        // the tail vacates.
+        let hole = (head + front) % cap;
+        for j in 0..back {
+            let v = ctx.get_array_element(buf, ((hole + j + 1) % cap) as usize);
+            ctx.set_array_element(buf, ((hole + j) % cap) as usize, v);
+        }
+        let new_tail = (head + size - 1) % cap;
+        ctx.set_array_element(buf, new_tail as usize, Value::Object(None));
+        ctx.set_field(this, AD_FIELD_TAIL, Value::Int(new_tail));
     }
-    // Clear the (now-duplicated) last logical slot so dropped references don't
-    // pin garbage and `toArray`/iteration never observe a stale value.
-    let last = ((head + size - 1) % cap) as usize;
-    ctx.set_array_element(buf, last, Value::Object(None));
-    let new_tail = (head + size - 1) % cap; // old tail - 1 (mod cap)
-    ctx.set_field(this, AD_FIELD_TAIL, Value::Int(new_tail));
-    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size - 1));
 }
 
 /// `ArrayDeque.remove(Object)` / `removeFirstOccurrence(Object)` — remove the
@@ -46222,7 +46392,6 @@ fn native_ad_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     }
     ctx.set_field(this, AD_FIELD_HEAD, Value::Int(0));
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(0));
-    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(0));
     Ok(None)
 }
 
@@ -46262,41 +46431,6 @@ fn ad_collect_elements(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     elems
 }
 
-fn native_ad_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    // `java/util/ArrayDeque$DeqIterator` -- the class HotSpot 25.0.4+7 hands
-    // out -- through the shared family mint.
-    //
-    // This site used to mint the FABRICATION `java/util/ArrayDeque$Itr`, which
-    // `--jdk-only` refused, landing on the real `Arrays$ArrayItr`. So one
-    // receiver answered two different wrong class names depending on the mode
-    // and neither was HotSpot's. Both are gone: the real class is minted in
-    // both modes, and `alloc_arraylist_iterator_as` refuses rather than
-    // fabricates if an image ever lacks it.
-    //
-    // The reasoning the old site recorded for NOT letting real
-    // `ArrayDeque.iterator()` bytecode run still holds and is why this is a
-    // snapshot rather than a live cursor: `native_ad_itr_remove` must keep our
-    // slot-3 `size` in step with a removal real `delete(..)` bytecode knows
-    // nothing about. Write-through is preserved -- `propagate_list_removal`
-    // routes a deque source to `native_ad_remove_first_occurrence`, which is
-    // what `SnapshotItrRoute::ArrayDeque` called.
-    //
-    // NOT fail-fast, and this is the one family of the three that cannot be:
-    // `DeqIterator` declares `cursor`, `remaining`, `lastRet` and no
-    // `expectedModCount` (the JDK's own is fail-fast off head/tail arithmetic
-    // instead), so `al_view_itr_expected_slot` finds no slot to seed and the
-    // third door stays quiet. Recorded in the L3 record as the residual it is
-    // rather than worked around by writing a generation into `remaining`, which
-    // is a field real `forEachRemaining` bytecode reads.
-    let elems = ad_collect_elements(ctx, this);
-    let itr =
-        alloc_family_snapshot_iterator(ctx, this, &elems, "java/util/ArrayDeque$DeqIterator")?;
-    Ok(Some(Value::Object(Some(itr))))
-}
 
 /// `ArrayDeque$Itr.remove()` — remove the element returned by the last `next()`
 /// from the BACKING deque (field 2). Without this native, `remove()` falls to
@@ -64304,6 +64438,29 @@ const UNMOD_FIELD_BACKING: usize = 0;
 /// map); keep the two in sync.
 const UNMOD_FIELD_IMMUTABLE: usize = 1;
 
+/// Slot 2 of a map-VIEW wrapper: set when the map it is a view OF came from an
+/// immutable factory.
+///
+/// Deliberately NOT `UNMOD_FIELD_IMMUTABLE`. That slot is a cross-crate
+/// contract -- `getclass_immutable_marker` in native-builtins reads it to
+/// decide whether `getClass()` says `ImmutableCollections$*` or
+/// `Collections$Unmodifiable*` -- and a `Map.of` keySet is NEITHER on HotSpot:
+/// it is `java.util.AbstractMap$1`. Widening that marker would make
+/// `getClass()` answer a third wrong name, and `unmod_is_immutable` also gates
+/// RULE I's null-query NPE, which this measurement says nothing about.
+///
+/// So this is a narrow flag with a single reader.
+const UNMOD_FIELD_IMMUTABLE_VIEW: usize = 2;
+
+/// Whether `this` is a view of a map that came from `Map.of`/`Map.copyOf`.
+fn unmod_is_immutable_map_view(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    ctx.object_num_fields(this) > UNMOD_FIELD_IMMUTABLE_VIEW
+        && matches!(
+            ctx.get_field(this, UNMOD_FIELD_IMMUTABLE_VIEW),
+            Value::Int(1)
+        )
+}
+
 fn is_unmod_set_class(name: &str) -> bool {
     matches!(
         name,
@@ -64399,6 +64556,32 @@ fn alloc_immutable_wrapper(
 ) -> Result<ObjectRef, MethodCallFailed> {
     let wrapper = alloc_unmod_wrapper(ctx, class_name, backing)?;
     ctx.set_field(wrapper, UNMOD_FIELD_IMMUTABLE, Value::Int(1));
+    Ok(wrapper)
+}
+
+/// Allocate a wrapper for one of a map's three VIEWS, carrying
+/// [`UNMOD_FIELD_IMMUTABLE_VIEW`] when the map itself was immutable.
+fn alloc_unmod_view_wrapper(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    backing: ObjectRef,
+    from_immutable: bool,
+) -> Result<ObjectRef, MethodCallFailed> {
+    if !from_immutable {
+        return alloc_unmod_wrapper(ctx, class_name, backing);
+    }
+    let backing_pin = ctx.pin_native_root(backing);
+    let wrapper = match try_alloc_synthetic(ctx, class_name, 3) {
+        Ok(w) => w,
+        Err(err) => {
+            ctx.unpin_native_roots(backing_pin);
+            return Err(err);
+        }
+    };
+    let backing = ctx.read_native_pin(backing_pin, backing);
+    ctx.set_field(wrapper, UNMOD_FIELD_BACKING, Value::Object(Some(backing)));
+    ctx.set_field(wrapper, UNMOD_FIELD_IMMUTABLE_VIEW, Value::Int(1));
+    ctx.unpin_native_roots(backing_pin);
     Ok(wrapper)
 }
 
@@ -65577,8 +65760,184 @@ fn native_unmod_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     unmod_delegate(ctx, args, "stream", "()Ljava/util/stream/Stream;")
 }
 
+/// `Spliterator.characteristics()` for an IMMUTABLE collection, measured across
+/// every shape the factories produce.
+///
+/// The backing's own answer is wrong for these because the JDK does not ask the
+/// backing: `ImmutableCollections` builds its spliterator with its own flags,
+/// and the size-1 shapes take `Collections.singletonSpliterator` instead.
+/// MEASURED against HotSpot 25.0.4+7 (`apps/probes/UtilCoverageSweep`):
+///
+/// ```text
+///   Set.of("a")            17745      List.of("a")           17745
+///   Set.of()               16449      List.of()              16464
+///   Set.of("a","b")        16449      List.of x3             16464
+///   Set.of x3 (SetN)       16449      Map.of().entrySet()    17745  (size 1)
+///   Map.of().keySet()      16449      Map.of().values()      16448
+/// ```
+///
+/// **The discriminator is SIZE, not class.** Every 17745 is a size-1 immutable
+/// -- `Set.of("a")`, `List.of("a")`, a one-entry `entrySet`, and
+/// `Collections.singleton`, which this VM already answered correctly and is the
+/// control that names the rule. The JDK routes those to
+/// `Collections.singletonSpliterator` (the `Collections$2` a strict-mode run
+/// reports); everything else goes through
+/// `Spliterators.spliterator(collection, flags)`, which contributes
+/// `SIZED | SUBSIZED` on top of the family's own bits.
+///
+/// COMPATIBLE MODE ONLY. Strict refuses `cratonvm/internal/Unmodifiable*` and
+/// runs java.base's own bodies, which is why it was already 0-diff on all of
+/// these -- the tenth row in this campaign where `--jdk-only` is the more
+/// correct mode.
+const SPL_IMMUTABLE_SINGLETON: i32 =
+    SPL_SIZED | SPL_DISTINCT | SPL_ORDERED | SPL_NONNULL | 0x0400 | SPL_SUBSIZED;
+
+/// The characteristics HotSpot's immutable factories answer, by shape.
+///
+/// MEASURED across the whole matrix (`apps/probes/ImmutableSplProbe`, HotSpot
+/// 25.0.4+7) rather than derived from the cells that failed, because the
+/// obvious rule -- "a size-1 immutable is a singleton" -- is contradicted by
+/// the very same map:
+///
+/// ```text
+///   Set.of("a")              17745  ImmutableCollections$Set12 / Collections$2
+///   List.of("a")             17745  ImmutableCollections$List12 / Collections$2
+///   Map.of("a",1).entrySet() 17745  ImmutableCollections$Set12 / Collections$2
+///   Map.of("a",1).keySet()   16449  AbstractMap$1 / Spliterators$IteratorSpliterator
+///   Map.of("a",1).values()   16448  AbstractMap$2 / Spliterators$IteratorSpliterator
+/// ```
+///
+/// The CLASS column is the rule. Every 17745 is `Collections$2`, which is
+/// `Collections.singletonSpliterator`, and `List12`/`Set12` route to it when
+/// their second slot is the empty sentinel -- so "size 1" is right, but only
+/// for a collection the factory built as a `List12`/`Set12`. A `Map.of`'s
+/// keySet and values are not: they are the anonymous `AbstractMap$1`/`$2`
+/// views, which carry no immutable bits at all, at any size. `entrySet` is the
+/// odd one because `Map1.entrySet()` is literally `Set.of(entry)`, and a
+/// two-entry map's `MapN$1` entrySet drops back to 16449.
+///
+/// `Collections.unmodifiableSet(hashSet)` is the control that must NOT move:
+/// the JDK's WRAPPER really does hand back the backing's spliterator, so that
+/// arm never reaches here.
+fn immutable_spliterator_characteristics(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    size: i32,
+    is_map_view: bool,
+) -> i32 {
+    let cls = ctx.class_name_arc_of_id(ctx.class_id_of_object(this));
+    if is_map_view {
+        // A view of an immutable map is a plain `AbstractMap` view, with one
+        // exception the class name already tells apart.
+        return match cls.as_deref() {
+            Some(UNMOD_ENTRY_SET_CLASS) if size == 1 => SPL_IMMUTABLE_SINGLETON,
+            Some(UNMOD_COLLECTION_CLASS) => SPL_SIZED | SPL_SUBSIZED,
+            _ => SPL_SIZED | SPL_DISTINCT | SPL_SUBSIZED,
+        };
+    }
+    // Size outranks the carrier here, and only here: it is the whole reason
+    // `Set.of("a")` and `List.of("a")` agree at 17745 while their two- and
+    // three-element siblings do not.
+    if size == 1 {
+        return SPL_IMMUTABLE_SINGLETON;
+    }
+    match cls.as_deref() {
+        // A list keeps its encounter order and is not distinct.
+        Some(UNMOD_LIST_CLASS) => SPL_SIZED | SPL_ORDERED | SPL_SUBSIZED,
+        // A values view is neither distinct nor ordered.
+        Some(UNMOD_COLLECTION_CLASS) => SPL_SIZED | SPL_SUBSIZED,
+        // Sets, keySets and entrySets: distinct, no encounter order.
+        _ => SPL_SIZED | SPL_DISTINCT | SPL_SUBSIZED,
+    }
+}
+
 fn native_unmod_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    unmod_delegate(ctx, args, "spliterator", "()Ljava/util/Spliterator;")
+    // An IMMUTABLE receiver -- or a view of an immutable map -- answers its own
+    // family's bits; an unmodifiable WRAPPER delegates, because the JDK's
+    // wrapper really does hand back the backing's spliterator
+    // (`unmodifiableSet(hashSet)` is 65 on both VMs, and that row is the
+    // control for leaving this arm alone).
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return unmod_delegate(ctx, args, "spliterator", "()Ljava/util/Spliterator;");
+    };
+    let is_map_view = unmod_is_immutable_map_view(&*ctx, this);
+    if !unmod_is_immutable(&*ctx, this) && !is_map_view {
+        return unmod_delegate(ctx, args, "spliterator", "()Ljava/util/Spliterator;");
+    }
+
+    let spl = unmod_delegate(ctx, args, "spliterator", "()Ljava/util/Spliterator;")?;
+
+    // ONLY a spliterator THIS CRATE MINTED may be written to. The backing's
+    // `spliterator()` is not guaranteed to reach `native_al_spliterator`: for a
+    // `List.of` the delegate lands on java.base's own `ArrayList.spliterator()`
+    // bytecode and hands back a REAL `ArrayList$ArrayListSpliterator`, whose
+    // slot 3 is its `this$0`. Writing a characteristics mask there clobbered
+    // it, and the next `estimateSize()` died in `getFence` with "Cannot read
+    // field modCount because this.this$0 is null" -- which is how this was
+    // found, one probe row after the change that caused it.
+    //
+    // `two-producers-of-one-carrier-class` again, in its most direct form: the
+    // synthetic `java/util/Spliterator` and the JDK's own classes both arrive
+    // here, and only one of them has a slot 3 that means what this code thinks
+    // it means.
+    let spl_is_ours = matches!(spl, Some(Value::Object(Some(o)))
+        if ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref()
+            == Some("java/util/Spliterator"));
+
+    if let (true, Some(Value::Object(Some(spl_obj)))) = (spl_is_ours, spl) {
+        let size = match ctx.get_field(spl_obj, 2) {
+            Value::Int(n) => n,
+            _ => -1,
+        };
+        let chars = immutable_spliterator_characteristics(&*ctx, this, size, is_map_view);
+        if ctx.object_num_fields(spl_obj) > SPL_FIELD_CHARACTERISTICS {
+            ctx.set_field(spl_obj, SPL_FIELD_CHARACTERISTICS, Value::Int(chars));
+            return Ok(spl);
+        }
+        // The backing handed back the THREE-field shape, which has no
+        // characteristics slot and therefore reads as `SPL_LIST_DEFAULT`
+        // however the mask is computed. Widen it: copy the array, cursor and
+        // length across and add the slot.
+        let arr = ctx.get_field(spl_obj, 0);
+        let cursor = ctx.get_field(spl_obj, 1);
+        let wide = try_alloc_synthetic(ctx, "java/util/Spliterator", 4)?;
+        ctx.set_field(wide, 0, arr);
+        ctx.set_field(wide, 1, cursor);
+        ctx.set_field(wide, 2, Value::Int(size));
+        ctx.set_field(wide, SPL_FIELD_CHARACTERISTICS, Value::Int(chars));
+        return Ok(Some(Value::Object(Some(wide))));
+    }
+
+    // The delegate handed back one of the JDK's OWN spliterators, which we may
+    // not write to and whose mask is the BACKING's rather than the immutable
+    // family's. `List.of("a")` is that case: java.base answers 16464 for the
+    // `ArrayList` behind it where HotSpot answers 17745 for a `List12`. Mint
+    // ours over the same elements instead. The rule was already right and
+    // simply had nowhere to be written, which is what left this one cell open
+    // after the set shapes were fixed.
+    let arr = unmod_delegate(ctx, args, "toArray", "()[Ljava/lang/Object;")?;
+    if let Some(Value::Object(Some(a))) = arr {
+        let len = ctx.array_length(a) as i32;
+        let chars = immutable_spliterator_characteristics(&*ctx, this, len, is_map_view);
+        let pin = ctx.pin_native_root(a);
+        // Not `?`: the pin is this frame's base and must be released before
+        // unwinding, or it and everything pinned above it are stranded.
+        let minted = match try_alloc_synthetic(ctx, "java/util/Spliterator", 4) {
+            Ok(m) => m,
+            Err(err) => {
+                ctx.unpin_native_roots(pin);
+                return Err(err);
+            }
+        };
+        let a = ctx.read_native_pin(pin, a);
+        ctx.set_field(minted, 0, Value::Object(Some(a)));
+        ctx.set_field(minted, 1, Value::Int(0));
+        ctx.set_field(minted, 2, Value::Int(len));
+        ctx.set_field(minted, SPL_FIELD_CHARACTERISTICS, Value::Int(chars));
+        ctx.unpin_native_roots(pin);
+        return Ok(Some(Value::Object(Some(minted))));
+    }
+    Ok(spl)
 }
 
 /// `subList` returns another unmodifiable view over the backing sub-list.
@@ -65975,9 +66334,11 @@ fn native_unmod_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
 /// `keySet()` returns an unmodifiable Set view of the backing map's key set.
 fn native_unmod_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let from_immutable = matches!(args.first(), Some(Value::Object(Some(m)))
+        if unmod_is_immutable(&*ctx, *m));
     let ks = unmod_delegate(ctx, args, "keySet", "()Ljava/util/Set;")?;
     if let Some(Value::Object(Some(inner))) = ks {
-        let w = alloc_unmod_wrapper(ctx, UNMOD_SET_CLASS, inner)?;
+        let w = alloc_unmod_view_wrapper(ctx, UNMOD_SET_CLASS, inner, from_immutable)?;
         return Ok(Some(Value::Object(Some(w))));
     }
     Ok(ks)
@@ -65985,9 +66346,11 @@ fn native_unmod_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 /// `values()` returns an unmodifiable Collection view of the backing values.
 fn native_unmod_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let from_immutable = matches!(args.first(), Some(Value::Object(Some(m)))
+        if unmod_is_immutable(&*ctx, *m));
     let vs = unmod_delegate(ctx, args, "values", "()Ljava/util/Collection;")?;
     if let Some(Value::Object(Some(inner))) = vs {
-        let w = alloc_unmod_wrapper(ctx, UNMOD_COLLECTION_CLASS, inner)?;
+        let w = alloc_unmod_view_wrapper(ctx, UNMOD_COLLECTION_CLASS, inner, from_immutable)?;
         return Ok(Some(Value::Object(Some(w))));
     }
     Ok(vs)
@@ -65999,9 +66362,11 @@ fn native_unmod_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// backing map would let `entry.setValue(...)` mutate through the
 /// "unmodifiable" view instead of throwing.
 fn native_unmod_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let from_immutable = matches!(args.first(), Some(Value::Object(Some(m)))
+        if unmod_is_immutable(&*ctx, *m));
     let es = unmod_delegate(ctx, args, "entrySet", "()Ljava/util/Set;")?;
     if let Some(Value::Object(Some(inner))) = es {
-        let w = alloc_unmod_wrapper(ctx, UNMOD_ENTRY_SET_CLASS, inner)?;
+        let w = alloc_unmod_view_wrapper(ctx, UNMOD_ENTRY_SET_CLASS, inner, from_immutable)?;
         return Ok(Some(Value::Object(Some(w))));
     }
     Ok(es)
@@ -68401,11 +68766,117 @@ const SPL_LIST_DEFAULT: i32 = SPL_ORDERED | SPL_SIZED | SPL_SUBSIZED;
 /// encounter order a hash container does not have is what a stream pipeline
 /// reads to decide it may skip a sort.
 const SPL_HASH_SET: i32 = SPL_SIZED | SPL_DISTINCT;
-/// `LinkedHashMap`'s: the same plus the encounter order it does have.
-const SPL_LINKED_SET: i32 = SPL_SIZED | SPL_DISTINCT | SPL_ORDERED;
+const SPL_NONNULL: i32 = 0x0100;
+const SPL_CONCURRENT: i32 = 0x1000;
+
+/// THE CHARACTERISTICS MATRIX, measured cell by cell rather than derived.
+///
+/// The first version of this file's spliterator work carried three constants
+/// and got three cells right, because the probe that drove it asked about three
+/// receivers. `apps/probes/UtilCoverageSweep`'s matrix asks all twenty-eight and
+/// found TWELVE wrong — every map VIEW, and the standalone `LinkedHashSet`. The
+/// numbers below are HotSpot 25.0.4+7's own answers:
+///
+/// ```text
+///                  keySet   values   entrySet    standalone set
+///   HashMap           65       64       65             65
+///   LinkedHashMap  16465    16464    16465          16465
+///   TreeMap           85       80       85             85
+///   Hashtable      16449    16448    16449             --
+///   Properties      4353     4352    16449             --
+/// ```
+///
+/// Three things in there are not guessable from the interface:
+///
+/// * **`values` is never DISTINCT** and, for `HashMap`, not `ORDERED` either --
+///   a values view can repeat and a hash map has no encounter order. `TreeMap`'s
+///   values ARE ordered but not SORTED: the sort is on the keys.
+/// * **`SUBSIZED` follows the JDK's construction, not the container.** The
+///   `LinkedHashMap` and `Hashtable` families go through
+///   `Spliterators.spliterator(Collection, ..)`, which adds `SIZED | SUBSIZED`;
+///   `HashMap`'s and `TreeMap`'s have hand-written spliterator classes that do
+///   not claim it. That is why `LinkedHashSet` is 16465 and `HashSet` is 65
+///   despite being the same shape of container.
+/// * **`Properties` is CONCURRENT | NONNULL and NOT SIZED**, because JDK 25
+///   backs it with a `ConcurrentHashMap` -- the same fact behind this record's
+///   §6.6 -- and its `entrySet` is the `Hashtable` cell rather than the
+///   concurrent one. That asymmetry is HotSpot's; it is recorded here because
+///   it is exactly the kind of thing a derived table would smooth over.
+const SPL_LINKED_SET: i32 = SPL_SIZED | SPL_DISTINCT | SPL_ORDERED | SPL_SUBSIZED;
+/// `LinkedHashMap.values()` -- ordered, sized, splittable, and not distinct.
+/// Numerically [`SPL_LIST_DEFAULT`]; kept as its own name so the matrix reads
+/// as a matrix and a later change to one cell cannot silently move the other.
+const SPL_LINKED_VALUES: i32 = SPL_SIZED | SPL_ORDERED | SPL_SUBSIZED;
+/// `HashMap.values()` -- sized and nothing else.
+const SPL_HASH_VALUES: i32 = SPL_SIZED;
 /// `TreeMap.KeySpliterator`: `SIZED | DISTINCT | SORTED | ORDERED`. No
 /// `SUBSIZED` — the JDK's does not claim it either.
 const SPL_TREE_SET: i32 = SPL_SIZED | SPL_DISTINCT | SPL_SORTED | SPL_ORDERED;
+/// `TreeMap.values()` -- ordered by the keys, so ORDERED but not SORTED, and
+/// not DISTINCT.
+const SPL_TREE_VALUES: i32 = SPL_SIZED | SPL_ORDERED;
+/// `Hashtable`'s views, which take the `Spliterators.spliterator(Collection..)`
+/// construction and so claim `SUBSIZED`, but have no encounter order.
+const SPL_HASHTABLE_SET: i32 = SPL_SIZED | SPL_DISTINCT | SPL_SUBSIZED;
+const SPL_HASHTABLE_VALUES: i32 = SPL_SIZED | SPL_SUBSIZED;
+/// `Properties`' key and value views, which are a `ConcurrentHashMap`'s.
+const SPL_CHM_SET: i32 = SPL_DISTINCT | SPL_CONCURRENT | SPL_NONNULL;
+const SPL_CHM_VALUES: i32 = SPL_CONCURRENT | SPL_NONNULL;
+
+/// Which of the three views a spliterator is being taken over.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SplViewKind {
+    Keys,
+    Values,
+    Entries,
+}
+
+/// The measured characteristics for a view over `source`. See the matrix on
+/// [`SPL_LINKED_SET`] for where every number comes from.
+fn view_spliterator_characteristics(
+    ctx: &dyn NativeContext,
+    source: ObjectRef,
+    kind: SplViewKind,
+) -> i32 {
+    let values = kind == SplViewKind::Values;
+    let name = ctx.class_name_arc_of_id(ctx.class_id_of_object(source));
+    // `Properties` before the Hashtable test it would otherwise satisfy: it
+    // extends `Hashtable` and is backed by a `ConcurrentHashMap`, and only the
+    // key and value views take the concurrent cell.
+    if name.as_deref() == Some("java/util/Properties") {
+        return match kind {
+            SplViewKind::Keys => SPL_CHM_SET,
+            SplViewKind::Values => SPL_CHM_VALUES,
+            SplViewKind::Entries => SPL_HASHTABLE_SET,
+        };
+    }
+    if is_tree_map_receiver(ctx, source) {
+        return if values {
+            SPL_TREE_VALUES
+        } else {
+            SPL_TREE_SET
+        };
+    }
+    if is_lhm_receiver(ctx, source) {
+        return if values {
+            SPL_LINKED_VALUES
+        } else {
+            SPL_LINKED_SET
+        };
+    }
+    if is_hashtable_receiver(ctx, source) {
+        return if values {
+            SPL_HASHTABLE_VALUES
+        } else {
+            SPL_HASHTABLE_SET
+        };
+    }
+    if values {
+        SPL_HASH_VALUES
+    } else {
+        SPL_HASH_SET
+    }
+}
 /// The slot a synthetic spliterator keeps its characteristics in. Absent on the
 /// three-field shape, which keeps [`SPL_LIST_DEFAULT`].
 const SPL_FIELD_CHARACTERISTICS: usize = 3;

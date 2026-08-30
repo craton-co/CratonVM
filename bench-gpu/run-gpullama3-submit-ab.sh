@@ -55,11 +55,14 @@ gpu_mhz() { nvidia-smi --query-gpu=clocks.sm --format=csv,noheader,nounits 2>/de
 # concurrent sessions and four other `rustc` processes have been observed
 # mid-measurement; a round taken against somebody else's build should be
 # visible rather than silently averaged in.
-busy() { ps -W 2>/dev/null | grep -cE 'rustc|cargo|link\.exe' || echo 0; }
+# `wc -l`, not `grep -c . || echo 0`: `grep -c` exits 1 on a zero count,
+# so the `||` fired on top of the `0` it had already printed and the
+# column showed a two-line "0/0". Same bug as wait-for-quiet.sh had.
+busy() { ps -W 2>/dev/null | grep -E 'rustc\.exe|link\.exe' | awk '{print $4}' | sort -u | wc -l; }
 
 # median submit_ms and the run's own achieved tok/s
 run() {
-  ( cd "$APP" && CRATON_EXTRA="-Dllama.craton.verbose=true" \
+  ( cd "$APP" && env $2 CRATON_EXTRA="-Dllama.craton.verbose=true" \
       bash run-craton-gpu.sh "$1" -p "Why is the sky blue?" -n "$N" 2>&1 ) \
   | awk '
       /kernels=/ { if (match($0, /submit_ms=[0-9,.]+/)) {
@@ -83,9 +86,9 @@ tmp="$(mktemp)"
 for r in $(seq 1 "$ROUNDS"); do
   ctl=$(control)
   if [ $((r % 2)) -eq 1 ]; then
-    a=$(run "$A"); b=$(run "$B"); order="A-then-B"
+    a=$(run "$A" "$A_ENV"); b=$(run "$B" "$B_ENV"); order="A-then-B"
   else
-    b=$(run "$B"); a=$(run "$A"); order="B-then-A"
+    b=$(run "$B" "$B_ENV"); a=$(run "$A" "$A_ENV"); order="B-then-A"
   fi
   set -- $a; asub=$1; atok=$2
   set -- $b; bsub=$1; btok=$2

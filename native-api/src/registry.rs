@@ -4324,6 +4324,61 @@ pub trait NativeGpuAccess: NativeInvokeAccess {
         None
     }
 
+    /// Begin recording dispatches on `stream_handle` into a graph instead
+    /// of running them.
+    ///
+    /// A launch costs the host whether or not the device is busy, and a
+    /// loop issuing hundreds of small launches per unit of work pays that
+    /// hundreds of times. Recording them once and replaying the recording
+    /// removes the per-launch host cost entirely.
+    ///
+    /// Default impl answers `false` (no GPU offload). The VM override
+    /// calls `runtime::offload::OffloadCache::graph_begin_capture`.
+    fn gpu_graph_begin_capture(&mut self, _stream_handle: u64) -> bool {
+        false
+    }
+
+    /// Stop recording and instantiate. Answers a graph handle, or `0` when
+    /// there was no capture or it was invalidated.
+    fn gpu_graph_end_capture(&mut self, _stream_handle: u64) -> u64 {
+        0
+    }
+
+    /// Submit every launch a graph recorded, onto `stream_handle`.
+    ///
+    /// Answers a submission handle, awaited and released exactly like a
+    /// dispatch's, or `0` if the replay was refused. A replay is
+    /// asynchronous; a caller that reads a result without awaiting the
+    /// handle reads what was there before.
+    fn gpu_graph_replay(&mut self, _stream_handle: u64, _graph_handle: u64) -> u64 {
+        0
+    }
+
+    /// Open an argument-update pass over a captured graph: the caller
+    /// re-issues its dispatch sequence and each dispatch rewrites the
+    /// arguments of the node it corresponds to, instead of launching.
+    fn gpu_graph_begin_replay(&mut self, _stream_handle: u64, _graph_handle: u64) -> bool {
+        false
+    }
+
+    /// Close the pass and submit the graph once. Answers a submission
+    /// handle, or `0` if the caller's sequence did not match the one
+    /// that was captured.
+    fn gpu_graph_end_replay(&mut self, _stream_handle: u64) -> u64 {
+        0
+    }
+
+    /// How many nodes a graph holds, or `-1` for an unknown handle. The
+    /// count a caller checks against the dispatches it made while
+    /// capturing: a graph with fewer nodes replays successfully and does
+    /// less.
+    fn gpu_graph_node_count(&self, _graph_handle: u64) -> i32 {
+        -1
+    }
+
+    /// Free a graph. Idempotent, like every other release in this trait.
+    fn gpu_graph_release(&mut self, _graph_handle: u64) {}
+
     /// Release a stream minted by [`gpu_stream_create`](Self::gpu_stream_create).
     /// Safe to call on an unknown or already-released `handle`
     /// (no-op) — same idempotent-release convention as
@@ -4475,6 +4530,25 @@ pub trait NativeGpuAccess: NativeInvokeAccess {
     /// Default impl returns None (no GPU offload). The VM
     /// override calls
     /// `runtime::offload::device_cache::download_into_bytes_if_dirty(handle)`.
+    /// Write little-endian host `bytes` into the device buffer that
+    /// backs `handle`, keeping its device pointer.
+    ///
+    /// The upload counterpart of
+    /// [`gpu_array_download_if_dirty`](Self::gpu_array_download_if_dirty),
+    /// and the one thing a captured CUDA graph needs from the host
+    /// between replays: a graph node holds the pointer it was captured
+    /// with, so new input has to be written through it.
+    ///
+    /// `Some(true)` written, `Some(false)` refused (wrong size, or the
+    /// copy failed), `None` no device buffer for this handle yet -- in
+    /// which case the caller's host-side store is the only copy and
+    /// updating it is sufficient. Default impl answers `None` (no GPU
+    /// offload); the VM override calls
+    /// `runtime::offload::device_cache::upload_from_bytes`.
+    fn gpu_array_upload_bytes(&self, _handle: u64, _bytes: &[u8]) -> Option<bool> {
+        None
+    }
+
     fn gpu_array_download_if_dirty(&self, _handle: u64) -> Option<Vec<u8>> {
         None
     }

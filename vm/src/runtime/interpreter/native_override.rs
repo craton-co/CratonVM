@@ -2844,7 +2844,6 @@ pub(super) fn force_native_over_real_jdk_bytecode(
             // `native_pq_iterator` are the only mint sites, and both families'
             // `iterator()` is itself overridden, so no bytecode path can
             // present an object of either class to these natives.
-            | "java/util/ArrayDeque$DeqIterator"
             | "java/util/PriorityQueue$Itr"
     ) && matches!(method_name, "hasNext" | "next" | "remove")
     {
@@ -7312,6 +7311,24 @@ fn real_protected_stub_class_common(class_name: &str) -> bool {
             | "java/util/concurrent/LinkedBlockingDeque"
             | "java/util/concurrent/atomic/AtomicBoolean"
             | "java/util/EnumSet"
+            // The permission family. `register_essential_natives` replaces
+            // their `(String)` / `(String,String)` constructors with a closure
+            // that writes `name` and returns — correct when this VM FABRICATED
+            // these classes (`b448f2039`), and a silent mutilation of the real
+            // ones now that those are loaded: `BasicPermission.init(name)` and
+            // `PropertyPermission.init(getMask(actions))` never ran, leaving
+            // `path` null and `mask` 0, so `implies()` NPEd, an invalid actions
+            // string was accepted where the JDK throws, and a serialization
+            // round trip died with "invalid actions mask".
+            //
+            // Correctness, not throughput — and the whole family, because the
+            // closure is registered over all five in one loop and every one of
+            // them inherits a real `init` from `BasicPermission`.
+            | "java/security/Permission"
+            | "java/security/BasicPermission"
+            | "java/lang/RuntimePermission"
+            | "java/util/PropertyPermission"
+            | "java/util/logging/LoggingPermission"
             // `java/util/Objects` is registered TWICE, and only the
             // real-JDK-path registration is a `SyntheticStub`:
             // `register_synthetic_overrides` installs it `Intrinsic` (on a

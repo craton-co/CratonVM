@@ -395,6 +395,34 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let uri = obj_arg(args, 0)?;
             let uri_text = p57_uri_full_text(ctx, uri);
+            // THE SCHEME DECIDES, and both refusals were missing.
+            // `Path.of(URI)` is `Paths.get(uri)`: a URI with no scheme is not
+            // absolute and raises `IllegalArgumentException`, and a scheme no
+            // installed provider claims raises `FileSystemNotFoundException`.
+            // This VM answered a Path for both — so `Path.of(new URI(
+            // "http://example.com/x"))` handed back a relative filesystem path
+            // built out of a URL, which then resolved against the CWD.
+            //
+            // MEASURED with `apps/probes/L4CensusTail.java`. `file:` and `jar:`
+            // are the two this VM serves; anything else is a refusal rather
+            // than a guess.
+            {
+                let head = uri_text.split('/').next().unwrap_or("");
+                let scheme = match head.split_once(':') {
+                    Some((s, _)) if !s.is_empty() && s.chars().all(|c| {
+                        c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.'
+                    }) && s.starts_with(|c: char| c.is_ascii_alphabetic()) => s.to_ascii_lowercase(),
+                    _ => {
+                        return Err(RuntimeError::IllegalArgumentException {
+                            message: format!("URI is not absolute: {uri_text}"),
+                        }
+                        .into())
+                    }
+                };
+                if scheme != "file" && scheme != "jar" {
+                    return Err(p57_file_system_not_found(ctx, &scheme));
+                }
+            }
             // `Paths.get(jar:file:...!/entry)` is the resource-facing half of
             // the jar-FS contract. Jetty's PathResourceFactory mounts the URI
             // first, then calls this conversion for the root and every
@@ -1022,6 +1050,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 .ok()
                 .map(|p| p57_read_path(ctx, p))
                 .unwrap_or_default();
+            if let Some(refused) = p57_refuse_non_archive(ctx, &jar_path) {
+                return Err(refused);
+            }
             let fs = p57_alloc_jar_filesystem(ctx, &jar_path)?;
             Ok(Some(Value::Object(Some(fs))))
         },
@@ -1038,6 +1069,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 .ok()
                 .map(|p| p57_read_path(ctx, p))
                 .unwrap_or_default();
+            if let Some(refused) = p57_refuse_non_archive(ctx, &jar_path) {
+                return Err(refused);
+            }
             let fs = p57_alloc_jar_filesystem(ctx, &jar_path)?;
             Ok(Some(Value::Object(Some(fs))))
         },
@@ -1051,6 +1085,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 .ok()
                 .map(|p| p57_read_path(ctx, p))
                 .unwrap_or_default();
+            if let Some(refused) = p57_refuse_non_archive(ctx, &jar_path) {
+                return Err(refused);
+            }
             let fs = p57_alloc_jar_filesystem(ctx, &jar_path)?;
             Ok(Some(Value::Object(Some(fs))))
         },
@@ -1643,7 +1680,28 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // throws `UnsupportedOperationException` on a null result) always
             // threw on Linux too — see
             // docs/known-issues/h2-suite-bugs/bug-h2-files-setposixfilepermissions-unsupported.md.
-            let is_posix = !cfg!(windows) && view_name.ends_with("PosixFileAttributeView");
+            let is_posix = !cfg!(windows)
+                && (view_name.ends_with("PosixFileAttributeView")
+                    // `PosixFileAttributeView extends FileOwnerAttributeView`,
+                    // so on a posix host asking for the OWNER view must resolve
+                    // to the same object. It resolved to null, and real
+                    // `Files.getOwner` is
+                    //
+                    //   FileOwnerAttributeView view =
+                    //       getFileAttributeView(path, FileOwnerAttributeView.class, options);
+                    //   if (view == null) throw new UnsupportedOperationException();
+                    //
+                    // so every `Files.getOwner` answered UOE on Linux once the
+                    // real bytecode ran -- including for a path that does not
+                    // exist, where the owed answer is `NoSuchFileException`.
+                    //
+                    //   Files.getOwner(<a real file>)   HotSpot an owner, this VM UOE
+                    //   Files.getOwner(<missing>)       HotSpot NoSuchFile,  this VM UOE
+                    //
+                    // MEASURED with the dial armed over `java/nio/file/Files`.
+                    // Same omission the posix view itself had before
+                    // `bug-h2-files-setposixfilepermissions-unsupported.md`.
+                    || view_name.ends_with("FileOwnerAttributeView"));
             let supported = is_dos || is_basic || is_posix;
             if crate::nbflags().dbg_fsp {
                 eprintln!(
@@ -5812,11 +5870,53 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // recover from — where the kernel's `O_NOFOLLOW` would have said
             // `ELOOP`. The delegation to `newFileChannel` below carries the same
             // check for every other case; this one has to be here.
-            if fsp_scan_open_options(ctx, args.get(2).copied()).nofollow {
+            let open_opts = fsp_scan_open_options(ctx, args.get(2).copied());
+            if open_opts.nofollow {
                 if let Some(refused) = p57_nofollow_reject(&p) {
                     return Err(refused);
                 }
             }
+            // CREATE_NEW MEANS FAIL IF IT EXISTS, and this door did not check.
+            // `fsp_new_output_stream` has the check; the real
+            // `FileSystemProvider.newOutputStream` bytecode does not call that
+            // native, it calls THIS one — so the guarantee held only while our
+            // own `newOutputStream` answered:
+            //
+            //   Files.createFile(<existing>)                 no throw, was FAEE
+            //   Files.newOutputStream(<existing>, CREATE_NEW) no throw, was FAEE
+            //   Files.copy(in, <existing>)                    no throw, was FAEE
+            //
+            // Three rows, two dial scopes, one missing check. CREATE_NEW is the
+            // option callers use to mean "I must be the one who creates this" —
+            // an exclusive-create that quietly opens the existing file instead
+            // is a lost-update, not a wrong exception.
+            //
+            // MEASURED with the shadow dial armed over
+            // `java/nio/file/spi/FileSystemProvider` and `java/nio/file/Files`.
+            if open_opts.create_new && std::path::Path::new(&p).exists() {
+                return Err(p57_file_already_exists(ctx, &p));
+            }
+            // NOT REFUSED HERE, and the attempt to is worth recording.
+            //
+            // `Files.readAllBytes(<a directory>)` raises `OutOfMemoryError` on
+            // this VM where HotSpot raises `IOException` — found with the dial
+            // armed over `java/nio/file/Files`. Refusing a directory at open
+            // looked like the fix and is wrong twice over:
+            //
+            //   open READ  on a dir   Linux ALLOWS it; the failure is EISDIR at
+            //                         the first read, which is why HotSpot's
+            //                         answer is a plain `IOException`
+            //   open WRITE on a dir   already correct here — HotSpot raises
+            //                         `java.nio.file.FileSystemException` and so
+            //                         did this VM, until a blanket refusal
+            //                         downgraded it to a bare `IOException`
+            //
+            // That blanket check turned a green row red (`L4FilesSweep`,
+            // "newByteChannel on dir for write") — the same right-behaviour
+            // wrong-type defect this same commit fixes three of. The real
+            // source of the OOME is whatever `readAllBytes` sizes its buffer
+            // from, one layer up, and it is left OPEN rather than papered over
+            // from here.
             // Preserve the NIO missing-file contract: opening a non-existent
             // path for READ — or for WRITE without CREATE/CREATE_NEW — must throw
             // `java.nio.file.NoSuchFileException`, which frameworks catch to treat
@@ -5919,10 +6019,33 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 None => std::path::Path::new(&p).exists(),
             };
             if !exists {
-                return Err(RuntimeError::IOException {
-                    message: format!("NoSuchFileException: {}", p),
-                }
-                .into());
+                // THE TYPE, not a message naming the type. This threw a bare
+                // `IOException` whose text was "NoSuchFileException: <path>",
+                // and `Files.createDirectories` walks up its parents with
+                //
+                //     try { provider(parent).checkAccess(parent); break; }
+                //     catch (NoSuchFileException x) { }
+                //
+                // A bare `IOException` is not caught by that, so it escaped the
+                // walk and `createDirectories("a/b")` failed outright naming
+                // the PARENT it was probing:
+                //
+                //   Files.createDirectories("lvl1/lvl2")
+                //     HotSpot   creates both
+                //     this VM   IOException: NoSuchFileException: <cwd>/lvl1
+                //
+                // Third time this lane has found a refusal with the right
+                // message and the wrong class (`Buffer.reset`'s
+                // `InvalidMarkException`, `Files.copy`'s `IllegalStateException`).
+                // `p57_no_such_file` has existed the whole time; this site just
+                // did not call it.
+                //
+                // MEASURED with the shadow dial armed over `java/nio/file/Files`,
+                // which is what makes the real `createDirectories` bytecode run
+                // instead of our own native -- but the wrong type is thrown in
+                // BOTH modes and any caller doing `catch (NoSuchFileException)`
+                // misses it unarmed too.
+                return Err(p57_no_such_file(ctx, &p)?);
             }
             // A jar-FS entry has no host permissions to consult; existence is
             // the whole of what the archive can answer.
@@ -5963,6 +6086,26 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                         .into());
                     }
                 }
+            }
+            // A NULL `Class` IS AN NPE. The JDK reaches
+            // `type == BasicFileAttributes.class` and then `type ==
+            // PosixFileAttributes.class` before falling through to
+            // `throw new UnsupportedOperationException()`, and every route
+            // there dereferences the argument -- `readAttributes(p, null)`
+            // raises `NullPointerException`, it does not quietly answer the
+            // basic view.
+            //
+            // Answering something for a caller who asked for nothing is the
+            // fabricated-success shape this lane keeps finding: the caller gets
+            // attributes it never requested a type for, and learns nothing
+            // about its own bug.
+            //
+            // The `#[cfg(windows)]` block above deliberately treats an ABSENT
+            // or UNNAMEABLE class as "no request"; an EXPLICIT null is a
+            // different thing and is refused here. MEASURED with the dial armed
+            // over `java/nio/file/Files`.
+            if matches!(args.get(2), Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
             }
             let path_obj = obj_arg(args, 1)?;
             let options = args.get(3).copied().unwrap_or(Value::Object(None));
@@ -21042,6 +21185,107 @@ mod named_attribute_tests {
     }
 }
 
+/// `Provider "<scheme>" not installed` — a typed
+/// `java.nio.file.FileSystemNotFoundException`.
+///
+/// The TYPE is what callers key on: a fallback that catches
+/// `FileSystemNotFoundException` to try a different resolution strategy does not
+/// match a supertype instance, exactly as with [`p57_closed_channel`]. Falls
+/// back to `IllegalArgumentException` when the class is not in the image, which
+/// is still a refusal rather than a wrong Path.
+fn p57_file_system_not_found(ctx: &mut dyn NativeContext, scheme: &str) -> MethodCallFailed {
+    let msg = format!("Provider \"{scheme}\" not installed");
+    if let Ok(Some(Value::Object(Some(exc)))) =
+        ctx.new_object("java/nio/file/FileSystemNotFoundException")
+    {
+        let s = ctx.create_string(&msg);
+        if ctx
+            .invoke(
+                "java/nio/file/FileSystemNotFoundException",
+                "<init>",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(exc)), Value::Object(Some(s))],
+            )
+            .is_ok()
+        {
+            return MethodCallFailed::ExceptionThrown(exc);
+        }
+    }
+    RuntimeError::IllegalArgumentException { message: msg }.into()
+}
+
+/// Refuse `FileSystems.newFileSystem` over a path that is plainly not an
+/// archive.
+///
+/// **Part three recorded this as an unclaimed residual and it was measurable
+/// all along** — `apps/probes/L4CensusTail.java` asks HotSpot directly:
+///
+/// ```text
+///   FileSystems.newFileSystem(<a text file>, (ClassLoader) null)
+///     HotSpot   ProviderNotFoundException
+///     this VM   a jar filesystem over a text file
+/// ```
+///
+/// The reason for deferring was blast radius: these three registrations are on
+/// the hot path for every jar this VM opens. That reason survives, and it is why
+/// the check is a MAGIC-BYTE test rather than a real probe of the archive — a
+/// file whose first two bytes are `PK` still takes exactly the path it took
+/// before, and so does anything this cannot read (a jar-FS sentinel, a missing
+/// path, a directory). Only a readable regular file that is definitively not a
+/// zip is refused.
+///
+/// Returning a filesystem for a non-archive is worse than it sounds: the
+/// failure does not appear here, it appears at the first entry lookup, in a
+/// caller with no idea the mount was bogus.
+fn p57_refuse_non_archive(ctx: &mut dyn NativeContext, path: &str) -> Option<MethodCallFailed> {
+    // `jar:` sentinels and anything with an entry separator are this VM's own
+    // encoding, not host paths — never second-guess them.
+    if path.starts_with("jar:") || path.contains("!/") {
+        return None;
+    }
+    let md = std::fs::metadata(path).ok()?;
+    if !md.is_file() {
+        return None;
+    }
+    let mut head = [0u8; 2];
+    {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).ok()?;
+        if f.read_exact(&mut head).is_err() {
+            // Shorter than two bytes: cannot be a zip, and cannot be anything
+            // else this serves either.
+            return Some(p57_provider_not_found(ctx, path));
+        }
+    }
+    if &head == b"PK" {
+        return None;
+    }
+    Some(p57_provider_not_found(ctx, path))
+}
+
+/// A typed `java.nio.file.ProviderNotFoundException`, for the same reason
+/// [`p57_file_system_not_found`] is typed: callers catch the exact class.
+fn p57_provider_not_found(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed {
+    let msg = format!("Provider not found for {path}");
+    if let Ok(Some(Value::Object(Some(exc)))) =
+        ctx.new_object("java/nio/file/ProviderNotFoundException")
+    {
+        let s = ctx.create_string(&msg);
+        if ctx
+            .invoke(
+                "java/nio/file/ProviderNotFoundException",
+                "<init>",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(exc)), Value::Object(Some(s))],
+            )
+            .is_ok()
+        {
+            return MethodCallFailed::ExceptionThrown(exc);
+        }
+    }
+    RuntimeError::IOException { message: msg }.into()
+}
+
 /// `FileStore.getAttribute`'s refusal, with the name the caller asked for.
 ///
 /// The JDK's message is the attribute string itself; a constant "no such
@@ -21086,10 +21330,15 @@ pub(crate) fn p59_files_read_attributes(
                 // Real readAttributes throws NoSuchFileException (an
                 // IOException) for missing files; FileTreeWalker catches it
                 // and reports visitFileFailed instead of walking garbage.
-                return Err(RuntimeError::IOException {
-                    message: format!("NoSuchFileException: {entry} in {jar}"),
-                }
-                .into());
+                //
+                // FileTreeWalker catches `IOException`, so the bare one that
+                // used to be thrown here happened to work for the walker --
+                // and only for the walker. Treating a missing file as OPTIONAL
+                // is written `catch (NoSuchFileException)`, which a supertype
+                // instance does not match: that is how SmallRye's optional
+                // config load turned into a boot failure elsewhere in this
+                // campaign. Same fix as `checkAccess` above.
+                return Err(p57_no_such_file(ctx, &path_str)?);
             }
         };
         basic_file_attributes_store(ctx, bfa, is_dir != 0, size, 0, 0, 0, 0);
@@ -21104,10 +21353,8 @@ pub(crate) fn p59_files_read_attributes(
             JarFsKind::Dir => (1, 0i64),
             JarFsKind::File => (0, jrtfs_entry_size(&java_home, &entry).unwrap_or(0)),
             JarFsKind::Absent => {
-                return Err(RuntimeError::IOException {
-                    message: format!("NoSuchFileException: {entry} in jrt:/"),
-                }
-                .into());
+                // Typed, for the reason on the jar arm above.
+                return Err(p57_no_such_file(ctx, &path_str)?);
             }
         };
         basic_file_attributes_store(ctx, bfa, is_dir != 0, size, 0, 0, 0, 0);
@@ -21887,16 +22134,37 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
         "valueOf",
         "(Ljava/lang/String;)Ljava/nio/file/FileVisitResult;",
         |ctx, args| {
+            // AN UNKNOWN NAME IS A REFUSAL, and `CONTINUE` was the worst
+            // possible thing to answer instead: `Enum.valueOf` raises
+            // `IllegalArgumentException`, and a walk that asked for TERMINATE
+            // through a misspelt or externally-supplied name kept walking. A
+            // null name is an NPE, not `CONTINUE` either.
+            //
+            // MEASURED with `apps/probes/L4CensusTail.java`.
+            // `PosixFilePermission.valueOf` — the same shape two files away —
+            // already refuses, which is what made this one visible.
             let name = match args.first() {
                 Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
-                _ => "CONTINUE".to_string(),
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("Name is null".into()),
+                    }
+                    .into())
+                }
             };
             let ordinal = match name.as_str() {
                 "CONTINUE" => 0,
                 "TERMINATE" => 1,
                 "SKIP_SUBTREE" => 2,
                 "SKIP_SIBLINGS" => 3,
-                _ => 0,
+                _ => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: format!(
+                            "No enum constant java.nio.file.FileVisitResult.{name}"
+                        ),
+                    }
+                    .into())
+                }
             };
             p57_alloc_enum(ctx, "java/nio/file/FileVisitResult", &name, ordinal)
         },
@@ -23073,6 +23341,14 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
             // Preserve the Instant's value (was dropped → stored 0, so every
             // FileTime.from(Instant) round-tripped to epoch 0). Read the real
             // java.time.Instant's named fields (seconds/nanos).
+            //
+            // A NULL Instant is an NPE (`Objects.requireNonNull(instant)`), not
+            // a FileTime of epoch 0 — which is a real timestamp, and one that
+            // compares, formats and sorts like any other. MEASURED with
+            // `apps/probes/L4CensusTail.java`.
+            if matches!(args.first(), Some(Value::Object(None))) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
             let millis = match args.first() {
                 Some(Value::Object(Some(inst))) => {
                     let secs = match ctx.get_field_by_name(*inst, "seconds") {

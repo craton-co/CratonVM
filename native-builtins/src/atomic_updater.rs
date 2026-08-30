@@ -211,6 +211,10 @@ const DESC_TAG_REF: i32 = 3;
 ///   into looking like a different package than intended.
 /// * Path separators (`/`, `\`, `:`) — a real Java field name never
 ///   contains these, and rejecting them shrinks the attack surface.
+/// HotSpot's helpful NPE for `newUpdater(null, ...)`, transcribed. Kept as a
+/// constant so the three call sites cannot drift apart.
+const NULL_TCLASS_NPE: &str = "java.lang.NullPointerException: Cannot invoke \"java.lang.Class.getDeclaredField(String)\" because \"tclass\" is null";
+
 fn validate_field_name(name: &str) -> Result<(), RuntimeError> {
     if name.is_empty() {
         return Err(RuntimeError::IllegalArgumentException {
@@ -356,6 +360,10 @@ fn build_updater(
     expected: impl Fn(&str) -> Option<i32>,
     impl_class: &str,
     vclass_mirror: Option<ObjectRef>,
+    // HotSpot's wording for THIS variant's type refusal, transcribed:
+    // "Must be integer type" / "Must be long type". The reference variant
+    // never reaches it -- it leaves by `ClassCastException` -- and passes "".
+    type_message: &str,
 ) -> MethodCallResult {
     validate_field_name(field_name).map_err(MethodCallFailed::from)?;
 
@@ -388,60 +396,29 @@ fn build_updater(
         )
     })?;
 
-    // Reject static / final.  ACC_STATIC = 0x0008, ACC_FINAL = 0x0010.
-    if meta.is_static || (meta.access_flags & 0x0008) != 0 {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: format!("field {field_name} must be non-static"),
-        }
-        .into());
-    }
-    if (meta.access_flags & 0x0010) != 0 {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: format!("field {field_name} must be non-final"),
-        }
-        .into());
-    }
-    // ACC_VOLATILE = 0x0040. MEASURED (`probes/AtomicUpdaterSweep.java`,
-    // compatible mode): `newUpdater(Holder.class, "plainInt")` on a NON-volatile
-    // field answered `no-throw` where HotSpot throws IllegalArgumentException.
+    // THE ORDER IS THE ORACLE'S, and it is measured rather than assumed
+    // (`apps/probes/AtomicFamilySweep.java`): a field that fails two checks at
+    // once names the one HotSpot reaches first.
     //
-    // This is the one validation whose absence is silently unsafe rather than
-    // merely wrong-typed: the whole contract of a field updater is that the
-    // field is volatile, and an updater handed a plain field gives every caller
-    // ordinary non-atomic reads and writes while looking exactly like an atomic
-    // one. `static` and `final` were already rejected two checks above; volatile
-    // was the third of the JDK's three and it was missing.
-    if (meta.access_flags & 0x0040) == 0 {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: format!("field {field_name} must be volatile"),
-        }
-        .into());
-    }
+    //   non-volatile LONG on an int updater -> "Must be integer type"
+    //   static non-volatile INT             -> "Must be volatile type"
+    //   static volatile INT                 -> IllegalArgumentException, no message
+    //
+    // So: TYPE, then VOLATILE, then static. This file used to run static ->
+    // volatile -> type and answer in its own words, so a static non-volatile
+    // field named the static check where the oracle names the volatile one.
 
-    // Variant-specific descriptor check.
-    // The REFERENCE variant on a non-reference field is a ClassCastException.
-    //
-    // The JDK's `AtomicReferenceFieldUpdater` compares the field's declared
-    // Class against the `vclass` argument and throws CCE on mismatch; an `int`
-    // field can never equal a reference `vclass`, so it leaves by that door and
-    // not by the descriptor check below. MEASURED (`AtomicUpdaterSweep`):
-    // `AtomicReferenceFieldUpdater.newUpdater(Holder.class, Integer.class, "i")`
-    // is HotSpot ClassCastException, this VM IllegalArgumentException.
-    //
-    // Checked here rather than in the `vclass` block further down because that
-    // block is only reached for a descriptor `ref_descriptor_to_internal_name`
-    // can name -- which a primitive descriptor is not, so it was unreachable
-    // for exactly this case.
+    // 1. TYPE. The REFERENCE variant on a non-reference field leaves by
+    //    ClassCastException instead -- the JDK compares the field's declared
+    //    Class against `vclass`, and a primitive can never equal a reference
+    //    one, so it never reaches the descriptor check.
     if vclass_mirror.is_some() && !descriptor_is_reference(&meta.descriptor) {
         return Err(RuntimeError::ClassCastException {
-            message: format!(
-                "field {field_name} is declared {} and cannot be a reference updater's field",
-                meta.descriptor
-            ),
+            // No message: HotSpot's is null here (measured).
+            message: String::new(),
         }
         .into());
     }
-
     let tag = expected(&meta.descriptor).ok_or_else(|| {
         tracing::warn!(
             field = %field_name,
@@ -449,12 +426,41 @@ fn build_updater(
             "T19.H5: newUpdater descriptor incompatible with updater variant"
         );
         MethodCallFailed::from(RuntimeError::IllegalArgumentException {
-            message: format!(
-                "field {field_name} descriptor {} is not compatible with this updater",
-                meta.descriptor
-            ),
+            message: type_message.to_string(),
         })
     })?;
+
+    // 2. VOLATILE. ACC_VOLATILE = 0x0040. MEASURED (`probes/AtomicUpdaterSweep
+    //    .java`, compatible mode): `newUpdater(Holder.class, "plainInt")` on a
+    //    NON-volatile field answered `no-throw` where HotSpot throws.
+    //
+    //    This is the one validation whose absence is silently unsafe rather
+    //    than merely wrong-typed: the whole contract of a field updater is that
+    //    the field is volatile, and an updater handed a plain field gives every
+    //    caller ordinary non-atomic reads and writes while looking exactly like
+    //    an atomic one.
+    if (meta.access_flags & 0x0040) == 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Must be volatile type".to_string(),
+        }
+        .into());
+    }
+
+    // 3. STATIC / FINAL. ACC_STATIC = 0x0008, ACC_FINAL = 0x0010. HotSpot
+    //    reaches these through `Unsafe.objectFieldOffset`, which raises
+    //    IllegalArgumentException with NO message.
+    if meta.is_static || (meta.access_flags & 0x0008) != 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: String::new(),
+        }
+        .into());
+    }
+    if (meta.access_flags & 0x0010) != 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: String::new(),
+        }
+        .into());
+    }
 
     // Reference variant: the JDK's reflective `newUpdater` performs a
     // type-equality check between the field's declared type and the
@@ -478,9 +484,11 @@ fn build_updater(
                     "T19.H5: newUpdater type mismatch (CCE)"
                 );
                 return Err(RuntimeError::ClassCastException {
-                    message: format!(
-                        "field {field_name} declared as {field_internal} but vclass={v_name}"
-                    ),
+                    // No message: HotSpot's is null here (measured). The
+                    // `tracing::warn!` above keeps the diagnosis, which is
+                    // where a VM-side detail belongs -- not in a message the
+                    // application compares.
+                    message: String::new(),
                 }
                 .into());
             }
@@ -560,7 +568,11 @@ fn native_arfu_new_updater(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let Some(tclass) = arg_obj(args, 0) else {
         return Err(new_updater_refusal(
             ctx,
-            "java.lang.NullPointerException: tclass",
+            // Transcribed from the oracle: HotSpot's helpful NPE names the
+            // call `newUpdater` is about to make. ONE LINE deliberately -- a
+            // Rust `\` continuation inside a literal has already baked source
+            // indentation into a transcribed message once in this lane.
+            NULL_TCLASS_NPE,
         ));
     };
     let Some(vclass) = arg_obj(args, 1) else {
@@ -593,6 +605,7 @@ fn native_arfu_new_updater(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         },
         CLS_REF_FIELD_UPDATER_IMPL,
         Some(vclass),
+        "",
     )
 }
 
@@ -601,7 +614,11 @@ fn native_aifu_new_updater(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let Some(tclass) = arg_obj(args, 0) else {
         return Err(new_updater_refusal(
             ctx,
-            "java.lang.NullPointerException: tclass",
+            // Transcribed from the oracle: HotSpot's helpful NPE names the
+            // call `newUpdater` is about to make. ONE LINE deliberately -- a
+            // Rust `\` continuation inside a literal has already baked source
+            // indentation into a transcribed message once in this lane.
+            NULL_TCLASS_NPE,
         ));
     };
     let Some(name_obj) = arg_obj(args, 1) else {
@@ -618,6 +635,7 @@ fn native_aifu_new_updater(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         descriptor_tag_for_int_variant,
         CLS_INT_FIELD_UPDATER_IMPL,
         None,
+        "Must be integer type",
     )
 }
 
@@ -626,7 +644,11 @@ fn native_alfu_new_updater(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let Some(tclass) = arg_obj(args, 0) else {
         return Err(new_updater_refusal(
             ctx,
-            "java.lang.NullPointerException: tclass",
+            // Transcribed from the oracle: HotSpot's helpful NPE names the
+            // call `newUpdater` is about to make. ONE LINE deliberately -- a
+            // Rust `\` continuation inside a literal has already baked source
+            // indentation into a transcribed message once in this lane.
+            NULL_TCLASS_NPE,
         ));
     };
     let Some(name_obj) = arg_obj(args, 1) else {
@@ -643,6 +665,7 @@ fn native_alfu_new_updater(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         descriptor_tag_for_long_variant,
         CLS_LONG_FIELD_UPDATER_IMPL,
         None,
+        "Must be long type",
     )
 }
 

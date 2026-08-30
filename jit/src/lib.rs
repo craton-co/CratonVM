@@ -21187,14 +21187,66 @@ fn try_compile_inner(
                             && desc.as_str() == &*cached.method_descriptor;
                         let is_self_recursive_wide =
                             is_self_recursive && matches!(ret, b'J' | b'D' | b'F');
+                        // The direct self-call marshals the hidden context pointer
+                        // plus EVERY Java argument into an entry-ABI register and
+                        // has no stack-argument path of its own, so it can only
+                        // serve a method that fits the register file: four on
+                        // Win64, six on SysV. `desc_args + 1` because a
+                        // self-recursive call is `invokestatic` (no receiver) and
+                        // the context takes `abi[0]`.
+                        //
+                        // Without this the marshal indexes off the end and PANICS
+                        // THE COMPILER THREAD, which does not come back — so the
+                        // first `static long f(int,int,int,int)` that calls itself
+                        // silently disables the JIT for the rest of the process.
+                        // MEASURED 2026-08-29 on Windows: `probes/SelfRecArgs.java`
+                        // compiles f1/f2/f3, panics on f4, and nothing compiles
+                        // after it. It reached a real workload as a HANG —
+                        // Hibernate's `DefaultCatalogAndSchemaTest` runs to a
+                        // 600 s timeout entirely interpreted.
+                        //
+                        // The requirement is stated where the marshal is
+                        // (`ir_lower::emit_self_recursive_call`) and enforced
+                        // here, because eligibility is the only place that can
+                        // still choose a different route.
+                        let selfrec_fits =
+                            desc_args + 1 <= crate::ir_lower::incoming_abi_reg_capacity();
+                        // CENSUS, on the existing compile-reporting flag rather
+                        // than a new one: this refusal is INVISIBLE from Java —
+                        // the method still runs and still answers correctly, it
+                        // just takes a slower route — so without a line here
+                        // "how much code does this guard turn away" has no
+                        // answer at all. Before the guard existed the same
+                        // population panicked the compiler thread instead, and
+                        // that was invisible too, which is how it survived to
+                        // reach a suite. One line per refused SITE; the reader
+                        // counts distinct methods.
+                        if is_self_recursive
+                            && !selfrec_fits
+                            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_COMPILED")
+                                .is_some()
+                        {
+                            eprintln!(
+                                "CRATONVM_DBG_JIT_COMPILED: selfrec-refused {cn}.{mn}{desc} \
+                                 args={desc_args} entry_regs={}",
+                                crate::ir_lower::incoming_abi_reg_capacity()
+                            );
+                        }
                         // Integer and reference self-recursion has the same direct-call
                         // ABI as the already-supported wide-return path. Void calls have
                         // no result slot for `emit_self_recursive_call` to fill.
                         let is_self_recursive_direct = selfrec_direct
                             && helpers.self_call_stack_guard != 0
                             && is_self_recursive
-                            && ret != b'V';
-                        if is_self_recursive_wide && !selfrec_direct {
+                            && ret != b'V'
+                            && selfrec_fits;
+                        // `!selfrec_fits` takes the same exit as `!selfrec_direct`,
+                        // and for the same reason: a self-recursive WIDE-return
+                        // method that cannot take the direct route must go to
+                        // single-pass, which emits its own direct self-call, rather
+                        // than to `jit_invoke_dispatch` — that route is what the
+                        // fib44 note above measured at 8.6x slower.
+                        if is_self_recursive_wide && (!selfrec_direct || !selfrec_fits) {
                             // Opt-out: bail the whole method to single-pass (fast
                             // direct self-call). The direct path keeps
                             // it on the IR path with a direct self-call instead

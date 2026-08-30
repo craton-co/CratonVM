@@ -380,8 +380,18 @@ fn stack_arg_block_size(stack_arg_count: usize) -> (i32, i32) {
 /// half stops. Historically `lower()` refused
 /// such a graph up front — see the Gap B bail there for what that cost the
 /// last time the two got out of step.
+///
+/// `pub(crate)` because the ELIGIBILITY decision has to consult it too. The
+/// direct self-recursive call (`emit_self_recursive_call`) marshals the context
+/// pointer plus every Java argument into one of these registers and has no
+/// stack-argument path of its own, so `jit::lib`'s `is_self_recursive_direct`
+/// must refuse a method that does not fit. That check used to be implied by
+/// `lower()`'s whole-method bail; when the prologue learned to read stack
+/// arguments the bail went away and the marshal's assumption became unguarded —
+/// which is the "last time the two got out of step" this doc comment already
+/// warned about, arrived at from the other side.
 #[inline]
-fn incoming_abi_reg_capacity() -> usize {
+pub(crate) fn incoming_abi_reg_capacity() -> usize {
     ENTRY_ABI_REGS.len()
 }
 
@@ -1968,6 +1978,35 @@ impl<'a> Lowerer<'a> {
             self.emit_zero_frame_slot(self.shadow_thread_slot_off);
             self.emit_zero_frame_slot(self.shadow_savetop_slot_off);
         }
+        // And the safepoint-id slot, for the SAME reason and on its own gate:
+        // `active_safepoint_id` reads `[rbp - sp_id_slot_off]` on any live
+        // frame, including one stopped BEFORE its first safepoint, and until
+        // that first `emit_safepoint_map` store the word is whatever the
+        // previous frame at this stack depth left behind.
+        //
+        // Ids start at 1 precisely so 0 can mean "no safepoint reached" (see
+        // the slot's allocation above), but nothing was writing the 0. The
+        // sentinel was a convention the prologue never established.
+        //
+        // MEASURED, `TestCachedQueryResults` (H2), 13 frames the band verifier
+        // reported as `no-map-for-id`: 10 read `0` and 3 read a HEAP POINTER at
+        // `sp_id_off`. That was diagnosed as two defects -- "has not reached a
+        // safepoint" and "something stored an oop into the reserved slot". It
+        // is one: uninitialised stack, reading as zero where the region happened
+        // to be clean and as a stale oop where it did not.
+        //
+        // Refusing the cycle is the benign outcome. The hazard this closes is
+        // that safepoint ids are small consecutive integers, so a stale word
+        // can equal a VALID id for this method -- and then
+        // `find_oop_map_for_safepoint_id` matches the map for a DIFFERENT
+        // program point and relocation rewrites against it. That is a silent
+        // wrong answer, not a refusal.
+        //
+        // `CRATONVM_JIT_ZERO_SPID=0` restores the uninitialised read: the
+        // one-binary A/B, and the kill switch.
+        if self.sp_id_slot_off > 0 && Self::zero_sp_id_slot_enabled() {
+            self.emit_zero_frame_slot(self.sp_id_slot_off);
+        }
         self.emit_frame_record();
         self.fetch_current_thread();
         self.zero_ref_phi_slots();
@@ -2915,6 +2954,20 @@ impl<'a> Lowerer<'a> {
     }
 
     /// `MOV qword [rbp - off], 0` (mod=10 disp32, /0).
+    /// `CRATONVM_JIT_ZERO_SPID` — default ON. Off restores the pre-fix
+    /// behaviour (the safepoint-id slot reads uninitialised stack until the
+    /// first safepoint stores an id), so the repair can be A/B'd on one binary.
+    fn zero_sp_id_slot_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            !matches!(
+                cratonvm_types::flags::runtime_var("CRATONVM_JIT_ZERO_SPID").as_deref(),
+                Ok("0") | Ok("false") | Ok("FALSE")
+            )
+        })
+    }
+
     fn emit_zero_frame_slot(&mut self, off: i32) {
         self.buf.emit(&[0x48, 0xC7, 0x85]);
         self.buf.emit(&(-off).to_le_bytes());
@@ -3270,8 +3323,24 @@ impl<'a> Lowerer<'a> {
         // register list `emit_prologue` reads incoming args from: abi[0] = the
         // hidden VM context pointer, abi[1 + i] = Java arg i. Each source is a
         // frame slot (memory), so loading straight into the abi registers cannot
-        // inter-clobber. `1 + num_args <= abi.len()` is guaranteed by the
-        // needs_context bail in `lower()`, so no arg spills off the register file.
+        // inter-clobber.
+        //
+        // `1 + num_args <= abi.len()` is required and is enforced at ELIGIBILITY
+        // (`jit::lib`'s `is_self_recursive_direct`, via
+        // `incoming_abi_reg_capacity`), not here. It used to be implied by
+        // `lower()`'s whole-method bail on a graph with more incoming slots than
+        // registers; when `emit_prologue` learned to read the overflow off the
+        // caller's stack (Gap B) that bail went away and this comment kept
+        // asserting a guarantee nobody was making any more.
+        //
+        // MEASURED, 2026-08-29, Windows: a `static long f(int,int,int,int)`
+        // calling itself is 4 Java args plus the context = 5 against a
+        // four-register file, so `abi[4]` panicked the compiler thread with
+        // `index out of bounds: the len is 4 but the index is 4` — and the
+        // thread does not come back, so the FIRST such method silently disables
+        // the JIT for the rest of the process. SysV has six registers and needs
+        // six arguments to reach it, which is why it showed up on Windows first.
+        // `probes/SelfRecArgs.java` is the arity sweep.
         #[cfg(target_os = "windows")]
         let abi: &[u8] = &[1, 2, 8, 9]; // RCX, RDX, R8, R9
         #[cfg(not(target_os = "windows"))]
@@ -3328,8 +3397,16 @@ impl<'a> Lowerer<'a> {
     /// `lib.rs` eagerly compiles a resolved `invokestatic` / non-`<init>`
     /// `invokespecial` callee via `callee_compiler` and records
     /// `(pc → (entry, callee_needs_context))`. Both call kinds are STATICALLY
-    /// bound, so no receiver type check is needed — exactly why single-pass may
+    /// bound, so no receiver TYPE check is needed — exactly why single-pass may
     /// bind them directly too.
+    ///
+    /// A null check is a different question, and this sentence used to answer
+    /// it by omission. `invokestatic` has no receiver to test; `invokespecial`
+    /// does, and JVMS 6.5 raises NPE at the INVOKE rather than inside the
+    /// callee. Jumping straight to a compiled entry skips the dispatch door
+    /// that used to raise it, so the only thing left to fault was the callee
+    /// body — and a body that never dereferences `this` does not. See
+    /// `has_receiver` below.
     ///
     /// # Why this matters
     ///
@@ -3385,6 +3462,7 @@ impl<'a> Lowerer<'a> {
     /// which both keeps the callee's buffer alive (`_direct_callee_roots`) and
     /// puts this method into the callee's invalidation closure, so the baked
     /// address can never outlive the code it points at.
+    #[allow(clippy::too_many_arguments)]
     fn emit_direct_cross_call(
         &mut self,
         inputs: &[NodeId],
@@ -3394,10 +3472,20 @@ impl<'a> Lowerer<'a> {
         callee_needs_ctx: bool,
         info_ptr: usize,
         ty: IrType,
+        has_receiver: bool,
+        bci: usize,
     ) {
         for i in 0..num_args {
             let arg = inputs[2 + i];
             self.load_to_rax(self.slot_of(arg));
+            // JVMS 6.5 on argument 0 of a receiver-bearing call. Deopt rather
+            // than raise inline: the interpreter re-executes this invoke and
+            // owns the canonical NPE, its message and its stack trace, exactly
+            // as it does for the field-access null checks above.
+            if i == 0 && has_receiver {
+                self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+                self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
+            }
             self.store_rax(self.args_stage_top_off - (i as i32) * 8);
         }
         let base = usize::from(callee_needs_ctx);
@@ -5371,6 +5459,15 @@ impl<'a> Lowerer<'a> {
                     node.bytecode_pc.and_then(|pc| self.direct_calls.get(&pc))
                 {
                     if entry != 0 {
+                        // 0 = virtual, 1 = special, 2 = interface, 3 = static,
+                        // 4 = self-recursive static. The first three carry a
+                        // receiver in argument 0; this map holds static and
+                        // special, and the test is right for all five.
+                        // SAFETY: as the `invoke_kind == 4` read above — the
+                        // pointer names a live `JitInvokeInfo` owned by
+                        // `ir_call_infos` for the lifetime of this compile.
+                        let has_receiver =
+                            matches!(unsafe { (*(*info_ptr as *const JitInvokeInfo)).invoke_kind }, 0 | 1 | 2);
                         self.emit_direct_cross_call(
                             &node.inputs,
                             slot,
@@ -5379,6 +5476,8 @@ impl<'a> Lowerer<'a> {
                             callee_needs_ctx,
                             *info_ptr,
                             node.ty,
+                            has_receiver,
+                            node.bytecode_pc.unwrap_or(0),
                         );
                         return;
                     }

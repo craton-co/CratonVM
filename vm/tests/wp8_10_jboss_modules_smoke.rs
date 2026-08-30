@@ -134,7 +134,27 @@ fn vm_with_modules_tree(
     // so org/jboss/modules/* resolves to the synthetic stub layout
     // from class_manager.rs at runtime.
     let probe_dir = fixture_dir().to_string_lossy().into_owned();
+    // A real `java.home`, not just the probe on the classpath.
+    //
+    // `VmConfig` with no `java_home` is still REAL-JDK mode -- the synthetic
+    // class library is a separate opt-in -- so `java.lang.String` gets
+    // synthesized while the registry drops every `Bridge` registered on it.
+    // That is deliberate and gated: `wp8_10_9_string_contains_native` asserts
+    // exactly which String registrations survive real-JDK mode, and `intern`
+    // is the only one. The policy's premise is that the real class bytes are
+    // there to be authoritative.
+    //
+    // Without a JDK that premise is false and the two gates want opposite
+    // things from one configuration: probe0 does `name.contains("Module")`
+    // and got `NoSuchMethodError` (the synthesized String does not declare
+    // it) or, once declared, `UnsatisfiedLinkError` (the bridge was dropped).
+    // Supplying the JDK is what makes this VM coherent rather than relaxing
+    // the policy for every VM that happens to lack one.
     let config = VmConfig::new().with_classpath(vec![probe_dir]);
+    let config = match java_home() {
+        Some(jh) => config.with_java_home(jh),
+        None => config,
+    };
     (Vm::new(config), tmp, mp_root_override)
 }
 
@@ -143,6 +163,28 @@ fn vm_with_modules_tree(
 fn mp_root_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// A real JDK 25, for the reason `vm_with_modules_tree` documents.
+fn java_home() -> Option<String> {
+    for var in ["CRATONVM_JAVA_HOME", "JAVA_HOME"] {
+        if let Ok(h) = std::env::var(var) {
+            if std::path::Path::new(&h).exists() {
+                return Some(h);
+            }
+        }
+    }
+    for candidate in [
+        "C:/craton/TornadoVM/jdk-25.0.3",
+        "C:/Program Files/Eclipse Adoptium/jdk-25.0.3.9-hotspot",
+        "C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot",
+        "/data/jdk25-real-20260717/jdk-25.0.3+9",
+    ] {
+        if std::path::Path::new(candidate).exists() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
 }
 
 fn require_probe() -> bool {

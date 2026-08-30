@@ -1558,11 +1558,32 @@ fn native_hashtable_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 /// `<init>(Ljava/lang/String;)V`
 ///   field 0 = String ref, field 1 = position (Int), field 2 = count (Int)
+// THIS FILE OWNS THE SLOTS. `deprecated_io_util.rs` registers the SAME
+// `StringBufferInputStream` and `LineNumberInputStream` triples and loses every
+// one of them -- measured with `--dump-native-registry`: its rows come back
+// `owns_slot=false, invocations=0` while these come back `owns_slot=true` with
+// real counts. The first pass of this fix went into that file, built green, and
+// changed nothing. Both copies are corrected so a future change to which
+// registrar wins cannot resurrect the defect, but THIS is the live one.
+//
+// `StringBufferInputStream` IS A LOW-BYTE STREAM: `count` is the CHARACTER
+// count and each read hands back `(byte) s.charAt(pos)`. `text.len()` is Rust's
+// UTF-8 byte length, a different number the moment any char is non-ASCII:
+//
+//   new StringBufferInputStream("ab\u00e9\u4e2d")
+//     HotSpot   available 4, bytes [97, 98, 233, 45]
+//     this VM   available 7, bytes [97, 98, 195, 169, 228, 184, 173]
+//
+// The JDK is deliberately lossy here -- that is WHY the class is deprecated.
+// Encoding as UTF-8 instead is not a fix: it changes the byte VALUES and the
+// LENGTH together, so a caller that sized a buffer from `available()` reads a
+// different number of different bytes. MEASURED with
+// `apps/probes/L4CensusTail.java`.
 fn native_sbis_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let str_obj = obj_arg(args, 1)?;
     let text = ctx.read_string(str_obj).unwrap_or_default();
-    let len = text.len() as i32;
+    let len = text.chars().count() as i32;
     ctx.set_field(this, 0, Value::Object(Some(str_obj)));
     ctx.set_field(this, 1, Value::Int(0)); // position
     ctx.set_field(this, 2, Value::Int(len)); // count
@@ -1590,7 +1611,12 @@ fn native_sbis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     }
 
     let text = ctx.read_string(str_ref).unwrap_or_default();
-    let b = text.as_bytes().get(pos).copied().unwrap_or(0) as i32;
+    // The low byte of the char at `pos` — see the note on `native_sbis_init`.
+    let b = text
+        .chars()
+        .nth(pos)
+        .map(|c| (c as u32 & 0xFF) as i32)
+        .unwrap_or(0);
     ctx.set_field(this, 1, Value::Int((pos + 1) as i32));
     Ok(Some(Value::Int(b)))
 }
@@ -1626,12 +1652,16 @@ fn native_sbis_read_buf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     }
 
     let text = ctx.read_string(str_ref).unwrap_or_default();
-    let bytes = text.as_bytes();
+    // Char-indexed and low-byte, exactly as the single-byte read.
+    let chars: Vec<char> = text.chars().collect();
     let avail = count - pos;
     let to_read = len.min(avail);
 
     for i in 0..to_read {
-        let b = bytes.get(pos + i).copied().unwrap_or(0) as i32;
+        let b = chars
+            .get(pos + i)
+            .map(|c| (*c as u32 & 0xFF) as i32)
+            .unwrap_or(0);
         ctx.set_array_element(buf, off + i, Value::Int(b));
     }
     ctx.set_field(this, 1, Value::Int((pos + to_read) as i32));
@@ -1745,14 +1775,24 @@ fn native_lnis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 fn native_lnis_read_buf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let buf = obj_arg(args, 1)?;
-    let off = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let len = match args.get(3) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
+    // BOUNDS FIRST, and as SIGNED ints. `*v as usize` turns -1 into
+    // 18446744073709551615, so a negative offset sailed past the (absent) check
+    // and then silently read nothing instead of raising
+    // `IndexOutOfBoundsException`. MEASURED with
+    // `apps/probes/L4CensusTail.java` (`read(buf, -1, 1)`).
+    let off_i = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+    let len_i = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+    let cap = ctx.array_length(buf) as i64;
+    if off_i < 0 || len_i < 0 || (len_i as i64) > cap - (off_i as i64) {
+        return Err(RuntimeError::IndexOutOfBoundsException {
+            message: Some(format!(
+                "off {off_i}, len {len_i}, buffer length {cap}"
+            )),
+        }
+        .into());
+    }
+    let off = off_i as usize;
+    let len = len_i as usize;
 
     if len == 0 {
         return Ok(Some(Value::Int(0)));
@@ -1801,7 +1841,29 @@ fn native_lnis_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Value::Object(Some(o)) => o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    ctx.invoke_virtual(inner, "available", "()I", &[])
+    // HALVED, because this stream collapses CRLF to one '\n'. The JDK is
+    //
+    //     (pushBack == -1) ? (in.available() + 1) / 2
+    //                      : (in.available() + 1) / 2 + 1
+    //
+    // a conservative floor: in the worst case every remaining pair of bytes is
+    // a CRLF that will be delivered as a single byte. Delegating raw
+    // over-reports —
+    //
+    //   "a\nb\r\nc\rd"   HotSpot available 4, this VM 8
+    //
+    // — and `available()` is the number callers size a buffer from and loop on,
+    // so over-reporting hands them a short read they did not plan for. MEASURED
+    // with `apps/probes/L4CensusTail.java`.
+    let raw = ctx
+        .invoke_virtual(inner, "available", "()I", &[])?
+        .and_then(|v| v.as_int())
+        .unwrap_or(0);
+    let pushback = match ctx.get_field(this, 3) {
+        Value::Int(v) if v >= 0 => 1,
+        _ => 0,
+    };
+    Ok(Some(Value::Int((raw + 1) / 2 + pushback)))
 }
 
 /// `reset()V` — restores saved line number and delegates to wrapped stream.

@@ -50,9 +50,9 @@ HotSpot          196      13        9
 
 **A `TIMEOUT` is not a failure and is not counted as one.** 38 against HotSpot's
 9, on the same shard layout and the same load, is a statement about SPEED —
-quantified in §5, which also says how far the serial re-run of those 38 got
-(3 usable verdicts, 1 withdrawn as an artefact of the re-run harness) and counts
-the other 34 as unmeasured.
+quantified in §5. **All 38 were subsequently re-run at 600 s and §6 has their
+verdicts**; the totals in this table are the 90-second ones and §6 restates them.
+
 
 ## 3. The headline: `--jdk-only` introduced no failures of its own
 
@@ -83,6 +83,65 @@ The five are real CratonVM defects and are recorded here so they are not lost �
 they belong to whoever owns those families, not to this lane. `TestSQLXML` and
 `TestDiskFull` surface as an internal `NullPointerException` and a missing MVStore
 chunk, which are the two worth a look first.
+
+### RE-CHECKED 2026-08-30 — four of the five still reproduce, and one is GONE
+
+That list was a day and ~150 `dev` commits old, so it was re-run rather than
+quoted. One execution per arm:
+
+```text
+TestWeb          compat FAIL   14s    strict FAIL     25s
+TestBnf          compat FAIL    8s    strict FAIL     11s
+TestTransaction  compat FAIL   10s    strict FAIL     11s
+TestDiskFull     compat FAIL    8s    strict TIMEOUT 600s
+TestSQLXML       compat PASS    3s    strict PASS      3s     <- no longer reproduces
+```
+
+**Four still fail, and still fail in COMPAT**, so §3's attribution holds for
+them unchanged: none is a `--jdk-only` defect.
+
+**`TestSQLXML` no longer reproduces at all.** 44 further runs say so — 20 solo
+(10 per mode) and **24 under six-way contention at load 11-15** — every one a
+pass. The contention arm is there deliberately: concurrency has manufactured two
+failures in this very record (§5's `ENOSPC`, §7's OOM), so "it only failed in the
+sharded corpus run" was the first alternative to rule out, and it is ruled out.
+
+It was NOT bisected across the ~150 commits. A defect that will not reproduce is
+a poor bisect subject, and the searchable signature is preserved here instead:
+
+```text
+JdbcSQLNonTransientException: General error: "java.lang.NullPointerException"
+```
+
+### The synthetic layer is eliminated for the three that still fail
+
+Each was re-run under `--jdk-only` with its own census attached, which is the
+step that turned "it survives strict" into an elimination for `TestOpenClose`:
+
+```text
+TestWeb          mode=jdk-only  compatibility_classes=0  synthetic_stub_invocations=0
+TestBnf          mode=jdk-only  compatibility_classes=0  synthetic_stub_invocations=0
+TestTransaction  mode=jdk-only  compatibility_classes=0  synthetic_stub_invocations=0
+                 all three: partial none, truncated false, dropped 0 -- totals, not floors
+```
+
+All three fail with **nothing fabricated and no synthetic stub invoked**, so none
+of them is a fabricated-carrier or synthetic-stub defect. Whatever they are, they
+live in the path both modes share. That is worth having on record for whoever
+picks them up, because it is the cheapest question to ask and the most annoying
+one to leave open.
+
+Two smaller notes. `TestDiskFull`'s message moved from `Chunk 4 not found` to
+`Chunk 3 not found`, so that row is not deterministic in its detail. **Neither is
+`TestWeb`'s** — §3 quotes it as `1#_ROWID_#_ROWID_ does not contain: column_name`
+and a later run of the same class in the same mode produced
+` does not contain: '`. Two runs, two different assertion bodies, so no single
+message from this class should be treated as its signature. And of the
+five, **`TestSQLXML` was the only one with no page anywhere** — the other four
+are already carried by `h2/nonpassed-40-census-20260818.md`,
+`h2/correctness-issues-consolidated.md`, and in `TestDiskFull`'s case its own
+`repros/h2-testdiskfull-livelock/` directory. So the one this lane could have
+adopted is the one that stopped failing.
 
 ## 4. The census, unioned over 181 reports
 
@@ -231,6 +290,161 @@ some of them — `TestIndex` at 107 s and `TestLIRSMemoryConsumption` at 264 s a
 both ordinary passes that a 90 s cap called timeouts. What they do **not**
 license is the claim that the other 34 are all passes: an unmeasured vector has
 no verdict, and `TestCases` is still over at 600 s.
+
+## 6. FINISHED 2026-08-30: the 38 were re-run, and the headline survives it
+
+§5 left 34 of the 38 capped vectors UNMEASURED and said so. They are measured
+now — all 38, at a 600-second cap, three shards, **working directory on `/data`**
+so the instrument fault §5 describes cannot recur.
+
+```text
+re-run of the 38          PASS 13    FAIL 4    TIMEOUT(600s) 21
+  rows carrying ENOSPC     0                   <- the §5 fault is gone
+```
+
+Folding that into §2 gives the corpus its complete strict-mode picture:
+
+```text
+                 PASS   FAIL   TIMEOUT
+--jdk-only, was   166     14     38  (90s)
+--jdk-only, now   179     18     21  (600s)      179+18+21 = 218
+```
+
+### The four new failures do not change §3's answer, and two of them needed the compat arm to say so
+
+```text
+                              HotSpot        CratonVM compat   CratonVM strict
+TestOutOfMemory               FAIL   17s     -                 FAIL     6s
+TestMvccMultiThreaded         FAIL    2s     -                 FAIL    10s
+TestOpenClose                 PASS   18s     FAIL   346s       FAIL   451s
+TestRandomMapOps              PASS  143s     FAIL   480s       TIMEOUT 600s
+```
+
+* The first two **fail on HotSpot too** — environment and fixture, like the nine
+  in §3.
+* The last two pass on HotSpot, so each got the third run that decides
+  attribution, and **both fail in CratonVM's COMPATIBLE mode as well**. They are
+  CratonVM defects, not `--jdk-only` defects.
+
+So after adjudicating every one of the 38, **`--jdk-only` still produces ZERO
+failures that compatible mode does not** — now over 197 adjudicated vectors
+rather than 180, which is the claim P4-A exists to make and it got stronger, not
+weaker, by being finished.
+
+`TestRandomMapOps` is worth one note: its HotSpot verdict was `TIMEOUT` at 90 s
+in §2, which is **not** "HotSpot fails". Re-run at 600 s it PASSES in 143 s. A
+cap on the oracle side is an absent oracle, and comparing against one would have
+mis-attributed this row in either direction.
+
+### Two defects to hand on
+
+Both are mode-independent CratonVM defects on classes HotSpot passes, and
+neither belongs to this lane:
+
+* **`org.h2.test.db.TestOpenClose`** — fails in both modes after ~350–450 s,
+  against an 18 s HotSpot pass. The 20x wall-clock gap is its own question.
+* **`org.h2.test.store.TestRandomMapOps`** — compatible mode dies with
+  `seed:3698333351056078266 op:1571 java.lang.NullPointerException`.
+  **Already owned:** `h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`,
+  whose own history records that the printed seeds do NOT replay, so that number
+  is not the lead it looks like. What this lane's measurement did add is on that
+  page as an addendum: the defect is **not** confined to the small heap the page
+  studies — 1g fails 4 of 4 and **4g fails too**, heap buying latency rather than
+  safety, and at 1g and above the dominant face is a WRONG ANSWER
+  (`Expected: 247 actual: 198`, a map short of entries) rather than the crash the
+  page opens with.
+
+### The 21 that still do not finish
+
+Still `TIMEOUT`, now at a cap **6.7x larger**, and still counted as UNMEASURED
+rather than as failures. The re-run itself ran under a host load between 12 and
+27 with other lanes active, so these remain load-qualified: a 600 s cap on a
+box at load 27 is not the same instrument as a 600 s cap on an idle one. What
+can be said is that they are the slow tail §5 predicted from the ratio data, and
+that nothing in the 17 that did resolve turned out to be a `--jdk-only` defect.
+
+## 7. The 21, given an ORACLE first — and the one strict-only failure was my own harness
+
+§6 left 21 vectors capped at 600 s and called them unmeasured. Raising the cap
+again would have been the obvious next move and would have been wrong for a
+third of them, because **seven of the 21 had no HotSpot verdict either** — they
+were `TIMEOUT` at 90 s on the oracle side too, and §6 had just finished
+recording that a capped oracle is an ABSENT oracle, not a failing one.
+
+### Step 1 — buy an oracle before spending anything on the subject
+
+HotSpot, 1800 s, on the seven:
+
+```text
+TestLob          PASS  138s     TestKill         TIMEOUT 1800s
+TestBenchmark    PASS  158s     TestPowerOffFs   TIMEOUT 1801s
+TestSimpleIndex  PASS  111s     TestPowerOffFs2  TIMEOUT 1802s
+                                TestSynth        TIMEOUT 1801s
+```
+
+Three were ordinary HotSpot passes hidden by the 90 s cap. **Four do not finish
+on HotSpot at twenty times that cap**, so no CratonVM verdict on them can mean
+anything, at any cap, ever. They are not slow-under-CratonVM; they are long.
+
+That leaves the set worth spending time on: **15 vectors with a HotSpot PASS**
+(12 already had one, plus the three just bought). The other six are 4 with no
+oracle and 2 that FAIL on HotSpot.
+
+### Step 2 — `--jdk-only` on the 15, at 1800 s
+
+```text
+PASS 5     TestLob 774s · TestKillProcessWhileWriting 456s
+           TestMVStoreCachePerformance 911s · TestBtreeIndex 479s · TestPerfectHash 249s
+FAIL 2     TestCachedQueryResults 1365s · TestMVStoreTool 160s
+TIMEOUT 8
+```
+
+### Step 3 — and this is where the corpus nearly got its first strict-only defect
+
+`TestMVStoreTool` failed under `--jdk-only` and PASSED in compatible mode, both
+at `--Xmx 1g`, against a 32 s HotSpot pass. That is the exact shape §3 says does
+not exist in this corpus, and it would have falsified the headline.
+
+**It does not reproduce.** Re-run alone on a quiet box:
+
+```text
+sharded, 3 concurrent shards   strict 1g   FAIL 160s   OutOfMemoryError: Java heap space
+alone                          strict 1g   PASS 704s
+alone                          strict 2g   PASS 708s
+alone                          compat 1g   PASS 557s
+```
+
+The failure was `OutOfMemoryError`, and the harness was running **three shards
+of `--Xmx 1g` concurrently** while other lanes used the same 31 GB box. Under
+that pressure the OOM landed on the strict arm; on a quiet box the same command
+passes with the same heap. **My own runner manufactured a mode-specific failure,
+for the second time in this page** — §5 was an `ENOSPC` from a working directory
+on the wrong filesystem, and this is the same species: a harness artefact that
+wears a defect's clothes and points at the mode you are studying.
+
+The rule this earns: **a candidate mode-specific failure is re-run ALONE before
+it is believed.** Concurrency is fine for finding candidates and worthless for
+confirming them, because the resource that decides the verdict is shared and the
+arm it lands on is luck.
+
+`TestCachedQueryResults` got the same treatment and is real, but not
+`--jdk-only`'s: **compat FAILs it too**, in 1078 s, so it is a mode-independent
+CratonVM defect on a class HotSpot passes in 9 s.
+
+### Where the corpus stands, complete
+
+```text
+                 PASS   FAIL   unresolved
+--jdk-only        185     19       14        = 218
+```
+
+The 14 unresolved are **8 that exceed 1800 s under `--jdk-only`, 4 that exceed
+1800 s on HOTSPOT as well, and 2 that HotSpot FAILs** — and only the first eight
+are a statement about this VM at all.
+
+**Across every vector this corpus can adjudicate, `--jdk-only` still produces
+zero failures that compatible mode does not.** The one candidate was the
+measuring instrument.
 
 ## Reproduce
 

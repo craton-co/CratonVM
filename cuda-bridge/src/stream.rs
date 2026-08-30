@@ -226,11 +226,82 @@ unsafe extern "C" fn host_callback_trampoline(user_data: *mut std::ffi::c_void) 
 #[cfg(feature = "cuda")]
 pub struct Stream {
     inner: StreamCuda,
+    capturing: std::sync::atomic::AtomicBool,
+    captured_slots: std::sync::Mutex<Vec<crate::LastWriteSlot>>,
 }
 
 #[cfg(not(feature = "cuda"))]
 pub struct Stream {
     inner: StreamStub,
+    capturing: std::sync::atomic::AtomicBool,
+    captured_slots: std::sync::Mutex<Vec<crate::LastWriteSlot>>,
+}
+
+impl Stream {
+    /// Whether a graph capture is open on this stream.
+    ///
+    /// A plain atomic rather than a `cuStreamIsCapturing` call, because
+    /// the launch path reads it on every launch and the answer is
+    /// something this crate already knows: `begin_capture` set it.
+    ///
+    /// The launch path needs it because the per-buffer `last_write`
+    /// event discipline is wrong inside a capture in both directions.
+    /// The completion event a captured launch records exists only
+    /// inside the graph, so a later `cuStreamWaitEvent` on it from a
+    /// download stream fails outright with `CUDA_ERROR_INVALID_VALUE` --
+    /// and the ordering it would have provided is redundant anyway,
+    /// since a single-stream capture becomes a linear chain of nodes
+    /// whose dependencies the driver derives from submission order.
+    pub(crate) fn is_capturing(&self) -> bool {
+        self.capturing.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record that a capture opened or closed on this stream.
+    ///
+    /// Opening one clears the accumulated slot list: a capture owns the
+    /// buffers it touches only for its own lifetime, and inheriting the
+    /// previous capture's list would make a replay stamp buffers this
+    /// graph never writes.
+    pub(crate) fn set_capturing(&self, on: bool) {
+        if on {
+            self.captured_slots
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+        }
+        self.capturing
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Remember that a captured launch took `slots` as arguments.
+    ///
+    /// The launch path hands these over instead of stamping them, and
+    /// [`crate::graph::GraphExec::launch`] stamps them with the replay's
+    /// completion event. That is what keeps the per-buffer ordering
+    /// contract intact across a graph: without it a capture would leave
+    /// every buffer it touched with an empty `last_write`, and a read
+    /// from any OTHER stream after a replay would be released with
+    /// nothing to wait on.
+    ///
+    /// Deduplicated by slot identity. One buffer is typically an
+    /// argument to many launches in a graph -- GPULlama3's 453 launches
+    /// name about 1800 arguments over roughly 100 distinct buffers --
+    /// and stamping the same slot 18 times per replay is 17 wasted lock
+    /// acquisitions.
+    pub(crate) fn note_captured_slots(&self, slots: &[crate::LastWriteSlot]) {
+        let mut held = self.captured_slots.lock().unwrap_or_else(|p| p.into_inner());
+        for slot in slots {
+            if !held.iter().any(|s| std::sync::Arc::ptr_eq(s, slot)) {
+                held.push(slot.clone());
+            }
+        }
+    }
+
+    /// Take the slots accumulated since `begin_capture`, for the graph
+    /// that is being handed back.
+    pub(crate) fn take_captured_slots(&self) -> Vec<crate::LastWriteSlot> {
+        std::mem::take(&mut *self.captured_slots.lock().unwrap_or_else(|p| p.into_inner()))
+    }
 }
 
 impl Stream {
@@ -275,6 +346,8 @@ impl Stream {
                 device,
                 id,
             },
+            capturing: std::sync::atomic::AtomicBool::new(false),
+            captured_slots: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -287,6 +360,8 @@ impl Stream {
     pub fn new(_ctx: &DeviceContext) -> Result<Self> {
         Ok(Self {
             inner: StreamStub::new(),
+            capturing: std::sync::atomic::AtomicBool::new(false),
+            captured_slots: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -352,6 +427,13 @@ impl Stream {
     /// caller's `Stream` to `backend_cuda::DeviceModuleInner::
     /// launch_raw_on_stream` for true per-stream kernel submission
     /// (AUDIT 2026-05-24 C32 stream-port fix).
+    /// The device this stream belongs to, for the `bind_to_thread` prelude
+    /// every raw-handle use in this crate shares.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn device_arc(&self) -> &std::sync::Arc<cudarc::driver::safe::CudaDevice> {
+        &self.inner.device
+    }
+
     #[cfg(feature = "cuda")]
     pub(crate) fn cuda_stream_arc(&self) -> &std::sync::Arc<cudarc::driver::safe::CudaStream> {
         &self.inner.stream
@@ -525,6 +607,8 @@ impl Stream {
     pub(crate) fn for_test() -> Self {
         Self {
             inner: StreamStub::new(),
+            capturing: std::sync::atomic::AtomicBool::new(false),
+            captured_slots: std::sync::Mutex::new(Vec::new()),
         }
     }
 }

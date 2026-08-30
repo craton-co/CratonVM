@@ -138,14 +138,25 @@ impl DeviceModule {
         // a second, hidden launch on `ctx.compute` to mirror the wait
         // onto. (The previous code launched on `ctx.compute` and had to
         // duplicate every wait there.)
-        for slot in &last_write_slots {
-            let maybe_ev = slot
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .as_ref()
-                .cloned();
-            if let Some(ev) = maybe_ev {
-                stream.wait_event(&ev)?;
+        //
+        // Skipped entirely while `stream` is capturing. Inside a
+        // capture the ordering these waits provide is already there:
+        // the driver derives a linear dependency chain from submission
+        // order on a single stream, so node N+1 already depends on
+        // node N. The waits would meanwhile be `cuStreamWaitEvent` on
+        // events recorded OUTSIDE the capture, which is exactly the
+        // class of call that invalidates one.
+        let capturing = stream.is_capturing();
+        if !capturing {
+            for slot in &last_write_slots {
+                let maybe_ev = slot
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                    .cloned();
+                if let Some(ev) = maybe_ev {
+                    stream.wait_event(&ev)?;
+                }
             }
         }
 
@@ -153,7 +164,19 @@ impl DeviceModule {
         // Allocate the completion event before submitting the kernel.
         // If event creation fails, no kernel has been queued and the
         // buffer ordering slots still describe the pre-launch state.
-        let kernel_done = Arc::new(Event::new(ctx)?);
+        //
+        // No event at all while capturing: `cuEventRecord` on a
+        // capturing stream records a node in the graph rather than a
+        // host-observable event, so the handle it produces cannot be
+        // waited on from another stream -- a later `to_host` would fail
+        // with `CUDA_ERROR_INVALID_VALUE` rather than reading the
+        // buffer. Nothing needs it: the graph orders its own nodes, and
+        // a caller waits on the replay's completion event instead.
+        let kernel_done = if capturing {
+            None
+        } else {
+            Some(Arc::new(Event::new(ctx)?))
+        };
 
         #[cfg(not(feature = "cuda"))]
         {
@@ -218,6 +241,28 @@ impl DeviceModule {
         // in stub mode, so the same call serves both backends; a
         // subsequent `cuStreamWaitEvent(any_stream, kernel_done)`
         // correctly gates that stream behind this kernel.
+        let Some(kernel_done) = kernel_done else {
+            // Capturing. There is no event to stamp -- one recorded on a
+            // capturing stream lives inside the graph and no other
+            // stream can wait on it -- and leaving the OLD event would
+            // be worse than clearing, because it describes a write from
+            // before this graph and a download released by it would be
+            // correctly ordered against the wrong thing.
+            //
+            // So: clear now, and hand the slots to the stream. The graph
+            // takes custody of them at `end_capture`, and every replay
+            // stamps them with its own completion event
+            // (`GraphExec::launch`). The window in which these buffers
+            // have no `last_write` is exactly the window in which
+            // nothing has written them -- a capture runs nothing -- so
+            // the per-buffer ordering contract holds throughout rather
+            // than being suspended for the life of the graph.
+            for slot in &last_write_slots {
+                *slot.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            }
+            stream.note_captured_slots(&last_write_slots);
+            return Ok(());
+        };
         if let Err(err) = stream.record_event(&kernel_done) {
             return recover_after_completion_event_failure(stream, &last_write_slots, err);
         }

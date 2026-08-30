@@ -297,11 +297,17 @@ self-consistent, and it is — the sweep round-trips every width through
 **Legal disagreement, not a defect.** Recorded because a future reader diffing
 this family will meet it again.
 
+**PROVEN 2026-08-30, having been asserted here since 2026-08-28.** Running the
+oracle as `java -XX:-UseCompressedOops` makes all three rows report `8`,
+matching CratonVM exactly, and drops the sweep diff from 20 changed lines to 14
+with no new difference in 457 rows. The probe runner now passes that flag --
+see §22.1. These three rows are gone from the residual.
+
 ### 4.3 `arrayIndexScale` / `arrayBaseOffset` on a NON-array (6 rows)
 
 ```text
 HotSpot    NoClassDefFoundError: java/lang/InvalidClassException
-CratonVM   1  and  16
+CratonVM   0  and  16      <- scale was 1 when this was written; see below
 ```
 
 Already adjudicated on 2026-08-26 in
@@ -315,11 +321,23 @@ This lane adds four rows to that record — `arrayIndexScale(int.class)` and
 `arrayIndexScale(Iface.class)` answer `1` too, so the catch-all covers
 primitives and interfaces as well as ordinary classes.
 
-**The prior adjudication stands.** Returning `0` (what the long-standing
-`sun.misc` javadoc specifies, and what callers guard on with
-`if (scale == 0) throw`) is defensible and is what I would change it to — but it
-is a behaviour change whose blast radius across JCTools-shaped consumers is
-unmeasured, the oracle cannot referee it, and a prior session weighed the same
+**UPDATED 2026-08-30 — the scale half of this was changed, and this section
+did not say so.** `array_index_scale_for_name` now returns `0` for a non-array,
+not `1`: exactly the value the paragraph below argued for, landed during this
+campaign while the text kept describing the old behaviour. All four scale rows
+(`String.class`, `int.class`, `Iface.class`, and the internal spelling) answer
+`0` today, so a caller following the documented
+`if (scale == 0) throw` guard now gets the refusal it is looking for.
+
+`arrayBaseOffset` on a non-array still answers `16`. There is no
+"`0` means invalid" convention for a base offset, no oracle can referee it —
+HotSpot's own refusal is the broken one described above — and nothing has been
+measured that would justify inventing one. That half of the prior adjudication
+stands.
+
+The original reasoning, kept because it is why the change was slow rather than
+skipped: returning `0` is a behaviour change whose blast radius across
+JCTools-shaped consumers was unmeasured, and a prior session weighed the same
 evidence and declined. Changing an adjudicated decision without new evidence is
 not a repair.
 
@@ -368,6 +386,10 @@ and refuse the fourth case with the `IllegalArgumentException` that
 `setMemory`/`copyMemory` at address 0 already produce (rows 27 and 28 of the
 null probe, where CratonVM is already correct and HotSpot SIGSEGVs). The
 prerequisite is a count of what reaches the fallback on a real workload.
+**That count exists now — see §21.** It is 0 across 116 regression vectors,
+both H2 vectors, Spring Boot and Tomcat+SSL, with a positive control that
+fires; and it is NOT yet available for the WildFly and Keycloak paths this
+section cites, which is why the refusal is still not made.
 
 ### 4.6 Nine registrations for methods this JDK image does not declare
 
@@ -702,7 +724,40 @@ build and prints how many vectors it actually executed.
 
 ---
 
-## 10. The probes are no longer in the tree — where they went, 2026-08-29
+## 10. WITHDRAWN — the probes came back, and this section was stale within hours
+
+**Do not read the rest of this section as current.** It said the probes
+were gone from the tree and told the next reader to recover them from git
+history. `probes/` was RESTORED on `dev` the same day, and L7 committed
+its own eleven probes back with a commit that explicitly withdrew the
+same claim elsewhere (`0675e40a5`). This lane's probes are back in
+`probes/` too, as of this commit:
+
+```text
+probes/UnsafeShadowSweep.java              the 457-row differential sweep
+probes/UnsafeNullArgProbe.java             33 null/OOB rows, one call per process
+probes/UnsafeSubwordProbe.java             26 sub-word atomic rows, behind a timeout
+probes/AllocBoundary.java                  the allocateMemory IAE/OOME boundary
+probes/UnsafeImageCensus.java              the multi-image declaration census
+probes/SegmentClassProbe.java              the FFM interface-class rows
+probes/unsafe-l1-run.sh                    the three-arm runner
+probes/unsafe-l1-residual-counts.sh        the R3/R5 counters
+probes/unsafe-l1-invocation-census.py      the retirement invocation census
+probes/unsafe-registrations.txt            the 212 triples the census reads
+```
+
+**The lesson is the section, not the probes.** A page that records the
+state of the tree rather than the state of a DEFECT rots at the speed of
+the tree — this one was wrong within hours of being written, in a
+directory whose own index warns that its snapshots rot. What was worth
+keeping is below and still true: an instrument that lives in the VM
+(`note_unsafe_side_store_offset`) outlives any directory somebody can
+delete, and §12 is the proof — it answered R5 from another lane's corpus
+logs, with no probe involved at all.
+
+<details><summary>The withdrawn text, kept for the record</summary>
+
+### (withdrawn) The probes are no longer in the tree — 2026-08-29
 
 `3b2901531` *"major doc consistency update before the realeas"* (the repo
 owner, pre-release) **removed the whole `probes/` directory: 867 files,
@@ -734,6 +789,9 @@ Re-adding the probe sources was **not** the resolution taken here. The removal
 is a deliberate release decision by the repo owner, and a merge that quietly
 resurrects three files of a directory somebody just retired is the wrong kind
 of conflict resolution.
+
+
+</details>
 
 ---
 
@@ -842,3 +900,757 @@ Recovered with `git checkout --` and redone through a temp file plus
 `os.replace`. Every patch script here now writes that way. This is the second
 time in this session that an `open(..., "w")` destroyed its target before
 failing; the first cost a probe source.
+
+---
+
+## 12. R5 CORRECTED — the fix I specified would have broken a DoD workload
+
+§9.3 measured 0 unclassified null-base offsets across 118 corpus vectors, said
+the specified refusal was "free on this corpus", and declined to take it because
+the corpus excludes the three definition-of-done workloads. **That caution was
+right, and this section is why.**
+
+L7 completed on 2026-08-29: all three DoD workloads now run under `--jdk-only`,
+and the H2 corpus — 218 test classes — is checked out on the build host with a
+per-vector runner that keeps stderr. Its strict run is dated 13:18–13:22, after
+this lane's instrument landed at ~11:20, so the answer was already sitting in
+those logs. **The marker string exists only in this lane's code, so its presence
+in the logs is self-verifying: that binary carried the instrument.**
+
+```text
+UNCLASSIFIED-NULL-BASE, H2 strict corpus, 218 classes
+  org.h2.test.db.TestFullText      11 warn lines, occurrence reached 513   PASS rc=0  57s
+  org.h2.test.unit.TestRecovery     6 warn lines, occurrence reached  17   PASS rc=0  22s
+  the other 216 classes             none
+  every hit:  offset = 0x0
+```
+
+The warn fires on the first occurrence and then at powers of two, so occurrence
+513 means **between 513 and 1024 calls in one passing vector**.
+
+**So the refusal §9.3 specified — an `IllegalArgumentException` for an
+unclassified null-base offset — would have thrown five hundred times inside a
+vector that currently passes.** It is not "licensed but untaken". It is
+measured unsafe, and the 0-of-118 that made it look free was the corpus being
+blind to the workload the path serves. This is the second time in this lane that
+widening the input made a counter confess; the first was the instrument that
+could not fire at all (§9.4).
+
+**The shape is narrower than R5 assumed, and that is the useful part.** Every
+hit is `offset = 0x0` — a null base at absolute address zero, not a scattered
+range of unrecognised offsets. On HotSpot that is a read or write of address 0
+and a SIGSEGV; here it lands in the side store and the caller continues. A
+future fix has one specific case to explain rather than a category:
+
+* what calls `Unsafe.<get/put/CAS>(null, 0)` hundreds of times in H2's full-text
+  and recovery paths, and is it H2's own code, a JDK class, or one of this VM's
+  internal callers? The instrument records the offset but not the caller, so
+  this is the next measurement, not a conclusion.
+* if those calls are writes whose values are never read back, the side store is
+  absorbing a no-op and the correct fix may be at the producer rather than here.
+
+**What is NOT claimed.** The compatible arm of that corpus run has only 5 of 218
+logs, so its zero is an unrun arm, not a measurement — the same trap this record
+already recorded once. And 216 clean classes do not make the other two rare;
+they make them specific.
+
+R5 stays OPEN, with a stronger reason than before: not "unmeasured", but
+"measured, and the obvious fix is refuted".
+
+---
+
+## 13. R1 on the workload it was written for — 0, and what that is worth
+
+§4.1 declined to match HotSpot's `InternalError` for
+`objectFieldOffset1` on a missing field name, because the minted synthetic
+offset is documented as the thing that unblocked WildFly's
+`Class$Atomic.casReflectionData` and **Spring Boot's
+`AbstractClassLoaderValue.putIfAbsent`** — workloads the regression corpus does
+not contain. §9.3 measured 0 mints across 118 corpus vectors and said so.
+
+Spring Boot is now reachable: L7's `probes/dod-arms.sh` runs it, and the arm was
+re-run here against this lane's instrumented binary.
+
+```text
+--jdk-only, this lane's binary, L7's DoD arms
+  sbsimple   Spring Boot, full context refresh, 55 beans   rc=0  DOD RESULT OK
+             "minting synthetic offset"   0
+             UNCLASSIFIED-NULL-BASE       0
+  tcssl      embedded Tomcat over HTTPS, 297 beans,
+             three real HTTPS requests                     rc=0  DOD RESULT OK
+             "minting synthetic offset"   0
+             UNCLASSIFIED-NULL-BASE       0
+```
+
+So the mint path is **dormant on the workload whose name is in its own
+justification**. Across four independent populations it has now fired zero
+times: 118 regression vectors, 218 H2 classes, a Spring Boot context refresh,
+and a servlet container serving HTTPS.
+
+**That is not a licence to remove it, and the reason is specific.** The rescue
+has two named consumers and only one has been measured. WildFly — the other, and
+the one whose `casReflectionData` hang the registrar comment actually cites — is
+**not checked out on this host** (`apps/wildfly*` does not exist), so its
+verdict is absent rather than negative. A rescue with two consumers, one silent
+and one unmeasured, is not a rescue that has been shown to be unnecessary.
+
+**R1 therefore stays OPEN, with its remaining question reduced to one name.**
+Anyone with a WildFly checkout can settle it: run it under `--jdk-only` with a
+binary carrying the existing `objectFieldOffset1` warn — it is already in the
+tree and needs no probe — and grep stderr for `minting synthetic offset`.
+
+### 13.1 Method note: the first attempt answered 0 from runs that never ran
+
+The first pass at this reported `UNCLASSIFIED=0 mint=0` for both arms — from
+runs that had died **in one second with zero output lines**. This lane's own
+worktree has no compiled `DodSpringApp` driver (`probes/out`), so the arm never
+reached Spring at all, and the stderr it left carried a `--jdk-only` policy
+violation that I briefly mistook for a regression on `dev`.
+
+Two things stopped it becoming a false result, and both were somebody else's
+design rather than my care:
+
+* **L7's runner prints `lines=0` and `NO-DOD-RESULT-LINE`.** A runner that
+  reports how much output a vector produced turns "it failed instantly" into a
+  visible fact instead of a zero.
+* **Isolating the variable before believing the conclusion.** Running L7's
+  binary with L7's classes (OK), then *this lane's* binary with L7's classes
+  (OK) showed the binary was never the problem. Had I stopped one step earlier I
+  would have filed a `dev` regression that does not exist.
+
+Third instance in this lane of the same shape — §9.4's mute instrument, §12's
+corpus blindness, and now this. **A zero is a claim about a run, and the run has
+to be shown to have happened first.**
+
+---
+
+## 14. R1 CLOSED — the mint is unreachable through its own documented consumers
+
+§13 left R1 open on one name: WildFly, which is not checked out on this host.
+It is closed now, and not by finding WildFly — by characterising the consumer
+surface instead of sampling it.
+
+The mint fires only when `Unsafe.objectFieldOffset(Class, String)` cannot find
+the named field. Its registrar comment names two consumers. Asked of JDK 25
+directly, with `javap`:
+
+* **`java.lang.Class$Atomic`** resolves exactly **three** names, all on
+  `java.lang.Class`, in a single `<clinit>`:
+  `reflectionData`, `annotationType`, `annotationData`. That `<clinit>` runs in
+  any VM that touches reflection at all.
+* **`jdk.internal.loader.AbstractClassLoaderValue`** references `Unsafe`
+  **zero times** on JDK 25. **That half of the citation is stale** — whatever it
+  did when the comment was written, it does not reach this path now.
+
+So the documented surface is three field lookups on one class, once per process
+— not a workload-dependent population. **WildFly reaches the mint only through
+the same `<clinit>`, which every measured workload already runs.** Its absence
+stopped mattering once the surface was characterised rather than sampled.
+
+Measured with `probes/MintReachProbe.java`, which leads with a positive control
+because this lane has been caught three times by a zero from an instrument that
+could not fire:
+
+```text
+                                          compatible   --jdk-only
+CONTROL objectFieldOffset(X, "noSuchField20260829")   mints      mints
+CONTROL a second bogus name, distinct offset          mints      mints
+Class.reflectionData   resolves non-zero                yes        yes
+Class.annotationType   resolves non-zero                yes        yes
+Class.annotationData   resolves non-zero                yes        yes
+two passes of getDeclaredFields / getDeclaredMethods /
+getAnnotations over seven classes
+  additional mints                                        0          0
+  TOTAL mint warns                                        2          2
+```
+
+Two warns, both the controls. The instrument fires exactly when it should and
+never otherwise.
+
+**Adjudicated: deliberate, and unreachable through its documented consumers.**
+Matching HotSpot's `InternalError` is now known to be a no-op on every measured
+path, so it is *available* to anyone who wants contract fidelity — but it should
+not be taken alone. The registrar comment names a second scenario the probe
+cannot reach: `ConcurrentHashMap.table` *"when the populator failed to wire the
+`rj_slot` metadata"*. That is a VM fragility the mint papers over, not a caller
+error, and removing a rescue before showing the fragility is gone is the mistake
+§12 records. **Precondition stated; row closed.**
+
+---
+
+## 15. R5 diagnosed to the caller and the native — and two hypotheses died
+
+§12 named the next measurement: the instrument records the offset but not the
+caller. It does now, and the answer took two wrong guesses on the way.
+
+```text
+org.h2.test.db.TestFullText, --jdk-only, PASSES rc=0
+  11 warn lines, occurrence reaching 513, every one:
+      offset = 0x0
+      caller = org/apache/lucene/store/MappedByteBufferIndexInputProvider
+      native = getIntVolatile   x10
+               compareAndSwapInt x1
+```
+
+`org.h2.test.unit.TestRecovery` is the same caller and offset, 6 lines.
+**One caller, one offset, two natives, across both classes.**
+
+### 15.1 Two hypotheses that died, and why saying so matters
+
+* **"Lucene is unmapping through `invokeCleaner`."** `javap` on Lucene 9.7's
+  `MappedByteBufferIndexInputProvider` shows exactly that — `unmapHackImpl()`
+  looks up `sun.misc.Unsafe`, `theUnsafe` and `invokeCleaner` and builds a
+  MethodHandle. It is the obvious answer and it is not this one: the natives
+  actually reached are `getIntVolatile` and `compareAndSwapInt`.
+* **"This VM answers a mapped buffer's address as 0, and Lucene reads through
+  it."** That was the §12 hypothesis, and it is REFUTED —
+  `probes/MappedAddrProbe.java` reports a non-zero address for a
+  `FileChannel.map` buffer, its duplicate and its slice, and for
+  `allocateDirect`, **identically on HotSpot and CratonVM in strict mode**. It
+  went into §12 as a suggestion; it would have gone into this section as a fact.
+
+### 15.2 What the evidence actually says
+
+`getIntVolatile(null, 0)` followed by `compareAndSwapInt(null, 0, ...)` is the
+shape of a **CAS on a field whose offset resolved to 0**, with the base null —
+not of an unmapping call. It is the same "offset 0 aliases slot 0" hazard the
+`objectFieldOffset1` comment describes, on the static path, being silently
+rescued by the side store. The side store is what makes that CAS loop terminate,
+which is why H2 passes and why refusing here would hang or break it.
+
+**A caveat on the attribution, stated because it changes what the name means.**
+This VM's MethodHandle dispatch does not create intermediate frames, so the
+innermost Java frame is the nearest *real* frame, not necessarily the literal
+caller. `MappedByteBufferIndexInputProvider` is where to start looking, not
+proof that Lucene's own bytecode issues the call.
+
+### 15.3 What would close it
+
+The remaining question is one field: **which field's offset resolved to 0.**
+Method-level attribution (the frame walk already added here returns only the
+class) or a targeted Lucene repro would name it. The fix then belongs at
+whatever produced the 0 — and NOT at the fallback, which §12 established and
+this section confirms: 513+ rescued calls in a vector that passes.
+
+Both instruments stay in the tree (`note_unsafe_side_store_offset` now reports
+`caller` and `site_line`), so the next measurement costs a run and no probe.
+
+## 16. R5 CLOSED: it was never an offset that resolved to 0
+
+§15.3 named the remaining question as *"which field's offset resolved to 0."*
+That question had a false premise, and finding that out took four instruments —
+each of which killed the one before it.
+
+### 16.1 The frame walk was reading the wrong end of the stack
+
+§15's attribution came from `frame_class_ids`, whose doc says **"innermost
+(most recent call) first"**. Adding method names meant switching to
+`capture_stack_trace`, which carries `method_name` and `byte_code_index`. Its
+first three entries came back as
+
+```text
+org/h2/test/db/TestFullText.main+6
+  <- org/h2/test/TestBase.testFromMain+8
+    <- org/h2/test/db/TestFullText.test+77
+```
+
+for **every** call site — and `main` *calls* `testFromMain` *calls* `test`. A
+second case on another thread agreed: `Task.run+1 <- TestFullText$1.call+163 <-
+JdbcPreparedStatement.execute+161`.
+
+**`capture_stack_trace` returns OUTERMOST-first; `frame_class_ids` returns
+innermost-first.** Neither doc mentions the other, and nothing in the tree
+depends on both. Reading the front of one gave the stack's floor, which is
+identical for every call site in a vector and therefore says nothing.
+
+Reversed, with the `Unsafe` skip removed (the skip hid three of four frames),
+the chain is exact:
+
+```text
+sun/misc/Unsafe.invokeCleaner+18
+  -> beforeMemoryAccess+19    -> isMemoryAccessWarned+9
+                                   -> getIntVolatile(null, 0)
+  -> beforeMemoryAccessSlow+104 -> trySetMemoryAccessWarned+11
+                                   -> compareAndSetBoolean+15
+                                   -> compareAndSwapInt(null, 0, ...)
+```
+
+Not Lucene. **JDK 25's own `sun.misc.Unsafe` deprecation-warning latch**, on
+the path of every legacy Unsafe memory access — which is why a full-text vector
+reached it 513+ times.
+
+### 16.2 Two more hypotheses died on the way
+
+* **"The arguments were truncated by MethodHandle dispatch."** bci 19 of
+  Lucene's cleaner lambda is `unmapper.invokeExact(buffer)`, and
+  `unsafe_obj(args, 1)` cannot distinguish an absent argument from a null one,
+  nor `unsafe_offset(args, 2)` an absent one from a real 0. Logging
+  `args.len()` settled it: **`nargs=3` for `getIntVolatile` and `nargs=5` for
+  `compareAndSwapInt` — full arity.** The arguments arrived; the null and the 0
+  are genuine.
+* **"MethodHandle dispatch is the producer."** `UnmapHackProbe.java`
+  reproduces Lucene 9.7's unmap hack in 40 lines with **no Lucene and no H2**,
+  and pairs it with the control that isolates the axis: the same call made
+  directly. It fires on **both** arms (bci 89 through the MethodHandle, bci 149
+  through reflection). The MethodHandle is incidental.
+
+### 16.3 The cause: two `static final` fields that were never assigned
+
+`javap` on JDK 25's `sun.misc.Unsafe` shows both latch methods reading
+`MEMORY_ACCESS_WARNED_BASE` (an `Object`) and `MEMORY_ACCESS_WARNED_OFFSET` (a
+`long`) and passing them straight to `getBooleanVolatile(Object,J)` /
+`compareAndSetBoolean(Object,JZZ)`. `<clinit>` computes that pair at bci
+185/195 from `staticFieldBase`/`staticFieldOffset` of the static `boolean
+memoryAccessWarned`.
+
+`StaticBaseProbe.java` tested the obvious suspect and **acquitted it** — for an
+ordinary class this VM is byte-identical to HotSpot: non-null base, distinct
+non-zero offsets, a working false→true latch. So nothing resolved to 0.
+
+`WarnLatchProbe.java` asked the other question, with its own control in the
+same run:
+
+| | HotSpot | CratonVM |
+| --- | --- | --- |
+| `MEMORY_ACCESS_WARNED_BASE` non-null | true | **false** |
+| `MEMORY_ACCESS_WARNED_OFFSET` non-zero | true | **false** |
+| control: `staticFieldBase(memoryAccessWarned)` non-null | true | true |
+| control: `staticFieldOffset(memoryAccessWarned)` non-zero | true | true |
+
+**`null` and `0` are the DEFAULT values of two never-assigned fields**, while
+the mechanism that should have filled them works perfectly. A zero read as an
+answer when it is really an uninitialised field — the same shape as
+[`a-consumer-count-cannot-explain-its-own-zero`].
+
+## 17. The bigger defect R5 was standing in front of
+
+`ClinitProbe.java` walks `sun.misc.Unsafe.<clinit>` by bci, checking a field
+written before, during and after the region of interest:
+
+| bci | field | HotSpot | CratonVM |
+| --- | --- | --- | --- |
+| 34/40 | `theUnsafe`, `theInternalUnsafe` | set | set |
+| 157 | `ARRAY_OBJECT_INDEX_SCALE` | non-zero | **0** |
+| 166 | `ADDRESS_SIZE` | non-zero | **0** |
+| 185/195 | latch `BASE`/`OFFSET` | set | **default** |
+| 214 | `MEMORY_ACCESS_OPTION` | set | set |
+
+**Every public constant on the legacy `sun.misc.Unsafe` spelling was zero.**
+
+This is not a new failure mode — it is the one `post_clinit_fixup`'s
+`jdk/internal/misc/Unsafe` arm already exists to repair, root-caused in that
+arm's own comment (ES-FAIL-FAMILY-20260710): `<clinit>` computes these through
+natives not yet registered this early in boot, and **an unregistered native
+silently returns its return type's zero rather than throwing**, so the
+`static final` latches at 0 for the life of the process.
+
+`sun.misc.Unsafe` has its own 18 copies (`<clinit>` bci 43..157 reads
+`jdk/internal/misc/Unsafe.ARRAY_*`) plus `ADDRESS_SIZE` at bci 166 — and its
+fixup arm repaired only `MEMORY_ACCESS_OPTION`. It copies from the sibling
+*before* the sibling's own arm has run, so it copies zeros.
+
+The consequence is the one that arm already spells out: any library following
+the documented `offset = ARRAY_<T>_BASE_OFFSET + index` protocol **through the
+legacy spelling** gets an offset short by 16 and reads the wrong bytes, with no
+exception thrown.
+
+### 17.1 Fixed, with the sibling arm's own values
+
+The `sun/misc/Unsafe` arm now backfills all nineteen — 16 for every
+`ARRAY_*_BASE_OFFSET`, the per-type `INDEX_SCALE`s, and `ADDRESS_SIZE = 8`
+(`size_of::<usize>()`, matching `native_unsafe_address_size` and the
+`ADDRESS_SIZE0` backfill already in that file). The repair writes only a field still
+holding 0, so a correctly-initialised future implementation stays
+authoritative -- see §18.2, which is where that became true: it was NOT true
+as originally written, and this sentence was a false claim about
+`set_static_by_name` until `set_static_if_zero` was added.
+
+After the fix, the `ClinitProbe` diff against HotSpot loses both rows: bci 157
+and bci 166 now match.
+
+### 17.2 What is deliberately NOT fixed
+
+`MEMORY_ACCESS_WARNED_BASE`/`_OFFSET` (bci 185/195) still hold their defaults,
+so the R5 warn still fires. Backfilling them needs the class mirror and this
+VM's own static-offset encoding, which `set_static_by_name` cannot synthesise —
+a different mechanism, not a longer list.
+
+**Its severity is now known rather than assumed, which is the point of leaving
+it visible.** The latch is the JDK's once-only deprecation-warning flag. With
+the pair at `(null, 0)` the read and the CAS both land in the private side
+store, consistently — so the latch still latches, `H2 TestFullText` and
+`TestRecovery` both pass (`rc=0`), and the only observable effect is on when
+that deprecation warning prints. This is the same reason §12 and §15 give for
+NOT refusing the fallback: 513+ rescued calls in a vector that passes.
+
+## 18. Accepting the fix — and a claim of mine that was false
+
+### 18.1 "Non-zero" is not "correct"
+
+`ClinitProbe` only asked *is it zero*. That was enough to FIND the defect and
+is not enough to ACCEPT the repair: **a backfill writing the wrong constant is
+also non-zero**, and would read as repaired.
+
+Diffing the values across VMs cannot serve as the oracle either — the right
+answers legitimately differ. CratonVM uses a uniform 16-byte header and no
+compressed oops, so `ARRAY_OBJECT_INDEX_SCALE` is 8 here and 4 on a
+compressed-oops HotSpot; a value diff would flag a correct answer as a defect.
+
+`UnsafeConstAgree.java` uses a **VM-independent invariant** instead. By the
+JDK's own construction the legacy spelling's `<clinit>` copies the internal
+constant, which the native computes, so all three are one number:
+
+```text
+sun.misc.Unsafe.ARRAY_<T>_BASE_OFFSET
+  == jdk.internal.misc.Unsafe.ARRAY_<T>_BASE_OFFSET
+  == theUnsafe.arrayBaseOffset(<T>[].class)
+```
+
+**0 disagreements on both VMs**, across all 9 types × {base, scale} plus
+`ADDRESS_SIZE` — and the access that was silently short by 16, a `byte[]` read
+through `ARRAY_BYTE_BASE_OFFSET + 2 * ARRAY_BYTE_INDEX_SCALE`, returns the byte
+actually stored there.
+
+**A probe artefact that read as a defect, recorded because it nearly became
+one.** The first version read the internal constants with `setAccessible`.
+That threw `InaccessibleObjectException` on CratonVM and succeeded on HotSpot —
+but only because the HotSpot command line carried `--add-opens` and the
+CratonVM one did not. It printed as a sentinel, which looks exactly like a
+missing field, which would have been a definition-of-done finding.
+`InternalFieldProbe.java` separated the two by reporting the *throwable class*
+rather than a value: `declared-but-InaccessibleObjectException`, so the fields
+exist and the class is the real one. (CratonVM does accept `--add-opens` and
+`--add-exports`; referencing the constants directly removes the artefact
+entirely.)
+
+### 18.2 The repair's own count was not a measurement. Now it is.
+
+**§17.1 said `set_static_by_name` "writes only a field still holding 0". That
+is false** — it writes unconditionally, returning true when it locates the
+field and the value fits the descriptor. Two consequences, both mine:
+
+* the arm's `19/19` meant *"nineteen fields found and written"*, not
+  *"nineteen were broken"* — so it was not evidence for what it was being cited
+  as evidence for;
+* the arm would overwrite a correct value if the underlying ordering were ever
+  fixed, which is the opposite of what I claimed.
+
+`set_static_if_zero` makes the claim true rather than retracting it: it reads
+the slot first and writes only a zero. The count is now a measurement —
+**`19/19` means all nineteen really were zero**, and a future `0/19` means the
+ordering has been fixed upstream and this arm is dead weight that can be
+deleted.
+
+Applied to **this lane's arm only**. The sibling `jdk/internal/misc/Unsafe`
+arm is another lane's, has its own history, and changing *when* it writes is a
+behaviour change I have no measurement for.
+
+### 18.3 The family, sized
+
+The fixup arms' own log lines from a single run:
+
+| arm | count | is the count a measurement? |
+| --- | --- | --- |
+| `jdk/internal/misc/Unsafe` ARRAY_* | 18/18 | no — unconditional, "found" |
+| `jdk/internal/misc/UnsafeConstants` | 5/5 | no — unconditional, "found" |
+| `sun/misc/Unsafe` ARRAY_*/ADDRESS_SIZE | **19/19** | **yes** — conditional |
+
+Nineteen zeroed constants are measured; the other twenty-three are *repaired*
+but their counts do not establish that they were broken. `ClinitProbe`
+independently measured two of the nineteen (bci 157, bci 166) against HotSpot
+before the fix, which is what turned the inference into a finding in the first
+place.
+
+### 18.4 An empty instrument that is NOT an absence proof
+
+`--dump-missing-natives` and `--dump-missing-natives-grouped` both come back
+empty on a run that demonstrably suffers the defect. That is **not** evidence
+that no natives were missing: nothing here shows those dumps can fire, and the
+latching happens during early boot, before the point a workload-level dump
+describes. Recorded as un-adjudicated rather than counted as a clean result —
+a zero from an instrument with no positive control is not a zero.
+
+## 19. R5 fully closed: the latch pair repaired, and the warns are gone
+
+§17.2 left the latch pair unfixed on the grounds that it "needs the class
+mirror and this VM's own static-offset encoding, which `set_static_by_name`
+cannot synthesise — a different mechanism, not a longer list."
+
+That was right about the mechanism and wrong about the difficulty, because it
+assumed the repair had to *synthesise an encoding*. It does not. Reading
+`native_unsafe_static_field_offset` shows what the call actually does:
+
+```rust
+let offset = synthetic_offset_for(&class_name, &format!("static:{field_name}"));
+remember_unsafe_static_field_offset(offset, class_id, field_index);
+```
+
+**The registration is the load-bearing half.** The number alone is inert; it is
+the `unsafe_static_field_targets` entry that later routes a null-base
+`getBooleanVolatile`/`compareAndSetBoolean` to the real static slot instead of
+into the private side store. Minting an offset without registering it would
+have *moved* the defect while looking like a fix.
+
+So the repair makes the same mint-and-register call `<clinit>` would have made,
+through a new `register_static_field_offset` in `native-builtins`, and stores
+the class mirror in `MEMORY_ACCESS_WARNED_BASE` — which is exactly what
+`native_unsafe_static_field_base` answers for a static field on this VM, and a
+shape `StaticBaseProbe` had already proved round-trips byte-identically to
+HotSpot.
+
+### 19.1 Result
+
+```text
+Post-clinit fixup: sun.misc.Unsafe memory-access latch repaired (2/2)
+```
+
+`2/2` through the conditional writer, so both really were at their defaults.
+
+| probe | before | after |
+| --- | --- | --- |
+| `ClinitProbe` vs HotSpot | 2 rows differ | **no differences** |
+| `WarnLatchProbe` vs HotSpot | 3 rows differ | **no differences** |
+| `UnmapHackProbe` warns | 3 | **0** |
+| `org.h2.test.db.TestFullText` warns | 11 (occurrence → 513) | **0** |
+| `org.h2.test.unit.TestRecovery` warns | 6 | **0** |
+
+Both H2 vectors still pass, `rc=0`.
+
+### 19.2 The zero is a real zero
+
+A fall to 0 is only evidence if the instrument can still fire, and this lane
+has three times been caught reading a mute instrument as a clean result.
+`NullBaseControl.java` makes the access the instrument exists to count — a null
+base with an offset that is not an arena handle, not a synthetic offset and not
+a registered static field:
+
+```text
+CONTROL warns: 2      offset=0x7654321 site_line=2924
+                      offset=0x7654329 site_line=2623
+```
+
+Both sites fire. The zeros above are measurements, not silence.
+
+**And the control also shows what was NOT fixed**, which is why it is worth
+keeping in the tree: it prints `cas |true|` for a compare-and-swap that wrote
+nowhere any reader can see. The null-base side store still invents a slot for a
+genuinely unclassified offset. R5 is closed because nothing in the JDK reaches
+that path any more — not because the path became safe. The instrument stays,
+and it is now quiet enough that a future occurrence is a signal rather than
+noise.
+
+## 20. The vector that should have caught this, and did not
+
+`RUnsafeArrayBase` is a core regression vector, on every arm, specifically
+about `sun.misc.Unsafe` array-base addressing. It was green for the entire life
+of the defect.
+
+The reason is one word: it calls
+
+```java
+long base = u.arrayBaseOffset(byte[].class);   // the METHOD — always worked
+```
+
+and never reads `sun.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET` — **the CONSTANT**,
+which is where the defect lived. A vector named for the exact surface can miss
+the exact defect by asking the wrong one of two sources that are supposed to be
+the same number.
+
+That is also why the campaign's other instruments were quiet: the natives were
+always right. Only the `<clinit>`-copied constants were zero, and nothing
+compared the two.
+
+### 20.1 The guard
+
+Nineteen agreement assertions plus the documented-protocol read, on the same
+VM-independent invariant §18.1 used — the constant and the native are one
+number by the JDK's own construction, so no value that legitimately differs
+between VMs is pinned.
+
+They are written as **"declared implies agrees"**, not "declared". That keeps
+the printed check count identical in every mode, which matters twice over: the
+suite compares this VM's stdout against HotSpot's, and `--synthetic-jdk` is not
+compiled into the binary this lane can build — a mode-dependent count would be
+an untestable change to another lane's arm. In every real-JDK mode the
+constants are declared and the guard bites.
+
+### 20.2 Proven live in both directions
+
+Asserting that a new test passes says nothing about whether it can fail.
+
+| | HotSpot | CratonVM |
+| --- | --- | --- |
+| unmodified | `PASS RUnsafeArrayBase (364 checks)` | `PASS RUnsafeArrayBase (364 checks)` |
+| one constant made to disagree | `AssertionError`, rc=1 | `AssertionError`, rc=1 |
+
+Identical check counts, so no stdout diff. And the negative control's message
+is the one a future reader needs:
+
+```text
+sun.misc.Unsafe.ARRAY_BYTE_BASE_OFFSET agrees with the native:
+constant says 16, native says 0
+ -- a zero here means <clinit> latched an unregistered native's zero return
+```
+
+The defect can now only recur loudly.
+
+## 21. §4.5's prerequisite, discharged — the fallback is reached by nothing
+
+§4.5 declined to refuse the unclassified null-base access and named exactly what
+would unblock the decision:
+
+> **The prerequisite is a count of what reaches the fallback on a real
+> workload.**
+
+Here is that count. Every row has a positive control, because every zero in this
+section is load-bearing.
+
+| population | vectors | hits |
+| --- | --- | --- |
+| regression vectors, `--jdk-only` | 116 completed rc=0 | **0** |
+| `org.h2.test.db.TestFullText` | 1 | **0** (was 11, occurrence → 513) |
+| `org.h2.test.unit.TestRecovery` | 1 | **0** (was 6) |
+| Spring Boot smoke test (`DOD RESULT OK`) | 1 | **0** |
+| Tomcat + SSL smoke test (`DOD RESULT OK`) | 1 | **0** |
+| `UnmapHackProbe` | 1 | **0** (was 3) |
+| **`NullBaseControl` (positive control)** | 1 | **2** |
+
+### 21.1 The three arms cannot answer this, and nearly said they could
+
+The obvious way to count is to grep the arm logs. It gives 0, and that 0 is
+**void**: `run.sh` captures each vector's output into a shell variable and
+passes it through `extract` before comparing, so VM chatter is discarded. The
+tell is that the arm logs contain **zero cratonvm `WARN` lines of any kind** —
+not zero of this one. A vector can warn on every call and still pass.
+
+So the sweep drives the vectors directly against the suite's own compiled
+classes with stderr kept, and runs `NullBaseControl` **in the same loop, through
+the same capture**. It reports 2. Without that row the whole table would be
+a mute instrument reported as a clean result — which this lane has now been
+caught by four times.
+
+The two DoD workloads carry their own denominator: each `.err` holds **6
+`Post-clinit fixup` lines**, so warns from this build demonstrably reach those
+files.
+
+**Caveat, stated because it bounds the claim:** the sweep runs vectors without
+their per-vector flags and classpath entries, so 4 of 120 exited non-zero and
+exercised less than the suite gives them.
+
+### 21.2 What this does and does not license
+
+**Discharged for four workload families**: the regression corpus, H2, Spring
+Boot and Tomcat+SSL. Nothing in any of them reaches the fallback, and the
+`compareAndSwapInt` that returns `true` having written nowhere is unreachable
+from real code in those populations.
+
+**NOT discharged for the rest.** §4.5's own justification cites the WildFly and
+Keycloak lazy-init paths, and those workloads are other lanes' — they are not
+checked out here and this lane cannot run them. The refusal §4.5 specifies
+(classify the offset; refuse the fourth case with the
+`IllegalArgumentException` that `setMemory`/`copyMemory` at address 0 already
+produce) is now **evidence-backed but not evidence-complete**, and flipping a
+shared path on partial evidence is the overlap this lane is supposed to avoid.
+
+So this stays a measured finding rather than a speculative repair — which is
+what the lane brief asks for, and I am saying which I did. Whoever owns WildFly
+or Keycloak can discharge the remainder with one run: the instrument is in the
+tree, `NullBaseControl` is the control, and the bar is the table above.
+
+**What changed underneath it:** §4.5 was written when the JDK itself reached
+this path 513+ times per H2 vector. §19 removed that consumer. The residual is
+no longer "a rescue something depends on" — it is a path nothing measured
+reaches, kept because the measurement does not yet cover everything.
+
+## 22. Taking on the residual itself
+
+The residual had been *characterised* — every row explained — but three of its
+explanations were assertions nobody had tested, and one was a decision nobody
+had re-costed. Taking it on means testing the explanations.
+
+### 22.1 The compressed-oops rows: asserted for four sessions, now proven
+
+§4.2 said `Object[]`, `String[]` and `int[][]` report 8 here and 4 on HotSpot
+because HotSpot runs with compressed oops and CratonVM does not. Every session
+that met those rows repeated it and moved on. **It was never tested**, and it
+costs one flag:
+
+```text
+java                            sun scale [Ljava.lang.Object; |4|
+java -XX:-UseCompressedOops     sun scale [Ljava.lang.Object; |8|   <- CratonVM: 8
+```
+
+All three rows match exactly, and the sweep diff falls from **20 changed lines
+to 14** — precisely those three rows, with no new difference anywhere in 457.
+
+The fix is in the runner, not the VM: **a differential whose oracle is
+configured unlike the VM under test reports its own configuration as a defect,
+permanently, in a column readers have to be told to ignore.**
+`unsafe-l1-run.sh` now passes `-XX:-UseCompressedOops`. This does not claim
+CratonVM matches a default-configured HotSpot — it claims those three rows are
+the oops mode and nothing else, which is now measured rather than assumed.
+
+### 22.2 The mint row: measured to zero, and NOT changed — here is why
+
+`objectFieldOffset(Class, String)` for a name the class does not have: HotSpot
+throws `InternalError`, CratonVM mints a synthetic offset and routes it through
+a per-object side store.
+
+Reachability, using the per-vector captures already on disk:
+
+| population | mints |
+| --- | --- |
+| 120 regression vectors | **0** |
+| Spring Boot / Tomcat+SSL (DoD) | **0** / **0** |
+| H2 `TestFullText` / `TestRecovery` | **0** / **0** |
+| `MintReachProbe` (positive control) | **2** |
+
+And the mint's own comment names its two consumers — WildFly's
+`Class$Atomic.casReflectionData` and Spring Boot's
+`AbstractClassLoaderValue.putIfAbsent`. §14 measured **both away**:
+`Class$Atomic` resolves its three real names on JDK 25, and
+`AbstractClassLoaderValue` references `Unsafe` zero times. A program that
+"works" through the mint is running a lazy-init guard against a phantom field,
+so it is already wrong.
+
+The case for matching HotSpot is therefore strong. **It is still not made**,
+and the blocker is neither evidence nor appetite:
+
+* `RuntimeError` has **no `InternalError` variant**, and no by-name throw is
+  available to a native — `MethodCallFailed::InternalError` is documented as
+  the UNCATCHABLE form and is not a Java throwable, so it is a different
+  behaviour, not this one.
+* Adding a variant means editing a shared error enum that is matched
+  exhaustively across the VM. That is a cross-cutting change to shared code for
+  one probe row that nothing measured depends on — and this lane's remaining
+  budget is better spent not destabilising seven other lanes.
+
+Recorded with the measurement attached so whoever adds that variant for another
+reason can close this row in the same commit.
+
+### 22.3 The non-array rows: half already correct
+
+Four of the six are `arrayIndexScale`, and they answer `0` — the documented
+sentinel, which callers test with `if (scale == 0) throw`. That half is
+arguably *better* than the oracle, whose refusal is the JDK bug described in
+§4.3. The two `arrayBaseOffset` rows answer `16`; there is no sentinel
+convention for a base offset and no oracle can referee it, so they stay.
+
+### 22.4 The residual after this section
+
+```text
+sweep  14 changed lines (7 rows)   was 20 (10 rows)
+null   20 changed lines (10 rows)  unchanged
+subword 0                          unchanged
+mode drift 0 on all three          unchanged
+```
+
+**Sweep (7 rows):** 1 mint row (§22.2, measured to zero, blocked on a shared
+enum) + 6 non-array rows (§22.3, four of them already the documented answer).
+
+**Null (10 rows):** 5 where CratonVM throws NPE/IAE and HotSpot SIGSEGVs —
+CratonVM is better and stays — and the 5 null-base rows of §21, reached by
+nothing measured and left to whoever can run WildFly.
+
+Nothing in the residual is now an unexplained difference, and nothing in it is
+explained by an untested assertion.

@@ -23,6 +23,7 @@ pub mod flags;
 pub mod float_format;
 pub mod handle;
 mod heap_types;
+pub mod identity_side_tables;
 pub mod intern;
 pub mod jfp;
 pub mod jit_activation;
@@ -608,6 +609,70 @@ pub mod scalar_deopt_census {
 /// The counters live here rather than in `cuda-bridge` for the same reason
 /// [`cell_census`] does: they are written in one crate and printed in
 /// another, and this is the crate both of them already depend on.
+/// How much of the GPU dispatch path is being served from memo rather than
+/// re-derived.
+///
+/// The two memos this counts -- the per-call-site method resolution and the
+/// `craton/gpu/GpuArray` class id -- have no observable semantics, so a
+/// wall clock on a shared host cannot tell "it did not fire" from "it fired
+/// and did not help". These counters can.
+///
+/// A `resolutions_missed` that keeps climbing after warm-up is the finding:
+/// it means call sites are not repeating, and the memo is pure overhead for
+/// that workload.
+pub mod gpu_dispatch_memo_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static RESOLVE_HIT: AtomicU64 = AtomicU64::new(0);
+    static RESOLVE_MISS: AtomicU64 = AtomicU64::new(0);
+    static ARRAY_PROBE: AtomicU64 = AtomicU64::new(0);
+
+    /// One dispatch served from the resolution memo.
+    #[inline]
+    pub fn note_resolve_hit() {
+        RESOLVE_HIT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One dispatch that had to resolve the long way.
+    #[inline]
+    pub fn note_resolve_miss() {
+        RESOLVE_MISS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One argument tested against the cached `GpuArray` class id.
+    #[inline]
+    pub fn note_array_probe() {
+        ARRAY_PROBE.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(resolution hits, resolution misses, array type probes)`.
+    #[must_use]
+    pub fn totals() -> (u64, u64, u64) {
+        (
+            RESOLVE_HIT.load(Ordering::Relaxed),
+            RESOLVE_MISS.load(Ordering::Relaxed),
+            ARRAY_PROBE.load(Ordering::Relaxed),
+        )
+    }
+
+    /// One line on the exit path, when this process dispatched anything.
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let (hit, miss, probes) = totals();
+        if hit + miss == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            eprintln!(
+                "[cratonvm] gpu dispatch memo: resolutions served={hit} re-derived={miss} \
+                 ({:.1}% memoised); GpuArray type probes={probes}, each one \
+                 integer compare",
+                100.0 * hit as f64 / (hit + miss).max(1) as f64,
+            );
+        });
+    }
+}
+
 pub mod gpu_event_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 

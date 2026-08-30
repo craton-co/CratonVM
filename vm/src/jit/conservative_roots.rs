@@ -3113,19 +3113,85 @@ fn report_unpublished_band_words(
             // words are that method's java-locals, one object in three
             // consecutive slots.
             let sp_id = frame_active_sp_id(rbp, cm);
-            let in_map = sp_id.map(|id| {
-                cm.oop_maps
-                    .iter()
-                    .filter(|m| m.bytecode_pc == id)
-                    .any(|m| m.frame_slot_offsets.iter().any(|s| i32::from(*s) == off))
-            });
+            // THREE answers, not two. `sp_id.map(..)` gave `Some(false)` both
+            // when a map was found and did not name the slot AND when NO MAP
+            // EXISTS for the stored id -- and those point at opposite repairs.
+            //
+            // Measured on `org.h2.test.jdbc.TestCachedQueryResults`
+            // (2026-08-29): six of seven reported words came from one frame
+            // whose stored id was `1729768472`. That is not a bytecode pc; it
+            // is `0x671a2c18`, the low 32 bits of `0x200671a2c18` -- the heap
+            // pointer this same scan reports two slots away in the same frame.
+            // The frame's sp-id slot holds half an object pointer, so no map
+            // can match it, and `live_hi=None` on the same line says the same
+            // thing. Printed as `Some(false)` that read as "the dataflow calls
+            // this slot dead", which sends a reader at the band verifier
+            // instead of at the frame whose id is garbage.
+            //
+            // `no-map-for-id` is also the honest label for what the SCAN does
+            // here: `frame_active_map_slots` returns `None`, so the dead-slot
+            // relaxation deliberately does not fire and the word is reported.
+            // The report now says which of the two it is.
+            let in_map: &'static str = match sp_id {
+                None => "no-sp-id",
+                Some(id) => {
+                    let mut any_map = false;
+                    let mut names_slot = false;
+                    for m in cm.oop_maps.iter().filter(|m| m.bytecode_pc == id) {
+                        any_map = true;
+                        if m.frame_slot_offsets.iter().any(|s| i32::from(*s) == off) {
+                            names_slot = true;
+                        }
+                    }
+                    if !any_map {
+                        "no-map-for-id"
+                    } else if names_slot {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                }
+            };
+            // THE DISCRIMINATOR for a `no-map-for-id` frame, and the reason
+            // this dump exists at all.
+            //
+            // A safepoint id that is not a bytecode pc has two opposite causes:
+            // something STORED an oop into the reserved sp-id slot (a codegen
+            // defect at that offset), or `rbp` is wrong for this frame so the
+            // read lands on a NEIGHBOURING slot that legitimately holds one (a
+            // frame-resolution defect, the family of the 2026-08-26
+            // innermost-mirror repair). Printing the whole reserved-locals tail
+            // beside `sp_id_off` separates them in one line: a pointer sitting
+            // exactly at `sp_id_off` is the first; the whole tail reading like
+            // some neighbouring frame's is the second.
+            if in_map == "no-map-for-id" {
+                let lo = cm.frame_layout.java_locals_hi.max(8);
+                let hi = cm.frame_layout.locals_hi;
+                let mut tail = String::new();
+                let mut o = lo;
+                while o <= hi && o - lo < 128 {
+                    let a = rbp.wrapping_sub(o as usize);
+                    if a >= rbp - frame_size && a + 8 <= rbp && a & 7 == 0 {
+                        // SAFETY: the same bounded, aligned in-band read the
+                        // walk above makes, on this thread's own frame.
+                        let v = unsafe { (a as *const usize).read() };
+                        tail.push_str(&format!(" [{o}]=0x{v:x}"));
+                    }
+                    o += 8;
+                }
+                eprintln!(
+                    "[moving-young-band]   no-map-for-id sp_id_off={} tail({}..{}):{}",
+                    cm.sp_id_slot_off, cm.frame_layout.java_locals_hi, hi, tail,
+                );
+            }
             eprintln!(
                 "[moving-young-band] {} off={off} region={} value=0x{w:x} published={} \
-                 sp_id={sp_id:?} in_map={in_map:?} \
+                 sp_id={sp_id:?} sp_id_off={} in_map={in_map} \
                  live_hi={live_hi:?} layout={:?}",
                 cm.method_label,
                 cm.frame_layout.region_name(off),
                 published.len(),
+                cm.sp_id_slot_off,
                 cm.frame_layout,
             );
         }
@@ -3909,6 +3975,18 @@ pub fn publish_peer_jit_coverage_for_stw() {
     if current_thread_jit_depth() == 0 {
         return;
     }
+    // WHICH obligation the peer's own proof fails on, when it fails.
+    //
+    // `proven=false` is the shortfall that refuses the whole cycle, and a
+    // count of them cannot be acted on: the proof has SIX ways to say no
+    // (`JIT_RELOCATION_UNSUPPORTED`, `NO_PRECISE_MAP`, `MISSING_EXACT_RBP`,
+    // `FOREIGN_INNERMOST_RBP`, `ACTIVE_FRAME_MAP`, `PARENT_FRAME_MAP`) and they
+    // want completely different repairs. The per-reason counters are already
+    // maintained process-wide, so a before/after snapshot around this one call
+    // names the term without any new bookkeeping. Only taken when the debug
+    // flag is on — it is two array reads either side of a proof that already
+    // walks the stack.
+    let before = xt_coverage_dbg().then(cratonvm_gc::gc_quiescence::moving_young_incomplete_reason_mask);
     let proven = refresh_moving_young_coverage_for_current_thread();
     // Read the depth AFTER the proof: it prunes returned entries, and the
     // deposit must not claim more than the proof covered.
@@ -3916,8 +3994,25 @@ pub fn publish_peer_jit_coverage_for_stw() {
     if proven && depth > 0 {
         cratonvm_gc::gc_quiescence::add_peer_proven_jit_depth(depth);
     }
-    if xt_coverage_dbg() {
-        eprintln!("[xt-coverage] peer deposit proven={proven} depth={depth}");
+    if let Some(before) = before {
+        let added = cratonvm_gc::gc_quiescence::moving_young_incomplete_reason_mask() & !before;
+        let mut why = String::new();
+        for i in 0..cratonvm_gc::gc_quiescence::incomplete_reason::COUNT {
+            if added & (1usize << i) != 0 {
+                if !why.is_empty() {
+                    why.push(',');
+                }
+                why.push_str(cratonvm_gc::gc_quiescence::incomplete_reason::label(i));
+            }
+        }
+        if why.is_empty() {
+            // Distinguishable from a reason literally labelled "none": this
+            // says the proof added no obligation to the mask at all, which for
+            // a `proven=false` deposit means the reason was ALREADY recorded
+            // this cycle (by this thread's earlier proof, or by a peer).
+            why.push_str("<no-new-reason>");
+        }
+        eprintln!("[xt-coverage] peer deposit proven={proven} depth={depth} why={why}");
     }
 }
 
@@ -4319,7 +4414,54 @@ fn warn_cross_thread_jit_gap() {
 /// dereference the read qword as a Rust reference; it is treated as an
 /// opaque address until validated.
 #[inline(always)]
+/// `CRATONVM_DBG_NO_JIT_ROOT_SCAN=1` — skip the conservative JIT frame scan
+/// UNCONDITIONALLY. **Diagnostic only, and unsound**: a JIT-held object whose
+/// only reference is a register or spill slot stops being a root at all, so a
+/// moving cycle will relocate it under the running frame. Never ship a run with
+/// this set.
+///
+/// It exists because the two levers that LOOK like they answer "is the
+/// conservative scan what retains this object?" do not:
+///
+/// * `CRATONVM_GC_PRECISE_ONLY_ROOTS` suppresses the scan only when the
+///   coverage proof passes, and its own doc records that firing on **~0.1 % of
+///   collections** (2 of 14 420, 31 of 46 135, 84 of 70 144). A run with it set
+///   still scans conservatively on 999 collections in 1000, so a null result
+///   from it is a vacuous zero, not evidence.
+/// * `CRATONVM_NO_CONSERVATIVE_LOCALS` gates the INTERPRETER's local scan,
+///   which is a different path.
+///
+/// The gate lives HERE and not at a call site because there are THREE doors
+/// into this function — `memory::roots::collect_roots` (gc-roots),
+/// `vm_exec`'s safepoint deposit, and `interpreter::gc_and_alloc`'s
+/// blocked-deposit. Gating only the first leaves the other two publishing
+/// conservative roots, which is a lever that reads as "no effect" while never
+/// having been applied.
+fn dbg_no_jit_root_scan() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_NO_JIT_ROOT_SCAN").is_some()
+    })
+}
+
+/// How many times [`dbg_no_jit_root_scan`] actually suppressed a scan.
+/// Reported at exit so the arm cannot be read as "no effect" when it was in
+/// fact "never engaged" — the failure mode this whole flag exists to avoid.
+pub static NO_JIT_ROOT_SCAN_SUPPRESSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
+    if dbg_no_jit_root_scan() {
+        let n = NO_JIT_ROOT_SCAN_SUPPRESSED
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if n == 1 {
+            eprintln!(
+                "[jitrootscan] CRATONVM_DBG_NO_JIT_ROOT_SCAN engaged                  -- conservative JIT frame roots are NOT being published (UNSOUND)"
+            );
+        }
+        return;
+    }
     // Capture the scanner's own SP at the call site (inlined into the
     // caller). Every active JIT spill region has its *lowest* address at
     // or above this value (the Rust stack grows downward on every supported
@@ -5110,6 +5252,27 @@ fn report_remap_residue(
 ) {
     let frame_size = cm.osr_frame_size;
     let mut hits = 0usize;
+    // A raw `stale_words` count is an UPPER BOUND and cannot be acted on. The
+    // spill cursor "reclaims by moving, it does not clear" (see
+    // `OopMapEntry::live_frame_hi`), so a word above the live bound still holds
+    // whatever reference last occupied it — a from-space address there is DEAD
+    // and rewriting it would be pointless, not a missed root. Only a stale word
+    // BELOW the bound is a live reference the map failed to name, and only that
+    // number says whether `moving_young_coverage_complete` is lying.
+    //
+    // `live_frame_hi == 0` means "unknown" (the same sentinel the band verifier
+    // reads), so those are counted separately rather than being silently folded
+    // into either answer.
+    let live_hi = cm
+        .oop_maps
+        .iter()
+        .filter(|m| m.bytecode_pc == sp_id)
+        .map(|m| m.live_frame_hi)
+        .max()
+        .unwrap_or(0);
+    let mut stale_live = 0usize;
+    let mut stale_dead = 0usize;
+    let mut stale_unknown = 0usize;
     let mut detail = String::new();
     if frame_size > 0 && (frame_size as usize) <= 1024 * 1024 && (frame_size as usize) <= rbp {
         let frame_size = frame_size as usize;
@@ -5120,12 +5283,23 @@ fn report_remap_residue(
             let w = unsafe { (addr as *const usize).read() };
             if let Some(&new) = pointer_map.get(&w) {
                 hits += 1;
-                if hits <= 12 {
+                let off = rbp - addr;
+                let class = if live_hi <= 0 {
+                    stale_unknown += 1;
+                    "unknown"
+                } else if (off as i64) < live_hi as i64 {
+                    stale_live += 1;
+                    "LIVE"
+                } else {
+                    stale_dead += 1;
+                    "dead"
+                };
+                // The LIVE ones are the finding; spend the detail budget on
+                // them rather than on whichever happen to come first.
+                if stale_live <= 12 && class == "LIVE" {
                     detail.push_str(&format!(
-                        " [off={} stale=0x{:x}->0x{:x}]",
-                        rbp - addr,
-                        w,
-                        new
+                        " [LIVE off={} stale=0x{:x}->0x{:x}]",
+                        off, w, new
                     ));
                 }
             }
@@ -5144,11 +5318,12 @@ fn report_remap_residue(
         mapped_desc.push_str(&format!(" {}=0x{:x}", off, v));
     }
     eprintln!(
-        "[remap-frame] method={} sp_id={} frame_size={} cov_complete={} mapped=[{}] rewritten={} inlined={:?} stale_words={}{}",
+        "[remap-frame] method={} sp_id={} frame_size={} cov_complete={} live_hi={} mapped=[{}] rewritten={} inlined={:?} stale_words={} stale_live={} stale_dead={} stale_unknown={}{}",
         cm.method_label,
         sp_id,
         frame_size,
         coverage_complete,
+        live_hi,
         mapped_desc,
         rewritten,
         cm.inlined_methods
@@ -5156,6 +5331,9 @@ fn report_remap_residue(
             .map(|(c, m, d)| format!("{c}.{m}{d}"))
             .collect::<Vec<_>>(),
         hits,
+        stale_live,
+        stale_dead,
+        stale_unknown,
         detail,
     );
 }

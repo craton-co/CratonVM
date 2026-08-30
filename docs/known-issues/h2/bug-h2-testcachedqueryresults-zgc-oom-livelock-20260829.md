@@ -1,8 +1,75 @@
 # `TestCachedQueryResults` — a ZGC `OutOfMemoryError` LIVELOCK, thousands per run, not a single failure
 
+
+## ADDENDUM 2026-08-30 (L7 corpus lane): the shortfall accounts EXACTLY, and three alternatives are eliminated
+
+The `--jdk-only` corpus hit this class, so it got the three arms. Both CratonVM
+modes fail with the *same* assertion, HotSpot passes:
+
+```text
+HotSpot          PASS     9s
+CratonVM compat  FAIL  1078s   AssertionError: Expected: 100000 actual: 98304
+CratonVM strict  FAIL  1365s   AssertionError: Expected: 100000 actual: 98304
+```
+
+### The 1696 missing entries are accounted for, to the unit
+
+```text
+100000 - 98304                                    = 1696
+OutOfMemoryError (length=65536) raised in tasks   = 1691
+SQLException caught by the callable and printed   =    5
+                                                    ----
+                                                    1696
+```
+
+**That is why this page's OOM framing is right, and it also explains the thing
+an OOM does not obviously explain — why the symptom is a WRONG ANSWER instead of
+a crash.** The callable catches `SQLException` only. An `OutOfMemoryError` is an
+`Error`, so it goes straight past that `catch`, is captured by the `FutureTask`
+`invokeAll` created for it, and **the test never calls `get()` on any of the
+futures it gets back**. 1691 tasks therefore die completely silently, each one
+simply never reaching `concurrentSet.add(countAfter)`, and the only trace is the
+final count.
+
+### Three things it is NOT, each checked rather than assumed
+
+* **Not `ConcurrentHashMap.newKeySet()` losing entries.**
+  `apps/probes/ChmKeySetGrowth.java` — 5 threads, 100000 distinct adds, the same
+  shape the test uses — reports `adds-returned-true 100000`, `size 100000`,
+  `contains-misses 0` on CratonVM. Identical to HotSpot.
+* **Not `ExecutorService.invokeAll` dropping tasks**, which was a live suspicion
+  because `docs/known-issues/` records an `invokeAll` that copied 3 of 8 on a
+  ForkJoinTask arm. `apps/probes/InvokeAllCount.java` submits 100000 callables
+  through `invokeAll` on a 5-thread pool: `futures 100000`, `done 100000`,
+  `executed 100000`. Identical to HotSpot.
+* **Not a lost update, and not this VM mishandling `FOR UPDATE`** — which the
+  assertion's own shape suggests, since the set holds distinct COUNTER VALUES
+  and `add` returning false is the test's lost-update detector. The run printed
+  **zero** `LOST UPDATE!` lines and **zero** `countAfter != countAtLock` lines.
+  `TestBase.println` is NOT gated behind a verbosity flag — it goes straight to
+  `System.out` — so those absences are evidence rather than silence. Every task
+  that reached the lock saw a value no other task had seen.
+
+### One thing retracted
+
+`98304 == 131072 - (131072 >>> 2)` is exactly `ConcurrentHashMap`'s resize
+threshold for a 131072-bucket table, and the same number appearing in two
+independent runs in two modes made a deterministic growth failure look likely.
+Both probes above refute it. The resemblance is a coincidence, and it is
+recorded here so the next reader does not spend the same hour on it.
+
 ## Status
 
-**OPEN, split out 2026-08-29** from
+**OPEN, and the chain is now traced to one frame — see §"2026-08-29 (second)".**
+The `xt_cov=(accepted=0 refused=1730)` lead this page shipped with turned out to
+be four measurements deep: the peers DO park, some of their own proofs return
+false, the obligation is `UNPUBLISHED_FRAME_OOP` in 3 of 4, and six of the seven
+unpublished words belong to frames whose safepoint-id slot carries no usable id.
+The discriminator then split THAT into two defects: **10 of 13 such frames have
+`sp_id == 0` — they have not reached their first safepoint — and 3 have a heap
+pointer sitting in the reserved slot.** It is not a shifted `rbp`.
+
+Split out 2026-08-29 from
 `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`, which is
 retired: that page's own class passes 2/2 and the four fragmentation defects it
 ended on are fixed. **This class is not fixed by them.**
@@ -88,7 +155,200 @@ operand-stack oop marks are not exact there — a revived dead-code merge
 reconstructing the stack at a nonzero depth). Both are compiler shapes, not
 collector ones, and both feed the refusal above.
 
-## What to do first
+## 2026-08-29 (second): the handshake refuses because PEER PROOFS FAIL — and one frame's safepoint id is half an object pointer
+
+The lead this page shipped with was `xt_cov=(accepted=0 refused=1730)`. Four
+measurements later the chain is complete, and the bottom of it is one frame.
+
+### 1. The peers DO park. Their own proofs fail.
+
+The shortfall was assumed to be peers the handshake cannot see — an OS-frozen
+thread, or one blocked in a native with compiled frames below it, which deposits
+nothing. `CRATONVM_DBG_XT_COVERAGE=1` says otherwise: the deposits happen, and
+some of them carry `proven=false`.
+
+```text
+[xt-coverage] peer_depth=3 proven=0 accounted=false
+[xt-coverage] peer_depth=9 proven=0 accounted=false
+[xt-coverage] peer_depth=3 proven=3 accounted=true
+...
+6 × peer deposit proven=true  depth=N
+4 × peer deposit proven=false depth=N
+```
+
+A peer that parks, runs its own per-thread coverage proof and gets `false`
+deposits nothing — and the initiator's test is `proven >= peer_depth`, so ONE
+failing peer refuses the whole cycle. That is a different repair target from
+"reach the parked peers", and it is where the work belongs.
+
+### 2. WHICH obligation — and the counter that could not say
+
+`proven=false` has six possible causes and they want six different repairs, so
+the peer-deposit line now names the one that fired. The first attempt at that
+diagnostic diffed `moving_young_fallback_reason_counts()` around the proof and
+reported `why=none` for every failure — **a vacuous read**: `bump_reason_count`
+has exactly one caller, `record_moving_young_coverage_fallback`, which is the
+GENERATIONAL collector's per-cycle accounting. On ZGC those counters never move
+at all. The reason MASK (`incomplete_reason_mask_add`, called on every mark) is
+the signal, and diffing it gives:
+
+```text
+2 × proven=false why=compiled-frame-oop-not-published
+1 × proven=false why=compiled-frame-band-unbounded,innermost-rbp-belongs-to-unguarded-callee
+1 × proven=false why=active-safepoint-map-incomplete,compiled-frame-oop-not-published
+```
+
+**`UNPUBLISHED_FRAME_OOP` in 3 of 4.** That is the obligation the parent page
+spent 2026-08-26/27 on and relaxed for dead slots; the relaxation is not enough
+here.
+
+### 3. The band census, and the one frame under all of it
+
+`CRATONVM_MOVING_YOUNG_BAND_DBG=1` — seven unpublished words in the run,
+4 `operand-spill` and 3 `reserved-locals-tail`. **Six of the seven are one
+frame**, and its header is the finding:
+
+```text
+off=48 region=reserved-locals-tail value=0x200671a2c18
+       sp_id=Some(1729768472) live_hi=None
+       layout={ java_locals_hi: 32, locals_hi: 88, spill_lo: 88, spill_hi: 192 }
+```
+
+`1729768472` is not a bytecode pc — those are bounded by 65535. It is
+**`0x671a2c18`, the low 32 bits of `0x200671a2c18`** — the heap pointer this same
+scan reports at `off=48` of the same frame. **The frame's safepoint-id slot
+holds half an object pointer.**
+
+`live_hi=None` on the same line is the same fact from the other side: no map
+matched the id, so `moving_young_frame_live_hi` had nothing to return. And
+because `frame_active_map_slots` also returns `None`, the 2026-08-27 dead-slot
+relaxation deliberately does not fire — which is why all six of that frame's
+words are reported and why its proof returns `UNPUBLISHED_FRAME_OOP`.
+
+The other frame in the same run reports `sp_id=Some(3) live_hi=Some(160)` and
+exactly one word. The machinery works; one frame's id does not.
+
+> The report used to print `in_map=Some(false)` for this, which reads as "the
+> dataflow calls this slot dead" and sends a reader at the band verifier. It
+> conflated "a map was found and does not name the slot" with "no map exists for
+> this id". It now prints `no-map-for-id`, and that is the line to grep.
+
+### 4. The discriminator, run — and it is TWO defects, not one
+
+`sp_id_off` and the whole reserved-locals tail are now printed beside a
+`no-map-for-id` frame, which separates "something stored an oop into the
+reserved slot" from "rbp is wrong so the read landed on a neighbour". One run,
+13 such frames:
+
+```text
+no-map-for-id sp_id_off=24 tail(8..64): [8]=0x2006689f670 [16]=0x20012385010
+    [24]=0x2004264ebc0 [32]=0x7305aeff7408 [40]=0x0 [48]=0x200161f0030 ...
+no-map-for-id sp_id_off=48 tail(32..88): [32]=0x0 [40]=0x20012385010
+    [48]=0x0 [56]=0x7305adff5408 [64]=0x80 [72]=0x20016ef0168 ...
+```
+
+| what is in the sp-id slot | frames | reading |
+|---|---:|---|
+| **`0`** | **10** | the frame has not reached its first safepoint — the slot is still the prologue's zero |
+| **a heap pointer** | **3** | the reserved slot has been OVERWRITTEN with an oop |
+| anything else | 0 | — |
+
+**It is not a shifted `rbp`.** In the first line the pointer sits at exactly
+`sp_id_off=24`, and the rest of that tail is plausible for this frame
+(`0x7305aeff7408` is a native/stack pointer — the cached JIT thread or the stack
+floor; `[40]=0x0`). A wrong `rbp` would have made the whole tail read like some
+other frame's, and it does not.
+
+So the one lead has become two, with very different sizes and repairs:
+
+* **10 of 13 — `sp_id == 0`, a frame that has not reached a safepoint yet.**
+  `find_oop_map_for_safepoint_id(0)` finds nothing, `frame_active_map_slots`
+  returns `None`, and the 2026-08-27 dead-slot relaxation FAILS CLOSED by
+  design — so every movable-looking word in that frame's band refuses the whole
+  collection. This is the dominant population and it is not a corruption at
+  all; it is a frame the machinery has no statement about. Whether it can be
+  discharged is a real question: its java locals hold incoming arguments, so a
+  relocation still has to rewrite them, and with no map the shadow stack is the
+  only channel that could. **Start here — it is 77 % of the refusals.**
+* ~~**3 of 13 — an oop AT `sp_id_off`.** A store whose offset lands in the
+  reserved-locals tail … a genuine codegen defect~~ — **WRONG, see §4a.** There
+  is no store. The slot was never initialised, so it read whatever the previous
+  frame at that stack depth left; zeroing it in the prologue takes this
+  population to 0 in both measured rounds.
+
+### 4a. 2026-08-27 — it is ONE defect, not two: the sp-id slot is never initialised
+
+The split above is wrong, and the correction is a one-line fix.
+
+**Nothing writes an oop into the reserved slot. Nothing writes the slot at
+all** until the first safepoint. `emit_prologue` zeroes
+`shadow_thread_slot_off` and `shadow_savetop_slot_off` — with a comment giving
+exactly the reason, *"it must read 0, not uninitialised stack. The single-pass
+backend zero-initialises for exactly this reason"* — and does **not** zero
+`sp_id_slot_off` beside them. Ids start at 1 precisely so `0` can mean "no
+safepoint reached" (the slot's own allocation comment says so), but the
+prologue never established the sentinel.
+
+So both populations are the same thing, read at two different pieces of stack:
+`0` where the region happened to be clean, a stale oop where a previous frame
+at that depth had left one. Not "a store whose offset lands in the
+reserved-locals tail".
+
+**MEASURED**, same class, one binary, `CRATONVM_JIT_ZERO_SPID` as the A/B, two
+rounds — the census split by what sits in the slot:
+
+| arm | `no-map-for-id` | `sp_id == 0` | sp-id out of range (a stale word) |
+|---|---:|---:|---:|
+| OFF (today) | 22 | 1 | **9** |
+| ON | 20 | 10 | **0** |
+| OFF (today) | 16 | 1 | **7** |
+| ON | 6 | 3 | **0** |
+
+The out-of-range population goes to **zero and stays there**, and the frames
+reappear in the `sp_id == 0` bucket. That is the predicted signature of
+uninitialised stack and not of a stray store.
+
+**The hazard this closes is worse than the refusal it was found through.**
+Safepoint ids are small consecutive integers, so a stale word can equal a
+*valid* id for that method — and then `find_oop_map_for_safepoint_id` matches
+the map for a DIFFERENT program point and relocation rewrites against it. A
+silent wrong answer, not a refused cycle. The 13-frame census only ever showed
+the loud half.
+
+**It does NOT fix this class.** `xt_cov` still reads `accepted=0` on both arms
+(refused 22/35 and 30/28 over 300 s), because a zeroed slot fails closed
+exactly as a garbage one did. What it does is remove the corruption hazard and
+collapse the two populations into one, so the remaining question is single and
+clean: **can a frame that has taken no safepoint be discharged?** That is now
+100 % of `no-map-for-id`, not 77 %.
+
+**Caveat on the single-pass backend, not fixed here.** `x64/safepoint.rs` stores
+`cur_bc_pc` as the id, and **bytecode pc 0 is legal** — so for those frames `0`
+is ambiguous between "at bci 0" and "never stored", and zeroing the prologue
+slot there could make an unsafepointed frame match the bci-0 map. The IR
+backend has no such ambiguity (ids start at 1), which is why the fix is scoped
+to it. Giving the single-pass backend a +1-encoded id would remove the
+ambiguity and let it take the same repair.
+
+**And this class's own symptom did not reproduce here**: `oom=0` on both arms
+at a 300 s cap on an idle host, against the page's `oom=2990` at 900 s. Either
+the cap or the load matters; the band census above is what the A/B rests on,
+not an OOM rate.
+
+### 5. What to do next, in order
+
+1. **Take the `sp_id == 0` population first** — now 100 % of `no-map-for-id`
+   after §4a removed the stale-word half, and the question is
+   whether a frame that has taken no safepoint can be discharged at all rather
+   than refusing every cycle it is live for.
+2. Only then look at the `operand-spill` words. Four of the seven are on the
+   frame with the garbage id and may simply be its neighbours.
+3. `CRATONVM_XT_JIT_COVERAGE_HANDSHAKE=0` remains the same-binary control: it
+   restores the blanket refusal, so it should change nothing here (the handshake
+   is already refusing every cycle) and a difference would mean the accounting,
+   not the proof, is the problem.
+
+## What to do first (superseded by the section above)
 
 1. **Find the retry loop.** `rc=124` at the cap with `oom` in the thousands is a
    caller swallowing `OutOfMemoryError` — H2's own code, or a
