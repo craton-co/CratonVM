@@ -131,12 +131,12 @@ fn a_captured_graph_replays_453_launches_for_less_than_issuing_them() {
     let exec = graph.instantiate().expect("instantiate");
 
     // Warm the replay path the same way the launch path was warmed.
-    exec.launch(&stream).expect("warmup replay");
+    exec.launch(&ctx, &stream).expect("warmup replay");
     stream.synchronize().expect("warmup replay drain");
 
     // ── Arm B: replay them. ──
     let t1 = std::time::Instant::now();
-    exec.launch(&stream).expect("replay");
+    exec.launch(&ctx, &stream).expect("replay");
     let replay_host = t1.elapsed();
     stream.synchronize().expect("replay drain");
     let replay_total = t1.elapsed();
@@ -276,14 +276,14 @@ fn a_replay_sees_a_scalar_written_through_the_captured_pointer() {
     let mut host = vec![0i32; n as usize];
 
     // k == 1: three launches add 1 each.
-    exec.launch(&stream).expect("replay 1");
+    exec.launch(&ctx, &stream).expect("replay 1");
     stream.synchronize().expect("drain 1");
     out.to_host(&mut host).expect("read 1");
     assert_eq!(host[0], 3, "three launches of +1 should total 3");
 
     // Now change k in place and replay the SAME graph.
     k.copy_from_host(&[10i32]).expect("copy_from_host");
-    exec.launch(&stream).expect("replay 2");
+    exec.launch(&ctx, &stream).expect("replay 2");
     stream.synchronize().expect("drain 2");
     out.to_host(&mut host).expect("read 2");
     assert_eq!(
@@ -302,3 +302,207 @@ fn a_replay_sees_a_scalar_written_through_the_captured_pointer() {
         "a length mismatch must fail rather than write what fits"
     );
 }
+
+/// A replay's writes must be visible to a stream that did not run it.
+///
+/// # The bug this is the regression test for
+///
+/// Capture cannot leave a useful `last_write` event on the buffers it
+/// touches: an event recorded on a capturing stream lives inside the
+/// graph and no other stream can wait on it. The first version of this
+/// feature therefore cleared those slots and left them cleared, which is
+/// correct for exactly one usage pattern -- one stream, and a caller who
+/// awaits the replay before reading. Any read from a SECOND stream was
+/// released with nothing to wait on, and would see whatever was in the
+/// buffer before the replay.
+///
+/// That is invisible to every other test here, because they all read
+/// back on the stream that replayed. This one deliberately does not: it
+/// reads through `to_host_async` on a different stream, which is exactly
+/// the path that consults `last_write`.
+#[test]
+fn a_replay_is_visible_to_a_stream_that_did_not_run_it() {
+    let Ok(ctx) = DeviceContext::new(0) else {
+        eprintln!("no CUDA device; skipping");
+        return;
+    };
+    let module = DeviceModule::from_ptx(&ctx, PTX, &["bump"]).expect("load PTX");
+    let capture_stream = Stream::new(&ctx).expect("capture stream");
+    let reader_stream = Stream::new(&ctx).expect("reader stream");
+    let n: i32 = 4096;
+    let out: DeviceBuffer<i32> = DeviceBuffer::zeros(&ctx, n as usize).expect("alloc");
+    let cfg = LaunchConfig::elementwise(n as u32);
+
+    // Enough launches that the device is still working on the graph when
+    // the host reaches the read below. One launch would very likely pass
+    // even with the ordering removed, which would make this test a
+    // decoration rather than a check.
+    const BUMPS: usize = 400;
+    capture_stream
+        .begin_capture(CaptureMode::ThreadLocal)
+        .expect("begin capture");
+    for _ in 0..BUMPS {
+        module
+            .launch_on_stream(
+                &ctx,
+                "bump",
+                &cfg,
+                KernelArgs::new().push_device_ptr(&out).push_i32(n),
+                &capture_stream,
+            )
+            .expect("captured launch");
+    }
+    let graph = capture_stream.end_capture(&ctx).expect("end capture");
+    let exec = graph.instantiate().expect("instantiate");
+
+    // The capture must have taken custody of the buffer, or the stamping
+    // below has nothing to stamp and the assertion that follows would
+    // pass for the wrong reason.
+    assert!(
+        exec.tracked_buffer_count() >= 1,
+        "the capture should have collected the argument buffer's last_write slot"
+    );
+
+    exec.launch(&ctx, &capture_stream).expect("replay");
+
+    // Read on the OTHER stream, without synchronising the one that
+    // replayed. Correct only because the replay stamped the buffer's
+    // `last_write` and `to_host_async` waits on it.
+    let mut host = vec![0i32; n as usize];
+    out.to_host_async(&mut host, &reader_stream)
+        .expect("async read on a second stream");
+    reader_stream.synchronize().expect("drain reader");
+
+    assert_eq!(
+        host[0], BUMPS as i32,
+        "a read on a second stream must see the whole replay ({BUMPS} bumps);          seeing 0 or a partial count means the replay left no last_write for          that stream to wait on"
+    );
+    assert!(
+        host.iter().all(|&v| v == BUMPS as i32),
+        "every element should have been bumped {BUMPS} times"
+    );
+}
+
+/// A captured node's SCALAR argument can be changed between replays.
+///
+/// This is the half of the mechanism that needs no cooperation from the
+/// code being captured. `a_replay_sees_a_scalar_written_through_the_captured_pointer`
+/// covers the other half — values the caller moved into device memory —
+/// which is faster but only available to a caller who can change their
+/// kernels. Here the kernel is untouched and the argument is an ordinary
+/// `int` parameter baked into the graph at capture time.
+///
+/// The assertion is on the OUTPUT, not on the call succeeding. A
+/// `cuGraphExecKernelNodeSetParams` that silently kept the captured
+/// arguments would return `CUDA_SUCCESS` and replay the old value, which
+/// is the failure worth catching.
+#[test]
+fn a_captured_nodes_scalar_argument_can_be_changed_between_replays() {
+    let Ok(ctx) = DeviceContext::new(0) else {
+        eprintln!("no CUDA device; skipping");
+        return;
+    };
+    let module = DeviceModule::from_ptx(&ctx, PTX_ADD_SCALAR, &["addc"]).expect("load PTX");
+    let stream = Stream::new(&ctx).expect("stream");
+    let n: i32 = 512;
+    let out: DeviceBuffer<i32> = DeviceBuffer::zeros(&ctx, n as usize).expect("alloc");
+    let cfg = LaunchConfig::elementwise(n as u32);
+    let args_with = |c: i32| {
+        KernelArgs::new()
+            .push_device_ptr(&out)
+            .push_i32(n)
+            .push_i32(c)
+    };
+
+    // Capture three launches of `+1`, keeping each node as it is added.
+    stream
+        .begin_capture(CaptureMode::ThreadLocal)
+        .expect("begin capture");
+    let mut nodes = Vec::new();
+    for _ in 0..3 {
+        module
+            .launch_on_stream(&ctx, "addc", &cfg, args_with(1), &stream)
+            .expect("captured launch");
+        nodes.push(
+            stream
+                .capturing_node()
+                .expect("capture info")
+                .expect("a captured launch must report its node"),
+        );
+    }
+    let exec = stream
+        .end_capture(&ctx)
+        .expect("end capture")
+        .instantiate()
+        .expect("instantiate");
+
+    let mut host = vec![0i32; n as usize];
+    exec.launch(&ctx, &stream).expect("replay 1");
+    stream.synchronize().expect("drain 1");
+    out.to_host(&mut host).expect("read 1");
+    assert_eq!(host[0], 3, "three launches of +1");
+
+    // Now rewrite every node's scalar to 10 and replay the SAME exec.
+    for node in &nodes {
+        exec.set_kernel_node_args(*node, &args_with(10))
+            .expect("set_kernel_node_args");
+    }
+    exec.launch(&ctx, &stream).expect("replay 2");
+    stream.synchronize().expect("drain 2");
+    out.to_host(&mut host).expect("read 2");
+    assert_eq!(
+        host[0], 33,
+        "the second replay must use the NEW scalar (3 + 3*10); 6 here means the          update was accepted and ignored, which is the failure this test exists for"
+    );
+
+    // Updating one node must change one node. A whole-graph rewrite
+    // would also produce a plausible-looking number, so this pins that
+    // the update is per-node.
+    exec.set_kernel_node_args(nodes[0], &args_with(100))
+        .expect("set one node");
+    exec.launch(&ctx, &stream).expect("replay 3");
+    stream.synchronize().expect("drain 3");
+    out.to_host(&mut host).expect("read 3");
+    assert_eq!(
+        host[0], 33 + 100 + 10 + 10,
+        "only the first node should have changed"
+    );
+    assert!(host.iter().all(|&v| v == 153));
+}
+
+/// `out[i] += c`, with `c` an ordinary scalar kernel parameter — the
+/// thing a graph bakes in and this test rewrites.
+const PTX_ADD_SCALAR: &str = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry addc(
+    .param .u64 out_ptr,
+    .param .s32 n,
+    .param .s32 c
+)
+{
+    .reg .pred  %p<2>;
+    .reg .s32   %r<8>;
+    .reg .u64   %rd<5>;
+
+    ld.param.u64 %rd1, [out_ptr];
+    ld.param.s32 %r1, [n];
+    ld.param.s32 %r6, [c];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.s32 %p1, %r5, %r1;
+    @%p1 bra DONE;
+    cvta.to.global.u64 %rd2, %rd1;
+    mul.wide.s32 %rd3, %r5, 4;
+    add.u64 %rd4, %rd2, %rd3;
+    ld.global.u32 %r7, [%rd4];
+    add.s32 %r7, %r7, %r6;
+    st.global.u32 [%rd4], %r7;
+DONE:
+    ret;
+}
+"#;
