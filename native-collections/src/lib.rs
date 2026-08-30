@@ -65608,7 +65608,101 @@ fn native_unmod_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     unmod_delegate(ctx, args, "stream", "()Ljava/util/stream/Stream;")
 }
 
+/// `Spliterator.characteristics()` for an IMMUTABLE collection, measured across
+/// every shape the factories produce.
+///
+/// The backing's own answer is wrong for these because the JDK does not ask the
+/// backing: `ImmutableCollections` builds its spliterator with its own flags,
+/// and the size-1 shapes take `Collections.singletonSpliterator` instead.
+/// MEASURED against HotSpot 25.0.4+7 (`apps/probes/UtilCoverageSweep`):
+///
+/// ```text
+///   Set.of("a")            17745      List.of("a")           17745
+///   Set.of()               16449      List.of()              16464
+///   Set.of("a","b")        16449      List.of x3             16464
+///   Set.of x3 (SetN)       16449      Map.of().entrySet()    17745  (size 1)
+///   Map.of().keySet()      16449      Map.of().values()      16448
+/// ```
+///
+/// **The discriminator is SIZE, not class.** Every 17745 is a size-1 immutable
+/// -- `Set.of("a")`, `List.of("a")`, a one-entry `entrySet`, and
+/// `Collections.singleton`, which this VM already answered correctly and is the
+/// control that names the rule. The JDK routes those to
+/// `Collections.singletonSpliterator` (the `Collections$2` a strict-mode run
+/// reports); everything else goes through
+/// `Spliterators.spliterator(collection, flags)`, which contributes
+/// `SIZED | SUBSIZED` on top of the family's own bits.
+///
+/// COMPATIBLE MODE ONLY. Strict refuses `cratonvm/internal/Unmodifiable*` and
+/// runs java.base's own bodies, which is why it was already 0-diff on all of
+/// these -- the tenth row in this campaign where `--jdk-only` is the more
+/// correct mode.
+const SPL_IMMUTABLE_SINGLETON: i32 =
+    SPL_SIZED | SPL_DISTINCT | SPL_ORDERED | SPL_NONNULL | 0x0400 | SPL_SUBSIZED;
+
+fn immutable_spliterator_characteristics(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    size: i32,
+) -> i32 {
+    // Size first: it outranks the carrier, and it is the whole reason
+    // `Set.of("a")` and `List.of("a")` agree at 17745 while their two- and
+    // three-element siblings do not.
+    if size == 1 {
+        return SPL_IMMUTABLE_SINGLETON;
+    }
+    match ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(this))
+        .as_deref()
+    {
+        // A list keeps its encounter order and is not distinct.
+        Some("cratonvm/internal/UnmodifiableList") => SPL_SIZED | SPL_ORDERED | SPL_SUBSIZED,
+        // A values view is neither distinct nor ordered.
+        Some("cratonvm/internal/UnmodifiableCollection") => SPL_SIZED | SPL_SUBSIZED,
+        // Sets, keySets and entrySets: distinct, no encounter order.
+        _ => SPL_SIZED | SPL_DISTINCT | SPL_SUBSIZED,
+    }
+}
+
 fn native_unmod_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // An IMMUTABLE receiver answers its own family's bits; an unmodifiable
+    // WRAPPER delegates, because the JDK's wrapper really does hand back the
+    // backing's spliterator (`unmodifiableSet(hashSet)` is 65 on both VMs, and
+    // that row is the control for leaving this arm alone).
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if unmod_is_immutable(&*ctx, *this) {
+            let spl = unmod_delegate(ctx, args, "spliterator", "()Ljava/util/Spliterator;")?;
+            if let Some(Value::Object(Some(spl_obj))) = spl {
+                let this = *this;
+                let size = match ctx.get_field(spl_obj, 2) {
+                    Value::Int(n) => n,
+                    _ => -1,
+                };
+                let chars = immutable_spliterator_characteristics(&*ctx, this, size);
+                if ctx.object_num_fields(spl_obj) > SPL_FIELD_CHARACTERISTICS {
+                    ctx.set_field(spl_obj, SPL_FIELD_CHARACTERISTICS, Value::Int(chars));
+                } else {
+                    // The backing handed back the THREE-field shape, which has
+                    // no characteristics slot and therefore reads as
+                    // `SPL_LIST_DEFAULT` however the mask is computed. Widen it:
+                    // copy the array, cursor and length across and add the slot.
+                    // Missing this is what left `List.of("a")` at 16464 after
+                    // the set shapes were already right -- the rule was correct
+                    // and had nowhere to be written.
+                    let arr = ctx.get_field(spl_obj, 0);
+                    let cursor = ctx.get_field(spl_obj, 1);
+                    let len = ctx.get_field(spl_obj, 2);
+                    let wide = try_alloc_synthetic(ctx, "java/util/Spliterator", 4)?;
+                    ctx.set_field(wide, 0, arr);
+                    ctx.set_field(wide, 1, cursor);
+                    ctx.set_field(wide, 2, len);
+                    ctx.set_field(wide, SPL_FIELD_CHARACTERISTICS, Value::Int(chars));
+                    return Ok(Some(Value::Object(Some(wide))));
+                }
+            }
+            return Ok(spl);
+        }
+    }
     unmod_delegate(ctx, args, "spliterator", "()Ljava/util/Spliterator;")
 }
 

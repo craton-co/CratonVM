@@ -740,24 +740,47 @@ These are not cosmetic: a stream pipeline reads DISTINCT to decide it may skip a
 `distinct()`, SORTED to skip a sort, and SIZED/SUBSIZED to decide how to split
 in parallel.
 
-### One row left, compatible mode only
+### The immutable factories, compatible mode only — 4 of 8 closed
 
 ```text
-Set.of("a").spliterator().characteristics()
-  HotSpot   17745   (java.util.Collections$2)
-  CratonVM     65   (java.util.Spliterator)      compatible mode only
+                       HotSpot   was    now
+  Set.of("a")            17745    65   17745
+  Set.of()               16449    65   16449
+  Set.of("a","b")        16449    65   16449
+  Set.of x3 (SetN)       16449    65   16449
+  List.of("a")           17745  16464  16464   <- open
+  Map.of().keySet()      16449    65     65    <- open
+  Map.of().values()      16448    64     64    <- open
+  Map.of().entrySet()    17745    65     65    <- open
 ```
 
-Strict is 0-diff: it drops the `SyntheticStub` factory registrations and runs
-java.base's own body. The receiver's CLASS is already right in both modes
-(`ImmutableCollections$Set12`), so the interception is upstream of the
-collection — in `java.util.Spliterators.spliterator(Collection, int)`, which is
-a different family's registrar and a different lane's row. A guard was written
-for `native_hs_spliterator` and REMOVED when a registry dump showed it never
-fired: an inert guard is a claim about the workload, and this one was false.
+**The discriminator is SIZE, not class**, which is what the whole shape of this
+row turns on. Every 17745 is a size-1 immutable — `Set.of("a")`, `List.of("a")`,
+a one-entry `entrySet`, and `Collections.singleton`, which this VM already
+answered correctly and is the control that names the rule. The JDK routes those
+to `Collections.singletonSpliterator` (the `Collections$2` a strict run reports)
+and everything else to `Spliterators.spliterator(collection, flags)`, which adds
+`SIZED | SUBSIZED` on top of the family's own bits. `unmodifiableSet(hashSet)`
+is 65 on both VMs and is the other control: the JDK's WRAPPER really does hand
+back the backing's spliterator, so that arm must keep delegating.
 
-The ninth place this campaign has found `--jdk-only` more correct than the
-default.
+The four `Set.of` cells are closed by
+`native_unmod_spliterator` answering the family's own bits when
+`unmod_is_immutable`, including a widen for the three-field spliterator shape,
+which has no characteristics slot to write into.
+
+Four remain, and they are diagnosed rather than guessed: `List.of` reaches the
+same native (`cratonvm/internal/UnmodifiableList`, 5 invocations in the probe
+run) and still answers the list default, so its immutable flag or its size is
+not reading as expected there; `Map.of`'s three views never reach it at all —
+they are set-shaped views resolved through `view_spliterator_characteristics`,
+which classifies by SOURCE family and has no immutable branch. Both need one
+more diagnostic cycle.
+
+**All of this is compatible mode only.** Strict is 0-diff on all 153 rows of
+this probe: it refuses `cratonvm/internal/Unmodifiable*` and runs java.base's
+own bodies. The tenth row in this campaign where `--jdk-only` is the more
+correct mode.
 
 ## 7. The final verification, and where the residuals ended
 
