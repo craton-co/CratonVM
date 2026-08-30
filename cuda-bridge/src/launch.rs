@@ -242,17 +242,25 @@ impl DeviceModule {
         // subsequent `cuStreamWaitEvent(any_stream, kernel_done)`
         // correctly gates that stream behind this kernel.
         let Some(kernel_done) = kernel_done else {
-            // Capturing. Clear the slots rather than leaving them:
-            // whatever event they held describes a write that happened
-            // before this graph, and a later download that waited on it
-            // would be released before the REPLAY's write, reading
-            // through a correctly-ordered wait on the wrong thing. With
-            // the slot empty, the caller's wait on the replay
-            // submission is the only ordering, which is what it should
-            // be.
+            // Capturing. There is no event to stamp -- one recorded on a
+            // capturing stream lives inside the graph and no other
+            // stream can wait on it -- and leaving the OLD event would
+            // be worse than clearing, because it describes a write from
+            // before this graph and a download released by it would be
+            // correctly ordered against the wrong thing.
+            //
+            // So: clear now, and hand the slots to the stream. The graph
+            // takes custody of them at `end_capture`, and every replay
+            // stamps them with its own completion event
+            // (`GraphExec::launch`). The window in which these buffers
+            // have no `last_write` is exactly the window in which
+            // nothing has written them -- a capture runs nothing -- so
+            // the per-buffer ordering contract holds throughout rather
+            // than being suspended for the life of the graph.
             for slot in &last_write_slots {
                 *slot.lock().unwrap_or_else(|p| p.into_inner()) = None;
             }
+            stream.note_captured_slots(&last_write_slots);
             return Ok(());
         };
         if let Err(err) = stream.record_event(&kernel_done) {
