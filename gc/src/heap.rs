@@ -4792,7 +4792,7 @@ mod tests {
 
             // The header decodes correctly via the new address.
             let h = heap.get_header(arr_new);
-            assert_eq!(h.kind, ObjectKind::Array);
+            assert_eq!(h.kind(), ObjectKind::Array);
             assert_eq!(h.array_length(), 4);
             assert_eq!(h.class_id, ClassId::new(7));
             // And the element values survived.

@@ -90,7 +90,7 @@ fn load_methods(class_name: &str) -> (Vec<ClassFileMethod>, String, cratonvm_rea
         .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
     let cf = read_class(&bytes)
         .unwrap_or_else(|e| panic!("failed to parse fixture {}: {e:?}", path.display()));
-    (cf.methods, cf.this_class, cf.constant_pool)
+    (cf.methods, cf.this_class.to_string(), cf.constant_pool)
 }
 
 /// Pick the (first) method with a given name. Phase 1 fixtures each
