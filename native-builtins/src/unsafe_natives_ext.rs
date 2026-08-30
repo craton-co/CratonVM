@@ -6078,6 +6078,8 @@ mod unsafe_static_field_offset_tests {
     fn thread_next_tid_offset_seeds_positive_null_base_counter() {
         let mut ctx = MockNativeContext::new();
         let offset = thread_next_tid_offset();
+        // `&mut ctx`: this test OWNS its MockNativeContext, unlike the 21
+        // production call sites which already hold a `&mut dyn NativeContext`.
         note_unsafe_side_store_offset(&mut ctx, offset, line!());
         lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, 1);
 
