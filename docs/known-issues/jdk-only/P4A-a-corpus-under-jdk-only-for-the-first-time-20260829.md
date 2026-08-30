@@ -84,6 +84,43 @@ they belong to whoever owns those families, not to this lane. `TestSQLXML` and
 `TestDiskFull` surface as an internal `NullPointerException` and a missing MVStore
 chunk, which are the two worth a look first.
 
+### RE-CHECKED 2026-08-30 — four of the five still reproduce, and one is GONE
+
+That list was a day and ~150 `dev` commits old, so it was re-run rather than
+quoted. One execution per arm:
+
+```text
+TestWeb          compat FAIL   14s    strict FAIL     25s
+TestBnf          compat FAIL    8s    strict FAIL     11s
+TestTransaction  compat FAIL   10s    strict FAIL     11s
+TestDiskFull     compat FAIL    8s    strict TIMEOUT 600s
+TestSQLXML       compat PASS    3s    strict PASS      3s     <- no longer reproduces
+```
+
+**Four still fail, and still fail in COMPAT**, so §3's attribution holds for
+them unchanged: none is a `--jdk-only` defect.
+
+**`TestSQLXML` no longer reproduces at all.** 44 further runs say so — 20 solo
+(10 per mode) and **24 under six-way contention at load 11-15** — every one a
+pass. The contention arm is there deliberately: concurrency has manufactured two
+failures in this very record (§5's `ENOSPC`, §7's OOM), so "it only failed in the
+sharded corpus run" was the first alternative to rule out, and it is ruled out.
+
+It was NOT bisected across the ~150 commits. A defect that will not reproduce is
+a poor bisect subject, and the searchable signature is preserved here instead:
+
+```text
+JdbcSQLNonTransientException: General error: "java.lang.NullPointerException"
+```
+
+Two smaller notes. `TestDiskFull`'s message moved from `Chunk 4 not found` to
+`Chunk 3 not found`, so that row is not deterministic in its detail. And of the
+five, **`TestSQLXML` was the only one with no page anywhere** — the other four
+are already carried by `h2/nonpassed-40-census-20260818.md`,
+`h2/correctness-issues-consolidated.md`, and in `TestDiskFull`'s case its own
+`repros/h2-testdiskfull-livelock/` directory. So the one this lane could have
+adopted is the one that stopped failing.
+
 ## 4. The census, unioned over 181 reports
 
 ```text
