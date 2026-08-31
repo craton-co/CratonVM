@@ -1,8 +1,92 @@
 # `-XX:+UseG1GC` fails `TestKillProcessWhileWriting` — a G1 `OutOfMemoryError` with no arena failure
 
+## ADDENDUM 2026-08-30: the OOM face is FIXED, the 48 617 dangling references were never a rate, and the class still does not pass
+
+Three separate corrections, in decreasing order of how much they change what
+this page says.
+
+### 1. The OOM face is fixed, and the fix is one gate that answered one bit too few
+
+`plausible_mark_scan_target` returned a single bool, and ANY refusal set
+`mark_saw_implausible`, which makes `cleanup` retain every region -- no
+in-place frees, no humongous reclaim -- for the whole cycle. That is the chain
+this page already traced: retain-all -> `humongous-eager declined_pauses=16103
+spans=0 bytes=0` -> `degraded=empty-collection-set` -> a 1 MiB
+`ByteBuffer.allocate` fails on a 1 GiB heap.
+
+**Two conditions were reaching that one bit, and only one of them is evidence
+of anything.** With the new `CRATONVM_G1_DBG_GRAY_PROV=1`, which records where
+each gray-set entry was pushed from, a 32 s run says:
+
+| refusal | count | what it is |
+|---|---:|---|
+| `NotAllocated` | **2 226** | at/beyond the region's cursor, or in a type that holds no object starts |
+| `TornHeader` | 23 | inside the allocated prefix, header does not decode |
+
+`NotAllocated` is provably not a live object: `cursor` only grows within an
+incarnation, so every live object satisfies `off + size <= cursor`. And it is
+ORDINARY, not corruption -- freed regions are deliberately no longer scrubbed
+(G1AUD-10), so a recycled region still holds its previous incarnation's bytes
+above the new cursor, and SATB retention means the marker legitimately scans
+objects that died mid-cycle whose referents were freed with them. Every one of
+the 2 226 names a live object's reference slot as its pusher
+(`prov=scan-child-legacy<-0x20042fac8d8`), not a stale worklist entry.
+
+The gate now returns `NotAllocated` vs `TornHeader`; only the latter impugns
+the cycle. MEASURED, one binary, `CRATONVM_G1_MARK_OOB_FAILSAFE=1` as the
+control, 900 s:
+
+| arm | retain-all cycles | real OOM |
+|---|---:|---:|
+| failsafe restored (pre-fix behaviour) | 17 | 0 |
+| split (default) | **1** | 0 |
+
+and **0 real `OutOfMemoryError` across three default runs**, against this
+page's 2 of 4. The `Caused by: java/lang/OutOfMemoryError: Java heap space
+(ByteBuffer.allocate 1048576)` face is gone.
+
+### 2. The 48 617 dangling references are SIX holders, and the count was never a rate
+
+The V7b verifier walks every surviving region LINEARLY on a rotating budget, so
+it re-reports the same unrepaired slot on every pause that reaches its region.
+Deduplicated by `(holder, target)`, this page's 48 617 lines are **6 distinct
+holders and 26 distinct targets**. The report now prints one line per distinct
+pair and carries `distinct=` and `total=`, so the two numbers stay separable.
+
+Two further cautions the page should carry:
+
+* the verifier inspects DEAD objects too -- it walks the region, not the live
+  set -- and a dead object pointing at a dead CSet object that was correctly
+  not evacuated is not a UAF at all;
+* `holder_marked` is now reported rather than assumed, and `marking_active` is
+  reported beside it **because the first attempt at this datum was vacuous**:
+  all 2 946 pairs in one run read `holder_marked=false` with
+  `marking_active=false`, i.e. the bitmap was cleared and could not answer.
+  A mark-bit read outside a mark cycle is not a liveness verdict.
+
+### 3. The class still does not pass, and what remains is named
+
+Four 900 s runs on the fixed binary: `rc=124` (cap), `rc=139` (SIGSEGV at
+223 s), `rc=124` (cap), and the failsafe control `rc=134`. So the OOM face is
+gone and the corruption faces are not. The logs name the source outright, and
+these are the lines to start from:
+
+```text
+[g1] worklist-scan[object]: REJECTED a non-object candidate (#134217728):
+    holder=0x20045f1bf90 class_id=0 kind=Object slot=2200197358352
+[g1] evacuation ref-scan CLAMPED a holder's element walk (#16384):
+    obj=0x20045f1c140 declared=2162688 room=1971
+```
+
+Both are throttled to powers of two, so `#134217728` means **at least 2^27**
+non-object candidates rejected and `#16384` at least 2^14 clamped walks. A
+holder with `class_id=0` and a slot index of 2.2e12 is not an object; something
+is walking memory that is not a live object and interpreting it as one. That is
+the next question on this page, and it is upstream of both remaining faces.
+
 ## Status
 
-**OPEN, split out 2026-08-29** from
+**OPEN. The OOM face is FIXED (2026-08-30, see the addendum above); the cap and SIGSEGV faces remain, and the 48 617 dangling references are 6 holders, not a rate. Split out 2026-08-29** from
 `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`, whose ZGC
 defect is closed and which never owned this row. The class **passes under the
 default collector**; only the explicit `-XX:+UseG1GC` arm fails.
