@@ -9876,6 +9876,9 @@ fn recycled_chunk_size(
     largest_low_free: usize,
     bump_headroom: usize,
     publish_vacated: bool,
+    // Is there a free block of at least `ZGC_LARGE_OBJECT_MIN` BESIDES the one
+    // `largest_low_free` names? See the starved rung below.
+    direct_reserve_spare: bool,
 ) -> Option<usize> {
     let size = largest_low_free & !(ZGC_TLAB_ALIGN - 1);
     if size >= want || size < need {
@@ -9885,9 +9888,49 @@ fn recycled_chunk_size(
         return Some(size);
     }
     // Below the preferred floor: worth it only when a full chunk can no longer
-    // be bumped without spending the large-object reserve.
+    // be bumped without spending the large-object reserve, AND only while the
+    // shared arena can still serve a direct allocation without this block.
+    //
+    // THE SECOND CONDITION IS THE ONE THAT WAS MISSING, AND IT COST A WORKLOAD.
+    //
+    // This rung takes `largest_low_free` -- the arena's LARGEST low block --
+    // for a THREAD-PRIVATE buffer. Once the bump is gone every refill in the
+    // process qualifies, so the large end of the free list is consumed
+    // continuously and, on a heap whose live objects wall every span, nothing
+    // replenishes it. `largest_free_block` then walks down to the rung's own
+    // floor and stays there.
+    //
+    // Measured on
+    // `org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest`
+    // at `--Xmx 1500m` (2026-08-30). Four `OutOfMemoryError`s on a **16 400**
+    // byte request -- a `char[8192]`, TLAB-eligible, so it reached the arena
+    // only because its own buffer could not serve it -- with 905 MB free and
+    // `largest_free_block=14232..16224`, i.e. sitting inside the 8-64 KiB band
+    // this rung had been grinding. The same class, same binary:
+    //
+    // ```text
+    //   default                                4x OOM, no @@RESULT
+    //   CRATONVM_ZGC_RELOCATE=0                4x OOM, largest_free_block identical
+    //   CRATONVM_ZGC_TARGETED_COMPACTION=1     4x OOM
+    //   CRATONVM_ZGC_TLAB_STARVED_RECYCLE=0    ok=132/132
+    //   CRATONVM_ZGC_TLAB=0                    ok=132/132
+    //   --Xmx 3000m                            ok=132/132
+    // ```
+    //
+    // The reserve is DERIVED, not tuned. Every direct arena allocation is
+    // smaller than [`ZGC_LARGE_OBJECT_MIN`] by construction -- at or above it
+    // the request is served from the arena's other end -- so one free block of
+    // that size is exactly what "the shared path can still be served" means.
+    // `direct_reserve_spare` is true when a block that big exists BESIDES the
+    // one on offer, which is the question `has_free_block_at_least` cannot
+    // answer for a caller about to consume the largest.
+    //
+    // The preferred rung above is untouched: at `want / 8` or better the block
+    // is a retired chunk coming back one survivor short, which is the shape
+    // this whole function was written for.
     (starved_recycle_permitted(publish_vacated)
         && bump_headroom < want
+        && direct_reserve_spare
         && size >= (want / 64).max(need))
         .then_some(size)
 }
@@ -11359,6 +11402,8 @@ impl ZgcRealHeap {
                 largest,
                 headroom,
                 self.publish_vacated_enabled.load(Ordering::Relaxed),
+                // ">= 2" is the point: one of them is the block being offered.
+                arena.low_free_blocks_at_least(ZGC_LARGE_OBJECT_MIN, 2) >= 2,
             )
                 .and_then(|size| arena.alloc(size, ZGC_TLAB_ALIGN).map(|p| (p, size)));
             // Which RUNG served this refill. Counted at the call site rather
@@ -14550,7 +14595,7 @@ pub(crate) mod tests {
         const CHUNK: usize = 512 * 1024;
         const NODE: usize = 96;
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, CHUNK - NODE, CHUNK * 4, true),
+            recycled_chunk_size(CHUNK, 64, CHUNK - NODE, CHUNK * 4, true, true),
             Some(CHUNK - NODE),
             "a chunk short by one AQS node must still be recycled",
         );
@@ -14562,19 +14607,19 @@ pub(crate) mod tests {
     fn the_recycled_chunk_decision_refuses_the_three_cases_it_must() {
         const CHUNK: usize = 512 * 1024;
         // 1. Nothing on the free list: ask for a full chunk.
-        assert_eq!(recycled_chunk_size(CHUNK, 64, 0, CHUNK * 4, true), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, 0, CHUNK * 4, true, true), None);
         // 2. Below the floor (`want / 8` = `max_tlab_alloc`): a buffer that
         //    small is churn, not a buffer.
-        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK / 8 - 8, CHUNK * 4, true), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK / 8 - 8, CHUNK * 4, true, true), None);
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, CHUNK / 8, CHUNK * 4, true),
+            recycled_chunk_size(CHUNK, 64, CHUNK / 8, CHUNK * 4, true, true),
             Some(CHUNK / 8),
             "the floor itself is acceptable",
         );
         // 3. At or above a full chunk: there is nothing to decide, the ordinary
         //    `alloc(want)` finds it.
-        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK, CHUNK * 4, true), None);
-        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK * 4, CHUNK * 4, true), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK, CHUNK * 4, true, true), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK * 4, CHUNK * 4, true, true), None);
     }
 
     /// The guarantee `tlab_refill`'s contract rests on: whatever size comes
@@ -14596,7 +14641,7 @@ pub(crate) mod tests {
                 CHUNK,
                 CHUNK * 2,
             ] {
-                if let Some(size) = recycled_chunk_size(CHUNK, need, largest, headroom, true) {
+                if let Some(size) = recycled_chunk_size(CHUNK, need, largest, headroom, true, true) {
                     assert!(
                         size >= need,
                         "need={need} largest={largest} produced a {size}-byte chunk",
@@ -14625,25 +14670,25 @@ pub(crate) mod tests {
         const CHUNK: usize = 512 * 1024;
         let short = CHUNK / 16; // 32 KiB -- below `want / 8`, above `want / 64`
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, short, CHUNK * 4, true),
+            recycled_chunk_size(CHUNK, 64, short, CHUNK * 4, true, true),
             None,
             "with headroom the alternative is a clean full-size bump, so a              short chunk is pure churn",
         );
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, true),
+            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, true, true),
             Some(short),
             "without it the alternative is spending the large-object reserve,              and the chunk is taken either way -- the only question is out of              WHICH space",
         );
         // The starved floor is a floor, not an abolition: dust is still refused
         // however starved the bump is.
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, CHUNK / 64 - 8, 0, true),
+            recycled_chunk_size(CHUNK, 64, CHUNK / 64 - 8, 0, true, true),
             None,
             "below `want / 64` a buffer is churning rather than buffering, and              that does not change with the alternative",
         );
         // ...and `need` still bounds it in the starved regime, or the refill
         // would install a chunk its own allocation cannot use.
-        assert_eq!(recycled_chunk_size(CHUNK, short + 8, short, 0, true), None);
+        assert_eq!(recycled_chunk_size(CHUNK, short + 8, short, 0, true, true), None);
     }
 
     /// **The starved floor is INERT while the vacated-span publication is off,
@@ -14664,21 +14709,64 @@ pub(crate) mod tests {
         const CHUNK: usize = 512 * 1024;
         let short = CHUNK / 16;
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, true),
+            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, true, true),
             Some(short),
             "the starved regime with the publication on"
         );
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, false),
+            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, false, true),
             None,
             "...and inert without it, because nothing would replenish what it takes"
         );
         // The PREFERRED floor is unaffected -- it is not the hazard, and gating
         // it would change the shipped behaviour of a switch nobody set.
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, CHUNK - 96, CHUNK - 8, false),
+            recycled_chunk_size(CHUNK, 64, CHUNK - 96, CHUNK - 8, false, true),
             Some(CHUNK - 96),
             "a chunk short by one AQS node is still worth taking either way"
+        );
+    }
+
+    /// The starved rung must leave the shared arena a block to allocate from.
+    ///
+    /// It takes `largest_low_free` -- the arena's LARGEST low block -- for a
+    /// THREAD-PRIVATE buffer, and once the bump is gone every refill in the
+    /// process qualifies. On a heap whose live objects wall every span nothing
+    /// replenishes the large end, so `largest_free_block` walks down to this
+    /// rung's own floor and stays there. A direct allocation -- one the
+    /// allocator reaches only because a TLAB could not serve it -- then has
+    /// nothing left.
+    ///
+    /// Measured on `DefaultCatalogAndSchemaTest` at `--Xmx 1500m`
+    /// (2026-08-30): four `OutOfMemoryError`s on a 16 400-byte `char[8192]`
+    /// with 905 MB free and `largest_free_block=14232..16224`, and
+    /// `CRATONVM_ZGC_TLAB_STARVED_RECYCLE=0` passes 132/132 on the same binary.
+    ///
+    /// Both directions are asserted. Only asserting the refusal would pass on a
+    /// patch that deleted the rung, and the rung is load-bearing for
+    /// `TestMVStoreTool`.
+    #[test]
+    fn the_starved_rung_yields_to_the_direct_allocation_reserve() {
+        const CHUNK: usize = 512 * 1024;
+        let short = CHUNK / 16; // 32 KiB: below `want / 8`, above `want / 64`
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, true, true),
+            Some(short),
+            "with a spare block for the shared path, the starved rung still fires"
+        );
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, true, false),
+            None,
+            "and refuses when the block on offer is the last one a direct              allocation could have used"
+        );
+        // The PREFERRED rung is untouched by the reserve: at `want / 8` or
+        // better the block is a retired chunk coming back one survivor short,
+        // which is the shape this function was written for, and gating it would
+        // re-open the `TestNonBlockingAPI` failure it exists to close.
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, CHUNK - 96, CHUNK - 8, true, false),
+            Some(CHUNK - 96),
+            "a chunk short by one AQS node is taken whatever the reserve says"
         );
     }
 
