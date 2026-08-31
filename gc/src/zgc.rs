@@ -2640,6 +2640,32 @@ pub struct ZgcRealHeap {
     /// CROSS_THREAD_JIT_PEER incomplete whenever a peer is in compiled code.
     /// Without this counter the two are indistinguishable at the summary line.
     relocation_on_proven_jit: AtomicUsize,
+    /// WHICH term of the relocation gate refused, per cycle.
+    ///
+    /// [`Self::relocation_skipped_jit`] is a COUNT, and a count of a
+    /// five-term conjunction cannot be acted on: `skipped_jit=13` is the same
+    /// number whether the kill switch is off, moving-young is disabled, the
+    /// per-cycle coverage proof failed, or this thread was scanned
+    /// conservatively. Each of those wants a different repair, and on
+    /// `DefaultCatalogAndSchemaTest` (2026-08-30) the difference was the whole
+    /// investigation: 13 of 14 cycles declined, and the generational
+    /// collector's own reason census read `coverage_fallbacks=0` because
+    /// `bump_reason_count` has exactly one caller and it is not on this
+    /// collector's path (see `gc_quiescence::moving_young_incomplete_reason_mask`,
+    /// which says so in as many words).
+    ///
+    /// Indexed by [`relocation_skip_reason`]. First failing term wins, in the
+    /// order the gate evaluates them, so the index names what actually forced
+    /// the decision rather than every term that happened to be false.
+    relocation_skip_reasons: [AtomicUsize; relocation_skip_reason::COUNT],
+    /// When the refusal was [`relocation_skip_reason::COVERAGE_INCOMPLETE`],
+    /// the `gc_quiescence::incomplete_reason` code that proof recorded.
+    ///
+    /// Separate from the array above because it answers the NEXT question: the
+    /// gate says "the proof failed", and this says which obligation it failed
+    /// on. Sized by the quiescence module's own `COUNT` so a new reason there
+    /// is a compile error here rather than a silently dropped column.
+    relocation_coverage_reasons: [AtomicUsize; crate::gc_quiescence::incomplete_reason::COUNT],
     /// Lifetime count of TLAB cells a [`Self::retire_all_tlabs`] could not
     /// lock, and so could not close.
     ///
@@ -3115,7 +3141,49 @@ pub struct ZgcRealHeap {
     /// `TestMVStoreTool` is the case: 2 888 live bytes in 49 runs standing
     /// between a 262 160-byte request and 266 104 contiguous bytes, in a cycle
     /// that relocated 1 817 474 objects by that ranking and left those 34.
-    compaction_target: Mutex<Option<(usize, usize)>>,
+    /// `(start, end, gc_count_when_recorded)`.
+    ///
+    /// The generation stamp is what stops the target LATCHING. It is
+    /// consume-once, so an outstanding one used to suppress every later
+    /// re-derivation for the rest of the process -- and if no cycle ever
+    /// reaches [`Self::take_compaction_target_pages`] (the relocation gate
+    /// declines, which on `DefaultCatalogAndSchemaTest` it does on 13 of 14
+    /// cycles), the FIRST failure's window is the only one the selector is
+    /// ever offered. Measured 2026-08-30: one `[zgc-target] recorded` line,
+    /// zero `consumed`, across four `OutOfMemoryError`s.
+    ///
+    /// That is also the wrong window to keep. The allocator runs a
+    /// try/GC/try/reclaim/try ladder, so failure #1 profiles the
+    /// PRE-collection arena and the post-GC one is the only view that says
+    /// what survives a collection -- the same argument
+    /// [`Self::frag_report_once`] makes for reporting twice rather than once.
+    compaction_target: Mutex<Option<(usize, usize, usize)>>,
+    /// Windows an allocation failure named for the next collection to empty.
+    ///
+    /// `forwarding::targeted_pages_selected()` alone cannot be acted on: it
+    /// reads 0 both when no failure ever named a window and when every named
+    /// window went unconsumed because no cycle relocated. Those want opposite
+    /// repairs, and telling them apart was the whole of the 2026-08-30
+    /// `DefaultCatalogAndSchemaTest` reading.
+    compaction_targets_recorded: AtomicUsize,
+    /// ...and how many a collection actually picked up.
+    compaction_targets_consumed: AtomicUsize,
+    /// TLAB refills served by a RECYCLED free-list block at or above the
+    /// preferred floor (`want / 8`), and refills served below it by the
+    /// starved floor.
+    ///
+    /// The starved floor is a switch (`CRATONVM_ZGC_TLAB_STARVED_RECYCLE`)
+    /// whose engagement nothing reported, so "this workload never reaches the
+    /// starved rung" and "it reaches it constantly" were the same run to a
+    /// reader. It takes the arena's LARGEST low free block, so every firing
+    /// lowers `largest_free_block` -- which is the number a direct
+    /// (non-TLAB-eligible) allocation is about to be measured against.
+    tlab_refill_recycled: AtomicUsize,
+    /// ...and the starved rung specifically. See
+    /// [`Self::tlab_refill_recycled`].
+    tlab_refill_starved: AtomicUsize,
+    /// Bytes the starved rung took off the free list.
+    tlab_refill_starved_bytes: AtomicUsize,
     /// Addresses this barrier has published since the cycle began. Telemetry
     /// for the adoption work — it is how you tell "the barrier is wired" from
     /// "the barrier is wired and the workload actually overwrites references",
@@ -3510,6 +3578,8 @@ impl ZgcRealHeap {
             corpse_cycle: AtomicU64::new(0),
             relocation_skipped_jit: AtomicUsize::new(0),
             relocation_on_proven_jit: AtomicUsize::new(0),
+            relocation_skip_reasons: std::array::from_fn(|_| AtomicUsize::new(0)),
+            relocation_coverage_reasons: std::array::from_fn(|_| AtomicUsize::new(0)),
             tlab_retire_skipped_total: AtomicUsize::new(0),
 
             unwalkable_reports: AtomicUsize::new(0),
@@ -3585,6 +3655,11 @@ impl ZgcRealHeap {
             high_objects_relocated: AtomicUsize::new(0),
             high_bytes_copied: AtomicUsize::new(0),
             compaction_target: Mutex::new(None),
+            compaction_targets_recorded: AtomicUsize::new(0),
+            compaction_targets_consumed: AtomicUsize::new(0),
+            tlab_refill_recycled: AtomicUsize::new(0),
+            tlab_refill_starved: AtomicUsize::new(0),
+            tlab_refill_starved_bytes: AtomicUsize::new(0),
             headroom_low: AtomicBool::new(false),
             gc_count: AtomicUsize::new(0),
             gc_log_enabled: AtomicBool::new(false),
@@ -4311,6 +4386,39 @@ impl ZgcRealHeap {
     /// coverage proof. See the field doc for why a zero here is informative.
     pub fn relocation_on_proven_jit(&self) -> usize {
         self.relocation_on_proven_jit.load(Ordering::Relaxed)
+    }
+
+    /// Refills served by a recycled block, split into the preferred rung and
+    /// the starved rung. See [`Self::tlab_refill_recycled`].
+    pub fn tlab_recycle_engagement(&self) -> (usize, usize, usize) {
+        (
+            self.tlab_refill_recycled.load(Ordering::Relaxed),
+            self.tlab_refill_starved.load(Ordering::Relaxed),
+            self.tlab_refill_starved_bytes.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Windows an allocation failure named, and windows a collection actually
+    /// consumed. See [`Self::compaction_targets_recorded`].
+    pub fn compaction_target_engagement(&self) -> (usize, usize) {
+        (
+            self.compaction_targets_recorded.load(Ordering::Relaxed),
+            self.compaction_targets_consumed.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Per-term census of the relocation refusal — see
+    /// [`relocation_skip_reason`].
+    pub fn relocation_skip_reason_counts(&self) -> [usize; relocation_skip_reason::COUNT] {
+        std::array::from_fn(|i| self.relocation_skip_reasons[i].load(Ordering::Relaxed))
+    }
+
+    /// For refusals attributed to [`relocation_skip_reason::COVERAGE_INCOMPLETE`],
+    /// the `gc_quiescence::incomplete_reason` the proof recorded.
+    pub fn relocation_coverage_reason_counts(
+        &self,
+    ) -> [usize; crate::gc_quiescence::incomplete_reason::COUNT] {
+        std::array::from_fn(|i| self.relocation_coverage_reasons[i].load(Ordering::Relaxed))
     }
 
     /// Lifetime count of TLAB cells a retire could not lock.
@@ -6180,13 +6288,39 @@ impl ZgcRealHeap {
         // That is a real limit of the proof, not of this gate.
         let compiled_frames_live = crate::gc_quiescence::is_active()
             || crate::gc_quiescence::unregistered_jit_frame_on_stack();
-        let frames_are_rewritable = zgc_relocate_under_proven_jit()
-            && crate::gc_quiescence::moving_young_enabled()
-            && !crate::gc_quiescence::moving_young_coverage_incomplete()
-            && !crate::gc_quiescence::force_non_moving_jit_roots()
-            && !crate::gc_quiescence::unregistered_jit_frame_on_stack();
+        // FIRST FAILING TERM, not the conjunction. The five terms below used
+        // to be one `&&` chain whose only trace was `relocation_skipped_jit`,
+        // and a count of a conjunction names nothing: see
+        // [`Self::relocation_skip_reasons`] for the run that cost.
+        let refusal: Option<usize> = if !zgc_relocate_under_proven_jit() {
+            Some(relocation_skip_reason::SWITCH_OFF)
+        } else if !crate::gc_quiescence::moving_young_enabled() {
+            Some(relocation_skip_reason::MOVING_YOUNG_DISABLED)
+        } else if crate::gc_quiescence::moving_young_coverage_incomplete() {
+            Some(relocation_skip_reason::COVERAGE_INCOMPLETE)
+        } else if crate::gc_quiescence::force_non_moving_jit_roots() {
+            Some(relocation_skip_reason::FORCED_NON_MOVING_ROOTS)
+        } else if crate::gc_quiescence::unregistered_jit_frame_on_stack() {
+            Some(relocation_skip_reason::UNREGISTERED_JIT_FRAME)
+        } else {
+            None
+        };
+        let frames_are_rewritable = refusal.is_none();
         if compiled_frames_live && !frames_are_rewritable {
             self.relocation_skipped_jit.fetch_add(1, Ordering::Relaxed);
+            if let Some(r) = refusal {
+                if let Some(slot) = self.relocation_skip_reasons.get(r) {
+                    slot.fetch_add(1, Ordering::Relaxed);
+                }
+                if r == relocation_skip_reason::COVERAGE_INCOMPLETE {
+                    // WHICH obligation the proof failed on. `moving_young_incomplete_reason`
+                    // is first-wins for the cycle, which is the one that forced it.
+                    let why = crate::gc_quiescence::moving_young_incomplete_reason();
+                    if let Some(slot) = self.relocation_coverage_reasons.get(why) {
+                        slot.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
             let reclaimed = self.arena.lock().retract_cursor_into_free_tail();
             return (0, reclaimed, cratonvm_types::PointerMap::default());
         }
@@ -7666,13 +7800,24 @@ impl ZgcRealHeap {
     /// Takes the arena lock itself: the caller dropped it before logging, and
     /// this must not extend that critical section.
     fn record_compaction_target(&self, request: usize) {
+        let gc_now = self.gc_count.load(Ordering::Relaxed);
         {
             let cur = self.compaction_target.lock();
-            if cur.is_some() {
-                // A target is already outstanding and no cycle has consumed it
-                // yet. Re-deriving it now would sort the free list again for an
-                // answer nothing has acted on.
-                return;
+            // A target outstanding from THIS collection generation stands: the
+            // caller's try/GC/try ladder can fail several times inside one
+            // generation, and re-deriving per attempt would sort the free list
+            // again for an answer nothing has acted on. That is the whole of
+            // the original early return and it is kept.
+            //
+            // A target outstanding from an EARLIER generation does not. A
+            // collection has since run and declined to consume it, so it now
+            // describes an arena that no longer exists -- and keeping it makes
+            // the feature latch: the first failure's window becomes the only
+            // one the selector is ever offered, for the life of the process.
+            if let Some((_, _, recorded_at)) = *cur {
+                if recorded_at == gc_now {
+                    return;
+                }
             }
         }
         let window = {
@@ -7699,7 +7844,9 @@ impl ZgcRealHeap {
                     w.end <= used_low
                 );
             }
-            *self.compaction_target.lock() = Some((w.start, w.end));
+            *self.compaction_target.lock() = Some((w.start, w.end, gc_now));
+            self.compaction_targets_recorded
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -7709,7 +7856,9 @@ impl ZgcRealHeap {
     /// not that cycle managed to evacuate it, so a stale window cannot pin the
     /// selector to one part of the arena forever.
     fn take_compaction_target_pages(&self) -> Option<(u64, u64)> {
-        let (start, end) = self.compaction_target.lock().take()?;
+        let (start, end, _recorded_at) = self.compaction_target.lock().take()?;
+        self.compaction_targets_consumed
+            .fetch_add(1, Ordering::Relaxed);
         if end <= start {
             return None;
         }
@@ -9543,6 +9692,42 @@ const ZGC_TLAB_ALIGN: usize = 8;
 /// it is not. Turn it on to exercise the low-region path or to bisect against
 /// a future high-region compactor. Latched: it decides what a collection does
 /// and must not change mid-cycle.
+/// Why a ZGC collection declined to run its low-end slide.
+///
+/// The gate in [`ZgcRealHeap::relocate_stw`] is a five-term conjunction, and
+/// until 2026-08-30 its only trace was one scalar. Each term has a different
+/// repair — a kill switch that is off wants turning on, an incomplete coverage
+/// proof wants a stronger JIT contract, a conservatively-scanned thread wants
+/// nothing at all — so the number that matters is which term said no.
+pub mod relocation_skip_reason {
+    /// `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` — the kill switch.
+    pub const SWITCH_OFF: usize = 0;
+    /// Moving-young is off process-wide, so no rewritable-root contract exists
+    /// to lean on.
+    pub const MOVING_YOUNG_DISABLED: usize = 1;
+    /// The per-cycle coverage proof reported at least one unproven obligation.
+    /// `relocation_coverage_reason:` names which.
+    pub const COVERAGE_INCOMPLETE: usize = 2;
+    /// This thread's root scan asked for non-moving JIT roots.
+    pub const FORCED_NON_MOVING_ROOTS: usize = 3;
+    /// A JIT frame was on this thread's stack without a `JitEntryGuard`.
+    pub const UNREGISTERED_JIT_FRAME: usize = 4;
+    /// One past the highest code; sizes the counter array.
+    pub const COUNT: usize = 5;
+
+    /// Human-readable label, for the summary line.
+    pub fn label(code: usize) -> &'static str {
+        match code {
+            SWITCH_OFF => "relocate-under-proven-jit-switch-off",
+            MOVING_YOUNG_DISABLED => "moving-young-disabled",
+            COVERAGE_INCOMPLETE => "coverage-proof-incomplete",
+            FORCED_NON_MOVING_ROOTS => "forced-non-moving-jit-roots",
+            UNREGISTERED_JIT_FRAME => "unregistered-jit-frame-on-stack",
+            _ => "unknown",
+        }
+    }
+}
+
 fn targeted_compaction_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
@@ -9691,6 +9876,9 @@ fn recycled_chunk_size(
     largest_low_free: usize,
     bump_headroom: usize,
     publish_vacated: bool,
+    // Is there a free block of at least `ZGC_LARGE_OBJECT_MIN` BESIDES the one
+    // `largest_low_free` names? See the starved rung below.
+    direct_reserve_spare: bool,
 ) -> Option<usize> {
     let size = largest_low_free & !(ZGC_TLAB_ALIGN - 1);
     if size >= want || size < need {
@@ -9700,9 +9888,58 @@ fn recycled_chunk_size(
         return Some(size);
     }
     // Below the preferred floor: worth it only when a full chunk can no longer
-    // be bumped without spending the large-object reserve.
+    // be bumped without spending the large-object reserve, AND only while the
+    // shared arena can still serve a direct allocation without this block.
+    //
+    // THE SECOND CONDITION IS THE ONE THAT WAS MISSING, AND IT COST A WORKLOAD.
+    //
+    // This rung takes `largest_low_free` -- the arena's LARGEST low block --
+    // for a THREAD-PRIVATE buffer. Once the bump is gone every refill in the
+    // process qualifies, so the large end of the free list is consumed
+    // continuously and, on a heap whose live objects wall every span, nothing
+    // replenishes it. `largest_free_block` then walks down to the rung's own
+    // floor and stays there.
+    //
+    // Measured on
+    // `org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest`
+    // at `--Xmx 1500m` (2026-08-30). Four `OutOfMemoryError`s on a **16 400**
+    // byte request -- a `char[8192]`, TLAB-eligible, so it reached the arena
+    // only because its own buffer could not serve it -- with 905 MB free and
+    // `largest_free_block=14232..16224`, i.e. sitting inside the 8-64 KiB band
+    // this rung had been grinding. The same class, same binary:
+    //
+    // ```text
+    //   default                                4x OOM, no @@RESULT
+    //   CRATONVM_ZGC_RELOCATE=0                4x OOM, largest_free_block identical
+    //   CRATONVM_ZGC_TARGETED_COMPACTION=1     4x OOM
+    //   CRATONVM_ZGC_TLAB_STARVED_RECYCLE=0    ok=132/132
+    //   CRATONVM_ZGC_TLAB=0                    ok=132/132
+    //   --Xmx 3000m                            ok=132/132
+    // ```
+    //
+    // The reserve is DERIVED, not tuned, and the derivation matters: it is
+    // `max_tlab_alloc`, the largest object a TLAB will ever serve, and
+    // therefore the largest allocation that can fall back to a DIRECT arena
+    // request when its own buffer cannot take it. That is precisely the
+    // request this rung competes with.
+    //
+    // `ZGC_LARGE_OBJECT_MIN` was the first cut and is wrong: the starved
+    // regime is by definition `largest_low_free < want / 8`, which is that
+    // constant, so a spare block that big can never exist while the rung is
+    // being asked and the gate degenerates into a kill switch. Measured --
+    // it took `TestKillProcessWhileWriting` from PASS to FAIL, which is what
+    // `CRATONVM_ZGC_TLAB_STARVED_RECYCLE=0` does.
+    //
+    // `direct_reserve_spare` is true when a block that big exists BESIDES the
+    // one on offer, which is the question `has_free_block_at_least` cannot
+    // answer for a caller about to consume the largest.
+    //
+    // The preferred rung above is untouched: at `want / 8` or better the block
+    // is a retired chunk coming back one survivor short, which is the shape
+    // this whole function was written for.
     (starved_recycle_permitted(publish_vacated)
         && bump_headroom < want
+        && direct_reserve_spare
         && size >= (want / 64).max(need))
         .then_some(size)
 }
@@ -11174,8 +11411,43 @@ impl ZgcRealHeap {
                 largest,
                 headroom,
                 self.publish_vacated_enabled.load(Ordering::Relaxed),
+                // ">= 2" is the point: one of them is the block being offered.
+                //
+                // The reserve is `max_tlab_alloc`, recomputed from `want` the
+                // way `ZTlabConfig` computes it. NOT `ZGC_LARGE_OBJECT_MIN`:
+                // that was the first cut and it is a disguised kill switch,
+                // because the starved regime is by definition
+                // `largest_low_free < want / 8` = 64 KiB, so a spare block of
+                // 64 KiB can never exist while the rung is being asked and the
+                // gate refuses every time. Measured: it took
+                // `TestKillProcessWhileWriting` from PASS to FAIL, which is
+                // exactly what turning the rung off does.
+                //
+                // `max_tlab_alloc` is the largest object a TLAB will ever
+                // serve, so it is the largest allocation that can fall back to
+                // a direct arena request when its own buffer cannot take it —
+                // which is the request this rung is competing with. Reserving
+                // one block that size is a real discriminator inside the
+                // starved band rather than a refusal of the whole band.
+                arena.low_free_blocks_at_least(
+                    (want / 8).min(crate::tlab::tlab_max_alloc()),
+                    2,
+                ) >= 2,
             )
                 .and_then(|size| arena.alloc(size, ZGC_TLAB_ALIGN).map(|p| (p, size)));
+            // Which RUNG served this refill. Counted at the call site rather
+            // than inside `recycled_chunk_size` so the pure function stays
+            // pure and testable; the two rungs are separated by the same
+            // `want / 8` the function uses.
+            if let Some((_, size)) = sized {
+                if size >= want / 8 {
+                    self.tlab_refill_recycled.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.tlab_refill_starved.fetch_add(1, Ordering::Relaxed);
+                    self.tlab_refill_starved_bytes
+                        .fetch_add(size, Ordering::Relaxed);
+                }
+            }
             // `alloc(want)` covers both the "the free list has a full-size
             // block" case and the bump.
             sized.or_else(|| arena.alloc(want, ZGC_TLAB_ALIGN).map(|p| (p, want)))
@@ -14352,7 +14624,7 @@ pub(crate) mod tests {
         const CHUNK: usize = 512 * 1024;
         const NODE: usize = 96;
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, CHUNK - NODE, CHUNK * 4, true),
+            recycled_chunk_size(CHUNK, 64, CHUNK - NODE, CHUNK * 4, true, true),
             Some(CHUNK - NODE),
             "a chunk short by one AQS node must still be recycled",
         );
@@ -14364,19 +14636,19 @@ pub(crate) mod tests {
     fn the_recycled_chunk_decision_refuses_the_three_cases_it_must() {
         const CHUNK: usize = 512 * 1024;
         // 1. Nothing on the free list: ask for a full chunk.
-        assert_eq!(recycled_chunk_size(CHUNK, 64, 0, CHUNK * 4, true), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, 0, CHUNK * 4, true, true), None);
         // 2. Below the floor (`want / 8` = `max_tlab_alloc`): a buffer that
         //    small is churn, not a buffer.
-        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK / 8 - 8, CHUNK * 4, true), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK / 8 - 8, CHUNK * 4, true, true), None);
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, CHUNK / 8, CHUNK * 4, true),
+            recycled_chunk_size(CHUNK, 64, CHUNK / 8, CHUNK * 4, true, true),
             Some(CHUNK / 8),
             "the floor itself is acceptable",
         );
         // 3. At or above a full chunk: there is nothing to decide, the ordinary
         //    `alloc(want)` finds it.
-        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK, CHUNK * 4, true), None);
-        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK * 4, CHUNK * 4, true), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK, CHUNK * 4, true, true), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK * 4, CHUNK * 4, true, true), None);
     }
 
     /// The guarantee `tlab_refill`'s contract rests on: whatever size comes
@@ -14398,7 +14670,7 @@ pub(crate) mod tests {
                 CHUNK,
                 CHUNK * 2,
             ] {
-                if let Some(size) = recycled_chunk_size(CHUNK, need, largest, headroom, true) {
+                if let Some(size) = recycled_chunk_size(CHUNK, need, largest, headroom, true, true) {
                     assert!(
                         size >= need,
                         "need={need} largest={largest} produced a {size}-byte chunk",
@@ -14427,25 +14699,25 @@ pub(crate) mod tests {
         const CHUNK: usize = 512 * 1024;
         let short = CHUNK / 16; // 32 KiB -- below `want / 8`, above `want / 64`
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, short, CHUNK * 4, true),
+            recycled_chunk_size(CHUNK, 64, short, CHUNK * 4, true, true),
             None,
             "with headroom the alternative is a clean full-size bump, so a              short chunk is pure churn",
         );
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, true),
+            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, true, true),
             Some(short),
             "without it the alternative is spending the large-object reserve,              and the chunk is taken either way -- the only question is out of              WHICH space",
         );
         // The starved floor is a floor, not an abolition: dust is still refused
         // however starved the bump is.
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, CHUNK / 64 - 8, 0, true),
+            recycled_chunk_size(CHUNK, 64, CHUNK / 64 - 8, 0, true, true),
             None,
             "below `want / 64` a buffer is churning rather than buffering, and              that does not change with the alternative",
         );
         // ...and `need` still bounds it in the starved regime, or the refill
         // would install a chunk its own allocation cannot use.
-        assert_eq!(recycled_chunk_size(CHUNK, short + 8, short, 0, true), None);
+        assert_eq!(recycled_chunk_size(CHUNK, short + 8, short, 0, true, true), None);
     }
 
     /// **The starved floor is INERT while the vacated-span publication is off,
@@ -14466,21 +14738,64 @@ pub(crate) mod tests {
         const CHUNK: usize = 512 * 1024;
         let short = CHUNK / 16;
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, true),
+            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, true, true),
             Some(short),
             "the starved regime with the publication on"
         );
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, false),
+            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, false, true),
             None,
             "...and inert without it, because nothing would replenish what it takes"
         );
         // The PREFERRED floor is unaffected -- it is not the hazard, and gating
         // it would change the shipped behaviour of a switch nobody set.
         assert_eq!(
-            recycled_chunk_size(CHUNK, 64, CHUNK - 96, CHUNK - 8, false),
+            recycled_chunk_size(CHUNK, 64, CHUNK - 96, CHUNK - 8, false, true),
             Some(CHUNK - 96),
             "a chunk short by one AQS node is still worth taking either way"
+        );
+    }
+
+    /// The starved rung must leave the shared arena a block to allocate from.
+    ///
+    /// It takes `largest_low_free` -- the arena's LARGEST low block -- for a
+    /// THREAD-PRIVATE buffer, and once the bump is gone every refill in the
+    /// process qualifies. On a heap whose live objects wall every span nothing
+    /// replenishes the large end, so `largest_free_block` walks down to this
+    /// rung's own floor and stays there. A direct allocation -- one the
+    /// allocator reaches only because a TLAB could not serve it -- then has
+    /// nothing left.
+    ///
+    /// Measured on `DefaultCatalogAndSchemaTest` at `--Xmx 1500m`
+    /// (2026-08-30): four `OutOfMemoryError`s on a 16 400-byte `char[8192]`
+    /// with 905 MB free and `largest_free_block=14232..16224`, and
+    /// `CRATONVM_ZGC_TLAB_STARVED_RECYCLE=0` passes 132/132 on the same binary.
+    ///
+    /// Both directions are asserted. Only asserting the refusal would pass on a
+    /// patch that deleted the rung, and the rung is load-bearing for
+    /// `TestMVStoreTool`.
+    #[test]
+    fn the_starved_rung_yields_to_the_direct_allocation_reserve() {
+        const CHUNK: usize = 512 * 1024;
+        let short = CHUNK / 16; // 32 KiB: below `want / 8`, above `want / 64`
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, true, true),
+            Some(short),
+            "with a spare block for the shared path, the starved rung still fires"
+        );
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, short, CHUNK - 8, true, false),
+            None,
+            "and refuses when the block on offer is the last one a direct              allocation could have used"
+        );
+        // The PREFERRED rung is untouched by the reserve: at `want / 8` or
+        // better the block is a retired chunk coming back one survivor short,
+        // which is the shape this function was written for, and gating it would
+        // re-open the `TestNonBlockingAPI` failure it exists to close.
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, CHUNK - 96, CHUNK - 8, true, false),
+            Some(CHUNK - 96),
+            "a chunk short by one AQS node is taken whatever the reserve says"
         );
     }
 
@@ -16555,6 +16870,73 @@ pub(crate) mod tests {
             on_largest > off_largest,
             "and the reason must be a bigger CONTIGUOUS block, not luck: \
              on={on_largest} off={off_largest}"
+        );
+    }
+
+    /// A compaction target must not LATCH across collections.
+    ///
+    /// `record_compaction_target` returns early while one is outstanding, so a
+    /// storm of failures inside one try/GC/try ladder does not re-sort the free
+    /// list per attempt. That early return used to have no generation stamp, so
+    /// a target nothing ever consumed suppressed every later re-derivation for
+    /// the life of the process -- and on `DefaultCatalogAndSchemaTest`
+    /// (2026-08-30) nothing ever did consume one: the relocation gate declined
+    /// 13 of 14 cycles, and the run logged one `recorded` line, zero
+    /// `consumed`, across four `OutOfMemoryError`s.
+    ///
+    /// Both halves are asserted, because only asserting the second would pass
+    /// on a patch that simply deleted the early return.
+    #[test]
+    fn a_compaction_target_is_not_latched_across_collections() {
+        let heap = ZgcRealHeap::new();
+        // Make the arena fragmented enough that `frag_profile` names a window
+        // at all -- without one, `record_compaction_target` stores nothing and
+        // the test would pass vacuously in both directions.
+        {
+            let mut arena = heap.arena.lock();
+            let base = arena.base_ptr() as usize;
+            let mut offsets = Vec::new();
+            for _ in 0..128 {
+                let p = arena.alloc(2048, 8).expect("fresh arena has room");
+                offsets.push(p as usize - base);
+            }
+            // Free every other block: a live/dead mosaic whose cheapest window
+            // is two holes walled by one survivor, which is the shape the
+            // targeted selector exists for.
+            for (i, off) in offsets.iter().enumerate() {
+                if i % 2 == 0 {
+                    arena.add_free_block(*off, 2048);
+                }
+            }
+        }
+        heap.record_compaction_target(4096);
+        let (recorded_1, _) = heap.compaction_target_engagement();
+        assert_eq!(
+            recorded_1, 1,
+            "the first failure must name a window, or the rest proves nothing"
+        );
+
+        // SAME generation: the ladder's later rungs must not re-derive.
+        heap.record_compaction_target(4096);
+        let (recorded_same_gen, _) = heap.compaction_target_engagement();
+        assert_eq!(
+            recorded_same_gen, 1,
+            "a second failure inside ONE collection generation must reuse the              outstanding target -- re-sorting the free list per attempt is what              the early return exists to prevent"
+        );
+
+        // A collection has now run and did NOT consume the target (the
+        // relocation gate declined). The next failure must be allowed to
+        // replace it: the old window describes an arena that no longer exists.
+        heap.gc_count.fetch_add(1, Ordering::Relaxed);
+        heap.record_compaction_target(4096);
+        let (recorded_next_gen, consumed) = heap.compaction_target_engagement();
+        assert_eq!(
+            recorded_next_gen, 2,
+            "a failure in a LATER generation must re-derive the window;              otherwise the first failure's target latches for the life of the              process and the selector is never offered another"
+        );
+        assert_eq!(
+            consumed, 0,
+            "nothing consumed a target here, which is exactly the state the              latch used to make permanent"
         );
     }
 

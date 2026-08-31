@@ -2697,15 +2697,60 @@ impl VmHeap {
             // rules out is a good one, and the next reader should not have to
             // re-derive it.
             let tlab_skipped = h.tlab_retire_skipped();
+            // `targeted_pages=0` on its own is two different facts: no
+            // allocation failure ever named a window, or every named window
+            // went unconsumed because no cycle relocated. On
+            // `DefaultCatalogAndSchemaTest` (2026-08-30) it was the second --
+            // one window recorded, zero consumed, across four
+            // `OutOfMemoryError`s -- and the two want opposite repairs.
+            let (targets_recorded, targets_consumed) = h.compaction_target_engagement();
+            // The starved TLAB rung takes the arena's LARGEST low free block, so
+            // every firing lowers the very number a direct allocation is about
+            // to fail against. Its switch shipped with no engagement counter,
+            // which made "never reached" and "reached constantly" the same run.
+            let (recycled_refills, starved_refills, starved_bytes) = h.tlab_recycle_engagement();
             eprintln!(
                 "[GC] zgc-features: parallel_mark_cycles={par_cycles} \
                  driver_passes={driver_passes} mark_fallbacks={mark_fallbacks} \
                  compaction_cycles={compactions} objects_relocated={relocated} \
                  relocation_skipped_jit={skipped_jit} \
                  relocation_on_proven_jit={proven_jit} \
-                 tlab_retire_skipped={tlab_skipped}                  targeted_pages={targeted_pages}",
+                 tlab_retire_skipped={tlab_skipped}                  targeted_pages={targeted_pages}                  targets_recorded={targets_recorded} targets_consumed={targets_consumed}                  tlab_recycled_refills={recycled_refills} tlab_starved_refills={starved_refills}                  tlab_starved_bytes={starved_bytes}",
                 targeted_pages = crate::zgc::forwarding::targeted_pages_selected(),
+                targets_recorded = targets_recorded,
+                targets_consumed = targets_consumed,
+                recycled_refills = recycled_refills,
+                starved_refills = starved_refills,
+                starved_bytes = starved_bytes,
             );
+            // WHICH of the five terms refused, and — when it was the coverage
+            // proof — which obligation. `relocation_skipped_jit` is a count of
+            // a conjunction; on its own it names nothing, and the generational
+            // collector's `moving_young_fallback_reason` census cannot fill the
+            // gap because its only writer is that collector's own per-cycle
+            // accounting (`gc_quiescence::moving_young_incomplete_reason_mask`
+            // says so). Printed only when something actually declined, so a
+            // clean run does not grow two empty sections.
+            let skip_reasons = h.relocation_skip_reason_counts();
+            for (reason, n) in skip_reasons.iter().enumerate() {
+                if *n > 0 {
+                    eprintln!(
+                        "[GC] zgc-relocation-skip-reason: {}={}",
+                        crate::zgc::relocation_skip_reason::label(reason),
+                        n
+                    );
+                }
+            }
+            let cov_reasons = h.relocation_coverage_reason_counts();
+            for (reason, n) in cov_reasons.iter().enumerate() {
+                if *n > 0 {
+                    eprintln!(
+                        "[GC] zgc-relocation-coverage-reason: {}={}",
+                        crate::gc_quiescence::incomplete_reason::label(reason),
+                        n
+                    );
+                }
+            }
             // THE OTHER END OF THE ARENA, on its own line.
             //
             // Every number above describes the LOW end. A heap can compact that
