@@ -64,11 +64,36 @@ Two further cautions the page should carry:
   `marking_active=false`, i.e. the bitmap was cleared and could not answer.
   A mark-bit read outside a mark cycle is not a liveness verdict.
 
-### 3. The class still does not pass, and what remains is named
+### 3. THE FAILURE MODE MOVED, and that is a cost this page must carry
 
-Four 900 s runs on the fixed binary: `rc=124` (cap), `rc=139` (SIGSEGV at
-223 s), `rc=124` (cap), and the failsafe control `rc=134`. So the OOM face is
-gone and the corruption faces are not. The logs name the source outright, and
+The retain-everything fail-safe was not fixing anything -- it was MASKING, by
+never freeing. Removing the mask lets evacuation run again, and the corruption
+that was previously latent now bites:
+
+| arm | runs | outcome |
+|---|---|---|
+| this page's original default `-XX:+UseG1GC` | 4 | `124` cap, `1` OOM, `124` cap, `1` OOM |
+| with the refusal split (default) | 4 | `124` cap, **`139` SIGSEGV**, `124` cap, **`139` SIGSEGV** |
+
+Zero `OutOfMemoryError` and zero retain-all cycles in the new arm, and two hard
+segfaults where there were none. **A caller should read that as a trade, not as
+an improvement**: the class failed before and fails now, and a SIGSEGV is a
+harder failure than a capped run.
+
+It is shipped default-ON anyway, for two reasons that should be re-examined if
+a G1 workload regresses. First, the blast radius is bounded -- G1 is not the
+default collector, so only an explicit `-XX:+UseG1GC` arm is affected. Second,
+the alternative is keeping a fail-safe that fires on an ordinary condition and
+buys its silence by never reclaiming, which cannot be a resting state.
+
+`CRATONVM_G1_MARK_OOB_FAILSAFE=1` restores the old behaviour on the same
+binary, and `mark_oob_gray_skips` is reported at cleanup so the fail-safe that
+stopped firing does not become one nobody can see.
+
+### 4. The class still does not pass, and what remains is named
+
+So the OOM face is gone and the corruption faces are not (see 3 above for the run
+table and what that trade costs). The logs name the source outright, and
 these are the lines to start from:
 
 ```text
@@ -86,7 +111,7 @@ the next question on this page, and it is upstream of both remaining faces.
 
 ## Status
 
-**OPEN. The OOM face is FIXED (2026-08-30, see the addendum above); the cap and SIGSEGV faces remain, and the 48 617 dangling references are 6 holders, not a rate. Split out 2026-08-29** from
+**OPEN. The OOM face is FIXED (2026-08-30) but the FAILURE MODE MOVED to SIGSEGV -- read the addendum above, section 3, before treating that as an improvement. The 48 617 dangling references are 6 holders, not a rate. Split out 2026-08-29** from
 `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`, whose ZGC
 defect is closed and which never owned this row. The class **passes under the
 default collector**; only the explicit `-XX:+UseG1GC` arm fails.
