@@ -2704,16 +2704,24 @@ impl VmHeap {
             // one window recorded, zero consumed, across four
             // `OutOfMemoryError`s -- and the two want opposite repairs.
             let (targets_recorded, targets_consumed) = h.compaction_target_engagement();
+            // The starved TLAB rung takes the arena's LARGEST low free block, so
+            // every firing lowers the very number a direct allocation is about
+            // to fail against. Its switch shipped with no engagement counter,
+            // which made "never reached" and "reached constantly" the same run.
+            let (recycled_refills, starved_refills, starved_bytes) = h.tlab_recycle_engagement();
             eprintln!(
                 "[GC] zgc-features: parallel_mark_cycles={par_cycles} \
                  driver_passes={driver_passes} mark_fallbacks={mark_fallbacks} \
                  compaction_cycles={compactions} objects_relocated={relocated} \
                  relocation_skipped_jit={skipped_jit} \
                  relocation_on_proven_jit={proven_jit} \
-                 tlab_retire_skipped={tlab_skipped}                  targeted_pages={targeted_pages}                  targets_recorded={targets_recorded} targets_consumed={targets_consumed}",
+                 tlab_retire_skipped={tlab_skipped}                  targeted_pages={targeted_pages}                  targets_recorded={targets_recorded} targets_consumed={targets_consumed}                  tlab_recycled_refills={recycled_refills} tlab_starved_refills={starved_refills}                  tlab_starved_bytes={starved_bytes}",
                 targeted_pages = crate::zgc::forwarding::targeted_pages_selected(),
                 targets_recorded = targets_recorded,
                 targets_consumed = targets_consumed,
+                recycled_refills = recycled_refills,
+                starved_refills = starved_refills,
+                starved_bytes = starved_bytes,
             );
             // WHICH of the five terms refused, and — when it was the coverage
             // proof — which obligation. `relocation_skipped_jit` is a count of

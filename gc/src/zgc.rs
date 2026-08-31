@@ -3168,6 +3168,22 @@ pub struct ZgcRealHeap {
     compaction_targets_recorded: AtomicUsize,
     /// ...and how many a collection actually picked up.
     compaction_targets_consumed: AtomicUsize,
+    /// TLAB refills served by a RECYCLED free-list block at or above the
+    /// preferred floor (`want / 8`), and refills served below it by the
+    /// starved floor.
+    ///
+    /// The starved floor is a switch (`CRATONVM_ZGC_TLAB_STARVED_RECYCLE`)
+    /// whose engagement nothing reported, so "this workload never reaches the
+    /// starved rung" and "it reaches it constantly" were the same run to a
+    /// reader. It takes the arena's LARGEST low free block, so every firing
+    /// lowers `largest_free_block` -- which is the number a direct
+    /// (non-TLAB-eligible) allocation is about to be measured against.
+    tlab_refill_recycled: AtomicUsize,
+    /// ...and the starved rung specifically. See
+    /// [`Self::tlab_refill_recycled`].
+    tlab_refill_starved: AtomicUsize,
+    /// Bytes the starved rung took off the free list.
+    tlab_refill_starved_bytes: AtomicUsize,
     /// Addresses this barrier has published since the cycle began. Telemetry
     /// for the adoption work — it is how you tell "the barrier is wired" from
     /// "the barrier is wired and the workload actually overwrites references",
@@ -3641,6 +3657,9 @@ impl ZgcRealHeap {
             compaction_target: Mutex::new(None),
             compaction_targets_recorded: AtomicUsize::new(0),
             compaction_targets_consumed: AtomicUsize::new(0),
+            tlab_refill_recycled: AtomicUsize::new(0),
+            tlab_refill_starved: AtomicUsize::new(0),
+            tlab_refill_starved_bytes: AtomicUsize::new(0),
             headroom_low: AtomicBool::new(false),
             gc_count: AtomicUsize::new(0),
             gc_log_enabled: AtomicBool::new(false),
@@ -4367,6 +4386,16 @@ impl ZgcRealHeap {
     /// coverage proof. See the field doc for why a zero here is informative.
     pub fn relocation_on_proven_jit(&self) -> usize {
         self.relocation_on_proven_jit.load(Ordering::Relaxed)
+    }
+
+    /// Refills served by a recycled block, split into the preferred rung and
+    /// the starved rung. See [`Self::tlab_refill_recycled`].
+    pub fn tlab_recycle_engagement(&self) -> (usize, usize, usize) {
+        (
+            self.tlab_refill_recycled.load(Ordering::Relaxed),
+            self.tlab_refill_starved.load(Ordering::Relaxed),
+            self.tlab_refill_starved_bytes.load(Ordering::Relaxed),
+        )
     }
 
     /// Windows an allocation failure named, and windows a collection actually
@@ -11332,6 +11361,19 @@ impl ZgcRealHeap {
                 self.publish_vacated_enabled.load(Ordering::Relaxed),
             )
                 .and_then(|size| arena.alloc(size, ZGC_TLAB_ALIGN).map(|p| (p, size)));
+            // Which RUNG served this refill. Counted at the call site rather
+            // than inside `recycled_chunk_size` so the pure function stays
+            // pure and testable; the two rungs are separated by the same
+            // `want / 8` the function uses.
+            if let Some((_, size)) = sized {
+                if size >= want / 8 {
+                    self.tlab_refill_recycled.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.tlab_refill_starved.fetch_add(1, Ordering::Relaxed);
+                    self.tlab_refill_starved_bytes
+                        .fetch_add(size, Ordering::Relaxed);
+                }
+            }
             // `alloc(want)` covers both the "the free list has a full-size
             // block" case and the bump.
             sized.or_else(|| arena.alloc(want, ZGC_TLAB_ALIGN).map(|p| (p, want)))
