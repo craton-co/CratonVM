@@ -1851,6 +1851,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::COMPAT, token: "mh-strict-invokeexact", on_key: Some("CRATONVM_MH_STRICT_INVOKEEXACT"), off_key: None, off_word: Some("0") },
     E { group: Group::COMPAT, token: "mockito-legacy-selectors", on_key: Some("CRATONVM_MOCKITO_LEGACY_SELECTORS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "stackwalker-jdk-walk", on_key: Some("CRATONVM_SW_JDK_WALK"), off_key: None, off_word: None },
+    E { group: Group::COMPAT, token: "jdk-random", on_key: Some("CRATONVM_JDK_RANDOM"), off_key: None, off_word: None },
     E { group: Group::GC, token: "stream-refresh-each", on_key: Some("CRATONVM_GC_STREAM_REFRESH_EACH"), off_key: None, off_word: None },
     E { group: Group::GC, token: "noflag-deposit-skip-jit-scan", on_key: Some("CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN"), off_key: None, off_word: None },
     E { group: Group::GC, token: "identity-hash-evict", on_key: Some("CRATONVM_IDENTITY_HASH_EVICT"), off_key: None, off_word: Some("0") },
