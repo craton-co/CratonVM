@@ -1578,6 +1578,9 @@ pub const INVENTORY: &[E] = &[
     // makes this cycle unprovable" refusal, which is what left a many-threaded
     // workload with no defragmentation at all. See
     // `vm/src/jit/conservative_roots.rs::xt_jit_coverage_handshake_enabled`.
+    // A measurement instrument, default-OFF and read with `is_some()`, so any
+    // value turns it on and there is no off word to spell.
+    E { group: Group::GC, token: "xt-jit-coverage-assume", on_key: Some("CRATONVM_XT_JIT_COVERAGE_ASSUME"), off_key: None, off_word: None },
     E { group: Group::GC, token: "xt-jit-coverage-handshake", on_key: Some("CRATONVM_XT_JIT_COVERAGE_HANDSHAKE"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-23 with the OSR coverage-question correction.
     // Default-ON, so a KILL SWITCH: `=0` makes the OSR fallback read
