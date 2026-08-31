@@ -109,6 +109,42 @@ holder with `class_id=0` and a slot index of 2.2e12 is not an object; something
 is walking memory that is not a live object and interpreting it as one. That is
 the next question on this page, and it is upstream of both remaining faces.
 
+### 4a. 2026-08-30 (later): the rejection report was naming the wrong field, and with that fixed the producer has ONE shape
+
+`evacuation_candidate_is_an_object` takes `(holder, slot, raw)`. Its two ARRAY
+call sites pass the element index for `slot`; its two OBJECT call sites passed
+**`raw` for both**, so every rejection this family has ever printed carried a
+heap address where the slot offset belongs. The object site is the one that
+fires in the millions, so the whole population was unattributable -- the
+`slot=2200197358352` in the line above is `0x2002FBF0BD0`, an address.
+
+Fixed, and the report now also carries the holder's `num_slots`,
+`array_length` and its region/offset/cursor, because `class_id=0 kind=Object`
+alone reads identically for a real class 0 and for memory being walked as an
+object. One 600 s run, every rejection:
+
+```text
+REJECTED a non-object candidate (#1): holder=0x20042800000 class_id=0
+    kind=Object num_slots=8192 array_len=0
+    holder_region=r4/Survivor/off=0/cursor=144312 slot=49616
+    candidate=0x2004520df70
+```
+
+**Every one has the same holder shape** -- `class_id=0 kind=Object
+num_slots=8192 array_len=0` -- and the holders sit at `off=0` of a Survivor
+region (the first object the evacuator copied in) or at a fixed `off=300576` of
+Old region 11 across cursors 470696 / 487824 / 590448 / 1048568.
+
+That is the next question, and it is a narrow one: **what is a legacy object
+with class 0 and 8192 slots, and is it an object at all?** `GAP_FILLER_CLASS_ID`
+is `0xF111E701`, so it is not a TLAB tail filler; and `dbg_verify_reachable_
+integrity`'s own `is_zeroed` predicate warns that a live never-hashed
+`new Object()` is indistinguishable from reclaimed memory by `class_id` alone,
+which is exactly the ambiguity the new `num_slots` field is there to break.
+The candidates it yields (`0x2004520df70`, `+0x20`, `+0x18`, `+0x18`, ...) are
+plausible heap addresses that are not object headers, so the slots are being
+read as references either way.
+
 ## Status
 
 **OPEN. The OOM face is FIXED (2026-08-30) but the FAILURE MODE MOVED to SIGSEGV -- read the addendum above, section 3, before treating that as an improvement. The 48 617 dangling references are 6 holders, not a rate. Split out 2026-08-29** from

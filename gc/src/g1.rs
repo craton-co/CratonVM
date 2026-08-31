@@ -5628,12 +5628,35 @@ impl G1Collector {
         if n <= 8 || n.is_power_of_two() {
             // SAFETY: `holder` is the object currently being scanned; the
             // evacuator owns it under the `regions` lock.
-            let (holder_class, holder_kind) = unsafe {
+            // The holder's SHAPE, not just its class. A rejection says a word
+            // inside a live region is not an object header; whether the HOLDER
+            // is one is the question that names the producer, and `class_id=0
+            // kind=Object` (zeroed memory being walked as an object) reads
+            // identically to a real class 0 without `num_slots`/`array_length`
+            // beside it.
+            let (holder_class, holder_kind, holder_slots, holder_len) = unsafe {
                 let h = &*(holder as *const ObjectHeader);
-                (h.class_id.as_u32(), h.kind())
+                (
+                    h.class_id.as_u32(),
+                    h.kind(),
+                    h.num_slots(),
+                    h.array_length(),
+                )
             };
+            let holder_region = self
+                .lookup_region_for_addr(holder as usize)
+                .map(|i| {
+                    let r = &regions[i];
+                    format!(
+                        "r{i}/{:?}/off={}/cursor={}",
+                        r.region_type,
+                        (holder as usize).wrapping_sub(r.data.as_ptr() as usize),
+                        r.cursor
+                    )
+                })
+                .unwrap_or_else(|| "r?".to_string());
             tracing::warn!(
-                "[g1] {site}: REJECTED a non-object candidate (#{n}): holder=0x{:x} class_id={holder_class} kind={holder_kind:?} slot={slot} candidate=0x{raw:x} — the word is inside the region span but is not a live object header, so evacuating it would have dereferenced it. The slot is left unchanged and the pause continues.",
+                "[g1] {site}: REJECTED a non-object candidate (#{n}): holder=0x{:x} class_id={holder_class} kind={holder_kind:?} num_slots={holder_slots} array_len={holder_len} holder_region={holder_region} slot={slot} candidate=0x{raw:x} — the word is inside the region span but is not a live object header, so evacuating it would have dereferenced it. The slot is left unchanged and the pause continues.",
                 holder as usize,
             );
         }
@@ -6008,7 +6031,13 @@ impl G1Collector {
                         regions,
                         "worklist-scan[object]",
                         obj_ptr,
-                        raw,
+                        // The SLOT, not the candidate. Both were `raw` here,
+                        // so every rejection this site has ever reported
+                        // printed a heap address where the offset belongs --
+                        // and this site is the one that fires in the millions
+                        // (`#134217728` on `TestKillProcessWhileWriting`), so
+                        // the whole population was unattributable.
+                        (slot_ptr as usize).wrapping_sub(obj_ptr as usize),
                         raw,
                     ) {
                         return;
@@ -6236,7 +6265,9 @@ impl G1Collector {
                             regions,
                             "rset-source-scan[object]",
                             obj_ptr,
-                            raw,
+                            // The SLOT, not the candidate -- see the twin at
+                            // `worklist-scan[object]`.
+                            (slot_ptr as usize).wrapping_sub(obj_ptr as usize),
                             raw,
                         ) {
                             return;
