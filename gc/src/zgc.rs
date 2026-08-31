@@ -9917,10 +9917,19 @@ fn recycled_chunk_size(
     //   --Xmx 3000m                            ok=132/132
     // ```
     //
-    // The reserve is DERIVED, not tuned. Every direct arena allocation is
-    // smaller than [`ZGC_LARGE_OBJECT_MIN`] by construction -- at or above it
-    // the request is served from the arena's other end -- so one free block of
-    // that size is exactly what "the shared path can still be served" means.
+    // The reserve is DERIVED, not tuned, and the derivation matters: it is
+    // `max_tlab_alloc`, the largest object a TLAB will ever serve, and
+    // therefore the largest allocation that can fall back to a DIRECT arena
+    // request when its own buffer cannot take it. That is precisely the
+    // request this rung competes with.
+    //
+    // `ZGC_LARGE_OBJECT_MIN` was the first cut and is wrong: the starved
+    // regime is by definition `largest_low_free < want / 8`, which is that
+    // constant, so a spare block that big can never exist while the rung is
+    // being asked and the gate degenerates into a kill switch. Measured --
+    // it took `TestKillProcessWhileWriting` from PASS to FAIL, which is what
+    // `CRATONVM_ZGC_TLAB_STARVED_RECYCLE=0` does.
+    //
     // `direct_reserve_spare` is true when a block that big exists BESIDES the
     // one on offer, which is the question `has_free_block_at_least` cannot
     // answer for a caller about to consume the largest.
@@ -11403,7 +11412,27 @@ impl ZgcRealHeap {
                 headroom,
                 self.publish_vacated_enabled.load(Ordering::Relaxed),
                 // ">= 2" is the point: one of them is the block being offered.
-                arena.low_free_blocks_at_least(ZGC_LARGE_OBJECT_MIN, 2) >= 2,
+                //
+                // The reserve is `max_tlab_alloc`, recomputed from `want` the
+                // way `ZTlabConfig` computes it. NOT `ZGC_LARGE_OBJECT_MIN`:
+                // that was the first cut and it is a disguised kill switch,
+                // because the starved regime is by definition
+                // `largest_low_free < want / 8` = 64 KiB, so a spare block of
+                // 64 KiB can never exist while the rung is being asked and the
+                // gate refuses every time. Measured: it took
+                // `TestKillProcessWhileWriting` from PASS to FAIL, which is
+                // exactly what turning the rung off does.
+                //
+                // `max_tlab_alloc` is the largest object a TLAB will ever
+                // serve, so it is the largest allocation that can fall back to
+                // a direct arena request when its own buffer cannot take it —
+                // which is the request this rung is competing with. Reserving
+                // one block that size is a real discriminator inside the
+                // starved band rather than a refusal of the whole band.
+                arena.low_free_blocks_at_least(
+                    (want / 8).min(crate::tlab::tlab_max_alloc()),
+                    2,
+                ) >= 2,
             )
                 .and_then(|size| arena.alloc(size, ZGC_TLAB_ALIGN).map(|p| (p, size)));
             // Which RUNG served this refill. Counted at the call site rather
