@@ -59,13 +59,14 @@ worth thirty seconds of `grep @@RESULT` before it is called an earlier death.
 
 ## The fix
 
-The starved rung now also requires a free block of at least
-`ZGC_LARGE_OBJECT_MIN` **besides** the one on offer.
+The starved rung now also requires a free block of at least **`max_tlab_alloc`**
+— recomputed from `want` the way `ZTlabConfig` computes it — **besides** the one
+on offer.
 
-The reserve is **derived, not tuned**: every direct arena allocation is smaller
-than that constant by construction — at or above it the request is served from
-the arena's other end — so one free block that size is exactly what "the shared
-path can still be served" means. `has_free_block_at_least` cannot answer it for
+The reserve is **derived, not tuned**: `max_tlab_alloc` is the largest object a
+TLAB will ever serve, and therefore the largest allocation that can fall back to
+a direct arena request when its own buffer cannot take it. That is exactly the
+request this rung competes with. `has_free_block_at_least` cannot answer it for
 a caller about to consume the largest block, which is why
 `Arena::low_free_blocks_at_least` is a count rather than a predicate.
 
@@ -73,6 +74,40 @@ The **preferred** rung (`want / 8` and better) is untouched. There the block is 
 retired chunk coming back one survivor short — the shape the whole function was
 written for — and gating it would re-open the `TestNonBlockingAPI` failure it
 exists to close.
+
+### The first cut was a kill switch, and the H2 classes caught it
+
+The reserve was first written as `ZGC_LARGE_OBJECT_MIN`. That is wrong by
+construction: the starved regime is *by definition*
+`largest_low_free < want / 8`, and `want / 8` **is** that constant — so a spare
+block of 64 KiB can never exist while the rung is being asked, and the gate
+refuses every time. `tlab_starved_refills=0` on the passing hibernate run looked
+like a discriminating gate and was a disabled one.
+
+The classes the rung was built for said so:
+
+| class | control (no gate) | 64 KiB reserve | `max_tlab_alloc` reserve |
+|---|---|---|---|
+| `org.h2.test.store.TestKillProcessWhileWriting` | PASS | **FAIL** | **PASS** |
+| `org.h2.test.store.TestMVStoreTool` | FAIL 31 s | FAIL 284 s | FAIL 28 s |
+| `org.h2.test.jdbc.TestCachedQueryResults` | HANG | HANG | — |
+| `DefaultCatalogAndSchemaTest` | 4 × OOM | ok=132 | **ok=132** |
+
+`TestKillProcessWhileWriting` going PASS → FAIL is precisely what
+`CRATONVM_ZGC_TLAB_STARVED_RECYCLE=0` does, which is what a gate that always
+refuses **is**. (`TestMVStoreTool` and `TestCachedQueryResults` fail and hang on
+the control too — both pre-existing, neither this.)
+
+With the reserve sized correctly the counters show a gate that discriminates
+rather than one that kills:
+
+```text
+64 KiB reserve      tlab_recycled_refills=15513  tlab_starved_refills=0
+max_tlab_alloc      tlab_recycled_refills=14155  tlab_starved_refills=12926
+```
+
+Both arms pass the hibernate class. Only the second one still lets the rung do
+its job.
 
 ## The three questions the old page left open
 
