@@ -926,6 +926,29 @@ pub struct JvmThread {
     /// See `fixed-bugs/jit-signals-root-gap.md`.
     pub jit_pending_exception: Option<ObjectRef>,
 
+    /// The uncaught throwable the launcher is about to render, parked here for
+    /// the duration of SHUTDOWN HOOK execution.
+    ///
+    /// The launcher gets an `ObjectRef` out of `MethodCallFailed::
+    /// ExceptionThrown`, then runs shutdown hooks BEFORE rendering it (HotSpot
+    /// runs hooks on the uncaught path too). A hook is arbitrary Java: it
+    /// allocates, and it can collect. Held only in a Rust local across that
+    /// call the throwable is reachable from nothing the collector can see, so
+    /// a collection during the hooks reclaims it — and the render then reads a
+    /// zeroed header, which decodes as `ClassId(0)`, which IS
+    /// `java.lang.Object`.
+    ///
+    /// That is `bug-h2-testopenclose-throwable-is-java-lang-object-20260829.md`:
+    /// `Exception in thread "main" java/lang/Object` with no message and no
+    /// frames, because the whole object is gone. H2's own
+    /// `OnExitDatabaseCloser` hook closes a database from the hook, which is
+    /// as much allocation as the window needs.
+    ///
+    /// Same two halves as `jit_pending_exception` above — `memory/roots.rs`
+    /// §10 pushes it, `memory/gc.rs` rewrites it — so the throwable survives
+    /// the hooks AND the launcher gets its post-move address.
+    pub uncaught_exception_pending: Option<ObjectRef>,
+
     /// T17.Δ.3 — JVMTI single-step enable for this thread.
     ///
     /// When set, the interpreter's per-instruction dispatch fires
@@ -1059,6 +1082,7 @@ impl JvmThread {
             shadow_stack: cratonvm_gc::shadow_stack::ShadowStack::empty(),
             pending_async_exception: None,
             jit_pending_exception: None,
+            uncaught_exception_pending: None,
             single_step_enabled: AtomicBool::new(false),
             frame_pop_requests: Vec::new(),
         }

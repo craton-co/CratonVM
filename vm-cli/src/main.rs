@@ -5717,6 +5717,24 @@ fn run() -> Result<()> {
     // which is a change to output every harness in this tree reads; W7-92 §7
     // records it as the follow-up.
     {
+        // PARK THE PENDING THROWABLE WHERE THE COLLECTOR CAN SEE IT.
+        //
+        // `result` holds an `ObjectRef` — a raw heap address in a Rust local.
+        // The hooks below are arbitrary Java: they allocate, and they can
+        // collect. Until this slot existed the throwable was reachable from
+        // nothing the collector scans, so a collection inside a hook reclaimed
+        // it and the render further down read a zeroed header — `ClassId(0)`,
+        // which IS `java.lang.Object`. That is
+        // `bug-h2-testopenclose-throwable-is-java-lang-object-20260829.md`:
+        // `Exception in thread "main" java/lang/Object`, no message, no frames,
+        // because the object was gone rather than mis-typed.
+        //
+        // `uncaught_exception_pending` is rooted AND remapped (roots.rs §10,
+        // gc.rs), so this both keeps it alive and gives us its post-move
+        // address back after the hooks.
+        if let Err(MethodCallFailed::ExceptionThrown(exc_ref)) = &result {
+            vm.main_thread.uncaught_exception_pending = Some(*exc_ref);
+        }
         let mut ctx = cratonvm_vm::vm::NativeContextImpl {
             shared: &vm.shared,
             thread: &mut vm.main_thread,
@@ -5728,6 +5746,17 @@ fn run() -> Result<()> {
         };
         cratonvm_native_builtins::lang_system::run_shutdown_hooks(&mut ctx, trigger);
     }
+
+    // Take the throwable back at whatever address it now lives at. A moving
+    // cycle during the hooks rewrote the slot; `result`'s copy is stale from
+    // that moment on, so everything below reads THIS one.
+    let relocated_exc = vm.main_thread.uncaught_exception_pending.take();
+    let result = match (result, relocated_exc) {
+        (Err(MethodCallFailed::ExceptionThrown(_)), Some(moved)) => {
+            Err(MethodCallFailed::ExceptionThrown(moved))
+        }
+        (other, _) => other,
+    };
 
     match result {
         Ok(_) => Ok(()),
