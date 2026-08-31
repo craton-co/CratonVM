@@ -3873,8 +3873,8 @@ pub fn refresh_moving_young_coverage_for_collection() -> bool {
     let peer_depth = peer_jit_depth();
     if peer_depth > 0 {
         let proven = cratonvm_gc::gc_quiescence::peer_proven_jit_depth();
-        let accounted =
-            xt_jit_coverage_handshake_enabled() && peer_coverage_accounted(peer_depth, proven);
+        let accounted = xt_jit_coverage_handshake_enabled()
+            && (peer_coverage_accounted(peer_depth, proven) || xt_jit_coverage_assume());
         cratonvm_gc::gc_quiescence::note_peer_coverage_verdict(accounted);
         if xt_coverage_dbg() {
             eprintln!(
@@ -3942,6 +3942,30 @@ fn xt_jit_coverage_handshake_enabled() -> bool {
 
 fn xt_coverage_dbg() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_XT_COVERAGE").is_some()
+}
+
+/// `CRATONVM_XT_JIT_COVERAGE_ASSUME=1` -- accept the peer accounting whatever
+/// the ledger says.
+///
+/// **A MEASUREMENT INSTRUMENT, and unsafe to run with.** It is how the question
+/// "is the cross-thread handshake the only thing between this workload and
+/// compaction?" is asked, in the same spirit as
+/// `CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY`. A peer that deposited nothing has
+/// NOT proved its frames rewritable, and relocating under it strands its oops.
+///
+/// It exists because the shortfall is now specific enough to be worth pricing.
+/// With the 2026-08-30 safepoint repairs every per-frame proof in a 300 s run
+/// of `org.h2.test.jdbc.TestCachedQueryResults` succeeds
+/// (`frame_cov=(no_slot=0 misaligned=0 no_map=0 incomplete=0 ok=601)`), and the
+/// peers that still refuse the cycle are the ones that never reach
+/// `publish_peer_jit_coverage_for_stw` at all -- threads blocked in a native
+/// with compiled frames below them, which park through the blocked-region
+/// protocol rather than the STW barrier. Giving them a deposit means teaching
+/// the blocked-region WAKE to remap JIT frames (it currently remaps only
+/// interpreter frames), which is a real change; this says whether it is worth
+/// making.
+fn xt_jit_coverage_assume() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_XT_JIT_COVERAGE_ASSUME").is_some()
 }
 
 /// A peer thread's half of the cross-thread JIT coverage handshake.

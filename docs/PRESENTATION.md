@@ -7,7 +7,7 @@ infrastructure — automatically. No annotations. No new APIs. No rewrites.
 Just your Java, running faster than the leading alternatives, on a
 memory-safe Rust foundation built for this decade.**
 
-*Version 0.3.0 · Java SE 8–25 · 400,000+ lines of Rust · 19,000+ automated
+*Version 0.3.0 · Java SE 8–25 · 400K+ lines of Rust · 19K+ automated
 tests · by Craton Software Company*
 
 ---
