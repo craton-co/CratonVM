@@ -5654,6 +5654,46 @@ pub fn unsafe_arena_translation_stats() -> ArenaTranslationStats {
     }
 }
 
+/// The arena real-pointer audit, as one greppable line, at process exit.
+///
+/// HERE in `native-builtins` and not only in `vm-cli`, for the reason the
+/// corrupt-cell census records beside it on the same path: **a JUnit runner
+/// leaves through `System.exit` and never reaches `vm-cli`'s normal-return
+/// arm.** The netty class this counter was built for --
+/// `io.netty.util.ResourceLeakDetectorTest` under
+/// `zgc-rewrite-pass-walks-off-a-reference-array-20260815` -- is exactly such a
+/// runner, and it exits NON-ZERO on its one failing test. A line printed only
+/// on the normal-return path is therefore missing from precisely the runs
+/// anyone would look at, and reads as a clean zero.
+///
+/// Prints when there is something to report, or when GC statistics were asked
+/// for. `translations` is the DENOMINATOR: without it, "the hazard never
+/// fired" and "no pointer was ever handed out on this workload" are the same
+/// run, which is the whole reason the count exists.
+///
+/// A `Once` keeps the two exit paths from printing it twice. On the
+/// `System.exit` path only `CRATONVM_GC_STATS` is consulted -- `--verbose:gc`
+/// is a launcher flag and is not reachable from a native.
+pub fn arena_translation_exit_summary(always: bool) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let s = unsafe_arena_translation_stats();
+    let noteworthy =
+        s.stale_on_realloc != 0 || s.stale_on_free != 0 || s.short_translations != 0;
+    if !always && !noteworthy {
+        return;
+    }
+    ONCE.call_once(|| {
+        eprintln!(
+            "[VM] arena-ptr: translations={} short_translations={} stale_on_realloc={} retained_on_realloc={} stale_on_free={}",
+            s.translations,
+            s.short_translations,
+            s.stale_on_realloc,
+            s.retained_on_realloc,
+            s.stale_on_free,
+        );
+    });
+}
+
 /// See [`unsafe_arena_translation_stats`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ArenaTranslationStats {
