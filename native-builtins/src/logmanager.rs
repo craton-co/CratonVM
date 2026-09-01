@@ -6265,13 +6265,20 @@ fn jul_standard_level_value(name: &str) -> Option<i32> {
 /// This is a fast path, not a shortcut. `isLoggable` is the method a logging
 /// facade calls on every guarded log site — JRuby's
 /// `JavaUtilLoggingLogger.isDebugEnabled()` is `logger.isLoggable(FINE)` — and
-/// answering it used to cost a `read_jul_logger_name` (which allocates a Rust
+/// answering it costs a `read_jul_logger_name` (which allocates a Rust
 /// `String` per call) plus a lock and a dotted-name walk. On the JBoss face
-/// that method had previously been a constant `true`, so implementing it
-/// honestly put that cost on a path that had none: measured, quarkus's
-/// JRuby/Asciidoctor class went 198 s -> 291 s isolated. Almost every process
-/// configures no levels at all, and for those this collapses back to one
-/// uncontended lock and an `is_empty`.
+/// that method had been a constant `true`, so implementing it honestly puts
+/// that cost on a path that had none. Almost every process configures no
+/// levels at all, and for those this collapses back to one uncontended lock
+/// and an `is_empty`.
+///
+/// The justification is the shape of the work, NOT a measurement. The
+/// candidate workload (quarkus's JRuby/Asciidoctor class) swings 198-470 s
+/// wall on this host across repeated runs of the SAME binary, so no A/B on it
+/// can resolve a per-call cost — the first pair that looked like a 47%
+/// regression was inside that band, and a later pair ran the other way by
+/// more. Do not cite a number here without a workload whose variance is
+/// smaller than the effect.
 fn no_explicit_logger_levels(vm: usize) -> bool {
     logger_explicit_levels(vm)
         .lock()

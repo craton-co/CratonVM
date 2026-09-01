@@ -230,20 +230,48 @@ here rather than in a commit.
 
 ## Verification
 
-* `cargo test -p cratonvm-native-builtins --lib`: **4177 pass, 0 fail**
+* `cargo test -p cratonvm-native-builtins --lib`: **4184 pass, 0 fail**
   (`logmanager` alone: 50, up from 44).
+* `regression-suite/run.sh`: **79 of 79 scheduled vectors pass**, `RJdkLogging`
+  — the tracked JUL vector — among them.
 * The probe, all three columns above: HotSpot vs CratonVM before vs after.
 * Quarkus core suite (313 classes, JIT on, real JDK, 4 shards, 300 s cap),
-  identical harness and `common.args` in both arms, only the binary differing:
+  identical harness and `common.args` in every arm, only the binary differing:
   `PASS=173 NOTESTS=64 FAIL=71..72 HANG=1..2 NOSTART=2 ABORTED=1`. **One class
   differs between the arms, and it is not a difference.**
   `JavadocToAsciidocTransformerConfigItemTest` reads HANG in the base arm and
-  FAIL 37/22/15 in the fixed arm; run isolated, **both binaries produce
+  FAIL 37/22/15 in both fixed arms; run isolated, **every binary produces
   37 found / 22 ok / 15 failed**, and the 15 are
   `ServiceConfigurationError: JRubyAsciidoctor could not be instantiated`,
   unrelated to logging. The base arm's HANG was the 300 s cap under 4-shard
   contention on a class that takes ~200-290 s isolated — a measurement of load,
   not of the change.
+
+  Do not read `sum_class_ms` off these runs as a throughput signal: the same
+  313 classes summed 534 s, 414 s and 569 s across three 4-shard runs of the
+  same harness. Under contention that number measures the host.
+
+### A per-call cost this session could not measure, and did not pretend to
+
+`isLoggable` is what a logging facade calls at every guarded log site (JRuby's
+`isDebugEnabled()` is `isLoggable(FINE)`), and on the JBoss face it had been a
+constant `true` — so implementing it honestly puts a name read (which
+allocates) and a lock on a path that previously had neither.
+`no_explicit_logger_levels` takes the answer before the receiver's name is read
+whenever nothing anywhere is configured, which is almost every process.
+
+That guard is justified by the shape of the work, **not** by the A/B that
+prompted it. The first isolated pair on the JRuby/Asciidoctor class read
+198 s base / 291 s fixed and looked like a 47% regression; two more interleaved
+rounds read 338/470 and 223/237, and a later pair with the guard in place read
+429 s base / 268 s fixed — i.e. the arms cross, and the same binary spans
+198-526 s. `Get-Process` sorted by CPU named the reason at the top of the list:
+this is a daily-driver desktop and Overwatch was running, alongside another
+session's `cratonvm` build. The honest conclusion is that this workload cannot
+resolve a per-call cost on this host, not that the cost is zero or that the
+guard removed it. A claim about `isLoggable` throughput needs a quiet host and
+a workload whose variance is smaller than the effect; neither was available
+here.
 
 Two test-harness defects had to be fixed for the new cases to mean anything,
 and both had been quietly weakening the existing ones:
