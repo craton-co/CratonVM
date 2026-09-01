@@ -2,10 +2,9 @@
 
 **Status: characterized, not fixed — likely the same VM-wide per-call
 throughput ceiling tracked elsewhere.** Investigated 2026-08-17 (Azure host,
-dev base `496bc3c2c` + the jboss-logmanager fix from the sibling doc). This
-corrects the previous doc's framing (`julogger-cast-to-jbosslogmanager-
-logger-20260817.md`, "what this fix exposed next") — it is **not** a hang at
-`QuarkusTestProfileAwareClassOrderer`.
+dev base `496bc3c2c` + the jboss-logmanager `getLogger`-cast fix). This
+corrects that report's "what this fix exposed next" framing — it is **not** a
+hang at `QuarkusTestProfileAwareClassOrderer`.
 
 ## What actually happens
 
@@ -78,9 +77,14 @@ this from reading as `NOSTART`/hang in a full-suite run:
 
 ## Related
 
-- `julogger-cast-to-jbosslogmanager-logger-20260817.md` — the bug this
-  investigation continued from; its "what this fix exposed next" section
-  should be read together with this correction.
+- The jboss-logmanager `getLogger`-cast report this investigation continued
+  from — retired to the non-public archive on 2026-09-01, once the residual it
+  had left open (the JBoss `Logger` face was a stub set, so the object that
+  fix started handing back could not hold a handler or a level) was closed.
+  The correction on this page is what replaced that page's "what this fix
+  exposed next" section, so there is nothing left there to read against it.
+- `jboss-logcontextinitializer-spi-not-consulted-20260901.md` — the one
+  logging divergence from that closure that is still open.
 - `perf/perf-bintrees-9x-gap-characterised.md` — the canonical
   characterization of the VM-wide per-call throughput ceiling this likely
   shares a cause with.
