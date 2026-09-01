@@ -1342,6 +1342,13 @@ use cratonvm_types::compat::CompatibilityMode;
 /// which left `<init>` shadowed. With the whole family refused the real
 /// constructor runs, and `RJdkIntrinsics3` passes: arms 119/119, 119/119,
 /// 79/79.
+/// **THREE baselines, not two.** `--features synthetic-jdk` has its own
+/// ([`BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK`]) since 2026-09-01, because that
+/// arm compiles registrars the other two do not. A change that moves this
+/// number almost always moves that one by the same amount — **re-freeze it in
+/// the same commit**, by running the third arm. Skipping it leaves a gate red
+/// that looks like somebody else's drift, which is exactly how the arm went
+/// unowned for three days before it had a constant at all.
 const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1645;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
@@ -1362,6 +1369,13 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1645;
 /// **+1 on 2026-08-30** for the Phase 2 retirement, on top of the same
 /// day's +8 re-freeze; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
+/// **THREE baselines, not two.** `--features synthetic-jdk` has its own
+/// ([`BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK`]) since 2026-09-01, because that
+/// arm compiles registrars the other two do not. A change that moves this
+/// number almost always moves that one by the same amount — **re-freeze it in
+/// the same commit**, by running the third arm. Skipping it leaves a gate red
+/// that looks like somebody else's drift, which is exactly how the arm went
+/// unowned for three days before it had a constant at all.
 const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1634;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
@@ -1406,7 +1420,18 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1634;
 /// two shipping resolves and not of this one — the family survives here by the
 /// `cfg`. Both statements are correct about their own arm, which is the whole
 /// reason this constant had to exist.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1600;
+/// **Re-frozen 1600 -> 1643 on 2026-09-01: +43, and not this arm's.** It is the
+/// same movement the two sibling constants took in the re-freeze above
+/// (1602 -> 1645 management, 1591 -> 1634 default), accounted there. This arm
+/// moved with them because the registrations behind it are compiled in all
+/// three resolves; the nine classified below are what it has *in addition*, and
+/// that number did not change.
+///
+/// **The re-freeze above did not move this constant, and that is the failure
+/// mode of a third baseline: nobody re-freezing the first two knows it
+/// exists.** It went red the moment their +43 landed. If you are re-freezing,
+/// re-freeze ALL THREE — see the pointer on both siblings.
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1643;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
