@@ -1622,6 +1622,7 @@ cached_is_set!(trivial_getter_verify, "CRATONVM_TRIVIAL_GETTER_VERIFY");
 cached_is_set!(frame_trace, "CRATONVM_FRAME_TRACE");
 cached_is_set!(iae_trace_os, "CRATONVM_IAE_TRACE");
 cached_is_set!(bd_debug, "CRATONVM_BD_DEBUG");
+cached_is_set!(dbg_native_shadow, "CRATONVM_DBG_NATIVE_SHADOW");
 cached_is_set!(nocode_dbg, "CRATONVM_DBG_NOCODE");
 cached_is_set!(nsme_dbg, "CRATONVM_DBG_NSME");
 cached_is_set!(cce_dbg, "CRATONVM_DBG_CCE");

@@ -1613,6 +1613,31 @@ impl Arena {
         }
     }
 
+    /// How many LOW free blocks are at least `size` bytes, counted up to `cap`.
+    ///
+    /// Not `has_free_block_at_least(size)` with a different name. That answers
+    /// "can the arena serve one request of this size"; this answers "would it
+    /// still be able to after somebody took one", which is the question a
+    /// caller about to CONSUME the largest block has to ask and the boolean
+    /// cannot.
+    ///
+    /// LOW tier only, and `size` is expected at or above [`LARGE_BLOCK_MIN`] —
+    /// the large tier is a `BTreeMap` keyed by size, so the range walk touches
+    /// only the buckets that qualify and stops at `cap`. A `size` below the
+    /// boundary would need the small tier too and is not what this exists for;
+    /// it saturates at `cap` rather than lying, so a caller asking about a
+    /// small size gets a conservative answer rather than a wrong one.
+    pub fn low_free_blocks_at_least(&self, size: usize, cap: usize) -> usize {
+        let mut n = 0usize;
+        for (_, blocks) in self.free_large.range(size..) {
+            n += blocks.len();
+            if n >= cap {
+                return cap;
+            }
+        }
+        n
+    }
+
     /// Bytes the LOW bump may still take without eating the large-object
     /// reserve — i.e. the headroom [`Self::alloc`]'s ordinary bump path has
     /// before the last-resort arm at the bottom of that function starts

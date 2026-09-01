@@ -36,6 +36,25 @@ use super::*;
 /// has to recognise it and a bare literal is not a thing a reader can look up.
 pub(super) const ENTRY_POLL_BC_PC: usize = u32::MAX as usize;
 
+/// "This frame has not reached a safepoint yet" -- the value the single-pass
+/// prologue stamps into the reserved safepoint-id slot.
+///
+/// The IR backend can use `0` for this, because its ids are a monotonic
+/// counter that starts at 1. This backend stores the BYTECODE PC, and **bci 0
+/// is legal** -- a constructor or a method that opens with `new`/an `invoke` is
+/// a very common shape -- so `0` there is ambiguous between "at bci 0" and
+/// "never stored", and stamping it would let an unsafepointed frame match the
+/// bci-0 map and be relocated against it.
+///
+/// `u32::MAX - 1` is unambiguous from both sides: no real bytecode pc is
+/// anywhere near 4 GiB, and it is distinct from [`ENTRY_POLL_BC_PC`], the other
+/// synthetic pc this backend uses. `find_oop_map_for_safepoint_id` finds
+/// nothing for it, so the coverage proof fails CLOSED -- which is the point.
+/// The hazard it removes is the one that is NOT loud: an uninitialised slot can
+/// read as a valid id for the method standing at that rbp, and relocation then
+/// rewrites against the wrong program point's map.
+pub(super) const SP_ID_UNSET_BC_PC: usize = (u32::MAX - 1) as usize;
+
 pub(super) const fn cmp_r64_imm32_opcode(r: u8) -> [u8; 3] {
     // 0x48 = REX.W; |0x01 adds REX.B, needed only for r8..r15.
     let rex = 0x48 | if r >= 8 { 0x01 } else { 0x00 };

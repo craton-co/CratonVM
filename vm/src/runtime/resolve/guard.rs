@@ -437,9 +437,15 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "vm/src/vm/vm_exec.rs",
         "find_method_recursive(",
-        9,
+        10,
         "migration step 4: `NativeContext` helper walks (virtual dispatch \
-         from natives, `toString` lookups). Out of edit scope (vm/src/vm/).",
+         from natives, `toString` lookups). Out of edit scope (vm/src/vm/). \
+         The tenth site (2026-08-30) is `invoke_or_native`'s JVMTI-redefine \
+         guard: it resolves once to learn the DECLARING class id and whether a \
+         concrete body exists, so a registered native yields to an agent's \
+         woven bytecode and only ever to a body that EXISTS. The declaring id \
+         is the point — a name lookup answers a different question, and \
+         answering it cost two builds before the walk replaced it.",
     ),
 ];
 
