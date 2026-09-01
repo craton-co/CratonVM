@@ -29,7 +29,7 @@ cratonvm/
   cuda-bridge/         cuda-bridge                  Thin CUDA Driver API bridge for GPU offload
   craton-gpu/          craton-gpu                   Build-time-only: packages the @GpuKernel/@Parallel Java annotation sources into a jar for jit-cuda's build script; no runtime code
   classloading/        cratonvm-classloading        Class loading & bytecode verification
-  gc/                  cratonvm-gc                  Garbage collectors (default generational semi-space; G1 region-based; ZgcRealHeap STW mark-sweep behind the default-off `zgc` feature)
+  gc/                  cratonvm-gc                  Garbage collectors (ZGC is the DEFAULT since 2026-08-10: concurrent-marking, compacting, optionally generational, behind the default-ON `zgc` feature; generational semi-space and G1 remain selectable)
   jfr/                 cratonvm-jfr                 Java Flight Recorder
   vm/                  cratonvm-vm                  VM runtime engine
   vm-cli/              cratonvm-cli                 CLI entry point
@@ -82,7 +82,7 @@ independently to inspect `.class` files.
 
 ## vm — Virtual Machine
 
-The VM is the core of the project (~1,350,000 Rust LoC across the 22 workspace
+The VM is the core of the project (~2,010,000 Rust LoC across the 22 workspace
 member crates, plus the separate `fuzz` harness workspace).
 It contains six major subsystems (several now extracted into their own
 crates).
@@ -99,20 +99,26 @@ find <the 22 member dirs> -name '*.rs' -type f \
   | xargs -0 cat | wc -l
 ```
 
-which reports roughly 1,350,000 lines across about 700 files.
+which reports roughly 2,010,000 lines (2,005,889 on 2026-09-01) across about
+760 files. Re-measure before quoting it: this figure and the table below stood
+at 1,350,000 for long enough to be wrong by 49%, because nothing regenerates
+them. If you change this paragraph, change the table too — they are derived
+from the same command.
 
 Rough size distribution, largest first, so newcomers know where the mass
 actually is:
 
+Measured 2026-09-01 with the command above, one directory at a time.
+
 | Crate | LoC | Crate | LoC |
 |-------|----:|-------|----:|
-| `native-builtins` | 552,000 | `native-awt` | 18,000 |
-| `vm` | 343,000 | `types` | 17,000 |
-| `jit` | 110,000 | `native-api` | 17,000 |
-| `gc` | 64,000 | `reader` | 14,000 |
-| `classloading` | 57,000 | `jfr` | 14,000 |
-| `native-collections` | 55,000 | `jit-cuda` | 10,000 |
-| `native-io` | 55,000 | remaining 9 | < 7,000 each |
+| `native-builtins` | 741,000 | `native-awt` | 18,000 |
+| `vm` | 449,000 | `types` | 37,000 |
+| `jit` | 234,000 | `native-api` | 35,000 |
+| `gc` | 153,000 | `reader` | 17,000 |
+| `native-collections` | 86,000 | `jfr` | 20,000 |
+| `native-io` | 82,000 | `jit-cuda` | 12,000 |
+| `classloading` | 74,000 | remaining 9 | < 13,000 each |
 
 Several individual files are far larger than is comfortable. The two worst have
 been split at the section banners they already carried:

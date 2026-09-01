@@ -629,6 +629,83 @@ receivers where that record measured 20: the two rows that moved are this lane's
 does**, which is the sixth place in this campaign where `--jdk-only` is the more
 correct of the two.
 
+## 9b. The rest of the package, swept afterwards (2026-08-30)
+
+The lane's four assignments were the top of `java.util.concurrent` by native
+count, not the whole of it. Three sweeps finished the package. Two found
+defects; the third is here because a clean sweep is a result.
+
+| sweep | rows | found |
+| --- | ---: | --- |
+| `apps/probes/SyncFamilySweep.java` — CountDownLatch, Semaphore, CyclicBarrier, Exchanger, Phaser, the locks, CompletableFuture, the executors, TimeUnit | 86 | **2 defects** |
+| `apps/probes/AtomicFamilySweep.java` — the atomics, the three atomic arrays, the field updaters, the adders/accumulators, stamped/markable refs | 84 | **5 rows**, all in the refusal layer |
+| `apps/probes/ConcurrentCollSweep.java` — ArrayBlocking/LinkedBlocking queues and deque, PriorityBlocking, Synchronous, LinkedTransfer, Delay, ConcurrentLinkedQueue/Deque, CopyOnWriteArrayList/Set, ConcurrentSkipListMap/Set | 82 | **nothing** |
+
+**`CountDownLatch.await(1, null)` answered `false`** where HotSpot raises NPE:
+the native defaulted a null `TimeUnit` to MILLISECONDS, so it waited a
+millisecond and timed out. **The STRICT arm was already right** — it refuses
+that native and runs the JDK's own bytecode, whose `await` opens with
+`unit.toNanos(timeout)`. A compatible-only diff on a validation axis names a
+SHADOW, every time. Six siblings on the same axis were the control.
+`StampedLock`'s three unlock doors also carried a message HotSpot does not.
+
+**The atomics had every exception CLASS right already** — an earlier
+`probes/AtomicUpdaterSweep.java` fixed those — and the whole defect was one
+layer down: the messages, and the ORDER the checks fire in. A field that fails
+TWO checks at once is what measures an order, and nothing else can:
+a non-volatile `long` on an int updater says `Must be integer type`, so type is
+checked before volatile; this VM ran static → volatile → type.
+
+**The concurrent collections found nothing across 82 rows** covering the null
+axis, the bounds and the refusals of thirteen classes — the axis on which this
+campaign has found defects in every other family it has asked. That is worth
+the page it takes: it is the difference between a family nobody has looked at
+and one that has been asked and answered.
+
+Two rows are recorded rather than fixed, because their messages belong to
+another surface: HotSpot's helpful NPE for `new AtomicIntegerArray((int[]) null)`
+names the CALL SITE's declared type (`"[I.clone()"`), which a clone native
+cannot know, and `newUpdater(C, null)`'s message comes from
+`Class.getDeclaredField`.
+
+## 9c. Under CONTENTION (2026-08-30) — the question the lane had not asked
+
+Every sweep above asks a SINGLE-THREADED question: argument validation,
+refusals, edge values. None of them runs two threads, which is what this package
+is for. And the gap mattered on paper: this VM's atomics are **lock-based rather
+than hardware** (`cratonvm-atomics-are-lock-based-not-hardware-atomic`), so
+"same answer" and "same answer under contention" are different claims.
+
+`apps/probes/ConcurrentStressSweep.java` asks the second one. **28 rows, 0-diff
+in both modes, stable across runs**, with the oracle deterministic over three.
+
+**Every row is an EXACT INVARIANT, never a timing or a schedule.** That is the
+whole of why it is diffable rather than a flake generator: a lost update shows
+as a wrong number, and an interleaving does not show at all.
+
+```text
+  4 threads x 5000 increments          -> exactly 20000, on AtomicInteger,
+                                          AtomicLong, LongAdder, updateAndGet
+                                          and a striped AtomicIntegerArray
+  a CAS race                           -> exactly ONE winner
+  ReentrantLock / synchronized / RWLock -> a NON-atomic `plain[0]++` totals
+                                          exactly 20000
+  ConcurrentHashMap merge / compute     -> exactly 20000; putIfAbsent one winner;
+                                          computeIfAbsent's function runs once
+  offer/drain, put/take, bounded ABQ    -> what went in came out, exactly once
+  CountDownLatch / Semaphore / Phaser /
+  CyclicBarrier                         -> release, permit conservation, phase
+  a 2000-task pool                      -> every task ran exactly once
+```
+
+**What this does NOT establish, stated because a green sweep invites the wrong
+conclusion.** It is 4 threads and 5000 iterations on a shared build host: it can
+catch a LOST UPDATE, and it cannot prove the absence of a race that needs a
+particular interleaving. It says the lock-based implementation conserves what it
+is supposed to conserve — not that it is free of rare ones. A race needs the
+amplification technique in
+`amplify-a-race-along-the-axis-its-window-sits-on`, not a bigger loop.
+
 ## 10. Reproduce
 
 > **The probes moved. They are `apps/probes/`, not `probes/`.** `3b2901531`
