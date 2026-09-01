@@ -41,10 +41,13 @@ as a wish list.
 - JNI: full function-table coverage and OnLoad/OnUnload protocol.
 - JCK compliance run on Java SE 25 (see [docs/legal.md](docs/legal.md)).
 - Concurrent garbage collector: G1 maturity, and production low-latency ZGC.
-  The `-XX:+UseZGC` backend that exists today is real and selectable but is a
-  stop-the-world non-moving mark-sweep, and it is compiled in only behind the
-  default-off `zgc` feature, so a stock build does not have it. The plan for a
-  genuinely concurrent, compacting one is
+  ZGC has been the **default** collector since 2026-08-10 (default-ON `zgc`
+  feature) and has since grown colored pointers, a load barrier, concurrent
+  marking, compaction and an opt-in generational mode. What remains open is
+  production hardening rather than existence — chiefly the JIT-side load
+  barrier, which is still unwired (`docs/feature-designs/zgc-jit-load-barrier.md`;
+  the JIT read helpers currently panic as a tripwire on a colored word). The
+  plan for the rest is
   [docs/feature-designs/zgc-production-implementation-plan.md](docs/feature-designs/zgc-production-implementation-plan.md).
 - JFR event coverage matching OpenJDK 25.
 
