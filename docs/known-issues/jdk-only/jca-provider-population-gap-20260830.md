@@ -107,20 +107,67 @@ measured eighteen days after that record, plus the verification W7-63 asked for
 and never got: `RJdkSecurity` is 153 checks, byte-identical between CratonVM and
 HotSpot, and that record now says so.
 
-## 5. Whether the 84 are table entries is still open
+## 5. ANSWERED: none of the 84 is a table entry — the fix site is each engine
 
-All 186 implementation classes **load on this VM exactly as they do on HotSpot**
-— `JcaGapSizer --check`, 186 of 186, and the two VMs' outputs are byte-identical
-including the `InaccessibleObjectException`s my probe's `setAccessible` provokes
-on both. So the code is present and reachable.
+The obvious hypothesis was that these are one-line `put_service` rows, as JCEKS
+turned out to be. **It is wrong, and it was worth an hour to find out rather than
+eighty-four rows to find out later.**
 
-That made "these are one-line `put_service` rows, like JCEKS was" attractive.
-**It is not established.** DH proves function without registration, which means
-the relationship between the table and the dispatch path is not the simple one
-that hypothesis assumes, and somebody should understand that path before adding
-84 rows to a table on the strength of it. The cheap next step is one service:
-add it, rebuild, and ask `getInstance` — a single answer settles whether the
-remaining 83 are clerical.
+### 5.1 Reading the dispatch path first
+
+Each JCA engine intercepts `getInstance` NATIVELY and answers from its own
+algorithm knowledge. The service map is consulted only by a provider-chain
+fallback — and `chain_provider_names()`, the entry to that walk, has **exactly
+one caller in the crate**: `jca/cipher.rs`. Its own comment says why it was
+added (X.509/PKCS/CMS callers name ciphers by OID) and that it is *"deliberately
+ordered AFTER this engine's own verdict, never before it"*.
+
+Every other engine is terminal. `SecretKeyFactory` is the plain case:
+`pbkdf2_get_instance` recognises the PBKDF2 and PBE families and its own doc says
+*"any other algorithm throws the same `NoSuchAlgorithmException`"*. It never
+reaches a provider walk, so no service row is reachable from it. `SecretKeyFactory
+DES` fails there — not for a missing row.
+
+That alone rules table rows out for **61 of the 84**.
+
+### 5.2 And the remaining 23 were measured, not assumed
+
+`Cipher` has the fallback, so its 23 were the half that could plausibly be
+clerical. The `KW`/`KWP` family is also *deliberately* unregistered — the seeding
+loop says `KWP` and `KW/PKCS5Padding` *"are in HotSpot's set and deliberately
+absent from ours"*, a choice made for advertisement parity.
+
+So the experiment: add six `put_service` rows for
+`AES_{128,192,256}/{KW/PKCS5Padding,KWP/NoPadding}`, rebuild, ask. Binary
+freshness confirmed by timestamp before testing, because a killed fat-LTO link
+leaves the old one in place.
+
+```text
+                          HotSpot            CratonVM WITH the six rows
+AES_128/KW/PKCS5Padding   OK provider=SunJCE NoSuchAlgorithmException: Cannot find any provider supporting …
+AES_128/KWP/NoPadding     OK provider=SunJCE NoSuchAlgorithmException: …
+AES_256/KW/PKCS5Padding   OK provider=SunJCE NoSuchAlgorithmException: …
+AES_256/KWP/NoPadding     OK provider=SunJCE NoSuchAlgorithmException: …
+```
+
+**Unchanged.** A service row is not sufficient even for the one engine that
+walks the chain. The refusal text — *"Cannot find any provider supporting"* — is
+the hand-written serviceable-transformation table's own, so that gate decides
+these names before any registration can matter.
+
+The experiment was reverted; nothing from it landed.
+
+### 5.3 What that leaves
+
+**0 of 84 are clerical.** The fix site is each engine's own recognised-algorithm
+set, or giving the other engines the chain fallback `Cipher` already has — both
+of which are real work in `provider_chain.rs` and its engine modules, and both
+of which belong to whoever owns that file rather than to a passing measurement.
+
+The advertisement decision noted above also deserves a second look by its author:
+it was reasoned about entirely in terms of what `Security.getAlgorithms` reports,
+and the same absence is visible on the SERVING side as a refusal of names HotSpot
+answers. Whether that is acceptable is a contract call, not a measurement.
 
 ## Reproduce
 
