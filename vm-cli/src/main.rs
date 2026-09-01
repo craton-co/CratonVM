@@ -42,6 +42,13 @@ use tracing::info;
 /// used to gate the compare-exchange itself; leaving it there would have made
 /// the phase report require an unrelated JIT flag. See
 /// `docs/observability/phase-accounting.md` §10.3.
+/// `--verbose:gc` was passed. Set as soon as the arguments are parsed, because
+/// the flag has to be readable from [`maybe_dump_shutdown_reports`], which runs
+/// on both exit arms and is handed no `args`. `CRATONVM_GC_STATS` needs no
+/// mirror — it is an environment variable and readable from anywhere.
+static GC_STATS_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn maybe_dump_shutdown_reports() {
     static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -55,6 +62,32 @@ fn maybe_dump_shutdown_reports() {
         .is_err()
     {
         return;
+    }
+
+    // The collector's own account of WHAT it did and WHY — the decision
+    // histogram, the per-reason moving-young fallback rows, and the two G1
+    // JIT-root lines (`g1 root coverage`, `g1 jit publication`).
+    //
+    // `gc_metrics::collector_decision_report` had no production caller at all
+    // until 2026-09-01 — `grep` returned its own unit tests — which quietly
+    // voided a claim.
+    // `bug-g1-evacuates-live-jit-reference-20260819.md` keeps
+    // `G1Collector::empty_jit_publication` as a detector rather than a fix, on
+    // the grounds that with the conservative scan always running under G1 an
+    // empty publication under a live compiled frame is once again a genuine
+    // anomaly, and says of the line that carries it: "the counter is ungated
+    // and should now read zero". Ungated it was. Printed it was not.
+    //
+    // Emitted from HERE rather than beside `print_gc_summary` in the teardown,
+    // because that block is only on the normal-return arm and the workloads
+    // this number is wanted for end in `System.exit` — `junit.textui.TestRunner`
+    // does, which is the page's own repro. That is the same "detector wired to
+    // the arm that does not run" shape as W7-90's slot-map sweep, and this
+    // function is where W7-90 put its answer.
+    if GC_STATS_REQUESTED.load(std::sync::atomic::Ordering::Acquire)
+        || std::env::var_os("CRATONVM_GC_STATS").is_some()
+    {
+        eprintln!("{}", cratonvm_vm::collector_decision_report());
     }
 
     // `CRATONVM_DBG=ir-isel` — the instruction selector's process totals.
@@ -4232,6 +4265,11 @@ fn run() -> Result<()> {
     ));
     tracing::info!("{}", active_jdk_mode_line());
     tracing::info!("compatibility mode: {}", compatibility_mode.as_str());
+    // Remembered for `maybe_dump_shutdown_reports`, which runs on BOTH exit
+    // arms and does not have `args`. See `GC_STATS_REQUESTED`.
+    if args.verbose_gc {
+        GC_STATS_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+    }
     if args.verbose_class || args.verbose_gc {
         eprintln!("[cratonvm] {}", active_jdk_mode_line());
         eprintln!(
@@ -5570,22 +5608,6 @@ fn run() -> Result<()> {
         || cratonvm_types::flags::flags().gc.g1_dbg_accessor
     {
         vm.shared.mem.heap.print_gc_summary();
-        // The collector's own account of WHAT it did and WHY — the decision
-        // histogram, the per-reason fallback rows, and the two G1 JIT-root
-        // lines (`g1 root coverage`, `g1 jit publication`).
-        //
-        // It had no production caller at all until 2026-09-01, which quietly
-        // voided a claim: `bug-g1-evacuates-live-jit-reference-20260819.md`
-        // kept `G1Collector::empty_jit_publication` as a detector on the
-        // grounds that with the conservative scan always running under G1, an
-        // empty publication under a live compiled frame is once again a genuine
-        // anomaly, and stated "the counter is ungated and should now read
-        // zero". Ungated it was; unreachable it also was — the only callers of
-        // this function were unit tests. A counter whose report nothing prints
-        // reads as zero for the same reason an unpublished bounds table reads
-        // as "no movable words".
-        eprint!("{}", cratonvm_vm::collector_decision_report());
-        eprintln!();
         {
             // Cross-thread STW peer-scan coverage. A non-zero count means the
             // collector swept while a peer it could not classify was still
