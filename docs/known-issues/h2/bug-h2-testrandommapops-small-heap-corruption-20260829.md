@@ -19,6 +19,114 @@ load ~3** — against the inherited base rate of "roughly one in three runs of
 lever is host quietness, not a flag, and it is the difference between a defect
 nobody could bisect and one anybody can.
 
+## ADDENDUM 2026-09-01: the COST is gone; the HOLE is not. Both were measured on one binary
+
+Two things this page states as current are no longer true, and one thing it
+implies is not true either. All figures below are `dev@56d6c3722`, one binary,
+`/proc/loadavg` recorded on every run as this page requires — and the host was
+BUSY (load 8–26), which matters in the direction noted at each row.
+
+### 1. The cost this page trades away has already been repaid
+
+`bbd9d05a9 fix(jit): name a direct call's staged argument oops in its safepoint
+map` (2026-08-30, hours after the fix above) closed the dominant
+`staged_unmappable` population. The trade this page documents — *"on
+String-heavy code the fix stops relocation entirely"*, `compaction_cycles`
+26 → 0 — does not reproduce:
+
+| probe | `compaction_cycles` | `objects_relocated` | `relocation_skipped_jit` |
+|---|---:|---:|---:|
+| gate ON (default) | 13 | 70 032 | **0** |
+| `CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE=0` | 13 | 70 014 | 0 |
+
+Not one cycle declines. The named regression is gone with it:
+`org.h2.test.store.TestMVStoreTool` at `--Xmx 1g` ran **clean to a 900 s cap in
+both arms** (`oom=0`), against the 57–61 s OOM this page records.
+
+So **`Next` items 2 and 3 are closed**: the follow-up that removes the cost
+landed, and there is no longer a cost that would justify defaulting
+`CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT` to OFF.
+
+### 2. The gate does NOT close the hole — it narrows it
+
+This is the correction that matters. The page reads as though the defect is
+contained fail-closed. It is not. With the gate at its **shipped default**,
+relocation runs and frames still keep pre-move references:
+
+| arm | result | frames | frames with a LIVE stale word | LIVE words |
+|---|---|---:|---:|---:|
+| gate ON (default) | clean to 900 s cap | 13 | **8** | **15** |
+| `..._MAP_INCOMPLETE=0` | **`rc=1` NPE at 497 s** | 128 | 88 | 322 |
+
+**Every one of those 8 frames reports `cov_complete=true`.** The gate declines
+relocation for maps the compiler has already JUDGED short; these maps are not
+judged short — `causes(...)` reports zero for the methods involved — so the gate
+never sees them. It removes most of the population and none of the mechanism.
+
+The two clean arms were run at load 8–18. This page's own rule is that a
+contended host suppresses this failure, so "clean to the cap" is weak evidence
+of safety and the residue count is the reading to trust.
+
+### 3. A smaller, steadier witness, and it is not H2
+
+`Next` item 1 asked for a one-method reproducer and named
+`String.substring(II)` at safepoint 41. That witness still reproduces — under
+the default, `mapped=[8, 112] rewritten=2 inlined=[] stale_live=1`, i.e. the
+page's offset 112 is now named and **offset 88 is still not**. But there is a
+smaller one: `probes/SafepointMapResidue.java`, 25 lines, no H2, about two
+minutes, and stable across runs:
+
+```text
+[remap-frame] method=java/lang/StringConcatHelper.doConcat:(...)
+  sp_id=51 frame_size=1056 cov_complete=true live_hi=96
+  mapped=[ 8=0x..ec40 16=0x..ed70 40=0x..0838 ] rewritten=1
+  stale_words=18 stale_live=1 stale_dead=17
+  [LIVE off=32 stale=0x20019013eb8->0x200102599b8]
+```
+
+Slot 40 was named and rewritten; word 32 holds the SAME object's OLD address,
+sits inside the live band, and the map never named it.
+
+**It is not inlining, and that was measured rather than assumed.** The frame
+carries an inlined `String.<init>([BB)V`, and `fully_oop_covered` has an
+`inline_sites.is_empty()` term — so "the inlined callee's locals are unnamed" is
+the obvious reading. Ablated:
+
+| arm | frames | frames with a LIVE stale word |
+|---|---:|---:|
+| default | 29 | 1 |
+| `CRATONVM_JIT_INLINE_CALLS=0` | 24 | **3** |
+| `CRATONVM_JIT_INLINE=0` | 25 | **3** |
+
+Turning inlining off does not remove them. What is left is the general case
+this page's own `What is actually wrong` section names, and it is worth
+restating in the single-pass backend's own terms: `record_oop_map` walks the
+operand stack and `continue`s past any entry whose `stack_oop_marks[i]` is
+false, **without clearing `map_incomplete`**. The only protection against a mark
+that is simply WRONG is the `stack_oop_marks_exact` seed — and on this witness
+`marks_inexact=0`. A mark vector believed exact and not exact is invisible to
+every counter on that line.
+
+### 4. The cause census printed six of its seven causes
+
+`map_incomplete_cause::snapshot()` returns seven; `driver.rs` printed
+`causes[0..=5]`. A method whose only unnameable references were inline-scope
+locals therefore printed all-zero causes — "no cause", from a cause census.
+**The `Which of the seven fired` section above was read off that line**, so the
+column that was missing is precisely the one its conclusion could not have
+ruled out. Fixed, with a `const` assert so a new variant is a compile error
+rather than another silent column.
+
+### Where that leaves the page
+
+* **OPEN**, and the remaining work is `Next` item 2 — unchanged in substance and
+  now with a two-minute reproducer instead of a 900-second one.
+* The three faces, the `ZGC_RELOCATE=0` bisect, the residue instrument and the
+  fail-closed gate all stand as written.
+* What must not be carried forward is the cost table and the
+  `RELOCATE_UNDER_PROVEN_JIT` recommendation: both describe a binary that is two
+  commits old.
+
 ## ADDENDUM 2026-08-30 (L7 corpus lane): it is NOT a small-heap defect — 4g fails too
 
 The `--jdk-only` corpus run hit this class at `--Xmx 1g` and could not attribute
