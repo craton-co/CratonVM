@@ -136,6 +136,28 @@ ABORTED=1 NOSTART=2 PASS=173 HANG=3 FAIL=70 NOTESTS=64
 `FAIL=70`, `HANG=3` and `NOTESTS=64` are the suite's own separate business and
 are not touched by this page.
 
+**Azure, full-scope, the first 11 classes of the 6,377-class `testlist.txt`,
+paired against HotSpot 25** — same argfile, same `CratonRunner`, one fork per
+class per arm, `common.args` unmodified. This is the environment and the list
+the "100%" claim was made on:
+
+* **Zero `NoSuchMethodError` in all 22 runs.**
+* **10 of the 11 pairs are identical** on `found`/`started`/`ok`/`failed`.
+  One class passes outright on both — `AeshHotReplacementInterceptorTest`,
+  `found=7 started=7 ok=7 failed=0`. Three fail on both, with the same counts.
+  Six report `found=N started=0` on both, which is the VM-agnostic silent skip
+  the class-orderer page already recorded, not a CratonVM verdict.
+* **One pair diverges**: `CdiInjectionInCommandTest` hit the 400s cap on
+  CratonVM (`rc=124`) where HotSpot finished in 95s. That is the
+  `TestResourceManager`/`URLPackageScanner` throughput gap, on a host sitting
+  at `loadavg` 25-30 from other sessions — the subject of
+  `quarkustestprofileawareclassorderer-not-a-hang-throughput-gap-20260817.md`,
+  not of this page.
+
+11 classes is a sample, not the suite. The full 6,377-class run is ~5 days of
+wall time and was not attempted; what the sample settles is the claim this page
+was opened on, which was categorical.
+
 ## What the original page checked, and why every check was clean
 
 Kept, because these are the results that point at the native:
@@ -198,7 +220,7 @@ Landed with this retirement, in `native-builtins/src/phases_late.rs`:
   away.
 
 `cargo test -p cratonvm-native-builtins --lib`: 4178 passed, 0 failed, 7
-ignored -- 4172 passed before this change, so the six new tests are the whole
+ignored — 4172 passed before this change, so the six new tests are the whole
 delta. `--tests` (the crate's six integration gates: registrar drift,
 duplicate registration, registry contracts, essential wiring, lock discipline,
 shim inheritance) is green as well.
