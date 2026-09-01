@@ -192,13 +192,89 @@ fails, in 641 s instead of 1078 s.
    a 96 %-free heap, and `zgc-high-compaction: cycles=0 declined=0
    objects_relocated=0` says the targeted compactor engaged **zero** times. Ask
    what those 13 runs are and why nothing is asked to move them.
-2. **Then the helper window**, 219 of 227 refusals. A peer inside a JIT helper
-   has provable compiled frames and an unrewritable Rust frame above them.
+2. ~~**Then the helper window**, 219 of 227 refusals.~~ **DONE 2026-09-01** --
+   discharged by pinning the peer's conservative roots rather than refusing the
+   cycle; see the 2026-09-01 addendum. Whether it makes THIS class compact is
+   still unmeasured (it needs a quiet host).
 3. `compiled-frame-oop-not-published` (5) and `unregistered-jit-frame-on-stack`
    (3) are not worth attacking until 1 and 2 are answered.
 4. `CRATONVM_XT_JIT_COVERAGE_ASSUME=1` settles "is the handshake the gate?" in
    one run. It is unsafe; read `relocation_on_proven_jit` before believing
    anything it produces.
+
+## ADDENDUM 2026-09-01: the dominant refusal is DISCHARGED, and it was never a proof to repair
+
+The 2026-08-30 (b) census named `xt-helper-window-conservative-scan` as **219 of
+227** refusals. It is now gone, and the repair is not a proof at all -- it is a
+root set that had nowhere to go.
+
+### What a helper window actually is
+
+A peer thread whose `Rip` is OUTSIDE compiled code but which has JIT frames on
+its native stack: it is inside a **Rust helper called from compiled code** when
+the collector's signal reaches it. `classify_slot_helper_window` freezes it,
+reads its published register file and every readable word of its stack from
+`rsp` up, and recovers a conservative root set. Those roots kept the objects
+alive and the cycle then refused to relocate anything at all.
+
+### Why it refused, and why that was avoidable
+
+ZGC has consumed `pinned_jit_roots_snapshot()` since 2026-08-13: conservative
+JIT roots pin their page, the objects stay still, and everything else may move.
+That mechanism was already right there. The helper-window peer simply had no
+way to use it:
+
+**`PINNED_JIT_ROOTS_BY_THREAD` is published BY EACH THREAD**, at its own
+safepoint arrival or blocking-region entry. A helper-window peer is exactly the
+thread that reached NEITHER -- a signal interrupted it mid-helper. And the scan
+that recovers its roots runs on the COLLECTOR's thread, so it cannot publish
+under the peer's `ThreadId` either. So the roots existed, the pin machinery
+existed, and nothing connected them; the cycle refused instead.
+
+The connection is a per-CYCLE pin set (`XT_CYCLE_PINNED_JIT_ROOTS`), unioned
+into `pinned_jit_roots_snapshot()` and cleared where the coverage verdict it
+used to be expressed as is cleared.
+
+**Soundness rests on COMPLETENESS, not on trust.** The Linux classifier reads
+the register file AND the whole readable stack band, so no address that peer can
+reach is missing -- which is exactly the property that lets pinning substitute
+for refusing. Pinned objects do not move; their FIELDS are still rewritten
+through the pointer map, as for any other pinned root. `classify_slot_helper_window`
+now returns `(has_jit, complete)`, and its two early returns -- `rsp` unusable,
+no readable region -- report `complete = false`. A partial scan is NOT pinned
+and keeps refusing, because pinning what you found does not help when what you
+missed is unrewritable too. The Windows arm keeps refusing outright: its
+completeness is not measurable here.
+
+### MEASURED, one binary, `org.h2.test.db.TestMultiThread`, both arms `rc=0`
+
+| arm | `helper_windows` | `hw_pinned` | `hw_refused` | `relocation_skipped_jit` |
+|---|---:|---:|---:|---:|
+| `CRATONVM_XT_HELPER_WINDOW_PIN=1` | 62 | **62** | **0** | 8 |
+| `=0` | 44 | 0 | 44 | 14 |
+
+and the coverage census, which is the readable half:
+
+```text
+PIN=0   xt-helper-window-conservative-scan=13   compiled-frame-oop-not-published=1
+PIN=1   (absent)                                compiled-frame-oop-not-published=5
+```
+
+The reason does not merely get rarer -- it leaves the census. `hw_pinned` and
+`hw_refused` ride on the `[GC] xt_peer_scan` line so neither has to be inferred
+from the other, and `CRATONVM_XT_HELPER_WINDOW_PIN=0` restores the refusal on
+the same binary.
+
+### What this does NOT yet establish
+
+`TestMultiThread` compacts either way (`objects_relocated` 64841 vs 66624), so
+it proves the refusal is discharged and NOT that this class now compacts. The
+run that would say so is `TestCachedQueryResults` itself, and the host it must
+run on has to be quiet: at load 26 the class does not finish inside 1800 s,
+`timeout` kills it, and **a killed run prints no `[GC]` summary at all** -- which
+is how one earlier attempt produced an empty gate census and a different failure
+(`Timeout trying to lock table "COUNTER"`) that says nothing about the heap.
+Read `relocation_on_proven_jit` before believing any arm of it.
 
 ## Status
 
