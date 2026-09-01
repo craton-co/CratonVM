@@ -5570,6 +5570,22 @@ fn run() -> Result<()> {
         || cratonvm_types::flags::flags().gc.g1_dbg_accessor
     {
         vm.shared.mem.heap.print_gc_summary();
+        // The collector's own account of WHAT it did and WHY — the decision
+        // histogram, the per-reason fallback rows, and the two G1 JIT-root
+        // lines (`g1 root coverage`, `g1 jit publication`).
+        //
+        // It had no production caller at all until 2026-09-01, which quietly
+        // voided a claim: `bug-g1-evacuates-live-jit-reference-20260819.md`
+        // kept `G1Collector::empty_jit_publication` as a detector on the
+        // grounds that with the conservative scan always running under G1, an
+        // empty publication under a live compiled frame is once again a genuine
+        // anomaly, and stated "the counter is ungated and should now read
+        // zero". Ungated it was; unreachable it also was — the only callers of
+        // this function were unit tests. A counter whose report nothing prints
+        // reads as zero for the same reason an unpublished bounds table reads
+        // as "no movable words".
+        eprint!("{}", cratonvm_vm::collector_decision_report());
+        eprintln!();
         {
             // Cross-thread STW peer-scan coverage. A non-zero count means the
             // collector swept while a peer it could not classify was still

@@ -1195,7 +1195,9 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
              incomplete={incomplete} reason={reason} chain={chain} \
              any_jit={any_jit} \
              scan_added={added} unrewritable={unrewritable} is_g1={is_g1} \
-             ybounds={ybounds} heaps={heaps}              bounds_representative={bounds_representative} frames={labels:?}",
+             ybounds={ybounds} heaps={heaps} \
+             bounds_representative={bounds_representative} \
+             frames={labels:?}",
             precise_only = moving_young_precise_only,
             proven = coverage_proven,
             osr_fb = moving_young_osr_fallback,
