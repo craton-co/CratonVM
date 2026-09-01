@@ -2546,6 +2546,13 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
         shadow_missing.truncate(16);
         let scauses = crate::x64::safepoint::shadow_incomplete_cause::snapshot();
         let causes = crate::x64::safepoint::map_incomplete_cause::snapshot();
+        // A census that prints fewer causes than it has is a census that can
+        // report "no cause" for a real one. Adding a variant without adding a
+        // column is now a compile error rather than a silent column.
+        const _: () = assert!(
+            crate::x64::safepoint::map_incomplete_cause::COUNT == 7,
+            "map_incomplete_cause gained a variant: add a column to the              frameslot-detail line below, then bump this"
+        );
         eprintln!(
             "[oopcov] uncovered method={} frameslot={} shadow={} \
              shadow_missing_pcs={shadow_missing:?} \
@@ -2565,7 +2572,7 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
         eprintln!(
             "[oopcov]   frameslot-detail method={} precise_maps={} sp_id_slot_off={} inline_sites={} \
              safepoints={} mapped={} unmapped_pcs={:?} \
-             causes(marks_inexact={} oop_in_reg={} stack_deep={} local_deep={} staged_deep={} staged_unmappable={})",
+             causes(marks_inexact={} oop_in_reg={} stack_deep={} local_deep={} staged_deep={}              staged_unmappable={} inline_local_unmappable={})",
             compiler.method_key,
             compiler.precise_maps,
             compiler.sp_id_slot_off,
@@ -2579,6 +2586,14 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
             causes[3],
             causes[4],
             causes[5],
+            // The SEVENTH cause. `map_incomplete_cause::snapshot()` has returned
+            // `[usize; 7]` since `INLINE_LOCAL_UNMAPPABLE` was added, and this
+            // line printed six of them -- so a run whose only unnameable
+            // references were inline-scope locals showed `causes(... all zero)`
+            // and read as "no cause", which is the one reading a cause census
+            // must never produce. The 2026-08-30 diagnosis that concluded "One
+            // cause, `staged_unmappable`" was made from this line.
+            causes[6],
         );
     }
     // Shadow-stack — frame offsets + thread-struct offset, so the OSR trampoline

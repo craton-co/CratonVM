@@ -93,9 +93,19 @@ pub mod map_incomplete_cause {
     /// classify the callee pc at all. See `Compiler::inline_oop_scopes`.
     pub static INLINE_LOCAL_UNMAPPABLE: AtomicUsize = AtomicUsize::new(0);
 
+    /// How many causes [`snapshot`] returns.
+    ///
+    /// Named so the census printer can assert against it. `driver.rs` printed
+    /// SIX of these seven for as long as the seventh existed, which made a run
+    /// whose only unnameable references were inline-scope locals read as
+    /// `causes(... all zero)` -- "no cause", from a cause census. The
+    /// 2026-08-30 diagnosis that concluded "One cause, `staged_unmappable`"
+    /// was made from that line.
+    pub const COUNT: usize = 7;
+
     /// `(marks_inexact, oop_in_register, stack_deep, local_deep, staged_deep,
     /// staged_unmappable, inline_local_unmappable)`.
-    pub fn snapshot() -> [usize; 7] {
+    pub fn snapshot() -> [usize; COUNT] {
         use std::sync::atomic::Ordering::Relaxed;
         [
             MARKS_INEXACT.load(Relaxed),
