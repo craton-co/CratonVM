@@ -241,8 +241,6 @@ def main(argv: list[str]) -> int:
             print(f"  pc    = {info['pc']:#018x}")
         if info["fault"] is not None:
             print(f"  fault = {info['fault']:#018x}")
-            if info["pc"] is not None:
-                pass
         print(
             "  table entries dumped: "
             + ", ".join(

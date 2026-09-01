@@ -6,8 +6,8 @@ plainly, and §0.4 had ruled symbolization impossible because both crashing
 builds are gone. It is not impossible; it just needed a different key. The
 faulting instruction is now named, the descriptor byte it crashed on is
 decoded, `0x5B` is explained by fact rather than by inference, and the crash
-reproduces on demand in a unit test — which it never did in the seven sessions
-this page spans.
+reproduces on demand in a unit test — which it never did across the five
+investigations this page records.
 
 The faulting instruction is the `Value` jump-table load inside
 **`cratonvm_gc::heap::coerce_field_value_for_slot`**, in its `b'L' | b'['`
@@ -19,7 +19,8 @@ likely the faulting instruction". The reader does not contain the table. Its
 caller does.
 
 That also makes §2.3 the fix for these eight files after all. Section 3 is the
-new work; everything from §0 down is preserved unchanged.
+new work; everything from §0 down is preserved — see the note immediately above
+§0 for the one formatting edit.
 
 ---
 
@@ -253,9 +254,9 @@ them in any of this page's audits:
 
 | site | what it fed |
 |---|---|
-| `jit_getfield`, legacy 16-byte slot | a **seven-arm `match val`** — the same shape as the crash |
-| `jit_putfield_int`, `CRATONVM_JIT_PFI_TRACE` | `{:?}`, which is itself a match over the discriminant |
-| `jit_putfield_ref`, SATB pre-barrier | `if let Value::Object(Some(_))`, then `satb_barrier` — a garbage pointer onto the mark queue |
+| `jit_getfield_impl`, legacy 16-byte slot | a **seven-arm `match val`** — the same shape as the crash |
+| `jit_putfield_int`, under the `pfi` trace | `{:?}`, which is itself a match over the discriminant |
+| `jit_putfield_object`, SATB pre-barrier | `if let Value::Object(Some(_))`, then `satb_barrier` — a garbage pointer onto the mark queue |
 | `ffm_read_long_slot` | `match { Value::Long(v) => .., _ => None }` |
 
 All four now go through `jit_read_value_cell_checked`, the VM-crate counterpart
