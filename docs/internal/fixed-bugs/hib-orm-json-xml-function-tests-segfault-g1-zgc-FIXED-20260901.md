@@ -1,3 +1,302 @@
+# hibernate-orm JSON/XML function tests SIGSEGV under G1/ZGC — ATTRIBUTED: the jump table is `coerce_field_value_for_slot`'s, one frame above the reader
+
+**Status: FIXED and CLOSED, 2026-09-01.** The last thing holding this page open
+was that its eight `hs_err` files had never been attributed — §2.7.3 said so
+plainly, and §0.4 had ruled symbolization impossible because both crashing
+builds are gone. It is not impossible; it just needed a different key. The
+faulting instruction is now named, the descriptor byte it crashed on is
+decoded, `0x5B` is explained by fact rather than by inference, and the crash
+reproduces on demand in a unit test — which it never did in the seven sessions
+this page spans.
+
+The faulting instruction is the `Value` jump-table load inside
+**`cratonvm_gc::heap::coerce_field_value_for_slot`**, in its `b'L' | b'['`
+descriptor arm, with `desc_byte == 0x5B == b'['`. The invalid `Value` it
+matches on was built **one frame lower**, by the collector's own `get_field`,
+and merely passed in — which is exactly why §2.3's audit of the *read* sites
+for a seven-entry jump table came back empty and concluded "none of them is
+likely the faulting instruction". The reader does not contain the table. Its
+caller does.
+
+That also makes §2.3 the fix for these eight files after all. Section 3 is the
+new work; everything from §0 down is preserved unchanged.
+
+---
+
+# 3. The attribution (2026-09-01)
+
+## 3.1 Why §0.4's "symbolization is no longer possible" was true and not final
+
+§0.4 is correct on its own terms: an RVA is meaningless without the image it
+indexes, `CRATONVM_SYMBOLIZE` against a near-miss build answers with plausible
+and entirely wrong names, and neither crashing build survives. Every attempt on
+this page tried to resolve `exe+0x2E9D12` — an **absolute** fact about one
+binary — and there was no binary to resolve it against.
+
+But the crash handler dumps the memory around `r10`, and `r10` *is the jump
+table*. A jump table stores **table-relative** displacements. So the
+differences between its entries are the differences between the code addresses
+they target: a property of the function's own layout, not of where the image
+was based or how it was linked.
+
+That is the key this page needed. It is build-independent, and the page's own
+evidence already proved it: the eight files come from two different builds with
+every RVA shifted, and
+
+```
+deltas from the entry at R10+0:
+  -0x9e, -0x9e, -0xc7, -0xb0, +0x0, +0x0, +0x2b, +0x0, -0x106, +0x2b, -0x106, -0x122
+```
+
+is **byte-identical in all eight**, across both builds. (Verified, not assumed:
+`scripts/hs-err-jumptable-fingerprint.py` parses the dump out of each file and
+prints the vector; the eight lines are the same line.)
+
+## 3.2 One hit, in five independent builds
+
+Scanning `.rdata` for a dword run with those deltas finds **exactly one match**
+in each modern `cratonvm.exe` on this box — five builds spanning 2026-08-30 to
+2026-09-01, at five different RVAs, and one match apiece, never two:
+
+| binary | table RVA | jump-table targets |
+|---|---|---|
+| `cratonvm/target/release` | `0x2411edc` | `0x2f7551`, `0x2f757c`, `0x2f744b`, … |
+| `cratonvm/target-hibreactive-20260830` | `0x244f96c` | `0x2fbdf1`, `0x2fbe1c`, `0x2fbceb`, … |
+| `CratonVM-hashevict-20260830` | `0x2484c40` | `0x2fbcc1`, `0x2fbcec`, `0x2fbbbb`, … |
+| `CratonVM-recycler-20260830` | `0x2499cc0` | `0x2fd411`, `0x2fd43c`, `0x2fd30b`, … |
+| `CratonVM-qlog-20260901` | `0x249ceec` | `0x2fab21`, `0x2fab4c`, `0x2faa1b`, … |
+
+`CRATONVM_SYMBOLIZE` on two of them, against their own PDBs:
+
+```
+0x2F7551  cratonvm_gc::heap::coerce_field_value_for_slot+0x151   [gc/src/heap.rs]
+0x2F757C  cratonvm_gc::heap::coerce_field_value_for_slot+0x17C   [gc/src/heap.rs]
+0x2F744B  cratonvm_gc::heap::coerce_field_value_for_slot+0x4B    [gc/src/heap.rs]
+--- CratonVM-recycler-20260830, a different build ---
+0x2FD411  cratonvm_gc::heap::coerce_field_value_for_slot+0x151
+0x2FD43C  cratonvm_gc::heap::coerce_field_value_for_slot+0x17C
+0x2FD2EF  cratonvm_gc::heap::coerce_field_value_for_slot+0x2F
+```
+
+Same function, same **offsets within the function** (`+0x151`, `+0x17C`), two
+independently linked binaries. The name is not an artifact of which image was
+scanned.
+
+## 3.3 The instruction, disassembled — and `0x5B` decoded
+
+Disassembling the current build at the function's entry settles the rest:
+
+```asm
+0x2f7400  push  rsi
+0x2f7401  push  rdi
+0x2f7402  sub   rsp, 0x38
+0x2f7406  movzx eax, r8b                     ; <-- desc_byte arrives in r8b
+0x2f740a  add   eax, -0x42                   ;     't' - 'B'
+0x2f740d  cmp   eax, 0x19                    ;     'B'..'[' is 26 wide
+0x2f7410  ja    0x2f744b                     ;     the `_ => value` arm
+0x2f7412  lea   r10, [rip + 0x211aa5b]       ;     outer table: match desc_byte
+0x2f7419  movsxd rax, dword ptr [r10 + rax*4]
+0x2f741d  add   rax, r10
+0x2f7420  jmp   rax
+...
+0x2f7439  mov   eax, dword ptr [rdx]         ; <-- the Value's u32 TAG
+0x2f743b  lea   r10, [rip + 0x211aa9a]       ;     inner table: match value
+0x2f7442  movsxd rax, dword ptr [r10 + rax*4]   ; <-- THE FAULTING INSTRUCTION
+0x2f7446  add   rax, r10
+0x2f7449  jmp   rax
+```
+
+Three facts fall out, each of which the page had been guessing at:
+
+1. **`r10` at `0x2f743b` resolves to `0x2411EDC`** — bit-for-bit the table the
+   fingerprint matched. The instruction that reads it is at `0x2f7442`, exactly
+   `0x10F` below the first table target, which is exactly where the crash's
+   `rip` sits relative to *its* first target. The faulting instruction is this
+   one.
+
+2. **`desc_byte` arrives in `r8b`.** In all eight logs
+   `rbx == r8 == r13 == 0x5B`, and `0x5B` is ASCII `[`. §2.7.2 spent a section
+   proposing that `0x5B == 91` was "an array's length, read through the `shape`
+   dword" and labelled it *"inference, not attribution"*. It is neither a slot
+   count nor an array length: it is the **descriptor byte** of the field being
+   read, held in three registers because a register allocator keeps a
+   long-lived argument alive across a 26-arm switch. Decoding the outer table
+   confirms the routing — `'L'` (index 10) and `'['` (index 25) are the only
+   two entries that reach `0x2f7439`, and the crash carried `'['`.
+
+3. **The `Value` arrives by pointer in `rdx`, and `rax` is literally its tag.**
+   In `hs_err_pid3512`, `rdx = 0x8D769D2B80` — a stack address, the caller's
+   spill slot for the 16-byte argument — and `rax = 0xEAF82DA0`, the `u32` at
+   `[rdx]`. §0.3 reasoned its way to "`rax` is a `Value` discriminant" from the
+   table's shape. It is that, read from that word, by that instruction.
+
+The arm grouping §0.2 decoded — indices 0/1/3 to one body, 2/5 to another, 4/6
+to a third — is the `b'L' | b'['` arm read straight off:
+
+| discriminants | source | why they share a body |
+|---|---|---|
+| 0, 1, 3 (`Int`, `Long`, `Double`) | two arms, `Int(_) \| Long(_)` and `Double(_)` | both end `Value::Object(None)`; LLVM tail-merges them |
+| 2, 5 (`Float`, `ReturnAddress`) | `Float(_) \| ReturnAddress(_)` | one arm |
+| 4, 6 (`Object`, `Uninitialized`) | `Object(_)` and `Uninitialized` | both are `value`, unchanged |
+
+## 3.4 What this settles: the collector correlation, mechanically
+
+`coerce_field_value_for_slot` takes its `Value` **by value**. It cannot have
+produced the invalid enum; it only consumed it. The producer is one frame down,
+and the call is `GarbageCollector::get_field_as`:
+
+```rust
+fn get_field_as(&self, obj: ObjectRef, index: usize, desc_byte: u8) -> Value {
+    let raw = self.get_field(obj, index);                 // <-- builds the Value
+    crate::heap::coerce_field_value_for_slot(raw, desc_byte, ..)   // <-- crashes on it
+}
+```
+
+So the chain is, end to end:
+
+```
+  get_field_as(obj, index, b'[')
+    -> g1::get_field / zgc::get_field
+         -> read_value_atomic     : transmute 16 bytes, NO discriminant check   [UB here]
+    -> coerce_field_value_for_slot(raw, b'[')
+         -> match value           : movsxd rax, [r10 + rax*4], NO bounds check  [SIGSEGV here]
+```
+
+and the original triage's central unexplained fact — **always G1 or ZGC, never
+Generational, on two independent runs** — is now mechanical rather than
+suggestive:
+
+* `gen_heap::read_slot` had screened the discriminant since HIB-CV-32. It
+  returned `Object(None)`, `coerce_field_value_for_slot` matched discriminant
+  4, and the run continued. **Generational was not avoiding the corrupt cell;
+  it was surviving it**, exactly as §2.1 argued from a different crash.
+* `g1::get_field` and `zgc::get_field` called the unchecked
+  `read_value_atomic`. They handed an invalid `Value` up one frame, and the
+  first `match` on it jumped through `.rdata`.
+
+§2.1 got the shape of this right ("the collector correlation is a property of
+the *reader*, not of the collector's barriers") without being able to name the
+consumer. This is the consumer.
+
+It also means **§2.3 was the fix for these eight files**, and disclaimed itself
+too strongly. Its reasoning was:
+
+> All three sites match with a single-variant `if let Value::Object(Some(..))`,
+> which lowers to a discriminant compare rather than the seven-entry jump table
+> §0.2 decoded […] So **none of them is likely the faulting instruction in
+> these eight files**.
+
+The premise is true and the conclusion does not follow. The reader was never
+going to *contain* the table; it `return`s the invalid `Value` to a caller who
+matches on it. Auditing read sites for the jump-table shape was looking for the
+crash one frame below where it happens. §2.3 moved `heap::read_slot`,
+`g1::get_field` and `zgc::get_field` onto the screened reader — which is the
+first three doors of the chain above.
+
+## 3.5 Reproduced on demand, at last
+
+`gc/tests/corrupt_value_cell_jump_table.rs` allocates a legacy object, writes
+16 bytes into slot 0 that are not a `Value` — tag `0xEAF82DA0`, `rax` from
+`hs_err_pid3512` verbatim — and reads it back through `get_field_as(obj, 0,
+b'[')`, the exact call the crash took, on all three collectors.
+
+* On current `dev`: three arms, one answer, `Value::Object(None)`. Green.
+* With `g1::get_field` reverted to `read_value_atomic` — one line, nothing else
+  changed: **`process didn't exit successfully: exit code 0xc0000005,
+  STATUS_ACCESS_VIOLATION`**.
+
+That is the same `EXCEPTION_ACCESS_VIOLATION (0xC0000005)` as the eight files,
+from the same instruction, in under a second, without a database, without
+hibernate, and without waiting 83 minutes for a suite. §1's "How to re-catch
+it" is retired: the answer to "reproduce the *server* condition" is that the
+server was never the variable, and the mechanism reproduces in a unit test.
+
+The file also carries the two anti-vacuity controls the page's history argues
+for: `the_corrupt_cell_is_actually_read` asserts the corrupt-cell census
+actually moved (so a change that stops reaching the legacy path fails instead
+of passing quietly), and `a_valid_cell_is_not_screened_out` asserts a valid
+cell still round-trips (so a guard that answered null for everything would be
+red).
+
+## 3.6 §0.5 item 3 is now finished, and ratcheted
+
+§0.5 item 3 asked for "a cheap, permanent improvement independent of finding
+the site: a `match` over a `Value` freshly read from an unvalidated slot should
+go through a checked constructor". §2.3 did the three GC readers it could see;
+§2.5 and §2.6 bounded two walks. Four unscreened `read_value_atomic` reads were
+still live, all in `vm/src/jit/helpers.rs`, none of them GC code and so none of
+them in any of this page's audits:
+
+| site | what it fed |
+|---|---|
+| `jit_getfield`, legacy 16-byte slot | a **seven-arm `match val`** — the same shape as the crash |
+| `jit_putfield_int`, `CRATONVM_JIT_PFI_TRACE` | `{:?}`, which is itself a match over the discriminant |
+| `jit_putfield_ref`, SATB pre-barrier | `if let Value::Object(Some(_))`, then `satb_barrier` — a garbage pointer onto the mark queue |
+| `ffm_read_long_slot` | `match { Value::Long(v) => .., _ => None }` |
+
+All four now go through `jit_read_value_cell_checked`, the VM-crate counterpart
+of `heap::read_value_cell_checked`, with its own counter
+(`JIT_CORRUPT_VALUE_CELLS`) beside the shared census.
+
+And because "audit the tree once" is how this defect got four sessions of
+partial passes, `scripts/check-value-cell-reads.sh` now fails CI on any call to
+`read_value_atomic` outside its own defining module. It carries a positive
+control (it must find calls to the *checked* reader, or it refuses rather than
+reporting a clean tree it never read) and was verified in both directions: green
+on the tree as it stands, red within one line of re-introducing an unscreened
+read.
+
+## 3.7 §0.5 item 1, made cheap
+
+§0.5 item 1 — "keep a copy of `cratonvm.exe` + `cratonvm.pdb` beside the run
+log, it costs 165 MB and is the difference between a decoded stack and this
+page" — was already half-answered: the crash handler grew an
+`exe build id: timestamp=... size_of_image=...` line, which tells you *which of
+your ten binaries* produced a report.
+
+It now also emits
+
+```
+#  exe pdb id: <GUID><age>
+```
+
+read from the PE debug directory's RSDS record. That is the key every symbol
+server and every debugger uses to find a PDB, so a crash log carrying it stays
+symbolizable when the exe is gone — 40 bytes instead of 165 MB, and it survives
+a `target/` clean.
+
+Section 3.1's technique is the fallback for logs that predate both lines, and
+`scripts/hs-err-jumptable-fingerprint.py` is where it lives.
+
+## 3.8 What this page no longer owns
+
+Every item that held it open is closed:
+
+* the producer — closed 2026-08-22, a wrong-kind read (§2.7.1);
+* the reader guards — §2.3, and now the four JIT-helper doors (§3.6);
+* the marker's extent — §2.5;
+* the `record_outgoing_rset_edges` walk — §2.6;
+* the fourteen unbounded flat-walk callers — answered 2026-08-26;
+* **the eight unattributed `hs_err` files — §3.1–§3.4**;
+* **`0x5B` — §3.3, and it was neither of the two things this page guessed**;
+* a reproduction — §3.5.
+
+The one thing that is *still* honestly true from §0.4: the two crashing
+binaries are gone and no PDB for them exists. That no longer matters, because
+the attribution never needed one.
+
+---
+
+*Everything below is the page as it stood on 2026-08-26, unchanged. Its
+`Status: OPEN` line is superseded by the block at the top of this file, and so
+is §0.4's "symbolization is no longer possible", §2.3's disclaimer and §2.7.2's
+`0x5B` inference — each is answered above and each is left here because the
+reasoning that produced it is worth reading beside the answer. Everything else
+stands: §0.2 and §0.3 read the jump table correctly, and §3 is what happens
+when that reading is carried one frame further.*
+
+---
+
 # hibernate-orm JSON/XML function tests SIGSEGV under G1/ZGC — the faulting instruction is decoded: a jump table indexed by a corrupt `Value` discriminant
 
 **Status: OPEN, mechanism IDENTIFIED, still not reproducible on demand
