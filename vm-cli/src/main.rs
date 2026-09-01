@@ -5565,10 +5565,15 @@ fn run() -> Result<()> {
     // `print_gc_summary`, and a census whose only output path is gated behind a
     // DIFFERENT flag prints nothing when you ask for it — which reads as
     // "zero accessor calls" rather than "you never enabled the report".
-    if args.verbose_gc
+    let gc_stats_requested = args.verbose_gc
         || std::env::var_os("CRATONVM_GC_STATS").is_some()
-        || cratonvm_types::flags::flags().gc.g1_dbg_accessor
-    {
+        || cratonvm_types::flags::flags().gc.g1_dbg_accessor;
+    // A stale or refused arena translation is a correctness event, so it is
+    // reported whether or not anyone asked for statistics -- gating one behind
+    // a stats flag turns "nobody asked" into "nothing happened". With the flag
+    // on, the line prints unconditionally so the DENOMINATOR is available too.
+    print_arena_translation_summary(gc_stats_requested);
+    if gc_stats_requested {
         vm.shared.mem.heap.print_gc_summary();
         {
             // Cross-thread STW peer-scan coverage. A non-zero count means the
@@ -6428,6 +6433,32 @@ fn run() -> Result<()> {
             bail!("{}", lines.join("\n"));
         }
     }
+}
+
+/// The Unsafe-arena real-pointer audit, as one greppable line.
+///
+/// `always` prints it even when there is nothing to report, which is what the
+/// GC-stats gate asks for: `translations` is the DENOMINATOR, and without it
+/// "the hazard never fired" and "no pointer was ever handed out on this
+/// workload" are the same run. That distinction is the whole reason this
+/// counter exists -- see `unsafe_arena_translation_stats`, and the
+/// `zgc-rewrite-pass-walks-off-a-reference-array-20260815` page whose last
+/// elimination-table row it was built for.
+fn print_arena_translation_summary(always: bool) {
+    let s = cratonvm_native_builtins::unsafe_arena_translation_stats();
+    let noteworthy =
+        s.stale_on_realloc != 0 || s.stale_on_free != 0 || s.short_translations != 0;
+    if !always && !noteworthy {
+        return;
+    }
+    eprintln!(
+        "[VM] arena-ptr: translations={} short_translations={}          stale_on_realloc={} retained_on_realloc={} stale_on_free={}",
+        s.translations,
+        s.short_translations,
+        s.stale_on_realloc,
+        s.retained_on_realloc,
+        s.stale_on_free,
+    );
 }
 
 fn main() {
