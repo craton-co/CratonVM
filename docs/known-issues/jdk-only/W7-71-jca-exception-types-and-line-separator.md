@@ -5,6 +5,27 @@ lane could not build or run Rust. Every expected value below is measured on
 Temurin 25.0.3+9 on Windows 11; nothing here has been observed on a CratonVM
 binary. The verification command is in §8.
 
+> **VERIFIED AGAINST A BINARY 2026-09-01.** The status above was written by a
+> lane that could not build or run Rust, and it stood for roughly three weeks.
+> Run on a release binary of `dev`, against HotSpot 25.0.4+7 on the same host:
+>
+> ```text
+> RCrypto
+>   HotSpot          PASS RCrypto (57 checks)
+>   CratonVM compat  PASS RCrypto (57 checks)      0 differing lines
+>   CratonVM strict  PASS RCrypto (57 checks)      0 differing lines
+> ```
+>
+> Byte-identical output in BOTH modes, so the source work this record describes
+> does what it claimed on a real binary.
+>
+> **The predicted COUNT is superseded: this record expected `PASS RCrypto (47 checks)`.** Other
+> lanes added to the shared vector across the three weeks. A count written as an
+> expectation ages into a falsehood the moment a shared vector grows -- what
+> survives verification is the ASSERTIONS, and those match. Do not re-derive a
+> defect from a count that merely moved.
+
+
 Predecessor: `W7-60-harness-extract-blindness.md`, which repaired the two
 instruments that made both of these visible. Neither is a regression. `RCrypto`
 went from 7 asserted checks to 27 and `RNioNoFollow` from **0 executed
