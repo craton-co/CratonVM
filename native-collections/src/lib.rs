@@ -14689,15 +14689,18 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, values.len() as i32);
     ctx.unpin_native_roots(this_pin);
+    // `this` is a pre-allocation address by now. Re-derive the source from the
+    // view's own back-reference, which is the one pointer to it guaranteed live
+    // and current -- and do it BEFORE the synchronized wrap, because the
+    // wrapper is not an ArrayList and `values_view_source` cannot read one.
+    // Taking it afterwards is why a `Hashtable` values view was never stored.
+    let src = values_view_source(&*ctx, list);
     let list = if sync {
         wrap_synchronized_view(ctx, list, false)?
     } else {
         list
     };
-    // `this` is a pre-allocation address by now. Re-derive the source from the
-    // view's own back-reference, which is the one pointer to it guaranteed
-    // live and current.
-    if let Some(src) = values_view_source(&*ctx, list) {
+    if let Some(src) = src {
         store_live_values_view(ctx, src, list);
     }
     Ok(Some(Value::Object(Some(list))))
@@ -15673,14 +15676,16 @@ fn cached_live_view(
     if !map_view_cache_enabled() {
         return None;
     }
-    // The `Hashtable`/`Properties` family is refused outright. Its accessors
-    // hand back a `Collections$Synchronized*` wrapper, and `Properties` in
-    // particular keeps half its keys in a Rust side-table that only its own
-    // `keySet()` assembles correctly — so a cached instance there would pin
-    // whatever the field-walking path produced instead of rebuilding it. The
-    // measured workload is a `LinkedHashMap`, so this costs nothing worth
-    // having and removes the whole question.
-    if wants_synchronized_views(&*ctx, source) {
+    // `Properties` is refused: it keeps half its keys in a Rust side-table that
+    // only its own `keySet()` assembles correctly, so a cached instance would
+    // pin whatever the field-walking path produced instead of rebuilding it.
+    // HotSpot does not cache a `Properties` view either, so the refusal is the
+    // right answer and not only the safe one.
+    //
+    // `Hashtable` is NOT refused, and used to be. The wrapper its accessors
+    // hand back is handled by `unwrap_synchronized` below; see
+    // [`view_cache_refused`] for the measurement that separated the two.
+    if view_cache_refused(&*ctx, source) {
         return None;
     }
     let field = view_cache_field(kind)?;
@@ -15722,7 +15727,7 @@ fn cached_live_view(
 /// `MAP_VIEW_CARRIERS` member whose elements are `Map.Entry`, not values, and
 /// it is not what `values()` returns.
 fn cached_live_values_view(ctx: &mut dyn NativeContext, source: ObjectRef) -> Option<ObjectRef> {
-    if !map_view_cache_enabled() || wants_synchronized_views(&*ctx, source) {
+    if !map_view_cache_enabled() || view_cache_refused(&*ctx, source) {
         return None;
     }
     let class_id = ctx.class_id_of_object(source);
@@ -15733,14 +15738,22 @@ fn cached_live_values_view(ctx: &mut dyn NativeContext, source: ObjectRef) -> Op
     let Value::Object(Some(view)) = ctx.get_field(source, slot) else {
         return None;
     };
+    // UNWRAP FIRST. A `Hashtable`'s accessors hand back a
+    // `Collections$SynchronizedCollection` around the real carrier, so both the
+    // carrier test and the source test have to look through it -- which
+    // `cached_live_view` already does for keySet and entrySet, and this did
+    // not. It is why a `Hashtable` values view stayed uncached even after the
+    // family stopped being refused outright: the stored object's class was the
+    // WRAPPER's, which is not a map-view carrier, so every lookup declined.
+    let inner = unwrap_synchronized(ctx, view);
     match ctx
-        .class_name_arc_of_id(ctx.class_id_of_object(view))
+        .class_name_arc_of_id(ctx.class_id_of_object(inner))
         .as_deref()
     {
         Some(n) if is_map_view_carrier(n) && n != TM_ENTRY_SET_CARRIER => {}
         _ => return None,
     }
-    let cached_source = values_view_source(&*ctx, view)?;
+    let cached_source = values_view_source(&*ctx, inner)?;
     if !std::ptr::eq(cached_source.as_ptr(), source.as_ptr()) {
         return None;
     }
@@ -15750,7 +15763,11 @@ fn cached_live_values_view(ctx: &mut dyn NativeContext, source: ObjectRef) -> Op
 
 /// Record `view` as this source's live `values()` view.
 fn store_live_values_view(ctx: &mut dyn NativeContext, source: ObjectRef, view: ObjectRef) {
-    if !map_view_cache_enabled() || wants_synchronized_views(&*ctx, source) {
+    // `view_cache_refused`, matching the reader. These two guards differ only
+    // in their return type, which is why the first pass at this change moved
+    // the reader and left the writer -- and a values view that is read from the
+    // cache but never written to it caches nothing at all.
+    if !map_view_cache_enabled() || view_cache_refused(&*ctx, source) {
         return;
     }
     try_set_jdk_map_field(ctx, source, "values", Value::Object(Some(view)));
@@ -15770,7 +15787,7 @@ fn store_live_view(ctx: &mut dyn NativeContext, source: ObjectRef, kind: i32, vi
     // Same refusal as the read side, and it has to be here too: a store the
     // read can never accept is a leak of a live view into a JDK slot for no
     // benefit at all.
-    if wants_synchronized_views(&*ctx, source) {
+    if view_cache_refused(&*ctx, source) {
         return;
     }
     let Some(field) = view_cache_field(kind) else {
@@ -16529,6 +16546,36 @@ fn wrap_synchronized_view(
 /// is a `Hashtable` or a subclass such as `Properties`.
 fn wants_synchronized_views(ctx: &dyn NativeContext, source: ObjectRef) -> bool {
     receiver_facts(ctx, source).has(CF_HASHTABLE_ANCESTRY)
+}
+
+/// Whether this receiver must NOT cache its view objects.
+///
+/// `Properties` ONLY, and the difference from `wants_synchronized_views` is
+/// measured rather than reasoned. HotSpot caches a `Hashtable`'s three views
+/// and does NOT cache a `Properties`'s:
+///
+/// ```text
+/// apps/probes/ViewIdentityProbe          HotSpot   was
+///   ht    keySet/values/entrySet same twice   true   false
+///   props keySet same twice                  false   false
+/// ```
+///
+/// `Hashtable.keySet()` is `if (keySet == null) keySet = synchronizedSet(...)`,
+/// while `Properties` overrides it to wrap its side `ConcurrentHashMap` afresh
+/// on every call. One predicate was standing for two classes that differ here,
+/// and it cost four rows: `ht values().equals(ht.values())` answered FALSE,
+/// because `AbstractCollection` does not override `equals` and each call handed
+/// back a different object.
+///
+/// The old refusal gave two reasons and only the second is `Properties`-shaped:
+/// the `Collections$Synchronized*` wrapper is already handled by
+/// `cached_live_view`'s `unwrap_synchronized`, and it is the side-table keys
+/// that only `Properties`' own `keySet()` assembles correctly. `Properties` is
+/// exactly `CF_HASHTABLE_ANCESTRY` without `CF_HASHTABLE_LAYOUT`, which is a
+/// distinction this file already draws for `native_map_put_evict`.
+fn view_cache_refused(ctx: &dyn NativeContext, source: ObjectRef) -> bool {
+    let facts = receiver_facts(ctx, source);
+    facts.has(CF_HASHTABLE_ANCESTRY) && !facts.has(CF_HASHTABLE_LAYOUT)
 }
 
 /// The collection inside a `Collections$Synchronized{Collection,Set,List,…}`,
@@ -26091,7 +26138,37 @@ fn of_list_allowing_nulls(
 /// what those factories produce.
 fn register_immutable_serialization_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // `SyntheticStub`, not `Bridge`, so `--jdk-only` DROPS the whole family and
+    // real bytecode runs.
+    //
+    // `Bridge` asserts "no working real-bytecode fallback exists". For this
+    // family that is a compatible-mode claim wearing a mode-independent tag,
+    // and under `--jdk-only` it was not merely unnecessary but FATAL:
+    //
+    // ```text
+    // apps/probes/UtilCoverage4Sweep, --jdk-only
+    //   48 ser List.of(1)  THREW java.lang.NoClassDefFoundError
+    //   ...
+    //   java.lang.NoClassDefFoundError: cratonvm/internal/UnmodifiableList
+    // ```
+    //
+    // -- every `List.of`/`Set.of`/`Map.of` failed to DESERIALIZE. Writing
+    // worked and produced the same 59 bytes HotSpot writes; the read side then
+    // reached `native_collser_read_resolve`, which rebuilds through `of_list`
+    // and `freeze_result` into a `cratonvm/internal/Unmodifiable*` that strict
+    // mode refuses to fabricate. The producers this carrier has are supposed to
+    // be dropped in strict -- `alloc_immutable_wrapper`'s doc says so and lists
+    // them -- and this one was missed because it is registered from a DIFFERENT
+    // registrar than the factories it mirrors, under this `Bridge` window.
+    //
+    // The reason the native exists at all is in `native_collser_read_resolve`:
+    // the real body rebuilds maps through real `ImmutableCollections` ctors,
+    // producing a `table`-backed object that this crate's map natives read as
+    // empty. That is true in COMPATIBLE mode, where those natives run. It is
+    // exactly false under `--jdk-only`, where they are dropped and a real
+    // `Map1` is the right answer and the only one -- which is why the strict
+    // rows now agree with HotSpot down to the class name.
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     for c in [
         "java/util/ImmutableCollections$List12",
         "java/util/ImmutableCollections$ListN",
@@ -26194,6 +26271,19 @@ fn stream_is_linked(ctx: &dyn NativeContext, stream: ObjectRef) -> bool {
         return false;
     }
     matches!(ctx.get_field(stream, STREAM_FIELD_LINKED), Value::Int(1))
+}
+
+/// Whether `stream` is the synthetic REFERENCE-stream carrier -- the one shape
+/// `stream_link_or_consume` may be applied to.
+///
+/// The primitive carriers are excluded for the reason
+/// `stream_link_or_consume` records: they reach the funnel through
+/// `int_stream_elements`, which is infallible at 25 call sites, so a throw
+/// there would be swallowed and silently degrade the stream to empty.
+fn stream_is_reference_carrier(ctx: &dyn NativeContext, stream: ObjectRef) -> bool {
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(stream))
+        .as_deref()
+        == Some("java/util/stream/Stream")
 }
 
 /// Set the linked-or-consumed flag. No-op on a stream with no slot for it.
@@ -26781,6 +26871,42 @@ fn stream_make_lazy_derived(
         return Ok(None);
     }
     let src_cur = ctx.read_native_pin(src_pin, src);
+    // W7-65: LINK the source.
+    //
+    // `stream_link_or_consume`'s doc argues the JDK's eight flag sites collapse
+    // onto the one funnel in `stream_elements`, because every operation reads
+    // the element snapshot through it. That is true of every EAGER operation
+    // and false of a lazy one: a lazy intermediate op appends to the op chain
+    // and never drains, so it never reached the funnel and never marked its
+    // source. Two of the JDK's eight sites are the intermediate-stage
+    // constructors, and this function is both of them.
+    //
+    // MEASURED, `apps/probes/StreamReuseProbe`, compatible mode:
+    //
+    // ```text
+    //   ref filter then filter second     HotSpot IllegalStateException   was ok
+    //   ref map then map second           HotSpot IllegalStateException   was ok
+    //   ref parent after child linked     HotSpot IllegalStateException   was 3
+    // ```
+    //
+    // AFTER THE `--jdk-only` REFUSAL ARM, NOT BEFORE IT, and that is the whole
+    // of why this is here rather than at the top. Strict mode DOES reach this
+    // function; it is refused a few lines up, returns `Ok(None)`, and the
+    // caller falls back to real java.base bytecode. Marking the source ahead of
+    // that refusal armed a stream this VM was about to hand back to the JDK's
+    // own pipeline, which then refused the caller's next use of it. Measured as
+    // `RJdkCollections` and `RJdkJmx` failing in the `--jdk-only` arm ONLY,
+    // 117/119, with both other arms green -- the signature of a change that
+    // fires on the strict path and nowhere else.
+    //
+    // On the error path the pin has to be released by hand: `src_pin` is this
+    // frame's base, and `?` here would strand it and everything above it.
+    if stream_is_reference_carrier(&*ctx, src_cur) {
+        if let Err(e) = stream_link_or_consume(ctx, src_cur) {
+            ctx.unpin_native_roots(src_pin);
+            return Err(e);
+        }
+    }
     // FIX (stream-eager-drain-20260715): do NOT eagerly materialize `src`
     // here. A `src` that still holds a live, undrained lazy spliterator
     // (STREAM_FIELD_LAZY_SPLITERATOR, slot 2 -- from
@@ -40039,7 +40165,44 @@ const RND_FIELD_SEED: usize = 0;
 /// slot reads back `Object(None)` by index) means "empty".
 const RND_FIELD_NEXT_GAUSSIAN: usize = 1;
 
+/// `CRATONVM_JDK_RANDOM=1` — retire this synthetic `java.util.Random` on a real
+/// JDK. OFF by default and slower when on; see
+/// `native-builtins/src/securerandom.rs::jdk_random_enabled`, which owns the
+/// flag and carries the measurement. This is the second of the two registration
+/// sites it has to reach.
+fn jdk_random_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JDK_RANDOM").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+
 fn register_random_natives(registry: &mut NativeMethodRegistry) {
+    // THIS SHAPE IS SYNTHETIC-JDK ONLY, and on a real JDK it is actively wrong.
+    //
+    // It keeps the seed in FIELD 0 of the receiver (`RND_FIELD_SEED`), which is
+    // what the synthetic `java/util/Random` layout declares. The REAL
+    // `java.util.Random` has `private final AtomicLong seed` in that slot — an
+    // object reference, not a long — so these bodies read and write the wrong
+    // thing and every draw comes back 0.
+    //
+    // That never showed because `securerandom.rs` registers the same ten
+    // triples afterwards and registration is LAST-WRITE-WINS, so this bridge
+    // was dead in compatible mode. Retiring THAT shadow uncovered this one:
+    // `--dump-native-registry` on the first attempt showed `nextInt()I` served
+    // by `kind: "bridge"`, `registered_by: native-collections/src/lib.rs`,
+    // `invocations: 7` — and `RandomSpec` printing eight rows of zeros while
+    // `AtomicLongSpec` proved the CAS loop underneath was byte-identical to
+    // HotSpot.
+    //
+    // So both sites take the same gate. On a real JDK with the flag on, neither
+    // registers and `java.util.Random`'s own bytecode runs.
+    if registry.real_jdk() && jdk_random_enabled() {
+        return;
+    }
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/Random";
@@ -54159,6 +54322,73 @@ fn tm_refresh_real_mirrors(ctx: &mut dyn NativeContext, args: &[Value]) {
     }
 }
 
+/// The `TreeMap` view cached in `field`, if it is still THIS map's view.
+///
+/// A separate pair from [`cached_live_view`] because the validation differs:
+/// that one reaches the source through `hs_backing_map`, and a `TreeMap` view
+/// keeps its source in a trailing array slot instead — `ts_view_source` for the
+/// TreeSet-shaped keySet, `values_view_source` for the two list-shaped ones.
+/// Both are tried, and a view whose stashed source is not this map is refused
+/// rather than adopted.
+///
+/// MEASURED before enabling, `apps/probes/ViewIdentityProbe`: HotSpot answers
+/// `true` to `tm.keySet() == tm.keySet()` and this VM answered `false`, because
+/// every call rebuilt the whole tree into a fresh view. The consequence is not
+/// only identity — `AbstractCollection` does not override `equals`, so
+/// `tm.values().equals(tm.values())` compared two different objects and
+/// answered FALSE where HotSpot says true.
+///
+/// LIVENESS is the property a cache must not cost, and it is measured in the
+/// same probe rather than argued: a view held across a `put`, a `remove` and an
+/// in-place value replacement answers for the map's CURRENT contents on every
+/// family, because these views resync from the stashed source on each read.
+/// Those rows passed before this change and must keep passing after it.
+///
+/// The carriers are the real JDK classes (`TreeMap$KeySet`, `TreeMap$Values`,
+/// `TreeMap$EntrySet`), so each is assignable to the field it is stored in —
+/// which matters because `try_set_jdk_map_field` resolves a field by NAME and
+/// does not check its descriptor.
+fn cached_tm_view(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    field: &str,
+    carrier: &str,
+) -> Option<ObjectRef> {
+    if !map_view_cache_enabled() {
+        return None;
+    }
+    let class_id = ctx.class_id_of_object(source);
+    let slot = ctx.resolve_field_index_by_class_id(class_id, field)?;
+    if slot >= ctx.object_num_fields(source) {
+        return None;
+    }
+    let Value::Object(Some(view)) = ctx.get_field(source, slot) else {
+        return None;
+    };
+    if ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(view))
+        .as_deref()
+        != Some(carrier)
+    {
+        return None;
+    }
+    let cached_source =
+        ts_view_source(&*ctx, view).or_else(|| values_view_source(&*ctx, view))?;
+    if !std::ptr::eq(cached_source.as_ptr(), source.as_ptr()) {
+        return None;
+    }
+    MAP_VIEW_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(view)
+}
+
+/// Record `view` as this `TreeMap`'s live view for `field`.
+fn store_tm_view(ctx: &mut dyn NativeContext, source: ObjectRef, field: &str, view: ObjectRef) {
+    if !map_view_cache_enabled() {
+        return;
+    }
+    try_set_jdk_map_field(ctx, source, field, Value::Object(Some(view)));
+}
+
 fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     tm_refresh_real_mirrors(ctx, args);
     let this = match args.first() {
@@ -54166,6 +54396,10 @@ fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Object(None))),
     };
     let this = tm_sync_native_state(ctx, this)?;
+    // AFTER the sync, because the sync can hand back a different `this`.
+    if let Some(cached) = cached_tm_view(ctx, this, "keySet", "java/util/TreeMap$KeySet") {
+        return Ok(Some(Value::Object(Some(cached))));
+    }
     let pairs = tm_collect_pairs(ctx, this);
     let size = pairs.len() as i32;
     // Family-1 stale-ObjectRef fix (2026-07-31): the two allocations below can
@@ -54203,6 +54437,9 @@ fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
     ts_set_slot(ctx, ts, TS_FIELD_COMPARATOR, comparator);
     ctx.unpin_native_roots(this_pin);
+    // The store half, on every return path. `this` and `ts` are both
+    // pin-refreshed above.
+    store_tm_view(ctx, this, "keySet", ts);
     Ok(Some(Value::Object(Some(ts))))
 }
 
@@ -54336,12 +54573,21 @@ fn native_tm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(Some(Value::Object(None))),
     };
     let this = tm_sync_native_state(ctx, this)?;
+    if let Some(cached) = cached_tm_view(ctx, this, "values", "java/util/TreeMap$Values") {
+        return Ok(Some(Value::Object(Some(cached))));
+    }
     // Live view: the ArrayList stashes the source TreeMap so
     // `values().iterator().remove()` deletes the matching entry from the tree.
     let pairs = tm_collect_pairs(ctx, this);
     let vals: Vec<Value> = pairs.into_iter().map(|(_, v)| v).collect();
     let carrier = values_carrier_for(&*ctx, this);
     let list = make_view_list_of(ctx, this, &vals, carrier)?;
+    // `this` is a pre-allocation address by now, so the source is re-derived
+    // from the view's own back-reference -- the one pointer to it guaranteed
+    // live and current. Same shape as `native_map_values`.
+    if let Some(src) = values_view_source(&*ctx, list) {
+        store_tm_view(ctx, src, "values", list);
+    }
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -54352,6 +54598,9 @@ fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Object(None))),
     };
     let this = tm_sync_native_state(ctx, this)?;
+    if let Some(cached) = cached_tm_view(ctx, this, "entrySet", TM_ENTRY_SET_CARRIER) {
+        return Ok(Some(Value::Object(Some(cached))));
+    }
     let pairs = tm_collect_pairs(ctx, this);
     // Live view: build Map.Entry objects and stash the source TreeMap so
     // removing an entry through the list (or its iterator) deletes the key.
@@ -54388,6 +54637,9 @@ fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         .collect();
     let this = ctx.read_native_pin(this_pin, this);
     let list = make_view_list_of(ctx, this, &entries, TM_ENTRY_SET_CARRIER)?;
+    if let Some(src) = values_view_source(&*ctx, list) {
+        store_tm_view(ctx, src, "entrySet", list);
+    }
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(list))))
 }
@@ -55267,8 +55519,15 @@ fn native_ts_init_collection(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// state lives in the same side-table -- correct for every method except this
 /// one pair, where the two contracts are opposites.
 fn native_view_add_unsupported(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // EMPTY, which `RuntimeError::to_java` turns into a null `getMessage()` by
+    // calling the no-arg ctor. HotSpot's is message-less -- the throw comes from
+    // `AbstractCollection.add`, which is `throw new
+    // UnsupportedOperationException()` -- and every other map's keySet in this
+    // crate already answers `msg=null`. Only `TreeMap$KeySet` reached this
+    // registration and carried an invented message with it.
+    // MEASURED, `apps/probes/ViewIdentityProbe` rows 149-150.
     Err(RuntimeError::UnsupportedOperationException {
-        message: "add is not supported on a key-set view".to_string(),
+        message: String::new(),
     }
     .into())
 }

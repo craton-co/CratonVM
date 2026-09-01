@@ -58,9 +58,151 @@ independent runs in two modes made a deterministic growth failure look likely.
 Both probes above refute it. The resemblance is a coincidence, and it is
 recorded here so the next reader does not spend the same hour on it.
 
+## ADDENDUM 2026-08-30 (b): THE LEAD THIS PAGE SHIPPED WITH IS REFUTED, and four real defects were fixed on the way to refuting it
+
+Read this section before any other. The page's headline lead --
+`xt_cov=(accepted=0 refused=1730)`, "attack the refusal before attacking the
+allocator" -- is **not what gates this class**, and that is now measured rather
+than argued.
+
+### 1. The refutation, in one table
+
+`CRATONVM_XT_JIT_COVERAGE_ASSUME=1` (added for this, and documented as unsafe)
+makes the peer accounting accept whatever the ledger says. One binary,
+`--Xmx 1g`, 1800 s cap, idle host:
+
+| arm | `xt_cov` | rc | secs | `arena` | OOM | assertion |
+|---|---|---:|---:|---:|---:|---|
+| default | `accepted=0 refused=1731` | 1 | 641 | 11 | 1696 | 100000 vs **98304** |
+| assume | `accepted=1731 refused=0` | 1 | 636 | 11 | 1696 | 100000 vs **98304** |
+
+Byte for byte the same failure. Taking the handshake from "refuses every cycle"
+to "accepts every cycle" changed nothing at all.
+
+**And the reason it changed nothing is itself the lesson, so read this counter
+before believing either row**: `relocation_on_proven_jit=0` and
+`relocation_skipped_jit=1731` in BOTH arms. Accepting the handshake removes ONE
+contribution to `moving_young_coverage_incomplete()`; the cycle had others, so
+relocation never ran in either arm. A run whose `relocation_on_proven_jit` is
+zero cannot say anything about compaction.
+
+### 2. What actually refuses, counted
+
+Same binary, 300 s, `CRATONVM_DBG_JIT_ROOTSCAN=1`, by `incomplete_reason` label:
+
+| reason | count |
+|---|---:|
+| `xt-helper-window-conservative-scan` | **219** |
+| `compiled-frame-oop-not-published` | 5 |
+| `unregistered-jit-frame-on-stack` | 3 |
+
+`helper_windows=15446` on the run's `[GC] xt_peer_scan` line. **A peer caught
+inside a JIT helper is the dominant refusal by two orders of magnitude.** That
+is a different obligation from the one this page chased: the peer's COMPILED
+frames are registered and provable, but the helper's own Rust frame holds
+`ObjectRef`s in Rust locals, which the conservative scan can mark and cannot
+rewrite. Discharging it is a PINNING question, not a proof repair.
+
+`unregistered-jit-frame-on-stack` is third and should NOT be attacked as stack
+residue: `CRATONVM_DBG_A5_CENSUS=1` reports `hits=2 shaped=2`, so the hits carry
+real frame shape and the existing shape filter would not convert them.
+
+### 3. What the failing allocation is -- and the retraction is itself retracted
+
+The page never said WHICH request fails. It is one shape, 1696 times:
+
+```text
+OutOfMemoryError { message: "Java heap space (native reference array of length 65536)" }
+    at org/h2/test/jdbc/TestCachedQueryResults.lambda$test$0
+```
+
+A reference array of length 65536 -- 524 304 bytes. The collector's own
+`zgc frag:` diagnostic, which was in the log all along, gives the arena state:
+
+```text
+request=524304 spans=219425 largest_span=246704 free_bytes=864745648 walls=219424
+zgc frag: the CHEAPEST window that could serve this request - 34288 live bytes
+    in 13 run(s) are all that stand between 490112 free bytes spread over
+    524400 bytes of contiguous arena
+    window_bytes=524400 window_free=490112 wall_bytes=34288 walls=13
+```
+
+**865 MB free in 219 425 spans, largest 241 KiB, against a 512 KiB request**,
+and the cheapest window that would serve it is walled by **13 runs totalling
+34 KB** on a heap that is 96 % free (`free_permille_at_worst=962`).
+
+**This un-retracts the retraction.** The page retracted
+`98304 == 131072 - (131072 >>> 2)` as "a coincidence". It is not: 98304 is where
+`ConcurrentHashMap` needs its next table, that table IS a 65536-slot reference
+array, and that array is the allocation that fails. `ChmKeySetGrowth` passes
+because it never builds this arena state -- the probe was right about
+`ConcurrentHashMap` and wrong about what the number meant.
+
+### 4. Four defects fixed on the way, all measured, none of them the cause
+
+All four are real, all four are one-binary A/Bs, and together they take the
+per-frame side of the coverage proof to **perfect**.
+
+**(a) The IR backend's safepoint POLL recorded no id and no map.**
+`emit_safepoint_poll` emitted a bare `TEST`/`JZ`/`CALL`. A thread parked in the
+slow path left its sp-id slot holding the prologue sentinel or the id of an
+EARLIER safepoint. The single-pass backend has always bracketed its poll
+(spill, sp-id, call, map); this is that bracketing, emitted inside the taken
+branch so the fast path is byte-identical.
+
+**(b) `Op::New` recorded no safepoint map.** Excluded on the reasoning above
+the `Op::NewArray` arm -- "unlike `Op::New`'s arm, which has no operand of its
+own to protect" -- which reads the map as protection for the NODE. It is not:
+it describes every live reference in the FRAME. The last surviving
+`no-map-for-id` frame after (a) was `java/util/ArrayList.iterator()`, a method
+whose whole body is `new Itr(this)`, reading `sp_id=0` against
+`maps=2 ids=[1, 2]`. It was parked in the allocation stub.
+
+| `CRATONVM_JIT_IR_GC_POINT_MAPS` | `no_map` | `no-map-for-id` lines |
+|---|---:|---:|
+| off | 11 | 18 |
+| poll only | 2 | 2 |
+| poll + `Op::New` | **0** | **0** |
+
+**(c) The single-pass prologue established no sp-id sentinel** -- the caveat
+section 4a explicitly deferred. Its ids are bytecode pcs and bci 0 is legal, so
+`0` cannot serve there; `SP_ID_UNSET_BC_PC` (`u32::MAX - 1`) can. This closes
+the half that is not loud: a dense id space means an uninitialised slot can read
+as a VALID id and be relocated against the wrong program point's map.
+
+**(d) A direct call's staged argument oops were declared unmappable.**
+`reserve_direct_call_service_slots` already copies every argument into a
+contiguous frame range; the sibling dispatch-helper site NAMES its equivalent
+buffer, the two direct sites set `pending_staged_args_unmapped` instead. This
+was the whole remaining `map_incomplete` population -- 121x the next cause:
+
+| `CRATONVM_JIT_DIRECT_CALL_ARG_MAPS` | `no_map` | `incomplete` | `ok` | `staged_unmappable` |
+|---|---:|---:|---:|---:|
+| 0 | 0 | 93 | 408 | 8989 |
+| 1 | 0 | **0** | 601 | **74** |
+
+After all four, a 1800 s run reports
+`frame_cov=(no_slot=0 misaligned=0 no_map=0 incomplete=0 ok=994)` and **zero**
+band words. Every per-frame coverage proof in the run succeeds. The class still
+fails, in 641 s instead of 1078 s.
+
+### 5. What to do next, in order (replaces the older list)
+
+1. **Price the window, not the proof.** 13 runs / 34 KB wall a 524 KB window on
+   a 96 %-free heap, and `zgc-high-compaction: cycles=0 declined=0
+   objects_relocated=0` says the targeted compactor engaged **zero** times. Ask
+   what those 13 runs are and why nothing is asked to move them.
+2. **Then the helper window**, 219 of 227 refusals. A peer inside a JIT helper
+   has provable compiled frames and an unrewritable Rust frame above them.
+3. `compiled-frame-oop-not-published` (5) and `unregistered-jit-frame-on-stack`
+   (3) are not worth attacking until 1 and 2 are answered.
+4. `CRATONVM_XT_JIT_COVERAGE_ASSUME=1` settles "is the handshake the gate?" in
+   one run. It is unsafe; read `relocation_on_proven_jit` before believing
+   anything it produces.
+
 ## Status
 
-**OPEN, and the chain is now traced to one frame — see §"2026-08-29 (second)".**
+**OPEN. The chain this Status line describes is REFUTED -- see the 2026-08-30 (b) addendum above, which measures the handshake at accepted=1731 refused=0 and gets the identical failure. Kept verbatim below because the four repairs it led to are real. Original text: the chain is traced to one frame — see §"2026-08-29 (second)".**
 The `xt_cov=(accepted=0 refused=1730)` lead this page shipped with turned out to
 be four measurements deep: the peers DO park, some of their own proofs return
 false, the obligation is `UNPUBLISHED_FRAME_OOP` in 3 of 4, and six of the seven
@@ -270,15 +412,75 @@ So the one lead has become two, with very different sizes and repairs:
   discharged is a real question: its java locals hold incoming arguments, so a
   relocation still has to rewrite them, and with no map the shadow stack is the
   only channel that could. **Start here — it is 77 % of the refusals.**
-* **3 of 13 — an oop AT `sp_id_off`.** A store whose offset lands in the
-  reserved-locals tail. Small, and a genuine codegen defect: nothing may write a
-  Java reference into a slot the frame layout reserved for the safepoint id.
-  Print the storing method (`cm.method_label` is already on the line) and look
-  at what it compiles at that offset.
+* ~~**3 of 13 — an oop AT `sp_id_off`.** A store whose offset lands in the
+  reserved-locals tail … a genuine codegen defect~~ — **WRONG, see §4a.** There
+  is no store. The slot was never initialised, so it read whatever the previous
+  frame at that stack depth left; zeroing it in the prologue takes this
+  population to 0 in both measured rounds.
+
+### 4a. 2026-08-27 — it is ONE defect, not two: the sp-id slot is never initialised
+
+The split above is wrong, and the correction is a one-line fix.
+
+**Nothing writes an oop into the reserved slot. Nothing writes the slot at
+all** until the first safepoint. `emit_prologue` zeroes
+`shadow_thread_slot_off` and `shadow_savetop_slot_off` — with a comment giving
+exactly the reason, *"it must read 0, not uninitialised stack. The single-pass
+backend zero-initialises for exactly this reason"* — and does **not** zero
+`sp_id_slot_off` beside them. Ids start at 1 precisely so `0` can mean "no
+safepoint reached" (the slot's own allocation comment says so), but the
+prologue never established the sentinel.
+
+So both populations are the same thing, read at two different pieces of stack:
+`0` where the region happened to be clean, a stale oop where a previous frame
+at that depth had left one. Not "a store whose offset lands in the
+reserved-locals tail".
+
+**MEASURED**, same class, one binary, `CRATONVM_JIT_ZERO_SPID` as the A/B, two
+rounds — the census split by what sits in the slot:
+
+| arm | `no-map-for-id` | `sp_id == 0` | sp-id out of range (a stale word) |
+|---|---:|---:|---:|
+| OFF (today) | 22 | 1 | **9** |
+| ON | 20 | 10 | **0** |
+| OFF (today) | 16 | 1 | **7** |
+| ON | 6 | 3 | **0** |
+
+The out-of-range population goes to **zero and stays there**, and the frames
+reappear in the `sp_id == 0` bucket. That is the predicted signature of
+uninitialised stack and not of a stray store.
+
+**The hazard this closes is worse than the refusal it was found through.**
+Safepoint ids are small consecutive integers, so a stale word can equal a
+*valid* id for that method — and then `find_oop_map_for_safepoint_id` matches
+the map for a DIFFERENT program point and relocation rewrites against it. A
+silent wrong answer, not a refused cycle. The 13-frame census only ever showed
+the loud half.
+
+**It does NOT fix this class.** `xt_cov` still reads `accepted=0` on both arms
+(refused 22/35 and 30/28 over 300 s), because a zeroed slot fails closed
+exactly as a garbage one did. What it does is remove the corruption hazard and
+collapse the two populations into one, so the remaining question is single and
+clean: **can a frame that has taken no safepoint be discharged?** That is now
+100 % of `no-map-for-id`, not 77 %.
+
+**Caveat on the single-pass backend, not fixed here.** `x64/safepoint.rs` stores
+`cur_bc_pc` as the id, and **bytecode pc 0 is legal** — so for those frames `0`
+is ambiguous between "at bci 0" and "never stored", and zeroing the prologue
+slot there could make an unsafepointed frame match the bci-0 map. The IR
+backend has no such ambiguity (ids start at 1), which is why the fix is scoped
+to it. Giving the single-pass backend a +1-encoded id would remove the
+ambiguity and let it take the same repair.
+
+**And this class's own symptom did not reproduce here**: `oom=0` on both arms
+at a 300 s cap on an idle host, against the page's `oom=2990` at 900 s. Either
+the cap or the load matters; the band census above is what the A/B rests on,
+not an OOM rate.
 
 ### 5. What to do next, in order
 
-1. **Take the `sp_id == 0` population first** — 10 of 13, and the question is
+1. **Take the `sp_id == 0` population first** — now 100 % of `no-map-for-id`
+   after §4a removed the stale-word half, and the question is
    whether a frame that has taken no safepoint can be discharged at all rather
    than refusing every cycle it is live for.
 2. Only then look at the `operand-spill` words. Four of the seven are on the

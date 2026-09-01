@@ -2118,7 +2118,8 @@ pub(crate) fn build_lambda_impl_cached(
     // PROBE THE RECEIVER'S CLASS, NOT ONLY THE DECLARING ONE. This is the
     // difference between the two doors a bound method reference and a lambda
     // body take, and it is the whole of the defect that
-    // `known-issues/jdk-only/a-bound-method-reference-is-a-different-dispatch-door`
+    // `jdk-only/a-bound-method-reference-is-a-different-dispatch-door-20260828.md`
+    // (retired to docs internal on 2026-08-30, so the prefix is dropped)
     // records:
     //
     //   * an ordinary `it.remove()` is an `invokeinterface`, and

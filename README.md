@@ -27,7 +27,7 @@ install, no `rt.jar`, one self-contained binary.
   relocating (see [ARCHITECTURE.md](ARCHITECTURE.md#memory-gc-crate)). Opt-in
   region-based G1 (`-XX:+UseG1GC`).
 - **Real frameworks run** — Spring, Spring Boot, Tomcat, Netty, Hibernate,
-  Hibernate Reactive, Quarkus, H2 Database boot and pass large test suites.
+  Hibernate Reactive, H2 Database, Postgres driver boot and pass large test suites.
 - **Rust implementation** — Rust removes many ambient memory hazards, but the
   VM, JIT, GC, FFI, I/O, AWT, CUDA, and JFR contain reviewed and still-being-
   audited `unsafe` regions. See [SECURITY.md](SECURITY.md).
@@ -47,19 +47,28 @@ install, no `rt.jar`, one self-contained binary.
 CPU, vs HotSpot JDK 25 C2 — same flags both sides, checksum-verified against
 HotSpot on every run (zero mismatches):
 
-| Benchmark               | JDK 25 C2 | CratonVM  | Ratio     | CV (CratonVM) |
-|--------------------------|-----------|-----------|-----------|---------------|
-| Arithmetic (2B ops)     | 1,852 ms  | 3,601 ms  | 1.94x     | 0.6% |
-| Fibonacci(44)           | 1,449 ms  | 5,059 ms  | 3.49x     | 0.6% |
-| Sieve (100K × 20K)      | 2,333 ms  | 2,360 ms  | **1.01x** | 2.0% |
-| Matrix 1280×1280        | 2,106 ms  | 2,094 ms  | **0.99x** | 0.2% |
-| HashMap (10M put/get)   | 983 ms    | 2,049 ms  | 2.08x     | 0.6% |
-| String/Regex (100K)     | 50 ms     | 200 ms    | 4.00x     | 0.9% |
-| Binary Trees (depth 18) | 176 ms    | 1,700 ms  | 9.66x     | 1.1% |
+| Benchmark               | JDK 25 C2 | CratonVM  | Ratio     | Growth       |
+|--------------------------|-----------|-----------|-----------|--------------|
+| Arithmetic (2B ops)     | 1,852 ms  | 3,601 ms  | 1.94x     | linear       |
+| Fibonacci(44)           | 1,449 ms  | 5,059 ms  | 3.49x     | linear       |
+| Sieve (100K × 20K)      | 2,333 ms  | 2,360 ms  | **1.01x** | parity       |
+| Matrix 1280×1280        | 2,106 ms  | 2,094 ms  | **0.99x** | parity       |
+| HashMap (10M put/get)   | 983 ms    | 2,049 ms  | 2.08x     | super-linear |
+| String/Regex (100K)     | 50 ms     | 200 ms    | 4.00x     | super-linear |
+| Binary Trees (depth 18) | 176 ms    | 1,700 ms  | 9.66x     | super-linear |
 
-Two rows (Matrix, Sieve) are at parity with HotSpot C2. Full methodology,
-per-row footnotes (HotSpot's Sieve bimodality, the Fibonacci gap), and
-historical context: [BENCHMARK.md](BENCHMARK.md).
+Two rows (Matrix, Sieve) are at parity with HotSpot C2. **Growth** is how the
+ratio moves when N grows several-fold at each row's own kernel (e.g.
+Arithmetic 2B→8B ops, Fibonacci 44→48, HashMap 10M→50M put/get, String/Regex
+100K→1M→10M, Binary Trees depth 18→20) — `linear` means the ratio stays
+roughly flat, `super-linear` means CratonVM's disadvantage compounds with N
+rather than staying proportional. The three `super-linear` rows are exactly
+the three allocation/GC-heavy kernels; the two `linear` rows are
+compute-bound with minimal allocation — pointing at GC/allocation machinery,
+not the interpreter or JIT compute path, as the shared mechanism. Full
+methodology, per-row footnotes (HotSpot's Sieve bimodality, the Fibonacci
+gap), the growth measurements, and historical context:
+[BENCHMARK.md](BENCHMARK.md).
 
 GPU offload, vs HotSpot C2 and [TornadoVM](https://github.com/beehive-lab/TornadoVM)
 4.0.1 (RTX 2060, N = 2²⁴, warm, full H2D+kernel+D2H round-trip, checksums

@@ -15521,29 +15521,6 @@ pub(crate) fn native_mhn_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     Ok(None)
 }
 
-/// `MethodHandleNatives.getConstant(int which)`
-///
-/// Returns VM-specific constants used by the MethodHandle implementation.
-/// Constants:
-///   0 = GC_COUNT_GWT (guard with test count) → 4
-///   1 = USE_SOFT_CACHE → 1
-///   4 = HAVE_PENDING_EXCEPTION → 0
-pub(crate) fn native_mhn_get_constant(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let which = match args.get(0) {
-        Some(Value::Int(w)) => *w,
-        _ => 0,
-    };
-    let result = match which {
-        0 => 4, // GC_COUNT_GWT — suggested MethodHandle.guardWithTest specialization threshold
-        1 => 1, // USE_SOFT_CACHE — use SoftReferences in method handle caching
-        _ => 0, // unknown constant → 0
-    };
-    Ok(Some(Value::Int(result)))
-}
-
 /// `MethodHandleNatives.linkMethod(Class<?> callerClass, int refKind, Class<?> defc, String name, Object type, Object[] appendixResult)`
 ///
 /// Links a method call site. Returns a MemberName that the VM can use for dispatch.
@@ -15589,43 +15566,6 @@ pub(crate) fn native_mhn_link_method(
     };
 
     let mh = alloc_method_handle(ctx, &class_name, &name, &desc, mh_kind)?;
-    Ok(Some(Value::Object(Some(mh))))
-}
-
-/// `MethodHandleNatives.linkCallSite(Object callerObj, int bsmIndex, Object name, Object type, Object staticArgs, Object[] appendixResult)`
-///
-/// Links an invokedynamic call site by resolving the bootstrap method and
-/// calling it to produce a CallSite. Returns a MemberName for the target.
-pub(crate) fn native_mhn_link_call_site(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    // In our VM, invokedynamic is already handled by the interpreter's
-    // specialized bootstrap dispatch (runtime/invokedynamic.rs). This native
-    // is called when the JDK's MethodHandleNatives.linkCallSite is invoked
-    // from Java code. We return a minimal MemberName that allows the call to
-    // proceed.
-
-    // Extract name from args[2]
-    let name = match args.get(2) {
-        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => NAME_INVOKE.to_string(),
-    };
-
-    // Extract MethodType from args[3]
-    let desc = match args.get(3) {
-        Some(Value::Object(Some(mt))) => descriptor_from_method_type(ctx, *mt),
-        _ => DESC_DEFAULT_OBJECT_RETURN.to_string(),
-    };
-
-    // Allocate a virtual MH as the linked target
-    let mh = alloc_method_handle(ctx, "", &name, &desc, MH_KIND_VIRTUAL)?;
-
-    // If appendixResult array is provided, store the MH as appendix
-    if let Some(Value::Object(Some(appendix_arr))) = args.get(5) {
-        ctx.set_array_element(*appendix_arr, 0, Value::Object(Some(mh)));
-    }
-
     Ok(Some(Value::Object(Some(mh))))
 }
 

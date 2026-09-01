@@ -1978,6 +1978,35 @@ impl<'a> Lowerer<'a> {
             self.emit_zero_frame_slot(self.shadow_thread_slot_off);
             self.emit_zero_frame_slot(self.shadow_savetop_slot_off);
         }
+        // And the safepoint-id slot, for the SAME reason and on its own gate:
+        // `active_safepoint_id` reads `[rbp - sp_id_slot_off]` on any live
+        // frame, including one stopped BEFORE its first safepoint, and until
+        // that first `emit_safepoint_map` store the word is whatever the
+        // previous frame at this stack depth left behind.
+        //
+        // Ids start at 1 precisely so 0 can mean "no safepoint reached" (see
+        // the slot's allocation above), but nothing was writing the 0. The
+        // sentinel was a convention the prologue never established.
+        //
+        // MEASURED, `TestCachedQueryResults` (H2), 13 frames the band verifier
+        // reported as `no-map-for-id`: 10 read `0` and 3 read a HEAP POINTER at
+        // `sp_id_off`. That was diagnosed as two defects -- "has not reached a
+        // safepoint" and "something stored an oop into the reserved slot". It
+        // is one: uninitialised stack, reading as zero where the region happened
+        // to be clean and as a stale oop where it did not.
+        //
+        // Refusing the cycle is the benign outcome. The hazard this closes is
+        // that safepoint ids are small consecutive integers, so a stale word
+        // can equal a VALID id for this method -- and then
+        // `find_oop_map_for_safepoint_id` matches the map for a DIFFERENT
+        // program point and relocation rewrites against it. That is a silent
+        // wrong answer, not a refusal.
+        //
+        // `CRATONVM_JIT_ZERO_SPID=0` restores the uninitialised read: the
+        // one-binary A/B, and the kill switch.
+        if self.sp_id_slot_off > 0 && Self::zero_sp_id_slot_enabled() {
+            self.emit_zero_frame_slot(self.sp_id_slot_off);
+        }
         self.emit_frame_record();
         self.fetch_current_thread();
         self.zero_ref_phi_slots();
@@ -2869,12 +2898,90 @@ impl<'a> Lowerer<'a> {
         self.buf.emit(&[0x0F, 0x84]); // JZ .clear
         let clear_patch = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+        // THE POLL IS A SAFEPOINT, so it owes the relocation contract exactly
+        // what a call owes it. It did not pay: no id was stored and no oop map
+        // was recorded, so a thread parked in the slow path left its frame's
+        // sp-id slot holding either the prologue's zero (no earlier GC point in
+        // this frame -- the method-entry poll is ALWAYS this) or the id of some
+        // EARLIER call, whose map describes a different program point.
+        //
+        // Both are refusals. `moving_young_frame_coverage_complete` finds no
+        // `OopMapEntry` for the stored id, counts `NO_MAP_FOR_STORED_ID`, and
+        // `frame_active_map_slots` / `moving_young_frame_live_hi` both return
+        // `None` -- which is fail-closed by design, so every movable word in
+        // the frame's band is reported unpublished and the whole cycle refuses
+        // with `UNPUBLISHED_FRAME_OOP`. Measured on
+        // `org.h2.test.jdbc.TestCachedQueryResults`, that is 100 % of the
+        // `no-map-for-id` population and the reason its cross-thread handshake
+        // reads `accepted=0 refused=1730`: one parked peer whose innermost
+        // frame is at a poll refuses the collection for every thread.
+        //
+        // The single-pass backend has always bracketed its poll this way
+        // (`x64/safepoint.rs::emit_safepoint_poll`: spill, sp-id store, call,
+        // oop map). This is that same bracketing, in the IR backend's own
+        // idiom -- it keeps every live value in a frame slot, so the map is a
+        // set of frame offsets and there is no register file to spill.
+        //
+        // Emitted INSIDE the taken branch: the fast path (flag clear, which is
+        // every execution but the ones that actually stop) is byte-for-byte
+        // unchanged, so a back edge in a hot loop pays nothing.
+        let mapped = Self::ir_gc_point_maps_enabled() && self.emit_safepoint_map_if_enabled();
         self.emit_mov_reg_imm64(RAX, self.safepoint_slow_path as u64);
         self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        if mapped {
+            // Pairs with the push `emit_safepoint_map` emitted: copies the
+            // (possibly rewritten) published values back into their frame slots
+            // and retracts `top`. Without it a poll that fires inside a loop
+            // leaks its published oops and walks the 2 MiB shadow stack off its
+            // end -- the failure mode the self-recursive direct-call arm
+            // documents.
+            self.emit_shadow_reload();
+        }
         let rel = self.buf.pos() as i32 - (clear_patch as i32 + 4);
         // IR safepoint poll -- tolerated on an overflowed buffer; see
         // `Self::patch_or_bail` / `patch_rel32_to_here`.
         Self::patch_or_bail(&mut self.buf, clear_patch, rel);
+    }
+
+    /// `emit_safepoint_map` at the current spill watermark, reporting whether
+    /// it emitted anything.
+    ///
+    /// `emit_safepoint_map` returns early -- silently -- when the compilation
+    /// reserved no sp-id slot or `CRATONVM_JIT_IR_RELOC_EMIT=0` withdrew the
+    /// contract. A caller that must pair a shadow RELOAD with the push needs to
+    /// know which happened; the eight call sites that sit in front of a real
+    /// call do not, because they reach the reload through
+    /// `emit_call_return_check`, whose `pending_shadow` is empty in that case.
+    fn emit_safepoint_map_if_enabled(&mut self) -> bool {
+        if self.sp_id_slot_off <= 0 || !Self::reloc_emit_enabled() {
+            return false;
+        }
+        self.emit_safepoint_map(self.spill_high_water);
+        true
+    }
+
+    /// `CRATONVM_JIT_IR_GC_POINT_MAPS=0` -- restore the two IR-backend
+    /// GC-capable sites that recorded no safepoint at all: the cooperative
+    /// safepoint POLL and `Op::New`.
+    ///
+    /// Default ON, and one switch rather than two because it is one statement:
+    /// every point in an IR body that can reach a collection has to record an
+    /// id and a map, or the collector reads the sp-id slot and finds either the
+    /// prologue sentinel (no map -> the cycle refuses) or the id of an EARLIER
+    /// safepoint (a map for a different program point -> a silent wrong
+    /// answer). The other six GC-capable ops have always paid it.
+    ///
+    /// With it off, `frame_coverage_reason::NO_MAP_FOR_STORED_ID` climbs again
+    /// and `xt_cov` refusals rise -- the census the fix is measured on.
+    fn ir_gc_point_maps_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            !matches!(
+                cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_GC_POINT_MAPS").as_deref(),
+                Ok("0") | Ok("false") | Ok("FALSE")
+            )
+        })
     }
 
     /// MOV [RBP - offset], reg  (REX.W [+ REX.R for an extended reg]).
@@ -2925,6 +3032,15 @@ impl<'a> Lowerer<'a> {
     }
 
     /// `MOV qword [rbp - off], 0` (mod=10 disp32, /0).
+    /// `CRATONVM_JIT_ZERO_SPID` — default ON. Off restores the pre-fix
+    /// behaviour (the safepoint-id slot reads uninitialised stack until the
+    /// first safepoint stores an id), so the repair can be A/B'd on one binary.
+    fn zero_sp_id_slot_enabled() -> bool {
+        // Shared with the single-pass backend, which establishes its own
+        // sentinel in `x64::frames::emit_prologue` under the same key.
+        crate::sp_id_slot_init_enabled()
+    }
+
     fn emit_zero_frame_slot(&mut self, off: i32) {
         self.buf.emit(&[0x48, 0xC7, 0x85]);
         self.buf.emit(&(-off).to_le_bytes());
@@ -4566,6 +4682,35 @@ impl<'a> Lowerer<'a> {
                 class_id,
                 num_fields,
             } => {
+                // `jit_new_object` can trigger a real collection (TLAB
+                // exhaustion), so this is a GC-capable point and owes the same
+                // map `Op::NewArray` / `Op::Call` / `Op::MonitorEnter` pay.
+                //
+                // It did not pay it, on the reasoning recorded above the
+                // `Op::NewArray` arm -- "unlike `Op::New`'s arm, which has no
+                // operand of its own to protect". That reads the map as
+                // protection for the NODE, and it is not: it describes every
+                // live reference IN THE FRAME at this program point. A frame
+                // parked inside the allocation therefore had its sp-id slot
+                // still naming whichever earlier safepoint last wrote it, or
+                // the prologue sentinel when none had.
+                //
+                // MEASURED on `org.h2.test.jdbc.TestCachedQueryResults`: with
+                // the poll repair in place the last surviving `no-map-for-id`
+                // frame was `java/util/ArrayList.iterator()` -- a method whose
+                // whole body is `new Itr(this)` -- reading `sp_id=0` against
+                // `maps=2 ids=[1, 2]`. It was parked in this stub.
+                //
+                // Ordered exactly as `Op::NewArray` orders it: the map is taken
+                // BEFORE `alloc_slot`, which marks this node's own result slot
+                // defined immediately, because the result is not written until
+                // the stub returns and publishing it early hands the collector
+                // an uninitialised word to treat as a live reference.
+                let mapped = Self::ir_gc_point_maps_enabled();
+                if mapped {
+                    let sp_live_hi = self.spill_high_water;
+                    self.emit_safepoint_map(sp_live_hi);
+                }
                 let slot = self.alloc_slot(id);
                 crate::runtime_lowering::emit_new_object_stub(
                     &mut self.buf,
@@ -4575,6 +4720,14 @@ impl<'a> Lowerer<'a> {
                     *num_fields,
                     self.frame_record,
                 );
+                // Retract the push the map above emitted. Unbalanced pushes are
+                // not a leak this backend tolerates: `lower_inner` compares
+                // `shadow_pushes` against `shadow_reloads` and refuses the whole
+                // method. RCX, never RAX -- the returned (possibly relocated)
+                // pointer is untouched.
+                if mapped {
+                    self.emit_shadow_reload();
+                }
 
                 // `jit_new_object` returns null after publishing a pending
                 // initialization/OOM exception. Convert that private sentinel
@@ -4612,8 +4765,7 @@ impl<'a> Lowerer<'a> {
             // exactly like `Op::New`'s failure path.
             //
             // `jit_newarray`/`jit_anewarray_object` can trigger a real
-            // collection (TLAB exhaustion), so — unlike `Op::New`'s arm,
-            // which has no operand of its own to protect — this allocation
+            // collection (TLAB exhaustion), so this allocation
             // needs a fresh safepoint map published BEFORE it, exactly as
             // `Op::MonitorEnter`/`Op::Call` do: without one, `sp_id_slot_off`
             // keeps naming whichever EARLIER safepoint last wrote it (or none
@@ -4664,9 +4816,9 @@ impl<'a> Lowerer<'a> {
                 // live oop silently lost its optimized body, `Short2.<init>()V`
                 // (`2 shadow pushes vs 1 reloads`) included.
                 //
-                // `Op::New` needs no counterpart: it emits no map, so it takes
-                // no push. Placed exactly where `Op::ConstString` /
-                // `Op::ConstClass` put theirs — after the stub, before the
+                // `Op::New` now emits the same pair for the same reason (see
+                // its arm above); it used to emit neither. Placed exactly where
+                // `Op::ConstString` / `Op::ConstClass` put theirs — after the stub, before the
                 // zero test — because the reload uses RCX and never RAX, so the
                 // returned (possibly relocated) pointer is untouched.
                 self.emit_shadow_reload();

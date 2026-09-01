@@ -659,6 +659,7 @@ pub(crate) fn remap_thread_object_slots(
         &mut thread.java_thread_obj,
         &mut thread.pending_async_exception,
         &mut thread.jit_pending_exception,
+        &mut thread.uncaught_exception_pending,
     ] {
         let Some(obj_ref) = slot.as_mut() else {
             continue;
@@ -2092,11 +2093,22 @@ mod tests {
         );
     }
 
-    /// §10 post-move fixup covers ALL three per-thread single-slot references,
-    /// `jit_pending_exception` included. Before it moved onto `JvmThread` the
-    /// JIT's pending throwable lived in a `thread_local!` that this function
-    /// could not name, so a moving collection left the interpreter's drain
-    /// reading a from-space address.
+    /// §10 post-move fixup covers ALL FOUR per-thread single-slot references.
+    ///
+    /// `jit_pending_exception` is here because it once lived in a
+    /// `thread_local!` this function could not name, so a moving collection
+    /// left the interpreter's drain reading a from-space address.
+    /// `uncaught_exception_pending` is here for the same shape one level up:
+    /// the launcher held the fatal throwable in a Rust LOCAL across
+    /// shutdown-hook execution, where neither half could reach it, and a
+    /// collection inside a hook reclaimed it — the render then read a zeroed
+    /// header as `ClassId(0)` and printed `Exception in thread "main"
+    /// java/lang/Object`. See
+    /// `fixed-suite-bugs/h2-suite-bugs/bug-h2-testopenclose-throwable-is-java-lang-object-FIXED-20260830.md`.
+    ///
+    /// The count below is the point of the test: a new slot added to
+    /// `remap_thread_object_slots` without being added here leaves the guard
+    /// asserting a stale total, which is how a half-wired slot gets in.
     #[test]
     fn moving_gc_rewrites_every_per_thread_object_slot() {
         use crate::threading::jvm_thread::{JvmThread, ThreadId};
@@ -2106,19 +2118,27 @@ mod tests {
         let mirror = unsafe { ObjectRef::from_raw(0x1000usize as *mut u8) };
         let async_exc = unsafe { ObjectRef::from_raw(0x2000usize as *mut u8) };
         let jit_exc = unsafe { ObjectRef::from_raw(0x3000usize as *mut u8) };
+        let uncaught = unsafe { ObjectRef::from_raw(0x4000usize as *mut u8) };
 
         let mut thread = JvmThread::new(ThreadId(0), "test");
         thread.java_thread_obj = Some(mirror);
         thread.pending_async_exception = Some(async_exc);
         thread.jit_pending_exception = Some(jit_exc);
+        thread.uncaught_exception_pending = Some(uncaught);
 
         let pointer_map = cratonvm_types::PointerMap::from_iter([
             (0x1000usize, 0x8000usize),
             (0x2000usize, 0x9000usize),
             (0x3000usize, 0xA000usize),
+            (0x4000usize, 0xB000usize),
         ]);
 
-        assert_eq!(remap_thread_object_slots(&mut thread, &pointer_map), 3);
+        assert_eq!(remap_thread_object_slots(&mut thread, &pointer_map), 4);
+        assert_eq!(
+            thread.uncaught_exception_pending.unwrap().as_ptr() as usize,
+            0xB000,
+            "the launcher's parked throwable must come back at its post-move address"
+        );
         assert_eq!(
             thread.java_thread_obj.unwrap().as_ptr() as usize,
             0x8000,

@@ -73,7 +73,7 @@ Continued on the Azure host (`dev` tip, fresh release build,
 | class | result | verdict |
 |---|---|---|
 | `org.h2.test.store.TestRandomMapOps` | FAIL, 108s, `ClassCastException` | **new correctness finding — see above, not yet root-caused** |
-| `org.h2.test.db.TestOpenClose` | FAIL, 2:04, `OutOfMemoryError` | **superseded 2026-08-29** — the OOM is gone with the ZGC fragmentation repairs; what remains is `Exception in thread "main" java/lang/Object` with no captured frames, split out to `bug-h2-testopenclose-throwable-is-java-lang-object-20260829.md` |
+| `org.h2.test.db.TestOpenClose` | FAIL, 2:04, `OutOfMemoryError` | **superseded 2026-08-29** — the OOM is gone with the ZGC fragmentation repairs; what remains is `Exception in thread "main" java/lang/Object` with no captured frames, split out to `fixed-suite-bugs/h2-suite-bugs/bug-h2-testopenclose-throwable-is-java-lang-object-FIXED-20260830.md` |
 | `org.h2.test.store.TestMVStoreCachePerformance` | FAIL, 5:55, `OutOfMemoryError` | **superseded 2026-08-29** — no OOM and no arena failure at all now; what remains is a WRONG RECEIVER (`NoSuchMethodError` for `Page.isPersistent()` against a `Page$PageReference`), split out to `bug-h2-testmvstorecacheperformance-pagereference-receiver-20260829.md` |
 | `org.h2.test.store.TestMVStoreTool` | FAIL, 1:33, `OutOfMemoryError` | the ZGC fragmentation defect, four repairs on 2026-08-29 — see `fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md` |
 

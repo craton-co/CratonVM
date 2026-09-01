@@ -1,6 +1,19 @@
 # `System.getProperties().clone()` enumerates in a different order than the receiver it was cloned from
 
-**Status: MEASURED, OPEN, NOT MINE TO FIX 2026-08-29.** Found while fixing the
+**Status: FIXED 2026-08-30 by lane L3.** `apps/probes/PropsOrderSweep` is
+0-diff in both modes, 23 of 23. The fix is the FIRST exit below, taken at the
+level its own objection lives at: `native_properties_clone` gates its backing
+rebuild on the RECEIVER having a CHM, so a clone is as CHM-less as the thing it
+was cloned from. The objection -- that the null `map` is deliberate so
+un-overridden JDK bodies fail loudly -- argues for the SOURCE keeping a null
+map, and the source keeps it; it cannot argue that a clone should differ from
+its source on the very property the loudness depends on. The probe also gained
+the terminal `DONE` marker it lacked, without which a truncated run read as a
+clean diff.
+
+Everything below is the record as written.
+
+**Status when written: MEASURED, OPEN, NOT MINE TO FIX 2026-08-29.** Found while fixing the
 `only_order_insensitive_functions_read_the_unordered_snapshot` red on `dev`;
 reported here rather than fixed, because the fix is a change to how a CHM-less
 `Properties` is cloned and that belongs to whoever owns

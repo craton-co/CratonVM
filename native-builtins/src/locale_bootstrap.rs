@@ -426,6 +426,81 @@ fn locale_country(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     Ok(Some(Value::Object(Some(ctx.create_string("")))))
 }
 
+/// Append a Java variant to a BCP-47 tag under construction, and return the
+/// private-use suffix the ill-formed part of it needs.
+///
+/// BCP-47 CANNOT CARRY EVERY JAVA VARIANT. A `variant` subtag is 5-8
+/// alphanumerics, or exactly 4 with a leading digit; `java.util.Locale` accepts
+/// anything. The JDK walks the "_"-joined list from the left, emits the
+/// well-formed ones as subtags, and moves the rest -- from the FIRST ill-formed
+/// one onward -- into the private-use sequence `x-lvariant-...`, which is what
+/// `forLanguageTag` reads back to recover the variant.
+///
+/// MEASURED, HotSpot 25.0.4+7, `apps/probes/UtilCoverage4Sweep`:
+///
+/// ```text
+///   POSIX       de-AT-POSIX                    5 alphanum: a subtag
+///   1234        de-AT-1234                     4, digit-first: a subtag
+///   abcdefgh    de-AT-abcdefgh                 8: a subtag
+///   x           de-AT-x-lvariant-x             1: private use
+///   123         de-AT-x-lvariant-123           3: private use
+///   POSIX_WIN   de-AT-POSIX-x-lvariant-WIN     split at the first bad one
+///   x_POSIX     de-AT-x-lvariant-x-POSIX       ill-formed first: all of it
+///   abcdefghi   de-AT                          9: DROPPED ENTIRELY
+/// ```
+///
+/// The last row is the one that cannot be guessed. A private-use subtag is
+/// itself 1-8 alphanumerics, so a 9-character variant does not fit there either
+/// and the whole private-use sequence is dropped -- the locale has no tag that
+/// can express it.
+///
+/// Before this, every sub went out as a bare subtag: `de-AT-x` for the fourth
+/// row, which is not even well-formed BCP-47 (an `x` singleton with nothing
+/// after it), and `forLanguageTag` read the variant back as EMPTY.
+///
+/// VERBATIM, not lower-cased. MEASURED: `Locale.of("en","US","POSIX")` tags as
+/// `en-US-POSIX` on HotSpot, and this once answered `en-US-posix` while
+/// `getVariant()` and `toString()` on the SAME object answered `POSIX` -- the
+/// locale disagreeing with its own tag. BCP-47 subtags compare
+/// case-insensitively, which is why that survived every test that parses the
+/// tag back and failed only a string comparison against one the JDK wrote.
+///
+/// ONE HELPER BECAUSE THERE ARE TWO PRODUCERS. `locale_tag` builds the tag
+/// twice -- once from the `locale_populate` side table that the constructors
+/// fill, and once from a real `baseLocale` -- and the side-table branch returns
+/// first for anything built by `new Locale(..)`. Fixing the `baseLocale` branch
+/// alone changed not one probe row.
+fn append_locale_variant(tag: &mut String, variant: &str) -> String {
+    if variant.is_empty() {
+        return String::new();
+    }
+    let subs: Vec<&str> = variant.split('_').filter(|s| !s.is_empty()).collect();
+    let well_formed = |s: &str| {
+        let n = s.len();
+        s.bytes().all(|b| b.is_ascii_alphanumeric())
+            && ((5..=8).contains(&n) || (n == 4 && s.as_bytes()[0].is_ascii_digit()))
+    };
+    let split = subs.iter().position(|s| !well_formed(s)).unwrap_or(subs.len());
+    for sub in &subs[..split] {
+        tag.push('-');
+        tag.push_str(sub);
+    }
+    let rest = &subs[split..];
+    if rest.is_empty()
+        || !rest
+            .iter()
+            .all(|s| (1..=8).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric()))
+    {
+        return String::new();
+    }
+    let mut priv_use = String::from("-x-lvariant");
+    for sub in rest {
+        priv_use.push('-');
+        priv_use.push_str(sub);
+    }
+    priv_use
+}
+
 fn locale_tag(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first() {
         // Synthetic locales (our getDefault) carry a recorded BCP-47 tag.
@@ -457,13 +532,8 @@ fn locale_tag(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 tag.push('-');
                 tag.push_str(&c.to_ascii_uppercase());
             }
-            if !v.is_empty() {
-                // `Locale` stores multiple variants "_"-joined; BCP-47 uses "-".
-                for sub in v.split('_').filter(|s| !s.is_empty()) {
-                    tag.push('-');
-                    tag.push_str(sub);
-                }
-            }
+            let priv_use = append_locale_variant(&mut tag, &v);
+            tag.push_str(&priv_use);
             return Ok(Some(Value::Object(Some(ctx.create_string(&tag)))));
         }
         // Real JDK Locale: build a BCP-47 tag from its baseLocale subtags.
@@ -505,22 +575,7 @@ fn locale_tag(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             tag.push('-');
             tag.push_str(&region.to_ascii_uppercase());
         }
-        if !variant.is_empty() {
-            // Locale stores multiple variants "_"-joined; BCP-47 uses "-".
-            //
-            // VERBATIM, not lower-cased. MEASURED: `Locale.of("en","US","POSIX")`
-            // tags as `en-US-POSIX` on HotSpot, and this branch answered
-            // `en-US-posix` while `getVariant()` and `toString()` on the SAME
-            // object answered `POSIX` -- so the locale disagreed with its own
-            // tag. BCP-47 subtags compare case-insensitively, which is why this
-            // survives every test that parses the tag back and fails only a
-            // string comparison against one the JDK wrote. The side-table
-            // branch above already pushed the subtag as stored.
-            for sub in variant.split('_').filter(|s| !s.is_empty()) {
-                tag.push('-');
-                tag.push_str(sub);
-            }
-        }
+        let lvariant = append_locale_variant(&mut tag, &variant);
         // Append BCP-47 extension subtags (e.g. "-u-ca-japanese", "-x-foo-bar").
         // `LocaleExtensions.id` already holds the canonical, lower-cased
         // extension sequence with the privateuse ('x') singleton ordered last —
@@ -529,15 +584,28 @@ fn locale_tag(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         // `forLanguageTag("en-US-u-ca-japanese").toLanguageTag()` -> "en-US").
         // Only real Locales constructed WITH extensions have a non-null
         // `localeExtensions`, so plain locales are unaffected.
+        let mut had_extensions = false;
         if let Value::Object(Some(le)) = ctx.get_field_by_name(*this, "localeExtensions") {
             if let Value::Object(Some(id_s)) = ctx.get_field_by_name(le, "id") {
                 if let Some(id) = ctx.read_string(id_s) {
                     if !id.is_empty() {
+                        had_extensions = true;
                         tag.push('-');
                         tag.push_str(&id);
                     }
                 }
             }
+        }
+        // AFTER the extensions: BCP-47 orders the private-use singleton last.
+        //
+        // Skipped when the locale already carries extensions, because `id`
+        // may itself end in an `x-` sequence and the two would have to MERGE
+        // into one rather than sit side by side. That combination is not
+        // reachable from `new Locale(lang, country, variant)`, which is what
+        // produces an ill-formed variant in the first place, and it is not
+        // measured -- so it declines rather than guessing.
+        if !had_extensions {
+            tag.push_str(&lvariant);
         }
         return Ok(Some(Value::Object(Some(ctx.create_string(&tag)))));
     }
