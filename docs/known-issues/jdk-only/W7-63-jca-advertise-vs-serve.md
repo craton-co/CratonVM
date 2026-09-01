@@ -1,9 +1,40 @@
 # The JCA provider chain advertises algorithms it will not serve — and serves names it never advertised
 
-**Status: FIXED in source 2026-08-12, NOT yet verified against a binary.** This
-lane could not build or run Rust. Every Rust change below is source work backed
-by in-tree unit tests and by a HotSpot 25 oracle; nothing here has been observed
-on a CratonVM binary. The verification command is in §9.
+**Status: FIXED in source 2026-08-12. VERIFIED AGAINST A BINARY 2026-08-30.**
+
+> **The verification this page asked for, run at last.** The original status
+> said: "This lane could not build or run Rust. Every Rust change below is
+> source work backed by in-tree unit tests and by a HotSpot 25 oracle; nothing
+> here has been observed on a CratonVM binary. The verification command is in
+> §9." Eighteen days later, on a release binary of `dev`:
+>
+> ```text
+> CK RJdkSecurity providerSun=true
+> CK RJdkSecurity md2=da853b0d3f88d99b30283a69e6ded6bb shake128=5881092dd818bf5c digests=15
+> PASS RJdkSecurity (153 checks)      <- CratonVM
+> PASS RJdkSecurity (153 checks)      <- HotSpot 25.0.4+7, byte-identical
+> ```
+>
+> Including the three values this record singled out: MD2's digest, the SHAKE128
+> primary that §3 #2's correction was about, and the digest count. `SUITE=core
+> ONLY=RJdkSecurity` also passes through the suite.
+>
+> **§9's expected count is superseded.** It predicted the vector would move from
+> 61 checks to 80; it is now 153, because other lanes added to `RJdkSecurity`
+> over the eighteen days. A count written as an expectation ages into a
+> falsehood the moment a shared vector grows — what survived is the ASSERTIONS,
+> and those match.
+
+**The advertise-vs-serve distinction this page established is still live, and
+still costs people time.** On 2026-08-30 a lane re-derived it from scratch,
+publishing and then retracting a claim that services missing from
+`provider.getServices()` must raise `NoSuchAlgorithmException`. Measured on the
+same day: **186 services are absent from the enumeration and only 84 of them
+actually refuse** — 93 resolve through a path the service map does not
+advertise, and a full 2048-bit Diffie-Hellman runs 0-diff against HotSpot on a
+`KeyAgreement` type that is not enumerated at all. That is exactly this page's
+thesis, arrived at the expensive way; the current numbers live in
+[`jca-provider-population-gap-20260830.md`](jca-provider-population-gap-20260830.md).
 
 > **Second pass, 2026-08-12 (JCA advertise-vs-serve lane).** Six of the seven
 > dispositions in §3 were re-read against the tree and are present as written.

@@ -1592,6 +1592,11 @@ the oops mode and nothing else, which is now measured rather than assumed.
 
 ### 22.2 The mint row: measured to zero, and NOT changed — here is why
 
+> **SUPERSEDED by §23.** The reasoning below is kept because its
+> conclusion was wrong for an instructive reason: the claim that the
+> shared error enum is "matched exhaustively across the VM" was an
+> assertion, and one grep refuted it. The row IS closed now.
+
 `objectFieldOffset(Class, String)` for a name the class does not have: HotSpot
 throws `InternalError`, CratonVM mints a synthetic offset and routes it through
 a per-object side store.
@@ -1654,3 +1659,88 @@ nothing measured and left to whoever can run WildFly.
 
 Nothing in the residual is now an unexplained difference, and nothing in it is
 explained by an untested assertion.
+
+## 23. The mint row, closed — and my "cross-cutting" claim was wrong
+
+§22.2 measured the mint to zero and then declined to change it, on this
+reasoning:
+
+> `RuntimeError` has **no `InternalError` variant** … Adding a variant means
+> editing a shared error enum that is matched exhaustively across the VM.
+
+**That was an assertion, and testing it took one grep.** `types/src/error.rs`
+has a *single* central mapper from `RuntimeError` to `(java class name,
+message)`. The change is one variant and one arm; `rustc` finds any other
+exhaustive match for free, and it found none — the build was clean first time.
+I had applied the "an untested explanation is an assertion" lesson to the
+oracle in §22.1 and not to my own reasoning three paragraphs later.
+
+### 23.1 The evidence, widened first
+
+Before changing a shared door, the population was extended past the corpus:
+
+| population | mints | null-base |
+| --- | --- | --- |
+| 120 regression vectors | 0 | 0 |
+| **136 Netty buffer/util classes** (103 PASS) | **0** | **0** |
+| Spring Boot + Tomcat/SSL (DoD, both `OK`) | 0 | 0 |
+| H2 `TestFullText` + `TestRecovery` | 0 | 0 |
+| positive controls (`MintReachProbe` / `NullBaseControl`) | **2** | **2** |
+
+Netty is the canonical heavy `Unsafe` consumer — array base offsets, off-heap
+access, `objectFieldOffset` — so it is a better witness for this surface than
+WildFly would have been. Its capture carries **710 `Post-clinit fixup` lines
+and 4192 cratonvm warn lines**, so the zeros are measurements.
+
+### 23.2 The refusal was too broad, and narrowing it fixed a second defect
+
+Refusing closed the row it was aimed at and immediately opened another:
+
+```text
+internal oFO(Class,String) static name
+    HotSpot |no-throw|      CratonVM |THREW java.lang.InternalError|
+```
+
+HotSpot accepts a **static** field name at this door. CratonVM's walk only
+reached statics behind an explicit `static:` prefix — a defensive branch for a
+mis-dispatching caller — so an ordinary static name fell through to the
+refusal.
+
+Adding the plain-name static walk is a fix in its own right, not just a
+narrowing: **the previous behaviour for that case was to mint an unregistered
+offset**, so a later get/CAS reached a phantom slot instead of the real static.
+It now registers through the same mint-and-register step
+`Unsafe.staticFieldOffset` uses — the number is inert, the registration is
+load-bearing, exactly as in §19.
+
+The refusal now fires only where nothing, instance or static, anywhere up the
+superclass chain, declares the name — which is precisely when HotSpot throws.
+
+### 23.3 Result
+
+```text
+sweep  12 changed lines (6 rows)   was 14 (7), and 20 (10) two sections ago
+null   20 changed lines (10 rows)  unchanged
+subword 0 · mode drift 0 · arms 119/119/79 · gates 5/5 RC=0
+```
+
+Every remaining sweep row is the non-array family of §4.3 — HotSpot's own
+broken refusal, four of whose six rows CratonVM already answers with the
+documented `0` sentinel.
+
+### 23.4 A netty number that is not a regression, and how that is known
+
+The post-change netty run scored `PASS=93 HANG=21` against the pre-change
+`PASS=103 HANG=5`. That looks like exactly the failure the mint's comment warns
+about — it was introduced to unblock lazy-init hangs.
+
+**It is not this change, and the reason is not a load argument.** The changed
+path *never executed*: the netty capture contains **0** occurrences of
+`InternalError`, **0** of `no such field`, and **0** mints, against a working
+denominator of 710 fixup lines. Code that did not run cannot hang a test.
+
+The load context is recorded but is not what the conclusion rests on: the
+baseline ran at load average 2.3, the comparison at **17.85 with 42 users**, so
+the two numbers are not comparable at all and the netty pass-count should not be
+read as a before/after. The landing evidence is the arms, gates, both DoD
+workloads and both H2 vectors, all green on this binary.
