@@ -116,7 +116,7 @@ done | tr -d '"' | sort -u | wc -l
 
 **What the three rows together say about the surface.** Grouping was a renaming,
 not a retirement: 986 declared knobs reached through 15 variables is still 986
-knobs. Of the names in `flag-surface.txt`, **494** are named nowhere outside
+knobs. Of the names in `flag-surface.txt`, **491** are named nowhere outside
 `docs/internal` — i.e. neither operator-facing nor referenced by CI — and **65**
 of those have at most one Rust read site outside the declaration table. That
 set, not the 15, is the honest retirement backlog. Reproduce both with the
