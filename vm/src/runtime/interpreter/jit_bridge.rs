@@ -184,6 +184,214 @@ fn osr_stage_get() -> &'static str {
     OSR_STAGE.with(std::cell::Cell::get)
 }
 
+// ---------------------------------------------------------------------------
+// Which interpreter frames are, right now, being run by compiled code
+// ---------------------------------------------------------------------------
+//
+// jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901, defect (3):
+// a trace captured after `main` has OSR'd says `main:62` -- the back-edge it
+// tiered up at -- where HotSpot says `main:66`, the call that was executing.
+//
+// ## The mechanism, read off this file rather than assumed
+//
+// `try_osr` enters through `osr_enter_planned` and the artifact runs the method
+// to its RETURN: the value comes back through that function's `ret_type`
+// conversion and `try_osr_with_backoff` turns it into
+// `OsrBackoffOutcome::ReturnOuter`. Compiled code therefore does NOT stop at
+// the loop exit -- everything after the loop, and every call the method makes
+// from there on, executes inside the artifact while the interpreter `Frame` for
+// that same activation sits untouched on `thread.frames` with `pc == entry_pc`.
+// A capture taken from inside that window (a throw in a callee, or another
+// thread's `Thread.getStackTrace()`) walks `thread.frames` and reports the loop
+// header for a method that is executing far below it. That is the *during*
+// sub-case, and it is the only one `probes/StackTraceAfterOsr.java` exercises.
+//
+// The *after* sub-case -- the interpreter continuing past the loop with a stale
+// pc -- does not exist here, and that was checked rather than assumed. Every
+// exit that leaves this frame alive already writes a pc: the OSR-exit transfer
+// (`deopt_resume::transfer_osr_exit_into_live_frame`) assigns
+// `frame.pc = resume_bci`, the RBC.6b handler entry assigns
+// `frame.pc = handler_pc`, and the safe-reject path deliberately leaves
+// `entry_pc` standing because by admission nothing was committed before it.
+// The only other way out is the normal return, which pops the frame.
+//
+// ## Why the pc itself must not be moved
+//
+// Two independent reasons, either one sufficient:
+//
+//   * `Frame::live_locals_mask_here` and `Frame::scan_local_objects_inner`
+//     compute the per-bci live-locals ROOT FILTER from
+//     `[self.pc, self.last_instr_pc]`. Advancing `pc` to where compiled code
+//     really is would make every slot that dies in between stop being a root --
+//     on a frame whose locals are the pre-OSR copies that the conservative half
+//     of the JIT root scan is leaning on.
+//   * The safe-reject exit above is correct only BECAUSE `frame.pc` is still
+//     `entry_pc`. Moving it would resume the interpreter at a bci this
+//     activation never reached, which is the silent-corruption shape RBC.7 is
+//     named for.
+//
+// So the refresh has to be a SIDE CHANNEL that the trace assembler reads and
+// neither the root scan nor any resume path can see. `Frame` is not this file's
+// to widen, so the channel is this registry.
+//
+// ## What this registry can and cannot answer
+//
+// It answers, authoritatively, WHICH interpreter frame is a live OSR
+// continuation and OF WHICH artifact -- two facts only the entry site knows.
+// `stackwalker::drop_osr_continuations` infers the first from
+// `cm.can_osr_enter(frame.pc)`, which is a property of a pc and not of an
+// activation: an interpreted frame genuinely parked on a back-edge while a
+// RECURSIVE compiled activation of the same method is live satisfies it too,
+// and that frame's compiled entry is then dropped from the trace.
+//
+// It cannot answer the current bci by itself, and no honest version of it can.
+// The bci compiled code is at lives in that activation's own frame at
+// `[rbp - cm.sp_id_slot_off]` -- the safepoint-id slot every GC-capable site
+// stores its `OopMapEntry::bytecode_pc` into, which is the mapping deopt and
+// the precise root scan already share. The OSR activation's RBP is reachable
+// only from the saved-RBP chain walk in `vm/src/jit/conservative_roots.rs`:
+// `top_rbp_mirror_read` names the INNERMOST compiled frame, and by capture time
+// that is some callee's, while the chain entry's `exact_rbp` has been
+// overwritten by every prologue that ran underneath it. Re-deriving the bci any
+// other way would be a SECOND pc->bci mapping beside deopt's, which is how this
+// class of defect gets made in the first place. The bci must therefore come
+// from the compiled entry `conservative_roots::active_compiled_frames` already
+// reports for this same activation, matched to the interpreter frame by the
+// pair below. See `.agent-requests/A7-wiring.txt`.
+
+/// Kill switch for the OSR-continuation registry.
+///
+/// Default ON. `CRATONVM_JIT_NO_OSR_PC_REFRESH=1` stops the registry being
+/// written and makes `live_osr_continuation_artifact` answer `None` everywhere,
+/// so every consumer falls back to the pc-shaped heuristic it used before --
+/// one binary, both answers.
+fn osr_pc_refresh_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_OSR_PC_REFRESH").is_none()
+    })
+}
+
+/// One interpreter frame that compiled code is running right now.
+#[derive(Clone, Copy)]
+struct OsrContinuation {
+    /// `thread.frames.len()` at the moment of entry -- deliberately the SAME
+    /// number `JitEntryGuard::enter_with_compiled_at` records as the chain
+    /// entry's `interp_depth`, so a consumer holding one of
+    /// `active_compiled_frames`' `(depth, label, class_id, cm_ptr)` tuples can
+    /// compare directly instead of inventing a second convention. The frame
+    /// itself is `frames[interp_depth - 1]`.
+    interp_depth: u32,
+    /// The artifact running this activation, as `Arc::as_ptr(..) as usize`.
+    /// Bit-identical to the `cm_ptr` that tuple carries: both are the address
+    /// of the payload of the same `Arc<CompiledMethod>`.
+    cm_ptr: usize,
+}
+
+thread_local! {
+    /// This thread's live OSR continuations, outermost first.
+    ///
+    /// A `Vec` rather than one slot because an OSR'd body can call a method
+    /// that itself OSRs; each is a separate activation at a different depth.
+    /// Written once per OSR ENTRY -- never per back-edge -- and read only by a
+    /// stack capture.
+    static OSR_CONTINUATIONS: std::cell::RefCell<Vec<OsrContinuation>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Publishes one `OsrContinuation` for exactly as long as the artifact is on
+/// the stack, and withdraws it however control leaves -- normal return, OSR
+/// exit, routed exception, or a panic unwinding through `catch_unwind`.
+struct OsrContinuationGuard {
+    /// The registry length before this guard pushed. `Drop` truncates back to
+    /// it rather than popping once, for the same reason `JitEntryGuard::drop`
+    /// restores its depth first: a non-local exit out of a NESTED OSR entry
+    /// could otherwise strand that descendant's record above ours, and a stale
+    /// record names a frame depth that by then belongs to a different
+    /// activation.
+    depth_at_push: usize,
+    /// `false` when the kill switch is set or the registry was already
+    /// borrowed; `Drop` must then truncate nothing.
+    armed: bool,
+}
+
+impl OsrContinuationGuard {
+    fn publish(interp_depth: usize, cm_ptr: usize) -> Self {
+        if !osr_pc_refresh_enabled() {
+            return Self {
+                depth_at_push: 0,
+                armed: false,
+            };
+        }
+        OSR_CONTINUATIONS.with(|c| match c.try_borrow_mut() {
+            Ok(mut v) => {
+                let depth_at_push = v.len();
+                v.push(OsrContinuation {
+                    // Saturate rather than panic: a depth this record cannot
+                    // represent must degrade to "no information", never take
+                    // the process down on a path that only feeds a diagnostic.
+                    interp_depth: u32::try_from(interp_depth).unwrap_or(u32::MAX),
+                    cm_ptr,
+                });
+                Self {
+                    depth_at_push,
+                    armed: true,
+                }
+            }
+            // Not reachable today -- the only reader holds the borrow for the
+            // length of one lookup and cannot re-enter OSR from inside it --
+            // but refusing to publish is the safe direction: the consumer then
+            // sees exactly what it saw before this registry existed.
+            Err(_) => Self {
+                depth_at_push: 0,
+                armed: false,
+            },
+        })
+    }
+}
+
+impl Drop for OsrContinuationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        OSR_CONTINUATIONS.with(|c| {
+            if let Ok(mut v) = c.try_borrow_mut() {
+                v.truncate(self.depth_at_push);
+            }
+        });
+    }
+}
+
+/// The artifact currently running `thread.frames[frame_index]` as an OSR
+/// continuation, as a `*const cratonvm_jit::CompiledMethod` cast to `usize` --
+/// the same encoding `conservative_roots::active_compiled_frames` uses for the
+/// `cm_ptr` in its tuples, so the two compare with `==`.
+///
+/// `None` means "no information", not "this frame is interpreted": it is also
+/// what the kill switch and a contended borrow report. A caller must fall back
+/// to whatever it did before rather than read it as a negative claim.
+///
+/// The consumer is `runtime::stackwalker`; the exact call site is written out
+/// in `.agent-requests/A7-wiring.txt`. It lives here because the OSR entry is
+/// the only place that knows the pairing -- nothing else on the thread can tell
+/// an OSR continuation apart from an interpreted frame that merely happens to
+/// be parked on a back-edge the artifact could have been entered at.
+#[allow(dead_code)] // wired up from `runtime::stackwalker`; see A7-wiring.txt
+pub(crate) fn live_osr_continuation_artifact(frame_index: usize) -> Option<usize> {
+    if !osr_pc_refresh_enabled() {
+        return None;
+    }
+    let depth = u32::try_from(frame_index.checked_add(1)?).ok()?;
+    OSR_CONTINUATIONS.with(|c| -> Option<usize> {
+        let live = c.try_borrow().ok()?;
+        live.iter()
+            .rev()
+            .find(|r| r.interp_depth == depth)
+            .map(|r| r.cm_ptr)
+    })
+}
+
 pub(super) fn compile_osr_artifact(
     shared: &SharedVm,
     class_id: ClassId,
@@ -3173,6 +3381,24 @@ pub(super) fn try_osr(
             &*compiled,
             Some(thread.frames.len()),
         );
+        // Publish this activation for exactly the window it is on the stack --
+        // see the "Which interpreter frames are, right now, being run by
+        // compiled code" block near the top of this file for why a trace needs
+        // it and why `frame.pc` itself must not be moved instead. Deliberately
+        // in the same scope as `_jit_root_guard` and taking the same
+        // `thread.frames.len()`, so the two records agree about the depth by
+        // construction rather than by convention. Declared second, so it is
+        // withdrawn FIRST: there is never an instant where the registry claims
+        // an activation whose chain entry has already gone.
+        //
+        // Cost: one push and one truncate per OSR ENTRY. Nothing is added to
+        // the back-edge poll (`should_try_osr` returns long before this
+        // function is reached) and nothing at all to the compiled loop; an
+        // entry already pays a cache lookup, two `Vec`s of locals and tags, and
+        // `validate_osr_entry`'s walk over every deopt point, each of which
+        // dwarfs this.
+        let _osr_continuation =
+            OsrContinuationGuard::publish(thread.frames.len(), Arc::as_ptr(&compiled) as usize);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point
             // was validated; `plan` is the proof, obtained from

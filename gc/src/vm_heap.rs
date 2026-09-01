@@ -933,6 +933,16 @@ impl VmHeap {
     }
 
     /// The software read barrier: repair `obj` if the collector moved it.
+    ///
+    /// This is **not** the ZGC colored-word load barrier, and it cannot be
+    /// taught to be one: its parameter is an [`ObjectRef`] -- a machine
+    /// pointer the caller has already fabricated -- not a reference SLOT, so
+    /// a colored word never reaches it in a form it could repair. Handed one
+    /// it would build an `ObjectRef` out of bit-63 bits, fail
+    /// [`Self::is_object_address`], fall through the `forwarded_after_slide`
+    /// lookup and return the same word unchanged: a silent no-op that also
+    /// violates `zgc::vaddr::debug_assert_plain_word`. The colored-word
+    /// barrier is [`Self::load_ref_slot_barriered`], which takes the slot.
     #[inline]
     pub fn load_and_forward(&self, obj: ObjectRef) -> ObjectRef {
         self.load_and_forward_inner(obj, false).0
@@ -966,6 +976,239 @@ impl VmHeap {
     #[inline]
     pub fn load_and_forward_validated(&self, obj: ObjectRef) -> ObjectRef {
         self.load_and_forward_inner(obj, validate_once_enabled()).0
+    }
+
+    /// Read a heap reference **SLOT** through this backend's load barrier.
+    ///
+    /// The value returned is a plain machine address (`0` = null) -- exactly
+    /// what [`cratonvm_types::narrow_oop::read_ref_slot`] returns on a
+    /// non-colored backend. A caller may therefore still run
+    /// `plausible_heap_pointer` afterwards, and MUST run it on the *result*
+    /// rather than on the slot word: a colored word is deliberately
+    /// implausible, so filtering the word first is what silently nulls a live
+    /// reference (risk J1 of `docs/feature-designs/zgc-jit-load-barrier.md`).
+    ///
+    /// # Why this exists at all, and why it is here and not in `vm/`
+    ///
+    /// The seven raw reference reads in `vm/src/jit/helpers.rs` panic as a
+    /// tripwire on a colored word instead of barriering it. The two of them
+    /// that still hold a SLOT when the plausibility filter runs -- the
+    /// reference-array element load and the compact-reference field load --
+    /// now funnel through `helpers::jit_load_ref_slot`, and this is the
+    /// function that seam calls. It could not be written in `vm/`:
+    /// `zgc::barrier::z_load` needs a `C: ZBarrierContext`, whose only
+    /// production implementor is `ZgcRealHeap`, and `VmHeap` publishes no
+    /// accessor that hands the context out. Dispatching here keeps every ZGC
+    /// detail inside `gc/` instead of growing a per-site ZGC special case,
+    /// which is the shape that already missed `emit_load_string_value_ptr`
+    /// once.
+    ///
+    /// # What each arm does
+    ///
+    /// * `Generational` / `G1`: today's `read_ref_slot`, byte for byte.
+    ///   Neither collector has a load barrier and neither may gain one here.
+    /// * `Zgc`, barrier NOT armed: the same plain read. This is the only path
+    ///   any shipping configuration takes -- see "Today it cannot fire".
+    /// * `Zgc`, barrier armed: [`crate::zgc::ZgcRealHeap::load_barrier_slot`],
+    ///   which is the one in-tree implementation of the colored-word barrier
+    ///   and already gets right the two conversions a fresh one gets wrong. It
+    ///   views the slot as an `AtomicU64`, runs
+    ///   `barrier::load_barrier_fast_bad`, and on a bad color calls
+    ///   `load_barrier_slow` (forward the offset, publish to the marker,
+    ///   CAS-heal the slot). Crucially it then converts **offset to address**:
+    ///   `z_load` hands back a bare 42-bit heap OFFSET, not a pointer, and
+    ///   returning it uncorrected is a silent truncation that
+    ///   `gc/src/zgc/relocate.rs` and `gc/src/zgc/mark.rs` both already carry
+    ///   doc comments warning about. Re-deriving that conversion here rather
+    ///   than delegating would be a second copy of exactly the knowledge those
+    ///   comments say must live in one place.
+    ///
+    /// # TODAY IT CANNOT FIRE -- the armed arm is dead code
+    ///
+    /// No colored word is stored in a heap slot in any shipping
+    /// configuration, so landing this changes nothing measurable:
+    ///
+    /// * `vm/src/vm/vm_init.rs` pins `const RELOCATION_REQUESTED: bool =
+    ///   false`.
+    /// * `ZgcRealHeap::set_barrier_color` -- the sole writer of the colored
+    ///   state -- has no non-test caller. Its own comment records the
+    ///   obligation on the first one.
+    /// * `barrier_good_mask` is initialised to `vaddr::Z_REMAPPED` and nothing
+    ///   moves it, so `load_barrier_armed()` is false for the process
+    ///   lifetime and `zgc::vaddr::color` has no production caller.
+    ///
+    /// The unarmed cost is therefore one relaxed `AtomicBool` load and a
+    /// not-taken branch on top of the read that already happened.
+    ///
+    /// # P1 -- SLOT WIDTH: compressed oops REFUSE the barrier, they do not get one
+    ///
+    /// `z_load` takes `&AtomicU64`, which is a promise about the SLOT: 8-byte
+    /// aligned, exactly 8 bytes, and valid for WRITES, because the slow path
+    /// self-heals with `slot.compare_exchange(observed, healed, AcqRel,
+    /// Acquire)`. With `narrow_oops_enabled()` the slot is FOUR bytes
+    /// (`read_ref_slot` branches on exactly that), so the `AtomicU64` view
+    /// would read and CAS four bytes of the neighbouring field -- the same
+    /// class of bug `emit_load_string_value_ptr` had to be fixed for once.
+    ///
+    /// A 4-byte path was considered and REJECTED, not deferred: a colored word
+    /// is `Z_COLORED_TAG | color | 42-bit offset`, i.e. bit 63 plus bits 42-46
+    /// plus a 42-bit payload. It does not fit in 32 bits under any encoding,
+    /// so there is no narrow colored word for a narrow barrier to operate on.
+    /// ZGC plus compressed oops is unsupported until the slot representation
+    /// itself changes, which is `zgc-reference-slot-representation.md`'s
+    /// problem and not this function's.
+    ///
+    /// So the narrow arm REFUSES. Unarmed it takes the same plain
+    /// `read_ref_slot` as everything else (identical behaviour, and the only
+    /// reachable case). Armed it panics, deliberately: the alternative is to
+    /// hand compiled code a truncated colored word, and this subsystem's house
+    /// rule -- the same one that makes `ZBarrierContext::on_forward_failure`
+    /// return `!` -- is that an unrepresentable reference fails loudly rather
+    /// than degrading to a wrong pointer. That panic is unreachable twice
+    /// over: `vm/src/vm/vm_init.rs` already refuses the ZGC + compressed-oops
+    /// combination at startup, and nothing arms the barrier. It is asserted
+    /// here anyway because `narrow_oops_enabled()` reads a process-global
+    /// `AtomicBool` that any code can set, so the init-time gate is a fact
+    /// about a default run and not an invariant of this call -- the hardening
+    /// `zgc-reference-slot-representation.md` asks for.
+    ///
+    /// # P3 -- offset 0 / null ambiguity: answered, with one residual
+    ///
+    /// `ZFastPath::Good(0)` is ambiguous between null and an object at heap
+    /// offset 0 (`vaddr::color_offset_roundtrip_many_offsets` asserts offset 0
+    /// is a legal non-null location). `load_barrier_slot` disambiguates it the
+    /// way `barrier.rs` says a Rust caller can and machine code cannot: it
+    /// re-reads the raw word and answers `None` only for `vaddr::Z_NULL`. So
+    /// the decision is made once, here, and not per caller.
+    ///
+    /// RESIDUAL for whoever arms this: that null test is a SECOND load, so a
+    /// mutator store landing between the barrier's load and it can be observed
+    /// as "offset 0" rather than null, yielding the arena base instead of `0`.
+    /// It is harmless while nothing is armed and it is not fixable without
+    /// `ZFastPath::Good` carrying the raw word alongside the offset. The
+    /// durable fix is open question 8 of `zgc-jit-load-barrier.md`: reserve
+    /// offset 0 in the page allocator so the ambiguity has no legal instance.
+    /// Risk J6 of that document is the same fact seen from the JIT side.
+    ///
+    /// # P4 -- `on_forward_failure` returns `!`: NOT handled here, and cannot be
+    ///
+    /// A `ZBarrierContext::forward` that answers `None` panics rather than
+    /// returning. That is a property of `ZgcRealHeap::forward`, not of this
+    /// call: it returns `Some(addr)` unconditionally while `relocate_active`
+    /// is false, which is always, so the panic is unreachable today. It stops
+    /// being unreachable the moment relocation is real and the forwarding
+    /// table can miss, and no wrapper here can turn it into a recoverable
+    /// answer -- the `!` return type is the whole point. Whoever makes
+    /// relocation real owns that decision at `ZgcRealHeap::forward`.
+    ///
+    /// # Ordered work list, folded in from `.agent-requests/A9-gc-barrier.txt`
+    ///
+    /// The steps that must complete, in order, before
+    /// `vm/src/vm/vm_init.rs`'s `RELOCATION_REQUESTED` may be flipped:
+    ///
+    /// 1. **NOT DONE -- the blocker.** Every other writer of a slot this
+    ///    barrier may CAS must be atomic.
+    ///    `cratonvm_types::narrow_oop::write_ref_slot` still does a plain
+    ///    `(ptr as *mut u64).write(addr)`, and a plain write racing
+    ///    `load_barrier_slow`'s `compare_exchange` on the same location is a
+    ///    data race -- undefined behaviour, not merely a lost update. The
+    ///    JIT-emitted inline reference stores under `jit/src/x64/` bypass
+    ///    `write_ref_slot` entirely and need the same treatment. Nothing may
+    ///    proceed past this; the exact requirement is written out in
+    ///    `.agent-requests/A16-vm-stores.txt`.
+    /// 2. **DONE.** The armed test:
+    ///    [`crate::zgc::ZgcRealHeap::load_barrier_armed`] already existed, so
+    ///    no new accessor was needed. Only its slot helper had to widen from
+    ///    private to `pub(crate)`.
+    /// 3. **DONE.** This function, with P1/P3/P4 decided above.
+    /// 4. **NOT DONE.** `vm/`: route `helpers::jit_load_ref_slot`'s
+    ///    `read_ref_slot(slot)` through this call. Note the gap A9's own
+    ///    comment records: `jit_aaload` receives no `vm_ptr`, so that seam has
+    ///    no `&VmHeap` to call this on and must reach one some other way (a
+    ///    thread-local heap handle, or a `vm_ptr` parameter threaded into the
+    ///    helper and its emission sites). This is NOT a one-line change, and
+    ///    the census `ref_load_census::COLORED_WORDS_SEEN` is what proves
+    ///    afterwards that no Category-A site was missed.
+    /// 5. **NOT DONE.** Sites D/E/F of `zgc-jit-load-barrier.md` 2.5.1, which
+    ///    hold an `ObjectRef` rather than a slot: their barriers belong
+    ///    upstream at `types/src/value.rs`'s `read_value_atomic` reference arm
+    ///    and at `vm::get_static_shared`, where they are shared with the
+    ///    interpreter rather than duplicated. A static slot is not atomic
+    ///    today and so may not be CAS-healable -- it may need a non-healing
+    ///    barrier kind.
+    /// 6. **NOT DONE.** The nine Category-A inline emission points of 2.3, or
+    ///    keep them routed to the helpers by
+    ///    `x64::zgc_read_barrier_blocks_inline_fields`.
+    /// 7. **NOT DONE.** Only then flip `RELOCATION_REQUESTED`.
+    ///
+    /// # Safety
+    ///
+    /// `slot` must point at a live reference slot of the current width
+    /// ([`cratonvm_types::narrow_oop::ref_field_size`]) inside a live object --
+    /// the same contract as `read_ref_slot`. On the armed ZGC path the slot
+    /// must additionally be valid for WRITES, because the barrier self-heals
+    /// it; every reference slot inside a live heap object is.
+    #[inline]
+    pub unsafe fn load_ref_slot_barriered(&self, slot: *const u8) -> u64 {
+        // Written as an early return on the one arm that differs rather than
+        // as a `match`, so the Generational/G1/unarmed-Zgc answer is LITERALLY
+        // the expression `jit_load_ref_slot` evaluates today. A `match` with
+        // three arms spelling the same call is three places for them to drift
+        // apart, and "landing this changes nothing measurable" has to be
+        // checkable by reading rather than by benchmarking.
+        #[cfg(feature = "zgc")]
+        if let VmHeap::Zgc(h) = self {
+            return Self::zgc_load_ref_slot_barriered(h, slot);
+        }
+        cratonvm_types::narrow_oop::read_ref_slot(slot)
+    }
+
+    /// The `Zgc` arm of [`Self::load_ref_slot_barriered`]. Split out so the
+    /// common path above stays one branch and one call, and so the ZGC
+    /// preconditions sit next to the code that depends on them.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::load_ref_slot_barriered`].
+    #[cfg(feature = "zgc")]
+    #[inline]
+    unsafe fn zgc_load_ref_slot_barriered(h: &ZgcRealHeap, slot: *const u8) -> u64 {
+        // P1. Order matters: test the WIDTH before the armed flag, so the
+        // unsupported combination is refused rather than silently reading and
+        // CAS-ing 8 bytes out of a 4-byte slot. The unarmed narrow read below
+        // is the ordinary one, which is what keeps a compressed-oops run
+        // byte-identical.
+        if cratonvm_types::narrow_oop::narrow_oops_enabled() {
+            assert!(
+                !h.load_barrier_armed(),
+                "ZGC colored-pointer load barrier armed while compressed oops are enabled: \
+                 the reference slot is 4 bytes and a colored word does not fit in 32 bits \
+                 (Z_COLORED_TAG is bit 63). vm_init refuses this combination at startup and \
+                 set_barrier_color has no non-test caller, so reaching here means one of \
+                 those two facts changed without this function being revisited. Refusing \
+                 rather than truncating -- see load_ref_slot_barriered, section P1."
+            );
+            return cratonvm_types::narrow_oop::read_ref_slot(slot);
+        }
+        if !h.load_barrier_armed() {
+            // The only path any shipping configuration takes.
+            return cratonvm_types::narrow_oop::read_ref_slot(slot);
+        }
+        // `AtomicU64` requires 8-byte alignment, and `compare_exchange` on a
+        // misaligned address is UB rather than a slow path. Every reference
+        // slot is 8-aligned by construction (`HEADER_SIZE` and `SLOT_SIZE` are
+        // both multiples of 8, and `ARRAY_DATA_OFFSET` likewise); this is a
+        // debug assert because it is an invariant of the layout, not an input
+        // to be validated on every load.
+        debug_assert_eq!(
+            slot as usize % 8,
+            0,
+            "reference slot must be 8-byte aligned for the AtomicU64 view the load barrier takes"
+        );
+        // Delegates the color test, the slow-path heal, the null
+        // disambiguation (P3) and the OFFSET -> ADDRESS conversion. `None` is
+        // null, which this signature spells `0`, matching `read_ref_slot`.
+        h.load_barrier_slot(slot as usize).map_or(0, |a| a as u64)
     }
 
     /// Decode the first 8 bytes of an object's header as a compact

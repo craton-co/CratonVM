@@ -45,6 +45,702 @@ fn inline_live_slot_clamp_disabled() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_LIVE_SLOT_CLAMP").is_some()
 }
 
+// ---------------------------------------------------------------------------
+// The spliced direct call's oop map, keyed at the RETURN ADDRESS
+// ---------------------------------------------------------------------------
+//
+// `emit_inline_direct_call` emits, in this order: the `CALL`, then
+// `emit_post_call_rbp_republish`, then `emit_oop_map_for_safepoint`. That last
+// one records `native_pc_offset = buf.pos()` at the moment it runs, so the map
+// is stamped at `return_address + sizeof(republish)` -- NOT at the return
+// address, which is the key every walker actually holds for a frame below the
+// innermost one (it reads it out of `[rbp+8]`).
+//
+// THE SIZE OF THE GAP, and why it is not a constant a consumer could absorb.
+// `emit_post_call_rbp_republish` has two shapes:
+//
+//   * the inline TLS mirror (`inline_rbp_tls_disp != 0`, which is the shape
+//     taken whenever `precise_maps` is on): 9 bytes for
+//     `MOV [tls:disp32], RBP`, plus 11 more for the
+//     `MOV DWORD [tls:disp32], compile_id` half that must move with it, so 9
+//     or 20;
+//   * the `helpers.frame_record` fallback: `PUSH RAX` + `SUB RSP, imm8` +
+//     `MOV ARG_REGS[0], RBP` + `CALL rel32` + `ADD RSP, imm8` + `POP RAX`,
+//     which is 1 + 4 + 3 + 5 + 4 + 1 = 18 (25 if the helper is out of rel32
+//     reach and `emit_call_imm64_via_rax` is used instead).
+//
+// It is never ZERO in any configuration where the discrepancy is observable:
+// the republish returns early only when `!precise_maps`, and the one consumer
+// that keys on this offset refuses outright when `sp_id_slot_off == 0`, which
+// `x64.rs` sets from the same `precise_maps`. So the exact lookup does not
+// merely usually miss -- it misses every time it is attempted.
+//
+// WHAT THIS IS, AND WHAT IT IS NOT. It is NOT a GC-correctness defect. That
+// was settled from the source before anything here was written, because the
+// answer decides how much risk the repair is worth:
+//
+//   * the root scan and the relocation walker key on the SAFEPOINT-ID slot,
+//     i.e. `OopMapEntry::bytecode_pc`. `conservative_roots`' frame scan, its
+//     `remap_one_jit_frame`, and `moving_young_frame_live_hi` all select with
+//     `.filter(|m| m.bytecode_pc == sp_id)`, and the innermost frame's
+//     evidence is `find_oop_map_for_safepoint_id`. Not one of them reads
+//     `native_pc_offset`;
+//   * `CompiledMethod::find_oop_map_for_pc` -- the exact binary search whose
+//     own doc says the GC walker calls it with the frame's return PC -- has
+//     ZERO non-test callers anywhere in the tree;
+//   * the only non-test exact match on `native_pc_offset` is
+//     `conservative_roots::compiled_frame_bci`'s first evidence source
+//     (`cm.oop_maps.iter().find(|m| m.native_pc_offset == off)`), which
+//     recovers a LINE NUMBER for a compiled stack frame;
+//   * the remaining readers are compile-time: `bytecode_walk`'s duplicated-
+//     region shift (it rewrites the field by a delta, it does not look one
+//     up) and `ir_lower`'s assertion that IR-tier entries carry `0` there.
+//
+// So the cost today is a silently degraded line number, not a lost root. It
+// is also not specific to splices: all five `emit_post_call_rbp_republish`
+// sites in `bytecode_walk.rs` have the same call/republish/map order, so the
+// exact path misses for every direct compiled-to-compiled call in this
+// backend. Fixing it here fixes the spliced arm; the top-level arms live in
+// another agent's file and are recorded in `.agent-requests/B5-wiring.txt`.
+//
+// WHY THE KEY IS RE-STAMPED RATHER THAN THE EMISSION REORDERED. Moving
+// `emit_oop_map_for_safepoint` above the republish would put the map at the
+// return address by construction and need no fixup afterwards. It is the
+// WRONG repair, and the reason is that that function does not only record
+// metadata -- it EMITS code: the shadow-stack reload (`emit_shadow_reload`,
+// which writes each pushed oop's possibly-relocated value back into its home
+// register or frame slot) and, after the map, the Stage-4 reload of oop
+// locals from their canonical slots. The republish's `helpers.frame_record`
+// shape contains a `CALL`, and `LOCAL_REGS` on SysV is
+// `[R12, R13, R14, R15, RBX, RSI, RDI]` -- RSI and RDI are CALLER-saved
+// there, and are `ARG_REGS[0]` and `ARG_REGS[1]` besides. Reordering would
+// therefore restore a live oop into a register the next few instructions
+// destroy, on the platform this VM is measured on. The frame the map
+// DESCRIBES is valid at both points (nothing in the republish moves RBP, and
+// the offsets are all `[rbp - off]`), so the description was never the
+// problem -- only the number it is filed under is. Re-stamping leaves the
+// emitted bytes BYTE-IDENTICAL, which is the smallest change that can be
+// right, and is the one thing that cannot introduce a codegen bug.
+//
+// FAIL CLOSED. Every shape `restamp_call_oop_map_at_return` does not
+// recognise leaves the entry exactly as `emit_oop_map_for_safepoint` wrote it
+// and is counted as `refused`. A wrong key is worse than the miss it
+// replaces: `find_oop_map_for_pc` binary-searches this table and
+// `compiled_frame_bci` takes the FIRST `find` match, so a duplicate or
+// out-of-order key answers with some other safepoint's bci -- a confidently
+// wrong line, which `compiled_frame_bci`'s own doc calls the single worst
+// outcome available to it.
+
+/// `CRATONVM_JIT=-inline-call-map-at-return` -- measurement-only escape hatch
+/// that restores the pre-fix key (return address + the republish's bytes), so
+/// the change is A/B-able in ONE binary. A regression in anything that reads
+/// `native_pc_offset` then bisects to this in one RUN rather than one BUILD,
+/// which on a 32-core host shared with several other sessions is the whole
+/// difference between a ten-minute answer and an hour-long one.
+///
+/// Cached, like `safepoint::oopmap_presence_only` and A18's map gate: the
+/// question is asked once per spliced direct call emitted, which is a compile-
+/// time path, but the answer cannot change within a process and re-reading the
+/// environment per splice would be the only cost this fix has.
+fn inline_call_map_at_return_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_CALL_MAP_AT_RETURN").is_some()
+    })
+}
+
+/// Census of the re-stamp, index-parallel with
+/// `INLINE_CALL_MAP_AT_RETURN_COUNTS`.
+///
+/// Five numbers rather than one, because "the fix is compiled in" and "the fix
+/// did anything" are different readings and a single total cannot separate
+/// them. A silent fallback is exactly the shape this project has been bitten
+/// by before -- an instrument armed where it cannot fire -- and the defect
+/// being repaired here went unseen for precisely that reason, so the counter
+/// is written to make a ZERO readable rather than merely absent:
+///
+/// * `stamped-at-return` -- the key was moved back onto the return address.
+///   This is the win. A zero here on a run that spliced direct calls means the
+///   republish emitted nothing, i.e. `precise_maps` was off, in which case
+///   `compiled_frame_bci` refuses the artifact anyway and there was nothing to
+///   repair.
+/// * `already-at-return` -- the map was already keyed correctly, so there was
+///   no gap to close. Kept separate from the above so "the republish is inert
+///   in this configuration" is distinguishable from "the fix engaged".
+/// * `no-map` -- the safepoint pushed no entry at all: an empty map is skipped
+///   off the precise path, and a failed compiler returns early. Not an error,
+///   and the largest bucket on the default path.
+/// * `refused` -- the ratchet. A shape that cannot be proven safe to re-key:
+///   more than one entry pushed by one safepoint, a key that would collide
+///   with or precede its neighbour, an offset that does not fit `u32`, or a
+///   stamped offset EARLIER than the return address (which would mean the
+///   buffer moved backwards between the call and the map). MUST be zero. A
+///   non-zero reading is a real finding about the emitter, not about this
+///   code, and the entry is left untouched when it happens.
+/// * `reverted` -- `CRATONVM_JIT_NO_INLINE_CALL_MAP_AT_RETURN` was set.
+pub const INLINE_CALL_MAP_AT_RETURN_NAMES: [&str; 5] = [
+    "stamped-at-return",
+    "already-at-return",
+    "no-map",
+    "refused",
+    "reverted",
+];
+
+static INLINE_CALL_MAP_AT_RETURN_COUNTS: [std::sync::atomic::AtomicU64; 5] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Index into [`INLINE_CALL_MAP_AT_RETURN_NAMES`]: the key was corrected.
+const INLINE_CALL_MAP_STAMPED: usize = 0;
+/// Index: the key already named the return address.
+const INLINE_CALL_MAP_ALREADY: usize = 1;
+/// Index: the safepoint published no map to re-key.
+const INLINE_CALL_MAP_NONE: usize = 2;
+/// Index: the ratchet refused. Must stay zero.
+const INLINE_CALL_MAP_REFUSED: usize = 3;
+/// Index: the kill switch is set, so the pre-fix key stands.
+const INLINE_CALL_MAP_REVERTED: usize = 4;
+
+/// Read the census. Printed by `jit-method-stats` once the one-line re-export
+/// in `jit/src/x64.rs` and the one-line format argument in `jit/src/tiered.rs`
+/// land -- the exact same two-file wiring `inline_live_slot_clamps` above
+/// already has. Both files were owned by another agent on 2026-09-01, so the
+/// edits are written out in `.agent-requests/B5-wiring.txt` instead of made
+/// here. Until then the census is readable in one run with
+/// `CRATONVM_DBG_OOPCOV=1`, which prints a line per event below; that name is
+/// reused deliberately rather than minted, so this adds exactly ONE new flag
+/// to the surface the `types/` declaration guard checks.
+pub fn inline_call_map_at_return_counts() -> [u64; 5] {
+    let mut out = [0u64; 5];
+    for (i, slot) in INLINE_CALL_MAP_AT_RETURN_COUNTS.iter().enumerate() {
+        out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
+/// Re-key the oop map `emit_oop_map_for_safepoint` has just pushed onto the
+/// RETURN ADDRESS of the call it belongs to. See the block comment above for
+/// why this is a re-stamp and not a reordering, and for the evidence that the
+/// defect it repairs is a line-number one rather than a GC one.
+///
+/// `maps_before` is `oop_maps.len()` sampled immediately BEFORE the emission,
+/// and `return_pc` the buffer position immediately after the `CALL` -- the
+/// same value `record_inline_frame_row` is handed, so the oop map and A18's
+/// inline-frame row are filed under ONE key rather than two. That agreement is
+/// the point: the consumer half looks both of them up with the address it read
+/// out of `[rbp+8]`, and a map keyed 20 bytes later would make the line number
+/// and the inlined-frame chain disagree about which call the frame is in.
+fn restamp_call_oop_map_at_return(
+    oop_maps: &mut [crate::OopMapEntry],
+    maps_before: usize,
+    return_pc: usize,
+) {
+    let outcome = restamp_outcome(oop_maps, maps_before, return_pc);
+    if let Some(slot) = INLINE_CALL_MAP_AT_RETURN_COUNTS.get(outcome) {
+        slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    // Under the existing oop-map coverage debug key, so the census is readable
+    // today without the `jit-method-stats` wiring. One line per spliced direct
+    // call is the same order of volume as the per-method `[oopcov]` lines
+    // `driver.rs` already prints under this key.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OOPCOV").is_some() {
+        eprintln!(
+            "[oopcov] inline-direct-call-map {} return_off={} census={:?}",
+            INLINE_CALL_MAP_AT_RETURN_NAMES
+                .get(outcome)
+                .copied()
+                .unwrap_or("?"),
+            return_pc,
+            inline_call_map_at_return_counts(),
+        );
+    }
+}
+
+/// The decision half of [`restamp_call_oop_map_at_return`], split out so every
+/// path -- including the refusals -- flows through one counter bump and one
+/// optional print rather than repeating both at seven `return` sites.
+///
+/// Returns the [`INLINE_CALL_MAP_AT_RETURN_NAMES`] index of what it did.
+fn restamp_outcome(
+    oop_maps: &mut [crate::OopMapEntry],
+    maps_before: usize,
+    return_pc: usize,
+) -> usize {
+    if inline_call_map_at_return_disabled() {
+        return INLINE_CALL_MAP_REVERTED;
+    }
+    // `emit_oop_map_for_safepoint` pushes at most one entry, and pushes none
+    // when the map came out empty off the precise path or when the compiler
+    // was already failed. Zero is ordinary; anything other than zero or one is
+    // a shape this function was not written against.
+    if oop_maps.len() == maps_before {
+        return INLINE_CALL_MAP_NONE;
+    }
+    if oop_maps.len() != maps_before + 1 {
+        return INLINE_CALL_MAP_REFUSED;
+    }
+    let Ok(return_off) = u32::try_from(return_pc) else {
+        // A code buffer past 4 GiB. Unreachable in this backend, and a
+        // truncating cast here would name a byte in some other method.
+        return INLINE_CALL_MAP_REFUSED;
+    };
+    let stamped = oop_maps[maps_before].native_pc_offset;
+    if stamped == return_off {
+        return INLINE_CALL_MAP_ALREADY;
+    }
+    if stamped < return_off {
+        // The map is emitted strictly after the call, so its key can only be
+        // LATER than the return address. An earlier one means the buffer moved
+        // backwards between the two -- a rewind this does not model, and one
+        // that would make the "still sorted" argument below unsound.
+        return INLINE_CALL_MAP_REFUSED;
+    }
+    // The table must stay sorted AND single-keyed. `find_oop_map_for_pc`
+    // binary-searches it (and `debug_assert`s the sortedness), and
+    // `compiled_frame_bci` takes the first linear `find` match, so a duplicate
+    // key resolves to whichever entry happens to come first. Lowering this
+    // entry's key can only bring it closer to its predecessor, so the
+    // predecessor is the only one that can be violated -- everything pushed
+    // after this point is at a strictly later buffer position. In practice the
+    // predecessor is at least the `CALL` instruction's own length below
+    // `return_off`; the check is a ratchet against that ceasing to be true.
+    if maps_before > 0 && oop_maps[maps_before - 1].native_pc_offset >= return_off {
+        return INLINE_CALL_MAP_REFUSED;
+    }
+    oop_maps[maps_before].native_pc_offset = return_off;
+    INLINE_CALL_MAP_STAMPED
+}
+
+// ---------------------------------------------------------------------------
+// PC -> inline-chain map (the PRODUCER half)
+// ---------------------------------------------------------------------------
+//
+// An inlined callee contributes NO stack-trace frame today, because
+// `conservative_roots::active_compiled_frames_with_bci` is flat: one entry per
+// compiled artifact. HotSpot's equivalent is a `ScopeDesc` CHAIN -- an inlined
+// callee is a nested scope at the same PC -- which is what makes the inlined
+// frames reappear in a warmed-up trace. See
+// `docs/known-issues/jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901.md`,
+// defect (2).
+//
+// WHAT WAS RULED OUT, in the order it was checked, because each one looked
+// like it should already be the answer:
+//
+//   * **`CompiledMethod::inlined_methods`.** It survives to runtime and names
+//     every spliced callee -- but it is a flat SET keyed by nothing. It exists
+//     for class-change invalidation, cannot say which callee a given PC is
+//     inside, and cannot say at which bci. Naming a frame from it would be
+//     guessing.
+//   * **The deopt caller chain.** `DeoptimizationPoint::frame_state.caller` IS
+//     a real chain, IS retained on the artifact, and IS PC-indexed
+//     (`find_deopt_point`). Two facts kill it. First, every level carries
+//     `method_key: self.method_key` -- the COMPILING method -- because
+//     `build_frame_state_at` has no other identity to stamp; a nested level
+//     would therefore name the outer method with an inner method's bci, which
+//     is the malformed pair this whole exercise exists not to produce.
+//     Second, and decisively, the invoke arm inside a splice deliberately
+//     publishes no point at all (`emit_inline_invoke_into_rax`: "Deliberately
+//     NO `snapshot_pre_intrinsic_call` here"), so the ONE native offset a
+//     stack walk actually keys on -- the return address of the call the deeper
+//     frame is suspended in -- has no deopt point under it. Making it publish
+//     one would record a resume bci the enclosing method does not have, which
+//     is exactly the `IndexOutOfBoundsException`-into-`InternalError`
+//     regression of 2026-08-28.
+//   * **`OopMapEntry`.** It is the right key and it does survive, but it has
+//     no spare field, and `bytecode_pc` inside a splice holds the ENCLOSING
+//     method's invoke bci (`cur_bc_pc` is not moved by the inline walk) --
+//     that is the answer `compiled_frame_bci` already returns, and the thing
+//     this map has to EXTEND rather than replace.
+//
+// So the chain has to be emitted. This is the emitter half: it records, per
+// call emitted from inside a spliced body, the chain of (callee label, bci)
+// pairs a stack walk arriving at that call must expand into frames.
+//
+// KEYS. Deliberately the same two `conservative_roots::compiled_frame_bci`
+// already uses, and no third one:
+//
+//   1. `native_offset` -- the buffer position immediately after the `CALL`,
+//      i.e. the return address a parent frame's RBP-chain walk reads, which is
+//      the key `OopMapEntry::native_pc_offset` is recorded under.
+//   2. `safepoint_bci` -- `cur_bc_pc` at the call, which is the value the
+//      emitter stores into the frame's safepoint-id slot and the value
+//      `compiled_frame_bci` recovers for the INNERMOST frame. It is the bci of
+//      the enclosing compiled method, so a chain found under it appends
+//      directly to the frame `compiled_frame_bci` already describes.
+//
+// FAIL CLOSED, in three places, because a fabricated frame is worse than an
+// absent one -- the reader cannot tell a wrong method name from a right one,
+// where a missing frame at least reads as missing:
+//
+//   * a level whose bci is not a spec-legal bytecode index (JVMS 4.9.1) or
+//     whose label is empty refuses the whole ROW, not just that level;
+//   * a rewound emission is dropped: rows are appended in emission order, so a
+//     later row whose `native_offset` is not strictly greater than the last
+//     kept one proves the buffer was rewound between them, and every kept row
+//     at or above that offset is discarded (that is the backstop; the three
+//     splice rollback paths also truncate explicitly);
+//   * a `safepoint_bci` two rows disagree about is POISONED rather than
+//     resolved to either answer. One bci covers a whole spliced region, so a
+//     splice containing two calls with different chains genuinely cannot be
+//     told apart from the safepoint-id slot alone -- the innermost frame's
+//     only evidence. `chain_for_safepoint_bci` then answers `None` and the
+//     frame is reported exactly as it is today.
+
+/// Exclusive upper bound on a bytecode index: `Code.code_length` must be less
+/// than 65536 (JVMS 4.9.1). Mirrors `conservative_roots::plausible_bci`'s
+/// bound on the consumer side, derived from the spec rather than from a list
+/// of the synthetic pcs this backend stamps (`ENTRY_POLL_BC_PC`,
+/// `SP_ID_UNSET_BC_PC`), both of which are far above it and are rejected by
+/// the same one test.
+const INLINE_FRAME_MAX_BCI: usize = 65_536;
+
+/// One level of an inline chain: a spliced callee, and the bytecode index --
+/// in THAT callee's own code -- of the call leading one level further in.
+///
+/// `label` is `"class/Name.method:descriptor"`, the same shape
+/// `CompiledMethod::method_label` carries, so the consumer parses it with the
+/// splitter `stackwalker::compiled_frame_entry` already has rather than a
+/// second one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct InlineFrameLevel {
+    /// `"class/Name.method:descriptor"`.
+    pub label: String,
+    /// Bytecode index inside `label`'s method.
+    pub bci: u32,
+}
+
+/// One PC-keyed row: at `native_offset` (equivalently, under safepoint id
+/// `safepoint_bci`), `chain` is the list of inlined callees the enclosing
+/// compiled frame is standing inside, INNERMOST FIRST.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct InlineFrameRow {
+    pub native_offset: u32,
+    pub safepoint_bci: u32,
+    pub chain: Vec<InlineFrameLevel>,
+}
+
+/// The finished map for one compiled artifact.
+///
+/// Empty -- and holding no allocation -- for every method that splices
+/// nothing, which is the overwhelming majority. Built once at the end of a
+/// compile and then immutable.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code, clippy::type_complexity)]
+pub struct InlineFrameMap {
+    /// Ascending by offset. Exact: a parent frame's return address names one
+    /// program point and nothing else.
+    by_native_offset: Vec<(u32, Vec<InlineFrameLevel>)>,
+    /// Ascending by bci. `None` = two rows under this bci disagreed, so the
+    /// safepoint-id evidence cannot pick between them and the lookup refuses.
+    by_safepoint_bci: Vec<(u32, Option<Vec<InlineFrameLevel>>)>,
+}
+
+#[allow(dead_code, clippy::type_complexity)]
+impl InlineFrameMap {
+    /// Nothing recorded -- the state of every compile that splices nothing,
+    /// and the state produced when the map is switched off.
+    pub fn is_empty(&self) -> bool {
+        self.by_native_offset.is_empty() && self.by_safepoint_bci.is_empty()
+    }
+
+    /// How many PC rows are held. Worth reporting separately from "a map was
+    /// built": that a map exists and that it named a live PC are different
+    /// facts, and a count of the first cannot stand for the second.
+    pub fn len(&self) -> usize {
+        self.by_native_offset.len()
+    }
+
+    /// The chain at an exact return-address offset -- the evidence available
+    /// for every frame BELOW the innermost one.
+    pub fn chain_for_native_offset(&self, native_offset: u32) -> Option<&[InlineFrameLevel]> {
+        self.by_native_offset
+            .binary_search_by_key(&native_offset, |(o, _)| *o)
+            .ok()
+            .map(|i| self.by_native_offset[i].1.as_slice())
+    }
+
+    /// The chain under a safepoint id -- the only evidence the INNERMOST frame
+    /// has, since it owns no return address on this stack.
+    ///
+    /// `None` both for "no row" and for "rows disagreed". The caller cannot act
+    /// differently on the two and must not: an ambiguous chain and an absent
+    /// one both mean no inlined frame may be reported here.
+    pub fn chain_for_safepoint_bci(&self, safepoint_bci: u32) -> Option<&[InlineFrameLevel]> {
+        let i = self
+            .by_safepoint_bci
+            .binary_search_by_key(&safepoint_bci, |(b, _)| *b)
+            .ok()?;
+        self.by_safepoint_bci[i].1.as_deref()
+    }
+
+    /// Collapse the raw emission-order rows into the two lookup tables.
+    ///
+    /// `code_len` is the artifact's final code length; a row past it describes
+    /// bytes that are not in the artifact and is dropped.
+    fn from_rows(rows: Vec<InlineFrameRow>, code_len: usize) -> Self {
+        // Rewind backstop. Rows are appended in emission order, so their
+        // offsets are strictly increasing UNLESS the buffer was rewound
+        // between two of them. When it was, every row at or above the new
+        // offset describes machine code that no longer exists.
+        let mut kept: Vec<InlineFrameRow> = Vec::new();
+        for row in rows {
+            while kept
+                .last()
+                .map(|last| last.native_offset >= row.native_offset)
+                .unwrap_or(false)
+            {
+                kept.pop();
+            }
+            kept.push(row);
+        }
+        let limit = u32::try_from(code_len).unwrap_or(u32::MAX);
+        kept.retain(|r| r.native_offset <= limit);
+
+        let mut by_native_offset: Vec<(u32, Vec<InlineFrameLevel>)> =
+            Vec::with_capacity(kept.len());
+        let mut by_safepoint_bci: Vec<(u32, Option<Vec<InlineFrameLevel>>)> = Vec::new();
+        for r in &kept {
+            by_native_offset.push((r.native_offset, r.chain.clone()));
+            match by_safepoint_bci
+                .iter_mut()
+                .find(|(b, _)| *b == r.safepoint_bci)
+            {
+                Some(slot) => {
+                    let agrees = match &slot.1 {
+                        Some(existing) => *existing == r.chain,
+                        None => false,
+                    };
+                    if !agrees {
+                        slot.1 = None;
+                    }
+                }
+                None => by_safepoint_bci.push((r.safepoint_bci, Some(r.chain.clone()))),
+            }
+        }
+        by_native_offset.sort_by_key(|(o, _)| *o);
+        by_safepoint_bci.sort_by_key(|(b, _)| *b);
+        Self {
+            by_native_offset,
+            by_safepoint_bci,
+        }
+    }
+}
+
+/// One live splice while the emitter is inside it.
+struct InlineFrameScope {
+    /// `"class/Name.method:descriptor"` of the callee being spliced.
+    label: String,
+    /// Where the invoke this splice replaces lives in the ENCLOSING bytecode --
+    /// the compiling method's own code for a top-level splice, the enclosing
+    /// callee's code for a nested one. Frozen at the push, which is why it can
+    /// still name the enclosing level after the walk has moved on.
+    entry_bci: usize,
+    /// Where THIS splice's walk currently stands, in the callee's own code.
+    /// `usize::MAX` until the walk sets it, which refuses the row rather than
+    /// publishing a bci nothing produced.
+    cur_pc: usize,
+}
+
+thread_local! {
+    /// Is a recording session open on this thread? A plain `Cell<bool>` so
+    /// every hook below can bail on one thread-local read: a compile that
+    /// splices nothing never reaches this file at all, and a compile that
+    /// splices while the session is closed pays exactly this read per splice
+    /// and per emitted call.
+    static INLINE_FRAME_RECORDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Rows for the compile in progress, in emission order.
+    static INLINE_FRAME_ROWS: std::cell::RefCell<Vec<InlineFrameRow>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The live splice stack, OUTERMOST first.
+    static INLINE_FRAME_SCOPES: std::cell::RefCell<Vec<InlineFrameScope>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether compiles emit a PC -> inline-chain map at all.
+///
+/// Default ON. `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` records nothing, so the
+/// retained metadata and the extra trace frames disappear together and both
+/// the cost and the behaviour are A/B-able inside ONE binary -- the same shape
+/// as `CRATONVM_JIT_NO_COMPILED_FRAME_LINES`, and for the same reason: a trace
+/// that looks wrong after warm-up must be attributable to one environment
+/// variable rather than to a rebuild.
+#[allow(dead_code)]
+pub fn inline_frame_map_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_FRAME_MAP").is_none()
+    })
+}
+
+/// Open a recording session for one compile. Anything left over from an
+/// abandoned compile on this thread is discarded here rather than inherited,
+/// because a row from a previous compile names an offset in a DIFFERENT code
+/// buffer.
+#[allow(dead_code)]
+pub fn begin_inline_frame_recording() {
+    let on = inline_frame_map_enabled();
+    INLINE_FRAME_ROWS.with(|r| r.borrow_mut().clear());
+    INLINE_FRAME_SCOPES.with(|s| s.borrow_mut().clear());
+    INLINE_FRAME_RECORDING.with(|c| c.set(on));
+}
+
+/// Close the session and hand back the finished map.
+///
+/// Always leaves the thread with no session open and no retained rows, on
+/// every exit from a compile -- including the ones that discard the artifact.
+#[allow(dead_code)]
+pub fn finish_inline_frame_recording(code_len: usize) -> InlineFrameMap {
+    let was_recording = INLINE_FRAME_RECORDING.with(|c| c.replace(false));
+    let rows = INLINE_FRAME_ROWS.with(|r| std::mem::take(&mut *r.borrow_mut()));
+    INLINE_FRAME_SCOPES.with(|s| s.borrow_mut().clear());
+    if !was_recording {
+        return InlineFrameMap::default();
+    }
+    InlineFrameMap::from_rows(rows, code_len)
+}
+
+#[inline]
+fn inline_frame_recording() -> bool {
+    INLINE_FRAME_RECORDING.with(std::cell::Cell::get)
+}
+
+/// `"class/Name.method:descriptor"` for a resolved site -- the shape
+/// `CompiledMethod::method_label` uses, built from the same three strings the
+/// invalidation triple is built from.
+fn inline_site_label(site: &crate::InlineSite) -> String {
+    format!("{}.{}:{}", site.class_name, site.method_name, site.descriptor)
+}
+
+fn push_inline_frame_scope(label: String, entry_bci: usize) {
+    if !inline_frame_recording() {
+        return;
+    }
+    INLINE_FRAME_SCOPES.with(|s| {
+        s.borrow_mut().push(InlineFrameScope {
+            label,
+            entry_bci,
+            cur_pc: usize::MAX,
+        })
+    });
+}
+
+fn pop_inline_frame_scope() {
+    if !inline_frame_recording() {
+        return;
+    }
+    INLINE_FRAME_SCOPES.with(|s| {
+        s.borrow_mut().pop();
+    });
+}
+
+/// Point the innermost live splice at the callee instruction being emitted.
+///
+/// Kept separate from `Compiler::inline_walk_at`, which looks like it would
+/// serve: a nested splice overwrites it and `try_emit_nested_inline` does not
+/// restore it, so after a nested body returns it names the INNER walk's last
+/// position while the enclosing walk is still emitting the miss edge of the
+/// same invoke. Reading it there would attribute the miss-edge call to a bci
+/// in another method's bytecode.
+fn set_inline_frame_scope_pc(cur_pc: usize) {
+    if !inline_frame_recording() {
+        return;
+    }
+    INLINE_FRAME_SCOPES.with(|s| {
+        if let Some(top) = s.borrow_mut().last_mut() {
+            top.cur_pc = cur_pc;
+        }
+    });
+}
+
+fn inline_frame_rows_len() -> usize {
+    if !inline_frame_recording() {
+        return 0;
+    }
+    INLINE_FRAME_ROWS.with(|r| r.borrow().len())
+}
+
+/// Discard rows recorded by an abandoned splice. Called from every rollback
+/// path that rewinds the buffer, beside the `deopt_points` truncation it
+/// mirrors: a row surviving a rollback would name an offset the fall-through
+/// call path has since overwritten with different code.
+fn truncate_inline_frame_rows(n: usize) {
+    if !inline_frame_recording() {
+        return;
+    }
+    INLINE_FRAME_ROWS.with(|r| r.borrow_mut().truncate(n));
+}
+
+/// The chain for the live splice stack, INNERMOST FIRST, or `None` when any
+/// level is not fully described.
+///
+/// Level `i`'s bci is where control leaves level `i` -- the walk's current
+/// position for the innermost level, and the frozen `entry_bci` of the level
+/// one deeper for every other. Refusing the whole chain on one bad level is
+/// deliberate: a chain with a hole is not a shorter chain, it is a chain whose
+/// remaining entries attach to the wrong caller.
+fn build_inline_frame_chain(scopes: &[InlineFrameScope]) -> Option<Vec<InlineFrameLevel>> {
+    if scopes.is_empty() {
+        return None;
+    }
+    let innermost = scopes.len() - 1;
+    let mut chain: Vec<InlineFrameLevel> = Vec::with_capacity(scopes.len());
+    let mut i = innermost + 1;
+    while i > 0 {
+        i -= 1;
+        let bci = if i == innermost {
+            scopes[innermost].cur_pc
+        } else {
+            scopes[i + 1].entry_bci
+        };
+        if bci >= INLINE_FRAME_MAX_BCI || scopes[i].label.is_empty() {
+            return None;
+        }
+        chain.push(InlineFrameLevel {
+            label: scopes[i].label.clone(),
+            // Cast: guarded above by the JVMS 4.9.1 bound.
+            bci: bci as u32,
+        });
+    }
+    Some(chain)
+}
+
+/// Record one row at the return address of a call emitted from inside a
+/// spliced body.
+///
+/// `native_offset` must be the buffer position immediately AFTER the `CALL`,
+/// because that is the value a parent frame's RBP-chain walk reads out of
+/// `[rbp+8]` and the key `OopMapEntry::native_pc_offset` uses.
+fn record_inline_frame_row(native_offset: usize, safepoint_bci: usize) {
+    if !inline_frame_recording() {
+        return;
+    }
+    let chain = INLINE_FRAME_SCOPES.with(|s| build_inline_frame_chain(s.borrow().as_slice()));
+    let Some(chain) = chain else {
+        return;
+    };
+    if safepoint_bci >= INLINE_FRAME_MAX_BCI {
+        return;
+    }
+    let native_offset = match u32::try_from(native_offset) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    INLINE_FRAME_ROWS.with(|r| {
+        r.borrow_mut().push(InlineFrameRow {
+            native_offset,
+            // Cast: guarded above by the JVMS 4.9.1 bound.
+            safepoint_bci: safepoint_bci as u32,
+            chain,
+        })
+    });
+}
+
 fn record_merge_state(
     states: &mut [Option<(usize, Vec<bool>)>],
     target: usize,
@@ -173,6 +869,14 @@ impl Compiler {
         // behind by a bailed splice would attach a caller frame to every later
         // point in the enclosing method.
         self.push_inline_scope(pc, site.callee_num_args);
+        // The inline-frame map's own scope, pushed in lockstep with the
+        // deopt scope above and popped beside it. Separate because the two
+        // answer different questions: `push_inline_scope` records the
+        // ENCLOSING frame's state so a deopt can rebuild it, and stamps the
+        // compiling method's key on every level; this one records the
+        // CALLEE's identity, which is what a stack trace has to name.
+        let inline_frame_rows_checkpoint = inline_frame_rows_len();
+        push_inline_frame_scope(inline_site_label(site), pc);
         let walk_at_checkpoint = self.inline_walk_at;
         self.inline_walk_at = (usize::MAX, 0);
         // The callee-local oop scope this splice pushes lives exactly as long
@@ -189,6 +893,7 @@ impl Compiler {
         // cleanly would overwrite where the OUTER one stands.
         self.inline_walk_at = walk_at_checkpoint;
         self.pop_inline_scope();
+        pop_inline_frame_scope();
         self.slot_mirror_suppressed = mirror_suppressed_checkpoint;
         self.slot_mirror = None;
         // PGO-02 §3, enforced rather than argued.
@@ -278,6 +983,7 @@ impl Compiler {
             self.null_check_store_stubs
                 .truncate(null_check_store_stubs_checkpoint);
             self.deopt_points.truncate(deopt_points_checkpoint);
+            truncate_inline_frame_rows(inline_frame_rows_checkpoint);
             crate::metrics::note_inline_call_arm(6);
             // Name the rollback. The count alone ("outer-splice-rolled-back=1")
             // says a planned splice was thrown away without saying by what, and
@@ -539,6 +1245,10 @@ impl Compiler {
             // Name the spot for a rollback report (see `inline_walk_at`). A
             // bail leaves this at the instruction it died on.
             self.inline_walk_at = (cpc, op);
+            // ...and keep the inline-frame scope pointed there too. See
+            // `set_inline_frame_scope_pc` for why this is not read off
+            // `inline_walk_at` at record time.
+            set_inline_frame_scope_pc(cpc);
             // Keep this splice's scope pointed at the instruction being
             // emitted, so a safepoint inside the body reads the oop-local mask
             // for the right callee pc. `last_mut`: a nested splice pushes its
@@ -2245,6 +2955,13 @@ impl Compiler {
         let total_sub = self.emit_stack_arg_setup(arg_slots, resolved.direct_needs_context);
         self.emit_pre_safepoint_spill();
         self.emit_call_absolute(resolved.direct_entry);
+        // The return address into THIS artifact -- the key a parent
+        // frame's RBP-chain walk reads out of `[rbp+8]`, recorded before
+        // the republish/oop-map bytes move the cursor past it. Held in a
+        // local because the oop map below has to be filed under this same
+        // number and `buf.pos()` will no longer be it by then.
+        let return_pc = self.buf.pos();
+        record_inline_frame_row(return_pc, self.cur_bc_pc);
         self.emit_post_call_rbp_republish();
         // A direct call to a compiled callee is still a safepoint: the callee
         // may allocate and trigger GC transitively. The caller's operand stack
@@ -2252,7 +2969,12 @@ impl Compiler {
         // locals this splice reserved live in the frame's spill area and are
         // covered by the same conservative frame sweep as every other spill
         // slot — over-approximate, hence pinned by a moving collector.
+        let maps_before = self.oop_maps.len();
         self.emit_oop_map_for_safepoint();
+        // That map was stamped at `buf.pos()`, which the republish above has
+        // already moved 9-20 bytes past the return address a walker keys on.
+        // Move the key back onto `return_pc`; the emitted bytes are untouched.
+        restamp_call_oop_map_at_return(&mut self.oop_maps, maps_before, return_pc);
         self.emit_stack_arg_cleanup(total_sub);
         self.emit_inline_callee_deopt_check(info, arg_slots.len(), service_args_base);
         true
@@ -2301,7 +3023,21 @@ impl Compiler {
         self.emit_mov_imm32_sx(ARG_REGS[3], num_args as i32); // Cast: x86-64 immediate encoding
         self.emit_pre_safepoint_spill();
         self.emit_call_absolute(self.helpers.invoke_dispatch);
+        // As the direct arm: the return address is the walk's key.
+        let return_pc = self.buf.pos();
+        record_inline_frame_row(return_pc, self.cur_bc_pc);
+        let maps_before = self.oop_maps.len();
         self.emit_oop_map_for_safepoint();
+        // Nothing is emitted between the call and the map here -- there is no
+        // republish on this arm -- so on the default path this is provably a
+        // no-op that records `already-at-return`. It is kept for two reasons.
+        // It is the CONTROL: a census where this arm reads `already` and the
+        // direct arm reads `stamped` separates "the fix engaged" from "the
+        // instrument fires on everything". And it is not unconditionally a
+        // no-op: under `CRATONVM_SHADOW`, `emit_oop_map_for_safepoint` emits
+        // the shadow reload BEFORE taking `buf.pos()`, so this arm's map drifts
+        // off the return address too, by a different and larger amount.
+        restamp_call_oop_map_at_return(&mut self.oop_maps, maps_before, return_pc);
         true
     }
 
@@ -2357,6 +3093,10 @@ impl Compiler {
         let bounds_check_stubs_checkpoint = self.bounds_check_stubs.len();
         let null_check_store_stubs_checkpoint = self.null_check_store_stubs.len();
 
+        // Rows recorded by the hit arm's nested splice. This function
+        // rewinds the buffer on three further paths AFTER that splice has
+        // succeeded, so its own rollbacks must discard them too.
+        let inline_frame_rows_checkpoint = inline_frame_rows_len();
         let recv_slot = self.stack[self.stack.len() - recv_depth];
         self.load_slot_to_reg(RAX, recv_slot);
         self.emit_test_r64_r64(RAX);
@@ -2377,6 +3117,7 @@ impl Compiler {
                 .truncate(exception_check_stubs_checkpoint);
             self.deopt_stubs.truncate(deopt_stubs_checkpoint);
             self.deopt_points.truncate(deopt_points_checkpoint);
+            truncate_inline_frame_rows(inline_frame_rows_checkpoint);
             self.forward_patches.truncate(forward_patches_checkpoint);
             self.jump_table_patches
                 .truncate(jump_table_patches_checkpoint);
@@ -2415,6 +3156,7 @@ impl Compiler {
                     .truncate(exception_check_stubs_checkpoint);
                 self.deopt_stubs.truncate(deopt_stubs_checkpoint);
                 self.deopt_points.truncate(deopt_points_checkpoint);
+                truncate_inline_frame_rows(inline_frame_rows_checkpoint);
                 self.forward_patches.truncate(forward_patches_checkpoint);
                 self.jump_table_patches
                     .truncate(jump_table_patches_checkpoint);
@@ -2447,6 +3189,7 @@ impl Compiler {
                 .truncate(exception_check_stubs_checkpoint);
             self.deopt_stubs.truncate(deopt_stubs_checkpoint);
             self.deopt_points.truncate(deopt_points_checkpoint);
+            truncate_inline_frame_rows(inline_frame_rows_checkpoint);
             self.forward_patches.truncate(forward_patches_checkpoint);
             self.jump_table_patches
                 .truncate(jump_table_patches_checkpoint);
@@ -2509,7 +3252,13 @@ impl Compiler {
         // trace — so passing the enclosing splice's pc keeps that trace
         // pointing at the caller-visible call site.
         let outer_pc = self.dbg_last_pc;
+        // The inline-frame scope for this level. `entry_bci` is the
+        // ENCLOSING callee's pc -- `inline_walk_at.0`, read HERE, before
+        // `try_emit_inline_body` overwrites it and does not restore it.
+        let inline_frame_rows_checkpoint = inline_frame_rows_len();
+        push_inline_frame_scope(inline_site_label(site), self.inline_walk_at.0);
         let inline_ok = self.try_emit_inline_body(outer_pc, site);
+        pop_inline_frame_scope();
         let published = self.deopt_stubs.len() > deopt_stubs_checkpoint
             || self.deopt_points.len() > deopt_points_checkpoint;
         if inline_ok && !published {
@@ -2523,6 +3272,7 @@ impl Compiler {
             .truncate(exception_check_stubs_checkpoint);
         self.deopt_stubs.truncate(deopt_stubs_checkpoint);
         self.deopt_points.truncate(deopt_points_checkpoint);
+        truncate_inline_frame_rows(inline_frame_rows_checkpoint);
         self.forward_patches.truncate(forward_patches_checkpoint);
         self.jump_table_patches
             .truncate(jump_table_patches_checkpoint);

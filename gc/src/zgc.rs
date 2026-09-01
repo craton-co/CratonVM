@@ -5651,8 +5651,24 @@ impl ZgcRealHeap {
     ///
     /// Returns the **machine address** the slot should be read as, or `None`
     /// for null.
+    ///
+    /// # Why `pub(crate)` and not private
+    ///
+    /// [`crate::vm_heap::VmHeap::load_ref_slot_barriered`] -- the backend-
+    /// dispatching seam the JIT read helpers call, which lives in a sibling
+    /// module -- delegates its armed `Zgc` arm here rather than re-deriving the
+    /// barrier. That is deliberate: this body is the single in-tree place that
+    /// gets the OFFSET -> ADDRESS conversion right (`z_load` returns a bare
+    /// 42-bit offset, and returning it uncorrected truncates silently -- see
+    /// `zgc/relocate.rs` and `zgc/mark.rs`) and the single place that resolves
+    /// the `Good(0)` null-versus-heap-offset-0 ambiguity. A second copy in
+    /// `vm_heap.rs` would be a second chance to get either one wrong.
+    ///
+    /// Deliberately NOT `pub`: nothing outside this crate should reach the
+    /// barrier except through `VmHeap`, because doing so is the per-site ZGC
+    /// special case `docs/feature-designs/zgc-jit-load-barrier.md` forbids.
     #[inline]
-    fn load_barrier_slot(&self, slot_addr: usize) -> Option<usize> {
+    pub(crate) fn load_barrier_slot(&self, slot_addr: usize) -> Option<usize> {
         use barrier::ZBarrierContext;
         // SAFETY: the caller supplies the address of an 8-byte-aligned
         // reference word inside a live object.
@@ -7023,10 +7039,80 @@ impl ZgcRealHeap {
                 });
             }
             for (slot_addr, to) in rewrites {
-                // SAFETY: `slot_addr` is an 8-byte-aligned reference word
-                // inside a live object, as reported by `reference_slots`, and
-                // the world is stopped.
-                unsafe { std::ptr::write(slot_addr as *mut u64, to) };
+                // A RELAXED ATOMIC store, not `std::ptr::write`.
+                //
+                // WHY THE OLD JUSTIFICATION HAD TO GO. This line's previous
+                // SAFETY note ended "and the world is stopped". That is true
+                // today and it is scheduled to stop being true: it is exactly
+                // the property step 7 of the ordered sequence on
+                // [`census::ZSlotShape::word_is_atomically_accessed_today`]
+                // removes, when flipping `RELOCATION_REQUESTED` makes
+                // relocation concurrent. A justification that expires on the
+                // very change it has to survive is worse than none, because
+                // whoever makes that change has no reason to come back here.
+                //
+                // THE NEW JUSTIFICATION. This is the word the ZGC load barrier
+                // SELF-HEALS: `zgc/barrier.rs`'s `load_barrier_slow` does
+                // `slot.compare_exchange(observed, healed, AcqRel, Acquire)`
+                // on an `&AtomicU64` view of this same address --
+                // [`ZgcRealHeap::load_barrier_slot`] takes that view of a
+                // `slot_addr` produced by this same `reference_slots` walk. A
+                // PLAIN write racing an ATOMIC read-modify-write on one
+                // location is a data race, and a data race is undefined
+                // behaviour in the Rust abstract machine whatever x86-64 does
+                // with an aligned qword. The hazard is not the instruction the
+                // backend emits: it is that the compiler is entitled to treat
+                // a plain access as unshared, and may therefore duplicate,
+                // widen, sink, hoist or invent it. `Relaxed` withdraws that
+                // entitlement and buys nothing else, which is the whole of
+                // what a CAS neighbour needs. Same argument and same spelling
+                // as the atomicity note over
+                // `cratonvm_types::narrow_oop::read_ref_slot` /
+                // `write_ref_slot` (`types/src/narrow_oop.rs:353`, `:370`) --
+                // deliberately not a second style.
+                //
+                // NOT STRONGER THAN `Relaxed`, for that note's four reasons in
+                // brief: the defect is the non-atomicity and not the ordering;
+                // the release/acquire edge belongs to the heal's own CAS and a
+                // slot writer participates in neither half of it; the
+                // Java-visible publication edges come from
+                // `set_field_volatile`'s bracketing `SeqCst` fences and from
+                // `write_compact_field`'s caller-supplied `Ordering`, never
+                // from a raw slot writer; and on x86-64 a `Relaxed` store of an
+                // aligned qword lowers to the same single `mov` the plain write
+                // did (`str` on aarch64), so this cannot move a benchmark and
+                // is safe to land AHEAD of the arming rather than with it.
+                //
+                // WIDTH -- 8 bytes unconditionally is correct HERE and only
+                // here. `reference_slots` reads compact fields and array
+                // elements through `narrow_oop::read_ref_slot`, which is FOUR
+                // bytes wide under compressed oops, so an 8-byte store would
+                // be four bytes of the neighbouring field. It cannot arise
+                // inside a `ZgcRealHeap`: ZGC and compressed oops are mutually
+                // exclusive, and the exclusion is enforced rather than
+                // aspirational. `vm/src/vm/vm_init.rs` refuses
+                // `-XX:+UseCompressedOops` for any backend but `Generational`
+                // and prints the refusal on stderr, and `zgc/vaddr.rs`'s
+                // "Interaction with compressed oops" section gives the reason
+                // it must STAY refused: a coloured word is `Z_COLORED_TAG` at
+                // bit 63, a colour at bits 42-46 and a 42-bit offset, which
+                // does not fit in 32 bits under any encoding -- the same fact
+                // that makes `VmHeap::load_ref_slot_barriered` refuse the
+                // narrow arm outright. So `narrow_oops_enabled()` is false for
+                // every slot this walk reports, and `to` is a full machine
+                // address that could not be narrowed anyway. A narrow arm here
+                // would be unreachable code asserting the opposite of the
+                // invariant, which is why there is not one.
+                //
+                // SAFETY: `slot_addr` is the address of a reference WORD inside
+                // a live object, as reported by `reference_slots`, whose own
+                // contract ([`census::ZSlotObservation::slot_addr`]) is
+                // `slot_addr % 8 == 0` for every shape it emits; the object was
+                // screened by `rewrite_target_is_walkable` a few lines above.
+                // Natural alignment is the one thing a relaxed atomic requires
+                // that a plain access does not -- and `ptr::write` required it
+                // too, so nothing that was sound becomes unsound.
+                unsafe { (&*(slot_addr as *const AtomicU64)).store(to, Ordering::Relaxed) };
             }
         }
 
@@ -9548,10 +9634,28 @@ impl ZgcRealHeap {
                         if tag != cratonvm_types::VTAG_OBJECT as u32 {
                             continue;
                         }
+                        // A RELAXED ATOMIC load, not `std::ptr::read`. This
+                        // marker runs CONCURRENTLY with mutators by design, and
+                        // this payload word is the word the ZGC load barrier
+                        // CAS-heals (`zgc/barrier.rs`'s `load_barrier_slow`).
+                        // A plain read racing that `compare_exchange` is a data
+                        // race and therefore UB in the Rust abstract machine
+                        // regardless of what an aligned qword does on x86-64.
+                        // `Relaxed` is the whole of the fix and changes no
+                        // codegen -- the same single `mov`. See the atomicity
+                        // note over `cratonvm_types::narrow_oop::read_ref_slot`
+                        // (`types/src/narrow_oop.rs:353`) for why nothing
+                        // stronger is warranted; this is that note's spelling.
+                        //
+                        // The 4-byte TAG load above stays PLAIN, deliberately:
+                        // the barrier CASes the PAYLOAD word, never the tag,
+                        // so the tag is not on the arming path. Its own
+                        // (separate, tracked) item is on
+                        // `census::ZSlotShape::word_is_atomically_accessed_today`.
                         let raw = unsafe {
-                            std::ptr::read(
-                                cell.add(cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET) as *const u64
-                            )
+                            (&*(cell.add(cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET)
+                                as *const AtomicU64))
+                                .load(Ordering::Relaxed)
                         };
                         if raw != 0 {
                             f(raw);
@@ -11870,7 +11974,20 @@ impl census::ZCensusHeapView for ZgcRealHeap {
                         };
                         let word_ptr =
                             unsafe { cell.add(cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET) };
-                        let word = unsafe { std::ptr::read(word_ptr as *const u64) };
+                        // A RELAXED ATOMIC load, for the reason spelled out
+                        // at the same read in `visit_strong_refs_at`: this
+                        // payload word is the word the load barrier CAS-heals
+                        // for a legacy field, and it is the word the compaction
+                        // rewrite pass in `relocate_stw` stores back through --
+                        // this walk is what produces the `slot_addr` that store
+                        // uses, so the read and the write have to be the same
+                        // kind of access or the pair is still a race. Mixing a
+                        // plain read with a `compare_exchange` on one location
+                        // is UB; `Relaxed` closes it and costs the same `mov`.
+                        //
+                        // The TAG read above stays plain -- see that same site.
+                        let word =
+                            unsafe { (&*(word_ptr as *const AtomicU64)).load(Ordering::Relaxed) };
                         // EVERY slot, tag and all — the census does the tag
                         // arithmetic itself. Filtering to `Value::Object` here is
                         // what would merge the never-written population into the

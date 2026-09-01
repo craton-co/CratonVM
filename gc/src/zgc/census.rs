@@ -292,26 +292,201 @@ impl ZSlotShape {
         }
     }
 
-    /// Whether this shape's reference word is **already** read and written
-    /// through `AtomicU64` today.
+    /// Whether **every** in-tree reader and writer of this shape's reference
+    /// word is an ATOMIC access today.
     ///
-    /// The study's §0 table, column 3. This is not decoration: study §2.3 shows
-    /// that mixed atomic/non-atomic access to one location is a data race and
-    /// therefore UB regardless of what x86-64 does, so a `false` here is a
-    /// named item of atomicity debt that the barrier must clear before it can
-    /// CAS that shape.
+    /// The study's §0 table, column 3, re-derived against the code on
+    /// 2026-09-01 rather than against the sentence that used to stand here.
+    /// This is not decoration: study §2.3 shows that mixed atomic/non-atomic
+    /// access to one location is a data race and therefore UB regardless of
+    /// what x86-64 does, so a `false` here is a named item of atomicity debt
+    /// that the load barrier must clear before it may CAS that shape. This
+    /// table is the authoritative frame for that work, which is why the
+    /// citations below are exact line numbers.
     ///
-    /// * [`ZSlotShape::CompactField`] — `types/src/field_layout.rs:986` (load)
-    ///   and `:1047` (store).
-    /// * [`ZSlotShape::LegacyField`] — `read_value_atomic` /
-    ///   `write_value_atomic`, `types/src/value.rs:1570`, `:1582`.
-    /// * [`ZSlotShape::ArrayElement`] — `read_ref_slot` / `write_ref_slot` are
-    ///   plain `read()` / `write()`, `types/src/narrow_oop.rs:203`, `:216`.
-    /// * [`ZSlotShape::StaticField`] — plain `Value` cell access.
+    /// # HOW THIS TABLE WENT STALE, so the next reader distrusts it correctly
+    ///
+    /// The previous version cited `types/src/narrow_oop.rs:203` / `:216` for
+    /// the array row. Those numbers had already drifted to `:245` / `:258` when
+    /// they were written down and are `:353` / `:370` today, and by then the
+    /// classification itself had gone false as well. A table that is right
+    /// about one row and wrong about another is worse than one that is wrong
+    /// about all four, because it gets believed. **Re-open every cited line
+    /// before relying on a row**; a stale line number is the cheap failure, a
+    /// stale verdict is not.
+    ///
+    /// # The four rows
+    ///
+    /// * [`ZSlotShape::CompactField`] — **ATOMIC.** Mutator side:
+    ///   `read_compact_field` / `write_compact_field`
+    ///   (`types/src/field_layout.rs:1123`, `:1182`), whose `Reference` arm is
+    ///   an `AtomicU64` load/store (an `AtomicU32` one under narrow oops) with
+    ///   a caller-supplied `Ordering`. Collector side and every other slot
+    ///   walker: `narrow_oop::read_ref_slot` / `write_ref_slot`
+    ///   (`types/src/narrow_oop.rs:353`, `:370`), relaxed atomics in both
+    ///   widths since 2026-09-01.
+    ///
+    /// * [`ZSlotShape::LegacyField`] — **NOT ATOMIC, and this row used to say
+    ///   it was.** The old claim held for the MUTATOR side only:
+    ///   `read_value_atomic` / `write_value_atomic`
+    ///   (`types/src/value.rs:1607`, `:1619`) read and write the 16-byte cell
+    ///   as two relaxed `AtomicU64` words, and ZGC's own accessors use them
+    ///   (`ZgcRealHeap::get_field` through `crate::heap::read_value_cell_checked`,
+    ///   `set_field_no_satb` through `write_value_atomic`). The COLLECTOR side
+    ///   does not: the evacuation loops write the whole cell with a plain
+    ///   `std::ptr::write::<Value>` at `gc/src/gc.rs:342`, `:806`, `:978` and
+    ///   `gc/src/gen_heap.rs:7009`, `:17194`, and `gc/src/g1.rs` writes it
+    ///   through `value_to_unaligned_ptr` (`gc/src/g1.rs:48`, called at
+    ///   `:14197` and `:21980`), which is `ptr::write_unaligned` and so cannot
+    ///   be made atomic at all without first proving alignment — the same
+    ///   constraint `narrow_oop::read_ref_slot_unaligned` carries.
+    ///
+    ///   **Tracked, not blocking**, and that distinction is the useful part of
+    ///   the row: those sites are the Generational and G1 evacuation loops,
+    ///   which never run over a `ZgcRealHeap`, so they are not slots the ZGC
+    ///   barrier can reach and CAS. The row reads `false` anyway because the
+    ///   SHAPE is shared — a reader who sees `true` here concludes the 16-byte
+    ///   cell is safe everywhere and carries that conclusion into `gc/`. ZGC's
+    ///   own two plain readers of this shape were converted on 2026-09-01:
+    ///   `ZgcRealHeap::visit_strong_refs_at` and this module's
+    ///   `reference_slots` (both `gc/src/zgc.rs`).
+    ///
+    ///   RESIDUAL on this row: the cell's 4-byte TAG word is still read plain
+    ///   by both of those walkers, while `write_value_atomic` stores it as the
+    ///   cell's LOW `AtomicU64` — which that `u32` read overlaps. It is off the
+    ///   arming path (the barrier CASes the payload word at
+    ///   `FIELD_CELL_PAYLOAD64_OFFSET`, never the tag at offset 0), and the
+    ///   repair, when someone wants it, is an `AtomicU64` low-word load with
+    ///   `w0 as u32` exactly as `read_value_checked_atomic`
+    ///   (`types/src/value.rs:1738`) already spells it. NOT an `AtomicU32`
+    ///   load: pairing atomics of two different widths on one location is not
+    ///   a repair, it is a second spelling of the same hazard.
+    ///
+    /// * [`ZSlotShape::ArrayElement`] — **ATOMIC since 2026-09-01**, and the
+    ///   row this function most recently had wrong. Every reference array
+    ///   element is read and written through `narrow_oop::read_ref_slot` /
+    ///   `write_ref_slot` (`types/src/narrow_oop.rs:353`, `:370`) — including
+    ///   `vm/src/jit/helpers.rs`'s `jit_aastore`, which uses them for both the
+    ///   SATB old-value read and the element store — and both are now relaxed
+    ///   atomics in the wide (`AtomicU64`) and narrow (`AtomicU32`) arms alike.
+    ///   `narrow_oop::read_ref_slot_unaligned` is deliberately NOT converted,
+    ///   and its own doc carries the rule that follows: a slot reachable
+    ///   through it is a slot the barrier must never CAS.
+    ///
+    /// * [`ZSlotShape::StaticField`] — **NOT ATOMIC, and the reason is subtler
+    ///   than "nobody got to it".** The store is a plain 16-byte `Value` struct
+    ///   assignment, `fields[field_index] = value`
+    ///   (`vm/src/vm/vm_object.rs:1841`). The load, `StaticsIndex::get`
+    ///   (`vm/src/vm/realms/class_realm.rs:267`-`:268`), is two `read_volatile`s
+    ///   — and **`read_volatile` is not an atomic access in Rust.** It is an
+    ///   optimisation barrier and nothing more: it stops the compiler eliding,
+    ///   merging or re-widening the access, and says nothing at all to the
+    ///   memory model. It races a `compare_exchange` exactly as a plain read
+    ///   does. That site's own comment is careful about it — "the read stays
+    ///   unsynchronized against a concurrent `putstatic` ... it is only no
+    ///   longer TORN" — but a reader who sees `volatile` and thinks `AtomicU64`
+    ///   will classify this row wrong, which is why it is written out here.
+    ///
+    ///   This one IS on the arming path. Step 5 below routes a barrier through
+    ///   `vm::get_static_shared`, and step 5's own text already records the
+    ///   consequence: a static slot cannot be CAS-healed, so it may need a
+    ///   NON-HEALING barrier kind rather than the self-healing one.
+    ///
+    /// # The ordered sequence this table serves, and where it stands
+    ///
+    /// Kept here, beside the classification, rather than in an agent scratch
+    /// file that gets deleted. The canonical long form is the work list on
+    /// `cratonvm_gc::vm_heap::VmHeap::load_ref_slot_barriered`; this is its
+    /// status as of 2026-09-01. Where the two disagree, re-read the code —
+    /// step 1 there still describes itself as "NOT DONE — the blocker" and
+    /// quotes a plain `(ptr as *mut u64).write(addr)` that
+    /// `types/src/narrow_oop.rs` no longer contains.
+    ///
+    /// * **Step 1 — DONE (2026-09-01).** `narrow_oop::read_ref_slot` /
+    ///   `write_ref_slot` are relaxed atomics in both widths. This is what
+    ///   moved the `ArrayElement` and `CompactField` rows above.
+    /// * **Step 2 — DONE.** The armed test, `ZgcRealHeap::load_barrier_armed`.
+    /// * **Step 3 — DONE.** The `gc/` barrier seam,
+    ///   `VmHeap::load_ref_slot_barriered`, with its P1 (slot width), P3 (null
+    ///   versus heap offset 0) and P4 (`on_forward_failure`) questions decided
+    ///   in its own doc.
+    /// * **Step 3, extended — DONE (2026-09-01), this crate.** The three
+    ///   ZGC-internal accesses to a word the barrier would CAS:
+    ///   `ZgcRealHeap::relocate_stw`'s compaction slot-rewrite STORE, and the
+    ///   legacy payload READS in `ZgcRealHeap::visit_strong_refs_at` and in
+    ///   this module's `reference_slots` (all `gc/src/zgc.rs`). The compaction
+    ///   store is the one that mattered: its SAFETY note rested on "the world
+    ///   is stopped", which is precisely the property step 7 removes.
+    /// * **Step 4 — NOT DONE.** The JIT read-helper SEAM exists —
+    ///   `vm/src/jit/helpers.rs`'s `jit_load_ref_slot` is the single chokepoint
+    ///   and both slot-holding sites (A and B of `zgc-jit-load-barrier.md`
+    ///   2.5.1) funnel through it — but its body is still a raw
+    ///   `read_ref_slot` under a `TODO(zgc)`. `jit_aaload` receives no
+    ///   `vm_ptr`, so reaching a `&VmHeap` from the hotter of the two sites is
+    ///   the actual work, not the call itself.
+    /// * **Step 5 — NOT DONE.** Sites D/E/F, which hold an `ObjectRef` rather
+    ///   than a slot: `types/src/value.rs`'s `read_value_atomic` reference arm
+    ///   and `vm::get_static_shared`. Blocked on the `StaticField` row above.
+    /// * **Step 6 — NOT DONE.** The `aastore` emitter coverage gate.
+    ///   `jit/src/x64/bytecode_walk.rs` opcode `0x53` emits the slot load and
+    ///   the element store inline (`jit/src/x64/arrays.rs`'s
+    ///   `emit_ref_aload_regs` / `emit_ref_astore_regs`) without consulting
+    ///   `narrow_oops_block_inline_fields()`, which the two compact arms do
+    ///   consult. This is NOT the UB of step 1 — an aligned qword `mov` is not
+    ///   a Rust access and cannot tear against a `lock cmpxchg` — it is a
+    ///   COVERAGE hole: an armed cycle would read a coloured word with no
+    ///   colour test and write a plain pointer into a slot the barrier next
+    ///   classifies as `Good` and truncates to 42 bits. Also outstanding under
+    ///   this step: the tier-2/tier-3 collector writers on the `LegacyField`
+    ///   row, if that shape is ever shared with a ZGC heap.
+    /// * **Step 7 — NOT DONE.** Only then flip `RELOCATION_REQUESTED`
+    ///   (`vm/src/vm/vm_init.rs`). Arming must additionally happen where no
+    ///   Java thread is inside compiled code, i.e. at a safepoint: an
+    ///   emission-time gate cannot reach ALREADY COMPILED inline sequences.
+    ///   That obligation is recorded on `ZgcRealHeap::set_barrier_color`.
+    ///
+    /// Nothing in steps 1-3 changes behaviour on a default run. The barrier is
+    /// unarmed for the life of every shipping process
+    /// (`RELOCATION_REQUESTED == false`, `set_barrier_color` has no non-test
+    /// caller, `barrier_good_mask` never leaves `Z_REMAPPED`), and a `Relaxed`
+    /// atomic access to a naturally aligned word lowers to the same single
+    /// instruction the plain access did on x86-64 and on aarch64 alike.
     pub fn word_is_atomically_accessed_today(self) -> bool {
         match self {
-            ZSlotShape::CompactField | ZSlotShape::LegacyField => true,
-            ZSlotShape::ArrayElement | ZSlotShape::StaticField => false,
+            ZSlotShape::CompactField | ZSlotShape::ArrayElement => true,
+            ZSlotShape::LegacyField | ZSlotShape::StaticField => false,
+        }
+    }
+
+    /// WHERE this shape's atomicity debt is, or `None` when the shape is clear.
+    ///
+    /// The machine-readable half of
+    /// [`ZSlotShape::word_is_atomically_accessed_today`]: the boolean says THAT
+    /// a shape is unsound to CAS, this says WHERE, so a report can print the
+    /// citation instead of sending its reader back to a doc comment that may
+    /// have drifted again. The two must agree, and
+    /// `the_shape_table_matches_the_study` asserts that they do — which is what
+    /// stops one of them being updated alone, the exact failure that made this
+    /// table wrong in the first place.
+    ///
+    /// The text is a `&'static str` and not a structured type on purpose: it is
+    /// read by humans following a citation, and a struct would invite adding
+    /// fields to it instead of clearing the debt.
+    pub fn atomicity_debt_note(self) -> Option<&'static str> {
+        match self {
+            ZSlotShape::CompactField | ZSlotShape::ArrayElement => None,
+            ZSlotShape::LegacyField => Some(
+                "collector-side writers are plain ptr::write::<Value> \
+                 (gc/src/gc.rs:342,:806,:978; gc/src/gen_heap.rs:7009,:17194) or \
+                 ptr::write_unaligned (gc/src/g1.rs:48); the mutator side is atomic \
+                 (types/src/value.rs:1607,:1619). Tracked, not blocking: those loops \
+                 are Generational/G1 evacuation and never run over a ZGC heap",
+            ),
+            ZSlotShape::StaticField => Some(
+                "plain 16-byte Value struct assignment (vm/src/vm/vm_object.rs:1841) \
+                 and a read_volatile load (vm/src/vm/realms/class_realm.rs:267), which \
+                 is NOT an atomic access in Rust. ON the arming path, via step 5",
+            ),
         }
     }
 
@@ -755,6 +930,17 @@ impl ZShapeTotals {
     /// The share of reference slots whose word is **not** accessed atomically
     /// today — study §2.3's atomicity debt, as a fraction of the slots the
     /// barrier would have to CAS.
+    ///
+    /// Composition as of 2026-09-01: [`ZSlotShape::LegacyField`] and
+    /// [`ZSlotShape::StaticField`]. [`ZSlotShape::ArrayElement`] LEFT this set
+    /// when `narrow_oop::write_ref_slot` became a relaxed atomic, and
+    /// `LegacyField` JOINED it when the table was re-derived against the
+    /// collector-side writers rather than the mutator-side pair alone — both
+    /// changes are argued row by row on
+    /// [`ZSlotShape::word_is_atomically_accessed_today`]. The set moved in both
+    /// directions on the same day, so a `non_atomic_share` printed by an older
+    /// binary is NOT comparable with one printed by a newer one, in either
+    /// direction. Compare shapes, not this scalar, across that boundary.
     pub fn non_atomic_share(&self) -> f64 {
         let mut part: u64 = 0;
         for shape in ZSlotShape::ALL {
@@ -1985,13 +2171,36 @@ mod tests {
 
     #[test]
     fn the_shape_table_matches_the_study() {
-        // Study §0's table, pinned. If a future change makes reference array
-        // elements atomic (blast-radius items 1-2), this test is where that fact
-        // gets recorded rather than quietly diverging from the doc.
+        // Study §0's table, pinned — and this is the change the previous
+        // version of this comment predicted: "if a future change makes
+        // reference array elements atomic (blast-radius items 1-2), this test
+        // is where that fact gets recorded". It did (2026-09-01,
+        // `narrow_oop::write_ref_slot`), and recording it here is what stops
+        // the doc and the code diverging silently a second time.
+        //
+        // `LegacyField` moved the OTHER way at the same time, and for a reason
+        // that has nothing to do with a new change: the row was simply wrong.
+        // It described the mutator-side `read_value_atomic` /
+        // `write_value_atomic` pair and never asked what the COLLECTOR side
+        // does, which is a plain `ptr::write::<Value>` of the whole 16-byte
+        // cell. See `word_is_atomically_accessed_today` for the citations.
         assert!(ZSlotShape::CompactField.word_is_atomically_accessed_today());
-        assert!(ZSlotShape::LegacyField.word_is_atomically_accessed_today());
-        assert!(!ZSlotShape::ArrayElement.word_is_atomically_accessed_today());
+        assert!(ZSlotShape::ArrayElement.word_is_atomically_accessed_today());
+        assert!(!ZSlotShape::LegacyField.word_is_atomically_accessed_today());
         assert!(!ZSlotShape::StaticField.word_is_atomically_accessed_today());
+
+        // The boolean and the citation must move together. Updating one alone
+        // is precisely how this table came to be right about one row and wrong
+        // about another, which is the state a reader cannot detect.
+        for shape in ZSlotShape::ALL {
+            assert_eq!(
+                shape.atomicity_debt_note().is_none(),
+                shape.word_is_atomically_accessed_today(),
+                "atomicity_debt_note and word_is_atomically_accessed_today \
+                 disagree for {}",
+                shape.key(),
+            );
+        }
 
         // Study §1.7: only the 16-byte-cell shapes carry a tag to gate on.
         assert!(ZSlotShape::LegacyField.needs_tag_gate());
@@ -2232,9 +2441,13 @@ mod tests {
         assert!((sum - 1.0).abs() < 1e-12, "shares must sum to 1, got {sum}");
         assert_eq!(t.legacy_share(), 0.75);
         assert_eq!(t.tagged_cell_share(), 0.75);
-        // Only array elements and statics are non-atomic today, and there are
-        // none of either here.
-        assert_eq!(t.non_atomic_share(), 0.0);
+        // The non-atomic set is `LegacyField` + `StaticField` (see
+        // `ZSlotShape::word_is_atomically_accessed_today`), and this fixture is
+        // three legacy slots out of four. Before 2026-09-01 this line read
+        // `0.0`, because the set was `ArrayElement` + `StaticField` and there
+        // are none of either here — the expectation moved with the table, not
+        // with the fixture, which is unchanged.
+        assert_eq!(t.non_atomic_share(), 0.75);
     }
 
     #[test]

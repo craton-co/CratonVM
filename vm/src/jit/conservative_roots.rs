@@ -4092,7 +4092,377 @@ fn dbg_swchain_enabled() -> bool {
     *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SWCHAIN").is_some())
 }
 
+/// Kill switch for the bytecode index carried on
+/// [`active_compiled_frames_with_bci`].
+///
+/// Default ON. `CRATONVM_JIT_NO_COMPILED_FRAME_LINES=1` makes every compiled
+/// frame report `None`, which is exactly the `byte_code_index: -1` /
+/// `(Unknown Source)` answer every compiled frame gave before 2026-09-01. The
+/// point of the switch is that a line that looks wrong in a warmed-up trace
+/// can be attributed — one environment variable decides whether it came from
+/// this recovery or from the method's own `LineNumberTable`, inside ONE
+/// binary.
+fn compiled_frame_bci_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_COMPILED_FRAME_LINES").is_none()
+    })
+}
+
+/// Is `recorded` a value the JVM spec permits as a bytecode index?
+///
+/// `Code.code_length` must be less than 65536 (JVMS 4.9.1), so every genuine
+/// bci is below that. Both synthetic pcs the single-pass backend stamps into
+/// this same field are far above it — `ENTRY_POLL_BC_PC` (`u32::MAX`, the
+/// method-entry poll) and `SP_ID_UNSET_BC_PC` (`u32::MAX - 1`, what the
+/// prologue writes into the safepoint-id slot so an unsafepointed frame cannot
+/// match the bci-0 map). One spec-derived bound rejects both, and it rejects
+/// them for a reason a reader can check rather than by listing two constants
+/// this crate cannot see (they are `pub(super)` inside the jit crate's x64
+/// module).
+fn plausible_bci(recorded: u32) -> Option<u32> {
+    const MAX_CODE_LENGTH: u32 = 65_536;
+    (recorded < MAX_CODE_LENGTH).then_some(recorded)
+}
+
+/// The bytecode index a live compiled frame is standing at — the same one a
+/// deopt at this point would resume the interpreter at — or `None` when it
+/// cannot be established from evidence the artifact itself vouches for.
+///
+/// # Why this needs no new metadata
+///
+/// The precise-oop-map machinery already emits a PC->bci map: every
+/// GC-capable safepoint pushes an [`cratonvm_jit::OopMapEntry`] whose
+/// `native_pc_offset` is the offset of the instruction AFTER the call and
+/// whose `bytecode_pc` is the `cur_bc_pc` that call was emitted under, and the
+/// prologue+call pair maintain the same value in the frame's own safepoint-id
+/// slot so a walker can read it while a helper is active. This function is two
+/// lookups into that existing table; it invents nothing.
+///
+/// Two evidence sources, in decreasing order of exactness:
+///
+///   1. **`native_pc`** — for every frame below the innermost one, the
+///      RBP-chain walk already read the return address into it, which is by
+///      construction the instruction after a call. That is precisely the key
+///      `native_pc_offset` is recorded under, so an exact hit names the bci of
+///      the call this frame is suspended in. No memory outside the artifact's
+///      own metadata is touched.
+///   2. **The safepoint-id slot** — the innermost frame has no return address
+///      of its own on this stack (its caller's does), so its position comes
+///      from `[rbp - sp_id_slot_off]`, the word the emitter stores immediately
+///      before each GC-capable call. It is only accepted when the artifact's
+///      own table has a map recorded under that id, which is what rejects a
+///      slot that was never written (the prologue stamps `u32::MAX - 1` there
+///      exactly so this fails closed) and a slot holding an oop rather than an
+///      id — both of which have been measured on this walk
+///      (`a-zgc-compaction-refusal-traced-four-levels-to-a-frames-sp-id-slot`).
+///
+/// # What it refuses, and why refusing is the whole point
+///
+/// * **The optimizing IR backend** (`used_ir_backend`). There
+///   `OopMapEntry::bytecode_pc` is NOT a bci: `ir_lower` stores a monotonic
+///   safepoint counter starting at 1 (its own doc says so, and the single-pass
+///   backend's `SP_ID_UNSET_BC_PC` comment explains why THAT backend cannot do
+///   the same). Those ids are small integers indistinguishable from plausible
+///   bcis, so reading one as a bci would resolve a real, confidently-wrong
+///   line — the single worst outcome available here. An IR-tier frame
+///   therefore keeps `-1`, as it did before; giving it a line needs a
+///   safepoint-id -> bci side table the artifact does not carry today.
+/// * **Any artifact with no safepoint-id slot** (`sp_id_slot_off == 0`). That
+///   is the recorded flag for "compiled without the precise gate", and it is
+///   also true of every aarch64 artifact, whose backend hard-codes
+///   `bytecode_pc: 0` — which would otherwise resolve every compiled frame to
+///   the first line of its method.
+/// * **Anything outside the spec's bci range** — see [`plausible_bci`].
+///
+/// `rbp` must already have been validated as a live, aligned frame base inside
+/// this thread's `[scanner_sp, entry_sp)` band by the caller; pass `None` when
+/// it has not been. That is why it is an `Option` rather than a bare address.
+fn compiled_frame_bci(
+    cm: &cratonvm_jit::CompiledMethod,
+    rbp: Option<usize>,
+    native_pc: Option<usize>,
+) -> Option<u32> {
+    if cm.used_ir_backend || cm.sp_id_slot_off == 0 {
+        return None;
+    }
+    if let Some(pc) = native_pc {
+        let entry = cm.entry_ptr() as usize;
+        let end = entry.saturating_add(cm.code_len());
+        // A return address is strictly INSIDE the body (there is at least a
+        // call instruction before it) and at most one past its last byte.
+        if entry != 0 && pc > entry && pc <= end {
+            // Cast: bounded by `code_len()`, which is a JIT buffer position.
+            let off = (pc - entry) as u32;
+            if let Some(map) = cm.oop_maps.iter().find(|m| m.native_pc_offset == off) {
+                if let Some(bci) = plausible_bci(map.bytecode_pc) {
+                    return Some(bci);
+                }
+            }
+        }
+    }
+    let sp_id = active_safepoint_id(rbp?, cm)?;
+    // The artifact's own table is the oracle: an id it never recorded is a
+    // stale or non-id word, not a program point.
+    cm.find_oop_map_for_safepoint_id(sp_id)?;
+    plausible_bci(sp_id)
+}
+
 pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
+    // The GC-side reader (`memory::roots`' `CRATONVM_DBG_JIT_ROOTSCAN` line)
+    // wants no bci and must not pay for one, so it keeps the historical
+    // four-tuple and the walk skips the recovery entirely.
+    active_compiled_frames_impl(false)
+        .into_iter()
+        .map(|(depth, label, owner, cm_ptr, _, _)| (depth, label, owner, cm_ptr))
+        .collect()
+}
+
+/// [`active_compiled_frames`] plus, per frame, the bytecode index it is
+/// standing at ([`compiled_frame_bci`]) — `None` wherever that could not be
+/// established.
+///
+/// A separate entry point rather than a widened tuple, so the GC root-scan
+/// diagnostic that consumes the four-tuple needs no edit and pays nothing for
+/// information it never reads.
+pub fn active_compiled_frames_with_bci() -> Vec<(u32, String, u32, usize, Option<u32>)> {
+    // The walk's sixth member — this frame's own return address — exists
+    // solely so [`active_compiled_frames_with_inline_chains`] can key the
+    // inline-frame map on the EXACT program point a parent frame is standing
+    // at. Nothing else wants a raw code pointer, so it is dropped here rather
+    // than leaked into a public tuple. The re-collect costs one small `Vec`
+    // per capture, next to the `String` clone this walk already performs per
+    // frame — measured against the alternative (a second copy of the
+    // stack-reading walk) that is the cheaper of the two by a wide margin.
+    active_compiled_frames_impl(compiled_frame_bci_enabled())
+        .into_iter()
+        .map(|(depth, label, owner, cm_ptr, bci, _)| (depth, label, owner, cm_ptr, bci))
+        .collect()
+}
+
+/// Kill switch for the inlined-callee frames carried on
+/// [`active_compiled_frames_with_inline_chains`].
+///
+/// Default ON, and the SAME variable the emitter half reads
+/// (`x64::inlining`'s `inline_frame_map_enabled`), because a half-switched
+/// feature is worse than either state: with the map emitted and the walk
+/// ignoring it the artifact pays for metadata nobody reads, and with the walk
+/// reading a map that was never emitted every frame silently loses its
+/// callees. One variable, both halves.
+fn inline_frame_chains_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_FRAME_MAP").is_none()
+    })
+}
+
+/// The callees inlined into `cm` at the program point a live frame is standing
+/// at, INNERMOST FIRST, as `(label, bci)` pairs — where `label` is
+/// `"class/Name.method:descriptor"`, the shape
+/// `CompiledMethod::method_label` already uses, and `bci` is that method's own
+/// bytecode index.
+///
+/// The chain EXTENDS [`compiled_frame_bci`]'s answer and never replaces it: the
+/// enclosing compiled method keeps the bci that function returns, and these are
+/// the frames HotSpot would show *below* it, from `ScopeDesc`'s nested scopes.
+/// An empty chain is the historical answer — one frame per artifact — and is
+/// what every non-inlining method produces.
+///
+/// # The two keys, and why neither one falls back to the other
+///
+/// The emitter half lives in `jit/src/x64/inlining.rs`
+/// (`begin_inline_frame_recording` / `finish_inline_frame_recording`) and
+/// records, at every call it emits from inside a spliced body, a row holding
+/// BOTH keys [`compiled_frame_bci`] already keys on: `native_offset`, the
+/// buffer position immediately after the `CALL` — which is exactly what a
+/// child frame's RBP-chain walk reads out of `[rbp+8]` — and `safepoint_bci`,
+/// the `cur_bc_pc` the emitter simultaneously stores into the frame's
+/// safepoint-id slot.
+///
+/// Which key applies is decided by WHICH FRAME is asking, not by which lookup
+/// happens to hit:
+///
+///   * a frame BELOW the innermost one owns a return address on this stack, so
+///     `native_pc` is `Some` and the exact offset names one program point and
+///     nothing else. That is the authoritative key and it is the only one
+///     consulted;
+///   * the INNERMOST frame owns no return address here (its caller's is the
+///     one on the stack), so the safepoint-id slot is its only evidence — the
+///     same asymmetry `compiled_frame_bci` is built around.
+///
+/// **There is deliberately no fallback from the exact key to the coarse one.**
+/// `compiled_frame_bci` does fall back, and it is right to: a bci is a
+/// property of the enclosing method and both keys answer with the same
+/// `cur_bc_pc`. A CHAIN is not. One `cur_bc_pc` covers a whole spliced region,
+/// and the calls emitted on the inline cache's MISS EDGE — the ones that were
+/// not spliced — sit under that same bci while recording no row of their own.
+/// A parent frame suspended on a miss edge would then be handed the chain
+/// belonging to the splice beside it: a frame naming a method that never ran,
+/// which is the one outcome this whole area refuses. A miss on the exact key
+/// means "this program point recorded no chain", and that is the answer.
+///
+/// # The optimizing tier needs no extra refusal here
+///
+/// [`compiled_frame_bci`] refuses an `used_ir_backend` artifact outright,
+/// because there `OopMapEntry::bytecode_pc` is a monotonic safepoint counter
+/// and not a bci. This function inherits that refusal WITHOUT restating it, and
+/// that is deliberate rather than an oversight: key 2 is reached only through
+/// the `bci` that function produced, so an IR-tier artifact can never get
+/// there. Key 1 is a CODE LAYOUT fact — the byte offset of a return address in
+/// this artifact's own buffer — and carries no assumption about which backend
+/// emitted it, so it needs no refusal. (In practice an IR artifact's map is
+/// empty anyway: `record_inline_frame_row` is called only from the single-pass
+/// splicer, and one compile produces one artifact, so a map can never describe
+/// a buffer other than its own.)
+///
+/// # What this assumes of the artifact (contract, 2026-09-01)
+///
+/// `CompiledMethod::inline_frame_map` is a `crate::x64::InlineFrameMap` with
+/// `is_empty()`, `chain_for_native_offset(u32)` and
+/// `chain_for_safepoint_bci(u32)` returning `Option<&[InlineFrameLevel]>`,
+/// each level exposing `label: String` and `bci: u32`. That is the only
+/// surface touched, and it is touched from this one function — the level type
+/// is never named here, so the jit crate needs to re-export nothing beyond
+/// what the field's own type already forces.
+///
+/// # The fail-closed rule, which does not wait for that
+///
+/// A missing or ambiguous chain must produce NO frame rather than a guessed
+/// one. That is stricter than the rule for a line number, and for a stronger
+/// reason: a wrong line is visibly a line, while an inlined frame naming the
+/// wrong method is indistinguishable from a real one to the person reading the
+/// trace. The emitter already refuses a row whose bci is not a spec-legal
+/// bytecode index, and POISONS a safepoint id two program points disagree
+/// about — one bci covers a whole spliced region, so a splice containing two
+/// calls with different chains cannot be told apart from the safepoint-id slot
+/// alone, which is the innermost frame's only evidence. Both refusals arrive
+/// here as an empty chain, which is exactly today's behaviour.
+fn compiled_frame_inline_chain(
+    cm_ptr: usize,
+    bci: Option<u32>,
+    native_pc: Option<usize>,
+) -> Vec<(String, u32)> {
+    if cm_ptr == 0 {
+        return Vec::new();
+    }
+    // SAFETY: exactly the contract documented on
+    // `PreciseFrameInfo::compiled_method` and relied on by every other read in
+    // this walk — the JIT cache holds an owning `Arc` for as long as the body
+    // is registered, the chain entry is popped the moment the call returns or
+    // unwinds, and this read happens on the owning thread strictly inside that
+    // window. Pointers that came from the RBP walk came from
+    // `lookup_jit_code_range`, which only answers for a still-registered range.
+    let cm = unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
+    if cm.inline_frame_map.is_empty() {
+        // The overwhelming majority: a method that splices nothing carries an
+        // empty map and no allocation, and this is the whole cost it adds to a
+        // throw.
+        return Vec::new();
+    }
+    // Key 1 — the exact return address, for every frame below the innermost.
+    if let Some(pc) = native_pc {
+        let entry = cm.entry_ptr() as usize;
+        let end = entry.saturating_add(cm.code_len());
+        // Same bound as `compiled_frame_bci`'s exact arm: a return address is
+        // strictly INSIDE the body (a call precedes it) and at most one past
+        // its last byte.
+        if entry != 0 && pc > entry && pc <= end {
+            // Cast: bounded by `code_len()`, a JIT buffer position.
+            let off = (pc - entry) as u32;
+            if let Some(chain) = cm.inline_frame_map.chain_for_native_offset(off) {
+                return chain.iter().map(|l| (l.label.clone(), l.bci)).collect();
+            }
+        }
+        // No fallback to key 2 here — see the doc above. An exact key that
+        // misses is evidence that this program point recorded no chain, not
+        // permission to consult a coarser one.
+        return Vec::new();
+    }
+    // Key 2 — the safepoint id, the innermost frame's only evidence. `bci` is
+    // what `compiled_frame_bci` recovered out of the frame's safepoint-id
+    // slot, which is the same `cur_bc_pc` the emitter recorded the row under.
+    let Some(bci) = bci else {
+        return Vec::new();
+    };
+    match cm.inline_frame_map.chain_for_safepoint_bci(bci) {
+        Some(chain) => chain.iter().map(|l| (l.label.clone(), l.bci)).collect(),
+        // `None` is both "no row" and "two rows disagreed and the emitter
+        // poisoned this bci". The caller cannot act differently on the two and
+        // must not: an ambiguous chain and an absent one both mean no inlined
+        // frame may be reported here.
+        None => Vec::new(),
+    }
+}
+
+/// [`active_compiled_frames_with_bci`] plus, per compiled frame, the chain of
+/// callees inlined into it at the point it is standing — innermost first,
+/// possibly (and usually) empty.
+///
+/// A separate entry point rather than a widened tuple, for the reason A1 gave
+/// when it added the bci one: the GC root-scan diagnostic consumes the
+/// four-tuple, `stackwalker` consumes the five-tuple, and neither should have
+/// to change or pay for information it never reads.
+///
+/// It calls [`active_compiled_frames_impl`] directly rather than layering over
+/// [`active_compiled_frames_with_bci`], and that is the one place this differs
+/// from A18's sketch. The reason is the EXACT key: the inline-frame map's
+/// authoritative key for a non-innermost frame is that frame's own return
+/// address, which the RBP-chain walk reads and the five-tuple throws away.
+/// Layering could only have keyed every frame on the safepoint id, i.e. on the
+/// coarse key, for frames that have the exact one available — see
+/// [`compiled_frame_inline_chain`] for why that is a fabricated-frame risk and
+/// not merely a precision loss. The walk itself still only READS live stack
+/// memory; it now also reports the address it already had in hand.
+///
+/// # Ordering
+///
+/// The chain is INNERMOST FIRST: element 0 is the deepest inlined callee, the
+/// last element is the outermost one, and the enclosing compiled method (the
+/// tuple's own label and bci) sits one step further out again. That is the
+/// opposite direction from the order `interleave_compiled_frames` emits, which
+/// is outermost-first — see `.agent-requests/A18-stackwalker.txt`, which spells
+/// out the expansion.
+#[allow(clippy::type_complexity)]
+pub fn active_compiled_frames_with_inline_chains(
+) -> Vec<(u32, String, u32, usize, Option<u32>, Vec<(String, u32)>)> {
+    let want_chains = inline_frame_chains_enabled();
+    active_compiled_frames_impl(compiled_frame_bci_enabled())
+        .into_iter()
+        .map(|(depth, label, owner, cm_ptr, bci, native_pc)| {
+            let chain = if want_chains && cm_ptr != 0 && (bci.is_some() || native_pc.is_some()) {
+                compiled_frame_inline_chain(cm_ptr, bci, native_pc)
+            } else {
+                // Neither key available means the walk could not place this
+                // activation at all, and an inline chain is a claim about a
+                // program point. Refusing here rather than inside the lookup
+                // keeps the two refusals — "no program point" and "no chain at
+                // this program point" — from being confused for one another.
+                //
+                // `bci.is_some() || native_pc.is_some()` rather than
+                // `bci.is_some()`: a frame BELOW the innermost one is placed by
+                // its return address, and `compiled_frame_bci` can still answer
+                // `None` for it (an optimizing-tier artifact, or an artifact
+                // with no safepoint-id slot) while the exact key is perfectly
+                // good. Gating the chain on the bci would have made the
+                // inlined-callee frames inherit a refusal that is about LINE
+                // NUMBERS and does not reach them.
+                Vec::new()
+            };
+            (depth, label, owner, cm_ptr, bci, chain)
+        })
+        .collect()
+}
+
+/// The walk. The sixth tuple member is the activation's own RETURN ADDRESS
+/// when the RBP-chain walk read one, and `None` for the innermost activation
+/// (whose return address is not on this stack) and for the boundary fallback.
+/// It is reported because it is the exact key
+/// [`compiled_frame_inline_chain`] needs and the walk already holds it;
+/// [`active_compiled_frames`] and [`active_compiled_frames_with_bci`] drop it
+/// again so no public tuple carries a raw code pointer.
+fn active_compiled_frames_impl(
+    want_bci: bool,
+) -> Vec<(u32, String, u32, usize, Option<u32>, Option<usize>)> {
     let nested_enabled = nested_trace_frames_enabled();
     let dbg_chain = dbg_swchain_enabled();
     let scanner_sp = current_stack_pointer();
@@ -4116,7 +4486,8 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
                 chain.len()
             );
         }
-        let mut out: Vec<(u32, String, u32, usize)> = Vec::with_capacity(chain.len());
+        let mut out: Vec<(u32, String, u32, usize, Option<u32>, Option<usize>)> =
+            Vec::with_capacity(chain.len());
         for (dbg_i, e) in chain.iter().enumerate() {
             let Some(info) = e.precise else {
                 if dbg_chain {
@@ -4145,7 +4516,26 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
             // (`stackwalker_log4j_deep_repeated_walks_finish_under_jit`).
             // Walk the saved-RBP chain the way `remap_active_jit_frames`'
             // Stage 5 already does, and report every activation.
-            let mut nested: Vec<*const cratonvm_jit::CompiledMethod> = Vec::new();
+            //
+            // Whether `exact_rbp` is a frame base a safepoint-id slot may be
+            // read out of. Mirrors `innermost_frame_method`'s own bounds test
+            // exactly, because that function ALSO answers `Some(cm)` when the
+            // RBP is unusable (it falls back to the boundary method) and the
+            // caller cannot tell the two answers apart from the outside.
+            // Reading `[rbp - off]` for an out-of-band RBP would be a wild
+            // read, not merely a wrong line.
+            let exact_rbp_usable = info.exact_rbp != 0
+                && info.exact_rbp & 0x7 == 0
+                && info.exact_rbp >= scanner_sp
+                && info.exact_rbp.saturating_add(16) <= entry_sp;
+            // `(artifact, bci, return address)`. The third member is `None`
+            // for the innermost activation and for the boundary fallback —
+            // neither owns a return address on this stack.
+            let mut nested: Vec<(
+                *const cratonvm_jit::CompiledMethod,
+                Option<u32>,
+                Option<usize>,
+            )> = Vec::new();
             if nested_enabled {
                 if let Some(innermost) = innermost_frame_method(
                     info.exact_rbp,
@@ -4154,7 +4544,17 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
                     scanner_sp,
                     info.compiled_method,
                 ) {
-                    nested.push(innermost);
+                    // The innermost frame has no return address of its own on
+                    // this stack, so only the safepoint-id slot can place it.
+                    let bci = if want_bci && exact_rbp_usable {
+                        // SAFETY: as the reporting loop at the end of this
+                        // function — the JIT cache holds the owning `Arc` for
+                        // as long as this frame is live on this thread.
+                        compiled_frame_bci(unsafe { &*innermost }, Some(info.exact_rbp), None)
+                    } else {
+                        None
+                    };
+                    nested.push((innermost, bci, None));
                 }
                 // JIT frames use `push rbp; mov rbp,rsp`, so `[rbp]` is the
                 // caller RBP and `[rbp+8]` the return address INTO that caller.
@@ -4187,7 +4587,25 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
                     }
                     match cratonvm_jit::lookup_jit_code_range(ret_addr) {
                         Some(cm_ptr) => {
-                            nested.push(cm_ptr as *const cratonvm_jit::CompiledMethod)
+                            let cm_ptr = cm_ptr as *const cratonvm_jit::CompiledMethod;
+                            // `ret_addr` lies in THIS method and is the
+                            // instruction after the call it is suspended in —
+                            // the exact key `native_pc_offset` is recorded
+                            // under. `parent_rbp` was bounds-checked just
+                            // above, so the sp-id fallback is safe to try too.
+                            let bci = if want_bci {
+                                // SAFETY: `lookup_jit_code_range` only answers
+                                // for a code range still registered in the
+                                // cache, which retains the owning `Arc`.
+                                compiled_frame_bci(
+                                    unsafe { &*cm_ptr },
+                                    Some(parent_rbp),
+                                    Some(ret_addr),
+                                )
+                            } else {
+                                None
+                            };
+                            nested.push((cm_ptr, bci, Some(ret_addr)));
                         }
                         // The parent is the interpreter / Rust boundary: this
                         // entry has no further compiled ancestors.
@@ -4200,14 +4618,20 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
             // short by a bound, one that never started (`exact_rbp == 0`), and
             // the kill-switch path all still owe the boundary method the chain
             // entry was pushed for.
-            if nested.last() != Some(&info.compiled_method) {
-                nested.push(info.compiled_method);
+            if nested.last().map(|(cm_ptr, _, _)| *cm_ptr) != Some(info.compiled_method) {
+                // No bci on this arm, deliberately: it fires exactly when the
+                // walk could NOT place the frame (`exact_rbp` unusable, a
+                // bound cut the walk short, or the nested walk is switched
+                // off), so `exact_rbp` is not known to belong to this method
+                // and its safepoint-id slot would be read against another
+                // method's frame layout.
+                nested.push((info.compiled_method, None, None));
             }
             if dbg_chain {
                 let names: Vec<String> = nested
                     .iter()
                     // SAFETY: as the reporting loop below.
-                    .map(|p| unsafe { &**p }.method_label.clone())
+                    .map(|(p, _, _)| unsafe { &**p }.method_label.clone())
                     .collect();
                 let mut runs: Vec<String> = Vec::new();
                 for n in &names {
@@ -4230,7 +4654,7 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
             // `runtime::stackwalker::interleave_compiled_frames` wants
             // outermost-first, and entries sharing an `interp_depth` keep their
             // push order.
-            for cm_ptr in nested.iter().rev() {
+            for (cm_ptr, bci, native_pc) in nested.iter().rev() {
                 // SAFETY: exactly the contract documented on
                 // `PreciseFrameInfo::compiled_method` — the JIT cache holds an
                 // owning `Arc` for as long as the body is registered, and the
@@ -4253,6 +4677,13 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
                     // points. Valid for exactly as long as the frame is live,
                     // which is the same window this whole function reads in.
                     *cm_ptr as usize,
+                    // The program point this activation is standing at, when
+                    // the artifact's own metadata could name it.
+                    *bci,
+                    // This activation's own return address, when the RBP-chain
+                    // walk read one. The EXACT key the inline-frame map is
+                    // recorded under; see `compiled_frame_inline_chain`.
+                    *native_pc,
                 ));
             }
         }
