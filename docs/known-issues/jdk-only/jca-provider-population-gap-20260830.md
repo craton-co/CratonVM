@@ -1,109 +1,128 @@
-# The JCA providers are half-populated, and the missing half has names
+# The JCA gap is 84 services, not 186 — and the enumeration does not predict which
 
-**Status: MEASURED 2026-08-30, OPEN, unclaimed.** Found while verifying another
-lane's `KeyStore.getInstance("JCEKS")` fix. That fix WORKS — this page is about
-what the same probes found beside it.
+**Status: MEASURED 2026-08-30, OPEN, unclaimed.** This page replaces an earlier
+version of itself written the same day, whose central inference was wrong. The
+correction is the most useful thing on it, so it is kept in §4 rather than
+quietly edited out.
 
-Probes: `apps/probes/JavaSecurityReach.java` (15 rows) and
-`apps/probes/SunJceServices.java` (17 rows), both diffed against HotSpot
-25.0.4+7 in compatible mode and under `--jdk-only`.
+Probes, all in `apps/probes/`: `JavaSecurityReach` (15 rows), `SunJceServices`
+(17), `JcaGapSizer` (enumerates every service with its implementation class, and
+`--check` tests loadability), `JcaResolveAll` (calls `getInstance` for every
+service in the gap), `DhAgree` (one full 2048-bit key agreement). Oracle
+throughout: HotSpot 25.0.4+7 on the same host.
 
-## First, the thing that is NOT broken
+## 1. What is not broken
 
-`HANDOFF-20260828-SCOPE` §4 carried `KeyStore.getInstance("JCEKS")` as an open,
-unclaimed gap. `d0beba0eb` closed it on 2026-08-29, and it is verified here:
+`HANDOFF-20260828-SCOPE` §4's last open item, `KeyStore.getInstance("JCEKS")`,
+was closed by `d0beba0eb` and is verified: `JavaSecurityReach` is **15 rows,
+0 differing, in compatible mode AND under `--jdk-only`**.
 
-```text
-JavaSecurityReach   15 rows   compat 0 differing   --jdk-only 0 differing
-```
-
-That includes the whole chain the gap used to be blamed on — and one premise
-worth retiring with it. `native-builtins/src/lib.rs`'s Cipher `<clinit>` shim
-says the real chain reads `${java.home}/conf/security/java.security` and fails
-with `IOException("Is a directory")`. **It does not, and has not for some
-time:**
-
-```text
-File.exists true · File.isFile true · File.isDirectory false · length 74132
-FileInputStream read=16 · Files.readAllBytes 74132 · Files.size 74132
-Security.getProviders count 12
-  SUN SunRsaSign SunEC SunJSSE SunJCE SunJGSS SunSASL XMLDSig SunPCSC JdkLDAP JdkSASL SunPKCS11
-```
-
-Every row identical to HotSpot. The provider LIST is complete and correct, and
-the file is a readable 74 KB regular file. Anyone reasoning from that comment is
-reasoning from a defect that no longer exists.
-
-## What IS still missing: roughly half of each provider's services
+That run also retires a premise still carried in
+`native-builtins/src/lib.rs`'s Cipher `<clinit>` shim, which says the real chain
+reads `${java.home}/conf/security/java.security` and fails
+`IOException("Is a directory")`. It does not, and the provider LIST is complete:
 
 ```text
-                        HotSpot   CratonVM
-SunJCE  class           com.sun.crypto.provider.SunJCE   java.security.Provider
-SunJCE  getServices()   194       103
-SunJCE  service types    13         7
-SunJCE  property count  496       252
-
-SUN     class           sun.security.provider.Sun        java.security.Provider
-SUN     getServices()    68        44
-SUN     service types    13        11
-SUN     property count  257       124
+File.isFile true · isDirectory false · length 74132 · readAllBytes 74132
+Security.getProviders() -> 12, the same names HotSpot gives, SunJCE among them
 ```
 
-The providers are SYNTHESISED — a bare `java.security.Provider` populated by
+## 2. The ENUMERATION gap: 186 services
+
+```text
+                     HotSpot   CratonVM
+services enumerated    262       147
+SunJCE getServices     194       103
+SUN    getServices      68        44
+provider class         com.sun.crypto.provider.SunJCE / sun.security.provider.Sun
+                       java.security.Provider (both, here)
+```
+
+The providers are synthesised — a bare `java.security.Provider` filled from
 `jca/provider_chain.rs`'s `put_service` table — rather than instances of the
-JDK's own provider classes. That is a deliberate shape, not news. The news is
-**which service types the table does not reach**:
+JDK's provider classes. **This is a real gap for anything that ENUMERATES**:
+`Security.getAlgorithms(type)`, provider inventories, security tooling that
+lists what is available. It is not, however, a prediction about what works.
+
+## 3. The FUNCTIONAL gap: 84 services, and it had to be measured
 
 ```text
-SunJCE missing:  AlgorithmParameterGenerator, KDF, KEM, KeyAgreement,
-                 SecretKeyFactory, Signature
-SUN    missing:  AlgorithmParameterGenerator, Configuration
+getInstance() over all 186 enumeration-missing services
+  HotSpot    ok=177   fail=0    skip=9      <- the control: every row is askable
+  CratonVM   ok= 93   fail=84   skip=9
 ```
 
-Two of those are load-bearing rather than exotic:
+**93 of the 186 resolve anyway.** `getInstance` reaches implementations the
+service map does not enumerate, so absence from `getServices()` does not imply
+`NoSuchAlgorithmException`. The 9 skips are `KDF`/`KEM`/`Configuration`, whose
+APIs this probe does not model — unasked, not passed.
 
-* **`SecretKeyFactory`** is how every password-based key is derived —
-  `PBKDF2WithHmacSHA256`, and the `PBEWith*` family that JCEKS and PKCS12 use to
-  protect private keys. Its absence is why the JCEKS work had to serve "exactly
-  what it serves for JKS, written under the right magic" rather than the real
-  encrypted format.
-* **`KeyAgreement`** is Diffie-Hellman. `KeyAgreement.getInstance("DH")` has no
-  SunJCE service to resolve to here.
+HotSpot fails none of the 177 it can be asked, so **all 84 CratonVM failures are
+real**, by type:
 
-## Why this is worth a page rather than a shrug
+```text
+23 Cipher      19 Signature   16 Mac        11 KeyGenerator
+ 8 SecretKeyFactory           4 AlgorithmParameters
+ 2 AlgorithmParameterGenerator             1 KeyFactory
+```
 
-`Security.getProviders()` answering 12 correct names makes the JCA look wired.
-It is wired at the LIST level and half-wired at the SERVICE level, and the
-difference is invisible until a program asks for an algorithm in one of the six
-missing types — at which point it gets `NoSuchAlgorithmException` from a
-provider that is present and named correctly. That is the same wrong-refuse
-direction the JCEKS row was, and the same shape: code that works on every real
-JDK and dies here.
+Note what that list is NOT: it is not the six "missing types". `Cipher` and
+`Mac` are both present types here, and between them account for 39 of the 84.
+Counting missing TYPES understates the gap in one direction and the enumeration
+overstates it in the other.
 
-**Not fixed here, and not sized.** Whether each missing type is a table entry or
-a real implementation depends on whether the JDK's SPI class can run as
-bytecode — which is exactly how JCEKS turned out to be tractable
-(`com.sun.crypto.provider.JceKeyStore` loads fine on this VM; row 17 of
-`SunJceServices` confirms it in both VMs). Somebody should ask that question per
-type before assuming either answer.
+## 4. The claim this page used to make, and the probe that killed it
+
+The first version reasoned: SunJCE is missing six service types, therefore
+"invisible until a program asks for an algorithm in one of the six missing types
+and gets `NoSuchAlgorithmException`". `KeyAgreement` was one of the six, so the
+cheapest possible check was to ask it — and `DhAgree` runs a complete 2048-bit
+Diffie-Hellman:
+
+```text
+                      HotSpot          CratonVM
+KeyAgreement provider SunJCE           SunJCE
+secret length         256              256
+both parties agree    true             true          <- 0 differing, all 7 rows
+```
+
+A type absent from every enumeration, performing a full key agreement whose
+shared secret both parties derive identically. **The inference from enumeration
+to function was simply invalid**, and one probe of the thing itself was worth
+more than the arithmetic that produced 186.
+
+## 5. Whether the 84 are table entries is still open
+
+All 186 implementation classes **load on this VM exactly as they do on HotSpot**
+— `JcaGapSizer --check`, 186 of 186, and the two VMs' outputs are byte-identical
+including the `InaccessibleObjectException`s my probe's `setAccessible` provokes
+on both. So the code is present and reachable.
+
+That made "these are one-line `put_service` rows, like JCEKS was" attractive.
+**It is not established.** DH proves function without registration, which means
+the relationship between the table and the dispatch path is not the simple one
+that hypothesis assumes, and somebody should understand that path before adding
+84 rows to a table on the strength of it. The cheap next step is one service:
+add it, rebuild, and ask `getInstance` — a single answer settles whether the
+remaining 83 are clerical.
 
 ## Reproduce
 
 ```bash
 J=/data/jdkimages/jdk25-linux/jdk-25.0.4+7
-javac -d /tmp/jca apps/probes/JavaSecurityReach.java apps/probes/SunJceServices.java
-(cd /tmp/jca && $J/bin/java -cp . SunJceServices)              > hs.txt 2>/dev/null
-(cd /tmp/jca && cratonvm --java-home $J -cp . SunJceServices)  > cv.txt 2>/dev/null
-diff hs.txt cv.txt
+javac -d /tmp/j apps/probes/JcaGapSizer.java apps/probes/JcaResolveAll.java apps/probes/DhAgree.java
+(cd /tmp/j && $J/bin/java -cp . JcaGapSizer)             > hs.txt 2>/dev/null
+(cd /tmp/j && cratonvm --java-home $J -cp . JcaGapSizer) > cv.txt 2>/dev/null
+comm -23 <(sort -u hs.txt) <(sort -u cv.txt) > missing.txt      # the 186
+(cd /tmp/j && cratonvm --java-home $J -cp . JcaResolveAll missing.txt) | tail -1
 ```
 
-Diff on **stdout only** — this VM's tracing goes to stderr and merging the two
-turns an 8-row difference into a 30-row one.
+Diff on **stdout only**; this VM's tracing goes to stderr.
 
-## A note on how this was found, which cost an hour
+## A note on how the first version got written
 
-The §4 row said "unclaimed", so I picked it up. It had been closed the previous
-evening; my worktree was **91 commits behind** and the row I was reading was the
-stale copy. `git show origin/dev:<page>` on the row BEFORE investigating would
-have cost one command. `docs/known-issues/` already says a triage page is stale
-the day after it is written; it is equally true of the page you are standing on.
+The §4 row said "unclaimed", so I picked it up; it had been closed the evening
+before and my worktree was 91 commits behind. `git show origin/dev:<page>` on
+the row would have cost one command. Then, having measured a real enumeration
+gap, I published a functional claim I had not measured. Both mistakes have the
+same shape — an inference standing in for a check that was one command away.
