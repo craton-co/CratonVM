@@ -96,9 +96,13 @@ characterized; worth its own doc once isolated.
 
 ## Related
 
-- `loggingsetuprecorder-nosuchmethoderror-at-classpath-scale-20260817.md` —
-  the prior blocker in the same bootstrap chain (turned out to be a 5-day
-  stale binary, not a live defect).
+- `internal/fixed-suite-bugs/quarkus/loggingsetuprecorder-nosuchmethoderror-at-classpath-scale-20260817.md`
+  — the prior blocker in the same bootstrap chain, retired 2026-09-01. The
+  binary that page ran was five days stale, but the defect it saw was real:
+  the Quarkus logging native wrote down its own copy of
+  `LoggingSetupRecorder.initializeLogging`'s descriptor, and `70248949c`
+  (2026-08-13) is the fix. The wording that used to stand here — "a stale
+  binary, not a live defect" — is true of 08-17, not of the bug.
 - `internal/fixed-suite-bugs/wildfly/wildfly-jboss-logmanager-geteffectivelevel-null-loggernode.md` —
   an earlier, different jboss-logmanager native-shim gap in the same file
   family.
