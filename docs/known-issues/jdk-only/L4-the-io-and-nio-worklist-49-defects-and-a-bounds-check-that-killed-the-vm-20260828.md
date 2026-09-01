@@ -2144,3 +2144,67 @@ Papering it with a second fabrication — registering `getFileTypeDetector` to
 return a synthetic detector — would move the number to the floor and make the
 retirement look safe while leaving the reason it is not exactly where it was.
 Deliberately not done.
+
+
+## P6.7 The last residual, re-measured — it was three rows more than the record said
+
+`FileInputStream.skip` past EOF has been this lane's single carried residual
+since part one, on a §4.3 note that called it "contract-legal, and a resolution
+finding no registrar edit can move". Both halves of that were re-measured on
+2026-08-30. The conclusion survives. The evidence did not, and neither did the
+count.
+
+**It is four rows, not one.** The probe asked one, so the record inherited one:
+
+```text
+                              HotSpot        this VM
+skip(4) at EOF                     4              0
+skip(2) on a 1-byte file           2              1
+skip(100), 1 byte remaining      100              0
+skip(-1) at position 0     IOException        no-throw
+```
+
+`FileInputStream` **overrides** `InputStream.skip` — its `skip0` is one `lseek`,
+so it may seek past the end and report bytes that were never there, and it
+refuses a negative count. Read-and-discard can only ever report what is
+actually present. Calling that "contract-legal" leaned on `InputStream.skip`'s
+licence to skip fewer bytes, which is the contract of the class this one
+overrides. `L4StreamTailSweep` now asks all four.
+
+**Both stated reasons were wrong.**
+
+*"`skip0(J)J` has `invocations: 0`, so the body cannot be the problem."* The
+registry now reads `skip 0 / skip0 5` for a five-`skip` program. That number is
+real and it is not entry — an `eprintln!` placed in the body printed **nothing**,
+in `--jdk-only` and in the default mode alike. The counter counts a dispatch
+ATTEMPT. (The mirror of `a-zero-invocation-count-is-evidence-about-a-counter`: a
+non-zero count is evidence about a counter too.)
+
+*"`FileInputStream.skip` resolves to its superclass's method."* It does not:
+
+```text
+FileInputStream.class.getMethod("skip", long.class).getDeclaringClass()
+  HotSpot   java.io.FileInputStream
+  this VM   java.io.FileInputStream
+```
+
+and `getDeclaredMethods` lists `skip` **and** `skip0` on the class, exactly as
+HotSpot does. Resolution is correct; what differs is the body `invokevirtual`
+enters. The four answers above are precisely `InputStream.skip`'s
+read-and-discard default, so that is the bytecode running.
+
+**So it is a DISPATCH finding** — the superclass body is entered for a method the
+subclass declares and overrides — and it is still true that no edit to either
+native in `native-io/src/lib.rs` can move it. A seek-based body was written and
+measured inert a second time before being reverted; code that cannot run is
+worse than the absence of it. The source note now carries this account instead
+of the old one.
+
+```text
+2924 differential rows across nine L4 probes, both modes
+2920 identical to HotSpot 25.0.4+7
+   4 residual — the FileInputStream.skip family, one dispatch cause
+```
+
+The headline moved from "1 residual" to 4 because the probe got more honest, not
+because the VM got worse.
