@@ -6452,7 +6452,7 @@ fn print_arena_translation_summary(always: bool) {
         return;
     }
     eprintln!(
-        "[VM] arena-ptr: translations={} short_translations={}          stale_on_realloc={} retained_on_realloc={} stale_on_free={}",
+        "[VM] arena-ptr: translations={} short_translations={} stale_on_realloc={} retained_on_realloc={} stale_on_free={}",
         s.translations,
         s.short_translations,
         s.stale_on_realloc,

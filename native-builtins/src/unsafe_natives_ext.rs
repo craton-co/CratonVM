@@ -5216,7 +5216,7 @@ mod unsafe_arena {
                     target: "cratonvm::unsafe_arena",
                     handle = format!("{addr:#x}"),
                     translations = n,
-                    "Unsafe-arena block is being FREED while native code holds a                      real pointer into it -- the `Vec` is dropped and its memory                      returned to the process allocator"
+                    "Unsafe-arena block is being FREED while native code holds a real pointer into it -- the `Vec` is dropped and its memory returned to the process allocator"
                 );
             }
             self.inner.write().remove(&addr);
@@ -5594,7 +5594,7 @@ pub fn unsafe_arena_real_ptr_bounded(addr: i64, want: usize) -> Option<*mut u8> 
             handle = format!("{addr:#x}"),
             remaining,
             want,
-            "refusing to publish a real pointer for an Unsafe-arena block that              is SHORTER than the length being advertised with it -- the callee              would write past the block"
+            "refusing to publish a real pointer for an Unsafe-arena block that is SHORTER than the length being advertised with it -- the callee would write past the block"
         );
         return None;
     }
@@ -6214,7 +6214,7 @@ mod unsafe_arena_real_ptr_tests {
         assert_eq!(remaining, 64, "the bound exists at the source");
         assert!(
             unsafe_arena_block_is_translated(held),
-            "handing a real pointer to native code must be recorded -- otherwise              `reallocate` cannot tell that it is about to move a buffer somebody              is holding"
+            "handing a real pointer to native code must be recorded -- otherwise `reallocate` cannot tell that it is about to move a buffer somebody is holding"
         );
 
         // Resizing it is the hazard: `Vec::resize` may move the buffer.
@@ -6232,7 +6232,7 @@ mod unsafe_arena_real_ptr_tests {
         unsafe_arena_free(doomed);
         assert!(
             !unsafe_arena_block_is_translated(doomed),
-            "the record must be dropped with the block, or a later handle at the              same address inherits a warning that is not about it"
+            "the record must be dropped with the block, or a later handle at the same address inherits a warning that is not about it"
         );
 
         unsafe_arena_free(held);
