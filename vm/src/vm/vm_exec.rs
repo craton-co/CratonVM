@@ -9959,6 +9959,14 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .map(|s| s.to_string())
     }
 
+    fn any_loaded_class_in_package(&self, package_slash: &str) -> bool {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .any_loaded_class_in_package(package_slash)
+    }
+
     fn set_class_hidden(&mut self, class_id: ClassId) {
         let mut cm = self.shared.classes.class_manager_write();
         if let Some(class) = cm.get_class_mut(class_id) {
