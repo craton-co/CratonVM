@@ -55,16 +55,24 @@ prints the vector; the eight lines are the same line.)
 ## 3.2 One hit, in five independent builds
 
 Scanning `.rdata` for a dword run with those deltas finds **exactly one match**
-in each modern `cratonvm.exe` on this box — five builds spanning 2026-08-30 to
+in each modern `cratonvm.exe` on this box — five builds spanning 2026-08-28 to
 2026-09-01, at five different RVAs, and one match apiece, never two:
 
-| binary | table RVA | jump-table targets |
+| binary (linked) | table RVA | the three distinct arm bodies |
 |---|---|---|
-| `cratonvm/target/release` | `0x2411edc` | `0x2f7551`, `0x2f757c`, `0x2f744b`, … |
-| `cratonvm/target-hibreactive-20260830` | `0x244f96c` | `0x2fbdf1`, `0x2fbe1c`, `0x2fbceb`, … |
-| `CratonVM-hashevict-20260830` | `0x2484c40` | `0x2fbcc1`, `0x2fbcec`, `0x2fbbbb`, … |
-| `CratonVM-recycler-20260830` | `0x2499cc0` | `0x2fd411`, `0x2fd43c`, `0x2fd30b`, … |
-| `CratonVM-qlog-20260901` | `0x249ceec` | `0x2fab21`, `0x2fab4c`, `0x2faa1b`, … |
+| `cratonvm/target/release` (08-28) | `0x2411edc` | `0x2f7551`, `0x2f757c`, `0x2f744b` |
+| `cratonvm/target-hibreactive-20260830` (08-30) | `0x244f96c` | `0x2fbdf1`, `0x2fbe1c`, `0x2fbceb` |
+| `CratonVM-hashevict-20260830` (08-30) | `0x2484c40` | `0x2fbcc1`, `0x2fbcec`, `0x2fbbbb` |
+| `CratonVM-recycler-20260830` (09-01) | `0x2499cc0` | `0x2fd411`, `0x2fd43c`, `0x2fd30b` |
+| `CratonVM-qlog-20260901` (09-01) | `0x249ceec` | `0x2fab21`, `0x2fab4c`, `0x2faa1b` |
+
+A 2026-08-03 build in `apps/tomcat` does **not** match, which is the expected
+and useful negative: `coerce_field_value_for_slot`'s arms have been edited
+repeatedly since (the `b'L'` arm's `Double` split, the `note_field_coercion_loss`
+routing), and a changed arm changes the layout the fingerprint measures. The
+technique identifies a function whose *shape* has not moved, not one that has
+never been touched — which is why the eight files, from builds a few days apart
+from each other and a month before these, still hit.
 
 `CRATONVM_SYMBOLIZE` on two of them, against their own PDBs:
 
@@ -177,6 +185,22 @@ suggestive:
 §2.1 got the shape of this right ("the collector correlation is a property of
 the *reader*, not of the collector's barriers") without being able to name the
 consumer. This is the consumer.
+
+**Why the caller is `get_field_as` and not `set_field_as`.** Both call
+`coerce_field_value_for_slot`, and the source alone does not choose between
+them. The crash does: a *store* receives its `Value` from the interpreter or
+from compiled code, where it was constructed as a `Value` and its tag is valid
+by construction. Only a *read* can present a tag that was never written as one.
+`rax = 0xEAF82DA0` therefore came out of memory, which makes this the read arm.
+
+(The frame above the fault, `exe+0x2FB43C`, is `0x1172A` past the faulting
+instruction; applying the same offset to the current build's copy of the
+function lands in `g1::G1Collector::get_field_raw`, with `zgc::get_field` a few
+hundred bytes further on. That agrees, and it is **not evidence** — it is
+exactly the near-miss symbolization §0.4 warns produces plausible and entirely
+wrong answers, and the same RVA taken literally in the current build resolves
+to an unrelated function. It is recorded because it agrees, not because it
+decides anything.)
 
 It also means **§2.3 was the fix for these eight files**, and disclaimed itself
 too strongly. Its reasoning was:
@@ -293,11 +317,12 @@ is §0.4's "symbolization is no longer possible", §2.3's disclaimer and §2.7.2
 `0x5B` inference — each is answered above and each is left here because the
 reasoning that produced it is worth reading beside the answer. Everything else
 stands: §0.2 and §0.3 read the jump table correctly, and §3 is what happens
-when that reading is carried one frame further.*
+when that reading is carried one frame further. The only edit is that its title
+below is demoted from `#` to `##`, so this file has one top-level heading.*
 
 ---
 
-# hibernate-orm JSON/XML function tests SIGSEGV under G1/ZGC — the faulting instruction is decoded: a jump table indexed by a corrupt `Value` discriminant
+## (preserved) hibernate-orm JSON/XML function tests SIGSEGV under G1/ZGC — the faulting instruction is decoded: a jump table indexed by a corrupt `Value` discriminant
 
 **Status: OPEN, mechanism IDENTIFIED, still not reproducible on demand
 (2026-08-22). The crash is a VM memory-safety defect, not an environmental one.
