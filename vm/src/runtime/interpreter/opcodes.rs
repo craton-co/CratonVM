@@ -2857,7 +2857,7 @@ pub(super) fn op_checkcast(
                 // comment above gives: the re-served face has a
                 // non-zero class id, which is exactly what the gate
                 // suppresses.
-                crate::memory::reclaim_guard::report_reclaimed_receiver_forced(
+                let reclaimed = crate::memory::reclaim_guard::report_reclaimed_receiver_forced(
                     shared,
                     obj_ref.as_ptr() as usize,
                     "checkcast",
@@ -2875,12 +2875,47 @@ pub(super) fn op_checkcast(
                 // address. The frame walk is the one view left, and it
                 // names the Java slot, hence the bytecode that put it
                 // there.
-                crate::memory::reclaim_guard::report_root_slice_provenance(
-                    shared,
-                    thread,
-                    obj_ref.as_ptr() as usize,
-                    "checkcast",
-                );
+                //
+                // GATED on the free-list verdict the line above returns.
+                // Unconditional was wrong: a failing `checkcast` is ORDINARY
+                // Java — `catch (ClassCastException)` is control flow in
+                // `equals`, in Jackson's and Spring's type probes — and
+                // `report_root_slice_provenance` ends in an unconditional
+                // `tracing::error!`. With no collection yet performed the
+                // published snapshot is trivially empty, so every such cast
+                // printed `in_published_snapshot=false … a root COLLECTION
+                // gap` at ERROR level. Six lines of Java were enough:
+                //
+                //     Object o = "s";
+                //     try { Integer i = (Integer) o; }
+                //     catch (ClassCastException e) {}
+                //
+                // `vm_exec.rs`'s copy of this pair already gated on the same
+                // verdict; only this one did not, and the divergence is what
+                // made the guard cry wolf on healthy runs. A stale reference
+                // reaching a cast still reports in full — `_forced` returns
+                // `true` exactly when the address really is reclaimed memory,
+                // which is the only case this provenance walk can explain.
+                //
+                // The free-list verdict is not the only evidence: an address
+                // whose block has already been handed out again is gone from
+                // the free list but still in the old-gen freed ledger, which
+                // the block below queries for its own report. Ask both, so
+                // the re-served face — the one this site exists for — keeps
+                // its provenance walk.
+                if reclaimed
+                    || cratonvm_gc::gen_heap::old_freed_lookup_covering(
+                        obj_ref.as_ptr() as usize,
+                    )
+                    .is_some()
+                {
+                    crate::memory::reclaim_guard::report_root_slice_provenance(
+                        shared,
+                        thread,
+                        obj_ref.as_ptr() as usize,
+                        "checkcast",
+                    );
+                }
                 {
                     let addr = obj_ref.as_ptr() as usize;
                     if let Some((cid, kind, site, seq, fbase, fsize, fflags)) =

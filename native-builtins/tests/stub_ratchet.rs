@@ -1310,7 +1310,39 @@ use cratonvm_types::compat::CompatibilityMode;
 /// which is this file's 1038-vs-1032 story told again.
 /// [`BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK`] closes both halves.
 ///
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1602;
+///
+/// # Re-frozen 2026-08-30, +43: the whole `java.util.Scanner` family
+///
+/// Cause (b), and the cleanest signal this gate can give: **the totals did not
+/// move at all** (13511 and 13879, unchanged), against a +43 stub delta. Every
+/// row is a relabel of a registration that was already there.
+///
+/// `dump_synthetic_stubs` names 42 distinct `java/util/Scanner.*` rows; the
+/// 43rd is the DUPLICATE `hasNext()Z` registration this family carries, which
+/// the census counts as a registration and the dump dedups to one name.
+///
+/// The whole family moved `Bridge` -> `SyntheticStub`, including the three rows
+/// that were explicitly `Intrinsic`, so `--jdk-only` now drops all of it and
+/// runs java.base's own `Scanner`. WHY: `apps/probes/ScannerShadowSweep` is the
+/// first differential coverage this class has ever had -- 94 rows against 43
+/// owning registrations -- and it found 25 wrong rows identical in both modes,
+/// among them `locale()` returning NULL, four methods reaching the parse path
+/// with RADIX 0, four NPEs on real fields our `<init>` never populated, a
+/// `useDelimiter` walk that drops an empty token and everything after it, and
+/// nine invented exception messages.
+///
+/// Under the retag, **strict is 0-diff on all 94 rows.** Compatible mode is
+/// unchanged by construction (`NativeKind::allowed_in` is unconditionally true
+/// there), so this moves the default mode by zero and the 25 rows stay open in
+/// it.
+///
+/// `register_scanner_natives` carried a recorded blocker saying this could not
+/// be done -- "the real bytecode runs against a Scanner whose real fields were
+/// never populated", citing `RJdkIntrinsics3`. That described a PARTIAL refusal
+/// which left `<init>` shadowed. With the whole family refused the real
+/// constructor runs, and `RJdkIntrinsics3` passes: arms 119/119, 119/119,
+/// 79/79.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1645;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1330,7 +1362,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1602;
 /// **+1 on 2026-08-30** for the Phase 2 retirement, on top of the same
 /// day's +8 re-freeze; the account is on
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1591;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1634;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
