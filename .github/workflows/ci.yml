@@ -431,6 +431,29 @@ jobs:
         shell: bash
         run: CV=target/debug/cratonvm TIMEOUT=600 bash scripts/jdk-only-strict-probes.sh
 
+      # A `--jdk-only` refusal is only a RETIREMENT when nothing already owns
+      # the triple. `register` is last-write-wins and its JdkOnly arm returns
+      # WITHOUT inserting, so when an earlier registration owns the slot the
+      # older native survives as the winner, the retirement silently does not
+      # happen, and the two modes run different code.
+      #
+      # HERE rather than only in the advisory `jdk-only` job, for the reason the
+      # two steps above state: that job is `continue-on-error` at the JOB level.
+      #
+      # It is a RATCHET over a committed set, not a demand for zero: the nine
+      # measured winner-differences are triaged (four are deliberate per-mode
+      # branching in `lang_system.rs`; the rest are this shape and behaviourally
+      # equal today), and it fails when that set GROWS. The script refuses with
+      # exit 2 rather than looking green when the report is empty or unparsable
+      # — a run with zero refusals is a broken measurement, not a clean gate.
+      #
+      # Prerequisites are the same ones the step above already relies on: `Set
+      # up JDK 25` exports JAVA_HOME and `Build` leaves target/debug/cratonvm.
+      - name: JDK-only refusal survivors (a refusal that did not retire)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: CV=target/debug/cratonvm bash scripts/jdk-only-refusal-survivors.sh
+
       # ARCH-2026-08-04 A7. A `pub` item referenced only by its own tests is
       # invisible to `dead_code`; `lockfree_resolve.rs` kept 389 lines of an
       # unwired resolution cache alive that way, through a 2026-07-26 audit that

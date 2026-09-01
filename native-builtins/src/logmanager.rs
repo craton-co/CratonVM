@@ -667,6 +667,16 @@ fn ensure_singleton(
     Ok(obj)
 }
 
+/// The one `java.util.logging.LogManager` this VM hands out, allocating it on
+/// first use — the same object `LogManager.getLogManager()` returns.
+///
+/// Exposed for `Handler.<init>`'s `manager` field initializer, which a native
+/// constructor otherwise skips. `None` when the singleton cannot be built,
+/// which leaves the field exactly as it was.
+pub(crate) fn jul_log_manager_singleton(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    ensure_singleton(ctx, CLS_JUL_LOG_MANAGER).ok()
+}
+
 /// Resolve one of the 9 standard `java.util.logging.Level` singletons
 /// (`INFO`, `ALL`, `FINE`, ...) by name. Shared by the root-level default,
 /// the convenience-method publishers, and `readConfiguration` parsing.
