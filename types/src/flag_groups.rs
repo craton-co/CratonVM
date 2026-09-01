@@ -658,6 +658,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "nativelibraries-load-ok", on_key: Some("CRATONVM_DBG_NATIVELIBRARIES_LOAD_OK"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "native-lookups", on_key: Some("CRATONVM_DBG_NATIVE_LOOKUPS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ncdfe", on_key: Some("CRATONVM_DBG_NCDFE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "native-shadow", on_key: Some("CRATONVM_DBG_NATIVE_SHADOW"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "needs-exact-trace", on_key: Some("CRATONVM_NEEDS_EXACT_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "net", on_key: Some("CRATONVM_DBG_NET"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "netty-queue", on_key: Some("CRATONVM_DBG_NETTY_QUEUE"), off_key: None, off_word: None },

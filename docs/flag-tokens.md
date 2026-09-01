@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-507 tokens.
+508 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -377,6 +377,7 @@ export inherited from a parent shell.
 | `nativelibraries-load-ok` | `CRATONVM_DBG_NATIVELIBRARIES_LOAD_OK` |
 | `native-lookups` | `CRATONVM_DBG_NATIVE_LOOKUPS` |
 | `ncdfe` | `CRATONVM_DBG_NCDFE` |
+| `native-shadow` | `CRATONVM_DBG_NATIVE_SHADOW` |
 | `needs-exact-trace` | `CRATONVM_NEEDS_EXACT_TRACE` |
 | `net` | `CRATONVM_DBG_NET` |
 | `netty-queue` | `CRATONVM_DBG_NETTY_QUEUE` |

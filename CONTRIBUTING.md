@@ -88,7 +88,7 @@ entries you saw — a *new* name in the output is the signal.
 | `cuda-bridge` | Thin CUDA Driver API bridge for GPU offload |
 | `craton-gpu` | Build-time Java annotation sources (`@Parallel` etc.) for GPU offload |
 | `classloading` | Class loading & bytecode verification |
-| `gc` | Generational GC default (young/old; Cheney moving + non-moving sweep); opt-in G1 region collector (`-XX:+UseG1GC`, experimental); `ZgcRealHeap`, a real memory-backed STW non-moving mark-sweep that `-XX:+UseZGC` genuinely selects, but compiled in only behind the default-off `zgc` feature, so absent from a stock build |
+| `gc` | **ZGC is the default collector** since 2026-08-10 (`GcAlgorithm::Zgc` in `vm/src/config.rs`, behind the default-ON `zgc` feature in `gc/Cargo.toml`): `ZgcRealHeap` plus `zgc_concurrent.rs` and the twelve `src/zgc/` modules — colored pointers (`vaddr`), a load barrier (`barrier::z_load`), concurrent marking (`CRATONVM_ZGC_CONC_START`), compaction (`relocate`, kill switch `CRATONVM_ZGC_RELOCATE=0`) and an opt-in generational mode (`CRATONVM_ZGC_GENERATIONAL=1`). Generational (young/old; Cheney moving + non-moving sweep) stays available via `-XX:+UseGenerationalGC` and is the default in a `--no-default-features` build; G1 is opt-in via `-XX:+UseG1GC` (experimental) |
 | `jfr` | Java Flight Recorder |
 | `vm` | VM runtime engine |
 | `vm-cli` | Command-line entry point |
