@@ -90,13 +90,39 @@ cratonvm-types`:
 
 | | count |
 |---|---|
-| distinct `CRATONVM_*` identifiers appearing anywhere in Rust source | 692 |
-| exact string literals (i.e. actually named by code, not prose) | 658 |
+| distinct `CRATONVM_*` identifiers appearing anywhere in Rust source | 1,056 |
+| exact string literals (i.e. actually named by code, not prose) | 993 |
 | **declared** in `flag_groups::INVENTORY` + scalars + group variables | **986** |
 | declared before this pass | 576 |
 | declared by this pass | **71** |
 | allowlisted as intentionally undeclared | 11 |
 | user-facing names an operator has to learn | 15 |
+
+The first two rows are **not** generated and no test enforces them, which is
+why they read 692 / 658 from 2026-08-06 until 2026-09-01 while the true figures
+were 1,056 / 993 — a gap large enough to make the declared count (986) look
+like it *exceeded* the number of flags in the source, which is not possible.
+Re-derive them before quoting; the recipe is the one in [How to
+regenerate](#how-to-regenerate):
+
+```bash
+# row 1 — identifiers anywhere in Rust source
+grep -rhoE 'CRATONVM_[A-Z0-9_]+' --include='*.rs' . | sort -u | wc -l
+# row 2 — exact string literals under <crate>/src
+for d in $(sed -n 's/^members = \[//p' Cargo.toml | tr -d '"[],'); do
+  [ -d "$d/src" ] && grep -rhoE '"CRATONVM_[A-Z0-9_]+"' "$d/src"
+done | tr -d '"' | sort -u | wc -l
+```
+
+**What the three rows together say about the surface.** Grouping was a renaming,
+not a retirement: 986 declared knobs reached through 15 variables is still 986
+knobs. Of the names in `flag-surface.txt`, **494** are named nowhere outside
+`docs/internal` — i.e. neither operator-facing nor referenced by CI — and **65**
+of those have at most one Rust read site outside the declaration table. That
+set, not the 15, is the honest retirement backlog. Reproduce both with the
+`ext2`/`rs2` counting in `tools/flag-census/`-style greps: a name's read count
+is its `--include='*.rs'` hits across the member crates minus its hits in
+`types/src/flag_groups.rs` (which is a declaration, not a read).
 
 Read-path split, over `<crate>/src` only:
 
