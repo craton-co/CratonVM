@@ -2400,6 +2400,15 @@ pub struct G1Collector {
     /// the target to the maximum on any unproductive pause, and only a
     /// PRODUCTIVE overrun tightens it again.
     young_target_regions: AtomicUsize,
+
+    /// This collector's entry in the process-global live-heap registry.
+    ///
+    /// RAII only — see `gen_heap::RELOCATABLE_HEAPS_LIVE`. G1 publishes into
+    /// neither of the two tables the frame-band verifier tests, so on its own
+    /// it already fails that verifier closed; the registration is what keeps a
+    /// MIXED process honest, where another collector's published table would
+    /// otherwise be read as an answer about G1's addresses.
+    _bounds_registration: crate::gen_heap::RelocatableHeapRegistration,
 }
 
 // SAFETY: All fields are either atomic, behind Mutex, or Arc. Raw pointers
@@ -2421,12 +2430,24 @@ static NEXT_G1_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 /// for exactly this reason; embedding and unit tests are where a heap actually
 /// gets dropped.
 ///
-/// Unconditional, matching that precedent: if another live heap owns the table
-/// it re-publishes (Generational at its next GC, G1 at construction), and until
-/// then helper-only is a safe, merely slower, state.
+/// **Owner-checked since 2026-09-01.** It was unconditional, on the precedent
+/// `GenerationalHeap::drop` set — "if another live heap owns the table it
+/// re-publishes (Generational at its next GC, G1 at construction), and until
+/// then helper-only is a safe, merely slower, state". That precedent was itself
+/// withdrawn: the gen-side `Drop` measured the claim and found it false (3 of 3
+/// collections on a default-collector run ran with an empty table, i.e. nothing
+/// re-published), and both it and `ZgcRealHeap::drop` are owner-checked now.
+/// This was the last of the three still wiping a table it might not own — a
+/// short-lived G1 collector (a sizing probe, a unit test in a peer thread)
+/// could blank a live heap's read bounds and cost every inline `getfield` in
+/// the process its fast path for good.
+///
+/// The discriminator is this collector's own arena base, which is what
+/// `publish_jit_read_bounds(0, arena_base, ..)` in [`G1Collector::new`] wrote
+/// into slot 0.
 impl Drop for G1Collector {
     fn drop(&mut self) {
-        crate::gen_heap::clear_jit_read_bounds();
+        crate::gen_heap::clear_jit_read_bounds_owned_by(self.arena.as_ptr() as usize);
     }
 }
 
@@ -2515,6 +2536,7 @@ impl G1Collector {
 
         Self {
             layout_domain: std::sync::atomic::AtomicU32::new(cratonvm_types::FIRST_LAYOUT_DOMAIN),
+            _bounds_registration: crate::gen_heap::RelocatableHeapRegistration::new(),
             config: config.clone(),
             arena,
             regions: Mutex::new(regions),

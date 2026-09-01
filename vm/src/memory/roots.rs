@@ -1195,7 +1195,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
              incomplete={incomplete} reason={reason} chain={chain} \
              any_jit={any_jit} \
              scan_added={added} unrewritable={unrewritable} is_g1={is_g1} \
-             ybounds={ybounds} frames={labels:?}",
+             ybounds={ybounds} heaps={heaps}              bounds_representative={bounds_representative} frames={labels:?}",
             precise_only = moving_young_precise_only,
             proven = coverage_proven,
             osr_fb = moving_young_osr_fallback,
@@ -1228,6 +1228,17 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
             // bands and classified nothing as young — a vacuous pass, not a
             // clean frame. See `published_young_regions_are_live`.
             ybounds = cratonvm_gc::gen_heap::published_young_regions_are_live(),
+            // How many heaps are alive, and whether the published tables can
+            // describe them all. Both tables are single-tenant (slot-0
+            // ownership), so `heaps>1` means one heap's addresses answer
+            // `false` to every residency test in the process — the same vacuous
+            // verifier `ybounds=false` reports, reached from a table that IS
+            // published and is simply about the other heap. Printed beside
+            // `ybounds` because `ybounds=true heaps=2` is the reading neither
+            // number gives on its own.
+            heaps = cratonvm_gc::gen_heap::live_relocatable_heaps(),
+            bounds_representative =
+                cratonvm_gc::gen_heap::published_bounds_represent_every_live_heap(),
         );
     }
 
