@@ -6,6 +6,12 @@
 > the landing protocol and what "done" means. It is permanent; the records here
 > are dated. Added 2026-08-29, when `HANDOFF-20260828-SCOPE.md` §3/§5/§6 moved
 > there so that page could retire without taking the rules out of circulation.
+>
+> **It did retire, on 2026-09-01**, to `jdk-only/HANDOFF-20260828-SCOPE.md` in
+> the internal tree, all three of its stated blockers discharged: Phase 2
+> adjudicated, §4's two owned items closed, §5 rehomed. The eight-lane campaign
+> that page scoped is finished; what it measured is a record, and what it taught
+> is on the operations page. **Nothing in this directory is an operating page.**
 
 **Built by lane C18, 2026-08-13.** Snapshot: `ls docs/known-issues/jdk-only/*.md`
 taken at **00:07 local on 2026-08-13**, **155 files** including this one, on

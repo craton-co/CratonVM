@@ -988,7 +988,42 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
 pub fn register_p59_bulk_stream_transfer(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
-    for class in ["java/io/InputStream", "java/io/FileInputStream"] {
+    // NOT on `java/io/InputStream`. Registering there overrode a public JDK
+    // method for EVERY stream in the process -- every `InputStream` subclass
+    // that does not declare its own `transferTo` inherits the registration --
+    // and that had two costs, one of them a correctness bug:
+    //
+    //  * the generic fallback below copies through a 16 MiB Java array where
+    //    the JDK uses 16384, so an ordinary two-byte copy allocated 16 MiB;
+    //  * a method CratonVM serves from Rust cannot carry an agent's woven
+    //    advice, so `Mockito.mock(InputStream.class)` could not intercept
+    //    `transferTo` on the path `willCallRealMethod` uses. Measured on
+    //    `org.springframework.http.client.SimpleClientHttpResponseTests`
+    //    (2026-08-30): the real `transferTo` reached through `Method.invoke`
+    //    ran this native, the advice never re-entered, Mockito's `SelfCallInfo`
+    //    self-call grant leaked one step, and the NEXT intercepted call --
+    //    `read(byte[],int,int)`, the one the test stubs to throw -- was
+    //    swallowed as a self-call. The real JDK `read` then loops on `read()`,
+    //    answered with an unstubbed default 0, filling the buffer and
+    //    reporting progress forever: rc=124 at the 500 s cap, with the stubbed
+    //    exception never thrown. `readNBytes`, `readAllBytes` and `skip` have
+    //    the identical shape, no native registered, and behave exactly like
+    //    HotSpot in the same run -- which is what isolates the registration
+    //    rather than the dispatch as the cause.
+    //
+    // The receivers this was BUILT for keep it. Both fast paths above are
+    // receiver-specific -- `has_byte_array_stream_layout` for the
+    // `ByteArrayInputStream` drain, `file_stream_fd` for the
+    // `FileInputStream` -> STORED-zip raw copy -- and Spring Boot's
+    // `ZipInflaterInputStream` already carries its own `read([BII)` native in
+    // this same registrar, which is where its bulk path belongs. Anything else
+    // now runs the JDK's own `transferTo`, which is what it should have been
+    // doing: the header of this function calls that method "ordinary
+    // bytecode".
+    for class in [
+        "java/io/ByteArrayInputStream",
+        "java/io/FileInputStream",
+    ] {
         r.register(
             class,
             "transferTo",

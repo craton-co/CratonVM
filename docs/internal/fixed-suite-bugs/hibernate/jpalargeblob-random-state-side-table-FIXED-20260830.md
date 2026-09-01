@@ -2,9 +2,29 @@
 
 ## Status
 
-**Mechanism 1 (the native-memory leak) is FIXED, 2026-08-30. Mechanism 2 (the
-per-call cost) is OPEN.** Two independent mechanisms, both CratonVM-specific,
-both reproducible in seconds by a standalone probe with no database.
+**RETIRED 2026-08-30.** Both of this page's own findings are fixed. The test it
+was opened for still fails, and that residual moved to
+`known-issues/hibernate/jpalargeblobtest-per-native-call-floor-20260830.md`
+— it is the VM's per-native-call floor, which is not a property of `Random`,
+blobs or H2 and wants its own owner.
+
+
+**Both of this page's own findings are CLOSED, 2026-08-30. The test still
+fails, and what is left is not this page's.** Two independent mechanisms, both
+CratonVM-specific, both reproducible in seconds by a standalone probe with no
+database.
+
+* **Mechanism 1, the native-memory leak — FIXED.** ~39 bytes per `Random` ever
+  constructed, retained forever off-heap. 16M instances: 2163.9 MB → 1354.6 MB,
+  flat across a 16x range.
+* **The `new Random()` entropy draw — FIXED.** It was a CSPRNG syscall per
+  construction, i.e. per byte of this fixture, and the spec says
+  `seedUniquifier() ^ System.nanoTime()`. 982.2 → 546.1 ns/op.
+* **Mechanism 2, the per-call cost — NOT A FINDING OF THIS PAGE.** It is the
+  VM's ~300 ns native-call floor times five calls per byte. See
+  [the arithmetic](#what-would-make-the-test-pass--the-arithmetic-closed-out).
+
+Net on the real test: **312 s → 232 s (1.35x)**, still over `@Timeout(120)`.
 
 The leak fix is `cratonvm_types::identity_side_tables`, an eviction channel the
 ZGC sweep drives; see [The fix](#the-fix-eviction-driven-from-the-sweep) below
@@ -305,18 +325,52 @@ function of the fixed seeds, so an evicted live entry — which re-seeds from OS
 entropy and still returns a number — shows up as a diverged checksum rather than
 as an error. Byte-identical to real HotSpot, 3/3 runs per arm.
 
-## What would make the test pass
+## What would make the test pass — the arithmetic, closed out
 
-The budget is 120 s for 100M bytes: **≤1200 ns/byte**, against 1670 today. A
-1.4x improvement clears it and a 2x is comfortable — so this does not need the
-whole gap closed.
+The budget is 120 s for 100M bytes: **≤1200 ns/byte**.
 
-**The leak fix does not clear it.** Freeing the memory does not make the path
-cheaper: the per-byte cost is mechanism 2, five native calls per iteration, and
-that is untouched. `JpaLargeBlobTest.jpaBlobStream` is still expected to exceed
-its `@Timeout(120)`. What the fix removes is the ~3.9 GB of unreclaimable native
-memory the test dragged along with it, which was the part that was a defect
-rather than a slowness.
+**Where it stands after the two fixes on this page.** The real test, run
+2026-08-30: `test_ms=231841` — **232 s, down from 312 s (1.35x)** — and it still
+FAILS `@Timeout(120)`.
+
+232 s / 100M bytes = **2318 ns/byte** end-to-end, against a 1200 budget. The
+decomposition (`probes/BlobStreamCost.java`, this host, quiet, after both
+fixes) splits it:
+
+| component | ns/byte | how it is isolated |
+|---|---:|---|
+| the fixture's `read()` | **1468.5** | `stream boxed+new Random` |
+| — of which BOXING | **812.2** | minus `stream prim +new Random` (656.3) |
+| — of which `new Random()`+`nextInt` | **551.2** | minus `stream prim +shared Random` (105.1) |
+| — of which loop + virtual dispatch | 105.1 | `stream prim +shared Random` |
+| H2's blob write (the remainder) | ~850 | 2318 − 1468.5 |
+
+Real HotSpot's whole `read()` is **34.0 ns/byte**.
+
+**So neither fix on this page could ever have cleared it, and nor will one
+more.** Both remaining components are the same thing — this VM's per-native-call
+floor of roughly 300 ns, times the calls the fixture makes per byte:
+
+* **boxing, 812 ns = ~3 calls.** `count > 0` is `Long.longValue`, `count--` is
+  `Long.longValue` + `Long.valueOf`.
+* **Random, 551 ns = ~2 calls.** `Random.<init>` and `Random.nextInt`.
+
+Removing the boxing alone lands at 2318 − 812 = **1506 ns/byte** — still over.
+Removing boxing AND the Random calls lands at **~955 ns/byte**, which is under
+1200 and is the first arrangement that passes.
+
+**That is a JIT-intrinsics project, not a finishing touch on this page.**
+`jit/src/lib.rs::try_resolve_intrinsic` already has the shape (a per-family
+match returning a `JitIntrinsic` the x64 ladder emits inline, as `Math.sqrt` and
+`Math.min/max` do) and reserved empty regions for other families.
+`Long.longValue` is a field load and would be a small addition; `Long.valueOf`
+needs an allocation fast path with the JDK's −128..127 cache, which is bigger.
+Both are VM-wide wins far beyond this test — the boxed-`Long` counter alone is
+140 ns/op here against HotSpot's 3.6.
+
+**This page has nothing left of its own to say about that.** Its two findings
+are closed; what remains is the per-call floor, which is a property of the VM
+and wants its own page and its own owner.
 
 ## Not yet done
 
@@ -337,25 +391,101 @@ rather than a slowness.
   collector, so the production path is covered; running under `g1` or the
   generational heap still leaks. Giving those two a dead-object channel is the
   follow-up, and it fixes their monitor pruning at the same time.
-- Decide whether `java.util.Random` needs a native at all in real-JDK mode. The
-  JDK's own implementation is pure Java, keeps its state in the object, and is
-  JIT-compilable. **MEASURED: the full spec surface is byte-identical** between
-  the native shadow and real HotSpot — seeded `nextInt`/`nextLong`/`nextDouble`/
-  `nextInt(bound)`/`nextBoolean`/`nextGaussian`/`nextBytes` and unseeded
-  distinctness, all eight rows. What blocks the A/B is that
-  `CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/Random` **does not engage in
-  compatible mode** — the dial is scoped to `--jdk-only`'s step-1 dispatch — so
-  retiring the shadow has to be measured by changing the registration, not by a
-  flag. Synthetic-JDK mode still needs these natives; the registrations' own
-  comment records them being dropped once and seeded `Random` returning
-  all-zero output.
-- Replace `set_entropy_seed`'s per-construction OS entropy draw with the JDK's
-  `seedUniquifier() ^ System.nanoTime()`. Not the bottleneck (falsified above),
-  but it is a syscall per `new Random()` and it is not what the spec says.
+- ~~Decide whether `java.util.Random` needs a native at all in real-JDK mode.~~
+  **ANSWERED 2026-08-30: it does. Retiring the shadow is 2.6x-7.7x SLOWER, and
+  the reason is worth keeping** — see
+  [Retiring the Random shadow](#retiring-the-random-shadow-built-measured-and-left-off)
+  below. The item's premise ("pure Java, keeps its state in the object, and is
+  JIT-compilable") is true and still leads to the wrong answer. Also: the A/B was
+  never blocked. `CRATONVM_ENFORCE_NATIVE_SHADOW` is scoped to `--jdk-only`, but
+  a probe that reimplements the same LCG in Java measures the same question on
+  today's binary with no VM change at all, and gating the registration is ~20
+  lines.
+- ~~Replace `set_entropy_seed`'s per-construction OS entropy draw with the JDK's
+  `seedUniquifier() ^ System.nanoTime()`.~~ **DONE 2026-08-30**, and it was
+  worth more than this line credited: 982.2 → 546.1 ns/op, which is 1.41x on the
+  whole fixture `read()`. The page called it "not the bottleneck (falsified
+  above)" because seeded and unseeded constructors cost the same — they did,
+  at 570 vs 620 ns, a 50 ns gap that read as noise. Re-measured quiet the gap
+  was 150 ns (832 vs 982), and it is now 9 ns (537 vs 546). **A falsification
+  measured once, on a contended host, at the resolution of the thing being
+  falsified, is not a falsification.**
 - `new StringBuilder()` measured **1076.8 ns/op** on CratonVM against HotSpot's
   0.1 in the same harness. Not on this test's path and not investigated — noted
   because it is a far broader surface than `Random` and the number is large
   enough to be worth its own look.
+
+## Retiring the Random shadow: built, measured, and left OFF
+
+`CRATONVM_JDK_RANDOM=1` (opt-in, default OFF) skips the `java/util/Random`
+native registrations on a real JDK so the JDK's own bytecode serves the class.
+It is correct and it is slower, so it ships off.
+
+### Why the obvious argument is wrong
+
+The real `java.util.Random`'s state is a `private final AtomicLong seed`, and
+every draw runs
+
+```java
+do { oldseed = seed.get(); nextseed = ...; } while (!seed.compareAndSet(oldseed, nextseed));
+```
+
+**`AtomicLong.get` and `AtomicLong.compareAndSet` are themselves natives in this
+VM** — confirmed from `--dump-native-registry`, 23 invocations each across a
+23-draw run. So the JDK path costs **two native calls per draw where the shadow
+costs one**, plus the Java frames around them.
+
+MEASURED, one binary, `probes/RandomShadowCost.java`:
+
+| arm | shadow (default) | JDK bytecode |
+|---|---:|---:|
+| `new Random(i).nextInt()` | **663.3 ns/op** | 1655.6–1689.9 ns/op |
+| `shared Random.nextInt()` | **109.0 ns/op** | 826.4–827.3 ns/op |
+
+**The estimate that motivated this was wrong, and the error is reusable.** The
+probe first priced the shadow against a hand-written `MyRandom` — the same LCG
+over a plain `long` field — at 122 ns/op, and predicted retiring the shadow
+would buy 6.8x. `MyRandom` is not `java.util.Random`: it has no `AtomicLong`, so
+it measured a *third* implementation that does not exist in either arm. A proxy
+for "the JDK's version" has to contain the part that makes the JDK's version
+expensive.
+
+This becomes the right default the moment `AtomicLong` stops being native, or
+`Random` gets a JIT intrinsic. Re-run the probe then; do not trust this table.
+
+### A latent defect it did uncover
+
+There are **three** implementations of `java.util.Random` in this tree, and the
+first attempt at the retirement made the wrong one live: `RandomSpec` printed
+eight rows of **zeros**.
+
+1. `native-collections/src/lib.rs::register_random_natives` — a **synthetic**
+   2-field shape that keeps the seed in FIELD 0 of the receiver, registered as
+   `Bridge`;
+2. `native-builtins/src/securerandom.rs` — the spec-exact LCG over the identity
+   side table, registered as `Intrinsic` **afterwards**;
+3. the real JDK bytecode, never reached in compatible mode.
+
+On a real JDK, field 0 of `java.util.Random` is the `AtomicLong` *reference*,
+not a long — so (1) reads and writes the wrong thing and every draw is 0. It was
+harmless only because (2) overwrites the same ten triples and registration is
+LAST-WRITE-WINS. Gating only (2) uncovered (1).
+
+`--dump-native-registry` named it in one run (`kind: "bridge"`,
+`registered_by: native-collections/src/lib.rs`, `invocations: 7`) while
+`probes/AtomicLongSpec.java` proved the machinery underneath was byte-identical
+to HotSpot — including the exact `Random.next(int)` CAS loop returning
+`-1170105035`. Both sites now take the same gate, so the two can no longer
+disagree about which JDK they are serving.
+
+### Correctness of the opt-in arm
+
+All three flag states — unset, `=1`, `=0` — are byte-identical to real HotSpot
+on `probes/RandomSpec.java` (8 rows), `probes/SecureRandomSpec.java` (11 rows,
+including SHA1PRNG's exact seeded bytes and the non-replay properties), and
+`probes/RandomLiveAcrossGc.java`. `SecureRandom extends Random`, so its
+superclass construction changes under the flag; that is what
+`SecureRandomSpec.java` exists to check.
 
 ## Repro — no database needed
 

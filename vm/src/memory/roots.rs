@@ -850,6 +850,14 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     if let Some(ref obj_ref) = thread.jit_pending_exception {
         roots.push(*obj_ref);
     }
+    // The uncaught throwable the launcher is holding across shutdown-hook
+    // execution. A hook allocates and can collect, and until this slot existed
+    // the throwable was reachable only from a Rust local — so the render after
+    // the hooks read a zeroed header and printed `java/lang/Object`. See
+    // `JvmThread::uncaught_exception_pending`.
+    if let Some(ref obj_ref) = thread.uncaught_exception_pending {
+        roots.push(*obj_ref);
+    }
     // The JIT's stashed deopt / exceptional frames. Those live in `jit/`
     // thread-locals — that crate cannot depend on `vm/`, so they cannot become
     // `JvmThread` fields the way the slot above did — and are reached through

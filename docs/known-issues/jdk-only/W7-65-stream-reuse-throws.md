@@ -4,6 +4,61 @@
 **Branch:** `fix/stream-reuse-throws-20260812`
 **Status:** fixed for reference streams; a named residual set is left open on purpose.
 
+> **RE-MEASURED ON A BINARY 2026-08-30 (lane L3), and the residual set is NOT
+> the one named here.** This record's update says "Nothing here has been built
+> or run"; `apps/probes/StreamReuseProbe` now runs it — 161 rows, every shape,
+> both modes, with the exception TYPE and MESSAGE on every row.
+>
+> **`--jdk-only` is 0-diff on all 161 rows.** Strict drops the synthetic stream
+> carriers and runs java.base's own `AbstractPipeline`, which models
+> `linkedOrConsumed` correctly by construction. Everything below is compatible
+> mode only.
+>
+> **§5.1 "primitive streams" is too wide.** `Arrays.stream(int[])` and
+> `IntStream.of` model reuse correctly today; `IntStream.range`, `mapToInt` and
+> `LongStream.range` do not. The split is not primitive-vs-reference.
+>
+> **§5.6 "short-layout streams" names the wrong property.** `List.of()` and
+> `List.of("a")` model reuse correctly; `Collections.singleton`,
+> `Collections.emptySet`, `ArrayDeque`, `Arrays.stream(T[])` and
+> `parallelStream` do not — and an empty `ArrayList` does. Size is not the
+> discriminator.
+>
+> **What the discriminator actually is: `java/util/stream/Stream` HAS TWO
+> PRODUCERS, AT TWO DIFFERENT WIDTHS.** `native-collections` mints it
+> `STREAM_NUM_FIELDS` = 5 wide, where slot 4 is the linked-or-consumed flag.
+> `native-builtins/src/phases_late/streams.rs` — a second, parallel stream
+> implementation ("P56") — mints the SAME class **one field wide** and reads its
+> elements from field 0. `stream_mark_linked` opens with "no-op on a stream with
+> no slot for it", so on a P56 stream the flag is silently dropped and every
+> reuse check passes.
+>
+> That is `two-producers-of-one-carrier-class-is-a-failure-family`, and it
+> explains all three lists above at once: a source reaches the modelled
+> behaviour or not according to which crate minted its stream, which correlates
+> with neither element type nor size.
+>
+> **FIXED in the same commit as this note:** the lazy intermediate-stage
+> builder now links its source. `stream_link_or_consume`'s doc argues the JDK's
+> eight sites collapse onto the one funnel in `stream_elements` because every
+> operation reads the snapshot through it — true of every EAGER operation, and
+> false of a lazy one, which appends to the op chain and never drains. Two of
+> the JDK's eight sites are the intermediate-stage constructors, and
+> `stream_make_lazy_derived` is both:
+>
+> ```text
+>   ref filter then filter second     HotSpot IllegalStateException   was ok
+>   ref map then map second           HotSpot IllegalStateException   was ok
+>   ref parent after child linked     HotSpot IllegalStateException   was 3
+> ```
+>
+> **STILL OPEN, and now precisely bounded:** the 11 rows above whose stream is a
+> P56 mint, plus three CLASS-NAME rows — `filter`, `map` and `mapToInt` answer
+> `ReferencePipeline$Head` where HotSpot answers `$2`, `$3` and `$4`, because a
+> derived stage is minted as a fresh head rather than as a child. Closing the 11
+> means giving P56 streams the flag slot AND a check at P56's own operations, in
+> a second crate; it is a cross-crate change and it is not attempted here.
+
 > **UPDATED 2026-08-12 — two of the six residuals are closed, and the widest one
 > is re-costed.** `close()` (§5.3) and `onClose()` (§5.4) are implemented, both in
 > `native-collections/src/lib.rs`, each behind the source census the residual was

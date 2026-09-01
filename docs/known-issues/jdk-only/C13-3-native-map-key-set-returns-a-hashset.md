@@ -1,5 +1,25 @@
 # C13-3 — `native_map_key_set` returns a real `HashSet`, and what breaks if it stops
 
+> **MEASURED ON A BINARY 2026-08-30, and the class-identity prediction in this
+> record is OBSOLETE.** Every CratonVM row on this page is marked PREDICTED FROM
+> SOURCE — "no CratonVM binary and no cargo were run" — and the view-class
+> rewrite it specifies has since landed. `apps/probes/ViewIdentityProbe` asks
+> the class, the superclass, six `instanceof`s, three casts, `equals` four ways,
+> `hashCode`, the mutator refusals, serialization, the iterator classes and view
+> liveness, for `HashMap`, `LinkedHashMap`, `TreeMap`, `Hashtable` and
+> `Properties`: **303 rows, 0-diff against HotSpot 25.0.4+7 in BOTH modes.**
+>
+> So `keySet()` is a `HashMap$KeySet`, `values()` is a `HashMap$Values` with
+> `AbstractCollection` above it, neither is `Serializable`, and the casts this
+> record predicted would succeed now throw `ClassCastException` exactly where
+> HotSpot throws.
+>
+> What the probe DID find was different and narrower, and is fixed in the same
+> commit: three families never cached their view objects, so
+> `map.keySet() == map.keySet()` was false and — because `AbstractCollection`
+> does not override `equals` — `map.values().equals(map.values())` was FALSE
+> too. See `MEASURED-VIEW-IDENTITY` below.
+
 **Status:** OPEN, nothing changed. Lane C13, 2026-08-12. **No CratonVM binary
 and no cargo were run** — every CratonVM row is PREDICTED from source. The
 HotSpot transcripts and `javap` output are measured.
@@ -174,3 +194,41 @@ door. C7-2 N3 already nominates the replacement text; it remains unapplied, and
 C13-1 §1 now supplies the mechanism proving the door could not have been the
 cause: the native-above-the-receiver walk follows `superclass` only and never
 enumerates interfaces.
+
+
+---
+
+## MEASURED-VIEW-IDENTITY — what was actually wrong, 2026-08-30
+
+Not class identity. View CACHING, in three places, each a different reason:
+
+* **`TreeMap`** was dispatched to `native_tm_key_set` / `_values` / `_entry_set`
+  BEFORE `native_map_key_set`'s cache check, and those three had no cache of
+  their own. They now use a `cached_tm_view`/`store_tm_view` pair, which is
+  separate from `cached_live_view` because a TreeMap view reaches its source
+  through a trailing array slot rather than through `hs_backing_map`.
+* **`Hashtable`** was refused outright by a predicate that stood for
+  "`Hashtable` or `Properties`". HotSpot caches a `Hashtable`'s three views and
+  does NOT cache a `Properties`'s — `Hashtable.keySet()` is
+  `if (keySet == null) keySet = ...`, while `Properties` wraps its side
+  `ConcurrentHashMap` afresh on every call. So we were right for `Properties`
+  and wrong for `Hashtable`, and one predicate could not say so.
+  `view_cache_refused` is `CF_HASHTABLE_ANCESTRY && !CF_HASHTABLE_LAYOUT`, a
+  distinction this file already drew elsewhere.
+* **The `values` view of a `Hashtable`** stayed uncached even after that,
+  because the stored object is a `Collections$SynchronizedCollection` wrapper:
+  the reader tested the WRAPPER's class against the map-view carrier list and
+  declined, and the writer tried to re-derive the source from the wrapper, which
+  is not an `ArrayList`, and stored nothing. `cached_live_view` had unwrapped
+  since it was written; its values twin never did.
+
+LIVENESS was measured before enabling any of it, not argued: a view held across
+a `put`, a `remove` and an in-place value replacement answers for the map's
+current contents on every family, because these views resync from the stashed
+source on each read. Those rows passed before the change and after it.
+
+One more row, unrelated: `TreeMap.keySet().add(x)` threw
+`UnsupportedOperationException` with the message
+`"add is not supported on a key-set view"`. HotSpot's is message-less — the
+throw comes from `AbstractCollection.add` — and every other map's keySet in this
+crate already answered `msg=null`.

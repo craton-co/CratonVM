@@ -406,6 +406,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "fullstack-scan", on_key: Some("CRATONVM_DBG_FULLSTACK_SCAN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "fwdwalk", on_key: Some("CRATONVM_DBG_FWDWALK"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "fwdguard", on_key: Some("CRATONVM_DBG_FWDGUARD"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "g1-dbg-gray-prov", on_key: Some("CRATONVM_G1_DBG_GRAY_PROV"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "g1-mark-oob-failsafe", on_key: Some("CRATONVM_G1_MARK_OOB_FAILSAFE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1-dbg-headers", on_key: Some("CRATONVM_G1_DBG_HEADERS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1-dbg-pins", on_key: Some("CRATONVM_G1_DBG_PINS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1-dbg-reach", on_key: Some("CRATONVM_G1_DBG_REACH"), off_key: None, off_word: None },
@@ -656,6 +658,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "nativelibraries-load-ok", on_key: Some("CRATONVM_DBG_NATIVELIBRARIES_LOAD_OK"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "native-lookups", on_key: Some("CRATONVM_DBG_NATIVE_LOOKUPS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ncdfe", on_key: Some("CRATONVM_DBG_NCDFE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "native-shadow", on_key: Some("CRATONVM_DBG_NATIVE_SHADOW"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "needs-exact-trace", on_key: Some("CRATONVM_NEEDS_EXACT_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "net", on_key: Some("CRATONVM_DBG_NET"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "netty-queue", on_key: Some("CRATONVM_DBG_NETTY_QUEUE"), off_key: None, off_word: None },
@@ -1415,6 +1418,12 @@ pub const INVENTORY: &[E] = &[
     // `verify-ir` above. `zero_sp_id_slot_enabled` reads the key and treats
     // `0`/`false`/`FALSE` as off; only `"0"` is spellable as a group token, and
     // the other two spellings keep working through the key itself.
+    // `ir-gc-point-maps` is default ON and `CRATONVM_JIT_IR_GC_POINT_MAPS=0`
+    // restores the two IR GC-capable sites that recorded no safepoint (the
+    // cooperative poll and `Op::New`), so `off_word` is exactly `"0"` -- the
+    // same shape as `zero-spid` below.
+    E { group: Group::JIT, token: "direct-call-arg-maps", on_key: Some("CRATONVM_JIT_DIRECT_CALL_ARG_MAPS"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "ir-gc-point-maps", on_key: Some("CRATONVM_JIT_IR_GC_POINT_MAPS"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "zero-spid", on_key: Some("CRATONVM_JIT_ZERO_SPID"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "card-metrics", on_key: Some("CRATONVM_GC_CARD_METRICS"), off_key: None, off_word: None },
     // NOTE: `CRATONVM_DBG_MAPGEN` and `CRATONVM_DBG_VACATED_FRAMES` are declared
@@ -1570,6 +1579,9 @@ pub const INVENTORY: &[E] = &[
     // makes this cycle unprovable" refusal, which is what left a many-threaded
     // workload with no defragmentation at all. See
     // `vm/src/jit/conservative_roots.rs::xt_jit_coverage_handshake_enabled`.
+    // A measurement instrument, default-OFF and read with `is_some()`, so any
+    // value turns it on and there is no off word to spell.
+    E { group: Group::GC, token: "xt-jit-coverage-assume", on_key: Some("CRATONVM_XT_JIT_COVERAGE_ASSUME"), off_key: None, off_word: None },
     E { group: Group::GC, token: "xt-jit-coverage-handshake", on_key: Some("CRATONVM_XT_JIT_COVERAGE_HANDSHAKE"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-23 with the OSR coverage-question correction.
     // Default-ON, so a KILL SWITCH: `=0` makes the OSR fallback read
@@ -1840,6 +1852,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::COMPAT, token: "mh-strict-invokeexact", on_key: Some("CRATONVM_MH_STRICT_INVOKEEXACT"), off_key: None, off_word: Some("0") },
     E { group: Group::COMPAT, token: "mockito-legacy-selectors", on_key: Some("CRATONVM_MOCKITO_LEGACY_SELECTORS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "stackwalker-jdk-walk", on_key: Some("CRATONVM_SW_JDK_WALK"), off_key: None, off_word: None },
+    E { group: Group::COMPAT, token: "jdk-random", on_key: Some("CRATONVM_JDK_RANDOM"), off_key: None, off_word: None },
     E { group: Group::GC, token: "stream-refresh-each", on_key: Some("CRATONVM_GC_STREAM_REFRESH_EACH"), off_key: None, off_word: None },
     E { group: Group::GC, token: "noflag-deposit-skip-jit-scan", on_key: Some("CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN"), off_key: None, off_word: None },
     E { group: Group::GC, token: "identity-hash-evict", on_key: Some("CRATONVM_IDENTITY_HASH_EVICT"), off_key: None, off_word: Some("0") },

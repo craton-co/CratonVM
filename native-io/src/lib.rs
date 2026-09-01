@@ -8504,10 +8504,56 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
     //
     //   RJdkIntrinsics3: findWithinHorizon(String, 0) expected "42", got null
     //
-    // So a correct classification does NOT imply the registrar can be retagged.
-    // That needs the state to move first (G88-1 §5) — retiring the Rust
-    // tokenizer, which is wave-2 work.
-    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // MEASURED 2026-08-30 (lane L3), and the paragraph above is WRONG about the
+    // blocker. `apps/probes/ScannerShadowSweep` is the first differential
+    // coverage this class has ever had -- 94 rows, 43 owning registrations, and
+    // it found 25 wrong rows IDENTICAL in both modes:
+    //
+    //   * `new Scanner("a").locale()` is NULL, where HotSpot answers the
+    //     default -- an NPE in any caller that compares it;
+    //   * `nextBigInteger()`, `hasNextBigInteger()`, `hasNextShort()` and
+    //     `hasNextByte()` reach the parse path with RADIX 0
+    //     (`IllegalArgumentException: radix:0`);
+    //   * `nextBigDecimal()`, `nextBigInteger(radix)`, `skip(String)` and
+    //     `findAll(String)` NPE on `this.matcher` / `this.patternCache`, real
+    //     fields our `<init>` never populates;
+    //   * `new Scanner("a,b,,c").useDelimiter(",")` walks `[a][b]` where HotSpot
+    //     walks `[a][b][][c]` -- it drops the empty token AND everything after
+    //     it;
+    //   * `1,234` does not parse as a grouped int in any locale;
+    //   * nine rows carry invented exception messages ("no more elements",
+    //     "token mismatch") where HotSpot's are null or carry the
+    //     `NumberFormatException` text.
+    //
+    // AND REFUSING THE FAMILY FIXES 24 OF THEM. Run under
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/Scanner`, the probe goes from 25
+    // wrong rows to 12. The recorded objection -- "the real bytecode runs
+    // against a Scanner whose real fields were never populated" -- described a
+    // refusal that left `<init>` shadowed. Refuse the WHOLE family and the real
+    // constructor runs, so the state is the JDK's and there is nothing left to
+    // populate.
+    //
+    // The 11 rows that broke under the dial were not a missing capability
+    // either. Scanner native invocations fell 186 -> 17 under it, and the 17
+    // that SURVIVED are exactly the `findWithinHorizon` and `match` rows below:
+    // the dial refuses `Bridge` and does not refuse `Intrinsic`. So real
+    // `nextLine`/`findInLine` bytecode was calling a still-shadowed
+    // `findWithinHorizon` that did not understand the real Scanner's state.
+    // Both candidate capabilities were ruled out by measurement rather than
+    // argument: `apps/probes/MatcherRegionProbe` is 39 of 40 rows clean on the
+    // region-bounded `Matcher` API `findPatternInBuffer` runs on -- `region`,
+    // `usePattern`, transparent and anchoring bounds, `hitEnd`, a `CharBuffer`
+    // input and Scanner's own line pattern -- and `apps/probes/ReadableProbe` is
+    // 0-diff on all 15 rows of `Readable.read(CharBuffer)`, the loop it drives.
+    //
+    // `SyntheticStub`, therefore, and the three `Intrinsic` rows below go with
+    // it -- a family that is refused in part is the configuration that produced
+    // the false blocker. `--jdk-only` now drops all 43 and runs java.base's own
+    // `Scanner`. COMPATIBLE MODE IS UNCHANGED: `NativeKind::allowed_in` returns
+    // an unconditional `true` there, so this moves the default mode by zero and
+    // the 25 rows stay open in it, against the day the Rust tokenizer is retired
+    // outright.
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let c = "java/util/Scanner";
 
     // Constructors
@@ -8659,23 +8705,24 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
     // it, which is the category the implementation in `phases_early.rs` used
     // before it moved here.
     //
-    // The other 35 registrations in this function are still `Bridge` by
-    // inheritance and still wrong for the same reason — see the
-    // JDK-ONLY-CLASSIFY note above. Re-tagging them moves the ratchet in the
-    // GOOD direction and belongs with whoever re-freezes it.
+    // The other 35 registrations in this function are `SyntheticStub` by
+    // inheritance as of 2026-08-30, and these three now match them. Leaving
+    // them `Intrinsic` is what made a partial refusal look like a missing
+    // capability: under the enforce dial these were the only Scanner natives
+    // still running, and real `nextLine` bytecode called them.
     registry.register_with_kind(
         c,
         "findWithinHorizon",
         "(Ljava/lang/String;I)Ljava/lang/String;",
         native_scanner_find_within_horizon_string,
-        cratonvm_native_api::NativeKind::Intrinsic,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
     registry.register_with_kind(
         c,
         "findWithinHorizon",
         "(Ljava/util/regex/Pattern;I)Ljava/lang/String;",
         native_scanner_find_within_horizon_pattern,
-        cratonvm_native_api::NativeKind::Intrinsic,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
     // `match()` is Intrinsic for the same reason as `findWithinHorizon` above:
     // `java.util.Scanner` declares no ACC_NATIVE method, so contract §1.5's
@@ -8686,7 +8733,7 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
         "match",
         "()Ljava/util/regex/MatchResult;",
         native_scanner_match,
-        cratonvm_native_api::NativeKind::Intrinsic,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
 
     // Interface dispatch: Iterator

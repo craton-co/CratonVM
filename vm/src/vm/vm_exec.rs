@@ -210,6 +210,31 @@ fn reject_missing_implementation(
 /// probe never got there.
 static CHECK_OVERRIDE_REACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CHECK_OVERRIDE_TRUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Times `invoke_or_native` dropped a registered native because an agent had
+/// woven the class it is declared on. Non-zero on any run with an inline mock
+/// maker, zero on every run without one.
+static NATIVE_SHADOW_DROPPED_BY_REDEFINE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read [`NATIVE_SHADOW_DROPPED_BY_REDEFINE`].
+pub fn native_shadow_dropped_by_redefine() -> u64 {
+    NATIVE_SHADOW_DROPPED_BY_REDEFINE.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// Times a `check_override` NAME disjunct was dropped because an agent had
+/// redefined the declaring class, so its woven bytecode is authoritative.
+///
+/// Counted rather than silent for the reason every other engagement counter in
+/// this tree is: the fix is invisible in a passing run, and "the guard is
+/// there" and "the guard fires" are different claims. A run of
+/// `SimpleClientHttpResponseTests` reads non-zero here; a run with no agent
+/// reads zero, which is what says the ordinary path is untouched.
+static CHECK_OVERRIDE_REDEFINE_SUPPRESSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read [`CHECK_OVERRIDE_REDEFINE_SUPPRESSED`].
+pub fn check_override_redefine_suppressed() -> u64 {
+    CHECK_OVERRIDE_REDEFINE_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Record a `--jdk-only` refusal of the §8 interface substitution.
 ///
@@ -355,10 +380,11 @@ pub fn dump_check_override_census() {
     }
     let c = check_override_census().lock();
     eprintln!(
-        "[CHECK_OVERRIDE_CENSUS] rows={} reached={} chain_true={}",
+        "[CHECK_OVERRIDE_CENSUS] rows={} reached={} chain_true={} redefine_suppressed={}",
         c.len(),
         CHECK_OVERRIDE_REACHED.load(std::sync::atomic::Ordering::Relaxed),
         CHECK_OVERRIDE_TRUE.load(std::sync::atomic::Ordering::Relaxed),
+        CHECK_OVERRIDE_REDEFINE_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed),
     );
     for ((cls, m, d), (n, abstract_only)) in c.iter() {
         eprintln!(
@@ -19333,12 +19359,123 @@ pub fn invoke_or_native(
     // with no field probe, and it is what keeps `ctx.invoke_virtual(pool,
     // "execute", ...)` from recursing into the same native forever (a real
     // stack overflow, confirmed via gdb, in the bug this probe was born from).
-    if let Some((callback, native_kind)) =
+    // JVMTI REDEFINE GUARD. "Always check native registry first" is right
+    // until an agent has woven advice into the class's own bytecode, at which
+    // point that bytecode is authoritative and a registered native shadowing it
+    // silently drops the instrumentation.
+    //
+    // This door is the one REFLECTION uses. `Method.invoke` reaches it as
+    // `native_method_invoke` -> `invoke_virtual` -> `invoke_or_native`, which is
+    // exactly how an instrumentation agent calls the real method, and it is how
+    // `org.springframework.http.client.SimpleClientHttpResponseTests` came to
+    // hang for a day as a suspected GC fragmentation bug. Named by a backtrace
+    // taken inside the native itself; guarding the four dispatch_virtual /
+    // invoke.rs doors first was not enough, because none of them is on this
+    // path.
+    //
+    // Mockito's inline mock maker weaves `java.io.InputStream`;
+    // `willCallRealMethod` then reflects into the real `transferTo`, landed
+    // here, and ran CratonVM's registered `transferTo` native. The advice never
+    // re-entered, so Mockito's `SelfCallInfo` self-call grant was never consumed
+    // and leaked one step: the NEXT intercepted call (`read([BII)`) was
+    // swallowed as a self-call and ran the real JDK body, which loops on
+    // `read()` -- answered with an unstubbed default 0 -- filling the buffer and
+    // reporting progress forever. The stubbed NullPointerException the test
+    // asserts on is never thrown and `transferTo` never returns.
+    //
+    // Which body ran is settled without a debugger by the buffer size: the
+    // native copies through 16 MiB, the JDK body through 16384. The mock saw
+    // 16777216 on every call where HotSpot saw 16384, while `readNBytes` and
+    // `skip` -- same shape, no native registered -- were intercepted correctly
+    // in the same run.
+    //
+    // The immunity allow-list is consulted exactly as the other doors consult
+    // it: mocking one `StringBuilder` or one synthetic collection must not
+    // expose real JDK bytecode that would read a layout CratonVM's instances do
+    // not carry. `native_shadow_suppressed_by_redefine`'s own first line is
+    // `if !any_class_redefined() { return false }`, a relaxed atomic load, so a
+    // process with no agent pays that and nothing else.
+    // ...and only where there is BYTECODE TO FALL BACK TO.
+    //
+    // "The class was redefined" is not on its own a reason to drop a native.
+    // Mockito's inline mock maker instruments `java.lang.Object` as well, so a
+    // bare class-level test drops `Object.hashCode()I` -- which is `ACC_NATIVE`
+    // in the real JDK and has no `Code` at all, so there is nothing for the
+    // fall-through to run and CratonVM's identity hash would go with it, for
+    // every object in the process, the moment anything anywhere is mocked.
+    // Measured: with the class-level test alone this fired on
+    // `java/lang/Object.hashCode()I` and on nothing else useful.
+    //
+    // The right question is the one `method.is_abstract()` asks one door over
+    // (contract §7 step 3b), widened by one word: a registered native may only
+    // yield to a body that EXISTS. So resolve the method and require a
+    // non-native one carrying `Code`. `transferTo` is ordinary Java bytecode
+    // and passes; `Object.hashCode` is not and does not.
+    // Resolved ONCE, against the exact declaring class, and reused by both the
+    // guard and its trace. A name lookup is a different question: it answers
+    // `get_loaded_class_id(effective_class)`, and for a boot class reached
+    // through a mock that is not necessarily the id the agent actually
+    // retransformed.
+    let redefine_probe: Option<(ClassId, bool, u32)> = {
+        let cm = shared.classes.class_manager.read();
+        cm.get_loaded_class_id(effective_class).and_then(|cid| {
+            crate::classloading::find_method_recursive(cid, method_name, descriptor, &cm.class_store)
+                .map(|(m, declaring_id)| {
+                    (
+                        declaring_id,
+                        !m.is_native() && m.code().is_some(),
+                        cm.class_redefine_generation(declaring_id),
+                    )
+                })
+        })
+    };
+    let native_shadow_dropped_by_redefine = crate::classloading::any_class_redefined()
+        && redefine_probe.is_some_and(|(_, has_body, generation)| has_body && generation > 0)
+        && !crate::runtime::interpreter::redefine_immune_forced_native(
+            effective_class,
+            method_name,
+            descriptor,
+        );
+    if crate::runtime::env_cache::dbg_native_shadow()
+        && crate::classloading::any_class_redefined()
+        && shared
+            .natives
+            .native_methods
+            .find(effective_class, method_name, descriptor)
+            .is_some()
+    {
+        // One line per distinct triple: this sits on a hot dispatch path.
+        static SEEN: std::sync::OnceLock<
+            parking_lot::Mutex<std::collections::BTreeSet<(String, String, String)>>,
+        > = std::sync::OnceLock::new();
+        let seen = SEEN.get_or_init(|| parking_lot::Mutex::new(Default::default()));
+        let key = (
+            effective_class.to_string(),
+            method_name.to_string(),
+            descriptor.to_string(),
+        );
+        if seen.lock().insert(key) {
+            eprintln!(
+                "[native-shadow] {effective_class}.{method_name}{descriptor}                  dropped={native_shadow_dropped_by_redefine} probe={redefine_probe:?}                  immune={}",
+                crate::runtime::interpreter::redefine_immune_forced_native(
+                    effective_class,
+                    method_name,
+                    descriptor
+                ),
+            );
+        }
+    }
+    if native_shadow_dropped_by_redefine {
+        NATIVE_SHADOW_DROPPED_BY_REDEFINE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some((callback, native_kind)) = if native_shadow_dropped_by_redefine {
+        None
+    } else {
         shared
             .natives
             .native_methods
             .find_with_kind(effective_class, method_name, descriptor)
-    {
+    } {
         if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
             eprintln!("[invoke_or_native] direct native hit");
         }
@@ -26888,8 +27025,79 @@ fn invoke_on_class_shared_inner(
                                     | ("flush", "()V")
                                     | ("close", "()V")
                             ));
-                    let check_override =
-                        method.is_abstract() || (!jdk_only_strict && name_override);
+                    // JVMTI REDEFINE GUARD -- the one native-shadow door that
+                    // did not have one.
+                    //
+                    // Every other gate that prefers a registered native over a
+                    // class's own bytecode already cedes to an agent's woven
+                    // bytecode: `execute_invokevirtual_vtable_fast` and
+                    // `populate_virtual_invoke_cache` (both in
+                    // `dispatch_virtual.rs`), the hierarchy walk in
+                    // `invoke.rs`, and `should_force_registered_native_over_bytecode`.
+                    // This chain -- reached by REFLECTIVE dispatch, i.e.
+                    // `Method.invoke` -- did not, so a native kept winning on
+                    // exactly the path an instrumentation agent uses to call the
+                    // real method.
+                    //
+                    // Measured 2026-08-30 on
+                    // `org.springframework.http.client.SimpleClientHttpResponseTests`,
+                    // which had been open for a day as a GC fragmentation bug and
+                    // is not one. Mockito's inline mock maker weaves advice into
+                    // `java.io.InputStream`; `willCallRealMethod` then reaches the
+                    // real `transferTo` through `Method.invoke`, which landed HERE
+                    // and ran CratonVM's registered `transferTo` native instead of
+                    // the woven body. Two consequences, and the second is the hang:
+                    //
+                    //   * the advice never re-entered, so Mockito's `SelfCallInfo`
+                    //     self-call grant was never consumed and leaked one step --
+                    //     the NEXT intercepted call (`read([BII)`) was swallowed as
+                    //     a self-call and ran the real JDK body;
+                    //   * that real `InputStream.read(byte[],int,int)` loops on
+                    //     `read()`, which the mock answers with an unstubbed
+                    //     default 0, so it fills the buffer and reports progress
+                    //     forever. `transferTo` never terminates: rc=124 at the
+                    //     500 s cap, with the stubbed exception never thrown.
+                    //
+                    // `method.is_abstract()` is deliberately NOT guarded: an
+                    // abstract method has no `Code`, so the registered native is
+                    // the only body there is and redefinition changes nothing
+                    // about that (contract §7 step 3b).
+                    //
+                    // Asked of `declaring_id` -- the class that OWNS the body the
+                    // native is shadowing -- and NOT of a name lookup.
+                    // `native_shadow_suppressed_in` resolves `class_name` through
+                    // `get_loaded_class_id`, which is a different question: a
+                    // reflective invoke arrives with the RECEIVER's class name, and
+                    // for a Mockito mock of an abstract type that is the generated
+                    // subclass, whose generation is and stays 0 while its
+                    // superclass is the one the agent wove. `find_method_recursive`
+                    // has already walked to the declaring class, so the exact id is
+                    // in hand and there is no reason to re-derive a worse one.
+                    //
+                    // Measured: with the name form this guard did not fire at all
+                    // and `Method.invoke(transferTo)` still ran the native --
+                    // `read3` saw a 16777216-byte buffer where the JDK body uses
+                    // 16384, while `readNBytes` and `skip` (no native registered)
+                    // were intercepted correctly in the same run.
+                    //
+                    // `method.is_abstract()` is deliberately NOT guarded: an
+                    // abstract method has no `Code`, so the registered native is
+                    // the only body there is and redefinition changes nothing
+                    // about that (contract §7 step 3b).
+                    let name_override_suppressed_by_redefine = name_override
+                        && crate::classloading::any_class_redefined()
+                        && cm.class_redefine_generation(declaring_id) > 0
+                        && !crate::runtime::interpreter::redefine_immune_forced_native(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        );
+                    if name_override_suppressed_by_redefine {
+                        CHECK_OVERRIDE_REDEFINE_SUPPRESSED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let check_override = method.is_abstract()
+                        || (!jdk_only_strict && name_override && !name_override_suppressed_by_redefine);
                     // A name disjunct wanted this native and strict policy said
                     // no. Record it where every other §1.4 observation goes, so
                     // `--jdk-only-report` names the triple instead of leaving a
