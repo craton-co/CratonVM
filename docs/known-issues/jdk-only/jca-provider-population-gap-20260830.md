@@ -91,6 +91,22 @@ shared secret both parties derive identically. **The inference from enumeration
 to function was simply invalid**, and one probe of the thing itself was worth
 more than the arithmetic that produced 186.
 
+## 4a. This page has prior art, and should have found it first
+
+[`W7-63-jca-advertise-vs-serve.md`](W7-63-jca-advertise-vs-serve.md) —
+2026-08-12 — is titled *"The JCA provider chain advertises algorithms it will
+not serve, and serves names it never advertised"*. It establishes the exact
+distinction §4 reports as a discovery, and it fixed seven defects along that
+axis. `provider_chain.rs` even cites it at the `ML-KEM` rows: *"the SPI class
+name in a service row was never evidence of anything ... what makes these rows
+truthful is the engine arm, not the string."*
+
+Reading it first would have saved §4 from happening. What this page adds is the
+CURRENT size of both halves — 186 enumerated-missing, 84 functionally missing —
+measured eighteen days after that record, plus the verification W7-63 asked for
+and never got: `RJdkSecurity` is 153 checks, byte-identical between CratonVM and
+HotSpot, and that record now says so.
+
 ## 5. Whether the 84 are table entries is still open
 
 All 186 implementation classes **load on this VM exactly as they do on HotSpot**
