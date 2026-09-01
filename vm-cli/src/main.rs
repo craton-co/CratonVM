@@ -5590,9 +5590,13 @@ fn run() -> Result<()> {
             let resig = cratonvm_vm::jit::xt_root_scan::XT_PEER_RESIGNALS.load(O::Relaxed);
             let saved =
                 cratonvm_vm::jit::xt_root_scan::XT_PEERS_CLASSIFIED_AFTER_RETRY.load(O::Relaxed);
+            let hw_pin =
+                cratonvm_vm::jit::xt_root_scan::XT_HELPER_WINDOWS_PINNED.load(O::Relaxed);
+            let hw_ref =
+                cratonvm_vm::jit::xt_root_scan::XT_HELPER_WINDOWS_REFUSED.load(O::Relaxed);
             eprintln!(
                 "[GC] xt_peer_scan: unclassified_peers={peers} cycles_with_unclassified={cycles} \
-                 taken_over={taken} xt_roots={roots} helper_windows={hw} \
+                 taken_over={taken} xt_roots={roots} helper_windows={hw} hw_pinned={hw_pin} hw_refused={hw_ref} \
                  resignals={resig} classified_after_retry={saved} enabled={}",
                 cratonvm_vm::jit::xt_root_scan::enabled(),
             );

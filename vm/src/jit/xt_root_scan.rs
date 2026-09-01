@@ -85,6 +85,15 @@ pub static XT_HELPER_WINDOWS_SCANNED: AtomicU64 = AtomicU64::new(0);
 /// A4 (fork6-fjp) — conservative roots contributed by helper-window peers.
 pub static XT_HELPER_WINDOW_ROOTS: AtomicU64 = AtomicU64::new(0);
 
+/// Helper windows DISCHARGED by pinning the peer's conservative roots, and
+/// those that still refused the collection.
+///
+/// The pair is the point: `pinned` alone cannot say whether the refusal is
+/// gone, and `refused` alone cannot say whether the pass ever ran. Zero in both
+/// means no peer was caught inside a helper.
+pub static XT_HELPER_WINDOWS_PINNED: AtomicU64 = AtomicU64::new(0);
+pub static XT_HELPER_WINDOWS_REFUSED: AtomicU64 = AtomicU64::new(0);
+
 /// Peers the STW cross-thread scan could NOT classify: it signalled them and
 /// they did not reach the handler before the deadline (`STATE_CANCELLED`), or
 /// no slot was free to arm. Such a peer is neither parked nor proven
@@ -207,6 +216,28 @@ pub fn helper_window_scan_enabled() -> bool {
     );
     CACHE.store(on as u64, Ordering::Relaxed);
     on
+}
+
+/// `CRATONVM_XT_HELPER_WINDOW_PIN=0` -- a helper window refuses the whole
+/// collection again instead of pinning the peer's conservative roots.
+///
+/// Default ON. The refusal it replaces is `incomplete_reason::XT_HELPER_WINDOW`,
+/// which on `org.h2.test.jdbc.TestCachedQueryResults` is **219 of 227**
+/// refusals -- i.e. the entire reason ZGC never compacts on the H2
+/// fragmentation family, and it is discharged by pinning rather than by any
+/// repair to a proof.
+///
+/// Sound because the Linux classifier's root set is COMPLETE for a frozen peer:
+/// it reads the published register file AND every readable word from `rsp` up,
+/// so no address that peer can reach is missing. Pinning those keeps them
+/// still; their fields are rewritten through the pointer map exactly as any
+/// other live object's are. A window whose scan was PARTIAL is not pinned and
+/// keeps refusing -- see `classify_slot_helper_window`'s `complete`.
+fn helper_window_pin_enabled() -> bool {
+    !matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_XT_HELPER_WINDOW_PIN").as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
+    )
 }
 
 /// A4 (fork6-fjp) — classify one peer's already-copied stack/register words.
@@ -1178,13 +1209,21 @@ mod imp {
         slot.clear();
     }
 
+    /// Returns `(has_jit, complete)`.
+    ///
+    /// `complete` is the half that licenses PINNING instead of refusing the
+    /// cycle: it says this peer's conservative root set is the WHOLE of what it
+    /// can reach -- its register file and every readable word of its stack from
+    /// `rsp` up. Pinning a partial set helps nothing, because what was missed
+    /// is unrewritable too, so the two early returns below report `false` and
+    /// the caller keeps refusing.
     fn classify_slot_helper_window<F>(
         slot: &LinuxSlot,
         regions: &[(usize, usize)],
         ranges: &[(usize, usize)],
         is_obj: &F,
         candidates: &mut Vec<ObjectRef>,
-    ) -> bool
+    ) -> (bool, bool)
     where
         F: Fn(usize) -> Option<ObjectRef>,
     {
@@ -1201,10 +1240,10 @@ mod imp {
 
         let rsp = slot.rsp.load(Ordering::Acquire);
         if rsp == 0 || rsp & 0x7 != 0 {
-            return has_jit;
+            return (has_jit, false);
         }
         let Some(end) = readable_region_end_from_regions(rsp, regions) else {
-            return has_jit;
+            return (has_jit, false);
         };
         let mut p = rsp;
         while p + 8 <= end {
@@ -1217,7 +1256,7 @@ mod imp {
             }
             p += 8;
         }
-        has_jit
+        (has_jit, true)
     }
 
     /// Linux implementation of the cross-thread JIT root scan. We cannot use
@@ -1369,6 +1408,8 @@ mod imp {
         let self_tid = gettid();
         let mut candidates: Vec<ObjectRef> = Vec::new();
         let mut windows = 0usize;
+        let mut pinned_windows = 0usize;
+        let mut unpinned_windows = 0usize;
         let mut found_total = 0usize;
         let mut examined = 0usize;
         let mut unclassified = 0usize;
@@ -1405,7 +1446,7 @@ mod imp {
             match answer {
                 STATE_PARKED => {
                     candidates.clear();
-                    let has_jit = classify_slot_helper_window(
+                    let (has_jit, complete) = classify_slot_helper_window(
                         slot,
                         &regions,
                         &ranges,
@@ -1416,6 +1457,33 @@ mod imp {
                         windows += 1;
                         found_total += candidates.len();
                         let roots_this_window = candidates.len();
+                        // PIN, rather than refuse the whole cycle.
+                        //
+                        // This peer's conservative root set is COMPLETE -- the
+                        // classifier read its register file and every readable
+                        // word of its stack -- so nothing it can reach is
+                        // missing from `candidates`. Pinning exactly those
+                        // addresses is the same contract the cooperatively
+                        // parked threads already get through
+                        // `publish_pinned_jit_roots`: the objects do not move,
+                        // their FIELDS are still rewritten through the pointer
+                        // map, and everything else in the heap may relocate.
+                        //
+                        // The peer could not publish for itself because it was
+                        // interrupted by our signal inside a Rust helper,
+                        // reaching neither a safepoint arrival nor a
+                        // blocking-region entry -- the only two deposit points.
+                        // The scan runs on the COLLECTOR's thread, so it cannot
+                        // publish under the peer's `ThreadId` either; hence a
+                        // per-cycle set.
+                        if complete && helper_window_pin_enabled() {
+                            let addrs: Vec<usize> =
+                                candidates.iter().map(|o| o.as_ptr() as usize).collect();
+                            cratonvm_gc::gc_quiescence::add_xt_cycle_pinned_jit_roots(&addrs);
+                            pinned_windows += 1;
+                        } else {
+                            unpinned_windows += 1;
+                        }
                         roots.append(&mut candidates);
                         if dbg() {
                             eprintln!(
@@ -1450,12 +1518,22 @@ mod imp {
         }
         XT_HELPER_WINDOWS_SCANNED.fetch_add(windows as u64, Ordering::Relaxed);
         XT_HELPER_WINDOW_ROOTS.fetch_add(found_total as u64, Ordering::Relaxed);
-        if windows > 0 {
-            // See the Windows arm.
+        // ONLY the windows we could not pin refuse the cycle now.
+        //
+        // A pinned window is discharged, not merely counted: its objects are in
+        // `pinned_jit_roots_snapshot()`, which the relocating collectors
+        // already consume to withhold pages. An unpinned one (a partial scan,
+        // or the kill switch) keeps the old blanket refusal.
+        //
+        // `CRATONVM_XT_HELPER_WINDOW_PIN=0` restores it for every window, which
+        // is the one-binary A/B for this change.
+        if unpinned_windows > 0 {
             cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
                 cratonvm_gc::gc_quiescence::incomplete_reason::XT_HELPER_WINDOW,
             );
         }
+        XT_HELPER_WINDOWS_PINNED.fetch_add(pinned_windows as u64, Ordering::Relaxed);
+        XT_HELPER_WINDOWS_REFUSED.fetch_add(unpinned_windows as u64, Ordering::Relaxed);
         cratonvm_gc::gc_quiescence::publish_xt_helper_window(windows as u64, found_total as u64);
         if dbg() {
             eprintln!(
