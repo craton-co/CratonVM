@@ -248,5 +248,60 @@ public class ReflectArgTypeSweep {
         t("v.getWrongReceiver", () -> vs.get("not-a-box"));
         t("v.casOk", () -> vs.compareAndSet(b, b.s, "z"));
         t("v.casWrongRef", () -> vs.compareAndSet(b, b.s, Integer.valueOf(3)));
+
+        // ---- the shapes a receiver/value check must NOT refuse -------------
+        //
+        // Same discipline as `InvokeCastSweep`'s hot-path half: a check that
+        // refuses working code is worse than the wrong answer it replaces, and
+        // the FFM regression proved a new probe cannot be trusted to think of
+        // the population that breaks it. These rows are the guard.
+        t("v.subclassReceiver", () -> { SubBox sb = new SubBox(); vs.set(sb, "sub"); return sb.s; });
+        t("v.subclassReceiverGet", () -> { SubBox sb = new SubBox(); return vs.get(sb); });
+        t("v.subclassReceiverCas", () -> {
+            SubBox sb = new SubBox();
+            return vs.compareAndSet(sb, sb.s, "z2");
+        });
+        // An `Object`-declared field accepts anything, and must never be judged.
+        t("v.objectFieldAnything", () -> {
+            VarHandle vo = MethodHandles.lookup().findVarHandle(Box.class, "o", Object.class);
+            Box b2 = new Box();
+            vo.set(b2, Integer.valueOf(3));
+            return b2.o;
+        });
+        // A BOXED primitive into a primitive field: legal, and the arm that
+        // refuses "nine" must not refuse this.
+        t("v.primBoxedValue", () -> {
+            Box b2 = new Box();
+            vi.set(b2, (int) Integer.valueOf(9));
+            return b2.i;
+        });
+        // A STATIC VarHandle has no receiver coordinate at all.
+        t("v.staticOk", () -> {
+            VarHandle vst = MethodHandles.lookup()
+                .findStaticVarHandle(Box.class, "stat", String.class);
+            vst.set("st2");
+            return vst.get();
+        });
+        // An ARRAY VarHandle is a different kind and takes (array, index).
+        t("v.arrayOk", () -> {
+            VarHandle va = MethodHandles.arrayElementVarHandle(String[].class);
+            String[] arr = new String[2];
+            va.set(arr, 0, "a");
+            return va.get(arr, 0);
+        });
+
+        // ---- the doors the fix did NOT touch, measured before deciding -----
+        t("v.getAndSetOk", () -> { Box b2 = new Box(); return vs.getAndSet(b2, "n"); });
+        t("v.getAndSetWrongReceiver", () -> vs.getAndSet("not-a-box", "n"));
+        t("v.getAndAddOk", () -> { Box b2 = new Box(); return vi.getAndAdd(b2, 1); });
+        t("v.getAndAddWrongReceiver", () -> vi.getAndAdd("not-a-box", 1));
+        t("v.compareAndExchangeOk", () -> {
+            Box b2 = new Box();
+            return vs.compareAndExchange(b2, b2.s, "x");
+        });
+        t("v.compareAndExchangeWrongRef", () -> {
+            Box b2 = new Box();
+            return vs.compareAndExchange(b2, b2.s, Integer.valueOf(3));
+        });
     }
 }

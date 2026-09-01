@@ -4582,6 +4582,9 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 Some(Value::Object(Some(r))) => *r,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            if let Some(refusal) = vh_instance_refusal(ctx, meta.as_deref(), receiver, None) {
+                return Err(refusal);
+            }
             let td = match meta.as_deref() {
                 Some(m) => vh_type_desc_from_meta(m),
                 None => vh_type_desc(ctx, this),
@@ -4808,6 +4811,10 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 _ => return Ok(None),
             };
             let value = args.get(2).cloned().unwrap_or(Value::Int(0));
+            if let Some(refusal) = vh_instance_refusal(ctx, meta.as_deref(), receiver, Some(value))
+            {
+                return Err(refusal);
+            }
 
             if field_idx >= 0 {
                 ctx.set_field(receiver, field_idx as usize, value);
@@ -4916,6 +4923,12 @@ fn varhandle_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let expected = args.get(2).cloned().unwrap_or(Value::Int(0));
     let new_val = args.get(3).cloned().unwrap_or(Value::Int(0));
+    // The NEW value is the one that gets STORED, so it is the one judged. The
+    // expected value is only compared, and a wrong-typed expectation simply
+    // fails the comparison -- which is what the JDK does too.
+    if let Some(refusal) = vh_instance_refusal(ctx, meta.as_deref(), receiver, Some(new_val)) {
+        return Err(refusal);
+    }
 
     let idx = if field_idx >= 0 {
         field_idx as usize
@@ -5028,6 +5041,15 @@ fn varhandle_compare_and_exchange_raw(
     };
     let expected = args.get(2).cloned().unwrap_or(Value::Int(0));
     let new_val = args.get(3).cloned().unwrap_or(Value::Int(0));
+    // MEASURED on HotSpot 25.0.3+9 before wiring, `probes/ReflectArgTypeSweep.java`:
+    // `getAndSet`, `getAndAdd` and `compareAndExchange` all raise
+    // ClassCastException on a wrong receiver too, so all three doors get the
+    // same check as `set`/`get`/`compareAndSet`. They were left out of the
+    // first pass because only the latter three had been measured, and an
+    // unmeasured door is where a fix at the wrong level starts.
+    if let Some(refusal) = vh_instance_refusal(ctx, meta.as_deref(), receiver, Some(new_val)) {
+        return Err(refusal);
+    }
 
     let idx = if field_idx >= 0 {
         field_idx as usize
@@ -5135,6 +5157,15 @@ fn varhandle_get_and_set_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Ok(Some(Value::Object(None))),
     };
     let new_val = args.get(2).cloned().unwrap_or(Value::Int(0));
+    // MEASURED on HotSpot 25.0.3+9 before wiring, `probes/ReflectArgTypeSweep.java`:
+    // `getAndSet`, `getAndAdd` and `compareAndExchange` all raise
+    // ClassCastException on a wrong receiver too, so all three doors get the
+    // same check as `set`/`get`/`compareAndSet`. They were left out of the
+    // first pass because only the latter three had been measured, and an
+    // unmeasured door is where a fix at the wrong level starts.
+    if let Some(refusal) = vh_instance_refusal(ctx, meta.as_deref(), receiver, Some(new_val)) {
+        return Err(refusal);
+    }
 
     let idx = if field_idx >= 0 {
         field_idx as usize
@@ -5274,6 +5305,11 @@ fn varhandle_get_and_add_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 Some(Value::Object(Some(r))) => *r,
                 _ => return Ok(Some(Value::Int(0))),
             };
+            // Receiver only: the delta is numeric, so there is no reference to
+            // judge and `vh_instance_refusal` is passed `None` for the value.
+            if let Some(refusal) = vh_instance_refusal(ctx, meta.as_deref(), receiver, None) {
+                return Err(refusal);
+            }
             let delta = args.get(2).cloned().unwrap_or(Value::Int(0));
             let idx = if field_idx >= 0 {
                 field_idx as usize
@@ -5457,6 +5493,10 @@ fn varhandle_get_and_bitwise_raw(
                 Some(Value::Object(Some(r))) => *r,
                 _ => return Ok(Some(Value::Int(0))),
             };
+            // Receiver only -- the mask is numeric. See `getAndAdd` above.
+            if let Some(refusal) = vh_instance_refusal(ctx, meta.as_deref(), receiver, None) {
+                return Err(refusal);
+            }
             let mask = args.get(2).cloned().unwrap_or(Value::Int(0));
             let idx = if field_idx >= 0 {
                 field_idx as usize
@@ -13384,6 +13424,97 @@ fn invoke_with_arguments_cast_refusal(
     let needs_receiver = kind == MH_KIND_VIRTUAL || kind == MH_KIND_SPECIAL;
     let has_bound = matches!(ctx.get_field(this, MH_BOUND), Value::Object(Some(_)));
     invoke_reference_cast_refusal(ctx, this, kind, needs_receiver, has_bound, unpacked)
+}
+
+/// Refuse a `VarHandle` INSTANCE access whose receiver is not an instance of the
+/// handle's coordinate class, or whose value does not fit the declared field.
+///
+/// # What this VM did instead
+///
+/// `varhandle_set`'s instance arm resolved `field_idx` from the VarHandle's OWN
+/// class and then applied it to whatever object arrived, with no arm between
+/// the two lines. Measured, `probes/ReflectArgTypeSweep.java`, BOTH modes:
+///
+/// ```text
+/// row                 HotSpot 25.0.3+9           CratonVM
+/// v.wrongRef          ClassCastException         3        <- Integer STORED in a String field
+/// v.wrongReceiver     ClassCastException         no-throw <- wrote through a String receiver
+/// v.primWrongRef      WrongMethodTypeException   no-throw <- "nine" STORED in an int field
+/// v.getWrongReceiver  ClassCastException         y        <- READ through a String receiver
+/// v.casWrongRef       ClassCastException         true     <- CAS succeeded
+/// ```
+///
+/// Two of those are worse than a wrong exception type. `v.wrongRef` leaves a
+/// `String`-declared field holding an `Integer` with nothing failing at the
+/// store, so the next ordinary read of that field is where it surfaces -- at a
+/// site that did nothing wrong. `v.getWrongReceiver` applied a `Box` field index
+/// to a `String` and returned what it found there.
+///
+/// # Why the ORDER of the checks is the whole design
+///
+/// These are the CAS-dominated paths this file has been tuned for twice: a
+/// thread-local plan memo took the global lock off the JIT's fast paths (a
+/// scaling probe went 0.07x -> 0.68x at 24 threads), and `vh_meta_get` returns
+/// an `Arc` precisely so a hot op pays a refcount bump instead of three `String`
+/// clones. A per-operation `class_id_by_name` + `is_subclass` would take a
+/// class-manager read lock on every `CompletableFuture` composition step and
+/// undo both.
+///
+/// So the receiver check is an INTEGER COMPARE against `meta.class_id`, which is
+/// already in hand. Only a mismatch -- a subclass receiver, or a genuinely wrong
+/// one -- pays `reference_arg_admitted`, and that predicate refuses only on a
+/// positive reading. A handle with no meta, or whose meta carries no class name,
+/// is not judged at all.
+fn vh_instance_refusal(
+    ctx: &mut dyn NativeContext,
+    meta: Option<&VarHandleMeta>,
+    receiver: ObjectRef,
+    value: Option<Value>,
+) -> Option<MethodCallFailed> {
+    let meta = meta?;
+    if meta.class_name.is_empty() {
+        return None;
+    }
+    // FAST PATH: the overwhelmingly common case is the exact class, and this
+    // arm costs one heap read and one integer compare.
+    let recv_cid = ctx.class_id_of_object(receiver);
+    if recv_cid.as_u32() != meta.class_id {
+        let target = format!("L{};", meta.class_name);
+        let recv = Value::Object(Some(receiver));
+        if reference_arg_admitted(ctx, recv, &target) == Some(false) {
+            return Some(reference_cast_failure(ctx, recv, &target));
+        }
+    }
+    let value = value?;
+    // A PRIMITIVE field given a reference that is not its wrapper is a
+    // `WrongMethodTypeException`, not a cast failure -- the JDK reports it as a
+    // signature mismatch because a `VarHandle` access is signature-polymorphic.
+    // No hierarchy walk is involved.
+    if matches!(
+        meta.field_desc.as_str(),
+        "I" | "J" | "F" | "D" | "Z" | "B" | "S" | "C"
+    ) {
+        if let Value::Object(Some(o)) = value {
+            let cid = ctx.class_id_of_object(o);
+            let name = ctx.class_name_of_id(cid).unwrap_or_default();
+            if crate::lang_class::wrapper_to_prim_desc(&name).is_none() {
+                return Some(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/lang/invoke/WrongMethodTypeException",
+                    &format!(
+                        "cannot convert {} to {}",
+                        name.replace('/', "."),
+                        meta.field_desc
+                    ),
+                ));
+            }
+        }
+        return None;
+    }
+    if reference_arg_admitted(ctx, value, &meta.field_desc) == Some(false) {
+        return Some(reference_cast_failure(ctx, value, &meta.field_desc));
+    }
+    None
 }
 
 fn invoke_narrowing_arg_refusal(

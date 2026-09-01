@@ -5508,7 +5508,7 @@ fn widening_allowed(src: &str, dst: &str) -> bool {
 }
 
 /// Infer the primitive descriptor for a wrapper class name.
-fn wrapper_to_prim_desc(wrapper: &str) -> Option<&'static str> {
+pub(crate) fn wrapper_to_prim_desc(wrapper: &str) -> Option<&'static str> {
     Some(match wrapper {
         "java/lang/Integer" => "I",
         "java/lang/Long" => "J",

@@ -196,6 +196,49 @@ one specific: `Method.invoke`, `Field.set`/`get`, `Constructor.newInstance` and
 `Array.set` all refuse correctly across wrong references, wrong receivers,
 arity, primitive widening/narrowing/null and `final` fields.
 
+## 6b. The frameworks also pass the DEFINITION-OF-DONE screen, which the probe cannot see
+
+A differential probe compares answers. It is blind to the thing the roadmap
+actually asks for — *no fabricated class instantiated, whatever its package,
+screened by the report's own rows and not by a prefix* — because a fabrication
+that gets refused and recovered from produces the SAME answer as one that never
+happened.
+
+So the screen was run over the six frameworks as well
+(`--jdk-only --explain-jdk-only --jdk-only-report`):
+
+```text
+CodegenFrameworkSmoke, --jdk-only
+  application_classes         2240
+  generated_classes            115
+  bridge_invocations        195569
+  intrinsic_invocations     513427
+  compatibility_classes          0     <- the bar
+  synthetic_stub_invocations     0     <- the bar
+```
+
+**Zero, on both counters, with 115 classes generated at runtime by ASM,
+ByteBuddy, Mockito, Javassist and Groovy.** Until now that bar had been
+demonstrated on the three roadmap workloads (Spring Boot, a servlet container
+over HTTPS, a JDBC workload) by the L7 lane. This extends it to the family the
+corpus report implicated — *"virtually everything that broke touches dynamic
+bytecode generation"*.
+
+Two fabrication REQUESTS appear in the rows, and both are strict mode working
+rather than failing — the blocking set is *refused AND not recovered from*, and
+`compatibility_classes: 0` is what says nothing was instantiated:
+
+```text
+cratonvm/stream/LazyOp          requested from native-collections/src/lib.rs:26768
+java/util/Enumeration$Impl      requested from native-builtins/src/classloader.rs:5477
+  reason (both): VM-requested stand-in: ensure_synthetic_class called with no
+                 class file on any classpath entry
+```
+
+Worth keeping because a request is where a future defect would first appear: if
+either of those ever stops being recovered from, the counter moves and the
+screen says so, while every differential row stays green.
+
 ## 7. Verification
 
 ```text
