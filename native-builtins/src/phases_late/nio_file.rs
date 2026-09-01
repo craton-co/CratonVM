@@ -9730,6 +9730,42 @@ pub(crate) fn p57_alloc_path(
     let s = ctx.create_string(&stored);
     let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field(obj, P57_PATH_FIELD, Value::Object(Some(s)));
+    // THE TWO INDICES ABOVE LAND ON THE WRONG FIELDS, and the fix is bigger
+    // than this function. Recorded here because the shape is not obvious from
+    // the code and cost a build to establish.
+    //
+    // `sun.nio.fs.UnixPath` is a REAL, fully loaded class in this VM -- 52
+    // declared methods and 7 declared fields, byte-identical to HotSpot's, and
+    // it declares `toString`. What is handed out is a real instance of it with
+    // none of those fields filled in. Read back through reflection
+    // (`--add-opens java.base/sun.nio.fs=ALL-UNNAMED`):
+    //
+    //   field         HotSpot                      this VM
+    //   path          byte[3] = a/b                NULL
+    //   stringValue   NULL                         NULL
+    //   fs            sun.nio.fs.LinuxFileSystem   String = "a/b"
+    //
+    // The instance slots are `fs`(0) `path`(1) `stringValue`(2) `hash`(3)
+    // `offsets`(4). So `P57_PATH_FIELD`(0) writes the path STRING where a
+    // `UnixFileSystem` belongs, and `P57_PATH_FS_FIELD`(1) writes the owning
+    // filesystem where a `byte[]` belongs -- two type-confused slots, invisible
+    // for as long as our own natives read them back by the same indices.
+    //
+    // A `set_field_by_name(obj, "stringValue", ..)` was added here and MEASURED
+    // INERT: the object is allocated against `java/nio/file/Path` -- the
+    // INTERFACE -- with two slots, so a `UnixPath` field name does not resolve
+    // and the write silently does nothing. `stringValue` read back NULL and the
+    // armed `java/nio/file/Path` scope did not move. Reverted rather than kept:
+    // code that cannot fire is worse than the absence of it.
+    //
+    // The real repair is to allocate as `sun/nio/fs/UnixPath` at its true width
+    // and store into the named slots -- `fs` for the owning filesystem (which is
+    // what that field MEANS), `path` for the bytes, `stringValue` for the
+    // string -- and move the 17 `P57_PATH_FIELD`/`P57_PATH_FS_FIELD` sites onto
+    // by-name access. That is a change to the hottest allocation in
+    // `java.nio.file` and wants its own measurement, including throughput;
+    // every unarmed row is 0-diff today, so it buys the RETIREMENT of this
+    // family, not a correctness fix.
     ctx.unpin_native_roots(obj_pin);
     Ok(obj)
 }

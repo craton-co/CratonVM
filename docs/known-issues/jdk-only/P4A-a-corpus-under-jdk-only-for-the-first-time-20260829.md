@@ -446,6 +446,44 @@ are a statement about this VM at all.
 zero failures that compatible mode does not.** The one candidate was the
 measuring instrument.
 
+## 8. The eight that exceed 1800 s: the slowness is NOT `--jdk-only`'s
+
+§7 left eight vectors that HotSpot passes and `--jdk-only` does not finish in
+1800 s. The tempting reading is that strict mode is what makes them slow. It is
+not, and the check does not need an idle host.
+
+**An absolute timing from this box is worthless** — it carries other lanes and
+sat between load 24 and 47 during this measurement. A COMPARISON between two
+arms survives that, provided both arms meet the same load, so each vector was
+run **compatible and strict adjacently**, one observation per arm, at a 900 s
+cap. Neighbouring runs see near-identical load even when the hour does not.
+
+```text
+vector                          compat            strict
+org.h2.test.db.TestCases        TIMEOUT  900s     TIMEOUT  900s
+org.h2.test.jdbc.TestCancel     TIMEOUT  900s     TIMEOUT  901s
+org.h2.test.scripts.TestScript  TIMEOUT  901s     TIMEOUT  900s
+```
+
+**Compatible mode does not finish them either.** Whatever makes these classes
+slow on this VM is present with the strict flag off, so `--jdk-only` is not the
+cause and the §7 timeouts are not evidence against it. That is the same verdict
+§3 and §6 reached for every failure this corpus produced, now extended to the
+slow tail: nothing here is strict-specific.
+
+**Three of eight, not eight of eight.** The run was stopped after three pairs
+when host load reached 47 on eight cores — my six processes were part of that,
+and five more pairs of "both arms over the cap" would have repeated the finding
+while making other lanes' measurements worse. The remaining five are
+`TestBenchmark`, `TestMVStoreBenchmark`, `TestCrashAPI`, `TestSimpleIndex` and
+`TestFileSystem`, and they are UNMEASURED on this axis rather than assumed to
+match.
+
+**What this does not say.** It does not say how slow CratonVM is on these
+classes — §5's ratio data is the closest this page has, and it is explicitly not
+a benchmark. It says only that the two CratonVM modes are indistinguishable
+here, which is the question that was open.
+
 ## Reproduce
 
 ```bash

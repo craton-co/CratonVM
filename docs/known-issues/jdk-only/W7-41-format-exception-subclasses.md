@@ -7,6 +7,27 @@ it — the root cause, the population count, the new refusals — is read from t
 source of `native-builtins/src/lang_string.rs` and of JDK 25's own
 `java.base/java/util/Formatter.java`, and is stated as such.
 
+> **VERIFIED AGAINST A BINARY 2026-09-01.** The status above was written by a
+> lane that could not build or run Rust, and it stood for roughly three weeks.
+> Run on a release binary of `dev`, against HotSpot 25.0.4+7 on the same host:
+>
+> ```text
+> RJdkFormatLocale
+>   HotSpot          PASS RJdkFormatLocale (20 checks)
+>   CratonVM compat  PASS RJdkFormatLocale (20 checks)      0 differing lines
+>   CratonVM strict  PASS RJdkFormatLocale (20 checks)      0 differing lines
+> ```
+>
+> Byte-identical output in BOTH modes, so the source work this record describes
+> does what it claimed on a real binary.
+>
+> **The predicted COUNT is superseded: this record expected no count of its own; `RJdkFormatLocale` was named as the vector that exists.** Other
+> lanes added to the shared vector across the three weeks. A count written as an
+> expectation ages into a falsehood the moment a shared vector grows -- what
+> survives verification is the ASSERTIONS, and those match. Do not re-derive a
+> defect from a count that merely moved.
+
+
 Everything below is in `native-builtins/src/lang_string.rs` unless said
 otherwise.
 
