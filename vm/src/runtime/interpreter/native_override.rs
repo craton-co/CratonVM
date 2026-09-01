@@ -2003,9 +2003,13 @@ pub(crate) fn is_input_stream_transfer_to_native_override(
     method_name: &str,
     descriptor: &str,
 ) -> bool {
+    // Kept in step with `register_p59_bulk_stream_transfer`, which no longer
+    // registers on `java/io/InputStream`: an override of the ROOT class covers
+    // every stream in the process, and a method served from Rust cannot carry
+    // an agent's woven advice. See that registrar for the measurement.
     matches!(
         class_name,
-        "java/io/InputStream" | "java/io/FileInputStream"
+        "java/io/ByteArrayInputStream" | "java/io/FileInputStream"
     ) && method_name == "transferTo"
         && descriptor == "(Ljava/io/OutputStream;)J"
 }
@@ -5165,7 +5169,7 @@ pub(super) fn force_native_over_real_jdk_bytecode(
 /// one `class_manager` read + a generation lookup, but only at the handful of
 /// dispatch sites that were about to serve a native/intrinsic shadow.
 #[inline]
-pub(super) fn native_shadow_suppressed_by_redefine(shared: &SharedVm, class_name: &str) -> bool {
+pub(crate) fn native_shadow_suppressed_by_redefine(shared: &SharedVm, class_name: &str) -> bool {
     if !crate::classloading::any_class_redefined() {
         return false;
     }
@@ -5542,7 +5546,7 @@ pub(crate) fn is_datagram_channel_open_native_override(
 /// from 32 broken operations to 18 rather than to 0, because the cache sites
 /// re-assembled their own chain and never saw it.
 /// `layout_immunity_is_not_open_coded` keeps the two in step.
-pub(super) fn redefine_immune_forced_native(
+pub(crate) fn redefine_immune_forced_native(
     class_name: &str,
     method_name: &str,
     method_descriptor: &str,

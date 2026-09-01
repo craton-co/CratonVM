@@ -1966,6 +1966,44 @@ pub(super) fn narrow_safepoint_spill_enabled() -> bool {
 /// [`Compiler::emit_pre_safepoint_spill_args_published`]. An allocation site, a
 /// safepoint poll, or any invoke shape that did not stage keeps the full
 /// selection, because it has not published anything.
+/// Name a direct call's reference ARGUMENTS in its safepoint map
+/// (`CRATONVM_JIT_DIRECT_CALL_ARG_MAPS`, **default-ON; `=0` restores the
+/// pre-fix arrangement**).
+///
+/// `reserve_direct_call_service_slots` already copies every argument of a baked
+/// direct call into a contiguous frame range, for the cold callee-sentinel
+/// exception service. That range is nameable, and the sibling dispatch-helper
+/// site names its equivalent buffer (`pending_staged_arg_oops`) -- but the two
+/// direct sites instead set `pending_staged_args_unmapped`, which makes
+/// `map_incomplete` true and so takes `moving_young_coverage_complete` false
+/// for that safepoint, and `fully_shadow_covered` false for the whole method.
+///
+/// MEASURED on `org.h2.test.jdbc.TestCachedQueryResults`, 300 s: that single
+/// cause fired **9 161** times against 78 for every other `map_incomplete`
+/// cause combined, and left `frame_cov=(no_map=0 incomplete=173 ok=780)` --
+/// i.e. after the IR-backend safepoint repairs closed `no_map` entirely, this
+/// is what the remaining refusals are.
+///
+/// Naming them also makes them PUBLISHED: `collect_live_oop_homes` reads
+/// `pending_staged_arg_oops`, so the shadow stack carries them and the band
+/// verifier stops finding an unpublished movable word where the service range
+/// sits. The cost is the elision: a direct call with a reference argument goes
+/// back to emitting the real pre-safepoint spill, because that is what emits
+/// the push. Calls with no reference argument are untouched.
+pub(super) fn direct_call_arg_maps_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_CALL_ARG_MAPS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
 pub(super) fn spill_args_published_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();

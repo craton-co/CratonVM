@@ -7622,14 +7622,12 @@ impl Compiler {
                             // fixed-suite-bugs/jit-direct-call-arg1-clobbered-by-arg0-FIXED.md.
                             let args_frame_top = self.next_spill_offset;
                             let (arg_slots, arg_oops) = self.pop_invoke_args(n);
-                            // A reference staged into an area no oop map can name (the
-                            // native-ABI outgoing-argument area, the direct-call service
-                            // slots, or an inlined callee's parameter locals). The
-                            // conservative scan covers those and the precise map cannot,
-                            // so this method must not claim precise coverage here.
-                            if arg_oops.iter().any(|&o| o) {
-                                self.pending_staged_args_unmapped = true;
-                            }
+                            // A reference staged where no oop map can name it fails the
+                            // safepoint closed. DEFERRED to just after the service-range
+                            // reservation below, because whether that is true here is
+                            // exactly what the reservation decides: when it succeeds it
+                            // copies every argument into a contiguous frame range, and a
+                            // frame range IS nameable. See `direct_call_arg_maps_enabled`.
                             // Spill cursor as the bytecode's operand stack sees it
                             // now that this invoke's arguments are popped. The
                             // return value belongs HERE, not wherever the
@@ -7777,9 +7775,28 @@ impl Compiler {
                                     self.load_slot_to_reg(R11, *slot);
                                     let off = base + ((arg_slots.len() - 1 - i) as i32) * 8;
                                     self.emit_store_local(off, R11);
+                                    // THE SAME CHANNEL THE DISPATCH SITE USES. Its args
+                                    // buffer pushes each oop among the arguments to
+                                    // `pending_staged_arg_oops`, so the safepoint map
+                                    // NAMES it and `collect_live_oop_homes` publishes it
+                                    // on the shadow stack. This copy is the same shape --
+                                    // a contiguous frame range, written before the CALL,
+                                    // still live after it (`emit_inline_callee_deopt_check`
+                                    // reads it) -- and it named nothing.
+                                    if direct_call_arg_maps_enabled() && arg_oops[i] {
+                                        self.pending_staged_arg_oops.push(off);
+                                    }
                                 }
                                 Some(base)
                             });
+                            // Only an argument oop with NO named home fails the
+                            // safepoint closed now. With the service range reserved
+                            // every one of them has one.
+                            if arg_oops.iter().any(|&o| o)
+                                && (!direct_call_arg_maps_enabled() || service_args_base.is_none())
+                            {
+                                self.pending_staged_args_unmapped = true;
+                            }
                             // Round-8 wave-3 HIGH fix: stack-arg setup
                             // for direct calls whose total arg count
                             // exceeds ARG_REGS. Uses platform ABI
@@ -7792,9 +7809,22 @@ impl Compiler {
                             // 14-store blind copy publishes nothing and only the
                             // safepoint id is needed. See
                             // `can_elide_direct_call_register_spill`.
+                            // `args_frame_resident` is what lets mode 2 admit a
+                            // reference argument: the service range makes it
+                            // frame-resident for the CONSERVATIVE walk. That is no
+                            // longer the whole obligation -- naming the argument in
+                            // the map means a moving cycle will rewrite it, and for
+                            // that it must also be PUBLISHED, which only the real
+                            // spill path emits. So a call that names its argument
+                            // oops declines the elision and pays the spill again;
+                            // `CRATONVM_JIT_DIRECT_CALL_ARG_MAPS=0` restores the
+                            // cheaper, unrelocatable arrangement.
+                            let names_arg_oops = direct_call_arg_maps_enabled()
+                                && service_args_base.is_some()
+                                && arg_oops.iter().any(|&o| o);
                             if self.can_elide_direct_call_register_spill(
                                 &arg_oops,
-                                service_args_base.is_some(),
+                                service_args_base.is_some() && !names_arg_oops,
                                 1,
                             ) {
                                 self.emit_safepoint_metadata_only();
@@ -10526,14 +10556,12 @@ impl Compiler {
                                 self.load_slot_to_reg(RAX, *receiver);
                                 self.emit_precise_null_check_field_store();
                             }
-                            // A reference staged into an area no oop map can name (the
-                            // native-ABI outgoing-argument area, the direct-call service
-                            // slots, or an inlined callee's parameter locals). The
-                            // conservative scan covers those and the precise map cannot,
-                            // so this method must not claim precise coverage here.
-                            if arg_oops.iter().any(|&o| o) {
-                                self.pending_staged_args_unmapped = true;
-                            }
+                            // A reference staged where no oop map can name it fails the
+                            // safepoint closed. DEFERRED to just after the service-range
+                            // reservation below, because whether that is true here is
+                            // exactly what the reservation decides: when it succeeds it
+                            // copies every argument into a contiguous frame range, and a
+                            // frame range IS nameable. See `direct_call_arg_maps_enabled`.
                             // Spill cursor as the bytecode's operand stack sees it
                             // now that this invoke's arguments are popped. The
                             // return value belongs HERE, not wherever the
@@ -10555,9 +10583,28 @@ impl Compiler {
                                     self.load_slot_to_reg(R11, *slot);
                                     let off = base + ((arg_slots.len() - 1 - i) as i32) * 8;
                                     self.emit_store_local(off, R11);
+                                    // THE SAME CHANNEL THE DISPATCH SITE USES. Its args
+                                    // buffer pushes each oop among the arguments to
+                                    // `pending_staged_arg_oops`, so the safepoint map
+                                    // NAMES it and `collect_live_oop_homes` publishes it
+                                    // on the shadow stack. This copy is the same shape --
+                                    // a contiguous frame range, written before the CALL,
+                                    // still live after it (`emit_inline_callee_deopt_check`
+                                    // reads it) -- and it named nothing.
+                                    if direct_call_arg_maps_enabled() && arg_oops[i] {
+                                        self.pending_staged_arg_oops.push(off);
+                                    }
                                 }
                                 Some(base)
                             });
+                            // Only an argument oop with NO named home fails the
+                            // safepoint closed now. With the service range reserved
+                            // every one of them has one.
+                            if arg_oops.iter().any(|&o| o)
+                                && (!direct_call_arg_maps_enabled() || service_args_base.is_none())
+                            {
+                                self.pending_staged_args_unmapped = true;
+                            }
                             // Round-8 wave-3 HIGH fix: stack-arg setup for
                             // invokespecial/virtual direct calls whose
                             // receiver+params exceed ARG_REGS.
@@ -10566,9 +10613,22 @@ impl Compiler {
                             // before any GC-triggering CALL -- see the
                             // invokestatic site above for why an oop-clean frame
                             // can publish the safepoint id alone.
+                            // `args_frame_resident` is what lets mode 2 admit a
+                            // reference argument: the service range makes it
+                            // frame-resident for the CONSERVATIVE walk. That is no
+                            // longer the whole obligation -- naming the argument in
+                            // the map means a moving cycle will rewrite it, and for
+                            // that it must also be PUBLISHED, which only the real
+                            // spill path emits. So a call that names its argument
+                            // oops declines the elision and pays the spill again;
+                            // `CRATONVM_JIT_DIRECT_CALL_ARG_MAPS=0` restores the
+                            // cheaper, unrelocatable arrangement.
+                            let names_arg_oops = direct_call_arg_maps_enabled()
+                                && service_args_base.is_some()
+                                && arg_oops.iter().any(|&o| o);
                             if self.can_elide_direct_call_register_spill(
                                 &arg_oops,
-                                service_args_base.is_some(),
+                                service_args_base.is_some() && !names_arg_oops,
                                 1,
                             ) {
                                 self.emit_safepoint_metadata_only();
