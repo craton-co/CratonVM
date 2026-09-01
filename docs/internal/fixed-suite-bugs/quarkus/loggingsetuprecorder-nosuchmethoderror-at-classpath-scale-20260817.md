@@ -110,6 +110,32 @@ The three copies of `LoggingSetupRecorder.class` on the real classpath
 about) are **md5-identical** and unchanged since 08-12, so a duplicate-class
 skew is ruled out by measurement rather than by reading.
 
+## The headline claim, re-measured
+
+"Blocks 100% of quarkus tests" is the part of this page that mattered, so it
+was re-run rather than reasoned about.
+
+**Windows, core-scope, 313 classes, dev tip of 2026-09-01** (the binary built
+from this branch, 4 shards, 300s cap, the `NOSTART` classifier ported into the
+Windows copy of the harness for this run):
+
+```
+classes=313 recorded=313 wall=10m47s
+ABORTED=1 NOSTART=2 PASS=173 HANG=3 FAIL=70 NOTESTS=64
+```
+
+* **1,360 `@Test` methods actually executed**, across 173 classes. Not one
+  `PASS` row has `started=0`, so none of them is the vacuous kind this page was
+  opened over.
+* **Zero** occurrences of `LoggingSetupRecorder` in any of the four shard logs.
+* The two `NOSTART` classes carry no linkage error, and both answer
+  `found=N started=0` on **HotSpot 25** with the same argfile
+  (`ExtensionAnnotationProcessorTest` 3/0, `ExtensionCatalogSerializationTest`
+  2/0). They are a JUnit-level skip, not a VM verdict.
+
+`FAIL=70`, `HANG=3` and `NOTESTS=64` are the suite's own separate business and
+are not touched by this page.
+
 ## What the original page checked, and why every check was clean
 
 Kept, because these are the results that point at the native:
@@ -171,8 +197,27 @@ Landed with this retirement, in `native-builtins/src/phases_late.rs`:
   WARN-level default filter; one `RUST_LOG=cratonvm_native_builtins=info`
   away.
 
-`cargo test -p cratonvm-native-builtins --lib`: 4184 passed, 0 failed (4178
-before, +6 new).
+`cargo test -p cratonvm-native-builtins --lib`: 4178 passed, 0 failed, 7
+ignored -- 4172 passed before this change, so the six new tests are the whole
+delta. `--tests` (the crate's six integration gates: registrar drift,
+duplicate registration, registry contracts, essential wiring, lock discipline,
+shim inheritance) is green as well.
+
+## The three runtime arms behind those claims
+
+A passing `MiniDriver` proves nothing on its own: if the mirror bailed out in
+its prelude, the real bytecode would set logging up and the run would look
+identical. So each claim has its own arm, each on the dev-tip Windows binary,
+each read off `RUST_LOG=cratonvm_native_builtins=info`.
+
+| arm | classpath | result |
+|---|---|---|
+| **served, real quarkus** | the 308- and the 2,226-entry classpath | `serving … params=14` with the full seven-`List` descriptor. The mirror ran; the pass is not vacuous. |
+| **served, the OLD shape** | a stub `LoggingSetupRecorder` declaring the six-`List` `initializeLogging`, first on the classpath | `serving … params=13`, and the stub's own method prints `OLD_SHAPE_SERVED arity=13` from inside Java. "Either shape works" is measured, not just unit-tested. |
+| **refused, and audible** | a stub whose `initializeLogging` takes an `int` the mirror cannot fill | exactly one WARN: `reason="parameter 1 is `I`, which this mirror cannot fill"`, and the VM continues. The diagnostic that did not exist in August can fire, and says which slot. |
+
+The stubs are under `apps/quarkus-suite-runner/repro-lsr-nsme/`
+(`oldshape-src/`, `fakelsr-src/`) with the argfiles that select them.
 
 ## Fast repro (kept, and corrected)
 
