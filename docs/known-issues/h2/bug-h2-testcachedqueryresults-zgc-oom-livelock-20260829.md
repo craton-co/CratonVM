@@ -413,6 +413,54 @@ so the next work is those two, together, with `relocation_on_proven_jit` as the
 only acceptance test -- and `CRATONVM_ZGC_ASSUME_REWRITABLE=1` as the upper
 bound that says what winning looks like.
 
+### 2026-09-02 (idle host): the OOM is gone and the RESIDUAL IS PAUSE DURATION, not the heap
+
+Three release-profile arms, `--Xmx 1g`, on a box that was briefly idle. The
+accounting is exact in every one -- **missing == COUNTER timeouts, OOM == 0**:
+
+| arm | load | `actual` | missing | COUNTER | OOM | conc cycles |
+|---|---:|---:|---:|---:|---:|---|
+| `ASSUME_REWRITABLE` | 8.92 | 99 988 | 12 | 12 | **0** | 0 of 26 |
+| `ASSUME_REWRITABLE` | 3.29 | 99 984 | 16 | 16 | **0** | 0 of 27 |
+| `ASSUME` + `CONC_START=60` | 8.48 | **99 990** | **10** | **10** | **0** | 4 of 26 |
+| `XT_HELPER_WINDOW_DISCHARGE` alone | 1.4 | *(capped)* | -- | 28 | **4 587** | -- |
+
+Two conclusions, and the second is new.
+
+**The helper-window discharge alone does not fix the class.** 4 587 reference-array
+OOMs, capped at 1800 s. That is the conjunction result reproduced on the class
+itself rather than on `TestMultiThread`, and it is why no single obligation is
+worth repairing on its own.
+
+**The residual failures are GC PAUSE DURATION, not host load.** The arm at load
+3.29 lost 16 and the arm at load 8.48 lost 10 -- fewer losses at HIGHER load, so
+contention cannot be the driver. What changed is that four of its cycles marked
+concurrently. And the mechanism is documented in the flag's own measurements
+(`Z_CONC_START_PERCENT_DEFAULT`):
+
+| arm | mean pause |
+|---|---:|
+| 8 mutator threads, stop-the-world | **609 ms** |
+| 8 mutator threads, concurrent, 2 workers | **253 ms** |
+
+**609 ms is above H2's `FOR UPDATE WAIT 0.5`.** So every STW compaction cycle
+that lands inside a lock wait costs one entry, and `CRATONVM_ZGC_CONC_START`
+(default `0`, i.e. every cycle stop-the-world) is what decides how many do.
+`zgc-real` reports `occupancy=64503936/1073741824` -- the heap is 6 % occupied
+once compaction runs, so the 60 % trigger rarely opens and only 4 of 26 cycles
+were concurrent. A lower `CONC_START` should open it on nearly all of them.
+
+So the path to a PASS is now fully specified and has nothing left in it that is
+mysterious:
+
+1. discharge the coverage conjunction so relocation runs without the unsafe
+   instrument (`compiled-frame-oop-not-published` + `cross-thread-jit-peer`
+   together);
+2. keep the compaction pause under 500 ms -- `CRATONVM_ZGC_CONC_START` low
+   enough that most cycles mark concurrently;
+3. measure on a box with headroom. This one spent the session between load 1 and
+   155, and at 155 with 1 GB free the OOM killer takes the JVM (`rc=137`).
+
 ### 2026-09-02 (RELEASE + forced relocation): the shortfall goes 1696 -> 12, and NONE of the 12 is an OOM
 
 The livedbg arm above could not produce a pass/fail because its `opt-level=1`
