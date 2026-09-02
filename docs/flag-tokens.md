@@ -1072,13 +1072,14 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-20 tokens.
+21 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `field-resolution-name-only` | `CRATONVM_FIELD_RESOLUTION_NAME_ONLY` |
 | `map-iterator-failfast` | `CRATONVM_NO_MAP_ITERATOR_FAILFAST` |
 | `map-view-cache` | `CRATONVM_MAP_VIEW_CACHE` |
+| `getresource-first-hit` | `CRATONVM_GETRESOURCE_FIRST_HIT` |
 | `verify-map-view-cache` | `CRATONVM_VERIFY_MAP_VIEW_CACHE` |
 | `eager-streams` | `CRATONVM_EAGER_STREAMS` |
 | `foreign-attach` | `CRATONVM_FOREIGN_ATTACH` |

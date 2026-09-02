@@ -52,6 +52,12 @@ public class Dispatch {
         System.out.println("per-extra-arg = "+((m[3]-m[1])/4));
         System.out.println("virtual-over-static = "+(m[4]-m[2]));
         System.out.println("iface-over-virtual  = "+(m[6]-m[4]));
+        // The arm that exercises the receiver-selection MEMO: the receiver
+        // class (B) does not declare the method, so the trivial
+        // receiver-equals-declaring short-circuit cannot fire and the walk --
+        // or its memo -- has to answer. `iface1` above takes the
+        // short-circuit, so it is the wrong arm to A/B the memo with.
+        System.out.println("ifaceInherited-over-virtual = "+(m[7]-m[4]));
         if(sink==42) System.out.println("x");
     }
 }

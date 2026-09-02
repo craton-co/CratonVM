@@ -11466,13 +11466,51 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         "java/lang/Boolean" | "java/lang/Character" => {
             &["java/io/Serializable", "java/lang/Comparable"]
         }
+        // The RANDOM-ACCESS lists. `ArrayList`, `Vector` and
+        // `CopyOnWriteArrayList` all declare `implements RandomAccess` on
+        // HotSpot; `LinkedList` deliberately does not, which is why it is no
+        // longer grouped with them.
+        //
+        // `RandomAccess` is a marker with no methods, and grouping the four
+        // cost the three that have it exactly that marker — measured
+        // 2026-09-02 in `--synthetic-jdk`:
+        //
+        //     ArrayList instanceof RandomAccess   HotSpot true   CratonVM false
+        //     Collections.unmodifiableList(list)  HotSpot $UnmodifiableRandomAccessList
+        //                                         CratonVM $UnmodifiableList
+        //
+        // The `Collections` code was right in both: `unmodifiableList` picks
+        // its view class BY that marker. And the marker is not decoration —
+        // `Collections.binarySearch`, `reverse`, `shuffle` and `fill` each
+        // branch on it to choose indexed access over an iterator, so an
+        // `ArrayList` without it silently took the linked-list path in every
+        // one. `W7-63-jca-advertise-vs-serve.md` §8 records that
+        // `--synthetic-jdk` "has never been built by any lane"; it builds, and
+        // this is what the first run of it found.
         "java/util/ArrayList"
-        | "java/util/LinkedList"
         | "java/util/Vector"
         | "java/util/concurrent/CopyOnWriteArrayList" => &[
             "java/util/List",
             "java/util/Collection",
             "java/lang/Iterable",
+            "java/util/RandomAccess",
+            "java/lang/Cloneable",
+            "java/io/Serializable",
+        ],
+        // `LinkedList` — no `RandomAccess`, matching HotSpot.
+        //
+        // It is also a `Deque` there (and so a `Queue`), and that is NOT added
+        // here on purpose: this VM's `LinkedList` carries most of the deque
+        // surface (`addFirst`/`addLast`/`pollFirst`/`pollLast`/`removeFirst`/
+        // `removeLast`/`descendingIterator`) and not all of it, so declaring
+        // the interface would turn a clean `ClassCastException` into a missing
+        // method at the point of use — a worse divergence than the one it
+        // closes. Left as a named gap rather than a half-kept promise.
+        "java/util/LinkedList" => &[
+            "java/util/List",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/lang/Cloneable",
             "java/io/Serializable",
         ],
         // A map view is a `Collection`, and deliberately NOT a `List` — that
