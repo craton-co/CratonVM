@@ -956,6 +956,37 @@ mod windows_fault {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let code = (*rec).exception_code;
+
+        // ── Implicit null check ─────────────────────────────────────────
+        //
+        // First, before the watchpoint and crash paths, and for the same
+        // reason the Unix handler does it first: a recovered fault is a Java
+        // NullPointerException that compiled code detects by faulting rather
+        // than by branching, not a crash to report.
+        //
+        // For an access violation `ExceptionInformation[1]` is the address
+        // that faulted (`[0]` is the read/write/execute discriminator, which
+        // this does not care about — a null receiver faults the same way
+        // whichever it was). `NumberParameters` is checked because the record
+        // only promises those words when it says it has them.
+        //
+        // The remaining conditions — the address inside the null page, and an
+        // EXACT registered PC rather than merely one inside some compiled
+        // method — are enforced by `recover`. RIP lives at offset 0xF8 in
+        // CONTEXT, the same slot the watchpoint path below reads.
+        const EXCEPTION_CONTINUE_EXECUTION_IN: i32 = -1;
+        if code == EXCEPTION_ACCESS_VIOLATION && (*rec).number_parameters >= 2 {
+            let ctx = (*info).context_record as *mut u8;
+            if !ctx.is_null() {
+                let addr = (*rec).exception_information[1];
+                let rip = core::ptr::read_unaligned(ctx.add(0xF8) as *const u64) as usize;
+                if let Some(target) = cratonvm_jit::implicit_null::recover(rip, addr) {
+                    core::ptr::write_unaligned(ctx.add(0xF8) as *mut u64, target as u64);
+                    return EXCEPTION_CONTINUE_EXECUTION_IN;
+                }
+            }
+        }
+
         // spring-bug-10 watchpoint: a HW data breakpoint fires STATUS_SINGLE_STEP.
         // If DR6 shows one of DR0-3 tripped, this is OUR savebase watchpoint —
         // inspect the value just written; if it is the corrupt 0xFFFF…FFFE, report
@@ -2256,11 +2287,63 @@ fn install_signal_handlers() {
     // for the rules. Roughly: only libc syscalls, atomics, and stack-local
     // arithmetic are allowed. No allocations, no locks, no formatting
     // machinery, no `std::fs`, no `Backtrace::capture`.
+    /// Point the interrupted thread's instruction pointer at `target`.
+    ///
+    /// Async-signal-safe: a single store into the kernel-supplied signal
+    /// frame. Only x86-64 Linux, which is the only Unix target where the JIT
+    /// emits an implicit null-check site at all — the AArch64 backend
+    /// dereferences no Java object, so it registers nothing and this is never
+    /// reached there.
+    #[cfg(unix)]
+    fn set_pc_in_ucontext(ucontext: *mut std::ffi::c_void, target: usize) -> bool {
+        if ucontext.is_null() {
+            return false;
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        unsafe {
+            let uc = ucontext as *mut libc::ucontext_t;
+            (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] = target as libc::greg_t;
+            true
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            let _ = target;
+            false
+        }
+    }
+
     extern "C" fn crash_signal_handler(
         sig: std::ffi::c_int,
         info: *mut libc::siginfo_t,
         ucontext: *mut std::ffi::c_void,
     ) {
+        // ── Implicit null check ─────────────────────────────────────────
+        //
+        // BEFORE the re-entry guard, deliberately. A recovered fault is not a
+        // crash: it is a Java-level NullPointerException that compiled code
+        // chose to detect by faulting rather than by branching. Latching
+        // CRASH_IN_PROGRESS on the way past would make the next REAL crash
+        // take the re-raise path and lose its report.
+        //
+        // Four conditions, all of them necessary — see
+        // `cratonvm_jit::implicit_null` for why each one is load-bearing.
+        // The two enforced here are that the signal is a memory-access fault
+        // and that `si_code` says `si_addr` is an address at all rather than a
+        // union member left over from `kill -SEGV`; the null-page and
+        // exact-PC conditions are enforced by `recover`.
+        if sig == libc::SIGSEGV && !info.is_null() {
+            let code_is_real = si_code_means_a_faulting_address(unsafe { (*info).si_code });
+            if code_is_real {
+                let addr = unsafe { (*info).si_addr() } as usize;
+                let pc = fault_pc_from_ucontext(ucontext) as usize;
+                if let Some(target) = cratonvm_jit::implicit_null::recover(pc, addr) {
+                    if set_pc_in_ucontext(ucontext, target) {
+                        return;
+                    }
+                }
+            }
+        }
+
         // Re-entry guard. `compare_exchange` on an `AtomicBool` is lock-free
         // and async-signal-safe on every architecture we target.
         if CRASH_IN_PROGRESS

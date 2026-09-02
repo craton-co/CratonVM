@@ -272,8 +272,21 @@ fn maybe_dump_shutdown_reports() {
             // emitted means it WAS reached and the dataflow proved nothing.
             // Those look identical as a percentage and want opposite fixes.
             let (nn_elided, nn_emitted) = cratonvm_jit::x64::receiver_null_check_counts();
+            let nn_implicit = cratonvm_jit::x64::receiver_null_check_implicit_count();
             eprintln!(
-                "[cratonvm] getfield receiver null checks: elided={nn_elided} emitted={nn_emitted}"
+                "[cratonvm] getfield receiver null checks: elided={nn_elided} \
+                 implicit={nn_implicit} emitted={nn_emitted}"
+            );
+            // Implicit null-check table. All four, because no one of them is a
+            // verdict: `registered` alone cannot separate "off" from "on and
+            // nothing qualified"; `recovered` alone cannot separate "no null
+            // receiver occurred" from "the entry was missing"; and a non-zero
+            // `declined` is the reading that says the table filled up and the
+            // feature has stopped applying to new compiles.
+            let (in_reg, in_ret, in_rec, in_dec) = cratonvm_jit::implicit_null::counts();
+            eprintln!(
+                "[cratonvm] implicit null checks: registered={in_reg} retired={in_ret} \
+                 recovered={in_rec} declined={in_dec}"
             );
         }
         // Reference loads whose slot did NOT hold a reference, contained by
@@ -4951,6 +4964,11 @@ fn run() -> Result<()> {
             // the actionable diagnostic for "main thread is in native code".
             cratonvm_vm::dispatch_trace::enable();
         }
+        // Arm the interpreter's dump gate BEFORE the watchdog exists, so a
+        // thread that is already deep inside one `execute_frame` when the
+        // deadline fires still observes the request (see
+        // `SharedVm::arm_stack_dump_watch`).
+        vm.shared.arm_stack_dump_watch();
         let shared_for_watchdog = std::sync::Arc::clone(&vm.shared);
         // RKC16N.5 — capture the audit-dump paths into the watchdog
         // thread so a hung run still produces a missing-natives

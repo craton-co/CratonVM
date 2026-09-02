@@ -4738,6 +4738,40 @@ impl<'a> Emitter<'a> {
         writeln!(self.body, "L_reduce_zero:").unwrap();
         writeln!(self.body, "    mov{mov_suffix} {}, {zero};", acc.name).unwrap();
         writeln!(self.body, "L_reduce:").unwrap();
+        self.emit_warp_fold(acc, add, wide);
+        let lane = self.regs.fresh_reg(RegKind::U32);
+        let is_lane0 = self.regs.fresh_reg(RegKind::Pred);
+        let nonzero = self.regs.fresh_reg(RegKind::Pred);
+        let do_add = self.regs.fresh_reg(RegKind::Pred);
+        let ret_ptr = self.regs.fresh_reg(RegKind::U64);
+        writeln!(self.body, "L_reduce_atomic:").unwrap();
+        writeln!(self.body, "    mov.u32 {}, %laneid;", lane.name).unwrap();
+        writeln!(self.body, "    setp.eq.u32 {}, {}, 0;", is_lane0.name, lane.name).unwrap();
+        writeln!(
+            self.body,
+            "    setp.ne{mov_suffix} {}, {}, {zero};",
+            nonzero.name, acc.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    and.pred {}, {}, {};",
+            do_add.name, is_lane0.name, nonzero.name
+        )
+        .unwrap();
+        writeln!(self.body, "    ld.param.u64 {}, [ret_ptr];", ret_ptr.name).unwrap();
+        writeln!(
+            self.body,
+            "    @{} red.global.add{atomic_suffix} [{}], {};",
+            do_add.name, ret_ptr.name, acc.name
+        )
+        .unwrap();
+        writeln!(self.body, "L_reduce_done:").unwrap();
+    }
+
+    /// Fold a warp's 32 lanes into lane 0 with five `shfl.sync.down`
+    /// steps. See [`Emitter::finalize_epilogue`] for the mask argument.
+    fn emit_warp_fold(&mut self, acc: &Reg, add: &str, wide: bool) {
         for offset in [16u32, 8, 4, 2, 1] {
             let other = self.regs.fresh_reg_with_wide(acc.kind, acc.wide);
             if wide {
@@ -4780,33 +4814,8 @@ impl<'a> Emitter<'a> {
             )
             .unwrap();
         }
-        let lane = self.regs.fresh_reg(RegKind::U32);
-        let is_lane0 = self.regs.fresh_reg(RegKind::Pred);
-        let nonzero = self.regs.fresh_reg(RegKind::Pred);
-        let do_add = self.regs.fresh_reg(RegKind::Pred);
-        let ret_ptr = self.regs.fresh_reg(RegKind::U64);
-        writeln!(self.body, "    mov.u32 {}, %laneid;", lane.name).unwrap();
-        writeln!(self.body, "    setp.eq.u32 {}, {}, 0;", is_lane0.name, lane.name).unwrap();
-        writeln!(
-            self.body,
-            "    setp.ne{mov_suffix} {}, {}, {zero};",
-            nonzero.name, acc.name
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    and.pred {}, {}, {};",
-            do_add.name, is_lane0.name, nonzero.name
-        )
-        .unwrap();
-        writeln!(self.body, "    ld.param.u64 {}, [ret_ptr];", ret_ptr.name).unwrap();
-        writeln!(
-            self.body,
-            "    @{} red.global.add{atomic_suffix} [{}], {};",
-            do_add.name, ret_ptr.name, acc.name
-        )
-        .unwrap();
     }
+
 }
 
 /// Find the loop bound for the canonical pattern by inspecting the
