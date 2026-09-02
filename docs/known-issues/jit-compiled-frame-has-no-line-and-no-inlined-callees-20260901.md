@@ -6,7 +6,7 @@
 | **Symptom** | A stack trace captured after warm-up lost frames, printed `-1` for the line of a compiled frame, and reported the OSR back-edge instead of the real call site. Cold traces were correct. Nothing threw and nothing logged. |
 | **Cause** | Five independent defects, four of them stacked on one row of one witness. The root of three is that `compiled_frame_entry` hard-coded `line_number: LINE_NUMBER_UNKNOWN` / `byte_code_index: -1` on a written-down premise — "no bci is recorded for a compiled frame" — that was **false**. |
 | **Fix** | Carry the bci the walk was already computing and throwing away; record a per-call inline-frame map beside the oop maps; publish a live-OSR-continuation registry and use it as a **display-only** bci override; drop a compiled entry that is the same activation as an interpreter frame, on an opcode proof rather than a shape; and snapshot the compiled frames at an implicit NPE before they unwind. |
-| **Verified** | Each half was measured on its own binary, x86-64, one `.class` file, with a **four-way kill-switch A/B**. **The merged binary has not been re-run** — see "What the merge changed, and what still has to be measured". |
+| **Verified** | Each half was measured on its own binary, and **the merged binary has now been built and run** (2026-09-02, x86-64 Windows, `dev` @ `eb79f5904`): all five A/B arms reproduce their predicted rows exactly, `after_main_osr` is HotSpot-exact in 79 of 80 runs, and the regression suite is 82/82 against HotSpot 25. See **The merged binary, measured**. |
 | **Not fixed** | (5) is partial. The caller-attribution walk still cannot see an inlined method; optimizing-tier and aarch64 frames still carry no line; the NPE `because "…" is null` clause is still missing. See **What remains open**. |
 
 **Severity, as filed:** high for diagnosability, zero for program results. Every
@@ -77,10 +77,81 @@ halves on top of it:
   address for a frame below the innermost, the safepoint id for the innermost,
   and no fall-back between them.
 
-**Nothing in this section has been re-run.** The predicted `after_main_osr` row
-for the merged binary is `len=5 [leaf:25 mid:26 outer:27 probe:42 main:66]` —
-HotSpot-exact — and the four A/B arms below are predicted to hold unchanged.
-Treat both as claims awaiting a run, not as measurements.
+**This section's predictions have now been run, and they held.** See
+**The merged binary, measured** below: the predicted `after_main_osr` row is
+what the merged binary produces, and all five A/B arms reproduce exactly. What
+the prediction did not anticipate is a rare collapse of the same row to a single
+frame — 1 run in 80 — recorded there.
+
+## The merged binary, measured
+
+Built and run 2026-09-02 on `dev` @ `eb79f5904`, x86-64 **Windows**, real-JDK
+mode, JDK 25, default flags unless an arm says otherwise. This closes the gap
+the section above left open: the two halves were developed in parallel, each
+measured on its own binary, and until now **nothing had run the merge**.
+
+### The witness
+
+| row | HotSpot 25 | merged binary |
+| --- | --- | --- |
+| `before_any_warm` | `len=5 [leaf:25 mid:26 outer:27 probe:42 main:54]` | identical |
+| `after_helper_warm` | `len=5 [leaf:25 mid:26 outer:27 probe:42 main:58]` | identical in 27 of 30 |
+| `after_main_osr` | `len=5 [leaf:25 mid:26 outer:27 probe:42 main:66]` | identical in **79 of 80** |
+
+`after_main_osr` is the row this page was opened over. It read
+`len=3 [leaf:25 probe:-1 main:62]` before any of this work.
+
+### The A/B arms — every prediction confirmed
+
+Three runs per arm, all three identical within each arm, all five matching the
+predicted row byte for byte:
+
+| arm | predicted = measured |
+| --- | --- |
+| default | `len=5 [leaf:25 mid:26 outer:27 probe:42 main:66]` |
+| `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` | `len=3 [leaf:25 probe:42 main:66]` |
+| `CRATONVM_JIT_NO_OSR_PC_REFRESH=1` | `len=5 [leaf:25 mid:26 outer:27 probe:42 main:62]` |
+| `CRATONVM_JIT_NO_COMPILED_FRAME_LINES=1` | `len=3 [leaf:25 probe:-1 main:62]` |
+| `CRATONVM_DISABLE_JIT=1` | `len=5 [leaf:25 mid:26 outer:27 probe:42 main:66]` |
+
+The dependency-chain claim holds as reasoned: switching (1) off starves (2) and
+(3), because `probe` is the innermost activation of its chain entry and owns no
+return address, so both the inline-frame lookup and the OSR override reach their
+program point through the bci (1) recovers. No arm was inert — each moved the
+row it claims to isolate, which is what separates "this half works" from "this
+half never engaged".
+
+### Suite
+
+`regression-suite`, full core list, output-compared against HotSpot 25:
+**82 of 82 passed, 0 failed.** `cargo test -p cratonvm-jit --lib`: 2133 passed.
+
+### What the prediction did not anticipate
+
+**`after_main_osr` collapses to `len=1 [main:66]` in roughly 1 run in 80.** Seen
+once in a 30-run block; a following 50-run block was clean, so the rate is about
+1.25% and the shape is the whole trace lost except the outermost frame.
+
+That is the same shape as (5)'s known-unfixed `after_osr` arm
+(`probes/StackTraceCompiledCallee.java`, which still reads `[main:71]` where
+HotSpot reads three frames), so the likeliest reading is that defect surfacing
+in this probe rather than a new one — but that is a hypothesis, not a
+measurement, and nothing here distinguishes them. It needs its own run.
+
+### `after_helper_warm`, and a correction
+
+This row answers fully correctly in 27 of 30 runs, and has for as long as it has
+been measured — the same 27/30 on `dev` *before* any of the inline-frame work.
+The three failures are line-only on the merged binary (`leaf:-1`, `mid:-1`),
+where the pre-audit binary sometimes lost a frame outright, so the shape
+improved.
+
+An earlier revision of this page, and of a kill switch's own doc comment,
+blamed an inline-frame implementation for this row on the strength of a
+**ten-run** control that showed 10/10. Ten runs cannot separate 100% from 90% —
+a clean sweep happens about 35% of the time at p=0.9. The thirty-run control is
+what showed plain `dev` failing identically. Whatever this row's residual is, it
+predates the work on this page and wants its own investigation.
 
 ## The four-way A/B — this is the proof
 
