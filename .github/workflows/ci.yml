@@ -231,6 +231,18 @@ jobs:
         shell: bash
         run: bash scripts/check-no-diag-prints.sh
 
+      # Forbid an UNSCREENED `Value` decode of a heap cell.
+      # `read_value_atomic` transmutes 16 bytes into an enum without checking
+      # the discriminant; a later `match` on the result is a jump table indexed
+      # by the tag with no bounds check. That instruction, in
+      # `gc::heap::coerce_field_value_for_slot`, is the decoded faulting
+      # instruction of the eight hibernate-orm JSON/XML SIGSEGVs.
+      # Bash-only script, so gate to the Linux leg.
+      - name: Forbid unscreened Value-cell decodes
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: bash scripts/check-value-cell-reads.sh
+
       # The CRATONVM_* surface reached 692 identifiers by growing roughly one
       # per fixed bug with no retirement path. It is now ten grouped variables
       # plus five scalars, and every knob is a token in

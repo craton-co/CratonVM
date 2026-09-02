@@ -2566,7 +2566,7 @@ pub fn unbox_poly_return_checked(
 /// fire on disjoint method names (`invokeExact` versus the `VarHandle` access
 /// modes) and share only the funnel they sit in, so one going wrong in the
 /// field must not force the other off.
-fn vh_strict_reference_return() -> bool {
+pub(crate) fn vh_strict_reference_return() -> bool {
     static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *STRICT.get_or_init(|| {
         !matches!(
@@ -2608,6 +2608,16 @@ fn boxed_primitive_supertypes(wrapper: &str) -> &'static [&'static str] {
         "java/lang/Character" | "java/lang/Boolean" => &[OBJ, CMP, SER, CONSTABLE],
         _ => &[],
     }
+}
+
+/// Is `name` one of the eight primitive wrapper classes?
+///
+/// The predicate half of [`PRIMITIVE_WRAPPER_CLASSES`], exposed because the
+/// `VarHandle` reference-read thin direct bind reproduces W6-1 on its own cold
+/// arm (`jit::helpers::varhandle_strict_reference_return_check`) and the two
+/// must fire on exactly the same eight classes.
+pub(crate) fn is_primitive_wrapper_class_name(name: &str) -> bool {
+    PRIMITIVE_WRAPPER_CLASSES.contains(&name)
 }
 
 /// The `VarHandle` access modes that RETURN the accessed variable, paired with

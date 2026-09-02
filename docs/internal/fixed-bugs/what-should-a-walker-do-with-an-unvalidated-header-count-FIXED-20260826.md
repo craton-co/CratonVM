@@ -2,7 +2,7 @@
 
 **Status: ANSWERED and IMPLEMENTED, 2026-08-26.** Filed 2026-08-24 as an open
 design question out of
-`known-issues/hibernate/hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md`
+`internal/fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md`
 §2.6, which fixed one instance and deliberately left the general case alone
 rather than change fourteen call sites blind.
 
@@ -314,7 +314,7 @@ end of this one. Filed separately.
 
 ## 10. Related
 
-* `known-issues/hibernate/hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md`
+* `internal/fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md`
   §2.5 (the concurrent marker's TOCTOU on the same kind of count — §6 above is
   the reader that pass missed) and §2.6 (the one caller fixed).
 * `internal/fixed-bugs/corrupt-value-cell-producer-was-a-string-array-FIXED-20260822.md`
@@ -440,7 +440,7 @@ a different place.
 
 ## 6. Related
 
-* `known-issues/hibernate/hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md`
+* `internal/fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md`
   §2.5 (the concurrent marker's TOCTOU on the same kind of count) and §2.6 (the
   one caller fixed).
 * `internal/fixed-bugs/corrupt-value-cell-producer-was-a-string-array-FIXED-20260822.md`
