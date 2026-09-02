@@ -384,6 +384,21 @@ pub(super) fn spliced_bytecode_len(site: &crate::InlineSite) -> usize {
 /// for the body's own frame, plus `callee_code_len` to bound its operand depth.
 /// A nested body gets its own locals and its own operand stack on top of the
 /// body that splices it, so the reserves add.
+/// DEFAULT ON. Opt out with `CRATONVM_JIT_NO_INLINE_RESERVE_PATH=1`, which
+/// puts the inline spill reserve back on a SUM over every site.
+///
+/// The arm exists because this changes the frame layout of every method that
+/// inlines anything, and the previous change to a frame layout in this
+/// subsystem -- reserving the scratch home at push time, 2026-09-02 -- shipped
+/// a nondeterministic heap corruption that cost a rebuild per hypothesis to
+/// bisect because no flag could separate it in one binary.
+pub(super) fn inline_reserve_path_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_RESERVE_PATH").is_none()
+    })
+}
+
 pub(super) fn spliced_stack_reserve(site: &crate::InlineSite) -> usize {
     let (_, param_span) = crate::compute_param_jvm_slots(&site.descriptor, site.callee_is_static);
     site.nested_sites
@@ -1102,14 +1117,11 @@ pub fn compile_with_param_slots(
     // a clobbered slot fed an enum-typed field). Reserve, per site,
     // `callee_max_locals + callee_code_len` (the latter bounds the callee's own
     // operand depth); the total is bounded by `MAX_INLINE_BUDGET`.
-    let inline_stack_reserve: usize = inline_sites
+    let inline_stack_reserve_sum: usize = inline_sites
         .values()
         .chain(extra_guard_bodies())
         .map(spliced_stack_reserve)
         .sum();
-    // Priced, not yet spent: what the same compile would reserve if the budget
-    // counted concurrently-live splices instead of every site. See
-    // `spliced_stack_reserve_path`.
     let inline_stack_reserve_path: usize = inline_sites
         .values()
         .chain(extra_guard_bodies())
@@ -1117,9 +1129,39 @@ pub fn compile_with_param_slots(
         .max()
         .unwrap_or(0);
     crate::note_inline_reserve(
-        inline_stack_reserve as u64,
+        inline_stack_reserve_sum as u64,
         inline_stack_reserve_path as u64,
     );
+    // Spend the concurrently-live figure, not the sum. DEFAULT ON; opt out
+    // with `CRATONVM_JIT_NO_INLINE_RESERVE_PATH=1`.
+    //
+    // The sum is what the comment above asks for, and it was right when it was
+    // written: the splicer used to keep the return value and leave the callee
+    // locals where they were. It does not any more. Both of the inline
+    // epilogue's return arms end with
+    // `self.next_spill_offset = caller_post_pop_spill`, and the outer walk
+    // calls `reset_spills()` at every instruction boundary on top of that, so
+    // sibling splices provably reuse the same words -- the void arm's own
+    // comment says the reclaim is load-bearing precisely for the NESTED case,
+    // where the mini-walk has no per-instruction reset. Only a root-to-leaf
+    // chain is ever live at once, which is what `spliced_stack_reserve_path`
+    // measures.
+    //
+    // Measured before the change: 280 words reserved against 7 needed on a
+    // 40-argument stress, 265 against 41 on CratonBench -- 2 KB of frame per
+    // compiled method to hold one 56-byte splice.
+    //
+    // Under-reserving here FAILS CLOSED. `callee_local_base`, the merge area
+    // and every callee operand push all go through `reserve_spill_slots`, which
+    // bounds against `spill_limit_offset` and bails the compile rather than
+    // writing past the region; the `exhausted` census column counts exactly
+    // that. So the worst case of this being wrong is inlining declined and a
+    // method left interpreted, visible in the census -- not a clobbered frame.
+    let inline_stack_reserve = if inline_reserve_path_enabled() {
+        inline_stack_reserve_path
+    } else {
+        inline_stack_reserve_sum
+    };
     let max_stack = max_stack
         .saturating_add(max_invoke_args)
         .saturating_add(inline_stack_reserve);
