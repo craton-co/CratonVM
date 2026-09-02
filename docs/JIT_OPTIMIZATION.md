@@ -733,7 +733,7 @@ cannot reach, and this is the only thing that covers them -- and that having it
 built, measured and switchable is worth more than an argument about whether it
 would have helped.
 
-#### The soak, 2026-09-02 — and why the default stays off anyway
+#### The soak, 2026-09-02, and the default
 
 It was off pending a soak. The soak ran, it is clean, and it also produced the
 number that argues against flipping the default. Both halves are recorded
@@ -775,19 +775,28 @@ trusted-oop receiver the dataflow cannot prove — in practice a field read off 
 *parameter* in a method hot enough to compile but not inlined. That is a real
 set, and a small one.
 
-**The default therefore stays off.** Not out of timidity, and no longer out of
-doubt about correctness: the mechanism works and the soak says so. It stays off
-because the three facts point the same way — the throughput effect is
-unmeasurable, the reach is a handful of sites, and the failure mode is the only
-*silent* one in this backend. Every other switch here has a wrong arm that
-produces a wrong answer, which a test catches; this one's wrong arm resumes
-execution at an address a stale table chose, which nothing catches. A feature
-that cannot be shown to help, on few sites, whose failure is invisible, does not
-earn a default.
+**The default is ON**, since 2026-09-02. Opt out with
+`CRATONVM_JIT_IMPLICIT_NULL_CHECK=0`.
 
-What it does earn is existing, measured and switchable, so that the next time
-someone asks whether the null check is on a profile there is a lever to pull and
-a number to read rather than an argument to have.
+The engineering recommendation at the end of the soak was to leave it off, and
+it is worth recording that it was overruled deliberately rather than forgotten.
+The case for off was never correctness — the soak settles that — it was that
+none of the three things a default usually rests on were present: the
+throughput effect is unmeasurable, the reach is a handful of sites, and the
+failure mode is the only *silent* one in this backend. The case for on is that
+the mechanism is the one thing covering the sites the proof-based elision
+cannot reach, it has soaked clean across three full suite passes and ~12,000
+translated faults, and a feature that is only ever exercised behind an opt-in
+flag is a feature that decays.
+
+Both readings are defensible. What matters more than which one won is that the
+**kill switch stays**, and that anyone debugging an unexplained crash in
+compiled code knows to reach for it first: `=0` restores
+`emit_trusted_oop_receiver_check` at both arms unconditionally, registers
+nothing, and returns a fault in compiled code to the crash reporter exactly as
+before this existed. Same binary, one run, no rebuild. That is the property
+that makes a silent failure mode survivable, and it is worth more here than it
+is anywhere else in this file.
 
 **Where the residual risk actually is**, for whoever revisits this: the
 lifetime hazard is driven by `CompiledMethod` drops, and the soak exercised only
@@ -825,7 +834,7 @@ need a deopt storm, not a bigger heap or a longer loop.
 | Inline TLAB bump in the optimizing tier | **ON** | `CRATONVM_JIT_IR_INLINE_TLAB=0` |
 | `this` seeded non-null at method entry | **ON** | `CRATONVM_JIT_THIS_NONNULL=0` |
 | `getfield` receiver null-check elision | **ON** | `CRATONVM_JIT_RECEIVER_NULL_ELIM=0` |
-| Implicit null check (fault + signal translation) | off — soaked clean; stays off on REACH, not doubt | `CRATONVM_JIT_IMPLICIT_NULL_CHECK=1` |
+| Implicit null check (fault + signal translation) | **ON** — soaked clean; the kill switch is the first move on any unexplained compiled-code crash | `CRATONVM_JIT_IMPLICIT_NULL_CHECK=0` |
 
 ### Performance — current status
 
