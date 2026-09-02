@@ -5395,7 +5395,19 @@ fn execute_frame_from_index(
     // primitive `*aload` / `*astore` fast arms; see `field_fast` for the
     // contract and for what turns them off. Hoisted per `execute_frame`
     // entry like every other gate above (same pgo-style tradeoff).
-    let fast_field_zgc = field_fast::fast_field_zgc(shared);
+$1    // ── Invoke fast door admission (2026-09-02) ─────────────────────────
+    // Off while anything the general dispatcher would have to observe per
+    // call is armed: PGO (it records call sites and receivers), the invoke
+    // traces, the frame trace, or a virtual thread. See
+    // `execute_invokevirtual_fast_door`.
+    let invoke_fast_door_on = !crate::runtime::env_cache::no_invoke_fast_door()
+        && !pgo_enabled
+        && !crate::runtime::env_cache::frame_trace()
+        && !crate::runtime::env_cache::dbg_h2trace()
+        && !crate::runtime::env_cache::dbg_loader_trace()
+        && !crate::runtime::env_cache::dbg_gse()
+        && !crate::runtime::env_cache::dbg_pbstart()
+        && !matches!(thread.kind, crate::threading::ThreadKind::Virtual);
     // ── OSR call floor (2026-09-02) ─────────────────────────────────────
     // `try_osr_with_backoff` cannot do anything until `Frame::backward_count`
     // reaches the smallest threshold `Frame::should_try_osr` accepts (the
@@ -7421,9 +7433,37 @@ fn execute_frame_from_index(
                 0xb6 => {
                     let cp_index = ((b1 as u16) << 8) | (b2 as u16); // Cast: bytecode operand decoding
                     let _ = frame;
-                    thread.frames[frame_idx].pc = saved_pc + 3;
-                    // PERF: consult the cheap thread-local inline cache FIRST.
-                    // A warm monomorphic site hits here and dispatches with one
+$1                    if invoke_fast_door_on {
+                        match execute_invokevirtual_fast_door(
+                            shared,
+                            thread,
+                            frame_idx,
+                            cp_index,
+                            false,
+                            fast_field_zgc,
+                        ) {
+                            Some(Ok(CachedCallResult::FramePushed)) => {
+                                frame_idx = thread.frames.len() - 1;
+                                continue;
+                            }
+                            Some(Ok(_)) => {
+                                continue;
+                            }
+                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e) {
+                                FastPathInvokeError::Runtime(re) => {
+                                    pending_runtime_error = Some((re, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Java(exc) => {
+                                    pending_java_exception = Some((exc, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Fatal(e) => return Err(e),
+                            },
+                            None => {}
+                        }
+                    }
+$2                    // A warm monomorphic site hits here and dispatches with one
                     // class-id compare + arg decode + frame push — no locks, no
                     // hierarchy walk. Only on a miss (cold site, or the receiver
                     // class changed) do we fall to the heavier `vtable_fast`
@@ -7653,11 +7693,37 @@ fn execute_frame_from_index(
                     let cp_index = ((b1 as u16) << 8) | (b2 as u16); // Cast: bytecode operand decoding
                     let _ = frame;
                     // invokeinterface is 5 bytes: opcode(1) + index(2) + count(1) + 0(1)
-                    thread.frames[frame_idx].pc = saved_pc + 5;
-                    let cached_result = execute_invokevirtual_cached(
-                        shared, thread, frame_idx, cp_index, saved_pc, false, true,
-                    );
-                    match cached_result {
+$1                    if invoke_fast_door_on {
+                        match execute_invokevirtual_fast_door(
+                            shared,
+                            thread,
+                            frame_idx,
+                            cp_index,
+                            true,
+                            fast_field_zgc,
+                        ) {
+                            Some(Ok(CachedCallResult::FramePushed)) => {
+                                frame_idx = thread.frames.len() - 1;
+                                continue;
+                            }
+                            Some(Ok(_)) => {
+                                continue;
+                            }
+                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e) {
+                                FastPathInvokeError::Runtime(re) => {
+                                    pending_runtime_error = Some((re, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Java(exc) => {
+                                    pending_java_exception = Some((exc, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Fatal(e) => return Err(e),
+                            },
+                            None => {}
+                        }
+                    }
+$2                    match cached_result {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
                             continue;

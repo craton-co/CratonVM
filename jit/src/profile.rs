@@ -881,9 +881,30 @@ impl ProfileStore {
         let mut write = shard.counts.write();
         match write.get(&packed_key) {
             Some(cell) => saturating_inc(cell),
+$1
+    /// `increment_invocation` by `n` at once. The interpreter's virtual fast
+    /// door counts on `CachedBytecodeMethod::interp_invocations` (one relaxed
+    /// `fetch_add`) and folds the count in here every few calls, so this
+    /// store still sees every call for the census while the per-call path no
+    /// longer takes a shard lock and a hash lookup.
+    pub fn add_invocations(&self, packed_key: u64, n: u32) -> u32 {
+        let shard = &self.invocation_counts[invocation_shard_for(packed_key)];
+        {
+            let read = shard.counts.read();
+            if let Some(cell) = read.get(&packed_key) {
+                let prev = cell.fetch_add(n, Ordering::Relaxed);
+                return prev.saturating_add(n);
+            }
+        }
+        let mut write = shard.counts.write();
+        match write.get(&packed_key) {
+            Some(cell) => {
+                let prev = cell.fetch_add(n, Ordering::Relaxed);
+                prev.saturating_add(n)
+            }
             None => {
-                write.insert(packed_key, AtomicU32::new(1));
-                1
+                write.insert(packed_key, AtomicU32::new(n));
+                n
             }
         }
     }

@@ -193,19 +193,63 @@ pub(super) fn getfield_fast(
     frame: &mut Frame,
     cp_index: u16,
 ) -> bool {
+    let class_id = frame.class_id;
+    getfield_fast_keyed(shared, zgc, sites, &mut frame.stack, class_id, cp_index, 0)
+}
+
+/// `getfield_fast` with the site key spelled out, for the invoke fast door's
+/// trivial-getter shortcut: the site belongs to the getter's declaring class
+/// and constant pool, while the operand stack is the caller's (the receiver
+/// on top is the getter's `this`). `ret_opcode` is the getter's `xreturn`
+/// opcode, checked against the field's storage kind the way
+/// `try_execute_cached_trivial_instance_getter` checks it against the
+/// descriptor; `0` skips the check for a plain `getfield`.
+#[inline]
+pub(super) fn getfield_fast_keyed(
+    shared: &SharedVm,
+    zgc: &ZgcRealHeap,
+    sites: &mut FastFieldSiteCache,
+    stack: &mut ValueStack,
+    class_id: ClassId,
+    cp_index: u16,
+    ret_opcode: u8,
+) -> bool {
     if crate::runtime::jvmti::any_field_watchpoint_active() {
         return false;
     }
-    let Some(ptr) = frame.stack.peek_compact().as_object_ptr() else {
+    if stack.len() == 0 {
+        return false;
+    }
+    let Some(ptr) = stack.peek_compact().as_object_ptr() else {
         return false;
     };
-    let site = match sites.get(frame.class_id, cp_index) {
+    let site = match sites.get(class_id, cp_index) {
         Some(s) => *s,
         None => {
             site_stats::bump(site_stats::FAST_GET_MISS);
             return false;
         }
     };
+    if ret_opcode != 0 {
+        let agrees = matches!(
+            (site.storage, ret_opcode),
+            (FieldStorageKind::Long, 0xad)
+                | (FieldStorageKind::Float, 0xae)
+                | (FieldStorageKind::Double, 0xaf)
+                | (FieldStorageKind::Reference, 0xb0)
+                | (
+                    FieldStorageKind::Int
+                        | FieldStorageKind::Boolean
+                        | FieldStorageKind::Byte
+                        | FieldStorageKind::Char
+                        | FieldStorageKind::Short,
+                    0xac
+                )
+        );
+        if !agrees {
+            return false;
+        }
+    }
     let Some(fp) = field_ptr_for(zgc, ptr, &site) else {
         return false;
     };
@@ -220,15 +264,15 @@ pub(super) fn getfield_fast(
         FieldStorageKind::Float => CompactValue::float(f32::from_bits(unsafe { load_u32(fp) })),
         FieldStorageKind::Long => {
             let v = unsafe { load_u64(fp) } as i64;
-            frame.stack.pop_compact();
-            frame.stack.push_long_unchecked(v);
+            stack.pop_compact();
+            stack.push_long_unchecked(v);
             site_stats::bump(site_stats::FAST_GET_HIT);
             return true;
         }
         FieldStorageKind::Double => {
             let v = f64::from_bits(unsafe { load_u64(fp) });
-            frame.stack.pop_compact();
-            frame.stack.push_double_unchecked(v);
+            stack.pop_compact();
+            stack.push_double_unchecked(v);
             site_stats::bump(site_stats::FAST_GET_HIT);
             return true;
         }
@@ -255,8 +299,8 @@ pub(super) fn getfield_fast(
             }
         }
     };
-    frame.stack.pop_compact();
-    frame.stack.push_compact(pushed);
+    stack.pop_compact();
+    stack.push_compact(pushed);
     site_stats::bump(site_stats::FAST_GET_HIT);
     true
 }

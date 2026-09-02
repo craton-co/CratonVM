@@ -5976,7 +5976,12 @@ pub(super) const INTERCEPT_SHAPE_CLASSLOADER_RESOURCE: u8 = 1 << 0;
 /// This triple could reach the `java/lang/Class` reflection re-target.
 pub(super) const INTERCEPT_SHAPE_CLASS_REFLECTION: u8 = 1 << 1;
 /// This triple could reach the real-`HttpURLConnection` carrier exemption.
-pub(super) const INTERCEPT_SHAPE_HTTP_CARRIER: u8 = 1 << 2;
+$1/// One of the three name-matched intercepts in the cached virtual
+/// dispatcher (`ClassLoader.setDefaultAssertionStatus`, the surefire
+/// `LazyLauncher.discover` native, the reflective `Method.invoke` /
+/// `Constructor.newInstance` override). Consumed only by the invoke fast
+/// door, which declines any method with a non-zero shape.
+pub(super) const INTERCEPT_SHAPE_NAMED: u8 = 1 << 3;
 
 /// Classify a call site's triple against the three special-case arms of
 /// [`intercept_force_registered_native_cached`], once.
@@ -5998,10 +6003,34 @@ pub(super) fn intercept_shape_of(class_name: &str, method_name: &str, descriptor
     if class_reflection_shape(method_name, descriptor) {
         shape |= INTERCEPT_SHAPE_CLASS_REFLECTION;
     }
-    if http_carrier_declaring_class(class_name) {
-        shape |= INTERCEPT_SHAPE_HTTP_CARRIER;
+$1    if named_intercept_shape(class_name, method_name, descriptor) {
+        shape |= INTERCEPT_SHAPE_NAMED;
     }
-    shape
+$2
+
+/// The name triples `intercept_classloader_set_default_assertion_status`,
+/// `surefire_lazy_launcher_discover_native` and
+/// `native_override_for_cached_reflect_invoke` match on.
+fn named_intercept_shape(class_name: &str, method_name: &str, descriptor: &str) -> bool {
+    matches!(
+        (class_name, method_name, descriptor),
+        (_, "setDefaultAssertionStatus", "(Z)V")
+            | (
+                _,
+                "discover",
+                "(Lorg/junit/platform/launcher/LauncherDiscoveryRequest;)Lorg/junit/platform/launcher/TestPlan;"
+            )
+            | (
+                "java/lang/reflect/Method",
+                "invoke",
+                "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"
+            )
+            | (
+                "java/lang/reflect/Constructor",
+                "newInstance",
+                "([Ljava/lang/Object;)Ljava/lang/Object;"
+            )
+    )
 }
 
 /// The name-keyed half of the `ClassLoader` null-resource re-target.

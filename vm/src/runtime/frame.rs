@@ -1190,8 +1190,88 @@ impl Frame {
 
     /// Reset this frame in-place for tail-call elimination.
     /// Reuses the existing Vec allocations (locals, stack) to avoid allocation.
-    pub fn reset_for_tail_call(
-        &mut self,
+    /// `new_pooled_cached` for arguments that are still operand-stack slots.
+    ///
+    /// The invoke fast door hands over `(slot, descriptor tag)` pairs read
+    /// straight off the caller's operand stack, so each argument is copied
+    /// once, `CompactValue` to `CompactValue`, with no `Value` in between.
+    /// `tag` is the descriptor's first byte for the parameter (`b'L'` for the
+    /// receiver): `b'J'` / `b'D'` occupy two local slots with the same filler
+    /// `copy_args_to_locals` writes, everything else one. The slot bits are
+    /// stored verbatim, which is exactly what `from_value_kinded` produced
+    /// from the decoded `Value` (`long` / `double_raw` / tagged scalars), so
+    /// the resulting locals are bit-identical to the general path's.
+    pub fn new_pooled_cached_compact(
+        cached: Arc<CachedBytecodeMethod>,
+        args: &[(CompactValue, u8)],
+        locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+        stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+    ) -> Self {
+        let needed: usize = args
+            .iter()
+            .map(|(_, t)| if matches!(*t, b'J' | b'D') { 2 } else { 1 })
+            .sum();
+        let n = (cached.max_locals as usize).max(needed);
+        let eff_max_locals = u16::try_from(n).unwrap_or(u16::MAX);
+        let (vals, mut kinds) = locals_pool.pop().unwrap_or_default();
+        let mut locals = u64_vec_to_compact(vals);
+        locals.clear();
+        kinds.clear();
+        locals.reserve(n);
+        kinds.reserve(n);
+        for (cv, tag) in args {
+            locals.push(*cv);
+            match *tag {
+                b'J' => {
+                    kinds.push(LKIND_LONG);
+                    locals.push(CompactValue::uninitialized());
+                    kinds.push(LKIND_OTHER);
+                }
+                b'D' => {
+                    kinds.push(LKIND_DOUBLE);
+                    locals.push(CompactValue::uninitialized());
+                    kinds.push(LKIND_OTHER);
+                }
+                _ => kinds.push(LKIND_OTHER),
+            }
+        }
+        locals.resize(n, CompactValue::uninitialized());
+        kinds.resize(n, LKIND_OTHER);
+        debug_assert_eq!(locals.len(), n);
+        debug_assert_eq!(kinds.len(), n);
+        let padded_max = (cached.max_stack as usize).max(16) + 8;
+        let stack = if let Some((vals, tags)) = stacks_pool.pop() {
+            ValueStack::from_pooled(vals, tags, padded_max)
+        } else {
+            ValueStack::new(padded_max)
+        };
+        let class_id = cached.declaring_class_id;
+        let code = cached.code.clone();
+        let max_stack = cached.max_stack;
+        Self {
+            class_id,
+            pc: 0,
+            last_instr_pc: 0,
+            locals,
+            local_kinds: kinds,
+            stack,
+            code,
+            max_stack,
+            max_locals: eff_max_locals,
+            inner: {
+                count_frame_kind(false);
+                FrameInner::Cached(cached)
+            },
+            method_index: None,
+            backward_count: 0,
+            osr_attempt_counts: Vec::new(),
+            monitor_on_exit: None,
+            seq: next_frame_seq(),
+            exec_epoch: 0,
+        }
+    }
+
+$1        &mut self,
         class_id: ClassId,
         code: Arc<[u8]>,
         max_stack: u16,

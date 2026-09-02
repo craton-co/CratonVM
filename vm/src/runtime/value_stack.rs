@@ -305,8 +305,20 @@ impl ValueStack {
         // CompactValue is repr(transparent) over u64 — Vec<u64> can be
         // transmuted to Vec<CompactValue> without reallocation.
         let mut slots = u64_vec_to_compact(vals);
-        slots.clear();
-        slots.resize(max_size, CompactValue::zero());
+        // A pooled slot buffer keeps whatever the previous frame left in it,
+        // and that is fine: every reader of `slots` — the pops and peeks, the
+        // GC scans (`scan_object_refs*`), the pointer rewrite
+        // (`update_object_refs`), freeze/thaw — stops at `len`, and a slot
+        // below `len` is always written by a push first. So a buffer that is
+        // already long enough is handed over as it is instead of being
+        // cleared and zero-filled on every call (`max_stack + 24` words,
+        // ~300 bytes of memset per invoke); only a buffer that is too short
+        // grows, and the grown tail is zero-filled as before (2026-09-02).
+        if slots.len() < max_size {
+            slots.resize(max_size, CompactValue::zero());
+        } else {
+            slots.truncate(max_size);
+        }
         // Reuse the pooled tag Vec as the `kinds` array. It MUST be cleared:
         // stale marks from a prior frame would over-mark fresh slots (the one
         // unsafe direction), so reset every entry to KIND_UNKNOWN.
@@ -1170,9 +1182,31 @@ impl ValueStack {
     /// # Panics
     /// Panics if fewer than `depth + 1` slots are live.
     #[inline(always)]
-    pub fn peek_compact_at(&self, depth: usize) -> CompactValue {
-        debug_assert!(self.len > depth, "stack underflow in peek_compact_at");
-        self.slots[self.len - 1 - depth]
+$1
+    /// Peek the slot `depth` below the top together with its kind mark
+    /// (`0` is the top). The invoke fast door reads every argument this way
+    /// before committing the pop, so a shape it cannot transfer verbatim
+    /// leaves the stack exactly as the general dispatcher expects it.
+    ///
+    /// # Panics
+    /// Panics if fewer than `depth + 1` slots are live.
+    #[inline(always)]
+    pub fn peek_with_kind_at(&self, depth: usize) -> (CompactValue, u8) {
+        debug_assert!(self.len > depth, "stack underflow in peek_with_kind_at");
+        let i = self.len - 1 - depth;
+        (self.slots[i], self.kinds[i])
+    }
+
+    /// Drop the top `n` slots without decoding them. The caller has already
+    /// copied them out (the invoke fast door moves them into the callee's
+    /// locals verbatim).
+    ///
+    /// # Panics
+    /// Panics if fewer than `n` slots are live.
+    #[inline(always)]
+    pub fn discard_top(&mut self, n: usize) {
+        debug_assert!(self.len >= n, "stack underflow in discard_top");
+        self.len -= n;
     }
 
     /// B12: checked sibling of [`Self::peek_compact`]. Returns
