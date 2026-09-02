@@ -596,6 +596,33 @@ documents — and `checkcast` does not throw on a null receiver at all, so its
 `JZ` targets a legal null path; eliding it would let a null fall into the
 `KIND_TAGS` byte compare and fault.
 
+#### Measured: it engages, and it does not show up in the clock
+
+Probe: `for (i = 0; i < 2000; i++) s += this.x;`, called 40,000 times — 80M
+executions of the elided check. Debug binary, Azure `vm1`, a shared host that
+was also running two fat-LTO release builds and an H2 suite.
+
+| Arm | census | checksum |
+|---|---|---|
+| both on | `elided=2 emitted=0` | 240000000 |
+| `CRATONVM_JIT_RECEIVER_NULL_ELIM=0` | `elided=0 emitted=2` | 240000000 |
+| `CRATONVM_JIT_THIS_NONNULL=0` | `elided=0 emitted=2` | 240000000 |
+
+Both halves are load-bearing and independently switchable — turning off either
+one returns the count to zero — and the answer matches HotSpot on every arm.
+
+Throughput, five interleaved reps per arm, CPU time (`%U + %S`; wall clock is
+meaningless on that host): medians **3.30 s on and 3.30 s off**, ranges
+3.01–3.33 and 3.13–3.39. **No detectable difference.** The loop does run
+compiled — the `--nojit` arm was still going after two minutes against 3.3
+seconds — so this is a measurement of compiled code, not of the interpreter.
+
+That is the expected result and it is worth stating rather than filing away:
+`TEST r,r; JZ rel32` is nine bytes and two well-predicted µops, and an
+out-of-order core hides them behind the load they guard. What the elision buys
+is **code size**, paid entirely at compile time, plus the fact that a check
+that is not emitted cannot be got wrong.
+
 **This is not an implicit null check, and that was the choice, not an
 omission.** The audit item asked for the HotSpot mechanism: let the load fault
 on the null page and translate the signal. `vm/src/runtime/crash_handler.rs`
@@ -612,6 +639,15 @@ removed is `TEST r,r; JZ rel32` — 9 bytes and two well-predicted µops — and
 proving it away costs nothing at runtime and cannot mistranslate a signal.
 Eliding by proof is strictly better than faulting where the proof exists; the
 implicit check is only worth its machinery where it does not.
+
+And the measurement above **bounds** what it could be worth here, which is the
+part that settles it: an implicit null check removes *exactly the same two
+instructions* this elision removes, at the sites where the proof fails. The
+arm that removes them measured the same as the arm that keeps them. Building a
+signal-based recovery path with a code-cache-lifetime dependency to buy an
+effect that a direct A/B cannot resolve is not a trade worth making now — and
+if a workload ever does show the check on its profile, this section is the
+record of what was already tried and what it cost.
 
 ### Summary table
 
