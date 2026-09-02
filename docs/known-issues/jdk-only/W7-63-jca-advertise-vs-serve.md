@@ -18,8 +18,22 @@
 > refuted this page's claim about `Collections.unmodifiableSet` and found
 > `ArrayList` missing `RandomAccess`.
 >
-> What is left is five `SunTls*` `KeyGenerator` services, and the reason is
-> structural rather than clerical (§8c).
+> ~~What is left is five `SunTls*` `KeyGenerator` services, and the reason is
+> structural rather than clerical (§8c).~~ **Closed the same day** — the
+> structural change the bullet named was made, and this VM now advertises
+> **335 of HotSpot's 335** services across the five providers while advertising
+> nothing HotSpot does not. §8f. The advertise-versus-serve ledger this page is
+> named for is at zero; what remains on the open list is one declined trade
+> (`LinkedList` is not a `Deque`).
+>
+> **2026-09-02, later the same day: §8c's second bullet closed too**, and its
+> own diagnosis was the thing that was wrong. `unmodifiableList(x) instanceof
+> RandomAccess` did not fail because a fabricated class failed to declare a
+> marker — it failed because the opcodes and `getClass()` each computed the
+> receiver's display class through a different subtype walk, and the opcodes'
+> walk was the exception-`catch_type` fallback, which cannot match an interface
+> at all. §8d. The bullet had sent the next reader to `native-collections`,
+> which was correct throughout.
 
 > **The verification this page asked for, run at last.** The original status
 > said: "This lane could not build or run Rust. Every Rust change below is
@@ -677,12 +691,13 @@ is identical to HotSpot 25.0.3 unless said otherwise.
 | `KeyGenerator` defaults | `getInstance(a).generateKey().getEncoded().length` | identical, incl. `DESede`=24 |
 | nine `SunRsaSign` names | sign + verify + the signature BYTES | identical, all 13 PKCS#1 v1.5 names |
 | ML-DSA `getProvider()` | `KeyFactory`/`Signature` `.getProvider().getName()` | identical, all four names |
-| `SUN.getServices()` | per-provider service counts | identical for SUN, SunRsaSign, SunEC, SunJSSE; SunJCE 189 vs 194 |
+| `SUN.getServices()` | per-provider service counts | identical for all five (SunJCE 189 vs 194 when this row was written; **194 vs 194** since §8f) |
 | `unmodifiableSet` | identity, mutation, class, in all three modes | identical |
 | `--synthetic-jdk` never built | it is now | builds, runs, one defect found |
 
-The one differing row is the five `SunTls*` services. Nothing else in the
-record's open list survives.
+The one differing row was the five `SunTls*` services, and §8f closed it. **No
+row of this table differs now**, and nothing else in the record's open list
+survives.
 
 ## 8b. The twenty-six signature names
 
@@ -740,25 +755,298 @@ makes the encoding right as well as the signature.
 
 ## 8c. What is still open
 
-* **Five `SunTls*` `KeyGenerator` services.** `SunTlsPrf`, `SunTls12Prf`,
+> **TWO of the three below closed on 2026-09-02**, both kept struck through with
+> what they turned out to be. The `RandomAccess` one is worth keeping because
+> its own diagnosis was wrong in a way that would have sent the next reader to
+> the wrong crate. The `SunTls*` one is worth keeping because its diagnosis was
+> RIGHT — it named the engine change required, in one sentence, weeks before
+> anyone made it — and the record of a correct deferral is worth as much as the
+> record of a wrong one.
+>
+> **This page's open list is now the single `LinkedList`/`Deque` bullet**, which
+> is a declined trade rather than an unfinished job.
+
+* ~~**Five `SunTls*` `KeyGenerator` services.** `SunTlsPrf`, `SunTls12Prf`,
   `SunTlsMasterSecret`, `SunTlsKeyMaterial`, `SunTlsRsaPremasterSecret` — the
   TLS-internal KDFs, which take `TlsKeyMaterialParameterSpec`-family specs this
   engine's two-field synthetic `KeyGenerator` cannot carry. Serving them means
   handing back a real `javax.crypto.KeyGenerator` over the platform's SPI and
   teaching all nine natives registered on that class to recognise a receiver
   they did not build (the `skf_receiver_is_ours` shape). An engine change, not
-  a row, and `every_keygenerator_the_engine_implements_is_advertised` asserts
-  they stay absent until it is made.
-* **`Collections.unmodifiableList(x) instanceof RandomAccess`** is `true` in
-  `--jdk-only`, where real bytecode builds the view, and `false` in the two
-  modes where `alloc_unmod_wrapper` fabricates it — the fabricated class does
-  not re-declare the marker its own NAME promises.
-  `apps/probes/RandomAccessProbe` is the three-line reproducer. Belongs to
-  whoever owns `native-collections`' wrapper minting.
+  a row.~~
+
+  > **CLOSED 2026-09-02, exactly as the bullet described.** The engine change
+  > was made: `build_real_key_generator` (the `KeyGenerator` twin of the
+  > `SecretKeyFactory`/`Mac`/`KeyFactory` builders, through
+  > `javax.crypto.KeyGenerator`'s own `(KeyGeneratorSpi, Provider, String)`
+  > constructor, on the engine's refusal path), five rows naming the real
+  > platform classes, and `keygen_real_spi` guarding all six `init`/`generateKey`
+  > natives.
+  >
+  > **This VM now advertises 335 of HotSpot's 335 services** across `SUN`,
+  > `SunRsaSign`, `SunJCE`, `SunEC` and `SunJSSE` — SunJCE 189 → 194 — and
+  > advertises nothing HotSpot does not. §8a's one differing row is gone.
+  >
+  > Verified on the BYTES, not on a resolve. TLS 1.2's PRF and the
+  > master-secret and key-material derivations are deterministic, so four of the
+  > five diff byte-for-byte against HotSpot 25.0.3
+  > (`apps/probes/JcaSunTlsVectors`); `SunTlsRsaPremasterSecret` draws a nonce,
+  > so its length and version bytes are diffed instead. See "8f. The engine
+  > change the SunTls bullet asked for" below.
+
+* ~~**`Collections.unmodifiableList(x) instanceof RandomAccess`** is `true` in
+  `--jdk-only` and `false` in the two modes where `alloc_unmod_wrapper`
+  fabricates the view — the fabricated class does not re-declare the marker its
+  own NAME promises. Belongs to whoever owns `native-collections`' wrapper
+  minting.~~
+
+  > **CLOSED 2026-09-02, and it was not the wrapper minting.** See
+  > "8d. One name that reads like the other" below. `apps/probes/RandomAccessProbe`
+  > is now byte-identical to HotSpot on twelve rows in `--jdk-only` and in
+  > real-JDK mode, across all three doors (`instanceof`, `checkcast`,
+  > `Class.isInstance`) and `getClass()`. `--synthetic-jdk` had a SECOND,
+  > unrelated cause for the same symptom, and the sweep run to check that one
+  > pair was not a coincidence found five more defects — §8e.
+
 * **`LinkedList` is not a `Deque`** here and is on HotSpot. Deliberately not
   declared: this VM carries most of the deque surface and not all of it, so the
   interface would turn a clean `ClassCastException` into a missing method at
   the point of use.
+
+## 8d. One name that reads like the other
+
+The wrapper minting was right, and so was every table this bullet pointed at.
+`cratonvm/internal/UnmodifiableList` is a stamp for BOTH of HotSpot's two
+unmodifiable-list classes, and the VM picks between them per instance by asking
+whether the wrapped list implements `RandomAccess` — `getClass()` through
+`native-builtins`' `getclass_backing_is_random_access`, and the
+`instanceof`/`checkcast` opcodes through `typecheck::unmod_backing_reaches`.
+Two implementations of one decision, which is the shape that fails.
+
+The opcode side asked through `ClassManager::is_subclass_of_by_name`. That
+function walks ONLY the superclass chain: it is the exception-`catch_type`
+fallback, and a `catch_type` is never an interface. `RandomAccess` is an
+interface, so it answered `false` for every list ever built — `ArrayList`
+reaches `AbstractList`, `AbstractCollection`, `Object` and stops. The
+`getClass()` side resolved the interface to a `ClassId` and used the
+DAG-walking `is_subclass`, so it answered `true`. One object, at one instant:
+
+```text
+v.getClass()                      java.util.Collections$UnmodifiableRandomAccessList
+RandomAccess.class.isInstance(v)  true
+v instanceof RandomAccess         false
+(RandomAccess) v                  ClassCastException
+```
+
+`display_class_satisfies_target` — the arm that exists precisely to keep the
+opcodes agreeing with `getClass()` — was reached, ran, and computed the wrong
+display class, so the fix is one function call and not a new mechanism. Two
+things made it hard to see and both are worth naming:
+
+* **The disagreement was invisible from either side alone.** `getInterfaces()`
+  returned `[RandomAccess]`, `getClass()` named the RandomAccess class, and the
+  declared interface `Class` object was `==` `RandomAccess.class` — every
+  reflective question answered correctly, because they all run on the display
+  class. Only a probe that asks all three doors about ONE object shows it, which
+  is why `apps/probes/RandomAccessProbe` prints an `agree=` column.
+* **The trap was already written down, on a different call site.** The
+  `Path.toString()` branch in `runtime/invokedynamic.rs` carries a paragraph
+  explaining that `is_subclass_of_by_name` "can never match an interface like
+  `Path` and this branch would silently never fire", added after a concurrent
+  commit made exactly this mistake. This is its second occurrence, and the name
+  is the whole reason: the function that sounds like the general one is the
+  special one. `classloading`'s
+  `the_supers_only_name_walk_cannot_see_an_interface_the_dag_walk_finds` now
+  asserts the divergence in both directions, so the next reader meets it as a
+  test rather than as a comment on an unrelated branch.
+
+The fix moved BOTH halves, which the second measurement forced. Correcting only
+the opcode side made `Collections.unmodifiableList(List.of("a", "b"))` — a
+wrapper whose backing is itself a stamp — read `instanceof=true isInstance=false`:
+a *new* disagreement, where before the pair had been wrong together. Each side
+now runs the same structural rule (`typecheck::object_reaches` and
+`getclass_object_reaches`), descending slot 0, because an unmodifiable view
+carries the marker exactly when the thing it wraps does. Both carry a comment
+saying they are a pair; neither may move alone.
+
+## 8e. The sweep that closed §8c's bullet found five more
+
+Fixing one pair is not evidence about the others, so `apps/probes/CollectionViewTypes`
+asks 24 collection views and 11 concrete classes about 14 interfaces each — 490
+cells, on HotSpot 25.0.3 and on this VM in all three modes, diffed on stdout.
+
+**Real-JDK: 35 of 35 rows now identical.** Three of them were not, and they are
+the OPPOSITE defect from §8d's — over-admissions, where this VM says `true` and
+HotSpot says `false`:
+
+```text
+aConcurrentSkipListSet instanceof List                     CratonVM true   HotSpot false
+aConcurrentSkipListMap instanceof Collection/List/Iterable  true    false
+aPriorityQueue         instanceof Deque                     true    false
+```
+
+`synthetic_implements` has a name-word fallback for classes with no real
+interface data, and it reads the word `List` out of `ConcurrentSkipList`**Set**
+and `ConcurrentSkipList`**Map** — a skip list is how they are BUILT, not what
+they are. This is the family the fallback's own comment already records ("`x
+instanceof List` returned true for a HashSet ... which broke JUnit's
+`Parameterized$RunnersFactory`"), fixed then for Set-versus-List and not for
+these. `PriorityQueue` is a third shape: `Queue` and `Deque` shared one match
+arm, and `Deque extends Queue` rather than the reverse.
+
+An over-admission here is worse than a refusal, because it converts a clean
+`ClassCastException` at the cast into a `NoSuchMethodError` at the first call —
+which is the exact trade §8c's `LinkedList`/`Deque` bullet declines to make. The
+arms now exclude a name whose FINAL word contradicts the target. Not a
+last-word-wins rule, which is tidier and wrong: `Collections$SetFromMap` ends in
+`Map` and is a `Set`.
+
+**`--synthetic-jdk`: every type row that can be measured is identical.** In that
+mode the supertype set comes from `class_manager.rs`'s interface table, and
+NONE of `Collections$Unmodifiable*`, `ImmutableCollections$*` or
+`Arrays$ArrayList` had an arm there — all of them fell to `_ => &[]` and
+declared nothing at all. The coarse questions still answered correctly, because
+the name-word fallback above reads `List` out of `UnmodifiableList`, so only the
+interfaces a name does NOT spell were lost:
+
+```text
+unmodifiableList(ArrayList)  Iterable      HotSpot true  CratonVM false
+                             RandomAccess          true           false
+Arrays.asList                RandomAccess          true           false
+                             Serializable          true           false
+List.of(..) / Set.of(..)     Iterable              true           false
+TreeSet                      SortedSet             true           false
+TreeMap                      SortedMap             true           false
+```
+
+A `Collection` that is not an `Iterable` is the worst of those: every for-each
+through an erased type is a `checkcast java/lang/Iterable`. `TreeSet` and
+`TreeMap` are the `ArrayList`/`LinkedList` split of §8's last bullet happening
+twice more — a group in that table costs its members exactly the markers that
+distinguish them.
+
+### Still open in `--synthetic-jdk`, and not this species
+
+* `Collections.emptyList()`/`emptySet()`/`emptyMap()` hand back a plain
+  `ArrayList`/`HashSet`/`HashMap`. Every type answer is right; the CLASS is
+  wrong (and so `Cloneable` is `true` where HotSpot says `false`). A
+  factory-return question, not a hierarchy one.
+* No `(Collection)` copy constructor for `Vector`, `CopyOnWriteArrayList`,
+  `ConcurrentSkipListSet`, `ConcurrentSkipListMap`, `ArrayDeque` or
+  `PriorityQueue`; no `Collections.unmodifiableSortedMap`; no
+  `DayOfWeek.MONDAY`. Method-surface completeness.
+* `LinkedList` is not a `Deque` — §8c's third bullet, unchanged and deliberate.
+
+The probe prints an `ERROR` row for each of those rather than dying: its first
+version called the factories inline, `unmodifiableSortedMap` raised
+`NoSuchMethodError` at row 22 in that mode, and the fourteen control rows below
+it — every sorted class, the whole reason they are in the probe — silently
+measured nothing. **A probe that stops early does not report less; it reports a
+shorter file that still diffs clean.**
+
+## 8f. The engine change the SunTls bullet asked for
+
+`getInstance` resolving is not the bar here, and the record says so twice
+already. The five `SunTls*` names are KDFs: routing to a generator and never
+initialising it, or initialising it with a spec whose fields were read in the
+wrong order, both produce an object that resolves and then hands back the wrong
+key. So the acceptance test is the BYTES.
+
+TLS 1.2's PRF is deterministic given (secret, label, seed), and so are the
+master-secret and key-material derivations built on it. Four of the five diff
+byte-for-byte; `SunTlsRsaPremasterSecret` draws a nonce, so its length and its
+two version bytes are what is fixed. `apps/probes/JcaSunTlsVectors`, both VMs,
+identical:
+
+```text
+SunTlsPrf                762791fa4ef968af841ad66563edc761…
+SunTls12Prf              eb621eb7ba5be377fceeb81260c3cc88…
+SunTlsMasterSecret       TlsMasterSecret c0dd6ecbed2c4fb4…
+SunTlsKeyMaterial        cw=e491f7c8… sw=7eae9609… civ=3a82de1c siv=c60442b3
+SunTlsRsaPremasterSecret len=48 version=0003
+```
+
+### Three parts, and the one that is easy to get wrong
+
+**The builder.** `build_real_key_generator` is the fourth sibling of
+`build_real_secret_key_factory`, `build_real_key_factory` and `build_real_mac`,
+through `javax.crypto.KeyGenerator`'s own protected
+`(KeyGeneratorSpi, Provider, String)` constructor. Reached only from
+`keygen_get_instance_named`'s refusal path — after this engine's own verdict,
+never before it, which is the whole safety argument `jdk_service_class` is
+written to.
+
+**The guard, which is the part that is easy to get wrong.** Every native on
+`javax/crypto/KeyGenerator` used to be able to assume the receiver was this
+crate's two-field synthetic (algorithm at slot 0, key size at slot 1). A real
+`KeyGenerator`'s slots hold `provider`/`spi`/`algorithm`/`lock` instead, so each
+native now asks `keygen_real_spi` first.
+
+That read is **type-checked, and the type check is not defensive
+programming — it is the discriminator**. `get_field_by_name` can fall back to a
+name→slot mapping, so asking a two-field synthetic for "spi" can return slot 0,
+which is a `String`. Handing that to `invoke_virtual` as a `KeyGeneratorSpi` is
+the failure; checking that it IS a `KeyGeneratorSpi` both prevents it and
+answers the question. The identical unchecked read put a `String` where a
+`Provider` belonged in `pbkdf2_get_provider` and killed the caller on
+`String.getName()` — this is that lesson applied before it could happen twice.
+
+No side table, which is the one deliberate difference from
+`skf_receiver_is_ours`: that one asks "did we build this" through an
+identity-keyed registry, this one asks "can I delegate" and answers with the
+object to delegate TO. Nothing to keep in step with GC relocation, nothing to
+evict.
+
+**The two `AlgorithmParameterSpec` `init` overloads were deliberate no-ops**,
+and they are the ONLY route into these five, whose entire input is a spec. They
+stay no-ops for a synthetic receiver, for the reason recorded on them (an
+`AlgorithmParameterSpec` is an empty marker interface, and the JCE contract lets
+a provider ignore parameters it does not recognise) — but on a real receiver
+they now forward. Swallowing the spec there would have left the generator
+uninitialised and moved the failure into `generateKey()`, which is a worse
+answer than the `NoSuchAlgorithmException` this used to give.
+
+### What the ratchet had to become
+
+`every_keygenerator_the_engine_implements_is_advertised` was a biconditional
+over HotSpot's own twenty-four names: advertised **iff**
+`keygen_default_bits` generates it. Serving the five by ROUTING rather than by
+generating makes that predicate too narrow, and narrowing is not conservatism
+here — it reds the test for names that work.
+
+It is a disjunction now: advertised iff (this crate generates it **or** the row
+names a real platform class). Deleting the old five-name assertion would have
+lost what it was protecting, so it was kept and inverted: those five must still
+have NO `keygen_default_bits` arm (an arm appearing there would mean someone
+fabricated a key where a KDF belongs) and must resolve to a
+`com.sun.crypto.provider.Tls*` class that is not the `.Native` marker.
+
+Checked for falsifiability rather than assumed: deleting one seed row reds it
+with `SunTlsPrf must be advertised with a real class`.
+
+### The regression surface, measured
+
+The guard runs on every `KeyGenerator` call in the VM, and the all-zero-key
+defect that `SecretKeySpec`'s copy shim exists for lives on this exact path. Run
+on both VMs and diffed:
+
+| probe | rows | result |
+|---|---:|---|
+| `JcaSunTlsVectors` | 5 | identical |
+| `JcaKeyGeneratorDefaults` | 24 | identical — the row that used to read "identical but the five `SunTls*`" |
+| `JcaKeygenScrub` | 5 | identical (the all-zero-key property) |
+| `JcaDerivationVectors` | 24 | identical |
+| per-provider service counts | 5 | identical, **335 of 335** |
+| `cargo test -p cratonvm-native-builtins --lib` | 4197 | passed |
+
+### Scope, stated honestly
+
+`sun.security.internal.spec` is not exported by `java.base`, so the probe needs
+`--add-exports java.base/sun.security.internal.spec=ALL-UNNAMED` on both VMs.
+The real caller of these five is `sun.security.ssl`'s own handshake, not
+application code. What closing this buys is that the JDK's TLS stack can reach
+its own KDFs through this VM's provider chain, and that the advertise-versus-
+serve ledger this page is named for reaches zero.
 
 ## 9. How to verify
 

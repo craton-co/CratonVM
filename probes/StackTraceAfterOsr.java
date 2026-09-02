@@ -17,7 +17,7 @@
  *   cratonvm -cp probes StackTraceAfterOsr
  *   CRATONVM_DISABLE_JIT=1 cratonvm -cp probes StackTraceAfterOsr
  *
- * See docs/known-issues/jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901.md
+ * See jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902.md
  */
 public class StackTraceAfterOsr {
     static int[][] table = new int[8][];

@@ -119,7 +119,7 @@ pub mod platform;
 pub mod profile;
 pub mod range_analysis;
 pub mod regalloc;
-pub(crate) mod runtime_lowering;
+pub mod runtime_lowering;
 pub mod scev;
 pub mod tiered;
 pub mod x64;
@@ -1617,6 +1617,24 @@ pub struct OopMapEntry {
     /// (`map_incomplete_cause::INLINE_LOCAL_UNMAPPABLE`) and contributes
     /// nothing here, so a word in its band stays honestly unattributed.
     pub inline_local_scopes: Vec<(i32, u16, u64)>,
+    /// Frame-resident OPERAND-STACK slots this safepoint's own stack model
+    /// classified as NOT holding a reference.
+    ///
+    /// The marked ones are already in `frame_slot_offsets`; these are their
+    /// complement, and they are what lets a stale word in the operand-spill
+    /// band be read as dead storage rather than merely unexplained. Measured
+    /// need: on `org.h2.test.store.TestRandomMapOps`, 36 of the 37 stale words
+    /// below `live_frame_hi` sit in `region=operand-spill`, where the locals
+    /// oracle above is silent.
+    ///
+    /// Only meaningful when `stack_marks_exact`; a mark vector that nobody
+    /// classified was PADDED with "not an oop", which is a default and not a
+    /// proof.
+    pub non_oop_stack_slots: Vec<i16>,
+    /// Whether the mark vector behind `non_oop_stack_slots` was exact
+    /// (`Compiler::stack_oop_marks_exact`). False turns every entry above from
+    /// a proof into a guess, so the report must not spend it.
+    pub stack_marks_exact: bool,
 }
 
 impl OopMapEntry {
@@ -1633,6 +1651,8 @@ impl OopMapEntry {
             local_oop_mask: None,
             num_locals: 0,
             inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         }
     }
 
@@ -2754,7 +2774,7 @@ pub struct CompiledMethod {
     /// `x64::driver::compile_with_param_slots`; read by
     /// `vm/src/jit/conservative_roots.rs` to give a warmed-up stack trace the
     /// frames an inlined callee otherwise contributes none of (defect 2 of
-    /// `jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901`).
+    /// `jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902`).
     ///
     /// Introspection and diagnosis ONLY. Never read by codegen, never by the
     /// GC root walk, never by deopt. A level here names a method and a bci and
@@ -2776,6 +2796,43 @@ pub struct CompiledMethod {
     /// retain nothing, so the retained metadata and the extra trace frames
     /// are A/B-able together inside one binary.
     pub inline_frame_map: crate::x64::InlineFrameMap,
+    /// Where each of this artifact's INLINE NULL CHECKS would raise: the
+    /// trapping bci in this method's own code, plus the spliced callees around
+    /// it, keyed by the id its cold trampoline passes to
+    /// `jit_npe_with_action`.
+    ///
+    /// The one program point a compiled frame reaches with no safepoint id to
+    /// its name, and therefore the one an `ActiveCompiledFrame` could not put a
+    /// line on. See `x64::NpeTrapSite`. Empty -- and allocation-free -- for
+    /// every method with no inline null check and for
+    /// `CRATONVM_JIT_NO_NPE_TRAP_LINES=1`.
+    ///
+    /// Introspection and diagnosis ONLY: read exactly once, by
+    /// `vm/src/jit/helpers.rs` while it snapshots the frames for an implicit
+    /// NPE. Never by codegen, the GC root walk or deopt.
+    pub npe_trap_map: crate::x64::NpeTrapMap,
+    /// Optimizing-tier safepoint id -> the BYTECODE INDEX that safepoint sits
+    /// at, ascending by id. Empty for every single-pass artifact.
+    ///
+    /// `OopMapEntry::bytecode_pc` is not a bci on this backend: `ir_lower`
+    /// stores a monotonic safepoint counter starting at 1 there, because an IR
+    /// safepoint is a NODE and several nodes can share one bci. Those counters
+    /// are small integers indistinguishable from plausible bcis, and the
+    /// artifact's own table records them -- so a stack walk that trusted the
+    /// slot would print a confidently WRONG line rather than none, which is why
+    /// `conservative_roots::activation_bci` refused an `used_ir_backend`
+    /// artifact outright and every optimizing-tier frame reported
+    /// `(Unknown Source)`. This is the translation that refusal was waiting
+    /// for: one `(id, bci)` pair per emitted safepoint, filled by
+    /// `Lowerer::emit_safepoint_map` from the same `cur_bci` the deopt machinery
+    /// already keys throw sites on, and passed through `resume_bci` so a
+    /// safepoint inside an IR-spliced callee reports the ENCLOSING invoke
+    /// rather than a pc that does not exist in this method's code.
+    ///
+    /// Introspection and diagnosis ONLY -- never read by codegen, the GC root
+    /// walk or deopt. It is a translation of an id the GC already keys on, not
+    /// a second source of truth about it.
+    pub safepoint_bci_table: Vec<(u32, u32)>,
     /// Deoptimization points: native code offsets where deopt can occur.
     /// Used by the deopt framework to reconstruct interpreter state.
     pub deopt_points: Vec<deopt::DeoptimizationPoint>,
@@ -3173,6 +3230,8 @@ impl CompiledMethod {
             // Two empty `Vec`s. No allocation, and none unless this compile
             // actually splices something.
             inline_frame_map: Default::default(),
+            npe_trap_map: Default::default(),
+            safepoint_bci_table: Vec::new(),
             deopt_points: Vec::new(),
             _deopt_point_boxes: Vec::new(),
             oop_maps: Vec::new(),
@@ -3255,6 +3314,8 @@ impl CompiledMethod {
             // Two empty `Vec`s. No allocation, and none unless this compile
             // actually splices something.
             inline_frame_map: Default::default(),
+            npe_trap_map: Default::default(),
+            safepoint_bci_table: Vec::new(),
             deopt_points: Vec::new(),
             _deopt_point_boxes: Vec::new(),
             oop_maps: Vec::new(),
@@ -3381,6 +3442,20 @@ impl CompiledMethod {
         self.oop_maps
             .iter()
             .find(|map| map.bytecode_pc == bytecode_pc)
+    }
+
+    /// The bytecode index an OPTIMIZING-tier safepoint id names, if this
+    /// artifact recorded one. See [`Self::safepoint_bci_table`].
+    ///
+    /// `None` for every single-pass artifact (the table is empty there, and the
+    /// id IS the bci) and for an id the lowerer emitted no translation for. A
+    /// caller must treat `None` as "no line available", never as bci 0.
+    #[inline]
+    pub fn safepoint_bci(&self, safepoint_id: u32) -> Option<u32> {
+        self.safepoint_bci_table
+            .binary_search_by_key(&safepoint_id, |(id, _)| *id)
+            .ok()
+            .map(|i| self.safepoint_bci_table[i].1)
     }
 
     /// real-frame-deopt: locate the deopt point for an exact native PC offset.
@@ -6308,6 +6383,22 @@ pub struct InlineSite {
     pub needs_heap: bool,
     /// Class name of the inlined callee (for invalidation tracking).
     pub class_name: String,
+    /// `ClassId` of [`Self::class_name`], or `0` when the producer did not
+    /// supply one (every hand-built test fixture).
+    ///
+    /// The resolver knows this id -- it is what it looked the body up by -- and
+    /// used to drop it. That is why an inlined level in a stack walk carried
+    /// only a NAME, and why `stackwalker::frame_class_ids_with_compiled` could
+    /// not expand one: that walk answers in `ClassId`, takes no `ClassStore`,
+    /// and resolving a JIT label by name to answer the JEP 403 deep-reflection
+    /// gate would be a security-relevant GUESS. Carried here it is not a guess:
+    /// it is the same id the splice's own invalidation dependency is recorded
+    /// against.
+    ///
+    /// `0` is the "unknown" sentinel, matching
+    /// [`NestedInlineSite::guard_class_id`]'s use of it, and a consumer must
+    /// REFUSE on it rather than substitute anything.
+    pub class_id: u32,
     /// Method name of the inlined callee.
     pub method_name: String,
     /// Descriptor of the inlined callee.
@@ -7766,6 +7857,7 @@ mod profile_guided_inlining_tests {
             ldc2w_info: Vec::new(),
             needs_heap: false,
             class_name: class.to_string(),
+            class_id: 0,
             method_name: method.to_string(),
             descriptor: "()I".to_string(),
             elided_invoke_pcs: Vec::new(),
@@ -8551,6 +8643,7 @@ mod inline_selection_tests {
             ldc2w_info: Vec::new(),
             needs_heap,
             class_name: "InlineCost".to_string(),
+            class_id: 0,
             method_name: "leaf".to_string(),
             descriptor: "()V".to_string(),
             elided_invoke_pcs: Vec::new(),
@@ -18250,6 +18343,154 @@ pub fn jit_bail_shortcircuits() -> u64 {
 /// Record one bail-list short-circuit. Called from [`compile_gate::admit`].
 pub(crate) fn note_jit_bail_shortcircuit() {
     JIT_BAIL_SHORTCIRCUITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Why each compiled frame in a stack trace got, or did not get, a line.
+///
+/// Lives in this crate rather than beside its only writer
+/// (`vm::jit::conservative_roots::activation_bci`) so that
+/// [`tiered::dump_method_stats_to_stderr`] can print it: the `vm` crate depends
+/// on this one, not the other way round.
+///
+/// **This is a refusal census, not a hit rate**, and the distinction is the
+/// whole point. The audit branch's `bci_lookup_census` was dropped in the
+/// 2026-09-01 merge along with the two-source lookup it described, and the
+/// lesson recorded in its place was that *a silent fallback producing a
+/// plausible answer is indistinguishable, from the outside, from the precise
+/// path working*. A bare `answered/total` pair has the same defect one level
+/// up: it cannot say whether the frames with no line are aarch64 artifacts, an
+/// optimizing tier with no translation table, frames stopped between
+/// safepoints, or a kill switch someone left set in an environment. Each of
+/// those wants a different fix and three of them are invisible in a trace,
+/// which prints `(Unknown Source)` for all of them.
+///
+/// Slots, in the order [`compiled_frame_line_counts`] returns them:
+///
+/// | # | name | meaning |
+/// |---|---|---|
+/// | 0 | `single-pass` | answered from the safepoint-id slot directly |
+/// | 1 | `ir` | answered through `CompiledMethod::safepoint_bci_table` |
+/// | 2 | `npe-trap` | answered from an inline null check's trap site |
+/// | 3 | `no-sp-id` | no usable safepoint id: no slot reserved (`sp_id_slot_off == 0`, which is also every aarch64 artifact), an out-of-band RBP, or the prologue's unset sentinel |
+/// | 4 | `id-unrecorded` | the id named no safepoint of this artifact's own |
+/// | 5 | `ir-untranslated` | an optimizing-tier id with no `(id, bci)` row |
+/// | 6 | `out-of-range` | the recovered value is not a spec-legal bci |
+/// | 7 | `switched-off` | `CRATONVM_JIT_NO_COMPILED_FRAME_LINES` or `CRATONVM_JIT_NO_IR_FRAME_LINES` |
+///
+/// Slots 3-7 are the populations the page
+/// `jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902` had to
+/// reason about with no instrument at all.
+static COMPILED_FRAME_LINE_COUNTS: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Index into [`COMPILED_FRAME_LINE_COUNTS`]: answered from the safepoint-id
+/// slot, single-pass backend.
+pub const FRAME_LINE_ANSWERED_SINGLE_PASS: usize = 0;
+/// Answered through the optimizing tier's `(id, bci)` table.
+pub const FRAME_LINE_ANSWERED_IR: usize = 1;
+/// Answered from an inline null check's recorded trap site.
+pub const FRAME_LINE_ANSWERED_NPE_TRAP: usize = 2;
+/// No usable safepoint id in the frame.
+pub const FRAME_LINE_REFUSED_NO_SP_ID: usize = 3;
+/// The id named no safepoint this artifact recorded.
+pub const FRAME_LINE_REFUSED_ID_UNRECORDED: usize = 4;
+/// An optimizing-tier id with no translation.
+pub const FRAME_LINE_REFUSED_IR_UNTRANSLATED: usize = 5;
+/// The recovered value is not a spec-legal bci.
+pub const FRAME_LINE_REFUSED_OUT_OF_RANGE: usize = 6;
+/// A kill switch is set.
+pub const FRAME_LINE_REFUSED_SWITCHED_OFF: usize = 7;
+
+/// Human names, parallel to the slot indices, so the dump and any future
+/// consumer cannot disagree about which column is which.
+pub const FRAME_LINE_SLOT_NAMES: [&str; 8] = [
+    "single-pass",
+    "ir",
+    "npe-trap",
+    "no-sp-id",
+    "id-unrecorded",
+    "ir-untranslated",
+    "out-of-range",
+    "switched-off",
+];
+
+/// Record one verdict. One bump, taken by every arm of `activation_bci`, so a
+/// new refusal cannot be added without choosing a column for it.
+#[inline]
+pub fn note_compiled_frame_line(slot: usize) {
+    if let Some(c) = COMPILED_FRAME_LINE_COUNTS.get(slot) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Read the census. See [`COMPILED_FRAME_LINE_COUNTS`] for the columns.
+pub fn compiled_frame_line_counts() -> [u64; 8] {
+    let mut out = [0u64; 8];
+    for (i, slot) in COMPILED_FRAME_LINE_COUNTS.iter().enumerate() {
+        out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
+/// How often each of `stackwalker::drop_osr_continuations`' two rules removed a
+/// compiled entry that was the SAME ACTIVATION as an interpreter frame.
+///
+/// | # | name | rule |
+/// |---|---|---|
+/// | 0 | `osr-authoritative` | rule 1, decided by the live-OSR-continuation registry |
+/// | 1 | `osr-heuristic` | rule 1, decided by `can_osr_enter(frame.pc)` because the registry had nothing to say |
+/// | 2 | `call-opcode` | rule 2, an ordinary compiled activation whose interpreter frame is not suspended at an `invoke*` |
+///
+/// Rule 2 is why this exists. Its revert shape is asserted by no test, and
+/// deliberately so: the only place it was ever "observed" was behind
+/// `CRATONVM_JIT_NO_INLINE=1`, a variable that does not exist and never did, so
+/// that arm ran the default configuration and isolated nothing. The shipped fix
+/// therefore rests on an opcode PROOF rather than on a measurement, and a check
+/// whose expected output nobody has measured is a false red waiting to happen.
+///
+/// A counter is what an unmeasurable claim can honestly have instead: it cannot
+/// say the rule is right, but it can say whether it ever FIRES, which is the
+/// question "does this code do anything at all" that no green test answers. A
+/// permanent zero across real workloads is itself a finding.
+static STACK_WALK_DEDUPE_COUNTS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Rule 1, decided by the live-OSR-continuation registry.
+pub const DEDUPE_OSR_AUTHORITATIVE: usize = 0;
+/// Rule 1, decided by the `can_osr_enter` pc heuristic.
+pub const DEDUPE_OSR_HEURISTIC: usize = 1;
+/// Rule 2, the ordinary compiled activation.
+pub const DEDUPE_CALL_OPCODE: usize = 2;
+
+/// Names parallel to the slot indices. See [`STACK_WALK_DEDUPE_COUNTS`].
+pub const DEDUPE_SLOT_NAMES: [&str; 3] = ["osr-authoritative", "osr-heuristic", "call-opcode"];
+
+/// Record one dedupe. See [`STACK_WALK_DEDUPE_COUNTS`].
+#[inline]
+pub fn note_stack_walk_dedupe(slot: usize) {
+    if let Some(c) = STACK_WALK_DEDUPE_COUNTS.get(slot) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Read the dedupe census. See [`STACK_WALK_DEDUPE_COUNTS`].
+pub fn stack_walk_dedupe_counts() -> [u64; 3] {
+    let mut out = [0u64; 3];
+    for (i, slot) in STACK_WALK_DEDUPE_COUNTS.iter().enumerate() {
+        out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    out
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -29620,6 +29861,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -29848,6 +30090,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -29927,6 +30170,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -31181,6 +31425,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -31325,6 +31570,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -31436,6 +31682,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -31557,6 +31804,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -31682,6 +31930,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -31749,6 +31998,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -31828,6 +32078,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -35222,6 +35473,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -35862,6 +36114,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -35882,6 +36135,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -36016,6 +36270,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),

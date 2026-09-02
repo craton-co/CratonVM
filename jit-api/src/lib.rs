@@ -198,6 +198,155 @@ mod descriptor_contract_tests {
 /// reorders an overload set across the capture/read window is the one case
 /// verification cannot catch, and eager capture has no such window. See
 /// `arch-2026-07-26/cross-owner-closeout.md` §6.
+///
+/// # Descriptor facts
+///
+/// [`Self::descriptor_facts`] memoizes everything the hot paths need out of
+/// `method_descriptor` — see [`DescriptorFacts`] for what was being re-parsed
+/// per call before it existed.
+
+/// Everything the interpreter's hot paths need to know about a method
+/// descriptor, tokenised once instead of on every call.
+///
+/// # Why this type exists
+///
+/// The descriptor of a resolved method never changes, yet two of the
+/// interpreter's hottest operations re-parsed it per execution:
+///
+/// * **Argument decode.** `ParamTags::of(&cached.method_descriptor)` ran a
+///   fresh byte scan of the descriptor on *every* invoke through the inline
+///   cache. Its own comment records tuning the inline width against ~11 ns of
+///   per-call fixed setup — the right measurement aimed at the wrong knob,
+///   because the scan should not have been happening at runtime at all.
+/// * **Reference return.** `areturn` called `cratonvm_jit::return_type`, a
+///   linear scan for `')'`, on every reference return — which in
+///   object-oriented bytecode is most returns.
+///
+/// Measured (`probes/Arity.java`, `--nojit`, min-of-9, arms interleaved both
+/// ways): each additional `int` argument cost ~35 ns against HotSpot's
+/// template interpreter at ~0.85 ns, and the zero-argument arm — which does
+/// no per-argument work at all — still carried the scan.
+///
+/// # Layout
+///
+/// Eleven bytes, `Copy`, no allocation and no indirection. `param_tags` holds
+/// the first [`DescriptorFacts::INLINE_PARAMS`] parameter tags in declaration
+/// order, **excluding** the receiver, with `b'['` standing for any array type
+/// (the same tokenisation `nth_param_tag_byte` performs). A descriptor with
+/// more parameters than that sets `param_tags_overflow` and readers fall back
+/// to the per-index rescan for the tail — the same fallback the pre-computed
+/// form always had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorFacts {
+    /// Parameter type tags, declaration order, receiver excluded.
+    pub param_tags: [u8; Self::INLINE_PARAMS],
+    /// How many entries of `param_tags` are meaningful.
+    pub param_tag_len: u8,
+    /// The descriptor declares more parameters than `param_tags` can hold.
+    pub param_tags_overflow: bool,
+    /// The byte after `')'`. `b'V'` for void, and for a malformed descriptor —
+    /// which is exactly what the `cratonvm_jit::return_type` scan this
+    /// replaces answered.
+    pub ret_tag: u8,
+}
+
+/// Kill switch for every [`DescriptorFacts`] consumer
+/// (`CRATONVM_JIT_NO_DESCRIPTOR_FACTS=1`, or
+/// `CRATONVM_JIT=-descriptor-facts`). Set, `ParamTags` and the return tag go
+/// back through the per-call descriptor scans they replaced, so the change can
+/// be priced inside one binary — a cross-binary comparison is not an A/B on a
+/// host whose run-to-run spread exceeds the effect.
+#[inline]
+pub fn descriptor_facts_disabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_DESCRIPTOR_FACTS").is_some()
+    })
+}
+
+/// The per-call return-tag scan [`CachedBytecodeMethod::return_tag`] replaces,
+/// kept here so the kill switch can restore the old cost exactly. Byte-for-byte
+/// the same answer as `cratonvm_jit::return_type`, which this crate cannot
+/// name (the dependency runs the other way).
+#[inline]
+fn scan_return_tag(descriptor: &str) -> u8 {
+    let bytes = descriptor.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b')' && i + 1 < bytes.len() {
+            return bytes[i + 1];
+        }
+    }
+    b'V'
+}
+
+impl DescriptorFacts {
+    /// Kept at 8 to match the inline width `ParamTags` was measured into: at
+    /// 16, the fixed setup cost regressed zero-argument calls in 7 of 8 paired
+    /// rounds. That measurement no longer binds — the tokenisation happens
+    /// once per method now, not once per call — but the array is still copied
+    /// out of the `OnceLock` on each read, so eight (which covers essentially
+    /// every real method) keeps that copy inside one cache line alongside the
+    /// three scalars.
+    pub const INLINE_PARAMS: usize = 8;
+
+    /// Tokenise `descriptor`. Pure; called once per method through
+    /// [`CachedBytecodeMethod::descriptor_facts`].
+    ///
+    /// The parameter walk mirrors `nth_param_tag_byte` exactly, including its
+    /// `b'['`-for-arrays tag; `vm`'s `param_tags_match_nth_param_tag_byte`
+    /// test pins the two against each other.
+    pub fn of(descriptor: &str) -> Self {
+        let bytes = descriptor.as_bytes();
+        let mut param_tags = [b'L'; Self::INLINE_PARAMS];
+        let mut len = 0usize;
+        let mut overflow = false;
+        let mut i = 1; // skip '('
+        while i < bytes.len() && bytes[i] != b')' {
+            let tag = bytes[i]; // first byte of this token ('[' for arrays)
+            while i < bytes.len() && bytes[i] == b'[' {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+            match bytes[i] {
+                b'L' => {
+                    while i < bytes.len() && bytes[i] != b';' {
+                        i += 1;
+                    }
+                    i += 1; // consume ';'
+                }
+                _ => {
+                    i += 1; // single-char primitive
+                }
+            }
+            if len < Self::INLINE_PARAMS {
+                param_tags[len] = tag;
+                len += 1;
+            } else {
+                overflow = true;
+            }
+        }
+        // Return tag: the byte after the FIRST ')'. Identical to
+        // `cratonvm_jit::return_type`, including its `b'V'` answer for a
+        // descriptor with no ')' or nothing after it.
+        let mut ret_tag = b'V';
+        for j in 0..bytes.len() {
+            if bytes[j] == b')' && j + 1 < bytes.len() {
+                ret_tag = bytes[j + 1];
+                break;
+            }
+        }
+        Self {
+            param_tags,
+            // Cast: bounded by `INLINE_PARAMS` (8) by the loop above.
+            param_tag_len: len as u8,
+            param_tags_overflow: overflow,
+            ret_tag,
+        }
+    }
+}
+
 pub struct CachedBytecodeMethod {
     pub declaring_class_id: ClassId,
     pub class_name: Arc<str>,
@@ -258,6 +407,14 @@ pub struct CachedBytecodeMethod {
     /// cell. Until then it turns ~55 string comparisons per cached dispatch
     /// into an O(1) read.
     pub force_native_cache: std::sync::OnceLock<bool>,
+    /// Memoized [`DescriptorFacts`] for [`Self::method_descriptor`]. Read
+    /// through [`Self::descriptor_facts`], never directly.
+    ///
+    /// A `OnceLock` rather than an eagerly-computed field so the ~50
+    /// struct literals that build this type (production and test alike)
+    /// keep one uniform, `const`-constructible initializer, exactly as the
+    /// four memo cells above it do.
+    pub descriptor_facts_cache: std::sync::OnceLock<DescriptorFacts>,
     /// Which of `intercept_force_registered_native_cached`'s three *special-case*
     /// arms this call site's triple can possibly reach, as `INTERCEPT_SHAPE_*`
     /// bits. Zero — the answer for almost every call site in a program — means
@@ -440,6 +597,11 @@ impl Clone for CachedBytecodeMethod {
             is_synchronized: self.is_synchronized,
             is_static: self.is_static,
             force_native_cache: self.force_native_cache.clone(),
+            // Same reasoning as `force_native_cache`: a pure function of a
+            // field the clone `Arc`-shares with this one
+            // (`method_descriptor`), so carrying the memo forward answers the
+            // same question.
+            descriptor_facts_cache: self.descriptor_facts_cache.clone(),
             // Same reasoning as `force_native_cache`: the cell is a pure
             // function of the triple, and the clone's triple is `Arc`-shared
             // with this one, so carrying the memo forward answers for the same
@@ -467,6 +629,31 @@ impl Clone for CachedBytecodeMethod {
 }
 
 impl CachedBytecodeMethod {
+    /// Everything the hot paths need from this method's descriptor,
+    /// tokenised on first use and shared by every later call through this
+    /// entry.
+    ///
+    /// This entry is `Arc`-shared across every dispatch that hits its call
+    /// site, so the scan happens once per METHOD rather than once per call.
+    /// See [`DescriptorFacts`] for the two hot paths that were re-parsing
+    /// the descriptor per execution before this existed.
+    #[inline]
+    pub fn descriptor_facts(&self) -> &DescriptorFacts {
+        self.descriptor_facts_cache
+            .get_or_init(|| DescriptorFacts::of(&self.method_descriptor))
+    }
+
+    /// The descriptor's return-type tag byte (`b'V'` for void).
+    /// Equivalent to `cratonvm_jit::return_type(&self.method_descriptor)`,
+    /// without the per-call scan.
+    #[inline]
+    pub fn return_tag(&self) -> u8 {
+        if descriptor_facts_disabled() {
+            return scan_return_tag(&self.method_descriptor);
+        }
+        self.descriptor_facts().ret_tag
+    }
+
     /// This entry's native-dispatch memo cell — see
     /// [`Self::native_callback_cache`] for the full contract.
     ///
@@ -1478,6 +1665,43 @@ pub struct JitRuntimeHelpers {
     /// floor; G1 keys on region state the emitter cannot see) ⇒ compiled code
     /// skips this test and falls back to `ref_store_post_gate` alone.
     pub ref_store_post_young_floor: usize,
+    /// F-08 — address of the GC's `JIT_G1_BARRIER` table (`gc/src/gen_heap.rs`),
+    /// baked as an immediate by the inline G1 post-write barrier.
+    ///
+    /// NOT a function pointer, and NOT a fourth spelling of
+    /// [`Self::region_bounds_addr`]. That table's EMPTINESS under G1 is what
+    /// closes defect G1-2, and it must keep answering "no inline reference
+    /// store may skip the collector's barrier" there; this one answers the
+    /// different question of what geometry an inline barrier needs in order to
+    /// BE the barrier — arena base, arena length, region mask, and the F-05
+    /// card table's base and shift. See `gc/src/gen_heap.rs::JitG1BarrierTable`.
+    ///
+    /// `0`, or a table whose `arena_len` word is zero, = no G1 collector has
+    /// published → the emitter emits no inline barrier and every compiled
+    /// reference store keeps the `putfield_object` helper it takes today.
+    /// Appended at the END of the struct so all prior golden offsets stay
+    /// stable.
+    pub g1_barrier_addr: usize,
+    /// F-08 — G1's post-write barrier, called from the inline arm when its two
+    /// inline filters (same region, null store) both fail to prove there is
+    /// nothing to remember.
+    ///
+    /// `extern "C" fn(vm_ptr: i64, obj_ptr: i64, val_ptr: i64)`.
+    ///
+    /// Distinct from [`Self::write_barrier`], which routes through
+    /// `VmHeap::write_barrier` and carries a `debug_assert!` requiring an SATB
+    /// pre-barrier on the same thread when a mark cycle is active. That
+    /// assertion is right for a general store and wrong for this caller: the
+    /// inline arm stores only when the field's OLD value is NULL, which is
+    /// exactly the case `satb_pre_barrier` returns from immediately, so no
+    /// pre-barrier is fired and none is owed. A dedicated entry point says that
+    /// once, here, instead of weakening an assertion that protects every other
+    /// caller.
+    ///
+    /// `0` = not wired (hand-built test tables) → no inline G1 barrier is
+    /// emitted. Appended at the END of the struct so all prior golden offsets
+    /// stay stable.
+    pub g1_post_write_barrier: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -1677,6 +1901,10 @@ helper_fields! {
     (ref_store_pre_gate,             FieldKind::Offset),
     (ref_store_post_gate,            FieldKind::Offset),
     (ref_store_post_young_floor,     FieldKind::Offset),
+    // NOT a pointer: address of the GC's JIT_G1_BARRIER table, baked as an
+    // immediate by the inline G1 post-write barrier. 0 = not wired.
+    (g1_barrier_addr,                FieldKind::Offset),
+    (g1_post_write_barrier,          FieldKind::OptionalPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -1702,7 +1930,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 72,
+    JitRuntimeHelpers::NUM_FIELDS == 74,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -1806,6 +2034,7 @@ mod tests {
             is_synchronized: false,
             is_static: false,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -2104,6 +2333,8 @@ mod tests {
             ref_store_pre_gate: 0x11F0,
             ref_store_post_gate: 0x11F8,
             ref_store_post_young_floor: 0x1200,
+            g1_barrier_addr: 0x1208,
+            g1_post_write_barrier: 0x1210,
         }
     }
 
@@ -2348,6 +2579,8 @@ mod tests {
             ref_store_pre_gate: 0,
             ref_store_post_gate: 0,
             ref_store_post_young_floor: 0,
+            g1_barrier_addr: 0,
+            g1_post_write_barrier: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -2524,9 +2757,10 @@ mod tests {
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
         // And the macro-driven count is the canonical one for this ABI
-        // revision -- 72 as of v10, which appended the three reference-store
-        // barrier gates.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 72);
+        // revision -- 74 as of v11. v10 appended dev's three reference-store
+        // barrier gates; F-08 appended the two G1 inline-barrier words after
+        // them, so both sets of golden offsets below stay where they were.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 74);
     }
 
     #[test]
@@ -2884,6 +3118,16 @@ mod tests {
                 "ref_store_post_young_floor",
                 std::mem::offset_of!(JitRuntimeHelpers, ref_store_post_young_floor),
             ),
+            (
+                72,
+                "g1_barrier_addr",
+                std::mem::offset_of!(JitRuntimeHelpers, g1_barrier_addr),
+            ),
+            (
+                73,
+                "g1_post_write_barrier",
+                std::mem::offset_of!(JitRuntimeHelpers, g1_post_write_barrier),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -2938,8 +3182,8 @@ mod tests {
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 43, "required-pointer count drifted");
-        assert_eq!(opt, 16, "optional-pointer count drifted");
-        assert_eq!(off, 13, "offset-field count drifted");
+        assert_eq!(opt, 17, "optional-pointer count drifted");
+        assert_eq!(off, 14, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }
 

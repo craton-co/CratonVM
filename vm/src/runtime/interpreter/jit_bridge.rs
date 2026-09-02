@@ -188,7 +188,7 @@ fn osr_stage_get() -> &'static str {
 // Which interpreter frames are, right now, being run by compiled code
 // ---------------------------------------------------------------------------
 //
-// jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901, defect (3):
+// jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902, defect (3):
 // a trace captured after `main` has OSR'd says `main:62` -- the back-edge it
 // tiered up at -- where HotSpot says `main:66`, the call that was executing.
 //
@@ -3708,6 +3708,7 @@ pub(super) fn try_osr(
             MethodCallFailed::ExceptionThrown(exc) => {
                 crate::runtime::exceptions::attach_snapshotted_npe_frames(
                     shared,
+                    &thread.frames,
                     exc,
                     npe_snapshot,
                 );
@@ -3738,7 +3739,12 @@ pub(super) fn try_osr(
                 // re-stashed: it was taken for this raise, and by the time a
                 // later drain surfaced the flag it would describe frames that
                 // are long gone. A short trace beats a confidently wrong one.
-                crate::jit::helpers::stash_jit_pending_npe();
+                //
+                // `set_jit_pending_npe_flag_only` is what makes that sentence
+                // true of the CODE: `stash_jit_pending_npe` takes a fresh
+                // snapshot of its own, so the frames were not dropped here at
+                // all — they were silently replaced by a shallower set.
+                crate::jit::helpers::set_jit_pending_npe_flag_only();
             }
         }
         return None;
@@ -5161,7 +5167,7 @@ pub(super) fn try_jit_upgrade_with_gate(
             &cached.method_descriptor,
             cached.declaring_class_id,
         ) {
-            let ret = crate::jit::return_type(&cached.method_descriptor);
+            let ret = cached.return_tag();
             let heap = compiled.needs_heap();
             return Some(CachedInvokeTarget::Jit {
                 compiled: compiled.into(),
@@ -5694,6 +5700,7 @@ pub(super) fn try_jit_upgrade_with_gate(
             is_synchronized: method.is_synchronized(),
             is_static: method.is_static(),
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -6329,7 +6336,7 @@ pub(super) fn try_jit_upgrade_with_gate(
         // whether a thin direct-call helper may shadow real bytecode.
         Some(&intrinsic_resolver),
     )?;
-    let ret = crate::jit::return_type(&cached.method_descriptor);
+    let ret = cached.return_tag();
     let heap = compiled.needs_heap();
 
     // Store in shared JIT cache
@@ -7166,6 +7173,7 @@ pub(super) fn try_jit_compile_callee_slow(
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
+        descriptor_facts_cache: std::sync::OnceLock::new(),
         intercept_shape_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
@@ -8879,6 +8887,18 @@ fn resolve_inline_site_from(
     } else {
         callee_class.to_string()
     };
+    // ...and its id, chosen by the SAME branch so the two can never name
+    // different classes. A stack walk that has to answer in `ClassId` -- the
+    // JEP 403 deep-reflection gate, `Class.forName`'s caller loader -- can then
+    // see a spliced frame without resolving a JIT label by name, which would be
+    // a guess in a security-relevant path. `cp_class_id` is the id
+    // `callee_class` was looked up under; `declaring_id` is the class that
+    // declares the body a receiver resolution selected.
+    let inlined_body_class_id = if receiver_class_id.is_some() {
+        declaring_id.as_u32()
+    } else {
+        cp_class_id.as_u32()
+    };
 
     if method.is_synchronized() {
         no!("synchronized");
@@ -9842,6 +9862,7 @@ fn resolve_inline_site_from(
         ldc2w_info,
         needs_heap,
         class_name: inlined_body_class_name,
+        class_id: inlined_body_class_id,
         method_name: callee_method.to_string(),
         descriptor: callee_desc.to_string(),
         elided_invoke_pcs,
@@ -10048,7 +10069,7 @@ pub(super) fn jit_saved_args_to_values(
     let is_static = cached.is_static;
     let mut out = Vec::with_capacity(np);
     // ONE forward scan, hoisted out of this per-argument loop.
-    let param_tags = ParamTags::of(&cached.method_descriptor);
+    let param_tags = ParamTags::for_method(&cached);
     for i in 0..np {
         let (cv, kind) = saved_args[i];
         let desc_byte = if is_static {
@@ -10232,7 +10253,7 @@ pub(super) fn execute_jit_call(
     let mut saved_args: [(CompactValue, u8); JIT_ABI_MAX_JAVA_ARGS] =
         [(CompactValue::zero(), 0u8); JIT_ABI_MAX_JAVA_ARGS];
     // ONE forward scan, hoisted out of this per-argument loop.
-    let param_tags = ParamTags::of(&cached.method_descriptor);
+    let param_tags = ParamTags::for_method(&cached);
     for i in (0..np).rev() {
         let (cv, kind) = thread.frames[frame_idx].stack.pop_with_kind_unchecked();
         saved_args[i] = (cv, kind);
@@ -10474,6 +10495,7 @@ pub(super) fn execute_jit_call(
             MethodCallFailed::ExceptionThrown(exc) => {
                 crate::runtime::exceptions::attach_snapshotted_npe_frames(
                     shared,
+                    &thread.frames,
                     exc,
                     npe_snapshot,
                 );
@@ -10962,6 +10984,7 @@ pub(super) fn execute_jit_call_decoded(
             MethodCallFailed::ExceptionThrown(exc) => {
                 crate::runtime::exceptions::attach_snapshotted_npe_frames(
                     shared,
+                    &thread.frames,
                     exc,
                     npe_snapshot,
                 );
@@ -11257,7 +11280,7 @@ pub(super) fn execute_jit_call_oneshot(
     }
     let args_jit = &jit_args[..np];
     let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
-    let return_type = crate::jit::return_type(&cached.method_descriptor);
+    let return_type = cached.return_tag();
     // `run_pushed_frame_to_completion` needs the depth the thread had BEFORE
     // any sink below materialised a frame.
     let frames_depth_on_entry = thread.frames.len();
@@ -11355,6 +11378,7 @@ pub(super) fn execute_jit_call_oneshot(
             MethodCallFailed::ExceptionThrown(exc) => {
                 crate::runtime::exceptions::attach_snapshotted_npe_frames(
                     shared,
+                    &thread.frames,
                     exc,
                     npe_snapshot,
                 );

@@ -15618,6 +15618,20 @@ mod file_normalise_tests {
         assert!(!file_is_absolute("C:foo"));
         assert!(!file_is_absolute("a\\b"));
         assert!(!file_is_absolute(""));
+        // A BARE DRIVE is a prefix but NOT a root, so it takes no separator:
+        // `WinNTFileSystem.resolve`'s `isDirectoryRelative` arm. `C:kid` names
+        // a file in drive C's OWN working directory; `C:\kid` names one in its
+        // root, and those coincide only when the process's directory on C:
+        // happens to be the root. MEASURED against HotSpot 25.0.3+9
+        // (`probes/FilePathSweep.java`, rows `[C:] child` and `[C:] twoArg`),
+        // which answers `C:kid`.
+        assert_eq!(j("C:", "kid"), "C:kid");
+        // ... and the rule is exactly two characters wide: a drive WITH a root
+        // is a root and keeps its separator, and a two-character parent that is
+        // not `<letter>:` is an ordinary relative name.
+        assert_eq!(j("C:/", "kid"), "C:\\kid");
+        assert_eq!(j("ab", "kid"), "ab\\kid");
+        assert_eq!(j("1:", "kid"), "1:\\kid");
     }
 
     #[cfg(windows)]
@@ -15714,6 +15728,95 @@ pub(crate) fn file_is_absolute(path: &str) -> bool {
     }
 }
 
+/// `java.io.File`'s absolutization -- `getAbsolutePath`'s rule, which is not
+/// Rust's.
+///
+/// Three cases, and Rust's `Path` can express only the first and the third:
+///
+///  * already absolute by **`File`'s** test ([`file_is_absolute`]) -- returned
+///    unchanged. Rust disagrees here: `Path::is_absolute` wants a prefix AND a
+///    root, so a UNC path is "relative" to it and gets joined onto the working
+///    directory, keeping the CWD's drive and discarding the server. That is
+///    where `new File("//").toURI()` produced `file:/C://` against HotSpot's
+///    `file:////`.
+///  * **drive-relative** on Windows (`C:` or `C:foo`) -- a drive letter with no
+///    root. Windows keeps a working directory PER DRIVE and this resolves
+///    against that one, which is what `WinNTFileSystem` does. MEASURED against
+///    HotSpot 25.0.3+9: `new File("C:").toURI()` is
+///    `file:/C:/craton/CratonVM/`, the process's directory on C:, not
+///    `file:/C:/`.
+///  * everything else -- joined onto the process working directory.
+///
+/// It deliberately does NOT collapse `.` or `..`. `getAbsolutePath` is not
+/// `getCanonicalPath`; HotSpot keeps `a\..\b`, and normalising here would move
+/// rows that already agree (`probes/FilePathSweep.java`, `[a/../b]`).
+pub(crate) fn file_absolutize(path: &str) -> String {
+    if file_is_absolute(path) {
+        return path.to_string();
+    }
+    #[cfg(windows)]
+    {
+        // `X:` / `X:rest` -- a drive letter NOT followed by a separator.
+        // `file_is_absolute` has already rejected `X:\...`, so reaching here
+        // with a drive prefix means drive-relative.
+        let c: Vec<char> = path.chars().collect();
+        if c.len() >= 2 && c[0].is_ascii_alphabetic() && c[1] == ':' {
+            if let Some(drive_cwd) = win_drive_working_directory(c[0]) {
+                let rest: String = c[2..].iter().collect();
+                if rest.is_empty() {
+                    return drive_cwd;
+                }
+                let sep = if drive_cwd.ends_with('\\') { "" } else { "\\" };
+                return format!("{drive_cwd}{sep}{rest}");
+            }
+        }
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd
+            .join(std::path::Path::new(path))
+            .to_string_lossy()
+            .into_owned(),
+        Err(_) => path.to_string(),
+    }
+}
+
+/// The working directory Windows keeps for one drive, asked for the way the
+/// platform answers it: `GetFullPathNameW` on the bare `X:`.
+///
+/// Only ever reached for the drive-relative shape, so `GetFullPathNameW`'s
+/// `.`/`..` collapsing cannot leak into an ordinary relative path -- which
+/// would break `getAbsolutePath`, whose contract is explicitly not to
+/// canonicalise.
+#[cfg(windows)]
+fn win_drive_working_directory(drive: char) -> Option<String> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFullPathNameW(
+            lp_file_name: *const u16,
+            n_buffer_length: u32,
+            lp_buffer: *mut u16,
+            lp_file_part: *mut *mut u16,
+        ) -> u32;
+    }
+    let input: Vec<u16> = format!("{drive}:").encode_utf16().chain(Some(0)).collect();
+    let mut buf = vec![0u16; 32768];
+    // SAFETY: `input` is NUL-terminated and lives across the call, `buf` is
+    // writable for `buf.len()` UTF-16 units, and the file-part out-parameter is
+    // documented as optional (null).
+    let n = unsafe {
+        GetFullPathNameW(
+            input.as_ptr(),
+            buf.len() as u32,
+            buf.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    if n == 0 || n as usize >= buf.len() {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..n as usize]))
+}
+
 pub(crate) fn file_join_parent_child_units(parent: &[u16], child: &[u16]) -> Vec<u16> {
     let mut cs = 0;
     let mut ce = child.len();
@@ -15753,8 +15856,32 @@ pub(crate) fn file_join_parent_child_units(parent: &[u16], child: &[u16]) -> Vec
     // the rule is simply: append a separator unless the parent already supplies
     // one. That also covers `C:\\` + `kid` -> `C:\\kid` rather than `C:\\\\kid`.
     let parent_norm = file_normalise_path_units(parent);
+    // A BARE DRIVE is a prefix but not a root, and the "ends in a separator"
+    // test above cannot see the difference. `WinNTFileSystem.resolve` names
+    // this case itself:
+    //
+    //     boolean isDirectoryRelative =
+    //         pn == 2 && isLetter(parent.charAt(0)) && parent.charAt(1) == ':';
+    //
+    // and when it holds it copies the child straight after the parent with NO
+    // separator. `C:kid` is "kid in the current directory ON drive C" and
+    // `C:\kid` is "kid in the ROOT of drive C" — Windows keeps a working
+    // directory per drive, so those name the same file only when the process's
+    // directory on C: happens to be the root. MEASURED against HotSpot
+    // 25.0.3+9, `probes/FilePathSweep.java`:
+    //
+    //   new File("C:", "kid").getPath()
+    //     HotSpot   C:kid
+    //     CratonVM  C:\kid
+    //
+    // Windows-only: on Unix `C:` is an ordinary relative name with no drive
+    // meaning at all, and HotSpot answers `C:/kid` there.
+    let parent_is_drive_relative = cfg!(windows)
+        && parent_norm.len() == 2
+        && parent_norm[1] == u16::from(b':')
+        && char::from_u32(u32::from(parent_norm[0])).is_some_and(|c| c.is_ascii_alphabetic());
     let mut joined: Vec<u16> = parent_norm.clone();
-    if !parent_norm.last().is_some_and(|&c| u_is_sep(c)) {
+    if !parent_is_drive_relative && !parent_norm.last().is_some_and(|&c| u_is_sep(c)) {
         joined.push(u16::from(b'/'));
     }
     joined.extend_from_slice(child_trim);
@@ -16880,14 +17007,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let path = file_read_path(ctx, this);
-            let p = std::path::Path::new(&path);
-            let abs = if p.is_absolute() {
-                path
-            } else {
-                std::env::current_dir()
-                    .map(|cwd| cwd.join(&path).to_string_lossy().into_owned())
-                    .unwrap_or(path)
-            };
+            // The SAME rule `toURI` uses, and they must not drift: `File.toURI()`
+            // is DEFINED in terms of `getAbsoluteFile()`, so a UNC or
+            // drive-relative path that absolutizes differently in the two places
+            // is a `File` whose own URI names a different file.
+            let abs = file_absolutize(&path);
             // java.io.File normalizes a trailing separator on ordinary paths
             // (`new File("/tmp/").getAbsolutePath()` is `/tmp`). Keeping it
             // made Keycloak persist kc.home.dir with a trailing slash while
@@ -16900,14 +17024,8 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     r.register(file, "getAbsoluteFile", "()Ljava/io/File;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        let p = std::path::Path::new(&path);
-        let abs = if p.is_absolute() {
-            path
-        } else {
-            std::env::current_dir()
-                .map(|cwd| cwd.join(&path).to_string_lossy().into_owned())
-                .unwrap_or(path)
-        };
+        // Same shared rule as `getAbsolutePath` above.
+        let abs = file_absolutize(&path);
         let abs = p57_trim_file_trailing_separator(&abs);
         Ok(Some(Value::Object(Some(file_alloc(ctx, &abs)?))))
     });
@@ -17607,17 +17725,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         // `new File("runner").toURI()` into `file:/runner/` — a nonexistent
         // root path that silently dropped relative classpath entries from
         // Gradle's ClasspathUtil walk.
-        let path = {
-            let p = std::path::Path::new(&path);
-            if p.is_absolute() {
-                path.clone()
-            } else {
-                match std::env::current_dir() {
-                    Ok(cwd) => cwd.join(p).to_string_lossy().to_string(),
-                    Err(_) => path.clone(),
-                }
-            }
-        };
+        let path = file_absolutize(&path);
         // Per `File.toURI()`, the result is `new URI("file", null, slashify(absPath, isDir), null)`,
         // which renders as `file:/C:/...` — a SINGLE slash before the path
         // (no `//authority`). Emitting `file://` + `/C:/...` produced the
@@ -17650,6 +17758,29 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         // Directory URIs end with a trailing slash, matching `slashify(...)`.
         if is_dir && !dir_path.ends_with('/') {
             dir_path.push('/');
+        }
+        // `File.toURI()` has one more line, and it is not decoration:
+        //
+        //     String sp = slashify(f.getPath(), f.isDirectory());
+        //     if (sp.startsWith("//")) sp = "//" + sp;
+        //     return new URI("file", null, sp, null);
+        //
+        // A UNC path slashifies to `//server/share`, and a URI whose
+        // scheme-specific part opens with `//` parses the next segment as an
+        // AUTHORITY. Without the doubling the host becomes `server` and the
+        // path shrinks to `/share`; with it the authority is empty and the
+        // whole `//server/share` stays in the path, which is what the JDK
+        // means. MEASURED against HotSpot 25.0.3+9:
+        //
+        //   new File("\\\\server\\share").toURI()
+        //     HotSpot   file:////server/share
+        //     CratonVM  file://server/share
+        //
+        // They do not merely render differently: `getHost()` answers `server`
+        // on one and `null` on the other, so a round trip through
+        // `new File(uri)` reaches a different place.
+        if dir_path.starts_with("//") {
+            dir_path.insert_str(0, "//");
         }
         // RFC 2396 percent-encoding, matching `sun.net.www.ParseUtil.encodePath`
         // used by `File.toURI()`. Without this, special path chars (`^`, space,

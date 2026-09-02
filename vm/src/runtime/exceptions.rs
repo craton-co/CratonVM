@@ -857,9 +857,26 @@ pub mod helpful_npe {
             Instruction::Aaload => {
                 // `<arr>[<idx>]`; recurse on both the array operand (two slots
                 // down) and the index (one slot down). HotSpot reconstructs the
-                // index too (`a[0]`, `a[i]`, `a[Owner.f]`); if either operand
-                // can't be classified we bail to the action-only message rather
-                // than fabricate a partial `a[...]`.
+                // index too (`a[0]`, `a[i]`, `a[Owner.f]`).
+                //
+                // An index it CANNOT reconstruct is printed as the literal
+                // ellipsis -- `a[...]` -- and that is not a partial answer, it
+                // is HotSpot's answer. `BytecodeUtils` renders a constant, a
+                // local and a field load and prints `...` for everything else,
+                // so `a[i & 7]`, `a[i + 1]` and `a[f()]` are all `a[...]`.
+                // Bailing on the index instead cost the WHOLE clause: the
+                // measured shape on `probes/StackTraceCompiledCallee` is
+                // `table[i & 7][0]`, where the `iand` is unmodelled, and
+                // CratonVM printed the action alone where HotSpot 25 prints
+                // `Cannot load from int array because
+                // "StackTraceCompiledCallee.table[...]" is null`. Residual 7 of
+                // `jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902`.
+                //
+                // The ARRAY operand still bails the whole expression when it
+                // cannot be classified, and must: `...[0]` would name no
+                // expression at all, where `a[...]` names one and elides only
+                // the subscript -- which is exactly the distinction HotSpot
+                // draws.
                 let stack = simulate_to(code, producer_bci, resolver)?;
                 let arr_slot = stack.len().checked_sub(2)?;
                 let idx_slot = stack.len().checked_sub(1)?;
@@ -870,8 +887,10 @@ pub mod helpful_npe {
                 let index = stack
                     .get(idx_slot)
                     .and_then(|s| s.producer_bci)
-                    .and_then(|b| describe_producer(code, b, resolver, depth + 1))?;
-                Some(Producer::expr(format!("{}[{}]", arr.text, index.text)))
+                    .and_then(|b| describe_producer(code, b, resolver, depth + 1))
+                    .map(|p| p.text)
+                    .unwrap_or_else(|| "...".to_string());
+                Some(Producer::expr(format!("{}[{index}]", arr.text)))
             }
             // A checkcast is transparent to the expression: `((String) o)` is
             // named after `o`. Recurse on the value being cast.
@@ -1866,14 +1885,21 @@ fn throwable_suppressed_sentinel(shared: &SharedVm) -> Option<Value> {
 ///
 /// A `None` snapshot (the kill switch, or an NPE with no compiled frames under
 /// it) leaves the throwable exactly as it was.
+///
+/// `frames` is the thread's own frame stack, and it is not optional: a compiled
+/// activation that is the SAME activation as one of those frames — an OSR
+/// continuation is always one — must be dropped, or the trace names it twice.
+/// See `stackwalker::dedupe_compiled_snapshot`.
 pub fn attach_snapshotted_npe_frames(
     shared: &SharedVm,
+    frames: &[crate::runtime::frame::Frame],
     throwable: ObjectRef,
     snapshot: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
 ) {
     let Some(snapshot) = snapshot else {
         return;
     };
+    let snapshot = crate::runtime::stackwalker::dedupe_compiled_snapshot(frames, snapshot);
     if snapshot.is_empty() {
         return;
     }

@@ -190,12 +190,23 @@ and a reported line number still means something.
 because *HotSpot's own correct output is frequently not valid UTF-8.* HotSpot
 derives `stdout.encoding` from the host — JEP 400 pinned `file.encoding` and
 deliberately left this one alone — so on a cp1252-style Windows console an `é`
-leaves HotSpot as the single byte `0xE9`. CratonVM emits UTF-8
-unconditionally. An earlier version of this harness decoded both children with
-`String::from_utf8_lossy`, which turned that `0xE9` into `U+FFFD` and then
-reported a divergence against a line HotSpot never wrote — the harness blaming
-the VM for a defect in its own decoder, and on the *reference* side, which is
-the least defensible place for a differential tool to be wrong.
+leaves HotSpot as the single byte `0xE9`. An earlier version of this harness
+decoded both children with `String::from_utf8_lossy`, which turned that `0xE9`
+into `U+FFFD` and then reported a divergence against a line HotSpot never wrote
+— the harness blaming the VM for a defect in its own decoder, and on the
+*reference* side, which is the least defensible place for a differential tool
+to be wrong.
+
+**Since 2026-09-01 CratonVM derives the same value from the same host, so the
+two sides no longer disagree about this by construction.** When this section was
+written CratonVM pinned `stdout.encoding` to `UTF-8` unconditionally, which made
+*every* non-ASCII line of *every* program a guaranteed divergence on a
+non-UTF-8 host — the ten-row Windows witness on the known-issue page below was
+found exactly that way. Both VMs now read the console/locale, and `--diff-hotspot`
+runs them on one machine, so that whole class of false red is gone. The escape
+and the hint below are kept, because the premise they defend against is still
+reachable: `CRATONVM_STDOUT_ENCODING=<name>` pins one side by hand, and a
+genuine charset defect produces the same shape.
 
 `capture` now decodes with an **injective** byte-to-text escape: valid UTF-8
 decodes normally, and every byte that is not part of a valid sequence becomes a
@@ -222,8 +233,12 @@ cratonvm --diff-hotspot -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8 <the sam
 `-D` properties are forwarded to both sides by the ordinary rule in §6, and
 `UTF-8` is the one value the specification blesses for these keys
 (`java.lang.System`'s property table: starting the runtime with
-`stdout.encoding` set to anything *else* is unspecified behaviour). Measured:
-this collapses all ten of the known-issue page's Windows divergences to zero.
+`stdout.encoding` set to anything *else* is unspecified behaviour). Measured
+2026-09-01: this collapsed all ten of the known-issue page's Windows
+divergences to zero — which is what proved they were encoding and not
+semantics. Since 2026-09-02 those ten do not diverge in the first place, so the
+pin is now a diagnostic for a divergence you are *investigating* rather than a
+workaround for one the VM guarantees.
 
 **It is a hint, not a masker.** The verdict stays `DIVERGENCE` and the exit code
 stays `1`. There is no `--diff-ignore-encoding`, deliberately:
@@ -251,8 +266,9 @@ records, and it would change the program under test. The user asks for it or
 nobody does.
 
 Full investigation, including the ten-row Windows witness and why CratonVM's
-`stdout.encoding` is a constant:
-`docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-20260901.md`.
+`stdout.encoding` *was* a constant:
+`docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-20260901.md`
+(§10 records the fix, §11 what it did not cover).
 It reproduces on Linux with no Windows box — `LC_ALL=C java -cp probes
 StdoutEncoding` gives the `?`-substituting side, and
 `java -Dstdout.encoding=ISO-8859-1 …` gives the raw-`0xE9` side that the lossy

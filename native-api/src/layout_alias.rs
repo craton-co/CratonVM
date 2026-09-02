@@ -294,10 +294,20 @@ impl AllocSite<'_> {
 /// the expensive part and only the caller can avoid building them.
 ///
 /// Returns the direction reported, or `None` when the row was suppressed —
-/// either the flag is off, the counts agree, `declared == 0`, or this exact
-/// `(class, requested, declared, site)` has been reported before. Returned
-/// rather than discarded so a caller (and a test) can tell "clean" from "not
-/// looking", which is the distinction this whole lane is about.
+/// either the flag is off, the counts agree, nothing was requested
+/// (`requested == 0`), or this exact `(class, requested, declared, site)` has
+/// been reported before. Returned rather than discarded so a caller (and a
+/// test) can tell "clean" from "not looking", which is the distinction this
+/// whole lane is about.
+///
+/// `declared == 0` is **not** in that list, and used to be. It is the
+/// [`Direction::Undeclared`] case — the short-object species — and [`classify`]
+/// makes it the FIRST arm it tests precisely so it can never be reached by
+/// accident ("It is the reported case, not the leftover one"). The stale clause
+/// described this recorder as dropping exactly the shape the detector had just
+/// been widened to catch, which reads as "the census cannot see it" to anyone
+/// who checks the contract instead of the body — and the census is the only
+/// instrument that answers "does this class have two layouts".
 ///
 /// # Deduplication
 ///
