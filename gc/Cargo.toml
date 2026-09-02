@@ -81,30 +81,27 @@ gpu-offload = []
 #    mark-sweep: it traces the live graph from the supplied roots, marks
 #    survivors in the header and reclaims dead objects onto a free list. It is
 #    non-moving, so it reclaims but does not compact.
-#  * `ZgcCollector` / `ZgcHeap` / `GenerationalZgc` / `ColoredPointer` /
-#    `LoadBarrier` remain a metadata-only SIMULATION of OpenJDK ZGC's model:
-#    synthetic `u64` page addresses with no backing storage, a forwarding
-#    table that copies no bytes, and a `&mut self` load barrier rather than an
-#    atomic self-healing CAS. Selecting one emits a one-time `tracing::warn!`
-#    so it can never masquerade as production ZGC. The module docs enumerate
-#    exactly what is deferred.
+#  * The SIMULATION is gone (2026-09-02). `ZgcCollector` / `ZgcHeap` /
+#    `GenerationalZgc` / `ColoredPointer` / `LoadBarrier` were a metadata-only
+#    model of OpenJDK ZGC -- synthetic page addresses, a forwarding table that
+#    copied no bytes, a `&mut self` load barrier -- kept as scaffolding for the
+#    real modules. The real modules landed, so the scaffolding was 1,250 lines
+#    of a production file that nothing outside its own tests referenced. Every
+#    concept in it now has an honest implementation: `zgc::vaddr`,
+#    `zgc::barrier`, `zgc::page`, `zgc::generation`.
 #  * The twelve `src/zgc/` modules are real, compiling and unit-tested, and
-#    HALF of them are now adopted by `ZgcRealHeap`. Counting uses in
-#    `src/zgc.rs` outside its `mod tests` (2026-08-10):
-#      census 24 · mark 15 · tlab 12 · vaddr 7 · page 2 · metrics 1  ADOPTED
-#      barrier · forwarding · remembered · generation · relocate · adapters NOT
-#    The TLAB is default-ON and serves `alloc_object`/`alloc_array` via
-#    `alloc_raw_tlab`, so do NOT say "not wired into the real allocator" —
-#    that phrasing was carried out of this file into
+#    most of them are adopted by `ZgcRealHeap` to some degree.
+#    DO NOT WRITE THE NUMBERS HERE. A census in this comment and its twin in
+#    `src/zgc.rs` were both wrong within days of being written, and the wrong
+#    one was carried into
 #    `docs/known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md`
-#    and used to discount a suite result. What is still true is the COLLECTOR:
-#    `ZgcRealHeap` remains a stop-the-world non-moving mark-sweep, the six
-#    unadopted modules are exactly the moving/generational/concurrent
-#    machinery, and `vm_init.rs` hard-codes `RELOCATION_REQUESTED = false`.
-#    The feature is not concurrent and not generational. Remaining adoption is
-#    tracked in `docs/feature-designs/zgc-production-implementation-plan.md`.
-#    Recount before quoting, from the repo root:
-#      awk '/^mod tests \{/{exit} {print}' gc/src/zgc.rs | grep -c '\bcensus::'
+#    and used to discount a suite result. The count now lives in
+#    `types/tests/zgc-submodule-adoption.txt`, is produced by
+#    `scripts/zgc-submodule-adoption.sh`, and is enforced by
+#    `zgc_submodule_adoption_matches_the_recorded_census` -- so it cannot go
+#    stale silently. Read it there.
+#    Remaining adoption is tracked in
+#    `docs/feature-designs/zgc-production-implementation-plan.md`.
 #
 # IT HAS IN-TREE CONSUMERS. `vm_heap.rs` carries a `VmHeap::Zgc` arm behind
 # `#[cfg(feature = "zgc")]`, and `cratonvm-vm` forwards the feature
