@@ -51959,11 +51959,17 @@ pub fn gc_overlay_owner_addrs() -> Option<std::collections::HashSet<usize>> {
     let index = overlay_owner_keys()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if index.is_empty() {
-        None
-    } else {
-        Some(index.keys().copied().collect())
-    }
+    // `Some` of an EMPTY set, not `None`, when nothing is registered.
+    //
+    // The two say opposite things to a marker. `None` means "I cannot
+    // enumerate my owners, so do not exclude anything on my behalf"
+    // (`ExternalRootProvider::owner_addrs`), which forces the per-object
+    // overlay lookup -- the provider lock and this mutex -- for every marked
+    // object in the heap. `Some(empty)` is the fact: this provider owns
+    // nothing, so no address needs asking about. A program that touches no
+    // native-backed collection is exactly the case that was paying most for
+    // the ambiguity.
+    Some(index.keys().copied().collect())
 }
 
 /// Return the Rust-side references owned by one already-marked collection.
@@ -71925,6 +71931,50 @@ fn native_executors_new_scheduled_pool(
 // so the request now equals the declared width.
 const CF_FIELD_RESULT: usize = 0;
 const CF_FIELD_DONE: usize = 1;
+
+/// `CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT` — default-ON, `=0` opts out. Routes
+/// the `postComplete()` callback through `invoke_virtual_bytecode_only`
+/// instead of `invoke_virtual`, i.e. straight to the interpreter's `execute`
+/// rather than through the by-NAME native resolver that misses. See the call
+/// site in `native_cf_complete`.
+fn cf_postcomplete_direct_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static GATE: AtomicU8 = AtomicU8::new(0);
+    match GATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = match cratonvm_types::flags::runtime_var(
+                "CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT",
+            ) {
+                Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+                Err(_) => true,
+            };
+            GATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// `CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP` — default-ON, `=0` opts out. See the
+/// call site in `native_cf_complete`.
+fn cf_postcomplete_skip_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static GATE: AtomicU8 = AtomicU8::new(0);
+    match GATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on =
+                match cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP") {
+                    Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+                    Err(_) => true,
+                };
+            GATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
 /// Number of slots a CratonVM *synthetic* `CompletableFuture` carries — the
 /// real declared width, because `CF_FIELD_RESULT`/`CF_FIELD_DONE` are the only
 /// two slots any native in this crate touches.
@@ -73581,7 +73631,32 @@ fn native_cf_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // cross-thread `complete()` (the timed `get(...)` only "self-heals"
         // because `parkNanos` re-polls `result`). Run `postComplete()` to release
         // waiters — this is the missing half of the synthetic override.
-        ctx.invoke_virtual(this, "postComplete", "()V", &[])?;
+        //
+        // ...but only when there is a stack to pop. `postComplete()`'s whole
+        // body is `while ((h = f.stack) != null || (f != this && (h = (f =
+        // this).stack) != null))`, so with `stack`@1 null it returns having
+        // done nothing — and this callback is not cheap: it is a by-NAME
+        // virtual dispatch out of a native, which resolves through
+        // `invoke_or_native` (two registry probes plus the descriptor-quirk
+        // scan, all of them misses — `postComplete` is not a native) and then
+        // through `invoke_on_class_shared_inner`. The composition page's
+        // "name-keyed lookup, 8.2 %" bucket is that chain: 100 005 missed
+        // `CompletableFuture.postComplete()V` registry lookups in 40 000
+        // chains, 76 % of every miss on the workload.
+        //
+        // A `complete()` with no dependents and no waiter is the common shape
+        // outside a composition benchmark; there the whole chain now costs one
+        // field read. `CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP=0` restores the
+        // unconditional callback so the two arms can be priced in one binary.
+        let no_waiters = matches!(ctx.get_field(this, CF_FIELD_DONE), Value::Object(None))
+            && cf_postcomplete_skip_enabled();
+        if !no_waiters {
+            if cf_postcomplete_direct_enabled() {
+                ctx.invoke_virtual_bytecode_only(this, "postComplete", "()V", &[])?;
+            } else {
+                ctx.invoke_virtual(this, "postComplete", "()V", &[])?;
+            }
+        }
     }
     Ok(Some(Value::Int(1)))
 }
@@ -73658,7 +73733,13 @@ fn native_cf_complete_exceptionally(
     // blocked in untimed `get()`/`join()`. Without this they hang forever on a
     // cross-thread exceptional completion — the same defect fixed in
     // `native_cf_complete`.
-    ctx.invoke_virtual(this, "postComplete", "()V", &[])?;
+    //
+    // `invoke_virtual_bytecode_only`, not `invoke_virtual`, for the reason the
+    // sibling in `native_cf_complete` states and measures: `postComplete` is
+    // ordinary JDK bytecode and can never be a native, so the by-NAME resolver
+    // is two hashes of the 53-byte triple plus the cold descriptor-quirk
+    // rewrite, all of them misses, per completion.
+    ctx.invoke_virtual_bytecode_only(this, "postComplete", "()V", &[])?;
     Ok(Some(Value::Int(1)))
 }
 

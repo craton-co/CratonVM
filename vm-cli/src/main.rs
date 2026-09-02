@@ -222,6 +222,10 @@ fn maybe_dump_shutdown_reports() {
     // the switch having been off.
     cratonvm_vm::threading::monitor::report_monitor_notify_census_at_exit();
 
+    // The two composition censuses (`CRATONVM_DBG_INTERP_FRAMES`,
+    // `CRATONVM_DBG_TIERUP_DECLINE`). Each prints nothing when unarmed.
+    cratonvm_vm::runtime::interp_census::report_at_exit();
+
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
         // The `getfield` fast-path ENGAGEMENT number, on the same switch. The
@@ -260,6 +264,33 @@ fn maybe_dump_shutdown_reports() {
             eprintln!(
                 "[cratonvm] compiled reference stores: gated={gated} declined={declined}"
             );
+            // The OPTIMIZING tier's own pair, never folded into the one above.
+            // Until 2026-09-02 that tier lowered every reference store to the
+            // helper unconditionally, so it reported neither number -- and a
+            // hot loop is compiled there, which is why a healthy single-pass
+            // count said nothing about where the time went. Zero on BOTH sides
+            // here means the tier compiled no reference store at all; a
+            // declined count with the reasons below means it asked and refused.
+            let (ir_gated, ir_declined) = cratonvm_jit::metrics::ir_ref_store_site_counts();
+            eprintln!(
+                "[cratonvm] optimizing-tier reference stores: gated={ir_gated} declined={ir_declined}"
+            );
+            for (name, count) in cratonvm_jit::metrics::ir_ref_store_declines() {
+                eprintln!("[cratonvm]   ir ref-store declined {name}: {count}");
+            }
+            // The DYNAMIC split, only under CRATONVM_DBG_IR_REF_STORE_TRACE=1.
+            // `gated=N` above is a count of emitted sequences; this is a count
+            // of executions, and a sequence whose compactness gate never
+            // passes has the first without the second.
+            let (inline_taken, helper_taken) = cratonvm_jit::metrics::ir_ref_store_path_counts();
+            if inline_taken != 0 || helper_taken != 0 {
+                eprintln!(
+                    "[cratonvm]   ir ref-store executions: inline={inline_taken} helper={helper_taken}"
+                );
+                for (name, count) in cratonvm_jit::metrics::ir_ref_store_bails() {
+                    eprintln!("[cratonvm]     ir ref-store bail {name}: {count}");
+                }
+            }
             // Optimizing-tier allocation. A zero on the left is the EXPECTED
             // reading under a default configuration -- `c2_alloc_upgrade` is
             // opt-in, so no method containing a `new` reaches that tier -- and

@@ -993,7 +993,7 @@ pub fn update_all_roots(
     // registers. This is what makes the moving collector correct under JIT.
     if crate::jit::conservative_roots::shadow_stack_enabled() {
         let _rewritten = thread.shadow_stack.remap(pointer_map);
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW").is_some() && _rewritten > 0
+        if crate::runtime::env_cache::dbg_shadow() && _rewritten > 0
         {
             eprintln!(
                 "[SHADOW] remap: depth={} rewritten={}",

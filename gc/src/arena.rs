@@ -1843,6 +1843,70 @@ impl Arena {
     /// reclaimed span itself so a later conservative root scan cannot
     /// observe a stale object header inside the hole.
     ///
+    /// Replace the whole LOW free list with `spans`, which must be
+    /// address-ordered, non-overlapping, non-adjacent, and below the low
+    /// cursor.
+    ///
+    /// The sweep used to hand this list over one dead object at a time, and
+    /// every consumer downstream then had to undo that: `coalesce_free_list`
+    /// sorted the whole list and merged neighbours, `retract_cursor_into_free_tail`
+    /// sorted it again to find the top block, `decommit_free_blocks` sorted it
+    /// again looking for granules, and `compact_low_to` sorted it once more.
+    /// Four or five full sorts and rebuilds per collection, all of them
+    /// recovering an ordering the sweep destroyed by walking objects instead
+    /// of address space.
+    ///
+    /// A sweep that computes free space as *the complement of the live set*
+    /// produces the merged, ordered list directly, so this installs it as it
+    /// stands: no sort, no coalesce pass, and `free_pushed` left at zero
+    /// because nothing is pending to merge.
+    ///
+    /// # Panics (debug only)
+    /// Debug-asserts the ordering and disjointness it relies on, and that
+    /// every span lies below the cursor.
+    /// Returns the bytes that were on the list this call replaced, which is
+    /// what a caller needs to tell "free now" from "freed by this cycle".
+    pub fn rebuild_low_free_list(&mut self, spans: &[(usize, usize)]) -> usize {
+        #[cfg(debug_assertions)]
+        {
+            let mut prev_end = 0usize;
+            for &(off, len) in spans {
+                assert!(len > 0, "an empty span is not a free block");
+                assert!(
+                    off >= prev_end,
+                    "spans must be ordered and disjoint: {off} starts below {prev_end}",
+                );
+                assert!(
+                    off + len <= self.cursor,
+                    "span {off}+{len} runs past the low cursor {}",
+                    self.cursor,
+                );
+                prev_end = off + len;
+            }
+        }
+        let was_free = self.clear_low_free_list();
+        for &(off, len) in spans {
+            if len == 0 {
+                continue;
+            }
+            if (off | len) & 7 != 0 {
+                warn_unaligned_block("rebuild", off, len);
+            }
+            self.max_free_upper = self.max_free_upper.max(len);
+            self.push_block_routed(FreeBlock {
+                offset: off,
+                size: len,
+            });
+        }
+        // Merged by construction, so nothing is pending and the backoff has
+        // nothing to back off from.
+        self.free_pushed = 0;
+        self.coalesce_threshold = COALESCE_THRESHOLD_MIN;
+        // The anchors index INTO the list this call just replaced.
+        self.clear_alloc_anchors();
+        was_free
+    }
+
     /// # Panics (debug only)
     /// Debug-asserts the block lies fully within the live (`< cursor`)
     /// region of the arena.
@@ -2160,7 +2224,7 @@ impl Arena {
 
     /// Drop every LOW-end block, leaving the high end untouched. The rebuild
     /// half of the two low-list operations above.
-    fn clear_low_free_list(&mut self) {
+    fn clear_low_free_list(&mut self) -> usize {
         let dropped: usize = self
             .free_small
             .iter()
@@ -2177,6 +2241,7 @@ impl Arena {
         self.free_large_blocks = 0;
         self.max_free_upper = 0;
         self.free_pushed = 0;
+        dropped
     }
 
     /// Snapshot of the current free list as `(offset, size)` pairs,
@@ -2709,6 +2774,28 @@ impl Arena {
     /// only the single highest block is considered. Returns 0 when that block
     /// does not reach the cursor (a live object sits above it), the ordinary
     /// mid-heap case.
+    /// Lower the low bump cursor to `new_cursor`, decommitting what that
+    /// gives back. Returns the bytes reclaimed.
+    ///
+    /// [`Self::retract_cursor_into_free_tail`] does the same thing by SEARCHING
+    /// for a free block that ends at the cursor, which means sorting the whole
+    /// low free list. A sweep that walked the address space already knows
+    /// where the last live object ends, so it can say so directly and the list
+    /// never has to carry -- or be sorted to find -- the tail span at all.
+    ///
+    /// Refuses to RAISE the cursor: this is a reclaim, and handing out bytes
+    /// above the cursor is the bump path.s job.
+    pub fn retract_cursor_to(&mut self, new_cursor: usize) -> usize {
+        if new_cursor >= self.cursor {
+            return 0;
+        }
+        let old_cursor = self.cursor;
+        let reclaimed = old_cursor - new_cursor;
+        self.cursor = new_cursor;
+        self.decommit_span(new_cursor, old_cursor);
+        reclaimed
+    }
+
     pub fn retract_cursor_into_free_tail(&mut self) -> usize {
         // LOW blocks only. Reading the whole list here would take the highest
         // block in the ARENA — which, once the large-object end has been used,
