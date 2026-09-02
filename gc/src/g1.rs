@@ -9981,6 +9981,27 @@ impl G1Collector {
             }
         }
 
+        // WHERE CLASS UNLOADING IS (F-19, and it is not here).
+        //
+        // A 2026-09-02 review reported "no class unloading is wired to the G1
+        // mark cycle", from `grep class_unloading gc/src/g1.rs` returning
+        // nothing. It IS wired, and the grep could not have found it: the real
+        // unload transaction lives in `vm/`, driven from
+        // `interpreter::gc_and_alloc::g1_remark_process_references` — the final
+        // remark, which is the only point in a cycle where a weak reference to a
+        // dead OLD-region referent can be observed dead — and from
+        // `process_references_after_gc` on the post-pause path. Each calls
+        // `classloader::gc_reconcile_defining_loaders` and then
+        // `memory::gc::unload_dead_class_metadata`.
+        //
+        // `gc/src/class_unloading.rs` is NOT that. Its module header says so:
+        // no caller anywhere in the workspace, every table permanently empty,
+        // kept as scaffolding. Do not wire it in without reading it.
+        //
+        // Left here because this is where the question gets asked from, and a
+        // grep that finds nothing reads as an answer.
+        // `vm/tests/g1_class_unloading_wired.rs` is the tripwire.
+
         // G1MARK-8: humongous reclaim trusts the same possibly-incomplete
         // closure — skip it under either fail-safe (G1AUD-3 adds the
         // undrained-gray-set case to the implausible-header one).
