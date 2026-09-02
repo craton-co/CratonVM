@@ -2017,6 +2017,13 @@ pub const INVENTORY: &[E] = &[
     // unconditional per-read rebuild, which is the A/B a same-binary
     // bisection needs.
     E { group: Group::COMPAT, token: "map-view-cache", on_key: Some("CRATONVM_MAP_VIEW_CACHE"), off_key: None, off_word: Some("0"), since: "2026-08-23" },
+    // `ClassLoader.getResource` / `Class.getResource` stopping at the first
+    // matching classpath entry, default-ON. `0` restores the whole-list walk
+    // that built every matching URL and returned element 0. The two are
+    // required to answer identically, so the flag can only change how much of
+    // the classpath was touched — which makes it the same-binary A/B for that
+    // cost.
+    E { group: Group::COMPAT, token: "getresource-first-hit", on_key: Some("CRATONVM_GETRESOURCE_FIRST_HIT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     // Take the elision decision, then rebuild anyway and compare, panicking
     // on divergence. Turns the soundness claim into something measured
     // rather than argued; expensive, so default-OFF.
