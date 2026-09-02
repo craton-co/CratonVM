@@ -577,7 +577,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-279 tokens.
+284 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -742,6 +742,7 @@ export inherited from a parent shell.
 | `ic-frame-republish` | `CRATONVM_JIT_NO_IC_FRAME_REPUBLISH` |
 | `checkcast-inline` | `CRATONVM_JIT_CHECKCAST_INLINE` |
 | `final-devirt` | `CRATONVM_JIT_FINAL_DEVIRT` |
+| `devirt-intrinsic-yield` | `CRATONVM_JIT_NO_DEVIRT_INTRINSIC_YIELD` |
 | `inline-calls` | `CRATONVM_JIT_INLINE_CALLS` |
 | `inline-nest` | `CRATONVM_JIT_INLINE_NEST` |
 | `inline-call-dispatch` | `CRATONVM_JIT_INLINE_CALL_DISPATCH` |
@@ -829,6 +830,7 @@ export inherited from a parent shell.
 | `elide-trivial-ctor` | `CRATONVM_JIT_ELIDE_TRIVIAL_CTOR` |
 | `site-cache-stubs` | `CRATONVM_JIT_SITE_CACHE_STUBS` |
 | `atomic-long-intrinsic` | `CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC` |
+| `box-unbox-intrinsic` | `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC` |
 | `tier-c1-threshold` | `CRATONVM_TIER_C1_THRESHOLD` |
 | `tier-c2-min-invocations` | `CRATONVM_TIER_C2_MIN_INVOCATIONS` |
 | `tier-c2-threshold` | `CRATONVM_TIER_C2_THRESHOLD` |
@@ -853,6 +855,9 @@ export inherited from a parent shell.
 | `verify-schedule` | `CRATONVM_JIT_VERIFY_SCHEDULE` |
 | `verify-types` | `CRATONVM_JIT_VERIFY_TYPES` |
 | `virtual-tierup` | `CRATONVM_JIT_VIRTUAL_TIERUP` |
+| `xt-helper-window-discharge` | `CRATONVM_XT_HELPER_WINDOW_DISCHARGE` |
+| `xt-helper-window-interior` | `CRATONVM_XT_HELPER_WINDOW_INTERIOR` |
+| `xt-helper-window-pin` | `CRATONVM_XT_HELPER_WINDOW_PIN` |
 | `xt-helper-window-scan` | `CRATONVM_XT_HELPER_WINDOW_SCAN` |
 | `xt-jit-root-scan` | `CRATONVM_XT_JIT_ROOT_SCAN` |
 | `xt-peer-deadline-ms` | `CRATONVM_XT_PEER_DEADLINE_MS` |
@@ -863,7 +868,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-108 tokens.
+109 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -950,6 +955,7 @@ export inherited from a parent shell.
 | `youngscan-stride` | `CRATONVM_YOUNGSCAN_STRIDE` |
 | `zgc-parmark` | `CRATONVM_ZGC_PARMARK` |
 | `zgc-relocate` | `CRATONVM_ZGC_RELOCATE` |
+| `zgc-assume-rewritable` | `CRATONVM_ZGC_ASSUME_REWRITABLE` |
 | `zgc-relocate-proven-jit` | `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT` |
 | `zgc-high-compaction` | `CRATONVM_ZGC_HIGH_COMPACTION` |
 | `zgc-tlab-starved-recycle` | `CRATONVM_ZGC_TLAB_STARVED_RECYCLE` |
@@ -1103,7 +1109,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-21 tokens.
+22 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1128,6 +1134,7 @@ export inherited from a parent shell.
 | `strict-swallows` | `CRATONVM_STRICT_SWALLOWS` |
 | `tomcat-mapper-natives` | `CRATONVM_TOMCAT_MAPPER_NATIVES` |
 | `vh-strict-reference-return` | `CRATONVM_VH_STRICT_REFERENCE_RETURN` |
+| `vh-null-coordinate-npe` | `CRATONVM_VH_NULL_COORDINATE_NPE` |
 
 ## `CRATONVM_TEST`
 

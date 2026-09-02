@@ -3808,7 +3808,7 @@ struct MergeState {
 //
 // ## The defect this closes
 //
-// `docs/known-issues/perf/string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901.md`
+// string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901
 // measured `s.charAt(i)` in a counted loop at a FLAT 186-196 ns/char from
 // 200 000 to 100 000 000 characters, against 5.2 ns/char for the identical
 // loop over a `char[]` in the same run and 0.5 on HotSpot. The cause is

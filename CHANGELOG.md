@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-09-02 `String` is `final`, and that is what killed its own intrinsic — 170x on `charAt`
+
+`String.charAt` in a compiled counted loop cost ~400 ns/char while a
+byte-identical body elsewhere in the same binary cost 3, and no documented
+lever moved it. `string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901`
+tested five hypotheses about the METHOD, refuted all five, correctly located
+the discriminator as the compile DOOR, and stopped one question short of why
+the doors differ.
+
+They differ because `java/lang/String` is `final`.
+`invokevirtual_site_final_owner` therefore answers for every
+`String.charAt`/`length`/`isEmpty`/`hashCode` site in the tree, and
+`try_compile_inner`'s invoke loop rewrites `invoke_kind` 0 -> 1 on that
+answer. Correct about dispatch, disastrous about codegen: the instance
+call-site intrinsic gate is `invoke_kind == 0 || invoke_kind == 2`, and a
+kind-1 site enters the inline/direct-bind ladder first and leaves the loop
+through its `continue`. So the site was bound to a real `CALL` into
+`charAt -> isLatin1 -> StringLatin1.charAt -> checkIndex ->
+Preconditions.checkIndex` and never offered the inline decode — silently, past
+all three `string-intrinsic` diagnostics and invisible to the pin's four
+counters. The OSR door runs no such rewrite, which is the whole of the 100x.
+
+The rewrite now yields: a site `try_resolve_intrinsic` or
+`try_resolve_string_intrinsic` would take stays at kind 0 for the gate to
+claim. The JVMS 5.4.6 rule the rewrite exists for is untouched — no intrinsic
+matches a private method, so `String.isLatin1`, `coder` and `checkIndex` stay
+pinned, and a test asserts it.
+
+`probes/CharAtCostCurve.java`'s `charAt` rows go from **~560 to ~3.3 ns/char**
+one binary, one flag (`CRATONVM_JIT_NO_DEVIRT_INTRINSIC_YIELD`) — ~1700x
+HotSpot to ~14x. `probes/CharAtDoorProbe.java`, added here, puts five
+byte-identical bodies in one class: the affected arm moves 262.70 -> 1.88 and
+the four unaffected arms do not move at all.
+
+Two things this also settles. The pin is **not** retirable: with the intrinsic
+actually reaching the emitter, `CRATONVM_JIT_NO_STRING_INTRINSIC_PIN=1` is now
+30x WORSE (~100 ns/char against ~3.3), where the page had measured it 3-5x
+better — both arms of that comparison were pricing a program the pin was no
+longer protecting. And the IR expander's design premise is false: measured with
+`CRATONVM_DBG_LICM=1`, `loop_has_hard_barrier=true` on every header, so the
+`value`/`coder` loads it depends on hoisting never leave the loop.
+
+Counted (`DEVIRT_YIELDED_TO_INTRINSIC`), printed beside the pin census. See
+`string-charat-loop-cost-and-the-unsteerable-intrinsic-FIXED-20260902.md`.
+
 ### 2026-09-02 The generational young collector's copy phase can run in parallel
 
 `GenerationalHeap`'s moving (Cheney) young cycle copied its survivors on one
