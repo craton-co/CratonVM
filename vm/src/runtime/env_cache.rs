@@ -1875,6 +1875,14 @@ cached_is_set!(no_osr_inline_gate, "CRATONVM_JIT_NO_OSR_INLINE_GATE");
 /// every cache hit through `execute_invokevirtual_cached`. Token:
 /// `CRATONVM_JIT=-invoke-fast-door`.
 cached_is_set!(no_invoke_fast_door, "CRATONVM_JIT_NO_INVOKE_FAST_DOOR");
+
+/// `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` -- disable the monomorphic
+/// `invokestatic` / `invokespecial` fast doors (borrowed cache entry,
+/// verbatim `CompactValue` argument transfer, and for `invokestatic` a
+/// per-method invocation counter in place of the sharded profile-store
+/// lock). Off routes every cache hit through the general dispatcher.
+/// Token: `CRATONVM_JIT=-nonvirtual-fast-door`.
+cached_is_set!(no_nonvirtual_fast_door, "CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR");
 /// `CRATONVM_DBG_BYTECODE_DUMP` -- temporary raw-bytecode + mnemonic
 /// disassembly dump (2026-07-15, JRubyScriptTemplateTests round 3): see
 /// `push_frame_and_fire_entry`'s own doc comment for the full story --
