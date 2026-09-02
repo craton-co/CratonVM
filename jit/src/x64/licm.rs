@@ -438,10 +438,11 @@ pub(crate) fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
         // is 4 bytes for the load/store/ret family, and `wide iinc <index>
         // <const>` is 6 bytes (extra 2-byte signed constant). The modified
         // opcode is the byte at `pc + 1`: only `iinc` (0x84) takes the 6-byte
-        // form. Currently latent — `jit_scan` rejects `wide`, so no compiled
-        // method contains it — but the length table must stay correct as
-        // defense-in-depth so every PC-stepping consumer stays in lockstep if
-        // `wide` is ever accepted. Keep the regalloc.rs `bc_len` twin in sync.
+        // form. NOT latent, whatever this comment used to say: `jit_scan`
+        // accepts the widened load/store and `iinc` forms
+        // (`x64/bytecode_compat.rs`), so compiled methods DO contain `wide` and
+        // every PC-stepping consumer of this table is load-bearing rather than
+        // defensive. Keep the regalloc.rs `bc_len` twin in sync.
         0xc4 => {
             if pc + 1 < code.len() && code[pc + 1] == 0x84 {
                 6 // wide iinc
