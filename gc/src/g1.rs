@@ -1697,6 +1697,60 @@ impl G1Region {
         align: usize,
         site: &'static str,
     ) -> Option<(*mut u8, usize)> {
+        self.bump_alloc_initialized(size, align, site, |_| {})
+    }
+
+    /// [`Self::bump_alloc`], with `init` run over the fresh span BEFORE the
+    /// region cursor is advanced.
+    ///
+    /// # The cursor is the publication point, so the header has to precede it
+    ///
+    /// `self.cursor` is what every heap walk in this file means by "there is an
+    /// object here": `scan_source_region_for_cset_refs`, `locate_in_object_grid`
+    /// and the Phase-4 walks all iterate `[0, cursor)` and decode a header at
+    /// each step, and `classify_candidate_header` accepts any address below the
+    /// cursor. Advancing the cursor before the header is written therefore
+    /// publishes an object that does not yet describe itself.
+    ///
+    /// `bump_alloc` used to do exactly that, and its callers finished the job
+    /// afterwards — `G1Collector::try_alloc_array` and
+    /// `G1Collector::try_alloc_object` write the `ObjectHeader` after
+    /// `alloc_in_region` has returned, i.e. after the regions lock has been
+    /// DROPPED. The span is zeroed, so a walker arriving in that window reads
+    /// `class_id=0`, `kind=Object` (tag 0), `num_slots=0` — and then, once the
+    /// caller's 16-byte header store is partly retired, whatever prefix of it
+    /// has landed. `ObjectHeader`'s first eight bytes are `class_id` and
+    /// `shape`; its `kind` and `element_type` live in the top bits of the
+    /// mark word, in the SECOND eight. So the intermediate state of an array
+    /// header store is `class_id`, `shape = length`, `kind = Object` — a
+    /// LEGACY OBJECT claiming `length` sixteen-byte slots, which for a
+    /// primitive array (`class_id` 0, see `try_alloc_array`'s callers) is
+    /// exactly `class_id=0 kind=Object num_slots=<length> array_len=0`.
+    ///
+    /// That is the holder shape the 2026-08-30 census on
+    /// `org.h2.test.store.TestKillProcessWhileWriting` found under EVERY
+    /// non-object-candidate rejection, and the walk it drives strides
+    /// `num_slots * 16` bytes — eight times the array's real extent for a
+    /// `byte[]` — through the objects that follow it, rewriting their cells.
+    ///
+    /// This is the same contract the JIT's inline allocator states at length
+    /// (`emit_inline_tlab_new`: "no walker can ever see a committed-but-
+    /// unheadered object") and that [`crate::tlab::Tlab::alloc_initialized`]
+    /// implements with a Release fence. G1's out-of-line allocator honoured
+    /// neither; it does now.
+    fn bump_alloc_initialized(
+        &mut self,
+        size: usize,
+        align: usize,
+        site: &'static str,
+        // `Fn`, not `FnOnce`: `alloc_in_region_initialized` has two arms that
+        // may each attempt a bump (the current Eden region, then a freshly
+        // claimed one), and only the arm that SUCCEEDS runs the initializer.
+        // A `FnOnce` cannot express "moved into a call that may return before
+        // using it", so callers build their header inside the closure body and
+        // the closure stays re-callable.
+        init: impl Fn(*mut u8),
+    ) -> Option<(*mut u8, usize)> {
         let base = self.data.as_mut_ptr() as usize;
         let current = base + self.cursor;
         let aligned = (current + align - 1) & !(align - 1);
@@ -1707,6 +1761,24 @@ impl G1Region {
             return None;
         }
 
+        let ptr = aligned as *mut u8;
+        // Zero-init the allocated area. This is the SINGLE establishment of
+        // the TLAB zeroing contract — `refill_tlab`'s carves used to repeat it
+        // over the identical range. `refill_tlab_zeroes_dirty_eden_bytes` is
+        // the oracle: it dirties Eden above the cursor and fails if this goes.
+        //
+        // It also moved ABOVE the cursor commit with the rest of the
+        // initialization: zeroing a span the cursor already covers is the
+        // same publication bug in a milder form (a walker reads the previous
+        // incarnation's bytes, since a freed region is no longer scrubbed).
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, size);
+        }
+        init(ptr);
+        // Data-before-boundary, stated independently of the lock the caller
+        // happens to hold — the same fence and the same reason as
+        // `Tlab::alloc_initialized`'s.
+        std::sync::atomic::fence(Ordering::Release);
         self.cursor = end;
         if gc_flags().g1_dbg_reach {
             self.bump_trail
@@ -1715,14 +1787,6 @@ impl G1Region {
                 self.tlab_trail
                     .record(self.reuse_epoch, offset_in_region, size, site);
             }
-        }
-        let ptr = aligned as *mut u8;
-        // Zero-init the allocated area. This is the SINGLE establishment of
-        // the TLAB zeroing contract — `refill_tlab`'s carves used to repeat it
-        // over the identical range. `refill_tlab_zeroes_dirty_eden_bytes` is
-        // the oracle: it dirties Eden above the cursor and fails if this goes.
-        unsafe {
-            std::ptr::write_bytes(ptr, 0, size);
         }
         Some((ptr, offset_in_region))
     }
@@ -2842,12 +2906,30 @@ impl G1Collector {
     /// Bump-allocate `size` bytes in the current Eden region.
     /// Returns `(pointer, region_index)` or `None` on failure.
     pub fn alloc_in_region(&self, size: usize) -> Option<(*mut u8, usize)> {
+        self.alloc_in_region_initialized(size, |_| {})
+    }
+
+    /// [`Self::alloc_in_region`], with `init` run over the fresh span while the
+    /// regions lock is still held and BEFORE the allocation is published.
+    ///
+    /// Every caller that writes an `ObjectHeader` must use this rather than
+    /// writing it after the plain form returns: see
+    /// [`G1Region::bump_alloc_initialized`] for what a walker reads in the
+    /// window between the cursor commit and a caller's header store, and why
+    /// an ARRAY header is the dangerous shape (its `kind` is in the second
+    /// half of the header, so a torn store reads back as a legacy object with
+    /// `num_slots = length`).
+    pub fn alloc_in_region_initialized(
+        &self,
+        size: usize,
+        init: impl Fn(*mut u8),
+    ) -> Option<(*mut u8, usize)> {
         let mut regions = self.regions.lock();
         let region_size = self.config.region_size;
 
         // Humongous check
         if size > region_size / 2 {
-            let result = self.alloc_humongous_locked(&mut regions, size);
+            let result = self.alloc_humongous_locked(&mut regions, size, &init);
             if result.is_some() {
                 // A humongous span consumes several regions at once — always
                 // the largest single bite out of the Free pool.
@@ -2859,7 +2941,9 @@ impl G1Collector {
         // Try current Eden region
         let cur = self.current_eden.load(Ordering::Relaxed);
         if cur < regions.len() && regions[cur].region_type == RegionType::Eden {
-            if let Some(result) = regions[cur].bump_alloc(size, 8, "obj:cur-eden") {
+            if let Some(result) =
+                regions[cur].bump_alloc_initialized(size, 8, "obj:cur-eden", &init)
+            {
                 return Some((result.0, cur));
             }
         }
@@ -2869,7 +2953,9 @@ impl G1Collector {
             debug_free_region_cursor(&regions[idx], idx, "alloc_in_region");
             regions[idx].region_type = RegionType::Eden;
             self.current_eden.store(idx, Ordering::Relaxed);
-            if let Some(result) = regions[idx].bump_alloc(size, 8, "obj:fresh-eden") {
+            if let Some(result) =
+                regions[idx].bump_alloc_initialized(size, 8, "obj:fresh-eden", &init)
+            {
                 self.note_region_consumed_locked(&regions);
                 return Some((result.0, idx));
             }
@@ -2910,6 +2996,7 @@ impl G1Collector {
         &self,
         regions: &mut Vec<G1Region>,
         size: usize,
+        init: &dyn Fn(*mut u8),
     ) -> Option<(*mut u8, usize)> {
         let region_size = self.config.region_size;
         if region_size == 0 || size < HEADER_SIZE {
@@ -2922,15 +3009,6 @@ impl G1Collector {
         let regions_needed = size.div_ceil(region_size).max(1);
 
         let start = find_contiguous_free(regions, regions_needed)?;
-
-        // Classify the span. `cursor = size` on the start makes walkers read
-        // the one object; `cursor = 0` on continuations makes walkers skip them.
-        regions[start].region_type = RegionType::HumongousStart;
-        regions[start].cursor = size;
-        for i in 1..regions_needed {
-            regions[start + i].region_type = RegionType::HumongousContinuation;
-            regions[start + i].cursor = 0;
-        }
 
         // Zero the entire contiguous span before handing it out. Continuation
         // regions come from `Free` slots that may still hold stale collected
@@ -2946,6 +3024,26 @@ impl G1Collector {
             // the reserved span.
             std::ptr::write_bytes(start_addr as *mut u8, 0, size);
         }
+        // The header, then the fence, then the classification - in that order,
+        // for the reason spelled out on `G1Region::bump_alloc_initialized`.
+        // Here the publication point is the region TYPE rather than a cursor:
+        // the span is invisible to every walker while its regions are `Free`,
+        // and becomes a `HumongousStart` carrying `cursor = size` the instant
+        // the loop below runs. Classifying first - which is what this function
+        // did - published a multi-region "object" whose header was whatever
+        // the caller had not yet come back to write.
+        init(start_addr as *mut u8);
+        std::sync::atomic::fence(Ordering::Release);
+
+        // Classify the span. `cursor = size` on the start makes walkers read
+        // the one object; `cursor = 0` on continuations makes walkers skip them.
+        regions[start].region_type = RegionType::HumongousStart;
+        regions[start].cursor = size;
+        for i in 1..regions_needed {
+            regions[start + i].region_type = RegionType::HumongousContinuation;
+            regions[start + i].cursor = 0;
+        }
+
 
         // Humongous bytes count toward the IHOP occupancy statistic (see
         // `recompute_old_gen_bytes`). Bump it here too so a burst of
@@ -10241,19 +10339,32 @@ impl G1Collector {
         // M6 (round-12 gc): checked `+ HEADER_SIZE` to match `try_alloc_array`
         // and gen_heap; a near-`usize::MAX` field count must not wrap.
         let total_size = HEADER_SIZE.checked_add(num_fields.checked_mul(SLOT_SIZE)?)?;
-        let (ptr, _region) = self.alloc_in_region(total_size)?;
-
-        let header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Object,
-            ArrayElementType::Reference,
-            0,
-            u32::try_from(num_fields).ok()?,
-        );
-        unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
-            Some(ObjectRef::from_raw(ptr))
-        }
+        let num_slots = u32::try_from(num_fields).ok()?;
+        // The header is written by the INITIALIZER, i.e. under the regions
+        // lock and before the allocation is published. Writing it after
+        // `alloc_in_region` returned left a window in which the region cursor
+        // already covered this address and the bytes there were the zeroed
+        // span, then a partly-retired 16-byte header store. See
+        // `G1Region::bump_alloc_initialized`.
+        let (ptr, _region) = self.alloc_in_region_initialized(total_size, |ptr| {
+            // SAFETY: `ptr` is the base of a span this allocation has just
+            // reserved and not yet published; it is 8-aligned and at least
+            // `HEADER_SIZE` bytes.
+            unsafe {
+                std::ptr::write(
+                    ptr as *mut ObjectHeader,
+                    ObjectHeader::new(
+                        class_id,
+                        ObjectKind::Object,
+                        ArrayElementType::Reference,
+                        0,
+                        num_slots,
+                    ),
+                );
+            }
+        })?;
+        // SAFETY: the initializer above wrote a well-formed header at `ptr`.
+        unsafe { Some(ObjectRef::from_raw(ptr)) }
     }
 
     /// Allocate and pre-initialize primitive-typed slots based on JVM
@@ -10305,25 +10416,44 @@ impl G1Collector {
     ) -> Option<ObjectRef> {
         let data_size = array_data_size(length, element_type).ok()?;
         let total_size = ARRAY_DATA_OFFSET.checked_add(data_size)?;
-        let (ptr, _region) = self.alloc_in_region(total_size)?;
-
-        // Mirror `length` into BOTH `array_length` and `num_slots`, matching
-        // `Heap::alloc_array` (heap.rs:367-370,403-410) and
-        // `GenerationalHeap::alloc_array` (gen_heap.rs:497-500). The shared
-        // header decoders in `vm_heap` / `walk_objects` (e.g.
-        // `VmHeap::num_fields(arr)`) consume `num_slots` and were silently
-        // returning 0 for any G1-allocated array prior to this fix.
-        let header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Array,
-            element_type,
-            u32::try_from(length).ok()?,
-            u32::try_from(length).expect("array length must fit u32 for G1 header num_slots"),
-        );
-        unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
-            Some(ObjectRef::from_raw(ptr))
-        }
+        let length_u32 = u32::try_from(length).ok()?;
+        // The header is written by the INITIALIZER, i.e. under the regions
+        // lock and before the allocation is published. Writing it after
+        // `alloc_in_region` returned left a window in which the region cursor
+        // already covered this address and the bytes there were the zeroed
+        // span, then a partly-retired 16-byte header store. See
+        // `G1Region::bump_alloc_initialized`.
+        //
+        // An ARRAY is the shape that made this window fatal rather than
+        // merely wrong: `kind` lives in the mark word, the SECOND half of the
+        // header, so the intermediate state of the store below is
+        // `class_id` + `shape = length` with `kind` still reading `Object`.
+        // A primitive array carries `class_id` 0, so that intermediate state
+        // is a legacy object claiming `length` SIXTEEN-byte slots -- eight
+        // times a `byte[]`'s real extent.
+        let (ptr, _region) = self.alloc_in_region_initialized(total_size, |ptr| {
+            // Mirror `length` into BOTH `array_length` and `num_slots`, matching
+            // `Heap::alloc_array` (heap.rs:367-370,403-410) and
+            // `GenerationalHeap::alloc_array` (gen_heap.rs:497-500). The shared
+            // header decoders in `vm_heap` / `walk_objects` (e.g.
+            // `VmHeap::num_fields(arr)`) consume `num_slots` and were silently
+            // returning 0 for any G1-allocated array prior to this fix.
+            // SAFETY: as in `try_alloc_object`.
+            unsafe {
+                std::ptr::write(
+                    ptr as *mut ObjectHeader,
+                    ObjectHeader::new(
+                        class_id,
+                        ObjectKind::Array,
+                        element_type,
+                        length_u32,
+                        length_u32,
+                    ),
+                );
+            }
+        })?;
+        // SAFETY: the initializer above wrote a well-formed header at `ptr`.
+        unsafe { Some(ObjectRef::from_raw(ptr)) }
     }
 
     /// Carve a TLAB from the current Eden region.
@@ -11799,7 +11929,27 @@ impl GarbageCollector for G1Collector {
         );
         let body_size = compact_body.unwrap_or(num_fields * SLOT_SIZE);
         let total_size = HEADER_SIZE + body_size;
-        let (ptr, _region) = self.alloc_in_region(total_size).unwrap_or_else(|| {
+        let num_slots = u32::try_from(num_fields).expect("field count exceeds u32::MAX");
+        // The header is written by the INITIALIZER -- under the regions lock,
+        // before the allocation is published. See
+        // `G1Region::bump_alloc_initialized`.
+        let (ptr, _region) = self
+            .alloc_in_region_initialized(total_size, |ptr| {
+                let mut header = ObjectHeader::new(
+                    class_id,
+                    ObjectKind::Object,
+                    ArrayElementType::Reference,
+                    0,
+                    num_slots,
+                );
+                if let Some(body) = compact_body {
+                    header.set_compact_shape(num_slots, body);
+                }
+                // SAFETY: `ptr` is the base of a reserved, unpublished span,
+                // 8-aligned and at least `HEADER_SIZE` bytes.
+                unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
+            })
+            .unwrap_or_else(|| {
             if gc_flags().g1_dbg_diag {
                 let regions = self.regions.lock();
                 let mut free = 0usize;
@@ -11839,21 +11989,8 @@ impl GarbageCollector for G1Collector {
             std::process::abort();
         });
 
-        let mut header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Object,
-            ArrayElementType::Reference,
-            0,
-            u32::try_from(num_fields).expect("field count exceeds u32::MAX"),
-        );
-        if let Some(body) = compact_body {
-            header.set_compact_shape(num_fields as u32, body);
-        }
-
-        unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
-            ObjectRef::from_raw(ptr)
-        }
+        // SAFETY: the initializer above wrote a well-formed header at `ptr`.
+        unsafe { ObjectRef::from_raw(ptr) }
     }
 
     fn alloc_array(
@@ -11865,7 +12002,36 @@ impl GarbageCollector for G1Collector {
         let data_size = array_data_size(length, element_type)
             .expect("array data size overflow in g1 alloc_array");
         let total_size = ARRAY_DATA_OFFSET + data_size;
-        let (ptr, _region) = self.alloc_in_region(total_size).unwrap_or_else(|| {
+        let length_u32 = u32::try_from(length).expect("array length exceeds u32::MAX");
+        // The header is written by the INITIALIZER -- under the regions lock,
+        // before the allocation is published. See
+        // `G1Region::bump_alloc_initialized`, and `try_alloc_array` for why an
+        // array header is the shape whose torn intermediate state reads back
+        // as a legacy object claiming `length` sixteen-byte slots.
+        //
+        // Mirror `length` into BOTH `array_length` and `num_slots`, matching
+        // `Heap::alloc_array` (heap.rs:367-370,403-410) and
+        // `GenerationalHeap::alloc_array` (gen_heap.rs:497-500). The shared
+        // header decoders in `vm_heap` / `walk_objects` (e.g.
+        // `VmHeap::num_fields(arr)`) consume `num_slots` and were silently
+        // returning 0 for any G1-allocated array prior to that fix.
+        let (ptr, _region) = self
+            .alloc_in_region_initialized(total_size, |ptr| {
+                // SAFETY: as in `alloc_object`.
+                unsafe {
+                    std::ptr::write(
+                        ptr as *mut ObjectHeader,
+                        ObjectHeader::new(
+                            class_id,
+                            ObjectKind::Array,
+                            element_type,
+                            length_u32,
+                            length_u32,
+                        ),
+                    );
+                }
+            })
+            .unwrap_or_else(|| {
             eprintln!(
                 "FATAL: G1: out of heap space for array allocation ({} bytes) \
                  -- see the object-allocation abort above for the invariant \
@@ -11875,24 +12041,8 @@ impl GarbageCollector for G1Collector {
             std::process::abort();
         });
 
-        // Mirror `length` into BOTH `array_length` and `num_slots`, matching
-        // `Heap::alloc_array` (heap.rs:367-370,403-410) and
-        // `GenerationalHeap::alloc_array` (gen_heap.rs:497-500). The shared
-        // header decoders in `vm_heap` / `walk_objects` (e.g.
-        // `VmHeap::num_fields(arr)`) consume `num_slots` and were silently
-        // returning 0 for any G1-allocated array prior to this fix.
-        let header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Array,
-            element_type,
-            u32::try_from(length).expect("array length exceeds u32::MAX"),
-            u32::try_from(length).expect("array length must fit u32 for G1 header num_slots"),
-        );
-
-        unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
-            ObjectRef::from_raw(ptr)
-        }
+        // SAFETY: the initializer above wrote a well-formed header at `ptr`.
+        unsafe { ObjectRef::from_raw(ptr) }
     }
 
     fn get_header(&self, obj: ObjectRef) -> &ObjectHeader {
