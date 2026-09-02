@@ -49596,7 +49596,7 @@ fn register_queue_deque_interface_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/util/Deque", "isEmpty", "()Z", native_ad_is_empty);
 
     // `java/util/ArrayDeque$Itr` RETIRED 2026-09-02 by the iterator-carrier
-    // census (`docs/internal/fixed-suite-bugs/iterator-carrier-census-20260902.md`).
+    // census (`fixed-suite-bugs/iterator-carrier-census-20260902.md`).
     // `hasNext`/`next`/`remove` were bound here to the 2-field snapshot
     // pattern for a class this crate stopped minting on 2026-08-30, when
     // ArrayDeque's iterator became the real `DeqIterator`.
@@ -74689,7 +74689,7 @@ mod tests {
     /// No natives may be bound to an iterator class this crate never MINTS.
     ///
     /// The durable output of the iterator-carrier census
-    /// (`docs/internal/fixed-suite-bugs/iterator-carrier-census-20260902.md`).
+    /// (`fixed-suite-bugs/iterator-carrier-census-20260902.md`).
     /// A registration keyed on a class nobody produces is inert until someone
     /// produces one, and then it WINS the slot over the registration that
     /// matches the shape actually minted. It has happened twice:
