@@ -83,7 +83,15 @@ const WORKER_STEP_BUDGET: usize = 256;
 /// Polling interval the worker uses when it observes an empty gray set
 /// but has not been told to stop. Park-with-timeout so SATB pushes that
 /// race past the `notify_work_available` signal still get picked up.
-const WORKER_POLL_MS: u64 = 5;
+///
+/// Ten-findings item 9b: this was 5 ms, and it was the PRIMARY wake — nothing
+/// on the mutator side notified a parked worker when a SATB buffer spilled,
+/// so a parked marker took the region guard and the SATB shards 200 times a
+/// second for the whole cycle to discover work it was never told about. The
+/// collector now wakes the workers itself (`G1Collector::wake_marker`, from
+/// the SATB spill, `push_gray_or_mark` and `remark`), and this is the
+/// fallback it was documented as.
+pub(crate) const WORKER_POLL_MS: u64 = 250;
 
 /// Shared state between the coordinator (typically the VM thread that
 /// initiated the GC cycle) and the background mark worker.
@@ -208,6 +216,9 @@ pub struct ConcurrentMarkController {
     /// `G1Collector::mark_worker_count()` decides how many there are, and a
     /// worker's index in this vector is the deque index it owns for its life.
     handles: Vec<JoinHandle<()>>,
+    /// Item 9b — kept so the wake handle installed at `spawn` can be
+    /// uninstalled when the cycle's workers are stopped.
+    g1: Arc<G1Collector>,
 }
 
 impl ConcurrentMarkController {
@@ -222,6 +233,8 @@ impl ConcurrentMarkController {
     /// bound on `spawn` is satisfied by the Arc.
     pub fn spawn(g1: Arc<G1Collector>) -> Self {
         let state = Arc::new(ConcurrentMarkState::new());
+        // Item 9b — let the collector wake these workers directly.
+        g1.install_mark_waker(Arc::clone(&state));
         // F-12 — one thread per gray deque. The collector fixed the count at
         // construction (`concurrent_mark_worker_count`, a quarter of the
         // evacuation width, or 1 under `CRATONVM_G1_PARALLEL_MARK=0`), because
@@ -243,7 +256,7 @@ impl ConcurrentMarkController {
             })
             .collect();
 
-        Self { state, handles }
+        Self { state, handles, g1 }
     }
 
     /// Body of the background mark thread.
@@ -307,6 +320,7 @@ impl ConcurrentMarkController {
     /// Returns the join handle's result so an OOM panic in the worker
     /// surfaces here.
     pub fn request_stop_and_join(mut self) -> std::thread::Result<()> {
+        self.g1.clear_mark_waker();
         self.state.request_stop();
         // Join EVERY worker, and report the first panic rather than the last:
         // a worker that unwound has left the cycle incomplete, and the
@@ -360,6 +374,7 @@ impl Drop for ConcurrentMarkController {
         // Best-effort cleanup if the user didn't call request_stop_and_join.
         // We can't block on join here (Drop is sync), but we can flip the
         // flag and let the OS reap the thread on exit.
+        self.g1.clear_mark_waker();
         self.state.request_stop();
         // Detach every worker: don't block. Production code should call
         // `request_stop_and_join` explicitly.
@@ -405,6 +420,42 @@ mod tests {
 
     /// Test #1 — the concurrent-mark thread spawns and joins cleanly.
     /// Verifies the basic thread-lifecycle skeleton: spawn → run → stop → join.
+    /// Item 9b: a seed pushed while every worker is parked is picked up by
+    /// the wake, not by the fallback poll. The bound is half the poll, so a
+    /// result inside it cannot have come from the timeout.
+    #[test]
+    fn a_seed_wakes_a_parked_marker_without_waiting_for_the_poll() {
+        let g1 = small_collector();
+        g1.start_concurrent_mark(&stw());
+        let controller = ConcurrentMarkController::spawn(Arc::clone(&g1));
+        for _ in 0..500 {
+            if controller.is_quiesced() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(controller.is_quiesced(), "the marker parks on an empty gray set");
+
+        let a = g1.alloc_object(ClassId::new(1), 0);
+        let t0 = std::time::Instant::now();
+        g1.remark(&stw(), &[a]);
+        let bound = Duration::from_millis(WORKER_POLL_MS / 2);
+        let mut marked = false;
+        while t0.elapsed() < bound {
+            if g1.dbg_is_marked(a.as_ptr() as usize) {
+                marked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        controller.request_stop_and_join().expect("worker joined");
+        assert!(
+            marked,
+            "the seed was not marked within {bound:?}; the parked worker was waiting \
+             for the {WORKER_POLL_MS} ms poll instead of the wake"
+        );
+    }
+
     #[test]
     fn concurrent_mark_thread_spawns_and_joins() {
         let g1 = small_collector();

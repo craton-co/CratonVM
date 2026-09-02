@@ -3683,6 +3683,35 @@ static TLAB_LAST_BREAK_ALLOC_TOTAL: std::sync::atomic::AtomicU64 =
 /// path doesn't bump `bytes_allocated_total`).
 static TLAB_SLOWPATH_ENTRIES_SINCE_GC: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Bytes handed out by SUCCESSFUL TLAB refills since the last refill-time
+/// `needs_gc()` fire — the second re-arm metric, for the HEALTHY path.
+///
+/// `gen-gc-minor-pause-20260902` swept `CRATONVM_GC_YOUNG_TRIGGER_PERCENT`
+/// over 50/75/90 and got identical collection counts at every setting, with
+/// `young_bytes_before` equal to the from-space CAPACITY on every cycle: the
+/// collections were driven by allocation failure, never by the trigger. The
+/// entry counter above is why. It was sized for the degraded modes it guards
+/// (a per-object slow path enters tens of thousands of times per second), but
+/// a healthy JIT workload refills a 256 KiB–1 MiB TLAB per slow-path entry
+/// and exhausts a 256 MiB semi-space in a few hundred entries — never the
+/// 65,536 the gate demanded. So on exactly the workloads that allocate the
+/// most, the trigger was consulted zero times per cycle, the from-space ran
+/// to capacity, and the pause-goal feedback that moves the threshold
+/// (`adapt_young_trigger_to_pause`) moved a number nothing read.
+///
+/// Two metrics, OR-ed: the entry count still fires in the crumb wedge (where a
+/// bytes stamp freezes, see above), and the bytes count fires on healthy TLAB
+/// flow after every [`NEEDSGC_MIN_REFILL_BYTES_BETWEEN_FIRES`] of refills.
+/// `needs_gc` carries its own anti-livelock floor, so consulting it more often
+/// cannot storm a young gen whose live set sits above the threshold.
+static TLAB_REFILL_BYTES_SINCE_GC: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Refilled bytes between two consults of the young trigger on the healthy
+/// path: 4 MiB, i.e. every 4–16 full-size TLABs. Small against any semi-space
+/// the trigger is worth having on, large enough that a mini-TLAB storm still
+/// consults `needs_gc` (one `Mutex` acquisition) a few hundred times per
+/// gigabyte rather than per refill.
+const NEEDSGC_MIN_REFILL_BYTES_BETWEEN_FIRES: u64 = 4 * 1024 * 1024;
 
 /// Gate for the two refill-time GC triggers (the wedge-breaker and the
 /// `needs_gc()` consult) — the crumb-treadmill cure (10.5M consecutive
@@ -3881,16 +3910,28 @@ pub(super) fn tlab_alloc_shaped_inner(
     // exists for never bumps that counter, so a bytes-based re-arm freezes
     // in exactly the wedge it guards (measured: 11.5M refill failures, one
     // GC, counter parked).
+    //
+    // gen-gc-five (2026-09-02): the entry count alone left the trigger DEAD on
+    // healthy TLAB flow — see `TLAB_REFILL_BYTES_SINCE_GC`. A refill-bytes
+    // stamp is OR-ed in so the trigger is consulted every few full-size
+    // TLABs; the entry count keeps the crumb wedge covered.
     if refill_needs_young_room && tlab_gc_trigger_enabled() {
         use std::sync::atomic::Ordering;
         const NEEDSGC_MIN_ENTRIES_BETWEEN_FIRES: u64 = 65_536;
         let entries = TLAB_SLOWPATH_ENTRIES_SINCE_GC.fetch_add(1, Ordering::Relaxed) + 1;
-        if entries >= NEEDSGC_MIN_ENTRIES_BETWEEN_FIRES
+        let refilled = TLAB_REFILL_BYTES_SINCE_GC.load(Ordering::Relaxed);
+        if (entries >= NEEDSGC_MIN_ENTRIES_BETWEEN_FIRES
+            || refilled >= NEEDSGC_MIN_REFILL_BYTES_BETWEEN_FIRES)
             && shared.mem.heap.needs_gc_for_jit_allocation()
         {
             TLAB_SLOWPATH_ENTRIES_SINCE_GC.store(0, Ordering::Relaxed);
+            TLAB_REFILL_BYTES_SINCE_GC.store(0, Ordering::Relaxed);
             thread.tlab.retire();
             maybe_gc_forced(shared, thread);
+        } else if refilled >= NEEDSGC_MIN_REFILL_BYTES_BETWEEN_FIRES {
+            // Consulted and declined: re-arm the bytes stamp so the next
+            // consult is another 4 MiB away rather than on every refill.
+            TLAB_REFILL_BYTES_SINCE_GC.store(0, Ordering::Relaxed);
         }
     }
 
@@ -4001,6 +4042,9 @@ pub(super) fn tlab_alloc_shaped_inner(
     }
     if let Some((buf, size)) = refill {
         shared.mem.tlab_refill_count.fetch_add(1, Ordering::Relaxed);
+        // Widening: usize -> u64 (value preserved). The healthy-path re-arm
+        // metric for the refill-time young trigger above.
+        TLAB_REFILL_BYTES_SINCE_GC.fetch_add(size as u64, Ordering::Relaxed);
         // Read the outgoing TLAB's running per-thread allocation total before
         // the struct is replaced — `Tlab::new` starts a fresh one at zero, and
         // `getThreadAllocatedBytes` must not go backwards at a refill.

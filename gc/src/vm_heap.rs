@@ -133,6 +133,12 @@ pub struct G1ConfigOverrides {
     /// `-Xms` — bytes to commit up front (F-16). `None` leaves
     /// `initial_heap_size` at its `0` = ergonomic default.
     pub initial_heap_size: Option<usize>,
+    /// `-XX:G1MixedGCLiveThresholdPercent=<n>` (clamped to 1..=100) — an Old
+    /// region at or above this percent live is never a mixed candidate.
+    pub mixed_gc_live_threshold_percent: Option<u8>,
+    /// `-XX:G1HeapWastePercent=<n>` (clamped to 0..=100) — the mixed phase
+    /// ends once the candidates' garbage is below this percent of the heap.
+    pub heap_waste_percent: Option<u8>,
 }
 
 // ─── GPU-offload coordination (Phase 6 item 1) ───────────────────────────
@@ -158,14 +164,25 @@ pub struct G1ConfigOverrides {
 #[cfg(feature = "gpu-offload")]
 pub static GPU_CRITICAL_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Spin-yield until every live `SafepointToken` has been dropped.
+/// Wait, **bounded**, until every live direct `SafepointToken` has been
+/// dropped.
 ///
 /// Called from the GC entry points on `GenerationalHeap` and
-/// `G1Collector` before starting a collection cycle, so a kernel
-/// running under a token never observes its inputs being moved.
+/// `G1Collector` before starting a collection cycle. The registry-backed
+/// coordination every collector now goes through
+/// ([`gpu_coordination::before_collection`], run by
+/// [`VmHeap::collect_garbage`] before this is reached) is what decides
+/// whether the cycle may relocate; this loop only covers a token taken
+/// directly on the legacy counter — which, since 2026-09-02, is a test
+/// fixture, not a production path.
 ///
-/// Emits a tracing warning after [`crate::safepoint::GPU_CRITICAL_DEADLINE_SECS`]
-/// seconds so an indefinitely-blocked collector still surfaces in logs.
+/// AUDIT 2026-09-02: this loop used to be unbounded, with one warning
+/// after five seconds. A counter nobody decremented — an abandoned
+/// submission, a torn-down VM — was therefore a collector that spun
+/// forever on every thread for the rest of the process. It now gives up
+/// after the registry's collector budget, and the cycle proceeds
+/// non-moving if the registry says relocation is forbidden (see
+/// [`gpu_relocation_forbidden`]).
 #[cfg(feature = "gpu-offload")]
 pub fn wait_for_gpu_critical_drain() {
     use std::sync::atomic::Ordering;
@@ -173,21 +190,22 @@ pub fn wait_for_gpu_critical_drain() {
         return;
     }
     let start = std::time::Instant::now();
-    let deadline = std::time::Duration::from_secs(crate::safepoint::GPU_CRITICAL_DEADLINE_SECS);
-    let mut warned = false;
+    let budget = cratonvm_cuda_bridge::critical::collector_wait_budget();
     loop {
         std::thread::yield_now();
         let now = GPU_CRITICAL_COUNT.load(Ordering::Acquire);
         if now == 0 {
             return;
         }
-        if !warned && start.elapsed() >= deadline {
+        if start.elapsed() >= budget {
             tracing::warn!(
-                "GC delayed >{}s by GPU critical section — {} active tokens",
-                crate::safepoint::GPU_CRITICAL_DEADLINE_SECS,
+                "GC waited {:?} for {} direct GPU critical token(s) and is proceeding \
+                 non-moving; a direct token held that long is a leak",
+                budget,
                 now,
             );
-            warned = true;
+            gpu_coordination::forbid_relocation_this_cycle();
+            return;
         }
     }
 }
@@ -197,6 +215,160 @@ pub fn wait_for_gpu_critical_drain() {
 #[cfg(not(feature = "gpu-offload"))]
 #[inline(always)]
 pub fn wait_for_gpu_critical_drain() {}
+
+/// Whether the cycle in progress must not relocate because of GPU work.
+///
+/// Read by every collector at its "may I move this" decision: ZGC's
+/// stop-the-world slide and its large-object compactor, the generational
+/// collector's moving-young choice, G1's evacuation. `false` for the
+/// whole life of a build without `gpu-offload`, and for every cycle of a
+/// process that never launched a kernel.
+#[cfg(feature = "gpu-offload")]
+#[inline]
+pub fn gpu_relocation_forbidden() -> bool {
+    gpu_coordination::relocation_forbidden()
+}
+
+/// See the `gpu-offload` twin. Always `false`.
+#[cfg(not(feature = "gpu-offload"))]
+#[inline(always)]
+pub fn gpu_relocation_forbidden() -> bool {
+    false
+}
+
+/// GPU critical-section coordination, at the one dispatcher every
+/// collector goes through.
+///
+/// AUDIT 2026-09-02. `cratonvm_cuda_bridge::critical` — owned tokens,
+/// leases, a bounded collector wait, keep-alive roots that survive a
+/// move — existed for six weeks with no caller in this crate or the VM.
+/// The collectors waited on a bare counter, forever; the VM held that
+/// counter from dispatch to writeback, so collection stopped for the
+/// length of every kernel; and ZGC, the default collector, did not wait
+/// at all, so its compacting slide could run under a device-to-host copy
+/// landing in the arena from the completion reaper, a thread the
+/// stop-the-world barrier never stops.
+///
+/// This module is the wiring. Before a cycle:
+///
+/// 1. wait, bounded by [`cratonvm_cuda_bridge::critical::collector_wait_budget`],
+///    for every token that declared
+///    [`Relocation::Forbidden`](cratonvm_cuda_bridge::critical::Relocation::Forbidden)
+///    — the short windows in which a DMA reads or writes the heap arena in
+///    place. A keep-alive-only token, the kind a submission holds for the
+///    life of its kernel, is NOT waited for: that is the whole point.
+/// 2. if the wait expired, veto relocation for this cycle
+///    ([`gpu_relocation_forbidden`]); the collectors take their non-moving
+///    path and the diversion is counted.
+/// 3. otherwise declare a moving cycle to the registry, so a `Forbidden`
+///    acquisition from an unstopped thread blocks until the cycle ends.
+/// 4. splice every outstanding token's keep-alive addresses in as roots,
+///    so a writeback target that is reachable from nothing else survives
+///    and is remapped.
+///
+/// After the cycle the remapped addresses are written back through
+/// [`Registry::remap_keepalive`](cratonvm_cuda_bridge::critical::Registry::remap_keepalive),
+/// and a holder reads them out through `CriticalToken::keepalive_addrs`
+/// before it writes.
+#[cfg(feature = "gpu-offload")]
+pub mod gpu_coordination {
+    use cratonvm_cuda_bridge::critical::{self, Registry, WaitOutcome};
+    use cratonvm_types::ObjectRef;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// Set for the duration of a cycle that must not relocate.
+    static RELOCATION_FORBIDDEN: AtomicBool = AtomicBool::new(false);
+
+    /// The process-wide registry.
+    pub fn registry() -> &'static Arc<Registry> {
+        critical::global()
+    }
+
+    /// See [`super::gpu_relocation_forbidden`].
+    #[inline]
+    pub fn relocation_forbidden() -> bool {
+        RELOCATION_FORBIDDEN.load(Ordering::Acquire)
+    }
+
+    /// Veto relocation for the cycle in progress. Idempotent; cleared by
+    /// [`CycleGuard::after_collection`].
+    pub fn forbid_relocation_this_cycle() {
+        if !RELOCATION_FORBIDDEN.swap(true, Ordering::AcqRel) {
+            registry().record_forced_non_moving_collection();
+        }
+    }
+
+    /// What one cycle owes the registry when it finishes.
+    #[must_use = "after_collection must run, or the relocation veto and the moving-cycle gate stay set"]
+    pub struct CycleGuard {
+        /// Keep-alive addresses of every outstanding token at cycle start,
+        /// as `ObjectRef`s for the root buffer. Empty in the common case.
+        pub extra_roots: Vec<ObjectRef>,
+        moving_declared: bool,
+    }
+
+    /// Steps 1-4 of the module doc. Runs on the collecting thread, with
+    /// the world stopped.
+    pub fn before_collection() -> CycleGuard {
+        let reg = registry();
+        let mut forbid = false;
+        if reg.outstanding() != 0 {
+            let outcome = reg.wait_for_relocation_clearance(critical::collector_wait_budget());
+            match outcome {
+                WaitOutcome::Drained { .. } => {}
+                WaitOutcome::TimedOut { .. } => forbid = true,
+            }
+        }
+        // A wait that came back drained can be overtaken by a token acquired
+        // in the gap; the registry answers the question at this instant.
+        if !forbid && reg.relocation_forbidden() {
+            forbid = true;
+        }
+        if forbid {
+            forbid_relocation_this_cycle();
+        } else {
+            reg.begin_moving_cycle();
+        }
+        let extra_roots = reg
+            .outstanding_keepalive_addrs()
+            .into_iter()
+            // SAFETY: the registry holds addresses declared by live tokens
+            // whose holders guarantee the objects are heap objects that
+            // were alive at declaration; the token being outstanding is
+            // what keeps them alive until now.
+            .map(|addr| unsafe { ObjectRef::from_raw(addr as *mut u8) })
+            .collect();
+        CycleGuard {
+            extra_roots,
+            moving_declared: !forbid,
+        }
+    }
+
+    impl CycleGuard {
+        /// `remapped` is the tail of the root buffer this guard's
+        /// `extra_roots` were appended to, after the collector rewrote it.
+        pub fn after_collection(self, remapped: &[ObjectRef]) {
+            let reg = registry();
+            if !self.extra_roots.is_empty() {
+                let moved: rustc_hash::FxHashMap<usize, usize> = self
+                    .extra_roots
+                    .iter()
+                    .zip(remapped)
+                    .filter(|(old, new)| old.as_ptr() != new.as_ptr())
+                    .map(|(old, new)| (old.as_ptr() as usize, new.as_ptr() as usize))
+                    .collect();
+                if !moved.is_empty() {
+                    reg.remap_keepalive(|addr| moved.get(&addr).copied());
+                }
+            }
+            if self.moving_declared {
+                reg.end_moving_cycle();
+            }
+            RELOCATION_FORBIDDEN.store(false, Ordering::Release);
+        }
+    }
+}
 
 // ─── Task #25: SATB triad-ordering debug assertion ───────────────────────
 //
@@ -352,6 +524,12 @@ impl VmHeap {
                 }
                 if let Some(pause) = overrides.max_gc_pause_ms {
                     config.max_gc_pause_ms = pause.max(1);
+                }
+                if let Some(p) = overrides.mixed_gc_live_threshold_percent {
+                    config.mixed_gc_live_threshold_percent = p.clamp(1, 100);
+                }
+                if let Some(p) = overrides.heap_waste_percent {
+                    config.heap_waste_percent = p.min(100);
                 }
                 if let Some(dedup) = overrides.string_dedup {
                     config.string_dedup_enabled = dedup;
@@ -2098,6 +2276,38 @@ impl VmHeap {
         roots: &mut [ObjectRef],
         monitors: &dyn MonitorCleanup,
     ) -> GcResult {
+        #[cfg(feature = "gpu-offload")]
+        {
+            let cycle = gpu_coordination::before_collection();
+            if cycle.extra_roots.is_empty() {
+                let result = self.collect_garbage_dispatch(stw, roots, monitors);
+                cycle.after_collection(&[]);
+                return result;
+            }
+            // Splice the GPU keep-alive roots onto the caller's, run the
+            // collector over both, then hand each half back to its owner
+            // with the post-collection addresses.
+            let n = roots.len();
+            let mut all: Vec<ObjectRef> = Vec::with_capacity(n + cycle.extra_roots.len());
+            all.extend_from_slice(roots);
+            all.extend_from_slice(&cycle.extra_roots);
+            let result = self.collect_garbage_dispatch(stw, &mut all, monitors);
+            roots.copy_from_slice(&all[..n]);
+            cycle.after_collection(&all[n..]);
+            result
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            self.collect_garbage_dispatch(stw, roots, monitors)
+        }
+    }
+
+    fn collect_garbage_dispatch(
+        &self,
+        stw: &crate::collector::StopTheWorldToken,
+        roots: &mut [ObjectRef],
+        monitors: &dyn MonitorCleanup,
+    ) -> GcResult {
         match self {
             VmHeap::Generational(h) => h.collect_garbage(stw, roots, monitors),
             VmHeap::G1(h) => h.collect_garbage(stw, roots, monitors),
@@ -2130,6 +2340,39 @@ impl VmHeap {
         // `cratonvm_types::ffm_epoch`. Bumped here, at the one dispatcher every
         // collector goes through, so a future collector cannot silently miss it.
         cratonvm_types::ffm_epoch::bump_ffm_epoch();
+        #[cfg(feature = "gpu-offload")]
+        {
+            // Same splice as `collect_garbage`; see there.
+            let cycle = gpu_coordination::before_collection();
+            if cycle.extra_roots.is_empty() {
+                let result =
+                    self.collect_with_finalizers_dispatch(stw, roots, finalizer_addrs, monitors);
+                cycle.after_collection(&[]);
+                return result;
+            }
+            let n = roots.len();
+            let mut all: Vec<ObjectRef> = Vec::with_capacity(n + cycle.extra_roots.len());
+            all.extend_from_slice(roots);
+            all.extend_from_slice(&cycle.extra_roots);
+            let result =
+                self.collect_with_finalizers_dispatch(stw, &mut all, finalizer_addrs, monitors);
+            roots.copy_from_slice(&all[..n]);
+            cycle.after_collection(&all[n..]);
+            result
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            self.collect_with_finalizers_dispatch(stw, roots, finalizer_addrs, monitors)
+        }
+    }
+
+    fn collect_with_finalizers_dispatch(
+        &self,
+        stw: &crate::collector::StopTheWorldToken,
+        roots: &mut [ObjectRef],
+        finalizer_addrs: &[usize],
+        monitors: &dyn MonitorCleanup,
+    ) -> (GcResult, Vec<usize>) {
         match self {
             VmHeap::Generational(h) => {
                 h.collect_garbage_with_finalizers(stw, roots, finalizer_addrs, monitors)
@@ -4238,10 +4481,18 @@ mod gpu_coordination_tests {
         assert_eq!(GPU_CRITICAL_COUNT.load(Ordering::Acquire), before);
     }
 
-    /// Hold a token on a worker thread for 200 ms; assert the
-    /// drain on the main thread blocks at least 150 ms.
+    /// Hold a direct token on a worker thread for 200 ms; the drain on
+    /// the main thread waits its budget, then GIVES UP and vetoes
+    /// relocation for the cycle instead of spinning until the token
+    /// drops.
+    ///
+    /// AUDIT 2026-09-02: this used to assert the drain blocked for at
+    /// least 150 ms — that the wait was unbounded. Unbounded was the
+    /// defect: a token nobody released was a collector that never ran
+    /// again. The bound is `collector_wait_budget()` (50 ms unless
+    /// `CRATONVM_GPU_CRITICAL_WAIT_MS` says otherwise).
     #[test]
-    fn drain_blocks_until_every_token_dropped() {
+    fn drain_gives_up_after_its_budget_and_vetoes_relocation() {
         let heap = std::sync::Arc::new(VmHeap::new(GcBackend::Generational, 1 << 20));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let heap2 = heap.clone();
@@ -4251,14 +4502,27 @@ mod gpu_coordination_tests {
             std::thread::sleep(Duration::from_millis(200));
         });
         started_rx.recv().unwrap();
+        let budget = cratonvm_cuda_bridge::critical::collector_wait_budget();
         let start = Instant::now();
         wait_for_gpu_critical_drain();
         let elapsed = start.elapsed();
-        holder.join().unwrap();
         assert!(
-            elapsed >= Duration::from_millis(150),
-            "drain returned in {elapsed:?} but the token was held for 200ms",
+            elapsed >= budget,
+            "drain returned in {elapsed:?}, before its {budget:?} budget"
         );
+        assert!(
+            elapsed < Duration::from_millis(190),
+            "drain waited {elapsed:?} for a token held 200 ms: the wait is still unbounded"
+        );
+        assert!(
+            gpu_relocation_forbidden(),
+            "a wait that gave up must veto relocation for the cycle"
+        );
+        holder.join().unwrap();
+        // What the collector does at the end of the cycle: clear the veto.
+        let cycle = gpu_coordination::before_collection();
+        cycle.after_collection(&[]);
+        assert!(!gpu_relocation_forbidden());
     }
 }
 

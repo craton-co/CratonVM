@@ -1235,7 +1235,16 @@ pub fn compile_with_param_slots(
     // proven non-null. Future null-check emission paths consult this
     // via `Compiler::is_local_nonnull(pc, local)` to skip redundant
     // `TEST reg, reg; JZ throw_npe` sequences.
-    let null_check_info = crate::null_check_elim::analyze(code, code_len);
+    //
+    // The receiver seed is derived here rather than passed in — see
+    // `null_check_elim::receiver_in_local_zero` for why, and for what the
+    // `None` (the two numbers disagree) case protects.
+    let null_check_info = {
+        let receiver = super::null_check_elim::this_nonnull_enabled()
+            && crate::null_check_elim::receiver_in_local_zero(method_key, num_params)
+                .unwrap_or(false);
+        crate::null_check_elim::analyze_with_receiver(code, code_len, receiver)
+    };
 
     // BCE: analyze loops for bounds check elimination
     // DBG (env-gated): CRATONVM_JIT_NO_BCE disables bounds-check elimination

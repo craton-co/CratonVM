@@ -267,6 +267,15 @@ fn maybe_dump_shutdown_reports() {
             // printing both is what separates that from "emitted and refused".
             let (bump, stub) = cratonvm_jit::runtime_lowering::ir_alloc_site_counts();
             eprintln!("[cratonvm] optimizing-tier allocations: inline-bump={bump} stub-only={stub}");
+            // getfield receiver null checks. The PAIR, never the ratio: an
+            // all-zero pair means the trusted-oop arm was never reached at all
+            // (no inline getfield compiled), while zero-elided-with-nonzero-
+            // emitted means it WAS reached and the dataflow proved nothing.
+            // Those look identical as a percentage and want opposite fixes.
+            let (nn_elided, nn_emitted) = cratonvm_jit::x64::receiver_null_check_counts();
+            eprintln!(
+                "[cratonvm] getfield receiver null checks: elided={nn_elided} emitted={nn_emitted}"
+            );
         }
         // Reference loads whose slot did NOT hold a reference, contained by
         // `GETFIELD_EXPECT_REFERENCE` instead of being handed to compiled code
@@ -1087,6 +1096,25 @@ struct Args {
         overrides_with = "g1_max_pause"
     )]
     g1_max_pause: Option<String>,
+
+    /// `-XX:G1MixedGCLiveThresholdPercent=<n>` → an Old region at or above
+    /// this percent live is never a mixed-collection candidate (honoured
+    /// under G1).
+    #[arg(
+        long = "XX:G1MixedLiveThreshold",
+        value_name = "PCT",
+        overrides_with = "g1_mixed_live_threshold"
+    )]
+    g1_mixed_live_threshold: Option<String>,
+
+    /// `-XX:G1HeapWastePercent=<n>` → the mixed phase ends once its candidates
+    /// hold less garbage than this percent of the heap (honoured under G1).
+    #[arg(
+        long = "XX:G1HeapWaste",
+        value_name = "PCT",
+        overrides_with = "g1_heap_waste"
+    )]
+    g1_heap_waste: Option<String>,
 
     /// `-XX:ParallelGCThreads=<n>` → GC evacuation worker count (honoured
     /// under G1). Absent means the count is derived from the machine.
@@ -2200,6 +2228,14 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             i += 1;
         } else if let Some(v) = a.strip_prefix("-XX:MaxGCPauseMillis=") {
             out.push("--XX:MaxGCPause".into());
+            out.push(v.to_string());
+            i += 1;
+        } else if let Some(v) = a.strip_prefix("-XX:G1MixedGCLiveThresholdPercent=") {
+            out.push("--XX:G1MixedLiveThreshold".into());
+            out.push(v.to_string());
+            i += 1;
+        } else if let Some(v) = a.strip_prefix("-XX:G1HeapWastePercent=") {
+            out.push("--XX:G1HeapWaste".into());
             out.push(v.to_string());
             i += 1;
         } else if let Some(v) = a.strip_prefix("-XX:MaxDirectMemorySize=") {
@@ -4515,6 +4551,20 @@ fn run() -> Result<()> {
             _ => eprintln!(
                 "Warning: ignoring -XX:MaxGCPauseMillis={s} (expected a positive integer)"
             ),
+        }
+    }
+    if let Some(s) = &args.g1_mixed_live_threshold {
+        match s.parse::<u8>() {
+            Ok(p) if (1..=100).contains(&p) => config.g1_mixed_gc_live_threshold_percent = Some(p),
+            _ => eprintln!(
+                "Warning: ignoring -XX:G1MixedGCLiveThresholdPercent={s} (expected 1..=100)"
+            ),
+        }
+    }
+    if let Some(s) = &args.g1_heap_waste {
+        match s.parse::<u8>() {
+            Ok(p) if p <= 100 => config.g1_heap_waste_percent = Some(p),
+            _ => eprintln!("Warning: ignoring -XX:G1HeapWastePercent={s} (expected 0..=100)"),
         }
     }
     if let Some(s) = &args.g1_string_dedup {
