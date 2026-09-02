@@ -112,6 +112,7 @@ mod build_script {
                 JavaRootResolution {
                     path: expected,
                     invalid_override: None,
+                    used_absolute_fallback: false,
                 }
             );
         }
@@ -136,7 +137,47 @@ mod build_script {
                 JavaRootResolution {
                     path: expected,
                     invalid_override: Some(invalid_override),
+                    used_absolute_fallback: false,
                 }
+            );
+        }
+
+        /// The resolution the build now reports on.
+        ///
+        /// On Windows with no override and no sibling checkout, the
+        /// resolver reaches an absolute install path that is a
+        /// convention of one machine — see `platform_fallback_java_root`,
+        /// whose own comment names the box. A build that lands here
+        /// produces annotation classes from a directory this repository
+        /// does not record, at a revision it does not pin, and said
+        /// nothing about it. The flag is what lets `resolve_java_root`
+        /// emit exactly one line of warning for that case and stay quiet
+        /// for the two reproducible ones.
+        #[test]
+        fn windows_absolute_fallback_is_flagged_as_non_reproducible() {
+            let temp = TempDir::new("winfallback");
+            let manifest = manifest_dir(temp.path());
+            fs::create_dir_all(&manifest).expect("create manifest dir");
+
+            // Nothing beside the workspace, no override: the only
+            // candidate left is the absolute one.
+            let resolution = resolve_java_root_from(None, &manifest, true);
+
+            assert!(
+                resolution.used_absolute_fallback,
+                "a Windows resolution that reached the absolute install path \
+                 must be flagged so the build can say so: {resolution:?}"
+            );
+            assert_eq!(resolution.invalid_override, None);
+
+            // …and the same inputs on a platform with no absolute
+            // candidate must NOT be flagged, or the warning would fire on
+            // every Linux build that simply has no sources.
+            let elsewhere = resolve_java_root_from(None, &manifest, false);
+            assert!(
+                !elsewhere.used_absolute_fallback,
+                "there is no machine-specific path to warn about off Windows: \
+                 {elsewhere:?}"
             );
         }
 
@@ -156,6 +197,7 @@ mod build_script {
                 JavaRootResolution {
                     path: expected,
                     invalid_override: None,
+                    used_absolute_fallback: false,
                 }
             );
         }

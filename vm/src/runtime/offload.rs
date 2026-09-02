@@ -176,6 +176,29 @@ pub struct OffloadCache {
     /// dispatch needs several streams so consecutive chunks can run
     /// concurrently, and these are private to the offload path (the
     /// `streams` map above holds Java-visible `GpuStream` handles).
+    /// Round-robin pool of streams for dispatches that did not bring
+    /// their own.
+    ///
+    /// AUDIT 2026-09-02: the handle-less path — which is every
+    /// transparent interpreter dispatch, i.e. the common case — used to
+    /// call `Stream::new(ctx)` per submission and drop it when the
+    /// submission was released. `cuStreamCreate` is not free and
+    /// `cuStreamDestroy` can synchronize, so a workload calling an
+    /// offloaded method in a loop paid for both on every call, to get a
+    /// stream it used exactly once. The chunked writeback already pools
+    /// its streams for exactly this reason; this is the same pool
+    /// discipline for the same cost.
+    ///
+    /// Two dispatches that land on the same pooled stream serialise
+    /// against each other. That is not a regression: the transparent
+    /// path marshals, launches, and then finalizes — a blocking wait —
+    /// before returning to the interpreter, so it never had two launches
+    /// in flight to overlap in the first place. Callers that DO want
+    /// overlap register their own stream through `stream_create` and
+    /// pass its handle, which bypasses this pool entirely.
+    dispatch_streams: RwLock<Vec<std::sync::Arc<Stream>>>,
+    /// Cursor into [`OffloadCache::dispatch_streams`].
+    next_dispatch_stream: std::sync::atomic::AtomicUsize,
     chunk_streams: RwLock<Vec<std::sync::Arc<Stream>>>,
     /// Reused page-locked staging slabs for the chunked writeback, one
     /// per element type. See `staging_slot!` for why they are cached.
@@ -549,6 +572,8 @@ impl OffloadCache {
             print_decisions: config.print_gpu_decisions,
             streams: RwLock::new(FxHashMap::default()),
             next_stream_handle: std::sync::atomic::AtomicU64::new(1),
+            dispatch_streams: RwLock::new(Vec::new()),
+            next_dispatch_stream: std::sync::atomic::AtomicUsize::new(0),
             chunk_streams: RwLock::new(Vec::new()),
             chunk_events: RwLock::new(Vec::new()),
             builtin_module: RwLock::new(None),
@@ -2678,6 +2703,58 @@ impl OffloadCache {
         Stream::new(ctx).map(std::sync::Arc::new)
     }
 
+    /// A stream for a dispatch that did not name one.
+    ///
+    /// Built once per device and handed out round-robin. See
+    /// [`OffloadCache::dispatch_streams`] for why pooling is safe here
+    /// and what it replaces.
+    ///
+    /// Falls back to a fresh `Stream::new` if the pool cannot be built,
+    /// so a driver that refuses to create streams up front still gets
+    /// the driver's own error at the point of use rather than a bare
+    /// "no streams".
+    fn dispatch_stream(
+        &self,
+        ctx: &cuda_bridge::DeviceContext,
+    ) -> Result<std::sync::Arc<Stream>, cuda_bridge::DeviceError> {
+        {
+            let have = self.dispatch_streams.read();
+            if !have.is_empty() {
+                let i = self
+                    .next_dispatch_stream
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(std::sync::Arc::clone(&have[i % have.len()]));
+            }
+        }
+        {
+            let mut slot = self.dispatch_streams.write();
+            if slot.is_empty() {
+                let mut made = Vec::with_capacity(dispatch_stream_pool_size());
+                for _ in 0..dispatch_stream_pool_size() {
+                    match Stream::new(ctx) {
+                        Ok(s) => made.push(std::sync::Arc::new(s)),
+                        Err(e) => {
+                            tracing::debug!(
+                                "gpu offload: dispatch stream pool unavailable ({e}); \
+                                 falling back to a per-dispatch stream"
+                            );
+                            made.clear();
+                            break;
+                        }
+                    }
+                }
+                *slot = made;
+            }
+            if !slot.is_empty() {
+                let i = self
+                    .next_dispatch_stream
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(std::sync::Arc::clone(&slot[i % slot.len()]));
+            }
+        }
+        Stream::new(ctx).map(std::sync::Arc::new)
+    }
+
     fn chunk_stream_pool(&self, ctx: &cuda_bridge::DeviceContext) -> Vec<std::sync::Arc<Stream>> {
         {
             let have = self.chunk_streams.read();
@@ -4316,13 +4393,15 @@ pub fn dispatch_method_from_native_on_stream(
                 );
             }
         },
-        None => match CudaStream::new(ctx) {
-            Ok(s) => Arc::new(s),
+        // A handle-less caller takes a pooled stream rather than a
+        // freshly created one — see `OffloadCache::dispatch_streams`.
+        None => match cache.dispatch_stream(ctx) {
+            Ok(s) => s,
             Err(e) => {
                 return record_failed_submission(
                     None,
                     kind_of_device_error(&e),
-                    format!("submitMethod: Stream::new failed: {e}"),
+                    format!("submitMethod: no dispatch stream available: {e}"),
                 );
             }
         },
@@ -6124,6 +6203,37 @@ pub enum ChunkedStage {
 const CHUNK_STREAMS_DEFAULT: usize = 8;
 #[cfg(feature = "gpu-offload")]
 const CHUNK_COUNT_DEFAULT: usize = 8;
+
+/// Streams the handle-less dispatch path rotates over, instead of
+/// creating and destroying one per submission.
+///
+/// Four, not one, and not eight. One would be enough for the
+/// transparent interpreter path on its own — it finalizes before
+/// returning, so it never has two launches in flight — but
+/// `dispatch_method_from_native` is also reachable from several Java
+/// threads at once, and giving those a shared stream would serialise
+/// dispatches the driver could have overlapped. Four covers that without
+/// holding open more driver objects than a program that never offloads
+/// anything would want to pay for.
+///
+/// Override with `CRATONVM_GPU_DISPATCH_STREAMS`, and set it to 1 to get
+/// the strictest ordering if a bug is ever suspected to be one of
+/// stream concurrency.
+#[cfg(feature = "gpu-offload")]
+const DISPATCH_STREAM_POOL_DEFAULT: usize = 4;
+
+/// See [`DISPATCH_STREAM_POOL_DEFAULT`].
+#[cfg(feature = "gpu-offload")]
+fn dispatch_stream_pool_size() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GPU_DISPATCH_STREAMS")
+            .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))
+            .filter(|n: &usize| *n >= 1 && *n <= 32)
+            .unwrap_or(DISPATCH_STREAM_POOL_DEFAULT)
+    })
+}
 
 /// Streams the chunked dispatch rotates launches over.
 /// Override with `CRATONVM_GPU_CHUNK_STREAMS`.

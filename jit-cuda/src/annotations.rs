@@ -44,6 +44,25 @@ pub enum GridShape {
     RowPerThread,
     /// Block-reduction shape — block-wide reductions land here.
     BlockReduction,
+    /// The annotation named a constant this crate does not know.
+    ///
+    /// AUDIT 2026-09-02. `parse_grid_shape` matches the Java enum by
+    /// CONSTANT NAME, against a `craton.gpu.GridShape` that is versioned
+    /// in a different repository (`craton-gpu-java`) and located at build
+    /// time by environment variable, sibling checkout, or absolute path.
+    /// An unrecognised name used to fall through to
+    /// `GridShape::default()`, which is `Elementwise` — so renaming or
+    /// adding a constant on the Java side would silently turn
+    /// `grid = BLOCK_REDUCTION` into an element-wise kernel.
+    ///
+    /// That is precisely the failure AUDIT 2026-08-28 fixed by rejecting
+    /// unimplemented grid shapes: a block reduction lowered element-wise
+    /// produces wrong answers rather than an error, and a rejection would
+    /// merely have run the method on the CPU. Defaulting an unknown name
+    /// re-opened it through the name channel. Landing here instead sends
+    /// the method back through the same rejection, which is the only
+    /// honest answer to "the user asked for a shape we cannot name".
+    Unknown,
 }
 
 /// How aggressively the analyzer should admit a `@GpuKernel`-marked
@@ -274,14 +293,33 @@ fn as_enum_const_name<'a>(value: &'a ElementValue, cp: &'a ConstantPool) -> Opti
     }
 }
 
+/// The Java constant names of `craton.gpu.GridShape`, in the order the
+/// enum declares them.
+///
+/// Named here rather than inline in the match so
+/// `rust_enum_names_match_the_java_definitions` can compare this list
+/// against the compiled `.class` file and fail when the two drift.
+pub(crate) const GRID_SHAPE_NAMES: [&str; 3] =
+    ["ELEMENTWISE", "ROW_PER_THREAD", "BLOCK_REDUCTION"];
+
 fn parse_grid_shape(value: &ElementValue, cp: &ConstantPool) -> GridShape {
     match as_enum_const_name(value, cp) {
         Some("ELEMENTWISE") => GridShape::Elementwise,
         Some("ROW_PER_THREAD") => GridShape::RowPerThread,
         Some("BLOCK_REDUCTION") => GridShape::BlockReduction,
-        _ => GridShape::default(),
+        // NOT `GridShape::default()` — see `GridShape::Unknown`.
+        _ => GridShape::Unknown,
     }
 }
+
+/// The Java constant names of `craton.gpu.AdmissionHint`, in the order
+/// the enum declares them. See [`GRID_SHAPE_NAMES`].
+pub(crate) const ADMISSION_HINT_NAMES: [&str; 4] = [
+    "STRICT",
+    "ALLOW_ALLOCATION",
+    "ALLOW_DIV_BY_ZERO",
+    "ALLOW_INTRINSIC_CALLS",
+];
 
 fn parse_admission_hint(value: &ElementValue, cp: &ConstantPool) -> AdmissionHint {
     match as_enum_const_name(value, cp) {
@@ -289,6 +327,11 @@ fn parse_admission_hint(value: &ElementValue, cp: &ConstantPool) -> AdmissionHin
         Some("ALLOW_ALLOCATION") => AdmissionHint::AllowAllocation,
         Some("ALLOW_DIV_BY_ZERO") => AdmissionHint::AllowDivByZero,
         Some("ALLOW_INTRINSIC_CALLS") => AdmissionHint::AllowIntrinsicCalls,
+        // Unlike `parse_grid_shape`, defaulting is safe here: `Strict` is
+        // the STRICTEST hint, so an unrecognised name loses coverage (a
+        // method that would have been admitted is not) and can never
+        // admit something the emitter cannot lower. The contract test
+        // catches the drift either way.
         _ => AdmissionHint::default(),
     }
 }
@@ -362,6 +405,102 @@ fn parse_enable_gpu_async(ann: &Annotation, cp: &ConstantPool) -> EnableAsyncAtt
 mod tests {
     use super::*;
     use cratonvm_reader::attribute::ElementValuePair;
+
+    /// The Rust match arms and the Java enums must name the same
+    /// constants.
+    ///
+    /// # Why this test is the load-bearing one for this file
+    ///
+    /// Every annotation value this crate understands is matched BY
+    /// STRING against a `craton.gpu.*` enum that lives in a DIFFERENT
+    /// repository (`craton-gpu-java`), located at build time by
+    /// `$CRATON_GPU_JAVA_SRC`, a sibling checkout, or — on Windows — an
+    /// absolute path. Nothing links the two versions. Renaming a Java
+    /// constant, or adding one, breaks nothing that either side can see:
+    /// javac still compiles, cargo still builds, and every existing test
+    /// still passes.
+    ///
+    /// What changes is behaviour, silently. `parse_admission_hint` falls
+    /// back to `Strict`, which merely loses coverage. `parse_grid_shape`
+    /// used to fall back to `Elementwise`, which does not: it would turn
+    /// `grid = BLOCK_REDUCTION` into an element-wise kernel and produce
+    /// wrong answers — the exact failure AUDIT 2026-08-28 fixed by
+    /// rejecting unimplemented shapes, re-opened through the name
+    /// channel. That fallback is now `GridShape::Unknown`, which the
+    /// analyzer rejects; this test is the other half, catching the drift
+    /// at build time rather than discovering it as a wrong answer.
+    ///
+    /// # Skipping, loudly
+    ///
+    /// The annotation classes are only present when the build found the
+    /// external project. When they are absent this test reports a skip
+    /// and passes, because failing would make the whole crate untestable
+    /// on a machine that has no reason to check out a second repository.
+    /// It prints what it did either way, so a CI run that covered
+    /// nothing says so instead of showing a green tick.
+    #[test]
+    fn rust_enum_names_match_the_java_definitions() {
+        let dir = env!("CRATON_GPU_CLASSES_DIR");
+        if dir.is_empty() {
+            eprintln!(
+                "SKIP rust_enum_names_match_the_java_definitions: the craton-gpu-java \
+                 project was not found at build time, so there are no compiled \
+                 annotation classes to check against. Set CRATON_GPU_JAVA_SRC to \
+                 enable this check."
+            );
+            return;
+        }
+        let mut checked = 0usize;
+        for (class, rust_names) in [
+            ("GridShape", &super::GRID_SHAPE_NAMES[..]),
+            ("AdmissionHint", &super::ADMISSION_HINT_NAMES[..]),
+        ] {
+            let path = std::path::Path::new(dir)
+                .join("craton")
+                .join("gpu")
+                .join(format!("{class}.class"));
+            if !path.is_file() {
+                eprintln!(
+                    "SKIP {class}: {} is not present, though the classes \
+                     directory is",
+                    path.display()
+                );
+                continue;
+            }
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let class_file = cratonvm_reader::class_reader::read_class(&bytes)
+                .unwrap_or_else(|e| panic!("parse {}: {e:?}", path.display()));
+            // An enum's constants are its `static final` fields typed as
+            // the enum itself. `$VALUES` is the synthetic array javac
+            // adds and is typed as an array, so the descriptor match
+            // excludes it without needing to know its name.
+            let want_descriptor = format!("Lcraton/gpu/{class};");
+            let mut java_names: Vec<String> = class_file
+                .fields
+                .iter()
+                .filter(|f| {
+                    f.is_static() && f.is_final() && &*f.descriptor == want_descriptor.as_str()
+                })
+                .map(|f| f.name.to_string())
+                .collect();
+            java_names.sort();
+            let mut rust_sorted: Vec<String> =
+                rust_names.iter().map(|s| s.to_string()).collect();
+            rust_sorted.sort();
+            assert_eq!(
+                java_names,
+                rust_sorted,
+                "craton.gpu.{class} and this crate's parser disagree about the \
+                 constant set.\n  Java: {java_names:?}\n  Rust: {rust_sorted:?}\n\
+                 A name only Java has is a value this crate will not recognise; \
+                 a name only Rust has is a match arm that can never fire. Update \
+                 the parser in annotations.rs and the list beside it.",
+            );
+            checked += 1;
+        }
+        eprintln!("rust_enum_names_match_the_java_definitions: checked {checked} enum(s)");
+    }
 
     /// Tiny builder that hands out fresh constant-pool indices and
     /// produces a `ConstantPool` at the end. Tests use this instead of
