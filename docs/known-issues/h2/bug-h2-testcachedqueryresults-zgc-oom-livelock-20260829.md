@@ -276,6 +276,55 @@ is how one earlier attempt produced an empty gate census and a different failure
 (`Timeout trying to lock table "COUNTER"`) that says nothing about the heap.
 Read `relocation_on_proven_jit` before believing any arm of it.
 
+### 2026-09-01 (later): two reproduction attempts that FAILED, and what each eliminates
+
+`probes/ZgcRefArrayFragProbe.java` is checked in because it does NOT reproduce.
+Both shapes were run at `--Xmx 1g` against a HotSpot control:
+
+| probe shape | HotSpot | CratonVM | arena failures |
+|---|---|---|---:|
+| `Object[65536]` in a loop + churn | `served=254483 failed=0` | `served=185964 failed=0` | 0 |
+| `ConcurrentHashMap` keySet to 100000 + churn | `size=100000 missing=0 oom=0` | `size=100000 missing=0 oom=0` | 0 |
+
+**`ConcurrentHashMap` growth to 100000 is not sufficient**, even with four churn
+threads shattering the arena underneath it. That settles a question this page
+has answered twice in opposite directions: the number 98304 IS the CHM resize
+threshold and the failing allocation IS that 65536-slot table (so the
+2026-08-30 un-retraction stands), AND the resize alone does not fail (so
+`ChmKeySetGrowth` was not wrong either). What fails it is the ARENA STATE H2
+builds -- `spans=219425 largest_span=246704` -- which takes sustained
+mixed-lifetime allocation over hundreds of seconds, not a burst.
+
+**And `helper_windows=0` in every probe run.** A pure-Java allocation workload
+never puts a peer inside a Rust helper at collection time; H2 does, through file
+I/O, MVStore chunk compression and the JDBC path. So the helper-window repair
+cannot be A/B'd on a probe like this -- an instrument armed where it cannot fire
+-- which is why `org.h2.test.db.TestMultiThread` is the class used for it above.
+
+The second shape also showed relocation ENGAGING on CratonVM
+(`relocation_on_proven_jit=118`, `compaction_cycles=116`, `objects_relocated=101058`)
+with zero arena failures. A heap that compacts does not reach this failure,
+which is consistent with everything else on this page and is the reason the
+class's `relocation_on_proven_jit=0` is the number that matters.
+
+### A measurement trap this class carries, and it is not the heap
+
+`TestCachedQueryResults` cannot be measured on a loaded host, for a reason that
+has nothing to do with GC. Its inner statement is
+
+```sql
+SELECT counter FROM Counter WHERE id = 1 FOR UPDATE WAIT 0.5
+```
+
+so under contention it fails with `Timeout trying to lock table "COUNTER"` --
+a starved half-second SQL lock. Two capped runs on a host at load 20-60
+produced exactly that and nothing else. Worse, both were killed by `timeout`
+(`rc=124`), and **a run killed by `timeout` prints no `[GC]` summary at all**,
+so `relocation_on_proven_jit`, the gate census and the frag windows are simply
+absent from it. Record `/proc/loadavg` beside every arm, give the run a cap it
+can finish inside, and treat a `COUNTER` timeout as "no measurement", not as a
+result.
+
 ## Status
 
 **OPEN. The chain this Status line describes is REFUTED -- see the 2026-08-30 (b) addendum above, which measures the handshake at accepted=1731 refused=0 and gets the identical failure. Kept verbatim below because the four repairs it led to are real. Original text: the chain is traced to one frame — see §"2026-08-29 (second)".**
