@@ -57,14 +57,29 @@ pub(crate) fn zgc_tlab_enabled_by_default() -> bool {
     }
 }
 
-/// The reserved footprint of a `bytes` request at [`ZGC_TLAB_ALIGN`].
-///
-/// Mirrors [`Tlab::alloc_initialized`]'s own `footprint` computation, so the
-/// bytes charged to [`ZgcRealHeap::allocated`] are the bytes the buffer
-/// actually consumed. (There is no *leading* padding to account for: the
-/// cursor never leaves the 8-byte grid because every request uses
-/// [`ZGC_TLAB_ALIGN`].)
-#[inline]
+/// Process-wide mirror of the per-heap mutator-TLAB counters, so the exit
+/// statistics (printed after the VM is gone) can still say whether the inline
+/// bump engaged: `(refills, refill bytes, objects registered, tail bytes
+/// returned)`. A zero in the first column under the default collector means
+/// the switch is off or the chunk budget is zero.
+pub static MUTATOR_TLAB_CENSUS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// The process-wide mutator-TLAB census (see [`MUTATOR_TLAB_CENSUS`]).
+pub fn mutator_tlab_census() -> (u64, u64, u64, u64) {
+    let c = &MUTATOR_TLAB_CENSUS;
+    (
+        c[0].load(Ordering::Relaxed),
+        c[1].load(Ordering::Relaxed),
+        c[2].load(Ordering::Relaxed),
+        c[3].load(Ordering::Relaxed),
+    )
+}
+
 /// Kill switch for the mutator-owned TLAB chunks: `CRATONVM_ZGC_MUTATOR_TLAB=0`.
 pub(crate) fn mutator_tlab_enabled() -> bool {
     use std::sync::OnceLock;
@@ -77,6 +92,14 @@ pub(crate) fn mutator_tlab_enabled() -> bool {
     })
 }
 
+/// The reserved footprint of a `bytes` request at [`ZGC_TLAB_ALIGN`].
+///
+/// Mirrors [`Tlab::alloc_initialized`]'s own `footprint` computation, so the
+/// bytes charged to [`ZgcRealHeap::allocated`] are the bytes the buffer
+/// actually consumed. (There is no *leading* padding to account for: the
+/// cursor never leaves the 8-byte grid because every request uses
+/// [`ZGC_TLAB_ALIGN`].)
+#[inline]
 pub(crate) fn zgc_tlab_footprint(bytes: usize) -> usize {
     bytes.saturating_add(ZGC_TLAB_ALIGN - 1) & !(ZGC_TLAB_ALIGN - 1)
 }
@@ -817,6 +840,8 @@ impl ZgcRealHeap {
         self.counters
             .mutator_tlab_refill_bytes
             .fetch_add(size, Ordering::Relaxed);
+        MUTATOR_TLAB_CENSUS[0].fetch_add(1, Ordering::Relaxed);
+        MUTATOR_TLAB_CENSUS[1].fetch_add(size as u64, Ordering::Relaxed);
         Some((ptr, size))
     }
 
@@ -836,6 +861,7 @@ impl ZgcRealHeap {
         }
         self.allocate_black_if_marking(addr as *mut u8);
         self.counters.mutator_tlab_objects.fetch_add(1, Ordering::Relaxed);
+        MUTATOR_TLAB_CENSUS[2].fetch_add(1, Ordering::Relaxed);
     }
 
     /// The `Tlab::retire` hook: a reserved tail inside this arena goes back on
@@ -856,6 +882,7 @@ impl ZgcRealHeap {
         self.counters
             .mutator_tlab_tail_bytes
             .fetch_add(tail_end - tail_start, Ordering::Relaxed);
+        MUTATOR_TLAB_CENSUS[3].fetch_add((tail_end - tail_start) as u64, Ordering::Relaxed);
         true
     }
 

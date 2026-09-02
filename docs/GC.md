@@ -618,11 +618,21 @@ registry. Non-moving ⇒ the pointer map is always empty and
 no barriers are needed; reference semantics come entirely from the VM-level
 protocol.
 
-**Mutators DO have TLABs on this backend.** `VmHeap::refill_tlab` returns
-`None` for `VmHeap::Zgc` — the buffers are not reached that way.
-`ZgcRealHeap::alloc_raw_tlab` (over `gc/src/zgc/tlab.rs`)
-is the funnel for every object and every array, it is **on by default**, and
-`CRATONVM_ZGC_TLAB=0` is the kill switch. A TLAB chunk is *reserved* space that
+**Mutators DO have TLABs on this backend — two kinds since 2026-09-02.**
+`ZgcRealHeap::alloc_raw_tlab` (over `gc/src/zgc/tlab.rs`) is the funnel for
+every object and every array the heap allocates itself, it is **on by
+default**, and `CRATONVM_ZGC_TLAB=0` is the kill switch. Separately,
+`VmHeap::refill_tlab` on the `Zgc` arm now hands a mutator thread a chunk for
+its own `JvmThread::tlab` (`ZgcRealHeap::refill_mutator_tlab`) — the chunk
+both JIT tiers' inline TLAB bump and the interpreter's `alloc_initialized`
+fast path bump. Until then that arm returned `None`, so under the default
+collector every compiled `new` was a `jit_new_object` helper call. Objects
+bumped from a mutator chunk are registered eagerly, one at a time, through
+`VmHeap::note_thread_tlab_object` (registry, quiescence note, allocation
+account, black allocation under a live mark), and the unused tail returns to
+the arena through the `Tlab::retire` hook the heap registers in `new_shared`.
+`CRATONVM_ZGC_MUTATOR_TLAB=0` is the kill switch; the exit statistics print
+`ZGC mutator TLAB: refills=… objects_registered=…` as the engagement census. A TLAB chunk is *reserved* space that
 no collection can reclaim while its owning thread lives, so it is invisible to
 any trigger that counts live bytes; the reservation budget is bounded by the
 live buffer count (`ZGC_TLAB_RESERVATION_SHARE`) for exactly that reason.

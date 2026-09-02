@@ -533,7 +533,7 @@ the contract it is missing.
 | Background compilation pipeline | **ON** | `CRATONVM_BG_COMPILE=0` |
 | C1→C2 supersede | **ON** | `CRATONVM_C2_SUPERSEDE=0` |
 | IR backend (int/ref/long/FP, non-virtual calls) | **ON** (bounded shape) | see `ir_compatible()` |
-| IR backend for virtual/interface calls | off | `CRATONVM_JIT_IR_CALL_VIRTUAL` |
+| IR backend for virtual/interface calls | **ON** | `CRATONVM_JIT_IR_CALL_VIRTUAL=0` |
 | Back-edge OSR | **ON**, threshold 1000 | `CRATONVM_JIT_OSR=0` |
 | OSR for `newarray`-containing methods | **ON** | `CRATONVM_OSR_NEWARRAY=0` |
 | Guarded-inline getfield (region-bounds-checked) | **ON** | `CRATONVM_JIT_GETFIELD_HELPER=1` |
@@ -547,10 +547,20 @@ the contract it is missing.
 | BC `crypto/{engines,io,modes,paddings}` + `math/` JIT | **allowed** | — |
 | BC blanket ban (`asn1/`, `util/`, ...) | still banned | `CRATONVM_JIT_ALLOW_PACKAGES` |
 | Precise JIT stack maps | **ON** | `CRATONVM_NO_PRECISE_JIT_MAPS` |
-| IR-tier register residency (GP + FP files) | off — built and verified, flip wants a measurement | `CRATONVM_JIT_IR_LINEAR_SCAN=1` |
+| IR-tier register residency (GP + FP files) | **ON** since 2026-09-02, phis included | `CRATONVM_JIT_IR_LINEAR_SCAN=0`, `CRATONVM_JIT_IR_PHI_RESIDENCY=0` |
+| IR-tier constants as immediates | **ON** | `CRATONVM_JIT_IR_CONST_IMM=0` |
+| IR-tier fused compare-and-branch, trampoline-free branches | **ON** | `CRATONVM_JIT_IR_FUSED_BRANCH=0` |
+| IR-tier receiver-guard CSE (once per receiver per block) | **ON** | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE=0` |
+| IR-tier gated inline reference stores | **ON** where a collector publishes a plan | `CRATONVM_JIT_IR_GATED_REF_STORE=0` |
+| IR-tier inline TLAB bump for `Op::New` | **ON** | `CRATONVM_JIT_IR_INLINE_TLAB=0` |
+| Thread pointer fetched from a TLS mirror (both tiers) | **ON** where the probe succeeds | `CRATONVM_JIT_TLS_THREAD_FETCH=0` |
+| One post-call sentinel compare (both tiers) | **ON** | `CRATONVM_JIT_MERGED_CALL_SENTINEL=0` |
+| ZGC mutator TLAB (the chunk the inline bump bumps) | **ON** | `CRATONVM_ZGC_MUTATOR_TLAB=0` |
+| Receiver-type + call-site profile recording | **ON** | `CRATONVM_TIER_PGO_RECEIVERS=0` (branch/back-edge recording stays behind `CRATONVM_TIER_PGO`) |
+| Guarded virtual inlining on receiver profiles | **ON** | `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE=0` |
 | Gated inline reference stores | **ON** where a collector publishes a plan | `CRATONVM_JIT_GATED_REF_STORE=0` |
 | Operand-stack register cache beyond pure kernels | off (see the section above for the ARG_REGS collision) | `CRATONVM_JIT_OPERAND_CACHE=1` |
-| Optimizing tier for allocation-bearing methods | off (the tier has no inline TLAB bump) | `CRATONVM_JIT_C2_ALLOC_UPGRADE` |
+| Optimizing tier for allocation-bearing methods | **ON** (the tier has an inline TLAB bump now) | `CRATONVM_JIT_C2_ALLOC_UPGRADE=0` |
 
 ### Performance — current status
 

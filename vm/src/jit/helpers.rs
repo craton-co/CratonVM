@@ -25487,6 +25487,23 @@ pub unsafe extern "C" fn jit_safepoint_slow_path() {
 ///
 /// `extern "C"` with the single `rbp` argument in the platform's first
 /// integer-argument register, matching the JIT's `ARG_REGS[0]` load.
+/// The mutator-TLAB engagement census, on the `jit.method_stats` switch:
+/// `(refills, refill bytes, objects registered, tail bytes returned)` for the
+/// chunks `ZgcRealHeap::refill_mutator_tlab` handed to `JvmThread::tlab`. A
+/// zero refill count under the default collector says the inline TLAB bump
+/// both JIT tiers emit never had a chunk to bump -- the exact reading this
+/// census exists to make visible (see the 2026-09-02 note on
+/// `VmHeap::refill_tlab`'s Zgc arm).
+pub fn report_zgc_mutator_tlab_census_at_exit() {
+    #[cfg(feature = "zgc")]
+    {
+        let (refills, bytes, objects, tail) = cratonvm_gc::zgc::mutator_tlab_census();
+        eprintln!(
+            "[cratonvm] ZGC mutator TLAB: refills={refills} refill_bytes={bytes}              objects_registered={objects} tail_bytes_returned={tail}"
+        );
+    }
+}
+
 extern "C" fn jit_frame_record(rbp: usize) {
     crate::jit::conservative_roots::set_top_frame_base(rbp);
 }

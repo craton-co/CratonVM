@@ -110,6 +110,7 @@ pub(crate) use sweep::{ZSweepCfg, ZSweepShard};
 /// The arena-backed thread-local allocation buffer -- not `zgc::tlab`, which
 /// buffers out of the page allocator. Split out of this file on 2026-09-02.
 mod arena_tlab;
+pub use arena_tlab::mutator_tlab_census;
 pub use arena_tlab::ZArenaTlabRetireSummary;
 pub(crate) use arena_tlab::{zgc_tlab_enabled_by_default, zgc_tlab_footprint, ZArenaTlabRegistry};
 
