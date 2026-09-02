@@ -6349,6 +6349,14 @@ impl G1Collector {
         // from an rset source walk, and a wrong header here is what walks the
         // loops below out of the region entirely — see
         // `holder_walkable_slots`.
+        // The holder AT SCAN TIME. `evacuate_object` already screens both ends
+        // of every copy and reports `copy_shape_drift`; a worklist holder is a
+        // to-space copy that went through it. So if this fires while
+        // `evacuate-src` / `evacuate-dest` stayed silent for the same address,
+        // the header was sound when it was copied and is not sound now --
+        // i.e. something overwrote the copy WITHIN the pause, which is a
+        // different defect from anything the copy path can produce.
+        self.note_implausible_legacy_header(regions, obj_ptr, header, "worklist-holder");
         if !self.candidate_header_is_plausible(regions, obj_ptr as usize) {
             let n = EVAC_HOLDER_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 8 || n.is_power_of_two() {
@@ -6583,6 +6591,12 @@ impl G1Collector {
                 break;
             }
             let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            // Same screen on the LINEAR walk. Note the standing caveat: this
+            // walk visits dead objects too (it walks the region, not the live
+            // set), so a hit here is weaker evidence than one at
+            // `worklist-holder` -- which is exactly why the two sites are
+            // named apart.
+            self.note_implausible_legacy_header(regions, obj_ptr, header, "rset-source-walk");
             // Round-9 gc CRIT-1: humongous continuation filler covers the
             // entire region; skip without trying to follow any oops.
             if is_humongous_filler(header) {
