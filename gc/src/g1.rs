@@ -3087,6 +3087,10 @@ static NEXT_G1_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 impl Drop for G1Collector {
     fn drop(&mut self) {
         crate::gen_heap::clear_jit_read_bounds_owned_by(self.arena.as_ptr() as usize);
+        // F-08 - and the barrier geometry with it. Owner-checked for the same
+        // reason: a dropped collector must not leave numbers behind that
+        // compiled code would then read as a live arena's.
+        crate::gen_heap::clear_jit_g1_barrier_owned_by(self.arena.as_ptr() as usize);
     }
 }
 
@@ -3192,6 +3196,25 @@ impl G1Collector {
         // colored words, no load barrier), unlike ZGC's, which is why ZGC does
         // not publish here.
         crate::gen_heap::publish_jit_read_bounds(0, arena_base, arena_end);
+
+        // F-08 - publish G1's geometry for the JIT's inline post-write barrier.
+        //
+        // A SEPARATE table from `JIT_REGION_BOUNDS`, whose emptiness under G1
+        // closes defect G1-2 and must stay empty, and from `JIT_READ_BOUNDS`
+        // just above, which answers the read-side "is this address mapped"
+        // question. Three tables for three questions; see `JitG1BarrierTable`
+        // for the argument and for why the mask is applied to `addr -
+        // arena_base` rather than to `addr`.
+        //
+        // `region_size` is a power of two (`normalize_region_size`), so
+        // `!(region_size - 1)` is the mask that isolates the region number.
+        crate::gen_heap::publish_jit_g1_barrier(
+            arena_base,
+            arena.len(),
+            !(config.region_size - 1),
+            cards.cards_base_addr(),
+            crate::g1_cards::G1_CARD_SHIFT,
+        );
 
         Self {
             layout_domain: std::sync::atomic::AtomicU32::new(cratonvm_types::FIRST_LAYOUT_DOMAIN),

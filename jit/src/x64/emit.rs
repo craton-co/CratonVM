@@ -1083,6 +1083,54 @@ impl Compiler {
         self.modrm_reg(src, dst);
     }
 
+    /// `SUB r64, [base + disp32]` (REX.W 2B /r).
+    ///
+    /// F-08 — the inline G1 barrier's `addr - arena_base`. A memory operand
+    /// rather than a baked immediate on purpose: the arena base is a property
+    /// of the collector INSTANCE, and compiled code outlives collector
+    /// construction in embedding and in the unit suite, so the value has to be
+    /// read at run time from the published table. That is the same rule
+    /// `emit_guarded_getfield_receiver_check` follows for the bounds it
+    /// compares against.
+    pub(super) fn emit_sub_r64_mem_disp32(&mut self, dst: u8, base: u8, disp: i32) {
+        let mut rex = 0x48u8;
+        if dst >= 8 {
+            rex |= 0x04;
+        }
+        if base >= 8 {
+            rex |= 0x01;
+        }
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x2B); // SUB r64, r/m64
+        self.buf.emit_byte(0x80 | ((dst & 7) << 3) | (base & 7));
+        self.buf.emit(&disp.to_le_bytes());
+    }
+
+    /// `AND r64, [base + disp32]` (REX.W 23 /r). Sets ZF from the result, so
+    /// the caller can branch on it without a separate `TEST`.
+    pub(super) fn emit_and_r64_mem_disp32(&mut self, dst: u8, base: u8, disp: i32) {
+        let mut rex = 0x48u8;
+        if dst >= 8 {
+            rex |= 0x04;
+        }
+        if base >= 8 {
+            rex |= 0x01;
+        }
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x23); // AND r64, r/m64
+        self.buf.emit_byte(0x80 | ((dst & 7) << 3) | (base & 7));
+        self.buf.emit(&disp.to_le_bytes());
+    }
+
+    /// `XOR dst64, src64` (REX.W 31 /r).
+    ///
+    /// Distinct from [`Self::emit_xor_reg_self`], which is the zeroing idiom.
+    pub(super) fn emit_xor_r64_r64(&mut self, dst: u8, src: u8) {
+        self.rex_w_rb(src, dst);
+        self.buf.emit_byte(0x31); // XOR r/m64, r64
+        self.modrm_reg(src, dst);
+    }
+
     pub(super) fn emit_shr_r64_imm8(&mut self, reg: u8, shift: u8) {
         self.rex_w_b(reg);
         self.buf.emit_byte(0xC1);

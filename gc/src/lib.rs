@@ -165,9 +165,9 @@ pub use gc_metrics::{
     collector_decision_report, gc_metrics_report, CollectorDecision, GcMetricsRaw, GcMetricsReport,
 };
 pub use gen_heap::{
-    clear_jit_read_bounds, jit_read_bounds_addr, jit_region_bounds_addr, publish_jit_read_bounds,
-    GenerationalHeap, HeapStats, HeapStatsSnapshot, JitReadBoundsTable, JitRegionBoundsTable,
-    JIT_READ_BOUNDS, JIT_REGION_BOUNDS,
+    clear_jit_read_bounds, jit_g1_barrier_addr, jit_read_bounds_addr, jit_region_bounds_addr,
+    publish_jit_read_bounds, GenerationalHeap, HeapStats, HeapStatsSnapshot, JitG1BarrierTable,
+    JitReadBoundsTable, JitRegionBoundsTable, JIT_G1_BARRIER, JIT_READ_BOUNDS, JIT_REGION_BOUNDS,
 };
 pub use heap::{ArrayElementType, Heap, ObjectHeader, ObjectKind};
 pub use mark_bitmap::MarkBitmap;
