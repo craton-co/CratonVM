@@ -95,6 +95,18 @@ pub fn mirrors_for_loader(loader_addr: usize) -> Option<Vec<usize>> {
 /// cycle needs the wholesale form: it never visits an old loader, so it never
 /// reaches the per-loader lookup, and a mirror reachable only that way would be
 /// swept while its class is live.
+/// The loader addresses that OWN pinned mirrors -- the keys, not the values.
+///
+/// The per-object lookup is keyed by owner address, so a marker can snapshot
+/// these once per collection and reject every other address without taking
+/// the lock.
+pub fn pinned_owner_addrs() -> Vec<usize> {
+    if !NON_EMPTY.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
+    store().read().keys().copied().collect()
+}
+
 pub fn all_pinned_mirrors() -> Vec<usize> {
     if !NON_EMPTY.load(Ordering::Relaxed) {
         return Vec::new();

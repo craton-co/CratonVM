@@ -17389,7 +17389,9 @@ pub fn register_essential_natives_with_shims(
         |_ctx, _args| -> MethodCallResult {
             Err(MethodCallFailed::from(
                 RuntimeError::NoSuchElementException {
-                    message: "Collections.emptyEnumeration()".to_string(),
+                    // A bare `new NoSuchElementException()` on the oracle;
+                    // empty is this crate's marker for a null message.
+                    message: String::new(),
                 },
             ))
         },
@@ -26534,9 +26536,10 @@ pub(crate) fn obj_arg(
             // we don't want to drown those in backtraces.
             if crate::nbflags().dbg_null_native {
                 eprintln!(
-                    "[obj_arg] null at idx={} args.len={}\n{}",
+                    "[obj_arg] null at idx={} args.len={} arg={:?}\n{}",
                     idx,
                     args.len(),
+                    args.get(idx),
                     std::backtrace::Backtrace::force_capture()
                 );
             }
