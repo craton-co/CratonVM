@@ -279,23 +279,42 @@ HotSpot in the same environment.
 ### The re-run after merging dev
 
 Everything above was measured on the branch before it took `origin/dev`. dev
-moved 52 commits under it, so it was rebuilt and re-run on the merge:
+moved 146 commits under it across two merges, so it was rebuilt and re-run on
+each:
 
 ```text
-                        before the merge      after the merge
-regression suite        81/81 · 121/121       82/82 · 122/122   (dev added a vector)
-harness-blindness       0 · 0                 0 · 0
-REncodingFidelity       PASS · PASS           PASS · PASS
-RBufferPoolCount        PASS · PASS           PASS · PASS
-RJdkJmx                 PASS · PASS           PASS · PASS
+                        before      after merge 1    after merge 2
+regression suite        81 · 121    82 · 122         84 · 124   (dev added vectors)
+harness-blindness       0 · 0       0 · 0            0 · 0
+REncodingFidelity       PASS·PASS   PASS · PASS      PASS · PASS
+RBufferPoolCount        PASS·PASS   PASS · PASS      PASS · PASS
+RJdkJmx                 PASS·PASS   PASS · PASS      PASS · PASS
 ```
 
-The post-merge binary is built with `lto = "thin"` and `codegen-units = 16`
+The second merge is the one that changed the shape of the fix rather than only
+its denominator: another lane had closed the same residual's `native.encoding`
+half the same day, and its record —
+`docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-20260901.md`
+— had staged the stream half and asked for an opt-out. So the streams now sit
+behind `CRATONVM_STDOUT_ENCODING`, verified in both directions in one binary
+under `LC_ALL=C`:
+
+```text
+                               stdout.encoding   System.out.charset()   println("[Ж]")
+default (derived)              ANSI_X3.4-1968    US-ASCII               5b 3f 5d
+CRATONVM_STDOUT_ENCODING=UTF-8 UTF-8             UTF-8                  5b d0 96 5d
+HotSpot 25.0.3+9               ANSI_X3.4-1968    US-ASCII               5b 3f 5d
+```
+
+and `sun.jnu.encoding` is deliberately left pinned at UTF-8 — it decides how
+FILE NAMES are encoded, which is class loading rather than printing, and that
+is the other lane's staging call. `REncodingFidelity` does not diff that key
+for exactly that reason; `probes/EncodingFidelity.java` prints it.
+
+The post-merge binaries are built with `lto = "thin"` and `codegen-units = 16`
 on six crates instead of the release profile's `fat` / `1`. That is not a
 preference: the shared host SIGKILLed the fat-LTO link of `cratonvm-cli` five
 times and `cratonvm-native-builtins` twice more, with `MemAvailable` at 0-1 GiB
 and load between 90 and 270 on 8 cores from other sessions' builds. Same
-sources, same `opt-level`; it is a correctness oracle and not a performance
-one, and every number in this record that is about SPEED — there are none —
-would need the standard profile. The pre-merge rows above are from a standard
-`--release` build.
+sources, same `opt-level`; they are correctness oracles and not performance
+ones. The pre-merge rows are from a standard `--release` build.
