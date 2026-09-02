@@ -1003,6 +1003,10 @@ struct ZgcCounters {
     /// `Arena::decommit_unbumped_middle` existed.
     bytes_uncommitted: AtomicUsize,
 
+    /// Cells `retire_all_tlabs_at_safepoint` could not lock -- the DANGEROUS
+    /// half of `tlab_retire_skipped_total`, which counts the opportunistic
+    /// callers too. See `retire_all_tlabs_at_safepoint`.
+    tlab_retire_skipped_at_safepoint: AtomicUsize,
     /// Allocate-black claims that actually had to touch the bitmap, i.e. the
     /// residual after the per-chunk blackening. `conc_black_allocations` counts
     /// every object born black; this counts the ones that cost an atomic. A run
@@ -1538,6 +1542,12 @@ pub struct ZgcRealHeap {
     /// [`Self::note_young_page`]. One bit per 64 KiB of arena, so a 4 GiB heap
     /// costs 8 KiB.
     young_pages: Vec<AtomicU64>,
+    /// Did THIS collection's safepoint retire leave a TLAB chunk behind?
+    ///
+    /// Armed by `retire_all_tlabs_at_safepoint`, consulted by `relocate_stw`,
+    /// cleared at the start of every collection. A gate reads it, so it stays
+    /// on the hot struct rather than in [`ZgcCounters`].
+    tlab_retire_incomplete: AtomicBool,
     /// Did an allocation land off the grain grid, making the young set
     /// incomplete? Forces every cycle whole-heap while set.
     young_page_grid_overflow: AtomicBool,
@@ -1799,6 +1809,7 @@ impl ZgcRealHeap {
                 (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect()
             },
             young_page_grid_overflow: AtomicBool::new(false),
+            tlab_retire_incomplete: AtomicBool::new(false),
             conc_start_adaptive: AtomicBool::new(conc_start_is_adaptive()),
             rate_sample_bytes: AtomicU64::new(0),
             rate_sample_nanos: AtomicU64::new(0),
@@ -1894,6 +1905,7 @@ impl ZgcRealHeap {
                 forwarding_words_read: AtomicUsize::new(0),
                 bytes_uncommitted: AtomicUsize::new(0),
                 conc_black_claims: AtomicUsize::new(0),
+            tlab_retire_skipped_at_safepoint: AtomicUsize::new(0),
                 relocation_on_page_pins: AtomicUsize::new(0),
             }),
         };
@@ -2880,6 +2892,20 @@ impl ZgcRealHeap {
     /// Lifetime count of TLAB cells a retire could not lock.
     pub fn tlab_retire_skipped(&self) -> usize {
         self.counters.tlab_retire_skipped_total.load(Ordering::Relaxed)
+    }
+
+    /// Cells the SAFEPOINT retire could not lock -- the dangerous half of
+    /// [`Self::tlab_retire_skipped`].
+    ///
+    /// The number `relocate_stw`'s old soundness argument needed and did not
+    /// have. `tlab_retire_skipped` counts four callers, three of which hold no
+    /// safepoint and for none of which a skip means anything; a run reporting
+    /// 42 there says nothing about whether any of them was this one. Zero here
+    /// is the ruling-out that paragraph claimed.
+    pub fn tlab_retire_skipped_at_safepoint(&self) -> usize {
+        self.counters
+            .tlab_retire_skipped_at_safepoint
+            .load(Ordering::Relaxed)
     }
 
     /// Mark-driver fixed-point waits that expired instead of being woken. See
@@ -4504,6 +4530,40 @@ impl ZgcRealHeap {
         // a register holding only a DERIVED/interior pointer names no base, so
         // pin-by-value does not protect the base. The resumed peer then keeps
         // loading through a stale derived pointer.
+        //
+        // LIFTING `XT_HELPER_WINDOW` OUT OF THIS SET WAS TRIED, MEASURED, AND
+        // REVERTED (2026-09-02). The argument was the D5 one, one level down:
+        // the derived-pointer hazard above is a statement about the PIN SET,
+        // not about the cycle -- `is_obj` accepts only bases, so an interior
+        // pointer is never pinned and its base moves. So `helper_window_pass`
+        // was made to publish every in-heap WORD of the frozen band, base or
+        // not, on the reasoning that an interior pointer lands on the same page
+        // as the object it points into and the page would then be withheld.
+        //
+        // It corrupts the heap. `probes/OopMapHelperWindow.java` drives the
+        // path for real (`helper-window pass: 1-2 window(s), 186-384
+        // conservative root(s)` on 5-8 collections of a run, where
+        // `OopMapPeerCoverage` reports `0 window(s)` and exercises nothing) and
+        // the arms are unambiguous:
+        //
+        //     lift enabled                 2 of 3 runs WRONG, NullPointerException
+        //                                  reading an array element written one
+        //                                  statement earlier
+        //     PAGE_PINNED_RELOCATE=0       3 of 3 correct
+        //     ZGC_RELOCATE=0               3 of 3 correct
+        //
+        // So page pins are NOT sufficient for a frozen peer, and the reason is
+        // not yet established -- the leading suspect is that
+        // `memory::roots::collect_roots` calls `clear_pinned_jit_roots()` and
+        // the JIT-frame scan then REPUBLISHES the collector thread's entry
+        // wholesale, discarding pins the helper-window pass added earlier on
+        // that same thread. Whoever picks this up should establish that first;
+        // if it holds, the pins need an entry of their own rather than a share
+        // of the collector's.
+        //
+        // `XT_TAKEOVER` was never lifted, and an unmeasured extension of the
+        // argument to a second path is how a sound repair becomes an unsound
+        // one -- which is what the row above records happening to the first.
         (1 << r::XT_TAKEOVER)
             | (1 << r::XT_HELPER_WINDOW)
             // A blanket statement that the JIT's relocation contract is not
@@ -5083,7 +5143,61 @@ impl ZgcRealHeap {
         } else {
             None
         };
-        let frames_are_rewritable = refusal.is_none();
+        // ---- A CHUNK THIS COLLECTION CANNOT SEE ---------------------------
+        //
+        // UNCONDITIONAL, and deliberately not a term of the compiled-frame
+        // chain below: a retained TLAB chunk has nothing to do with whether the
+        // JIT is active. `retire_all_tlabs_at_safepoint` could not lock a cell,
+        // so its owner still holds a reserved span -- and then nothing keeps
+        // the compaction cursor above it, `compact_low_to` retracts past it and
+        // zeroes it, `clear_low_free_list` drops the only record that it was
+        // reserved, and the arena and that thread fill one span.
+        //
+        // This was previously argued away rather than checked. The argument
+        // was: *"`tlab_retire_skipped` measured zero across every run of the
+        // `ResourceLeakDetectorTest` repro, so no chunk is ever retained and a
+        // refusal built on it could never fire."* That counter also counted the
+        // THREE opportunistic callers (`alloc_raw`, `walk_objects`, the census
+        // driver), none of which holds a safepoint and for none of which a skip
+        // means anything -- so its zero was never evidence about this case.
+        // `probes/OopMapPeerCoverage.java` reports 42 skips across both kinds,
+        // which is exactly the reading a conflated counter cannot act on.
+        if self.tlab_retire_incomplete.load(Ordering::Acquire) {
+            self.counters.relocation_skipped_jit.fetch_add(1, Ordering::Relaxed);
+            if let Some(slot) = self
+                .counters
+                .relocation_skip_reasons
+                .get(relocation_skip_reason::TLAB_RETIRE_INCOMPLETE)
+            {
+                slot.fetch_add(1, Ordering::Relaxed);
+            }
+            let reclaimed = self.arena.lock().retract_cursor_into_free_tail();
+            return (0, reclaimed, cratonvm_types::PointerMap::default());
+        }
+
+        // `CRATONVM_ZGC_ASSUME_REWRITABLE=1` -- **A MEASUREMENT INSTRUMENT, and
+        // unsafe to run with.** It answers the one question this family turns
+        // on and which no per-obligation repair can answer: if every compiled
+        // frame WERE rewritable, would compaction fix the workload at all?
+        //
+        // Discharging obligations one at a time cannot answer it, and two
+        // attempts on record show why. `CRATONVM_XT_JIT_COVERAGE_ASSUME` took
+        // the cross-thread handshake from `accepted=0 refused=1731` to
+        // `accepted=1731 refused=0` and `TestCachedQueryResults` failed
+        // identically, because other obligations still marked the cycle
+        // incomplete. `CRATONVM_XT_HELPER_WINDOW_DISCHARGE` then removed
+        // `xt-helper-window-conservative-scan` outright (12 -> absent on
+        // `TestMultiThread`) and `relocation_on_proven_jit` went 1 -> 0,
+        // because the refusals redistributed to
+        // `compiled-frame-oop-not-published` and `cross-thread-jit-peer`.
+        //
+        // `coverage-proof-incomplete` is a CONJUNCTION. Only forcing the whole
+        // term says whether the conjunction is worth satisfying, and that is
+        // the ONLY thing this flag is for. It relocates under frames nobody
+        // proved rewritable; expect corruption if the answer is no.
+        let assume_rewritable =
+            cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_ASSUME_REWRITABLE").is_some();
+        let frames_are_rewritable = refusal.is_none() || assume_rewritable;
         if compiled_frames_live && !frames_are_rewritable {
             self.counters.relocation_skipped_jit.fetch_add(1, Ordering::Relaxed);
             if let Some(r) = refusal {
@@ -5113,7 +5227,13 @@ impl ZgcRealHeap {
         if crate::gc_quiescence::moving_young_coverage_incomplete() {
             self.counters.relocation_on_page_pins.fetch_add(1, Ordering::Relaxed);
         }
-        // A RETAINED TLAB CHUNK WAS THE OBVIOUS SUSPECT HERE, AND IT IS RULED
+        // A RETAINED TLAB CHUNK IS NOW A REFUSAL ABOVE, not a ruling-out. The
+        // paragraph that used to stand here said it "could never fire" on the
+        // strength of a counter that conflated the safepoint caller with three
+        // opportunistic ones. Kept below as history, because the shape of the
+        // hazard it describes is right and only the evidence was wrong.
+        //
+        // A RETAINED TLAB CHUNK WAS THE OBVIOUS SUSPECT HERE, AND IT WAS RULED
         // OUT. `retire_all_tlabs` skips a cell it cannot `try_lock`, and on a
         // compacting heap that would be unsound rather than merely wasteful:
         // nothing keeps the compaction cursor above a chunk the collector
@@ -8904,8 +9024,12 @@ pub mod relocation_skip_reason {
     pub const FORCED_NON_MOVING_ROOTS: usize = 3;
     /// A JIT frame was on this thread's stack without a `JitEntryGuard`.
     pub const UNREGISTERED_JIT_FRAME: usize = 4;
+    /// This collection's safepoint TLAB retire could not lock a cell, so a
+    /// thread's chunk is still reserved and invisible to the collector. See
+    /// `ZArenaTlabRegistry`-side `retire_all_tlabs_at_safepoint`.
+    pub const TLAB_RETIRE_INCOMPLETE: usize = 5;
     /// One past the highest code; sizes the counter array.
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 6;
 
     /// Human-readable label, for the summary line.
     pub fn label(code: usize) -> &'static str {
@@ -8915,6 +9039,7 @@ pub mod relocation_skip_reason {
             COVERAGE_INCOMPLETE => "coverage-proof-incomplete",
             FORCED_NON_MOVING_ROOTS => "forced-non-moving-jit-roots",
             UNREGISTERED_JIT_FRAME => "unregistered-jit-frame-on-stack",
+            TLAB_RETIRE_INCOMPLETE => "tlab-retire-incomplete-at-safepoint",
             _ => "unknown",
         }
     }
@@ -11631,7 +11756,11 @@ impl GarbageCollector for ZgcRealHeap {
         // enters `registry` at hand-out (`ZArenaTlabRegistry`'s
         // `registry_batch` note explains why batching was reverted), so it is
         // already there before this call.
-        self.retire_all_tlabs();
+        // AT A SAFEPOINT, and it matters which: a cell this cannot lock is
+        // holding a chunk the collector cannot see, and `relocate_stw` must
+        // then decline. Cleared first, so the flag describes THIS cycle.
+        self.tlab_retire_incomplete.store(false, Ordering::Release);
+        self.retire_all_tlabs_at_safepoint();
 
         // ---- GIVE THE UN-BUMPED MIDDLE BACK TO THE OS --------------------
         //
@@ -13757,6 +13886,88 @@ pub(crate) mod tests {
             "{stamped} forwarding records were written and none of them can be \
              read back -- the space under them was handed to the OS"
         );
+    }
+
+    // ---- The safepoint TLAB retire, and the helper window -----------------
+
+    /// **A TLAB cell the SAFEPOINT retire could not lock refuses relocation.**
+    ///
+    /// The hazard `tlab_retire_skipped_total`'s own doc states: nothing keeps
+    /// the compaction cursor above a chunk the collector cannot see, so
+    /// `compact_low_to` retracts past it and zeroes it, `clear_low_free_list`
+    /// drops the only record that it was reserved, and the arena and the
+    /// chunk's owner then fill one span.
+    ///
+    /// It used to be argued away rather than checked -- *"`tlab_retire_skipped`
+    /// measured zero ... so a refusal built on it could never fire"* -- on a
+    /// counter that also counted three callers holding no safepoint, for none
+    /// of which a skip means anything. `probes/OopMapPeerCoverage.java` reports
+    /// 31 skips of which 0 are the dangerous kind, which is the reading the
+    /// conflated counter could not produce.
+    ///
+    /// The exact edit that trips it: removing the `tlab_retire_incomplete` term
+    /// from `relocate_stw`, or putting it back inside the
+    /// `compiled_frames_live` guard, where a retained chunk has no business
+    /// being.
+    #[test]
+    fn a_tlab_cell_locked_at_a_safepoint_refuses_relocation() {
+        let _serial = quiescence_test_guard();
+        let (heap, mut roots, pre) = sparse_pages_for_relocation();
+        // Arm the flag the safepoint retire would have set.
+        heap.tlab_retire_incomplete.store(true, Ordering::Release);
+        let stw = unsafe { StopTheWorldToken::new() };
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                let _ = heap.relocate_stw_for_test(
+                    &pre.iter().copied().collect::<Vec<_>>(),
+                );
+            },
+        );
+        assert_eq!(
+            moved_of(&roots, &pre),
+            0,
+            "relocation ran with a TLAB chunk the collection could not see"
+        );
+        let counts = heap.relocation_skip_reason_counts();
+        assert!(
+            counts[relocation_skip_reason::TLAB_RETIRE_INCOMPLETE] > 0,
+            "nothing moved, but the refusal was attributed to something else: \
+             {counts:?}"
+        );
+        // ...and it refuses WITHOUT a compiled frame, which is the whole point
+        // of taking it out of that chain: a retained chunk has nothing to do
+        // with the JIT.
+        assert!(
+            !crate::gc_quiescence::is_active(),
+            "the fixture must not have armed quiescence, or this proves nothing"
+        );
+        let _ = &mut roots;
+        let _ = &stw;
+    }
+
+    /// **Clearing the flag lets the same cycle relocate.**
+    ///
+    /// The companion, and the thing that says the refusal above is a gate
+    /// rather than a fixture that never moves anything.
+    #[test]
+    fn a_clean_safepoint_retire_leaves_relocation_alone() {
+        let _serial = quiescence_test_guard();
+        let (heap, roots, pre) = sparse_pages_for_relocation();
+        heap.tlab_retire_incomplete.store(false, Ordering::Release);
+        let live: Vec<usize> = pre.clone();
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                let (moved, _, _) = heap.relocate_stw_for_test(&live);
+                assert!(
+                    moved > 0,
+                    "the fixture moved nothing even with the flag down; the \
+                     refusal test above would pass for the wrong reason"
+                );
+            },
+        );
+        let _ = roots;
     }
 
     // ---- D5: the relocation refusal, per page rather than per cycle -------

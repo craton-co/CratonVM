@@ -632,12 +632,48 @@ pub(super) fn stw_take_over_and_wait(
         // re-scanning it only widens the conservative-candidate volume that
         // feeds the mark-phase writer, with zero coverage benefit.
         let blocked_os_tids = shared.threads.thread_registry.blocked_os_tids();
-        let (windows, _roots) = xt::helper_window_pass(
-            &taken,
-            &|a| shared.mem.heap.is_object_address(a),
-            xt_roots,
-            &blocked_os_tids,
-        );
+        // WHICH PREDICATE, and it is the open question on
+        // `bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829`.
+        //
+        // `is_object_address` is `registry.contains(addr)` -- EXACT BASES ONLY.
+        // A frozen peer holding a DERIVED pointer (a compiled loop's pointer
+        // into an array body) contributes no candidate at all, so its base is
+        // never pinned, and that is why a helper window has to refuse the whole
+        // collection rather than pin its way out of it.
+        //
+        // `is_heap_addr` resolves an interior pointer to its base, and is no
+        // longer expensive doing it: one backwards bit scan plus one header
+        // dereference (`nearest_base_at_or_below`), not the O(live) registry
+        // iteration it once was. The cost that HAS to be priced before adopting
+        // it is the WIDER conservative root set -- every `long` that happens to
+        // land inside a live object's extent becomes a root.
+        //
+        // `CRATONVM_XT_HELPER_WINDOW_INTERIOR=1` is that measurement, and only
+        // that: it changes which words become conservative roots and pins, and
+        // changes NOTHING about the refusal, which both this site and
+        // `xt_root_scan` still raise unconditionally. Compare `hw_roots` on the
+        // `[GC] xt_peer_scan` line between the arms.
+        // The discharge IMPLIES the interior probe: pinning is only complete
+        // when a derived pointer resolves to the base that must not move, so
+        // the two cannot be selected independently.
+        let interior = xt::helper_window_discharge_enabled()
+            || cratonvm_types::flags::runtime_var_os("CRATONVM_XT_HELPER_WINDOW_INTERIOR")
+                .is_some();
+        let (windows, _roots) = if interior {
+            xt::helper_window_pass(
+                &taken,
+                &|a| shared.mem.heap.is_heap_addr(a),
+                xt_roots,
+                &blocked_os_tids,
+            )
+        } else {
+            xt::helper_window_pass(
+                &taken,
+                &|a| shared.mem.heap.is_object_address(a),
+                xt_roots,
+                &blocked_os_tids,
+            )
+        };
         helper_windows = windows;
     }
     // Publish any reserved TLAB tails still present after the barrier is
@@ -666,8 +702,25 @@ pub(super) fn stw_take_over_and_wait(
         // stopped meaning "un-rewritable peer state" — see
         // `gc_quiescence::unrewritable_peer_state`. Both are set here because
         // this cycle genuinely satisfies both.
-        cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete();
-        cratonvm_gc::gc_quiescence::mark_unrewritable_peer_state();
+        // THE SECOND REFUSAL, and the one the first discharge attempt missed.
+        // Suppressing only `xt_root_scan`'s labelled `XT_HELPER_WINDOW` moved
+        // the refusal into this unlabelled bucket and left engagement exactly
+        // where it was -- `relocation_on_proven_jit` 1 with the pin against 2
+        // without. Both sites have to agree, off the same condition.
+        //
+        // A TAKEN-OVER peer is a different population: its roots come from the
+        // takeover pass, which is not pinned here, so `taken.count() > 0` keeps
+        // refusing regardless. Only a cycle whose sole unrewritable state is
+        // helper windows -- every one of them pinned from a COMPLETE,
+        // interior-resolving scan -- may be discharged.
+        let helper_only = taken.count() == 0 && helper_windows > 0;
+        let discharged = xt::helper_window_discharge_enabled()
+            && helper_only
+            && xt::helper_windows_all_pinned_this_cycle();
+        if !discharged {
+            cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete();
+            cratonvm_gc::gc_quiescence::mark_unrewritable_peer_state();
+        }
     }
     taken
 }

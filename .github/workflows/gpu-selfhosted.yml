@@ -73,6 +73,71 @@ jobs:
           TG: ${{ github.workspace }}/test_classes/gpu
         run: bash bench-gpu/ci-gate.sh | tee gpu-gate.log
 
+      # The cross-stream ordering contract, against the driver rather
+      # than against the stub.
+      #
+      # Every behavioural test of streams, events and launches in
+      # `cuda-bridge` is `#[cfg(all(test, not(feature = "cuda")))]` —
+      # enabling the `cuda` feature takes the crate from 39 unit tests to
+      # 16 and from 6 integration tests to 1, because the rest inspect an
+      # operation log the real backend does not keep. A model is worth
+      # testing against and a model is not the thing: a missing
+      # `cuStreamWaitEvent` is invisible to an op-log assertion and is a
+      # race on hardware. These three are `#[ignore]`d so a machine
+      # without a device skips them, which means this job is the only
+      # place they ever run.
+      # The VM-side offload runtime, in the shapes ci-gate.sh does not
+      # reach: concurrent dispatch from several Java threads, residency
+      # cache coherence across host writes (plain astore AND
+      # System.arraycopy), read-only input suppression, aliased
+      # arguments, and a bounds deopt followed by more submits.
+      #
+      # This is the regression test for the 2026-09-02 invalidation
+      # holes: the interpreter's FAST xastore arm and the native bulk
+      # array copy both wrote arrays without evicting the GPU
+      # input-residency cache, so the next submit computed from stale
+      # device data. Four of these seven scenarios failed before the fix.
+      - name: VM offload runtime stress (real driver)
+        shell: bash
+        env:
+          CV: ${{ github.workspace }}/target-gpu/release/cratonvm.exe
+          JDK: ${{ env.JDK }}
+          TG: ${{ github.workspace }}/test_classes/gpu
+        run: bash bench-gpu/runtime-stress.sh | tee runtime-stress.log
+
+      # Concurrent dispatch: one context, many threads — the shape
+      # `OffloadCacheRegistry` gives every dispatching Java thread. This
+      # is the regression test for the 2026-09-02 `DeviceBuffer::zeros`
+      # defect, where an unordered zeroing memset overwrote a kernel's
+      # output. It only reproduces at 4 MiB buffers, so it is sized for
+      # that and must not be shrunk to make it quicker.
+      - name: cuda-bridge concurrent dispatch (real driver)
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target-gpu
+        run: |
+          cargo test --release -p cratonvm-cuda-bridge --features cuda               --test concurrent_dispatch_it -- --ignored --nocapture
+
+      - name: cuda-bridge cross-stream ordering (real driver)
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target-gpu
+        run: |
+          cargo test --release -p cratonvm-cuda-bridge --features cuda               --test stream_ordering_it -- --ignored --nocapture
+
+      # Not a gate: bandwidth and module-load numbers move with the
+      # driver and the box, and a threshold on them would fail whenever
+      # something else was running. Recorded so the two decisions they
+      # settled — no pinned staging on the upload path, no cubin cache —
+      # can be revisited against fresh numbers rather than these.
+      - name: cuda-bridge transfer + module-load report
+        shell: bash
+        continue-on-error: true
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target-gpu
+        run: |
+          cargo test --release -p cratonvm-cuda-bridge --features cuda               --test transfer_bandwidth_it -- --ignored --nocapture               | tee transfer-report.log
+
       - name: Upload gate log
         if: always()
         uses: actions/upload-artifact@v4

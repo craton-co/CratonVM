@@ -116,6 +116,11 @@ pub mod gc;
 /// [`gc_metrics::collector_decision_report`]).
 pub mod gc_metrics;
 pub mod gc_quiescence;
+/// Parallel evacuation for the generational young (Cheney) copy phase — the
+/// copy-then-CAS forwarding protocol, per-worker to-space buffers, and the
+/// work-sharing closure. Driven only by [`gen_heap`]; the census counters are
+/// public so a run can say whether the parallel path engaged.
+pub mod gen_evac;
 pub mod gen_heap;
 pub mod heap;
 pub mod mark_bitmap;
