@@ -324,6 +324,41 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
             );
         }
         ctx.set_field_by_name(*this, "filter", Value::Object(None));
+        // `private final LogManager manager = LogManager.getLogManager();` is
+        // this class's FIRST field initializer, and a native `<init>` skips it
+        // for the same reason it skipped `errorManager` below. MEASURED, both
+        // modes, `probes/JulHandlerLevel.java`:
+        //
+        //   Handler.manager   HotSpot  LogManager
+        //                     --jdk-only  LogManager   (the real ctor runs:
+        //                                               this registration is
+        //                                               a SyntheticStub and
+        //                                               strict refuses it)
+        //                     compatible  null
+        //
+        // So the gap was compatible-mode only, and closing it converges the two
+        // modes rather than inventing anything: the value written is the same
+        // singleton `LogManager.getLogManager()` answers.
+        //
+        // Same two guards as `errorManager`: the field must EXIST (a synthetic
+        // `Handler` has no `manager`, and `get_field_by_name` cannot tell
+        // "absent" from "null"), and it must still be null, so a real
+        // constructor that did run is never clobbered. `this` is re-read
+        // through a pin because building the singleton allocates.
+        let handler_class_for_manager = ctx.class_id_of_object(*this);
+        if ctx
+            .resolve_field_index_by_class_id(handler_class_for_manager, "manager")
+            .is_some()
+            && matches!(ctx.get_field_by_name(*this, "manager"), Value::Object(None))
+        {
+            let this_pin = ctx.pin_native_root(*this);
+            let manager = crate::logmanager::jul_log_manager_singleton(ctx);
+            let this_live = ctx.read_native_pin(this_pin, *this);
+            ctx.unpin_native_roots(this_pin);
+            if let Some(manager) = manager {
+                ctx.set_field_by_name(this_live, "manager", Value::Object(Some(manager)));
+            }
+        }
         // `java.util.logging.Handler`'s third field initializer is
         // `private volatile ErrorManager errorManager = new ErrorManager();`
         // — and a native `<init>` replaces the real constructor wholesale, so

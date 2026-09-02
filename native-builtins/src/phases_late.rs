@@ -825,6 +825,128 @@ fn invoke_collections_value(ctx: &mut dyn NativeContext, name: &str, desc: &str)
     ctx.invoke("java/util/Collections", name, desc, &[]).ok()?
 }
 
+/// One argument slot of `LoggingSetupRecorder.initializeLogging`, chosen from
+/// the parameter's own descriptor rather than from a written-down position.
+///
+/// Kept separate from `Value` so [`logging_setup_arg_plan`] is a pure function
+/// of the descriptor and can be unit-tested without a VM: the object handles a
+/// `Value` needs here (the components object, the empty list/map, the
+/// `LaunchMode` constant) only exist mid-bootstrap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoggingSetupArg {
+    /// The `DiscoveredLogComponents` this mirror just built.
+    Components,
+    /// `Collections.emptyMap()`.
+    EmptyMap,
+    /// `Collections.emptyList()`.
+    EmptyList,
+    /// `LaunchMode.DEVELOPMENT`.
+    LaunchMode,
+    /// `false` — every `boolean` in this signature.
+    False,
+    /// The caller's supplier `RuntimeValue` — the LAST `RuntimeValue` parameter.
+    SupplierRuntimeValue,
+    /// `null` — every other reference, including the handler `RuntimeValue`
+    /// the real bytecode passes `aconst_null` for.
+    Null,
+}
+
+/// Why the mirror cannot model an `initializeLogging` signature it was handed.
+///
+/// Both variants mean "the recorder moved somewhere this native no longer
+/// describes" — the condition that let the six-versus-seven-`List` descriptor
+/// rot survive unseen. They are reported, once, by the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LoggingSetupRefusal {
+    /// The descriptor did not parse as a method descriptor at all.
+    UnparseableDescriptor,
+    /// A parameter this native has no value for, at index `.0`, spelled `.1`.
+    UnfillableParameter(usize, String),
+}
+
+impl LoggingSetupRefusal {
+    fn describe(&self) -> String {
+        match self {
+            Self::UnparseableDescriptor => "descriptor does not parse".to_string(),
+            Self::UnfillableParameter(i, p) => {
+                format!("parameter {i} is `{p}`, which this mirror cannot fill")
+            }
+        }
+    }
+}
+
+/// Decide what to pass for each parameter of `initializeLogging`, from the
+/// parameter list alone.
+///
+/// **The descriptor is READ OFF THE CLASS, never written down.** It used to be
+/// a literal with six `Ljava/util/List;` parameters, matching the Quarkus
+/// revision this native was written against. The recorder has since grown a
+/// seventh list (the per-named-handler formatter map), so on a newer Quarkus
+/// every call through here raised `NoSuchMethodError:
+/// LoggingSetupRecorder.initializeLogging(...)`, and because the mirror's
+/// refusals were silent the only visible symptom was that Quarkus test classes
+/// stopped starting. See
+/// `internal/fixed-suite-bugs/quarkus/loggingsetuprecorder-nosuchmethoderror-at-classpath-scale-20260817.md`.
+///
+/// The plan reproduces the argument vector the bytecode `handleFailedStart`
+/// itself builds, on either shape: empty list for every `List`, empty map for
+/// the `Map`, `false` for both booleans, a null `RuntimeValue` for the handler
+/// slot and the supplied one for the last.
+pub(crate) fn logging_setup_arg_plan(
+    descriptor: &str,
+) -> Result<Vec<LoggingSetupArg>, LoggingSetupRefusal> {
+    let Some((params, _ret)) = crate::lang_invoke::split_descriptor_params(descriptor) else {
+        return Err(LoggingSetupRefusal::UnparseableDescriptor);
+    };
+    let last_runtime_value = params
+        .iter()
+        .rposition(|p| p == "Lio/quarkus/runtime/RuntimeValue;");
+    let mut plan = Vec::with_capacity(params.len());
+    for (i, param) in params.iter().enumerate() {
+        plan.push(match param.as_str() {
+            "Lio/quarkus/runtime/logging/DiscoveredLogComponents;" => LoggingSetupArg::Components,
+            "Ljava/util/Map;" => LoggingSetupArg::EmptyMap,
+            "Ljava/util/List;" => LoggingSetupArg::EmptyList,
+            "Lio/quarkus/runtime/LaunchMode;" => LoggingSetupArg::LaunchMode,
+            "Z" => LoggingSetupArg::False,
+            "Lio/quarkus/runtime/RuntimeValue;" if Some(i) == last_runtime_value => {
+                LoggingSetupArg::SupplierRuntimeValue
+            }
+            // Every other reference parameter — including the handler
+            // `RuntimeValue` the real bytecode passes `aconst_null` for.
+            _ if param.starts_with('L') || param.starts_with('[') => LoggingSetupArg::Null,
+            // A primitive this native does not know how to fill means the
+            // signature moved somewhere this mirror no longer models.
+            // Refusing beats guessing a value into a logging bootstrap.
+            _ => return Err(LoggingSetupRefusal::UnfillableParameter(i, param.clone())),
+        });
+    }
+    Ok(plan)
+}
+
+/// Report, once per process, that the mirror found `LoggingSetupRecorder` but
+/// could not model it.
+///
+/// Deliberately WARN and deliberately unconditional: reaching here means the
+/// class is present (so this really is a Quarkus/Keycloak application) and the
+/// mirror is about to do nothing. That silence is what cost a five-day
+/// investigation the last time this rotted — the failure had no output of its
+/// own, and only showed up as `started=0` on every quarkus test class. Every
+/// refusal BEFORE the recorder class resolves stays quiet, because those just
+/// mean "this application is not Quarkus".
+fn report_logging_setup_mirror_refusal(reason: &str) {
+    use std::sync::atomic::AtomicBool;
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if REPORTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    tracing::warn!(
+        reason,
+        "the Quarkus logging mirror cannot model LoggingSetupRecorder.initializeLogging; \
+         handleFailedStart is a no-op for this application"
+    );
+}
+
 /// `LoggingSetupRecorder.handleFailedStart(...)` rebuilds a small transient
 /// logging config from Keycloak's already-registered config. On HotSpot that
 /// path retains Quarkus' converter set; under CratonVM the transient builder
@@ -1058,10 +1180,30 @@ fn native_quarkus_logging_handle_failed_start(
         let log_runtime_rv_cur = ctx.read_native_pin(log_runtime_rv_pin, log_runtime_rv);
         let console_runtime_rv_cur =
             ctx.read_native_pin(console_runtime_rv_pin, console_runtime_rv);
+        // The recorder's CONSTRUCTOR descriptor is still written down, and it
+        // is the only other one in this mirror that can rot the way
+        // `initializeLogging`'s did. Its failure mode is at least loud — the
+        // `?` propagates a real `NoSuchMethodError` — but the error alone does
+        // not say that a hand-written mirror is what named the missing method,
+        // which is precisely the step the last investigation spent days on.
+        // Say it here, once, and then let the invoke fail exactly as before.
+        const RECORDER_CTOR_DESC: &str = "(Lio/quarkus/runtime/logging/LogBuildTimeConfig;\
+Lio/quarkus/runtime/RuntimeValue;Lio/quarkus/runtime/RuntimeValue;)V";
+        let recorder_cid = ctx.class_id_of_object(recorder);
+        if !ctx
+            .declared_methods(recorder_cid)
+            .iter()
+            .any(|m| m.name == "<init>" && m.descriptor == RECORDER_CTOR_DESC)
+        {
+            report_logging_setup_mirror_refusal(
+                "LoggingSetupRecorder declares no constructor matching the one this mirror \
+                 writes down; the NoSuchMethodError that follows is the mirror's, not the app's",
+            );
+        }
         ctx.invoke(
             "io/quarkus/runtime/logging/LoggingSetupRecorder",
             "<init>",
-            "(Lio/quarkus/runtime/logging/LogBuildTimeConfig;Lio/quarkus/runtime/RuntimeValue;Lio/quarkus/runtime/RuntimeValue;)V",
+            RECORDER_CTOR_DESC,
             &[
                 Value::Object(Some(recorder)),
                 Value::Object(Some(log_build_cur)),
@@ -1101,24 +1243,13 @@ fn native_quarkus_logging_handle_failed_start(
         let empty_map_cur = read_pinned_object_value(ctx, empty_map_pin, empty_map);
         let empty_list_cur = read_pinned_object_value(ctx, empty_list_pin, empty_list);
         let supplier_rv_cur = ctx.read_native_pin(supplier_rv_pin, supplier_rv);
-        // The descriptor is READ OFF THE CLASS, never written down here.
-        //
-        // It used to be a literal with six `Ljava/util/List;` parameters,
-        // matching the Quarkus revision this native was written against. The
-        // recorder has since grown a seventh list (the per-named-handler
-        // formatter map), so on a newer Quarkus every call through here raised
-        // `NoSuchMethodError: LoggingSetupRecorder.initializeLogging(...)` —
-        // caught and reported as nothing worse than a logging-setup failure,
-        // which is exactly why it survived: the literal named a method that no
-        // longer existed and only the arity said so.
+        // The descriptor is READ OFF THE CLASS, never written down here — see
+        // `logging_setup_arg_plan`, which carries the why and is unit-pinned
+        // against both the old six-`List` shape and the current seven.
         //
         // `initializeLogging` is the recorder's only overload (its sibling is
         // `initializeLoggingForImageBuild`, no-arg), so selecting by name and
-        // return type is unambiguous, and filling the argument vector from the
-        // parsed parameter list reproduces the bytecode `handleFailedStart`
-        // itself runs on either shape: empty list for every `List`, empty map
-        // for the `Map`, false for both booleans, a null `RuntimeValue` for the
-        // handler slot and the supplied one for the last.
+        // return type is unambiguous.
         let recorder_class_id =
             match ctx.ensure_class_initialized("io/quarkus/runtime/logging/LoggingSetupRecorder") {
                 Ok(cid) => cid,
@@ -1134,36 +1265,45 @@ fn native_quarkus_logging_handle_failed_start(
             })
             .map(|m| m.descriptor)
         else {
+            // The class resolved but carries no `initializeLogging` returning a
+            // `ShutdownListener`. Loud, for the same reason the two refusals in
+            // `logging_setup_arg_plan` are.
+            report_logging_setup_mirror_refusal(
+                "no initializeLogging returning io/quarkus/runtime/shutdown/ShutdownListener",
+            );
             return Ok(None);
         };
-        let Some((params, _ret)) = crate::lang_invoke::split_descriptor_params(&descriptor) else {
-            return Ok(None);
+        let plan = match logging_setup_arg_plan(&descriptor) {
+            Ok(plan) => plan,
+            Err(refusal) => {
+                report_logging_setup_mirror_refusal(&refusal.describe());
+                return Ok(None);
+            }
         };
-        let last_runtime_value = params
-            .iter()
-            .rposition(|p| p == "Lio/quarkus/runtime/RuntimeValue;");
-        let mut call_args = Vec::with_capacity(params.len());
-        for (i, param) in params.iter().enumerate() {
-            call_args.push(match param.as_str() {
-                "Lio/quarkus/runtime/logging/DiscoveredLogComponents;" => {
-                    Value::Object(Some(components_cur))
-                }
-                "Ljava/util/Map;" => empty_map_cur,
-                "Ljava/util/List;" => empty_list_cur,
-                "Lio/quarkus/runtime/LaunchMode;" => Value::Object(Some(launch_mode)),
-                "Z" => Value::Int(0),
-                "Lio/quarkus/runtime/RuntimeValue;" if Some(i) == last_runtime_value => {
-                    Value::Object(Some(supplier_rv_cur))
-                }
-                // Every other reference parameter — including the handler
-                // `RuntimeValue` the real bytecode passes `aconst_null` for.
-                _ if param.starts_with('L') || param.starts_with('[') => Value::Object(None),
-                // A primitive this native does not know how to fill means the
-                // signature moved somewhere this mirror no longer models.
-                // Refusing beats guessing a value into a logging bootstrap.
-                _ => return Ok(None),
-            });
-        }
+        let call_args: Vec<Value> = plan
+            .into_iter()
+            .map(|slot| match slot {
+                LoggingSetupArg::Components => Value::Object(Some(components_cur)),
+                LoggingSetupArg::EmptyMap => empty_map_cur,
+                LoggingSetupArg::EmptyList => empty_list_cur,
+                LoggingSetupArg::LaunchMode => Value::Object(Some(launch_mode)),
+                LoggingSetupArg::False => Value::Int(0),
+                LoggingSetupArg::SupplierRuntimeValue => Value::Object(Some(supplier_rv_cur)),
+                LoggingSetupArg::Null => Value::Object(None),
+            })
+            .collect();
+        // ENGAGEMENT CENSUS. `handleFailedStart` succeeding is otherwise
+        // indistinguishable from this mirror never having run at all — the
+        // real bytecode would also just set logging up — so a passing run
+        // could not tell "served" from "never reached". At INFO it costs
+        // nothing behind the WARN-level default filter and is one
+        // `RUST_LOG=cratonvm_native_builtins=info` away when a future session
+        // needs to prove the path is live. Fires at most once per VM.
+        tracing::info!(
+            params = call_args.len(),
+            %descriptor,
+            "Quarkus logging mirror: serving LoggingSetupRecorder.handleFailedStart"
+        );
         ctx.invoke_virtual(recorder_cur, "initializeLogging", &descriptor, &call_args)?;
 
         Ok(None)
@@ -10372,5 +10512,108 @@ mod unsigned_radix_tests {
             "legal radices must still parse"
         );
         worker.join().expect("worker thread panicked");
+    }
+}
+
+#[cfg(test)]
+mod quarkus_logging_setup_descriptor_tests {
+    use super::{logging_setup_arg_plan, LoggingSetupArg, LoggingSetupRefusal};
+
+    /// The shape the mirror used to have written down as a literal: SIX
+    /// `Ljava/util/List;` parameters. Quarkus removed it, and because the
+    /// literal was the only thing that said which arity to call, every call
+    /// raised `NoSuchMethodError` (found 2026-08-17, fixed 2026-08-13 in
+    /// `70248949c`). Pinned so this shape stays SERVED, not special-cased.
+    const SIX_LIST_SHAPE: &str = "(Lio/quarkus/runtime/logging/DiscoveredLogComponents;\
+Ljava/util/Map;ZLio/quarkus/runtime/RuntimeValue;\
+Ljava/util/List;Ljava/util/List;Ljava/util/List;Ljava/util/List;Ljava/util/List;Ljava/util/List;\
+Lio/quarkus/runtime/RuntimeValue;Lio/quarkus/runtime/LaunchMode;Z)\
+Lio/quarkus/runtime/shutdown/ShutdownListener;";
+
+    /// The shape quarkus 999-SNAPSHOT actually ships: SEVEN lists, the seventh
+    /// being the per-`NamedHandlerType` formatter map.
+    const SEVEN_LIST_SHAPE: &str = "(Lio/quarkus/runtime/logging/DiscoveredLogComponents;\
+Ljava/util/Map;ZLio/quarkus/runtime/RuntimeValue;\
+Ljava/util/List;Ljava/util/List;Ljava/util/List;Ljava/util/List;Ljava/util/List;Ljava/util/List;\
+Ljava/util/List;Lio/quarkus/runtime/RuntimeValue;Lio/quarkus/runtime/LaunchMode;Z)\
+Lio/quarkus/runtime/shutdown/ShutdownListener;";
+
+    fn plan(desc: &str) -> Vec<LoggingSetupArg> {
+        logging_setup_arg_plan(desc).expect("this shape must be modellable")
+    }
+
+    #[test]
+    fn both_recorder_shapes_are_served_with_the_right_arity() {
+        assert_eq!(plan(SIX_LIST_SHAPE).len(), 13);
+        assert_eq!(plan(SEVEN_LIST_SHAPE).len(), 14);
+    }
+
+    #[test]
+    fn every_list_slot_is_an_empty_list_on_both_shapes() {
+        for desc in [SIX_LIST_SHAPE, SEVEN_LIST_SHAPE] {
+            let lists = plan(desc)
+                .iter()
+                .filter(|a| **a == LoggingSetupArg::EmptyList)
+                .count();
+            let declared = desc.matches("Ljava/util/List;").count();
+            assert_eq!(
+                lists, declared,
+                "every declared List must be filled with an empty list ({desc})"
+            );
+        }
+    }
+
+    /// The handler `RuntimeValue` takes `aconst_null` and the supplier
+    /// `RuntimeValue` — the LAST one — takes the caller's value. Getting this
+    /// backwards is invisible in an arity check, so pin the positions.
+    #[test]
+    fn only_the_last_runtime_value_carries_the_supplier() {
+        for desc in [SIX_LIST_SHAPE, SEVEN_LIST_SHAPE] {
+            let p = plan(desc);
+            let suppliers: Vec<usize> = p
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| **a == LoggingSetupArg::SupplierRuntimeValue)
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(suppliers.len(), 1, "exactly one supplier slot ({desc})");
+            assert_eq!(
+                suppliers[0],
+                p.len() - 3,
+                "the supplier is the RuntimeValue before LaunchMode ({desc})"
+            );
+            assert_eq!(p[3], LoggingSetupArg::Null, "the handler RuntimeValue is null");
+        }
+    }
+
+    #[test]
+    fn the_fixed_slots_are_where_the_bytecode_puts_them() {
+        let p = plan(SEVEN_LIST_SHAPE);
+        assert_eq!(p[0], LoggingSetupArg::Components);
+        assert_eq!(p[1], LoggingSetupArg::EmptyMap);
+        assert_eq!(p[2], LoggingSetupArg::False);
+        assert_eq!(p[p.len() - 2], LoggingSetupArg::LaunchMode);
+        assert_eq!(p[p.len() - 1], LoggingSetupArg::False);
+    }
+
+    /// A primitive the mirror has no value for must REFUSE and say which slot,
+    /// not guess. Refusing is what keeps a moved signature from being called
+    /// with a fabricated argument.
+    #[test]
+    fn an_unfillable_primitive_refuses_and_names_the_slot() {
+        let moved = "(Lio/quarkus/runtime/logging/DiscoveredLogComponents;I)\
+Lio/quarkus/runtime/shutdown/ShutdownListener;";
+        assert_eq!(
+            logging_setup_arg_plan(moved),
+            Err(LoggingSetupRefusal::UnfillableParameter(1, "I".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_non_descriptor_refuses_rather_than_panicking() {
+        assert_eq!(
+            logging_setup_arg_plan("not a descriptor"),
+            Err(LoggingSetupRefusal::UnparseableDescriptor)
+        );
     }
 }

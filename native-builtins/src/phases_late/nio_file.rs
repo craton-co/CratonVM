@@ -9730,6 +9730,57 @@ pub(crate) fn p57_alloc_path(
     let s = ctx.create_string(&stored);
     let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field(obj, P57_PATH_FIELD, Value::Object(Some(s)));
+    // THE TWO INDICES ABOVE LAND ON THE WRONG FIELDS, and the fix is bigger
+    // than this function. Recorded here because the shape is not obvious from
+    // the code and cost a build to establish.
+    //
+    // `sun.nio.fs.UnixPath` is a REAL, fully loaded class in this VM -- 52
+    // declared methods and 7 declared fields, byte-identical to HotSpot's, and
+    // it declares `toString`. What is handed out is a real instance of it with
+    // none of those fields filled in. Read back through reflection
+    // (`--add-opens java.base/sun.nio.fs=ALL-UNNAMED`):
+    //
+    //   field         HotSpot                      this VM
+    //   path          byte[3] = a/b                NULL
+    //   stringValue   NULL                         NULL
+    //   fs            sun.nio.fs.LinuxFileSystem   String = "a/b"
+    //
+    // The instance slots are `fs`(0) `path`(1) `stringValue`(2) `hash`(3)
+    // `offsets`(4). So `P57_PATH_FIELD`(0) writes the path STRING where a
+    // `UnixFileSystem` belongs, and `P57_PATH_FS_FIELD`(1) writes the owning
+    // filesystem where a `byte[]` belongs -- two type-confused slots, invisible
+    // for as long as our own natives read them back by the same indices.
+    //
+    // TWO WAYS OF FILLING `stringValue` WERE TRIED AND BOTH MEASURED INERT.
+    // Recorded together because the reason is the same and it is not the one
+    // the first attempt assumed.
+    //
+    //   set_field_by_name(obj, "stringValue", ..)                    no-op
+    //   resolve_field_index_by_class_id(class_id_of_object(obj), ..) no-op
+    //
+    // NOT a width problem: `try_alloc_concurrent_synthetic` allocates at
+    // `max(requested, real)` slots, so all five of `UnixPath`'s are there. It
+    // is an IDENTITY problem -- that allocator deliberately "keeps the
+    // requested identity" so field writes use the requested layout, so this
+    // object's `ClassId` is `java/nio/file/Path`, the INTERFACE, while Java's
+    // `getClass()` reports `sun.nio.fs.UnixPath`. Every name-based route
+    // resolves against the interface and misses.
+    //
+    // Which also means the reflection read that showed `stringValue = NULL` is
+    // not evidence of an empty slot: reflection resolves through the real
+    // class, which this object is not filed under. Two different mechanisms,
+    // one wrong conclusion available from each.
+    //
+    // Both reverted: code that cannot fire is worse than the absence of it.
+    //
+    // The real repair is to allocate as `sun/nio/fs/UnixPath` at its true width
+    // and store into the named slots -- `fs` for the owning filesystem (which is
+    // what that field MEANS), `path` for the bytes, `stringValue` for the
+    // string -- and move the 17 `P57_PATH_FIELD`/`P57_PATH_FS_FIELD` sites onto
+    // by-name access. That is a change to the hottest allocation in
+    // `java.nio.file` and wants its own measurement, including throughput;
+    // every unarmed row is 0-diff today, so it buys the RETIREMENT of this
+    // family, not a correctness fix.
     ctx.unpin_native_roots(obj_pin);
     Ok(obj)
 }

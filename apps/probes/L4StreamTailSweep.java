@@ -347,8 +347,28 @@ public class L4StreamTailSweep {
             p("read at EOF", in.read());
             p("read(b,0,0) at EOF", in.read(new byte[1], 0, 0));
             p("available at EOF", in.available());
+            // THE RESIDUAL, ASKED IN FULL. One row here said "skip at EOF"
+            // and the lane carried "1 residual" on the strength of it. The
+            // defect is three rows: `FileInputStream` OVERRIDES
+            // `InputStream.skip` with an `lseek`, so it may skip past the end
+            // and report bytes that were never there, and it refuses a
+            // negative count. A probe that asks only the first understates its
+            // own finding, and a headline built on it is tidier than the truth.
             p("skip at EOF", in.skip(4));
             in.close();
+            try (FileInputStream sk = new FileInputStream(f)) {
+                p("skip(2) then read", sk.skip(2) + ":" + sk.read());
+                // Past the remaining bytes: lseek succeeds, so the JDK reports
+                // the full count. Read-and-discard can only report what is
+                // there, which is how the two answers differ.
+                p("skip past remaining", sk.skip(100));
+                p("read after skipping past end", sk.read());
+            }
+            try (FileInputStream sk = new FileInputStream(f)) {
+                // lseek before the start fails EINVAL -> IOException. Answering
+                // 0 makes a rewind attempt look like a no-op that succeeded.
+                t("skip(-1) at position 0", () -> sk.skip(-1));
+            }
             t("read after close", () -> in.read());
             t("available after close", () -> in.available());
             t("new FileInputStream(missing)", () -> new FileInputStream(new File("l4-nope.bin")));
