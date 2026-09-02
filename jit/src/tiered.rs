@@ -1481,6 +1481,19 @@ pub fn dump_method_stats_to_stderr() {
         "[cratonvm] JIT String-intrinsic pin: fired={sp_fired} blind-no-layout={sp_no_layout} \
          blind-no-resolver={sp_no_resolver} fail-closed={sp_fail_closed}"
     );
+    // Beside the pin, because the two answer the halves of one question. The
+    // pin says whether a String-accessor method was kept OFF the optimizing
+    // tier; this says, for the ones that reached it, whether the expansion's
+    // `value`/`coder` reads are inline loads or `jit_getfield` helper CALLs.
+    // Before the rows existed, every expanded `charAt` paid two CALLs per
+    // character -- 917,203,334 of them on one `probes/CharAtCostCurve.java`
+    // run -- and nothing in this dump said so: `getfield helper calls` counted
+    // them without naming the source, and `emitted_charAt` reported the
+    // expansion as a success.
+    eprintln!(
+        "[cratonvm] JIT String-access inline rows: sites={}",
+        crate::string_access_compact_rows()
+    );
     // Sites the `final`-class devirtualisation handed BACK to a call-site
     // intrinsic (`crate::devirt_yielded_to_intrinsic_count`).
     //

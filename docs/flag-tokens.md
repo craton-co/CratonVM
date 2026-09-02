@@ -577,7 +577,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-286 tokens.
+288 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -651,6 +651,8 @@ export inherited from a parent shell.
 | `inclusive-bce` | `CRATONVM_JIT_INCLUSIVE_BCE` |
 | `inline-allow-static` | `CRATONVM_INLINE_ALLOW_STATIC` |
 | `inline-getfield` | `CRATONVM_JIT_INLINE_GETFIELD` |
+| `string-access-inline-rows` | `CRATONVM_JIT_NO_STRING_ACCESS_INLINE_ROWS` |
+| `licm-read-hoist` | `CRATONVM_JIT_NO_LICM_READ_HOIST` |
 | `inline-live-slot-clamp` | `CRATONVM_JIT_NO_INLINE_LIVE_SLOT_CLAMP` |
 | `inline-new` | `CRATONVM_JIT_DISABLE_INLINE_NEW` |
 | `inline-putfield` | `CRATONVM_NO_JIT_INLINE_PUTFIELD` |
