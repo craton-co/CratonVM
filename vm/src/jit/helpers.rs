@@ -24979,6 +24979,11 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         .and_then(|shared| shared.mem.heap.jit_card_table_info())
         .unwrap_or((0, 0, 0));
 
+    // `(pre, post, young_floor)` — all-zero until a collector publishes a
+    // reference-store barrier plan. Read once, so the three fields below can
+    // never name three different generations of the table.
+    let ref_store_gates = cratonvm_gc::jit_ref_store_gate_addrs();
+
     let helpers = JitRuntimeHelpers {
         newarray: jit_newarray as *const () as usize,
         new_object: jit_new_object as *const () as usize,
@@ -25130,6 +25135,20 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         // keeps the native dispatch it has today.
         ffm_segment_get: jit_ffm_segment_get as *const () as usize,
         ffm_segment_set: jit_ffm_segment_set as *const () as usize,
+        // Reference-store barrier gates. All three come from ONE call, so a
+        // half-wired plan — two live addresses and a stale third — is not
+        // expressible here: `jit_ref_store_gate_addrs` returns all-zero until a
+        // collector has published, and all-zero is what every emitter arm reads
+        // as "keep the full-helper path you have today".
+        //
+        // Deliberately NOT conditioned on the collector in this file. "May
+        // compiled code skip this call" belongs to the collector that answers
+        // it, and it answers by publishing or declining to; a second copy of
+        // that decision here is exactly how `region_bounds_addr` came to mean
+        // two different things at once.
+        ref_store_pre_gate: ref_store_gates.0,
+        ref_store_post_gate: ref_store_gates.1,
+        ref_store_post_young_floor: ref_store_gates.2,
         // Cooperative JIT safepoint polling (CRATONVM_JIT_SAFEPOINT_POLLS,
         // off by default) — address of the process-global VM's
         // stw_requested flag byte. `process_vm()` is published by

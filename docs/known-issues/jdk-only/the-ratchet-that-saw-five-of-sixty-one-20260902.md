@@ -161,6 +161,39 @@ is about — and `H5-1` is itself one of the 56 that were invisible until today.
 Recorded here, not fixed here: deleting a dead registration is a change to
 `net_phase_e.rs`, which belongs to whoever owns that file.
 
+
+### WITHDRAWN 2026-09-02 — the nine registrations are NOT unreachable
+
+The paragraph above is **wrong**, and the error is worth keeping visible because
+the reasoning looked sound.
+
+`HttpServer.create()` — the NO-ARG factory — mints a receiver whose runtime
+class IS `com/sun/net/httpserver/HttpServer`:
+
+```text
+com/sun/net/httpserver/HttpServer   11 rows, 11 invocations   <- the no-arg door
+sun/net/httpserver/HttpServerImpl   11 rows,  1 invocation    <- the two-arg door
+```
+
+`HttpServerWildcardAddressProbe` only ever calls `create(InetSocketAddress, int)`,
+which mints `HS_IMPL_CLASS`. Every zero I read was a statement about the door my
+probe took, and I published it as a statement about the class.
+
+**The general rule was right; the per-row check is what I skipped.** A
+registration on an abstract class is unreachable *unless this VM mints a carrier
+under that exact name* — and `re10_create_unbound_server` does exactly that, with
+a comment at the mint site saying so. One `grep` for the class name as a literal
+would have found it. Reading `HttpServerImpl`'s rows as independently-authored
+twins was the same mistake twice: they are an `alias_class` SNAPSHOT of the
+public class's rows, not a second author.
+
+**What the investigation did find is worse than dead rows**, and has its own
+page: minting the public name handed the application an instance of an ABSTRACT
+class, and `HttpServer.createContext(...)` returned a context whose every
+accessor threw `AbstractMethodError` on both shipping arms. Four defects, all
+now fixed and verified. See
+[`the-httpserver-family-four-defects-20260902.md`](the-httpserver-family-four-defects-20260902.md).
+
 ## Reproduce
 
 ```bash

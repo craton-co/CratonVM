@@ -4904,7 +4904,21 @@ pub(crate) fn native_system_init_phase1(
     // this helper defensive: it ensures the real `java/io/PrintStream`
     // class is loaded so the `charset` field is resolvable, and it
     // verifies the write actually landed.
-    fn install_charset(ctx: &mut dyn NativeContext, stream: ObjectRef) {
+    /// The charset name a system stream should carry: its `*.encoding`
+    /// property when the launcher or the platform set one, UTF-8 otherwise.
+    ///
+    /// Reading the PROPERTY rather than calling
+    /// `cratonvm_native_api::os_encoding` directly is what makes
+    /// `-Dstdout.encoding=…` on the command line work, exactly as it does on
+    /// HotSpot: the property table has already absorbed the `-D` overrides by
+    /// the time `initPhase1` runs.
+    fn std_stream_encoding(ctx: &dyn NativeContext, key: &str) -> String {
+        ctx.get_system_property(key)
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "UTF-8".to_string())
+    }
+
+    fn install_charset(ctx: &mut dyn NativeContext, stream: ObjectRef, encoding: &str) {
         // Ensure the real PrintStream class is loaded so `charset` is a
         // resolvable field name. (No-op in pure synthetic-jdk mode.)
         let _ = ctx.ensure_class_initialized("java/io/PrintStream");
@@ -4917,15 +4931,25 @@ pub(crate) fn native_system_init_phase1(
         // caller that encodes through this stream dies with
         // `AbstractMethodError` rather than the NPE this helper exists to
         // prevent -- a worse error, one frame further from the cause. See
-        // `docs/known-issues/jdk-only/bug-printstream-charset-answers-the-abstract-base-20260825.md`.
+        // `bug-printstream-charset-answers-the-abstract-base-20260825-FIXED-20260901.md`
+        // (retired 2026-09-01 with both of its residuals closed; the stamp
+        // below is one of them).
         //
         // This runs during `initPhase1`, which is why the hand-allocated stub
         // was reached for in the first place, so the real call is attempted
         // defensively and the stub stays as the fallback: bootstrap ordering
         // decides which one lands, and neither outcome is worse than today's.
         // `PrintStream.charset()` repairs a stub survivor on first read.
-        let cs_obj = {
-            let want = ctx.create_string("UTF-8");
+        // `encoding` is the STREAM's encoding, not a constant: HotSpot gives
+        // `System.out` the console's charset (`ANSI_X3.4-1968` under `LANG=C`,
+        // `Cp1251` on a 1251 Windows host) and only `file.encoding` is pinned
+        // to UTF-8. Stamping UTF-8 unconditionally is what made
+        // `System.out.print("Ж")` write UTF-8 bytes where HotSpot writes `?`
+        // — `printstream_encode` and `install_real_stream_fields` below both
+        // read THIS object, so the stamp decides the bytes as well as the
+        // answer to `charset()`.
+        let resolve = |ctx: &mut dyn NativeContext, name: &str| -> Option<ObjectRef> {
+            let want = ctx.create_string(name);
             match ctx.invoke(
                 "java/nio/charset/Charset",
                 "forName",
@@ -4939,16 +4963,28 @@ pub(crate) fn native_system_init_phase1(
                         Some("java/nio/charset/Charset")
                     ) =>
                 {
-                    real
+                    Some(real)
                 }
-                _ => {
+                _ => None,
+            }
+        };
+        let cs_obj = match resolve(ctx, encoding) {
+            Some(real) => real,
+            // The host named an encoding this image has no charset for (a
+            // synthetic-JDK build asked for `cp866`, say). A stand-in that
+            // CLAIMS that encoding while everything downstream writes UTF-8
+            // would be worse than either honest answer, so degrade the whole
+            // stream to UTF-8 rather than the name alone.
+            None => match resolve(ctx, "UTF-8") {
+                Some(utf8) => utf8,
+                None => {
                     let cs_fields = ctx.class_num_total_fields(cs_class).max(1);
                     let stub = ctx.alloc_object(cs_class, cs_fields);
-                    let name = ctx.create_string("UTF-8");
+                    let name = ctx.create_string(encoding);
                     ctx.set_field(stub, 0, Value::Object(Some(name)));
                     stub
                 }
-            }
+            },
         };
         // Use field-by-name so we hit the real-JDK `charset` slot (its
         // declared index differs from any synthetic ordering).
@@ -5107,12 +5143,14 @@ pub(crate) fn native_system_init_phase1(
     }
 
     if let Some(out_stream) = ctx.get_system_stream("out") {
-        install_charset(ctx, out_stream);
+        let enc = std_stream_encoding(ctx, "stdout.encoding");
+        install_charset(ctx, out_stream, &enc);
         install_real_stream_fields(ctx, out_stream, "out");
         ctx.set_static_field_by_name("java/lang/System", "out", Value::Object(Some(out_stream)));
     }
     if let Some(err_stream) = ctx.get_system_stream("err") {
-        install_charset(ctx, err_stream);
+        let enc = std_stream_encoding(ctx, "stderr.encoding");
+        install_charset(ctx, err_stream, &enc);
         install_real_stream_fields(ctx, err_stream, "err");
         ctx.set_static_field_by_name("java/lang/System", "err", Value::Object(Some(err_stream)));
     }

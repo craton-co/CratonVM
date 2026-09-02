@@ -677,6 +677,13 @@ fn test_helpers() -> JitRuntimeHelpers {
         // accessor site in these tests keeps its ordinary native dispatch.
         ffm_segment_get: 0,
         ffm_segment_set: 0,
+        // 0 = no collector published a reference-store barrier plan, so every
+        // ref-store site in these tests keeps the full-helper path. That is
+        // what makes the gated sequence additive: a hand-built table gets the
+        // pre-existing emission, byte for byte.
+        ref_store_pre_gate: 0,
+        ref_store_post_gate: 0,
+        ref_store_post_young_floor: 0,
     }
 }
 
@@ -16132,4 +16139,95 @@ fn s31_inline_reservations_count_nested_bodies() {
     // the old root-only formula would have reserved for its root.
     assert!(spliced_bytecode_len(&outer) > spliced_bytecode_len(&leaf));
     assert!(spliced_stack_reserve(&outer) > spliced_stack_reserve(&leaf));
+}
+
+/// `emit_cmp_r64_mem_disp` picks the narrowest legal encoding, and the widths
+/// it declines to narrow are declined for a reason, not by omission.
+///
+/// The six containment compares in `emit_guarded_getfield_receiver_check` read
+/// table words at displacements 0..40 through RDX. Every one fits a `disp8`;
+/// before this encoder existed each paid the disp32 form, three wasted bytes
+/// apiece on a guard that runs before every unproven-receiver field access.
+///
+/// The two x86 base-register special cases are pinned here as well, because
+/// both are silent mis-encodings rather than assembler errors: RBP/R13 have no
+/// `mod=00` form (that bit pattern is RIP-relative), and RSP/R12 need a SIB
+/// byte this emitter does not produce.
+#[test]
+fn the_containment_compare_narrows_its_displacement_and_knows_the_two_base_cases() {
+    let mk = || {
+        let alloc_result = crate::regalloc::RegAllocResult {
+            assignments: Vec::new(),
+            xmm_assignments: Vec::new(),
+            used_callee_saved: Vec::new(),
+            used_xmm_regs: Vec::new(),
+            block_live_in: Vec::new(),
+        };
+        Compiler::new(
+            "cmp-disp-width-test".to_string(),
+            ExecutableBuffer::new(4096).expect("test executable buffer"),
+            0,
+            0,
+            8,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            alloc_result,
+            false,
+            test_helpers(),
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Vec::new(),
+        )
+    };
+    let bytes = |f: &dyn Fn(&mut Compiler)| -> Vec<u8> {
+        let mut c = mk();
+        let at = c.buf.pos();
+        f(&mut c);
+        c.buf.as_slice()[at..].to_vec()
+    };
+
+    // RDX base, displacement 0: mod=00, no displacement byte at all.
+    assert_eq!(
+        bytes(&|c| c.emit_cmp_r64_mem_disp(RAX, RDX, 0)),
+        vec![0x48, 0x3B, 0x02],
+    );
+    // RDX base, the five remaining table words: mod=01 + one byte.
+    for disp in [8i32, 16, 24, 32, 40] {
+        assert_eq!(
+            bytes(&|c| c.emit_cmp_r64_mem_disp(RAX, RDX, disp)),
+            vec![0x48, 0x3B, 0x42, disp as u8],
+            "displacement {disp} did not take the disp8 form",
+        );
+    }
+    // Past a signed byte: back to mod=10 + disp32, byte-identical to the
+    // encoder this one delegates to.
+    let wide = bytes(&|c| c.emit_cmp_r64_mem_disp(RAX, RDX, 4096));
+    assert_eq!(wide, bytes(&|c| c.emit_cmp_r64_mem_disp32(RAX, RDX, 4096)));
+
+    // RBP has no mod=00 form: a zero displacement still emits an explicit
+    // disp8 of 0, never the three-byte shape RDX gets.
+    assert_eq!(
+        bytes(&|c| c.emit_cmp_r64_mem_disp(RAX, RBP, 0)),
+        vec![0x48, 0x3B, 0x45, 0x00],
+    );
+    // RSP needs a SIB byte neither form emits, so it is handed to the disp32
+    // encoder unchanged rather than narrowed into a wrong operand here.
+    assert_eq!(
+        bytes(&|c| c.emit_cmp_r64_mem_disp(RAX, RSP, 8)),
+        bytes(&|c| c.emit_cmp_r64_mem_disp32(RAX, RSP, 8)),
+    );
+    // An extended base keeps its REX.B, and R13 inherits RBP's rule.
+    assert_eq!(
+        bytes(&|c| c.emit_cmp_r64_mem_disp(RAX, R13, 0)),
+        vec![0x49, 0x3B, 0x45, 0x00],
+    );
 }
