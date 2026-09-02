@@ -2602,6 +2602,19 @@ impl SharedVm {
                 cratonvm_native_builtins::lang_invoke::register_t28_method_handle_completeness(
                     &mut native_methods,
                 );
+                // The MethodHandles LOOP family, tryFinally and arrayLength.
+                //
+                // THIS list is the one that matters for --jdk-only: real-JDK
+                // mode installs only the ESSENTIAL registrars, so wiring a new
+                // registrar into lib.rs alone leaves it absent here and the call
+                // falls through to JDK bytecode. Measured, and it is why the
+                // first build of these six changed nothing:
+                // `--dump-native-registry` under --jdk-only listed
+                // MethodHandles.constant and .guardWithTest and NOT .zero,
+                // .arrayLength or any of the four loops.
+                cratonvm_native_builtins::lang_invoke::register_mh_loop_family(
+                    &mut native_methods,
+                );
                 // Round 85: LambdaMetafactory.metafactory/altMetafactory natives.
                 // log4j ServiceLoaderUtil.callServiceLoader calls
                 // LambdaMetafactory.metafactory directly (not via invokedynamic).
