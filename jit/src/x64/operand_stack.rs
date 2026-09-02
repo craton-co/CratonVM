@@ -25,6 +25,29 @@ use super::*;
 /// 2026-09-02 — shipped a nondeterministic heap corruption that took a bisect
 /// with a rebuild per hypothesis to find, because no flag could separate it in
 /// one binary. This one can.
+/// TEST-ONLY, opt-in: cap `spill_slots` at this many words, whatever
+/// `max_stack` asks for. Unset (the default) means no cap.
+///
+/// `spill-range-exhausted` is a refusal nothing in the tree could count until
+/// the spill census landed, and on every workload measured it fires ZERO times
+/// with 7 to 9 words of headroom to spare. A census column that never fires is
+/// indistinguishable from one armed where it cannot fire, and the way to tell
+/// them apart is to make the thing happen on purpose. Shrinking the budget does
+/// that without inventing a pathological method: it is the same emitter, the
+/// same workload and the same code path, with less room.
+///
+/// It caps rather than replaces, so a small method is unaffected and the arm
+/// only bites where the budget was actually being used.
+pub fn spill_slots_cap() -> Option<usize> {
+    static G: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_SPILL_SLOTS_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    })
+}
+
 pub fn canonical_flush_home_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
