@@ -893,6 +893,46 @@ pub struct GcFlags {
     /// debug build runs both and asserts they agree, so the claim is checked
     /// rather than asserted in prose.
     pub g1_cleanup_walk: bool,
+    /// `CRATONVM_G1_CARD_RSET` — F-05: screen G1's Phase-2 remembered-set
+    /// source walks against a per-arena CARD TABLE, instead of walking every
+    /// byte of every named source region. Default **ON**
+    /// ([`parse::on_unless_zero`]); `=0` restores the whole-region walk.
+    ///
+    /// A remembered-set entry names a source REGION, so acting on one edge cost
+    /// a walk of the whole region — every object header validated, every
+    /// reference slot visited, a region lookup per slot — i.e. a cost
+    /// proportional to BYTES IN THE SOURCE rather than to the number of edges.
+    /// The card table records, per 512 bytes, whether a cross-region reference
+    /// store ever landed there, so a source with no dirty card is skipped
+    /// outright and an object touching no dirty card is stepped over without
+    /// any per-slot work. See `gc/src/g1_cards.rs`.
+    ///
+    /// `=0` is the bisection lever and the FIRST thing to try for a suspected
+    /// G1 lost-edge or dangling-reference defect that appears after 2026-09-02:
+    /// under it Phase 2 reads no card and walks each source exactly as it did
+    /// before. The card table is still MAINTAINED under `=0` (the barrier's
+    /// store is unconditional), so the flag isolates the READ side — which is
+    /// the side that can lose an edge — rather than half-disabling both.
+    pub g1_card_rset: bool,
+    /// `CRATONVM_G1_INLINE_BARRIER` — F-08: let the JIT emit G1's post-write
+    /// barrier inline instead of routing every compiled reference store to the
+    /// `jit_putfield_object` helper. Opt-in ([`parse::present`]).
+    ///
+    /// Closing defect G1-2 (`audits/g1-audit.md` §8.1, §10) made every
+    /// JIT-compiled reference store an out-of-line call, because the inline
+    /// fast paths are gated on the `JIT_REGION_BOUNDS` table, which G1
+    /// deliberately never publishes. §10 measured the cost as falling on the
+    /// `n.left = newChild` shape that dominates allocation-heavy code. This
+    /// emits a real G1 post-barrier — same-region test, null test, then the
+    /// out-of-line remembered-set call — against a SEPARATE published table, so
+    /// the G1-2 gate is untouched.
+    ///
+    /// Default OFF because it is a code-generation change on an experimental
+    /// collector and because the last inline barrier this JIT had
+    /// (`Compiler::inline_card_mark_available`, a different mechanism against a
+    /// different table) was disabled after a WildFly boot audit found a missed
+    /// dirty card. `=1` is how it gets measured before it becomes a default.
+    pub g1_inline_barrier: bool,
     /// `CRATONVM_G1_DBG_RSET` — after every G1 evacuation pause, verify that
     /// every cross-region reference into a COLLECTABLE region is named in that
     /// region's remembered set. Opt-in diagnostic; whole-heap and O(live
@@ -1166,6 +1206,8 @@ impl GcFlags {
             g1_scrub_free: present(src, "CRATONVM_G1_SCRUB_FREE"),
             g1_narrow_fixup: on_unless_zero(src, "CRATONVM_G1_NARROW_FIXUP"),
             g1_cleanup_walk: present(src, "CRATONVM_G1_CLEANUP_WALK"),
+            g1_card_rset: on_unless_zero(src, "CRATONVM_G1_CARD_RSET"),
+            g1_inline_barrier: present(src, "CRATONVM_G1_INLINE_BARRIER"),
             identity_hash_evict: on_unless_zero(src, "CRATONVM_IDENTITY_HASH_EVICT"),
             g1_dbg_rset: present(src, "CRATONVM_G1_DBG_RSET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),

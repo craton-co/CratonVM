@@ -567,6 +567,29 @@ Ordered. Each item is a precondition for the next being meaningful.
    the reading item 2's `cset_verify_truncated` counter exists to make possible,
    and it means `dangling=0` here is "nothing found in 995,328 objects
    sampled", not "the heap was exhaustively clean at any instant".
+
+   **F-05 (2026-09-02) — the SPACE reading above answered the wrong question,
+   and a card table shipped for the other one.** `rset_bytes_per_live_byte =
+   0.000034` says the remembered set is cheap to STORE. It says nothing about
+   what it costs to USE, and that is where the cost was: an entry names a source
+   REGION, so acting on one remembered edge meant `scan_source_region_for_cset_refs`
+   walking the whole source — every header validated, every reference slot read,
+   an `evacuation_candidate_is_an_object` check and a `region_for_ptr` binary
+   search per candidate — i.e. a cost proportional to BYTES IN THE SOURCE rather
+   than to the number of edges. A single edge into a 1 MiB Old region cost a
+   megabyte walk, and a COARSENED rset makes every live region a nominal source.
+   `gc/src/g1_cards.rs` adds a per-arena byte-per-512-bytes card table maintained
+   by the same three producers that maintain the rset, and Phase 2 now skips a
+   source with no dirty card outright and steps over any object that touches no
+   dirty card. `CRATONVM_G1_CARD_RSET=0` restores the whole-region walk.
+   Measured on the unit fixture (one holder among hundreds of fillers in a 1 MiB
+   source): `scanned=512 skipped=1048064` — 99.95% of the source walk removed.
+   The region-index rset is unchanged and still decides WHICH regions a pause
+   looks at; the cards decide WHERE INSIDE one. Residual: no block-start table,
+   so the walk still steps object-by-object (see the long comment at the
+   per-object screen for why `bump_alloc` cannot maintain one across a TLAB
+   carve), and a card is cleaned only at `G1Region::reset`, so a long-lived Old
+   region's cards saturate.
 6. ~~**Decide the JNI-pinned-source policy explicitly.**~~ **DONE.** Stated in
    `a_jni_pinned_region_is_an_ordinary_rset_source_not_a_wholesale_one`, which
    pins both halves: a JNI-pinned region is held out of the CSet but is an

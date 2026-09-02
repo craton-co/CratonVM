@@ -89,6 +89,7 @@ pub mod concurrent_mark;
 pub mod evac_pool;
 pub mod external_roots;
 pub mod g1;
+pub mod g1_cards;
 pub mod g1_concurrent;
 pub mod gc;
 /// Card / remembered-set cost counters and the per-cycle collector-decision
