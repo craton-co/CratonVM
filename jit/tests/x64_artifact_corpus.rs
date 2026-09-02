@@ -401,6 +401,11 @@ fn metadata_hash(cm: &cratonvm_jit::CompiledMethod) -> u64 {
             i(&mut v, *n as i64);
             i(&mut v, *mk as i64);
         }
+        i(&mut v, m.stack_marks_exact as i64);
+        i(&mut v, m.non_oop_stack_slots.len() as i64);
+        for o in &m.non_oop_stack_slots {
+            i(&mut v, *o as i64);
+        }
         i(&mut v, m.frame_slot_offsets.len() as i64);
         for o in &m.frame_slot_offsets {
             i(&mut v, *o as i64);

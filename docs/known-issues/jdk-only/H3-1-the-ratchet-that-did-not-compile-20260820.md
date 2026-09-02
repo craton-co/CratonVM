@@ -7,6 +7,49 @@ MEASURED here are source facts (`grep`, `git show`, `rustfmt --check`), JDK
 image facts (`javap`/`src.zip` on the real JDK 25.0.3+9 image), and two Python
 self-tests that were actually executed.
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** This record's title defect — a
+> ratchet that did not compile, taking the whole `--test stub_ratchet` binary
+> and nine other tests with it — is FIXED. Both configurations were built and
+> run, separately, as §"The commands" insists ("Run both, paste both — never
+> derive one from the other"):
+>
+> ```text
+> stub-ratchet [management (the shipping cratonvm-cli registry)]:
+>     1645 SyntheticStub registrations out of 13897 total (baseline 1645, slack 0)
+> stub-ratchet [no-management (ten jmx registrars short of shipping)]:
+>     1634 SyntheticStub registrations out of 13529 total (baseline 1634, slack 0)
+> ```
+>
+> Both compile, both run, both pass with **slack 0**. That is what the record
+> owed, and it had said "no binary carrying these changes has been built or run"
+> for **13 days**.
+>
+> **The −7 IS NOT VERIFIED, and cannot be from here.** §5's table predicts:
+>
+> ```text
+>                                     before   predicted after   measured 2026-09-02
+> BASELINE_SYNTHETIC_STUBS_MANAGEMENT    1622        1615               1645
+> BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT 1611        1604               1634
+> MEASURED_TOTAL_REGISTRATIONS_MGMT     13160       13153              13897
+> ```
+>
+> Every "before" value in that table is gone from the tree, so the delta has no
+> subtrahend left to measure against. Thirteen days of other lanes added
+> registrations — **+744 total registrations** on the management arm — and the
+> baselines were re-frozen somewhere in there by whoever did it.
+>
+> What survives the drift is a consistency check, and it passes: both arms moved
+> by **exactly the same amount** (+23 against this table's "before", +30 against
+> its "after"). A delta that differed between the two arms would be a finding;
+> an equal one is the signature of shared registrars growing, which is the
+> expected background.
+>
+> So: the compile defect is closed and measured. §5's arithmetic is **stale, not
+> wrong** — nobody can now tell whether the seven rows came out as predicted,
+> because the ratchet froze over them. That is the cost of leaving a re-freeze
+> unverified for thirteen days, and it is worth more as a lesson than the seven
+> rows were.
+
 **Date** 2026-08-20
 **Branch** lane H3 worktree off `claude/jdk-only-mode-handoff-09b48c`
 **Subject** `native-builtins/src/phases_late/streams.rs`, `native-io/src/process.rs`,
