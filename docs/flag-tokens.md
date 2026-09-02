@@ -577,7 +577,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-286 tokens.
+291 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -616,6 +616,7 @@ export inherited from a parent shell.
 | `c2-first-call` | `CRATONVM_JIT_C2_FIRST_CALL` |
 | `c2-supersede` | `CRATONVM_C2_SUPERSEDE` |
 | `callee-oop-flush` | `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH` |
+| `spill-slots-cap` | `CRATONVM_JIT_SPILL_SLOTS_CAP` |
 | `code-cache-max-mb` | `CRATONVM_JIT_CODE_CACHE_MAX_MB` |
 | `conservative-locals` | `CRATONVM_NO_CONSERVATIVE_LOCALS` |
 | `ctor-direct-call` | `CRATONVM_NO_CTOR_DIRECT_CALL` |
@@ -680,6 +681,7 @@ export inherited from a parent shell.
 | `gated-ref-store` | `CRATONVM_JIT_GATED_REF_STORE` |
 | `this-nonnull` | `CRATONVM_JIT_THIS_NONNULL` |
 | `receiver-null-elim` | `CRATONVM_JIT_RECEIVER_NULL_ELIM` |
+| `implicit-null-check` | `CRATONVM_JIT_IMPLICIT_NULL_CHECK` |
 | `operand-cache` | `CRATONVM_JIT_OPERAND_CACHE` |
 | `ir-reloc-emit` | `CRATONVM_JIT_IR_RELOC_EMIT` |
 | `reloc-gate-map-incomplete` | `CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE` |
@@ -785,6 +787,9 @@ export inherited from a parent shell.
 | `param-tag-scan` | `CRATONVM_JIT_NO_PARAM_TAG_SCAN` |
 | `descriptor-facts` | `CRATONVM_JIT_NO_DESCRIPTOR_FACTS` |
 | `backedge-poll-gate` | `CRATONVM_JIT_NO_BACKEDGE_POLL_GATE` |
+| `field-fast-path` | `CRATONVM_JIT_NO_FIELD_FAST_PATH` |
+| `osr-inline-gate` | `CRATONVM_JIT_NO_OSR_INLINE_GATE` |
+| `invoke-fast-door` | `CRATONVM_JIT_NO_INVOKE_FAST_DOOR` |
 | `iface-select-memo` | `CRATONVM_JIT_NO_IFACE_SELECT_MEMO` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
 | `ir-unresumable-trap-guard` | `CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD` |
@@ -870,7 +875,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-112 tokens.
+115 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -911,6 +916,7 @@ export inherited from a parent shell.
 | `g1-reserve-heap` | `CRATONVM_G1_RESERVE_HEAP` |
 | `g1-uncommit` | `CRATONVM_G1_UNCOMMIT` |
 | `g1-card-rset` | `CRATONVM_G1_CARD_RSET` |
+| `g1-card-clean` | `CRATONVM_G1_CARD_CLEAN` |
 | `g1-inline-barrier` | `CRATONVM_G1_INLINE_BARRIER` |
 | `g1-mark-lock-yield` | `CRATONVM_G1_MARK_LOCK_YIELD` |
 | `g1-shared-alloc` | `CRATONVM_G1_SHARED_ALLOC` |
@@ -927,6 +933,7 @@ export inherited from a parent shell.
 | `gpu-critical-wait-ms` | `CRATONVM_GPU_CRITICAL_WAIT_MS` |
 | `gpu-host-callback` | `CRATONVM_GPU_HOST_CALLBACK` |
 | `gpu-device-pool` | `CRATONVM_GPU_DEVICE_POOL` |
+| `gpu-wait-latch` | `CRATONVM_GPU_WAIT_LATCH` |
 | `gpu-zerocopy` | `CRATONVM_GPU_NO_ZEROCOPY` |
 | `lhm-root-all` | `CRATONVM_LHM_ROOT_ALL` |
 | `max-inflated-bytes` | `CRATONVM_MAX_INFLATED_BYTES` |
@@ -949,6 +956,7 @@ export inherited from a parent shell.
 | `par-evac` | `CRATONVM_GC_PAR_EVAC` |
 | `par-threads` | `CRATONVM_GC_PAR_THREADS` |
 | `sync-young-wipe` | `CRATONVM_GC_SYNC_YOUNG_WIPE` |
+| `jit-ref-store-gates` | `CRATONVM_GC_JIT_REF_STORE_GATES` |
 | `promotion-guard` | `CRATONVM_NO_GC_PROMOTION_GUARD` |
 | `promotion-oom-guard-broad` | `CRATONVM_PROMOTION_OOM_GUARD_BROAD` |
 | `selective-promote` | `CRATONVM_NO_SELECTIVE_PROMOTE` |
@@ -1114,7 +1122,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-22 tokens.
+23 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1140,6 +1148,7 @@ export inherited from a parent shell.
 | `tomcat-mapper-natives` | `CRATONVM_TOMCAT_MAPPER_NATIVES` |
 | `vh-strict-reference-return` | `CRATONVM_VH_STRICT_REFERENCE_RETURN` |
 | `vh-null-coordinate-npe` | `CRATONVM_VH_NULL_COORDINATE_NPE` |
+| `vh-unsupported-mode-uoe` | `CRATONVM_VH_UNSUPPORTED_MODE_UOE` |
 
 ## `CRATONVM_TEST`
 

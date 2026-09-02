@@ -20701,6 +20701,254 @@ pub(crate) fn native_class_get_type_name(
     Ok(Some(Value::Object(Some(ctx.create_string(&type_name)))))
 }
 
+/// The three JDK enums the synthetic model did not carry, in `javap`
+/// declaration order — which IS the ordinal, and is not alphabetical.
+///
+/// These lists are the SAME data as `class_manager.rs`'s `enum_constant_fields`
+/// rows and must stay identical to them: that side declares the statics so
+/// `GETSTATIC` resolves, this side populates them so the resolved value is not
+/// null, and either half alone is worse than neither.
+#[cfg(feature = "synthetic-jdk")]
+pub(crate) const DAY_OF_WEEK_CONSTANTS: &[&str] = &[
+    "MONDAY",
+    "TUESDAY",
+    "WEDNESDAY",
+    "THURSDAY",
+    "FRIDAY",
+    "SATURDAY",
+    "SUNDAY",
+];
+#[cfg(feature = "synthetic-jdk")]
+pub(crate) const HTTP_VERSION_CONSTANTS: &[&str] = &["HTTP_1_1", "HTTP_2"];
+#[cfg(feature = "synthetic-jdk")]
+pub(crate) const HTTP_REDIRECT_CONSTANTS: &[&str] = &["NEVER", "ALWAYS", "NORMAL"];
+
+/// One `<clinit>`/`values()` pair per enum, because the registry takes fn
+/// POINTERS and a loop over `(class, constants)` would need capturing
+/// closures. Each body is a single delegation, so the logic these six share
+/// still has exactly one implementation.
+#[cfg(feature = "synthetic-jdk")]
+macro_rules! synthetic_enum_pair {
+    ($clinit:ident, $values:ident, $class:expr, $constants:expr) => {
+        pub(crate) fn $clinit(
+            ctx: &mut dyn NativeContext,
+            _args: &[Value],
+        ) -> MethodCallResult {
+            publish_synthetic_enum_constants(ctx, $class, $constants)
+        }
+        pub(crate) fn $values(
+            ctx: &mut dyn NativeContext,
+            _args: &[Value],
+        ) -> MethodCallResult {
+            let _ = ctx.ensure_class_initialized($class);
+            synthetic_enum_values(ctx, $class, $constants)
+        }
+    };
+}
+
+#[cfg(feature = "synthetic-jdk")]
+synthetic_enum_pair!(
+    day_of_week_clinit,
+    day_of_week_values,
+    "java/time/DayOfWeek",
+    DAY_OF_WEEK_CONSTANTS
+);
+#[cfg(feature = "synthetic-jdk")]
+synthetic_enum_pair!(
+    http_version_clinit,
+    http_version_values,
+    "java/net/http/HttpClient$Version",
+    HTTP_VERSION_CONSTANTS
+);
+#[cfg(feature = "synthetic-jdk")]
+synthetic_enum_pair!(
+    http_redirect_clinit,
+    http_redirect_values,
+    "java/net/http/HttpClient$Redirect",
+    HTTP_REDIRECT_CONSTANTS
+);
+
+/// Mint and publish a synthetic JDK enum's constants, exactly as its real
+/// `<clinit>` would, then publish `$VALUES`.
+///
+/// ONE implementation, parameterised, rather than a copy per enum. That is the
+/// whole point: `posix_publish_constants` — the model this generalises — is
+/// itself the survivor of a copy that went wrong. Its doc records that the
+/// `name`/`ordinal` slot fallbacks in the two sibling copies were INVERTED
+/// relative to each other, latent only because `class_manager` happens to give
+/// these stubs `java/lang/Enum` as a superclass, and that "one enum copied from
+/// this model without that row" would make every constant NAMELESS — non-null,
+/// and matching nothing in `valueOf`. Adding three more enums by copy would
+/// have been three more chances at that.
+///
+/// The three obligations that model states, kept here:
+///
+/// 1. **`name` and `ordinal` come from [`enum_name_ordinal_slots`]**, which
+///    resolves both against `java/lang/Enum`, so they cannot be got the wrong
+///    way round at one site without being wrong at all of them.
+/// 2. **Declaration order IS the ordinal.** `compareTo`, `EnumMap` and
+///    `EnumSet` all key on it, so `constants` must be given in `javap` order.
+/// 3. **`$VALUES` is re-READ out of the statics**, not filled from the refs
+///    minted in pass one: `new_ref_array` allocates and can move them. The
+///    re-read is also what makes `values()[i] == CONSTANT`, the identity
+///    `Enum.valueOf`, `Class.getEnumConstants` and `EnumSet` rely on.
+///
+/// Runtime-gated on `is_class_synthetic_stub` rather than on the Cargo feature,
+/// so a feature-enabled binary running real-JDK mode leaves the JDK's own
+/// interned constants alone.
+pub(crate) fn publish_synthetic_enum_constants(
+    ctx: &mut dyn NativeContext,
+    class: &str,
+    constants: &[&str],
+) -> MethodCallResult {
+    if !ctx.is_class_synthetic_stub(class) {
+        return Ok(None);
+    }
+    let Some(cid) = ctx.class_id_by_name(class) else {
+        return Ok(None);
+    };
+    // Idempotence: `<clinit>` runs once per class by construction, but a second
+    // entry through any path must not replace live constants with fresh objects
+    // that then fail `==`.
+    if let Some(first) = constants.first() {
+        if let Some(slot) = ctx.static_field_index_by_name(cid, first) {
+            if matches!(ctx.get_static_field(cid, slot), Value::Object(Some(_))) {
+                return Ok(None);
+            }
+        }
+    }
+    let (name_idx, ord_idx) = crate::phases_late::nio_file::enum_name_ordinal_slots(ctx);
+    let nfields = ctx.class_num_total_fields(cid).max(2);
+    for (ord, &name) in constants.iter().enumerate() {
+        let obj = ctx.alloc_object(cid, nfields);
+        // Pin across `create_string`: a moving young GC there would relocate
+        // the fresh constant while this frame still holds `obj`. Nothing
+        // allocates between the field writes and the publish to the static,
+        // which is a GC root, so the constant is never unreachable-but-live.
+        let obj_pin = ctx.pin_native_root(obj);
+        let name_obj = ctx.create_string(name);
+        let obj = ctx.read_native_pin(obj_pin, obj);
+        ctx.unpin_native_roots(obj_pin);
+        ctx.set_field(obj, name_idx, Value::Object(Some(name_obj)));
+        // Cast: no JDK enum modelled here is near `i32`.
+        ctx.set_field(obj, ord_idx, Value::Int(ord as i32));
+        ctx.set_static_field_by_name(class, name, Value::Object(Some(obj)));
+    }
+    let values_array = ctx.new_ref_array(cid, constants.len());
+    for (idx, &name) in constants.iter().enumerate() {
+        let published = match ctx.static_field_index_by_name(cid, name) {
+            Some(slot) => ctx.get_static_field(cid, slot),
+            None => Value::Object(None),
+        };
+        // `set_array_element` does not allocate, so `values_array` cannot move
+        // underneath this loop.
+        ctx.set_array_element(values_array, idx, published);
+    }
+    // Both spellings: javac emits `$VALUES`, ecj emits `ENUM$VALUES`, and a
+    // write to an undeclared static is a silent no-op, so writing both is free.
+    ctx.set_static_field_by_name(class, "$VALUES", Value::Object(Some(values_array)));
+    ctx.set_static_field_by_name(class, "ENUM$VALUES", Value::Object(Some(values_array)));
+    Ok(None)
+}
+
+/// `<Enum>.values()` — a FRESH array each call, holding the interned constants.
+///
+/// Freshness is not stylistic: the real method is `$VALUES.clone()`, so
+/// `values() != values()` while `values()[0] == CONSTANT`. Handing back one
+/// shared array would let a single caller's `values()[0] = null` corrupt every
+/// later caller.
+///
+/// Reads through the STATICS rather than `$VALUES` so it is correct even if the
+/// `$VALUES` declaration is ever missing from a stub's field table — the shape
+/// `posix_file_permission_values` documents as a live gap for its own enum.
+pub(crate) fn synthetic_enum_values(
+    ctx: &mut dyn NativeContext,
+    class: &str,
+    constants: &[&str],
+) -> MethodCallResult {
+    let cid = ctx.ensure_class_initialized(class)?;
+    let arr = ctx.new_ref_array(cid, constants.len());
+    for (idx, &name) in constants.iter().enumerate() {
+        let published = match ctx.static_field_index_by_name(cid, name) {
+            Some(slot) => ctx.get_static_field(cid, slot),
+            None => Value::Object(None),
+        };
+        ctx.set_array_element(arr, idx, published);
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `java.lang.Enum.valueOf(Class, String)` — **`--synthetic-jdk` only**.
+///
+/// `java/lang/Enum`'s five natives were retired on 2026-08-23 (`80d60e911`),
+/// correctly: the retirement was measured against the real-JDK regression
+/// suite, where `Enum.valueOf`'s real bytecode serves every call and a native
+/// only shadows it.
+///
+/// `--synthetic-jdk` has no bytecode to fall back on, so the same retirement
+/// left `Enum.valueOf` an `UnsatisfiedLinkError` in that mode — for EVERY enum,
+/// including user-defined ones. Measured 2026-09-02 with
+/// `apps/probes/SyntheticEnumSurface`: real-JDK identical to HotSpot on all 20
+/// rows, `--synthetic-jdk` failing this one on a three-constant local enum
+/// whose `values()`, `name()`, `ordinal()` and `getEnumConstants()` all worked.
+///
+/// That is the third time this session one retirement has behaved this way
+/// (`ArrayDeque.iterator()` and `Collections.unmodifiableSortedMap` are the
+/// others): **a native retired because real bytecode covers it is retired in
+/// BOTH modes, and only one of them has the bytecode.** Hence the `cfg` —
+/// real-JDK keeps the retirement exactly as measured.
+///
+/// Built on the same `$VALUES` path as `native_class_get_enum_constants`
+/// rather than a second constant source, so the two cannot disagree about
+/// which constants an enum has.
+#[cfg(feature = "synthetic-jdk")]
+pub(crate) fn native_enum_value_of(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let (cls, name_obj) = match (args.first(), args.get(1)) {
+        (Some(Value::Object(Some(c))), Some(Value::Object(Some(n)))) => (*c, *n),
+        // Both arguments are `@NotNull` in the JDK and it NPEs on either.
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Name is null".to_string()),
+            }
+            .into())
+        }
+    };
+    let wanted = ctx.read_string(name_obj).unwrap_or_default();
+    let class_name = mirror_class_id(ctx, cls)
+        .and_then(|id| ctx.class_name_of_id(id))
+        .unwrap_or_default();
+
+    // Reuse the shared constant source; `Some(array)` here is exactly what
+    // `Class.getEnumConstants()` would hand back.
+    let constants = native_class_get_enum_constants(ctx, &[Value::Object(Some(cls))])?;
+    if let Some(Value::Object(Some(arr))) = constants {
+        let n = ctx.array_length(arr);
+        for i in 0..n {
+            let Value::Object(Some(k)) = ctx.get_array_element(arr, i) else {
+                continue;
+            };
+            // Slot 0 is `Enum.name` — the same index `classloader.rs`'s
+            // `resolve_field_index("java/lang/Enum", "name")` test pins.
+            if let Value::Object(Some(nm)) = ctx.get_field(k, 0) {
+                if ctx.read_string(nm).as_deref() == Some(wanted.as_str()) {
+                    return Ok(Some(Value::Object(Some(k))));
+                }
+            }
+        }
+    }
+    // HotSpot's exact wording, so a caller matching on the message still works:
+    //   No enum constant com.example.Colour.MAUVE
+    Err(
+        cratonvm_types::error::RuntimeError::IllegalArgumentException {
+            message: format!("No enum constant {}.{wanted}", class_name.replace('/', ".")),
+        }
+        .into(),
+    )
+}
+
 pub(crate) fn native_class_get_enum_constants(
     ctx: &mut dyn NativeContext,
     args: &[Value],
