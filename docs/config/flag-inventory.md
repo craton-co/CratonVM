@@ -90,18 +90,31 @@ cratonvm-types`:
 
 | | count |
 |---|---|
-| distinct `CRATONVM_*` identifiers appearing anywhere in Rust source | 1,081 |
-| exact string literals (i.e. actually named by code, not prose) | 1,016 |
+| distinct `CRATONVM_*` identifiers appearing anywhere in Rust source | 1,084 |
+| exact string literals (i.e. actually named by code, not prose) | 1,019 |
 | **declared** in `flag_groups::INVENTORY` + scalars + group variables | **1013** |
 | declared before this pass | 576 |
 | declared by this pass | **71** |
 | allowlisted as intentionally undeclared | 11 |
 | user-facing names an operator has to learn | 15 |
 
-The first two rows are **not** generated and no test enforces them, which is
-why they read 692 / 658 from 2026-08-06 until 2026-09-01 while the true figures
-were 1,056 / 993 — a gap large enough to make the declared count (986) look
-like it *exceeded* the number of flags in the source, which is not possible.
+The first two rows are **not** produced by
+`tools/flag-census/render-inventory.sh`, but both are now ENFORCED:
+`flag_inventory_surface_counts_are_current` in
+`types/tests/doc_numeric_claims.rs` fails `cargo test -p cratonvm-types` when
+either drifts, and prints the exact command to regenerate it. It caught both on
+2026-09-02: row 1 at 1,081 against a true **1,084**, row 2 at 1,016 against a
+true **1,019**.
+
+Row 2 counts quoted literals under `<member>/src` only, so it is expected to be
+SMALLER than row 1: a name reached only through prose, or through a key built at
+runtime, is in row 1 and not here. Reading the description without that
+qualifier gives 1,030 (every `*.rs` in the tree) or 1,021 (`src` directories
+including non-members) -- both wrong, and the reason the command belongs in the
+test rather than in a reader's head. Take it from the failure output, not from
+this paragraph.
+
+Historically: the first two rows read 692 / 658 from 2026-08-06 until 2026-09-01 while the true figures were 1,056 / 993 -- a gap large enough to make the declared count (986) look like it *exceeded* the number of flags in the source, which is not possible.
 They were re-derived again on 2026-09-01 and had already moved to 1,065 / 1,001
 on the same day — and moved twice more within that afternoon while eight new
 flags were being registered. That drift rate is the reason the instruction
