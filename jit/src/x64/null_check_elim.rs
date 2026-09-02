@@ -410,3 +410,176 @@ mod preceding_aload_nonnull_local_tests {
         assert_eq!(preceding_aload_nonnull_local(&code, 5), None);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Receiver null-check elision — flags and engagement census
+// ---------------------------------------------------------------------------
+
+/// Seed `this` as non-null at method entry — **default ON**, opt out with
+/// `CRATONVM_JIT_THIS_NONNULL=0`.
+///
+/// Separate from [`receiver_null_elim_enabled`] because the blast radii are
+/// different, and a single switch would have made them indistinguishable in a
+/// bisect. This one widens a fact that THREE existing consumers already read
+/// (the inline array null-check elision, the `ifnull`/`ifnonnull` branch
+/// elision, and now the getfield receiver guard); that one adds the third
+/// consumer. Turning this off restores the previous entry state — nothing
+/// proven on entry — exactly.
+pub(super) fn this_nonnull_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_THIS_NONNULL").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// Drop the `getfield` receiver's `TEST`/`JZ` when the dataflow proves it
+/// non-null — **default ON**, opt out with `CRATONVM_JIT_RECEIVER_NULL_ELIM=0`.
+///
+/// Off restores an unconditional `emit_trusted_oop_receiver_check` at both
+/// getfield arms, so the off arm is the previous binary's behaviour rather
+/// than a degraded one.
+pub(super) fn receiver_null_elim_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_RECEIVER_NULL_ELIM").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+static RECEIVER_NULL_CHECKS_ELIDED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static RECEIVER_NULL_CHECKS_EMITTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(super) fn note_receiver_null_check_elided() {
+    RECEIVER_NULL_CHECKS_ELIDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(super) fn note_receiver_null_check_emitted() {
+    RECEIVER_NULL_CHECKS_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(elided, emitted)` getfield receiver null checks, process-wide.
+///
+/// The pair, not the ratio: an all-zero pair and a zero-elided pair look the
+/// same in a percentage and want opposite fixes — the first means the arm was
+/// never reached (no trusted-oop getfield compiled at all), the second that it
+/// was reached and the dataflow proved nothing. A soak that reports neither
+/// number has not measured whether this feature engaged.
+pub fn receiver_null_check_counts() -> (u64, u64) {
+    (
+        RECEIVER_NULL_CHECKS_ELIDED.load(std::sync::atomic::Ordering::Relaxed),
+        RECEIVER_NULL_CHECKS_EMITTED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+#[cfg(test)]
+mod receiver_elision_tests {
+    use super::preceding_aload_nonnull_local;
+    use crate::null_check_elim::analyze_with_receiver;
+
+    /// The two halves the getfield emitter ANDs together, tested together.
+    ///
+    /// `emit_trusted_oop_receiver_check_at` elides only when
+    /// `preceding_aload_nonnull_local` names a local AND the dataflow proves
+    /// it. Testing either alone would miss the pairing -- which is where the
+    /// bug would be, since the two are indexed by the same bci and derived
+    /// from the same array.
+    #[test]
+    fn the_getfield_receiver_resolves_to_this_and_the_dataflow_proves_it() {
+        #[rustfmt::skip]
+        let code: Vec<u8> = vec![
+            0x2A,               // 0: aload_0
+            0xB4, 0x00, 0x01,   // 1: getfield #1
+            0xAC,               // 4: ireturn
+        ];
+        assert_eq!(
+            preceding_aload_nonnull_local(&code, 1),
+            Some(0),
+            "the receiver of a getfield is the value the preceding aload pushed"
+        );
+
+        let seeded = analyze_with_receiver(&code, code.len(), true);
+        assert!(seeded.is_nonnull(1, 0), "and the seed proves it at bci 1");
+
+        let unseeded = analyze_with_receiver(&code, code.len(), false);
+        assert!(
+            !unseeded.is_nonnull(1, 0),
+            "without the seed the very first `this.field` in a method still \
+             pays the check -- this is the arm the seed removes"
+        );
+    }
+
+    /// A `getfield` whose receiver did not come from an `aload` is refused
+    /// outright, so the elision can never be handed a local it did not derive.
+    /// The chained form `this.a.b` is the common instance: the inner
+    /// `getfield` pushes the receiver of the outer one.
+    #[test]
+    fn a_chained_getfield_receiver_is_not_attributed_to_a_local() {
+        #[rustfmt::skip]
+        let code: Vec<u8> = vec![
+            0x2A,               // 0: aload_0
+            0xB4, 0x00, 0x01,   // 1: getfield #1   (this.a)
+            0xB4, 0x00, 0x02,   // 4: getfield #2   (.b)
+            0xAC,               // 7: ireturn
+        ];
+        assert_eq!(
+            preceding_aload_nonnull_local(&code, 4),
+            None,
+            "`this.a` is not a local, and its nullness is not local 0's"
+        );
+    }
+}
+
+#[cfg(test)]
+mod receiver_elision_reach_tests {
+    /// The two `getfield` arms must consult the dataflow, and the other four
+    /// receiver-guard sites must NOT.
+    ///
+    /// This is a source scan because the property is about which CALL each arm
+    /// makes, and the arms are unreachable from a unit test without a full
+    /// compile fixture. It is worth the brittleness: the edit that breaks it —
+    /// "unify these six sites on one helper" — looks like tidying and is a
+    /// miscompile at four of them.
+    ///
+    /// * The two `getfield` arms are identifiable by their return shape,
+    ///   `(…, None)`: they hand back a patch list and a separate null patch.
+    ///   Their receiver is the top-of-stack value the preceding `aload`
+    ///   pushed, which is what `preceding_aload_nonnull_local` decodes.
+    /// * The two `putfield` arms must stay on the bare check. `putfield`'s
+    ///   stack is `[…, objectref, value]`, so the preceding push is the stored
+    ///   VALUE — attributing the receiver's nullness to it is the shape of the
+    ///   Tomcat `MessageBytes.setString` miscompile that
+    ///   `opcode_dereferences_receiver` documents.
+    /// * The two `checkcast` arms must stay on the bare check for a different
+    ///   reason: `checkcast` does not throw on a null receiver at all (a null
+    ///   casts to anything), so its `JZ` targets a legal null path rather than
+    ///   an NPE. Eliding it would let a null fall into the `KIND_TAGS` byte
+    ///   compare and fault.
+    #[test]
+    fn only_the_getfield_arms_consult_the_null_check_dataflow() {
+        let src = include_str!("bytecode_walk.rs");
+        let consulting = src.matches("emit_trusted_oop_receiver_check_at(code, pc)").count();
+        assert_eq!(
+            consulting, 2,
+            "expected exactly the two `getfield` arms to consult the dataflow; \
+             found {consulting}. A THIRD consulting site is only correct if its \
+             receiver is the value the immediately-preceding `aload` pushed — \
+             see this test's doc comment for the two shapes where it is not."
+        );
+        let bare = src.matches("self.emit_trusted_oop_receiver_check()").count();
+        assert_eq!(
+            bare, 4,
+            "expected the two `putfield` and two `checkcast` arms to keep the \
+             unconditional check; found {bare}. Moving one of them onto the \
+             `_at` form is a miscompile, not a simplification."
+        );
+    }
+}

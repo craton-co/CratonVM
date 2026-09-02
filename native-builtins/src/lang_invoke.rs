@@ -4517,7 +4517,131 @@ fn vh_box_access_result(
 /// VarHandle.get(receiver) → value
 /// Signature-polymorphic: args arrive as individual values from the call-site,
 /// i.e. args = [vh_ref, receiver] for instance fields.
+/// `CRATONVM_VH_NULL_COORDINATE_NPE=0` — restore the pre-2026-09-02 behaviour,
+/// in which a `VarHandle` access with a NULL coordinate answered instead of
+/// throwing.
+///
+/// Default on. The switch exists because this turns silence into an exception
+/// on a path any workload can reach, so a suite that starts failing has to be
+/// bisectable to this and not to a rebuild.
+fn vh_null_coordinate_npe_enabled() -> bool {
+    !matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_VH_NULL_COORDINATE_NPE").as_deref(),
+        Ok("0")
+    )
+}
+
+/// The null check every access mode owes its leading COORDINATE.
+///
+/// # What was wrong
+///
+/// HotSpot raises `NullPointerException` when a `VarHandle` access is given a
+/// null coordinate — the receiver of an instance-field handle, or the array of
+/// an array-element handle. CratonVM answered instead. Measured on JDK 25 with
+/// `RJdkVarHandleNullCoord`, which walks every access mode against an `int`
+/// instance field, an `Object` instance field and an `int[]` element handle:
+/// **75 of its 76 rows disagreed**, and the one that agreed is the control (a
+/// STATIC-field handle, which has no coordinate to be null).
+///
+/// ```text
+///   35 rows  returned 0        primitive reads, compareAndExchange, getAndAdd, bitwise
+///   15 rows  returned false    every CAS mode
+///   13 rows  returned normally every write mode  <- a lost store, silently
+///   12 rows  returned null     reference reads
+///    1 row   correct           the static-handle control
+/// ```
+///
+/// The write rows are the worst of them: a store through a null receiver was
+/// simply dropped, so the next read returned a stale value that looks
+/// legitimate. The CAS rows are next: answering `false` tells the caller
+/// "somebody else won the race", which is a retry loop rather than a failure.
+///
+/// # Why it is one check and not thirty
+///
+/// The registry is FIRST-WINS and `--dump-native-registry` names this file for
+/// all 37 `java/lang/invoke/VarHandle` registrations — `phases_late/
+/// reflect_invoke.rs` registers many of the same names and never owns a slot.
+/// Those 37 names reach seven registered entry points, and this is called from
+/// each of them.
+///
+/// # Why it is free
+///
+/// `VarHandle.get` is 21 368 822 calls on one netty phase, so a check that
+/// costs anything per access is a regression. Only a leading coordinate that
+/// is ACTUALLY NULL (or absent) reaches the slow path below; everything else —
+/// a live object, or a primitive, which is what `args[1]` is for a
+/// static-field handle's `set` — returns after one `match`.
+///
+/// # What it deliberately does not cover
+///
+/// `SegmentVarHandle` and the `MemorySegment` layout kind are skipped: their
+/// null behaviour was not measured against the oracle, and a guard that
+/// guesses is worse than none. `RJdkVarHandleNullCoord` covers what is
+/// asserted here and nothing else.
+fn vh_check_leading_coordinate(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<(), MethodCallFailed> {
+    // The hot path. A present, non-null leading argument is every ordinary
+    // access; a primitive there belongs to a static-field handle, which has no
+    // coordinate at all.
+    match args.get(1) {
+        Some(Value::Object(None)) | None => {}
+        _ => return Ok(()),
+    }
+    if !vh_null_coordinate_npe_enabled() {
+        return Ok(());
+    }
+    let Some(this) = args.first().and_then(|v| match v {
+        Value::Object(Some(o)) => Some(*o),
+        _ => None,
+    }) else {
+        // No handle to ask. Leave it to the access mode's own decode, which is
+        // what produced today's answer for this shape.
+        return Ok(());
+    };
+    if is_segment_var_handle(ctx, this) {
+        return Ok(());
+    }
+    // The kind, resolved the same way `vh_value_and_coordinate_descriptors`
+    // resolves it, and for the same reason: a REAL-JDK array handle has no
+    // side-table entry and its slot 0 is the real `vform` REFERENCE, so
+    // reading it as a kind tag would silently call it an instance handle.
+    let meta_kind = vh_meta_get(ctx, this).as_deref().map(|m| m.kind);
+    let kind = match meta_kind {
+        Some(k) => k,
+        None => {
+            if real_array_var_handle_descriptors(ctx, this).is_some() {
+                VH_KIND_ARRAY
+            } else {
+                ctx.get_field(this, VH_KIND)
+                    .as_int()
+                    .unwrap_or(VH_KIND_INSTANCE)
+            }
+        }
+    };
+    let coordinate = match kind {
+        // No coordinate: `args[1]` is the VALUE, and a null one is a legal
+        // store of null into a reference static.
+        VH_KIND_STATIC => return Ok(()),
+        VH_KIND_ARRAY => "array",
+        VH_KIND_BYTE_VIEW_LE | VH_KIND_BYTE_VIEW_BE => "array",
+        VH_KIND_BYTE_BUFFER_VIEW_LE | VH_KIND_BYTE_BUFFER_VIEW_BE => "buffer",
+        VH_KIND_INSTANCE => "receiver",
+        // An unmeasured kind (the `MemorySegment` layout handle) keeps today's
+        // behaviour rather than inheriting a rule nothing checked.
+        _ => return Ok(()),
+    };
+    Err(RuntimeError::NullPointerException {
+        message: Some(format!(
+            "VarHandle access with a null {coordinate} coordinate"
+        )),
+    }
+    .into())
+}
+
 fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    vh_check_leading_coordinate(ctx, args)?;
     let this = obj_arg(args, 0)?;
     // `SegmentVarHandle` (JEP 454 FFM API): a distinct real class with its own
     // (real) fields, no synthetic VH_KIND entry. Must be checked before the
@@ -4777,6 +4901,7 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// Signature-polymorphic: args arrive as individual values from the call-site,
 /// i.e. args = [vh_ref, receiver, value] for instance fields.
 fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    vh_check_leading_coordinate(ctx, args)?;
     let this = obj_arg(args, 0)?;
     // `SegmentVarHandle` (JEP 454 FFM API): see the matching check in `varhandle_get`.
     if is_segment_var_handle(ctx, this) {
@@ -4900,6 +5025,7 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// Signature-polymorphic: args arrive as individual values from the call-site,
 /// i.e. args = [vh_ref, receiver, expected, new_value] for instance fields.
 fn varhandle_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    vh_check_leading_coordinate(ctx, args)?;
     let this = obj_arg(args, 0)?;
     // C38: Array-element CAS — args = [vh, array, idx, expected, new_value].
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
@@ -5009,6 +5135,7 @@ fn varhandle_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// `Object` call site needs it and why the boxing cannot live at the
 /// poly-return boundary.
 fn varhandle_compare_and_exchange(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    vh_check_leading_coordinate(ctx, args)?;
     let raw = varhandle_compare_and_exchange_raw(ctx, args);
     vh_box_access_result(ctx, args, raw)
 }
@@ -5131,6 +5258,7 @@ fn varhandle_compare_and_exchange_raw(
 /// `Object` call site needs it and why the boxing cannot live at the
 /// poly-return boundary.
 fn varhandle_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    vh_check_leading_coordinate(ctx, args)?;
     let raw = varhandle_get_and_set_raw(ctx, args);
     vh_box_access_result(ctx, args, raw)
 }
@@ -5255,6 +5383,7 @@ fn varhandle_get_and_set_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// requires; `unbox_poly_return` then unwraps it for a primitive call site such
 /// as H2's `([III)I`.
 fn varhandle_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    vh_check_leading_coordinate(ctx, args)?;
     let raw = varhandle_get_and_add_raw(ctx, args);
     vh_box_access_result(ctx, args, raw)
 }
@@ -5440,6 +5569,7 @@ fn varhandle_get_and_bitwise(
     args: &[Value],
     op: VhBitOp,
 ) -> MethodCallResult {
+    vh_check_leading_coordinate(ctx, args)?;
     let raw = varhandle_get_and_bitwise_raw(ctx, args, op);
     vh_box_access_result(ctx, args, raw)
 }

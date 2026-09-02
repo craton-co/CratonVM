@@ -756,6 +756,12 @@ pub struct GcFlags {
     /// cost [`Self::full_rset_scan`] used to pay unconditionally. That is the
     /// trade: pay it while you are auditing, not forever.
     pub verify_rset: bool,
+    /// `CRATONVM_GC_SYNC_YOUNG_WIPE` — zero the evacuated young semi-space
+    /// INSIDE the pause, as every moving cycle did before 2026-09-02, instead
+    /// of on a helper thread after it. The revert lever for the off-pause
+    /// wipe; the first thing to set if a conservative root ever names the
+    /// inactive semi-space.
+    pub gc_sync_young_wipe: bool,
     /// `CRATONVM_OLD_SWEEP_JIT` — default **ON** opt-out for the old-gen
     /// non-moving sweep. [`parse::on_unless_zero`].
     pub old_sweep_jit: bool,
@@ -867,10 +873,19 @@ pub struct GcFlags {
     /// has already overrun, so the first (largest) pause is always paid in
     /// full and it is the one p99 reports. The flag delivers a real median
     /// improvement and a real throughput cost, which is a trade a specific
-    /// latency-sensitive workload may well want — but it is not a default, and
-    /// nothing measured here says it should be one.
+    /// latency-sensitive workload may well want — which is why, on that
+    /// measurement, it shipped opt-in.
     ///
-    /// Turn it on and measure YOUR pause distribution before keeping it.
+    /// # Default ON since 2026-09-02 (ten-findings item 10)
+    ///
+    /// What made the goal unhonourable was not this sizing but the pause it
+    /// was sizing against: every young pause walked the whole old generation
+    /// in its fix-up phase (and any humongous span made that unconditional),
+    /// and the mixed CSet's copy budget priced only the copying. With the
+    /// fix-up narrow on every pause and the mixed budget charged for the
+    /// walk's measured cost, the target is the only piece of `MaxGCPauseMillis`
+    /// that was still off. `CRATONVM_G1_YOUNG_PAUSE_TARGET=0` restores the
+    /// free-pool-only trigger.
     pub g1_young_pause_target: bool,
     /// `CRATONVM_G1_SCRUB_FREE` — zero a region's bytes when a collection
     /// frees it. **Opt-in** ([`parse::present`]); off means the allocator's own
@@ -1218,6 +1233,22 @@ pub struct GcFlags {
     /// `CRATONVM_GC_PAR_MIN_BYTES` — young-gen size below which parallelism
     /// never pays for itself; default 16 MiB.
     pub gc_par_min_bytes: usize,
+    /// `CRATONVM_GC_PAR_EVAC` — run the generational young collector's MOVING
+    /// (Cheney) copy phase on the same worker set its mark phase already uses.
+    /// Default **ON** ([`parse::on_unless_zero`]); set `=0` to force the
+    /// single-threaded evacuator.
+    ///
+    /// On by default because it cannot engage on its own: the copy phase only
+    /// goes parallel when [`Self::gc_par_threads`] policy already asked for
+    /// two or more workers (which needs a young gen past
+    /// [`Self::gc_par_min_bytes`], or an explicit request) AND the cycle is a
+    /// moving one AND to-space has the per-worker-buffer slack. Defaulting it
+    /// off would leave the parallel copy inert on every workload that has the
+    /// heap for it, which is the state a gated feature dies in.
+    ///
+    /// `=0` is the bisection lever: the serial and parallel evacuators produce
+    /// the same forwarding map, so a suspected regression is one run apart.
+    pub gc_par_evac: bool,
     /// `CRATONVM_DBG_GC_STRESS`, falling back to `CRATONVM_GC_STRESS` — force
     /// a GC every N bytes allocated. Values `<= 0` and unparseable values are
     /// treated as unset. Despite the `DBG_` name this changes GC scheduling,
@@ -1400,11 +1431,12 @@ impl GcFlags {
             card_table_only: present(src, "CRATONVM_CARD_TABLE_ONLY"),
             full_rset_scan: present(src, "CRATONVM_GC_FULL_RSET_SCAN"),
             verify_rset: present(src, "CRATONVM_GC_VERIFY_RSET"),
+            gc_sync_young_wipe: present(src, "CRATONVM_GC_SYNC_YOUNG_WIPE"),
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
             g1_parallel_evac_in_jit: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC_IN_JIT"),
             g1_eager_humongous: on_unless_zero(src, "CRATONVM_G1_EAGER_HUMONGOUS"),
-            g1_young_pause_target: present(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
+            g1_young_pause_target: on_unless_zero(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
             g1_scrub_free: present(src, "CRATONVM_G1_SCRUB_FREE"),
             g1_narrow_fixup: on_unless_zero(src, "CRATONVM_G1_NARROW_FIXUP"),
             g1_cleanup_walk: present(src, "CRATONVM_G1_CLEANUP_WALK"),
@@ -1430,6 +1462,7 @@ impl GcFlags {
             gc_par_threads: usize_opt(src, "CRATONVM_GC_PAR_THREADS"),
             gc_par_min_bytes: usize_opt(src, "CRATONVM_GC_PAR_MIN_BYTES")
                 .unwrap_or(16 * 1024 * 1024),
+            gc_par_evac: on_unless_zero(src, "CRATONVM_GC_PAR_EVAC"),
             gc_stress_bytes: utf8(src, "CRATONVM_DBG_GC_STRESS")
                 .or_else(|| utf8(src, "CRATONVM_GC_STRESS"))
                 .and_then(|v| v.trim().parse::<usize>().ok())

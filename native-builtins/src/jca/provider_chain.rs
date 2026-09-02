@@ -1825,6 +1825,36 @@ pub(crate) fn build_real_key_factory(
     )
 }
 
+/// The `KeyGenerator` twin, through `javax.crypto.KeyGenerator`'s own
+/// `(KeyGeneratorSpi, Provider, String)` constructor.
+///
+/// Reached only from `keygen_get_instance_named`'s refusal path — the same
+/// ordering every caller of `build_real_spi_wrapper` obeys, and the whole
+/// safety argument for admitting a JDK provider here (see `jdk_service_class`).
+///
+/// What comes back is a REAL `KeyGenerator` whose `spi` field holds the
+/// platform's own generator, not this crate's two-field synthetic. That is the
+/// point: the five `SunTls*` KDFs take `TlsKeyMaterialParameterSpec`-family
+/// specs that the synthetic's `init` surface cannot carry, and the JDK's
+/// generators already implement them. The cost is that every native registered
+/// on `javax/crypto/KeyGenerator` now meets receivers it did not build, which
+/// `keygen_real_spi` is the guard for.
+pub(crate) fn build_real_key_generator(
+    ctx: &mut dyn NativeContext,
+    provider: &str,
+    algo: &str,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    build_real_spi_wrapper(
+        ctx,
+        provider,
+        "KeyGenerator",
+        algo,
+        algo,
+        "javax/crypto/KeyGenerator",
+        "(Ljavax/crypto/KeyGeneratorSpi;Ljava/security/Provider;Ljava/lang/String;)V",
+    )
+}
+
 /// The `Mac` twin of [`build_real_key_factory`], through
 /// `javax.crypto.Mac`'s own `(MacSpi, Provider, String)` constructor.
 pub(crate) fn build_real_mac(
@@ -3882,18 +3912,38 @@ fn seed_retired_getalgorithms_literals() {
     // `Security.getAlgorithms` (their property key is `Alg.Alias.…`), which is
     // why HotSpot's own list names ARCFOUR and not RC4.
     put_alias(JCE, "KeyGenerator", "RC4", "ARCFOUR");
-    // Deliberately NOT seeded, for a checkable reason rather than an oversight:
-    // the five `SunTls*` generators, which are TLS-internal KDFs driven by
-    // `sun.security.ssl` and take `TlsKeyMaterialParameterSpec`-family specs
-    // this engine's two-field `init` surface does not carry. Serving them means
-    // handing back a REAL `javax.crypto.KeyGenerator` over the platform's SPI,
-    // which every native registered on this class would then have to recognise
-    // (the `skf_receiver_is_ours` shape) — a change to the whole engine, not a
-    // row. Recorded as the residual it is.
+    // The five `SunTls*` generators: TLS-internal KDFs driven by
+    // `sun.security.ssl`, taking `TlsKeyMaterialParameterSpec`-family specs
+    // that this engine's two-field `init` surface cannot carry.
     //
-    // `HmacSHA3-{224,256,384,512}` and `HmacSHA512/{224,256}` used to be on
-    // this list for the same kind of reason — `keygen_default_bits` had no arm
-    // — and they are seeded above now that it does.
+    // They were the last unseeded `KeyGenerator` names on HotSpot's list, and
+    // the note here used to say why they had to stay that way: serving them
+    // means handing back a REAL `javax.crypto.KeyGenerator` over the platform's
+    // SPI, which every native on this class would then have to recognise. That
+    // is what `keygen_real_spi` now does, so the rows are real rows naming real
+    // classes and the engine falls to them on its own refusal.
+    //
+    // `HmacSHA3-{224,256,384,512}` and `HmacSHA512/{224,256}` were on that list
+    // for the same kind of reason — `keygen_default_bits` had no arm — and were
+    // seeded above once it did. This is the same move one engine over.
+    for (algorithm, class_name) in [
+        ("SunTlsPrf", "com.sun.crypto.provider.TlsPrfGenerator$V10"),
+        ("SunTls12Prf", "com.sun.crypto.provider.TlsPrfGenerator$V12"),
+        (
+            "SunTlsMasterSecret",
+            "com.sun.crypto.provider.TlsMasterSecretGenerator",
+        ),
+        (
+            "SunTlsKeyMaterial",
+            "com.sun.crypto.provider.TlsKeyMaterialGenerator",
+        ),
+        (
+            "SunTlsRsaPremasterSecret",
+            "com.sun.crypto.provider.TlsRsaPremasterSecretGenerator",
+        ),
+    ] {
+        put_service(JCE, "KeyGenerator", algorithm, class_name);
+    }
     put_service(
         "SunRsaSign",
         "KeyPairGenerator",
@@ -9239,20 +9289,29 @@ mod tests {
             "SunTlsPrf",
             "SunTlsRsaPremasterSecret",
         ];
+        // ADVERTISED iff SERVICEABLE, and "serviceable" is now a disjunction:
+        // this crate generates the key itself (`keygen_default_bits`), or the
+        // row names a REAL platform class that `build_real_key_generator`
+        // instantiates on the engine's refusal. Before 2026-09-02 only the
+        // first arm existed and the five `SunTls*` names were asserted ABSENT;
+        // widening the predicate rather than deleting the assertion is what
+        // keeps this a check instead of a restatement.
         for name in HOTSPOT_SUNJCE_KEYGENERATORS {
             let generates = crate::phases_early::keygen_default_bits(name).is_some();
+            let delegates = service_implementation_class("KeyGenerator", "SunJCE", name).is_some();
             let advertised = get_service_entry("SunJCE", "KeyGenerator", name).is_some();
             assert_eq!(
-                generates, advertised,
-                "KeyGenerator.{name}: keygen_default_bits generates={generates} but SunJCE                  advertises={advertised} — the two must agree in BOTH directions"
+                generates || delegates,
+                advertised,
+                "KeyGenerator.{name}: generates={generates} delegates={delegates} but SunJCE                  advertises={advertised} — advertised and serviceable must agree in BOTH                  directions"
             );
         }
-        // The five `SunTls*` KDFs are the ones that must still be absent, and
-        // for a reason that is not a missing table row: they take
-        // `TlsKeyMaterialParameterSpec`-family specs this engine's two-field
-        // `init` surface cannot carry. Asserted by name so that serving them
-        // (which means handing back a real `javax.crypto.KeyGenerator` over the
-        // platform's SPI) reds here and is done deliberately.
+        // The five `SunTls*` KDFs take `TlsKeyMaterialParameterSpec`-family
+        // specs, so this crate must NOT claim to generate them from a key size
+        // — they are served by routing to the platform's own generator, and a
+        // `keygen_default_bits` arm appearing here would mean someone had
+        // fabricated a key where a KDF belongs. The disjunction above is what
+        // admits them; this pins WHICH arm may do it.
         for tls in [
             "SunTlsPrf",
             "SunTls12Prf",
@@ -9263,6 +9322,12 @@ mod tests {
             assert!(
                 crate::phases_early::keygen_default_bits(tls).is_none(),
                 "{tls} is a parameter-spec-driven KDF, not a key size"
+            );
+            let class = service_implementation_class("KeyGenerator", "SunJCE", tls)
+                .unwrap_or_else(|| panic!("{tls} must be advertised with a real class"));
+            assert!(
+                class.starts_with("com.sun.crypto.provider.Tls") && !class.ends_with(".Native"),
+                "{tls} must route to the platform generator, got {class:?}"
             );
         }
     }

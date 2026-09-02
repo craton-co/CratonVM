@@ -8,7 +8,7 @@
 //! returns [`DeviceError::NoDriver`] so the rest of the workspace can
 //! still build, test, and run on commodity hardware.
 
-use crate::{DeviceCaps, DeviceError, KernelArgs, LaunchConfig, Result};
+use crate::{DeviceCaps, DeviceError, Result};
 use std::marker::PhantomData;
 
 pub(crate) fn probe_device(_device_ordinal: u32) -> Result<DeviceCaps> {
@@ -29,6 +29,12 @@ impl DeviceContextInner {
         Err(DeviceError::NoDriver)
     }
 
+    /// Stub twin of the cuda backend's allocator-event recording. No
+    /// driver, no memset, nothing to order.
+    pub(crate) fn record_alloc_event(&self, _event: &crate::Event) -> Result<()> {
+        Ok(())
+    }
+
     pub(crate) fn synchronize(&self) -> Result<()> {
         Err(DeviceError::NoDriver)
     }
@@ -47,9 +53,7 @@ impl DeviceModuleInner {
     /// `DeviceModule::launch_on_stream`, whose stub branch records a
     /// `StreamOp::Launch` and never touches the module — so an inert
     /// fixture is sufficient to exercise the op-log integration tests
-    /// in `tests/stub_op_log.rs` without a real driver. The
-    /// driver-bound `DeviceModule::launch_raw` (synchronous, no
-    /// stream) still returns `NoDriver` via `launch_raw` below.
+    /// in `tests/stub_op_log.rs` without a real driver.
     pub(crate) fn from_ptx(
         _ctx: &DeviceContextInner,
         _ptx: &str,
@@ -57,16 +61,6 @@ impl DeviceModuleInner {
         _kernel_names: &[&str],
     ) -> Result<Self> {
         Ok(Self)
-    }
-
-    pub(crate) fn launch_raw(
-        &self,
-        _ctx: &DeviceContextInner,
-        _kernel: &str,
-        _cfg: &LaunchConfig,
-        _args: KernelArgs,
-    ) -> Result<()> {
-        Err(DeviceError::NoDriver)
     }
 }
 

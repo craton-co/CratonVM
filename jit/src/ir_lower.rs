@@ -538,6 +538,12 @@ struct Lowerer<'a> {
     /// Compact-layout/TLAB-aware object allocation helper. Live `Op::New`
     /// nodes use the same shared runtime-lowering stub as the baseline tier.
     new_object: usize,
+    /// TLAB geometry and the post-init helper, for the inline bump that
+    /// `Op::New` takes instead of the stub. All three are wired together or
+    /// not at all; `emit_inline_tlab_new_ir` declines on any zero.
+    tlab_cursor_off: i32,
+    tlab_end_off: i32,
+    tlab_post_init: usize,
     /// cov-06 — `jit_newarray(vm, atype, length) -> array | 0`. The lowering
     /// for a PRIMITIVE `Op::NewArray` (`element_type != 0`); zero-fill, GC
     /// retry and the zero-on-failure convention (negative length OR OOM) are
@@ -1176,6 +1182,10 @@ impl<'a> Lowerer<'a> {
             putfield_float: helpers.putfield_float,
             putfield_double: helpers.putfield_double,
             new_object: helpers.new_object,
+            // Casts: both are byte offsets inside `JvmThread`, far below i32::MAX.
+            tlab_cursor_off: helpers.tlab_cursor_offset_in_thread as i32,
+            tlab_end_off: helpers.tlab_end_offset_in_thread as i32,
+            tlab_post_init: helpers.tlab_post_init,
             newarray: helpers.newarray,
             anewarray_object: helpers.anewarray_object,
             monitor_enter: helpers.monitor_enter,
@@ -5180,14 +5190,41 @@ impl<'a> Lowerer<'a> {
                     self.emit_safepoint_map(sp_live_hi);
                 }
                 let slot = self.alloc_slot(id);
-                crate::runtime_lowering::emit_new_object_stub(
-                    &mut self.buf,
-                    self.context_slot_off,
-                    self.new_object,
-                    *class_id,
-                    *num_fields,
-                    self.frame_record,
-                );
+                // Inline TLAB bump first, with the stub as its slow path.
+                // Declining emits the stub alone, which is the behaviour this
+                // arm had before the bump existed.
+                //
+                // The safepoint map above still stands: the bump itself cannot
+                // collect, but its slow path is the same stub, and a map is a
+                // statement about the FRAME at this program point rather than
+                // about which arm runs.
+                let tlab_plan = crate::runtime_lowering::InlineTlabPlan {
+                    thread_slot_off: self.shadow_thread_slot_off,
+                    cursor_off: self.tlab_cursor_off,
+                    end_off: self.tlab_end_off,
+                    post_init: self.tlab_post_init,
+                    context_off: self.context_slot_off,
+                    class_id: *class_id,
+                    num_fields: *num_fields,
+                };
+                let inlined = ir_inline_tlab_enabled()
+                    && crate::runtime_lowering::emit_inline_tlab_new_ir(
+                        &mut self.buf,
+                        &tlab_plan,
+                        self.new_object,
+                        self.frame_record,
+                    );
+                if !inlined {
+                    crate::runtime_lowering::note_stub_only_alloc();
+                    crate::runtime_lowering::emit_new_object_stub(
+                        &mut self.buf,
+                        self.context_slot_off,
+                        self.new_object,
+                        *class_id,
+                        *num_fields,
+                        self.frame_record,
+                    );
+                }
                 // Retract the push the map above emitted. Unbalanced pushes are
                 // not a leak this backend tolerates: `lower_inner` compares
                 // `shadow_pushes` against `shadow_reloads` and refuses the whole
@@ -11773,6 +11810,28 @@ pub(crate) fn lower_inner_with_scopes(
 
 // ── Tests ────────────────────────────────────────────────────────────
 
+/// Inline TLAB bump for the optimizing tier's `Op::New` — **default ON**, opt
+/// out with `CRATONVM_JIT_IR_INLINE_TLAB=0`.
+///
+/// Off restores `emit_new_object_stub` alone, which is what this arm emitted
+/// before the bump existed, so the two are A/B-able in one binary. That is not
+/// a courtesy: the last frame-shaped change that shipped without a switch cost
+/// a full rebuild per hypothesis to bisect.
+///
+/// Note what turning this on does NOT do. `c2_alloc_upgrade_enabled()` is
+/// opt-in, so no method containing a `new` reaches this tier at all under a
+/// default configuration and the bump is unreachable. Closing that gate's
+/// stated reason is exactly what this change is for — see
+/// `the_optimizing_tier_stays_shut_to_allocation_while_it_has_no_inline_tlab`,
+/// which now passes because the bump exists rather than because the gate is
+/// shut.
+fn ir_inline_tlab_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_INLINE_TLAB") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -13393,7 +13452,7 @@ mod tests {
         let ir_src = include_str!("ir_lower.rs");
         // The `Op::New` arm's lowering, as it stands.
         let uses_stub = ir_src.contains("runtime_lowering::emit_new_object_stub");
-        let has_inline_bump = ir_src.contains("emit_inline_tlab");
+        let has_inline_bump = ir_src.contains("emit_inline_tlab_new_ir");
         assert!(
             uses_stub || has_inline_bump,
             "the `Op::New` arm lowers through neither the stub nor an inline \
@@ -18428,3 +18487,4 @@ pub static IC_FRAME_REPUBLISH_SITES: std::sync::atomic::AtomicUsize =
 pub fn ic_frame_republish_sites() -> usize {
     IC_FRAME_REPUBLISH_SITES.load(std::sync::atomic::Ordering::Relaxed)
 }
+
