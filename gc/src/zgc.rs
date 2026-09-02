@@ -17277,7 +17277,7 @@ pub(crate) mod tests {
     /// reads a "header" made of the new tenant's payload. That is the failure
     /// `rewrite_target_is_walkable` reports, and it has been seen in
     /// production with the offending headers decoding as String character
-    /// data (`docs/known-issues/gc/zgc-rewrite-pass-walks-off-a-reference-array-20260815.md`).
+    /// data (`zgc-rewrite-pass-walks-off-a-reference-array-20260815.md`).
     ///
     /// **Read this test for what it is.** It asserts the property that failure
     /// violates; it does not reproduce that failure. The guard it covers HAS

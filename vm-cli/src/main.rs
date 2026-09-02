@@ -5603,10 +5603,15 @@ fn run() -> Result<()> {
     // `print_gc_summary`, and a census whose only output path is gated behind a
     // DIFFERENT flag prints nothing when you ask for it — which reads as
     // "zero accessor calls" rather than "you never enabled the report".
-    if args.verbose_gc
+    let gc_stats_requested = args.verbose_gc
         || std::env::var_os("CRATONVM_GC_STATS").is_some()
-        || cratonvm_types::flags::flags().gc.g1_dbg_accessor
-    {
+        || cratonvm_types::flags::flags().gc.g1_dbg_accessor;
+    // A stale or refused arena translation is a correctness event, so it is
+    // reported whether or not anyone asked for statistics -- gating one behind
+    // a stats flag turns "nobody asked" into "nothing happened". With the flag
+    // on, the line prints unconditionally so the DENOMINATOR is available too.
+    cratonvm_native_builtins::arena_translation_exit_summary(gc_stats_requested);
+    if gc_stats_requested {
         vm.shared.mem.heap.print_gc_summary();
         {
             // Cross-thread STW peer-scan coverage. A non-zero count means the

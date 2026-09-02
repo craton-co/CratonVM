@@ -854,6 +854,35 @@ public class UnsafeShadowSweep {
             if (q != 0) u.freeMemory(q);
         });
         t("reallocateMemory negative size", () -> u.reallocateMemory(0, -1));
+        // A GROW MUST NOT SWALLOW A LATER ALLOCATION. Two live allocations are
+        // independent whatever addresses a VM picks, so this is behaviour and
+        // not an address diff. CratonVM's arena resolved an address to the
+        // greatest block base at or below it and bumped its handle counter by
+        // the ORIGINAL request, so growing the first block made it answer for
+        // the second: every access through the later handle landed silently in
+        // the earlier block, and neither one reported anything.
+        //
+        // The load-bearing row is the SCAN of the grown block. Checking that
+        // the later allocation reads back what it wrote passes even when the
+        // two alias -- the write and the read hit the same aliased cell. Only
+        // the earlier block can show the damage, and only by looking at all of
+        // it, because the later block lands somewhere in the middle.
+        {
+            long g = u.allocateMemory(64);
+            long h = u.allocateMemory(64);
+            long g2 = u.reallocateMemory(g, 4096);
+            u.setMemory(g2, 4096, (byte) 0x11);
+            u.setMemory(h, 64, (byte) 0x77);
+            boolean intact = true;
+            for (long i = 0; i < 4096; i++) {
+                if (u.getByte(g2 + i) != (byte) 0x11) { intact = false; break; }
+            }
+            p("a grown block is not overwritten by a later allocation", intact);
+            p("and the later allocation keeps its own bytes", u.getByte(h) == (byte) 0x77);
+            u.freeMemory(g2);
+            u.freeMemory(h);
+        }
+
         t("internal reallocateMemory negative size", () -> v.reallocateMemory(0, -1));
 
         p("addressSize", u.addressSize());
