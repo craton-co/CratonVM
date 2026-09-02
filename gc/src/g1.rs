@@ -14128,6 +14128,68 @@ mod tests {
         G1Collector::new(small_config())
     }
 
+    /// The header initializer must run BEFORE the allocation is visible to a
+    /// heap walk. At collector level the regions lock IS that visibility: every
+    /// walk in this file iterates a `&[G1Region]` obtained from it, and the
+    /// region cursor it reads is what says "there is an object here". So the
+    /// contract is testable as "the lock is still held, and the span is already
+    /// zeroed, while `init` runs".
+    ///
+    /// This is the regression guard for the ordering
+    /// `G1Region::bump_alloc_initialized` documents: the four header-writing
+    /// callers used to write their `ObjectHeader` after `alloc_in_region` had
+    /// returned and the lock had been dropped, so a walker arriving in between
+    /// read `class_id` and `shape` with the mark word (which carries `kind`)
+    /// not yet stored -- an ARRAY as a legacy object claiming `length`
+    /// sixteen-byte slots.
+    #[test]
+    fn the_allocation_initializer_runs_before_the_allocation_is_published() {
+        let gc = make_collector();
+        let ran = std::cell::Cell::new(false);
+        let got = gc.alloc_in_region_initialized(64, |p| {
+            assert!(
+                gc.regions.try_lock().is_none(),
+                "the regions lock must still be held while the header is written,                  or a walker can see a published-but-unheadered address"
+            );
+            // SAFETY: `p` is the base of the 64-byte span this allocation just
+            // reserved; the initializer owns it exclusively.
+            let bytes = unsafe { std::slice::from_raw_parts(p, 64) };
+            assert!(
+                bytes.iter().all(|b| *b == 0),
+                "the span must already be zeroed when the initializer runs --                  zeroing after the cursor commit is the same publication bug in                  a milder form, since a recycled region is not scrubbed"
+            );
+            ran.set(true);
+        });
+        assert!(got.is_some(), "the allocation must succeed on a fresh heap");
+        assert!(ran.get(), "the initializer must have run");
+    }
+
+    /// ...and the initializer is actually wired to the header write: an array
+    /// allocated out of line reads back through the same decoders the region
+    /// walk uses. `num_slots` mirroring `array_length` is the property that
+    /// makes a torn header indistinguishable from a legacy object, so both are
+    /// asserted.
+    #[test]
+    fn out_of_line_array_allocation_publishes_a_decodable_array_header() {
+        let gc = make_collector();
+        // Larger than `TLAB_MAX_ALLOC` (32 KiB) in the real VM: this entry
+        // point is the one every big array takes.
+        let arr = gc
+            .try_alloc_array(ClassId::new(0), ArrayElementType::Int, 8192)
+            .expect("fresh heap must serve one 32 KiB array");
+        // SAFETY: `try_alloc_array` returned a live object reference.
+        let header = unsafe { &*(arr.as_ptr() as *const ObjectHeader) };
+        assert_eq!(header.kind(), ObjectKind::Array);
+        assert_eq!(header.element_type(), ArrayElementType::Int);
+        assert_eq!(header.array_length(), 8192);
+        assert_eq!(header.num_slots(), 8192);
+        let regions = gc.regions.lock();
+        assert!(
+            gc.candidate_header_is_plausible(&regions, arr.as_ptr() as usize),
+            "the published array must satisfy the same screen the evacuator applies"
+        );
+    }
+
     #[test]
     fn refill_tlab_zeroes_dirty_eden_bytes() {
         let gc = make_collector();
