@@ -29,6 +29,12 @@ impl DeviceContextInner {
         Err(DeviceError::NoDriver)
     }
 
+    /// Stub twin of the cuda backend's allocator-event recording. No
+    /// driver, no memset, nothing to order.
+    pub(crate) fn record_alloc_event(&self, _event: &crate::Event) -> Result<()> {
+        Ok(())
+    }
+
     pub(crate) fn synchronize(&self) -> Result<()> {
         Err(DeviceError::NoDriver)
     }
