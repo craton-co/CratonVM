@@ -370,6 +370,49 @@ is no longer blocked on an unknown:
 Step 3 is the one to be careful with: discharging only the labelled site is what
 made the first attempt look like progress while engagement did not move at all.
 
+### 2026-09-02 (decisive): COMPACTION FIXES IT. The obstacle is entirely the coverage conjunction
+
+`CRATONVM_ZGC_ASSUME_REWRITABLE=1` forces the whole relocation gate. One binary,
+`--Xmx 1g`, 3000 s cap:
+
+| arm | `arena allocation failed` | 65536-slot ref-array OOM |
+|---|---:|---:|
+| `CRATONVM_ZGC_ASSUME_REWRITABLE=1` | **0** | **0** |
+| off | 14 | **13 999** |
+
+**The failing allocation disappears completely.** Not fewer, not slower --
+absent. So every framing question this page has carried is now settled:
+
+* the OOM framing is RIGHT: it is fragmentation of the low end, and relocation
+  relieves it;
+* `98304` really is where `ConcurrentHashMap` needs its 65536-slot table, and
+  that table really is the request that cannot be served;
+* the four JIT safepoint defects fixed on 2026-08-30 are real repairs to the
+  COVERAGE PROOF, and none of them could ever have fixed this class on their
+  own, because the proof is a conjunction and they each closed one term;
+* and the helper-window work is likewise a term, not the answer.
+
+**Both arms still hit the cap** with `Timeout trying to lock table "COUNTER"`,
+which is the load artefact described above and not a heap result -- the runs
+were at load 13-48. The heap evidence is per-cycle and survives that; the
+pass/fail does not, and is still owed on a quiet host.
+
+### What this makes the work
+
+The question is no longer "which obligation" but "how many". Discharging one at
+a time provably does not move `relocation_on_proven_jit` -- three attempts, each
+removing a different term, each leaving engagement where it was. The remaining
+terms measured on `TestMultiThread` after the helper window is discharged are:
+
+```text
+zgc-relocation-coverage-reason: compiled-frame-oop-not-published=8
+zgc-relocation-coverage-reason: cross-thread-jit-peer=5
+```
+
+so the next work is those two, together, with `relocation_on_proven_jit` as the
+only acceptance test -- and `CRATONVM_ZGC_ASSUME_REWRITABLE=1` as the upper
+bound that says what winning looks like.
+
 ### 2026-09-02 (later): the discharge WORKS and changes nothing -- `coverage-proof-incomplete` is a conjunction
 
 `CRATONVM_XT_HELPER_WINDOW_DISCHARGE=1` gates BOTH refusal sites off one
