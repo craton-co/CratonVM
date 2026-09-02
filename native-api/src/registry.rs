@@ -1997,6 +1997,28 @@ pub trait NativeClassAccess {
         None
     }
 
+    /// Is any currently-LOADED class a member of `package_slash` (immediate
+    /// members only; `""` is the default package)?
+    ///
+    /// The question `ClassLoader.getDefinedPackage` actually asks. A loader
+    /// DEFINES a package once it has defined a class in it, which is why the
+    /// class-file *visibility* probes above cannot answer it: the boot image
+    /// contains `java/awt/image/*.class` on every run, and HotSpot still
+    /// answers `null` for `java.awt.image` until something loads one.
+    ///
+    /// # The default is `false`, and that is the safe direction
+    ///
+    /// An implementation that has not overridden this answers "no class of
+    /// that package is loaded", which makes the module-backed arm of
+    /// `classloader::builtin_loader_defines_package` decline rather than
+    /// fabricate. Declining is the answer `getDefinedPackage`'s contract
+    /// prefers (a missing `Package` over an invented one) and is exactly what
+    /// this VM did before that arm existed.
+    fn any_loaded_class_in_package(&self, package_slash: &str) -> bool {
+        let _ = package_slash;
+        false
+    }
+
     /// Mark a class as hidden (JEP 371). Hidden classes are not discoverable via
     /// `Class.forName` or `ClassLoader.findLoadedClass`.
     fn set_class_hidden(&mut self, class_id: ClassId) {
@@ -6724,6 +6746,59 @@ impl NativeMethodRegistry {
         &self.refused
     }
 
+    /// The refusals that did **not** retire their method — every
+    /// [`JdkOnlyViolation::SyntheticNativeRegistered`] whose triple was already
+    /// owned, so an earlier native survived and still serves in strict mode.
+    ///
+    /// Returns `(class, method, descriptor, survivor)`. This is the species
+    /// `registrar_drift.rs` is structurally blind to (it compares a
+    /// synthetic-only pass against a shipping one, and this is two SHIPPING
+    /// passes) and that `duplicate_registration_gate.rs` names as its blind
+    /// spot 3 (a dropped registration leaves no census row at all).
+    pub fn refusals_that_left_a_survivor(&self) -> Vec<(&str, &str, &str, &str)> {
+        self.refused
+            .iter()
+            .filter_map(|v| match v {
+                JdkOnlyViolation::SyntheticNativeRegistered {
+                    class,
+                    method,
+                    descriptor,
+                    survivor: Some(survivor),
+                    ..
+                } => Some((
+                    class.as_str(),
+                    method.as_str(),
+                    descriptor.as_str(),
+                    survivor.as_str(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `"<kind>@<file>:<line>"` of the registration that currently owns this
+    /// triple, or `None` when nothing does.
+    ///
+    /// Called only from the `JdkOnly` refusal arm, which is bounded by the
+    /// number of refusals rather than by the ~3,100 registrations, so the
+    /// `format!` is affordable there for the same reason the site string is.
+    fn surviving_owner(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<String> {
+        let class_state = self.class_prefilter(class_name)?;
+        let idx = self.slot_index_from_state(class_state, class_name, method_name, descriptor)?;
+        let slot = self.slots.get(idx as usize)?;
+        let site = self
+            .provenance
+            .get(slot.reg_index as usize)
+            .map(|p| format!("{}:{}", p.site.file(), p.site.line()))
+            .unwrap_or_else(|| "<no provenance>".to_string());
+        Some(format!("{}@{}", slot.kind.as_str(), site))
+    }
+
     /// Enable real-JDK-mode dropping of synthetic natives whose hardcoded
     /// field-slot layout corrupts the real JDK object (see
     /// [`drop_real_layout_synthetic`](Self)). Call before the `register_*`
@@ -7128,12 +7203,19 @@ impl NativeMethodRegistry {
             // is bounded by the number of refusals (which the gate drives to
             // zero), not by the ~3,100 registrations.
             let site = core::panic::Location::caller();
+            // The refusal is only a RETIREMENT when nothing already owns the
+            // triple. See `JdkOnlyViolation::SyntheticNativeRegistered`'s
+            // `survivor` doc: an earlier registration survives the refusal and
+            // keeps serving, so strict mode runs that older native rather than
+            // the real bytecode the policy was asking for.
+            let survivor = self.surviving_owner(class_name, method_name, descriptor);
             self.refused
                 .push(JdkOnlyViolation::SyntheticNativeRegistered {
                     class: class_name.to_string(),
                     method: method_name.to_string(),
                     descriptor: descriptor.to_string(),
                     registered_by: Some(format!("{}:{}", site.file(), site.line())),
+                    survivor,
                 });
             // Return WITHOUT inserting: nothing is pushed to `registrations` /
             // `categories` / `provenance` / `slots`, so the refused triple never
@@ -10552,7 +10634,13 @@ mod tests {
                 method,
                 descriptor,
                 registered_by,
+                survivor,
             }] => {
+                assert!(
+                    survivor.is_none(),
+                    "nothing was registered for this triple before the refusal, \
+                     so the refusal really did retire it: {survivor:?}"
+                );
                 assert_eq!(class, "j/J");
                 assert_eq!(method, "fake");
                 assert_eq!(descriptor, "()I");

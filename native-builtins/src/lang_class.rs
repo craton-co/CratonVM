@@ -19751,7 +19751,12 @@ pub(crate) fn i2_classloader_get_defined_package(
     // see `package_class_files_visible_to_loader`.
     if !defined_lazily {
         let class_glob = package_class_glob(&package_name);
-        if !crate::classloader::package_class_files_visible_to_loader(ctx, loader, &class_glob) {
+        if !crate::classloader::package_class_files_visible_to_loader(
+            ctx,
+            loader,
+            &package_name,
+            &class_glob,
+        ) {
             return Ok(Some(Value::Object(None)));
         }
     }

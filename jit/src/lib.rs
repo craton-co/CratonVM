@@ -10595,15 +10595,44 @@ pub fn long_box_direct_helper_sites() -> (u64, u64) {
 /// the per-call floor `Preconditions.checkIndex` and
 /// `Reference.reachabilityFence` were taken off for 143 -> 23 ns.
 ///
-/// **Scope: primitive returns only.** A reference-returning read is left on
-/// the funnel deliberately. The generic path applies
-/// `unbox_poly_return_checked`, whose W6-1 rule turns *a boxed primitive
-/// reaching a non-`Object` reference return* into a `WrongMethodTypeException`
-/// — and that rule reads the CALL SITE's own descriptor, which a thin helper
-/// does not have (a baked direct call has no `JitInvokeInfo`). The synthetic
-/// call site these helpers fall back through carries an erased
-/// `(Ljava/lang/Object;)X` descriptor, which is indistinguishable from the real
-/// one for a primitive `X` and is NOT for a reference one.
+/// **Scope: primitive returns, and reference returns in two classified kinds.**
+/// Reference returns were out of scope until 2026-09-01, on the argument that
+/// the generic path applies `unbox_poly_return_checked`, whose W6-1 rule turns
+/// *a boxed primitive reaching a non-`Object` reference return* into a
+/// `WrongMethodTypeException` — and that rule reads the CALL SITE's own
+/// descriptor, which a thin helper does not have (a baked direct call has no
+/// `JitInvokeInfo`), so the synthetic call site these helpers fall back through
+/// carries an erased `(Ljava/lang/Object;)X` descriptor, indistinguishable from
+/// the real one for a primitive `X` and NOT for a reference one.
+///
+/// That argument was right about the erased descriptor and wrong about the
+/// conclusion, because it priced only the COLD arm. Two facts settle it:
+///
+/// * the FAST arm cannot lose W6-1. `varhandle_instance_field_read_bits`
+///   refuses unless the variable's own kind agrees with the site's — a
+///   reference site over a PRIMITIVE variable, which is W6-1's entire fire
+///   set, is declined there. The identical refusal already governs
+///   `try_varhandle_instance_field_read`, the funnel's copy of this read,
+///   which has served reference returns since it was written and returns raw
+///   bits WITHOUT reaching `unbox_poly_return_checked` at all. So compiled
+///   code's reference reads are already outside W6-1 today; binding them
+///   changes their cost, not their semantics;
+/// * the COLD arm keeps W6-1 by CLASSIFYING the site at compile time instead
+///   of carrying its descriptor. A boxed primitive is assignable to exactly
+///   fourteen reference types — `java/lang/Object`, the five shared wrapper
+///   supertypes and the eight wrappers themselves. So a reference site is one
+///   of three things, and only the third would need the descriptor it cannot
+///   have: `Ljava/lang/Object;` ([`VARHANDLE_READ_KIND_REF_OBJECT`]), where
+///   the erased stand-in IS the real descriptor and W6-1 can never fire; one
+///   of the other thirteen ([`VARHANDLE_BOX_ACCEPTING_RETURNS`]), where the
+///   answer depends on WHICH wrapper arrived, so the site is not bound at all;
+///   and anything else ([`VARHANDLE_READ_KIND_REF_STRICT`]), where NO boxed
+///   primitive is assignable, so "the cold arm produced a box" is a W6-1 fire
+///   with no further information needed — which is what
+///   `varhandle_read_direct_impl` checks and raises on.
+///
+/// `RJdkHandles`' `String bogus = (String) vi.get(h)` over an `int` field is a
+/// `REF_STRICT` site, and the vector that holds this honest.
 pub static VARHANDLE_READ_DIRECT_FNS: [std::sync::atomic::AtomicUsize; VARHANDLE_READ_SLOTS] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; VARHANDLE_READ_SLOTS];
 
@@ -10615,11 +10644,108 @@ pub static VARHANDLE_READ_DIRECT_FNS: [std::sync::atomic::AtomicUsize; VARHANDLE
 pub const VARHANDLE_READ_MODES: [&str; 4] = ["get", "getVolatile", "getOpaque", "getAcquire"];
 
 /// The primitive return kinds served by [`VARHANDLE_READ_DIRECT_FNS`], in
-/// slot-minor order. `L` and `[` are absent on purpose — see the cells' own doc.
+/// slot-minor order, occupying kinds `0..8`. The two REFERENCE kinds follow
+/// them at [`VARHANDLE_READ_KIND_REF_OBJECT`] and
+/// [`VARHANDLE_READ_KIND_REF_STRICT`]; `[` is still absent, because an array
+/// return is outside `varhandle_reference_return_mismatch`'s fire set today and
+/// a stand-in descriptor would have to reproduce that exclusion for no measured
+/// caller.
 pub const VARHANDLE_READ_RETURNS: [u8; 8] = [b'Z', b'B', b'C', b'S', b'I', b'J', b'F', b'D'];
 
-/// `VARHANDLE_READ_MODES.len() * VARHANDLE_READ_RETURNS.len()`.
-pub const VARHANDLE_READ_SLOTS: usize = 32;
+/// Slot-minor kind for a site whose declared return is exactly
+/// `Ljava/lang/Object;`. The helpers' erased stand-in descriptor is that site's
+/// real descriptor, so nothing is lost on either arm.
+pub const VARHANDLE_READ_KIND_REF_OBJECT: usize = 8;
+
+/// Slot-minor kind for a site whose declared return is a reference type no
+/// boxed primitive is assignable to. The cold arm may therefore treat "a box
+/// came back" as a W6-1 mismatch without knowing which class the site named.
+pub const VARHANDLE_READ_KIND_REF_STRICT: usize = 9;
+
+/// Slot-minor kinds: the eight primitives plus the two reference kinds.
+pub const VARHANDLE_READ_KINDS: usize = 10;
+
+/// `VARHANDLE_READ_MODES.len() * VARHANDLE_READ_KINDS`.
+pub const VARHANDLE_READ_SLOTS: usize = 40;
+
+/// The thirteen reference types, besides `java/lang/Object`, that a boxed
+/// primitive can legally arrive at: the five shared wrapper supertypes and the
+/// eight wrappers themselves.
+///
+/// A site returning one of these is NOT bound. Whether a box satisfies it
+/// depends on WHICH wrapper the access produced (`Character` at a
+/// `java/lang/Number` site is a mismatch, `Integer` is not), and that is the
+/// one question neither slot kind can answer without the site's descriptor.
+///
+/// The list is the union of `vm::vm_exec::boxed_primitive_supertypes`' rows
+/// minus `java/lang/Object`, plus its `PRIMITIVE_WRAPPER_CLASSES`. A name added
+/// there and not here can only cost a bind, never correctness: the
+/// classification errs towards `REF_STRICT`, and `REF_STRICT` throws where the
+/// funnel would have thrown.
+pub const VARHANDLE_BOX_ACCEPTING_RETURNS: [&str; 13] = [
+    "java/lang/Number",
+    "java/lang/Comparable",
+    "java/io/Serializable",
+    "java/lang/constant/Constable",
+    "java/lang/constant/ConstantDesc",
+    "java/lang/Boolean",
+    "java/lang/Byte",
+    "java/lang/Character",
+    "java/lang/Short",
+    "java/lang/Integer",
+    "java/lang/Long",
+    "java/lang/Float",
+    "java/lang/Double",
+];
+
+/// The access-mode half of a slot.
+pub const fn varhandle_read_slot_mode(slot: usize) -> usize {
+    slot / VARHANDLE_READ_KINDS
+}
+
+/// The return-kind half of a slot.
+pub const fn varhandle_read_slot_kind(slot: usize) -> usize {
+    slot % VARHANDLE_READ_KINDS
+}
+
+/// The `return_type` byte a slot's call site carries: the primitive char for
+/// kinds `0..8`, and `L` for both reference kinds.
+pub const fn varhandle_read_slot_return(slot: usize) -> u8 {
+    let kind = varhandle_read_slot_kind(slot);
+    if kind < VARHANDLE_READ_RETURNS.len() {
+        VARHANDLE_READ_RETURNS[kind]
+    } else {
+        b'L'
+    }
+}
+
+/// Is this slot one of the two REFERENCE-returning kinds?
+pub const fn varhandle_read_slot_is_reference(slot: usize) -> bool {
+    varhandle_read_slot_kind(slot) >= VARHANDLE_READ_RETURNS.len()
+}
+
+/// `CRATONVM_JIT_VARHANDLE_REF_READ_DIRECT=0` — keep binding the PRIMITIVE read
+/// kinds and send the two REFERENCE kinds back to the generic funnel, which
+/// serves them through `try_varhandle_instance_field_read`.
+///
+/// Separate from `CRATONVM_JIT_VARHANDLE_READ_DIRECT_HELPERS` on purpose: the
+/// reference half landed twelve days after the primitive half, and the A/B that
+/// prices it has to be a single binary with one switch between the arms — the
+/// rule the whole `varhandle` family of switches beside it exists for. Turning
+/// the WHOLE read bind off would move the primitive rows too and price the
+/// wrong change. Default ON.
+pub fn varhandle_ref_read_direct_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_VARHANDLE_REF_READ_DIRECT")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
 
 /// The single-reference-coordinate, primitive-return shape this bind serves,
 /// as a slot into [`VARHANDLE_READ_DIRECT_FNS`], or `None` when the site is
@@ -10664,12 +10790,31 @@ pub fn varhandle_read_helper_slot(method: &str, descriptor: &str) -> Option<usiz
     if !one_reference_param {
         return None;
     }
-    let ret = descriptor[close + 1..].as_bytes();
-    if ret.len() != 1 {
+    let ret = &descriptor[close + 1..];
+    let kind = if ret.len() == 1 {
+        VARHANDLE_READ_RETURNS
+            .iter()
+            .position(|r| *r == ret.as_bytes()[0])?
+    } else if !varhandle_ref_read_direct_enabled() {
+        // The reference half's kill switch is read HERE rather than at the emit
+        // sites, so all three doors (single-pass, OSR, and the IR
+        // intrinsic-site test) refuse together and the primitive half is
+        // untouched by it. Three doors that disagree about one bind is the
+        // defect `try_compile is NOT the only compile door` is written about.
         return None;
-    }
-    let kind = VARHANDLE_READ_RETURNS.iter().position(|r| *r == ret[0])?;
-    Some(mode * VARHANDLE_READ_RETURNS.len() + kind)
+    } else if ret == "Ljava/lang/Object;" {
+        VARHANDLE_READ_KIND_REF_OBJECT
+    } else if ret.starts_with('L') && is_single_object_descriptor(ret) {
+        let class = &ret[1..ret.len() - 1];
+        if VARHANDLE_BOX_ACCEPTING_RETURNS.contains(&class) {
+            return None;
+        }
+        VARHANDLE_READ_KIND_REF_STRICT
+    } else {
+        // `V`, an array return, or a malformed descriptor.
+        return None;
+    };
+    Some(mode * VARHANDLE_READ_KINDS + kind)
 }
 
 /// `Lfoo/Bar;` and nothing after it — one object descriptor consuming the
@@ -24116,8 +24261,7 @@ fn try_compile_inner(
                                     entry,
                                     needs_context: true,
                                     num_params: 1,
-                                    return_type: VARHANDLE_READ_RETURNS
-                                        [slot % VARHANDLE_READ_RETURNS.len()],
+                                    return_type: varhandle_read_slot_return(slot),
                                     guard_class_id: 0,
                                 },
                             ));
@@ -26449,10 +26593,36 @@ mod varhandle_read_direct_bind_tests {
         for (mode, name) in VARHANDLE_READ_MODES.iter().enumerate() {
             assert_eq!(
                 varhandle_read_helper_slot(name, desc),
-                Some(mode * VARHANDLE_READ_RETURNS.len() + int_slot),
+                Some(mode * VARHANDLE_READ_KINDS + int_slot),
                 "{name} on the netty refCnt descriptor",
             );
         }
+    }
+
+    /// Every slot's canonical call-site descriptor, in slot order.
+    ///
+    /// The primitive kinds are `(Ljava/lang/Object;)X`; the two reference kinds
+    /// are the `Object` return and one concrete `REF_STRICT` stand-in
+    /// (`java/lang/String` — the class `RJdkHandles`' wrong-type vector uses).
+    fn canonical_descriptors() -> Vec<(usize, String, &'static str)> {
+        let mut out = Vec::new();
+        for (mode, name) in VARHANDLE_READ_MODES.iter().enumerate() {
+            for kind in 0..VARHANDLE_READ_KINDS {
+                let ret = if kind < VARHANDLE_READ_RETURNS.len() {
+                    (VARHANDLE_READ_RETURNS[kind] as char).to_string()
+                } else if kind == VARHANDLE_READ_KIND_REF_OBJECT {
+                    "Ljava/lang/Object;".to_string()
+                } else {
+                    "Ljava/lang/String;".to_string()
+                };
+                out.push((
+                    mode * VARHANDLE_READ_KINDS + kind,
+                    format!("(Ljava/lang/Object;){ret}"),
+                    *name,
+                ));
+            }
+        }
+        out
     }
 
     /// Every slot is reachable and no two shapes share one.
@@ -26464,16 +26634,96 @@ mod varhandle_read_direct_bind_tests {
     #[test]
     fn every_mode_return_pair_has_its_own_slot() {
         let mut seen = std::collections::HashSet::new();
-        for name in VARHANDLE_READ_MODES {
-            for ret in VARHANDLE_READ_RETURNS {
-                let desc = format!("(Ljava/lang/Object;){}", ret as char);
-                let slot = varhandle_read_helper_slot(name, &desc)
-                    .unwrap_or_else(|| panic!("{name}{desc} was not recognised"));
-                assert!(slot < VARHANDLE_READ_SLOTS);
-                assert!(seen.insert(slot), "{name}{desc} collided on slot {slot}");
-            }
+        for (expected, desc, name) in canonical_descriptors() {
+            let slot = varhandle_read_helper_slot(name, &desc)
+                .unwrap_or_else(|| panic!("{name}{desc} was not recognised"));
+            assert_eq!(slot, expected, "{name}{desc} landed on the wrong slot");
+            assert!(slot < VARHANDLE_READ_SLOTS);
+            assert!(seen.insert(slot), "{name}{desc} collided on slot {slot}");
         }
         assert_eq!(seen.len(), VARHANDLE_READ_SLOTS);
+    }
+
+    /// The three-way classification of a REFERENCE return, which is the whole
+    /// of how the cold arm keeps W6-1 without the site's descriptor.
+    ///
+    /// The middle row is the one that is easy to lose: a site returning
+    /// `java/lang/Number` must NOT bind, because whether a box satisfies it
+    /// depends on which wrapper arrived (`Integer` yes, `Character` no) and
+    /// neither reference slot can answer that. Binding it as `REF_STRICT`
+    /// would throw where HotSpot does not.
+    #[test]
+    fn a_reference_return_is_classified_three_ways() {
+        assert_eq!(
+            varhandle_read_helper_slot("get", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+            Some(VARHANDLE_READ_KIND_REF_OBJECT),
+        );
+        for accepting in VARHANDLE_BOX_ACCEPTING_RETURNS {
+            let desc = format!("(Ljava/lang/Object;)L{accepting};");
+            assert_eq!(
+                varhandle_read_helper_slot("get", &desc),
+                None,
+                "{accepting} accepts SOME box, so its site cannot be REF_STRICT",
+            );
+        }
+        for strict in [
+            "java/lang/String",
+            "java/lang/CharSequence",
+            "java/util/concurrent/CompletableFuture$Completion",
+            "HibfixVarHandleProbe$Node",
+        ] {
+            let desc = format!("(Ljava/lang/Object;)L{strict};");
+            assert_eq!(
+                varhandle_read_helper_slot("get", &desc),
+                Some(VARHANDLE_READ_KIND_REF_STRICT),
+                "{strict} accepts no box and must bind strictly",
+            );
+        }
+    }
+
+    /// The kill switch reaches the recogniser itself, so all three doors refuse
+    /// together — and it must leave the PRIMITIVE half alone, which is the
+    /// whole reason it is a separate switch from the read bind's own.
+    ///
+    /// Read through the recogniser rather than the `OnceLock`, because the
+    /// process-wide latch cannot be flipped twice in one test binary.
+    #[test]
+    fn the_reference_half_has_its_own_switch() {
+        // The switch is a `OnceLock` on an env var, so this test asserts the
+        // SHAPE of the decision the recogniser makes, not the latch: a slot
+        // >= VARHANDLE_READ_RETURNS.len() is a reference kind, and every one of
+        // them is reached through the `varhandle_ref_read_direct_enabled()`
+        // arm, while no primitive kind is.
+        let primitive = varhandle_read_helper_slot("get", "(Ljava/lang/Object;)I").unwrap();
+        assert!(!varhandle_read_slot_is_reference(primitive));
+        for desc in [
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            "(Ljava/lang/Object;)Ljava/lang/String;",
+        ] {
+            let slot = varhandle_read_helper_slot("get", desc)
+                .expect("the reference kinds bind by default");
+            assert!(varhandle_read_slot_is_reference(slot), "{desc}");
+        }
+    }
+
+    /// `varhandle_read_slot_return` is what three emit sites now use in place
+    /// of the old `slot % RETURNS.len()`, and it has to agree with the
+    /// descriptor the slot's synthetic call site carries.
+    #[test]
+    fn a_slots_return_byte_matches_its_descriptor() {
+        for (slot, desc, _) in canonical_descriptors() {
+            let want = desc.as_bytes()[desc.find(')').unwrap() + 1];
+            assert_eq!(
+                varhandle_read_slot_return(slot),
+                want,
+                "slot {slot} ({desc})",
+            );
+        }
+        assert_eq!(varhandle_read_slot_mode(VARHANDLE_READ_SLOTS - 1), 3);
+        assert_eq!(
+            varhandle_read_slot_kind(VARHANDLE_READ_SLOTS - 1),
+            VARHANDLE_READ_KIND_REF_STRICT
+        );
     }
 
     /// The shapes that must NOT bind, each for its own reason.
@@ -26485,7 +26735,7 @@ mod varhandle_read_direct_bind_tests {
     /// that assumes `[handle, receiver]` an argument list of a different
     /// shape.
     #[test]
-    fn only_a_single_reference_coordinate_with_a_primitive_return_binds() {
+    fn only_a_single_reference_coordinate_with_a_servable_return_binds() {
         // A static-field handle: no coordinates at all.
         assert_eq!(varhandle_read_helper_slot("get", "()I"), None);
         // An array-element handle: (array, index).
@@ -26508,15 +26758,21 @@ mod varhandle_read_direct_bind_tests {
         );
         // A primitive coordinate is not an instance-field receiver.
         assert_eq!(varhandle_read_helper_slot("get", "(I)I"), None);
-        // Reference returns are out of scope — `unbox_poly_return_checked`'s
-        // W6-1 rule reads the SITE's declared class, which a baked direct call
-        // cannot carry. See `VARHANDLE_READ_DIRECT_FNS`.
+        // An ARRAY return is still out of scope: it is outside
+        // `varhandle_reference_return_mismatch`'s fire set today, so neither
+        // reference kind describes it and a stand-in would have to reproduce
+        // that exclusion for no measured caller.
         assert_eq!(
-            varhandle_read_helper_slot("get", "(Ljava/lang/Object;)Ljava/lang/String;"),
+            varhandle_read_helper_slot("get", "(Ljava/lang/Object;)[I"),
             None
         );
         assert_eq!(
-            varhandle_read_helper_slot("get", "(Ljava/lang/Object;)[I"),
+            varhandle_read_helper_slot("get", "(Ljava/lang/Object;)[Ljava/lang/String;"),
+            None
+        );
+        // Two object descriptors run together is not one return type.
+        assert_eq!(
+            varhandle_read_helper_slot("get", "(Ljava/lang/Object;)Lfoo;Lbar;"),
             None
         );
         // `void` is not a read.
@@ -26567,16 +26823,13 @@ mod varhandle_read_direct_bind_tests {
     fn the_slots_are_registered_in_recognition_order() {
         let addrs: [usize; VARHANDLE_READ_SLOTS] = std::array::from_fn(|i| 0x1000 + i * 0x10);
         set_varhandle_read_direct_fns(&addrs);
-        for name in VARHANDLE_READ_MODES {
-            for ret in VARHANDLE_READ_RETURNS {
-                let desc = format!("(Ljava/lang/Object;){}", ret as char);
-                let slot = varhandle_read_helper_slot(name, &desc).unwrap();
-                assert_eq!(
-                    VARHANDLE_READ_DIRECT_FNS[slot].load(std::sync::atomic::Ordering::Relaxed),
-                    addrs[slot],
-                    "{name}{desc} -> slot {slot}",
-                );
-            }
+        for (_, desc, name) in canonical_descriptors() {
+            let slot = varhandle_read_helper_slot(name, &desc).unwrap();
+            assert_eq!(
+                VARHANDLE_READ_DIRECT_FNS[slot].load(std::sync::atomic::Ordering::Relaxed),
+                addrs[slot],
+                "{name}{desc} -> slot {slot}",
+            );
         }
         // Leave the cells as `build_helpers` would find them — `0` is the
         // "use the generic dispatch helper" sentinel, and a fake address left

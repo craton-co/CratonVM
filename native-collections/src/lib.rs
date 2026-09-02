@@ -40200,6 +40200,35 @@ fn register_random_natives(registry: &mut NativeMethodRegistry) {
     //
     // So both sites take the same gate. On a real JDK with the flag on, neither
     // registers and `java.util.Random`'s own bytecode runs.
+    //
+    // THE DEFAULT IS OFF, AND IT IS CHOSEN BY MEASURING THE INERT ONE.
+    // `apps/probes/RandomShadowSweep` is the first differential coverage this
+    // class has had -- 51 rows over the seeded sequence, the bounded draws, the
+    // JDK 17+ `RandomGenerator` surface, `nextBytes`, `setSeed` and the
+    // `ints`/`longs`/`doubles` streams. `java.util.Random`'s algorithm is pinned
+    // in its javadoc, so a seeded sequence has exactly one legal answer and
+    // every row prints VALUES.
+    //
+    //   flag OFF (shadowed)   0-diff, both modes, 32 registrations, 265 calls
+    //   flag ON  (retired)    0-diff, both modes, 0 registrations
+    //
+    // So the retirement is FREE IN CORRECTNESS. It is not free in throughput,
+    // which is the axis a correctness probe cannot see, and which is why this
+    // default stays off. `apps/probes/RandomBench`, A/B/B/A interleaved on an
+    // idle host to keep load drift out of it:
+    //
+    // ```text
+    //                    shadowed        retired
+    //   nextInt          171, 188        1484, 1437   ns/op
+    //   nextInt(1000)    182, 199        1595, 1368
+    //   nextDouble       238, 243        2895, 2719
+    // ```
+    //
+    // -- 8x on the integer draws and 11x on `nextDouble`. The real body is a CAS
+    // loop on an `AtomicLong` where this native is a plain field read, and this
+    // VM's atomics are lock-based rather than hardware, so the gap is structural
+    // rather than a missing optimisation. Flipping this default is a throughput
+    // decision, not a correctness one, and the numbers above are what it costs.
     if registry.real_jdk() && jdk_random_enabled() {
         return;
     }
