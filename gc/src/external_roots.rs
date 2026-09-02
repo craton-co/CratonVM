@@ -25,6 +25,15 @@ pub type OwnerPredicate<'a> = dyn Fn(usize) -> bool + 'a;
 pub struct ExternalRootProvider {
     pub name: &'static str,
     pub scan: fn(&mut Vec<ObjectRef>),
+    /// The COMPLETE set of addresses that own roots from this provider, or
+    /// `None` when the provider cannot enumerate them.
+    ///
+    /// `None` is not "no owners" -- it is "do not assume". A marker may skip
+    /// the per-object [`Self::roots_for_owner`] call for an address no
+    /// provider names, and a provider that returns `None` while still serving
+    /// roots would have those edges silently dropped, so `None` disables that
+    /// optimisation for every provider at once. Return `Some` of an EMPTY set
+    /// to say "I own nothing", which is a fact and is filterable.
     pub owner_addrs: fn() -> Option<HashSet<usize>>,
     /// Roots owned by the object at `owner_addr`, whose CURRENT class id the
     /// caller supplies so the provider can reject a STALE owner entry.
@@ -142,6 +151,21 @@ pub fn scan_external_roots(roots: &mut Vec<ObjectRef>) {
     for provider in snapshot() {
         (provider.scan)(roots);
     }
+}
+
+/// `(owners, complete)`: every address any provider names, and whether ALL
+/// of them were able to say. See [`ExternalRootProvider::owner_addrs`] -- a
+/// single `None` makes the whole index unusable for exclusion.
+pub fn owner_addrs_and_completeness() -> (HashSet<usize>, bool) {
+    let mut owners = HashSet::new();
+    let mut complete = true;
+    for provider in snapshot() {
+        match (provider.owner_addrs)() {
+            Some(set) => owners.extend(set),
+            None => complete = false,
+        }
+    }
+    (owners, complete)
 }
 
 pub fn external_owner_addrs() -> Option<HashSet<usize>> {

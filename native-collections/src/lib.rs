@@ -51959,11 +51959,17 @@ pub fn gc_overlay_owner_addrs() -> Option<std::collections::HashSet<usize>> {
     let index = overlay_owner_keys()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if index.is_empty() {
-        None
-    } else {
-        Some(index.keys().copied().collect())
-    }
+    // `Some` of an EMPTY set, not `None`, when nothing is registered.
+    //
+    // The two say opposite things to a marker. `None` means "I cannot
+    // enumerate my owners, so do not exclude anything on my behalf"
+    // (`ExternalRootProvider::owner_addrs`), which forces the per-object
+    // overlay lookup -- the provider lock and this mutex -- for every marked
+    // object in the heap. `Some(empty)` is the fact: this provider owns
+    // nothing, so no address needs asking about. A program that touches no
+    // native-backed collection is exactly the case that was paying most for
+    // the ambiguity.
+    Some(index.keys().copied().collect())
 }
 
 /// Return the Rust-side references owned by one already-marked collection.

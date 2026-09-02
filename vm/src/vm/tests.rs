@@ -65780,6 +65780,38 @@ fn m4_tlab_refill_from_heap() {
     assert!(size > 0);
 }
 
+/// The `Zgc` arm of `refill_tlab` returned `None` until 2026-09-02, which left
+/// the JIT's inline allocator dead on the default collector. It now carves a
+/// zeroed chunk, and a retire of the VM buffer hands the unused tail back to
+/// the arena rather than leaving an unregistered filler nothing can reclaim.
+#[cfg(feature = "zgc")]
+#[test]
+fn zgc_refill_tlab_carves_a_chunk_and_retire_returns_the_tail() {
+    use cratonvm_gc::{GcBackend, VmHeap};
+    let heap = VmHeap::new(GcBackend::Zgc, 16 * 1024 * 1024);
+    let (ptr, size) = heap
+        .refill_tlab(64 * 1024)
+        .expect("ZGC must hand the VM thread's TLAB a chunk");
+    assert!(!ptr.is_null());
+    assert!(size >= 8 * 1024 && size <= 64 * 1024, "chunk of {size} bytes");
+    let mut tlab = unsafe { cratonvm_gc::Tlab::new(ptr, size) };
+    assert!(tlab.alloc(128, 8).is_some());
+    // The chunk was charged whole at refill; the retire credits the tail back.
+    let allocated_before = heap.allocated_bytes();
+    tlab.retire();
+    assert!(tlab.is_retired());
+    assert_eq!(
+        allocated_before - heap.allocated_bytes(),
+        size - 128,
+        "the retired tail must be credited back to the heap"
+    );
+    let VmHeap::Zgc(z) = &heap else {
+        panic!("GcBackend::Zgc must build a Zgc heap");
+    };
+    let (refills, refill_bytes, tails, tail_bytes) = z.vm_tlab_engagement();
+    assert_eq!((refills, refill_bytes, tails, tail_bytes), (1, size, 1, size - 128));
+}
+
 #[test]
 fn m4_arena_grow() {
     // Verify arena can expand capacity.
