@@ -18,12 +18,21 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-src="$root/gc/src/zgc.rs"
+# THE COLLECTOR, not one file. `zgc.rs` was split on 2026-09-02 and its own
+# child modules are as much "the collector" as it is -- counting only `zgc.rs`
+# would report a module as abandoned the moment its caller moved next door.
+# The twelve modules being counted are NOT in this list: a module referencing
+# itself is not adoption.
+srcs="$root/gc/src/zgc.rs $root/gc/src/zgc/starts.rs $root/gc/src/zgc/sweep.rs $root/gc/src/zgc/arena_tlab.rs"
 out="$root/types/tests/zgc-submodule-adoption.txt"
 
 modules="adapters barrier census forwarding generation mark metrics page relocate remembered tlab vaddr"
 
-body="$(awk '/^mod tests \{/{exit} {print}' "$src")"
+body=""
+for f in $srcs; do
+  body="${body}$(awk '/^mod tests \{/{exit} {print}' "$f")"$'
+'
+done
 census=""
 for m in $modules; do
   # OCCURRENCES, not lines -- `grep -c` counts matching LINES, and a line with

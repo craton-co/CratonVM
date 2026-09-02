@@ -8,5 +8,5 @@ metrics 1
 page 9
 relocate 2
 remembered 3
-tlab 15
-vaddr 26
+tlab 17
+vaddr 27
