@@ -1235,7 +1235,16 @@ pub fn compile_with_param_slots(
     // proven non-null. Future null-check emission paths consult this
     // via `Compiler::is_local_nonnull(pc, local)` to skip redundant
     // `TEST reg, reg; JZ throw_npe` sequences.
-    let null_check_info = crate::null_check_elim::analyze(code, code_len);
+    //
+    // The receiver seed is derived here rather than passed in — see
+    // `null_check_elim::receiver_in_local_zero` for why, and for what the
+    // `None` (the two numbers disagree) case protects.
+    let null_check_info = {
+        let receiver = super::null_check_elim::this_nonnull_enabled()
+            && crate::null_check_elim::receiver_in_local_zero(method_key, num_params)
+                .unwrap_or(false);
+        crate::null_check_elim::analyze_with_receiver(code, code_len, receiver)
+    };
 
     // BCE: analyze loops for bounds check elimination
     // DBG (env-gated): CRATONVM_JIT_NO_BCE disables bounds-check elimination
@@ -2228,6 +2237,24 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
         return None;
     }
 
+    // Backstop for the implicit null check. Every site recorded by
+    // `emit_trusted_oop_receiver_check_at` must have been bound to a recovery
+    // address by `bind_implicit_null_recovery` before the walk ended. One left
+    // pending means a receiver check was elided and the slow path it faults
+    // into was never emitted — the site would run unguarded and its
+    // NullPointerException would arrive as a SIGSEGV.
+    //
+    // That cannot happen through any path in the arm as written (the arm that
+    // opts in always reaches its guarded slow path), which is exactly why it
+    // is asserted rather than reasoned about: the property belongs to control
+    // flow several hundred lines away from the elision, and an edit that
+    // breaks it would produce a crash on a null receiver in production rather
+    // than a red test.
+    if compiler.has_unbound_implicit_null_sites() {
+        crate::note_jit_bail_site_at("implicit-null-unbound", compiler.dbg_last_pc, 0);
+        return None;
+    }
+
     // Patch branches (both forward and backward are handled). A `false`
     // return means some branch targeted a PC that was never emitted as an
     // instruction boundary (malformed/unverified bytecode) — reject the
@@ -2526,12 +2553,28 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     // into the artifact (which partially moves `compiler`).
     let frame_layout = compiler.frame_layout();
     let method_label = compiler.method_label.clone();
+    // Taken before `compiler.buf` moves into the artifact. Registration waits
+    // until `cm` exists, so a compile that bails before that registers
+    // nothing — and one that bails after is unregistered by
+    // `CompiledMethod::drop`, which retires the whole code range.
+    let implicit_null_sites = std::mem::take(&mut compiler.implicit_null_sites);
     let mut cm = if needs_heap {
         CompiledMethod::new_with_context(compiler.buf)
     } else {
         CompiledMethod::new(compiler.buf)
     };
     cm.has_dispatch = has_dispatch;
+    if !implicit_null_sites.is_empty() {
+        let base = cm.entry as usize;
+        for (fault_off, recover_off) in implicit_null_sites {
+            // A full table DECLINES. The site keeps its elided check, and the
+            // fault it would have caught then arrives as a crash instead of an
+            // NPE — so a decline is a real loss, not a graceful degradation,
+            // and that is why `implicit_null::counts` prints it rather than
+            // swallowing it.
+            let _ = crate::implicit_null::register(base + fault_off, base + recover_off);
+        }
+    }
 
     // RBC.5 — record the declaring classes of every getstatic/putstatic
     // site (already resolved into `static_field_info` by the caller) so the

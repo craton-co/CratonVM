@@ -254,7 +254,10 @@ terminal test was `GetConsoleMode` where HotSpot's is `isatty`, and `chcp 65001`
 was spelled `cp65001` where HotSpot spells it `UTF-8`. See
 `stdout-encoding-differs-from-hotspot-on-windows-20260901.md` §11. The
 `MS932`/`GBK`/`MS949`/`MS950` ANSI rows are still the JDK's table and not a
-host's, and no CratonVM binary has been BUILT on Windows.
+host's. A CratonVM binary WAS then built on Windows (2026-09-02) and its whole
+849-byte `REncodingFidelity` output is byte-identical to HotSpot's on that host,
+`println("[Ж]")` included — `5b c6 5d`, the single cp1251 byte, where this VM
+used to write the UTF-8 pair `5b d0 96 5d`.
 
 And a real degradation, stated because it is a behaviour change and not a
 theoretical one: if the host names an encoding this image has no charset for
@@ -344,6 +347,17 @@ and `sun.jnu.encoding` is deliberately left pinned at UTF-8 — it decides how
 FILE NAMES are encoded, which is class loading rather than printing, and that
 is the other lane's staging call. `REncodingFidelity` does not diff that key
 for exactly that reason; `probes/EncodingFidelity.java` prints it.
+
+A 60-class slice of the Spring Boot suite ran on the same binary against the
+2026-08-31 HotSpot baseline: **55 PASS, 5 EMPTY (no runnable tests), 0 failures,
+0 hangs**, corrupt-cell census clean on 60 of 60 logs. That is the part the
+regression suite cannot reach — a real framework booting, with real charset
+conversion and real MBean registration; `SpringApplicationAdminMXBeanRegistrarTests`
+is in the slice and passes, which exercises the platform MBean server this work
+touched. It is a slice and not the gauntlet: the netty and tomcat runners keep
+their pass/fail lists as generated artefacts rather than tracked ones, so there
+was no baseline on the host to diff a full run against, and a full netty run's
+HANG count is not interpretable on a host carrying three other lanes' builds.
 
 The post-merge binaries are built with `lto = "thin"` and `codegen-units = 16`
 on six crates instead of the release profile's `fat` / `1`. That is not a

@@ -311,6 +311,17 @@ FILE NAMES are encoded, which is class loading rather than printing, and that
 is the other lane's staging call. `REncodingFidelity` does not diff that key
 for exactly that reason; `probes/EncodingFidelity.java` prints it.
 
+A 60-class slice of the Spring Boot suite ran on the same binary against the
+2026-08-31 HotSpot baseline: **55 PASS, 5 EMPTY (no runnable tests), 0 failures,
+0 hangs**, corrupt-cell census clean on 60 of 60 logs. That is the part the
+regression suite cannot reach — a real framework booting, with real charset
+conversion and real MBean registration; `SpringApplicationAdminMXBeanRegistrarTests`
+is in the slice and passes, which exercises the platform MBean server this work
+touched. It is a slice and not the gauntlet: the netty and tomcat runners keep
+their pass/fail lists as generated artefacts rather than tracked ones, so there
+was no baseline on the host to diff a full run against, and a full netty run's
+HANG count is not interpretable on a host carrying three other lanes' builds.
+
 The post-merge binaries are built with `lto = "thin"` and `codegen-units = 16`
 on six crates instead of the release profile's `fat` / `1`. That is not a
 preference: the shared host SIGKILLed the fat-LTO link of `cratonvm-cli` five

@@ -1631,6 +1631,15 @@ pub struct G1CollectorConfig {
     pub mixed_gc_count_target: u8,
     /// Maximum percentage of old regions to include per mixed GC (default 10).
     pub old_cset_region_threshold_percent: u8,
+    /// Ten-findings item 3 — an Old region at or above this percent live is
+    /// never a mixed-collection candidate (default 85; HotSpot's
+    /// `G1MixedGCLiveThresholdPercent`). Evacuating it would be nearly a full
+    /// copy for almost no reclaim.
+    pub mixed_gc_live_threshold_percent: u8,
+    /// Item 3 — the mixed phase ends early once the garbage held by the
+    /// remaining candidates is below this percent of the heap (default 5;
+    /// HotSpot's `G1HeapWastePercent`).
+    pub heap_waste_percent: u8,
 }
 
 impl Default for G1CollectorConfig {
@@ -1657,6 +1666,8 @@ impl Default for G1CollectorConfig {
             string_dedup_enabled: false,
             mixed_gc_count_target: 8,
             old_cset_region_threshold_percent: 10,
+            mixed_gc_live_threshold_percent: 85,
+            heap_waste_percent: 5,
         }
     }
 }
@@ -2333,6 +2344,51 @@ const MARK_LOCK_BATCH: usize = 32;
 /// batches' worth of scanning, so a worker that refills has enough to work on
 /// while its peers refill too.
 const MARK_REFILL_CHUNK: usize = 64;
+
+/// Ten-findings item 1 — a humongous span whose remembered set names more
+/// live source regions than this is retained until the next mark cycle's
+/// cleanup rather than having every source walked at every pause. Eight is
+/// HotSpot's `G1EagerReclaimRemSetThreshold` default and the same trade: a
+/// widely-referenced buffer is not the short-lived one eager reclaim is for.
+const EAGER_RECLAIM_MAX_SOURCES: usize = 8;
+
+/// Ten-findings item 9 — a reference array longer than this is marked in
+/// chunks of this many elements. The concurrent marker scans a gray object
+/// while holding the region table's shared guard, so one `Object[10_000_000]`
+/// used to be an 80 MB scan during which every pause (an exclusive-guard
+/// taker) waited. A gray-set entry now carries a chunk index in its high 16
+/// bits (`gray_entry`), the first chunk marks the array and pushes a
+/// continuation for the second, and so on; a 4096-element chunk is ~32 KB of
+/// slots, on the order of one ordinary object scan.
+const MARK_ARRAY_CHUNK: usize = 4096;
+/// Item 9 — where the chunk index lives in a gray-set entry. User-space
+/// addresses on x86-64 and AArch64 fit in 48 bits (Windows: 47); the top 16
+/// carry the chunk. An array longer than `GRAY_CHUNK_MAX * MARK_ARRAY_CHUNK`
+/// elements (2^28, a 2 GB reference array) has its tail scanned whole by the
+/// last chunk.
+const GRAY_CHUNK_SHIFT: u32 = 48;
+const GRAY_ADDR_MASK: usize = (1usize << GRAY_CHUNK_SHIFT) - 1;
+const GRAY_CHUNK_MAX: usize = (1usize << (usize::BITS - GRAY_CHUNK_SHIFT)) - 1;
+const _: () = assert!(
+    usize::BITS == 64,
+    "the gray-set chunk encoding packs a chunk index above a 48-bit address"
+);
+
+#[inline]
+fn gray_entry(addr: usize, chunk: usize) -> usize {
+    debug_assert_eq!(addr & !GRAY_ADDR_MASK, 0, "a gray address must fit in 48 bits");
+    addr | (chunk.min(GRAY_CHUNK_MAX) << GRAY_CHUNK_SHIFT)
+}
+
+#[inline]
+fn gray_entry_addr(entry: usize) -> usize {
+    entry & GRAY_ADDR_MASK
+}
+
+#[inline]
+fn gray_entry_chunk(entry: usize) -> usize {
+    entry >> GRAY_CHUNK_SHIFT
+}
 
 /// F-12 — RAII "this thread has mark work in flight" counter.
 ///
@@ -3201,6 +3257,18 @@ pub struct G1Collector {
     /// See [`ActiveMarker`] for why an empty-queue test alone is not
     /// termination.
     mark_active: AtomicUsize,
+
+    /// Item 9b — the parked-worker wake handle for the current mark cycle;
+    /// see [`Self::install_mark_waker`].
+    mark_waker: Mutex<Option<std::sync::Arc<crate::g1_concurrent::ConcurrentMarkState>>>,
+
+    /// Ten-findings item 10 — decaying estimate (7/8 old, 1/8 new) of the
+    /// Phase-4 fix-up walk's cost in nanoseconds, from the last pauses'
+    /// `fixup_us`. The mixed CSet's copy-time budget is the pause goal MINUS
+    /// this; before, the budget priced only the copying and a mixed pause
+    /// overran its goal by however long the fix-up took. See
+    /// [`Self::old_cset_copy_budget_ns`].
+    fixup_ns_ema: AtomicU64,
     /// F-12 telemetry — successful steals from a peer's deque.
     ///
     /// The engagement census for the work-stealing half of F-12. Zero steals on
@@ -3529,6 +3597,12 @@ pub struct G1Collector {
     /// input (the claim re-checks `region_type == Free` under the lock).
     free_scan_hint: AtomicUsize,
 
+    /// Item 8 — the downward twin of [`Self::free_scan_hint`] for young
+    /// claims: the highest region index the next `claim_free_region_young`
+    /// should probe first. `usize::MAX` means "start at the top of the
+    /// committed prefix"; the claim clamps it.
+    young_scan_hint: AtomicUsize,
+
     /// G1AUD-9 — per-destination-type evacuation allocation cursor, the
     /// serial evacuator's equivalent of the parallel evacuator's per-worker
     /// TLAB.
@@ -3854,6 +3928,7 @@ impl G1Collector {
             rset_edge_same_region: AtomicU64::new(0),
             free_region_count: AtomicUsize::new(num_regions),
             free_scan_hint: AtomicUsize::new(0),
+            young_scan_hint: AtomicUsize::new(usize::MAX),
             evac_dest_survivor: AtomicUsize::new(usize::MAX),
             evac_dest_old: AtomicUsize::new(usize::MAX),
             young_region_count: AtomicUsize::new(0),
@@ -3889,6 +3964,8 @@ impl G1Collector {
                 .map(|_| Mutex::new(Vec::new()))
                 .collect(),
             mark_active: AtomicUsize::new(0),
+            mark_waker: Mutex::new(None),
+            fixup_ns_ema: AtomicU64::new(0),
             mark_steals: AtomicUsize::new(0),
             mark_worker_scans: (0..concurrent_mark_worker_count(&config))
                 .map(|_| AtomicUsize::new(0))
@@ -4133,11 +4210,39 @@ impl G1Collector {
     /// Called ONLY when a new region is consumed — once per `region_size`
     /// bytes of allocation, never per object — so the O(num_regions) count is
     /// amortized away. `regions` must already be locked by the caller.
+    /// Re-arm the native-allocation pressure latch after a region left the
+    /// Free pool.
+    ///
+    /// Ten-findings item 6: this reads the maintained [`Self::free_region_count`]
+    /// instead of re-counting the table. It used to call
+    /// [`Self::publish_region_census`] — a full pass over every region — and
+    /// so did `refill_tlab` just before claiming, which made every Eden region
+    /// claimed cost TWO table scans under the exclusive lock. The count is now
+    /// decremented at the one funnel every Free->occupied transition goes
+    /// through ([`Self::note_free_regions_claimed`]) and re-derived by the
+    /// census every pause runs at its end, so between pauses it is exact and
+    /// O(1).
     fn note_region_consumed_locked(&self, regions: &[G1Region]) {
-        let free = self.publish_region_census(regions);
+        let free = self.free_region_count.load(Ordering::Relaxed);
         let pct = self.needs_gc_free_percent.load(Ordering::Relaxed).max(1);
         if free * 100 < regions.len() * pct {
             self.native_alloc_pressure.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Item 6 — account `count` regions leaving the Free pool, `young` of
+    /// which become Eden or Survivor. Called under the exclusive guard by every
+    /// claim path; the pause-end census is the backstop that re-derives both
+    /// counters from the table, so a drift here can only be transient.
+    #[inline]
+    fn note_free_regions_claimed(&self, count: usize, young: usize) {
+        let _ = self
+            .free_region_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(count))
+            });
+        if young > 0 {
+            self.young_region_count.fetch_add(young, Ordering::Relaxed);
         }
     }
 
@@ -4276,7 +4381,74 @@ impl G1Collector {
         // so it will not be Free on the next probe.
         let next = if idx + 1 >= regions.len() { 0 } else { idx + 1 };
         self.free_scan_hint.store(next, Ordering::Relaxed);
+        self.note_free_regions_claimed(1, 0);
         Some(idx)
+    }
+
+    /// Ten-findings item 8: claim a Free region for a YOUNG occupant — an Eden
+    /// region, or a Survivor evacuation destination — from the TOP of the
+    /// committed prefix, searching downward from [`Self::young_scan_hint`].
+    ///
+    /// [`Self::claim_free_region`] hands out the lowest Free region, and
+    /// `find_contiguous_free` looks for a humongous run from index 0, so before
+    /// this change Eden regions and humongous spans were both first-fit from
+    /// the bottom: every Eden claim between two humongous allocations broke up
+    /// the contiguous runs the next humongous allocation needed, and a heap
+    /// with a few large buffers fragmented itself. HotSpot separates the two
+    /// populations by taking young regions from the tail of the free list and
+    /// old/humongous from the head; this is the same split. Old destinations
+    /// and humongous spans keep claiming upward from 0, young claims downward
+    /// from the top of what is committed, and the two grow toward each other.
+    ///
+    /// Lazy commit (F-16) is preserved: the prefix grows by one region only
+    /// when the committed range holds no Free region at all. The first
+    /// uncommitted index is Free by construction — decommit only ever releases
+    /// trailing Free regions — so growing is claiming it. `commit_through_region`
+    /// is a no-op for an index already inside the prefix and is kept on that
+    /// path for the invariant it checks, not for the work it does.
+    fn claim_free_region_young(&self, regions: &[G1Region]) -> Option<usize> {
+        let region_size = self.config.region_size.max(1);
+        let committed = (self.arena.committed_len() / region_size).min(regions.len());
+        if committed > 0 {
+            let top = committed - 1;
+            let hint = self.young_scan_hint.load(Ordering::Relaxed).min(top);
+            if let Some(idx) = find_free_region_down_from(regions, hint, top) {
+                if !self.commit_through_region(idx) {
+                    return None;
+                }
+                // Resume BELOW this region next time; it is about to be retyped.
+                self.young_scan_hint
+                    .store(idx.checked_sub(1).unwrap_or(top), Ordering::Relaxed);
+                self.note_free_regions_claimed(1, 1);
+                return Some(idx);
+            }
+        }
+        // Nothing Free inside the prefix: grow it by one region.
+        if committed < regions.len() {
+            let idx = committed;
+            if regions[idx].region_type != RegionType::Free {
+                return None;
+            }
+            if !self.commit_through_region(idx) {
+                return None;
+            }
+            // The regions below `idx` were just proven occupied, so the next
+            // search may as well start at the new top.
+            self.young_scan_hint.store(idx, Ordering::Relaxed);
+            self.note_free_regions_claimed(1, 1);
+            return Some(idx);
+        }
+        None
+    }
+
+    /// Item 8 — the placement policy in one place: young occupants from the
+    /// top, everything else from the bottom.
+    #[inline]
+    fn claim_free_region_for(&self, regions: &[G1Region], occupant: RegionType) -> Option<usize> {
+        match occupant {
+            RegionType::Eden | RegionType::Survivor => self.claim_free_region_young(regions),
+            _ => self.claim_free_region(regions),
+        }
     }
 
     /// F-11 — how many Eden stripes this collector allocates through.
@@ -4377,6 +4549,9 @@ impl G1Collector {
     #[inline]
     fn reset_free_scan_hint(&self) {
         self.free_scan_hint.store(0, Ordering::Relaxed);
+        // Item 8: `usize::MAX` reads as "the top of the committed prefix" in
+        // `claim_free_region_young`, which clamps it.
+        self.young_scan_hint.store(usize::MAX, Ordering::Relaxed);
     }
 
     /// Native-allocation pressure signal — see the field doc. Consumed at the
@@ -4450,13 +4625,31 @@ impl G1Collector {
         // Humongous check. Retypes a run of Free regions: exclusive.
         if size > region_size / 2 {
             let mut regions = self.regions.write();
-            let result = self.alloc_humongous_locked(&mut regions, size);
-            if result.is_some() {
-                // A humongous span consumes several regions at once — always
-                // the largest single bite out of the Free pool.
-                self.note_region_consumed_locked(&regions);
+            let (start, _needed) = self.claim_humongous_span_locked(&mut regions, size)?;
+            // A humongous span consumes several regions at once — always the
+            // largest single bite out of the Free pool.
+            self.note_region_consumed_locked(&regions);
+            // Ten-findings item 7: the span is zeroed under the SHARED guard.
+            // A 100 MB array used to be memset while every other allocating
+            // thread waited on the exclusive lock; now they carve their TLABs
+            // beside it. The claim above typed the regions with the start
+            // region's cursor still 0, so nothing admitted under the shared
+            // guard can walk into the span before the cursor is published
+            // below — and a pause, which is the only thing that walks regions
+            // wholesale, needs the exclusive guard and waits for this one.
+            let regions = parking_lot::RwLockWriteGuard::downgrade(regions);
+            let start_addr = regions[start].data.addr();
+            unsafe {
+                // SAFETY: `[start_addr, start_addr + needed*region_size)` is a
+                // run of adjacent arena slices this claim just typed and
+                // committed, and `size <= needed*region_size`.
+                std::ptr::write_bytes(start_addr as *mut u8, 0, size);
             }
-            return result;
+            regions[start].set_cursor(size);
+            // Humongous bytes count toward the IHOP occupancy statistic; the
+            // next pause's recompute replaces this running total.
+            self.old_gen_bytes.fetch_add(size, Ordering::Relaxed);
+            return Some((start_addr as *mut u8, start));
         }
 
         // Fast path: this thread's Eden stripe, shared guard, atomic claim.
@@ -4495,13 +4688,14 @@ impl G1Collector {
             }
         }
 
-        // Find a new free region for this stripe's Eden
-        if let Some(idx) = self.claim_free_region(&regions) {
+        // Find a new free region for this stripe's Eden — from the top of the
+        // committed prefix (item 8).
+        if let Some(idx) = self.claim_free_region_young(&regions) {
             debug_free_region_cursor(&regions[idx], idx, "alloc_in_region");
             regions[idx].region_type = RegionType::Eden;
             self.eden_slots[slot].store(idx, Ordering::Relaxed);
+            self.note_region_consumed_locked(&regions);
             if let Some(result) = regions[idx].bump_alloc(size, 8, "obj:fresh-eden") {
-                self.note_region_consumed_locked(&regions);
                 return Some((result.0, idx));
             }
         }
@@ -4537,11 +4731,20 @@ impl G1Collector {
     /// GC-internal region-aware accessors but invisible to the JIT's flat
     /// addressing — a humongous element past the first region read/wrote
     /// unrelated memory (silent zero tail at ~1–2 MB, SIGSEGV at ~4 MB+).
-    fn alloc_humongous_locked(
+    /// Item 7 — the exclusive half of a humongous allocation: find and type a
+    /// contiguous run of `size.div_ceil(region_size)` Free regions, commit
+    /// through it, and account the regions as consumed. The start region's
+    /// cursor is deliberately left at 0: every walker bounds itself by the
+    /// cursor, so a span whose cursor is unpublished holds no objects to any
+    /// reader admitted under the shared guard. The caller zeroes the span
+    /// under that guard and then publishes the cursor.
+    ///
+    /// Returns `(start_index, regions_needed)`.
+    fn claim_humongous_span_locked(
         &self,
         regions: &mut Vec<G1Region>,
         size: usize,
-    ) -> Option<(*mut u8, usize)> {
+    ) -> Option<(usize, usize)> {
         let region_size = self.config.region_size;
         if region_size == 0 || size < HEADER_SIZE {
             return None;
@@ -4561,37 +4764,43 @@ impl G1Collector {
             return None;
         }
 
-        // Classify the span. `cursor = size` on the start makes walkers read
-        // the one object; `cursor = 0` on continuations makes walkers skip them.
+        // Classify the span. `cursor = 0` on continuations makes walkers skip
+        // them; the start region's cursor becomes `size` only once the span is
+        // zeroed (see `alloc_in_region`).
         regions[start].region_type = RegionType::HumongousStart;
-        regions[start].set_cursor(size);
+        regions[start].set_cursor(0);
         for i in 1..regions_needed {
             regions[start + i].region_type = RegionType::HumongousContinuation;
             regions[start + i].set_cursor(0);
         }
+        self.note_free_regions_claimed(regions_needed, 0);
 
-        // Zero the entire contiguous span before handing it out. Continuation
-        // regions come from `Free` slots that may still hold stale collected
-        // data; `G1Region::reset` zeroes a region only on its STW retire path.
-        // The arena is one allocation, so a single `write_bytes` across the
-        // full span is in-bounds and contiguous.
+        Some((start, regions_needed))
+    }
+
+    /// Allocate a humongous span entirely under the exclusive guard: claim,
+    /// zero, publish. `alloc_in_region` does the zeroing under the shared
+    /// guard instead (item 7); this form exists for callers that already hold
+    /// the exclusive guard.
+    ///
+    /// Continuation regions come from `Free` slots that may still hold stale
+    /// collected data — `G1Region::reset` zeroes a region only on its STW
+    /// retire path — so the whole span is zeroed before it is handed out.
+    #[allow(dead_code)]
+    fn alloc_humongous_locked(
+        &self,
+        regions: &mut Vec<G1Region>,
+        size: usize,
+    ) -> Option<(*mut u8, usize)> {
+        let (start, _needed) = self.claim_humongous_span_locked(regions, size)?;
         let start_addr = regions[start].data.addr();
         unsafe {
-            // SAFETY: `[start_addr, start_addr + regions_needed*region_size)` is
-            // `regions_needed` adjacent arena slices reserved by this
-            // allocation (`find_contiguous_free` returned a Free run); `size <=
-            // regions_needed*region_size`, so zeroing `size` bytes stays inside
-            // the reserved span.
+            // SAFETY: the claim typed and committed a run of adjacent arena
+            // slices at least `size` bytes long.
             std::ptr::write_bytes(start_addr as *mut u8, 0, size);
         }
-
-        // Humongous bytes count toward the IHOP occupancy statistic (see
-        // `recompute_old_gen_bytes`). Bump it here too so a burst of
-        // humongous allocation can cross the marking threshold *between*
-        // pauses — the next pause's recompute replaces this running total,
-        // so drift never accumulates.
+        regions[start].set_cursor(size);
         self.old_gen_bytes.fetch_add(size, Ordering::Relaxed);
-
         Some((start_addr as *mut u8, start))
     }
 
@@ -4690,7 +4899,7 @@ impl G1Collector {
         }
 
         // Allocate a new free region (Free regions are never in the CSet).
-        if let Some(idx) = this.claim_free_region(regions) {
+        if let Some(idx) = this.claim_free_region_for(regions, target_type) {
             debug_free_region_cursor(&regions[idx], idx, "alloc_in_type_locked");
             regions[idx].region_type = target_type;
             if target_type == RegionType::Survivor {
@@ -5626,15 +5835,7 @@ impl G1Collector {
         phase_mark = std::time::Instant::now();
 
         // Phase 4: Update forwarding pointers in non-CSet regions
-        let narrow = self.phase4_regions_to_walk(
-            &regions,
-            Some(&pre_evac),
-            &narrow_sources,
-            gc_flags().g1_eager_humongous
-                && regions
-                    .iter()
-                    .any(|r| r.region_type == RegionType::HumongousStart),
-        );
+        let narrow = self.phase4_regions_to_walk(&regions, Some(&pre_evac), &narrow_sources);
         let census = self.update_references_in_regions(
             &mut regions,
             &cset_set,
@@ -5819,7 +6020,15 @@ impl G1Collector {
         let mut candidates: Vec<(usize, f64)> = regions
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.region_type == RegionType::Old && !r.pinned && r.live_bytes > 0)
+            .filter(|(_, r)| {
+                r.region_type == RegionType::Old
+                    && !r.pinned
+                    && r.live_bytes > 0
+                    // Item 3 — the live threshold; see `mixed_phase_has_work`.
+                    && r.live_bytes * 100
+                        < self.config.region_size
+                            * self.config.mixed_gc_live_threshold_percent as usize
+            })
             .map(|(i, r)| (i, r.gc_efficiency))
             .collect();
         candidates.sort_by(|a, b| {
@@ -5831,7 +6040,7 @@ impl G1Collector {
         // path: bound the old CSet by the `max_gc_pause_ms` copy-time budget
         // (rolling `evac_ns_per_byte` × `live_bytes`) on top of the percentage
         // cap, always keeping at least one region for forward progress.
-        let budget_ns = self.config.max_gc_pause_ms.saturating_mul(1_000_000);
+        let budget_ns = self.old_cset_copy_budget_ns();
         let ns_per_byte = self.evac_ns_per_byte.load(Ordering::Relaxed).max(1);
         let mut cost_ns: u64 = 0;
         let mut out: Vec<usize> = Vec::new();
@@ -5931,6 +6140,10 @@ impl G1Collector {
                     && !r.pinned
                     && !jit_pinned_regions.contains(i)
                     && r.live_bytes > 0
+                    // Item 3 — the live threshold; see `mixed_phase_has_work`.
+                    && r.live_bytes * 100
+                        < self.config.region_size
+                            * self.config.mixed_gc_live_threshold_percent as usize
             })
             .map(|(i, r)| (i, r.gc_efficiency))
             .collect();
@@ -5951,7 +6164,7 @@ impl G1Collector {
         // (`mixed_gc_remaining`). The percentage cap remains the hard upper
         // bound; the budget only binds when a single mixed GC would copy enough
         // live old data to blow the target (a genuinely long pause).
-        let budget_ns = self.config.max_gc_pause_ms.saturating_mul(1_000_000);
+        let budget_ns = self.old_cset_copy_budget_ns();
         let ns_per_byte = self.evac_ns_per_byte.load(Ordering::Relaxed).max(1);
         let mut old_cost_ns: u64 = 0;
         let mut old_selected: usize = 0;
@@ -5966,6 +6179,10 @@ impl G1Collector {
         }
 
         let cset_set: RegionSet = cset.iter().copied().collect();
+        // Ten-findings item 2 — the pre-evacuation `(region_type, cursor)`
+        // snapshot the narrow fix-up diffs against; see the young path.
+        let pre_evac: Vec<(RegionType, usize)> =
+            regions.iter().map(|r| (r.region_type, r.cursor())).collect();
         // Same invariant as the young path: a pinned region must never enter a
         // collection set, because Phase 5 resets every CSet region that holds
         // no self-forwarded object. A mixed CSet is the harder case — it also
@@ -6068,6 +6285,7 @@ impl G1Collector {
             set
         };
         let rset_sources_scanned = mixed_rset_sources.len();
+        let narrow_sources = mixed_rset_sources.clone();
 
         // F-05 — see the twin in `young_collection`: the JIT-pinned additions
         // are walked wholesale, the remembered set's own sources are screened.
@@ -6123,21 +6341,25 @@ impl G1Collector {
 
         // Update references and free evacuated regions.
         //
-        // F-04 residual, stated deliberately: the mixed fix-up stays WIDE.
-        // `phase4_regions_to_walk`'s narrowing argument is that a slot needing
-        // a rewrite is reachable only through the CSet's remembered set, and
-        // for a mixed CSet that leans on the rset of the OLD members — a set
-        // whose completeness for old->old edges is maintained by this very
-        // walk's rebuild half. Narrowing it would make the rebuild's input
-        // depend on the rebuild's own output, and the failure mode is a
-        // use-after-free in the generation a mixed pause exists to reclaim.
-        // Mixed pauses are infrequent (the serial-evacuator note above says so
-        // and uses it to justify not parallelising them at all), so this costs
-        // little. What would license the change is
-        // `dbg_verify_rset_completeness` reporting `missing=0` across a full
-        // mixed sequence with the narrow set applied — the checker exists and
-        // is wired here now.
-        let census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map, None);
+        // Ten-findings item 2: the mixed fix-up is narrowed by the same rule as
+        // the young one. F-04 left it wide on the argument that the OLD
+        // members' rsets are "maintained by this very walk's rebuild half", so
+        // narrowing would feed the rebuild its own output. That argument proves
+        // too much: the young CSet's rsets are maintained by exactly the same
+        // producers (the mutator barrier, the rebuild over walked regions, the
+        // evacuation-failure fix-up), and the young walk has been narrow since
+        // G1AUD-11. What makes either sound is that every slot needing a
+        // rewrite lives in a region that is a recorded SOURCE of some CSet
+        // member or a region this pause WROTE INTO — and the rebuild only ever
+        // ADDS edges for the regions it walks, which is what a narrow walk
+        // does too; a region it does not walk keeps the entries it had. The
+        // rebuild has never been what makes THIS pause sound (a missing
+        // barrier entry is a UAF in this pause and repaired for the next —
+        // `audits/g1-audit.md` §2.1); it repairs for later pauses, and it still
+        // does. `CRATONVM_G1_NARROW_FIXUP=0` restores the wide walk for both.
+        let narrow = self.phase4_regions_to_walk(&regions, Some(&pre_evac), &narrow_sources);
+        let census =
+            self.update_references_in_regions(&mut regions, &cset_set, &pointer_map, narrow.as_ref());
         phases.fixup_us = phase_mark.elapsed().as_micros() as u64;
         phases.fixup_regions = census.walked_regions;
         phases.fixup_bytes = census.walked_bytes;
@@ -6845,15 +7067,7 @@ impl G1Collector {
         // by the same rule the serial path uses; `parallel_sources` is
         // precisely the `narrow_sources` term (`live_rset_sources` plus every
         // JIT-pinned region) that `phase4_regions_to_walk` wants.
-        let narrow = self.phase4_regions_to_walk(
-            &regions,
-            Some(&pre_evac),
-            &parallel_sources,
-            gc_flags().g1_eager_humongous
-                && regions
-                    .iter()
-                    .any(|r| r.region_type == RegionType::HumongousStart),
-        );
+        let narrow = self.phase4_regions_to_walk(&regions, Some(&pre_evac), &parallel_sources);
         let census =
             self.update_references_in_regions(&mut regions, &cset_set, &pointer_map, narrow.as_ref());
         phases.fixup_us = phase_mark.elapsed().as_micros() as u64;
@@ -6994,6 +7208,10 @@ impl G1Collector {
                     && !r.pinned
                     && !jit_pinned_regions.contains(i)
                     && r.live_bytes > 0
+                    // Item 3 — the live threshold; see `mixed_phase_has_work`.
+                    && r.live_bytes * 100
+                        < self.config.region_size
+                            * self.config.mixed_gc_live_threshold_percent as usize
             })
             .map(|(i, r)| (i, r.gc_efficiency))
             .collect();
@@ -7003,7 +7221,7 @@ impl G1Collector {
                 .then_with(|| a.0.cmp(&b.0))
         });
 
-        let budget_ns = self.config.max_gc_pause_ms.saturating_mul(1_000_000);
+        let budget_ns = self.old_cset_copy_budget_ns();
         let ns_per_byte = self.evac_ns_per_byte.load(Ordering::Relaxed).max(1);
         let mut old_cost_ns: u64 = 0;
         let mut old_selected: usize = 0;
@@ -7067,6 +7285,10 @@ impl G1Collector {
         // the serial `mixed_collection`).
         let keepalive = self.marking_keepalive_roots(&regions, &cset_set);
 
+        // Item 2 — pre-evacuation snapshot for the narrow fix-up.
+        let pre_evac: Vec<(RegionType, usize)> =
+            regions.iter().map(|r| (r.region_type, r.cursor())).collect();
+
         // G1AUD-6 — same source set the serial `mixed_collection` builds; see
         // the long note in `young_collection_parallel`.
         let parallel_sources: RegionSet = {
@@ -7117,8 +7339,10 @@ impl G1Collector {
         phases.closure_us = phase_mark.elapsed().as_micros() as u64;
         phase_mark = std::time::Instant::now();
 
-        // Wide, like the serial mixed path — see the F-04 residual note there.
-        let census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map, None);
+        // Narrow, like the serial mixed path — see the item 2 note there.
+        let narrow = self.phase4_regions_to_walk(&regions, Some(&pre_evac), &parallel_sources);
+        let census =
+            self.update_references_in_regions(&mut regions, &cset_set, &pointer_map, narrow.as_ref());
         phases.fixup_us = phase_mark.elapsed().as_micros() as u64;
         phases.fixup_regions = census.walked_regions;
         phases.fixup_bytes = census.walked_bytes;
@@ -8005,54 +8229,55 @@ impl G1Collector {
                 for i in 0..len {
                     let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * 8) };
                     let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
-                    if raw != 0
-                        && self.evacuation_candidate_is_an_object(
-                            regions,
-                            "worklist-scan[array]",
-                            obj_ptr,
-                            i,
-                            raw as usize,
-                        )
-                    {
-                        let ref_ptr = raw as usize as *mut u8;
-                        if let Some(region_idx) = self.region_for_ptr(regions, ref_ptr) {
-                            if cset.contains(&region_idx) {
-                                // Round-5 fix (CRIT, O(N²)): the prior code
-                                // pushed `new_ptr` onto the worklist in BOTH
-                                // branches of the dedup `if/else`, so every
-                                // already-evacuated target was rescanned —
-                                // turning ref-cycles into quadratic blow-up
-                                // and reaching the worklist budget cap in
-                                // pathological graphs. The dedup signal we
-                                // need is "was this evacuation fresh?".
-                                // `evacuate_object` inserts into
-                                // `pointer_map` only when it actually copies.
-                                // Step 9: take the freshness from the
-                                // evacuation outcome (`fresh`) rather than a
-                                // separate `contains_key` pre-check (a TOCTOU
-                                // under parallel evacuation) and push to the
-                                // worklist only on a fresh evacuation.
-                                if let Some((new_ptr, fresh)) = self.evacuate_object(
-                                    regions,
-                                    ref_ptr,
-                                    pointer_map,
-                                    objects_copied,
-                                    bytes_copied,
-                                    cset,
-                                ) {
-                                    unsafe {
-                                        std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
-                                    }
-                                    if fresh {
-                                        work_list.push(new_ptr);
-                                    }
-                                }
-                            } else if let Some(&new_addr) = pointer_map.get(&(ref_ptr as usize)) {
-                                // Already forwarded from a previous scan
-                                unsafe {
-                                    std::ptr::write(slot_ptr as *mut u64, new_addr as u64);
-                                }
-                            }
+                    if raw == 0 {
+                        continue;
+                    }
+                    // Ten-findings item 4: decide CSet membership from the
+                    // ADDRESS before touching the referent. The plausibility
+                    // screen reads the candidate's header, which for the
+                    // old->old references that dominate a source walk is one
+                    // cold cache line per slot spent on an object this pause
+                    // will never move. Region index and bitset test first;
+                    // only a CSet resident is worth validating.
+                    let ref_ptr = raw as usize as *mut u8;
+                    let Some(region_idx) = self.region_for_ptr(regions, ref_ptr) else {
+                        continue;
+                    };
+                    if !cset.contains(&region_idx) {
+                        // Not in the CSet, so not forwarded: the pointer map
+                        // only ever names CSet residents (`evacuate_object` is
+                        // reached through this same membership test), so the
+                        // "already forwarded" rewrite that used to sit here
+                        // could never fire.
+                        continue;
+                    }
+                    if !self.evacuation_candidate_is_an_object(
+                        regions,
+                        "worklist-scan[array]",
+                        obj_ptr,
+                        i,
+                        raw as usize,
+                    ) {
+                        continue;
+                    }
+                    // Round-5 fix (CRIT, O(N²)): push `new_ptr` onto the
+                    // worklist only when this evacuation was FRESH — the
+                    // freshness comes from the evacuation outcome, not a
+                    // separate `contains_key` pre-check (a TOCTOU under
+                    // parallel evacuation).
+                    if let Some((new_ptr, fresh)) = self.evacuate_object(
+                        regions,
+                        ref_ptr,
+                        pointer_map,
+                        objects_copied,
+                        bytes_copied,
+                        cset,
+                    ) {
+                        unsafe {
+                            std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
+                        }
+                        if fresh {
+                            work_list.push(new_ptr);
                         }
                     }
                 }
@@ -8063,6 +8288,15 @@ impl G1Collector {
                 header,
                 0,
                 |slot_ptr, raw, compact| {
+                    // Item 4 — membership before plausibility; see the array
+                    // arm above for why.
+                    let ref_ptr = raw as *mut u8;
+                    let Some(region_idx) = self.region_for_ptr(regions, ref_ptr) else {
+                        return;
+                    };
+                    if !cset.contains(&region_idx) {
+                        return;
+                    }
                     if !self.evacuation_candidate_is_an_object(
                         regions,
                         "worklist-scan[object]",
@@ -8078,30 +8312,20 @@ impl G1Collector {
                     ) {
                         return;
                     }
-                    let ref_ptr = raw as *mut u8;
-                    if let Some(region_idx) = self.region_for_ptr(regions, ref_ptr) {
-                        if cset.contains(&region_idx) {
-                            // Round-5 fix (CRIT, O(N²)): only push the
-                            // forwarded target onto the worklist when this
-                            // call site actually evacuated it. Step 9: the
-                            // freshness comes from the evacuation outcome
-                            // (`fresh`), not a separate `contains_key`
-                            // pre-check (a TOCTOU under parallel evacuation).
-                            if let Some((new_ptr, fresh)) = self.evacuate_object(
-                                regions,
-                                ref_ptr,
-                                pointer_map,
-                                objects_copied,
-                                bytes_copied,
-                                cset,
-                            ) {
-                                write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
-                                if fresh {
-                                    work_list.push(new_ptr);
-                                }
-                            }
-                        } else if let Some(&new_addr) = pointer_map.get(&raw) {
-                            write_flat_object_reference(slot_ptr, new_addr, compact);
+                    // Round-5 fix (CRIT, O(N²)): only push the forwarded
+                    // target onto the worklist when this call site actually
+                    // evacuated it (`fresh`).
+                    if let Some((new_ptr, fresh)) = self.evacuate_object(
+                        regions,
+                        ref_ptr,
+                        pointer_map,
+                        objects_copied,
+                        bytes_copied,
+                        cset,
+                    ) {
+                        write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
+                        if fresh {
+                            work_list.push(new_ptr);
                         }
                     }
                 },
@@ -8344,6 +8568,15 @@ impl G1Collector {
                         if raw == 0 {
                             continue;
                         }
+                        // Item 4 — CSet membership from the address first; the
+                        // header screen runs only for a CSet resident.
+                        let ref_ptr = raw as usize as *mut u8;
+                        let Some(ridx) = self.region_for_ptr(regions, ref_ptr) else {
+                            continue;
+                        };
+                        if !cset.contains(&ridx) {
+                            continue;
+                        }
                         if !self.evacuation_candidate_is_an_object(
                             regions,
                             "rset-source-scan[array]",
@@ -8353,27 +8586,21 @@ impl G1Collector {
                         ) {
                             continue;
                         }
-                        let ref_ptr = raw as usize as *mut u8;
-                        if let Some(ridx) = self.region_for_ptr(regions, ref_ptr) {
-                            if cset.contains(&ridx) {
-                                // Step 9: `fresh` ignored — this RSet-source
-                                // scan keeps its existing unconditional push
-                                // (behaviour-identical; the parallel evacuator
-                                // will gate it on `fresh`).
-                                if let Some((new_ptr, _fresh)) = self.evacuate_object(
-                                    regions,
-                                    ref_ptr,
-                                    pointer_map,
-                                    objects_copied,
-                                    bytes_copied,
-                                    cset,
-                                ) {
-                                    unsafe {
-                                        std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
-                                    }
-                                    work_list.push(new_ptr);
-                                }
+                        // Step 9: `fresh` ignored — this RSet-source scan keeps
+                        // its existing unconditional push (behaviour-identical;
+                        // the parallel evacuator gates it on `fresh`).
+                        if let Some((new_ptr, _fresh)) = self.evacuate_object(
+                            regions,
+                            ref_ptr,
+                            pointer_map,
+                            objects_copied,
+                            bytes_copied,
+                            cset,
+                        ) {
+                            unsafe {
+                                std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
                             }
+                            work_list.push(new_ptr);
                         }
                     }
                 }
@@ -8383,6 +8610,15 @@ impl G1Collector {
                     header,
                     0,
                     |slot_ptr, raw, compact| {
+                        // Item 4 — CSet membership from the address first; the
+                        // header screen runs only for a CSet resident.
+                        let ref_ptr = raw as *mut u8;
+                        let Some(ridx) = self.region_for_ptr(regions, ref_ptr) else {
+                            return;
+                        };
+                        if !cset.contains(&ridx) {
+                            return;
+                        }
                         if !self.evacuation_candidate_is_an_object(
                             regions,
                             "rset-source-scan[object]",
@@ -8394,26 +8630,17 @@ impl G1Collector {
                         ) {
                             return;
                         }
-                        let ref_ptr = raw as *mut u8;
-                        if let Some(ridx) = self.region_for_ptr(regions, ref_ptr) {
-                            if cset.contains(&ridx) {
-                                // Step 9: `fresh` ignored (see the Array branch).
-                                if let Some((new_ptr, _fresh)) = self.evacuate_object(
-                                    regions,
-                                    ref_ptr,
-                                    pointer_map,
-                                    objects_copied,
-                                    bytes_copied,
-                                    cset,
-                                ) {
-                                    write_flat_object_reference(
-                                        slot_ptr,
-                                        new_ptr as usize,
-                                        compact,
-                                    );
-                                    work_list.push(new_ptr);
-                                }
-                            }
+                        // Step 9: `fresh` ignored (see the Array branch).
+                        if let Some((new_ptr, _fresh)) = self.evacuate_object(
+                            regions,
+                            ref_ptr,
+                            pointer_map,
+                            objects_copied,
+                            bytes_copied,
+                            cset,
+                        ) {
+                            write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
+                            work_list.push(new_ptr);
                         }
                     },
                 );
@@ -8492,15 +8719,16 @@ impl G1Collector {
         regions: &[G1Region],
         pre: Option<&[(RegionType, usize)]>,
         rset_sources: &RegionSet,
-        want_census: bool,
     ) -> Option<RegionSet> {
         if !gc_flags().g1_narrow_fixup {
             return None;
         }
-        // The census is a whole-heap question; nothing narrower can answer it.
-        if want_census {
-            return None;
-        }
+        // Ten-findings item 1: the humongous census used to force the wide walk
+        // here ("a whole-heap question"), which made every young pause on a
+        // heap holding ONE large buffer O(heap). The question is now answered
+        // from the spans' remembered sets — see
+        // `humongous_spans_referenced_by_rset` — so nothing about humongous
+        // objects widens the fix-up any more.
         let pre = pre?;
         if pre.len() != regions.len() {
             // A snapshot that does not describe this region table cannot be
@@ -8547,7 +8775,14 @@ impl G1Collector {
         let heap_has_humongous = regions
             .iter()
             .any(|r| r.region_type == RegionType::HumongousStart);
-        let want_census = gc_flags().g1_eager_humongous && heap_has_humongous;
+        // Ten-findings item 1: a census is taken only when this walk is WIDE. A
+        // narrow walk cannot answer a whole-heap question, so eager reclaim
+        // reads the humongous spans' remembered sets instead
+        // (`humongous_spans_referenced_by_rset`), and a humongous span no
+        // longer forces every young pause to walk the whole old generation.
+        let want_census =
+            gc_flags().g1_eager_humongous && heap_has_humongous && narrow.is_none();
+        census.taken = want_census;
         if !rewrite && !want_census {
             return census;
         }
@@ -8758,6 +8993,17 @@ impl G1Collector {
                 if span != holder_span {
                     if let Some(c) = census.as_mut() {
                         c.referenced.insert(span);
+                    }
+                    // Ten-findings item 1: ALSO a remembered-set edge, on the
+                    // span's start region. A narrow pause takes no census, and
+                    // eager reclaim then asks the span's rset who might still
+                    // hold it — so the edges the census used to carry are
+                    // recorded the way every other cross-region edge is, card
+                    // included (the card store is unconditional for the reason
+                    // given in the collectable arm below).
+                    self.cards.dirty_addr(obj_ptr as usize);
+                    if seen.insert(span) {
+                        out.push((span, holder));
                     }
                 }
             } else if target != holder && is_collectable_region_type(regions[target].region_type) {
@@ -9841,7 +10087,13 @@ impl G1Collector {
                 None => false,
             }
         };
-        keepalive.extend(worklist.iter().copied().filter(|&a| cset_resident(a)));
+        // Item 9 — entries carry a chunk index; the keep-alive wants addresses.
+        keepalive.extend(
+            worklist
+                .iter()
+                .map(|&e| gray_entry_addr(e))
+                .filter(|&a| cset_resident(a)),
+        );
         // F-12 — the gray set is no longer only the seed queue. A CSet-resident
         // gray sitting in a WORKER'S deque is just as snapshot-live as one in
         // the seed queue, and missing it is not a missed optimisation: the
@@ -9855,7 +10107,12 @@ impl G1Collector {
         drop(worklist);
         for deque in self.mark_deques.iter() {
             let deque = deque.lock();
-            keepalive.extend(deque.iter().copied().filter(|&a| cset_resident(a)));
+            keepalive.extend(
+                deque
+                    .iter()
+                    .map(|&e| gray_entry_addr(e))
+                    .filter(|&a| cset_resident(a)),
+            );
         }
         keepalive
     }
@@ -9943,10 +10200,46 @@ impl G1Collector {
     /// Is `addr` waiting to be scanned anywhere in the gray set?
     /// Diagnostics and tests only — O(gray set).
     fn gray_set_contains(&self, addr: usize) -> bool {
-        if self.mark_worklist.lock().contains(&addr) {
+        let names = |e: &usize| gray_entry_addr(*e) == addr;
+        if self.mark_worklist.lock().iter().any(names) {
             return true;
         }
-        self.mark_deques.iter().any(|d| d.lock().contains(&addr))
+        self.mark_deques.iter().any(|d| d.lock().iter().any(names))
+    }
+
+    /// Test/diagnostic (item 9): how many gray entries are array-chunk
+    /// continuations rather than objects.
+    pub(crate) fn dbg_gray_chunk_entries(&self) -> usize {
+        let is_chunk = |e: &usize| gray_entry_chunk(*e) > 0;
+        self.mark_worklist.lock().iter().filter(|e| is_chunk(e)).count()
+            + self
+                .mark_deques
+                .iter()
+                .map(|d| d.lock().iter().filter(|e| is_chunk(e)).count())
+                .sum::<usize>()
+    }
+
+    /// Item 9b — wake every parked concurrent-mark worker. Installed by
+    /// [`crate::g1_concurrent::ConcurrentMarkController::spawn`] for the life
+    /// of a cycle; a no-op otherwise. Called wherever gray work is created
+    /// (a SATB buffer spilling to the shared queue, a pause pushing a
+    /// keep-alive, remark seeding roots), which is what lets the workers park
+    /// without a short poll.
+    pub(crate) fn install_mark_waker(
+        &self,
+        waker: std::sync::Arc<crate::g1_concurrent::ConcurrentMarkState>,
+    ) {
+        *self.mark_waker.lock() = Some(waker);
+    }
+
+    pub(crate) fn clear_mark_waker(&self) {
+        *self.mark_waker.lock() = None;
+    }
+
+    fn wake_marker(&self) {
+        if let Some(w) = self.mark_waker.lock().as_ref() {
+            w.notify_work_available();
+        }
     }
 
     /// F-12 — fill `out` with work for `worker`, from the shared seed queue if
@@ -10019,16 +10312,20 @@ impl G1Collector {
         cset_set: &RegionSet,
         pointer_map: &cratonvm_types::PointerMap,
     ) {
-        let mut remap = |addr: &mut usize| -> bool {
-            if let Some(&new_addr) = pointer_map.get(&*addr) {
+        let mut remap = |entry: &mut usize| -> bool {
+            // Item 9 — an entry carries a chunk index above the address; remap
+            // the address and keep the chunk.
+            let chunk = gray_entry_chunk(*entry);
+            let addr = gray_entry_addr(*entry);
+            if let Some(&new_addr) = pointer_map.get(&addr) {
                 // Object was evacuated — follow the forwarding ptr.
-                *addr = new_addr;
+                *entry = gray_entry(new_addr, chunk);
                 return true;
             }
             // Not forwarded. If the address lived in a CSet region it is now
             // dangling (the region was reset above) so drop it. Otherwise
             // (Old / non-CSet) leave it alone.
-            match self.region_for_ptr(regions, *addr as *mut u8) {
+            match self.region_for_ptr(regions, addr as *mut u8) {
                 Some(idx) if cset_set.contains(&idx) => false,
                 _ => true,
             }
@@ -10056,6 +10353,8 @@ impl G1Collector {
             regions[idx].try_mark_and_account(new_addr);
             self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
         }
+        drop(worklist);
+        self.wake_marker();
     }
 
     /// Test/diagnostic: has `addr` been grayed or marked by the current
@@ -10618,6 +10917,11 @@ impl G1Collector {
                 };
                 remaining -= 1;
                 in_batch -= 1;
+                // Item 9 — an entry is an address plus a chunk index; chunk 0 is
+                // the object itself, a higher chunk a continuation of a long
+                // reference array that is already marked.
+                let chunk = gray_entry_chunk(obj_addr);
+                let obj_addr = gray_entry_addr(obj_addr);
 
                 // Defensive: confirm this address really lives in some region.
                 // (Stale roots from before a heap rearrangement would otherwise
@@ -10732,9 +11036,17 @@ impl G1Collector {
                 // funnel, same numbers, one atomic per region per batch instead
                 // of one per object. `MarkLiveBytes` flushes on Drop, so the
                 // `continue` below cannot lose a credit.
-                match regions[region_idx].try_mark_and_measure(obj_addr) {
-                    None => continue,
-                    Some(bytes) => live_bytes.add(region_idx, bytes),
+                if chunk == 0 {
+                    match regions[region_idx].try_mark_and_measure(obj_addr) {
+                        None => continue,
+                        Some(bytes) => live_bytes.add(region_idx, bytes),
+                    }
+                } else if !regions[region_idx].mark_bitmap.is_marked(obj_addr) {
+                    // Item 9 — a continuation is only ever pushed by the scan
+                    // of its own chunk 0, which marked the array first; an
+                    // unmarked one is a stale entry a pause dropped the object
+                    // of, and there is nothing to scan.
+                    continue;
                 }
 
                 // Scan the object's reference fields and push gray successors.
@@ -10743,7 +11055,7 @@ impl G1Collector {
                 // readable for the duration of the GC cycle (regions are
                 // pinned by the lock guard).
                 let header = unsafe { &*(obj_addr as *const ObjectHeader) };
-                self.scan_object_refs(obj_ptr, header, &regions, deque_cap, &mut worklist);
+                self.scan_object_refs(obj_ptr, header, &regions, deque_cap, &mut worklist, chunk);
             }
             drop(worklist);
             let scanned = before - remaining;
@@ -10855,6 +11167,7 @@ impl G1Collector {
                             &regions,
                             MARK_WORKLIST_CAP,
                             &mut worklist,
+                            0,
                         );
                     }
                     offset += obj_size;
@@ -10886,6 +11199,7 @@ impl G1Collector {
         regions: &[G1Region],
         cap: usize,
         worklist: &mut Vec<usize>,
+        chunk: usize,
     ) {
         // CRIT-perf fix: use the O(log R) cached `lookup_region_for_addr`
         // helper instead of an O(R) linear walk. The wrapper preserves
@@ -10957,7 +11271,27 @@ impl G1Collector {
         if header.kind() == ObjectKind::Array {
             if header.element_type() == ArrayElementType::Reference {
                 // Reference array: 8-byte compact slot per element.
-                for i in 0..header.array_length() as usize {
+                //
+                // Item 9 — scan this chunk only, and push the next chunk as a
+                // continuation entry BEFORE the children so a LIFO pop drains
+                // the children first (locality) and comes back for the rest.
+                let len = header.array_length() as usize;
+                let start = chunk.saturating_mul(MARK_ARRAY_CHUNK).min(len);
+                let end = if chunk >= GRAY_CHUNK_MAX {
+                    len
+                } else {
+                    start.saturating_add(MARK_ARRAY_CHUNK).min(len)
+                };
+                if end < len {
+                    if worklist.len() >= cap {
+                        // The overflow rescan re-scans every marked object from
+                        // chunk 0, which re-derives this continuation.
+                        self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
+                    } else {
+                        worklist.push(gray_entry(obj_ptr as usize, chunk + 1));
+                    }
+                }
+                for i in start..end {
                     let raw: u64 = read_ref(i * 8);
                     if raw == 0 {
                         continue;
@@ -11303,6 +11637,11 @@ impl G1Collector {
         if resume_phase == ConcurrentGcPhase::ConcurrentMark {
             self.gc_state.set_phase(ConcurrentGcPhase::ConcurrentMark);
         }
+        drop(worklist);
+        drop(regions);
+        // Item 9b — the seeds are work; a worker parked on an empty gray set
+        // must not learn that from its fallback poll.
+        self.wake_marker();
     }
 
     /// Cleanup phase: compute per-region live_bytes and gc_efficiency,
@@ -11960,7 +12299,7 @@ impl G1Collector {
             0
         };
 
-        if !census.complete {
+        if census.taken && !census.complete {
             return declined(
                 "a phase-4 region walk aborted, so the census under-counts live edges",
             );
@@ -11983,8 +12322,22 @@ impl G1Collector {
             return declined("evacuation failure kept cset regions phase 4 never walked");
         }
 
-        // Everything the pause can see a reference from.
-        let mut live = census.referenced.clone();
+        // Everything the pause can see a reference from. A wide walk took a
+        // census, exact for what it walked; a narrow walk did not (item 1), and
+        // the spans' remembered sets answer instead.
+        let mut live = if census.taken {
+            census.referenced.clone()
+        } else {
+            match self.humongous_spans_referenced_by_rset(regions, jit_pinned) {
+                Some(set) => set,
+                None => {
+                    return declined(
+                        "a remembered-set source walk aborted, so rset-derived liveness \
+                         under-counts",
+                    )
+                }
+            }
+        };
         let mut note_addr = |live: &mut RegionSet, addr: usize| {
             if let Some(idx) = self.lookup_region_for_addr(addr) {
                 if let Some(span) = humongous_span_start(regions, idx) {
@@ -12096,6 +12449,154 @@ impl G1Collector {
     /// exactly the case the caller has already refused to act on — the
     /// condition is checked there, so reaching one here means the census and
     /// this pass disagree, and the assertion below is the point.
+    /// Ten-findings item 1 — which humongous spans some object outside the CSet
+    /// still references, answered from the spans' REMEMBERED SETS rather than
+    /// from a whole-heap walk.
+    ///
+    /// Every cross-region edge into a span's start region is recorded there: by
+    /// the mutator post-write barrier, by the Phase-4 rebuild for the regions
+    /// it walks (which now includes humongous targets), and by the
+    /// evacuation-failure fix-up. An entry names a SOURCE REGION, and the
+    /// source's object may have died since it stored the edge, so an entry is
+    /// evidence, not a verdict: the source is walked — card-screened, because
+    /// every recording path dirties the holder's card and a card is cleared
+    /// only when its region is reset — and the span is live iff a reference
+    /// into it is actually found. A span whose rset is coarsened, or that names
+    /// more than [`EAGER_RECLAIM_MAX_SOURCES`] live sources, is simply retained
+    /// until the next mark cycle's cleanup, which is the shape of HotSpot's
+    /// `G1EagerReclaimRemSetThreshold`. JIT-pinned regions are walked wholesale
+    /// for the reason Phase 2 walks them wholesale: a compiled store there is
+    /// not assumed to have taken the barrier.
+    ///
+    /// A source is walked once even when several spans name it, since one walk
+    /// notes every span the source references. Returns `None` if a walk broke
+    /// on an object it could not size — the refusal a wide census reports as
+    /// `complete == false`.
+    fn humongous_spans_referenced_by_rset(
+        &self,
+        regions: &[G1Region],
+        jit_pinned: &RegionSet,
+    ) -> Option<RegionSet> {
+        let mut live = RegionSet::new();
+        let mut walked = RegionSet::new();
+        let mut sources: Vec<usize> = Vec::new();
+        for (i, r) in regions.iter().enumerate() {
+            if r.region_type != RegionType::HumongousStart {
+                continue;
+            }
+            if r.rset.is_coarsened() {
+                live.insert(i);
+                continue;
+            }
+            sources.clear();
+            for (source, generation) in r.rset.sources_with_generations() {
+                if !Self::rset_entry_is_stale(regions, source, generation)
+                    && regions[source].region_type != RegionType::Free
+                {
+                    sources.push(source);
+                }
+            }
+            if sources.len() > EAGER_RECLAIM_MAX_SOURCES {
+                live.insert(i);
+                continue;
+            }
+            for &s in &sources {
+                if walked.insert(s)
+                    && !self.note_humongous_targets_in_region(regions, s, true, &mut live)
+                {
+                    return None;
+                }
+            }
+        }
+        for s in jit_pinned.iter() {
+            if s < regions.len()
+                && walked.insert(s)
+                && !self.note_humongous_targets_in_region(regions, s, false, &mut live)
+            {
+                return None;
+            }
+        }
+        Some(live)
+    }
+
+    /// Item 1 — walk one source region, read-only, and add every humongous span
+    /// it references (other than its own) to `out`. With `card_screen`, an
+    /// object touching no dirty card is stepped over — sound because every path
+    /// that records an edge dirties the holder's card. Returns `false` if the
+    /// walk broke on an object it could not size.
+    fn note_humongous_targets_in_region(
+        &self,
+        regions: &[G1Region],
+        src_idx: usize,
+        card_screen: bool,
+        out: &mut RegionSet,
+    ) -> bool {
+        let r = &regions[src_idx];
+        if matches!(
+            r.region_type,
+            RegionType::Free | RegionType::HumongousContinuation
+        ) {
+            return true;
+        }
+        let own_span = humongous_span_start(regions, src_idx);
+        let base = r.data.as_ptr() as usize;
+        let cursor = r.cursor();
+        let screen = card_screen && gc_flags().g1_card_rset;
+        let jit_skips = self.jit_tlab_skip_spans();
+        let mut note = |raw: usize, out: &mut RegionSet| {
+            if raw == 0 {
+                return;
+            }
+            if let Some(j) = self.lookup_region_for_addr(raw) {
+                if let Some(span) = humongous_span_start(regions, j) {
+                    if Some(span) != own_span {
+                        out.insert(span);
+                    }
+                }
+            }
+        };
+        let mut offset = 0usize;
+        while offset < cursor {
+            let obj_addr = base + offset;
+            if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_addr) {
+                offset += skip;
+                continue;
+            }
+            if let Some(gap) = gap_filler_len(obj_addr as *const u8) {
+                offset += gap;
+                continue;
+            }
+            let header = unsafe { &*(obj_addr as *const ObjectHeader) };
+            if is_humongous_filler(header) {
+                break;
+            }
+            let obj_size = object_total_size(header);
+            if obj_size < HEADER_SIZE || offset + obj_size > cursor {
+                return false;
+            }
+            if screen && !self.cards.any_dirty_in(obj_addr, obj_size) {
+                offset += obj_size;
+                continue;
+            }
+            let obj_ptr = obj_addr as *mut u8;
+            if header.kind() == ObjectKind::Array {
+                if header.element_type() == ArrayElementType::Reference {
+                    let data = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
+                    for k in 0..header.array_length() as usize {
+                        let raw = unsafe { std::ptr::read(data.add(k * 8) as *const u64) };
+                        note(raw as usize, out);
+                    }
+                }
+            } else {
+                for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |_, raw, _| {
+                    note(raw, out)
+                });
+            }
+            offset += obj_size;
+        }
+        true
+    }
+
     #[cfg(debug_assertions)]
     fn debug_assert_no_reference_into_spans(
         &self,
@@ -12657,6 +13158,18 @@ impl G1Collector {
     /// slow EMA (1/8 weight on the new sample) and clamped to a sane band so a
     /// single anomalous cycle cannot wreck the estimate. No-op when nothing was
     /// copied (no signal).
+    /// Ten-findings item 10 — the copy-time budget for the OLD half of a mixed
+    /// CSet: the pause goal minus the fix-up walk's expected cost
+    /// (`fixup_ns_ema`). The selectors always take at least one old region for
+    /// forward progress, so a budget of zero still makes progress; it just
+    /// stops padding a pause the walk has already spent.
+    fn old_cset_copy_budget_ns(&self) -> u64 {
+        self.config
+            .max_gc_pause_ms
+            .saturating_mul(1_000_000)
+            .saturating_sub(self.fixup_ns_ema.load(Ordering::Relaxed))
+    }
+
     fn update_evac_cost(&self, pause_ns: u64, bytes_copied: usize) {
         if bytes_copied == 0 || pause_ns == 0 {
             return;
@@ -12722,6 +13235,22 @@ impl G1Collector {
 
         // G1AUD-9 — re-size the young generation from this pause's measured
         // cost against `max_gc_pause_ms`.
+        // Item 10 — remember what the fix-up walk cost, so the next mixed
+        // CSet's copy budget is the goal minus it (`old_cset_copy_budget_ns`).
+        if matches!(
+            collection_type,
+            G1CollectionType::YoungOnly | G1CollectionType::Mixed
+        ) {
+            let observed = phases.fixup_us.saturating_mul(1_000);
+            let prev = self.fixup_ns_ema.load(Ordering::Relaxed);
+            let next = if prev == 0 {
+                observed
+            } else {
+                prev.saturating_mul(7).saturating_add(observed) / 8
+            };
+            self.fixup_ns_ema.store(next, Ordering::Relaxed);
+        }
+
         self.update_young_target(collection_type, pause_us, stats);
 
         // F-18 — re-derive the tenuring threshold from the age histogram this
@@ -13127,6 +13656,63 @@ impl G1Collector {
             && self.mixed_gc_remaining.load(Ordering::Relaxed) > 0
     }
 
+    /// Ten-findings items 2 and 3 — is there an Old region worth a mixed pause?
+    ///
+    /// A candidate is unpinned, has mark data, and is below the live threshold
+    /// (`mixed_gc_live_threshold_percent`, HotSpot's
+    /// `G1MixedGCLiveThresholdPercent`): a region that is 98% live costs almost
+    /// a full copy to reclaim 2%, and the old selectors used to take it on the
+    /// pause budget alone. The phase has work only if some candidate exists AND
+    /// the garbage the candidates hold together is at least
+    /// `heap_waste_percent` of the heap (`G1HeapWastePercent`) — below that the
+    /// mixed pauses are all copy and no reclaim, and the phase ends early. The
+    /// JIT-pinned set is not known here; a candidate a pause later excludes on
+    /// that ground makes that one pause mixed-with-nothing, which is the
+    /// pre-existing behaviour and rare.
+    fn mixed_phase_has_work(&self) -> bool {
+        let regions = self.regions.read();
+        let region_size = self.config.region_size;
+        let threshold = self.config.mixed_gc_live_threshold_percent as usize;
+        let mut candidates = 0usize;
+        let mut reclaimable = 0usize;
+        for r in regions.iter() {
+            if r.region_type == RegionType::Old
+                && !r.pinned
+                && r.live_bytes > 0
+                && r.live_bytes * 100 < region_size * threshold
+            {
+                candidates += 1;
+                reclaimable += r.cursor().saturating_sub(r.live_bytes);
+            }
+        }
+        if candidates == 0 {
+            return false;
+        }
+        // The waste floor is a HEADROOM policy: with plenty of Free regions,
+        // a mixed pause that copies a lot to reclaim a little is not worth
+        // taking. It must not refuse the work when the heap is tight — measured
+        // on `G1CardChurn 11 60` at `-Xmx24m`: with the floor applied
+        // unconditionally, a pause storm of ~886 young pauses (against ~40)
+        // ran while the free pool sat under the trigger and the only regions
+        // that could relieve it were refused as "not worth it". HotSpot has
+        // the same floor and a full GC behind it; this collector's full GC IS
+        // the mixed sequence, so the floor is waived once the Free pool is
+        // within twice the free-percent trigger.
+        let total = regions.len().max(1);
+        let free = self.free_region_count.load(Ordering::Relaxed);
+        let trigger_pct = self.needs_gc_free_percent.load(Ordering::Relaxed).max(1);
+        let tight = free * 100 < total * (trigger_pct * 2).min(100);
+        tight
+            || reclaimable * 100 >= self.config.heap_size * self.config.heap_waste_percent as usize
+    }
+
+    /// Item 2 — close the mixed phase before its pause budget is spent.
+    fn end_mixed_phase(&self, why: &str) {
+        tracing::debug!("g1: ending the mixed phase early — {why}");
+        self.mixed_gc_remaining.store(0, Ordering::Relaxed);
+        self.marking_complete.store(false, Ordering::Relaxed);
+    }
+
     // -----------------------------------------------------------------------
     // Fallible allocation (Phase 89)
     // -----------------------------------------------------------------------
@@ -13273,7 +13859,8 @@ impl G1Collector {
         // those regions to the per-object allocator — which, unlike this one,
         // has callers that cannot be told "no" (`GarbageCollector::
         // alloc_object` aborts the process). See `tlab_reserve_regions`.
-        let free_count = self.publish_region_census(&regions);
+        // Item 6: the maintained count, not a table scan.
+        let free_count = self.free_region_count.load(Ordering::Relaxed);
         if free_count <= self.tlab_reserve_regions(regions.len()) {
             // Latch the pressure signal on the way out: the workload is
             // allocating hard enough to exhaust the pool and something must
@@ -13281,14 +13868,21 @@ impl G1Collector {
             self.native_alloc_pressure.store(true, Ordering::Relaxed);
             return None;
         }
-        if let Some(idx) = self.claim_free_region(&regions) {
+        if let Some(idx) = self.claim_free_region_young(&regions) {
             debug_free_region_cursor(&regions[idx], idx, "refill_tlab");
             regions[idx].region_type = RegionType::Eden;
             self.eden_slots[slot].store(idx, Ordering::Relaxed);
+            self.note_region_consumed_locked(&regions);
+            // Item 7: the carve zeroes its whole extent (up to a full region),
+            // and it used to do so under the exclusive guard, stalling every
+            // other allocating thread for the memset. Downgrade first: the
+            // region is typed and published in its stripe slot, so the carve
+            // below is the same shared-guard `bump_alloc` any other thread
+            // would do against it.
+            let regions = parking_lot::RwLockWriteGuard::downgrade(regions);
             if let Some(carve) =
                 self.carve_tlab_from_eden_slot(&regions, slot, requested_size, "tlab:fresh-eden")
             {
-                self.note_region_consumed_locked(&regions);
                 return Some(carve);
             }
         }
@@ -13372,8 +13966,12 @@ impl G1Collector {
         if old_ref == 0 {
             return;
         }
-        if self.satb_queue.is_active() {
-            crate::satb::satb_thread_local_log(&self.satb_queue, old_ref);
+        if self.satb_queue.is_active()
+            && crate::satb::satb_thread_local_log(&self.satb_queue, old_ref)
+        {
+            // Item 9b — a thread-local buffer just spilled to the shared queue:
+            // that is gray work, so wake a parked marker for it.
+            self.wake_marker();
         }
     }
 
@@ -15596,6 +16194,12 @@ impl GarbageCollector for G1Collector {
         // more specific statement, and the coverage lever (opt-in, ~100% rate)
         // subsumes this case whenever it is on, so recording IT here would hide
         // every real instance behind a reason that means almost nothing.
+        // A device DMA against the heap arena that the bounded GPU
+        // critical-section wait could not outlast. G1 has no non-moving
+        // sweep to divert to, so the fail-safe is the same one the two
+        // refusals above use: an empty collection set, every object at its
+        // address. See `vm_heap::gpu_relocation_forbidden`.
+        let gpu_refuse = crate::vm_heap::gpu_relocation_forbidden();
         let (decision, degraded_reason_bit) = if refuse_empty_publication {
             (
                 crate::gc_metrics::decision_reason::NON_MOVING_G1_EMPTY_JIT_PUBLICATION,
@@ -15605,6 +16209,11 @@ impl GarbageCollector for G1Collector {
             (
                 crate::gc_metrics::decision_reason::NON_MOVING_G1_ROOT_COVERAGE_INCOMPLETE,
                 crate::gc_metrics::g1_degraded::ROOT_COVERAGE_INCOMPLETE,
+            )
+        } else if gpu_refuse {
+            (
+                crate::gc_metrics::decision_reason::NON_MOVING_G1_GPU_CRITICAL,
+                crate::gc_metrics::g1_degraded::NONE,
             )
         } else {
             (
@@ -15617,7 +16226,7 @@ impl GarbageCollector for G1Collector {
             decision,
             coverage_incomplete.unwrap_or(crate::gc_quiescence::incomplete_reason::NONE),
         );
-        if refuse.is_some() || refuse_empty_publication {
+        if refuse.is_some() || refuse_empty_publication || gpu_refuse {
             crate::gc_metrics::record_g1_cycle(
                 crate::gc_metrics::g1_cycle_kind::YOUNG,
                 0,
@@ -15638,7 +16247,15 @@ impl GarbageCollector for G1Collector {
         }
         let pause_start = std::time::Instant::now();
         let result = if self.needs_mixed_gc() {
-            self.mixed_collection(roots, monitors)
+            if self.mixed_phase_has_work() {
+                self.mixed_collection(roots, monitors)
+            } else {
+                // Ten-findings item 2: nothing old is worth collecting, so end
+                // the mixed phase now instead of spending the rest of its
+                // budgeted pauses as young pauses in disguise.
+                self.end_mixed_phase("no old region is worth collecting");
+                self.young_collection(roots, monitors)
+            }
         } else {
             self.young_collection(roots, monitors)
         };
@@ -15944,6 +16561,36 @@ fn find_free_region(regions: &[G1Region]) -> Option<usize> {
 /// exactly what [`find_free_region`] does, only without paying for the prefix
 /// the caller already consumed. See [`G1Collector::free_scan_hint`] for why
 /// restarting at 0 made region claiming quadratic in the region count.
+/// Item 8 — the downward twin of [`find_free_region_from`]: the first Free
+/// region at or below `start`, then (wrapping) the first at or below `top`
+/// and above `start`. Both bounds are inclusive and `top` is the last region
+/// of the committed prefix, so the search never leaves committed memory.
+fn find_free_region_down_from(regions: &[G1Region], start: usize, top: usize) -> Option<usize> {
+    let len = regions.len();
+    if len == 0 {
+        return None;
+    }
+    let top = top.min(len - 1);
+    let start = start.min(top);
+    let mut probed = 0usize;
+    for i in (0..=start).rev() {
+        probed += 1;
+        if regions[i].region_type == RegionType::Free {
+            note_free_scan(probed);
+            return Some(i);
+        }
+    }
+    for i in ((start + 1)..=top).rev() {
+        probed += 1;
+        if regions[i].region_type == RegionType::Free {
+            note_free_scan(probed);
+            return Some(i);
+        }
+    }
+    note_free_scan(probed);
+    None
+}
+
 fn find_free_region_from(regions: &[G1Region], start: usize) -> Option<usize> {
     let len = regions.len();
     if len == 0 {
@@ -16509,9 +17156,21 @@ struct BumpEntry {
 /// never allocates under the regions lock, and entries carry `epoch` so a trail
 /// surviving a [`G1Region::reset`] cannot be misread as describing the current
 /// incarnation.
+/// Ten-findings item 5: the ring is a `Vec` that stays EMPTY until the first
+/// `record`, which only `CRATONVM_G1_DBG_REACH=1` ever makes.
+///
+/// It used to be an inline `[BumpEntry; BUMP_TRAIL_LEN]` — 32 entries of 48
+/// bytes, twice per region (`bump_trail` and `tlab_trail`) — so every
+/// `G1Region` carried 3 KiB of diagnostic ring whether or not the flag was on,
+/// and every linear pass over the region table (the CSet filters, the census,
+/// the humongous `any()` checks, the free-region searches, cleanup) streamed
+/// megabytes of it. The region entry is now a few hundred bytes; see
+/// `a_region_table_entry_stays_small`. Capacity is reserved once, on first use,
+/// so the diagnostic path allocates exactly one buffer per ring, not one per
+/// advance.
 #[derive(Default)]
 struct BumpTrail {
-    entries: [BumpEntry; BUMP_TRAIL_LEN],
+    entries: Vec<BumpEntry>,
     len: usize,
     next: usize,
 }
@@ -16519,13 +17178,21 @@ struct BumpTrail {
 impl BumpTrail {
     #[inline]
     fn record(&mut self, epoch: u64, offset: usize, size: usize, site: &'static str) {
-        self.entries[self.next] = BumpEntry {
+        let entry = BumpEntry {
             epoch,
             offset,
             size,
             tid: bump_tid(),
             site,
         };
+        if self.entries.len() < BUMP_TRAIL_LEN {
+            if self.entries.is_empty() {
+                self.entries.reserve_exact(BUMP_TRAIL_LEN);
+            }
+            self.entries.push(entry);
+        } else {
+            self.entries[self.next] = entry;
+        }
         self.next = (self.next + 1) % BUMP_TRAIL_LEN;
         self.len = (self.len + 1).min(BUMP_TRAIL_LEN);
     }
@@ -16633,6 +17300,10 @@ struct HumongousCensus {
     /// object. Over-approximates liveness: a reference from a dead holder still
     /// counts, which costs one extra cycle of retention and never a UAF.
     referenced: RegionSet,
+    /// Item 1 — whether a census was taken at all. Only a WIDE fix-up walk
+    /// takes one; after a narrow walk `referenced` is empty and meaningless,
+    /// and eager reclaim consults the spans' remembered sets instead.
+    taken: bool,
     /// Every region the walk was supposed to cover ran to its natural end.
     complete: bool,
     /// G1AUD-10 — how much heap the fix-up walk actually covered: non-CSet
@@ -17102,11 +17773,151 @@ mod tests {
             string_dedup_enabled: false,
             mixed_gc_count_target: 8,
             old_cset_region_threshold_percent: 10,
+            mixed_gc_live_threshold_percent: 85,
+            // The fixtures below hand-build Old regions a few hundred bytes
+            // long; a waste floor would end their mixed phases before they ran.
+            heap_waste_percent: 0,
         }
     }
 
     fn make_collector() -> G1Collector {
         G1Collector::new(small_config())
+    }
+
+    /// Ten-findings item 5. The region table is walked linearly by every
+    /// pause, the census, and the free-region searches; an entry that carries
+    /// kilobytes of inline diagnostic ring turns each of those into a
+    /// multi-megabyte stream. The bound is generous on purpose — it is here to
+    /// catch the next inline array, not to pin a layout.
+    #[test]
+    fn a_region_table_entry_stays_small() {
+        let size = std::mem::size_of::<G1Region>();
+        assert!(
+            size <= 512,
+            "G1Region is {size} bytes; a linear pass over the region table streams \
+             this much per region, so keep diagnostics out of line"
+        );
+    }
+
+    /// Item 6: the Free/young counters are maintained at the claim funnel and
+    /// agree with a fresh census, so `refill_tlab` no longer has to rescan the
+    /// table to learn how many regions are left.
+    #[test]
+    fn the_free_region_count_tracks_claims_without_a_rescan() {
+        let gc = make_collector();
+        let total = gc.num_regions();
+        assert_eq!(gc.free_region_count.load(Ordering::Relaxed), total);
+        assert_eq!(gc.young_region_count(), 0);
+
+        // One Eden region claimed by a TLAB refill.
+        gc.refill_tlab(4096).expect("a fresh heap refills a TLAB");
+        assert_eq!(gc.free_region_count.load(Ordering::Relaxed), total - 1);
+        assert_eq!(gc.young_region_count(), 1);
+
+        // A humongous span of two regions.
+        let _h = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 150_000);
+        assert_eq!(gc.free_region_count.load(Ordering::Relaxed), total - 3);
+        assert_eq!(gc.young_region_count(), 1);
+
+        // The census, re-derived from the table, says the same thing.
+        let (free_before, young_before) = (
+            gc.free_region_count.load(Ordering::Relaxed),
+            gc.young_region_count(),
+        );
+        gc.with_regions_mut(|_| {});
+        assert_eq!(gc.free_region_count.load(Ordering::Relaxed), free_before);
+        assert_eq!(gc.young_region_count(), young_before);
+    }
+
+    /// Item 8: young regions are claimed from the top of the committed prefix
+    /// and humongous spans from the bottom, so the two populations do not
+    /// interleave and a humongous run is not broken up by Eden claims.
+    #[test]
+    fn young_regions_claim_from_the_top_and_humongous_from_the_bottom() {
+        let gc = make_collector();
+        let total = gc.num_regions();
+        gc.refill_tlab(4096).expect("a fresh heap refills a TLAB");
+        let mut eden_idx = usize::MAX;
+        gc.with_regions_mut(|regions| {
+            eden_idx = regions
+                .iter()
+                .position(|r| r.region_type == RegionType::Eden)
+                .expect("one Eden region");
+        });
+        assert_eq!(eden_idx, total - 1, "Eden is the highest committed region");
+
+        let h = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 150_000);
+        let h_idx = gc
+            .lookup_region_for_addr(h.as_ptr() as usize)
+            .expect("the span lives in the arena");
+        assert_eq!(h_idx, 0, "the humongous span starts at the bottom");
+
+        // A second Eden claim lands directly below the first, not in the
+        // hole the humongous span would have needed.
+        gc.with_regions_mut(|regions| regions[eden_idx].set_cursor(regions[eden_idx].data.len()));
+        gc.refill_tlab(4096).expect("a second TLAB");
+        let mut edens: Vec<usize> = Vec::new();
+        gc.with_regions_mut(|regions| {
+            edens = regions
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.region_type == RegionType::Eden)
+                .map(|(i, _)| i)
+                .collect();
+        });
+        assert_eq!(edens, vec![total - 2, total - 1]);
+    }
+
+    /// Item 8, the lazy-commit half: a young claim takes a Free region INSIDE
+    /// the committed prefix while one exists, and grows the prefix by exactly
+    /// one region only when none does.
+    #[test]
+    fn young_claims_do_not_grow_the_committed_prefix_while_it_has_room() {
+        let gc = G1Collector::new(G1CollectorConfig {
+            heap_size: 64 * 1024 * 1024,
+            initial_heap_size: 4 * 1024 * 1024,
+            ..small_config()
+        });
+        if !gc.heap_is_reserved() {
+            return; // the fallback commits everything; nothing to observe
+        }
+        let region = 1024 * 1024;
+        assert_eq!(gc.committed_bytes(), 4 * region);
+        for expected in (0..4).rev() {
+            let (ptr, _) = gc.refill_tlab(4096).expect("a TLAB");
+            let idx = gc.lookup_region_for_addr(ptr as usize).expect("in arena");
+            assert_eq!(idx, expected, "claims walk down through the prefix");
+            assert_eq!(gc.committed_bytes(), 4 * region, "no growth while the prefix has room");
+            gc.with_regions_mut(|regions| regions[idx].set_cursor(regions[idx].data.len()));
+        }
+        let (ptr, _) = gc.refill_tlab(4096).expect("a TLAB from a grown prefix");
+        let idx = gc.lookup_region_for_addr(ptr as usize).expect("in arena");
+        assert_eq!(idx, 4, "the prefix grew by one region and the claim took it");
+        assert_eq!(gc.committed_bytes(), 5 * region);
+    }
+
+    /// Item 7: a humongous span reused after its previous occupant died is
+    /// zeroed before it is handed out, on the path that now zeroes under the
+    /// shared guard.
+    #[test]
+    fn a_reused_humongous_span_is_zeroed_before_it_is_handed_out() {
+        let gc = make_collector();
+        let first = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 150_000);
+        for i in [0usize, 77_777, 149_999] {
+            gc.set_array_element(first, i, Value::Long(0x5EED_5EED))
+                .unwrap();
+        }
+        let first_addr = first.as_ptr() as usize;
+        let _churn = gc.alloc_object(ClassId::new(1), 1);
+        let mut roots: Vec<ObjectRef> = vec![];
+        gc.young_collection(&mut roots, &NoopMonitors);
+        assert_eq!(gc.count_regions(RegionType::HumongousStart), 0);
+
+        let second = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 150_000);
+        assert_eq!(second.as_ptr() as usize, first_addr, "the span was reused");
+        for i in [0usize, 77_777, 149_999] {
+            assert_eq!(gc.get_array_element(second, i).unwrap(), Value::Long(0));
+        }
     }
 
     #[test]
@@ -18639,6 +19450,80 @@ mod tests {
 
     /// The point of the feature: an unreferenced span goes away at the next
     /// pause rather than waiting for a mark cycle that may never come.
+    /// Ten-findings item 1: with a humongous span present, a young pause no
+    /// longer walks the whole heap to take a census. An Old region this pause
+    /// never touches is not walked, and the span it holds still survives,
+    /// because liveness now comes from the span's remembered set — and when
+    /// the holder drops its reference, the stale-by-death entry is walked,
+    /// found empty, and the span is reclaimed.
+    #[test]
+    fn a_humongous_span_held_by_an_untouched_old_object_survives_a_narrow_pause() {
+        let gc = make_collector();
+        let h = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 100_000);
+        gc.set_array_element(h, 5, Value::Long(0xABCD)).unwrap();
+
+        // An Old holder placed by hand, the way `cleanup` leaves one, storing
+        // its reference through the barrier so the edge is recorded.
+        let holder = {
+            let mut regions = gc.regions.write();
+            let idx = regions
+                .iter()
+                .position(|r| r.region_type == RegionType::Free)
+                .expect("a free region");
+            regions[idx].region_type = RegionType::Old;
+            let (ptr, _) = regions[idx]
+                .bump_alloc(HEADER_SIZE + SLOT_SIZE, 8, "test")
+                .expect("room for one object");
+            let header = ObjectHeader::new(
+                ClassId::new(1),
+                ObjectKind::Object,
+                ArrayElementType::Reference,
+                0,
+                1,
+            );
+            unsafe {
+                std::ptr::write(ptr as *mut ObjectHeader, header);
+                ObjectRef::from_raw(ptr)
+            }
+        };
+        gc.with_regions_mut(|_| {}); // republish the counters after the hand edit
+        gc.set_field(holder, 0, Value::Object(Some(h)));
+
+        // Young churn so the pause has a non-empty CSet.
+        let _churn = gc.alloc_object(ClassId::new(2), 1);
+        let mut roots: Vec<ObjectRef> = vec![];
+        gc.young_collection(&mut roots, &NoopMonitors);
+
+        assert_eq!(
+            gc.count_regions(RegionType::HumongousStart),
+            1,
+            "the span is held by the untouched Old object"
+        );
+        assert_eq!(gc.get_array_element(h, 5).unwrap(), Value::Long(0xABCD));
+        let last = gc
+            .pause_history_snapshot()
+            .last()
+            .cloned()
+            .expect("a pause was recorded");
+        let occupied = gc.num_regions() - free_region_count(&gc);
+        assert!(
+            (last.phases.fixup_regions as usize) < occupied,
+            "the fix-up walked {} of {occupied} occupied regions — the humongous \
+             span forced a wide walk",
+            last.phases.fixup_regions
+        );
+
+        gc.set_field(holder, 0, Value::Object(None));
+        let _churn = gc.alloc_object(ClassId::new(2), 1);
+        gc.young_collection(&mut roots, &NoopMonitors);
+        assert_eq!(
+            gc.count_regions(RegionType::HumongousStart),
+            0,
+            "nothing references the span any more, and its rset entry alone \
+             must not keep it"
+        );
+    }
+
     #[test]
     fn a_young_pause_reclaims_a_humongous_span_nothing_references() {
         let gc = make_collector();
@@ -19336,6 +20221,232 @@ mod tests {
     }
 
     // -- Mixed collection --
+
+    /// Ten-findings item 2: a mixed pause's fix-up is narrow, and the narrow
+    /// set still carries the GC-internal edge rebuild a LATER pause depends
+    /// on. An untouched Old region proves the narrowing; a rootless young
+    /// pause afterwards proves the rebuild.
+    #[test]
+    fn a_narrow_mixed_pause_still_records_the_edges_a_later_young_pause_needs() {
+        let gc = make_collector();
+        let region_size = gc.config.region_size;
+        let (a_idx, b_idx, c_idx) = (1usize, 2usize, 3usize);
+        // Three Old regions built by hand. A holds the only reference to an
+        // object in B; B is the one mixed candidate (64 bytes live); A and C
+        // are far too live to be candidates, and C is touched by nothing.
+        let (a_obj, b_obj) = {
+            let mut regions = gc.regions.write();
+            for (idx, live) in [(a_idx, region_size - 64), (b_idx, 64), (c_idx, region_size)] {
+                regions[idx].region_type = RegionType::Old;
+                regions[idx].live_bytes = live;
+                regions[idx].gc_efficiency = live as f64 / region_size as f64;
+            }
+            let mut place = |idx: usize| -> ObjectRef {
+                let (ptr, _) = regions[idx]
+                    .bump_alloc(HEADER_SIZE + SLOT_SIZE, 8, "test")
+                    .expect("room for one object");
+                let header = ObjectHeader::new(
+                    ClassId::new(1),
+                    ObjectKind::Object,
+                    ArrayElementType::Reference,
+                    0,
+                    1,
+                );
+                unsafe {
+                    std::ptr::write(ptr as *mut ObjectHeader, header);
+                    ObjectRef::from_raw(ptr)
+                }
+            };
+            let a = place(a_idx);
+            let b = place(b_idx);
+            let _ = place(c_idx);
+            (a, b)
+        };
+        gc.with_regions_mut(|_| {});
+        gc.set_field(b_obj, 0, Value::Int(0x1234));
+        gc.set_field(a_obj, 0, Value::Object(Some(b_obj))); // barrier: B.rset += A
+
+        gc.marking_complete.store(true, Ordering::Relaxed);
+        gc.mixed_gc_remaining.store(1, Ordering::Relaxed);
+        let b_before = b_obj.as_ptr();
+        let mut roots = vec![a_obj];
+        let r = gc.mixed_collection(&mut roots, &NoopMonitors);
+        assert!(r.stats.objects_copied >= 1, "B's object must have been evacuated");
+        let moved = match gc.get_field(roots[0], 0) {
+            Value::Object(Some(o)) => o,
+            other => panic!("A lost its reference: {other:?}"),
+        };
+        assert_ne!(moved.as_ptr(), b_before);
+        assert_eq!(gc.get_field(moved, 0), Value::Int(0x1234));
+
+        let last = gc
+            .pause_history_snapshot()
+            .last()
+            .cloned()
+            .expect("the mixed pause was recorded");
+        let occupied = gc.num_regions() - free_region_count(&gc);
+        assert!(
+            (last.phases.fixup_regions as usize) < occupied,
+            "the mixed fix-up was wide: it walked {} of {occupied} occupied regions",
+            last.phases.fixup_regions
+        );
+
+        // The copy now lives in a region the next young pause collects, and
+        // that pause has NO roots: only the edge the narrow rebuild recorded
+        // for A keeps it alive.
+        let mut no_roots: Vec<ObjectRef> = vec![];
+        gc.young_collection(&mut no_roots, &NoopMonitors);
+        let kept = match gc.get_field(a_obj, 0) {
+            Value::Object(Some(o)) => o,
+            other => panic!("A lost its reference across the young pause: {other:?}"),
+        };
+        assert_eq!(gc.get_field(kept, 0), Value::Int(0x1234));
+    }
+
+    /// Item 2: a completed mark cycle leaves a budget of mixed pauses; when no
+    /// Old region is worth collecting, the phase ends at the first of them
+    /// instead of burning all eight as whole-heap young pauses.
+    #[test]
+    fn the_mixed_phase_ends_early_when_no_old_region_is_worth_collecting() {
+        let gc = make_collector();
+        gc.marking_complete.store(true, Ordering::Relaxed);
+        gc.mixed_gc_remaining.store(8, Ordering::Relaxed);
+        assert!(gc.needs_mixed_gc());
+        let _churn = gc.alloc_object(ClassId::new(1), 1);
+        let mut roots: Vec<ObjectRef> = vec![];
+        let _ = GarbageCollector::collect_garbage(&gc, &stw(), &mut roots, &NoopMonitors);
+        assert!(
+            !gc.needs_mixed_gc(),
+            "with no candidate the phase must end, not count down"
+        );
+        assert_eq!(gc.mixed_gc_remaining.load(Ordering::Relaxed), 0);
+        let last = gc
+            .pause_history_snapshot()
+            .last()
+            .cloned()
+            .expect("a pause was recorded");
+        assert_eq!(last.collection_type, G1CollectionType::YoungOnly);
+    }
+
+    /// Item 3: the live threshold keeps a nearly-live region out of every
+    /// selector, and the waste floor ends the phase when what is left to
+    /// reclaim is not worth a pause.
+    #[test]
+    fn the_mixed_phase_respects_the_live_threshold_and_the_waste_floor() {
+        let gc = G1Collector::new(G1CollectorConfig {
+            heap_waste_percent: 5,
+            ..small_config()
+        });
+        let region_size = gc.config.region_size;
+        gc.with_regions_mut(|regions| {
+            regions[1].region_type = RegionType::Old;
+            regions[1].set_cursor(region_size);
+            regions[1].live_bytes = region_size * 9 / 10;
+            regions[1].gc_efficiency = 0.9;
+        });
+        assert!(
+            gc.select_old_regions_for_mixed_gc().is_empty(),
+            "90% live is above the 85% threshold"
+        );
+        assert!(!gc.mixed_phase_has_work());
+
+        gc.with_regions_mut(|regions| {
+            regions[2].region_type = RegionType::Old;
+            regions[2].set_cursor(region_size);
+            regions[2].live_bytes = region_size / 2;
+            regions[2].gc_efficiency = 0.5;
+        });
+        assert_eq!(gc.select_old_regions_for_mixed_gc(), vec![2]);
+        assert!(
+            gc.mixed_phase_has_work(),
+            "512 KiB of garbage is 6.25% of an 8 MiB heap, above the 5% floor"
+        );
+
+        gc.with_regions_mut(|regions| {
+            regions[2].live_bytes = region_size * 78 / 100;
+            regions[2].gc_efficiency = 0.78;
+        });
+        assert_eq!(
+            gc.select_old_regions_for_mixed_gc(),
+            vec![2],
+            "78% live is still a candidate by the threshold"
+        );
+        assert!(
+            !gc.mixed_phase_has_work(),
+            "224 KiB of garbage is 2.7% of the heap, below the 5% floor"
+        );
+
+        // …until the Free pool is tight: then the floor is waived, because the
+        // mixed sequence is the only thing that can relieve the pressure.
+        consume_regions(&gc, 5); // 8 regions, 2 Old, 5 consumed -> 1 Free, under 2x the 25% trigger
+        assert!(
+            gc.mixed_phase_has_work(),
+            "with the Free pool under twice the trigger the waste floor must not refuse work"
+        );
+    }
+
+    /// Item 10: the mixed copy budget is charged for the fix-up walk. Two
+    /// cheap candidates both fit a budget nothing else has spent; once the
+    /// walk is expected to take the whole goal, only the forward-progress
+    /// region is taken.
+    #[test]
+    fn the_mixed_copy_budget_is_charged_for_the_fix_up_walk() {
+        // `old_cset_region_threshold_percent` caps at max(1, 10% of 8) = 1
+        // region; lift it so the budget is what decides.
+        let gc = G1Collector::new(G1CollectorConfig {
+            old_cset_region_threshold_percent: 100,
+            ..small_config()
+        });
+        gc.with_regions_mut(|regions| {
+            for idx in [1usize, 2] {
+                regions[idx].region_type = RegionType::Old;
+                regions[idx].set_cursor(1000);
+                regions[idx].live_bytes = 100;
+                regions[idx].gc_efficiency = 0.1;
+            }
+        });
+        assert_eq!(gc.select_old_regions_for_mixed_gc(), vec![1, 2]);
+        gc.fixup_ns_ema.store(
+            gc.config.max_gc_pause_ms.saturating_mul(1_000_000),
+            Ordering::Relaxed,
+        );
+        assert_eq!(gc.old_cset_copy_budget_ns(), 0);
+        assert_eq!(
+            gc.select_old_regions_for_mixed_gc(),
+            vec![1],
+            "with the goal spent on the walk, only the forward-progress region is taken"
+        );
+    }
+
+    /// Item 9: a long reference array is marked in chunks — one pop marks the
+    /// array and scans its first chunk, and the remainder waits in the gray
+    /// set as a continuation entry rather than being scanned under one hold of
+    /// the region guard. Every element is still reached.
+    #[test]
+    fn a_long_reference_array_is_marked_in_chunks() {
+        let gc = make_collector();
+        let len = MARK_ARRAY_CHUNK * 2 + 7;
+        let arr = gc.alloc_array(ClassId::new(7), ArrayElementType::Reference, len);
+        let mut leaves = Vec::with_capacity(len);
+        for i in 0..len {
+            let o = gc.alloc_object(ClassId::new(1), 0);
+            gc.set_array_element(arr, i, Value::Object(Some(o))).unwrap();
+            leaves.push(o);
+        }
+        gc.start_concurrent_mark(&stw());
+        gc.remark(&stw(), &[arr]);
+        assert!(!gc.concurrent_mark_step(1), "one pop leaves work behind");
+        assert_eq!(
+            gc.dbg_gray_chunk_entries(),
+            1,
+            "the array's remainder is one continuation entry"
+        );
+        while !gc.concurrent_mark_step(usize::MAX) {}
+        for (i, o) in leaves.iter().enumerate() {
+            assert!(gc.dbg_is_marked(o.as_ptr() as usize), "leaf {i} was not reached");
+        }
+        gc.cleanup(&stw());
+    }
 
     #[test]
     fn mixed_collection_selects_old_regions() {
@@ -21582,10 +22693,18 @@ mod tests {
     fn consume_regions(gc: &G1Collector, count: usize) {
         let full = gc.config.region_size;
         let mut regions = gc.regions.write();
-        for r in regions.iter_mut().take(count) {
+        // Item 8: young claims come from the TOP of the table, so a fixture
+        // that wants "the next claim finds the pool nearly empty" must fill
+        // from the top too — including whatever Eden region an earlier
+        // allocation in the test already claimed there.
+        for r in regions.iter_mut().rev().take(count) {
             r.region_type = RegionType::Eden;
             r.set_cursor(full);
         }
+        // Item 6: the Free/young counters are maintained at the claim funnel,
+        // which this fixture bypasses — republish them from the table the way
+        // every pause does at its end.
+        gc.publish_region_census(&regions);
     }
 
     /// G1AUD-11 — the post-pause remembered-set completeness invariant.
@@ -21867,8 +22986,8 @@ mod tests {
         let sources: RegionSet = [3usize].into_iter().collect();
         let regions = gc.regions.read();
         let narrow = gc
-            .phase4_regions_to_walk(&regions, Some(&pre), &sources, false)
-            .expect("narrowing is on and no census is wanted");
+            .phase4_regions_to_walk(&regions, Some(&pre), &sources)
+            .expect("narrowing is on");
 
         assert!(
             narrow.contains(&3),
@@ -21885,31 +23004,23 @@ mod tests {
         );
     }
 
-    /// …and the two things that must still force the WIDE walk.
+    /// …and the two things that must still force the WIDE walk. (The
+    /// humongous census used to be a third; ten-findings item 1 moved that
+    /// question to the spans' remembered sets, so a humongous span no longer
+    /// widens anything.)
     #[test]
-    fn the_fixup_stays_wide_for_the_humongous_census_and_without_a_snapshot() {
+    fn the_fixup_stays_wide_without_a_usable_snapshot() {
         let gc = G1Collector::new(many_region_config());
-        let pre: Vec<(RegionType, usize)> = {
-            let regions = gc.regions.read();
-            regions.iter().map(|r| (r.region_type, r.cursor())).collect()
-        };
         let sources = RegionSet::new();
         let regions = gc.regions.read();
 
         assert!(
-            gc.phase4_regions_to_walk(&regions, Some(&pre), &sources, true)
-                .is_none(),
-            "\"nothing in the heap references this span\" is a whole-heap claim; \
-             the census must force the wide walk"
-        );
-        assert!(
-            gc.phase4_regions_to_walk(&regions, None, &sources, false)
-                .is_none(),
+            gc.phase4_regions_to_walk(&regions, None, &sources).is_none(),
             "no snapshot means no way to know what changed — fail wide"
         );
         let short = vec![(RegionType::Free, 0usize); 2];
         assert!(
-            gc.phase4_regions_to_walk(&regions, Some(&short), &sources, false)
+            gc.phase4_regions_to_walk(&regions, Some(&short), &sources)
                 .is_none(),
             "a snapshot that does not describe this region table must fail wide"
         );
@@ -22173,7 +23284,14 @@ mod tests {
         // only asks which region the address falls in and what type that region
         // is — so synthetic in-region addresses are exactly what a real
         // reference slot looks like to it.
-        let (t1, t2) = (holder + 1, holder + 2);
+        // Item 8 places young regions at the TOP of the table, so the holder
+        // may be the last region; take the two targets from whichever side has
+        // room.
+        let (t1, t2) = if holder + 2 < gc.num_regions() {
+            (holder + 1, holder + 2)
+        } else {
+            (holder - 1, holder - 2)
+        };
         let (a1, a2) = {
             let mut regions = gc.regions.write();
             regions[t1].region_type = RegionType::Eden;
@@ -22202,9 +23320,11 @@ mod tests {
         }
 
         out.sort_unstable();
+        let mut expected = vec![(t1, holder), (t2, holder)];
+        expected.sort_unstable();
         assert_eq!(
             out,
-            vec![(t1, holder), (t2, holder)],
+            expected,
             "fifteen slots naming region {t1} are ONE edge, not fifteen — and \
              the distinct target {t2} must still be recorded"
         );
@@ -23950,6 +25070,8 @@ mod tests {
             string_dedup_enabled: false,
             mixed_gc_count_target: 8,
             old_cset_region_threshold_percent: 10,
+            mixed_gc_live_threshold_percent: 85,
+            heap_waste_percent: 0,
         }
     }
 

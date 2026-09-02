@@ -515,6 +515,12 @@ pub struct VmConfig {
     /// `-XX:ParallelGCThreads=<n>` — GC worker threads. `None` derives the
     /// count from the machine (F-13).
     pub g1_parallel_gc_threads: Option<usize>,
+    /// `-XX:G1MixedGCLiveThresholdPercent=<n>` — an Old region at or above
+    /// this percent live is never a mixed-collection candidate.
+    pub g1_mixed_gc_live_threshold_percent: Option<u8>,
+    /// `-XX:G1HeapWastePercent=<n>` — the mixed phase ends once the
+    /// candidates' reclaimable garbage is below this percent of the heap.
+    pub g1_heap_waste_percent: Option<u8>,
 
     /// Enable compressed object pointers (`-XX:+UseCompressedOops`).
     /// Reduces memory usage by using 32-bit references for heaps < 32 GB.
@@ -942,6 +948,8 @@ impl Default for VmConfig {
             g1_parallel_gc_threads: None,
             g1_max_gc_pause_ms: None,
             g1_string_dedup: None,
+            g1_mixed_gc_live_threshold_percent: None,
+            g1_heap_waste_percent: None,
             use_compressed_oops: false,
             use_compact_headers: false,
             shared_archive_file: None,

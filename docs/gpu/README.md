@@ -205,9 +205,10 @@ Thin, JVM-agnostic CUDA Driver API wrapper. **Two backends:**
   without a CUDA toolkit.
 - `backend_cuda.rs` — gated by the `cuda` feature. Real bindings via
   the [`cudarc`](https://crates.io/crates/cudarc) crate (pinned to
-  `cuda-12060`). Runs a 3-stream context internally (H2D / compute /
-  D2H) with per-buffer `last_write` event ordering so `launch_raw` and
-  `launch_on_stream` compose safely without manual synchronization.
+  `cuda-12060`). Owns two copy streams for the synchronous transfers
+  and orders every kernel launch by per-buffer `last_write` events;
+  owns the device-allocation pool (`CRATONVM_GPU_DEVICE_POOL=0`
+  disables it).
 
 Public surface:
 
@@ -220,7 +221,7 @@ Public surface:
 | `KernelArgs` | Builder pattern: `push_device_ptr`, `push_i32`/`i64`/`f32`/`f64`. |
 | `LaunchConfig` + `LaunchConfig::elementwise(n)` / `elementwise_for_kernel` | Grid/block dimensions; the latter queries `cuOccupancyMaxPotentialBlockSize` and is what dispatch actually uses. |
 | `Stream` / `Event` | `Event::query()` (non-blocking probe), `Stream::add_host_callback` (`cuLaunchHostFunc` — callback must not call any CUDA API), `record_event`/`wait_event`. |
-| `module.launch_raw(&ctx, name, &cfg, args)` / `launch_on_stream` | Kernel launch, sync or stream-scoped. |
+| `module.launch_on_stream(&ctx, name, &cfg, args, &stream)` | Kernel launch, always on a caller-created stream. |
 | `DeviceError` | `NoDriver` + per-stage variants (`Driver`, `Load`, `KernelNotFound`, `Launch`, `Memcpy`). |
 
 ### 2. `jit-cuda` (crate) — Java bytecode → PTX lowering

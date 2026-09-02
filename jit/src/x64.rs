@@ -250,6 +250,8 @@ mod deopt_stubs;
 mod objects;
 pub(crate) use objects::note_ungated_ref_store;
 pub use objects::ref_store_site_counts;
+pub use null_check_elim::receiver_null_check_counts;
+pub use null_check_elim::receiver_null_check_implicit_count;
 mod osr;
 mod simd;
 
@@ -1335,6 +1337,17 @@ struct Compiler {
     /// emission passes to skip the `TEST reg, reg; JZ throw_npe`
     /// sequence when the receiver is already known non-null.
     null_check_info: crate::null_check_elim::NullCheckInfo,
+    /// Implicit null-check sites whose faulting instruction has been emitted
+    /// but whose recovery address is not yet known — `(fault_off, bc_pc)`.
+    /// Drained by `bind_implicit_null_recovery` when the slow path is bound;
+    /// a non-empty vector at the end of a compile means a site was elided
+    /// without a recovery address and fails the compile.
+    implicit_null_pending: Vec<(usize, usize)>,
+    /// Resolved `(fault_off, recover_off)` pairs, registered against the final
+    /// code address once the artifact exists. Offsets rather than addresses:
+    /// the buffer base is stable from allocation, but registration must not
+    /// happen until the compile is known to have succeeded.
+    implicit_null_sites: Vec<(usize, usize)>,
     /// T5.2.15 — SIMD element-wise loops detected via SuperWord.
     ///
     /// Each entry describes one vectorizable `out[i] = a[i] OP b[i]`
@@ -2742,6 +2755,8 @@ impl Compiler {
             shadow_pushed_any: false,
             induction_vars: Vec::new(),
             null_check_info: crate::null_check_elim::NullCheckInfo::default(),
+            implicit_null_pending: Vec::new(),
+            implicit_null_sites: Vec::new(),
             simd_element_wise_loops: Vec::new(),
             bulk_zero_byte_fill_loops: Vec::new(),
             bulk_set_byte_stride_loops: Vec::new(),
@@ -2907,6 +2922,80 @@ impl Compiler {
     /// inline null-check stubs at array store/load sites.
     pub(crate) fn is_local_nonnull(&self, pc: usize, local: usize) -> bool {
         self.null_check_info.is_nonnull(pc, local)
+    }
+
+    /// Any implicit null-check site still waiting for a recovery address?
+    ///
+    /// Checked once at the end of a compile. A `true` here means a receiver
+    /// check was elided and the slow path it should fault into was never
+    /// bound — the site would run unguarded and its NPE would arrive as a
+    /// SIGSEGV. The caller fails the compile.
+    pub(crate) fn has_unbound_implicit_null_sites(&self) -> bool {
+        !self.implicit_null_pending.is_empty()
+    }
+
+    /// Bind every pending implicit null-check site to the slow path that
+    /// starts at the current buffer position, **after verifying that the
+    /// instruction we declined to guard actually faults on a null receiver.**
+    ///
+    /// # Why the bytes are decoded rather than trusted
+    ///
+    /// `emit_trusted_oop_receiver_check_at` elides the check and records the
+    /// offset the NEXT instruction will occupy. Which instruction that is
+    /// belongs to the arm that called it, and an edit there — inserting a
+    /// register move, reordering a guard — would silently move the fault onto
+    /// an instruction that does not dereference the receiver, or does not
+    /// fault at all. The check would then simply be gone, with nothing to say
+    /// so.
+    ///
+    /// So the emitted bytes are decoded here and required to be
+    /// `MOV r32, [RAX + disp32]` with `disp32` inside the null page. That is
+    /// what the arm emits (the `GC_FLAGS` byte read at `[RAX + 15]`), and the
+    /// displacement bound is the same constant the signal handler screens on,
+    /// so the compiler and the handler agree by construction rather than by
+    /// two people remembering the same number.
+    ///
+    /// # Fail-closed
+    ///
+    /// A mismatch calls `self.fail`, which discards the artifact and sends the
+    /// method back to the interpreter. There is deliberately no path that
+    /// keeps the compile and re-emits the check: the fast path is already
+    /// encoded by now, and squeezing a check back in would move everything
+    /// after it.
+    pub(crate) fn bind_implicit_null_recovery(&mut self) {
+        if self.implicit_null_pending.is_empty() {
+            return;
+        }
+        let recover_off = self.buf.pos();
+        let pending = std::mem::take(&mut self.implicit_null_pending);
+        for (fault_off, bc_pc) in pending {
+            let mut head = [0u8; 6];
+            let ok = {
+                let bytes = self.buf.as_slice();
+                if fault_off + 6 <= bytes.len() {
+                    head.copy_from_slice(&bytes[fault_off..fault_off + 6]);
+                    true
+                } else {
+                    false
+                }
+            };
+            // `MOV r32, r/m32` (0x8B), ModRM mod=10 (disp32) r/m=000 (RAX),
+            // then a little-endian disp32. No REX prefix: both the destination
+            // and the base are low registers in the sequence that reaches
+            // here, so a REX byte means this is a different instruction.
+            let shaped = ok
+                && head[0] == 0x8B
+                && (head[1] & 0xC7) == 0x80
+                && (0..crate::implicit_null::NULL_PAGE_LIMIT as i32)
+                    .contains(&i32::from_le_bytes([head[2], head[3], head[4], head[5]]));
+            if !shaped {
+                self.dbg_last_pc = bc_pc;
+                self.fail("implicit-null-shape");
+                self.implicit_null_sites.clear();
+                return;
+            }
+            self.implicit_null_sites.push((fault_off, recover_off));
+        }
     }
 
     /// Raise the compile-wide failure flag, naming the site that raised it.

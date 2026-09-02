@@ -266,6 +266,28 @@ fn maybe_dump_shutdown_reports() {
             // printing both is what separates that from "emitted and refused".
             let (bump, stub) = cratonvm_jit::runtime_lowering::ir_alloc_site_counts();
             eprintln!("[cratonvm] optimizing-tier allocations: inline-bump={bump} stub-only={stub}");
+            // getfield receiver null checks. The PAIR, never the ratio: an
+            // all-zero pair means the trusted-oop arm was never reached at all
+            // (no inline getfield compiled), while zero-elided-with-nonzero-
+            // emitted means it WAS reached and the dataflow proved nothing.
+            // Those look identical as a percentage and want opposite fixes.
+            let (nn_elided, nn_emitted) = cratonvm_jit::x64::receiver_null_check_counts();
+            let nn_implicit = cratonvm_jit::x64::receiver_null_check_implicit_count();
+            eprintln!(
+                "[cratonvm] getfield receiver null checks: elided={nn_elided} \
+                 implicit={nn_implicit} emitted={nn_emitted}"
+            );
+            // Implicit null-check table. All four, because no one of them is a
+            // verdict: `registered` alone cannot separate "off" from "on and
+            // nothing qualified"; `recovered` alone cannot separate "no null
+            // receiver occurred" from "the entry was missing"; and a non-zero
+            // `declined` is the reading that says the table filled up and the
+            // feature has stopped applying to new compiles.
+            let (in_reg, in_ret, in_rec, in_dec) = cratonvm_jit::implicit_null::counts();
+            eprintln!(
+                "[cratonvm] implicit null checks: registered={in_reg} retired={in_ret} \
+                 recovered={in_rec} declined={in_dec}"
+            );
         }
         // Reference loads whose slot did NOT hold a reference, contained by
         // `GETFIELD_EXPECT_REFERENCE` instead of being handed to compiled code
@@ -1086,6 +1108,25 @@ struct Args {
         overrides_with = "g1_max_pause"
     )]
     g1_max_pause: Option<String>,
+
+    /// `-XX:G1MixedGCLiveThresholdPercent=<n>` → an Old region at or above
+    /// this percent live is never a mixed-collection candidate (honoured
+    /// under G1).
+    #[arg(
+        long = "XX:G1MixedLiveThreshold",
+        value_name = "PCT",
+        overrides_with = "g1_mixed_live_threshold"
+    )]
+    g1_mixed_live_threshold: Option<String>,
+
+    /// `-XX:G1HeapWastePercent=<n>` → the mixed phase ends once its candidates
+    /// hold less garbage than this percent of the heap (honoured under G1).
+    #[arg(
+        long = "XX:G1HeapWaste",
+        value_name = "PCT",
+        overrides_with = "g1_heap_waste"
+    )]
+    g1_heap_waste: Option<String>,
 
     /// `-XX:ParallelGCThreads=<n>` → GC evacuation worker count (honoured
     /// under G1). Absent means the count is derived from the machine.
@@ -2199,6 +2240,14 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             i += 1;
         } else if let Some(v) = a.strip_prefix("-XX:MaxGCPauseMillis=") {
             out.push("--XX:MaxGCPause".into());
+            out.push(v.to_string());
+            i += 1;
+        } else if let Some(v) = a.strip_prefix("-XX:G1MixedGCLiveThresholdPercent=") {
+            out.push("--XX:G1MixedLiveThreshold".into());
+            out.push(v.to_string());
+            i += 1;
+        } else if let Some(v) = a.strip_prefix("-XX:G1HeapWastePercent=") {
+            out.push("--XX:G1HeapWaste".into());
             out.push(v.to_string());
             i += 1;
         } else if let Some(v) = a.strip_prefix("-XX:MaxDirectMemorySize=") {
@@ -4516,6 +4565,20 @@ fn run() -> Result<()> {
             ),
         }
     }
+    if let Some(s) = &args.g1_mixed_live_threshold {
+        match s.parse::<u8>() {
+            Ok(p) if (1..=100).contains(&p) => config.g1_mixed_gc_live_threshold_percent = Some(p),
+            _ => eprintln!(
+                "Warning: ignoring -XX:G1MixedGCLiveThresholdPercent={s} (expected 1..=100)"
+            ),
+        }
+    }
+    if let Some(s) = &args.g1_heap_waste {
+        match s.parse::<u8>() {
+            Ok(p) if p <= 100 => config.g1_heap_waste_percent = Some(p),
+            _ => eprintln!("Warning: ignoring -XX:G1HeapWastePercent={s} (expected 0..=100)"),
+        }
+    }
     if let Some(s) = &args.g1_string_dedup {
         config.g1_string_dedup = Some(s == "true");
     }
@@ -4901,6 +4964,11 @@ fn run() -> Result<()> {
             // the actionable diagnostic for "main thread is in native code".
             cratonvm_vm::dispatch_trace::enable();
         }
+        // Arm the interpreter's dump gate BEFORE the watchdog exists, so a
+        // thread that is already deep inside one `execute_frame` when the
+        // deadline fires still observes the request (see
+        // `SharedVm::arm_stack_dump_watch`).
+        vm.shared.arm_stack_dump_watch();
         let shared_for_watchdog = std::sync::Arc::clone(&vm.shared);
         // RKC16N.5 — capture the audit-dump paths into the watchdog
         // thread so a hung run still produces a missing-natives
@@ -5780,9 +5848,13 @@ fn run() -> Result<()> {
             let resig = cratonvm_vm::jit::xt_root_scan::XT_PEER_RESIGNALS.load(O::Relaxed);
             let saved =
                 cratonvm_vm::jit::xt_root_scan::XT_PEERS_CLASSIFIED_AFTER_RETRY.load(O::Relaxed);
+            let hw_pin =
+                cratonvm_vm::jit::xt_root_scan::XT_HELPER_WINDOWS_PINNED.load(O::Relaxed);
+            let hw_ref =
+                cratonvm_vm::jit::xt_root_scan::XT_HELPER_WINDOWS_REFUSED.load(O::Relaxed);
             eprintln!(
                 "[GC] xt_peer_scan: unclassified_peers={peers} cycles_with_unclassified={cycles} \
-                 taken_over={taken} xt_roots={roots} helper_windows={hw} \
+                 taken_over={taken} xt_roots={roots} helper_windows={hw} hw_pinned={hw_pin} hw_refused={hw_ref} \
                  resignals={resig} classified_after_retry={saved} enabled={}",
                 cratonvm_vm::jit::xt_root_scan::enabled(),
             );

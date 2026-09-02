@@ -85,11 +85,18 @@
 //! one machine (1251) is measured; the `MS932`/`GBK`/`MS949`/`MS950` rows of
 //! [`windows_acp_name`] are still from the JDK's table and not from a host.
 //!
-//! `sun.jnu.encoding` is deliberately NOT derived from here. It decides how
-//! FILE NAMES are encoded, so moving it changes class loading rather than
-//! printing — a different blast radius, and the staging in
-//! `stdout-encoding-differs-from-hotspot-on-windows-20260901.md` §9 keeps it
-//! out of this step on purpose.
+//! `sun.jnu.encoding` IS derived, since 2026-09-02, and the reason it was not
+//! before is worth keeping: it "decides how FILE NAMES are encoded, so moving
+//! it changes class loading rather than printing". That is true of **HotSpot**
+//! and measurably not of this VM — `sun.nio.fs.UnixPath.encode` consults the
+//! key and refuses a name it cannot represent, while CratonVM's path handling
+//! is Rust-side and never reads it. MEASURED both ways, both platforms; see
+//! [`native_encoding`]'s callers and §12 of
+//! `stdout-encoding-differs-from-hotspot-on-windows-20260901.md`.
+//!
+//! So deriving it is a FIDELITY change and cannot be a behavioural one. The
+//! residual that leaves is stated there rather than hidden: under a C locale
+//! this VM now reports a narrower encoding than its own I/O actually honours.
 
 use std::sync::OnceLock;
 
