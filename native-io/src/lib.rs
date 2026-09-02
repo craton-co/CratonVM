@@ -8624,6 +8624,15 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
     // `SyntheticStub` alone cannot do (`NativeKind::allowed_in` is
     // unconditionally true for `Compatible`).
     //
+    // AND IT COSTS NOTHING ELSE. The whole `java.util` corpus was re-run in
+    // compatible mode with the flag ON -- UtilCoverage, UtilCoverage4,
+    // UtilTail2, UtilTail, Collections, MapViews, Properties, ViewIdentity,
+    // Base64 and UtilUnshadowed, 1631 rows -- and every one is byte-identical
+    // to its flag-OFF run. Only `ScannerShadowSweep` moves, 50 diff lines to 0.
+    // A retirement that closes 25 rows is worth little if it opens others
+    // somewhere the probe for THIS class cannot see, so the corpus is the
+    // check, not the class's own probe.
+    //
     // Throughput says leave it off. `apps/probes/ScannerBench`, A/B/B/A
     // interleaved so load drift cannot be mistaken for the effect, ns per scan
     // of a 40-item source:
