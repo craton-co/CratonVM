@@ -1142,7 +1142,7 @@ mod windows_fault {
         // not name, and `CRATONVM_SYMBOLIZE` resolves an RVA against WHATEVER
         // binary it is handed — a near-miss build answers with plausible,
         // entirely wrong function names and four-digit offsets. That is exactly
-        // how `known-issues/hibernate/hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md`
+        // how `internal/fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md`
         // spent two sessions unable to symbolize eight of its own crash logs:
         // by the time anyone looked, nothing recorded which build produced
         // them, and ten surviving binaries all disagreed.
@@ -1174,6 +1174,82 @@ mod windows_fault {
                              carrying BOTH of these)",
                             timestamp, size_of_image
                         );
+                        // ...and WHICH PDB resolves them.
+                        //
+                        // `timestamp` + `size_of_image` identify the EXE, which
+                        // is what you need if you still have ten candidate
+                        // binaries to sort through. The RSDS record in the
+                        // debug directory identifies the **PDB**, by the same
+                        // GUID+age key every symbol server and every debugger
+                        // uses — so a crash log carrying it stays symbolizable
+                        // when the exe is long gone, which is the state the
+                        // JSON/XML page spent two sessions stuck in. 40 bytes
+                        // here replaces "keep a 165 MB binary beside every run
+                        // log".
+                        //
+                        // Bounds: `debug_rva`/`debug_size` and every offset
+                        // derived from them are checked against `size_of_image`
+                        // before use. A fault inside a fault handler is a lost
+                        // report, so nothing here trusts a header field.
+                        let soi = size_of_image as usize;
+                        // IMAGE_OPTIONAL_HEADER64.DataDirectory[6] (Debug) is
+                        // at NT + 24 + 112 + 6*8.
+                        let dd = nt + 24 + 112 + 6 * 8;
+                        let debug_rva =
+                            core::ptr::read_unaligned(dd as *const u32) as usize;
+                        let debug_size =
+                            core::ptr::read_unaligned((dd + 4) as *const u32) as usize;
+                        // IMAGE_DEBUG_DIRECTORY is 28 bytes.
+                        if debug_rva != 0
+                            && debug_size >= 28
+                            && debug_rva.saturating_add(debug_size) <= soi
+                        {
+                            let mut off = 0usize;
+                            while off + 28 <= debug_size {
+                                let e = module_base + debug_rva + off;
+                                // .Type at +12, .SizeOfData at +16,
+                                // .AddressOfRawData at +20.
+                                let ty = core::ptr::read_unaligned((e + 12) as *const u32);
+                                let sz =
+                                    core::ptr::read_unaligned((e + 16) as *const u32) as usize;
+                                let raw =
+                                    core::ptr::read_unaligned((e + 20) as *const u32) as usize;
+                                // 2 == IMAGE_DEBUG_TYPE_CODEVIEW. An RSDS
+                                // record is 4 (magic) + 16 (GUID) + 4 (age) +
+                                // a NUL-terminated pdb path.
+                                if ty == 2
+                                    && sz >= 24
+                                    && raw != 0
+                                    && raw.saturating_add(sz) <= soi
+                                    && core::ptr::read_unaligned(
+                                        (module_base + raw) as *const u32,
+                                    ) == 0x5344_5352
+                                {
+                                    let g = module_base + raw + 4;
+                                    let d1 = core::ptr::read_unaligned(g as *const u32);
+                                    let d2 = core::ptr::read_unaligned((g + 4) as *const u16);
+                                    let d3 = core::ptr::read_unaligned((g + 6) as *const u16);
+                                    let d4: [u8; 8] =
+                                        core::ptr::read_unaligned((g + 8) as *const [u8; 8]);
+                                    let age =
+                                        core::ptr::read_unaligned((g + 16) as *const u32);
+                                    let mut guid = String::with_capacity(40);
+                                    let _ = write!(guid, "{d1:08X}{d2:04X}{d3:04X}");
+                                    for b in d4 {
+                                        let _ = write!(guid, "{b:02X}");
+                                    }
+                                    let _ = writeln!(
+                                        report,
+                                        "#  exe pdb id: {guid}{age:X} \
+                                         (the symbol-server key — a PDB with this \
+                                         GUID+age symbolizes every RVA above, \
+                                         with or without the exe)"
+                                    );
+                                    break;
+                                }
+                                off += 28;
+                            }
+                        }
                     }
                 }
             }
@@ -1260,7 +1336,7 @@ mod windows_fault {
             // fault, and it answers the question a raw register dump makes the
             // reader answer by hand. It is not hypothetical: all eight crash
             // logs behind
-            // `known-issues/hibernate/hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md`
+            // `internal/fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md`
             // satisfy `fault == r10 + rax*4` — a jump-table load with a
             // garbage index — and nothing said so, so two sessions read the
             // scattered addresses as random corruption instead.
@@ -1592,7 +1668,7 @@ pub fn symbolize_rvas(_rvas: &[usize]) -> Vec<(usize, Option<String>)> {
 ///
 /// A register dump alone leaves this to the reader, and the reader does not do
 /// it: all eight crash logs behind
-/// `docs/known-issues/hibernate/hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md`
+/// `docs/internal/fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md`
 /// satisfy `fault == r10 + rax*4` — an unchecked jump-table load with a garbage
 /// index — and because nothing said so, two sessions read the wildly scattered
 /// fault addresses as random corruption and looked for an environmental cause.
@@ -2289,7 +2365,7 @@ fn install_signal_handlers() {
             // done since 2026-08-22, which Linux did not have. That is not a
             // hypothetical gap: all eight logs behind
             // known-issues/hibernate/
-            // hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md
+            // hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md
             // satisfy `fault == r10 + rax*4`, an unchecked jump-table load with
             // a garbage index, and two sessions read the scattered addresses as
             // random corruption because nothing said so.
@@ -2728,7 +2804,7 @@ not an address\n",
 /// JSON/XML crashes were decoded by testing `fault_address == r10 + rax*4` --
 /// which the Linux report could not have answered, because it never printed
 /// `rax` (docs/known-issues/hibernate/
-/// hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md).
+/// hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md).
 #[cfg(unix)]
 const GREG_RAX: usize = 0;
 #[cfg(unix)]

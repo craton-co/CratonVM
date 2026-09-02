@@ -1667,8 +1667,7 @@ pub(super) fn compile_osr_artifact(
                                     entry,
                                     needs_context: true,
                                     num_params: 1,
-                                    return_type: cratonvm_jit::VARHANDLE_READ_RETURNS
-                                        [slot % cratonvm_jit::VARHANDLE_READ_RETURNS.len()],
+                                    return_type: cratonvm_jit::varhandle_read_slot_return(slot),
                                     guard_class_id: 0,
                                 },
                             ));
