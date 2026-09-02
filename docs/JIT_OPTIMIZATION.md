@@ -717,11 +717,21 @@ is dropped, and the optimizing tier's own explicit check handles them. That is
 worth knowing before reading a `recovered=0` as a broken feature — it is more
 often a measurement of which tier owned the method.
 
-**Throughput is unchanged**, exactly as the elision A/B above predicted it
-would be: an implicit check removes the same two instructions the proof-based
-elision removes, and that pair did not move the clock either. The reason to
-have it is not speed; it is that the sites where no proof exists are precisely
-the ones the elision cannot reach, and this is what covers them.
+**Throughput is unchanged.** A 120-million-call probe reading a field off a
+parameter, five interleaved reps of CPU time, `CRATONVM_C2_SUPERSEDE=0` so the
+arm under test is the one that runs: medians **5.68 s on and 5.55 s off**,
+ranges 5.22-5.78 and 5.12-5.87. Read that as no detectable difference rather
+than as a regression -- the fast path with the flag on is the fast path with it
+off minus two instructions, so it cannot actually be slower, and the overlap is
+the host.
+
+Which is exactly what the elision A/B above predicted: an implicit check
+removes the same `TEST`/`JZ` pair the proof-based elision removes, and that
+pair did not move the clock either. **The reason to have this is not speed.**
+It is that the sites where no proof exists are precisely the ones the elision
+cannot reach, and this is the only thing that covers them -- and that having it
+built, measured and switchable is worth more than an argument about whether it
+would have helped.
 
 **It is off by default**, and that is not timidity. Every other switch in this
 backend has a wrong arm that produces a wrong answer, which a test can catch.
