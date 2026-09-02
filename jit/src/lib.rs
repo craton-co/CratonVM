@@ -18594,6 +18594,7 @@ static COMPILED_FRAME_LINE_COUNTS: [std::sync::atomic::AtomicU64; 8] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
 ];
 
 /// Index into [`COMPILED_FRAME_LINE_COUNTS`]: answered from the safepoint-id
@@ -18673,6 +18674,7 @@ pub fn compiled_frame_line_counts() -> [u64; 8] {
 /// | 13 | `res-inline-locals` | an inlined callee's local frame |
 /// | 14 | `res-inline-merge` | an inlined body's branch-merge area |
 /// | 15 | `res-call-service` | the direct-call argument-service copy |
+/// | 17 | `range-probe-declined` | a `spill_range_fits` PROBE answered no. Separate from `exhausted`, which counts only ranges that were actually being taken — the two used to be the same number, because the probe and the reservation shared one function |
 /// | 16 | `res-helper-args` | a helper's argument buffer or out-parameter (intrinsic dispatch, FFM, the monitor receiver) |
 /// | 12 | `inline-reserve-spent` | what `spill_size` ACTUALLY added (a MAX over compiles). The engagement counter: it equals column 10 with the switch off and column 11 with it on, and inferring which without measuring it is how an inert change ships |
 ///
@@ -18688,7 +18690,7 @@ pub fn compiled_frame_line_counts() -> [u64; 8] {
 /// method, so 19 words is nearly the whole budget for one method and a rounding
 /// error for another. A refusal count of zero plus a large minimum headroom is
 /// a much stronger statement than the refusal count on its own.
-static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 17] = [
+static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 18] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -18699,6 +18701,7 @@ static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 17] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(u64::MAX),
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -18753,11 +18756,14 @@ pub const SPILL_RES_INLINE_MERGE: usize = 14;
 pub const SPILL_RES_CALL_SERVICE: usize = 15;
 /// A helper's argument buffer or out-parameter.
 pub const SPILL_RES_HELPER_ARGS: usize = 16;
+/// A `spill_range_fits` probe answered no. Not a reservation, not in the
+/// partition — a question, counted so making it answerable did not lose it.
+pub const SPILL_RANGE_PROBE_DECLINED: usize = 17;
 /// Alias: the flush's own reservation column, named for `SpillReason::Flush`.
 pub const SPILL_RES_FLUSH: usize = SPILL_FLUSH_RESERVED;
 
 /// Human names, parallel to the slot indices.
-pub const SPILL_CURSOR_SLOT_NAMES: [&str; 17] = [
+pub const SPILL_CURSOR_SLOT_NAMES: [&str; 18] = [
     "flush-calls",
     "flush-reserved",
     "flush-canonical",
@@ -18775,6 +18781,7 @@ pub const SPILL_CURSOR_SLOT_NAMES: [&str; 17] = [
     "res-inline-merge",
     "res-call-service",
     "res-helper-args",
+    "range-probe-declined",
 ];
 
 /// Add `n` to one column. `peak-words` must not go through here — it is a
@@ -18813,8 +18820,8 @@ pub fn note_spill_peak(words: u64, headroom: u64) {
 }
 
 /// Read the census. See [`SPILL_CURSOR_COUNTS`] for the columns.
-pub fn spill_cursor_counts() -> [u64; 17] {
-    let mut out = [0u64; 17];
+pub fn spill_cursor_counts() -> [u64; 18] {
+    let mut out = [0u64; 18];
     for (i, slot) in SPILL_CURSOR_COUNTS.iter().enumerate() {
         out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
     }

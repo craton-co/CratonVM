@@ -7315,6 +7315,14 @@ impl Compiler {
                                 }
                             }
                             if !self.spill_range_fits(scratch_base, 5) {
+                                // Named here rather than inside the probe: this
+                                // is the arraycopy intrinsic's five scratch
+                                // homes, and a bail site of
+                                // `spill-range-exhausted` said only that some
+                                // range somewhere did not fit.
+                                self.fail(
+                                    "singlepass-codegen/arraycopy-scratch-spill-exhausted",
+                                );
                                 return false;
                             }
                             let s_src = scratch_base;
@@ -11136,7 +11144,11 @@ impl Compiler {
                                 // the next bytecode re-allocates spill slots
                                 // from the same base.
                                 let scratch_slots = if is_byte_form { 2 } else { 4 };
-                                if !self.spill_range_fits(self.next_spill_offset, scratch_slots) {
+                                if !self.spill_range_fits(self.next_spill_offset, scratch_slots)
+                                {
+                                    self.fail(
+                                        "singlepass-codegen/intrinsic-pin-spill-exhausted",
+                                    );
                                     return false;
                                 }
                                 let s_recv = self.next_spill_offset;
