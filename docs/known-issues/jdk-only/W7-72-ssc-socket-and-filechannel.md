@@ -7,6 +7,25 @@ This record is what happened when the two blockers were actually paid off — a
 GC-rooted side table for the first, and a cross-crate owner plus a settled
 registrar ordering for the second.
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** The banner above says "Nothing here
+> was built or run as CratonVM". The ratchet this record's residual table names
+> has now been run, on a build from this tree, **by name**:
+>
+> ```text
+> cargo test -p cratonvm-native-api --test guarded_slot_maps \
+>     ssc_p58_socket_stays_deleted_and_the_registrar_stays_gated
+> 1 passed, 0 failed, 10 filtered out
+> ```
+>
+> It was run by NAME rather than by file on purpose. A file that passes proves
+> its tests pass; it does not prove the test a record cites still exists, because
+> a renamed or deleted test leaves the file green and the citation dangling. The
+> `1 passed / 10 filtered out` line is what says the name still resolves.
+>
+> The whole file is green too (11 passed). What this does NOT do is verify the
+> record's field-layout claims: those come from `javap` against a JDK image, and
+> a Rust ratchet cannot check them.
+
 Branch `fix/ssc-socket-wrong-field-and-filechannel-isopen-20260812`.
 **Nothing here was built or run as CratonVM.** Every JDK field layout is
 `javap -p` against the Temurin 25.0.3+9 image on this Windows host
