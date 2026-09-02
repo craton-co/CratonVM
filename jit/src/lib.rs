@@ -6832,10 +6832,18 @@ pub fn inline_site_expansion_cost_tiered(site: &InlineSite, site_is_hot: bool) -
 
 /// Maximum nesting depth of inlined scopes. HotSpot's `MaxInlineLevel`.
 ///
-/// The single-pass emitter cannot nest today (it bails on any callee invoke
-/// that is not a resolver-proven elidable super-`<init>`), so the wiring passes
-/// `depth = 1` and this never binds. It is enforced anyway so a nesting
-/// emitter inherits a limit instead of needing one added.
+/// **This comment used to say the single-pass emitter cannot nest.** It can:
+/// `try_emit_nested_inline` / `emit_guarded_nested_inline` splice inside a
+/// splice, `InlineSite::nested_sites` carries the plan, and
+/// [`MAX_INLINE_NEST_DEPTH`] bounds it at 3 — the depth the JUnit assert chain
+/// needs to collapse. The sentence about the emitter bailing on any callee
+/// invoke that is not a resolver-proven elidable super-`<init>`, and the
+/// `depth = 1` that followed from it, describe the tree before nesting landed.
+///
+/// What is still true is that this constant does not bind: 3 is the live limit
+/// and it is the smaller of the two. Kept as HotSpot's `MaxInlineLevel` so a
+/// resolver that ever plans deeper inherits a ceiling rather than needing one
+/// added.
 pub const INLINE_MAX_DEPTH: usize = 9;
 
 /// Maximum number of copies of the SAME method allowed on one inline stack —

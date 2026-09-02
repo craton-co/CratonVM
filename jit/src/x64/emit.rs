@@ -1098,6 +1098,89 @@ impl Compiler {
         }
     }
 
+    /// `MOVZX r32, byte [base + disp8]` — a one-BYTE header read.
+    ///
+    /// The reference-store gates test bits of the `GC_FLAGS_BYTE_OFFSET` byte,
+    /// which sits 15 bytes into a 16-byte header. The pre-existing readers of
+    /// it use `MOV r32, [base + disp]` — a FOUR-byte read starting at byte 15,
+    /// so three of the four bytes come from the first instance field, or from
+    /// whatever follows a field-less object. That works only because every
+    /// consumer masks the low byte back out. This emitter reads the byte the
+    /// callers actually want.
+    pub(super) fn emit_movzx_r32_mem8(&mut self, dst: u8, base: u8, disp: i32) {
+        let mut rex = 0u8;
+        if dst >= 8 {
+            rex |= 0x44;
+        }
+        if base >= 8 {
+            rex |= 0x41;
+        }
+        if rex != 0 {
+            self.buf.emit_byte(rex);
+        }
+        self.buf.emit(&[0x0F, 0xB6]); // MOVZX r32, r/m8
+        self.emit_modrm_disp_for_base(dst, base, disp);
+    }
+
+    /// `CMP BYTE [base + disp], imm8`.
+    pub(super) fn emit_cmp_mem8_imm8(&mut self, base: u8, disp: i32, imm: u8) {
+        if base >= 8 {
+            self.buf.emit_byte(0x41); // REX.B
+        }
+        self.buf.emit_byte(0x80); // CMP r/m8, imm8  (/7)
+        self.emit_modrm_disp_for_base(7, base, disp);
+        self.buf.emit_byte(imm);
+    }
+
+    /// `CMP r8, BYTE [base + disp]` — an unsigned byte compare against a
+    /// memory-resident threshold. `lhs` must be one of the legacy byte
+    /// registers (AL/CL/DL/BL); an extended register would need a REX prefix
+    /// this encoding does not emit, so it is refused rather than mis-encoded.
+    pub(super) fn emit_cmp_r8_mem8(&mut self, lhs: u8, base: u8, disp: i32) {
+        debug_assert!(lhs < 4, "emit_cmp_r8_mem8: r{lhs} is not a legacy byte register");
+        if base >= 8 {
+            self.buf.emit_byte(0x41); // REX.B
+        }
+        self.buf.emit_byte(0x3A); // CMP r8, r/m8
+        self.emit_modrm_disp_for_base(lhs, base, disp);
+    }
+
+    /// `TEST r8, imm8` for a legacy byte register.
+    pub(super) fn emit_test_r8_imm8(&mut self, reg: u8, imm: u8) {
+        debug_assert!(reg < 4, "emit_test_r8_imm8: r{reg} is not a legacy byte register");
+        self.buf.emit(&[0xF6, 0xC0 | (reg & 7), imm]);
+    }
+
+    /// ModRM byte plus displacement for `[base + disp]`, smallest legal form.
+    ///
+    /// The two x86 base special cases both apply and both are silent
+    /// mis-encodings if ignored: `base & 7 == 0b101` (RBP/R13) has no `mod=00`
+    /// form, and `base & 7 == 0b100` (RSP/R12) needs a SIB byte, which this
+    /// emits as the canonical `0x24`.
+    fn emit_modrm_disp_for_base(&mut self, reg: u8, base: u8, disp: i32) {
+        let needs_disp = disp != 0 || base & 7 == 0b101;
+        let short = (i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&disp);
+        let mode: u8 = if !needs_disp {
+            0x00
+        } else if short {
+            0x40
+        } else {
+            0x80
+        };
+        self.buf.emit_byte(mode | ((reg & 7) << 3) | (base & 7));
+        if base & 7 == 0b100 {
+            self.buf.emit_byte(0x24); // SIB: scale=0, index=none, base=rsp/r12
+        }
+        if needs_disp {
+            if short {
+                // Cast: guarded by `short`.
+                self.buf.emit_byte(disp as u8);
+            } else {
+                self.buf.emit(&disp.to_le_bytes());
+            }
+        }
+    }
+
     /// Emit `MOV r64, r64` (register-to-register move).
     pub(super) fn emit_mov_r64_r64(&mut self, dst: u8, src: u8) {
         // Peephole: skip self-moves (no-op). Matches `emit_mov_reg_reg`.

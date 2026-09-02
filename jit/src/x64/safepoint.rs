@@ -472,7 +472,7 @@ impl Compiler {
         }
         for slot in self.stack.iter() {
             match *slot {
-                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) => keep |= bit(r),
+                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r, ..) => keep |= bit(r),
                 StackSlot::Frame(_) | StackSlot::Xmm(_) => {}
             }
         }
@@ -825,7 +825,7 @@ impl Compiler {
             !self
                 .stack
                 .iter()
-                .any(|slot| matches!(slot, StackSlot::Scratch(_) | StackSlot::Xmm(_)))
+                .any(|slot| matches!(slot, StackSlot::Scratch(..) | StackSlot::Xmm(_)))
         };
         if !survivors_ok {
             if !strict_survivors {
@@ -918,7 +918,7 @@ impl Compiler {
             return false;
         }
         for (slot, &is_oop) in self.stack.iter().zip(self.stack_oop_marks.iter()) {
-            if is_oop && matches!(slot, StackSlot::Scratch(_) | StackSlot::Xmm(_)) {
+            if is_oop && matches!(slot, StackSlot::Scratch(..) | StackSlot::Xmm(_)) {
                 shadow_incomplete_cause::OOP_IN_SCRATCH_OR_XMM.fetch_add(1, Relaxed);
                 return false;
             }
@@ -982,7 +982,7 @@ impl Compiler {
                 continue;
             }
             match self.stack[i] {
-                StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg) => {
+                StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg, ..) => {
                     homes.push(ShadowHome::Reg(reg))
                 }
                 // Operand entry spilled to a frame slot: covered by the

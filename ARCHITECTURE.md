@@ -317,7 +317,7 @@ collector and the workload that justifies it. The open items are the `pointer_ma
 
 **Object layout:**
 ```
-[ObjectHeader (32 bytes)] [field0] [field1] ...
+[ObjectHeader (16 bytes)] [field0] [field1] ...
 ```
 
 Field cell width depends on the field's type and on the layout in force
@@ -335,12 +335,19 @@ Field cell width depends on the field's type and on the layout in force
 (`ref_offsets`). The interpreter/native `Value` enum is a boundary type, not
 the physical instance-field representation.
 
-The 32-byte header (`ObjectHeader`, `types/src/heap_types.rs`) is the current
-compatibility contract. A 24- or 16-byte header would require a separate object
-model: folding forwarding state into the mark word couples collector relocation
-to thin/inflated monitor state, while removing the identity hash alone saves no
-space after alignment. Header compression is therefore an experiment, not an
-unfinished requirement of the compact field layout.
+The header is **16 bytes** (`HEADER_SIZE`, `types/src/heap_types.rs`):
+`class_id` (4) + `shape` (4) + `mark_word` (8).
+
+This paragraph used to describe a 32-byte header and call compression "an
+experiment, not an unfinished requirement", listing the two reasons it could not
+shrink: folding forwarding state into the mark word would couple relocation to
+monitor state, and removing the identity hash alone saves nothing after
+alignment. Both were answered rather than avoided. The mark word absorbed the
+header three times over 2026-08-06/07 -- `forwarding_ptr` (32 -> 24), then
+`identity_hash_code`, then the `kind` / `element_type` / `gc_age` / `gc_flags`
+quartet into bits 48..63 (24 -> 16). The identity-hash fold is the instructive
+one: it did buy zero on its own, exactly as the old paragraph said, and it was
+the prerequisite for the eight bytes the quartet's move then paid out.
 
 Arrays use compact element sizes (1/2/4/8 bytes per element depending on type;
 `element_byte_size`), with reference elements at `REF_ELEMENT_SIZE` = 8 B.

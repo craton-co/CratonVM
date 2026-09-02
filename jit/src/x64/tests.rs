@@ -677,6 +677,13 @@ fn test_helpers() -> JitRuntimeHelpers {
         // accessor site in these tests keeps its ordinary native dispatch.
         ffm_segment_get: 0,
         ffm_segment_set: 0,
+        // 0 = no collector published a reference-store barrier plan, so every
+        // ref-store site in these tests keeps the full-helper path. That is
+        // what makes the gated sequence additive: a hand-built table gets the
+        // pre-existing emission, byte for byte.
+        ref_store_pre_gate: 0,
+        ref_store_post_gate: 0,
+        ref_store_post_young_floor: 0,
     }
 }
 

@@ -236,6 +236,23 @@ fn maybe_dump_shutdown_reports() {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        // Reference-store barrier gating. BOTH numbers, always: a zero on the
+        // left alone cannot distinguish "this collector published no barrier
+        // plan" from "this workload compiled no reference stores", and those
+        // call for opposite next steps. `gated` counts sites that got the
+        // inline SATB/post-barrier gate sequence; `declined` counts sites that
+        // asked and kept the full `jit_putfield_object` path.
+        //
+        // The switch this replaces measured nothing:
+        // `CRATONVM_NO_JIT_INLINE_PUTFIELD` was a no-op under the default
+        // collector because the path it disabled was already unreachable
+        // (`region_bounds_are_live` is false under G1 and ZGC).
+        {
+            let (gated, declined) = cratonvm_jit::x64::ref_store_site_counts();
+            eprintln!(
+                "[cratonvm] compiled reference stores: gated={gated} declined={declined}"
+            );
+        }
         // Reference loads whose slot did NOT hold a reference, contained by
         // `GETFIELD_EXPECT_REFERENCE` instead of being handed to compiled code
         // as a pointer. Printed even when zero, and on the same switch: this
