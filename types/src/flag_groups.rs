@@ -1170,8 +1170,21 @@ pub const INVENTORY: &[E] = &[
     // this row is the whole fix.
     E { group: Group::JIT, token: "precise-getstatic-checkcast", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST"), off_word: None, since: "2026-08-11" },
     E { group: Group::JIT, token: "precise-alloc-athrow", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW"), off_word: None, since: "2026-08-17" },
+    // Opt-in. The GP register file landed beside the FP one on 2026-09-02, but
+    // the flip still wants a wall-clock measurement -- see
+    // `ir_lower::linear_scan_enabled`. `since` stays 2026-08-01: the flag is the
+    // same flag, and this column dates the KNOB, not its capability.
     E { group: Group::JIT, token: "ir-linear-scan", on_key: Some("CRATONVM_JIT_IR_LINEAR_SCAN"), off_key: None, off_word: None, since: "2026-08-01" },
     E { group: Group::JIT, token: "ir-long", on_key: Some("CRATONVM_JIT_IR_LONG"), off_key: None, off_word: None, since: "2026-06-21" },
+    // Default-ON A/B lever: `x64::gated_ref_store_enabled` reads `0`. Its
+    // predecessor `CRATONVM_NO_JIT_INLINE_PUTFIELD` measured exactly zero under
+    // the default collector, because the path it disabled was already
+    // unreachable there.
+    E { group: Group::JIT, token: "gated-ref-store", on_key: Some("CRATONVM_JIT_GATED_REF_STORE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // OPT-IN, and known to miscompile until the ARG_REGS audit lands -- see
+    // `x64::operand_cache_enabled`. Declared so the two arms are measurable in
+    // one binary, which is what the previous shape (no flag at all) prevented.
+    E { group: Group::JIT, token: "operand-cache", on_key: Some("CRATONVM_JIT_OPERAND_CACHE"), off_key: None, off_word: None, since: "2026-09-02" },
     // Default-ON A/B lever: `ir_lower::reloc_emit_enabled` reads `0`/`false`.
     E { group: Group::JIT, token: "ir-reloc-emit", on_key: Some("CRATONVM_JIT_IR_RELOC_EMIT"), off_key: None, off_word: Some("0"), since: "2026-07-31" },
     // Declared 2026-08-30 with the relocation-gate coupling. Default-ON, so a
@@ -2001,6 +2014,13 @@ pub const INVENTORY: &[E] = &[
     // unconditional per-read rebuild, which is the A/B a same-binary
     // bisection needs.
     E { group: Group::COMPAT, token: "map-view-cache", on_key: Some("CRATONVM_MAP_VIEW_CACHE"), off_key: None, off_word: Some("0"), since: "2026-08-23" },
+    // `ClassLoader.getResource` / `Class.getResource` stopping at the first
+    // matching classpath entry, default-ON. `0` restores the whole-list walk
+    // that built every matching URL and returned element 0. The two are
+    // required to answer identically, so the flag can only change how much of
+    // the classpath was touched — which makes it the same-binary A/B for that
+    // cost.
+    E { group: Group::COMPAT, token: "getresource-first-hit", on_key: Some("CRATONVM_GETRESOURCE_FIRST_HIT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     // Take the elision decision, then rebuild anyway and compare, panicking
     // on divergence. Turns the soundness claim into something measured
     // rather than argued; expensive, so default-OFF.

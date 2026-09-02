@@ -2564,18 +2564,7 @@ impl Rsa {
         digest: cratonvm_native_builtins_crypto::signature::DigestAlgorithm,
         message: &[u8],
     ) -> Vec<u8> {
-        use cratonvm_native_builtins_crypto::signature::DigestAlgorithm as D;
-        let hash: Vec<u8> = match digest {
-            D::Sha1 => {
-                use sha1::Digest;
-                let mut h = sha1::Sha1::new();
-                h.update(message);
-                h.finalize().to_vec()
-            }
-            D::Sha256 => Sha256::digest(message).to_vec(),
-            D::Sha384 => Sha384::digest(message).to_vec(),
-            D::Sha512 => Sha512::digest(message).to_vec(),
-        };
+        let hash = Self::digest_for_pkcs1v15(digest, message);
         let k = (key.n.bit_length() + 7) / 8;
         let Some(em) = Self::pkcs1v15_encode_digest(digest, &hash, k) else {
             return Vec::new();
@@ -2584,31 +2573,56 @@ impl Rsa {
         rsa_private_op_blinded(key, &m).to_bytes_be_padded(k)
     }
 
+    /// The digest bytes for a PKCS#1 v1.5 signature, for every algorithm the
+    /// `SunRsaSign` provider advertises.
+    ///
+    /// MD2 and MD5 come from this crate's own `real_md2` / `real_md5` — the
+    /// implementations `W7-63-jca-advertise-vs-serve.md` §3 #1 added and
+    /// adjudicated against HotSpot on ten messages including the three MD2
+    /// padding boundaries — and the SHA-3 family from the `sha3` dependency
+    /// that same section notes was "already a dependency". None of this is new
+    /// cryptography; the nine names failed at `sign()` for want of an arm.
+    pub(crate) fn digest_for_pkcs1v15(
+        digest: cratonvm_native_builtins_crypto::signature::DigestAlgorithm,
+        message: &[u8],
+    ) -> Vec<u8> {
+        use cratonvm_native_builtins_crypto::signature::DigestAlgorithm as D;
+        use sha3::Digest as _;
+        match digest {
+            D::Md2 => crate::real_md2(message),
+            D::Md5 => crate::real_md5(message),
+            D::Sha1 => {
+                use sha1::Digest;
+                let mut h = sha1::Sha1::new();
+                h.update(message);
+                h.finalize().to_vec()
+            }
+            D::Sha224 => sha2::Sha224::digest(message).to_vec(),
+            D::Sha256 => Sha256::digest(message).to_vec(),
+            D::Sha384 => Sha384::digest(message).to_vec(),
+            D::Sha512 => Sha512::digest(message).to_vec(),
+            D::Sha512_224 => sha2::Sha512_224::digest(message).to_vec(),
+            D::Sha512_256 => sha2::Sha512_256::digest(message).to_vec(),
+            D::Sha3_224 => sha3::Sha3_224::digest(message).to_vec(),
+            D::Sha3_256 => sha3::Sha3_256::digest(message).to_vec(),
+            D::Sha3_384 => sha3::Sha3_384::digest(message).to_vec(),
+            D::Sha3_512 => sha3::Sha3_512::digest(message).to_vec(),
+        }
+    }
+
     fn pkcs1v15_encode_digest(
         digest: cratonvm_native_builtins_crypto::signature::DigestAlgorithm,
         hash: &[u8],
         k: usize,
     ) -> Option<Vec<u8>> {
-        use cratonvm_native_builtins_crypto::signature::DigestAlgorithm as D;
-        // DigestInfo DER prefixes (RFC 8017 §9.2 note 1).
-        let digest_info_prefix: &[u8] = match digest {
-            D::Sha1 => &[
-                0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04,
-                0x14,
-            ],
-            D::Sha256 => &[
-                0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
-                0x01, 0x05, 0x00, 0x04, 0x20,
-            ],
-            D::Sha384 => &[
-                0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
-                0x02, 0x05, 0x00, 0x04, 0x30,
-            ],
-            D::Sha512 => &[
-                0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
-                0x03, 0x05, 0x00, 0x04, 0x40,
-            ],
-        };
+        // GENERATED, not transcribed. This carried its own copy of RFC 8017
+        // §9.2 note 1's four hex blobs, which is one transcription per digest
+        // and a second copy of knowledge the verify side also held (through
+        // the `rsa` crate's `Pkcs1v15Sign::new::<D>()`). Both now come from
+        // `DigestAlgorithm::pkcs1v15_digest_info_prefix`, whose own test
+        // asserts it reproduces the published blobs byte for byte — so sign
+        // and verify cannot drift, and adding a digest is an OID and a length.
+        let digest_info_prefix = digest.pkcs1v15_digest_info_prefix();
         let t_len = digest_info_prefix.len() + hash.len();
         // Need: 00 01 || PS(>=8 bytes of FF) || 00 || T  => k >= t_len + 11.
         // `ps_len = k - t_len - 3` must be >= 8, equivalently k >= t_len + 11.
@@ -2618,7 +2632,7 @@ impl Rsa {
         em.push(0x01);
         em.extend(std::iter::repeat(0xff).take(ps_len));
         em.push(0x00);
-        em.extend_from_slice(digest_info_prefix);
+        em.extend_from_slice(&digest_info_prefix);
         em.extend_from_slice(hash);
         Some(em)
     }
@@ -5845,8 +5859,14 @@ pub fn rsa_verify_digest(
     signature: &[u8],
 ) -> Option<bool> {
     let (n, e) = rsa_key_get_pub(id)?;
-    match cratonvm_native_builtins_crypto::signature::verify_rsa_pkcs1_v15_checked(
-        &n, &e, digest, message, signature,
+    // Hash HERE and use the prehashed entry point, because this crate is the
+    // one that can compute all thirteen digests — `native-builtins-crypto`
+    // depends on nothing of ours and carries only the four it can hash itself.
+    // The padding, which is the half that must not be duplicated, stays over
+    // there; `digest_for_pkcs1v15` is the only thing this side adds.
+    let hash = Rsa::digest_for_pkcs1v15(digest, message);
+    match cratonvm_native_builtins_crypto::signature::verify_rsa_pkcs1_v15_prehashed(
+        &n, &e, digest, &hash, signature,
     ) {
         Ok(v) => Some(v),
         // A rejected key or a wrong-length signature is "never checked", not

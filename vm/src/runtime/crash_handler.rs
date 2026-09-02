@@ -1103,7 +1103,11 @@ mod windows_fault {
             captured as usize
         };
 
-        let tname = current_thread_name().unwrap_or_else(|| "<unnamed>".to_string());
+        // `super::`, because this is `mod windows_fault` and the function is at
+        // file scope. Unqualified it compiles on no platform — the module is
+        // `#[cfg(windows)]`, so a Linux build never type-checks this body and
+        // the break reaches Windows only.
+        let tname = super::current_thread_name().unwrap_or_else(|| "<unnamed>".to_string());
         let pid = std::process::id();
 
         let mut report = String::with_capacity(4096);
@@ -3201,8 +3205,14 @@ pub fn current_thread_name() -> Option<String> {
     {
         use core::ffi::c_void;
         extern "system" {
-            fn GetCurrentThread() -> *mut c_void;
-            fn GetThreadDescription(thread: *mut c_void, out: *mut *mut u16) -> i32;
+            // `isize`, not `*mut c_void`, and the crate has no choice about
+            // it: `jit::helpers` declares the same symbol that way — "this
+            // module treats handles as `isize`" — and
+            // `clashing_extern_declarations` is `--deny`ed, so two spellings
+            // of one import fail the build. Windows-only, which is why it
+            // reached this tree at all.
+            fn GetCurrentThread() -> isize;
+            fn GetThreadDescription(thread: isize, out: *mut *mut u16) -> i32;
             fn LocalFree(mem: *mut c_void) -> *mut c_void;
         }
         let mut wide: *mut u16 = core::ptr::null_mut();
