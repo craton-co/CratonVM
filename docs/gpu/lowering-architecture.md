@@ -92,6 +92,23 @@ loaded once in the prologue instead of per access; `mad.wide.s32`
 instead of `cvt`+`mul`+`add`; and retiring the check entirely against
 what the dispatch guard already proved (`Emitter::prove_index_within_param`).
 
+The last of those is a bounds-check elimination, and it is worth naming
+what kind: a single dominance fact, hand-checked, for one shape. It is
+not `bce.rs`. It does not know about `a[i+1]`, or an index derived from
+two loop variables, or a bound held in a local across a conditional. It
+cannot be applied to the nested shape at all, because that guard is
+`tid < R * C` computed in `s32` and the proof would rest on a product
+that can overflow. Those are exactly the cases SCEV answers.
+
+**One item from the review does not survive contact and should be
+struck**: "no register reuse — ptxas spills rather than argue". PTX
+virtual registers are allocated by `ptxas`, which does its own register
+allocation; declaring many of them is close to free. What costs is
+*live ranges*, and the three 64-bit temporaries each array access used
+to hold simultaneously were a real live-range problem — which the
+`mad.wide.s32` fold removed. There is no separate register-reuse work
+to do here.
+
 ### What that is worth on hardware
 
 Measured on an RTX 2060 (driver 610.88, CUDA 13.3) against a binary
@@ -123,23 +140,6 @@ re-measured with more rounds it reversed to 3/4 the other way, which is
 what a 12-22% run-to-run spread does to a 4% difference. The ray tracer
 is the arm with real index arithmetic per pixel and it is the arm that
 moves — and its variance collapses too (1.40-1.51 against 1.54-2.54).
-
-The last of those is a bounds-check elimination, and it is worth naming
-what kind: a single dominance fact, hand-checked, for one shape. It is
-not `bce.rs`. It does not know about `a[i+1]`, or an index derived from
-two loop variables, or a bound held in a local across a conditional. It
-cannot be applied to the nested shape at all, because that guard is
-`tid < R * C` computed in `s32` and the proof would rest on a product
-that can overflow. Those are exactly the cases SCEV answers.
-
-**One item from the review does not survive contact and should be
-struck**: "no register reuse — ptxas spills rather than argue". PTX
-virtual registers are allocated by `ptxas`, which does its own register
-allocation; declaring many of them is close to free. What costs is
-*live ranges*, and the three 64-bit temporaries each array access used
-to hold simultaneously were a real live-range problem — which the
-`mad.wide.s32` fold removed. There is no separate register-reuse work
-to do here.
 
 ## The two options
 
