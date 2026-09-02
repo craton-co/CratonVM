@@ -5079,6 +5079,53 @@ pub(crate) fn is_classloader_instance(ctx: &dyn NativeContext, obj: ObjectRef) -
     false
 }
 
+/// Kill switch for the first-hit `ClassLoader.getResource` walk below.
+/// `CRATONVM_GETRESOURCE_FIRST_HIT=0` restores the whole-list walk that builds
+/// every matching URL and returns element 0. Default ON.
+///
+/// A same-binary lever, not a safety valve: the two walks are required to
+/// answer identically (`class_path.rs`'s
+/// `the_incremental_walk_returns_what_the_whole_list_walk_returns_first`), so
+/// the only thing this flag can change is how much of the classpath was
+/// touched to get there. That makes it the A/B for the cost, which is the one
+/// claim a page about a throughput gap has to be able to check.
+fn get_resource_first_hit_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var_os("CRATONVM_GETRESOURCE_FIRST_HIT")
+                .as_deref()
+                .and_then(|s| s.to_str()),
+            Some("0")
+        )
+    })
+}
+
+/// The first classpath URL for `resource_name`, stopping at the entry that
+/// answers.
+///
+/// The one implementation behind BOTH singular resource doors —
+/// `ClassLoader.getResource` here and `Class.getResource` in `lang_class` —
+/// because they had the same whole-list-then-take-element-0 shape and a fix to
+/// one of them is a fix a bisect can miss on the other.
+///
+/// Falls back to the whole-list walk for a GLOB name, which can match several
+/// names inside a single classpath entry: "the first URL this entry serves"
+/// would silently drop the rest, and `resource_name_supports_incremental_scan`
+/// is the predicate that knows the difference.
+pub(crate) fn first_resource_url(
+    ctx: &mut dyn NativeContext,
+    resource_name: &str,
+) -> Option<String> {
+    if get_resource_first_hit_enabled() && ctx.resource_name_supports_incremental_scan(resource_name)
+    {
+        return ctx
+            .next_resource_url(resource_name, 0, 0)
+            .map(|(url, _, _)| url);
+    }
+    ctx.find_all_resource_urls(resource_name).into_iter().next()
+}
+
 fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // ClassLoader.getResource(String) → URL
     //
@@ -5309,9 +5356,28 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // same name. Fall back to "classpath:<name>" when only `find_resource`
     // (raw bytes) succeeds — covers synthetic test loaders that override
     // find_resource without participating in the structured walk.
-    let urls = ctx.find_all_resource_urls(resource_name);
-    let url_str = if let Some(first) = urls.first() {
-        first.clone()
+    //
+    // STOP AT THE FIRST HIT. `next_resource_url` walks the same segments in
+    // the same order and yields the same elements as `find_all_resource_urls`
+    // (its own doc states the enumeration-to-exhaustion equivalence), so
+    // element 0 is identical either way — but the whole-list call kept
+    // scanning after it had the answer. For an archive entry that costs a hash
+    // probe; for a DIRECTORY entry it costs an `exists()` and a canonicalize,
+    // i.e. filesystem syscalls, on every remaining entry of the classpath.
+    //
+    // `getResource` is one call per class discovered by a ShrinkWrap package
+    // scan (`ClassLoaderAsset.<init>` is `classLoader.getResource(name)`),
+    // which is what made a quarkus `TestResourceManager.start()` several times
+    // slower than HotSpot — HotSpot's `getResource` returns at the first hit.
+    // The incremental walk already existed for the lazy `getResources`
+    // enumeration; the singular door had simply never been wired to it.
+    //
+    // The gate is required: a GLOB name can match several entries WITHIN one
+    // classpath entry, and "the first URL this entry serves" would drop the
+    // rest — `resource_name_supports_incremental_scan` is what excludes those,
+    // and they fall through to the whole-list walk below.
+    let url_str = if let Some(first) = first_resource_url(ctx, resource_name) {
+        first
     } else if ctx.find_resource(resource_name).is_some() {
         format!("classpath:{name}")
     } else {
@@ -7956,6 +8022,36 @@ pub(crate) fn package_class_files_visible_to_loader(
     if loader_has_recorded_url_set(ctx, loader) {
         return false;
     }
+    // Step 4 -- a custom loader this VM has no URL view of -- was the LAST arm
+    // still answering the visibility question this function exists to stop
+    // answering. `new ClassLoader(null) {}`, which defines nothing at all,
+    // claimed every application package on the process class path:
+    //
+    //   custom.getDefinedPackage("com.example.app")   HotSpot null   was: a Package
+    //
+    // Ask the loader's OWN definitions instead. A user-defined loader has a
+    // namespace id of its own, and `any_loaded_class_in_package_for_loader`
+    // answers exactly "did THIS loader define a class in this package" -- which
+    // is `getDefinedPackage`'s contract, and is what the loaders this arm was
+    // written for actually need:
+    //
+    // * ByteBuddy's `JavaDispatcher$DynamicClassLoader` asks about the package
+    //   it has just defined `Invoker` into, so it still answers non-null;
+    // * `GroovyClassLoader.definePackageInternal` reads
+    //   `getDefinedPackage(p) == null` before `definePackage(p, ...)`. The
+    //   FIRST class in a package answers null (as on HotSpot, and as the
+    //   caller wants), the second answers non-null and the duplicate
+    //   `definePackage` -- `IllegalArgumentException: <pkg>` -- is skipped.
+    //
+    // A loader with no namespace id of its own (id < 3: it delegates to the
+    // built-in chain) keeps the historical global probe, unchanged.
+    let namespace = loader_namespace_id(ctx, loader);
+    if namespace >= cratonvm_types::ClassLoaderId::NATIVE_FIRST_USER_DEFINED {
+        return ctx.any_loaded_class_in_package_for_loader(
+            &package_name.replace('.', "/"),
+            namespace,
+        );
+    }
     !ctx.find_all_resource_urls(class_glob).is_empty()
 }
 
@@ -8017,9 +8113,23 @@ thread_local! {
 }
 
 fn jdk_builtin_module_sets(ctx: &mut dyn NativeContext) -> Option<Arc<BuiltinModuleSets>> {
-    static CACHE: OnceLock<Mutex<Option<Arc<BuiltinModuleSets>>>> = OnceLock::new();
-    let cell = CACHE.get_or_init(|| Mutex::new(None));
-    if let Some(hit) = cell.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+    // `OrderedPlMutex` at the leaf level, not a raw `Mutex`: this crate
+    // re-enters the VM, so a global lock with no `LockLevel` is a deadlock the
+    // order checker cannot see, and `lock_discipline_ratchet` refuses one
+    // ("Do NOT raise the baseline").
+    //
+    // `Scratch` is honest here rather than convenient. The guard is never held
+    // across anything: the read below runs Java -- a class initialisation and
+    // three `invoke_virtual`s -- and it runs with NOTHING locked, because both
+    // acquisitions are single statements that publish or fetch an `Arc` and
+    // end. Nothing is taken while holding this, which is exactly what L0 means.
+    static CACHE: OnceLock<OrderedPlMutex<Option<Arc<BuiltinModuleSets>>>> = OnceLock::new();
+    let cell = CACHE.get_or_init(|| OrderedPlMutex::new(None, LockLevel::Scratch));
+    // Bound to a local FIRST. An `if let` scrutinee temporary lives to the end
+    // of the whole `if let`, so a guard taken there would still be held in an
+    // `else` arm the next edit adds.
+    let hit = cell.lock().clone();
+    if let Some(hit) = hit {
         return Some(hit);
     }
     if READING_MODULE_SETS.with(|f| f.replace(true)) {
@@ -8028,7 +8138,7 @@ fn jdk_builtin_module_sets(ctx: &mut dyn NativeContext) -> Option<Arc<BuiltinMod
     let sets = jdk_builtin_module_sets_uncached(ctx);
     READING_MODULE_SETS.with(|f| f.set(false));
     let sets = sets?;
-    *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&sets));
+    *cell.lock() = Some(Arc::clone(&sets));
     Some(sets)
 }
 
@@ -8107,6 +8217,113 @@ fn read_string_set_rooted(
     } else {
         Some(out)
     }
+}
+
+/// Is `package_slash` in a module the JDK's own table assigns to the PLATFORM
+/// loader?
+///
+/// Memoised per package. A package's module cannot change once the image is
+/// loaded, and `Class.getClassLoader()` is asked far more often than there are
+/// packages -- so the lookup is a short-string hash, not a module-registry walk
+/// plus an `Arc` clone, on every call.
+///
+/// A package whose module is not yet known is NOT memoised: answering `false`
+/// because the module registry had not been populated yet, and then freezing
+/// it, is how a memo turns a boot-order accident into a permanent wrong answer.
+fn package_is_platform_defined(ctx: &mut dyn NativeContext, package_slash: &str) -> bool {
+    static MEMO: OnceLock<Mutex<std::collections::HashMap<String, bool>>> = OnceLock::new();
+    let memo = MEMO.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some(hit) = memo
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(package_slash)
+        .copied()
+    {
+        return hit;
+    }
+    let Some(sets) = jdk_builtin_module_sets(ctx) else {
+        return false;
+    };
+    let Some(module) = ctx.module_for_package(package_slash) else {
+        return false;
+    };
+    let answer = sets.platform.contains(&module);
+    memo.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(package_slash.to_string(), answer);
+    answer
+}
+
+/// The PLATFORM loader, when `class_name` (slash form) is an image class whose
+/// module the JDK assigns to it -- and `None` for a boot-module class, an
+/// application class, or an image this VM cannot read the tables out of.
+///
+/// # Not every image class is boot-loaded
+///
+/// This VM reads the whole jimage through one class path and tags every class
+/// in it `ClassLoaderId::Bootstrap`, so `Class.getClassLoader()` answered
+/// `null` for all of them. The JDK does not: `ModuleLoaderMap` splits the
+/// image's modules between the boot and platform loaders, and the ~24 platform
+/// modules (`java.sql`, `java.net.http`, `java.scripting`, `jdk.httpserver`, ...)
+/// are DEFINED by `ClassLoaders$PlatformClassLoader`. MEASURED:
+///
+/// ```text
+///   java.sql.Connection .getClassLoader()   HotSpot PlatformClassLoader   was null
+///   javax.script.ScriptEngine...            HotSpot PlatformClassLoader   was null
+///   java.lang.String    .getClassLoader()   HotSpot null                  null
+///   java.awt.Color      .getClassLoader()   HotSpot null (java.desktop is BOOT)
+/// ```
+///
+/// The direction matters the way it does for an application class reported as
+/// bootstrap-loaded: `null` means "the boot loader owns this" to every caller
+/// that keys a cache, picks a proxy loader, or decides a delegation parent.
+///
+/// This changes the REPORTED loader only. Class definition, resource
+/// resolution and loader namespaces are untouched -- the class store stays
+/// flat, and `is_builtin_loader_class` already keeps `Class.getResource*` off
+/// the loader-delegation path for every built-in loader, the platform one
+/// included.
+pub(crate) fn platform_loader_for_image_class(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+) -> Option<ObjectRef> {
+    let (package_slash, _) = class_name.rsplit_once('/')?;
+    if !package_is_platform_defined(ctx, package_slash) {
+        return None;
+    }
+    get_or_create_platform_loader(ctx).ok()
+}
+
+/// The PLATFORM loader when `module_name` is one the JDK's own table assigns to
+/// it; `None` for a boot module, an application module, or an unreadable image.
+///
+/// The module-name form of [`platform_loader_for_image_class`], for
+/// `Module.getClassLoader()`. The JDK keeps the two answers in step -- every
+/// class in `java.sql` reports the same loader its module does -- so they have
+/// to come from the same table or a caller can catch this VM contradicting
+/// itself with two calls.
+pub(crate) fn platform_loader_for_module(
+    ctx: &mut dyn NativeContext,
+    module_name: &str,
+) -> Option<ObjectRef> {
+    let sets = jdk_builtin_module_sets(ctx)?;
+    if !sets.platform.contains(module_name) {
+        return None;
+    }
+    get_or_create_platform_loader(ctx).ok()
+}
+
+/// Is `loader` the VM's platform-loader singleton?
+///
+/// Identity first, class name as the real-JDK fallback -- the same two-step
+/// [`loader_namespace_id_at`] uses, and for the same reason: the JDK can
+/// manufacture another `PlatformClassLoader` object before our singleton is
+/// observed.
+pub(crate) fn is_platform_loader_object(ctx: &dyn NativeContext, loader: ObjectRef) -> bool {
+    platform_loader_of(ctx.vm_identity()).is_some_and(|p| p.as_ptr() == loader.as_ptr())
+        || ctx
+            .class_name_of_id(ctx.class_id_of_object(loader))
+            .is_some_and(|name| name == "jdk/internal/loader/ClassLoaders$PlatformClassLoader")
 }
 
 /// Does this built-in loader DEFINE `package_name` (dot form)?

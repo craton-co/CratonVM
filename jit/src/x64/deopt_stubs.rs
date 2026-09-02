@@ -895,7 +895,7 @@ impl Compiler {
                 // `float`/`double` in XMM or a spill slot), so it stays
                 // `Unsupported` — exactly what `typed_local_frame_value` does
                 // for a `LocalKind::Float`/`Double` that claims a GPR home.
-                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) => {
+                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r, ..) => {
                     if is_oop {
                         FrameValue::RegisterRef(*r)
                     } else if indy_tag == Some(b'J') {

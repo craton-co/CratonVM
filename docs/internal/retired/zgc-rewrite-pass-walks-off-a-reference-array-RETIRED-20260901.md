@@ -1167,35 +1167,94 @@ smaller capacity at a higher offset, which is the same inequality. The guard is
 therefore expected to read `short_translations=0` on healthy workloads, and that
 is the reading to expect rather than a suspicious one.
 
-## What has NOT been re-measured, and why
+## The repro, re-run 2026-09-02 — and three ways it nearly lied
 
-The repro itself — `io.netty.util.ResourceLeakDetectorTest` under
-`-XX:+UseZGC --nojit`, at the 38 reps this page's own power calculation
-derived — has not been re-run against this branch at the time of writing. Two
-things stood in the way and both are worth recording:
+`io.netty.util.ResourceLeakDetectorTest`, `-XX:+UseZGC --nojit --Xmx 1500m`,
+one class per VM through `CratonRunner`, on the shared Azure host. Two arms of
+38 — the power step this page's first bisect derived — the first with
+`CRATONVM_DBG_ZGC_CORPSE=1` and `--verbose:gc`, the second with neither,
+because an instrument that runs on only one arm is a variable of the
+comparison.
 
-* **the netty test build was gone.** `/data/cratonvm/apps/netty/*/target/` had
+| arm | reps | completed | **SIGSEGV** | host OOM (137) | hang | documented shape | mean load |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| corpse gate + `--verbose:gc` | 38 | 35 | **0** | 3 | 0 | 35/35 | 129 |
+| neither | 38 | 33 | **0** | 5 | 0 | 33/33 | 93 |
+
+Every completed rep is `found=3 ok=2 failed=1` — the counts this page records,
+i.e. the residual GC-independent failure and nothing else. On the gated arm
+the extent census reported **0 overlaps** and **0 `below16=` lines** across all
+38. Those two columns are structurally zero on the plain arm — the gate is off —
+and are NOT reported as a finding for it.
+
+**68 completed reps, zero SIGSEGV.** At this page's recorded 3/23 ≈ 0.13 that is
+`0.87^68 ≈ 8e-5`, about 1 in 13,000; at the pre-fix control's 2/26 ≈ 0.077 it is
+`0.923^68 ≈ 0.004`, about 1 in 230.
+
+### The arm is not vacuous, and that is checked rather than assumed
+
+Compaction is required for this defect — this page's own measurement is that
+`CRATONVM_ZGC_RELOCATE=0` has never produced an overlap or a crash on any arm.
+So the arm has to slide. It does, on both cycles of every run:
+
+```
+[GC] zgc-real: cycle=1 ... objects_copied=24026 bytes_copied=2737344 bytes_freed=1533832
+[GC] zgc-real: cycle=2 ... objects_copied=24445 bytes_copied=2773976 bytes_freed=10162368
+```
+
+**But it is a much smaller heap than the one this page was written against.**
+The seventh pass recorded a cursor of 1.19 GB collapsing to 138 MB on cycle 2 —
+the collapse being the evidence of a slide. This run peaks at `cursor=14232208`,
+14 MB, in the same 1.5 GB capacity, and the cursor GROWS. Two cycles, ~24k
+objects relocated each. So the slide runs and the arm is live, but the
+*pressure* is not what the 3/23 was measured under, and 0/68 here is weaker
+evidence than 0/68 would have been in August. Recorded rather than glossed.
+
+### Three ways this run nearly reported the wrong thing
+
+Each produced a result that looks exactly like a good one:
+
+* **the netty test build was GONE.** `/data/cratonvm/apps/netty/*/target/` had
   been cleaned when `/data` filled, while `common.args` still listed those
-  directories and the SNAPSHOT jars (main classes only) stayed put. A first
-  38-rep arm therefore ran to completion with `rc=0`, `found=0`, ~22 s per rep
-  and `collections=0` — a **vacuous arm that reads exactly like a clean one**.
-  Rebuilding one module fixes it in about a minute:
-  `mvn -o -pl common -am -DskipTests -Dcheckstyle.skip=true ... test-compile`,
-  after which the documented `found=3 ok=2 failed=1` shape returns. Screen every
-  rep on that shape, never on `rc`;
-* **the shared host could not link the binary.** Fat LTO at `-j 1` was
-  SIGKILLed twice at `avail` 0-4 GB with load 40-190 from other sessions. A
-  driver is parked there waiting for `avail>=10G` and `load<30`.
+  directories and the SNAPSHOT jars — main classes only — stayed put. A first
+  38-rep arm ran to completion at `rc=0`, ~22 s per rep, `collections=0`, and
+  **`found=0`**. That is NOTESTS, which the suite runner scores as its own
+  status, and it reads exactly like a clean pass. One offline module rebuild
+  (`mvn -o -pl common -am -DskipTests -Dcheckstyle.skip=true … test-compile`,
+  about a minute) restored the documented shape. **Screen every rep on
+  `found=`, never on `rc`;**
+* **`rc=137` is not the crash.** Rep 7 came back with a signal, and a screen of
+  `rc != 0` — or even `rc >= 128` — calls that a reproduction. 137 is 128+9,
+  SIGKILL: the host's **OOM killer**, which was taking other sessions' `rustc`
+  processes in the same minute (`dmesg -T | grep "killed process"`). The rep's
+  own stderr had **zero** crash markers and simply stopped after two clean GC
+  cycles. The signal to count is **139**, and only beside a crash marker. Eight
+  of the 76 reps were lost this way;
+* **the counts come from `@@RESULT` on STDOUT.** The first harness parsed
+  `found=… started=… ok=… failed=…` as one pattern; the runner emits
+  `found= ok= failed= aborted= skipped= ms=` with no `started=` — that field is
+  `PerTestProgressRunner`'s. Every rep parsed as zero.
 
-What that leaves is stated plainly: the branch is verified by 4190
-`native-builtins` and 2645 `cratonvm-vm` unit tests, 80/80 of the Java
-regression suite against HotSpot, and the 472-row `UnsafeShadowSweep`
-differential in which exactly one line moved. The GC crash this page is about
-was closed by bisect on 2026-08-19 and none of this touches the collector. The
-outstanding rep run would add a **denominator** — netty is the workload that
-actually reaches `unsafe_arena_real_ptr`, so it is the one that can say whether
-`translations` is non-zero in production — and it is not load-bearing for the
-retirement.
+### What the counters say, and what that is worth
+
+`translations=0` on **all 68 readable reps**. Not "the hazard did not fire" —
+**no real pointer was ever handed out**. `ResourceLeakDetectorTest` does not
+reach `unsafe_arena_real_ptr` at all.
+
+Nor do the obvious candidates. `ZstdEncoderTest` (13/13) and
+`Lz4FrameEncoderTest` (13/13), both chosen because zstd-jni and lz4-java are
+named in `direct_buffer_native_address`'s own doc comment as the natives that
+dereference what `GetDirectBufferAddress` returns, also report
+`translations=0`.
+
+So across this corpus the JNI translation path is **never reached**, and the
+three fixes above are latent-hazard fixes with no production engagement
+measured. **That is a finding rather than a gap.** Before this session the same
+runs printed nothing at all, so "the hazard never fired" and "no pointer was
+ever handed out" were the same log; they are now different logs. The engagement
+that IS proven is at the level the fix lives — the unit tests drive
+`GetDirectBufferAddress` with a live tagged handle, and every guard fails with
+only its own fix reverted.
 
 ## The elimination table, final
 
@@ -1235,10 +1294,11 @@ at once produce `class not found` for whichever vector loses the race. A 78/80
 and an earlier 79-with-`RReflect`-failing were both that, and both went to 80/80
 when re-run alone. **Run it serially, or read its failures as your own.**
 
-**Not proven:** that any of the three ever fired on a real workload. The
-engagement counters exist now precisely so that question has an answer next time,
-and this page's own history says a counter without a denominator is not an
-answer.
+**Measured, and negative:** none of the three has fired on a real workload.
+`translations=0` across 68 completed reps of the repro and two JNI-heavy codec
+classes — this corpus never hands a real arena pointer to native code at all.
+That is now a reading rather than a silence, which is the whole point of giving
+the counter a denominator and a reader.
 
 **Still inference, unchanged from 2026-08-19:** that the `reference_slots` /
 `relocate_stw` fault this page opens with is the same defect the bisect closed.

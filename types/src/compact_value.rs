@@ -708,6 +708,26 @@ pub(crate) fn degrade_counter_test_lock() -> std::sync::MutexGuard<'static, ()> 
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Is the per-source first-degradation prose wanted on this run?
+///
+/// Read through `flags::runtime_var_os` rather than `std::env::var_os` so a
+/// DECLARED name is served by the latched flag snapshot: the `CRATONVM_DBG`
+/// token spellings (`coercion`, `overlay`, `corrupt-cell`) resolve to these
+/// keys, and a raw `getenv` here would make the token spelling silently do
+/// nothing -- the failure `gc::heap::coercion_loss_verbose` documents at its
+/// own call site.
+///
+/// Latched in a `OnceLock` because the answer cannot change within a process
+/// and this is consulted from a path a stress run can still reach often.
+fn degradation_diag_verbose() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        crate::flags::runtime_var_os("CRATONVM_DBG_COERCION").is_some()
+            || crate::flags::runtime_var_os("CRATONVM_DBG_OVERLAY").is_some()
+            || crate::flags::runtime_var_os("CRATONVM_DBG_CORRUPT_CELL").is_some()
+    })
+}
+
 /// Cold one-shot diagnostic for a source's first observed degradation.
 ///
 /// Kept out-of-line and `#[cold]` so the branch in
@@ -739,6 +759,26 @@ fn emit_first_degradation_diag(source: DegradationSource, site: &'static str) {
     // recoverable fallback (returns Value::Long / false rather than dereferencing
     // a bogus pointer), not UB — see note_object_degradation / object_degradation_count
     // and the to_value Safety contract. Keep only the one-shot non-fatal diagnostic.
+    // 2026-09-01: the prose is now behind a debug flag and the numbers moved to
+    // `degradation_exit_summary`. This block was never the loud one -- a `Once`
+    // per source caps it at three lines per process -- but it is three lines of
+    // paragraph-length prose on the default stderr of a program that never asked
+    // for a diagnostic, and the goal is a `cratonvm Hello` whose stderr is empty.
+    // NOTHING about what is counted, or about what is returned to Java, changes
+    // here: the `fetch_add` in `note_object_degradation_at` runs exactly as
+    // before, and `degradation_exit_summary` reports all three sources rather
+    // than only the first event of each.
+    //
+    // Three gates rather than one, because three lanes want this and none is a
+    // superset of the others: `CRATONVM_DBG_COERCION` is the descriptor-loss
+    // lane (a degraded reference and a coerced reference slot are one defect
+    // seen from two sides), `CRATONVM_DBG_OVERLAY` is the native-overlay hunter
+    // that reads slot-level damage, and `CRATONVM_DBG_CORRUPT_CELL` arms the
+    // corrupt-cell census, whose whole subject is a word that cannot be a live
+    // pointer.
+    if !degradation_diag_verbose() {
+        return;
+    }
     FIRST_DEGRADATION_DIAG[source.index()].call_once(|| {
         match source {
             // Unchanged text for the interpreter source: it is the only source
@@ -772,6 +812,408 @@ fn emit_first_degradation_diag(source: DegradationSource, site: &'static str) {
                 site,
             ),
         }
+    });
+}
+
+/// The G30 descriptor-coercion census: per-species counts, a sampled locator,
+/// and one line at process exit.
+///
+/// # Why the counters live in this crate and not beside the guard
+///
+/// They are bumped in `cratonvm_gc::heap::note_field_coercion_loss` and
+/// printed from `native-builtins`' shutdown trailer, and
+/// `cratonvm-native-builtins` does not depend on `cratonvm-gc`. This is the
+/// same crate-reachability argument that put [`crate::cell_census`] in this
+/// crate: a JUnit runner leaves through `System.exit` and never reaches
+/// `vm-cli`'s normal-return arm, so a summary printed anywhere the shutdown
+/// trailer cannot call appears in ZERO logs of a whole suite sweep -- and an
+/// absent line reads exactly like a clean run.
+///
+/// # Why this is a count now and was a log before
+///
+/// Until 2026-09-01 every occurrence went to `tracing::warn!` under an
+/// escalating `n < 4 || n.is_power_of_two()` sample. MEASURED on a stock
+/// `cratonvm Hello`: 24 of the 28 lines that one-line program printed to
+/// stderr came from this one guard, whose `primitive-into-reference` read
+/// species reached occurrence 2048 during boot. An instrument that IS the
+/// background cannot be the thing you notice, so a default run is now silent
+/// and pays one line at exit. The per-occurrence rows are unchanged and still
+/// reachable: `CRATONVM_DBG_COERCION` gives every occurrence with a
+/// backtrace, `CRATONVM_DBG_OVERLAY` keeps the escalating sample for the
+/// overlay-hunting lane that reads these rows beside its own.
+///
+/// # A quiet run is not a clean run
+///
+/// THIS CENSUS SEES DESCRIPTOR MISMATCHES ONLY. A write that lands on the
+/// WRONG slot whose value nonetheless fits that field's own descriptor is
+/// invisible to it, so "no line printed" means "no writer contradicted a
+/// descriptor", not "every field was written correctly". G59-1 measured both
+/// halves of one defect at once: two writes tripped this guard, and two more
+/// from the same source line landed silently on an `int` and set a 1ms
+/// connect timeout. The caveat is repeated inside the exit line itself,
+/// because the reader of that line is exactly the person who did not read
+/// this comment.
+pub mod coercion_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Row count: one per `cratonvm_gc::heap::FieldCoercionLoss` variant.
+    pub const SPECIES: usize = 4;
+    /// Column count: one per `cratonvm_gc::heap::FieldAccessKind` variant.
+    pub const KINDS: usize = 3;
+
+    /// Species names in `FieldCoercionLoss::index()` order.
+    ///
+    /// Duplicated from `cratonvm_gc::heap::FieldCoercionLoss::name` rather
+    /// than imported, because `gc` depends on this crate and not the other
+    /// way round. Drift would silently mislabel the exit line, so it is
+    /// pinned from the `gc` side by
+    /// `gc::heap::tests::the_census_tables_match_the_coercion_enums`, which
+    /// is the only reason duplicating them is acceptable.
+    pub const SPECIES_NAMES: [&str; SPECIES] = [
+        "primitive-into-reference",
+        "primitive-into-reference-uncoerced",
+        "null-into-primitive",
+        "pointer-into-primitive",
+    ];
+
+    /// Access-kind names in `FieldAccessKind::index()` order. Same pinning
+    /// argument as [`SPECIES_NAMES`].
+    pub const KIND_NAMES: [&str; KINDS] = ["read", "store", "unattributed"];
+
+    /// `class_id` value meaning "the caller carried no provenance". A real
+    /// `ClassId` never reaches `u32::MAX`.
+    pub const NO_CLASS: u32 = u32::MAX;
+    /// Slot index meaning "unknown". Sixteen bits are kept for the index, so
+    /// this is also what a (nonexistent in practice) slot 65535 reports as.
+    pub const NO_INDEX: u32 = 0xFFFF;
+
+    /// One counter per (species, access kind). Flat so the increment is a
+    /// single relaxed `fetch_add` on an already-cold path.
+    static COUNTS: [[AtomicU64; KINDS]; SPECIES] = [
+        [const { AtomicU64::new(0) }; KINDS],
+        [const { AtomicU64::new(0) }; KINDS],
+        [const { AtomicU64::new(0) }; KINDS],
+        [const { AtomicU64::new(0) }; KINDS],
+    ];
+
+    /// How many distinct `(kind, species, descriptor, slot, class)` tuples the
+    /// census can name.
+    ///
+    /// Sixteen, not one: the first-seen locator is not the most common one,
+    /// and a count with no locator is not actionable -- "2048 coercions" and
+    /// "2048 coercions, all of them class 64 slot 2 at descriptor `[`" are
+    /// different findings, and only the second can be repaired. Sixteen slots
+    /// covers the observed boot population (one dominant tuple plus a short
+    /// tail) at 256 bytes of static, and anything past it is counted in
+    /// [`locator_spill`] rather than silently dropped.
+    const LOCATOR_SLOTS: usize = 16;
+
+    /// Packed locator keys; `0` means "slot never claimed". Claimed exactly
+    /// once, by CAS, and never evicted -- see [`note_locator`].
+    static LOCATOR_KEYS: [AtomicU64; LOCATOR_SLOTS] = [const { AtomicU64::new(0) }; LOCATOR_SLOTS];
+    /// Hit count for the key in the same position of [`LOCATOR_KEYS`].
+    static LOCATOR_HITS: [AtomicU64; LOCATOR_SLOTS] = [const { AtomicU64::new(0) }; LOCATOR_SLOTS];
+    /// Events whose locator found the table full. Reported, because a large
+    /// spill beside a small `hits` means the hottest name printed is a sample
+    /// rather than the maximum.
+    static LOCATOR_SPILL: AtomicU64 = AtomicU64::new(0);
+
+    /// Pack a site into a locator key.
+    ///
+    /// The key is never zero because `descriptor` is a JVMS descriptor byte
+    /// and no descriptor is NUL, which is what lets `0` mean "empty slot" in
+    /// [`LOCATOR_KEYS`] without a second flag word per slot.
+    #[inline]
+    fn locator_key(species: usize, kind: usize, descriptor: u8, class_id: u32, index: u32) -> u64 {
+        (((kind as u64) & 0xF) << 60)
+            | (((species as u64) & 0xF) << 56)
+            | ((descriptor as u64) << 48)
+            | (((index as u64) & 0xFFFF) << 32)
+            | (class_id as u64)
+    }
+
+    /// Inverse of [`locator_key`]: `(species, kind, descriptor, class_id, index)`.
+    #[inline]
+    fn locator_parts(key: u64) -> (usize, usize, u8, u32, u32) {
+        (
+            ((key >> 56) & 0xF) as usize,
+            ((key >> 60) & 0xF) as usize,
+            ((key >> 48) & 0xFF) as u8,
+            (key & 0xFFFF_FFFF) as u32,
+            ((key >> 32) & 0xFFFF) as u32,
+        )
+    }
+
+    /// Bump the hit count for one locator, claiming a slot for it if the
+    /// table has one free.
+    ///
+    /// Open-addressed with linear probing over the whole table and NO
+    /// eviction: the table exists to name the DOMINANT producer, and any
+    /// eviction policy lets a long tail of one-shot sites push that producer
+    /// out -- which is the failure mode that makes a locator worthless. Work
+    /// is bounded by `LOCATOR_SLOTS` relaxed loads plus at most one CAS, on a
+    /// path that only runs once a coercion has already destroyed a value, so
+    /// this is affordable in a default build. That matters: a locator you have
+    /// to know to ask for is how a run gets read without one.
+    #[inline]
+    fn note_locator(key: u64) {
+        // Fibonacci hash of the key, then take the top bits: the low bits are
+        // the class id, and class ids are dense small integers, so indexing on
+        // them directly would pile every species of one class into adjacent
+        // slots.
+        let mut i = ((key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 60) as usize) % LOCATOR_SLOTS;
+        for _ in 0..LOCATOR_SLOTS {
+            let cur = LOCATOR_KEYS[i].load(Ordering::Relaxed);
+            if cur == key {
+                LOCATOR_HITS[i].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            if cur == 0 {
+                match LOCATOR_KEYS[i].compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed)
+                {
+                    Ok(_) => {
+                        LOCATOR_HITS[i].fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    // Lost the race. If the winner wrote OUR key the slot is
+                    // still ours to count in; otherwise keep probing.
+                    Err(other) if other == key => {
+                        LOCATOR_HITS[i].fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    Err(_) => {}
+                }
+            }
+            i = (i + 1) % LOCATOR_SLOTS;
+        }
+        LOCATOR_SPILL.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one value-destroying descriptor coercion.
+    ///
+    /// Returns the number of events already recorded for this
+    /// `(species, kind)` pair -- i.e. the occurrence ordinal the caller's
+    /// escalating `n < 4 || n.is_power_of_two()` sample needs when a debug
+    /// flag has asked for the per-occurrence rows.
+    ///
+    /// Pass [`NO_CLASS`] / [`NO_INDEX`] when the caller carries no
+    /// provenance; those render as `-1` in the exit line, the same way the
+    /// demoted per-occurrence WARN rendered them, so old and new logs grep
+    /// alike.
+    ///
+    /// An out-of-range `species`/`kind` is ignored rather than panicking:
+    /// this is a diagnostic on a path that has already lost a value, and
+    /// turning a table-width mismatch into an abort would be the instrument
+    /// doing more damage than the defect. The widths are pinned by a `const`
+    /// assertion on the `gc` side instead.
+    #[inline]
+    pub fn note(species: usize, kind: usize, descriptor: u8, class_id: u32, index: u32) -> u64 {
+        if species >= SPECIES || kind >= KINDS {
+            return 0;
+        }
+        let n = COUNTS[species][kind].fetch_add(1, Ordering::Relaxed);
+        note_locator(locator_key(species, kind, descriptor, class_id, index));
+        n
+    }
+
+    /// How many times each (species, access kind) pair has fired, indexed the
+    /// same way as [`SPECIES_NAMES`] and [`KIND_NAMES`].
+    #[must_use]
+    pub fn counts() -> [[u64; KINDS]; SPECIES] {
+        let mut out = [[0u64; KINDS]; SPECIES];
+        for (r, row) in COUNTS.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                out[r][c] = cell.load(Ordering::Relaxed);
+            }
+        }
+        out
+    }
+
+    /// Total value-destroying descriptor coercions in this process.
+    #[must_use]
+    pub fn total() -> u64 {
+        COUNTS
+            .iter()
+            .flatten()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Events the locator table had no room for. Non-zero means the tuple
+    /// named by [`hottest_locator`] is the busiest of the sixteen TRACKED
+    /// tuples, not provably the busiest overall.
+    #[must_use]
+    pub fn locator_spill() -> u64 {
+        LOCATOR_SPILL.load(Ordering::Relaxed)
+    }
+
+    /// The busiest tracked locator:
+    /// `(species, kind, descriptor, class_id, index, hits)`, or `None` when
+    /// nothing has fired.
+    #[must_use]
+    pub fn hottest_locator() -> Option<(usize, usize, u8, u32, u32, u64)> {
+        let mut best: Option<(usize, u64)> = None;
+        for i in 0..LOCATOR_SLOTS {
+            if LOCATOR_KEYS[i].load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+            let hits = LOCATOR_HITS[i].load(Ordering::Relaxed);
+            // An explicit match rather than `map_or` / `is_none_or`: the
+            // workspace MSRV is 1.80 and `Option::is_none_or` is 1.82, while
+            // recent clippy rewrites `map_or(true, ..)` into it. This spells
+            // the same thing and is not a lint battleground.
+            let better = match best {
+                None => true,
+                Some((_, b)) => hits > b,
+            };
+            if better {
+                best = Some((i, hits));
+            }
+        }
+        let (i, hits) = best?;
+        let (species, kind, descriptor, class_id, index) =
+            locator_parts(LOCATOR_KEYS[i].load(Ordering::Relaxed));
+        Some((species, kind, descriptor, class_id, index, hits))
+    }
+
+    /// Render `class_id`/`index` the way the demoted per-occurrence WARN did:
+    /// `-1` for "the caller has no provenance", so the two are greppable
+    /// together across old and new logs.
+    fn or_minus_one(v: u32, absent: u32) -> i64 {
+        if v == absent {
+            -1
+        } else {
+            i64::from(v)
+        }
+    }
+
+    /// One line on the exit path, and only when something fired.
+    ///
+    /// Not behind a debug flag, deliberately, and not printed when the count
+    /// is zero -- the two decisions answer different questions. Unconditional
+    /// on non-zero, because a count you have to know to ask for is how a run
+    /// gets read without one. Silent on zero, because the whole point of the
+    /// change is that a hello-world prints nothing, and because this census
+    /// CANNOT certify a clean run anyway: it sees descriptor mismatches only
+    /// (see the module comment), so a printed `total=0` would be a stronger
+    /// claim than the instrument is able to make.
+    ///
+    /// Idempotent -- `Once`-guarded -- because two exit arms call it: the
+    /// `System.exit` shutdown trailer in `native-builtins::lang_system`, and
+    /// `vm-cli`'s normal-return arm, which is the one a program returning
+    /// from `main` takes instead.
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let counts = counts();
+        let total: u64 = counts.iter().flatten().sum();
+        if total == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            let mut by_species = String::new();
+            for (s, row) in counts.iter().enumerate() {
+                if row.iter().all(|&n| n == 0) {
+                    continue;
+                }
+                by_species.push(' ');
+                by_species.push_str(SPECIES_NAMES[s]);
+                by_species.push('[');
+                let mut first = true;
+                for (k, &n) in row.iter().enumerate() {
+                    if n == 0 {
+                        continue;
+                    }
+                    if !first {
+                        by_species.push(' ');
+                    }
+                    first = false;
+                    by_species.push_str(KIND_NAMES[k]);
+                    by_species.push('=');
+                    by_species.push_str(&n.to_string());
+                }
+                by_species.push(']');
+            }
+            let spill = match locator_spill() {
+                0 => String::new(),
+                n => format!(
+                    " (+{n} untracked locator(s): this is the busiest TRACKED site, \
+                     not provably the busiest)"
+                ),
+            };
+            let hottest = match hottest_locator() {
+                Some((s, k, d, c, i, hits)) => format!(
+                    " hottest={}/{} class_id={} index={} descriptor={} hits={}{}",
+                    SPECIES_NAMES.get(s).copied().unwrap_or("?"),
+                    KIND_NAMES.get(k).copied().unwrap_or("?"),
+                    or_minus_one(c, NO_CLASS),
+                    or_minus_one(i, NO_INDEX),
+                    d as char,
+                    hits,
+                    spill,
+                ),
+                None => String::new(),
+            };
+            eprintln!(
+                "[cratonvm] descriptor-coercion census: total={total}{by_species}{hottest} \
+                 -- field accesses whose value contradicted the slot's declared descriptor \
+                 and was DESTROYED \
+                 (G30-1-the-silent-reference-slot-coercion-20260817.md). This is NOT the \
+                 W7-84 autobox guard: that one boxes and fires only for the class mirror; \
+                 this one nulls (or zeroes). class_id=-1/index=-1 means the caller has no \
+                 provenance yet (G30 NOMINATION 1). CRATONVM_DBG_LAYOUT=1 resolves a \
+                 class_id to a name; CRATONVM_DBG_COERCION=1 restores the per-occurrence \
+                 warning with a backtrace, CRATONVM_DBG_OVERLAY=1 the rate-limited sample. \
+                 THIS COUNTS DESCRIPTOR MISMATCHES ONLY: a wrong slot whose value happens \
+                 to fit the field's own descriptor is invisible here, so the ABSENCE of \
+                 this line is not a clean run."
+            );
+        });
+    }
+}
+
+/// One line at exit naming every reference degradation this process counted.
+///
+/// The per-source `Once` diagnostics in `emit_first_degradation_diag` used
+/// to be the only report and printed unconditionally on a default run. They
+/// are now behind the same debug flags as the coercion guard's per-occurrence
+/// rows, for the same reason: a one-line program's stderr must be empty, and
+/// a paragraph of prose about a counter reaching 1 is not something a reader
+/// at boot can act on.
+///
+/// What replaces them carries MORE, not less. Those lines fired on the first
+/// event per source and never said how many followed; this prints all three
+/// counters, so "interpreter=1" (the benign long-versus-object collision) and
+/// "interpreter=1 jit=4200" stop looking alike.
+///
+/// `jit=` and `array-element=` are the diagnostically loaded halves: a JIT'd
+/// frame is exactly the frame a deposited root snapshot can miss, and neither
+/// of those two sources has the interpreter's benign reading. See
+/// [`DegradationSource`].
+pub fn degradation_exit_summary() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let breakdown = object_degradation_breakdown();
+    let total: u64 = breakdown.iter().sum();
+    if total == 0 {
+        return;
+    }
+    ONCE.call_once(|| {
+        let mut parts = String::new();
+        for source in DegradationSource::ALL {
+            parts.push(' ');
+            parts.push_str(source.name());
+            parts.push('=');
+            parts.push_str(&breakdown[source.index()].to_string());
+        }
+        eprintln!(
+            "[cratonvm] reference-degradation census: total={total}{parts} -- \
+             reference-shaped words that could not be live heap pointers and were handed \
+             to Java as null. `interpreter` has a benign reading (a primitive long whose \
+             bits collide with the SUB_OBJECT tag); `jit` and `array-element` do not -- \
+             the word came from a slot the JVM type system says IS a reference, so a \
+             non-zero count there is a GC root-coverage failure until proven otherwise. \
+             Set CRATONVM_DBG_COERCION=1, CRATONVM_DBG_OVERLAY=1 or \
+             CRATONVM_DBG_CORRUPT_CELL=1 for the per-source first-event prose."
+        );
     });
 }
 
