@@ -714,6 +714,13 @@ impl ZgcRealHeap {
     /// are indistinguishable, which is exactly what an earlier attempt at
     /// `-Xmx512m` showed.
     ///
+    /// The regression suite is 87/0 on BOTH arms, release binary, quiet host.
+    /// Runs against the DEBUG binary while the box was building something else
+    /// showed 5-7 failures per arm whose sets differed in both directions --
+    /// three vectors failed only with this feature OFF, which it cannot cause --
+    /// and every one of them passed in isolation afterwards. That is the
+    /// host, not the sweep, and it is worth knowing before reading a red one.
+    ///
     /// Read per COLLECTION rather than latched in a `OnceLock`: this is
     /// consulted once a cycle, so caching it buys nothing and costs the
     /// ability to A/B the two sweeps against one another in one process --
