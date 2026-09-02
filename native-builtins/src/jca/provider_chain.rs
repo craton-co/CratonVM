@@ -4157,6 +4157,58 @@ fn seed_sunjce_pbe_services() {
     }
 }
 
+/// SunJCE's sixteen password-based and SSL `Mac` services.
+///
+/// None of them is an HMAC this crate computes: `HmacPBESHA*` is the PKCS#12
+/// v1.0 §B.2 key derivation feeding an HMAC, `PBEWithHmacSHA*` is PBMAC1
+/// (PBKDF2 feeding an HMAC), and `SslMac{MD5,SHA1}` is the SSL 3.0 MAC, which
+/// is not HMAC at all (concatenation with pad bytes, not the XOR construction).
+/// Three separate derivations, none of them a name-table entry away.
+///
+/// They do not need to be. `phases_late::ssl_security`'s `Mac.getInstance`
+/// already falls to `find_service_provider("Mac", algo)` +
+/// `build_real_mac` for a name it cannot compute — the route added for
+/// BouncyCastle's MAC families — and that route now admits a JDK provider too
+/// (`jdk_service_class`), so a row here IS the implementation, driven from the
+/// platform's own class. Ordered after this engine's verdict, so no name it
+/// computes changes hands.
+fn seed_sunjce_pbe_mac_services() {
+    const P: &str = "SunJCE";
+    // (algorithm spelling, class-name spelling) — the `SHA-512/224` pair
+    // differs between the two, as everywhere else in this file.
+    const HASHES: &[(&str, &str)] = &[
+        ("SHA1", "SHA1"),
+        ("SHA224", "SHA224"),
+        ("SHA256", "SHA256"),
+        ("SHA384", "SHA384"),
+        ("SHA512", "SHA512"),
+        ("SHA512/224", "SHA512_224"),
+        ("SHA512/256", "SHA512_256"),
+    ];
+    for (algo_hash, class_hash) in HASHES {
+        // PKCS#12 `HmacPBESHA*` — `HmacPKCS12PBECore$HmacPKCS12PBE_SHA1`.
+        put_service(
+            P,
+            "Mac",
+            &format!("HmacPBE{algo_hash}"),
+            &format!("com.sun.crypto.provider.HmacPKCS12PBECore$HmacPKCS12PBE_{class_hash}"),
+        );
+        // PBMAC1 `PBEWithHmacSHA*` — `PBMAC1Core$HmacSHA1`.
+        put_service(
+            P,
+            "Mac",
+            &format!("PBEWithHmac{algo_hash}"),
+            &format!("com.sun.crypto.provider.PBMAC1Core$Hmac{class_hash}"),
+        );
+    }
+    for (algo, class) in [
+        ("SslMacMD5", "com.sun.crypto.provider.SslMacCore$SslMacMD5"),
+        ("SslMacSHA1", "com.sun.crypto.provider.SslMacCore$SslMacSHA1"),
+    ] {
+        put_service(P, "Mac", algo, class);
+    }
+}
+
 /// SunJCE's `SecretKeyFactory` table — thirty services, of which this crate
 /// advertised NONE.
 ///
@@ -7364,6 +7416,7 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         // ParameterGenerator` services, which were neither.
         seed_sunjce_secret_key_factory_services();
         seed_algorithm_parameter_generator_services();
+        seed_sunjce_pbe_mac_services();
         let gi = "sun/security/jca/GetInstance";
         r.register(
             gi,
@@ -8722,6 +8775,15 @@ mod tests {
     fn every_advertised_sunjce_mac_is_computable() {
         let _lock = reset_service_state_for_tests();
         seed_direct_native_engine_services();
+        // The SECOND seeder, added 2026-09-02, and the reason this line is
+        // here: the population below is read out of the registry, but the
+        // registry holds only what the seeders this test CALLS have put in it.
+        // Sixteen new `Mac` services seeded from a function this test did not
+        // call left the ratchet passing over a set that no longer matched the
+        // VM's — the same "population transcribed from the registrar rather
+        // than from the platform" shape `every_public_mac_method_is_registered`
+        // was caught by (E25-R11).
+        seed_sunjce_pbe_mac_services();
         let advertised: Vec<String> = services()
             .lock()
             .get("SunJCE")
@@ -8731,11 +8793,36 @@ mod tests {
             .map(|e| e.algorithm.clone())
             .collect();
         assert!(
-            advertised.len() >= 12,
+            advertised.len() >= 28,
             "the SunJCE Mac seed looks empty: {advertised:?}"
         );
         for algorithm in &advertised {
             let bytes = crate::phases_late::ssl_security::mac_compute_hmac(algorithm, b"k", b"d");
+            // SERVICEABLE, which is a disjunction — and was a single term until
+            // the PKCS#12 / PBMAC1 / SSL MAC families landed.
+            //
+            // None of those sixteen is an HMAC this crate computes (PKCS#12
+            // v1.0 B.2 derivation, PBKDF2-then-HMAC, and the SSL 3.0 pad-byte
+            // construction respectively), and none needs to be:
+            // `Mac.getInstance` falls to `build_real_mac` for a name it cannot
+            // compute, so the platform's own class serves them. The W4-3
+            // property this test exists for is "advertised implies
+            // serviceable", not "advertised implies computed HERE" — but the
+            // second arm has to be a REAL class, because a `.Native` marker row
+            // is precisely an advertisement with nothing behind it.
+            let routed = get_service_entry("SunJCE", "Mac", algorithm)
+                .map(|e| {
+                    let c = e.class_name.trim().to_string();
+                    !c.is_empty() && !c.ends_with(".Native")
+                })
+                .unwrap_or(false);
+            assert!(
+                bytes.is_some() || routed,
+                "SunJCE advertises Mac.{algorithm}, and neither mac_compute_hmac nor a real                  implementation class serves it"
+            );
+            if bytes.is_none() {
+                continue;
+            }
             let len = crate::phases_late::ssl_security::mac_output_length(algorithm);
             assert!(
                 bytes.is_some(),

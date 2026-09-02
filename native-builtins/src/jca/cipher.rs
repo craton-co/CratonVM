@@ -5904,7 +5904,32 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
     });
 
     let sks = "javax/crypto/spec/SecretKeySpec";
-    r.register(sks, "<clinit>", "()V", clinit_noop);
+    // `<clinit>` is NOT a no-op here, and stubbing it cost fourteen MACs.
+    //
+    // The real one (JDK 25 `src.zip`) is one statement:
+    //
+    //     static { SharedSecrets.setJavaxCryptoSpecAccess(SecretKeySpec::clear); }
+    //
+    // That is the ONLY writer of `jdk.internal.access.SharedSecrets`'
+    // `JavaxCryptoSpecAccess` slot, and JDK code inside `java.base` reads it to
+    // scrub key material. Replacing the static block with a no-op left the slot
+    // null for the life of the process, so every reader NPEs — measured
+    // 2026-09-02 on all fourteen PKCS#12 / PBMAC1 `Mac` services:
+    //
+    //     Mac.getInstance("HmacPBESHA256").init(pbeKey, params)
+    //       NullPointerException: Cannot invoke
+    //       "jdk.internal.access.JavaxCryptoSpecAccess.clearSecretKeySpec(...)"
+    //       because the return value of
+    //       "jdk.internal.access.SharedSecrets.getJavaxCryptoSpecAccess()" is null
+    //
+    // and `getInstance` resolved for all fourteen, which is why a gap census
+    // that scores on `getInstance` could not see it
+    // (`jca-provider-population-gap-20260830.md`; `apps/probes/JcaMacVectors`
+    // is what does).
+    //
+    // The `<init>` shim below stays: it is the copy-the-array fix, and it is
+    // independent of the static block.
+    let _ = clinit_noop;
     // `SecretKeySpec.<init>` is `this.key = key.clone()` in the real class
     // (`java.base/javax/crypto/spec/SecretKeySpec.java`, JDK 25 `src.zip`), and
     // the javadoc states why: "The contents of the array are copied to protect
