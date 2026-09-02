@@ -11180,11 +11180,17 @@ impl G1Collector {
         self.evac_ns_per_byte.store(next.max(1), Ordering::Relaxed);
     }
 
-    /// Account for one completed STW collection: bump the counters, append the
-    /// microsecond-granular record to the bounded pause ring, and emit the log
-    /// line(s). Called by every young/mixed evacuation path (serial + parallel)
-    /// so the pause sink and the `[GC ...]` log stay in lock-step. `pause_us`
-    /// is `Instant::elapsed().as_micros()` — see `G1PauseRecord`.
+    /// Account for one completed STW collection with NO phase breakdown.
+    ///
+    /// **Test convenience only since F-07.** Every production evacuation driver
+    /// — both young, both mixed, and the kept-region drain — now measures its
+    /// own phases and calls [`Self::record_collection_with_phases`] directly. A
+    /// production caller here would record an all-zero breakdown, which the
+    /// `[GC-STAT]` renderer suppresses entirely, so the pause would silently
+    /// stop being attributable. That is the state the parallel driver (the
+    /// DEFAULT one) was in until F-07.
+    ///
+    /// `pause_us` is `Instant::elapsed().as_micros()` — see `G1PauseRecord`.
     fn record_collection(&self, collection_type: G1CollectionType, pause_us: u64, stats: &GcStats) {
         self.record_collection_with_phases(
             collection_type,

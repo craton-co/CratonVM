@@ -364,7 +364,36 @@ walk and a large old generation are different problems. The seven fields SUM to
 which runs in release builds and used to be charged to no phase at all, and
 `other_us` is the derived remainder. A table whose rows do not sum to the total
 cannot be used to argue that a cost was removed rather than moved, which is
-exactly what the rest of this section tries to do with it. On `probes/G1ChurnPauseProbe 96 900`
+exactly what the rest of this section tries to do with it.
+
+The first thing the completed partition showed is a cost nobody had a number
+for. On `probes/G1ChurnPauseProbe 8 40` at `-Xmx256m`, ten runs, **`verify_us`
+is 10.8-14.5 % of every young pause** — the budgeted post-pause
+dangling-reference sweep, which runs in release builds and was previously
+charged to no phase at all. It is defensible while G1-11 is open, but it is a
+choice, and `CRATONVM_G1_VERIFY_BUDGET` is now a decision an operator can
+actually make. (Also from those runs: the seven fields summed to `pause_us`
+EXACTLY, all ten times.)
+
+*Parallel evacuation on JIT-warm pauses (F-01), first reading.* Same probe and
+heap, five interleaved reps per arm, one pause per run:
+
+| arm | median pause | median wall |
+|---|---|---|
+| `CRATONVM_G1_PARALLEL_EVAC_IN_JIT=0` (the old fallback) | 305 ms | 7606 ms |
+| default | 268 ms | 7683 ms |
+
+Pause −12 %, wall unchanged, and the probe's checksum was identical across all
+ten runs and equal to a real JDK 25's. Read it as a direction, not a
+measurement: it is a **debug build** on a host running two other agents'
+compiles, so the absolute numbers mean nothing and the copy loop's share is not
+the release build's. The release-build version of this is owed, together with
+the young-sizing re-run above.
+
+One asymmetry in it is real and expected: the parallel arm's fix-up walked 21-26
+regions against the serial arm's 12. N workers claim N to-space regions, so more
+regions are "written into" and the narrowed Phase-4 set is correspondingly
+wider. The parallel closure pays for it and then some. On `probes/G1ChurnPauseProbe 96 900`
 at `-Xmx2048m` a 330 ms young pause split: roots 0.7 %, remembered-set
 walks 0.03 %, Cheney closure 38 %, whole-heap fix-up 10-18 %, freeing the
 collection set **42 %**. That last figure is why the phase breakdown exists
