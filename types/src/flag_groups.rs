@@ -1204,6 +1204,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "this-nonnull", on_key: Some("CRATONVM_JIT_THIS_NONNULL"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     // Drops the getfield receiver TEST/JZ where the dataflow proves it dead.
     E { group: Group::JIT, token: "receiver-null-elim", on_key: Some("CRATONVM_JIT_RECEIVER_NULL_ELIM"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // OPT-IN, and the only switch in this backend whose wrong arm is SILENT:
+    // a stale or mis-shaped entry does not produce a wrong answer, it resumes
+    // execution at an address the table chose. Default off until it has soaked.
+    E { group: Group::JIT, token: "implicit-null-check", on_key: Some("CRATONVM_JIT_IMPLICIT_NULL_CHECK"), off_key: None, off_word: None, since: "2026-09-02" },
     // OPT-IN, and known to miscompile until the ARG_REGS audit lands -- see
     // `x64::operand_cache_enabled`. Declared so the two arms are measurable in
     // one binary, which is what the previous shape (no flag at all) prevented.
