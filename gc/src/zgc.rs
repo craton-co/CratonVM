@@ -6316,7 +6316,29 @@ impl ZgcRealHeap {
         } else {
             None
         };
-        let frames_are_rewritable = refusal.is_none();
+        // `CRATONVM_ZGC_ASSUME_REWRITABLE=1` -- **A MEASUREMENT INSTRUMENT, and
+        // unsafe to run with.** It answers the one question this family turns
+        // on and which no per-obligation repair can answer: if every compiled
+        // frame WERE rewritable, would compaction fix the workload at all?
+        //
+        // Discharging obligations one at a time cannot answer it, and two
+        // attempts on record show why. `CRATONVM_XT_JIT_COVERAGE_ASSUME` took
+        // the cross-thread handshake from `accepted=0 refused=1731` to
+        // `accepted=1731 refused=0` and `TestCachedQueryResults` failed
+        // identically, because other obligations still marked the cycle
+        // incomplete. `CRATONVM_XT_HELPER_WINDOW_DISCHARGE` then removed
+        // `xt-helper-window-conservative-scan` outright (12 -> absent on
+        // `TestMultiThread`) and `relocation_on_proven_jit` went 1 -> 0,
+        // because the refusals redistributed to
+        // `compiled-frame-oop-not-published` and `cross-thread-jit-peer`.
+        //
+        // `coverage-proof-incomplete` is a CONJUNCTION. Only forcing the whole
+        // term says whether the conjunction is worth satisfying, and that is
+        // the ONLY thing this flag is for. It relocates under frames nobody
+        // proved rewritable; expect corruption if the answer is no.
+        let assume_rewritable =
+            cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_ASSUME_REWRITABLE").is_some();
+        let frames_are_rewritable = refusal.is_none() || assume_rewritable;
         if compiled_frames_live && !frames_are_rewritable {
             self.relocation_skipped_jit.fetch_add(1, Ordering::Relaxed);
             if let Some(r) = refusal {

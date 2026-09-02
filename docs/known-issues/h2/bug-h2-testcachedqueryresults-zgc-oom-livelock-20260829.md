@@ -370,6 +370,40 @@ is no longer blocked on an unknown:
 Step 3 is the one to be careful with: discharging only the labelled site is what
 made the first attempt look like progress while engagement did not move at all.
 
+### 2026-09-02 (later): the discharge WORKS and changes nothing -- `coverage-proof-incomplete` is a conjunction
+
+`CRATONVM_XT_HELPER_WINDOW_DISCHARGE=1` gates BOTH refusal sites off one
+per-cycle condition and forces the interior-resolving probe, so the helper
+window is genuinely discharged this time -- not just relabelled. One binary,
+`org.h2.test.db.TestMultiThread`:
+
+| discharge | helper windows | coverage reasons | `skipped_jit` | `on_proven_jit` | compaction |
+|---|---:|---|---:|---:|---:|
+| off | 49 | **`xt-helper-window=12`**, `oop-not-published=3` | 15 | 1 | 1 cycle / 2 220 |
+| on | 37 | *(absent)*, `cross-thread-jit-peer=5`, `oop-not-published=8` | 13 | **0** | **0** |
+
+The reason leaves the census. **Engagement does not improve** -- it goes to
+zero, and `coverage-proof-incomplete` barely moves (15 -> 13). The refusals
+simply redistribute to the next obligations in line.
+
+**That is the third time the same lesson has arrived, and it should be the
+page's headline.** `coverage-proof-incomplete` is a CONJUNCTION over many
+obligations, and discharging them one at a time can never move
+`relocation_on_proven_jit`:
+
+* `CRATONVM_XT_JIT_COVERAGE_ASSUME` took the handshake to
+  `accepted=1731 refused=0` -> the class failed identically;
+* `CRATONVM_XT_HELPER_WINDOW_PIN` removed the label only -> engagement 1 vs 2;
+* `CRATONVM_XT_HELPER_WINDOW_DISCHARGE` removed the obligation outright ->
+  engagement 1 -> 0.
+
+So the next measurement is not another repair. It is
+`CRATONVM_ZGC_ASSUME_REWRITABLE=1`, which forces the WHOLE term and is
+unsafe by construction, and it answers the only question worth asking before
+any further work: **if every compiled frame were rewritable, would compaction
+fix this class at all?** If it would not, the page's OOM framing is wrong at the
+root and every coverage repair above it is beside the point.
+
 ### 2026-09-01 (later): two reproduction attempts that FAILED, and what each eliminates
 
 `probes/ZgcRefArrayFragProbe.java` is checked in because it does NOT reproduce.

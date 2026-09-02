@@ -839,7 +839,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-85 tokens.
+86 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -904,6 +904,7 @@ export inherited from a parent shell.
 | `youngscan-stride` | `CRATONVM_YOUNGSCAN_STRIDE` |
 | `zgc-parmark` | `CRATONVM_ZGC_PARMARK` |
 | `zgc-relocate` | `CRATONVM_ZGC_RELOCATE` |
+| `zgc-assume-rewritable` | `CRATONVM_ZGC_ASSUME_REWRITABLE` |
 | `zgc-relocate-proven-jit` | `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT` |
 | `zgc-high-compaction` | `CRATONVM_ZGC_HIGH_COMPACTION` |
 | `zgc-tlab-starved-recycle` | `CRATONVM_ZGC_TLAB_STARVED_RECYCLE` |

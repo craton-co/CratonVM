@@ -1560,6 +1560,7 @@ pub const INVENTORY: &[E] = &[
     // restores the older refusal that fired on the mere existence of a
     // compiled frame -- which is why the default configuration never
     // defragmented. See `gc/src/zgc.rs::zgc_relocate_under_proven_jit`.
+    E { group: Group::GC, token: "zgc-assume-rewritable", on_key: Some("CRATONVM_ZGC_ASSUME_REWRITABLE"), off_key: None, off_word: None },
     E { group: Group::GC, token: "zgc-relocate-proven-jit", on_key: Some("CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-29 with the LARGE-OBJECT end's compactor. Default-ON,
     // so a KILL SWITCH with the same `off_word: Some("0")` as its neighbours:
