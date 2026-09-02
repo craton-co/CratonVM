@@ -14,6 +14,18 @@ The four review items, each shipped with a kill switch:
 | 3 | reductions fold each warp with `shfl.sync.down` before ONE `red.global.add` per warp | (none — codegen; `GATE_REDUCTION=1` in `ci-gate.sh` checks it) |
 | 4 | device `AllocPool` (exact-size free list, 512 MiB cap); dead barrier `cuEventRecord` and dead streams removed | `CRATONVM_GPU_DEVICE_POOL=0` |
 
+Items 1 and 3 are wins on hardware. Item 2 is correctness with no
+timing claim. Item 4 is the honest one: the pool engages on one of the
+three workloads measured, and its first version carried a defect of the
+same kind as item 1 — see below.
+
+**A caveat on the absolute timings.** The host is a daily-driver
+workstation and another session was compiling during part of this
+validation (load 90%, three `rustc` processes). Numbers taken then are
+marked; the direction of each A/B held in every round, but the absolute
+per-launch figures drifted about 2x between a quiet host and a busy
+one, so read the arms against each other and not against the clock.
+
 ## Item 3 — reduction (`GpuDotBench 16777216 5`)
 
 | arm | dot_ms | checksum |
@@ -40,32 +52,51 @@ resident `GpuArray`s, awaited once.
 `SpontaneousCompletionCheck 4194304`: PASS — the reaper completes a
 submission with no future call on it.
 
-## Item 4 — transfer floor (`GpuTransferFloor 2764800 30`, best_ms)
+## Item 4 — device allocation pool
 
-Interleaved rounds, same binary, pool on vs `CRATONVM_GPU_DEVICE_POOL=0`:
+**Read the census before the timings.** The exit line
+`[cratonvm] gpu events: ... device allocs: cuMemAlloc=N pooled=M parked=P`
+says whether the pool was engaged at all, and on two of the three
+workloads it was not:
 
-| round | pool on | pool off |
-|---|---|---|
-| 1 | 1.227 | 1.288 |
-| 2 | 1.662 | 2.040 |
-| 3 | 1.415 | 1.473 |
-| 4 | 1.410 | 1.683 |
-| 5 | 1.507 | 1.257 |
+| workload | cuMemAlloc | pooled | parked |
+|---|---|---|---|
+| `GpuTransferFloor 2764800 30` | 2 | 0 | 0 |
+| `GpuAsyncChainBench 65536 400 5` | 22-58 | 0 | 3 |
+| `GpuDotBench 16777216 5` | 4 | 5 (55.6%) | 6 |
 
-Pool on wins 4 of 5 rounds; best-of-5 1.227 vs 1.257 ms. Checksum
-11466174412800 in every run. The pool stays default-on: the gain is small on
-this workload (one resident input, one chunked writeback) and the point of
-the pool is the allocation-per-dispatch shape, where `cuMemAlloc` +
-`cuMemFree` is the floor.
+The transfer floor allocates its buffers once and holds them, so the
+earlier pool-on/pool-off timings on it were comparing two arms in which
+the pool did nothing — noise, reported as a 4-of-5 win. The chain bench
+parks 3 blocks and reuses none. Only the dot bench, which allocates a
+scalar-return cell per dispatch, actually recycles.
 
-Pinned-host staging for H2D uploads was prototyped behind
-`CRATONVM_GPU_PINNED_H2D=1` and measured neutral here (1.41 vs 1.33 ms
-best, single runs), and slower (0.77-0.90x) in the independent bandwidth
-measurement in `cuda-bridge/tests/transfer_bandwidth_it.rs`; it was removed
-rather than left as an opt-in that is never a win.
+That census line is also what found the two defects below. It had been
+printing in zero logs: `gpu_event_census::exit_summary` sat behind
+`dispatch_timing::report`'s `calls == 0` early return, and `CALLS` only
+moves on the `submitMethod` path, so no `--gpu` run printed it.
 
-`GpuWarm f 4194304 5`: warm_ms=2, SAMPLE=-1430079446 (matches HotSpot via
-`ci-gate.sh`).
+### The drop-time wait (fixed)
+
+`DeviceBuffer::drop` called `ev.synchronize()` when the buffer's
+last-write event had not fired, to widen the pool's admission. The
+thread that drops a per-dispatch buffer is the thread submitting the
+next dispatch, so that wait serialised the chain — the same defect as
+the per-launch host callback. It now retires only an already-fired
+block. The drop hook is gated on `device_pool_enabled()` too, so
+`CRATONVM_GPU_DEVICE_POOL=0` is a complete ablation rather than half of
+one.
+
+`cuda-bridge/tests/alloc_pool_it.rs` is the regression test for the
+admission rule, with both negative controls run.
+
+### Pinned H2D staging (removed)
+
+Prototyped behind `CRATONVM_GPU_PINNED_H2D=1`, then measured against
+the pageable path by `cuda-bridge/tests/transfer_bandwidth_it.rs`:
+10-23% SLOWER at every size from 1 to 128 MiB, because the host memcpy
+into the pinned slab costs more than the faster DMA saves. The flag,
+the pool and the staging branch are gone.
 
 ## Item 2 — critical sections
 
