@@ -2015,6 +2015,48 @@ pub struct G1PausePhases {
     /// told from a large old generation.
     pub fixup_regions: u32,
     pub fixup_bytes: u64,
+    /// The region census AFTER this pause: Free / Eden / Survivor / Old /
+    /// humongous.
+    ///
+    /// `needs_gc` triggers on the FREE FRACTION, so "how much did this pause
+    /// buy" is not answerable from `bytes_freed` alone -- it is answerable
+    /// from how many regions came back. A pause that frees bytes without
+    /// returning regions to the Free pool leaves the trigger latched and the
+    /// next pause starts immediately, which is the storm shape
+    /// `young_target_regions` documents as "a trigger the collector cannot
+    /// satisfy".
+    ///
+    /// Filled inside the pause, where the regions guard is already held. The
+    /// census this replaces was written as a `try_lock` inside the `[GC-STAT]`
+    /// emitter -- and every collection path calls that emitter while holding
+    /// the guard, so the `try_lock` ALWAYS failed and the counts were never
+    /// once printed. An instrument armed where it cannot fire.
+    pub free_regions: u32,
+    pub eden_regions: u32,
+    pub surv_regions: u32,
+    pub old_regions: u32,
+    pub hum_regions: u32,
+}
+
+impl G1PausePhases {
+    /// Fill the region census from a borrowed region table.
+    fn record_region_census(&mut self, regions: &[G1Region]) {
+        let (mut f, mut e, mut s, mut o, mut h) = (0u32, 0u32, 0u32, 0u32, 0u32);
+        for r in regions.iter() {
+            match r.region_type {
+                RegionType::Free => f += 1,
+                RegionType::Eden => e += 1,
+                RegionType::Survivor => s += 1,
+                RegionType::Old => o += 1,
+                _ => h += 1,
+            }
+        }
+        self.free_regions = f;
+        self.eden_regions = e;
+        self.surv_regions = s;
+        self.old_regions = o;
+        self.hum_regions = h;
+    }
 }
 
 /// Percentile reduction of the recorded pauses, split by collection type
@@ -4207,6 +4249,8 @@ impl G1Collector {
         // forwarding entry (incomplete remembered set => UAF). No-op on
         // the release/quiet path; aborts in debug.
         phases.free_us = phase_mark.elapsed().as_micros() as u64;
+        // The census, while the guard is still held -- see the field docs.
+        phases.record_region_census(&regions);
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
         self.dbg_verify_rset_completeness(&regions, "young-serial");
         // Env-gated diagnostics (no-ops unless CRATONVM_G1_DBG_HEADERS /
@@ -10514,7 +10558,7 @@ impl G1Collector {
             String::new()
         } else {
             format!(
-                " roots_us={} rset_us={} closure_us={} fixup_us={} free_us={}                  fixup_regions={} fixup_bytes={}",
+                " roots_us={} rset_us={} closure_us={} fixup_us={} free_us={}                  fixup_regions={} fixup_bytes={} free_regions={} eden_regions={} surv_regions={} old_regions={} hum_regions={}",
                 phases.roots_us,
                 phases.rset_us,
                 phases.closure_us,
@@ -10522,6 +10566,11 @@ impl G1Collector {
                 phases.free_us,
                 phases.fixup_regions,
                 phases.fixup_bytes,
+                phases.free_regions,
+                phases.eden_regions,
+                phases.surv_regions,
+                phases.old_regions,
+                phases.hum_regions,
             )
             .replace("                 ", "")
         };
@@ -10532,33 +10581,15 @@ impl G1Collector {
             stats.bytes_copied,
             stats.bytes_freed,
             if gc_flags().g1_dbg_reach {
-                // try_lock: the collection paths call this while still holding
-                // the regions guard (diagnostic-only; skip the counts then).
-                if let Some(regions) = self.regions.try_lock() {
-                    let mut f = 0usize;
-                    let mut e = 0usize;
-                    let mut s = 0usize;
-                    let mut o = 0usize;
-                    let mut h = 0usize;
-                    for r in regions.iter() {
-                        match r.region_type {
-                            RegionType::Free => f += 1,
-                            RegionType::Eden => e += 1,
-                            RegionType::Survivor => s += 1,
-                            RegionType::Old => o += 1,
-                            _ => h += 1,
-                        }
-                    }
-                    format!(
-                        " free={f} eden={e} surv={s} old={o} hum={h} old_bytes={}",
-                        self.old_gen_bytes.load(Ordering::Relaxed)
-                    )
-                } else {
-                    format!(
-                        " old_bytes={}",
-                        self.old_gen_bytes.load(Ordering::Relaxed)
-                    )
-                }
+                // The region census used to be taken HERE, behind a `try_lock`
+                // with the comment "the collection paths call this while still
+                // holding the regions guard (diagnostic-only; skip the counts
+                // then)". Every collection path does exactly that, so the
+                // `try_lock` always failed and the counts were never once
+                // printed -- an instrument armed where it cannot fire. It is
+                // taken inside the pause now and rides on `phase_note`; see
+                // `G1PausePhases::free_regions`.
+                format!(" old_bytes={}", self.old_gen_bytes.load(Ordering::Relaxed))
             } else {
                 String::new()
             },
