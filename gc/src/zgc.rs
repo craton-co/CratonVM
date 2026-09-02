@@ -7947,7 +7947,7 @@ impl ZgcRealHeap {
 
     /// Bump-allocate `size` zeroed bytes (8-byte aligned) and register the
     /// base address. Returns `None` on OOM.
-    fn alloc_raw(&self, size: usize) -> Option<*mut u8> {
+    fn alloc_raw(&self, size: usize, init: &dyn Fn(*mut u8)) -> Option<*mut u8> {
         // Which end of the arena. See `Arena::high_cursor` for the measurement
         // this exists for; the short version is that one long-lived object
         // inside a thread's private TLAB chunk caps every hole in the heap at
@@ -8098,6 +8098,22 @@ impl ZgcRealHeap {
             unsafe { std::ptr::write_bytes(ptr, 0, size) };
             ptr
         };
+        // THE HEADER, BEFORE THE REGISTRY. `registry.insert` is this heap's
+        // publication point: it is what `is_object_address` answers from and
+        // what `collect_garbage`'s snapshot enumerates, so between the insert
+        // and the caller's header write the address is an object nothing has
+        // described. The span above is zeroed, so a reader in that window
+        // decodes `class_id=0, shape=0, kind=Object` -- a well-formed EMPTY
+        // object -- and the sweep would size it at `HEADER_SIZE`, find
+        // `GC_FLAG_MARKED` clear (`allocate_black_if_marking` has not run
+        // either) and free 16 bytes of an object that is neither dead nor 16
+        // bytes long.
+        //
+        // See `G1Region::bump_alloc_initialized` for the same ordering in the
+        // G1 backend and `GenerationalHeap::try_alloc_young_initialized`, whose
+        // SAFETY comment has stated the rule since long before either: "`init`
+        // writes the valid header before the arena lock is released".
+        init(ptr);
         // One `fetch_or` into the object-start bitmap — no lock, no hash, no
         // table that grows with the live set. See the "Object-start membership"
         // section header for the measurement this replaced.
@@ -8134,17 +8150,25 @@ impl ZgcRealHeap {
     pub fn try_alloc_object(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
         let fields_size = num_fields.checked_mul(SLOT_SIZE)?;
         let total = HEADER_SIZE.checked_add(fields_size)?;
-        let ptr = self.alloc_raw_tlab(total)?;
-        let header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Object,
-            ArrayElementType::Reference,
-            0,
-            u32::try_from(num_fields).ok()?,
-        );
-        unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
-        }
+        // The header is written by the INITIALIZER, i.e. before the address
+        // enters the object-start registry. See `alloc_raw`.
+        let num_slots = u32::try_from(num_fields).ok()?;
+        let ptr = self.alloc_raw_tlab(total, |ptr| {
+            // SAFETY: `ptr` is the base of a zeroed, exclusively-owned span the
+            // allocator has just reserved and not yet published.
+            unsafe {
+                std::ptr::write(
+                    ptr as *mut ObjectHeader,
+                    ObjectHeader::new(
+                        class_id,
+                        ObjectKind::Object,
+                        ArrayElementType::Reference,
+                        0,
+                        num_slots,
+                    ),
+                );
+            }
+        })?;
         // Allocate BLACK while a concurrent cycle is marking. Must follow
         // the header write above; see `allocate_black_if_marking`.
         self.allocate_black_if_marking(ptr);
@@ -8219,12 +8243,18 @@ impl ZgcRealHeap {
         }
         let data_size = array_data_size(length, element_type).ok()?;
         let total = ARRAY_DATA_OFFSET.checked_add(data_size)?;
-        let ptr = self.alloc_raw_tlab(total)?;
+        // The header is written by the INITIALIZER, i.e. before the address
+        // enters the object-start registry. See `alloc_raw`.
         let len_u32 = u32::try_from(length).ok()?;
-        let header = ObjectHeader::new(class_id, ObjectKind::Array, element_type, len_u32, len_u32);
-        unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
-        }
+        let ptr = self.alloc_raw_tlab(total, |ptr| {
+            // SAFETY: as in `try_alloc_object`.
+            unsafe {
+                std::ptr::write(
+                    ptr as *mut ObjectHeader,
+                    ObjectHeader::new(class_id, ObjectKind::Array, element_type, len_u32, len_u32),
+                );
+            }
+        })?;
         // Allocate BLACK while a concurrent cycle is marking. Must follow
         // the header write above; see `allocate_black_if_marking`.
         self.allocate_black_if_marking(ptr);
@@ -11498,7 +11528,7 @@ impl ZgcRealHeap {
     /// chunk reservations would not still be crossed afterwards, and the
     /// parked-live-set re-arm reasoning (`gc_rearm`) would be reading two
     /// different quantities on either side of the sweep.
-    fn alloc_tlab(&self, size: usize) -> Option<*mut u8> {
+    fn alloc_tlab(&self, size: usize, init: &dyn Fn(*mut u8)) -> Option<*mut u8> {
         if !self.tlab_enabled.load(Ordering::Relaxed) {
             return None;
         }
@@ -11515,6 +11545,13 @@ impl ZgcRealHeap {
                 tlab.alloc(size)?
             }
         };
+        // The header first, for the reason spelled out at the twin call in
+        // `alloc_raw`: registration is publication, and an address that is
+        // registered but not yet described is one the sweep can size at
+        // `HEADER_SIZE` and free. The TLAB chunk is zeroed by `tlab_refill`, so
+        // the window's reader sees an empty object rather than garbage -- which
+        // bounds the damage without removing it.
+        init(addr as *mut u8);
         // Registered INSIDE the cell lock, and before the pointer is returned
         // to anyone: `is_object_address` is a mutator-path oracle on this heap,
         // not just a GC one, so the window in which a live object is absent
@@ -11533,10 +11570,14 @@ impl ZgcRealHeap {
     /// takes. The fallback is the pre-TLAB path byte-for-byte, so a heap with
     /// the kill switch off behaves exactly as it did before this change.
     #[inline]
-    fn alloc_raw_tlab(&self, size: usize) -> Option<*mut u8> {
-        match self.alloc_tlab(size) {
+    fn alloc_raw_tlab(&self, size: usize, init: impl Fn(*mut u8)) -> Option<*mut u8> {
+        // `Fn`, not `FnOnce`: the TLAB arm may decline (size, kill switch, a
+        // refill that cannot be served) without having run the initializer, and
+        // the `alloc_raw` fallback then needs it. Only one of the two ever
+        // runs it, on the span it is about to publish.
+        match self.alloc_tlab(size, &init) {
             Some(ptr) => Some(ptr),
-            None => self.alloc_raw(size),
+            None => self.alloc_raw(size, &init),
         }
     }
 }
@@ -12751,25 +12792,31 @@ impl GarbageCollector for ZgcRealHeap {
         let total = HEADER_SIZE
             .checked_add(fields_size)
             .expect("object total size overflow");
-        let ptr = self.alloc_raw_tlab(total).unwrap_or_else(|| {
-            eprintln!("FATAL: ZGC(real): out of heap space for object ({total} bytes)");
-            std::process::abort();
-        });
-        let mut header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Object,
-            ArrayElementType::Reference,
-            0,
-            u32::try_from(num_fields).expect("field count exceeds u32::MAX"),
-        );
-        if let Some(body) = compact_body {
-            header.set_compact_shape(num_fields as u32, body);
-        }
-        // SAFETY: `ptr` is a fresh zeroed allocation of `total >= HEADER_SIZE`.
-        let obj = unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
-            ObjectRef::from_raw(ptr)
-        };
+        let num_slots = u32::try_from(num_fields).expect("field count exceeds u32::MAX");
+        // The header is written by the INITIALIZER, i.e. before the address
+        // enters the object-start registry. See `alloc_raw`.
+        let ptr = self
+            .alloc_raw_tlab(total, |ptr| {
+                let mut header = ObjectHeader::new(
+                    class_id,
+                    ObjectKind::Object,
+                    ArrayElementType::Reference,
+                    0,
+                    num_slots,
+                );
+                if let Some(body) = compact_body {
+                    header.set_compact_shape(num_slots, body);
+                }
+                // SAFETY: `ptr` is a fresh zeroed span of `total >= HEADER_SIZE`
+                // bytes that the allocator has not yet published.
+                unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
+            })
+            .unwrap_or_else(|| {
+                eprintln!("FATAL: ZGC(real): out of heap space for object ({total} bytes)");
+                std::process::abort();
+            });
+        // SAFETY: the initializer above wrote a well-formed header at `ptr`.
+        let obj = unsafe { ObjectRef::from_raw(ptr) };
         // Allocate BLACK while a concurrent cycle is marking. Must follow the
         // header write; see `allocate_black_if_marking`.
         self.allocate_black_if_marking(ptr);
@@ -12790,23 +12837,31 @@ impl GarbageCollector for ZgcRealHeap {
         let total = HEADER_SIZE
             .checked_add(data_size)
             .expect("array total size overflow");
-        let ptr = self.alloc_raw_tlab(total).unwrap_or_else(|| {
-            eprintln!("FATAL: ZGC(real): out of heap space for array ({total} bytes)");
-            std::process::abort();
-        });
         let len_u32 = u32::try_from(length).expect("array length exceeds u32::MAX");
-        let header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Array,
-            element_type,
-            len_u32,
-            len_u32, // mirror length into num_slots, like Heap/G1/gen_heap
-        );
-        // SAFETY: fresh zeroed allocation of `total >= HEADER_SIZE`.
-        let obj = unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
-            ObjectRef::from_raw(ptr)
-        };
+        // The header is written by the INITIALIZER, i.e. before the address
+        // enters the object-start registry. See `alloc_raw`.
+        let ptr = self
+            .alloc_raw_tlab(total, |ptr| {
+                // SAFETY: fresh zeroed, unpublished span of `total >= HEADER_SIZE`.
+                unsafe {
+                    std::ptr::write(
+                        ptr as *mut ObjectHeader,
+                        ObjectHeader::new(
+                            class_id,
+                            ObjectKind::Array,
+                            element_type,
+                            len_u32,
+                            len_u32, // mirror length into num_slots, like Heap/G1/gen_heap
+                        ),
+                    );
+                }
+            })
+            .unwrap_or_else(|| {
+                eprintln!("FATAL: ZGC(real): out of heap space for array ({total} bytes)");
+                std::process::abort();
+            });
+        // SAFETY: the initializer above wrote a well-formed header at `ptr`.
+        let obj = unsafe { ObjectRef::from_raw(ptr) };
         // Allocate BLACK while a concurrent cycle is marking. Must follow the
         // header write; see `allocate_black_if_marking`.
         self.allocate_black_if_marking(ptr);
