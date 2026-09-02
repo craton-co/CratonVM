@@ -89,8 +89,9 @@ pub mod concurrent_mark;
 pub mod evac_pool;
 pub mod external_roots;
 pub mod g1;
-pub mod heap_reservation;
+pub mod g1_cards;
 pub mod g1_concurrent;
+pub mod heap_reservation;
 pub mod gc;
 /// Card / remembered-set cost counters and the per-cycle collector-decision
 /// record (see [`gc_metrics::gc_metrics_report`] and
@@ -165,9 +166,9 @@ pub use gc_metrics::{
     collector_decision_report, gc_metrics_report, CollectorDecision, GcMetricsRaw, GcMetricsReport,
 };
 pub use gen_heap::{
-    clear_jit_read_bounds, jit_read_bounds_addr, jit_region_bounds_addr, publish_jit_read_bounds,
-    GenerationalHeap, HeapStats, HeapStatsSnapshot, JitReadBoundsTable, JitRegionBoundsTable,
-    JIT_READ_BOUNDS, JIT_REGION_BOUNDS,
+    clear_jit_read_bounds, jit_g1_barrier_addr, jit_read_bounds_addr, jit_region_bounds_addr,
+    publish_jit_read_bounds, GenerationalHeap, HeapStats, HeapStatsSnapshot, JitG1BarrierTable,
+    JitReadBoundsTable, JitRegionBoundsTable, JIT_G1_BARRIER, JIT_READ_BOUNDS, JIT_REGION_BOUNDS,
 };
 pub use heap::{ArrayElementType, Heap, ObjectHeader, ObjectKind};
 pub use mark_bitmap::MarkBitmap;

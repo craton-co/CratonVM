@@ -114,7 +114,7 @@ use crate::JitRuntimeHelpers;
 /// (Revision `2` shipped the 60-field table; the `monitor_enter`/`monitor_exit`
 /// append that made it 62 did not bump this constant, because at the time
 /// nothing checked it. `ABI_REVISIONS` is that check.)
-pub const JIT_HELPERS_ABI_VERSION: u32 = 9;
+pub const JIT_HELPERS_ABI_VERSION: u32 = 10;
 
 /// Size in bytes of the helper table under [`JIT_HELPERS_ABI_VERSION`].
 ///
@@ -693,6 +693,10 @@ helper_fn_slots! {
     // `(seg, index, kind, raw_value) -> 1 handled | 0 declined` — the WRITE
     // twin. See `JitRuntimeHelpers::ffm_segment_set`.
     HelperFnFfmSegmentSet, ffm_segment_set, ffm_segment_set_fn, (i64, i64, i64, i64) -> i64;
+    // `(vm_ptr, obj_ptr, val_ptr)` — G1's post-write barrier, called from the
+    // inline barrier's slow arm. See `JitRuntimeHelpers::g1_post_write_barrier`
+    // for why it is not `write_barrier`.
+    HelperFnG1PostWriteBarrier, g1_post_write_barrier, g1_post_write_barrier_fn, (i64, i64, i64) -> ();
     // JVMS §6.5 aastore covariance check ONLY — (vm_ptr, array_ptr, val) ->
     // `i64::MIN` = refused (ArrayStoreException published) / `0` = proceed.
     // NOT the store: the caller keeps the inline MOV, the SATB pre-write
@@ -837,6 +841,9 @@ helper_field_table! {
     (ldc_string_cp,                  Function, false),
     (ffm_segment_get,                Function, false),
     (ffm_segment_set,                Function, false),
+    // Address of the GC's JIT_G1_BARRIER table, not a call target.
+    (g1_barrier_addr,                Constant, false),
+    (g1_post_write_barrier,          Function, false),
 }
 
 // ---------------------------------------------------------------------
@@ -857,7 +864,7 @@ const _: () = assert!(
 
 // Pin the literal count so a *removal* also has to touch this line.
 const _: () = assert!(
-    NUM_HELPER_FIELDS == 69,
+    NUM_HELPER_FIELDS == 71,
     "JitRuntimeHelpers field count changed — bump JIT_HELPERS_ABI_VERSION, the \
      literal here, and the size literal below",
 );
@@ -865,8 +872,8 @@ const _: () = assert!(
 // Pin the literal size and alignment. The JIT bakes `disp32` offsets derived
 // from this layout into RWX memory; a silent change here is a wild call.
 const _: () = assert!(
-    JIT_HELPERS_ABI_SIZE == 552,
-    "JitRuntimeHelpers size changed (expected 67 * 8 = 536) — the JIT's baked \
+    JIT_HELPERS_ABI_SIZE == 568,
+    "JitRuntimeHelpers size changed (expected 71 * 8 = 568) — the JIT's baked \
      helper offsets are now wrong; bump JIT_HELPERS_ABI_VERSION deliberately",
 );
 const _: () = assert!(
@@ -1031,6 +1038,8 @@ pub const GOLDEN_HELPER_OFFSETS: [(&str, usize); NUM_HELPER_FIELDS] = [
     ("ldc_string_cp", 528),
     ("ffm_segment_get", 536),
     ("ffm_segment_set", 544),
+    ("g1_barrier_addr", 552),
+    ("g1_post_write_barrier", 560),
 ];
 
 // Every golden row must name the descriptor row at the same index AND agree
@@ -1166,6 +1175,19 @@ pub const ABI_REVISIONS: &[HelperAbiRevision] = &[
         version: 9,
         num_fields: 69,
         size: 552,
+    },
+    // v10 -- appended `g1_barrier_addr` / `g1_post_write_barrier` (F-08), the
+    // table and the call target G1's INLINE post-write barrier needs. Closing
+    // defect G1-2 had made every JIT-compiled reference store an out-of-line
+    // `putfield_object` call under G1, because the inline arms are gated on a
+    // table G1 deliberately leaves empty; this pair is what lets the emitter
+    // put a real G1 barrier inline instead of borrowing the generational one's
+    // premises. Both optional: zeros emit no inline barrier and every store
+    // keeps the helper call it takes today.
+    HelperAbiRevision {
+        version: 10,
+        num_fields: 71,
+        size: 568,
     },
 ];
 
@@ -1374,7 +1396,7 @@ const _: () = {
         }
         i += 1;
     }
-    assert!(functions == 59, "callable-slot count changed");
+    assert!(functions == 60, "callable-slot count changed");
     assert!(
         offsets == 4,
         "the number of displacement slots changed — an Offset slot is baked as \
@@ -1382,7 +1404,7 @@ const _: () = {
          really is a displacement and is range-checked by validate_with",
     );
     assert!(
-        constants == 6,
+        constants == 7,
         "the number of baked-address slots changed — a Constant slot is loaded \
          as data and is NOT range-checked by validate_with, so misclassifying \
          a displacement as one silently removes its only sanity check",
@@ -1396,7 +1418,7 @@ const _: () = {
     // The runtime test below (`functions - required == 12`) was already on
     // the new number; this const was the only site still carrying 13.
     assert!(
-        optional_fns == 16,
+        optional_fns == 17,
         "the optional-callable count changed — every optional slot MUST have a \
          zero check at its emitter call site; confirm the new one does before \
          updating this number",
@@ -1758,6 +1780,8 @@ mod tests {
             ("ldc_string_cp", offset_of!(H, ldc_string_cp)),
             ("ffm_segment_get", offset_of!(H, ffm_segment_get)),
             ("ffm_segment_set", offset_of!(H, ffm_segment_set)),
+            ("g1_barrier_addr", offset_of!(H, g1_barrier_addr)),
+            ("g1_post_write_barrier", offset_of!(H, g1_post_write_barrier)),
         ];
 
         assert_eq!(HELPER_FIELDS.len(), probes.len());
@@ -1788,15 +1812,15 @@ mod tests {
     /// loudly rather than be absorbed by a computed expression.
     #[test]
     fn helper_table_size_and_align_are_the_literal_abi_numbers() {
-        assert_eq!(core::mem::size_of::<H>(), 552);
+        assert_eq!(core::mem::size_of::<H>(), 568);
         assert_eq!(core::mem::align_of::<H>(), 8);
-        assert_eq!(JIT_HELPERS_ABI_SIZE, 552);
+        assert_eq!(JIT_HELPERS_ABI_SIZE, 568);
         assert_eq!(JIT_HELPERS_ABI_ALIGN, 8);
         assert_eq!(HELPER_FIELD_STRIDE, 8);
-        assert_eq!(NUM_HELPER_FIELDS, 69);
-        assert_eq!(H::NUM_FIELDS, 69);
-        assert_eq!(H::NUM_HELPER_FN_FIELDS, 59);
-        assert_eq!(JIT_HELPERS_ABI_VERSION, 9);
+        assert_eq!(NUM_HELPER_FIELDS, 71);
+        assert_eq!(H::NUM_FIELDS, 71);
+        assert_eq!(H::NUM_HELPER_FN_FIELDS, 60);
+        assert_eq!(JIT_HELPERS_ABI_VERSION, 10);
     }
 
     /// The golden table is the only name→offset binding in the crate written
@@ -1821,7 +1845,7 @@ mod tests {
         }
         // The last golden offset plus one stride is the whole table.
         let (last_name, last_offset) = GOLDEN_HELPER_OFFSETS[H::NUM_FIELDS - 1];
-        assert_eq!(last_name, "ffm_segment_set");
+        assert_eq!(last_name, "g1_post_write_barrier");
         assert_eq!(last_offset + HELPER_FIELD_STRIDE, JIT_HELPERS_ABI_SIZE);
     }
 
@@ -1834,9 +1858,9 @@ mod tests {
         assert_eq!(
             last,
             HelperAbiRevision {
-                version: 9,
-                num_fields: 69,
-                size: 552,
+                version: 10,
+                num_fields: 71,
+                size: 568,
             },
         );
         // Append-only history: each revision strictly grows the table.
@@ -2030,11 +2054,11 @@ mod tests {
             .filter(|d| d.kind == HelperKind::Constant)
             .count();
         let required = HELPER_FIELDS.iter().filter(|d| d.required).count();
-        assert_eq!(functions, 59, "callable slots");
+        assert_eq!(functions, 60, "callable slots");
         assert_eq!(offsets, 4, "displacement slots");
-        assert_eq!(constants, 6, "baked-address slots");
+        assert_eq!(constants, 7, "baked-address slots");
         assert_eq!(required, 43, "required slots");
-        assert_eq!(functions - required, 16, "optional callable slots");
+        assert_eq!(functions - required, 17, "optional callable slots");
         assert_eq!(functions + offsets + constants, H::NUM_FIELDS);
     }
 
@@ -2191,13 +2215,13 @@ mod tests {
     fn as_words_matches_the_struct_fields() {
         let mut h = H::default();
         h.newarray = 1;
-        // The LAST field, whatever it currently is — `ffm_segment_set`
-        // since the FFM element accessors were appended.
-        h.ffm_segment_set = 2;
+        // The LAST field, whatever it currently is — `g1_post_write_barrier`
+        // since F-08 appended G1's inline barrier pair.
+        h.g1_post_write_barrier = 2;
         let w = h.as_words();
         assert_eq!(w[0], 1, "first slot");
         assert_eq!(w[H::NUM_FIELDS - 1], 2, "last slot");
-        assert_eq!(w.len(), 69);
+        assert_eq!(w.len(), 71);
     }
 
     /// Build a table with every *required* slot non-zero and every optional

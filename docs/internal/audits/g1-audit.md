@@ -582,6 +582,43 @@ Ordered. Each item is a precondition for the next being meaningful.
    the reading item 2's `cset_verify_truncated` counter exists to make possible,
    and it means `dangling=0` here is "nothing found in 995,328 objects
    sampled", not "the heap was exhaustively clean at any instant".
+
+   **F-05 (2026-09-02) — the SPACE reading above answered the wrong question,
+   and a card table shipped for the other one.** `rset_bytes_per_live_byte =
+   0.000034` says the remembered set is cheap to STORE. It says nothing about
+   what it costs to USE, and that is where the cost was: an entry names a source
+   REGION, so acting on one remembered edge meant `scan_source_region_for_cset_refs`
+   walking the whole source — every header validated, every reference slot read,
+   an `evacuation_candidate_is_an_object` check and a `region_for_ptr` binary
+   search per candidate — i.e. a cost proportional to BYTES IN THE SOURCE rather
+   than to the number of edges. A single edge into a 1 MiB Old region cost a
+   megabyte walk, and a COARSENED rset makes every live region a nominal source.
+   `gc/src/g1_cards.rs` adds a per-arena byte-per-512-bytes card table maintained
+   by the same three producers that maintain the rset, and Phase 2 now skips a
+   source with no dirty card outright and steps over any object that touches no
+   dirty card. `CRATONVM_G1_CARD_RSET=0` restores the whole-region walk.
+   Measured on the unit fixture (one holder among hundreds of fillers in a 1 MiB
+   source): `scanned=512 skipped=1048064` — 99.95% of the source walk removed.
+   The region-index rset is unchanged and still decides WHICH regions a pause
+   looks at; the cards decide WHERE INSIDE one. Residual: no block-start table,
+   so the walk still steps object-by-object (see the long comment at the
+   per-object screen for why `bump_alloc` cannot maintain one across a TLAB
+   carve), and a card is cleaned only at `G1Region::reset`, so a long-lived Old
+   region's cards saturate.
+
+   **END-TO-END, 2026-09-02.** `G1CardChurn 11 200` (four retained depth-11
+   trees whose leaves are re-pointed at fresh young `int[]` every round, so the
+   edges are old->young and the checksum is computed from data reachable ONLY
+   through them) at `-Xmx24m -XX:InitiatingHeapOccupancyPercent=15 --nojit`:
+   42 pauses, young and mixed, `checksum=82273920000` — byte-identical to
+   HotSpot and to the same binary under `CRATONVM_G1_CARD_RSET=0`. Engagement
+   on the mixed pauses reads `rset_scanned=2406256 rset_skipped=86240`, i.e.
+   about 3.5% of the source walk removed. That number is small and it is the
+   honest one for this probe: it re-points EVERY leaf every round, so nearly
+   every card in the holder regions is dirty by construction. It is the
+   worst case for a card screen, not the case it is for. The 99.95% figure
+   above is the other end of the same distribution (one holder among hundreds
+   of clean fillers), and a real application sits between them.
 6. ~~**Decide the JNI-pinned-source policy explicitly.**~~ **DONE.** Stated in
    `a_jni_pinned_region_is_an_ordinary_rset_source_not_a_wholesale_one`, which
    pins both halves: a JNI-pinned region is held out of the CSet but is an
@@ -673,3 +710,69 @@ routes to the helper, so the disable is fail-safe. Re-enabling it — with
 end-to-end coverage for every compiled store form and the card-table lifecycle —
 is what would give G1 back an inline post barrier, for old and fresh receivers
 alike.
+
+### F-08 (2026-09-02) — G1 got an inline post barrier of its own, and it is NOT the card mark
+
+The paragraph above is right that the generational inline card mark is the way
+to give the GENERATIONAL collector its inline barrier back, and it stays
+disabled: `inline_card_mark_available()` is still a constant `false` and this
+change does not touch it. What it got wrong is treating that as G1's only
+recovery path. G1's post barrier is a different mechanism with different inputs,
+and it does not need the card mark, the `GC_FLAG_OLD_GEN` bit, or the
+`JIT_REGION_BOUNDS` table whose emptiness closes G1-2:
+
+```
+if dst == null                              -> nothing to remember
+if (src - base) >> shift == (dst - base) >> shift  -> nothing to remember
+otherwise                                   -> record the edge
+```
+
+Both elided cases are exactly the cases `post_write_barrier_rset` returns from
+without touching anything, so the inline filter removes calls whose callee
+would have returned and never a call that would have recorded. Everything else
+— an address outside the arena, a Free destination region, an edge this thread
+already recorded — is left to the callee.
+
+Shipped as `jit/src/x64/objects.rs::emit_g1_barrier_filter` plus a lean
+`jit_g1_post_write_barrier` helper, against a **fourth** process-global table
+(`gc/src/gen_heap.rs::JIT_G1_BARRIER`: arena base, arena length, region mask,
+and F-05's card table base and shift). A fourth table rather than a fourth use
+of an existing one, for the third time and the same reason: `JIT_REGION_BOUNDS`
+must stay empty under G1 or G1-2 re-opens, and `publishing_the_g1_barrier_table_does_not_make_region_bounds_live`
+is the test that says so.
+
+Two things it deliberately does NOT do. It does not dirty the F-05 card inline,
+because the remembered-set ENTRY still has to be recorded and that is a hash-map
+insert keyed on a (source, target) region pair with no inline form — dirtying
+inline and calling anyway is duplicated work, and the callee dirties on the way
+through. Making the barrier fully inline would additionally require Phase 2 to
+take its source set from the card table rather than from the region-index
+remembered set, which is a collector policy change and not an emitter one; the
+table carries the card base and shift so that work starts from the numbers
+rather than from a table migration. And it does not use the trusted-oop
+receiver check, whose premise ("with bounds live the backend is Generational")
+is precisely what this arm falsifies.
+
+`CRATONVM_G1_INLINE_BARRIER`, **default OFF**. The soundness argument above is a
+proof about which calls are elided rather than a claim about behaviour, and the
+executable unit test pins the four cases the filter separates — including the
+one that only exists because G1's arena is malloc-aligned rather than
+region-aligned, where a base-free `(obj ^ val) & mask` would call two addresses
+either side of a real region boundary "same region" and lose the edge. It still
+ships off, because this is a code-generation change on an experimental
+collector and because the last inline barrier this JIT had was disabled by a
+production audit rather than by a review. The flag is how it gets measured
+before it becomes a default; §10's own advice ("it should be measured under the
+reliability gate rather than assumed small") applies to the recovery as much as
+to the cost.
+
+**END-TO-END, 2026-09-02.** `G1CardChurn 11 60` at `-Xmx24m` with the JIT WARM
+(no `--nojit`), which is the arm every earlier G1 result in this document was
+missing: `checksum=7616601600` with `CRATONVM_G1_INLINE_BARRIER=1`, identical to
+the same binary with it off and to HotSpot. The arm was verified to have been
+TAKEN rather than merely enabled — `emit_g1_barrier_filter` logs
+`jit: G1 inline post-write barrier ACTIVE` once per process at `info`, present
+in the flag-on run and absent in the flag-off control. A checksum from a gated
+path nobody confirmed was entered is the "a subsystem kill switch passing 6/6 is
+not a diagnosis" failure, and this file has been on the receiving end of it
+before.

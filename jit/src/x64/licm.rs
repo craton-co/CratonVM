@@ -532,6 +532,85 @@ pub fn region_bounds_are_live(bounds_addr: usize) -> bool {
     })
 }
 
+/// F-08 — is a G1 collector's geometry published, so an inline G1 post-write
+/// barrier can be emitted at all?
+///
+/// The THIRD bounds-shaped predicate in this file, and it must not be confused
+/// with either of the other two. [`region_bounds_are_live`] answers "may an
+/// inline reference store skip the collector's barrier", and under G1 the
+/// answer is permanently NO — that is defect G1-2's closure and this function
+/// does not touch it. This one answers a question that only arises AFTER that
+/// no: "if the emitter is going to run a real G1 barrier inline, does it have
+/// the numbers?"
+///
+/// The numbers live in `gc/src/gen_heap.rs::JIT_G1_BARRIER`, published once by
+/// `G1Collector::new` and cleared (owner-checked) on its `Drop`. `arena_len`
+/// (word 1) is the liveness flag and is stored last with `Release`, so a
+/// non-zero length implies the other four words are visible.
+///
+/// Fail-safe in both race directions, exactly as its sibling is: a compile that
+/// observes the table before the first publish, or after a collector is
+/// dropped, reports "not live" and the caller emits the `jit_putfield_object`
+/// helper call it emits today. A `0` address (the JIT unit-test helper tables,
+/// and any embedding that never wired the field) is likewise not live, which is
+/// what stops a caller baking a `MOV r64, 0` + `SUB r64, [r64]` that would
+/// fault.
+pub fn g1_barrier_table_live(g1_barrier_addr: usize) -> bool {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if g1_barrier_addr == 0 {
+        return false;
+    }
+    // SAFETY: `g1_barrier_addr` is non-zero here and is only ever set from
+    // `cratonvm_gc::jit_g1_barrier_addr()` — the address of the `'static`
+    // `JIT_G1_BARRIER: JitG1BarrierTable`, whose sole field is
+    // `[AtomicUsize; 5]` and which lives for the whole process — or, in this
+    // crate's tests, from a `static [AtomicUsize; 5]`. Both are valid, aligned
+    // and initialised for the loads below, which pair race-freely with the
+    // collector's `Release` store of word 1.
+    let words = unsafe { &*(g1_barrier_addr as *const [AtomicUsize; 5]) };
+    let arena_len = words[1].load(Ordering::Acquire);
+    if arena_len == 0 {
+        return false;
+    }
+    // A published table with a zero base or a zero region mask would make the
+    // emitted sequence wrong rather than merely useless, so treat it as not
+    // live rather than trusting the publisher. `region_mask` is
+    // `!(region_size - 1)` and can never legitimately be zero.
+    words[0].load(Ordering::Relaxed) != 0 && words[2].load(Ordering::Relaxed) != 0
+}
+
+/// F-08 — `CRATONVM_G1_INLINE_BARRIER`. Opt-in, default OFF.
+///
+/// See the flag's doc on `cratonvm_types::GcFlags` for why it ships off: this
+/// is a code-generation change on an experimental collector, and the last
+/// inline barrier this JIT had (`Compiler::inline_card_mark_available`, a
+/// DIFFERENT mechanism against a DIFFERENT table) was disabled after a WildFly
+/// boot audit found an old object left on a clean card. That one is not
+/// re-enabled by this and stays a constant `false`.
+pub fn g1_inline_barrier_enabled() -> bool {
+    #[cfg(test)]
+    if G1_INLINE_BARRIER_FORCED.with(|c| c.get()) {
+        return true;
+    }
+    cratonvm_types::flags().gc.g1_inline_barrier
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for [`g1_inline_barrier_enabled`].
+    ///
+    /// THREAD-local, not a process-global, and that is the whole point. The
+    /// real switch is a `cratonvm_types::flags()` field latched once per
+    /// process from the environment, so a test cannot vary it without
+    /// publishing the change to every other test in the binary — the exact
+    /// hazard that produced this workspace's narrow-oop-geometry flake, and the
+    /// reason `RememberedSet::add_reference_in_generation_within` exists on the
+    /// GC side. A thread-local override is visible only to the test that set
+    /// it, and `cargo test` gives each test its own thread.
+    pub(crate) static G1_INLINE_BARRIER_FORCED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 /// Inline TLAB `new` — bump allocation emitted directly in compiled code.
 ///
 /// Default-ON again (bt18-inline-tlab-regression-20260724): the emission is

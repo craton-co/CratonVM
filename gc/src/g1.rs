@@ -1293,6 +1293,14 @@ impl<'a> SharedEvac<'a> {
     /// remembered-set source region, evacuate every CSet-bound reference and
     /// rewrite the slot in place, pushing freshly-evacuated targets onto the
     /// shared work queue. Mirrors the serial `scan_source_region_for_cset_refs`.
+    ///
+    /// F-05 — `card_screen` mirrors the serial walker's parameter exactly; see
+    /// `G1Collector::scan_source_region_for_cset_refs` for the argument and for
+    /// why the JIT-pinned sources pass `false`. The two walkers have to agree:
+    /// a screen applied on one arm and not the other would make
+    /// `CRATONVM_G1_PARALLEL_EVAC` change what the pause FINDS, not just how
+    /// fast it finds it, and this file's history already has one defect
+    /// (G1-9) that was a divergence between these two scans.
     unsafe fn seed_source_region(
         &self,
         source_idx: usize,
@@ -1301,6 +1309,7 @@ impl<'a> SharedEvac<'a> {
         objs: &mut usize,
         bytes: &mut usize,
         deferred_self_forwarded: &mut Vec<usize>,
+        card_screen: bool,
     ) {
         if self.cset.contains(&source_idx) {
             return;
@@ -1312,6 +1321,23 @@ impl<'a> SharedEvac<'a> {
             }
             (r.cursor, r.data.addr() as *mut u8)
         };
+
+        let screen = card_screen && gc_flags().g1_card_rset;
+        let cards = self.collector.cards();
+        self.collector
+            .card_regions_offered
+            .fetch_add(1, Ordering::Relaxed);
+        if screen && !cards.any_dirty_in(base as usize, cursor) {
+            self.collector
+                .card_regions_skipped
+                .fetch_add(1, Ordering::Relaxed);
+            self.collector
+                .card_bytes_skipped
+                .fetch_add(cursor as u64, Ordering::Relaxed);
+            return;
+        }
+        let mut scanned_bytes = 0u64;
+        let mut skipped_bytes = 0u64;
 
         let jit_skips = self.collector.jit_tlab_skip_spans();
         let mut newly: Vec<usize> = Vec::new();
@@ -1352,6 +1378,16 @@ impl<'a> SharedEvac<'a> {
             if obj_size < HEADER_SIZE || offset + obj_size > cursor {
                 break;
             }
+
+            // F-05 — the per-object card screen, identical in meaning to the
+            // serial walker's. See it for why the test is over the object's
+            // whole byte range and why there is no block-start table.
+            if screen && !cards.any_dirty_in(obj_ptr as usize, obj_size) {
+                skipped_bytes += obj_size as u64;
+                offset += obj_size;
+                continue;
+            }
+            scanned_bytes += obj_size as u64;
 
             if kind == ObjectKind::Array {
                 if etype == ArrayElementType::Reference {
@@ -1424,6 +1460,14 @@ impl<'a> SharedEvac<'a> {
 
             offset += obj_size;
         }
+
+        // F-05 — same publication as the serial walker's.
+        self.collector
+            .card_bytes_scanned
+            .fetch_add(scanned_bytes, Ordering::Relaxed);
+        self.collector
+            .card_bytes_skipped
+            .fetch_add(skipped_bytes, Ordering::Relaxed);
 
         if !newly.is_empty() {
             self.outstanding.fetch_add(newly.len(), Ordering::AcqRel);
@@ -1757,6 +1801,18 @@ pub struct G1Region {
     /// Cleared by [`Self::reset`] (the bitmap is cleared there too, so the two
     /// stay in step) and at every mark start.
     marked_bytes_below_tams: AtomicUsize,
+    /// F-05 — the arena-wide card table, shared by every region and by the
+    /// collector.
+    ///
+    /// Held here, rather than only on [`G1Collector`], for one reason:
+    /// [`Self::reset`] is the point at which a region's remembered set is
+    /// cleared, and the cards are the same claim at a finer granularity, so
+    /// they have to be cleared in the same place or the two drift. `reset`
+    /// takes `&mut self` on a region and has no path to the collector, so the
+    /// region has to be able to reach the table itself. Every region in a
+    /// collector shares one `Arc`; the table is allocated once in
+    /// `G1Collector::new` and never resized.
+    cards: std::sync::Arc<crate::g1_cards::G1CardTable>,
     /// The same, restricted to `tlab:*` carves.
     ///
     /// A shared ring cannot answer the question it exists for. TLAB carves are
@@ -1773,11 +1829,16 @@ impl G1Region {
     /// Create a free region backed by `region_size` bytes starting at arena
     /// address `base`. The caller ([`G1Collector::new`]) guarantees the range
     /// is a live, region-exclusive slice of the collector's `arena`.
-    fn from_arena(base: usize, region_size: usize) -> Self {
+    fn from_arena(
+        base: usize,
+        region_size: usize,
+        cards: std::sync::Arc<crate::g1_cards::G1CardTable>,
+    ) -> Self {
         // Round-2 fix (HIGH — GC #5): bitmap covers exactly this region's
         // backing slice. Base = arena address, span = region_size.
         let mark_bitmap = MarkBitmap::new(base, region_size);
         Self {
+            cards,
             region_type: RegionType::Free,
             data: RegionBuf::new(base, region_size),
             cursor: 0,
@@ -1806,7 +1867,10 @@ impl G1Region {
     fn new(region_size: usize) -> Self {
         let buf = vec![0u8; region_size].into_boxed_slice();
         let base = Box::leak(buf).as_mut_ptr() as usize;
-        Self::from_arena(base, region_size)
+        // F-05: a standalone region gets a card table covering exactly itself,
+        // so `reset` and the card screen behave as they do in a real arena.
+        let cards = std::sync::Arc::new(crate::g1_cards::G1CardTable::new(base, region_size));
+        Self::from_arena(base, region_size, cards)
     }
 
     /// F-06 — this region's top-at-mark-start, in bytes from its base.
@@ -1917,6 +1981,25 @@ impl G1Region {
         self.live_bytes = 0;
         self.gc_efficiency = 0.0;
         self.rset.clear();
+        // F-05 — the cards are the same claim as the rset at a finer
+        // granularity, so they are cleared by the same statement that clears
+        // it. A card says "a cross-region reference store landed in these 512
+        // bytes"; this reset zero-fills the region and hands it back to the
+        // allocator, so nothing that could have held such a reference survives
+        // and every card of the region is a lie from here on. Leaving them
+        // dirty would not be unsound (Phase 2 would over-scan, exactly as a
+        // stale rset entry makes it over-scan) but it would make the screen
+        // useless within a few cycles: a region that is recycled every young
+        // pause would accumulate dirty cards forever.
+        //
+        // Cleared over `data.len()` rather than `prev_cursor`: a
+        // `HumongousContinuation` carries `cursor = 0` while its bytes hold the
+        // start object's payload, so a cursor-bounded clear would leave that
+        // span dirty for the region's next incarnation. The whole slice is the
+        // only bound that is right for every region type, and every region
+        // boundary is a card boundary (see `G1CardTable`), so this never
+        // touches a neighbour's cards.
+        self.cards.clear_range(self.data.as_ptr() as usize, self.data.len());
         self.pinned = false;
         self.pin_count = 0;
         self.age = 0;
@@ -2356,6 +2439,27 @@ pub struct G1PausePhases {
     /// told from a large old generation.
     pub fixup_regions: u32,
     pub fixup_bytes: u64,
+    /// F-05 — how many remembered-set source regions this pause was asked to
+    /// walk, and how many of them the card screen let it skip outright because
+    /// no card of the region was dirty.
+    ///
+    /// The denominator for `rset_us`, and the engagement readout for the card
+    /// table. `rset_regions_offered == 0` means Phase 2 had nothing to do at
+    /// all — a different fact from `rset_regions_skipped == 0`, which means the
+    /// screen ran and refused every region, which is in turn different from
+    /// "the feature is off" (`CRATONVM_G1_CARD_RSET=0`, under which
+    /// `rset_regions_skipped` and `rset_bytes_skipped` are both zero while
+    /// `rset_bytes_scanned` accounts for everything).
+    pub rset_regions_offered: u32,
+    pub rset_regions_skipped: u32,
+    /// F-05 — bytes of objects whose reference slots Phase 2 actually visited,
+    /// and bytes it stepped over because the object touched no dirty card.
+    ///
+    /// Their sum is what the pre-F-05 walk would have visited, so
+    /// `skipped / (scanned + skipped)` is the fraction of the source walk the
+    /// card table removed.
+    pub rset_bytes_scanned: u64,
+    pub rset_bytes_skipped: u64,
 }
 
 impl G1PausePhases {
@@ -2828,6 +2932,37 @@ pub struct G1Collector {
     /// 100-slot object incurred ~25k linear probes during evacuation.
     region_lookup: Vec<(usize, usize)>,
 
+    /// F-05 — the arena-wide card table: one byte per 512 bytes of heap,
+    /// recording whether a cross-region reference store ever landed there.
+    ///
+    /// The remembered set answers "which REGIONS hold an edge into me"; this
+    /// answers "where INSIDE one of them". Phase 2 needs both, and before F-05
+    /// it had only the first, so acting on a single remembered edge cost a walk
+    /// of the entire source region. Shared (`Arc`) with every [`G1Region`],
+    /// which clears its own range in [`G1Region::reset`] — see
+    /// [`crate::g1_cards`] for the lifetime rule and for why a scanned card is
+    /// deliberately NOT cleaned.
+    cards: std::sync::Arc<crate::g1_cards::G1CardTable>,
+
+    /// F-05 engagement counters. A feature whose engagement cannot be counted
+    /// is one nobody can tell is running, and these are read out per pause in
+    /// [`G1PausePhases`] (`rset_regions_skipped` / `rset_bytes_scanned` /
+    /// `rset_bytes_skipped`).
+    ///
+    /// `card_regions_offered` counts source regions Phase 2 was asked to walk;
+    /// `card_regions_skipped` the subset that had no dirty card at all and were
+    /// therefore not walked; `card_bytes_scanned` the bytes of objects whose
+    /// reference slots were visited; `card_bytes_skipped` the bytes of objects
+    /// stepped over because they touched no dirty card. The two byte counters
+    /// sum to what the pre-F-05 walk would have visited, so the ratio is the
+    /// engagement, and a zero in `card_bytes_skipped` beside a non-zero
+    /// `card_bytes_scanned` says the screen ran and refused — which a bare
+    /// "cards scanned" count could never distinguish from "the screen never ran".
+    card_regions_offered: AtomicU64,
+    card_regions_skipped: AtomicU64,
+    card_bytes_scanned: AtomicU64,
+    card_bytes_skipped: AtomicU64,
+
     /// Lock-free inclusive-exclusive bounds `[arena_base, arena_end)` of the
     /// single contiguous backing arena. Immutable for the collector's
     /// lifetime (the `arena` `Box` is allocated once in [`G1Collector::new`]
@@ -3037,7 +3172,13 @@ static NEXT_G1_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 /// into slot 0.
 impl Drop for G1Collector {
     fn drop(&mut self) {
+        // F-16: the arena is a `ReservedHeap` now, so its base comes from
+        // `base()` rather than from a slice pointer.
         crate::gen_heap::clear_jit_read_bounds_owned_by(self.arena.base());
+        // F-08 - and the barrier geometry with it. Owner-checked for the same
+        // reason: a dropped collector must not leave numbers behind that
+        // compiled code would then read as a live arena's.
+        crate::gen_heap::clear_jit_g1_barrier_owned_by(self.arena.base());
     }
 }
 
@@ -3113,8 +3254,28 @@ impl G1Collector {
         let arena_base = arena.base();
         let arena_end = arena_base + arena.reserved_len();
 
+        // F-05 — one card table for the whole arena, shared by the collector
+        // (which dirties from the write barrier) and by every region (which
+        // clears its own range on `reset`). Allocated before the regions
+        // because each region captures a clone of the `Arc`.
+        // F-16: the RESERVATION, not the committed prefix. A region anywhere in
+        // the reservation can be committed later, and the card table has to
+        // have a byte for it before that happens — it is metadata beside the
+        // heap, not inside it, so covering the whole span costs one byte per
+        // 512 and buys never having to resize it.
+        let cards = std::sync::Arc::new(crate::g1_cards::G1CardTable::new(
+            arena_base,
+            arena.reserved_len(),
+        ));
+
         let regions: Vec<G1Region> = (0..num_regions)
-            .map(|i| G1Region::from_arena(arena_base + i * config.region_size, config.region_size))
+            .map(|i| {
+                G1Region::from_arena(
+                    arena_base + i * config.region_size,
+                    config.region_size,
+                    std::sync::Arc::clone(&cards),
+                )
+            })
             .collect();
 
         // Build the address-to-region lookup table (sorted by base addr).
@@ -3161,6 +3322,30 @@ impl G1Collector {
         // the committed prefix that is exactly false. `commit_through_region`
         // republishes it as the prefix grows.
         crate::gen_heap::publish_jit_read_bounds(0, arena_base, arena_base + arena.committed_len());
+
+        // F-08 - publish G1's geometry for the JIT's inline post-write barrier.
+        //
+        // A SEPARATE table from `JIT_REGION_BOUNDS`, whose emptiness under G1
+        // closes defect G1-2 and must stay empty, and from `JIT_READ_BOUNDS`
+        // just above, which answers the read-side "is this address mapped"
+        // question. Three tables for three questions; see `JitG1BarrierTable`
+        // for the argument and for why the mask is applied to `addr -
+        // arena_base` rather than to `addr`.
+        //
+        // `region_size` is a power of two (`normalize_region_size`), so
+        // `!(region_size - 1)` is the mask that isolates the region number.
+        crate::gen_heap::publish_jit_g1_barrier(
+            arena_base,
+            // F-16: the reservation. This word is the table's "is it published"
+            // predicate rather than a bound anything loads through — the
+            // emitted sequence reads only the base and the region mask — so it
+            // describes the address range the geometry is valid for, which is
+            // the whole reservation whatever fraction of it is committed.
+            arena.reserved_len(),
+            !(config.region_size - 1),
+            cards.cards_base_addr(),
+            crate::g1_cards::G1_CARD_SHIFT,
+        );
 
         Self {
             layout_domain: std::sync::atomic::AtomicU32::new(cratonvm_types::FIRST_LAYOUT_DOMAIN),
@@ -3230,6 +3415,11 @@ impl G1Collector {
             rset_cache_epoch: AtomicU64::new(0),
             instance_id: NEXT_G1_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             region_lookup,
+            cards,
+            card_regions_offered: AtomicU64::new(0),
+            card_regions_skipped: AtomicU64::new(0),
+            card_bytes_scanned: AtomicU64::new(0),
+            card_bytes_skipped: AtomicU64::new(0),
             arena_base,
             arena_end,
             region_shift,
@@ -4233,6 +4423,13 @@ impl G1Collector {
                     regions[dst_idx]
                         .rset
                         .add_reference_in_generation(src_idx, generation);
+                    // F-05 — a GC-internal edge producer must dirty the card
+                    // the same way the mutator barrier does, or Phase 2's card
+                    // screen skips the very region this call just named. The
+                    // card is the HOLDER's, not the slot's: `any_dirty_in` is
+                    // asked about an object's whole byte range, so a dirty card
+                    // anywhere in the holder scans all of its slots.
+                    self.cards.dirty_addr(obj_addr);
                 }
             }
         };
@@ -4747,6 +4944,11 @@ impl G1Collector {
                 unique_sources
             );
         }
+        // F-05 — the card screen is applied to the remembered set's own
+        // sources and NOT to the JIT-pinned regions added above; see the
+        // `card_screen` parameter's doc for why the defence-in-depth walk must
+        // stay wholesale.
+        let card_screen_snapshot = self.card_scan_snapshot();
         for src_idx in unique_sources {
             self.scan_source_region_for_cset_refs(
                 &mut regions,
@@ -4756,8 +4958,10 @@ impl G1Collector {
                 &mut objects_copied,
                 &mut bytes_copied,
                 &mut work_list,
+                !jit_pinned_regions.contains(&src_idx),
             );
         }
+        self.fill_card_scan_phases(&mut phases, card_screen_snapshot);
         if dbg_phases {
             eprintln!(
                 "[g1][PHASES] after-sources forwards={} (delta={})",
@@ -5269,6 +5473,9 @@ impl G1Collector {
         };
         let rset_sources_scanned = mixed_rset_sources.len();
 
+        // F-05 — see the twin in `young_collection`: the JIT-pinned additions
+        // are walked wholesale, the remembered set's own sources are screened.
+        let card_screen_snapshot = self.card_scan_snapshot();
         for src_idx in mixed_rset_sources {
             self.scan_source_region_for_cset_refs(
                 &mut regions,
@@ -5278,8 +5485,10 @@ impl G1Collector {
                 &mut objects_copied,
                 &mut bytes_copied,
                 &mut work_list,
+                !jit_pinned_regions.contains(&src_idx),
             );
         }
+        self.fill_card_scan_phases(&mut phases, card_screen_snapshot);
 
         phases.rset_us = phase_mark.elapsed().as_micros() as u64;
         phase_mark = std::time::Instant::now();
@@ -5508,6 +5717,15 @@ impl G1Collector {
     /// dropped the JIT-pinned half; see `young_collection_parallel` for why that
     /// is a live-object loss and not merely a missing optimisation.
     ///
+    /// `wholesale_sources` (F-05) is the subset of `sources` that must be
+    /// walked with NO card screen — the JIT-pinned regions. The screen is
+    /// derived from the premise that every reference store into a region
+    /// reached `post_write_barrier_rset`, and walking the pinned regions
+    /// wholesale is precisely the collector declining to rely on that premise
+    /// (see the note at the `young_collection` call site). Passing the same set
+    /// on both arms is what keeps `CRATONVM_G1_PARALLEL_EVAC` a speed switch
+    /// rather than a semantics switch — the divergence class of defect G1-9.
+    ///
     /// SAFETY: `regions_base` must be the live regions Vec base and the caller
     /// must hold `regions.lock()` for the whole call WITHOUT dereferencing the
     /// guard (see the module SAFETY MODEL note). `pool` lists currently-Free
@@ -5520,6 +5738,7 @@ impl G1Collector {
         roots: &mut [ObjectRef],
         keepalive: &[usize],
         sources: &RegionSet,
+        wholesale_sources: &RegionSet,
     ) -> (cratonvm_types::PointerMap, usize, usize) {
         // One-shot confirmation that the parallel evacuator is genuinely active
         // (the gauntlet lesson: never assume a gated path was taken — verify).
@@ -5622,6 +5841,9 @@ impl G1Collector {
                 &mut objs,
                 &mut bytes,
                 &mut main_deferred_self_forwarded,
+                // F-05: the JIT-pinned half of `sources` is walked wholesale,
+                // exactly as on the serial arm.
+                !wholesale_sources.contains(&src_idx),
             );
         }
 
@@ -5943,6 +6165,10 @@ impl G1Collector {
         // Take the raw regions base; do NOT deref `regions` again until after
         // `parallel_evacuate` returns (see the module SAFETY MODEL note).
         let regions_base = RegionsBase(regions.as_mut_ptr());
+        // F-05 — the parallel arm reports seed+closure as one `closure_us`, so
+        // the card-screen counters are diffed around the whole call rather than
+        // around a separate Phase 2.
+        let card_screen_snapshot = self.card_scan_snapshot();
         let (pointer_map, objects_copied, bytes_copied) = unsafe {
             self.parallel_evacuate(
                 regions_base,
@@ -5951,8 +6177,10 @@ impl G1Collector {
                 roots,
                 &keepalive,
                 &parallel_sources,
+                &jit_pinned_regions,
             )
         };
+        self.fill_card_scan_phases(&mut phases, card_screen_snapshot);
         // Phase 3.5 — finalizer resurrection (F-01). The serial driver runs
         // this between the closure and the fix-up, and it was the last real
         // reason the dispatch in `young_collection` forced serial. It needs
@@ -6237,6 +6465,10 @@ impl G1Collector {
         let mut phase_mark = std::time::Instant::now();
 
         let regions_base = RegionsBase(regions.as_mut_ptr());
+        // F-05 — the parallel arm reports seed+closure as one `closure_us`, so
+        // the card-screen counters are diffed around the whole call rather than
+        // around a separate Phase 2.
+        let card_screen_snapshot = self.card_scan_snapshot();
         let (pointer_map, objects_copied, bytes_copied) = unsafe {
             self.parallel_evacuate(
                 regions_base,
@@ -6245,8 +6477,10 @@ impl G1Collector {
                 roots,
                 &keepalive,
                 &parallel_sources,
+                &jit_pinned_regions,
             )
         };
+        self.fill_card_scan_phases(&mut phases, card_screen_snapshot);
         // Phase 3.5 — finalizer resurrection; see the twin in
         // `young_collection_parallel`.
         let mut pointer_map = pointer_map;
@@ -7284,6 +7518,22 @@ impl G1Collector {
     /// were reset, causing silent use-after-free. Pattern mirrors
     /// `scan_and_evacuate_refs` but operates on a region's full object
     /// walk rather than a single evacuated object.
+    ///
+    /// F-05 — `card_screen` asks for the card table to narrow this walk (the
+    /// whole-region skip and the per-object skip below; both are additionally
+    /// gated on `CRATONVM_G1_CARD_RSET`).
+    ///
+    /// Callers pass `false` for the JIT-PINNED regions, which
+    /// `young_collection`/`mixed_collection` add to the source set on top of
+    /// the remembered set's own. Those are walked wholesale as
+    /// defence-in-depth — the comment at the young-collection call site says so
+    /// explicitly — precisely because the collector does not want to assume
+    /// every store into them went through `post_write_barrier_rset`. A card
+    /// screen is derived from that same assumption, so applying it there would
+    /// quietly convert a deliberate belt-and-braces walk into one that trusts
+    /// the belt. The cost of the carve-out is bounded by the number of pinned
+    /// regions, which is zero unless a thread is in JIT or a TLAB tail is
+    /// unretired.
     fn scan_source_region_for_cset_refs(
         &self,
         regions: &mut Vec<G1Region>,
@@ -7293,6 +7543,7 @@ impl G1Collector {
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
         work_list: &mut Vec<*mut u8>,
+        card_screen: bool,
     ) {
         // Source must be a live non-CSet region; cset sources from rset can
         // include indices that have since been reclassified.
@@ -7306,6 +7557,28 @@ impl G1Collector {
             }
             (r.cursor, r.data.as_mut_ptr())
         };
+
+        // F-05 — the whole-region screen. A source region none of whose cards
+        // is dirty holds no cross-region reference at all, so it cannot hold
+        // one into the collection set, and the megabyte walk below is skipped
+        // entirely. This is the case the finding is about: a remembered-set
+        // entry is additive and outlives the edge that created it by up to a
+        // full mark cycle, and a COARSENED rset makes every live region a
+        // nominal source, so most of what Phase 2 walks has nothing in it.
+        let screen = card_screen && gc_flags().g1_card_rset;
+        self.card_regions_offered.fetch_add(1, Ordering::Relaxed);
+        if screen && !self.cards.any_dirty_in(base as usize, cursor) {
+            self.card_regions_skipped.fetch_add(1, Ordering::Relaxed);
+            self.card_bytes_skipped
+                .fetch_add(cursor as u64, Ordering::Relaxed);
+            return;
+        }
+        // Bytes whose reference slots this walk visited, and bytes it stepped
+        // over because the object touched no dirty card. Accumulated locally
+        // and published once, so the screen does not put an atomic RMW in the
+        // per-object loop it exists to make cheaper.
+        let mut scanned_bytes = 0u64;
+        let mut skipped_bytes = 0u64;
 
         let jit_skips = self.jit_tlab_skip_spans();
         let dbg_walk = gc_flags().g1_dbg_reach;
@@ -7409,6 +7682,51 @@ impl G1Collector {
                 );
             }
 
+            // F-05 — the per-object screen.
+            //
+            // WHAT IS AND IS NOT SKIPPED. The object walk still steps
+            // object-by-object: without a block-start table this walk cannot
+            // resynchronise at an arbitrary card boundary, so the header read
+            // and `object_total_size` above are unavoidable. What the screen
+            // removes is everything that is actually expensive — the per-slot
+            // reads, an `evacuation_candidate_is_an_object` validation per
+            // non-null slot, and a `region_for_ptr` binary search per candidate
+            // — which is where a source-region walk spends its time.
+            //
+            // WHY THERE IS NO BLOCK-START TABLE. The obvious design records,
+            // per card, the offset of an object that starts in it, maintained
+            // by `G1Region::bump_alloc` (the single place bytes are committed
+            // to a region). It does not work here, and the reason is the TLAB:
+            // `bump_alloc` carves a whole TLAB in ONE call with a `tlab:` site
+            // tag, and the objects inside it are written later by the mutator —
+            // by the interpreter's own bump pointer and by the JIT's INLINE
+            // `new`, neither of which calls into this crate. So a table
+            // maintained at `bump_alloc` would record one entry for a 32 KiB
+            // carve and nothing for the hundreds of objects in it, which is not
+            // "incomplete" but WRONG: an absent entry is indistinguishable from
+            // "no object starts in this card", and skipping to the next known
+            // start would step over live cross-region references. That is a
+            // use-after-free, which is why the weaker screen is the one that
+            // shipped.
+            //
+            // What would falsify this: a hook at TLAB RETIREMENT that fills in
+            // the block starts for the span being retired (the retire path
+            // already walks nothing, but it does know the span), plus the same
+            // for the frozen-tail publication path. That is the work the
+            // residual names.
+            //
+            // The test is `any_dirty_in(obj, size)` — the object's WHOLE byte
+            // range, not just its header's card — because a card is dirtied for
+            // the holder's address by the barrier but an object may straddle
+            // several cards and every producer is free to name any of them.
+            // Over-approximating here is free; under-approximating is a UAF.
+            if screen && !self.cards.any_dirty_in(obj_ptr as usize, obj_size) {
+                skipped_bytes += obj_size as u64;
+                offset += obj_size;
+                continue;
+            }
+            scanned_bytes += obj_size as u64;
+
             // Walk reference slots; mirror scan_and_evacuate_refs's slot
             // dispatch but rewrite the slot atomically-by-store (STW: no
             // concurrent mutator; uses the same plain ptr::write pattern
@@ -7501,6 +7819,16 @@ impl G1Collector {
 
             offset += obj_size;
         }
+
+        // F-05 — publish this region's screen outcome. Both counters, always:
+        // a `scanned` with no `skipped` beside it says the screen RAN and
+        // refused everything, which is a different fact from the screen never
+        // having run, and a single "cards scanned" number cannot tell them
+        // apart.
+        self.card_bytes_scanned
+            .fetch_add(scanned_bytes, Ordering::Relaxed);
+        self.card_bytes_skipped
+            .fetch_add(skipped_bytes, Ordering::Relaxed);
     }
 
     /// Update interior references in all non-CSet regions using the pointer map.
@@ -7831,6 +8159,20 @@ impl G1Collector {
                     }
                 }
             } else if target != holder && is_collectable_region_type(regions[target].region_type) {
+                // F-05 — dirty the holder's card BEFORE the `seen` dedup.
+                //
+                // `seen` is keyed on the target region alone and is cleared
+                // once per HOLDER REGION, so the first object in an Old region
+                // that points into Eden suppresses the edge push for every
+                // later object in that same region pointing into the same Eden
+                // region. That is correct for the rset (an rset entry is a
+                // region pair, and one is enough) and would be a lost edge for
+                // the card table, which is per ADDRESS: the suppressed objects
+                // are exactly the ones whose cards would stay clean, and Phase
+                // 2 would then step over them. This is the same trap as the
+                // per-thread edge memo in `post_write_barrier_rset`, and it is
+                // avoided the same way — the card store is unconditional.
+                self.cards.dirty_addr(obj_ptr as usize);
                 // G1AUD-9: emit each `(target, holder)` edge ONCE per holder
                 // region — see `seen_targets` at the caller.
                 if seen.insert(target) {
@@ -11414,7 +11756,7 @@ impl G1Collector {
             String::new()
         } else {
             format!(
-                " roots_us={} rset_us={} closure_us={} fixup_us={} free_us={}                  verify_us={} other_us={} fixup_regions={} fixup_bytes={}",
+                " roots_us={} rset_us={} closure_us={} fixup_us={} free_us={}                  verify_us={} other_us={} fixup_regions={} fixup_bytes={}                  rset_regions={}/{} rset_scanned={} rset_skipped={}",
                 phases.roots_us,
                 phases.rset_us,
                 phases.closure_us,
@@ -11424,6 +11766,15 @@ impl G1Collector {
                 phases.other_us,
                 phases.fixup_regions,
                 phases.fixup_bytes,
+                // F-05 engagement: skipped-of-offered regions, then the bytes
+                // the source walk visited vs. the bytes the card screen let it
+                // step over. Both halves are printed so a zero is readable:
+                // `rset_skipped=0` with a non-zero `rset_scanned` is "the
+                // screen ran and refused", not "the screen is off".
+                phases.rset_regions_skipped,
+                phases.rset_regions_offered,
+                phases.rset_bytes_scanned,
+                phases.rset_bytes_skipped,
             )
             .replace("                 ", "")
         };
@@ -12066,6 +12417,39 @@ impl G1Collector {
         set
     }
 
+    /// F-05 — the four card-screen counters as of now, for a pause to diff
+    /// against after Phase 2.
+    ///
+    /// The counters are process-lifetime monotone atomics (Phase 2's walkers
+    /// hold `&self`, and the parallel evacuator's seeding runs off a
+    /// `SharedEvac` that has no `&mut` to anything the pause owns), so a pause
+    /// reads its own contribution as a difference rather than by resetting
+    /// them. Resetting would race with a concurrent-mark step that happens to
+    /// be scanning at the same moment.
+    fn card_scan_snapshot(&self) -> [u64; 4] {
+        [
+            self.card_regions_offered.load(Ordering::Relaxed),
+            self.card_regions_skipped.load(Ordering::Relaxed),
+            self.card_bytes_scanned.load(Ordering::Relaxed),
+            self.card_bytes_skipped.load(Ordering::Relaxed),
+        ]
+    }
+
+    /// F-05 — publish `now - before` into the pause's phase table.
+    fn fill_card_scan_phases(&self, phases: &mut G1PausePhases, before: [u64; 4]) {
+        let now = self.card_scan_snapshot();
+        phases.rset_regions_offered = now[0].saturating_sub(before[0]) as u32;
+        phases.rset_regions_skipped = now[1].saturating_sub(before[1]) as u32;
+        phases.rset_bytes_scanned = now[2].saturating_sub(before[2]);
+        phases.rset_bytes_skipped = now[3].saturating_sub(before[3]);
+    }
+
+    /// F-05 — the arena card table, for the tests and for the F-08 barrier
+    /// table publication.
+    pub(crate) fn cards(&self) -> &std::sync::Arc<crate::g1_cards::G1CardTable> {
+        &self.cards
+    }
+
     /// Post-write barrier: track cross-region references in remembered sets.
     ///
     /// Round-9 gc CRIT-8 — hot path: a per-thread cache of the
@@ -12111,6 +12495,35 @@ impl G1Collector {
                 return;
             }
         };
+
+        // F-05 — dirty the SOURCE card, and do it here: before the per-thread
+        // edge memo below, before the region-pointer cache, before the Free
+        // gate on the destination.
+        //
+        // WHY THIS EXACT PLACE. The memo below skips the rset insert for an
+        // edge this thread already recorded in this epoch. That is sound for
+        // the rset — a set insert is idempotent — but a card is per SOURCE
+        // ADDRESS, not per (source region, target region) pair: the same edge
+        // key covers stores into two different objects 400 KiB apart in the
+        // same source region, i.e. two different cards. Dirtying after the memo
+        // check would leave the second one clean, and a clean card holding a
+        // live cross-region reference is exactly the use-after-free this whole
+        // structure exists to prevent. So the card store is unconditional on
+        // every cross-region store; it is one `mov` into a byte the cache line
+        // for is almost always already hot.
+        //
+        // WHY THE CROSS-REGION TEST IS THE RIGHT GATE. Card and rset entry are
+        // written under identical conditions, which is what lets Phase 2 skip a
+        // source region with no dirty card: a same-region store from a non-CSet
+        // region reaches a referent in that same non-CSet region, so it can
+        // never be an edge into the collection set, and neither structure needs
+        // to know about it.
+        //
+        // NOT gated on `g1_card_rset`. That flag disables the READ side (the
+        // screen in Phase 2); the write side stays on so the flag is a pure
+        // read-side A/B rather than a half-disabled feature whose card table is
+        // then wrong for the rest of the run.
+        self.cards.dirty_addr(src_addr);
 
         let collector_id = self.instance_id;
 
@@ -15495,7 +15908,22 @@ mod tests {
     fn small_config() -> G1CollectorConfig {
         G1CollectorConfig {
             heap_size: 8 * 1024 * 1024, // 8 MB
-            initial_heap_size: 0,       // F-16: the ergonomic
+            // F-16: the WHOLE heap committed up front, deliberately.
+            //
+            // Production commits a region as it is claimed, and every path that
+            // writes into one commits it first. Dozens of tests in this module
+            // bypass those paths entirely — they reach into the region table,
+            // set a `region_type` by hand and call `bump_alloc` directly — which
+            // is a reasonable way to build a fixture and is exactly what lazy
+            // commit makes fault. Those tests are asserting things about
+            // evacuation, remembered sets and cards, not about commit state, so
+            // the fixture gives them the pre-F-16 world and says so.
+            //
+            // The tests that ARE about commit state build their own config with
+            // an explicit `initial_heap_size`; see
+            // `a_large_heap_does_not_commit_itself_at_startup` and its
+            // neighbours.
+            initial_heap_size: 8 * 1024 * 1024,
             region_size: 1024 * 1024,   // 1 MB
             max_gc_pause_ms: 200,
             ihop_percent: 45,
@@ -21961,7 +22389,8 @@ mod tests {
         let region_size = 1024 * 1024;
         G1CollectorConfig {
             heap_size: region_size * region_count,
-            initial_heap_size: 0,
+            // F-16: fully committed, for the reason `small_config` states.
+            initial_heap_size: region_size * region_count,
             region_size,
             max_gc_pause_ms: 200,
             ihop_percent: 45,
@@ -24482,6 +24911,505 @@ mod tests {
             facts.degraded & g1_degraded::EVACUATION_FAILURE,
             0,
             "an evacuation failure must be visible in the cycle record"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // F-05 - the card table
+    // ---------------------------------------------------------------
+
+    use crate::g1_cards::G1_CARD_BYTES;
+
+    /// Every producer of a remembered-set entry must also dirty the holder's
+    /// card, because Phase 2 now uses the card to decide whether to look at the
+    /// region the entry names. A producer that records the entry and not the
+    /// card names a region Phase 2 then skips: the referent is not evacuated
+    /// and Phase 5 frees the region it lives in.
+    ///
+    /// Producer 1 of 3: the mutator post-write barrier.
+    #[test]
+    fn the_mutator_barrier_dirties_the_holders_card() {
+        let gc = make_collector();
+        let holder = gc.alloc_object(ClassId::new(1), 1);
+        let holder_addr = holder.as_ptr() as usize;
+        let src = gc
+            .lookup_region_for_addr(holder_addr)
+            .expect("holder region");
+
+        // A same-region store records no rset entry, so it must dirty no card
+        // either -- the two structures have to agree about what an edge IS, or
+        // the whole-region screen (which reads "no dirty card" as "no
+        // cross-region edge") is answering a different question from the one
+        // `live_rset_sources` asked.
+        assert!(!gc.cards().is_dirty_addr(holder_addr));
+        let same_region_target = {
+            let regions = gc.regions.lock();
+            regions[src].data.as_ptr() as usize
+        };
+        gc.post_write_barrier_rset(holder, unsafe {
+            ObjectRef::from_raw(same_region_target as *mut u8)
+        });
+        assert!(
+            !gc.cards().is_dirty_addr(holder_addr),
+            "a same-region store must leave the card clean, exactly as it leaves the rset empty"
+        );
+
+        // A cross-region store dirties the HOLDER's card (not the target's:
+        // the card answers "where in the source is the slot", and Phase 2 walks
+        // the source).
+        let far_region = (src + 1) % gc.num_regions();
+        let far_addr = {
+            let mut regions = gc.regions.lock();
+            regions[far_region].region_type = RegionType::Old;
+            let (ptr, _) = regions[far_region]
+                .bump_alloc(HEADER_SIZE, 8, "test")
+                .expect("room in a fresh region");
+            ptr as usize
+        };
+        gc.post_write_barrier_rset(holder, unsafe { ObjectRef::from_raw(far_addr as *mut u8) });
+        assert!(
+            gc.cards().is_dirty_addr(holder_addr),
+            "the cross-region post-write barrier must dirty the holder's card"
+        );
+        assert!(
+            !gc.cards().is_dirty_addr(far_addr),
+            "the TARGET's card says nothing; only the source is ever walked"
+        );
+    }
+
+    /// Producer 2 of 3: the Phase-4 GC-internal edge rebuild
+    /// (`collect_outgoing_cross_region_edges`), which records the edges the
+    /// COLLECTOR creates by copying or rewriting and for which no mutator
+    /// barrier ever fires.
+    ///
+    /// The card store in that producer sits BEFORE its `seen` dedup, and this
+    /// test is why: `seen` is keyed on the target region and cleared once per
+    /// holder REGION, so the second and later objects of a region pointing into
+    /// the same target are suppressed. Suppressing the rset push is right;
+    /// suppressing the card would leave those objects on clean cards.
+    #[test]
+    fn the_phase4_edge_rebuild_dirties_every_holders_card_not_just_the_first() {
+        let gc = make_collector();
+        let holder_region = 1usize;
+        let target_region = 2usize;
+        let (a, b, target) = {
+            let mut regions = gc.regions.lock();
+            regions[holder_region].region_type = RegionType::Old;
+            regions[target_region].region_type = RegionType::Old;
+            let (t, _) = regions[target_region]
+                .bump_alloc(HEADER_SIZE, 8, "test")
+                .expect("room");
+            // Two holders far enough apart to land on different cards.
+            let (a, _) = regions[holder_region]
+                .bump_alloc(G1_CARD_BYTES, 8, "test")
+                .expect("room");
+            let (b, _) = regions[holder_region]
+                .bump_alloc(HEADER_SIZE + SLOT_SIZE, 8, "test")
+                .expect("room");
+            (a, b, t)
+        };
+        // Give both holders one reference slot pointing at `target`.
+        for h in [a, b] {
+            unsafe {
+                *(h as *mut ObjectHeader) = ObjectHeader::new(
+                    ClassId::new(7),
+                    ObjectKind::Object,
+                    ArrayElementType::Reference,
+                    0,
+                    1,
+                );
+                // Legacy (non-compact) cell: a full 16-byte `Value`, which is
+                // what the reference walkers decode. A bare pointer word here
+                // is not a reference at all and the walk finds nothing.
+                write_flat_object_reference(h.add(HEADER_SIZE), target as usize, false);
+            }
+        }
+        assert!(
+            !gc.cards().is_dirty_addr(a as usize) && !gc.cards().is_dirty_addr(b as usize),
+            "nothing has fired a barrier for these hand-built objects"
+        );
+
+        let regions = gc.regions.lock();
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        let mut seen = RegionSet::new();
+        for h in [a, b] {
+            let header = unsafe { &*(h as *const ObjectHeader) };
+            gc.collect_outgoing_cross_region_edges(
+                &regions,
+                holder_region,
+                h,
+                header,
+                &mut out,
+                &mut seen,
+                None,
+            );
+        }
+        drop(regions);
+        assert_eq!(
+            out.len(),
+            1,
+            "the rset edge is deduped per holder region -- that is the behaviour \
+             the card store must NOT inherit"
+        );
+        assert!(gc.cards().is_dirty_addr(a as usize), "first holder's card");
+        assert!(
+            gc.cards().is_dirty_addr(b as usize),
+            "the DEDUPED second holder's card must be dirty too, or Phase 2 steps over it"
+        );
+    }
+
+    /// Producer 3 of 3: the evacuation-failure fixup
+    /// (`record_outgoing_rset_edges`), which records the outgoing edges of
+    /// objects a wedged drain left parked in kept regions.
+    #[test]
+    fn the_evacuation_failure_fixup_dirties_the_holders_card() {
+        let gc = make_collector();
+        let holder_region = 3usize;
+        let target_region = 4usize;
+        let (h, target) = {
+            let mut regions = gc.regions.lock();
+            regions[holder_region].region_type = RegionType::Old;
+            regions[target_region].region_type = RegionType::Old;
+            let (t, _) = regions[target_region]
+                .bump_alloc(HEADER_SIZE, 8, "test")
+                .expect("room");
+            let (h, _) = regions[holder_region]
+                .bump_alloc(HEADER_SIZE + SLOT_SIZE, 8, "test")
+                .expect("room");
+            (h, t)
+        };
+        unsafe {
+            *(h as *mut ObjectHeader) = ObjectHeader::new(
+                    ClassId::new(9),
+                    ObjectKind::Object,
+                    ArrayElementType::Reference,
+                    0,
+                    1,
+                );
+            *(target as *mut ObjectHeader) = ObjectHeader::new(
+                    ClassId::new(10),
+                    ObjectKind::Object,
+                    ArrayElementType::Reference,
+                    0,
+                    0,
+                );
+            write_flat_object_reference(h.add(HEADER_SIZE), target as usize, false);
+        }
+        assert!(!gc.cards().is_dirty_addr(h as usize));
+
+        let mut regions = gc.regions.lock();
+        assert!(gc.record_outgoing_rset_edges(&mut regions, h as usize));
+        assert!(
+            regions[target_region]
+                .rset
+                .sources()
+                .contains(&holder_region),
+            "precondition: the fixup recorded the edge at all"
+        );
+        drop(regions);
+        assert!(
+            gc.cards().is_dirty_addr(h as usize),
+            "the kept-region fixup must dirty the card beside the rset entry it records"
+        );
+    }
+
+    /// A region's cards are cleared by `reset`, in the same statement that
+    /// clears its remembered set. Leaving them dirty is not unsound but makes
+    /// the screen useless within a few cycles, because a region recycled every
+    /// young pause would accumulate dirty cards forever.
+    #[test]
+    fn resetting_a_region_cleans_its_cards_and_leaves_its_neighbours_alone() {
+        let gc = make_collector();
+        let (base_1, base_2) = {
+            let regions = gc.regions.lock();
+            (
+                regions[1].data.as_ptr() as usize,
+                regions[2].data.as_ptr() as usize,
+            )
+        };
+        gc.cards().dirty_addr(base_1);
+        gc.cards().dirty_addr(base_1 + 4 * G1_CARD_BYTES);
+        gc.cards().dirty_addr(base_2);
+        gc.with_regions_mut(|rs| rs[1].reset(1));
+        assert!(!gc.cards().is_dirty_addr(base_1));
+        assert!(!gc.cards().is_dirty_addr(base_1 + 4 * G1_CARD_BYTES));
+        assert!(
+            gc.cards().is_dirty_addr(base_2),
+            "region 2's cards are not region 1's to clear"
+        );
+    }
+
+    /// The whole-region screen: a remembered-set entry naming a source with no
+    /// dirty card is a stale entry, and Phase 2 skips the region rather than
+    /// walking a megabyte for it.
+    ///
+    /// This is the shape F-05 is about. An rset entry is additive -- its only
+    /// pruning is `cleanup`'s recycled-source pass -- so an entry routinely
+    /// outlives the edge that created it, and a COARSENED rset nominates every
+    /// live region in the heap.
+    ///
+    /// Driven through `young_collection_serial` and, in the twin below,
+    /// `young_collection_parallel`. Calling the dispatching `young_collection`
+    /// would have exercised only whichever arm the default flags select — this
+    /// file's history has a test that silently measured the parallel evacuator
+    /// while claiming to cover the serial one, and the two arms have their own
+    /// copies of this walk.
+    #[test]
+    fn a_source_region_with_no_dirty_card_is_skipped_entirely() {
+        // The kill switch turns off the very thing this test measures. Say so
+        // and skip, rather than going red on a deliberate A/B arm — the test's
+        // ability to fail is established against the DEFAULT (on) arm, which is
+        // the arm that ships.
+        if !gc_flags().g1_card_rset {
+            eprintln!(
+                "[F-05] skipped: CRATONVM_G1_CARD_RSET=0 disables the card screen this test measures"
+            );
+            return;
+        }
+        let gc = make_collector();
+        // Q lives in Eden and will be in the collection set.
+        let q = gc.alloc_object(ClassId::new(2), 1);
+        let q_region = gc
+            .lookup_region_for_addr(q.as_ptr() as usize)
+            .expect("q region");
+
+        // A stale entry: region `stale` is named as a source of Q's region but
+        // holds no cross-region reference (nothing ever dirtied its cards).
+        // It is given real, walkable contents so that "skipped" is a claim
+        // about the screen and not about an empty region.
+        let stale = (q_region + 3) % gc.num_regions();
+        let stale_base = {
+            let mut regions = gc.regions.lock();
+            regions[stale].region_type = RegionType::Old;
+            for _ in 0..64 {
+                let (p, _) = regions[stale]
+                    .bump_alloc(HEADER_SIZE, 8, "test")
+                    .expect("room");
+                unsafe { *(p as *mut ObjectHeader) = ObjectHeader::new(
+                    ClassId::new(5),
+                    ObjectKind::Object,
+                    ArrayElementType::Reference,
+                    0,
+                    0,
+                ) };
+            }
+            regions[q_region].rset.add_reference(stale);
+            regions[stale].data.as_ptr() as usize
+        };
+        assert!(
+            !gc.cards()
+                .any_dirty_in(stale_base, gc.config.region_size),
+            "precondition: nothing dirtied the stale source's cards"
+        );
+
+        let before = gc.card_regions_skipped.load(Ordering::Relaxed);
+        let mut roots: Vec<ObjectRef> = vec![q];
+        let _ = gc.young_collection_serial(&mut roots, &NoopMonitors);
+        assert!(
+            gc.card_regions_skipped.load(Ordering::Relaxed) > before,
+            "a source region with no dirty card must be skipped, not walked"
+        );
+    }
+
+    /// Parallel-evacuator twin of
+    /// [`a_source_region_with_no_dirty_card_is_skipped_entirely`]. The seed
+    /// walk in `SharedEvac::seed_source_region` is a separate copy of the same
+    /// scan, and defect G1-9 was exactly a divergence between the two.
+    #[test]
+    fn a_source_region_with_no_dirty_card_is_skipped_entirely_parallel() {
+        // The kill switch turns off the very thing this test measures. Say so
+        // and skip, rather than going red on a deliberate A/B arm — the test's
+        // ability to fail is established against the DEFAULT (on) arm, which is
+        // the arm that ships.
+        if !gc_flags().g1_card_rset {
+            eprintln!(
+                "[F-05] skipped: CRATONVM_G1_CARD_RSET=0 disables the card screen this test measures"
+            );
+            return;
+        }
+        let gc = G1Collector::new(parallel_config(2, 8));
+        let q = gc.alloc_object(ClassId::new(2), 1);
+        let q_region = gc
+            .lookup_region_for_addr(q.as_ptr() as usize)
+            .expect("q region");
+        let stale = (q_region + 3) % gc.num_regions();
+        let stale_base = {
+            let mut regions = gc.regions.lock();
+            regions[stale].region_type = RegionType::Old;
+            for _ in 0..64 {
+                let (p, _) = regions[stale]
+                    .bump_alloc(HEADER_SIZE, 8, "test")
+                    .expect("room");
+                unsafe {
+                    *(p as *mut ObjectHeader) = ObjectHeader::new(
+                        ClassId::new(5),
+                        ObjectKind::Object,
+                        ArrayElementType::Reference,
+                        0,
+                        0,
+                    )
+                };
+            }
+            regions[q_region].rset.add_reference(stale);
+            regions[stale].data.as_ptr() as usize
+        };
+        assert!(!gc.cards().any_dirty_in(stale_base, gc.config.region_size));
+
+        let before = gc.card_regions_skipped.load(Ordering::Relaxed);
+        let mut roots: Vec<ObjectRef> = vec![q];
+        let _ = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        assert!(
+            gc.card_regions_skipped.load(Ordering::Relaxed) > before,
+            "the parallel seed walk must skip a source with no dirty card too"
+        );
+    }
+
+    /// The per-object screen, and the correctness half beside it: the ONE
+    /// object in a source region that holds a CSet-bound reference is still
+    /// found, while the objects around it are stepped over.
+    ///
+    /// Both halves matter and each catches a different mistake. Without the
+    /// `skipped` assertion the test passes on a screen that never engages;
+    /// without the evacuation assertion it passes on a screen that skips
+    /// everything.
+    ///
+    /// Serial arm; the parallel twin follows. See the note on
+    /// `a_source_region_with_no_dirty_card_is_skipped_entirely` for why the
+    /// dispatching entry point is not used.
+    #[test]
+    fn the_per_object_screen_skips_the_clean_objects_and_finds_the_dirty_one() {
+        // The kill switch turns off the very thing this test measures. Say so
+        // and skip, rather than going red on a deliberate A/B arm — the test's
+        // ability to fail is established against the DEFAULT (on) arm, which is
+        // the arm that ships.
+        if !gc_flags().g1_card_rset {
+            eprintln!(
+                "[F-05] skipped: CRATONVM_G1_CARD_RSET=0 disables the card screen this test measures"
+            );
+            return;
+        }
+        let gc = make_collector();
+        // Fill the first Eden region with objects that reference nothing, then
+        // put the holder at the end of it. The fillers occupy whole cards that
+        // no barrier ever dirties.
+        let first = gc.alloc_object(ClassId::new(1), 1);
+        let holder_region = gc
+            .lookup_region_for_addr(first.as_ptr() as usize)
+            .expect("region");
+        let mut holder = first;
+        for _ in 0..512 {
+            let o = gc.alloc_object(ClassId::new(1), 1);
+            if gc.lookup_region_for_addr(o.as_ptr() as usize) != Some(holder_region) {
+                break;
+            }
+            holder = o;
+        }
+        // Q in a different region, reached ONLY through `holder`.
+        let mut q = gc.alloc_object(ClassId::new(2), 1);
+        while gc.lookup_region_for_addr(q.as_ptr() as usize) == Some(holder_region) {
+            q = gc.alloc_object(ClassId::new(2), 1);
+        }
+        gc.set_field(q, 0, Value::Int(31337));
+        gc.set_field(holder, 0, Value::Object(Some(q)));
+
+        // Retype the holder's region to Old so it is a remembered-set SOURCE
+        // rather than a collection-set member.
+        gc.with_regions_mut(|rs| rs[holder_region].region_type = RegionType::Old);
+
+        let scanned_before = gc.card_bytes_scanned.load(Ordering::Relaxed);
+        let skipped_before = gc.card_bytes_skipped.load(Ordering::Relaxed);
+        let mut roots: Vec<ObjectRef> = vec![];
+        let result = gc.young_collection_serial(&mut roots, &NoopMonitors);
+        let scanned = gc.card_bytes_scanned.load(Ordering::Relaxed) - scanned_before;
+        let skipped = gc.card_bytes_skipped.load(Ordering::Relaxed) - skipped_before;
+
+        // Correctness: Q was reachable only from the holder, so the screen must
+        // not have stepped over the holder.
+        let q_new = result
+            .pointer_map
+            .get(&(q.as_ptr() as usize))
+            .copied()
+            .expect("Q, referenced only from the screened source region, must be evacuated");
+        let q_new_ref = unsafe { ObjectRef::from_raw(q_new as *mut u8) };
+        assert_eq!(
+            gc.get_field(holder, 0),
+            Value::Object(Some(q_new_ref)),
+            "the holder's slot must be rewritten to Q's new location"
+        );
+        assert_eq!(gc.get_field(q_new_ref, 0).as_int(), Some(31337));
+
+        // Engagement: the fillers were stepped over without their slots being
+        // visited. Printed as well as asserted so a future change that makes
+        // this vacuous is visible in the log.
+        eprintln!("[F-05] per-object screen: scanned={scanned} skipped={skipped}");
+        assert!(
+            skipped > 0,
+            "the card screen must have stepped over the clean fillers \
+             (scanned={scanned} skipped={skipped}); a screen that engages on nothing \
+             is indistinguishable from no screen at all"
+        );
+        assert!(
+            skipped > scanned,
+            "one holder among hundreds of fillers should leave the skipped bytes \
+             dominant (scanned={scanned} skipped={skipped})"
+        );
+    }
+
+    /// Parallel-evacuator twin of
+    /// [`the_per_object_screen_skips_the_clean_objects_and_finds_the_dirty_one`].
+    #[test]
+    fn the_per_object_screen_skips_the_clean_objects_and_finds_the_dirty_one_parallel() {
+        // The kill switch turns off the very thing this test measures. Say so
+        // and skip, rather than going red on a deliberate A/B arm — the test's
+        // ability to fail is established against the DEFAULT (on) arm, which is
+        // the arm that ships.
+        if !gc_flags().g1_card_rset {
+            eprintln!(
+                "[F-05] skipped: CRATONVM_G1_CARD_RSET=0 disables the card screen this test measures"
+            );
+            return;
+        }
+        let gc = G1Collector::new(parallel_config(2, 8));
+        let first = gc.alloc_object(ClassId::new(1), 1);
+        let holder_region = gc
+            .lookup_region_for_addr(first.as_ptr() as usize)
+            .expect("region");
+        let mut holder = first;
+        for _ in 0..512 {
+            let o = gc.alloc_object(ClassId::new(1), 1);
+            if gc.lookup_region_for_addr(o.as_ptr() as usize) != Some(holder_region) {
+                break;
+            }
+            holder = o;
+        }
+        let mut q = gc.alloc_object(ClassId::new(2), 1);
+        while gc.lookup_region_for_addr(q.as_ptr() as usize) == Some(holder_region) {
+            q = gc.alloc_object(ClassId::new(2), 1);
+        }
+        gc.set_field(q, 0, Value::Int(31337));
+        gc.set_field(holder, 0, Value::Object(Some(q)));
+        gc.with_regions_mut(|rs| rs[holder_region].region_type = RegionType::Old);
+
+        let scanned_before = gc.card_bytes_scanned.load(Ordering::Relaxed);
+        let skipped_before = gc.card_bytes_skipped.load(Ordering::Relaxed);
+        let mut roots: Vec<ObjectRef> = vec![];
+        let result = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        let scanned = gc.card_bytes_scanned.load(Ordering::Relaxed) - scanned_before;
+        let skipped = gc.card_bytes_skipped.load(Ordering::Relaxed) - skipped_before;
+
+        let q_new = result
+            .pointer_map
+            .get(&(q.as_ptr() as usize))
+            .copied()
+            .expect("Q must be evacuated on the parallel arm too");
+        let q_new_ref = unsafe { ObjectRef::from_raw(q_new as *mut u8) };
+        assert_eq!(gc.get_field(holder, 0), Value::Object(Some(q_new_ref)));
+        assert_eq!(gc.get_field(q_new_ref, 0).as_int(), Some(31337));
+        eprintln!("[F-05] per-object screen (parallel): scanned={scanned} skipped={skipped}");
+        assert!(
+            skipped > scanned,
+            "the parallel seed walk must engage the screen too \
+             (scanned={scanned} skipped={skipped})"
         );
     }
 

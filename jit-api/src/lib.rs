@@ -1411,6 +1411,43 @@ pub struct JitRuntimeHelpers {
     /// `value` carries raw bits: the integral kinds in their low bytes, float
     /// and double as `to_bits()`.
     pub ffm_segment_set: usize,
+    /// F-08 — address of the GC's `JIT_G1_BARRIER` table (`gc/src/gen_heap.rs`),
+    /// baked as an immediate by the inline G1 post-write barrier.
+    ///
+    /// NOT a function pointer, and NOT a fourth spelling of
+    /// [`Self::region_bounds_addr`]. That table's EMPTINESS under G1 is what
+    /// closes defect G1-2, and it must keep answering "no inline reference
+    /// store may skip the collector's barrier" there; this one answers the
+    /// different question of what geometry an inline barrier needs in order to
+    /// BE the barrier — arena base, arena length, region mask, and the F-05
+    /// card table's base and shift. See `gc/src/gen_heap.rs::JitG1BarrierTable`.
+    ///
+    /// `0`, or a table whose `arena_len` word is zero, = no G1 collector has
+    /// published → the emitter emits no inline barrier and every compiled
+    /// reference store keeps the `putfield_object` helper it takes today.
+    /// Appended at the END of the struct so all prior golden offsets stay
+    /// stable.
+    pub g1_barrier_addr: usize,
+    /// F-08 — G1's post-write barrier, called from the inline arm when its two
+    /// inline filters (same region, null store) both fail to prove there is
+    /// nothing to remember.
+    ///
+    /// `extern "C" fn(vm_ptr: i64, obj_ptr: i64, val_ptr: i64)`.
+    ///
+    /// Distinct from [`Self::write_barrier`], which routes through
+    /// `VmHeap::write_barrier` and carries a `debug_assert!` requiring an SATB
+    /// pre-barrier on the same thread when a mark cycle is active. That
+    /// assertion is right for a general store and wrong for this caller: the
+    /// inline arm stores only when the field's OLD value is NULL, which is
+    /// exactly the case `satb_pre_barrier` returns from immediately, so no
+    /// pre-barrier is fired and none is owed. A dedicated entry point says that
+    /// once, here, instead of weakening an assertion that protects every other
+    /// caller.
+    ///
+    /// `0` = not wired (hand-built test tables) → no inline G1 barrier is
+    /// emitted. Appended at the END of the struct so all prior golden offsets
+    /// stay stable.
+    pub g1_post_write_barrier: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -1600,6 +1637,10 @@ helper_fields! {
     (ldc_string_cp,                  FieldKind::OptionalPtr),
     (ffm_segment_get,                FieldKind::OptionalPtr),
     (ffm_segment_set,                FieldKind::OptionalPtr),
+    // NOT a pointer: address of the GC's JIT_G1_BARRIER table, baked as an
+    // immediate by the inline G1 post-write barrier. 0 = not wired.
+    (g1_barrier_addr,                FieldKind::Offset),
+    (g1_post_write_barrier,          FieldKind::OptionalPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -1625,7 +1666,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 69,
+    JitRuntimeHelpers::NUM_FIELDS == 71,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -2024,6 +2065,8 @@ mod tests {
             ldc_string_cp: 0x11D8,
             ffm_segment_get: 0x11E0,
             ffm_segment_set: 0x11E8,
+            g1_barrier_addr: 0x11F0,
+            g1_post_write_barrier: 0x11F8,
         }
     }
 
@@ -2265,6 +2308,8 @@ mod tests {
             ldc_string_cp: 0,
             ffm_segment_get: 0,
             ffm_segment_set: 0,
+            g1_barrier_addr: 0,
+            g1_post_write_barrier: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -2440,8 +2485,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 67.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 69);
+        // And the macro-driven count is the canonical 71.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 71);
     }
 
     #[test]
@@ -2784,6 +2829,16 @@ mod tests {
                 "ffm_segment_set",
                 std::mem::offset_of!(JitRuntimeHelpers, ffm_segment_set),
             ),
+            (
+                69,
+                "g1_barrier_addr",
+                std::mem::offset_of!(JitRuntimeHelpers, g1_barrier_addr),
+            ),
+            (
+                70,
+                "g1_post_write_barrier",
+                std::mem::offset_of!(JitRuntimeHelpers, g1_post_write_barrier),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -2838,8 +2893,8 @@ mod tests {
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 43, "required-pointer count drifted");
-        assert_eq!(opt, 16, "optional-pointer count drifted");
-        assert_eq!(off, 10, "offset-field count drifted");
+        assert_eq!(opt, 17, "optional-pointer count drifted");
+        assert_eq!(off, 11, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }
 

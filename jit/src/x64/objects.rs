@@ -468,6 +468,229 @@ impl Compiler {
         vec![self.emit_jcc_rel32_patch(0x84)] // JZ -> checked helper
     }
 
+    // -----------------------------------------------------------------
+    // F-08 — the inline G1 post-write barrier
+    // -----------------------------------------------------------------
+
+    /// Byte offsets into the published `JIT_G1_BARRIER` table
+    /// (`gc/src/gen_heap.rs::JitG1BarrierTable`). Five `usize` words:
+    /// `[arena_base, arena_len, region_mask, card_table_base, card_shift]`.
+    pub(super) const G1B_ARENA_BASE: i32 = 0;
+    pub(super) const G1B_ARENA_LEN: i32 = 8;
+    pub(super) const G1B_REGION_MASK: i32 = 16;
+
+    /// F-08 — may this compile emit a real G1 post-write barrier inline,
+    /// instead of routing every reference store to `jit_putfield_object`?
+    ///
+    /// Three things must hold, and each of them is a separate hazard:
+    ///
+    /// * the opt-in flag is set (`CRATONVM_G1_INLINE_BARRIER`, default OFF);
+    /// * a G1 collector has published its geometry into `JIT_G1_BARRIER`, so
+    ///   the arena base, length and region mask the sequence loads are real;
+    /// * the lean barrier helper is wired, since the inline arm's slow path
+    ///   CALLs it and a zero there would be a call to address 0. A hand-built
+    ///   test helper table leaves it zero; that is the "not wired" contract
+    ///   every optional slot in `JitRuntimeHelpers` carries.
+    ///
+    /// **This does not, and must not, re-open defect G1-2.** That defect is
+    /// about an inline store that SKIPS the barrier; `region_bounds_are_live`
+    /// stays false under G1 and every generational-style barrier-free arm stays
+    /// unreachable there. What this enables is an arm that EMITS the barrier —
+    /// the same remembered-set edge `post_write_barrier_rset` records, with the
+    /// two cases in which that function provably does nothing filtered out
+    /// inline. See `emit_g1_post_write_barrier_regs` for that argument in full.
+    ///
+    /// It is also not `inline_card_mark_available()`, which is a deliberate
+    /// constant `false` and stays one. That is the GENERATIONAL card mark,
+    /// disabled after a WildFly boot audit found an old `org/jboss/modules/
+    /// Module` reference to a young child left on a CLEAN card. Different
+    /// mechanism, different table, different collector; the two are kept
+    /// separate so that re-enabling one never silently re-enables the other.
+    pub(super) fn g1_inline_barrier_available(&self) -> bool {
+        g1_inline_barrier_enabled()
+            && g1_barrier_table_live(self.helpers.g1_barrier_addr)
+            && self.helpers.g1_post_write_barrier != 0
+    }
+
+    /// F-08 — receiver guard for the inline G1 store arm: null, alignment and
+    /// containment in a mapped arena, returning the patch sites the caller
+    /// routes to its slow path.
+    ///
+    /// **Why this passes `read_bounds_addr` where the store arms pass
+    /// `region_bounds_addr`, and why that is not the mistake the doc on
+    /// [`Self::emit_guarded_getfield_receiver_check`] warns about.**
+    ///
+    /// That warning says handing the READ table to a STORE caller "would
+    /// silently unblock exactly the fast path G1-2 exists to block". It is
+    /// about a caller that uses containment as its LICENCE TO SKIP THE
+    /// BARRIER: under G1 the store-side table is empty, every receiver is
+    /// rejected, and that rejection is what forces the helper. Swapping in a
+    /// table G1 does publish would let those receivers through with no barrier
+    /// at all.
+    ///
+    /// This caller does not skip the barrier. It emits one
+    /// ([`Self::emit_g1_post_write_barrier_regs`]) on the path this guard
+    /// admits. Containment here is doing its ORIGINAL job and only that job —
+    /// "is this address inside mapped arena memory, so the header reads and the
+    /// 8-byte field store that follow cannot fault" — which is precisely the
+    /// question `JIT_READ_BOUNDS` answers and which G1 publishes into. The
+    /// store-side table is untouched and `region_bounds_are_live` still reads
+    /// it and still says no.
+    ///
+    /// If this guard admitted a receiver it should not, the failure mode is a
+    /// fault or a corrupt store, not a lost remembered-set edge; the barrier
+    /// below runs for every admitted receiver regardless.
+    pub(super) fn emit_g1_store_receiver_check(&mut self) -> Vec<usize> {
+        self.emit_guarded_getfield_receiver_check(self.helpers.read_bounds_addr)
+    }
+
+    /// F-08 — G1's post-write barrier, inline.
+    ///
+    /// Preconditions: `obj_reg` holds the receiver and `val_reg` the stored
+    /// reference, the inline store has already happened, and `scratch` is a
+    /// register the caller does not need afterwards. All three are clobbered.
+    /// `obj_slot` / `val_slot` are the stack slots the operands came from, so
+    /// the slow arm can reload them into the ABI argument registers without
+    /// depending on what the filter did to the originals.
+    ///
+    /// # The sequence
+    ///
+    /// ```text
+    ///   test val, val                 ; a null store records nothing
+    ///   jz   done
+    ///   mov  scratch, imm64 &JIT_G1_BARRIER
+    ///   sub  obj, [scratch + 0]       ; obj - arena_base
+    ///   sub  val, [scratch + 0]       ; val - arena_base
+    ///   xor  obj, val
+    ///   and  obj, [scratch + 16]      ; & region_mask, sets ZF
+    ///   jz   done                     ; same region: nothing to remember
+    ///   <reload ABI args from slots>
+    ///   call g1_post_write_barrier
+    /// done:
+    /// ```
+    ///
+    /// # Why eliding those two cases is sound
+    ///
+    /// `G1Collector::post_write_barrier_rset` opens with exactly the same two
+    /// tests and returns without touching anything when either fires:
+    ///
+    /// * a null stored reference has `lookup_region_for_addr(0) == None`, so
+    ///   the `(Some(s), Some(d)) if s != d` match arm cannot be taken;
+    /// * two addresses in the same region take the same `_ => return` arm.
+    ///
+    /// So the inline filter removes calls whose callee would have returned, and
+    /// never a call that would have recorded. The remaining cases — an address
+    /// outside G1's arena, a destination region that is Free, an edge this
+    /// thread already recorded — are all left to the callee, which already
+    /// distinguishes them and which is where the F-05 card store lives.
+    ///
+    /// # Why the arena base is SUBTRACTED rather than the XOR taken raw
+    ///
+    /// `(obj ^ val) & region_mask == 0` asks whether the two addresses share an
+    /// aligned `region_size` block of the address space, and G1's arena is not
+    /// region-aligned, so an aligned block is NOT a region: exactly one region
+    /// boundary falls inside each block, and two addresses straddling it would
+    /// be called "same region", the barrier skipped, and a live cross-region
+    /// edge lost. That is a use-after-free, so the two subtractions are
+    /// load-bearing rather than tidy.
+    ///
+    /// The alignment the arena actually has has already changed once under this
+    /// reasoning and the argument must not come to depend on it. It was a
+    /// `Vec<u8>` (malloc-aligned) when this was written; since F-16 it is an
+    /// `mmap` / `VirtualAlloc` reservation, so 4 KiB on Linux and 64 KiB on
+    /// Windows. Neither is a region — the default region size is 1 MiB and the
+    /// ergonomic can take it to 32 MiB — and neither is guaranteed by anything
+    /// the collector promises. The subtractions are correct for ANY base, which
+    /// is the property to preserve.
+    ///
+    /// An out-of-arena operand makes its subtraction wrap to a huge value; that
+    /// can only make the XOR differ and send the store to the helper, which
+    /// then no-ops. The failure direction is a wasted call, never a lost edge.
+    ///
+    /// # Why the card is not dirtied here
+    ///
+    /// It could be — the table carries the card base and shift — but it would
+    /// buy nothing. The remembered-set ENTRY still has to be recorded, and that
+    /// is a hash-map insert keyed on a (source region, target region) pair with
+    /// no inline form. Dirtying the card inline and then calling anyway is
+    /// duplicated work; the callee dirties it on the way through. What would
+    /// change this is Phase 2 taking its source set from the card table instead
+    /// of from the region-index remembered set, which is a collector policy
+    /// change and not an emitter one.
+    pub(super) fn emit_g1_post_write_barrier_regs(
+        &mut self,
+        obj_reg: u8,
+        val_reg: u8,
+        scratch: u8,
+        obj_slot: StackSlot,
+        val_slot: StackSlot,
+    ) {
+        let nothing_to_do = self.emit_g1_barrier_filter(obj_reg, val_reg, scratch);
+        // Everything the filter could not dismiss: the collector's own barrier.
+        // Both operands are reloaded from their stack slots, because the filter
+        // destroyed the registers they were in.
+        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+        self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+        self.load_slot_to_reg(ARG_REGS[2], val_slot);
+        self.emit_call_absolute(self.helpers.g1_post_write_barrier);
+        for patch in nothing_to_do {
+            self.patch_rel32_to_here(patch);
+        }
+    }
+
+    /// F-08 — the two-test filter alone, without the call it guards.
+    ///
+    /// Returns the jump sites the caller must patch to "nothing to remember".
+    /// Clobbers all three registers.
+    ///
+    /// Split from [`Self::emit_g1_post_write_barrier_regs`] so the filter can
+    /// be EXECUTED in a unit test without a compiled frame — the call arm
+    /// reloads its operands through `emit_load_local` / `load_slot_to_reg`,
+    /// which need a real prologue and a real heap local, and that requirement
+    /// would otherwise put the part of this sequence that can silently
+    /// miscompile (three instruction encodings this file had no other user for,
+    /// and an address-arithmetic argument) beyond the reach of any test that
+    /// runs the code. Same motive as `RememberedSet::add_reference_in_generation_within`:
+    /// make the risky half addressable on its own.
+    pub(super) fn emit_g1_barrier_filter(
+        &mut self,
+        obj_reg: u8,
+        val_reg: u8,
+        scratch: u8,
+    ) -> Vec<usize> {
+        // Engagement, not assumption. The codebase's own rule ("never assume a
+        // gated path was taken -- verify") is why `g1: parallel evacuation
+        // ACTIVE` exists, and it applies twice over to a barrier that is opt-in
+        // AND behind three conjoined conditions: a run whose checksum matches
+        // HotSpot proves nothing about this arm unless something says the arm
+        // was emitted. One line per process, at `info`.
+        {
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!(
+                    "jit: G1 inline post-write barrier ACTIVE (F-08, CRATONVM_G1_INLINE_BARRIER)"
+                );
+            }
+        }
+        debug_assert!(
+            self.helpers.g1_barrier_addr != 0,
+            "F-08: emit_g1_barrier_filter called with no JIT_G1_BARRIER table — \
+             the sequence would load through a null table address"
+        );
+        // 1. Null stored reference: `post_write_barrier_rset` returns.
+        self.emit_test_r64_r64(val_reg);
+        let done_null = self.emit_jcc_rel32_patch(0x84); // JZ
+                                                         // 2. Same region: `post_write_barrier_rset` returns.
+        self.emit_mov_imm64(scratch, self.helpers.g1_barrier_addr as i64);
+        self.emit_sub_r64_mem_disp32(obj_reg, scratch, Self::G1B_ARENA_BASE);
+        self.emit_sub_r64_mem_disp32(val_reg, scratch, Self::G1B_ARENA_BASE);
+        self.emit_xor_r64_r64(obj_reg, val_reg);
+        self.emit_and_r64_mem_disp32(obj_reg, scratch, Self::G1B_REGION_MASK);
+        let done_same = self.emit_jcc_rel32_patch(0x84); // JZ
+        vec![done_null, done_same]
+    }
+
     /// The full-barrier route every inline reference-`putfield` arm falls back
     /// to: `jit_putfield_object(heap, obj, field_index, value)`, which performs
     /// the SATB pre-barrier and the collector's OWN post-write barrier — G1's
@@ -509,6 +732,15 @@ impl Compiler {
     ) {
         let cell_off = (HEADER_SIZE + compact_body_offset as usize) as i32;
 
+        // F-08 — the G1 arm. Entered only when a G1 collector has published
+        // its geometry AND the opt-in flag is set; it emits a REAL G1
+        // post-write barrier after the store instead of borrowing the
+        // generational arm's "a young receiver needs no barrier" premise,
+        // which is false under G1 (see G1-2 below and `audits/g1-audit.md`
+        // §10). `region_bounds_are_live` is deliberately NOT consulted for it
+        // and stays false under G1 — the store-side table is untouched.
+        let g1 = self.g1_inline_barrier_available();
+
         // G1-2: no published bounds ⇒ no generational card metadata ⇒ the
         // "young receiver needs no post barrier" premise does not hold (G1's
         // RSet edge into a JNI-pinned, CSet-excluded region would be lost).
@@ -516,7 +748,7 @@ impl Compiler {
         // an all-zero table, and with an unwired table it would bake a
         // `MOV RDX,0` + `CMP RAX,[RDX]` that faults — so take the helper
         // outright instead of emitting an inline path that can never run.
-        if !region_bounds_are_live(self.helpers.region_bounds_addr) {
+        if !g1 && !region_bounds_are_live(self.helpers.region_bounds_addr) {
             self.emit_ref_putfield_helper_call(obj_slot, val_slot, field_index);
             return;
         }
@@ -524,7 +756,11 @@ impl Compiler {
         let mut bail: Vec<usize> = Vec::new();
 
         self.load_slot_to_reg(RAX, obj_slot);
-        bail.extend(self.emit_guarded_getfield_receiver_check(self.helpers.region_bounds_addr));
+        if g1 {
+            bail.extend(self.emit_g1_store_receiver_check());
+        } else {
+            bail.extend(self.emit_guarded_getfield_receiver_check(self.helpers.region_bounds_addr));
+        }
 
         // A registered compact class may still have legacy instances when a
         // synthetic/native allocation used a mismatched slot count.
@@ -537,7 +773,15 @@ impl Compiler {
 
         // Without direct generational card metadata, old receivers retain the
         // collector-specific helper. Otherwise the post-store mark is inline.
-        if !self.inline_card_mark_available() {
+        //
+        // F-08: the G1 arm skips this test entirely, and that is the point.
+        // `GC_FLAG_OLD_GEN` is a GENERATIONAL bit; G1 stamps it (defect G1-1's
+        // fix) but its own post barrier does not care about it, because a G1
+        // remembered-set edge is cross-REGION, not old-to-young. Testing it
+        // here would send every promoted receiver to the helper for no reason
+        // while doing nothing for the young-into-pinned-region case that
+        // actually needs the barrier.
+        if !g1 && !self.inline_card_mark_available() {
             self.emit_test_mem8_imm8(
                 RAX,
                 cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
@@ -560,7 +804,12 @@ impl Compiler {
         // Compact reference fields are bare 8-byte pointers.
         self.load_slot_to_reg(RDX, val_slot);
         self.emit_mov_mem_disp32_r64(RAX, RDX, cell_off);
-        if self.inline_card_mark_available() {
+        if g1 {
+            // F-08. RCX is dead here (it last held the num_slots bound), so it
+            // is the scratch; RAX and RDX are clobbered by the filter and the
+            // slow arm reloads both from their slots.
+            self.emit_g1_post_write_barrier_regs(RAX, RDX, RCX, obj_slot, val_slot);
+        } else if self.inline_card_mark_available() {
             self.emit_inline_card_mark_regs(RAX, RDX);
         }
         let done = self.emit_jmp_rel32_patch();
@@ -604,9 +853,26 @@ impl Compiler {
     ) {
         let cell_off = (HEADER_SIZE + compact_body_offset as usize) as i32;
 
+        // F-08 — the G1 arm, as in `emit_inline_body_compact_ref_putfield`.
+        // §10 of the audit named THIS emitter as where closing G1-2 costs
+        // measurable time: `n.left = newChild` inside `<init>` is the shape
+        // that dominates allocation-heavy code, and it became a helper call.
+        // The arm below stores inline and then runs a real G1 post barrier,
+        // whose common case for that shape — parent and child allocated back
+        // to back in one Eden region — is two instructions and a not-taken
+        // branch.
+        //
+        // §10 also explains why the barrier cannot simply be ELIDED for a
+        // freshly allocated receiver: G1 pinning is region-granular, the
+        // allocator does not avoid pinned regions, and a pinned young region
+        // is held out of the collection set and reached only through its
+        // remembered set. So the store must run a barrier; it just does not
+        // have to run a CALL.
+        let g1 = self.g1_inline_barrier_available();
+
         // G1-2: bounds not live ⇒ not the generational backend ⇒ every
         // reference store must run the collector's own post-write barrier.
-        if !region_bounds_are_live(self.helpers.region_bounds_addr) {
+        if !g1 && !region_bounds_are_live(self.helpers.region_bounds_addr) {
             self.emit_ref_putfield_helper_call(obj_slot, val_slot, field_index);
             return;
         }
@@ -624,14 +890,24 @@ impl Compiler {
         // perfectly-predicted not-taken branch; without it a null receiver
         // faulted on the `gc_flags` header read below instead of reaching the
         // helper's defined no-op semantics.
-        bail.extend(self.emit_trusted_oop_receiver_check());
+        // F-08: the G1 arm takes the FULL containment guard rather than the
+        // bare null test. The trusted-oop substitution's premise is "with
+        // bounds live the backend is Generational", which is exactly what this
+        // arm falsifies, so it cannot inherit the cheaper check — and the
+        // header reads and 8-byte store below need the receiver to be inside
+        // mapped arena memory whatever the collector is.
+        if g1 {
+            bail.extend(self.emit_g1_store_receiver_check());
+        } else {
+            bail.extend(self.emit_trusted_oop_receiver_check());
+        }
         self.emit_test_mem8_imm8(
             RAX,
             cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
             cratonvm_types::GC_FLAG_COMPACT,
         );
         bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ legacy -> helper
-        if !self.inline_card_mark_available() {
+        if !g1 && !self.inline_card_mark_available() {
             self.emit_test_mem8_imm8(
                 RAX,
                 cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
@@ -642,7 +918,10 @@ impl Compiler {
 
         self.load_slot_to_reg(RDX, val_slot);
         self.emit_mov_mem_disp32_r64(RAX, RDX, cell_off);
-        if self.inline_card_mark_available() {
+        if g1 {
+            // F-08 — RCX is untouched by this emitter, so it is free scratch.
+            self.emit_g1_post_write_barrier_regs(RAX, RDX, RCX, obj_slot, val_slot);
+        } else if self.inline_card_mark_available() {
             self.emit_inline_card_mark_regs(RAX, RDX);
         }
         let done = self.emit_jmp_rel32_patch();
