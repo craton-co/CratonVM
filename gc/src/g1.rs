@@ -1738,6 +1738,25 @@ impl G1Region {
     /// unheadered object") and that [`crate::tlab::Tlab::alloc_initialized`]
     /// implements with a Release fence. G1's out-of-line allocator honoured
     /// neither; it does now.
+    ///
+    /// # The default collector already does it this way
+    ///
+    /// `GenerationalHeap::try_alloc_young_initialized` takes the same
+    /// initializer and its SAFETY comment states the invariant outright --
+    /// "`init` writes the valid header before the arena lock is released" --
+    /// and every `gen_heap` allocation entry point builds its `ObjectHeader`
+    /// inside that closure. G1 is the only backend that did not, which is the
+    /// collector asymmetry the H2 page reports: the class passes under the
+    /// default collector and fails only under `-XX:+UseG1GC`.
+    ///
+    /// # Which allocations were exposed
+    ///
+    /// Anything that does not take a TLAB. `TLAB_MAX_ALLOC` is 32 KiB, so
+    /// EVERY array larger than that went out of line unconditionally -- and
+    /// `int[8192]`, `long[8192]` and `Object[8192]` are all over it, which is
+    /// the censused `num_slots=8192`. Smaller allocations reach it too,
+    /// whenever the TLAB fast path misses and the slow arm falls through to
+    /// the shared heap.
     fn bump_alloc_initialized(
         &mut self,
         size: usize,
