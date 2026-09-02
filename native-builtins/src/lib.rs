@@ -17389,7 +17389,9 @@ pub fn register_essential_natives_with_shims(
         |_ctx, _args| -> MethodCallResult {
             Err(MethodCallFailed::from(
                 RuntimeError::NoSuchElementException {
-                    message: "Collections.emptyEnumeration()".to_string(),
+                    // A bare `new NoSuchElementException()` on the oracle;
+                    // empty is this crate's marker for a null message.
+                    message: String::new(),
                 },
             ))
         },
