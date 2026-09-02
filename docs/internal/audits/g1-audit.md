@@ -590,6 +590,20 @@ Ordered. Each item is a precondition for the next being meaningful.
    per-object screen for why `bump_alloc` cannot maintain one across a TLAB
    carve), and a card is cleaned only at `G1Region::reset`, so a long-lived Old
    region's cards saturate.
+
+   **END-TO-END, 2026-09-02.** `G1CardChurn 11 200` (four retained depth-11
+   trees whose leaves are re-pointed at fresh young `int[]` every round, so the
+   edges are old->young and the checksum is computed from data reachable ONLY
+   through them) at `-Xmx24m -XX:InitiatingHeapOccupancyPercent=15 --nojit`:
+   42 pauses, young and mixed, `checksum=82273920000` — byte-identical to
+   HotSpot and to the same binary under `CRATONVM_G1_CARD_RSET=0`. Engagement
+   on the mixed pauses reads `rset_scanned=2406256 rset_skipped=86240`, i.e.
+   about 3.5% of the source walk removed. That number is small and it is the
+   honest one for this probe: it re-points EVERY leaf every round, so nearly
+   every card in the holder regions is dirty by construction. It is the
+   worst case for a card screen, not the case it is for. The 99.95% figure
+   above is the other end of the same distribution (one holder among hundreds
+   of clean fillers), and a real application sits between them.
 6. ~~**Decide the JNI-pinned-source policy explicitly.**~~ **DONE.** Stated in
    `a_jni_pinned_region_is_an_ordinary_rset_source_not_a_wholesale_one`, which
    pins both halves: a JNI-pinned region is held out of the CSet but is an
@@ -736,3 +750,14 @@ production audit rather than by a review. The flag is how it gets measured
 before it becomes a default; §10's own advice ("it should be measured under the
 reliability gate rather than assumed small") applies to the recovery as much as
 to the cost.
+
+**END-TO-END, 2026-09-02.** `G1CardChurn 11 60` at `-Xmx24m` with the JIT WARM
+(no `--nojit`), which is the arm every earlier G1 result in this document was
+missing: `checksum=7616601600` with `CRATONVM_G1_INLINE_BARRIER=1`, identical to
+the same binary with it off and to HotSpot. The arm was verified to have been
+TAKEN rather than merely enabled — `emit_g1_barrier_filter` logs
+`jit: G1 inline post-write barrier ACTIVE` once per process at `info`, present
+in the flag-on run and absent in the flag-off control. A checksum from a gated
+path nobody confirmed was entered is the "a subsystem kill switch passing 6/6 is
+not a diagnosis" failure, and this file has been on the receiving end of it
+before.

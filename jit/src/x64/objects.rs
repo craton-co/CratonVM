@@ -649,6 +649,21 @@ impl Compiler {
         val_reg: u8,
         scratch: u8,
     ) -> Vec<usize> {
+        // Engagement, not assumption. The codebase's own rule ("never assume a
+        // gated path was taken -- verify") is why `g1: parallel evacuation
+        // ACTIVE` exists, and it applies twice over to a barrier that is opt-in
+        // AND behind three conjoined conditions: a run whose checksum matches
+        // HotSpot proves nothing about this arm unless something says the arm
+        // was emitted. One line per process, at `info`.
+        {
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!(
+                    "jit: G1 inline post-write barrier ACTIVE (F-08, CRATONVM_G1_INLINE_BARRIER)"
+                );
+            }
+        }
         debug_assert!(
             self.helpers.g1_barrier_addr != 0,
             "F-08: emit_g1_barrier_filter called with no JIT_G1_BARRIER table — \
