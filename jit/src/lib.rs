@@ -18537,17 +18537,31 @@ pub fn compiled_frame_line_counts() -> [u64; 8] {
 /// | 3 | `exhausted` | compiles refused `spill-range-exhausted` |
 /// | 4 | `past-limit` | compiles refused `spill-cursor-past-limit` |
 /// | 5 | `peak-words` | high-water mark of live spill words in any one compile (a MAX, not a sum) |
+/// | 6 | `res-push` | words reserved by `push_stack` — the ordinary operand push |
+/// | 7 | `res-invalidate` | words reserved by `invalidate_callee_saved` |
+/// | 8 | `res-total` | every word reserved, so the two attributed columns read as a fraction of a whole |
+/// | 9 | `min-headroom` | the FEWEST words left between a reservation's end and `spill_limit_offset`, over every compile (a MIN; `u64::MAX` means nothing reserved) |
 ///
 /// Column 2 is the engagement counter for the canonical-home flush: a zero
 /// there with a non-zero column 1 means that path never ran, which is a
 /// different finding from it running and not helping.
-static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 6] = [
+///
+/// Column 9 is the one that answers "how close did anything actually get?".
+/// `peak-words` alone cannot: the limit is `max_stack` words and varies per
+/// method, so 19 words is nearly the whole budget for one method and a rounding
+/// error for another. A refusal count of zero plus a large minimum headroom is
+/// a much stronger statement than the refusal count on its own.
+static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 10] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(u64::MAX),
 ];
 
 /// `flush_scratch_registers` invocations.
@@ -18562,36 +18576,54 @@ pub const SPILL_REFUSED_EXHAUSTED: usize = 3;
 pub const SPILL_REFUSED_PAST_LIMIT: usize = 4;
 /// High-water mark of live spill words in any one compile.
 pub const SPILL_PEAK_WORDS: usize = 5;
+/// Words reserved by the ordinary operand push.
+pub const SPILL_RES_PUSH: usize = 6;
+/// Words reserved by `invalidate_callee_saved`.
+pub const SPILL_RES_INVALIDATE: usize = 7;
+/// Every word reserved, by any caller.
+pub const SPILL_RES_TOTAL: usize = 8;
+/// Fewest words ever left between a reservation and the spill limit.
+pub const SPILL_MIN_HEADROOM: usize = 9;
 
 /// Human names, parallel to the slot indices.
-pub const SPILL_CURSOR_SLOT_NAMES: [&str; 6] = [
+pub const SPILL_CURSOR_SLOT_NAMES: [&str; 10] = [
     "flush-calls",
     "flush-reserved",
     "flush-canonical",
     "exhausted",
     "past-limit",
     "peak-words",
+    "res-push",
+    "res-invalidate",
+    "res-total",
+    "min-headroom",
 ];
 
 /// Add `n` to one column. `peak-words` must not go through here — it is a
 /// maximum, and summing maxima produces a number that describes no run.
 #[inline]
 pub fn note_spill_cursor(slot: usize, n: u64) {
-    debug_assert!(slot != SPILL_PEAK_WORDS, "peak-words is a max, not a sum");
+    debug_assert!(
+        slot != SPILL_PEAK_WORDS && slot != SPILL_MIN_HEADROOM,
+        "peak-words is a max and min-headroom a min; neither is a sum"
+    );
     if let Some(c) = SPILL_CURSOR_COUNTS.get(slot) {
         c.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-/// Raise the peak-words high-water mark to `words` if it is higher.
+/// Raise the peak-words high-water mark to `words` if it is higher, and lower
+/// the headroom low-water mark to `headroom` if it is smaller. One call, so a
+/// reservation cannot record one and forget the other.
 #[inline]
-pub fn note_spill_peak(words: u64) {
+pub fn note_spill_peak(words: u64, headroom: u64) {
     SPILL_CURSOR_COUNTS[SPILL_PEAK_WORDS].fetch_max(words, std::sync::atomic::Ordering::Relaxed);
+    SPILL_CURSOR_COUNTS[SPILL_MIN_HEADROOM].fetch_min(headroom, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Read the census. See [`SPILL_CURSOR_COUNTS`] for the columns.
-pub fn spill_cursor_counts() -> [u64; 6] {
-    let mut out = [0u64; 6];
+pub fn spill_cursor_counts() -> [u64; 10] {
+    let mut out = [0u64; 10];
     for (i, slot) in SPILL_CURSOR_COUNTS.iter().enumerate() {
         out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
     }

@@ -48,11 +48,18 @@ impl Compiler {
             self.fail("singlepass-codegen/spill-range-exhausted");
             return None;
         }
-        crate::note_spill_peak(u64::try_from((end - self.base_spill_offset) / 8).unwrap_or(0));
+        crate::note_spill_peak(
+            u64::try_from((end - self.base_spill_offset) / 8).unwrap_or(0),
+            u64::try_from((self.spill_limit_offset - end) / 8).unwrap_or(0),
+        );
         Some(end)
     }
 
     pub(super) fn reserve_spill_slots(&mut self, slots: usize) -> Option<i32> {
+        // Every reservation, so the three attributed columns can be read as a
+        // fraction of a whole rather than as three numbers with an unknown
+        // remainder beside them.
+        crate::note_spill_cursor(crate::SPILL_RES_TOTAL, slots as u64);
         let start = self.next_spill_offset;
         let end = self.checked_spill_range_end(start, slots)?;
         self.next_spill_offset = end;
@@ -82,6 +89,7 @@ impl Compiler {
         if self.stack.is_empty() && self.stack_oop_marks.is_empty() {
             self.stack_oop_marks_exact = true;
         }
+        crate::note_spill_cursor(crate::SPILL_RES_PUSH, 1);
         let offset = self.reserve_spill_slots(1)?;
         let slot = StackSlot::Frame(offset);
         self.stack.push(slot);
@@ -1079,6 +1087,7 @@ impl Compiler {
             return;
         }
         // Spill the register value once
+        crate::note_spill_cursor(crate::SPILL_RES_INVALIDATE, 1);
         let Some(off) = self.reserve_spill_slots(1) else {
             return;
         };
