@@ -526,6 +526,75 @@ same reason. Opening the gate means first lifting the inline TLAB sequence into
 both front ends share allocation, dispatch and monitor contracts, and this is
 the contract it is missing.
 
+### The 2026-09-02 eight-finding pass — what moved, and what did not
+
+An audit of where the JIT loses to HotSpot produced eight findings; all eight
+are addressed above. What follows is the measurement, and the residuals that
+survive it, stated rather than left to be inferred.
+
+**Method.** ONE binary, every new default flipped off against every one on,
+arms alternated with the order reversed on alternate reps, `-Xmx4g`,
+`bench/CratonBench.java` one phase per fresh process. Windows workstation, not
+the Azure bench host, so these are NOT comparable with `BENCHMARK.md`'s
+HotSpot ratios and are not written there. The host is noisy — one phase varied
+12.5–18.3 s inside a single arm — so the statistic is the MINIMUM of each arm,
+which is the least contaminated one, and a difference smaller than the arm's
+own spread is reported as neutral rather than as a win.
+
+| phase | all-off | all-on | |
+|---|---:|---:|---|
+| HashMap (10M put/get) | 12,231 ms | **8,312 ms** | **1.47x** |
+| String/Regex (100K) | 405 ms | **345 ms** | 1.17x |
+| Binary Trees (d=18) | 20,511 ms | **18,897 ms** | 1.09x |
+| Matrix 1280² | 2,343 ms | 2,339 ms | neutral |
+| Arithmetic (2B ops) | 7,554 ms | 7,364 ms | neutral |
+| Fibonacci(44), Sieve | — | — | inside the noise band |
+
+Checksums identical on every row of every arm (`1549999915000000`,
+`5000050000`, `68332206`, `173943680`, `9592`).
+
+The shape of that result is the point: the rows that move are the
+allocation- and call-heavy ones, which is what the findings were about. Matrix
+is a pure `int[][]` triple loop that the single-pass backend already
+vectorises and that allocates almost nothing — it should not move, and it does
+not.
+
+**A correctness bug this pass introduced and fixed, worth recording because
+the kill switch is what found it.** Giving ZGC mutators a TLAB made the
+single-pass inline-`new` fast path reachable for the first time on that
+collector, and that path skips `tlab_post_init` — the helper that enters the
+object in ZGC's object-start registry, which is that collector's only record
+that an object exists. 8 of 86 regression-suite vectors failed; the same
+binary with `CRATONVM_ZGC_MUTATOR_TLAB=0` passed 86 of 86, which located it in
+one run. See `JitRuntimeHelpers::tlab_registration_required` (helper ABI v12).
+
+**Residuals, in the order they are worth taking.**
+
+1. **The operand-stack register cache stays pure-kernel-only, and this pass
+   recommends AGAINST widening it.** Its blocker is unchanged — `SCRATCH_REGS`
+   is `[R8, R9]` and both are argument registers on both ABIs — and the fix
+   would be a dynamic pool of callee-saved registers the local allocator did
+   not hand out. But two things now argue the payoff does not justify it: the
+   RELOAD half of the round-trip is already elided by `slot_mirror` (see the
+   array-load page's step 7), so what remains is one STORE per push; and the
+   adjacent change — reserving the home word at push time — shipped a
+   nondeterministic heap corruption on 2026-09-02 and was reverted the same
+   day. A one-store win is not worth a third visit to that code.
+2. **Every compiled call still republishes RBP and pushes/reloads the shadow
+   stack.** Those buy precise roots, not nothing, and removing them is a GC
+   trade rather than a codegen one.
+3. **Nothing compares a C2 body against the C1 body it replaces.** The
+   policy question is unchanged and deliberately still open — the obvious
+   static metrics both misjudge the good cases, since a bigger body is usually
+   inlining or unrolling and more call sites can be a callee's own calls after
+   its frame was inlined away. What this pass adds is the DATA: with
+   `CRATONVM_DBG=jitc`, a supersede prints `c1=<bytes> c2=<bytes>`. What it
+   also does is remove the causes that made a C2 body worse — the tier now has
+   an inline TLAB bump, gated inline reference stores, and a register file.
+4. **`Node` is still 48 bytes against HotSpot's 24.** Unchanged, structural,
+   and a GC item: see
+   `known-issues/perf/perf-bintrees-9x-gap-characterised.md`.
+
 ### Summary table
 
 | Feature | Default | Opt-out / opt-in var |
