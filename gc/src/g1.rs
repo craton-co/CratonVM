@@ -2036,6 +2036,18 @@ pub struct G1PausePhases {
     pub surv_regions: u32,
     pub old_regions: u32,
     pub hum_regions: u32,
+    /// How many regions this pause actually collected, and how many young
+    /// regions each pin vocabulary kept OUT of that set.
+    ///
+    /// `bytes_freed` cannot separate "there was little garbage" from "almost
+    /// nothing was collectable": measured on the H2 class, 19 268 young pauses
+    /// in 240 s freeing a mean of 356 KB each -- about a third of a region per
+    /// pause, on a heap whose trigger is a 25% free fraction. Either the
+    /// collection set is tiny or it is nearly all pinned out, and only these
+    /// three numbers say which.
+    pub cset_regions: u32,
+    pub jni_pinned_out: u32,
+    pub jit_pinned_out: u32,
 }
 
 impl G1PausePhases {
@@ -3914,6 +3926,8 @@ impl G1Collector {
         // able to tell "nothing was garbage" from "everything was pinned".
         let (jni_pinned_out, jit_pinned_out) =
             count_young_regions_pinned_out(regions.as_slice(), &jit_pinned_regions);
+        // Carried to `phases` below, which is not in scope yet.
+        let cset_regions_selected = cset.len() as u32;
 
         if cset.is_empty() {
             let mut degraded = crate::gc_metrics::g1_degraded::EMPTY_COLLECTION_SET;
@@ -3971,6 +3985,11 @@ impl G1Collector {
         // already takes one; see `G1PausePhases` for why this is not
         // debug-gated.
         let mut phases = G1PausePhases::default();
+        // What this pause was ALLOWED to collect, and what the two pin
+        // vocabularies kept out of it -- see the field docs.
+        phases.cset_regions = cset_regions_selected;
+        phases.jni_pinned_out = jni_pinned_out as u32;
+        phases.jit_pinned_out = jit_pinned_out as u32;
         let mut phase_mark = std::time::Instant::now();
 
         // Process root references
@@ -10558,7 +10577,7 @@ impl G1Collector {
             String::new()
         } else {
             format!(
-                " roots_us={} rset_us={} closure_us={} fixup_us={} free_us={}                  fixup_regions={} fixup_bytes={} free_regions={} eden_regions={} surv_regions={} old_regions={} hum_regions={}",
+                " roots_us={} rset_us={} closure_us={} fixup_us={} free_us={}                  fixup_regions={} fixup_bytes={} free_regions={} eden_regions={} surv_regions={} old_regions={} hum_regions={} cset_regions={} jni_pinned_out={} jit_pinned_out={}",
                 phases.roots_us,
                 phases.rset_us,
                 phases.closure_us,
@@ -10571,6 +10590,9 @@ impl G1Collector {
                 phases.surv_regions,
                 phases.old_regions,
                 phases.hum_regions,
+                phases.cset_regions,
+                phases.jni_pinned_out,
+                phases.jit_pinned_out,
             )
             .replace("                 ", "")
         };
