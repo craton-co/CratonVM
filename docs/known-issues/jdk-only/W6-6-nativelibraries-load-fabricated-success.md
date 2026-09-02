@@ -1,5 +1,37 @@
 # `NativeLibraries.load` returned `true` for every library in the universe
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** The banner says "nothing here was
+> built or run". The unit test this record names as what still covers the body
+> has now been run, on a build from this tree:
+>
+> ```text
+> cargo test -p cratonvm-native-builtins bare_native_library_name
+>   bare_native_library_name_tests::decodes_the_canonical_paths_the_jdk_loader_passes ... ok
+>   bare_native_library_name_tests::windows_spelling_keeps_a_leading_lib ... ok
+>   2 passed, 0 failed, 4214 filtered out
+> ```
+>
+> Both arms of §3's point are covered: the JDK passes
+> `file.getCanonicalPath()`, so the native sees a PATH where every policy
+> question is phrased in bare names, and the Windows spelling keeps a leading
+> `lib`. That is what the record said the test was for.
+>
+> **The road this record was WRITTEN for is now reachable, and still has not been
+> taken.** §"What still covers the body" ends: *"The Linux real-JDK
+> boot-`<clinit>` road this record was written for is off this host and was not
+> exercised"* — true when it was written on Windows. This note was taken on
+> LINUX with a real JDK 25 image, so that road is no longer off the host. It was
+> still not exercised here, because exercising it means driving
+> `ClassLoader.loadLibrary` -> `NativeLibraries.loadLibrary` through real boot
+> bytecode rather than running a unit test, which is a probe this note did not
+> write.
+>
+> Recording it because the constraint that made it impossible has lifted and the
+> sentence saying so would otherwise keep reading as permanent. Several records
+> in this campaign were written under conditions — no `cargo`, no Linux, no JDK
+> image — that no longer hold, and their stated non-coverage is worth re-reading
+> rather than inheriting.
+
 **Status (re-read 2026-08-12, second pass — source and committed baselines only;
 nothing here was built or run):**
 
