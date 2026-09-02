@@ -1,4 +1,12 @@
-# `-XX:+UseG1GC` fails `TestKillProcessWhileWriting` — a G1 `OutOfMemoryError` with no arena failure
+# `-XX:+UseG1GC` fails `TestKillProcessWhileWriting` — FIXED 2026-09-02
+
+**The class passes, 3/3.** Two independent defects, found in this order and
+both measured: a conservative root pointing INSIDE a reference array, from
+which the collector fabricated an object (section 4d), and one live
+finalizable object disabling eager humongous reclaim for the whole process,
+which left the heap 81% humongous and Eden at one region (section 4f). The
+sections below are in the order they were investigated, so read 4d and 4f for
+the causes and the `## Status` block for what each era of this page claimed.
 
 ## ADDENDUM 2026-08-30: the OOM face is FIXED, the 48 617 dangling references were never a rate, and the class still does not pass
 
@@ -630,12 +638,32 @@ Two regression tests, one per direction. The second --
 `an_unrelated_finalizer_candidate_no_longer_suppresses_eager_reclaim` -- FAILS
 on the old code, so it is not a vacuous guard.
 
+#### MEASURED on the shipped fix: the class PASSES
+
+Three G1 reps and a same-day control, one binary, 900 s cap:
+
+| arm | rc | secs | pauses | `hum_regions` | `free_regions` | `cset_regions` | V7b | implausible |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `-XX:+UseG1GC` rep 1 | **0 PASS** | 694 | 89 | 27.7 | 978.4 | 127.8 | 0 | 0 |
+| `-XX:+UseG1GC` rep 2 | **0 PASS** | 716 | 90 | 35.8 | 969.8 | 126.2 | 0 | 0 |
+| `-XX:+UseG1GC` rep 3 | **0 PASS** | 605 | 90 | 34.2 | 971.6 | 126.5 | 0 | 0 |
+| default collector | 0 PASS | 392 | -- | -- | -- | -- | 0 | 0 |
+
+The sound fix reproduces the unsound probe exactly (88 pauses / hum 26.5 /
+free 980.3 / 449 MB freed per pause), which is what makes the probe's result
+transferable. `v7b=0` and `implausible=0` on every rep, so the section-4d root
+fix holds under a collector that is now actually reclaiming.
+
+G1 runs the class in 605-716 s against the control's 392 s -- still ~1.7x, which
+is a throughput question and not this page's.
+
 #### What is left
 
 
-No arm passes -- halving the pause cost just buys more pauses in the same
-900 s (82 000 - 102 000, up from 51 000 - 61 000). Turning the walk off
-entirely still leaves **tens of thousands of young pauses per 900 s** -- one every 11-15 ms, each freeing about
+At the time 4e was written no arm passed -- halving the pause cost just bought
+more pauses in the same 900 s (82 000 - 102 000, up from 51 000 - 61 000).
+Section 4f found why, and with it fixed the pause count is 89. Turning the
+fix-up walk off alone still left **tens of thousands of young pauses per 900 s** -- one every 11-15 ms, each freeing about
 0.5 MB of a 1 GiB heap, against 88 Mixed pauses in 2400 s. `young_target_regions`
 starts at 60% of the heap, so the young generation is not supposed to be
 collected at that granularity. Why the trigger fires that often, and why Mixed
@@ -643,7 +671,9 @@ almost never runs, is the next question on this page.
 
 ## Status
 
-**OPEN. The OOM face is FIXED (2026-08-30) and held on 2026-09-02 (section 4c: 0 real `OutOfMemoryError` on both G1 arms, and the default-collector control PASSES in 811 s the same day, so the cap is a failure and not a slow host). The ROOT CAUSE of the corruption family is found and fixed (section 4d): G1 evacuated a CSet root pointing INSIDE a reference array and manufactured an object out of the element -- `num_slots=512` was the top half of a heap address, not a shape. Every downstream implausible-header site went to ZERO and V7b dangling references to 0, but the class STILL CAPS at 900 s, so the cap face is untouched. A separate allocation-publication defect was also fixed (section 4b) and did not close anything on its own. The FAILURE MODE MOVED to SIGSEGV in 2026-08-30's arm -- read section 3 before treating that as an improvement. The 48 617 dangling references are 6 holders, not a rate. Split out 2026-08-29** from
+**FIXED 2026-09-02 — the class PASSES under `-XX:+UseG1GC`, 3/3 (605-716 s, against 392 s for the default collector on the same host and binary), with zero dangling references and zero implausible headers.** Two independent defects had to close: the CORRUPTION face (section 4d — G1 evacuated a conservative root pointing INSIDE a reference array and fabricated an object from the element) and the CAP face (section 4f — one live finalizable object disabled eager humongous reclaim for the whole process, leaving the heap 81% humongous and Eden at one region). Historical status below.
+
+**The OOM face is FIXED (2026-08-30) and held on 2026-09-02 (section 4c: 0 real `OutOfMemoryError` on both G1 arms, and the default-collector control PASSES in 811 s the same day, so the cap is a failure and not a slow host). The ROOT CAUSE of the corruption family is found and fixed (section 4d): G1 evacuated a CSet root pointing INSIDE a reference array and manufactured an object out of the element -- `num_slots=512` was the top half of a heap address, not a shape. Every downstream implausible-header site went to ZERO and V7b dangling references to 0, but the class STILL CAPS at 900 s, so the cap face is untouched. A separate allocation-publication defect was also fixed (section 4b) and did not close anything on its own. The FAILURE MODE MOVED to SIGSEGV in 2026-08-30's arm -- read section 3 before treating that as an improvement. The 48 617 dangling references are 6 holders, not a rate. Split out 2026-08-29** from
 `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`, whose ZGC
 defect is closed and which never owned this row. The class **passes under the
 default collector**; only the explicit `-XX:+UseG1GC` arm fails.
