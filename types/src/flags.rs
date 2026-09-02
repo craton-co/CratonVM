@@ -917,6 +917,47 @@ pub struct GcFlags {
     /// region table is once again atomic for a whole step, which is the
     /// behaviour every G1 mark cycle before 2026-09-02 ran under.
     pub g1_mark_lock_yield: bool,
+    /// `CRATONVM_G1_SHARED_ALLOC` — F-11. Let G1 serve an object allocation or
+    /// a TLAB refill out of the current Eden region under a SHARED regions
+    /// guard, claiming space with an atomic compare-exchange on the region's
+    /// bump cursor. Default **ON** ([`parse::on_unless_zero`]); `=0` sends
+    /// every allocation down the exclusive path instead.
+    ///
+    /// `G1Region::cursor` was a plain `usize`, so bumping it needed
+    /// `&mut G1Region`, so every allocation took the collector's one exclusive
+    /// lock — the same lock the whole stop-the-world pause and (before F-10)
+    /// the concurrent marker held. At the 256 KiB default TLAB against 1 MiB
+    /// regions four refills exhaust a region, so this was not a rare path: it
+    /// was every thread, continuously, at exactly the moment the heap fills.
+    ///
+    /// `=0` is the bisection lever. It does not select a different algorithm —
+    /// it skips the shared probe and enters the identical slow path, which
+    /// re-probes the current Eden under the exclusive guard — so a regression
+    /// that survives `=0` is not about the lock. Try it first for any suspected
+    /// G1 allocation-corruption or lost-TLAB-zeroing defect: under it the
+    /// cursor moves only under exclusion, which is the behaviour every G1 run
+    /// before 2026-09-02 was produced under.
+    pub g1_shared_alloc: bool,
+    /// `CRATONVM_G1_EDEN_STRIPES=<n>` — F-11. How many Eden regions G1 keeps
+    /// open for mutator allocation at once. Unset means the machine-derived
+    /// default (hardware parallelism, capped at an eighth of the heap's
+    /// regions); `=1` is the single global Eden the collector had before F-11.
+    ///
+    /// Removing the exclusive lock from allocation (`CRATONVM_G1_SHARED_ALLOC`)
+    /// only moves the bottleneck if the threads then bump DIFFERENT cursors.
+    /// Measured at four threads, shared-guard allocation into one Eden region
+    /// was about 1.9x slower per object than the exclusive lock it replaced:
+    /// the threads compare-exchange the same word and, because objects are tens
+    /// of bytes, write each other's cache lines on the way out, while the
+    /// exclusive arm's barging mutex lets one thread run a long cache-hot
+    /// burst. Striping is what makes the shared guard pay.
+    ///
+    /// The knob is a `usize` rather than a boolean because it is also the
+    /// fragmentation dial: each stripe holds a partially-filled region that no
+    /// pause has reclaimed yet, so `n` regions of Eden are in flight. `=1` is
+    /// the bisection lever; a larger `n` than the default is a deliberate
+    /// trade of footprint for allocation parallelism.
+    pub g1_eden_stripes: Option<usize>,
     /// `CRATONVM_G1_DBG_RSET` — after every G1 evacuation pause, verify that
     /// every cross-region reference into a COLLECTABLE region is named in that
     /// region's remembered set. Opt-in diagnostic; whole-heap and O(live
@@ -1191,6 +1232,8 @@ impl GcFlags {
             g1_narrow_fixup: on_unless_zero(src, "CRATONVM_G1_NARROW_FIXUP"),
             g1_cleanup_walk: present(src, "CRATONVM_G1_CLEANUP_WALK"),
             g1_mark_lock_yield: on_unless_zero(src, "CRATONVM_G1_MARK_LOCK_YIELD"),
+            g1_shared_alloc: on_unless_zero(src, "CRATONVM_G1_SHARED_ALLOC"),
+            g1_eden_stripes: usize_min1(src, "CRATONVM_G1_EDEN_STRIPES"),
             identity_hash_evict: on_unless_zero(src, "CRATONVM_IDENTITY_HASH_EVICT"),
             g1_dbg_rset: present(src, "CRATONVM_G1_DBG_RSET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),

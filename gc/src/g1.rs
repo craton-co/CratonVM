@@ -963,7 +963,7 @@ impl<'a> SharedEvac<'a> {
     unsafe fn retire_tlab(&self, tlab: &mut Tlab) {
         if let Some(idx) = tlab.region_idx.take() {
             let region = &mut *self.regions_base.0.add(idx);
-            region.cursor = tlab.offset;
+            region.set_cursor(tlab.offset);
         }
         tlab.base = 0;
         tlab.len = 0;
@@ -1297,7 +1297,7 @@ impl<'a> SharedEvac<'a> {
             if r.region_type == RegionType::Free {
                 return;
             }
-            (r.cursor, r.data.addr() as *mut u8)
+            (r.cursor(), r.data.addr() as *mut u8)
         };
 
         let jit_skips = self.collector.jit_tlab_skip_spans();
@@ -1660,7 +1660,42 @@ pub struct G1Region {
     /// Backing storage for this region (a slice of [`G1Collector::arena`]).
     pub data: RegionBuf,
     /// Bump pointer: next free byte offset.
-    pub cursor: usize,
+    ///
+    /// # F-11 — why this is atomic
+    ///
+    /// It was a plain `usize`, which made every bump — a Java object
+    /// allocation, and every 256 KiB TLAB refill — require `&mut G1Region`,
+    /// which required the exclusive regions lock. With a 256 KiB default TLAB
+    /// against 1 MiB regions, four refills exhaust an Eden region, so a
+    /// multi-threaded allocator hit that exclusive lock constantly AND hit the
+    /// region-claim slow path behind it every fourth refill.
+    ///
+    /// As an `AtomicUsize` the bump is a compare-exchange loop under a SHARED
+    /// (read) regions guard, so N allocating threads no longer serialise on the
+    /// region table — and neither does the concurrent marker, which reads
+    /// cursors under the same shared guard (F-10).
+    ///
+    /// Read it with [`Self::cursor`] and write it with [`Self::set_cursor`];
+    /// the field is private so that no site can go around
+    /// [`Self::bump_alloc`]'s claim protocol by assigning it directly.
+    ///
+    /// **Publication window, and why it is bounded.** `bump_alloc` publishes
+    /// the new cursor with the compare-exchange and only THEN zeroes the range
+    /// it claimed, so between those two points a concurrent reader that walks
+    /// `[0, cursor)` can see bytes that are neither zeroed nor a written
+    /// object. That window is not new in kind — the object HEADER has always
+    /// been written by the caller after the allocator released the lock, and a
+    /// 256 KiB TLAB carve has always exposed a large span below the cursor that
+    /// its owner fills incrementally — but F-11 changes what is in it from
+    /// zeroes to the stale bytes of a recycled region (`G1Region::reset` no
+    /// longer scrubs; see its comment). The rule that keeps it bounded is that
+    /// **no concurrent reader walks `[0, cursor)`**: every heap walk is either
+    /// stop-the-world or takes the regions WRITE guard, which excludes the
+    /// allocator. The one concurrent walk that existed —
+    /// `concurrent_mark_step`'s overflow rescan — was moved onto the write
+    /// guard for exactly this reason. Adding a walker that runs under `read()`
+    /// is what would falsify this.
+    cursor: AtomicUsize,
     /// Bytes of live data (computed during marking).
     pub live_bytes: usize,
     /// GC efficiency: `live_bytes / region_size`. Lower means more garbage.
@@ -1712,7 +1747,7 @@ pub struct G1Region {
     /// (`CRATONVM_G1_DBG_REACH=1`). See [`BumpTrail`] for why a walk break needs
     /// it: the trail of walked objects names the victim, this names the call
     /// that committed the bytes.
-    bump_trail: BumpTrail,
+    bump_trail: Mutex<BumpTrail>,
     /// F-06 — this region's `(incarnation, cursor, type)` at the last
     /// `start_concurrent_mark`, or `None` outside a cycle.
     ///
@@ -1742,7 +1777,7 @@ pub struct G1Region {
     /// what happened on all four breaks of the first run. Keeping carves in
     /// their own ring makes the owner of a large committed hole recoverable no
     /// matter how much per-object traffic followed it.
-    tlab_trail: BumpTrail,
+    tlab_trail: Mutex<BumpTrail>,
 }
 
 impl G1Region {
@@ -1756,7 +1791,7 @@ impl G1Region {
         Self {
             region_type: RegionType::Free,
             data: RegionBuf::new(base, region_size),
-            cursor: 0,
+            cursor: AtomicUsize::new(0),
             live_bytes: 0,
             gc_efficiency: 0.0,
             rset: RememberedSet::default(),
@@ -1768,8 +1803,8 @@ impl G1Region {
             mark_bitmap,
             mark_start: None,
             marked_bytes_below_tams: AtomicUsize::new(0),
-            bump_trail: BumpTrail::default(),
-            tlab_trail: BumpTrail::default(),
+            bump_trail: Mutex::new(BumpTrail::default()),
+            tlab_trail: Mutex::new(BumpTrail::default()),
         }
     }
 
@@ -1803,14 +1838,38 @@ impl G1Region {
     ///   region's ENTIRE content postdates it.
     fn tams(&self) -> usize {
         match self.mark_start {
-            None => self.cursor,
+            None => self.cursor(),
             Some((epoch, snap_cursor, snap_type))
                 if epoch == self.reuse_epoch && snap_type == self.region_type =>
             {
-                snap_cursor.min(self.cursor)
+                snap_cursor.min(self.cursor())
             }
             Some(_) => 0,
         }
+    }
+
+    /// This region's bump cursor: the offset of the next free byte.
+    ///
+    /// F-11 made the field atomic (see its doc); this is the read side. The
+    /// load is `Acquire` so a reader that observes a cursor also observes the
+    /// writes the claiming thread made before publishing it.
+    #[inline]
+    pub fn cursor(&self) -> usize {
+        self.cursor.load(Ordering::Acquire)
+    }
+
+    /// Set this region's bump cursor outright.
+    ///
+    /// For the stop-the-world phases that move a cursor wholesale — retiring a
+    /// TLAB's unused tail, sizing a humongous start, `reset`, and the tests
+    /// that stage a fill level. Ordinary allocation must go through
+    /// [`Self::bump_alloc`], which CLAIMS a range instead of overwriting the
+    /// cursor: a `set_cursor` racing a concurrent claim would silently
+    /// un-allocate whatever the claimer had just been handed. Every caller is
+    /// therefore either stop-the-world or holds the regions write guard.
+    #[inline]
+    pub fn set_cursor(&self, value: usize) {
+        self.cursor.store(value, Ordering::Release);
     }
 
     /// F-06 — mark `addr` black and, if it predates TAMS, add its size to
@@ -1855,7 +1914,7 @@ impl G1Region {
         // regions guard is held for the duration of a mark step.
         let header = unsafe { &*(addr as *const ObjectHeader) };
         let size = object_total_size(header);
-        if size >= HEADER_SIZE && off.saturating_add(size) <= self.cursor {
+        if size >= HEADER_SIZE && off.saturating_add(size) <= self.cursor() {
             self.marked_bytes_below_tams
                 .fetch_add(size, Ordering::Relaxed);
         }
@@ -1864,7 +1923,7 @@ impl G1Region {
 
     /// Remaining free bytes in this region.
     fn remaining(&self) -> usize {
-        self.data.len().saturating_sub(self.cursor)
+        self.data.len().saturating_sub(self.cursor())
     }
 
     /// Step 7 — estimated time (ns) to evacuate this region's live data, used
@@ -1886,10 +1945,10 @@ impl G1Region {
     fn reset(&mut self, rset_generation: u64) {
         // Captured BEFORE the fields are cleared — the zero-fill below is
         // bounded by them (see the `dirty` computation at the end).
-        let prev_cursor = self.cursor;
+        let prev_cursor = self.cursor();
         let was_humongous_continuation = self.region_type == RegionType::HumongousContinuation;
         self.region_type = RegionType::Free;
-        self.cursor = 0;
+        self.set_cursor(0);
         self.live_bytes = 0;
         self.gc_efficiency = 0.0;
         self.rset.clear();
@@ -1981,35 +2040,65 @@ impl G1Region {
     /// the tail later), so the tag has to come from the call site — nothing left
     /// in the region recovers it.
     fn bump_alloc(
-        &mut self,
+        &self,
         size: usize,
         align: usize,
         site: &'static str,
     ) -> Option<(*mut u8, usize)> {
-        let base = self.data.as_mut_ptr() as usize;
-        let current = base + self.cursor;
-        let aligned = (current + align - 1) & !(align - 1);
-        let offset_in_region = aligned - base;
-        let end = offset_in_region + size;
+        let base = self.data.addr();
+        // F-11 — claim the range with a compare-exchange rather than a
+        // read-modify-write through `&mut`. The loop body is the identical
+        // arithmetic the exclusive version did; the only new thing is that a
+        // losing racer re-reads the cursor and tries again against the winner's
+        // result. A plain `fetch_add` would not do: the claim is `align`, then
+        // `+ size`, then a bounds check, so a thread has to be able to WITHDRAW
+        // when the region turns out to be full, and `fetch_add` cannot.
+        //
+        // Termination: every successful exchange strictly increases the cursor
+        // and the cursor is bounded by `data.len()`, so a losing racer makes
+        // progress toward either a fit or the `end > len` refusal.
+        let (ptr, offset_in_region) = loop {
+            let cursor = self.cursor.load(Ordering::Acquire);
+            let current = base + cursor;
+            let aligned = (current + align - 1) & !(align - 1);
+            let offset_in_region = aligned - base;
+            let end = offset_in_region + size;
 
-        if end > self.data.len() {
-            return None;
-        }
+            if end > self.data.len() {
+                return None;
+            }
 
-        self.cursor = end;
+            // `AcqRel` on success publishes this claim to the next claimer;
+            // `Acquire` on failure is what makes the re-read see the winner's.
+            if self
+                .cursor
+                .compare_exchange_weak(cursor, end, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break (aligned as *mut u8, offset_in_region);
+            }
+        };
+
         if gc_flags().g1_dbg_reach {
             self.bump_trail
+                .lock()
                 .record(self.reuse_epoch, offset_in_region, size, site);
             if site.starts_with("tlab:") {
                 self.tlab_trail
+                    .lock()
                     .record(self.reuse_epoch, offset_in_region, size, site);
             }
         }
-        let ptr = aligned as *mut u8;
         // Zero-init the allocated area. This is the SINGLE establishment of
         // the TLAB zeroing contract — `refill_tlab`'s carves used to repeat it
         // over the identical range. `refill_tlab_zeroes_dirty_eden_bytes` is
         // the oracle: it dirties Eden above the cursor and fails if this goes.
+        //
+        // The claim above guarantees this range is exclusively ours — no other
+        // thread's exchange can overlap it — so two allocators zeroing at once
+        // never touch the same byte. See the `cursor` field doc for the window
+        // between publishing the cursor and finishing this zeroing, and for the
+        // rule (no concurrent walker below a cursor) that bounds it.
         unsafe {
             std::ptr::write_bytes(ptr, 0, size);
         }
@@ -2128,13 +2217,13 @@ fn cleanup_tams_from_snapshot(
     region: &G1Region,
 ) -> usize {
     if snapshot.is_empty() {
-        return region.cursor;
+        return region.cursor();
     }
     match snapshot.get(region_idx) {
         Some(&(epoch, snap_cursor, snap_type))
             if epoch == region.reuse_epoch && snap_type == region.region_type =>
         {
-            snap_cursor.min(region.cursor)
+            snap_cursor.min(region.cursor())
         }
         _ => 0,
     }
@@ -2174,7 +2263,7 @@ fn walk_marked_bytes_below_tams(
             break;
         }
         let obj_size = object_total_size(header);
-        if obj_size < HEADER_SIZE || offset + obj_size > region.cursor {
+        if obj_size < HEADER_SIZE || offset + obj_size > region.cursor() {
             break;
         }
         if region.mark_bitmap.is_marked(obj_addr) {
@@ -2598,8 +2687,35 @@ pub struct G1Collector {
     /// mark cycle completed under promotion pressure).
     mark_start_snapshot: Mutex<Vec<(u64, usize, RegionType)>>,
 
-    /// Index of the current Eden allocation region.
-    current_eden: AtomicUsize,
+    /// Eden allocation slots: for each stripe, the region index it is
+    /// currently bump-allocating into, or `usize::MAX` for "none yet".
+    ///
+    /// # F-11 — why this is a set and not a single index
+    ///
+    /// It was one `AtomicUsize`, so every allocating thread in the process
+    /// bumped ONE region's cursor. Once F-11 let that bump happen under a
+    /// shared guard, that single cursor became the bottleneck instead of the
+    /// lock: N threads compare-exchanging one word, and — because objects are
+    /// tens of bytes — writing the same cache lines as each other on the way
+    /// out. Measured at 4 threads on a 512 MiB heap, a shared-guard allocation
+    /// into ONE Eden region was about 1.9x SLOWER per object than the exclusive
+    /// lock it replaced, consistently across interleaved runs. The exclusive
+    /// arm wins that comparison because `parking_lot`'s mutex barges: one
+    /// thread keeps re-acquiring and runs a long, cache-hot, uncontended burst.
+    ///
+    /// Removing the lock is therefore only half the change. This is the other
+    /// half: a thread picks a stripe once and allocates from that stripe's own
+    /// region, so the cursors are distinct words and the objects land in
+    /// distinct pages. `CRATONVM_G1_EDEN_STRIPES=1` collapses it back to the
+    /// single global Eden, which is both the bisection lever and the arm that
+    /// reproduces the measurement above.
+    ///
+    /// The cost is fragmentation: each stripe holds a partially-filled region,
+    /// so up to `stripes - 1` regions' worth of Eden is in flight and
+    /// uncollected at any moment. [`G1Collector::eden_stripe_count`] therefore
+    /// caps the count at an eighth of the heap's regions, which makes the
+    /// default unit-test heap (8 regions) single-striped and unchanged.
+    eden_slots: Box<[AtomicUsize]>,
     /// Next identity hash code to assign.
     next_hash_code: AtomicI32,
 
@@ -2704,6 +2820,23 @@ pub struct G1Collector {
     /// reading of 1 per step is how you would discover the flag was off, or
     /// that a future edit hoisted the guard back out of the loop.
     mark_lock_batches: AtomicUsize,
+    /// F-11 engagement counters — allocations served by the SHARED-guard fast
+    /// path versus those that had to take the exclusive guard.
+    ///
+    /// The finding is about which lock allocation takes, and nothing about a
+    /// returned pointer says which one it was. These make the answer readable:
+    /// a healthy steady state is `shared` dominating by orders of magnitude,
+    /// with `exclusive` counting roughly one per region claimed. `shared == 0`
+    /// on a run that allocated means `CRATONVM_G1_SHARED_ALLOC=0` was in force
+    /// (or a future edit removed the fast path), which is exactly the "the gate
+    /// was inert" reading a timing number alone can never give.
+    alloc_shared_claims: AtomicUsize,
+    /// The exclusive half of [`Self::alloc_shared_claims`].
+    alloc_exclusive_claims: AtomicUsize,
+    /// TLAB refills served under the shared guard (F-11).
+    tlab_shared_carves: AtomicUsize,
+    /// TLAB refills that had to take the exclusive guard (F-11).
+    tlab_exclusive_carves: AtomicUsize,
     /// Throttle counter for [`G1Collector::mark_oob_report_budget`].
     mark_oob_report_count: AtomicUsize,
     /// `CRATONVM_G1_DBG_GRAY_PROV=1` — for each address currently on the gray
@@ -3140,7 +3273,9 @@ impl G1Collector {
             regions: RwLock::new(regions),
             jit_tlab_skip_regions: Mutex::new(Vec::new()),
             cset_verify_cursor: AtomicUsize::new(0),
-            current_eden: AtomicUsize::new(usize::MAX), // no eden yet
+            eden_slots: (0..Self::eden_stripe_count(num_regions))
+                .map(|_| AtomicUsize::new(usize::MAX)) // no eden yet
+                .collect(),
             next_hash_code: AtomicI32::new(1),
             needs_gc_free_percent: AtomicUsize::new(25),
             // Every region starts Free (`G1Region::from_arena`). Seeding this
@@ -3180,6 +3315,10 @@ impl G1Collector {
             mark_saw_implausible: AtomicBool::new(false),
             mark_oob_gray_skips: AtomicUsize::new(0),
             mark_lock_batches: AtomicUsize::new(0),
+            alloc_shared_claims: AtomicUsize::new(0),
+            alloc_exclusive_claims: AtomicUsize::new(0),
+            tlab_shared_carves: AtomicUsize::new(0),
+            tlab_exclusive_carves: AtomicUsize::new(0),
             mark_oob_report_count: AtomicUsize::new(0),
             gray_prov: Mutex::new(std::collections::HashMap::new()),
             v7b_reported: Mutex::new(std::collections::HashSet::new()),
@@ -3385,6 +3524,93 @@ impl G1Collector {
         Some(idx)
     }
 
+    /// F-11 — how many Eden stripes this collector allocates through.
+    ///
+    /// `CRATONVM_G1_EDEN_STRIPES=n` pins it; `=1` is the single global Eden the
+    /// collector had before F-11. Otherwise it is the hardware parallelism,
+    /// capped at an eighth of the heap's regions so striping can never eat a
+    /// small heap: at 8 regions or fewer the cap gives 1, which is exactly the
+    /// pre-F-11 shape, so no small-heap behaviour changes by default.
+    ///
+    /// Not `parallel_worker_count()`: that is a GC-worker ergonomic sized for
+    /// pause work, and this is a MUTATOR-side fan-out. Tying them would make
+    /// `CRATONVM_G1_WORKERS=1` — a determinism knob for the evacuator — quietly
+    /// serialise allocation as well.
+    fn eden_stripe_count(num_regions: usize) -> usize {
+        if let Some(n) = gc_flags().g1_eden_stripes {
+            return n.max(1);
+        }
+        let par = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
+        par.min((num_regions / 8).max(1)).max(1)
+    }
+
+    /// The Eden stripe this thread allocates from.
+    ///
+    /// Assigned once per OS thread from a process-global round-robin and then
+    /// cached, so the choice costs one thread-local load on the allocation fast
+    /// path. Round-robin rather than a hash of the thread id because thread ids
+    /// are not uniformly distributed and a collision costs exactly the
+    /// contention this striping exists to remove. The counter is global rather
+    /// than per-collector on purpose — it is a spreading device, not an
+    /// identity, and a thread that outlives one collector should keep landing
+    /// on a different stripe from its neighbours in the next one.
+    #[inline]
+    fn eden_slot(&self) -> usize {
+        let stripes = self.eden_slots.len();
+        if stripes == 1 {
+            return 0;
+        }
+        thread_local! {
+            static SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+        }
+        static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
+        let raw = SLOT.with(|c| {
+            let cached = c.get();
+            if cached != usize::MAX {
+                return cached;
+            }
+            let assigned = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
+            c.set(assigned);
+            assigned
+        });
+        raw % stripes
+    }
+
+    /// Retire every Eden stripe whose region this pause is about to collect.
+    ///
+    /// The single-slot version of this was five copies of
+    /// `if cset.contains(&cur) { store(usize::MAX) }`, one per collection path.
+    /// Striping turns each of them into a loop, and a path that forgot to
+    /// retire a stripe would keep bump-allocating into a region the pause had
+    /// just reset — so there is one implementation and the five sites call it.
+    fn retire_eden_slots_in_cset(&self, cset: &RegionSet) {
+        for slot in self.eden_slots.iter() {
+            let idx = slot.load(Ordering::Relaxed);
+            if idx != usize::MAX && cset.contains(&idx) {
+                slot.store(usize::MAX, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Retire every Eden stripe unconditionally. Test/diagnostic use.
+    #[cfg(test)]
+    fn clear_eden_slots(&self) {
+        for slot in self.eden_slots.iter() {
+            slot.store(usize::MAX, Ordering::Relaxed);
+        }
+    }
+
+    /// The region this thread is currently allocating into, if any.
+    /// Test/diagnostic use — production code reads the slot it is about to
+    /// bump, so that it and the bump see the same region.
+    #[cfg(test)]
+    fn dbg_current_eden(&self) -> usize {
+        self.eden_slots[self.eden_slot()].load(Ordering::Relaxed)
+    }
+
     /// Reset the Free-region scan hint to the head of the table.
     ///
     /// Called when a collection has just rebuilt the pool: the freed regions
@@ -3437,12 +3663,38 @@ impl G1Collector {
 
     /// Bump-allocate `size` bytes in the current Eden region.
     /// Returns `(pointer, region_index)` or `None` on failure.
+    ///
+    /// # F-11 — the common case runs under a SHARED guard
+    ///
+    /// This used to take the exclusive regions lock unconditionally, for every
+    /// object, because bumping a `usize` cursor needed `&mut G1Region`. With an
+    /// atomic cursor the overwhelmingly common case — there is a current Eden
+    /// region and it has room — is a compare-exchange under `read()`, so N
+    /// allocating threads no longer serialise, and neither do they exclude the
+    /// concurrent marker (which also reads under `read()` since F-10).
+    ///
+    /// The exclusive guard is still taken for the two things that genuinely
+    /// mutate the region TABLE rather than a region's cursor: a humongous span
+    /// (which reserves a run of Free regions and retypes them) and claiming a
+    /// fresh Eden (which retypes one, and must not hand the same Free slot to
+    /// two claimers). Those are per-REGION events — one per megabyte of
+    /// allocation at the default region size — not per-object ones.
+    ///
+    /// After queueing for the write guard the current-Eden probe is repeated,
+    /// because a thread that got there first may have already installed a fresh
+    /// region with room in it; without that re-check a burst of threads all
+    /// arriving at an exhausted Eden would burn one Free region each.
+    ///
+    /// `CRATONVM_G1_SHARED_ALLOC=0` skips the shared fast path, so every
+    /// allocation goes down the exclusive route the collector used before
+    /// F-11. That arm is deliberately not a separate code path: it is the same
+    /// slow path, entered without the fast probe.
     pub fn alloc_in_region(&self, size: usize) -> Option<(*mut u8, usize)> {
-        let mut regions = self.regions.write();
         let region_size = self.config.region_size;
 
-        // Humongous check
+        // Humongous check. Retypes a run of Free regions: exclusive.
         if size > region_size / 2 {
+            let mut regions = self.regions.write();
             let result = self.alloc_humongous_locked(&mut regions, size);
             if result.is_some() {
                 // A humongous span consumes several regions at once — always
@@ -3452,19 +3704,39 @@ impl G1Collector {
             return result;
         }
 
-        // Try current Eden region
-        let cur = self.current_eden.load(Ordering::Relaxed);
+        // Fast path: this thread's Eden stripe, shared guard, atomic claim.
+        let slot = self.eden_slot();
+        if gc_flags().g1_shared_alloc {
+            let regions = self.regions.read();
+            let cur = self.eden_slots[slot].load(Ordering::Relaxed);
+            if cur < regions.len() && regions[cur].region_type == RegionType::Eden {
+                if let Some(result) = regions[cur].bump_alloc(size, 8, "obj:cur-eden") {
+                    self.alloc_shared_claims.fetch_add(1, Ordering::Relaxed);
+                    return Some((result.0, cur));
+                }
+            }
+        }
+
+        // Slow path: no Eden for this stripe, or it is full. Exclusive.
+        let mut regions = self.regions.write();
+        self.alloc_exclusive_claims.fetch_add(1, Ordering::Relaxed);
+
+        // Try this stripe's Eden region — re-probed under the write guard
+        // because another thread on the same stripe may have installed a fresh
+        // one while we queued (and because with the fast path off this is the
+        // ONLY probe).
+        let cur = self.eden_slots[slot].load(Ordering::Relaxed);
         if cur < regions.len() && regions[cur].region_type == RegionType::Eden {
             if let Some(result) = regions[cur].bump_alloc(size, 8, "obj:cur-eden") {
                 return Some((result.0, cur));
             }
         }
 
-        // Find a new free region for Eden
+        // Find a new free region for this stripe's Eden
         if let Some(idx) = self.claim_free_region(&regions) {
             debug_free_region_cursor(&regions[idx], idx, "alloc_in_region");
             regions[idx].region_type = RegionType::Eden;
-            self.current_eden.store(idx, Ordering::Relaxed);
+            self.eden_slots[slot].store(idx, Ordering::Relaxed);
             if let Some(result) = regions[idx].bump_alloc(size, 8, "obj:fresh-eden") {
                 self.note_region_consumed_locked(&regions);
                 return Some((result.0, idx));
@@ -3522,10 +3794,10 @@ impl G1Collector {
         // Classify the span. `cursor = size` on the start makes walkers read
         // the one object; `cursor = 0` on continuations makes walkers skip them.
         regions[start].region_type = RegionType::HumongousStart;
-        regions[start].cursor = size;
+        regions[start].set_cursor(size);
         for i in 1..regions_needed {
             regions[start + i].region_type = RegionType::HumongousContinuation;
-            regions[start + i].cursor = 0;
+            regions[start + i].set_cursor(0);
         }
 
         // Zero the entire contiguous span before handing it out. Continuation
@@ -3700,10 +3972,10 @@ impl G1Collector {
                 if gc_flags().g1_dbg_reach {
                     eprintln!(
                         "[g1][FREED] evac region={cset_idx} type={:?} cursor={:#x}",
-                        regions[cset_idx].region_type, regions[cset_idx].cursor
+                        regions[cset_idx].region_type, regions[cset_idx].cursor()
                     );
                 }
-                bytes_freed += regions[cset_idx].cursor;
+                bytes_freed += regions[cset_idx].cursor();
                 regions[cset_idx].reset(generation);
             }
         }
@@ -3869,7 +4141,7 @@ impl G1Collector {
                             .map(|r| {
                                 hexdump_around(
                                     r.data.as_ptr() as *mut u8,
-                                    r.cursor,
+                                    r.cursor(),
                                     seed.wrapping_sub(r.data.as_ptr() as usize),
                                 )
                             })
@@ -4139,10 +4411,7 @@ impl G1Collector {
         self.dbg_verify_reachable_integrity(&regions, roots, "kept-drain");
         phases.verify_us = phase_mark.elapsed().as_micros() as u64;
 
-        let cur_eden = self.current_eden.load(Ordering::Relaxed);
-        if cset_set.contains(&cur_eden) {
-            self.current_eden.store(usize::MAX, Ordering::Relaxed);
-        }
+        self.retire_eden_slots_in_cset(&cset_set);
 
         self.recompute_old_gen_bytes(&regions);
         self.publish_occupancy_metrics(&regions);
@@ -4376,7 +4645,7 @@ impl G1Collector {
         // future allocation path cannot forget to register itself — see
         // `phase4_regions_to_walk`. One pass over two words per region.
         let pre_evac: Vec<(RegionType, usize)> =
-            regions.iter().map(|r| (r.region_type, r.cursor)).collect();
+            regions.iter().map(|r| (r.region_type, r.cursor())).collect();
 
         // Phase 1: Scan roots and evacuate reachable objects from CSet
         let cset_set: RegionSet = cset.iter().copied().collect();
@@ -4644,10 +4913,7 @@ impl G1Collector {
         // to the concurrent-mark cleanup phase as before.
 
         // Reset current eden if it was in the CSet
-        let cur_eden = self.current_eden.load(Ordering::Relaxed);
-        if cset_set.contains(&cur_eden) {
-            self.current_eden.store(usize::MAX, Ordering::Relaxed);
-        }
+        self.retire_eden_slots_in_cset(&cset_set);
 
         // Update old gen bytes tracking.
         // Relaxed ordering: this is a statistics counter read only by IHOP heuristics;
@@ -5146,10 +5412,7 @@ impl G1Collector {
         self.dbg_verify_reachable_integrity(&regions, roots, "mixed-serial");
         phases.verify_us = phase_mark.elapsed().as_micros() as u64;
 
-        let cur_eden = self.current_eden.load(Ordering::Relaxed);
-        if cset_set.contains(&cur_eden) {
-            self.current_eden.store(usize::MAX, Ordering::Relaxed);
-        }
+        self.retire_eden_slots_in_cset(&cset_set);
 
         // Relaxed ordering: statistics counter for IHOP heuristics only.
         self.recompute_old_gen_bytes(&regions);
@@ -5658,7 +5921,7 @@ impl G1Collector {
         // One pass over two words per region, on a path that already makes
         // several such passes.
         let pre_evac: Vec<(RegionType, usize)> =
-            regions.iter().map(|r| (r.region_type, r.cursor)).collect();
+            regions.iter().map(|r| (r.region_type, r.cursor())).collect();
 
         // Marking keep-alive (see `marking_keepalive_roots`): computed while
         // the guard is still dereferenceable, passed to the evacuator as
@@ -5798,10 +6061,7 @@ impl G1Collector {
             }
         }
 
-        let cur_eden = self.current_eden.load(Ordering::Relaxed);
-        if cset_set.contains(&cur_eden) {
-            self.current_eden.store(usize::MAX, Ordering::Relaxed);
-        }
+        self.retire_eden_slots_in_cset(&cset_set);
 
         self.recompute_old_gen_bytes(&regions);
         self.publish_occupancy_metrics(&regions);
@@ -6067,10 +6327,7 @@ impl G1Collector {
             }
         }
 
-        let cur_eden = self.current_eden.load(Ordering::Relaxed);
-        if cset_set.contains(&cur_eden) {
-            self.current_eden.store(usize::MAX, Ordering::Relaxed);
-        }
+        self.retire_eden_slots_in_cset(&cset_set);
 
         self.recompute_old_gen_bytes(&regions);
         self.publish_occupancy_metrics(&regions);
@@ -6614,7 +6871,7 @@ impl G1Collector {
                         "r{i}/{:?}/off={}/cursor={}",
                         r.region_type,
                         (holder as usize).wrapping_sub(r.data.as_ptr() as usize),
-                        r.cursor
+                        r.cursor()
                     )
                 })
                 .unwrap_or_else(|| "r?".to_string());
@@ -6660,7 +6917,7 @@ impl G1Collector {
             return declared;
         };
         let base = start.data.as_ptr() as usize;
-        let mut end = base + start.cursor;
+        let mut end = base + start.cursor();
         while let Some(next) = regions.get(idx + 1) {
             if next.region_type != RegionType::HumongousContinuation {
                 break;
@@ -6737,7 +6994,7 @@ impl G1Collector {
                 if addr < base {
                     return (HeaderVerdict::BelowRegionBase, Some(idx));
                 }
-                if addr >= base + r.cursor {
+                if addr >= base + r.cursor() {
                     return (HeaderVerdict::AboveCursor, Some(idx));
                 }
             }
@@ -6784,7 +7041,7 @@ impl G1Collector {
                     "verdict={verdict:?} region={i} type={:?} base=0x{base:x} cursor=0x{:x} \
                      off=0x{:x} age={} pinned={} reuse_epoch={} recycled_in_generation={} {}",
                     r.region_type,
-                    r.cursor,
+                    r.cursor(),
                     addr.wrapping_sub(base),
                     r.age,
                     r.pinned,
@@ -6834,7 +7091,7 @@ impl G1Collector {
         let jit_skips = self.jit_tlab_skip_spans();
         let mut offset = 0usize;
         let mut objects = 0usize;
-        while offset < region.cursor {
+        while offset < region.cursor() {
             let obj_ptr = (base + offset) as *mut u8;
             if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_ptr as usize) {
                 if target < offset + skip {
@@ -6870,7 +7127,7 @@ impl G1Collector {
                 return format!("grid=HUMONGOUS-FILLER at=0x{offset:x}");
             }
             let obj_size = object_total_size(header);
-            if obj_size < HEADER_SIZE || offset + obj_size > region.cursor {
+            if obj_size < HEADER_SIZE || offset + obj_size > region.cursor() {
                 return format!(
                     "grid=WALK-BROKE at=0x{offset:x} obj_size=0x{obj_size:x} after={objects} \
                      objects (target=0x{target:x})"
@@ -7065,7 +7322,7 @@ impl G1Collector {
             if r.region_type == RegionType::Free {
                 return;
             }
-            (r.cursor, r.data.as_mut_ptr())
+            (r.cursor(), r.data.as_mut_ptr())
         };
 
         let jit_skips = self.jit_tlab_skip_spans();
@@ -7119,8 +7376,9 @@ impl G1Collector {
                         "[g1][DESYNC-COVER] {} {} bumps=[{}]",
                         describe_skip_coverage(&jit_skips, obj_ptr as usize, base, cursor),
                         r.tlab_trail
-                            .describe_owner_or(&r.bump_trail, r.reuse_epoch, offset),
-                        r.bump_trail.render(),
+                            .lock()
+                            .describe_owner_or(&r.bump_trail.lock(), r.reuse_epoch, offset),
+                        r.bump_trail.lock().render(),
                     );
                 }
                 break;
@@ -7149,14 +7407,15 @@ impl G1Collector {
                         "[g1][WALKBRK-COVER] {} {} {}",
                         describe_skip_coverage(&jit_skips, obj_ptr as usize, base, cursor),
                         r.tlab_trail
-                            .describe_owner_or(&r.bump_trail, r.reuse_epoch, offset),
+                            .lock()
+                            .describe_owner_or(&r.bump_trail.lock(), r.reuse_epoch, offset),
                         hexdump_around(base, cursor, offset),
                     );
                     eprintln!(
                         "[g1][WALKBRK-BUMPS] region={source_idx} epoch={} carves=[{}] bumps=[{}]",
                         r.reuse_epoch,
-                        r.tlab_trail.render(),
-                        r.bump_trail.render(),
+                        r.tlab_trail.lock().render(),
+                        r.bump_trail.lock().render(),
                     );
                 }
                 break;
@@ -7341,7 +7600,7 @@ impl G1Collector {
         let mut set = rset_sources.clone();
         for (i, r) in regions.iter().enumerate() {
             let (was_type, was_cursor) = pre[i];
-            if r.region_type != was_type || r.cursor != was_cursor {
+            if r.region_type != was_type || r.cursor() != was_cursor {
                 set.insert(i);
             }
         }
@@ -7442,7 +7701,7 @@ impl G1Collector {
                 continue;
             }
 
-            let cursor = regions[i].cursor;
+            let cursor = regions[i].cursor();
             let base = regions[i].data.as_mut_ptr();
             let mut offset = 0usize;
             let mut trail = WalkTrail::default();
@@ -7498,13 +7757,13 @@ impl G1Collector {
                         );
                         eprintln!(
                             "[g1][WALKBRK-BUMPS] phase4 region={i} {} carves=[{}] bumps=[{}]",
-                            regions[i].tlab_trail.describe_owner_or(
-                                &regions[i].bump_trail,
+                            regions[i].tlab_trail.lock().describe_owner_or(
+                                &regions[i].bump_trail.lock(),
                                 regions[i].reuse_epoch,
                                 offset,
                             ),
-                            regions[i].tlab_trail.render(),
-                            regions[i].bump_trail.render(),
+                            regions[i].tlab_trail.lock().render(),
+                            regions[i].bump_trail.lock().render(),
                         );
                     }
                     // The rest of this region was never inspected, so any
@@ -7695,7 +7954,7 @@ impl G1Collector {
                 continue;
             }
             let base = regions[h].data.as_ptr() as usize;
-            let cursor = regions[h].cursor;
+            let cursor = regions[h].cursor();
             let mut offset = 0usize;
             while offset < cursor {
                 let obj_ptr = (base + offset) as *mut u8;
@@ -7863,7 +8122,7 @@ impl G1Collector {
                 break;
             }
 
-            let cursor = regions[i].cursor;
+            let cursor = regions[i].cursor();
             let base = regions[i].data.as_ptr();
             let mut offset = 0usize;
 
@@ -8137,7 +8396,7 @@ impl G1Collector {
                 continue;
             }
             let base = region.data.as_ptr();
-            let cursor = region.cursor;
+            let cursor = region.cursor();
             let mut offset = 0usize;
             while offset < cursor {
                 let obj_ptr = unsafe { base.add(offset) };
@@ -8242,7 +8501,7 @@ impl G1Collector {
                 continue;
             }
             let base = region.data.as_ptr();
-            let cursor = region.cursor;
+            let cursor = region.cursor();
             let mut off = 0usize;
             while off < cursor {
                 let obj_ptr = unsafe { base.add(off) };
@@ -8374,7 +8633,7 @@ impl G1Collector {
             if region.region_type == RegionType::HumongousStart {
                 return (off == 0).then_some(size);
             }
-            (off + size <= region.cursor).then_some(size)
+            (off + size <= region.cursor()).then_some(size)
         };
 
         let mut stack: Vec<usize> = Vec::new();
@@ -8410,7 +8669,7 @@ impl G1Collector {
                     let (hoff, hcur) = hregion
                         .map(|ri| {
                             let base = regions[ri].data.as_ptr() as usize;
-                            (holder - base, regions[ri].cursor)
+                            (holder - base, regions[ri].cursor())
                         })
                         .unwrap_or((0, 0));
                     eprintln!(
@@ -8798,7 +9057,7 @@ impl G1Collector {
                 r.mark_bitmap.clear();
                 // F-06: the per-region mirror of the row written below, and the
                 // byte accumulator that is only meaningful against it.
-                r.mark_start = Some((r.reuse_epoch, r.cursor, r.region_type));
+                r.mark_start = Some((r.reuse_epoch, r.cursor(), r.region_type));
                 r.marked_bytes_below_tams.store(0, Ordering::Relaxed);
             }
             // TAMS snapshot: record every region's incarnation + fill level
@@ -8810,7 +9069,7 @@ impl G1Collector {
             snap.extend(
                 regions
                     .iter()
-                    .map(|r| (r.reuse_epoch, r.cursor, r.region_type)),
+                    .map(|r| (r.reuse_epoch, r.cursor(), r.region_type)),
             );
         }
         self.mark_worklist.lock().clear();
@@ -8981,7 +9240,7 @@ impl G1Collector {
                 Some(r) if r.region_type == RegionType::Free => false,
                 Some(r) => {
                     let base = r.data.as_ptr() as usize;
-                    *addr >= base && *addr < base + r.cursor
+                    *addr >= base && *addr < base + r.cursor()
                 }
                 None => false,
             },
@@ -9271,7 +9530,7 @@ impl G1Collector {
                             refusal,
                             impugns,
                             r.region_type,
-                            r.cursor,
+                            r.cursor(),
                             off,
                             r.data.len(),
                             r.reuse_epoch,
@@ -9304,19 +9563,23 @@ impl G1Collector {
             // through. See the batching note above.
         }
 
-        // Re-take the guards to answer the "is marking done?" question and, if
-        // needed, run the overflow rescan. Re-reading the worklist rather than
-        // carrying a stale emptiness across the batch loop is deliberate: a
-        // mutator's SATB flush or an STW pause's re-gray may have refilled it
-        // while the guards were down, and reporting a fixed point that another
-        // thread has already invalidated is exactly how a live subtree goes
-        // unscanned.
-        let regions = self.regions.read();
-        let mut worklist = self.mark_worklist.lock();
-
-        if !worklist.is_empty() {
-            // Ran out of budget but still have work — caller should call again.
-            return false;
+        // Re-take the guards to answer the "is marking done?" question.
+        // Re-reading the worklist rather than carrying a stale emptiness across
+        // the batch loop is deliberate: a mutator's SATB flush or an STW
+        // pause's re-gray may have refilled it while the guards were down, and
+        // reporting a fixed point that another thread has already invalidated
+        // is exactly how a live subtree goes unscanned.
+        {
+            let _regions = self.regions.read();
+            let worklist = self.mark_worklist.lock();
+            if !worklist.is_empty() {
+                // Ran out of budget but still have work — call again.
+                return false;
+            }
+            if !self.mark_worklist_overflowed.load(Ordering::Relaxed) {
+                // Worklist empty and no overflow: marking complete.
+                return true;
+            }
         }
 
         // Round-9 gc HIGH-5 — graceful overflow handling. If any push
@@ -9329,10 +9592,32 @@ impl G1Collector {
         // a full pass causes no new pushes the worklist drains and we
         // declare marking complete. The bitmap monotonically grows, so
         // this terminates after a bounded number of passes.
-        if self.mark_worklist_overflowed.load(Ordering::Relaxed) {
-            // Reset the flag so we can detect re-overflow during recovery.
-            self.mark_worklist_overflowed
-                .store(false, Ordering::Relaxed);
+        //
+        // F-11 — this rescan takes the WRITE guard, not the read guard the
+        // drain above uses, and that is load-bearing rather than incidental.
+        // It is the only walk over `[0, cursor)` in the collector that is not
+        // stop-the-world, and once allocation bumps a cursor under a SHARED
+        // guard (F-11) a concurrent walker can observe a cursor that already
+        // covers a range whose zeroing has not landed yet. Under the exclusive
+        // guard that window cannot be observed at all, which restores exactly
+        // the exclusion this walk had when `regions` was a `Mutex`. The cost is
+        // nil in practice: the rescan only runs after the gray set hit
+        // `MARK_WORKLIST_CAP` (a million entries) and is already O(heap).
+        let regions = self.regions.write();
+        let mut worklist = self.mark_worklist.lock();
+        if !worklist.is_empty() {
+            // Refilled while the guards were swapped — the caller steps again,
+            // and the overflow flag is still set for a later rescan.
+            return false;
+        }
+        // Reset the flag so we can detect re-overflow during recovery.
+        // `swap` rather than load-then-store: between dropping the read guard
+        // and taking the write guard another thread may have set it, and a
+        // plain store would then clear an overflow nobody rescanned.
+        if !self.mark_worklist_overflowed.swap(false, Ordering::Relaxed) {
+            return true;
+        }
+        {
             let jit_skips = self.jit_tlab_skip_spans();
             for region in regions.iter() {
                 if region.region_type == RegionType::Free {
@@ -9340,7 +9625,7 @@ impl G1Collector {
                 }
                 let base = region.data.as_ptr() as usize;
                 let mut offset = 0usize;
-                while offset < region.cursor {
+                while offset < region.cursor() {
                     let obj_addr = base + offset;
                     // INT-3 — frozen-peer TLAB tail: skip before interpreting.
                     if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_addr) {
@@ -9358,7 +9643,7 @@ impl G1Collector {
                         break;
                     }
                     let obj_size = object_total_size(header);
-                    if obj_size < HEADER_SIZE || offset + obj_size > region.cursor {
+                    if obj_size < HEADER_SIZE || offset + obj_size > region.cursor() {
                         break;
                     }
                     if region.mark_bitmap.is_marked(obj_addr) {
@@ -9368,15 +9653,11 @@ impl G1Collector {
                     offset += obj_size;
                 }
             }
-            // Tell the caller to keep stepping — the rescan likely
-            // refilled the worklist with newly-discovered references.
-            // Returning `false` causes the marking loop to call us
-            // again, which will drain whatever the rescan produced.
-            return worklist.is_empty() && !self.mark_worklist_overflowed.load(Ordering::Relaxed);
         }
-
-        // Worklist empty and no overflow: marking complete.
-        true
+        // Tell the caller to keep stepping — the rescan likely refilled the
+        // worklist with newly-discovered references. Returning `false` causes
+        // the marking loop to call us again, which drains what it produced.
+        worklist.is_empty() && !self.mark_worklist_overflowed.load(Ordering::Relaxed)
     }
 
     /// Scan an object's reference slots; for each in-heap, not-yet-marked
@@ -9880,7 +10161,7 @@ impl G1Collector {
         // the post-pause worklist remaps).
         // Deliberately a warn + retain, NOT a `debug_assert!`: cleanup runs on
         // a heap that may already be damaged, and the module's own policy (see
-        // the `live_bytes > region.cursor` clamp below) is that it must not
+        // the `live_bytes > region.cursor()` clamp below) is that it must not
         // introduce a panic path there. The invariant is pinned by
         // `cleanup_with_an_undrained_gray_set_retains_every_region` instead,
         // which is a stronger check than an assertion because it proves the
@@ -9950,7 +10231,7 @@ impl G1Collector {
             let mut live_bytes = region
                 .marked_bytes_below_tams
                 .load(Ordering::Relaxed)
-                .saturating_add(region.cursor.saturating_sub(tams));
+                .saturating_add(region.cursor().saturating_sub(tams));
 
             // The walk this replaced, kept as a lever and as an oracle.
             //
@@ -9963,7 +10244,7 @@ impl G1Collector {
             // than a comment.
             if gc_flags().g1_cleanup_walk || cfg!(debug_assertions) {
                 let walked = walk_marked_bytes_below_tams(region, base, tams, &jit_skips);
-                let walked_live = walked.saturating_add(region.cursor.saturating_sub(tams));
+                let walked_live = walked.saturating_add(region.cursor().saturating_sub(tams));
                 debug_assert_eq!(
                     walked_live, live_bytes,
                     "region {region_idx}: the accumulated live bytes ({live_bytes}) \
@@ -9987,17 +10268,17 @@ impl G1Collector {
             // introduce a new panic path on an already-damaged heap, and a
             // clamped value is still non-zero, so the in-place-free decision
             // below is unaffected.
-            if live_bytes > region.cursor {
+            if live_bytes > region.cursor() {
                 tracing::warn!(
                     "g1 cleanup: region {} reported {} live bytes over a {}-byte \
                      cursor (tams {}) — clamping; a header in this region is \
                      likely corrupt",
                     region_idx,
                     live_bytes,
-                    region.cursor,
+                    region.cursor(),
                     tams
                 );
-                live_bytes = region.cursor;
+                live_bytes = region.cursor();
             }
 
             region.live_bytes = live_bytes;
@@ -10042,7 +10323,7 @@ impl G1Collector {
                 if gc_flags().g1_dbg_reach {
                     eprintln!(
                         "[g1][FREED] cleanup region={region_idx} cursor={:#x}",
-                        region.cursor
+                        region.cursor()
                     );
                 }
                 region.reset(cleanup_generation);
@@ -10236,7 +10517,7 @@ impl G1Collector {
                 continue;
             }
 
-            let total_size = regions[i].cursor;
+            let total_size = regions[i].cursor();
             let regions_needed = total_size.div_ceil(region_size).max(1);
             let Some(end) = i
                 .checked_add(regions_needed)
@@ -10247,7 +10528,7 @@ impl G1Collector {
             };
 
             // G1MAT-2: validate the span before resetting anything in it. The
-            // extent is derived purely from `regions[i].cursor`, so a stale or
+            // extent is derived purely from `regions[i].cursor()`, so a stale or
             // corrupt cursor on a `HumongousStart` would silently `reset()`
             // (zero-fill + retype-to-Free) regions belonging to OTHER live
             // objects. Every region a humongous span actually owns is typed
@@ -10439,7 +10720,7 @@ impl G1Collector {
                 i += 1;
                 continue;
             }
-            let total_size = regions[i].cursor;
+            let total_size = regions[i].cursor();
             let regions_needed = total_size.div_ceil(region_size).max(1);
             let Some(end) = i
                 .checked_add(regions_needed)
@@ -10541,7 +10822,7 @@ impl G1Collector {
                 continue;
             }
             let base = region.data.as_ptr() as *mut u8;
-            let cursor = region.cursor;
+            let cursor = region.cursor();
             let mut offset = 0usize;
             while offset < cursor {
                 let obj_ptr = unsafe { base.add(offset) };
@@ -11091,7 +11372,7 @@ impl G1Collector {
         let live: usize = regions
             .iter()
             .filter(|r| r.region_type != RegionType::Free)
-            .map(|r| r.cursor)
+            .map(|r| r.cursor())
             .sum();
         // G1 keeps no allocated-object/byte totals of its own, so those two
         // stay at whatever they were rather than being clobbered with a zero
@@ -11115,7 +11396,7 @@ impl G1Collector {
                         | RegionType::HumongousContinuation
                 )
             })
-            .map(|r| r.cursor)
+            .map(|r| r.cursor())
             .sum();
         self.old_gen_bytes.store(old_bytes, Ordering::Relaxed);
     }
@@ -11137,7 +11418,7 @@ impl G1Collector {
         let mut count = 0usize;
         for r in regions.iter() {
             if r.region_type == RegionType::Eden {
-                used += r.cursor;
+                used += r.cursor();
                 count += 1;
             }
         }
@@ -11151,7 +11432,7 @@ impl G1Collector {
         let mut count = 0usize;
         for r in regions.iter() {
             if r.region_type == RegionType::Old {
-                used += r.cursor;
+                used += r.cursor();
                 count += 1;
             }
         }
@@ -11277,7 +11558,6 @@ impl G1Collector {
     /// the Eden region's bump pointer, exactly like how `refill_tlab` works in
     /// the generational collector but backed by G1 regions.
     pub fn refill_tlab(&self, requested_size: usize) -> Option<(*mut u8, usize)> {
-        let mut regions = self.regions.write();
         let region_size = self.config.region_size;
 
         // Don't serve TLABs for requests larger than half a region
@@ -11285,29 +11565,38 @@ impl G1Collector {
             return None;
         }
 
-        // Try current Eden region
-        let cur = self.current_eden.load(Ordering::Relaxed);
-        if cur < regions.len() && regions[cur].region_type == RegionType::Eden {
-            let remaining = regions[cur].remaining();
-            if remaining >= 256 {
-                let actual = tlab_carve_size(requested_size, remaining);
-                if let Some((ptr, _off)) = regions[cur].bump_alloc(actual, 8, "tlab:cur-eden") {
-                    // TLAB contract: every backend returns a fully zeroed
-                    // chunk. Inline compiled allocation relies on this for
-                    // JVM default field values and zero-valued header words.
-                    // Eden regions are recycled without clearing their bytes,
-                    // so the contract has to be established somewhere — and
-                    // `bump_alloc` already establishes it, zeroing exactly
-                    // `actual` bytes at exactly this pointer before returning
-                    // it. A second `write_bytes` over the identical range was
-                    // memsetting the whole TLAB twice.
-                    return Some((ptr, actual));
-                }
+        // F-11 fast path: carve out of the current Eden under a SHARED guard.
+        //
+        // This is the site the finding is about. At the 256 KiB default TLAB
+        // (`tlab::DEFAULT_TLAB_SIZE`) against 1 MiB regions, four refills
+        // exhaust a region, so every allocating thread came through here
+        // constantly and every one of them took the collector's single
+        // exclusive lock to do it. The carve is now an atomic claim; only the
+        // fourth-refill region change still needs exclusion.
+        let slot = self.eden_slot();
+        if gc_flags().g1_shared_alloc {
+            let regions = self.regions.read();
+            if let Some(carve) =
+                self.carve_tlab_from_eden_slot(&regions, slot, requested_size, "tlab:cur-eden")
+            {
+                self.tlab_shared_carves.fetch_add(1, Ordering::Relaxed);
+                return Some(carve);
             }
         }
 
         // Find a new free region for Eden and carve TLAB from it.
-        //
+        let mut regions = self.regions.write();
+        self.tlab_exclusive_carves.fetch_add(1, Ordering::Relaxed);
+
+        // Re-probe the current Eden under the write guard: another thread may
+        // have installed a fresh region while we queued, and with the shared
+        // fast path off this is the ONLY probe (the pre-F-11 behaviour).
+        if let Some(carve) =
+            self.carve_tlab_from_eden_slot(&regions, slot, requested_size, "tlab:cur-eden")
+        {
+            return Some(carve);
+        }
+
         // Emergency reserve: a TLAB refill is a *speculative bulk* claim (the
         // thread may retire the chunk with most of it unused), so once the
         // Free pool is down to the reserve, stop serving refills and leave
@@ -11325,21 +11614,60 @@ impl G1Collector {
         if let Some(idx) = self.claim_free_region(&regions) {
             debug_free_region_cursor(&regions[idx], idx, "refill_tlab");
             regions[idx].region_type = RegionType::Eden;
-            self.current_eden.store(idx, Ordering::Relaxed);
-            let remaining = regions[idx].remaining();
-            if remaining >= 256 {
-                let actual = tlab_carve_size(requested_size, remaining);
-                if let Some((ptr, _off)) = regions[idx].bump_alloc(actual, 8, "tlab:fresh-eden") {
-                    // `bump_alloc` has already zeroed exactly these `actual`
-                    // bytes; re-zeroing them here was a second full pass over
-                    // the TLAB. See the sibling carve above.
-                    self.note_region_consumed_locked(&regions);
-                    return Some((ptr, actual));
-                }
+            self.eden_slots[slot].store(idx, Ordering::Relaxed);
+            if let Some(carve) =
+                self.carve_tlab_from_eden_slot(&regions, slot, requested_size, "tlab:fresh-eden")
+            {
+                self.note_region_consumed_locked(&regions);
+                return Some(carve);
             }
         }
 
         None
+    }
+
+    /// Carve a TLAB out of whatever region Eden stripe `slot` currently names.
+    ///
+    /// Split out of [`Self::refill_tlab`] by F-11 so the identical carve can be
+    /// attempted under the shared guard and then, if it failed, under the
+    /// exclusive one — the two arms have to agree exactly or the kill switch
+    /// would be selecting different behaviour rather than a different lock.
+    ///
+    /// The retry loop is what the atomic cursor costs. `remaining()` is a
+    /// SNAPSHOT: another thread can claim part of it between the read and this
+    /// thread's compare-exchange, in which case `bump_alloc` refuses and the
+    /// size has to be recomputed against what is actually left. It terminates
+    /// because a region's cursor only ever moves up, so each retry either fits
+    /// or falls under the 256-byte floor.
+    ///
+    /// TLAB contract: the returned chunk is fully zeroed. Inline compiled
+    /// allocation relies on that for JVM default field values and zero-valued
+    /// header words, and Eden regions are recycled WITHOUT clearing their bytes
+    /// (`G1Region::reset`), so it has to be established somewhere —
+    /// `bump_alloc` establishes it, zeroing exactly the range it claimed. There
+    /// is deliberately no second `write_bytes` here; that was memsetting every
+    /// TLAB twice. `refill_tlab_zeroes_dirty_eden_bytes` is the oracle.
+    fn carve_tlab_from_eden_slot(
+        &self,
+        regions: &[G1Region],
+        slot: usize,
+        requested_size: usize,
+        site: &'static str,
+    ) -> Option<(*mut u8, usize)> {
+        let cur = self.eden_slots[slot].load(Ordering::Relaxed);
+        if cur >= regions.len() || regions[cur].region_type != RegionType::Eden {
+            return None;
+        }
+        loop {
+            let remaining = regions[cur].remaining();
+            if remaining < 256 {
+                return None;
+            }
+            let actual = tlab_carve_size(requested_size, remaining);
+            if let Some((ptr, _off)) = regions[cur].bump_alloc(actual, 8, site) {
+                return Some((ptr, actual));
+            }
+        }
     }
 
     /// Get a reference to the global SATB queue.
@@ -12488,7 +12816,7 @@ impl G1Collector {
                 // is below the region's allocation cursor.
                 _ => {
                     let base = r.data.as_ptr() as usize;
-                    if addr < base || addr >= base + r.cursor {
+                    if addr < base || addr >= base + r.cursor() {
                         return false;
                     }
                     // G1CORE-3: a kept region with UNRESOLVED evacuation
@@ -12513,7 +12841,7 @@ impl G1Collector {
                     // address in the same region — the common case for a
                     // stack scan or a run of native calls, which see the same
                     // Eden over and over — is answered without the lock.
-                    live_region_memo::fill(self.instance_id, epoch, idx, base, base + r.cursor);
+                    live_region_memo::fill(self.instance_id, epoch, idx, base, base + r.cursor());
                     true
                 }
             },
@@ -12532,7 +12860,7 @@ impl G1Collector {
                 continue;
             }
             let base = r.data.as_ptr() as usize;
-            let used = r.cursor;
+            let used = r.cursor();
             let mut offset = 0;
             while offset < used {
                 let ptr = (base + offset) as *mut u8;
@@ -13675,7 +14003,7 @@ impl GarbageCollector for G1Collector {
 
     fn allocated_bytes(&self) -> usize {
         let regions = self.regions.read();
-        regions.iter().map(|r| r.cursor).sum()
+        regions.iter().map(|r| r.cursor()).sum()
     }
 }
 
@@ -13798,7 +14126,7 @@ fn count_young_regions_pinned_out(
 /// the defect and aborting here would replace a walk break with a crash.
 #[inline]
 fn debug_free_region_cursor(region: &G1Region, idx: usize, site: &'static str) {
-    if !gc_flags().g1_dbg_reach || region.cursor == 0 {
+    if !gc_flags().g1_dbg_reach || region.cursor() == 0 {
         return;
     }
     eprintln!(
@@ -13806,14 +14134,14 @@ fn debug_free_region_cursor(region: &G1Region, idx: usize, site: &'static str) {
          (reuse_epoch={} recycled_in_generation={} live_bytes={} pinned={} age={}) — \
          this region became Free without `reset`, so [0,{:#x}) is committed with no \
          object grid. bumps=[{}]",
-        region.cursor,
+        region.cursor(),
         region.reuse_epoch,
         region.recycled_in_generation,
         region.live_bytes,
         region.pinned,
         region.age,
-        region.cursor,
-        region.bump_trail.render(),
+        region.cursor(),
+        region.bump_trail.lock().render(),
     );
 }
 
@@ -13823,7 +14151,7 @@ fn debug_free_region_cursor(region: &G1Region, idx: usize, site: &'static str) {
 /// The rounding is the whole point, and its absence was a live heap-corruption
 /// bug (`known-issues/springboot/g1-fullsuite-regression-20260808.md`).
 /// [`G1Region::bump_alloc`] aligns the carve's START to 8 and then commits
-/// exactly `size` bytes, so an unaligned `size` leaves `region.cursor` on an odd
+/// exactly `size` bytes, so an unaligned `size` leaves `region.cursor()` on an odd
 /// boundary. `Tlab::new` meanwhile rounds its `end` DOWN to 8 — its documented
 /// "release-mode safety net ... giving up at most 7 bytes of tail". The two
 /// disagree, and the bytes between them belong to nobody:
@@ -14091,7 +14419,7 @@ fn classify_mark_scan_target(region: &G1Region, obj_addr: usize) -> Result<(), G
     // satisfy start + size <= cursor, so start + HEADER_SIZE <= cursor.)
     if off
         .checked_add(HEADER_SIZE)
-        .is_none_or(|end| end > region.cursor)
+        .is_none_or(|end| end > region.cursor())
     {
         return Err(GrayRefusal::NotAllocated);
     }
@@ -14104,7 +14432,7 @@ fn classify_mark_scan_target(region: &G1Region, obj_addr: usize) -> Result<(), G
         return Err(GrayRefusal::TornHeader);
     };
     if region.region_type != RegionType::HumongousStart
-        && off.checked_add(size).is_none_or(|end| end > region.cursor)
+        && off.checked_add(size).is_none_or(|end| end > region.cursor())
     {
         // The header decodes but claims an extent running past everything this
         // region has ever handed out. Also a torn header, not a stale address.
@@ -14301,7 +14629,7 @@ fn bump_tid() -> u64 {
     BUMP_TID.with(|t| *t)
 }
 
-/// One recorded cursor advance: who moved `region.cursor`, from where, by how
+/// One recorded cursor advance: who moved `region.cursor()`, from where, by how
 /// much, and in which incarnation of the region.
 #[derive(Default, Clone, Copy)]
 struct BumpEntry {
@@ -14926,9 +15254,9 @@ mod tests {
 
         let expected_ptr = {
             let mut regions = gc.regions.write();
-            let idx = gc.current_eden.load(Ordering::Relaxed);
+            let idx = gc.dbg_current_eden();
             let region = &mut regions[idx];
-            let ptr = unsafe { region.data.as_mut_ptr().add(region.cursor) };
+            let ptr = unsafe { region.data.as_mut_ptr().add(region.cursor()) };
             unsafe { std::ptr::write_bytes(ptr, 0xa5, 4096) };
             ptr
         };
@@ -14940,6 +15268,253 @@ mod tests {
         assert!(
             bytes.iter().all(|&byte| byte == 0),
             "G1 must return a fully zeroed TLAB even from dirty recycled Eden"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // F-11 — allocation under a shared regions guard
+    // -----------------------------------------------------------------------
+
+    /// F-11, engagement. Once an Eden region exists, TLAB refills come out of
+    /// it under the SHARED guard; only a region change pays the exclusive one.
+    ///
+    /// This is the census. A returned TLAB pointer says nothing about which
+    /// lock produced it, so without these counters "the fast path is running"
+    /// is unfalsifiable — and `shared == 0` is precisely the reading that would
+    /// tell you the gate is inert (kill switch on, or a future edit removed
+    /// the probe).
+    ///
+    /// Verified capable of failing: with the shared probe in `refill_tlab`
+    /// disabled — the `CRATONVM_G1_SHARED_ALLOC=0` arm — `shared` is 0 and
+    /// `exclusive` is 8, and both assertions go red.
+    #[test]
+    fn tlab_refills_after_the_first_are_served_under_the_shared_guard() {
+        let gc = make_collector();
+        // 64 KiB carves against 1 MiB regions: 16 fit, so 8 refills cross no
+        // region boundary once the first one has installed an Eden.
+        for _ in 0..8 {
+            gc.refill_tlab(64 * 1024).expect("TLAB refill");
+        }
+        let shared = gc.tlab_shared_carves.load(Ordering::Relaxed);
+        let exclusive = gc.tlab_exclusive_carves.load(Ordering::Relaxed);
+        assert!(
+            shared >= 6,
+            "8 refills produced only {shared} shared-guard carves ({exclusive} exclusive); the \
+             first refill has to claim a region, but the rest must not (F-11)"
+        );
+        assert!(
+            exclusive <= 2,
+            "8 refills took the exclusive guard {exclusive} times — F-11's point is that only a \
+             region CHANGE needs it"
+        );
+    }
+
+    /// F-11, the concurrency claim itself. An allocation must complete while
+    /// another thread holds the regions guard for reading.
+    ///
+    /// That reader stands in for the concurrent marker, which since F-10 scans
+    /// its batches under `read()`. Before F-11 an allocation needed `write()`,
+    /// so it could not overlap a marker batch at all — this test would sit on
+    /// `recv_timeout` until the guard was dropped. The timeout is what makes it
+    /// an observation rather than an assertion: a pass means the allocation
+    /// genuinely finished with the reader still holding on.
+    ///
+    /// Verified capable of failing: with the shared probe in `alloc_in_region`
+    /// disabled (the kill-switch arm), the allocating thread blocks on
+    /// `write()` and the `recv_timeout` expires.
+    #[test]
+    fn an_allocation_completes_while_a_marker_style_reader_holds_the_guard() {
+        let gc = Arc::new(make_collector());
+        // Establish a current Eden region with room in it, so the allocation
+        // below has no reason to want the exclusive guard.
+        gc.alloc_object(ClassId::new(1), 0);
+
+        let reader = gc.regions.read();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let allocator = {
+            let gc = Arc::clone(&gc);
+            std::thread::spawn(move || {
+                let obj = gc.alloc_object(ClassId::new(2), 1);
+                let _ = tx.send(obj.as_ptr() as usize);
+            })
+        };
+
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(5));
+        // Hold the read guard across the assertion, then release: dropping it
+        // early would let a blocked writer through and hide the failure.
+        let addr = outcome.expect(
+            "an allocation must not need the EXCLUSIVE regions guard while a reader holds it \
+             (F-11); this timed out, which is the pre-F-11 behaviour",
+        );
+        drop(reader);
+        allocator.join().expect("allocator thread");
+        assert!(addr != 0);
+    }
+
+    /// F-11, safety of the compare-exchange claim. Concurrent allocators must
+    /// never be handed overlapping memory.
+    ///
+    /// The cursor bump is now a CAS loop instead of a read-modify-write under
+    /// an exclusive lock, and the failure mode of getting that wrong is two
+    /// threads receiving the same address (or overlapping ranges) and then
+    /// scribbling on each other. A single-threaded test cannot see it, so this
+    /// runs four real threads and checks two things a duplicate claim breaks:
+    /// every address is distinct, and every object still reads back the field
+    /// value its own thread wrote.
+    ///
+    /// Verified capable of failing: replacing the compare-exchange in
+    /// `bump_alloc` with a load-then-store (the non-atomic shape the exclusive
+    /// lock used to make safe) produces duplicate addresses within a few runs.
+    #[test]
+    fn concurrent_bump_claims_never_hand_out_the_same_bytes_twice() {
+        const THREADS: usize = 4;
+        const PER_THREAD: usize = 1500;
+
+        let gc = Arc::new(make_collector());
+        let workers: Vec<_> = (0..THREADS)
+            .map(|tid| {
+                let gc = Arc::clone(&gc);
+                std::thread::spawn(move || {
+                    let mut mine = Vec::with_capacity(PER_THREAD);
+                    for _ in 0..PER_THREAD {
+                        let obj = gc.alloc_object(ClassId::new(11), 1);
+                        gc.set_field(obj, 0, Value::Int(tid as i32));
+                        mine.push(obj);
+                    }
+                    // Read back only after this thread has finished allocating,
+                    // so an overlap with a LATER allocation is still visible.
+                    for obj in &mine {
+                        assert_eq!(
+                            gc.get_field(*obj, 0).as_int(),
+                            Some(tid as i32),
+                            "another thread's allocation overwrote this object's field"
+                        );
+                    }
+                    mine.into_iter()
+                        .map(|o| o.as_ptr() as usize)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        let mut all = Vec::new();
+        for w in workers {
+            all.extend(w.join().expect("allocator thread"));
+        }
+        assert_eq!(all.len(), THREADS * PER_THREAD);
+        let distinct: std::collections::HashSet<usize> = all.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            all.len(),
+            "the atomic claim handed the same address to two threads"
+        );
+    }
+
+    /// F-11, the zeroing contract under a concurrent claim.
+    ///
+    /// `G1Region::bump_alloc` is the SINGLE establishment of the TLAB zeroing
+    /// contract (`G1Region::reset` no longer scrubs a freed region, because
+    /// that was 42% of a young pause), and the JIT's inline `new` depends on
+    /// it. Moving the bump to a compare-exchange moved the zeroing off the
+    /// exclusive lock, so this checks it still covers exactly the claimed range
+    /// when several threads claim at once out of an Eden region that has been
+    /// deliberately dirtied above its cursor.
+    ///
+    /// Verified capable of failing: deleting the `write_bytes` in `bump_alloc`
+    /// makes every carve come back full of the 0xa5 pattern.
+    #[test]
+    fn concurrent_tlab_carves_are_each_fully_zeroed() {
+        const THREADS: usize = 4;
+        const CARVE: usize = 16 * 1024;
+
+        let gc = Arc::new(make_collector());
+        gc.alloc_object(ClassId::new(1), 0);
+        // Dirty everything above the current cursor in this Eden region, the
+        // way a recycled region is dirty since the free-scrub deletion.
+        {
+            let mut regions = gc.regions.write();
+            let idx = gc.dbg_current_eden();
+            let region = &mut regions[idx];
+            let from = region.cursor();
+            let len = region.data.len() - from;
+            unsafe { std::ptr::write_bytes(region.data.as_mut_ptr().add(from), 0xa5, len) };
+        }
+
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let gc = Arc::clone(&gc);
+                std::thread::spawn(move || {
+                    for _ in 0..8 {
+                        let (ptr, len) = gc.refill_tlab(CARVE).expect("TLAB refill");
+                        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+                        assert!(
+                            bytes.iter().all(|&b| b == 0),
+                            "a concurrently-carved TLAB was not fully zeroed"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().expect("carver thread");
+        }
+    }
+
+    /// F-11, striping. Threads that allocate at the same time must land in
+    /// DIFFERENT Eden regions.
+    ///
+    /// This is the half of F-11 that the lock change alone does not buy.
+    /// Moving the bump off the exclusive lock only helps if the threads then
+    /// stop fighting over one cursor word and one set of cache lines — and
+    /// measured at four threads, shared-guard allocation into a single Eden
+    /// region was slower than the exclusive lock it replaced. So the property
+    /// under test is not "allocation works" (a single-threaded test covers
+    /// that) but "two concurrently allocating threads are handed memory from
+    /// two different regions".
+    ///
+    /// Verified capable of failing: with `eden_stripe_count` forced to 1 — the
+    /// `CRATONVM_G1_EDEN_STRIPES=1` arm — every thread reports the same region
+    /// index and the distinct count is 1.
+    #[test]
+    fn concurrent_allocators_are_spread_across_eden_stripes() {
+        // 64 regions, so the "at most an eighth of the heap" cap allows 8
+        // stripes; the machine's parallelism decides the rest.
+        let gc = Arc::new(G1Collector::new(G1CollectorConfig {
+            heap_size: 64 * 1024 * 1024,
+            region_size: 1024 * 1024,
+            ..small_config()
+        }));
+        let stripes = gc.eden_slots.len();
+        if stripes < 2 {
+            // A single-core machine (or an explicit `=1`) has nothing to
+            // spread across. Say so rather than passing quietly: a vacuous
+            // pass that looks like a real one is how a dead gate survives.
+            eprintln!("[F-11] eden striping not exercised: {stripes} stripe(s) on this machine");
+            return;
+        }
+
+        const THREADS: usize = 4;
+        let start = Arc::new(std::sync::Barrier::new(THREADS));
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let gc = Arc::clone(&gc);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    let (_ptr, region) = gc.alloc_in_region(64).expect("allocation");
+                    region
+                })
+            })
+            .collect();
+        let used: std::collections::HashSet<usize> = workers
+            .into_iter()
+            .map(|w| w.join().expect("allocator thread"))
+            .collect();
+
+        assert!(
+            used.len() >= 2,
+            "{THREADS} concurrent allocators all landed in the same Eden region ({used:?})              despite {stripes} stripes being available — striping is what makes the shared              allocation guard pay (F-11)"
         );
     }
 
@@ -15242,7 +15817,7 @@ mod tests {
                 src_idx - 1
             };
             regions[dst_idx].region_type = RegionType::Old;
-            regions[dst_idx].cursor = 4096;
+            regions[dst_idx].set_cursor(4096);
             let addr = regions[dst_idx].data.as_ptr() as usize;
             (dst_idx, addr)
         };
@@ -15253,7 +15828,7 @@ mod tests {
         let seed_addr = {
             let mut regions = gc.regions.write();
             let region = &mut regions[src_idx];
-            let addr = region.data.as_ptr() as usize + region.cursor + 64;
+            let addr = region.data.as_ptr() as usize + region.cursor() + 64;
             assert_eq!(addr & 0x7, 0, "seed must stay 8-aligned");
             // SAFETY: `addr` is inside the region's own `region_size`-byte
             // buffer (the cursor is far below it in a fresh collector), so both
@@ -15321,7 +15896,7 @@ mod tests {
                 src_idx - 1
             };
             regions[dst_idx].region_type = RegionType::Old;
-            regions[dst_idx].cursor = 4096;
+            regions[dst_idx].set_cursor(4096);
             let addr = regions[dst_idx].data.as_ptr() as usize;
             (dst_idx, addr)
         };
@@ -15752,11 +16327,11 @@ mod tests {
             }
             let base = r.data.as_ptr() as usize;
             let mut off = 0usize;
-            while off < r.cursor {
+            while off < r.cursor() {
                 let addr = base + off;
                 let header = unsafe { &*(addr as *const ObjectHeader) };
                 let size = object_total_size(header);
-                if size < HEADER_SIZE || off + size > r.cursor {
+                if size < HEADER_SIZE || off + size > r.cursor() {
                     break;
                 }
                 if header.is_forwarded() {
@@ -15802,7 +16377,7 @@ mod tests {
             for r in regions.iter_mut() {
                 if r.region_type == RegionType::Free {
                     r.region_type = RegionType::Old;
-                    r.cursor = r.data.len();
+                    r.set_cursor(r.data.len());
                 }
             }
         });
@@ -15959,7 +16534,7 @@ mod tests {
     fn region_new_is_free() {
         let r = G1Region::new(1024);
         assert_eq!(r.region_type, RegionType::Free);
-        assert_eq!(r.cursor, 0);
+        assert_eq!(r.cursor(), 0);
         assert!(!r.pinned);
         assert_eq!(r.age, 0);
         assert_eq!(r.live_bytes, 0);
@@ -15971,16 +16546,16 @@ mod tests {
         let (ptr, offset) = r.bump_alloc(64, 8, "test").unwrap();
         assert!(!ptr.is_null());
         assert_eq!(offset, 0);
-        assert_eq!(r.cursor, 64);
+        assert_eq!(r.cursor(), 64);
 
         let (ptr2, offset2) = r.bump_alloc(128, 8, "test").unwrap();
         assert!(!ptr2.is_null());
         assert_eq!(offset2, 64);
-        assert_eq!(r.cursor, 192);
+        assert_eq!(r.cursor(), 192);
     }
 
     /// A TLAB carve must end 8-aligned, because `Tlab::new` rounds its `end`
-    /// DOWN to 8 while `bump_alloc` commits the full size to `region.cursor`.
+    /// DOWN to 8 while `bump_alloc` commits the full size to `region.cursor()`.
     /// Any gap between those two is heap no man's land — see
     /// [`tlab_carve_size`] for what a linear walk does when it arrives there.
     ///
@@ -16025,8 +16600,8 @@ mod tests {
             "carve at {off:#x} of {actual:#x} leaves [{tlab_end_addr:#x},{region_end_addr:#x}) \
              owned by neither the TLAB nor any object",
         );
-        assert_eq!(r.cursor, off + actual);
-        assert_eq!(r.cursor & 7, 0);
+        assert_eq!(r.cursor(), off + actual);
+        assert_eq!(r.cursor() & 7, 0);
     }
 
     #[test]
@@ -16049,13 +16624,13 @@ mod tests {
     fn region_reset() {
         let mut r = G1Region::new(1024);
         r.region_type = RegionType::Eden;
-        r.cursor = 500;
+        r.set_cursor(500);
         r.live_bytes = 200;
         r.pinned = true;
         r.age = 5;
         r.reset(0);
         assert_eq!(r.region_type, RegionType::Free);
-        assert_eq!(r.cursor, 0);
+        assert_eq!(r.cursor(), 0);
         assert!(!r.pinned);
         assert_eq!(r.age, 0);
     }
@@ -16878,11 +17453,11 @@ mod tests {
         {
             let mut regions = gc.regions.write();
             regions[0].region_type = RegionType::Old;
-            regions[0].cursor = 100;
+            regions[0].set_cursor(100);
             regions[0].live_bytes = 10;
             regions[0].gc_efficiency = 0.1; // 10% live = 90% garbage, best candidate
             regions[1].region_type = RegionType::Old;
-            regions[1].cursor = 100;
+            regions[1].set_cursor(100);
             regions[1].live_bytes = 90;
             regions[1].gc_efficiency = 0.9; // 90% live = 10% garbage, poor candidate
         }
@@ -18526,7 +19101,7 @@ mod tests {
         let mut regions = gc.regions.write();
         for r in regions.iter_mut().take(count) {
             r.region_type = RegionType::Eden;
-            r.cursor = full;
+            r.set_cursor(full);
         }
     }
 
@@ -18557,7 +19132,7 @@ mod tests {
             }
             let base = region.data.as_ptr() as usize;
             let mut offset = 0usize;
-            while offset < region.cursor {
+            while offset < region.cursor() {
                 let obj_ptr = (base + offset) as *mut u8;
                 if let Some(gap) = gap_filler_len(obj_ptr) {
                     offset += gap;
@@ -18568,7 +19143,7 @@ mod tests {
                     break;
                 }
                 let size = object_total_size(header);
-                if size < HEADER_SIZE || offset + size > region.cursor {
+                if size < HEADER_SIZE || offset + size > region.cursor() {
                     break;
                 }
                 let mut check = |raw: usize| {
@@ -18793,18 +19368,18 @@ mod tests {
         {
             let mut regions = gc.regions.write();
             regions[7].region_type = RegionType::Old;
-            regions[7].cursor = 128;
+            regions[7].set_cursor(128);
         }
         let pre: Vec<(RegionType, usize)> = {
             let regions = gc.regions.read();
-            regions.iter().map(|r| (r.region_type, r.cursor)).collect()
+            regions.iter().map(|r| (r.region_type, r.cursor())).collect()
         };
         // What this pause did: region 3 is a remembered-set source, region 5
         // was allocated into (Free -> Survivor, cursor grew).
         {
             let mut regions = gc.regions.write();
             regions[5].region_type = RegionType::Survivor;
-            regions[5].cursor = 64;
+            regions[5].set_cursor(64);
         }
         let sources: RegionSet = [3usize].into_iter().collect();
         let regions = gc.regions.read();
@@ -18833,7 +19408,7 @@ mod tests {
         let gc = G1Collector::new(many_region_config());
         let pre: Vec<(RegionType, usize)> = {
             let regions = gc.regions.read();
-            regions.iter().map(|r| (r.region_type, r.cursor)).collect()
+            regions.iter().map(|r| (r.region_type, r.cursor())).collect()
         };
         let sources = RegionSet::new();
         let regions = gc.regions.read();
@@ -18886,12 +19461,12 @@ mod tests {
                 let len = region.data.len();
                 region.region_type = RegionType::Eden;
                 region.data[..4096].fill(0xAA);
-                region.cursor = 4096;
+                region.set_cursor(4096);
 
                 region.reset(7);
 
                 assert_eq!(region.region_type, RegionType::Free);
-                assert_eq!(region.cursor, 0);
+                assert_eq!(region.cursor(), 0);
                 assert!(
                     region.data.iter().all(|&b| b == 0),
                     "under CRATONVM_G1_SCRUB_FREE a Free region must be entirely zero"
@@ -18913,7 +19488,7 @@ mod tests {
                 let mut region = G1Region::new(64 * 1024);
                 region.region_type = RegionType::HumongousContinuation;
                 region.data.fill(0xBB);
-                region.cursor = 0; // as `alloc_humongous_locked` leaves it
+                region.set_cursor(0); // as `alloc_humongous_locked` leaves it
 
                 region.reset(7);
 
@@ -18935,12 +19510,12 @@ mod tests {
         let mut region = G1Region::new(64 * 1024);
         region.region_type = RegionType::Eden;
         region.data[..4096].fill(0xAA);
-        region.cursor = 4096;
+        region.set_cursor(4096);
 
         region.reset(7);
 
         assert_eq!(region.region_type, RegionType::Free);
-        assert_eq!(region.cursor, 0, "the region is empty regardless");
+        assert_eq!(region.cursor(), 0, "the region is empty regardless");
         assert!(
             region.data[..4096].iter().any(|&b| b == 0xAA),
             "freeing a region must NOT memset it — that is the allocator's job \
@@ -18962,7 +19537,7 @@ mod tests {
         let mut region = G1Region::new(64 * 1024);
         region.region_type = RegionType::Eden;
         region.data.fill(0xAA);
-        region.cursor = 32 * 1024;
+        region.set_cursor(32 * 1024);
 
         region.reset(7);
         assert!(
@@ -19050,7 +19625,7 @@ mod tests {
             "the hint named a CSet region and must be ignored"
         );
         assert_eq!(
-            regions[1].cursor, 0,
+            regions[1].cursor(), 0,
             "nothing may be bump-allocated into a CSet region"
         );
         assert_eq!(
@@ -19166,7 +19741,7 @@ mod tests {
         {
             let mut regions = gc.regions.write();
             regions[3].region_type = RegionType::Old;
-            regions[3].cursor = 4096;
+            regions[3].set_cursor(4096);
         }
         // Publish a deliberately stale (too low) count, as a pre-cleanup
         // consumption would have.
@@ -19524,9 +20099,9 @@ mod tests {
             // Free one region back so a claim is possible at all.
             let mut regions = gc.regions.write();
             regions[7].region_type = RegionType::Free;
-            regions[7].cursor = 0;
+            regions[7].set_cursor(0);
         }
-        gc.current_eden.store(usize::MAX, Ordering::Relaxed);
+        gc.clear_eden_slots();
         let _ = GarbageCollector::alloc_object(&gc, ClassId::new(1), 1);
         assert!(
             gc.native_alloc_pressure(),
@@ -19596,7 +20171,7 @@ mod tests {
         gc.with_regions_mut(|regions| {
             for i in 0..7 {
                 regions[i].region_type = RegionType::Eden;
-                regions[i].cursor = 100;
+                regions[i].set_cursor(100);
             }
         });
         // 1 free out of 8 = 12.5% free, threshold is 25%
@@ -19613,14 +20188,14 @@ mod tests {
         gc.with_regions_mut(|regions| {
             for r in regions.iter_mut() {
                 r.region_type = RegionType::Eden;
-                r.cursor = 100;
+                r.set_cursor(100);
             }
         });
         assert!(gc.needs_gc(), "no Free regions at all must ask for a GC");
         gc.with_regions_mut(|regions| {
             for r in regions.iter_mut() {
                 r.region_type = RegionType::Free;
-                r.cursor = 0;
+                r.set_cursor(0);
             }
         });
         assert!(
@@ -19765,7 +20340,7 @@ mod tests {
     fn gc_efficiency_computation() {
         let mut r = G1Region::new(1024);
         r.region_type = RegionType::Old;
-        r.cursor = 500;
+        r.set_cursor(500);
         r.live_bytes = 200;
         r.gc_efficiency = r.live_bytes as f64 / 1024.0;
         assert!(r.gc_efficiency < 0.2);
@@ -22198,7 +22773,7 @@ mod tests {
         let snapshot: Vec<(u64, usize, RegionType)> = {
             let mut regions = gc.regions.write();
             for (i, r) in regions.iter_mut().enumerate() {
-                let cursor = if i == region_idx { tams_offset } else { r.cursor };
+                let cursor = if i == region_idx { tams_offset } else { r.cursor() };
                 r.mark_start = Some((r.reuse_epoch, cursor, r.region_type));
                 r.marked_bytes_below_tams.store(0, Ordering::Relaxed);
             }
@@ -22209,7 +22784,7 @@ mod tests {
                     let cursor = if i == region_idx {
                         tams_offset
                     } else {
-                        r.cursor
+                        r.cursor()
                     };
                     (r.reuse_epoch, cursor, r.region_type)
                 })
@@ -22248,7 +22823,7 @@ mod tests {
 
         // TAMS at the top: everything in the region predates the snapshot, so
         // the bitmap alone decides and nothing is implicitly live.
-        let cursor = gc.regions.read()[idx].cursor;
+        let cursor = gc.regions.read()[idx].cursor();
         force_mark_snapshot(&gc, idx, cursor);
 
         let live_size = {
@@ -22297,7 +22872,7 @@ mod tests {
             let regions = gc.regions.read();
             gc.region_for_ptr(&regions, obj.as_ptr()).unwrap()
         };
-        let cursor = gc.regions.read()[idx].cursor;
+        let cursor = gc.regions.read()[idx].cursor();
         force_mark_snapshot(&gc, idx, cursor);
         {
             let regions = gc.regions.read();
@@ -22310,7 +22885,7 @@ mod tests {
         gc.with_regions_mut(|regions| {
             regions[idx].reset(1);
             regions[idx].region_type = RegionType::Old;
-            regions[idx].cursor = 4096;
+            regions[idx].set_cursor(4096);
         });
         {
             let regions = gc.regions.read();
@@ -22392,7 +22967,7 @@ mod tests {
             let regions = gc.regions.read();
             (
                 regions[idx].live_bytes,
-                regions[idx].cursor,
+                regions[idx].cursor(),
                 regions[idx].gc_efficiency,
             )
         };
@@ -22440,7 +23015,7 @@ mod tests {
             let regions = gc.regions.read();
             (
                 regions[idx].live_bytes,
-                regions[idx].cursor,
+                regions[idx].cursor(),
                 regions[idx].region_type,
             )
         };
@@ -22457,7 +23032,7 @@ mod tests {
     }
 
     /// G1MAT-2 — `reclaim_dead_humongous_spans_locked` derives a span's extent
-    /// from `regions[i].cursor` alone. If that disagrees with the region table
+    /// from `regions[i].cursor()` alone. If that disagrees with the region table
     /// (a stale or corrupt cursor), the old code would `reset()` — zero-fill
     /// and retype-to-Free — regions belonging to OTHER live objects. Require
     /// every claimed continuation region to actually be typed
@@ -22476,7 +23051,7 @@ mod tests {
         gc.with_regions_mut(|regions| {
             regions[start_idx].live_bytes = 0; // "dead" per the mark bitmap
             regions[bystander].region_type = RegionType::Old;
-            regions[bystander].cursor = 4096;
+            regions[bystander].set_cursor(4096);
         });
 
         let reclaimed = {
@@ -22495,7 +23070,7 @@ mod tests {
             "the bystander region must not be retyped"
         );
         assert_eq!(
-            regions[bystander].cursor, 4096,
+            regions[bystander].cursor(), 4096,
             "the bystander region must not be zero-filled/reset"
         );
         assert_eq!(
@@ -22653,7 +23228,7 @@ mod tests {
             for (i, r) in regions.iter_mut().enumerate() {
                 if i != idx {
                     r.region_type = RegionType::Old;
-                    r.cursor = 0;
+                    r.set_cursor(0);
                 }
             }
         });
@@ -22716,7 +23291,7 @@ mod tests {
             for (i, r) in regions.iter_mut().enumerate() {
                 if i != idx {
                     r.region_type = RegionType::Old;
-                    r.cursor = 0;
+                    r.set_cursor(0);
                 }
             }
         });
@@ -23059,7 +23634,7 @@ mod tests {
 
         let regions = gc.regions.read();
         assert_eq!(regions[start].region_type, RegionType::HumongousStart);
-        let total = regions[start].cursor;
+        let total = regions[start].cursor();
         assert!(total > region_size, "the object spans more than one region");
         let needed = total.div_ceil(region_size).max(1);
         for r in &regions[start + 1..start + needed] {
@@ -23069,7 +23644,7 @@ mod tests {
                 "every region a span owns must be typed as a continuation — the \
                  reclaimer refuses to free a span whose shape disagrees"
             );
-            assert_eq!(r.cursor, 0, "continuations must be invisible to walkers");
+            assert_eq!(r.cursor(), 0, "continuations must be invisible to walkers");
         }
         // The object's first and last byte are inside the reserved run.
         let base = regions[start].data.addr();
@@ -23142,7 +23717,7 @@ mod tests {
         let gc2 = make_collector();
         let p = gc2.alloc_object(ClassId::new(1), 1);
         let p_region = gc2.lookup_region_for_addr(p.as_ptr() as usize).unwrap();
-        gc2.current_eden.store(usize::MAX, Ordering::Relaxed);
+        gc2.clear_eden_slots();
         let q = gc2.alloc_object(ClassId::new(2), 1);
         let q_region = gc2.lookup_region_for_addr(q.as_ptr() as usize).unwrap();
         assert_ne!(p_region, q_region);
@@ -23223,7 +23798,7 @@ mod tests {
         let p = gc.alloc_object(ClassId::new(1), 1);
         let p_region = gc.lookup_region_for_addr(p.as_ptr() as usize).unwrap();
         // Retire the current Eden so Q lands in a different region.
-        gc.current_eden.store(usize::MAX, Ordering::Relaxed);
+        gc.clear_eden_slots();
         let q = gc.alloc_object(ClassId::new(2), 1);
         let q_region = gc.lookup_region_for_addr(q.as_ptr() as usize).unwrap();
         assert_ne!(p_region, q_region, "Q must be cross-region from P");
@@ -23281,7 +23856,7 @@ mod tests {
         let gc2 = make_collector();
         let p2 = gc2.alloc_object(ClassId::new(1), 1);
         let p2_region = gc2.lookup_region_for_addr(p2.as_ptr() as usize).unwrap();
-        gc2.current_eden.store(usize::MAX, Ordering::Relaxed);
+        gc2.clear_eden_slots();
         let q2 = gc2.alloc_object(ClassId::new(2), 1);
         let q2_region = gc2.lookup_region_for_addr(q2.as_ptr() as usize).unwrap();
         assert_ne!(p2_region, q2_region);
@@ -23681,7 +24256,7 @@ mod tests {
         // at the top of P's region and needs it to sit above the cursor, which
         // the "allocate until the region rolls over" idiom used elsewhere would
         // make impossible.
-        gc.current_eden.store(usize::MAX, Ordering::Relaxed);
+        gc.clear_eden_slots();
         let q = gc.alloc_object(ClassId::new(2), 1);
         let q_region = gc.lookup_region_for_addr(q.as_ptr() as usize).unwrap();
         assert_ne!(p_region, q_region, "Q must be cross-region from P");
@@ -23701,7 +24276,7 @@ mod tests {
             let r = &regions[p_region];
             let base = r.data.addr();
             let len = r.data.len();
-            assert!(r.cursor + 64 < len, "the tail must sit above the cursor");
+            assert!(r.cursor() + 64 < len, "the tail must sit above the cursor");
             (base + len - 64, base + len)
         };
         gc.set_jit_tlab_skip_regions(&[(skip_start, skip_end)]);
