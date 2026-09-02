@@ -2943,12 +2943,33 @@ impl G1Collector {
         size: usize,
         init: impl Fn(*mut u8),
     ) -> Option<(*mut u8, usize)> {
+        // ONE-BINARY A/B for the ordering itself. `CRATONVM_G1_LATE_HEADER_WRITE=1`
+        // restores the pre-fix behaviour -- publish first, write the header
+        // after the lock is dropped -- on the same binary, so the fix can be
+        // bisected against a workload without a second build. Default OFF.
+        if g1_late_header_write() {
+            let result = self.alloc_in_region_locked(size, &|_| {});
+            if let Some((ptr, _)) = result {
+                init(ptr);
+            }
+            return result;
+        }
+        self.alloc_in_region_locked(size, &init)
+    }
+
+    /// The body of [`Self::alloc_in_region_initialized`]: takes the regions
+    /// lock and runs `init` over the fresh span before publishing it.
+    fn alloc_in_region_locked(
+        &self,
+        size: usize,
+        init: &dyn Fn(*mut u8),
+    ) -> Option<(*mut u8, usize)> {
         let mut regions = self.regions.lock();
         let region_size = self.config.region_size;
 
         // Humongous check
         if size > region_size / 2 {
-            let result = self.alloc_humongous_locked(&mut regions, size, &init);
+            let result = self.alloc_humongous_locked(&mut regions, size, init);
             if result.is_some() {
                 // A humongous span consumes several regions at once — always
                 // the largest single bite out of the Free pool.
@@ -2961,7 +2982,7 @@ impl G1Collector {
         let cur = self.current_eden.load(Ordering::Relaxed);
         if cur < regions.len() && regions[cur].region_type == RegionType::Eden {
             if let Some(result) =
-                regions[cur].bump_alloc_initialized(size, 8, "obj:cur-eden", &init)
+                regions[cur].bump_alloc_initialized(size, 8, "obj:cur-eden", init)
             {
                 return Some((result.0, cur));
             }
@@ -2973,7 +2994,7 @@ impl G1Collector {
             regions[idx].region_type = RegionType::Eden;
             self.current_eden.store(idx, Ordering::Relaxed);
             if let Some(result) =
-                regions[idx].bump_alloc_initialized(size, 8, "obj:fresh-eden", &init)
+                regions[idx].bump_alloc_initialized(size, 8, "obj:fresh-eden", init)
             {
                 self.note_region_consumed_locked(&regions);
                 return Some((result.0, idx));
@@ -13304,6 +13325,27 @@ fn evac_refusal_is_torn(verdict: HeaderVerdict) -> bool {
         | HeaderVerdict::BelowRegionBase
         | HeaderVerdict::AboveCursor => false,
     }
+}
+
+/// `CRATONVM_G1_LATE_HEADER_WRITE=1` -- publish an out-of-line allocation
+/// BEFORE its header is written, i.e. the ordering G1 had until 2026-09-01.
+///
+/// The one-binary A/B for that fix. `alloc_in_region_initialized` normally runs
+/// the caller's header write over the fresh span while the regions lock is
+/// still held; with this set it publishes first and calls the initializer after
+/// the lock is dropped, reopening the window in which a heap walk reads an
+/// address the cursor covers and a header that is not there yet. See
+/// [`G1Region::bump_alloc_initialized`] for what a walker reads in that window
+/// and why an ARRAY is the shape that makes it fatal.
+///
+/// Default OFF. It exists because the fix UNBLOCKS a workload rather than
+/// moving a number, and a fix like that has no A/B unless the old behaviour is
+/// reachable on the same binary.
+fn g1_late_header_write() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_G1_LATE_HEADER_WRITE").is_some()
+    })
 }
 
 /// `CRATONVM_G1_MARK_OOB_FAILSAFE=1` -- treat [`GrayRefusal::NotAllocated`]
