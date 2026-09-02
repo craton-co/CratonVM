@@ -25313,16 +25313,6 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     // --- T2.8: MethodHandle completeness (unreflect, permuteArguments, guardWithTest) ---
     crate::lang_invoke::register_t28_method_handle_completeness(registry);
 
-    // --- The MethodHandles LOOP family, tryFinally and arrayLength ---
-    //
-    // AFTER the two registrars above, so a later duplicate cannot shadow these
-    // silently. None of these six triples was registered at all before
-    // 2026-09-01: each fell through to real JDK bytecode that needs LambdaForm
-    // internals this VM does not provide, and surfaced as NullPointerException
-    // / NoSuchMethodError / AbstractMethodError rather than as a wrong answer.
-    // Measured in probes/MhCombinatorSweep.java.
-    crate::lang_invoke::register_mh_loop_family(registry);
-
     // --- Phase 8.4: JMX (Java Management Extensions) ---
     #[cfg(feature = "management")]
     {

@@ -26763,40 +26763,6 @@ fn invoke_on_class_shared_inner(
                                 // Groovy's `Selector.setCallSiteTarget`). Pin the
                                 // passthrough native.
                                 | "explicitCastArguments"
-                                // THE LOOP FAMILY, TRYFINALLY, ARRAYLENGTH and
-                                // ZERO. Same mechanism as every name above: the
-                                // real JDK bytecode builds its result out of
-                                // `LambdaForm`/`BoundMethodHandle` species this
-                                // VM does not implement, so it fails --
-                                // NullPointerException for the three loops,
-                                // NoSuchMethodError for `iteratedLoop`,
-                                // AbstractMethodError for `arrayLength`, and
-                                // `InternalError: Failed to link speciesData to
-                                // speciesCode` for `tryFinally`.
-                                //
-                                // Worse, once `BoundMethodHandle.<clinit>` has
-                                // failed the class stays failed, so every LATER
-                                // MethodHandles call in the same VM answers
-                                // NoClassDefFoundError -- which is how
-                                // `zero(String)` and `empty(...)`, two rows that
-                                // had been passing, went red without either
-                                // being touched.
-                                //
-                                // Registering the natives is NOT enough on its
-                                // own: this literal list is what decides they
-                                // are reached, and a registration absent from it
-                                // is installed and never dispatched. Measured
-                                // twice -- `--dump-native-registry` showed
-                                // `MethodHandles.constant` present and
-                                // `MethodHandles.zero` absent from the SAME
-                                // registrar, which is what named this list.
-                                | "zero"
-                                | "arrayLength"
-                                | "tryFinally"
-                                | "countedLoop"
-                                | "whileLoop"
-                                | "doWhileLoop"
-                                | "iteratedLoop"
                             ))
                         || crate::runtime::interpreter::is_method_handles_varhandle_factory_native_override(
                             class_name,

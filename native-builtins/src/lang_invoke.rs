@@ -8014,26 +8014,9 @@ pub(crate) fn register_method_handles_constant_bridge(r: &mut NativeMethodRegist
                 Some(Value::Object(Some(m))) => mirror_to_descriptor(ctx, *m).into_owned(),
                 _ => DESC_OBJECT.to_string(),
             };
-            let value = args.get(1).copied().unwrap_or(Value::Object(None));
-            // `constant(int.class, null)` is a NullPointerException on HotSpot:
-            // a primitive constant has nothing to unbox. Accepted silently here
-            // before (`probes/MhCombinatorSweep.java`, `k.constantNullPrimitive`),
-            // which hands back a handle whose invocation produces a fabricated
-            // zero at some later, unrelated call.
-            if matches!(
-                ret_desc.as_str(),
-                "I" | "J" | "F" | "D" | "Z" | "B" | "S" | "C"
-            ) && matches!(value, Value::Object(None))
-            {
-                return Err(RuntimeError::NullPointerException {
-                    message: Some(format!(
-                        "constant: null value for primitive type {ret_desc}"
-                    )),
-                }
-                .into());
-            }
             let desc = format!("(){ret_desc}");
             let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_CONSTANT)?;
+            let value = args.get(1).copied().unwrap_or(Value::Object(None));
             ctx.set_field(handle, MH_BOUND, value);
             Ok(Some(Value::Object(Some(handle))))
         },
@@ -8242,29 +8225,6 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                 _ => 0,
             };
             let values = args.get(2).copied().unwrap_or(Value::Object(None));
-            // `insertArguments` cannot bind more values than the target has
-            // parameters from `pos` onward. HotSpot raises
-            // `IllegalArgumentException`; this accepted it and produced a
-            // handle whose extra bound values are silently dropped at dispatch
-            // (`probes/MhCombinatorSweep.java`, `p.insertTooMany`).
-            if let Value::Object(Some(vals)) = values {
-                let supplied = ctx.array_length(vals);
-                if let Some(tdesc) = mh_type_descriptor(ctx, target) {
-                    if let Some((params, _)) = split_descriptor_params(&tdesc) {
-                        let from = pos.max(0) as usize;
-                        let available = params.len().saturating_sub(from);
-                        if supplied > available {
-                            return Err(RuntimeError::IllegalArgumentException {
-                                message: format!(
-                                    "too many values to insert: {supplied} for {available} \
-                                     remaining parameter(s) at position {from}"
-                                ),
-                            }
-                            .into());
-                        }
-                    }
-                }
-            }
             let wrapper = alloc_mh_carrier(ctx, "__mh_insert_wrapper__", 3);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, values);
@@ -8648,33 +8608,12 @@ pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
         mh,
         "zero",
         "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
-        |ctx, args| {
-            // `zero(T)` is `()T` returning T's DEFAULT VALUE -- 0 for a
-            // primitive, null for a reference. It used to allocate a bare
-            // handle with no `MH_KIND` and a hardcoded `()V` type, so
-            // `mh_dispatch` no-opped and `(int) zero(int.class).invoke()` came
-            // back as a NullPointerException rather than `0`
-            // (`probes/MhCombinatorSweep.java`, row `k.zeroInt`).
-            //
-            // Modelled as the CONSTANT it is: same kind as
-            // `MethodHandles.constant`, with the zero of the right shape bound.
-            let ret_desc = match args.first() {
-                Some(Value::Object(Some(m))) => mirror_to_descriptor(ctx, *m).into_owned(),
-                _ => DESC_OBJECT.to_string(),
-            };
-            let desc = format!("(){ret_desc}");
-            let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_CONSTANT)?;
-            // MH_BOUND is a REFERENCE slot. Storing a raw `Value::Int(0)` into
-            // it is the `primitive-into-reference` store the GC guard nulls
-            // (G30-1), and the corrupted handle then dragged the JDK's own
-            // `BoundMethodHandle`/`ClassSpecializer` machinery in, which failed
-            // with `InternalError: Failed to link speciesData to speciesCode` --
-            // and took `zero(String)` and `empty(...)` down with it, two rows
-            // that had been passing. So the zero is NOT stored: a null bound
-            // with a primitive return IS the encoding, decoded by the
-            // MH_KIND_CONSTANT arm.
-            ctx.set_field(handle, MH_BOUND, Value::Object(None));
-            Ok(Some(Value::Object(Some(handle))))
+        |ctx, _args| {
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17)?;
+            if let Ok(Some(mt)) = build_method_type_from_descriptor(ctx, "()V") {
+                ctx.set_field_by_name(obj, "type", Value::Object(Some(mt)));
+            }
+            Ok(Some(Value::Object(Some(obj))))
         },
     );
     r.set_category(__prev_cat);
@@ -10057,51 +9996,6 @@ pub(crate) const MH_KIND_ARRAY_GET: i32 = 24;
 /// factories shared.
 pub(crate) const MH_KIND_ARRAY_SET: i32 = 25;
 
-/// `MethodHandles.arrayLength(T[].class)` -- `(T[])int`.
-///
-/// Unregistered before, so the call fell through to the real JDK bytecode,
-/// which reaches `LambdaForm` machinery this VM does not provide and surfaced
-/// as `AbstractMethodError` (`probes/MhCombinatorSweep.java`, `k.arrayLength`).
-pub(crate) const MH_KIND_ARRAY_LENGTH: i32 = 26;
-
-/// `MethodHandles.tryFinally(target, cleanup)`.
-///
-/// The cleanup runs on BOTH paths and its signature is
-/// `(Throwable, <target return>, <target params>...)`. Measured on HotSpot
-/// 25.0.3+9, and the two paths do NOT agree about whose value wins:
-///
-/// ```text
-/// g.tryFinallyNormal   F:ok:Y:x:x                 <- the CLEANUP's result is the result
-/// g.tryFinallyThrows   throws IllegalStateException <- the throwable propagates, cleanup's
-///                                                     result discarded
-/// ```
-///
-/// Getting that backwards would swallow every exception a `tryFinally` wraps,
-/// which is why both paths have a row.
-pub(crate) const MH_KIND_TRY_FINALLY: i32 = 27;
-
-/// The `MethodHandles` LOOP family -- `countedLoop`, `whileLoop`,
-/// `doWhileLoop`, `iteratedLoop`. All four were unregistered, so all four
-/// reached JDK bytecode that this VM cannot run: three `NullPointerException`
-/// and one `NoSuchMethodError`.
-///
-/// One kind with a SHAPE discriminator on the wrapper rather than four kinds,
-/// because the four differ only in how the next value is produced and when the
-/// predicate is consulted. The wrapper is
-/// `[shape:int, init, body, pred_or_count, iterator_or_null]`.
-///
-/// **Single loop variable only.** The general `MethodHandles.loop(clauses...)`
-/// admits several, and this does not implement it -- a caller that needs it
-/// still gets the old behaviour rather than a wrong answer, because `loop`
-/// remains unregistered.
-pub(crate) const MH_KIND_LOOP: i32 = 28;
-
-/// Loop shapes for [`MH_KIND_LOOP`], stored at wrapper slot 0.
-pub(crate) const LOOP_SHAPE_COUNTED: i32 = 0;
-pub(crate) const LOOP_SHAPE_WHILE: i32 = 1;
-pub(crate) const LOOP_SHAPE_DO_WHILE: i32 = 2;
-pub(crate) const LOOP_SHAPE_ITERATED: i32 = 3;
-
 // ---------------------------------------------------------------------------
 // Round-9 perf: LambdaMetafactory CallSite cache.
 // ---------------------------------------------------------------------------
@@ -10787,184 +10681,6 @@ fn mh_dispatch_filter(
 /// `combiner` are the two handles; `pos` is the fold position (0 for the basic
 /// form). The adapter's `type()` mirrors the target minus the folded result
 /// parameter, but for CratonVM's dispatch only the wrapper fields matter.
-/// The descriptor all four loop factories share: three `MethodHandle`
-/// arguments, one `MethodHandle` result. They differ only by NAME.
-const THREE_MH: &str = "(Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodHandle;)Ljava/lang/invoke/MethodHandle;";
-
-/// Build a [`MH_KIND_LOOP`] handle for one of the four convenience loops.
-///
-/// `init`/`body`/`aux` are the raw argument slots; which is which depends on
-/// the shape, because the JDK orders them differently per factory
-/// (`whileLoop(init, pred, body)` but `doWhileLoop(init, body, pred)` -- the
-/// same three handles in two orders, which is exactly the kind of thing a
-/// single shared helper gets wrong if the caller does not spell it out).
-fn make_loop_adapter(
-    ctx: &mut dyn NativeContext,
-    shape: i32,
-    init: Option<ObjectRef>,
-    body: Option<ObjectRef>,
-    aux: Option<ObjectRef>,
-) -> MethodCallResult {
-    let body = match body {
-        Some(b) => b,
-        None => return Ok(Some(Value::Object(None))),
-    };
-    let wrapper = alloc_mh_carrier(ctx, "__mh_loop_wrapper__", 5);
-    let wrapper_pin = ctx.pin_native_root(wrapper);
-    ctx.set_field(wrapper, 0, Value::Int(shape));
-    ctx.set_field(wrapper, 1, init.map_or(Value::Object(None), |o| Value::Object(Some(o))));
-    ctx.set_field(wrapper, 2, Value::Object(Some(body)));
-    ctx.set_field(wrapper, 3, aux.map_or(Value::Object(None), |o| Value::Object(Some(o))));
-
-    // The loop's result type is the loop VARIABLE's type, i.e. what `init`
-    // returns; a loop with no init carries the body's return instead. The
-    // parameter list is the handle's own external arguments -- none for the
-    // first three shapes, and the `Iterable` for `iteratedLoop`.
-    let ret = init
-        .and_then(|i| mh_type_descriptor(ctx, i))
-        .or_else(|| mh_type_descriptor(ctx, body))
-        .and_then(|d| split_descriptor_params(&d).map(|(_, r)| r))
-        .unwrap_or_else(|| DESC_OBJECT.to_string());
-    let desc = if shape == LOOP_SHAPE_ITERATED {
-        format!("(Ljava/lang/Iterable;){ret}")
-    } else {
-        format!("(){ret}")
-    };
-    let adapter = alloc_method_handle(ctx, "__adapter__", "loop", &desc, MH_KIND_LOOP)?;
-    let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
-    ctx.unpin_native_roots(wrapper_pin);
-    ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
-    Ok(Some(Value::Object(Some(adapter))))
-}
-
-fn loop_arg(args: &[Value], i: usize) -> Option<ObjectRef> {
-    match args.get(i) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    }
-}
-
-/// Register the loop family, `tryFinally` and `arrayLength`.
-///
-/// Every one of these was UNREGISTERED, so the call reached the real JDK
-/// bytecode, which builds its result out of `LambdaForm`/`BoundMethodHandle`
-/// internals this VM does not implement. Measured
-/// (`probes/MhCombinatorSweep.java`, 2026-09-01): three
-/// `NullPointerException`, one `NoSuchMethodError`, one `AbstractMethodError`,
-/// and `tryFinally` NPE on both its paths -- six rows, none of them an edge
-/// case. `tryFinally` and `countedLoop` are what a bytecode generator reaches
-/// for once it stops emitting loops by hand.
-pub fn register_mh_loop_family(r: &mut NativeMethodRegistry) {
-    let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    let mhs = "java/lang/invoke/MethodHandles";
-
-    // countedLoop(iterations, init, body)
-    r.register(mhs, "countedLoop", THREE_MH, |ctx, args| {
-        make_loop_adapter(
-            ctx,
-            LOOP_SHAPE_COUNTED,
-            loop_arg(args, 1),
-            loop_arg(args, 2),
-            loop_arg(args, 0),
-        )
-    });
-    // whileLoop(init, pred, body)
-    r.register(mhs, "whileLoop", THREE_MH, |ctx, args| {
-        make_loop_adapter(
-            ctx,
-            LOOP_SHAPE_WHILE,
-            loop_arg(args, 0),
-            loop_arg(args, 2),
-            loop_arg(args, 1),
-        )
-    });
-    // doWhileLoop(init, body, pred) -- body and pred SWAPPED relative to
-    // whileLoop, which is the JDK's ordering and not a transcription slip.
-    r.register(mhs, "doWhileLoop", THREE_MH, |ctx, args| {
-        make_loop_adapter(
-            ctx,
-            LOOP_SHAPE_DO_WHILE,
-            loop_arg(args, 0),
-            loop_arg(args, 1),
-            loop_arg(args, 2),
-        )
-    });
-    // iteratedLoop(iterator, init, body) -- `iterator` may be null, meaning
-    // "use the Iterable's own iterator()", which is the only form implemented.
-    r.register(mhs, "iteratedLoop", THREE_MH, |ctx, args| {
-        make_loop_adapter(
-            ctx,
-            LOOP_SHAPE_ITERATED,
-            loop_arg(args, 1),
-            loop_arg(args, 2),
-            loop_arg(args, 0),
-        )
-    });
-
-    // tryFinally(target, cleanup)
-    r.register(
-        mhs,
-        "tryFinally",
-        "(Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodHandle;)Ljava/lang/invoke/MethodHandle;",
-        |ctx, args| {
-            let target = match args.first() {
-                Some(Value::Object(Some(t))) => *t,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let cleanup = args.get(1).copied().unwrap_or(Value::Object(None));
-            let wrapper = alloc_mh_carrier(ctx, "__mh_try_finally_wrapper__", 2);
-            ctx.set_field(wrapper, 0, Value::Object(Some(target)));
-            ctx.set_field(wrapper, 1, cleanup);
-            let desc = mh_type_descriptor(ctx, target)
-                .or_else(|| mh_read_desc(ctx, target))
-                .unwrap_or_default();
-            let adapter =
-                alloc_method_handle(ctx, "__adapter__", "tryFinally", &desc, MH_KIND_TRY_FINALLY)?;
-            ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
-            // The composed handle has the TARGET's type -- the cleanup only
-            // observes, it does not change the shape.
-            if let Value::Object(Some(mt)) = ctx.get_field_by_name(target, "type") {
-                ctx.set_field_by_name(adapter, "type", Value::Object(Some(mt)));
-            }
-            Ok(Some(Value::Object(Some(adapter))))
-        },
-    );
-
-    // arrayLength(arrayClass) -> (T[])int
-    r.register(
-        mhs,
-        "arrayLength",
-        "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
-        |ctx, args| {
-            let arr_desc: String = match args.first() {
-                Some(Value::Object(Some(mirror))) => match resolve_class_name_robust(ctx, *mirror) {
-                    Some(name) => {
-                        let d = class_name_to_descriptor(&name).into_owned();
-                        if !d.starts_with('[') {
-                            return Err(RuntimeError::IllegalArgumentException {
-                                message: format!(
-                                    "MethodHandles.arrayLength: not an array type: {name}"
-                                ),
-                            }
-                            .into());
-                        }
-                        d
-                    }
-                    None => format!("[{DESC_OBJECT}"),
-                },
-                _ => format!("[{DESC_OBJECT}"),
-            };
-            let desc = format!("({arr_desc})I");
-            let handle =
-                alloc_method_handle(ctx, "__adapter__", "arrayLength", &desc, MH_KIND_ARRAY_LENGTH)?;
-            Ok(Some(Value::Object(Some(handle))))
-        },
-    );
-
-    r.set_category(__prev_cat);
-}
-
 fn make_fold_adapter(
     ctx: &mut dyn NativeContext,
     target: Option<Value>,
@@ -10999,42 +10715,8 @@ fn make_fold_adapter(
         .unwrap_or_default();
     let adapter = alloc_method_handle(ctx, "__adapter__", "fold", &desc, MH_KIND_FOLD)?;
     let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
-    ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
-    // type(): the combiner's RESULT fills the parameter at `pos`, so the
-    // composed handle takes one FEWER argument than the target. `alloc_method_handle`
-    // populated `type` from the target's descriptor, so the fold claimed the
-    // UNFOLDED arity:
-    //
-    //   foldArguments(cat3(S,S,S)S, shout(S)S)
-    //     HotSpot   (String,String)String
-    //     was       (String,String,String)String
-    //
-    // A right VALUE with a wrong TYPE is the dangerous half of this pair, and
-    // it is not cosmetic: SpEL's `FunctionReference` reads a handle's arity to
-    // decide whether to re-wrap its arguments, and a stale type made it nest an
-    // extra empty `Object[]` -- the same mechanism `bindTo`'s insert adapter
-    // documents a few hundred lines up.
-    //
-    // A VOID combiner inserts nothing, so it removes no parameter.
-    let combiner_ref = ctx.read_native_pin(combiner_pin, combiner_ref);
-    let combiner_is_void = mh_type_descriptor(ctx, combiner_ref)
-        .and_then(|d| split_descriptor_params(&d).map(|(_, ret)| ret == "V"))
-        .unwrap_or(false);
-    if !combiner_is_void {
-        if let Some(tdesc) = mh_type_descriptor(ctx, target) {
-            if let Some((mut params, ret)) = split_descriptor_params(&tdesc) {
-                let p = pos.max(0) as usize;
-                if p < params.len() {
-                    params.remove(p);
-                    let new_desc = format!("({}){}", params.concat(), ret);
-                    if let Ok(Some(mt)) = build_method_type_from_descriptor(ctx, &new_desc) {
-                        ctx.set_field_by_name(adapter, "type", Value::Object(Some(mt)));
-                    }
-                }
-            }
-        }
-    }
     ctx.unpin_native_roots(target_pin);
+    ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
     Ok(Some(Value::Object(Some(adapter))))
 }
 
@@ -11327,219 +11009,6 @@ fn mh_guard_truthy(ctx: &dyn NativeContext, result: Option<Value>) -> bool {
 }
 
 /// `MethodHandles.catchException` dispatch (`MH_KIND_CATCH`).
-/// `MethodHandles.tryFinally` dispatch ([`MH_KIND_TRY_FINALLY`]).
-///
-/// `bound` is the 2-field wrapper `[target, cleanup]`. The cleanup's parameter
-/// list is `(Throwable, <return>, <as many leading target params as it
-/// declares>)`, and only as many arguments as it actually declares are
-/// forwarded -- the same `saturating_sub`/`min` shape `mh_dispatch_catch` uses,
-/// for the same reason: a cleanup is allowed to ignore the trailing arguments.
-fn mh_dispatch_try_finally(
-    ctx: &mut dyn NativeContext,
-    bound: Value,
-    extra_args: &[Value],
-) -> MethodCallResult {
-    let wrapper = match bound {
-        Value::Object(Some(w)) => w,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let target = match ctx.get_field(wrapper, 0) {
-        Value::Object(Some(t)) => t,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let cleanup = match ctx.get_field(wrapper, 1) {
-        Value::Object(Some(c)) => c,
-        // No cleanup is not an error; it is just the bare target.
-        _ => return mh_dispatch(ctx, target, extra_args),
-    };
-    // GC-safety: running the target can relocate `cleanup`, which is read again
-    // on both arms below.
-    let cleanup_pin = ctx.pin_native_root(cleanup);
-    let outcome = mh_dispatch(ctx, target, extra_args);
-    let cleanup = ctx.read_native_pin(cleanup_pin, cleanup);
-    let cdesc = mh_type_descriptor(ctx, cleanup)
-        .or_else(|| mh_read_desc(ctx, cleanup))
-        .unwrap_or_default();
-    let cparams = count_descriptor_params(&cdesc);
-    let forward_n = cparams.saturating_sub(2).min(extra_args.len());
-
-    match outcome {
-        Ok(result) => {
-            let mut cargs = Vec::with_capacity(2 + forward_n);
-            cargs.push(Value::Object(None)); // no throwable
-            cargs.push(result.unwrap_or(Value::Object(None)));
-            cargs.extend_from_slice(&extra_args[..forward_n]);
-            let cleanup = ctx.read_native_pin(cleanup_pin, cleanup);
-            ctx.unpin_native_roots(cleanup_pin);
-            // On the NORMAL path the cleanup's result IS the handle's result.
-            mh_dispatch(ctx, cleanup, &cargs)
-        }
-        Err(MethodCallFailed::ExceptionThrown(thrown)) => {
-            let thrown_pin = ctx.pin_native_root(thrown);
-            let cleanup = ctx.read_native_pin(cleanup_pin, cleanup);
-            let thrown = ctx.read_native_pin(thrown_pin, thrown);
-            let mut cargs = Vec::with_capacity(2 + forward_n);
-            cargs.push(Value::Object(Some(thrown)));
-            // The result slot is a zero of the return type; the cleanup may read
-            // it but its value is unspecified on this path.
-            cargs.push(Value::Object(None));
-            cargs.extend_from_slice(&extra_args[..forward_n]);
-            let _ = mh_dispatch(ctx, cleanup, &cargs);
-            let thrown = ctx.read_native_pin(thrown_pin, thrown);
-            ctx.unpin_native_roots(cleanup_pin);
-            // ...and on the EXCEPTIONAL path the throwable wins, whatever the
-            // cleanup returned. Measured; see MH_KIND_TRY_FINALLY.
-            Err(MethodCallFailed::ExceptionThrown(thrown))
-        }
-        other => other,
-    }
-}
-
-/// The `MethodHandles` loop family dispatch ([`MH_KIND_LOOP`]).
-///
-/// Wrapper layout `[shape:int, init, body, pred_or_count, iterable_or_null]`.
-/// One loop variable, threaded as the body's first argument; the handle's own
-/// arguments follow it, which is what `iteratedLoop` needs for its `Iterable`.
-///
-/// The iteration cap is a backstop, not a semantic: a predicate that never goes
-/// false is a caller bug, and hanging the VM is a worse way to report it than
-/// an exception naming the combinator.
-fn mh_dispatch_loop(
-    ctx: &mut dyn NativeContext,
-    bound: Value,
-    extra_args: &[Value],
-) -> MethodCallResult {
-    const MAX_ITERATIONS: usize = 10_000_000;
-    let wrapper = match bound {
-        Value::Object(Some(w)) => w,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let shape = match ctx.get_field(wrapper, 0) {
-        Value::Int(k) => k,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let obj_at = |ctx: &mut dyn NativeContext, i: usize| match ctx.get_field(wrapper, i) {
-        Value::Object(Some(o)) => Some(o),
-        _ => None,
-    };
-    let init = obj_at(ctx, 1);
-    let body = match obj_at(ctx, 2) {
-        Some(b) => b,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let aux = obj_at(ctx, 3); // predicate, or the count handle
-    let mut acc = match init {
-        Some(i) => mh_dispatch(ctx, i, extra_args)?.unwrap_or(Value::Object(None)),
-        None => Value::Object(None),
-    };
-
-    match shape {
-        LOOP_SHAPE_COUNTED => {
-            let n = match aux {
-                Some(c) => match mh_dispatch(ctx, c, extra_args)? {
-                    Some(Value::Int(n)) => n.max(0),
-                    _ => 0,
-                },
-                None => 0,
-            };
-            for i in 0..n {
-                let mut bargs = Vec::with_capacity(2 + extra_args.len());
-                bargs.push(acc);
-                bargs.push(Value::Int(i));
-                bargs.extend_from_slice(extra_args);
-                acc = mh_dispatch(ctx, body, &bargs)?.unwrap_or(Value::Object(None));
-            }
-            Ok(Some(acc))
-        }
-        LOOP_SHAPE_WHILE | LOOP_SHAPE_DO_WHILE => {
-            let pred = match aux {
-                Some(p) => p,
-                None => return Ok(Some(acc)),
-            };
-            let mut iterations = 0usize;
-            loop {
-                if shape == LOOP_SHAPE_WHILE {
-                    let mut pargs = Vec::with_capacity(1 + extra_args.len());
-                    pargs.push(acc);
-                    pargs.extend_from_slice(extra_args);
-                    match mh_dispatch(ctx, pred, &pargs)? {
-                        Some(Value::Int(0)) | None => return Ok(Some(acc)),
-                        Some(Value::Object(None)) => return Ok(Some(acc)),
-                        _ => {}
-                    }
-                }
-                let mut bargs = Vec::with_capacity(1 + extra_args.len());
-                bargs.push(acc);
-                bargs.extend_from_slice(extra_args);
-                acc = mh_dispatch(ctx, body, &bargs)?.unwrap_or(Value::Object(None));
-                if shape == LOOP_SHAPE_DO_WHILE {
-                    let mut pargs = Vec::with_capacity(1 + extra_args.len());
-                    pargs.push(acc);
-                    pargs.extend_from_slice(extra_args);
-                    match mh_dispatch(ctx, pred, &pargs)? {
-                        Some(Value::Int(0)) | None => return Ok(Some(acc)),
-                        Some(Value::Object(None)) => return Ok(Some(acc)),
-                        _ => {}
-                    }
-                }
-                iterations += 1;
-                if iterations > MAX_ITERATIONS {
-                    return Err(RuntimeError::IllegalStateException {
-                        message: format!(
-                            "MethodHandles loop exceeded {MAX_ITERATIONS} iterations \
-                             without its predicate going false"
-                        ),
-                    }
-                    .into());
-                }
-            }
-        }
-        LOOP_SHAPE_ITERATED => {
-            // The Iterable is the handle's FIRST own argument. Walk it through
-            // `Iterator`, which is the same door the real JDK uses.
-            let subject = match extra_args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                Some(Value::Object(None)) => {
-                    return Err(RuntimeError::NullPointerException {
-                        message: Some("iteratedLoop: iterable must not be null".to_string()),
-                    }
-                    .into());
-                }
-                _ => return Ok(Some(acc)),
-            };
-            let it = match ctx.invoke_virtual(subject, "iterator", "()Ljava/util/Iterator;", &[])? {
-                Some(Value::Object(Some(i))) => i,
-                _ => return Ok(Some(acc)),
-            };
-            let it_pin = ctx.pin_native_root(it);
-            let mut iterations = 0usize;
-            loop {
-                let it = ctx.read_native_pin(it_pin, it);
-                let has = matches!(
-                    ctx.invoke_virtual(it, "hasNext", "()Z", &[])?,
-                    Some(Value::Int(n)) if n != 0
-                );
-                if !has {
-                    break;
-                }
-                let it = ctx.read_native_pin(it_pin, it);
-                let item = ctx
-                    .invoke_virtual(it, "next", "()Ljava/lang/Object;", &[])?
-                    .unwrap_or(Value::Object(None));
-                let bargs = vec![acc, item];
-                acc = mh_dispatch(ctx, body, &bargs)?.unwrap_or(Value::Object(None));
-                iterations += 1;
-                if iterations > MAX_ITERATIONS {
-                    break;
-                }
-            }
-            ctx.unpin_native_roots(it_pin);
-            Ok(Some(acc))
-        }
-        _ => Ok(Some(acc)),
-    }
-}
-
 fn mh_dispatch_catch(
     ctx: &mut dyn NativeContext,
     bound: Value,
@@ -12241,17 +11710,6 @@ pub(crate) fn mh_dispatch(
             let v = match ret {
                 "Z" | "B" | "C" | "S" | "I" | "J" | "F" | "D" => match bound {
                     Value::Object(Some(obj)) => crate::lang_class::unbox_value(ctx, obj),
-                    // A NULL bound with a primitive return is how
-                    // `MethodHandles.zero(<primitive>)` is encoded -- see that
-                    // factory for why the zero cannot simply be stored in the
-                    // reference-typed MH_BOUND slot. `constant` cannot reach
-                    // this arm: it refuses a null value for a primitive type.
-                    Value::Object(None) => match ret {
-                        "J" => Value::Long(0),
-                        "F" => Value::Float(0.0),
-                        "D" => Value::Double(0.0),
-                        _ => Value::Int(0),
-                    },
                     other => other,
                 },
                 _ => bound,
@@ -12529,21 +11987,6 @@ pub(crate) fn mh_dispatch(
         MH_KIND_FOLD => mh_dispatch_fold(ctx, bound, extra_args),
         MH_KIND_COLLECT_ARGS => mh_dispatch_collect_args(ctx, bound, extra_args),
         MH_KIND_CATCH => mh_dispatch_catch(ctx, bound, extra_args),
-        MH_KIND_TRY_FINALLY => mh_dispatch_try_finally(ctx, bound, extra_args),
-        MH_KIND_LOOP => mh_dispatch_loop(ctx, bound, extra_args),
-        MH_KIND_ARRAY_LENGTH => {
-            let arr = match extra_args.first() {
-                Some(Value::Object(Some(a))) => *a,
-                Some(Value::Object(None)) => {
-                    return Err(RuntimeError::NullPointerException {
-                        message: Some("arrayLength: array must not be null".to_string()),
-                    }
-                    .into());
-                }
-                _ => return Ok(Some(Value::Int(0))),
-            };
-            Ok(Some(Value::Int(ctx.array_length(arr) as i32)))
-        }
         MH_KIND_RETURN_FILTER => mh_dispatch_return_filter(ctx, bound, extra_args),
         MH_KIND_INVOKER => {
             // `MethodHandles.exactInvoker`/`invoker`/`spreadInvoker`: the
@@ -12597,51 +12040,13 @@ pub(crate) fn mh_dispatch(
                 return mh_dispatch(ctx, target, extra_args);
             }
             let last = extra_args.len() - 1;
-            // The COUNT the spreader was built with, stashed at wrapper slot 1
-            // by the `asSpreader` factory. It is part of the contract, not a
-            // hint: `asSpreader(String[], 3)` handed a 2-element array is an
-            // `IllegalArgumentException` on HotSpot.
-            //
-            // Measured, `probes/MhCombinatorSweep.java` -- this arm spread
-            // whatever length arrived and let the target read the missing
-            // parameters as null:
-            //   c.asSpreaderWrongLen   HotSpot IllegalArgumentException   was `a|b|null`
-            //   c.asSpreaderNullArray  HotSpot NullPointerException       was `null|null|null`
-            // A fabricated `null` argument is worse than a missing refusal,
-            // because nothing fails at the call that was actually wrong.
-            let want: Option<usize> = match ctx.get_field(wrapper, 1) {
-                Value::Int(c) if c >= 0 => Some(c as usize),
-                _ => None,
-            };
             let mut full: Vec<Value> = Vec::with_capacity(last + 4);
             full.extend_from_slice(&extra_args[..last]);
-            match extra_args[last] {
-                Value::Object(Some(arr)) => {
-                    let n = ctx.array_length(arr);
-                    if let Some(want) = want {
-                        if n != want {
-                            return Err(RuntimeError::IllegalArgumentException {
-                                message: format!("array is not of length {want}"),
-                            }
-                            .into());
-                        }
-                    }
-                    for i in 0..n {
-                        full.push(ctx.get_array_element(arr, i));
-                    }
+            if let Value::Object(Some(arr)) = extra_args[last] {
+                let n = ctx.array_length(arr);
+                for i in 0..n {
+                    full.push(ctx.get_array_element(arr, i));
                 }
-                Value::Object(None) => {
-                    // Only a spreader that actually spreads something refuses a
-                    // null: `asSpreader(T[], 0)` accepts one, exactly as the JDK
-                    // does, because it reads no elements out of it.
-                    if want.is_some_and(|w| w > 0) {
-                        return Err(RuntimeError::NullPointerException {
-                            message: Some("spread array must not be null".to_string()),
-                        }
-                        .into());
-                    }
-                }
-                _ => {}
             }
             mh_dispatch(ctx, target, &full)
         }
@@ -14169,78 +13574,6 @@ fn invoke_narrowing_arg_refusal(
 /// integral-to-integral widenings need no conversion and are absent below.
 /// Anything else -- a narrowing, a reference, a `void` -- returns `None` and
 /// leaves today's behaviour untouched.
-/// The NARROWING half of the return conversion, for
-/// `MethodHandles.explicitCastArguments` only.
-///
-/// # Why this is not reachable from `asType`
-///
-/// `asType` REFUSES a narrowing return at creation time -- measured, and
-/// `probes/MhCombinatorSweep.java`'s `x.asTypeNarrowRefuses` row holds it to
-/// that. So by the time a handle reaches dispatch with a narrowing
-/// leaf-to-declared pair, `explicitCastArguments` is the only thing that can
-/// have produced it: that is exactly the contract difference between the two,
-/// and it is why this can be unconditional here rather than needing a marker
-/// on the handle.
-///
-/// # What it fixes
-///
-/// ```text
-/// explicitCastArguments(len, (String)byte).invoke("abcdef")
-///   HotSpot   6
-///   was       0
-/// ```
-///
-/// `widen_return_value` answered `None` for the narrowing, so the result was
-/// boxed against the LEAF descriptor (`I`) while the call site read `B`, and
-/// the mismatch downstream produced a fabricated zero. A wrong VALUE from an
-/// explicit cast is indistinguishable from a correct one at the call site,
-/// which is why it is fixed ahead of the missing combinators.
-///
-/// JLS 5.1.3 narrowing, plus the float/double to integral rules. `byte`,
-/// `short`, `char` and `int` share `Value::Int`, so the integral narrowings
-/// must TRUNCATE explicitly -- returning the wide value unchanged would leave
-/// `(byte) 300` reading as 300.
-fn narrow_return_value(value: Value, from_ret: u8, to_ret: u8) -> Option<Value> {
-    if from_ret == to_ret {
-        return None;
-    }
-    let as_i64 = |v: Value| match v {
-        Value::Int(i) => Some(i64::from(i)),
-        Value::Long(l) => Some(l),
-        _ => None,
-    };
-    let as_f64 = |v: Value| match v {
-        Value::Float(f) => Some(f64::from(f)),
-        Value::Double(d) => Some(d),
-        _ => None,
-    };
-    let truncate = |n: i64, to: u8| -> Option<Value> {
-        Some(match to {
-            b'B' => Value::Int(i32::from(n as i8)),
-            b'S' => Value::Int(i32::from(n as i16)),
-            b'C' => Value::Int(i32::from(n as u16)),
-            b'I' => Value::Int(n as i32),
-            b'Z' => Value::Int((n & 1) as i32),
-            b'J' => Value::Long(n),
-            _ => return None,
-        })
-    };
-    match (from_ret, to_ret) {
-        // integral -> narrower integral, and long -> int and friends
-        (b'B' | b'S' | b'C' | b'I' | b'J', b'B' | b'S' | b'C' | b'I' | b'Z') => {
-            truncate(as_i64(value)?, to_ret)
-        }
-        (b'J', b'J') => None,
-        // floating -> integral
-        (b'F' | b'D', b'B' | b'S' | b'C' | b'I' | b'Z' | b'J') => {
-            truncate(as_f64(value)? as i64, to_ret)
-        }
-        // double -> float
-        (b'D', b'F') => Some(Value::Float(as_f64(value)? as f32)),
-        _ => None,
-    }
-}
-
 fn widen_return_value(value: Value, from_ret: u8, to_ret: u8) -> Option<Value> {
     if from_ret == to_ret {
         return None;
@@ -14289,10 +13622,8 @@ fn box_return_against_target(
         return auto_box_return(ctx, result, leaf_desc);
     }
     match result {
-        Ok(Some(value)) => match widen_return_value(value, from, to)
-            .or_else(|| narrow_return_value(value, from, to))
-        {
-            Some(converted) => auto_box_return(ctx, Ok(Some(converted)), target),
+        Ok(Some(value)) => match widen_return_value(value, from, to) {
+            Some(widened) => auto_box_return(ctx, Ok(Some(widened)), target),
             None => auto_box_return(ctx, Ok(Some(value)), leaf_desc),
         },
         other => auto_box_return(ctx, other, leaf_desc),
@@ -15500,48 +14831,6 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
             };
             let catch_type = args.get(1).copied().unwrap_or(Value::Object(None));
             let handler = args.get(2).copied().unwrap_or(Value::Object(None));
-            // The handler's FIRST parameter must be able to receive the caught
-            // exception -- `catchException(t, ClassCastException.class, h)` where
-            // `h` takes an `IllegalStateException` is an
-            // `IllegalArgumentException` on HotSpot, and was accepted here
-            // (`probes/MhCombinatorSweep.java`, `g.catchWrongType`). The handle
-            // it produced would have passed the wrong exception type to the
-            // handler at dispatch, i.e. a ClassCastException from inside a
-            // catch block.
-            //
-            // Judged with the SAME loader-blind by-name walk the argument-cast
-            // work exposed, and with the same posture: a `None` from the
-            // context, or a type that does not resolve, is an ALLOW.
-            if let (Value::Object(Some(ct)), Value::Object(Some(h))) = (catch_type, handler) {
-                if let Some(ct_cid) = crate::lang_class::mirror_class_id(ctx, ct) {
-                    if let Some(hdesc) = mh_type_descriptor(ctx, h) {
-                        if let Some((params, _)) = split_descriptor_params(&hdesc) {
-                            if let Some(first) = params.first() {
-                                if first.starts_with('L') && first.ends_with(';') {
-                                    let want = first[1..first.len() - 1].to_string();
-                                    let admitted = ctx
-                                        .class_name_of_id(ct_cid)
-                                        .is_some_and(|n| n == want)
-                                        || ctx.class_assignable_to_name(ct_cid, &want)
-                                            != Some(false);
-                                    if !admitted {
-                                        return Err(RuntimeError::IllegalArgumentException {
-                                            message: format!(
-                                                "handler's leading parameter {} cannot receive {}",
-                                                want.replace('/', "."),
-                                                ctx.class_name_of_id(ct_cid)
-                                                    .unwrap_or_default()
-                                                    .replace('/', ".")
-                                            ),
-                                        }
-                                        .into());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
             let wrapper = alloc_mh_carrier(ctx, "__mh_catch_wrapper__", 3);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, catch_type);
