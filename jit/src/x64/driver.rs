@@ -1128,10 +1128,6 @@ pub fn compile_with_param_slots(
         .map(spliced_stack_reserve_path)
         .max()
         .unwrap_or(0);
-    crate::note_inline_reserve(
-        inline_stack_reserve_sum as u64,
-        inline_stack_reserve_path as u64,
-    );
     // Spend the concurrently-live figure, not the sum. DEFAULT ON; opt out
     // with `CRATONVM_JIT_NO_INLINE_RESERVE_PATH=1`.
     //
@@ -1162,6 +1158,11 @@ pub fn compile_with_param_slots(
     } else {
         inline_stack_reserve_sum
     };
+    crate::note_inline_reserve(
+        inline_stack_reserve_sum as u64,
+        inline_stack_reserve_path as u64,
+        inline_stack_reserve as u64,
+    );
     let max_stack = max_stack
         .saturating_add(max_invoke_args)
         .saturating_add(inline_stack_reserve);
