@@ -566,8 +566,28 @@ both are given `-Dstdout.encoding=UTF-8`.
    out of the syscalls (`windows_stream_encoding_for`) so the matrix is a unit
    test rather than only a comment.
 
-   Still unmeasured on Windows: everything ABOVE the property, because no
-   CratonVM binary has been BUILT on Windows and run against §1's witness —
-   only `cratonvm_native_api` was compiled and executed there. The bytes
-   `System.out` puts on a Windows console are still inferred from the Linux
-   arm of §10, which §3 argues is the same mechanism.
+   **The binary was then built on Windows too, and §1's witness closed.**
+   `cargo build --release --bin cratonvm` on the 1251 host, thin-LTO,
+   8m15s. `regression-suite/src/REncodingFidelity.java` run on it and on
+   HotSpot 25.0.3+9, same shell, stdout redirected, output compared as BYTES:
+
+   ```text
+                              CratonVM      HotSpot
+     bytes of output          849           849        byte-identical
+     native.encoding          Cp1251        Cp1251
+     stdout.encoding          Cp1251        Cp1251
+     System.out.charset()     windows-1251  windows-1251
+     println("[Ж]") on fd 1   5b c6 5d      5b c6 5d
+   ```
+
+   `c6` is the single cp1251 byte for `Ж`. Before this work CratonVM wrote
+   `5b d0 96 5d` — the UTF-8 pair — which is §1's `s_lower` shape and the
+   reason this page exists. The whole chain is now measured on Windows rather
+   than inferred: `GetACP` -> the property -> the `Charset` `install_charset`
+   stamps -> `printstream_encode` -> the bytes on fd 1.
+
+   One sliver is still not directly measured, and cannot easily be: the bytes
+   written to an attached CONSOLE's screen buffer, as opposed to a redirected
+   fd. Capturing those needs console-buffer scraping. The encoder is the same
+   code either way — it is driven by the stamped charset, and that charset is
+   measured on a real console at two code pages in §10.

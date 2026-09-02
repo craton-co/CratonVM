@@ -118,6 +118,19 @@ fn native_platform_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> M
     let native_encoding = ctx
         .get_system_property("native.encoding")
         .unwrap_or_else(|| "UTF-8".to_string());
+    // The three stream keys, on the same rule and for the same reason. Read
+    // BEFORE the `set` closure below, which borrows `ctx` mutably for the rest
+    // of the function. See the `--- Encoding ---` block for why these are read
+    // back rather than pinned even though they are inert here.
+    let stdout_encoding = ctx
+        .get_system_property("stdout.encoding")
+        .unwrap_or_else(|| "UTF-8".to_string());
+    let stderr_encoding = ctx
+        .get_system_property("stderr.encoding")
+        .unwrap_or_else(|| "UTF-8".to_string());
+    let stdin_encoding = ctx
+        .get_system_property("stdin.encoding")
+        .unwrap_or_else(|| "UTF-8".to_string());
 
     // Allocate a String[] of FIXED_LENGTH (40 elements), all null initially
     let arr = ctx.new_array(ArrayElementType::Reference, FIXED_LENGTH);
@@ -170,25 +183,35 @@ fn native_platform_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> M
     set(JAVA_IO_TMPDIR_NDX, &tmp.to_string_lossy());
 
     // --- Encoding ---
-    // Only `native.encoding` is derived (see the note at the top of this
-    // function). The three STREAM keys stay UTF-8 on purpose, and are inert
-    // here in any case: `SystemProps.initProperties` reaches these three
-    // indexes only through `putIfAbsent`, and `vmProperties()` below already
-    // supplies all three, so whatever is written here is overridden before
-    // anything can read it. Whether `System.out` should follow the console is
-    // a compatibility judgement with a blast radius across every Windows user
-    // and is deferred to its own reviewed change —
-    // docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-20260901.md.
+    // Every derived key is read back out of the property map, never restated.
+    // Three tables hold these six keys — this one, `vmProperties()` below, and
+    // `SharedVm::new`'s `sys_props` in `vm/src/vm/vm_init.rs` — and a literal in
+    // any of them is a second answer to a question another one already answers.
+    // That is not hypothetical: two hard-coded copies under a comment asserting
+    // "JDK 18+ pinned to UTF-8" is precisely how that false premise survived
+    // unexamined until 2026-09-01.
     //
-    // `sun.jnu.encoding` stays UTF-8 for a stronger reason than deferral: it
-    // decides how FILE NAMES are encoded, so moving it would change class
-    // loading rather than printing. It is also, with `native.encoding`, one of
-    // only two keys `initProperties` `put`s unconditionally from this table —
-    // the other four here are overridden by `vmProperties()` before use.
+    // The three STREAM keys are INERT here — `SystemProps.initProperties`
+    // reaches these indexes only through `putIfAbsent`, and `vmProperties()`
+    // already supplies all three, so whatever is written here is overridden
+    // before anything can read it. They are still read back rather than pinned,
+    // because "inert" is a property of today's `vmProperties()` and not of this
+    // function: the moment that table stops supplying one, a literal `"UTF-8"`
+    // here would silently become the answer and undo the derivation, leaving no
+    // trace in the key anyone would think to inspect. The stream encodings
+    // stopped being UTF-8 on 2026-09-01 (§10 of
+    // docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-20260901.md).
+    //
+    // `sun.jnu.encoding` is the one key still PINNED, and for a reason rather
+    // than by deferral: it decides how FILE NAMES are encoded, so moving it
+    // changes class loading rather than printing. It is also, with
+    // `native.encoding`, one of only two keys `initProperties` `put`s
+    // unconditionally from this table — so unlike the three above, a literal
+    // here is the answer, not a shadowed one. §11 of the page above carries it.
     set(NATIVE_ENCODING_NDX, native_encoding.as_str());
-    set(STDOUT_ENCODING_NDX, "UTF-8");
-    set(STDERR_ENCODING_NDX, "UTF-8");
-    set(STDIN_ENCODING_NDX, "UTF-8");
+    set(STDOUT_ENCODING_NDX, stdout_encoding.as_str());
+    set(STDERR_ENCODING_NDX, stderr_encoding.as_str());
+    set(STDIN_ENCODING_NDX, stdin_encoding.as_str());
     set(SUN_JNU_ENCODING_NDX, "UTF-8");
     set(SUN_IO_UNICODE_ENCODING_NDX, "UnicodeLittle");
 
