@@ -10000,28 +10000,6 @@ impl G1Collector {
     ///
     /// Returns bytes reclaimed.
     ///
-    /// The reasons this will decline that are already decidable BEFORE Phase 4
-    /// walks anything, or `None` if it could still proceed.
-    ///
-    /// # Why this is not just tidiness
-    ///
-    /// The humongous census is the ONLY thing that forces Phase 4 to take its
-    /// whole-heap walk (`phase4_regions_to_walk` returns `None` when
-    /// `want_census`). Measured on `TestKillProcessWhileWriting`, 2026-09-02:
-    /// that walk covers **843 of 1024 regions and 446 MB per young pause**, and
-    /// costs 3 063 us of a 7 588 us mean pause -- against 18 us for the
-    /// evacuation closure that does all the copying.
-    ///
-    /// And on that workload it bought NOTHING. A `CRATONVM_G1_DBG_REACH=1` run
-    /// logged the decline on **every one of 15 639 pauses**, always with the
-    /// same reason: *"an object registered for finalization is awaiting
-    /// finalize()"*. One registered finalizable object disables eager reclaim
-    /// for the whole run, while the census it cannot use is paid for on every
-    /// pause. The H2 page's 2026-08-29 census recorded the same thing from the
-    /// other end: `humongous-eager: spans=0 bytes=0 declined_pauses=16103`.
-    ///
-    /// `census.complete` is deliberately NOT here: it is a property of the walk
-    /// itself, so it cannot be known before the walk and stays at the call site.
     /// Is the humongous census worth taking this pause?
     ///
     /// ONE home for a predicate that had two, which is what let them drift.
@@ -10043,6 +10021,40 @@ impl G1Collector {
             && self.eager_reclaim_early_decline(pointer_map).is_none()
     }
 
+    /// The reasons [`Self::eager_reclaim_humongous_locked`] will decline that
+    /// are already decidable BEFORE Phase 4 walks anything, or `None` if it
+    /// could still proceed.
+    ///
+    /// # Why this is not just tidiness
+    ///
+    /// The humongous census is the ONLY thing that forces Phase 4 to take its
+    /// whole-heap walk (`phase4_regions_to_walk` returns `None` when
+    /// `want_census`). Measured on `TestKillProcessWhileWriting`, 2026-09-02:
+    /// that walk covered **843 of 1024 regions and 446 MB per young pause**, at
+    /// 3 063 us of a 7 588 us mean pause -- against 18 us for the evacuation
+    /// closure that does all the copying.
+    ///
+    /// And on that workload it bought NOTHING. A `CRATONVM_G1_DBG_REACH=1` run
+    /// logged the decline on **every one of 15 639 pauses**, always with the
+    /// same reason: *"an object registered for finalization is awaiting
+    /// finalize()"*. The H2 page's 2026-08-29 census recorded the same thing
+    /// from the other end: `humongous-eager: spans=0 bytes=0
+    /// declined_pauses=16103`.
+    ///
+    /// # The finalizer gate is the one that matters, and it is not rare
+    ///
+    /// `finalizer_pause` is set from `collect_garbage_with_finalizers` when the
+    /// pause has ANY registered, not-yet-enqueued finalizable object -- not
+    /// just a dead one. A heap with one live finalizable object anywhere (a
+    /// `FileInputStream` will do) therefore holds this true for the whole
+    /// process, and eager humongous reclaim NEVER RUNS. Measured consequence on
+    /// H2, whose MVStore allocates 1 MiB `ByteBuffer`s that each become a
+    /// TWO-region humongous span at a 1 MiB region size: **829 of 1024 regions
+    /// humongous, Eden squeezed to 1.1 regions, a 1.5-region collection set,
+    /// and 80 young pauses per second.**
+    ///
+    /// `census.complete` is deliberately NOT here: it is a property of the walk
+    /// itself, so it cannot be known before the walk and stays at the call site.
     fn eager_reclaim_early_decline(
         &self,
         pointer_map: &cratonvm_types::PointerMap,
