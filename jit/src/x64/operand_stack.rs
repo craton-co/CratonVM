@@ -17,6 +17,21 @@
 
 use super::*;
 
+/// DEFAULT ON. Opt out with `CRATONVM_JIT_NO_CANONICAL_FLUSH_HOME=1`, which
+/// puts `flush_scratch_registers` back on a fresh spill word per flushed value.
+///
+/// The arm exists because this changes WHERE a live operand lives across a
+/// call, and the last change to that answer — reserving the home at push time,
+/// 2026-09-02 — shipped a nondeterministic heap corruption that took a bisect
+/// with a rebuild per hypothesis to find, because no flag could separate it in
+/// one binary. This one can.
+pub fn canonical_flush_home_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_CANONICAL_FLUSH_HOME").is_none()
+    })
+}
+
 impl Compiler {
     pub(super) fn checked_spill_range_end(&mut self, start: i32, slots: usize) -> Option<i32> {
         let bytes = slots.checked_mul(8).and_then(|n| i32::try_from(n).ok());
@@ -29,9 +44,11 @@ impl Compiler {
             return None;
         };
         if start < self.base_spill_offset || end > self.spill_limit_offset {
+            crate::note_spill_cursor(crate::SPILL_REFUSED_EXHAUSTED, 1);
             self.fail("singlepass-codegen/spill-range-exhausted");
             return None;
         }
+        crate::note_spill_peak(u64::try_from((end - self.base_spill_offset) / 8).unwrap_or(0));
         Some(end)
     }
 
@@ -508,6 +525,7 @@ impl Compiler {
             }
         }
         if next > self.spill_limit_offset {
+            crate::note_spill_cursor(crate::SPILL_REFUSED_PAST_LIMIT, 1);
             self.fail("singlepass-codegen/spill-cursor-past-limit");
             return;
         }
@@ -766,13 +784,14 @@ impl Compiler {
         // it would actually take; the flag is opt-in so the two arms can be
         // measured in one binary.
         //
-        // A SECOND defect is real and still OPEN: `flush_scratch_registers`
-        // reserves a fresh spill word per flushed value, so a stretch with
-        // several calls grows the region once per call until
-        // `spill-range-exhausted` fails the compile. Reserving the home at PUSH
-        // time instead was tried on 2026-09-02 and reverted the same day: it
-        // made this function advance the spill cursor, which shipped a
-        // nondeterministic heap corruption. See `StackSlot::Scratch`.
+        // The SECOND defect — a stretch of calls growing the spill region once
+        // per flush until `spill-range-exhausted` failed the compile — is fixed
+        // in `flush_home`, and deliberately NOT here. Reserving the home at PUSH
+        // time was tried on 2026-09-02 and reverted the same day: it made this
+        // function advance the spill cursor, the OSR entry's local homes are
+        // derived from the same layout, and the result was a nondeterministic
+        // heap corruption. Nothing in this function may touch the cursor, which
+        // is why the fix lives entirely on the flush side.
         if self.kernel_operand_cache || operand_cache_enabled() {
             let free = SCRATCH_REGS.iter().copied().find(|&candidate| {
                 !self
@@ -837,15 +856,68 @@ impl Compiler {
         }
     }
 
+    /// Where the flush should put the value that currently sits at
+    /// operand-stack position `idx`.
+    ///
+    /// The plain answer — take the next word off the spill cursor — is what
+    /// grows the region. The cursor only moves back at an instruction boundary
+    /// (`reset_spills`) and only down to just past the HIGHEST live frame slot,
+    /// so one live value parked high (`invalidate_callee_saved` reserves at the
+    /// top of the reserve and repoints buried entries at it) pins every dead
+    /// word below it out of reach. A stretch of calls then takes a fresh word
+    /// per flush above that pin until `checked_spill_range_end` refuses and the
+    /// whole method falls back to the interpreter.
+    ///
+    /// So prefer the position's OWN canonical home, `base + idx*8` — the word
+    /// `canonicalize_stack` would give it at the next merge point anyway, and
+    /// the layout `spill_size` is sized for. Two guards make that sound, and
+    /// both are refusals rather than repairs:
+    ///
+    /// * **It must lie inside the already-reserved region** (`< next_spill_offset`).
+    ///   An instruction that needs private scratch homes takes them from a base
+    ///   that clears every live frame slot — above the cursor, never below it
+    ///   (see `arraycopy_scratch_homes_are_allocated_clear_of_the_operand_homes`).
+    ///   Staying under the cursor is what keeps this flush from landing on one.
+    /// * **No other position may already own that word.** Frame offsets are NOT
+    ///   monotone in stack position: `invalidate_callee_saved` repoints buried
+    ///   entries to a single high word, so position 0 can hold `base + 5*8`.
+    ///   Writing a canonical home blind would overwrite a live buried operand —
+    ///   the same class of clobber `canonicalize_stack` solves with a parallel
+    ///   move, and the reason this asks instead of assuming.
+    ///
+    /// When either guard says no, fall back to reserving. That is today's
+    /// behaviour, so the worst case is unchanged and the best case is bounded
+    /// by `stack.len()`.
+    fn flush_home(&mut self, idx: usize) -> Option<i32> {
+        if canonical_flush_home_enabled() {
+            let canonical = self
+                .base_spill_offset
+                .checked_add(i32::try_from(idx).ok()?.checked_mul(8)?)?;
+            let inside = canonical.checked_add(8).is_some_and(|end| end <= self.next_spill_offset);
+            if inside
+                && !self
+                    .stack
+                    .iter()
+                    .enumerate()
+                    .any(|(j, s)| j != idx && matches!(s, StackSlot::Frame(o) if *o == canonical))
+            {
+                crate::note_spill_cursor(crate::SPILL_FLUSH_CANONICAL, 1);
+                return Some(canonical);
+            }
+        }
+        crate::note_spill_cursor(crate::SPILL_FLUSH_RESERVED, 1);
+        self.reserve_spill_slots(1)
+    }
+
     pub(super) fn flush_scratch_registers(&mut self) {
+        crate::note_spill_cursor(crate::SPILL_FLUSH_CALLS, 1);
         // Collect scratch slots first to avoid double-mutable-borrow of self
         // (iterating &mut self.stack while calling self.emit_store_local).
         //
-        // Each entry carries the home the PUSH reserved for it, and the flush
-        // stores there rather than reserving another. That is the whole
-        // difference between this and the shape that made a call-heavy method
-        // grow its spill region once per call until the range was exhausted —
-        // see `push_from_rax`.
+        // Each flushed value goes to `flush_home`, which prefers the position's
+        // own canonical word over a fresh one — see there for why a fresh word
+        // per flush is what made a call-heavy method grow its spill region until
+        // the range was exhausted.
         let scratch_slots: Vec<(usize, u8)> = self
             .stack
             .iter()
@@ -859,7 +931,7 @@ impl Compiler {
             })
             .collect();
         for (idx, reg) in scratch_slots {
-            let Some(off) = self.reserve_spill_slots(1) else {
+            let Some(off) = self.flush_home(idx) else {
                 return;
             };
             self.emit_store_local(off, reg);
@@ -883,7 +955,7 @@ impl Compiler {
             })
             .collect();
         for (idx, xmm) in xmm_slots {
-            let Some(off) = self.reserve_spill_slots(1) else {
+            let Some(off) = self.flush_home(idx) else {
                 return;
             };
             // Direct MOVQ [rbp-off], XMM — saves the round-trip
@@ -929,7 +1001,7 @@ impl Compiler {
                 })
                 .collect();
             for (idx, reg) in callee_oop_slots {
-                let Some(off) = self.reserve_spill_slots(1) else {
+                let Some(off) = self.flush_home(idx) else {
                     return;
                 };
                 self.emit_store_local(off, reg);

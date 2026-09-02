@@ -18518,6 +18518,86 @@ pub fn compiled_frame_line_counts() -> [u64; 8] {
     out
 }
 
+/// What the single-pass backend's operand-spill cursor did, and why a compile
+/// was refused when it ran out of room.
+///
+/// `spill-range-exhausted` is a REFUSAL, and a refused compile is invisible:
+/// the method keeps running interpreted and nothing says so. The one thing the
+/// tree could say about it was the last bail site of the last compile
+/// (`take_jit_bail_site`), a single thread-local slot with no count — so
+/// "does this happen at all, and on what?" had no answer, and the fix that was
+/// tried for it on 2026-09-02 was measured by a GC-stress test rather than by
+/// the cursor it moved.
+///
+/// | # | name | meaning |
+/// |---|---|---|
+/// | 0 | `flush-calls` | `flush_scratch_registers` invocations |
+/// | 1 | `flush-reserved` | words the flush took from the cursor, growing the region |
+/// | 2 | `flush-canonical` | words the flush wrote to the position's own `base + i*8` home instead of taking a new one |
+/// | 3 | `exhausted` | compiles refused `spill-range-exhausted` |
+/// | 4 | `past-limit` | compiles refused `spill-cursor-past-limit` |
+/// | 5 | `peak-words` | high-water mark of live spill words in any one compile (a MAX, not a sum) |
+///
+/// Column 2 is the engagement counter for the canonical-home flush: a zero
+/// there with a non-zero column 1 means that path never ran, which is a
+/// different finding from it running and not helping.
+static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// `flush_scratch_registers` invocations.
+pub const SPILL_FLUSH_CALLS: usize = 0;
+/// Words the flush took from the spill cursor.
+pub const SPILL_FLUSH_RESERVED: usize = 1;
+/// Words the flush wrote to the position's own canonical home.
+pub const SPILL_FLUSH_CANONICAL: usize = 2;
+/// Compiles refused because the spill range ran out.
+pub const SPILL_REFUSED_EXHAUSTED: usize = 3;
+/// Compiles refused because the cursor was already past the limit.
+pub const SPILL_REFUSED_PAST_LIMIT: usize = 4;
+/// High-water mark of live spill words in any one compile.
+pub const SPILL_PEAK_WORDS: usize = 5;
+
+/// Human names, parallel to the slot indices.
+pub const SPILL_CURSOR_SLOT_NAMES: [&str; 6] = [
+    "flush-calls",
+    "flush-reserved",
+    "flush-canonical",
+    "exhausted",
+    "past-limit",
+    "peak-words",
+];
+
+/// Add `n` to one column. `peak-words` must not go through here — it is a
+/// maximum, and summing maxima produces a number that describes no run.
+#[inline]
+pub fn note_spill_cursor(slot: usize, n: u64) {
+    debug_assert!(slot != SPILL_PEAK_WORDS, "peak-words is a max, not a sum");
+    if let Some(c) = SPILL_CURSOR_COUNTS.get(slot) {
+        c.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Raise the peak-words high-water mark to `words` if it is higher.
+#[inline]
+pub fn note_spill_peak(words: u64) {
+    SPILL_CURSOR_COUNTS[SPILL_PEAK_WORDS].fetch_max(words, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the census. See [`SPILL_CURSOR_COUNTS`] for the columns.
+pub fn spill_cursor_counts() -> [u64; 6] {
+    let mut out = [0u64; 6];
+    for (i, slot) in SPILL_CURSOR_COUNTS.iter().enumerate() {
+        out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
 /// How often each of `stackwalker::drop_osr_continuations`' two rules removed a
 /// compiled entry that was the SAME ACTIVATION as an interpreter frame.
 ///

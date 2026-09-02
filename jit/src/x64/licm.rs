@@ -7901,12 +7901,17 @@ pub fn gated_ref_store_enabled() -> bool {
 /// two arms in one binary.
 ///
 /// **The frame-growth defect this was blamed for is fixed independently** and
-/// is not gated here: `StackSlot::Scratch` now carries the home word its push
-/// reserved, and `flush_scratch_registers` stores into that instead of
-/// reserving another. Before, a straight-line stretch with several calls
-/// reserved a fresh word at every flush and grew the spill region until it hit
-/// `spill-range-exhausted`. Pure kernels get that fix today, and it is the
-/// prerequisite that would make any future widening bounded.
+/// is not gated here — but not the way this comment claimed between
+/// 2026-09-01 and 2026-09-02. Carrying the home word on `StackSlot::Scratch`
+/// and reserving it at PUSH time made `push_from_rax` advance the spill cursor;
+/// the OSR entry's local homes come off the same layout, so an OSR transition
+/// loaded the wrong words. That shipped a nondeterministic heap corruption and
+/// was reverted the same day. The fix that stands is `Compiler::flush_home`:
+/// the flush prefers the position's own canonical `base + i*8` word over a
+/// fresh one, which reclaims the dead words a single high live slot pins out of
+/// `reset_spills`' reach — and moves no cursor a push can observe. Pure kernels
+/// get that fix today, and it is the prerequisite that would make any future
+/// widening bounded.
 pub fn operand_cache_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
