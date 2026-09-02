@@ -577,7 +577,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-267 tokens.
+270 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -601,6 +601,9 @@ export inherited from a parent shell.
 | `alloc-class-cache` | `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE` |
 | `alloc-spill-sink` | `CRATONVM_JIT_NO_ALLOC_SPILL_SINK` |
 | `arith-licm` | `CRATONVM_DISABLE_ARITH_LICM` |
+| `arraylen-licm` | `CRATONVM_DISABLE_ARRAYLEN_LICM` |
+| `rip-safepoint-poll` | `CRATONVM_JIT_RIP_SAFEPOINT_POLL` |
+| `fused-bounds-load` | `CRATONVM_JIT_FUSED_BOUNDS_LOAD` |
 | `bce` | `CRATONVM_JIT_NO_BCE` |
 | `bg-compile` | `CRATONVM_BG_COMPILE` |
 | `bytecode-loop-xform` | `CRATONVM_JIT_BYTECODE_LOOP_XFORM` |

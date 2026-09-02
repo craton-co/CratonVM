@@ -574,8 +574,7 @@ impl Compiler {
     /// Cooperative JIT safepoint poll (`CRATONVM_JIT_SAFEPOINT_POLLS`, see
     /// [`jit_safepoint_polls_enabled`]) — emits:
     /// ```asm
-    /// MOV  R11, imm64            ; helpers.safepoint_flag_addr
-    /// TEST byte ptr [R11], 0xFF  ; nonzero => STW requested
+    /// TEST byte ptr [rip+disp32], 0xFF  ; helpers.safepoint_flag_addr
     /// JZ   .no_poll
     ///   <emit_pre_safepoint_spill>              ; frame-slot oop map valid
     ///   CALL helpers.safepoint_slow_path
@@ -584,12 +583,26 @@ impl Compiler {
     /// ```
     /// matching the `self_call_stack_guard` call sequence's spill/call/oop-map
     /// bracketing exactly (see that call site in the direct self-recursive
-    /// call arm). x86-64 has no `CMP [m64], imm` form that takes a bare
-    /// absolute address, so the flag address is first materialized into the
-    /// scratch register R11 (never a Java-local home — see `LOCAL_REGS` —
-    /// nor an `ARG_REGS`/`SCRATCH_REGS` member, so it is always free to
-    /// clobber here) via `MOV R11, imm64`, then read with a single non-atomic
-    /// byte `TEST`.
+    /// call arm).
+    ///
+    /// x86-64 has no `TEST [m64], imm8` form that takes a bare 64-bit absolute
+    /// address, and this poll used to conclude from that that the flag address
+    /// had to be materialized into the scratch register R11 first
+    /// (`MOV R11, imm64` — 10 bytes) before a `TEST BYTE [R11], 0xFF`
+    /// (5 bytes). It does have a RIP-relative form, which is the whole poll in
+    /// **one 7-byte instruction and no register**:
+    /// [`Self::emit_test_mem8_abs_imm8`]. The back edge of every compiled loop
+    /// in the VM pays this, not only array loops — see
+    /// `array-element-load-baseline-codegen-20260901` for the sizing.
+    ///
+    /// The RIP-relative form needs the flag to sit within ±2GB of the emitted
+    /// instruction. The JIT code cache and the VM's data segment are separate
+    /// mappings, so that is a property of the process layout and not
+    /// something this emitter may assume: `emit_test_mem8_abs_imm8` reports
+    /// the reach failure and the old `MOV R11, imm64` sequence is emitted
+    /// instead. R11 is never a Java-local home (see `LOCAL_REGS`) nor an
+    /// `ARG_REGS`/`SCRATCH_REGS` member, so it stays free to clobber on that
+    /// path.
     ///
     /// The slow helper resolves the current VM and Java thread from published
     /// process state/TLS, so the sequence is valid in pure methods too.
@@ -603,9 +616,16 @@ impl Compiler {
         if self.helpers.safepoint_flag_addr == 0 || self.helpers.safepoint_slow_path == 0 {
             return;
         }
-        // Cast: x86-64 immediate encoding
-        self.emit_mov_imm64(R11, self.helpers.safepoint_flag_addr as i64);
-        self.emit_test_mem8_imm8(R11, 0, 0xFF);
+        if !jit_rip_safepoint_poll_enabled()
+            || !self.emit_test_mem8_abs_imm8(self.helpers.safepoint_flag_addr, 0xFF)
+        {
+            // Out of ±2GB RIP reach, or the kill switch is set — materialize
+            // the address and read through it, the shape this poll had before
+            // 2026-09-02.
+            // Cast: x86-64 immediate encoding
+            self.emit_mov_imm64(R11, self.helpers.safepoint_flag_addr as i64);
+            self.emit_test_mem8_imm8(R11, 0, 0xFF);
+        }
         let no_poll = self.emit_jcc_rel32_patch(0x84); // JZ (flag clear) -> skip slow path
         self.emit_pre_safepoint_spill();
         self.emit_call_absolute(self.helpers.safepoint_slow_path);
@@ -2087,6 +2107,7 @@ mod tests {
             0,
             8,
             false,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),

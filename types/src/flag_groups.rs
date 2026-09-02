@@ -1016,6 +1016,14 @@ pub const INVENTORY: &[E] = &[
     // disables the sink and `off_word` must stay `None`.
     E { group: Group::JIT, token: "alloc-spill-sink", on_key: None, off_key: Some("CRATONVM_JIT_NO_ALLOC_SPILL_SINK"), off_word: None, since: "2026-08-06" },
     E { group: Group::JIT, token: "arith-licm", on_key: None, off_key: Some("CRATONVM_DISABLE_ARITH_LICM"), off_word: None, since: "2026-06-16" },
+    // Declared 2026-09-02 with the three codegen changes of
+    // `array-element-load-baseline-codegen-20260901`. All three are default-ON
+    // and all three change the EMITTED BYTES of code that runs on every
+    // iteration of every array loop, so each gets its own lever at the level
+    // the change is at.
+    E { group: Group::JIT, token: "arraylen-licm", on_key: None, off_key: Some("CRATONVM_DISABLE_ARRAYLEN_LICM"), off_word: None, since: "2026-09-02" },
+    E { group: Group::JIT, token: "rip-safepoint-poll", on_key: Some("CRATONVM_JIT_RIP_SAFEPOINT_POLL"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::JIT, token: "fused-bounds-load", on_key: Some("CRATONVM_JIT_FUSED_BOUNDS_LOAD"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "bce", on_key: None, off_key: Some("CRATONVM_JIT_NO_BCE"), off_word: None, since: "2026-06-03" },
     E { group: Group::JIT, token: "bg-compile", on_key: Some("CRATONVM_BG_COMPILE"), off_key: None, off_word: None, since: "2026-06-18" },
     // The bytecode loop rewriter (`x64::plan_bytecode_loop_xform`: peel,

@@ -424,8 +424,9 @@ fails, this table is stale.
 | `HEADER_SIZE as i32` (bare) | 1 | disp32 | 25881 |
 | `HEADER_SIZE as i32` in a computed matrix-dot displacement | 2 | **disp8** after range-bounded arithmetic | 14233 (B row), 14235 (A element) |
 | `HEADER_SIZE` in compile-time arithmetic | 18 | not emitted directly | 64 (import), 14880, 14959, 15070, 15164, 15166, 22109, 22110, 22313, 22552, 22641, 27247, 28426, 29437, 29461, 29476, 29491, 29507, 29529 |
-| `ARRAY_LENGTH_OFFSET as u8` | 23 | **disp8** | 14265, 14359, 14389, 14394 (matrix-dot guards), 17289, 17452, 18886, 18976, 23706, 23716, 23968, 24064, 24068, 24234, 25094, 25175, 25220, 25351, 25354, 26042, `emit_bulk_zero_byte_fill_preheader`, `emit_bulk_set_byte_stride_preheader`, `emit_byte_sieve_preheader` |
+| `ARRAY_LENGTH_OFFSET as u8` | 22 | **disp8** | 14265, 14359, 14389, 14394 (matrix-dot guards), 17289, 17452, 18886, 18976, 23706, 23716, 23968, 24064, 24068, 24234, 25094, 25175, 25220, 25351, 25354, 26042, `emit_bulk_zero_byte_fill_preheader`, `emit_bulk_set_byte_stride_preheader`, `emit_byte_sieve_preheader` |
 | `ARRAY_LENGTH_OFFSET as i32` | 5 | disp32 | 25497, 25503, 25607, 25723, 25728 |
+| `ARRAY_LENGTH_OFFSET` through `disp::disp8_const` | 2 | **disp8**, build-checked | `x64/arrays.rs::emit_bounds_check`, `x64/deopt_stubs.rs::emit_bounds_check_stubs` |
 | `NUM_SLOTS_OFFSET as i32` | 4 | disp32 | 14915, 15239 (inline TLAB `shape`), 22614, 22689 |
 | `GC_FLAGS_OFFSET as i32` | 11 | disp32 | 14671, 14690, 14890, 14900, 14965, 14972, 22144, 22351, 22591, 22600, 22669 |
 | `FORWARDING_PTR_OFFSET as i32` (and `+ 4`) | 2 | disp32 | 15269, 15274 |
@@ -435,8 +436,17 @@ fails, this table is stale.
 | `NUM_SLOTS_OFFSET` in Rust pointer arithmetic | 1 | n/a | 29422 |
 
 Totals: **35** `HEADER_SIZE` disp8 sites, **13** `HEADER_SIZE` disp32 sites, **18**
-compile-time-arithmetic uses, **28** `ARRAY_LENGTH_OFFSET` sites, **23** other named
-header-offset sites. **117 sites** in this file.
+compile-time-arithmetic uses, **29** `ARRAY_LENGTH_OFFSET` sites, **23** other named
+header-offset sites. **118 sites** in this file.
+
+2026-09-02: the raw-narrowing row fell 23 -> 22 and the checked row appeared. The array
+bounds check's length load moved from the fast path into its cold stub — the fast path is
+now `CMP ECX, [RAX+len]`, one instruction and four bytes fewer on **every** emitted bounds
+check — so the constant is spelled at two sites instead of one, and both were written as a
+`const` binding through `disp::disp8_const` rather than a bare `as u8`. That is the
+stronger form ir_lower already used: a layout change pushing the offset past 127 is a
+BUILD failure at the site, not an inventory diff noticed afterwards. Migrating the
+remaining 22 raw narrowings the same way is the obvious follow-up and is not done here.
 
 The four rows marked "was bare" are the whole of this session's mechanical change to §6:
 three bare integer literals (`4`, `8`, `4`) inside `emit_inline_tlab_new` became named
