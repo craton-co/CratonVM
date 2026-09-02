@@ -16990,6 +16990,99 @@ mod tests {
         );
     }
 
+    /// A counted loop over `a.length` reaches the register allocator.
+    ///
+    /// The end-to-end form of [`the_two_value_defining_enumerations_agree`],
+    /// and the one that names the consequence rather than the cause.
+    /// `plan_register_residency`'s agreement check compares `wants_loc`
+    /// (`regalloc::ir_op_defines_value`) against `node_color`
+    /// (`op_defines_result_slot`) and declines register residency for the
+    /// WHOLE method on a single disagreement. `Op::ArrayLength` was in the
+    /// second list and not the first, so this shape — the most ordinary
+    /// counted loop in Java — declined every time, and the flag reported
+    /// nothing because it printed only on success.
+    ///
+    /// The bytecode is `static int f(int[] a) { int s = 0; for (int i = 0; i <
+    /// a.length; i++) s += a[i]; return s; }`, assembled by hand so the
+    /// `arraylength` is unmistakably present rather than incidental to a
+    /// fixture.
+    ///
+    /// Asserted on the AGREEMENT, not on a promotion count: whether this
+    /// particular graph ends up with a register is the allocator's business and
+    /// may legitimately change, but the two models must never disagree about
+    /// which values want a home.
+    #[test]
+    fn a_counted_loop_over_array_length_reaches_the_allocator() {
+        use crate::regalloc::build_live_model;
+
+        // 0: iconst_0            s = 0
+        // 1: istore_1
+        // 2: iconst_0            i = 0
+        // 3: istore_2
+        // 4: iload_2         <-- loop head
+        // 5: aload_0
+        // 6: arraylength         THE OP THAT USED TO DECLINE THE METHOD
+        // 7: if_icmpge +15  --> 22
+        // 10: iload_1
+        // 11: aload_0
+        // 12: iload_2
+        // 13: iaload
+        // 14: iadd
+        // 15: istore_1
+        // 16: iinc 2, 1
+        // 19: goto -15      --> 4
+        // 22: iload_1
+        // 23: ireturn
+        let code: [u8; 24] = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x2a, 0xbe, 0xa2, 0x00, 0x0f, 0x1b, 0x2a, 0x1c, 0x2e,
+            0x60, 0x3b, 0x84, 0x02, 0x01, 0xa7, 0xff, 0xf1, 0x1b, 0xac,
+        ];
+        let graph = IrBuilder::new(1, 3)
+            .build(&code, code.len())
+            .expect("the loop builds");
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::ArrayLength)),
+            "the fixture must contain an ArrayLength, or this test proves nothing"
+        );
+
+        let schedule = ir_schedule::schedule(&graph);
+        let plan = plan_slots(&graph, &schedule, None);
+        let live = build_live_model(&graph, &schedule);
+
+        assert_eq!(
+            live.wants_loc.len(),
+            plan.node_color.len(),
+            "the two models disagree about how many nodes there are"
+        );
+        let disagreeing: Vec<(usize, String)> = live
+            .wants_loc
+            .iter()
+            .zip(plan.node_color.iter())
+            .enumerate()
+            .filter(|(_, (wants, color))| **wants != color.is_some())
+            .map(|(id, _)| {
+                (
+                    id,
+                    graph
+                        .nodes
+                        .get(id)
+                        .map(|n| format!("{:?}", n.op))
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert!(
+            disagreeing.is_empty(),
+            "liveness and colourer disagree on {disagreeing:?} — \
+             `plan_register_residency` declines residency for the whole method \
+             on any one of these, so this ordinary counted loop gets no \
+             registers at all",
+        );
+    }
+
     /// `op_defines_result_slot` names exactly the arms that allocate a slot.
     ///
     /// The direction that matters is *over*-claiming: an op listed here whose
