@@ -1595,6 +1595,27 @@ static ZGC_UNSIZABLE_WARNED: AtomicBool = AtomicBool::new(false);
 /// [`cratonvm_types::GcFlags`] field, because a declared flag latches on first
 /// read and a mid-run `set_var` then becomes invisible to the very suite that
 /// wants to A/B it. Read once per heap, in [`ZgcRealHeap::with_capacity`].
+/// Runtime kill switch: `CRATONVM_ZGC_MARKBITS`. **Default on.**
+///
+/// `0` / `off` / `false` / `no` (case-insensitive) puts this cycle's mark bits
+/// back in the object header's [`GC_FLAG_MARKED`], byte for byte, so the A/B is
+/// a re-run and not a rebuild. See [`ZgcRealHeap::mark_bits`] for the three
+/// costs the side bitmap removes.
+///
+/// Read once per heap, in [`ZgcRealHeap::with_capacity`], for the same two
+/// reasons as [`zgc_start_bits_enabled_by_default`]: it layers with `-XX:` like
+/// every other flag, and a declared `GcFlags` field would latch on first read
+/// and make a mid-run `set_var` invisible to the suite that wants to A/B it.
+fn zgc_mark_bits_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_MARKBITS") {
+        Some(raw) => {
+            let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no")
+        }
+        None => true,
+    }
+}
+
 fn zgc_start_bits_enabled_by_default() -> bool {
     match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_STARTBITS") {
         Some(raw) => {
@@ -1646,6 +1667,11 @@ pub(crate) struct ZObjectStartBits {
     /// One-shot latch for the "the grid could not encode a base" warning: one
     /// line per allocation would itself be the hang.
     overflow_warned: AtomicBool,
+    /// Which bitmap this is, for the spill warning. Two instances exist over
+    /// the SAME geometry -- the object-start registry and the mark bits (see
+    /// [`ZgcRealHeap::mark_bits`]) -- and a warning that does not say which one
+    /// spilled names the wrong invariant.
+    label: &'static str,
 }
 
 // SAFETY: identical argument to `crate::young_mark::YoungMarkBits`. Every
@@ -1657,8 +1683,19 @@ unsafe impl Send for ZObjectStartBits {}
 unsafe impl Sync for ZObjectStartBits {}
 
 impl ZObjectStartBits {
-    /// Cover `[base, base + span)`.
+    /// Cover `[base, base + span)` as the object-start registry.
     fn new(base: usize, span: usize) -> Self {
+        Self::labelled(base, span, "object-start")
+    }
+
+    /// Cover `[base, base + span)` under a stated role.
+    ///
+    /// The mark bitmap is a second instance over the identical geometry, and
+    /// that identity is the point: both are indexed off the same `arena_base`
+    /// on the same 8-byte grid, so a base the registry can encode is a base the
+    /// mark bits can encode, and neither can silently disagree with the other
+    /// about which addresses are representable.
+    fn labelled(base: usize, span: usize, label: &'static str) -> Self {
         let nwords = span.div_ceil(8).div_ceil(64);
         let words = if nwords == 0 {
             std::ptr::NonNull::<AtomicU64>::dangling().as_ptr()
@@ -1681,6 +1718,7 @@ impl ZObjectStartBits {
             overflow: Mutex::new(FxHashSet::default()),
             overflow_len: AtomicUsize::new(0),
             overflow_warned: AtomicBool::new(false),
+            label,
         }
     }
 
@@ -1749,10 +1787,11 @@ impl ZObjectStartBits {
                 addr = addr,
                 base = self.base,
                 span = self.span,
-                "zgc object-start bitmap: an allocation base is off the 8-byte \
-                 grid (or outside the arena) — falling back to the exact side \
-                 set for it; membership stays correct, but every such base \
-                 costs a lock and the bitmap is not carrying it"
+                label = self.label,
+                "zgc bitmap: an address is off the 8-byte grid (or outside the \
+                 arena) — falling back to the exact side set for it; membership \
+                 stays correct, but every such address costs a lock and the \
+                 bitmap is not carrying it"
             );
         }
     }
@@ -1797,6 +1836,82 @@ impl ZObjectStartBits {
                 self.overflow_len.store(n, Ordering::Release);
             }
         }
+    }
+
+    /// Set the bit for `addr` and report whether **this call** set it.
+    ///
+    /// The exactly-once primitive the concurrent marker needs, and the reason
+    /// the mark bits can leave the object header at all.
+    /// [`ObjectHeader::try_add_gc_flags`] is a CAS loop on a byte that shares
+    /// its word with `gc_age` and the sticky layout flags; this is one
+    /// `fetch_or` on a word that carries nothing but mark bits, so there is no
+    /// value to re-check and nothing for a retry loop to do.
+    ///
+    /// The caller's contract is `try_mark`'s verbatim: **`true` means you now
+    /// own the obligation to scan it.** Two `true`s for one object would be a
+    /// double scan (wasteful); a lost update would leave an object marked and
+    /// never traced, so its children are swept while it is alive and pointing
+    /// at them. `fetch_or` returns the previous word, which is exactly the
+    /// evidence needed to tell the two apart.
+    ///
+    /// `AcqRel`: the `Release` half publishes whatever the marker wrote before
+    /// claiming (nothing today, but the ordering must not depend on that), and
+    /// the `Acquire` half pairs with a peer's claim so a worker that loses the
+    /// race sees everything the winner did before it.
+    ///
+    /// Off-grid addresses go to the exact side set, where "did I insert it"
+    /// is `FxHashSet::insert`'s own answer.
+    #[inline]
+    fn claim(&self, addr: usize) -> bool {
+        match self.locate(addr) {
+            // SAFETY: `locate` bounds-checked `addr`, so `w < self.nwords`.
+            Some((w, mask)) => {
+                let prev = unsafe { (*self.words.add(w)).fetch_or(mask, Ordering::AcqRel) };
+                prev & mask == 0
+            }
+            None => {
+                let mut overflow = self.overflow.lock();
+                let inserted = overflow.insert(addr);
+                if inserted {
+                    let n = overflow.len();
+                    self.overflow_len.store(n, Ordering::Release);
+                }
+                inserted
+            }
+        }
+    }
+
+    /// Clear **every** bit, in one pass over the words.
+    ///
+    /// # Why this is the whole argument for a side bitmap
+    ///
+    /// The state it replaces is "walk the registry and clear
+    /// [`GC_FLAG_MARKED`] in every object's header". That walk is one
+    /// read-modify-write per object, scattered over the whole arena, each one
+    /// dirtying a 64-byte line that has to be written back — and the 2026-08-17
+    /// pause anatomy measured it at **94-96% of the mark-start pause** (34 ms
+    /// of 35 on a 4.6M-entry registry, 66 of 69 on a 10.8M one). Here the same
+    /// operation is a sequential store over `span / 512` bytes: 8 MB for a
+    /// 4.2 GB heap, touched linearly, with no dependency on how many objects
+    /// the heap holds.
+    ///
+    /// **STOP-THE-WORLD ONLY.** `Relaxed` stores plus one trailing `Release`
+    /// fence rather than a released store per word: with every mutator parked
+    /// there is no concurrent reader to order against word by word, and the
+    /// single fence is what the resumed mutators synchronise with. A caller
+    /// that runs this with the world alive would erase claims out from under
+    /// the marker, which is a use-after-free, not a torn read -- so the
+    /// ordering is not what protects it and the caller's safepoint is.
+    fn clear_all(&self) {
+        for w in 0..self.nwords {
+            // SAFETY: `w < self.nwords`, and `words` holds exactly that many.
+            unsafe { (*self.words.add(w)).store(0, Ordering::Relaxed) };
+        }
+        if self.overflow_len.load(Ordering::Acquire) != 0 {
+            self.overflow.lock().clear();
+            self.overflow_len.store(0, Ordering::Release);
+        }
+        std::sync::atomic::fence(Ordering::Release);
     }
 
     /// Is anything held outside the grid? See [`Self::overflow`].
@@ -3455,6 +3570,52 @@ pub struct ZgcRealHeap {
     /// A `Mutex` because `collect_garbage` takes `&self`. Uncontended by
     /// construction: the only lock site is inside the stop-the-world pause.
     dead_scratch: Mutex<Vec<usize>>,
+
+    /// This cycle's mark bits, OUT of the object headers.
+    ///
+    /// `None` restores [`GC_FLAG_MARKED`] in the header byte-for-byte, so the
+    /// A/B is a re-run and not a rebuild -- see [`zgc_mark_bits_enabled`]. Also
+    /// `None` for a degenerate arena, where the grid covers nothing.
+    ///
+    /// # The three costs this removes
+    ///
+    /// A mark bit in the header means every mark operation is a
+    /// read-modify-write of a 64-byte line somewhere in the arena, and there
+    /// are three passes that do nothing else:
+    ///
+    ///  1. **The mark-start clearing walk.** One RMW per registered object,
+    ///     scattered. Measured at 94-96% of the mark-start pause (34 ms of 35
+    ///     at 4.6M objects; 66 of 69 at 10.8M). It is now
+    ///     [`ZObjectStartBits::clear_all`] -- a linear store over `span / 512`
+    ///     bytes, 8 MB for a 4.2 GB heap, independent of the object count.
+    ///  2. **The trace's set.** The marker reads the object's fields anyway, so
+    ///     the LINE is touched either way -- but a header write DIRTIES it, and
+    ///     a dirty line has to be written back. Marking 13M objects meant
+    ///     ~832 MB of writeback for 13M bits of information. In the bitmap the
+    ///     same information is `live_objects / 8` bytes, densely packed.
+    ///  3. **The sweep's per-survivor clear.** On a non-generational run the
+    ///     sweep otherwise only READS a survivor's header (`alloc_size`), so
+    ///     dropping this write means a whole-heap sweep no longer dirties the
+    ///     entire live set.
+    ///
+    /// # Geometry
+    ///
+    /// Constructed from the same `(arena_base, capacity)` as
+    /// [`Self::registry`], through the same constructor, so the two bitmaps
+    /// agree by construction about which addresses are representable. Costs a
+    /// second 1/64th of the arena, committed the same way and demand-faulted
+    /// the same way.
+    ///
+    /// # The invariant
+    ///
+    /// **Between collections every bit is clear**, exactly as
+    /// [`GC_FLAG_MARKED`] was: the sweep ends with a `clear_all`. That is
+    /// deliberately the same observable state as before rather than the
+    /// cheaper "leave them set, they are stale anyway" -- the between-cycles
+    /// readers ([`Self::is_marked_addr`], the census view) would otherwise all
+    /// need to learn about epochs, and each one that did not would silently
+    /// report last cycle's answer.
+    mark_bits: Option<ZObjectStartBits>,
 }
 
 // SAFETY: identical argument to `Heap`/`G1Collector` (heap.rs:143). The only
@@ -3720,6 +3881,18 @@ impl ZgcRealHeap {
             tlabs: ZArenaTlabRegistry::for_capacity(cap),
             tlab_enabled: AtomicBool::new(zgc_tlab_enabled_by_default()),
             dead_scratch: Mutex::new(Vec::new()),
+            // THE SAME TWO NUMBERS as `registry` above, through the same
+            // constructor. Any drift between the two grids would make an
+            // address the registry accepts unrepresentable in the mark bitmap,
+            // where it would silently spill to the exact side set.
+            mark_bits: {
+                let span = arena_end.saturating_sub(arena_base);
+                if zgc_mark_bits_enabled() && span > 0 {
+                    Some(ZObjectStartBits::labelled(arena_base, span, "mark"))
+                } else {
+                    None
+                }
+            },
         };
         // G2c: seed the arena's allocation policy to match the mode the flag just
         // chose. `set_generational_enabled` keeps them in step afterwards; doing
@@ -3964,7 +4137,15 @@ impl ZgcRealHeap {
         // mark set with a previous cycle's bits in it, which is a retained
         // object at best. Release builds skip the walk entirely, which is the
         // whole point.
-        if !known_clear || cfg!(debug_assertions) {
+        // THE BITMAP ARM DOES NOT WALK AT ALL, in either build. A `clear_all`
+        // is a linear store over `capacity / 512` bytes and does not scale with
+        // the object count, so the release build's reason for skipping (it
+        // would be clearing already-clear bits) and the debug build's reason
+        // for walking (verify the latch) both stop applying: there is nothing
+        // cheaper to skip to, and the counter the debug walk exists to produce
+        // -- `stale` -- costs a full registry walk to compute. The verification
+        // moves to `conc_bits_known_clear`'s own test.
+        if !self.mark_clear_all() && (!known_clear || cfg!(debug_assertions)) {
             let registered = self.registry.snapshot();
             snapshot_us = clock.lap();
             // ONE `bases()` call: it materialises a `Vec` of every registered
@@ -4224,7 +4405,7 @@ impl ZgcRealHeap {
         if !self.mark_active.load(Ordering::Relaxed) {
             return;
         }
-        self.header_ref(ptr).add_gc_flags(GC_FLAG_MARKED);
+        self.mark_set(ptr as usize);
         self.conc_black_allocations.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -9127,21 +9308,94 @@ impl ZgcRealHeap {
         }
     }
 
-    /// True iff the object at `base` carries the [`GC_FLAG_MARKED`] bit set by
-    /// the current cycle's mark phase. `base == 0` (null) is treated as not
-    /// live. Used as the `is_marked` predicate handed to the shared
-    /// [`ReferenceProcessor`] so weak/soft/phantom clearing observes the exact
-    /// liveness the trace computed.
+    // ---- THE MARK-BIT FUNNEL ----------------------------------------------
+    //
+    // Every read and write of this cycle's liveness bit goes through the four
+    // methods below, and nothing outside them names [`GC_FLAG_MARKED`] on this
+    // collector's path. That is what makes [`Self::mark_bits`] a kill switch
+    // rather than a fork: with it `None` the four are the header operations
+    // they replaced, byte for byte.
+    //
+    // They are `#[inline]` and branch on an `Option` that is fixed at heap
+    // construction, so the branch predicts perfectly and the header arm costs
+    // exactly what it did before.
+
+    /// Is the object at `base` marked live for this cycle? **Query only.**
+    ///
+    /// An implementation that marked as a side effect would answer "live,
+    /// because I just made it live" for every referent handed to
+    /// [`ReferenceProcessor`], and no weak, soft, phantom or cleaner reference
+    /// would ever be cleared again.
+    #[inline]
+    fn mark_is_set(&self, base: usize) -> bool {
+        match &self.mark_bits {
+            Some(bits) => bits.contains(base),
+            // SAFETY: every address reachable here is either a registered live
+            // allocation base (whose first HEADER_SIZE bytes are a valid
+            // header) or null, which every caller screens.
+            None => self.header_ref(base as *mut u8).gc_flags() & GC_FLAG_MARKED != 0,
+        }
+    }
+
+    /// Mark the object at `base`, reporting whether **this call** marked it.
+    ///
+    /// The exactly-once claim: `true` means the caller now owns the obligation
+    /// to trace the object's out-edges. See [`ZObjectStartBits::claim`] and
+    /// [`ObjectHeader::try_add_gc_flags`] for why a lost update here is fatal
+    /// rather than merely wasteful.
+    #[inline]
+    fn mark_claim(&self, base: usize) -> bool {
+        match &self.mark_bits {
+            Some(bits) => bits.claim(base),
+            // SAFETY: as `mark_is_set`.
+            None => self
+                .header_ref(base as *mut u8)
+                .try_add_gc_flags(GC_FLAG_MARKED),
+        }
+    }
+
+    /// Mark the object at `base`, unconditionally.
+    ///
+    /// For the callers that already know the bit is clear, or do not care —
+    /// the young cycle's old-generation pre-mark and the single-threaded
+    /// trace, both of which have just tested it.
+    #[inline]
+    fn mark_set(&self, base: usize) {
+        match &self.mark_bits {
+            Some(bits) => bits.insert(base),
+            // SAFETY: as `mark_is_set`.
+            None => self.header_ref(base as *mut u8).add_gc_flags(GC_FLAG_MARKED),
+        }
+    }
+
+    /// Clear **every** mark bit in the heap.
+    ///
+    /// One linear pass over `capacity / 512` bytes on the bitmap arm; on the
+    /// header arm the caller must still walk the registry, which is why this
+    /// answers `false` there instead of pretending to have done it.
+    ///
+    /// **Stop-the-world only** — see [`ZObjectStartBits::clear_all`].
+    #[must_use = "the header arm cannot clear in bulk and the caller must walk"]
+    fn mark_clear_all(&self) -> bool {
+        match &self.mark_bits {
+            Some(bits) => {
+                bits.clear_all();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// True iff the object at `base` is marked live by the current cycle's mark
+    /// phase. `base == 0` (null) is treated as not live. Used as the
+    /// `is_marked` predicate handed to the shared [`ReferenceProcessor`] so
+    /// weak/soft/phantom clearing observes the exact liveness the trace
+    /// computed.
     fn is_marked_addr(&self, base: usize) -> bool {
         if base == 0 {
             return false;
         }
-        // SAFETY: every address reachable here is either a registered live
-        // allocation base (whose first HEADER_SIZE bytes are a valid header)
-        // or null (handled above). Reference referents/objects discovered for
-        // this heap are always such bases.
-        let header = self.header_mut(base as *mut u8);
-        header.gc_flags() & GC_FLAG_MARKED != 0
+        self.mark_is_set(base)
     }
 
     /// This heap's [`census::ZSlotCensus`] — the reference-slot instrument.
@@ -11762,7 +12016,7 @@ impl census::ZCensusHeapView for ZgcRealHeap {
 
         for base in bases {
             let header = self.header_mut(base as *mut u8);
-            if header.gc_flags() & GC_FLAG_MARKED == 0 {
+            if !self.mark_is_set(base) {
                 continue;
             }
             let kind = match header.kind() {
@@ -12234,8 +12488,7 @@ impl mark::ZMarkContext for ZgcRealHeap {
             self.registry.contains(addr as usize),
             "try_mark on an address the engine did not gate through is_in_heap"
         );
-        self.header_ref(addr as usize as *mut u8)
-            .try_add_gc_flags(GC_FLAG_MARKED)
+        self.mark_claim(addr as usize)
     }
 
     /// Is the object at `addr` marked live for this cycle? **Query only.**
@@ -12255,7 +12508,7 @@ impl mark::ZMarkContext for ZgcRealHeap {
         if addr == 0 {
             return false;
         }
-        self.header_ref(addr as usize as *mut u8).gc_flags() & GC_FLAG_MARKED != 0
+        self.mark_is_set(addr as usize)
     }
 
     /// Report the object's **strong** out-edges, plus the three pin edges.
@@ -13410,17 +13663,35 @@ impl GarbageCollector for ZgcRealHeap {
         // reads it as live, and the sweep clears the bit and retains it. Folded
         // into a pass that already runs, so a young cycle costs no extra walk of
         // the registry.
+        //
+        // THE BITMAP ARM SPLITS THE PASS IN TWO, and only a young cycle keeps
+        // the walk. Clearing is `mark_clear_all` -- one linear store over
+        // `capacity / 512` bytes -- so a WHOLE-HEAP cycle no longer walks the
+        // registry here at all. That is a full pass over every registered
+        // object, with a read-modify-write of a scattered 64-byte line each,
+        // removed from every default (non-generational, non-concurrent)
+        // collection. A young cycle still walks, because pre-marking the old
+        // generation needs each object's `gc_age`, which lives nowhere but the
+        // header; it no longer WRITES the header, only the bitmap.
         let mut gen_old_retained = 0usize;
         if !marked_concurrently {
-            registered.for_each_base(|base| {
-                let header = self.header_mut(base as *mut u8);
-                if young_cycle && header.gc_age() >= promo_age {
-                    header.add_gc_flags(GC_FLAG_MARKED);
-                    gen_old_retained += 1;
-                } else {
-                    header.clear_gc_flags(GC_FLAG_MARKED);
-                }
-            });
+            let bulk_cleared = self.mark_clear_all();
+            if young_cycle {
+                registered.for_each_base(|base| {
+                    let header = self.header_mut(base as *mut u8);
+                    if header.gc_age() >= promo_age {
+                        self.mark_set(base);
+                        gen_old_retained += 1;
+                    } else if !bulk_cleared {
+                        header.clear_gc_flags(GC_FLAG_MARKED);
+                    }
+                });
+            } else if !bulk_cleared {
+                registered.for_each_base(|base| {
+                    self.header_mut(base as *mut u8)
+                        .clear_gc_flags(GC_FLAG_MARKED);
+                });
+            }
         }
         // The old generation's contribution to the root set. Computed after the
         // pre-mark so the mark bits and `addr_is_young` agree, and before either
@@ -13565,11 +13836,10 @@ impl GarbageCollector for ZgcRealHeap {
                     continue;
                 }
                 let header = self.header_mut(addr as *mut u8);
-                if header.gc_flags() & GC_FLAG_MARKED != 0 {
+                if !self.mark_claim(addr) {
                     continue; // already visited
                 }
                 let class_id = header.class_id.as_u32();
-                header.add_gc_flags(GC_FLAG_MARKED);
                 self.enumerate_references(addr as *mut u8, &mut work, skip_for(addr));
                 if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id) {
                     work.push(loader);
@@ -13626,8 +13896,7 @@ impl GarbageCollector for ZgcRealHeap {
                     c_unreg += 1;
                     continue; // not a current allocation (already swept earlier)
                 }
-                let header = self.header_mut(addr as *mut u8);
-                if header.gc_flags() & GC_FLAG_MARKED != 0 {
+                if self.mark_is_set(addr) {
                     c_marked += 1;
                     continue; // survived normally — stays registered, not finalized
                 }
@@ -13644,11 +13913,10 @@ impl GarbageCollector for ZgcRealHeap {
                         continue; // ZGC-4: same wild-child skip as the main loop
                     }
                     let h = self.header_mut(a as *mut u8);
-                    if h.gc_flags() & GC_FLAG_MARKED != 0 {
+                    if !self.mark_claim(a) {
                         continue;
                     }
                     let class_id = h.class_id.as_u32();
-                    h.add_gc_flags(GC_FLAG_MARKED);
                     self.enumerate_references(a as *mut u8, &mut work, skip_for(a));
                     if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id) {
                         work.push(loader);
@@ -13727,11 +13995,9 @@ impl GarbageCollector for ZgcRealHeap {
                 if addr == 0 || !registered.contains(addr) {
                     continue; // ZGC-4: same wild-child skip as the main loop
                 }
-                let header = self.header_mut(addr as *mut u8);
-                if header.gc_flags() & GC_FLAG_MARKED != 0 {
+                if !self.mark_claim(addr) {
                     continue;
                 }
-                header.add_gc_flags(GC_FLAG_MARKED);
                 self.enumerate_references(addr as *mut u8, &mut work, skip_for(addr));
             }
         }
@@ -13859,6 +14125,9 @@ impl GarbageCollector for ZgcRealHeap {
         let merge_dead_runs = self.gen_dead_runs_enabled.load(Ordering::Relaxed);
         // The run being accumulated, ARENA-RELATIVE, and the two engagement
         // counters. `None` between runs and after a flush.
+        // Can the mark bits be cleared in bulk after the loop, rather than one
+        // survivor's header at a time inside it? Read once, outside.
+        let bulk_clearable = self.mark_bits.is_some();
         let mut dead_run: Option<(usize, usize)> = None;
         let mut dead_runs = 0usize;
         let mut dead_in_runs = 0usize;
@@ -13902,12 +14171,25 @@ impl GarbageCollector for ZgcRealHeap {
                 // silent.
                 let Some(size) = Self::alloc_size(header) else {
                     unsizable += 1;
-                    header.clear_gc_flags(GC_FLAG_MARKED);
+                    if !bulk_clearable {
+                        header.clear_gc_flags(GC_FLAG_MARKED);
+                    }
                     return; // `return` and not `continue`: this is a closure now
                 };
-                if header.gc_flags() & GC_FLAG_MARKED != 0 {
-                    // Survivor: clear the mark bit for next cycle, keep it.
-                    header.clear_gc_flags(GC_FLAG_MARKED);
+                if self.mark_is_set(base) {
+                    // Survivor: keep it, and clear the mark bit for the next
+                    // cycle.
+                    //
+                    // ON THE BITMAP ARM THERE IS NOTHING TO CLEAR HERE. One
+                    // `clear_all` after the loop does the whole heap, which is
+                    // the difference between a linear store over
+                    // `capacity / 512` bytes and a read-modify-write of every
+                    // survivor's 64-byte header line -- i.e. between touching
+                    // 8 MB and dirtying the entire live set, on a phase that is
+                    // otherwise read-only on a non-generational run.
+                    if !bulk_clearable {
+                        header.clear_gc_flags(GC_FLAG_MARKED);
+                    }
                     bytes_copied += size;
                     objects_copied += 1;
                     // PHASE G: one more collection survived. `age_survivor`
@@ -14298,17 +14580,32 @@ impl GarbageCollector for ZgcRealHeap {
         // callsite. Adopting the metrics module is a larger step — it has to be
         // fed from every phase, not just here — so this line stays standalone
         // until then; replace it wholesale at that point.
-        // THE SWEEP HAS JUST MADE EVERY MARK BIT CLEAR -- but only on a cycle
-        // whose sweep was UNBOUNDED. A young cycle skips everything below
-        // `sweep_floor`, and those objects were pre-marked above, so their bits
-        // are still SET. Claiming otherwise would let the next mark start skip
-        // its clearing walk and hand the sweep a mark set carrying a previous
-        // cycle's bits, which retains whatever the old generation reached.
+        // EVERY MARK BIT IS CLEAR FROM HERE, and on the bitmap arm that is a
+        // statement about one linear store rather than about which objects the
+        // sweep happened to visit.
         //
+        // The header arm can only claim it for a cycle whose sweep was
+        // UNBOUNDED: a young cycle skips everything below `sweep_floor`, and
+        // those objects were pre-marked above, so their bits are still SET.
+        // Claiming otherwise there would let the next mark start skip its
+        // clearing walk and hand the sweep a mark set carrying a previous
+        // cycle's bits, retaining whatever the old generation reached.
+        //
+        // The bitmap arm has no such gap, because `clear_all` does not care
+        // what the sweep visited -- which is also why a young cycle on this arm
+        // costs nothing extra to leave clean. Placed AFTER the sweep block (the
+        // arena guard is released) and BEFORE compaction, which reads no mark
+        // bit by design -- see `relocate_stw`'s note on why its live set is a
+        // parameter.
+        let bits_clear = if self.mark_clear_all() {
+            true
+        } else {
+            sweep_floor == 0
+        };
         // See `conc_bits_known_clear`; the debug build walks anyway and
         // `debug_assert`s this rather than trusting it.
         self.conc_bits_known_clear
-            .store(sweep_floor == 0, Ordering::Release);
+            .store(bits_clear, Ordering::Release);
 
         let sweep_us = clock.lap();
         if let Some(started) = gc_started {
@@ -15685,6 +15982,202 @@ pub(crate) mod tests {
         (addrs, still)
     }
 
+    // ---- D2b: the mark bits, out of the object header ---------------------
+
+    /// Build a heap on a chosen mark-bit arm, without touching the process
+    /// environment (which would decide the arm for every other test in the
+    /// binary).
+    fn heap_on_mark_arm(bytes: usize, bitmap: bool) -> ZgcRealHeap {
+        let mut heap = ZgcRealHeap::with_capacity(bytes);
+        if bitmap {
+            assert!(
+                heap.mark_bits.is_some(),
+                "the default arm should be the bitmap; is CRATONVM_ZGC_MARKBITS \
+                 set in this process?"
+            );
+        } else {
+            heap.mark_bits = None;
+        }
+        heap.set_tlab_enabled(false);
+        heap
+    }
+
+    /// Allocate a chain of `n` objects, each pointing at the next, and return
+    /// their bases head-first.
+    fn mark_arm_chain(heap: &ZgcRealHeap, n: usize) -> Vec<usize> {
+        let objs: Vec<ObjectRef> = (0..n)
+            .map(|_| heap.alloc_object(ClassId::new(9), 1))
+            .collect();
+        for i in 0..n.saturating_sub(1) {
+            heap.set_field(objs[i], 0, Value::Object(Some(objs[i + 1])));
+        }
+        objs.into_iter().map(|o| o.as_ptr() as usize).collect()
+    }
+
+    /// **THE ARM-EQUIVALENCE TEST.** Both arms must reclaim exactly the same
+    /// objects.
+    ///
+    /// This is the claim the whole kill switch rests on: `CRATONVM_ZGC_MARKBITS=0`
+    /// is a re-run, not a different collector. The sweep that follows cannot
+    /// tell which storage the bits came from, so if the two arms ever disagree
+    /// about one object the difference is a retained object or a
+    /// use-after-free, and nothing else in the file would notice.
+    ///
+    /// Driven through the real `collect_garbage`, so it exercises the clear
+    /// pass, the trace, the reference phase and the sweep together.
+    #[test]
+    fn both_mark_arms_reclaim_exactly_the_same_objects() {
+        fn survivors_of(bitmap: bool) -> (usize, usize) {
+            let heap = heap_on_mark_arm(8 * 1024 * 1024, bitmap);
+            let live = mark_arm_chain(&heap, 200);
+            let garbage = mark_arm_chain(&heap, 200);
+            let head = unsafe { ObjectRef::from_raw(live[0] as *mut u8) };
+            let stw = unsafe { StopTheWorldToken::new_unchecked() };
+            let mut roots = [head];
+            heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            let kept = live.iter().filter(|a| heap.registry.contains(**a)).count();
+            let leaked = garbage.iter().filter(|a| heap.registry.contains(**a)).count();
+            (kept, leaked)
+        }
+        let bitmap = survivors_of(true);
+        let header = survivors_of(false);
+        assert_eq!(
+            bitmap, header,
+            "the two mark arms disagree: bitmap kept/leaked {bitmap:?}, header \
+             kept/leaked {header:?}"
+        );
+        assert_eq!(bitmap.0, 200, "the rooted chain must survive in full");
+        assert_eq!(bitmap.1, 0, "the unrooted chain must be reclaimed in full");
+    }
+
+    /// **The bitmap arm does not write the header's mark bit at all.**
+    ///
+    /// The saving is the write, so the test is on the write. A collection that
+    /// left `GC_FLAG_MARKED` set in a survivor's header would mean the funnel
+    /// has a hole -- some site still reaching for `add_gc_flags` -- and a
+    /// header-arm reader would then see a stale mark.
+    #[test]
+    fn the_bitmap_arm_leaves_the_header_mark_bit_untouched() {
+        let heap = heap_on_mark_arm(8 * 1024 * 1024, true);
+        let live = mark_arm_chain(&heap, 64);
+        let head = unsafe { ObjectRef::from_raw(live[0] as *mut u8) };
+        let stw = unsafe { StopTheWorldToken::new_unchecked() };
+        let mut roots = [head];
+        heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+        for base in &live {
+            assert_eq!(
+                heap.header_ref(*base as *mut u8).gc_flags() & GC_FLAG_MARKED,
+                0,
+                "0x{base:x} carries GC_FLAG_MARKED after a bitmap-arm collection \
+                 -- some mark site is not going through the funnel"
+            );
+        }
+    }
+
+    /// **`claim` is exactly-once, under real contention.**
+    ///
+    /// `true` from `mark_claim` means "you now own the obligation to trace this
+    /// object". Two `true`s are a double scan (wasteful); a lost update leaves
+    /// an object marked and never traced, so its children are swept while it is
+    /// alive and pointing at them. One `fetch_or` on a word shared with 63
+    /// neighbouring grid slots is what makes that exact.
+    ///
+    /// The exact edit that trips it: a `load` / `or` / `store` in
+    /// `ZObjectStartBits::claim`.
+    #[test]
+    fn a_contended_mark_claim_succeeds_exactly_once_per_object() {
+        const OBJECTS: usize = 512;
+        const THREADS: usize = 8;
+        let heap = std::sync::Arc::new(heap_on_mark_arm(8 * 1024 * 1024, true));
+        // Adjacent allocations, so most of them share a bitmap word with a
+        // neighbour -- which is the whole reason a plain RMW would lose one.
+        let bases: std::sync::Arc<Vec<usize>> =
+            std::sync::Arc::new(mark_arm_chain(&heap, OBJECTS));
+        let wins = std::sync::Arc::new(AtomicUsize::new(0));
+        let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let heap = std::sync::Arc::clone(&heap);
+            let bases = std::sync::Arc::clone(&bases);
+            let wins = std::sync::Arc::clone(&wins);
+            let start = std::sync::Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                let mut local = 0usize;
+                for b in bases.iter() {
+                    if heap.mark_claim(*b) {
+                        local += 1;
+                    }
+                }
+                wins.fetch_add(local, Ordering::Relaxed);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let total = wins.load(Ordering::Relaxed);
+        assert_eq!(
+            total, OBJECTS,
+            "{THREADS} threads claiming {OBJECTS} objects produced {total} wins; \
+             exactly one thread must win each object"
+        );
+        for b in bases.iter() {
+            assert!(heap.mark_is_set(*b), "0x{b:x} was claimed but is not marked");
+        }
+    }
+
+    /// **`clear_all` really clears, including the off-grid spill set.**
+    ///
+    /// The bulk clear is what replaces the registry walk, so a bulk clear that
+    /// missed anything would hand the next cycle's sweep a mark set carrying
+    /// the previous cycle's bits -- retaining whatever it reached, silently.
+    #[test]
+    fn the_bulk_mark_clear_leaves_nothing_set() {
+        let heap = heap_on_mark_arm(8 * 1024 * 1024, true);
+        let bases = mark_arm_chain(&heap, 128);
+        for b in &bases {
+            heap.mark_set(*b);
+        }
+        // An address the 8-byte grid cannot encode, which goes to the spill
+        // set -- the path a plain word memset would miss.
+        let off_grid = heap.arena_base + 3;
+        heap.mark_set(off_grid);
+        assert!(heap.mark_is_set(off_grid));
+        assert!(heap.mark_clear_all());
+        for b in &bases {
+            assert!(!heap.mark_is_set(*b), "0x{b:x} survived the bulk clear");
+        }
+        assert!(
+            !heap.mark_is_set(off_grid),
+            "the off-grid spill set survived the bulk clear"
+        );
+    }
+
+    /// **The header arm refuses the bulk clear, so its callers still walk.**
+    ///
+    /// `mark_clear_all` answers `false` there rather than pretending to have
+    /// done the work. A `true` would make every caller skip its walk and leave
+    /// every bit set -- which is the shape of a collector that retains
+    /// everything forever.
+    #[test]
+    fn the_header_arm_refuses_the_bulk_clear_so_its_callers_walk() {
+        let heap = heap_on_mark_arm(1024 * 1024, false);
+        let bases = mark_arm_chain(&heap, 16);
+        for b in &bases {
+            heap.mark_set(*b);
+        }
+        assert!(
+            !heap.mark_clear_all(),
+            "the header arm cannot clear in bulk and must say so"
+        );
+        for b in &bases {
+            assert!(
+                heap.mark_is_set(*b),
+                "0x{b:x} was cleared by a call that reported it had not cleared"
+            );
+        }
+    }
+
     /// **The registry prune does not depend on the dead SLICE.**
     ///
     /// It used to: the sweep collected every dead base into a `Vec` and then
@@ -16818,7 +17311,7 @@ pub(crate) mod tests {
         *OVERLAY_ARMED.lock() = None;
 
         assert!(
-            heap.header_ref(overlay.as_ptr()).gc_flags() & GC_FLAG_MARKED != 0,
+            heap.mark_is_set(overlay.as_ptr() as usize),
             "an overlay reachable only through a live owner must survive the mark"
         );
     }
@@ -16873,7 +17366,7 @@ pub(crate) mod tests {
         // Count what the parallel engine marked, directly off the headers.
         let par_marked = all
             .iter()
-            .filter(|o| par.header_ref(o.as_ptr()).gc_flags() & GC_FLAG_MARKED != 0)
+            .filter(|o| par.mark_is_set(o.as_ptr() as usize))
             .count();
 
         assert_eq!(
@@ -16909,7 +17402,7 @@ pub(crate) mod tests {
 
         for (name, obj) in [("root", root), ("child", child), ("grandchild", grandchild)] {
             assert!(
-                heap.header_ref(obj.as_ptr()).gc_flags() & GC_FLAG_MARKED != 0,
+                heap.mark_is_set(obj.as_ptr() as usize),
                 "{name} must be marked by the parallel engine"
             );
         }
@@ -16931,9 +17424,9 @@ pub(crate) mod tests {
             .expect("the driver must certify a complete mark set at a safepoint");
         heap.end_concurrent_mark_cycle();
 
-        assert!(heap.header_ref(root.as_ptr()).gc_flags() & GC_FLAG_MARKED != 0);
+        assert!(heap.mark_is_set(root.as_ptr() as usize));
         assert!(
-            heap.header_ref(orphan.as_ptr()).gc_flags() & GC_FLAG_MARKED == 0,
+            !heap.mark_is_set(orphan.as_ptr() as usize),
             "an unreachable object must not be marked, or nothing is ever collected"
         );
     }
@@ -19070,12 +19563,36 @@ pub(crate) mod tests {
             heap.allocated_bytes()
         );
 
-        // (4) THE MARK-BIT LATCH MUST BE DOWN.
-        assert!(
-            !heap.conc_bits_known_clear.load(Ordering::Acquire),
-            "objects below the floor keep the mark bit the pre-mark set, so the \
-             next mark start MUST do its clearing walk"
-        );
+        // (4) THE MARK-BIT LATCH, WHICH THE TWO ARMS ANSWER DIFFERENTLY.
+        //
+        // On the HEADER arm the latch must be DOWN: objects below the floor
+        // keep the mark bit the pre-mark set, the bounded sweep never visits
+        // them to clear it, and the next mark start MUST do its clearing walk
+        // or it hands the sweep a mark set carrying this cycle's old-generation
+        // bits.
+        //
+        // On the BITMAP arm it must be UP, and that is the point of the arm:
+        // `mark_clear_all` does not care what the sweep visited, so a young
+        // cycle leaves the heap clean for the price of one linear store. A
+        // `false` here would mean the bulk clear did not run.
+        if heap.mark_bits.is_some() {
+            assert!(
+                heap.conc_bits_known_clear.load(Ordering::Acquire),
+                "the bitmap arm clears every bit after the sweep whatever the \
+                 floor was, so the latch must be UP"
+            );
+            assert!(
+                !heap.mark_is_set(roots[0].as_ptr() as usize),
+                "a survivor below the floor is still marked after a young \
+                 cycle's bulk clear"
+            );
+        } else {
+            assert!(
+                !heap.conc_bits_known_clear.load(Ordering::Acquire),
+                "objects below the floor keep the mark bit the pre-mark set, so \
+                 the next mark start MUST do its clearing walk"
+            );
+        }
 
         // And the old generation is intact and walkable.
         assert_eq!(conc_walk_chain(&heap, roots[0]), chain);
