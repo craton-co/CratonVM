@@ -2509,6 +2509,27 @@ pub struct G1Collector {
     /// out from under a `finalize()` that has not run yet.
     finalizer_pause: AtomicBool,
 
+    /// The addresses [`Self::collect_garbage_with_finalizers`] was handed this
+    /// pause, kept for [`Self::eager_reclaim_humongous_locked`].
+    ///
+    /// Separate from `pending_finalizer_roots` for the reason that field's doc
+    /// gives -- Phase 3.5 CONSUMES that list with `std::mem::take`, so by the
+    /// time eager reclaim runs it is empty on every path. This copy is not
+    /// consumed, so the reclaim can name the one shape `finalizer_pause` used
+    /// to decline the entire reclaim for: a HUMONGOUS object with a finalizer,
+    /// which is dead, is never in the CSet, is therefore never resurrected, and
+    /// so is invisible to the census.
+    ///
+    /// Naming those spans is strictly cheaper than the gate it replaces.
+    /// `finalizer_pause` is true for ANY registered not-yet-enqueued
+    /// finalizable object -- one live `FileInputStream` is enough -- so the gate
+    /// disabled eager humongous reclaim for the whole process. Measured on H2
+    /// `TestKillProcessWhileWriting` (2026-09-02), gate versus no gate:
+    /// 76 787 young pauses -> **88**, humongous regions 830 -> **26**, free
+    /// regions 184 -> **980**, collection set 1.2 -> **128** regions, and the
+    /// class goes from a 900 s cap to **passing in 633 s**.
+    finalizer_addrs_this_pause: Mutex<Vec<usize>>,
+
     /// Persistent parallel-evacuation worker threads (see [`crate::evac_pool`]).
     ///
     /// Created on the FIRST parallel pause rather than in [`G1Collector::new`],
@@ -2787,6 +2808,7 @@ impl G1Collector {
             v7b_reported: Mutex::new(std::collections::HashSet::new()),
             reference_skip: Mutex::new(FxHashSet::default()),
             pending_finalizer_roots: Mutex::new(Vec::new()),
+            finalizer_addrs_this_pause: Mutex::new(Vec::new()),
             resurrected_finalizers: Mutex::new(Vec::new()),
             kept_unresolved_regions: Mutex::new(std::collections::HashSet::new()),
             kept_unresolved_live: Mutex::new(std::collections::HashSet::new()),
@@ -5700,6 +5722,9 @@ impl G1Collector {
         monitors: &dyn MonitorCleanup,
     ) -> (GcResult, Vec<usize>) {
         *self.pending_finalizer_roots.lock() = finalizer_addrs.to_vec();
+        // The copy Phase 3.5 does not consume — see
+        // `finalizer_addrs_this_pause`.
+        *self.finalizer_addrs_this_pause.lock() = finalizer_addrs.to_vec();
         self.resurrected_finalizers.lock().clear();
         self.finalizer_pause
             .store(!finalizer_addrs.is_empty(), Ordering::Relaxed);
@@ -5710,6 +5735,7 @@ impl G1Collector {
         // (e.g. an empty-CSet early return) so a later plain collection
         // never sees stale candidates.
         self.pending_finalizer_roots.lock().clear();
+        self.finalizer_addrs_this_pause.lock().clear();
         self.finalizer_pause.store(false, Ordering::Relaxed);
         let mut dead = std::mem::take(&mut *self.resurrected_finalizers.lock());
         // `retry_after_evacuation_failure` (run inside collect_garbage,
@@ -10065,12 +10091,14 @@ impl G1Collector {
         if !self.mark_worklist.lock().is_empty() {
             return Some("the gray set is non-empty");
         }
-        if self.finalizer_pause.load(Ordering::Relaxed) && !g1_ignore_finalizer_gate() {
-            // NOT `pending_finalizer_roots.is_empty()`: Phase 3.5 has already
-            // taken that list by the time this runs, so the obvious test passes
-            // unconditionally. See the `finalizer_pause` field.
-            return Some("an object registered for finalization is awaiting finalize()");
-        }
+        // NO FINALIZER GATE. It used to decline the entire reclaim whenever
+        // `finalizer_pause` was set, and that flag is true for ANY registered
+        // not-yet-enqueued finalizable object -- one live `FileInputStream` is
+        // enough -- so eager humongous reclaim never ran for the life of the
+        // process. `eager_reclaim_humongous_locked` now names the exact shape
+        // the gate was protecting (a humongous object WITH a finalizer, which
+        // is never in the CSet and so is never resurrected) in its live set
+        // instead. See `finalizer_addrs_this_pause`.
         if pointer_map.iter().any(|(old, new)| old == new) {
             return Some("evacuation failure kept cset regions phase 4 never walked");
         }
@@ -10139,6 +10167,24 @@ impl G1Collector {
         };
         for root in roots {
             note_addr(&mut live, root.as_ptr() as usize);
+        }
+        // EVERY object registered for finalization this pause, at the address
+        // it had when the pause started. This is what replaced the wholesale
+        // `finalizer_pause` decline, and it is aimed at the one shape that
+        // decline existed for: a HUMONGOUS object with a finalizer. Such an
+        // object is unreachable (that is why it is being finalized), is never
+        // in the CSet (humongous spans are not evacuated), and therefore never
+        // reaches `resurrected_finalizers` — so nothing else in this function
+        // would name it live and the span would be freed out from under a
+        // `finalize()` that has not run.
+        //
+        // A dead finalizable object that merely REFERENCES a humongous span
+        // needs nothing extra: the census counts references from dead holders
+        // too (see `HumongousCensus::referenced`, "over-approximates
+        // liveness"), and a resurrected one is walked at its post-copy address
+        // by the loop below.
+        for &addr in self.finalizer_addrs_this_pause.lock().iter() {
+            note_addr(&mut live, addr);
         }
         // Post-copy addresses of objects resurrected for finalization this
         // pause: unreachable by definition, and exactly why they need naming.
@@ -13903,34 +13949,6 @@ fn g1_late_header_write() -> bool {
 ///
 /// The one-binary A/B for the split. With it set, `TestKillProcessWhileWriting`
 /// goes back to retaining every region on essentially every cycle.
-/// `CRATONVM_G1_IGNORE_FINALIZER_GATE=1` -- **DELIBERATELY UNSOUND**, a probe
-/// and nothing else. Default OFF, and it must stay that way.
-///
-/// It removes the `finalizer_pause` gate from
-/// [`G1Collector::eager_reclaim_early_decline`] so eager humongous reclaim can
-/// run on a heap that has registered finalizable objects. That is NOT SAFE: a
-/// registered finalizable object that is dead and outside this pause's CSet is
-/// unreachable from the humongous census, so a span it references reads as
-/// unreferenced and would be freed under an object that still has to be
-/// finalized -- a use-after-free.
-///
-/// It exists to answer one question before a sound fix is built for it: is that
-/// gate what leaves the H2 workload with 829 of 1024 regions humongous, Eden at
-/// 1.1 regions and 80 young pauses per second? A hypothesis about a cause is
-/// worth a probe before it is worth an engineering change.
-fn g1_ignore_finalizer_gate() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_G1_IGNORE_FINALIZER_GATE")
-            .and_then(|v| v.into_string().ok())
-            .map(|v| {
-                let v = v.trim().to_ascii_lowercase();
-                !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
-            })
-            .unwrap_or(false)
-    })
-}
-
 fn mark_oob_failsafe() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -15592,6 +15610,74 @@ mod tests {
             "an open mark cycle must suppress eager reclaim: SATB snapshot \
              liveness applies and the gray set holds addresses this pause \
              never walked"
+        );
+    }
+
+    /// A HUMONGOUS object WITH A FINALIZER must survive its own unreachability
+    /// until `finalize()` has run.
+    ///
+    /// This is the exact shape the wholesale `finalizer_pause` decline existed
+    /// for, and the reason removing that decline needed a replacement rather
+    /// than a deletion: the object is unreachable (that is why it is being
+    /// finalized), a humongous span is never in the CSet so Phase 3.5 never
+    /// resurrects it, and nothing else in `eager_reclaim_humongous_locked`
+    /// would name it live. Naming it from `finalizer_addrs_this_pause` is what
+    /// keeps it, and this test is what keeps that true.
+    ///
+    /// The gate it replaced was not free: `finalizer_pause` is set for ANY
+    /// registered not-yet-enqueued finalizable object, so a single live one
+    /// disabled eager humongous reclaim for the whole process — measured on H2
+    /// as 830 of 1024 regions humongous and 76 787 young pauses per 900 s,
+    /// against 26 and 88 without it.
+    #[test]
+    fn a_humongous_object_awaiting_finalization_is_never_eagerly_reclaimed() {
+        let gc = make_collector();
+        let doomed = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 100_000);
+        assert_eq!(gc.count_regions(RegionType::HumongousStart), 1);
+        let addr = doomed.as_ptr() as usize;
+        // Unreachable from any root, and registered for finalization: exactly
+        // the state the reference processor hands to the collector.
+        let _churn = gc.alloc_object(ClassId::new(1), 1);
+        let mut roots: Vec<ObjectRef> = vec![];
+        let (_result, _dead) =
+            gc.collect_garbage_with_finalizers(&stw(), &mut roots, &[addr], &NoopMonitors);
+
+        assert_eq!(
+            gc.count_regions(RegionType::HumongousStart),
+            1,
+            "a humongous object registered for finalization must not be reclaimed \
+             before finalize() runs: it is unreachable by construction, and a \
+             humongous span is never in the CSet, so nothing else names it live"
+        );
+    }
+
+    /// ...and the other half of that change: a humongous span that is merely
+    /// unreachable, on a pause that HAS finalizer candidates, is still
+    /// reclaimed. The old gate declined outright here, which is what disabled
+    /// the feature for any process holding one finalizable object.
+    #[test]
+    fn an_unrelated_finalizer_candidate_no_longer_suppresses_eager_reclaim() {
+        let gc = make_collector();
+        let keeper = gc.alloc_object(ClassId::new(1), 1);
+        let _dead_span = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 100_000);
+        assert_eq!(gc.count_regions(RegionType::HumongousStart), 1);
+
+        let _churn = gc.alloc_object(ClassId::new(1), 1);
+        let mut roots: Vec<ObjectRef> = vec![keeper];
+        // A finalizer candidate that is NOT the humongous span.
+        let (_result, _dead) = gc.collect_garbage_with_finalizers(
+            &stw(),
+            &mut roots,
+            &[keeper.as_ptr() as usize],
+            &NoopMonitors,
+        );
+
+        assert_eq!(
+            gc.count_regions(RegionType::HumongousStart),
+            0,
+            "an unreachable humongous span must still be reclaimed on a pause \
+             that merely HAS finalizer candidates -- declining here is what left \
+             830 of 1024 regions humongous on the H2 workload"
         );
     }
 

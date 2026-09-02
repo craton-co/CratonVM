@@ -835,12 +835,11 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-87 tokens.
+86 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `g1-late-header-write` | `CRATONVM_G1_LATE_HEADER_WRITE` |
-| `g1-ignore-finalizer-gate` | `CRATONVM_G1_IGNORE_FINALIZER_GATE` |
 | `g1-mark-oob-failsafe` | `CRATONVM_G1_MARK_OOB_FAILSAFE` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `moving-young-bounds-guard` | `CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD` |
