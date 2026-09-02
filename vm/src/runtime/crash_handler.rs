@@ -692,15 +692,6 @@ pub fn write_crash_report(info: &CrashInfo, path: &Path) -> io::Result<()> {
 mod windows_fault {
     use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-    // The fault handler names the faulting thread with the parent module's
-    // TLS-teardown-safe reader (`current_thread_name`, which falls back to the
-    // published name table when `std::thread::current()` is already gone).
-    // Needed as an explicit import because this is a nested `mod`, and because
-    // it is `#[cfg(windows)]` a missing one is invisible to a Linux build:
-    // `f013c771e` added the call and every Windows `cargo check -p cratonvm-vm`
-    // has failed since.
-    use super::current_thread_name;
-
     #[repr(C)]
     struct ExceptionRecord {
         exception_code: u32,
@@ -3210,24 +3201,14 @@ pub fn current_thread_name() -> Option<String> {
     {
         use core::ffi::c_void;
         extern "system" {
-            // `isize`, NOT `*mut c_void`, and the difference is a build error
-            // rather than a style choice: `jit::helpers` declares the same
-            // symbol as `-> isize` (it threads handles through
-            // `DuplicateHandle(sh: isize, ..)`), and `clashing_extern_declarations`
-            // is `-D`-denied in this workspace. Declaring it as a pointer here
-            // made every WINDOWS `cargo check -p cratonvm-vm` fail while a
-            // Linux CI leg stayed green, because this whole block is
-            // `#[cfg(windows)]`. The handle is pointer-sized either way; the
-            // one call site casts. See the identical note on
-            // `GetCurrentProcess` in `jit/src/../helpers.rs`.
-            fn GetCurrentThread() -> isize;
+            fn GetCurrentThread() -> *mut c_void;
             fn GetThreadDescription(thread: *mut c_void, out: *mut *mut u16) -> i32;
             fn LocalFree(mem: *mut c_void) -> *mut c_void;
         }
         let mut wide: *mut u16 = core::ptr::null_mut();
         // SAFETY: `GetThreadDescription` writes a LocalAlloc'd, NUL-terminated
         // UTF-16 buffer into `wide` on success; we free it below.
-        let hr = unsafe { GetThreadDescription(GetCurrentThread() as *mut c_void, &mut wide) };
+        let hr = unsafe { GetThreadDescription(GetCurrentThread(), &mut wide) };
         if hr < 0 || wide.is_null() {
             return None;
         }
