@@ -2923,9 +2923,25 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
     // frame reports "not verified", never "verified clean". The gate is on the
     // UNION being live, so a collector that publishes neither table still gets
     // the refusal it had before rather than a quiet pass.
-    if bounds_guard_enabled() && !cratonvm_gc::gen_heap::movable_bounds_are_live() {
-        *reason_out = cratonvm_gc::gc_quiescence::incomplete_reason::YOUNG_BOUNDS_UNPUBLISHED;
-        return true;
+    //
+    // The gate has TWO ways to fire and they are reported apart, because the
+    // second one looks like success from every angle the first is checked
+    // from. A table can be useless because it is empty (nobody published) or
+    // because it is about somebody else: both tables are process-global and
+    // discriminated by slot 0, so each describes exactly ONE heap, and a second
+    // live heap leaves the loser's every address answering `false` to
+    // `addr_is_movable` — published, fresh, and not about these frames. See
+    // `gen_heap::RELOCATABLE_HEAPS_LIVE`.
+    if bounds_guard_enabled() {
+        if !cratonvm_gc::gen_heap::published_bounds_represent_every_live_heap() {
+            *reason_out =
+                cratonvm_gc::gc_quiescence::incomplete_reason::BOUNDS_NOT_REPRESENTATIVE;
+            return true;
+        }
+        if !cratonvm_gc::gen_heap::movable_bounds_are_live() {
+            *reason_out = cratonvm_gc::gc_quiescence::incomplete_reason::YOUNG_BOUNDS_UNPUBLISHED;
+            return true;
+        }
     }
     let scanner_sp = current_stack_pointer();
     let mut unverified = false;
@@ -4092,20 +4108,36 @@ fn dbg_swchain_enabled() -> bool {
     *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SWCHAIN").is_some())
 }
 
-/// Kill switch for the bytecode index carried on
-/// [`active_compiled_frames_with_bci`].
+/// Kill switch for the bytecode index carried on [`ActiveCompiledFrame`].
 ///
 /// Default ON. `CRATONVM_JIT_NO_COMPILED_FRAME_LINES=1` makes every compiled
-/// frame report `None`, which is exactly the `byte_code_index: -1` /
+/// frame report `bci: -1`, which is exactly the `byte_code_index: -1` /
 /// `(Unknown Source)` answer every compiled frame gave before 2026-09-01. The
 /// point of the switch is that a line that looks wrong in a warmed-up trace
 /// can be attributed — one environment variable decides whether it came from
 /// this recovery or from the method's own `LineNumberTable`, inside ONE
-/// binary.
+/// binary. It reverts the OSR line with it: `stackwalker`'s display-only
+/// override is the bci of a compiled half that no longer has one.
 fn compiled_frame_bci_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_COMPILED_FRAME_LINES").is_none()
+    })
+}
+
+/// Kill switch for the inlined-callee chain carried on
+/// [`ActiveCompiledFrame`].
+///
+/// Default ON, and the SAME variable the emitter half reads
+/// (`x64::inlining`'s `inline_frame_map_enabled`), because a half-switched
+/// feature is worse than either state: with the map emitted and the walk
+/// ignoring it the artifact pays for metadata nobody reads, and with the walk
+/// reading a map that was never emitted every frame silently loses its
+/// callees. One variable, both halves.
+fn inline_frame_chains_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_FRAME_MAP").is_none()
     })
 }
 
@@ -4125,395 +4157,92 @@ fn plausible_bci(recorded: u32) -> Option<u32> {
     (recorded < MAX_CODE_LENGTH).then_some(recorded)
 }
 
-/// Census of [`compiled_frame_bci`]'s two evidence sources, and of the ways it
-/// refuses.
+/// One live compiled activation, as a stack capture needs it.
 ///
-/// # Why this exists
-///
-/// Every direct compiled-to-compiled call in the x64 single-pass backend filed
-/// its oop map 9-25 bytes PAST the return address, because the emitter ran
-/// `emit_post_call_rbp_republish` between the `CALL` and
-/// `emit_oop_map_for_safepoint` and the map records `native_pc_offset =
-/// buf.pos()` at the moment it runs. So [`compiled_frame_bci`]'s exact
-/// `native_pc_offset` lookup -- evidence source 1, the precise one -- missed
-/// EVERY time it was attempted, and fell through to the coarser safepoint-id
-/// slot, which answered. The function returned a bci either way.
-///
-/// Nobody noticed for as long as the defect existed, and the reason is the only
-/// lesson worth keeping: a silent fallback that produces a plausible answer is
-/// indistinguishable, from the outside, from the precise path working. There
-/// was no number that could have disagreed. Two atomics beside that `find`
-/// would have named it years earlier (`.agent-requests/B5-wiring.txt` (4)), so
-/// here they are.
-///
-/// # How to read it
-///
-/// The reading that matters is `exact_missed_fell_back` against `exact_hit`. A
-/// large `exact_missed_fell_back` with a near-zero `exact_hit` is the defect
-/// above, or a fresh instance of it: the map keys and the return addresses do
-/// not agree. `fallback_sp_id_hit` is deliberately NOT named as a success --
-/// it is the count of frames whose line number came from the coarser evidence,
-/// which is a correct answer arrived at through a degraded route.
-///
-/// `exact_unavailable` is the CONTROL, and it is why a raw miss count would
-/// mislead: the innermost activation of every chain owns no return address on
-/// this stack, so its `native_pc` is `None` by construction and it can only
-/// ever use the safepoint-id slot. Those frames are not misses. Without this
-/// bucket they would be indistinguishable from them, and the ratio the first
-/// paragraph asks you to read would be wrong by however deep the walk went.
-///
-/// The emitter half of the same census is
-/// `jit::x64::inline_call_map_at_return_counts()` (`stamped-at-return`,
-/// `already-at-return`, `no-map`, `refused`, `reverted`). One run carrying both
-/// is what confirms the emitter's `stamped-at-return` is actually being SPENT:
-/// its stamps and this module's `exact_hit` should move together.
-///
-/// # Invariant, so a reading can be checked rather than trusted
-///
-/// Exactly one TERMINAL outcome is counted per call:
-///
-/// ```text
-/// calls = exact_hit + fallback_sp_id_hit + refused_ir_backend
-///       + refused_no_sp_id_slot + refused_implausible_bci + refused_no_evidence
-/// ```
-///
-/// and, orthogonally, exactly one ROUTE is counted for every call that got past
-/// the two up-front refusals:
-///
-/// ```text
-/// calls - refused_ir_backend - refused_no_sp_id_slot
-///       = exact_hit + exact_missed_fell_back + exact_unavailable
-/// ```
-///
-/// A snapshot that violates either has a counting bug, not a finding.
-///
-/// # Why the counters are ungated
-///
-/// Unlike `jit::helpers::ref_load_census` -- whose per-site counts sit behind a
-/// cached flag read because they ride the hottest reference read in the VM --
-/// [`compiled_frame_bci`] runs once per compiled frame per STACK CAPTURE
-/// (a throw, a `getStackTrace`, a `StackWalker`), and only when
-/// `compiled_frame_bci_enabled()` already said yes. A relaxed increment there
-/// is far below the `String` clone the same walk performs per frame. Ungated
-/// buys the property that matters here: a zero is a real zero, and cannot be a
-/// counter nobody switched on. Only the PER-EVENT detail is gated, on the
-/// existing `CRATONVM_DBG_SWCHAIN` -- the flag that already dumps this exact
-/// walk, including "how the innermost frame resolved" -- rather than on a new
-/// name.
-pub mod bci_lookup_census {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    /// Evidence source 1 answered: the frame's return address hit an oop map
-    /// recorded under that exact `native_pc_offset`, and its `bytecode_pc` was
-    /// a plausible bci. The precise route.
-    pub const EXACT_HIT: usize = 0;
-    /// Evidence source 1 was ATTEMPTED and produced nothing, so the lookup fell
-    /// back to the safepoint-id slot. **This is the number the defect above
-    /// would have shown.** It is a fallback, not a success, whatever the call
-    /// went on to return.
-    pub const EXACT_MISSED_FELL_BACK: usize = 1;
-    /// Evidence source 1 could not be attempted: no `native_pc` (the innermost
-    /// activation of a chain owns no return address on this stack), or one
-    /// outside the artifact's body. The control arm -- see the module doc.
-    pub const EXACT_UNAVAILABLE: usize = 2;
-    /// The safepoint-id slot answered. A correct bci by the coarser route.
-    pub const FALLBACK_HIT: usize = 3;
-    /// Refused: an optimizing-IR-backend artifact, whose `bytecode_pc` is a
-    /// monotonic safepoint counter and not a bci at all.
-    pub const REFUSED_IR_BACKEND: usize = 4;
-    /// Refused: the artifact carries no safepoint-id slot (`sp_id_slot_off ==
-    /// 0`) -- compiled without the precise gate, or aarch64.
-    pub const REFUSED_NO_SP_ID_SLOT: usize = 5;
-    /// Refused: the recovered value is outside the spec's bci range (>= 65536).
-    /// See `plausible_bci`; both synthetic pcs the backend stamps land here.
-    pub const REFUSED_IMPLAUSIBLE_BCI: usize = 6;
-    /// Refused: no validated `rbp`, or the slot held no id, or the artifact's
-    /// own table never recorded the id it held. Not one of the three documented
-    /// refusals -- it is the residue that makes the invariant in the module doc
-    /// balance, and a rising count here is a stack-walk finding rather than a
-    /// metadata one.
-    pub const REFUSED_NO_EVIDENCE: usize = 7;
-
-    const N: usize = 8;
-    const NAMES: [&str; N] = [
-        "exact_hit",
-        "exact_missed_fell_back",
-        "exact_unavailable",
-        "fallback_sp_id_hit",
-        "refused_ir_backend",
-        "refused_no_sp_id_slot",
-        "refused_implausible_bci",
-        "refused_no_evidence",
-    ];
-
-    static COUNTS: [AtomicU64; N] = [
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-    ];
-
-    /// Count one outcome, one of the constants above. Relaxed and advisory: it
-    /// carries no happens-before relationship with the metadata it describes.
-    #[inline]
-    pub(super) fn note(slot: usize) {
-        if let Some(c) = COUNTS.get(slot) {
-            c.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// One `[swchain] bci ...` line per lookup, on `CRATONVM_DBG_SWCHAIN=1`.
+/// Replaces the `(depth, label, class_id, cm_ptr)` tuple this function used to
+/// return. The tuple was the reason a compiled frame had no line number: it
+/// carried no bytecode index, and `stackwalker::compiled_frame_entry` — the
+/// only consumer that wants one — could therefore do nothing but hard-code
+/// `LINE_NUMBER_UNKNOWN`. See
+/// `internal/fixed-bugs/jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901.md`.
+#[derive(Debug, Clone)]
+pub struct ActiveCompiledFrame {
+    /// Interpreter depth this activation's chain entry was pushed at; the
+    /// splice point in `stackwalker::interleave_compiled_frames`.
+    pub interp_depth: u32,
+    /// `"class/Name.method:descriptor"`, from the artifact's `method_label`.
+    pub label: String,
+    /// `ObjectHeader` class id of the artifact's owner.
+    pub owner_class_id: u32,
+    /// The `CompiledMethod` this activation is running, as a raw address.
+    /// Valid for exactly as long as the frame is live.
+    pub cm_ptr: usize,
+    /// Bytecode index this activation is stopped at, or `-1` when the frame
+    /// published no usable safepoint id. NEVER a guess: see
+    /// [`activation_bci`].
+    pub bci: i32,
+    /// The callees the JIT INLINED into this artifact at the program point
+    /// this activation is standing at, INNERMOST FIRST, as
+    /// `("class/Name.method:descriptor", bci)` pairs — the label in the same
+    /// shape [`ActiveCompiledFrame::label`] uses, so one splitter parses both,
+    /// and the bci in that callee's own code.
     ///
-    /// The flag is REUSED rather than minted: it already gates the dump of this
-    /// same walk, including how the innermost frame resolved, so a run
-    /// diagnosing a wrong line gets both halves from one variable. The counters
-    /// above are unaffected by it -- only this per-event detail is gated.
-    pub(super) fn trace(
-        outcome: &str,
-        cm: &cratonvm_jit::CompiledMethod,
-        native_offset: Option<u32>,
-        bci: Option<u32>,
-    ) {
-        if !super::dbg_swchain_enabled() {
-            return;
-        }
-        let off = match native_offset {
-            Some(o) => o.to_string(),
-            None => String::from("-"),
-        };
-        let b = match bci {
-            Some(v) => v.to_string(),
-            None => String::from("-"),
-        };
-        eprintln!(
-            "[swchain] bci {outcome} method={} native_off={off} bci={b} maps={}",
-            cm.method_label,
-            cm.oop_maps.len(),
-        );
-    }
-
-    /// The eight counters, in the order of the constants above.
-    ///
-    /// Always real numbers, unlike `jit::helpers::ref_load_census::snapshot`'s
-    /// `Option` -- these are ungated, so there is no "switched off" state for a
-    /// zero to be confused with. See the module doc for why that trade goes the
-    /// other way here.
-    pub fn snapshot() -> Vec<(&'static str, u64)> {
-        NAMES
-            .iter()
-            .zip(COUNTS.iter())
-            .map(|(n, c)| (*n, c.load(Ordering::Relaxed)))
-            .collect()
-    }
-
-    /// One `[JIT_BCI_LOOKUPS]` line on stderr.
-    ///
-    /// Prints `exact_missed_fell_back` beside `exact_hit` deliberately: the
-    /// pair is the reading, and a total would hide it.
-    pub fn report() {
-        let mut line = String::from("[JIT_BCI_LOOKUPS]");
-        for (name, n) in snapshot() {
-            line.push_str(&format!(" {name}={n}"));
-        }
-        eprintln!("{line}");
-    }
+    /// It is HotSpot's `ScopeDesc` chain, and it is why a compiled frame is
+    /// not one frame: an inlined callee pushes nothing and, before this,
+    /// contributed nothing to a trace. Empty for every non-inlining method and
+    /// for every refusal on the producer side, and an empty chain reproduces
+    /// the historical one-entry-per-artifact answer exactly. See
+    /// [`compiled_frame_inline_chain`].
+    pub inline_chain: Vec<(String, u32)>,
 }
 
-/// The bytecode index a live compiled frame is standing at — the same one a
-/// deopt at this point would resume the interpreter at — or `None` when it
-/// cannot be established from evidence the artifact itself vouches for.
+/// The bytecode index a live compiled activation is stopped at.
 ///
-/// # Why this needs no new metadata
+/// Reads the safepoint id the emitter publishes into `[rbp - sp_id_slot_off]`
+/// before every GC-capable call — the same slot `moving_young_frame_live_hi`
+/// and the precise root walkers already key off — and then REQUIRES that the
+/// artifact actually recorded a safepoint with that id.
 ///
-/// The precise-oop-map machinery already emits a PC->bci map: every
-/// GC-capable safepoint pushes an [`cratonvm_jit::OopMapEntry`] whose
-/// `native_pc_offset` is the offset of the instruction AFTER the call and
-/// whose `bytecode_pc` is the `cur_bc_pc` that call was emitted under, and the
-/// prologue+call pair maintain the same value in the frame's own safepoint-id
-/// slot so a walker can read it while a helper is active. This function is two
-/// lookups into that existing table; it invents nothing.
+/// That second half is what makes this safe to put on a stack trace. The slot
+/// is written before a call, so between calls it holds the id of the last
+/// safepoint rather than the current position; and an artifact that reserves no
+/// slot leaves whatever the frame's uninitialised memory held. Requiring the id
+/// to name one of THIS artifact's own recorded safepoints rejects both, at the
+/// cost of answering `None` for a frame stopped somewhere no safepoint covers.
+/// A frame with no line is what this page's own reasoning asked for over a
+/// frame with a wrong one, and it is what the caller falls back to.
 ///
-/// Two evidence sources, in decreasing order of exactness:
-///
-///   1. **`native_pc`** — for every frame below the innermost one, the
-///      RBP-chain walk already read the return address into it, which is by
-///      construction the instruction after a call. That is precisely the key
-///      `native_pc_offset` is recorded under, so an exact hit names the bci of
-///      the call this frame is suspended in. No memory outside the artifact's
-///      own metadata is touched.
-///   2. **The safepoint-id slot** — the innermost frame has no return address
-///      of its own on this stack (its caller's does), so its position comes
-///      from `[rbp - sp_id_slot_off]`, the word the emitter stores immediately
-///      before each GC-capable call. It is only accepted when the artifact's
-///      own table has a map recorded under that id, which is what rejects a
-///      slot that was never written (the prologue stamps `u32::MAX - 1` there
-///      exactly so this fails closed) and a slot holding an oop rather than an
-///      id — both of which have been measured on this walk
-///      (`a-zgc-compaction-refusal-traced-four-levels-to-a-frames-sp-id-slot`).
-///
-/// # What it refuses, and why refusing is the whole point
+/// # Two more things it refuses
 ///
 /// * **The optimizing IR backend** (`used_ir_backend`). There
 ///   `OopMapEntry::bytecode_pc` is NOT a bci: `ir_lower` stores a monotonic
-///   safepoint counter starting at 1 (its own doc says so, and the single-pass
-///   backend's `SP_ID_UNSET_BC_PC` comment explains why THAT backend cannot do
-///   the same). Those ids are small integers indistinguishable from plausible
-///   bcis, so reading one as a bci would resolve a real, confidently-wrong
-///   line — the single worst outcome available here. An IR-tier frame
-///   therefore keeps `-1`, as it did before; giving it a line needs a
-///   safepoint-id -> bci side table the artifact does not carry today.
-/// * **Any artifact with no safepoint-id slot** (`sp_id_slot_off == 0`). That
-///   is the recorded flag for "compiled without the precise gate", and it is
-///   also true of every aarch64 artifact, whose backend hard-codes
-///   `bytecode_pc: 0` — which would otherwise resolve every compiled frame to
-///   the first line of its method.
-/// * **Anything outside the spec's bci range** — see [`plausible_bci`].
+///   safepoint counter starting at 1 (its own doc says so, and the
+///   single-pass backend's `SP_ID_UNSET_BC_PC` comment explains why THAT
+///   backend cannot do the same). Those ids are small integers
+///   indistinguishable from plausible bcis, AND the artifact's own table
+///   records them — so the confirmation above passes and a real,
+///   confidently-wrong line comes out. An IR-tier frame therefore keeps `-1`,
+///   as it did before; giving it a line needs a safepoint-id -> bci side
+///   table the artifact does not carry today.
+/// * **Anything outside the spec's bci range** — see [`plausible_bci`]. The
+///   two synthetic pcs the single-pass backend stamps are already rejected by
+///   the `i32::try_from` below (both are within one of `u32::MAX`), but that
+///   is an accident of their VALUES rather than a rule, and the rule is what
+///   the next synthetic pc will be measured against.
 ///
-/// `rbp` must already have been validated as a live, aligned frame base inside
-/// this thread's `[scanner_sp, entry_sp)` band by the caller; pass `None` when
-/// it has not been. That is why it is an `Option` rather than a bare address.
-///
-/// # Every outcome is counted
-///
-/// The exact lookup below missed EVERY time it was attempted for as long as the
-/// oop-map-after-republish defect existed, and fell through to the safepoint-id
-/// slot, which answered -- so the function returned a plausible bci and nothing
-/// observable said which evidence produced it. [`bci_lookup_census`] is that
-/// missing number: `exact_hit` against `exact_missed_fell_back`, with
-/// `exact_unavailable` separating the innermost frames that never had a return
-/// address to look up. Read its module doc before reading its numbers; the
-/// fallback is counted AS a fallback on purpose.
-fn compiled_frame_bci(
-    cm: &cratonvm_jit::CompiledMethod,
-    rbp: Option<usize>,
-    native_pc: Option<usize>,
-) -> Option<u32> {
-    // `self::` is required: in edition 2021 a bare `use` path is resolved from
-    // the crate root, so `use bci_lookup_census` would not find the sibling
-    // module this function sits beside.
-    use self::bci_lookup_census as census;
-    // The two up-front refusals, separated: an IR-backend artifact carries
-    // safepoint ids where a bci would be, and an artifact with no safepoint-id
-    // slot was compiled without the precise gate (or is aarch64). Counting them
-    // apart is what stops "this workload gets no compiled lines" being one
-    // undifferentiated silence.
+/// An artifact with no safepoint-id slot (`sp_id_slot_off == 0`) — compiled
+/// without the precise gate, or aarch64, whose backend hard-codes
+/// `bytecode_pc: 0` and would otherwise resolve every compiled frame to the
+/// first line of its method — is already refused by `active_safepoint_id`.
+fn activation_bci(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<i32> {
     if cm.used_ir_backend {
-        census::note(census::REFUSED_IR_BACKEND);
-        census::trace("refused-ir-backend", cm, None, None);
         return None;
     }
-    if cm.sp_id_slot_off == 0 {
-        census::note(census::REFUSED_NO_SP_ID_SLOT);
-        census::trace("refused-no-sp-id-slot", cm, None, None);
-        return None;
-    }
-    // Whether evidence source 1 was even available at this frame, as opposed to
-    // available and unhelpful. Without the distinction a miss count is
-    // contaminated by every innermost activation, which owns no return address
-    // on this stack and could never have used the exact key.
-    let mut exact_attempted = false;
-    if let Some(pc) = native_pc {
-        let entry = cm.entry_ptr() as usize;
-        let end = entry.saturating_add(cm.code_len());
-        // A return address is strictly INSIDE the body (there is at least a
-        // call instruction before it) and at most one past its last byte.
-        if entry != 0 && pc > entry && pc <= end {
-            exact_attempted = true;
-            // Cast: bounded by `code_len()`, which is a JIT buffer position.
-            let off = (pc - entry) as u32;
-            if let Some(map) = cm.oop_maps.iter().find(|m| m.native_pc_offset == off) {
-                if let Some(bci) = plausible_bci(map.bytecode_pc) {
-                    census::note(census::EXACT_HIT);
-                    census::trace("exact-hit", cm, Some(off), Some(bci));
-                    return Some(bci);
-                }
-            }
-        }
-    }
-    // Past this point the answer, if any, comes from the COARSER evidence. That
-    // is the fact the census exists to make visible: the code below returns a
-    // bci that reads exactly like the precise one.
-    if exact_attempted {
-        census::note(census::EXACT_MISSED_FELL_BACK);
-    } else {
-        census::note(census::EXACT_UNAVAILABLE);
-    }
-    let Some(sp_id) = rbp.and_then(|r| active_safepoint_id(r, cm)) else {
-        census::note(census::REFUSED_NO_EVIDENCE);
-        census::trace("refused-no-sp-id", cm, None, None);
-        return None;
-    };
-    // The artifact's own table is the oracle: an id it never recorded is a
-    // stale or non-id word, not a program point.
-    if cm.find_oop_map_for_safepoint_id(sp_id).is_none() {
-        census::note(census::REFUSED_NO_EVIDENCE);
-        census::trace("refused-unrecorded-sp-id", cm, None, None);
-        return None;
-    }
-    match plausible_bci(sp_id) {
-        Some(bci) => {
-            census::note(census::FALLBACK_HIT);
-            census::trace("fallback-sp-id", cm, None, Some(bci));
-            Some(bci)
-        }
-        None => {
-            census::note(census::REFUSED_IMPLAUSIBLE_BCI);
-            census::trace("refused-implausible-bci", cm, None, None);
-            None
-        }
-    }
-}
-
-pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
-    // The GC-side reader (`memory::roots`' `CRATONVM_DBG_JIT_ROOTSCAN` line)
-    // wants no bci and must not pay for one, so it keeps the historical
-    // four-tuple and the walk skips the recovery entirely.
-    active_compiled_frames_impl(false)
-        .into_iter()
-        .map(|(depth, label, owner, cm_ptr, _, _)| (depth, label, owner, cm_ptr))
-        .collect()
-}
-
-/// [`active_compiled_frames`] plus, per frame, the bytecode index it is
-/// standing at ([`compiled_frame_bci`]) — `None` wherever that could not be
-/// established.
-///
-/// A separate entry point rather than a widened tuple, so the GC root-scan
-/// diagnostic that consumes the four-tuple needs no edit and pays nothing for
-/// information it never reads.
-pub fn active_compiled_frames_with_bci() -> Vec<(u32, String, u32, usize, Option<u32>)> {
-    // The walk's sixth member — this frame's own return address — exists
-    // solely so [`active_compiled_frames_with_inline_chains`] can key the
-    // inline-frame map on the EXACT program point a parent frame is standing
-    // at. Nothing else wants a raw code pointer, so it is dropped here rather
-    // than leaked into a public tuple. The re-collect costs one small `Vec`
-    // per capture, next to the `String` clone this walk already performs per
-    // frame — measured against the alternative (a second copy of the
-    // stack-reading walk) that is the cheaper of the two by a wide margin.
-    active_compiled_frames_impl(compiled_frame_bci_enabled())
-        .into_iter()
-        .map(|(depth, label, owner, cm_ptr, bci, _)| (depth, label, owner, cm_ptr, bci))
-        .collect()
-}
-
-/// Kill switch for the inlined-callee frames carried on
-/// [`active_compiled_frames_with_inline_chains`].
-///
-/// Default ON, and the SAME variable the emitter half reads
-/// (`x64::inlining`'s `inline_frame_map_enabled`), because a half-switched
-/// feature is worse than either state: with the map emitted and the walk
-/// ignoring it the artifact pays for metadata nobody reads, and with the walk
-/// reading a map that was never emitted every frame silently loses its
-/// callees. One variable, both halves.
-fn inline_frame_chains_enabled() -> bool {
-    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_FRAME_MAP").is_none()
-    })
+    let id = active_safepoint_id(rbp, cm)?;
+    // `find_oop_map_for_safepoint_id` is `&self` and is the artifact's own
+    // record of which bytecode PCs it emitted a safepoint at.
+    cm.find_oop_map_for_safepoint_id(id)?;
+    i32::try_from(plausible_bci(id)?).ok()
 }
 
 /// The callees inlined into `cm` at the program point a live frame is standing
@@ -4522,21 +4251,21 @@ fn inline_frame_chains_enabled() -> bool {
 /// `CompiledMethod::method_label` already uses, and `bci` is that method's own
 /// bytecode index.
 ///
-/// The chain EXTENDS [`compiled_frame_bci`]'s answer and never replaces it: the
-/// enclosing compiled method keeps the bci that function returns, and these are
-/// the frames HotSpot would show *below* it, from `ScopeDesc`'s nested scopes.
-/// An empty chain is the historical answer — one frame per artifact — and is
-/// what every non-inlining method produces.
+/// The chain EXTENDS [`activation_bci`]'s answer and never replaces it: the
+/// enclosing compiled method keeps the bci that function returns, and these
+/// are the frames HotSpot would show *below* it, from `ScopeDesc`'s nested
+/// scopes. An empty chain is the historical answer — one frame per artifact —
+/// and is what every non-inlining method produces.
 ///
 /// # The two keys, and why neither one falls back to the other
 ///
 /// The emitter half lives in `jit/src/x64/inlining.rs`
 /// (`begin_inline_frame_recording` / `finish_inline_frame_recording`) and
 /// records, at every call it emits from inside a spliced body, a row holding
-/// BOTH keys [`compiled_frame_bci`] already keys on: `native_offset`, the
-/// buffer position immediately after the `CALL` — which is exactly what a
-/// child frame's RBP-chain walk reads out of `[rbp+8]` — and `safepoint_bci`,
-/// the `cur_bc_pc` the emitter simultaneously stores into the frame's
+/// BOTH keys this walk can offer: `native_offset`, the buffer position
+/// immediately after the `CALL` — which is exactly what a child frame's
+/// RBP-chain walk reads out of `[rbp+8]` — and `safepoint_bci`, the
+/// `cur_bc_pc` the emitter simultaneously stores into the frame's
 /// safepoint-id slot.
 ///
 /// Which key applies is decided by WHICH FRAME is asking, not by which lookup
@@ -4547,45 +4276,30 @@ fn inline_frame_chains_enabled() -> bool {
 ///     nothing else. That is the authoritative key and it is the only one
 ///     consulted;
 ///   * the INNERMOST frame owns no return address here (its caller's is the
-///     one on the stack), so the safepoint-id slot is its only evidence — the
-///     same asymmetry `compiled_frame_bci` is built around.
+///     one on the stack), so the safepoint-id slot — i.e. [`activation_bci`]'s
+///     answer — is its only evidence.
 ///
 /// **There is deliberately no fallback from the exact key to the coarse one.**
-/// `compiled_frame_bci` does fall back, and it is right to: a bci is a
-/// property of the enclosing method and both keys answer with the same
-/// `cur_bc_pc`. A CHAIN is not. One `cur_bc_pc` covers a whole spliced region,
-/// and the calls emitted on the inline cache's MISS EDGE — the ones that were
-/// not spliced — sit under that same bci while recording no row of their own.
-/// A parent frame suspended on a miss edge would then be handed the chain
-/// belonging to the splice beside it: a frame naming a method that never ran,
-/// which is the one outcome this whole area refuses. A miss on the exact key
-/// means "this program point recorded no chain", and that is the answer.
+/// A bci is a property of the enclosing method and both keys answer with the
+/// same `cur_bc_pc`. A CHAIN is not. One `cur_bc_pc` covers a whole spliced
+/// region, and the calls emitted on the inline cache's MISS EDGE — the ones
+/// that were not spliced — sit under that same bci while recording no row of
+/// their own. A parent frame suspended on a miss edge would then be handed the
+/// chain belonging to the splice beside it: a frame naming a method that never
+/// ran, which is the one outcome this whole area refuses. A miss on the exact
+/// key means "this program point recorded no chain", and that is the answer.
 ///
 /// # The optimizing tier needs no extra refusal here
 ///
-/// [`compiled_frame_bci`] refuses an `used_ir_backend` artifact outright,
-/// because there `OopMapEntry::bytecode_pc` is a monotonic safepoint counter
-/// and not a bci. This function inherits that refusal WITHOUT restating it, and
-/// that is deliberate rather than an oversight: key 2 is reached only through
-/// the `bci` that function produced, so an IR-tier artifact can never get
-/// there. Key 1 is a CODE LAYOUT fact — the byte offset of a return address in
-/// this artifact's own buffer — and carries no assumption about which backend
-/// emitted it, so it needs no refusal. (In practice an IR artifact's map is
-/// empty anyway: `record_inline_frame_row` is called only from the single-pass
-/// splicer, and one compile produces one artifact, so a map can never describe
-/// a buffer other than its own.)
+/// [`activation_bci`] refuses an `used_ir_backend` artifact outright, so key 2
+/// can never be reached for one. Key 1 is a CODE LAYOUT fact — the byte offset
+/// of a return address in this artifact's own buffer — and carries no
+/// assumption about which backend emitted it, so it needs no refusal. (In
+/// practice an IR artifact's map is empty anyway: `record_inline_frame_row` is
+/// called only from the single-pass splicer, and one compile produces one
+/// artifact, so a map can never describe a buffer other than its own.)
 ///
-/// # What this assumes of the artifact (contract, 2026-09-01)
-///
-/// `CompiledMethod::inline_frame_map` is a `crate::x64::InlineFrameMap` with
-/// `is_empty()`, `chain_for_native_offset(u32)` and
-/// `chain_for_safepoint_bci(u32)` returning `Option<&[InlineFrameLevel]>`,
-/// each level exposing `label: String` and `bci: u32`. That is the only
-/// surface touched, and it is touched from this one function — the level type
-/// is never named here, so the jit crate needs to re-export nothing beyond
-/// what the field's own type already forces.
-///
-/// # The fail-closed rule, which does not wait for that
+/// # The fail-closed rule
 ///
 /// A missing or ambiguous chain must produce NO frame rather than a guessed
 /// one. That is stricter than the rule for a line number, and for a stronger
@@ -4593,26 +4307,16 @@ fn inline_frame_chains_enabled() -> bool {
 /// wrong method is indistinguishable from a real one to the person reading the
 /// trace. The emitter already refuses a row whose bci is not a spec-legal
 /// bytecode index, and POISONS a safepoint id two program points disagree
-/// about — one bci covers a whole spliced region, so a splice containing two
-/// calls with different chains cannot be told apart from the safepoint-id slot
+/// about (`CRATONVM_JIT_NO_INLINE_MISS_EDGE_POISON=1` reverts that half alone)
+/// — one bci covers a whole spliced region, so a splice containing two calls
+/// with different chains cannot be told apart from the safepoint-id slot
 /// alone, which is the innermost frame's only evidence. Both refusals arrive
-/// here as an empty chain, which is exactly today's behaviour.
+/// here as an empty chain, which is exactly the pre-2026-09-01 behaviour.
 fn compiled_frame_inline_chain(
-    cm_ptr: usize,
-    bci: Option<u32>,
+    cm: &cratonvm_jit::CompiledMethod,
+    bci: i32,
     native_pc: Option<usize>,
 ) -> Vec<(String, u32)> {
-    if cm_ptr == 0 {
-        return Vec::new();
-    }
-    // SAFETY: exactly the contract documented on
-    // `PreciseFrameInfo::compiled_method` and relied on by every other read in
-    // this walk — the JIT cache holds an owning `Arc` for as long as the body
-    // is registered, the chain entry is popped the moment the call returns or
-    // unwinds, and this read happens on the owning thread strictly inside that
-    // window. Pointers that came from the RBP walk came from
-    // `lookup_jit_code_range`, which only answers for a still-registered range.
-    let cm = unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
     if cm.inline_frame_map.is_empty() {
         // The overwhelming majority: a method that splices nothing carries an
         // empty map and no allocation, and this is the whole cost it adds to a
@@ -4623,11 +4327,10 @@ fn compiled_frame_inline_chain(
     if let Some(pc) = native_pc {
         let entry = cm.entry_ptr() as usize;
         let end = entry.saturating_add(cm.code_len());
-        // Same bound as `compiled_frame_bci`'s exact arm: a return address is
-        // strictly INSIDE the body (a call precedes it) and at most one past
-        // its last byte.
+        // A return address is strictly INSIDE the body (there is at least a
+        // call instruction before it) and at most one past its last byte.
         if entry != 0 && pc > entry && pc <= end {
-            // Cast: bounded by `code_len()`, a JIT buffer position.
+            // Cast: bounded by `code_len()`, which is a JIT buffer position.
             let off = (pc - entry) as u32;
             if let Some(chain) = cm.inline_frame_map.chain_for_native_offset(off) {
                 return chain.iter().map(|l| (l.label.clone(), l.bci)).collect();
@@ -4639,12 +4342,12 @@ fn compiled_frame_inline_chain(
         return Vec::new();
     }
     // Key 2 — the safepoint id, the innermost frame's only evidence. `bci` is
-    // what `compiled_frame_bci` recovered out of the frame's safepoint-id
-    // slot, which is the same `cur_bc_pc` the emitter recorded the row under.
-    let Some(bci) = bci else {
+    // what `activation_bci` recovered out of the frame's safepoint-id slot,
+    // which is the same `cur_bc_pc` the emitter recorded the row under.
+    if bci < 0 {
         return Vec::new();
-    };
-    match cm.inline_frame_map.chain_for_safepoint_bci(bci) {
+    }
+    match cm.inline_frame_map.chain_for_safepoint_bci(bci as u32) {
         Some(chain) => chain.iter().map(|l| (l.label.clone(), l.bci)).collect(),
         // `None` is both "no row" and "two rows disagreed and the emitter
         // poisoned this bci". The caller cannot act differently on the two and
@@ -4654,76 +4357,10 @@ fn compiled_frame_inline_chain(
     }
 }
 
-/// [`active_compiled_frames_with_bci`] plus, per compiled frame, the chain of
-/// callees inlined into it at the point it is standing — innermost first,
-/// possibly (and usually) empty.
-///
-/// A separate entry point rather than a widened tuple, for the reason A1 gave
-/// when it added the bci one: the GC root-scan diagnostic consumes the
-/// four-tuple, `stackwalker` consumes the five-tuple, and neither should have
-/// to change or pay for information it never reads.
-///
-/// It calls [`active_compiled_frames_impl`] directly rather than layering over
-/// [`active_compiled_frames_with_bci`], and that is the one place this differs
-/// from A18's sketch. The reason is the EXACT key: the inline-frame map's
-/// authoritative key for a non-innermost frame is that frame's own return
-/// address, which the RBP-chain walk reads and the five-tuple throws away.
-/// Layering could only have keyed every frame on the safepoint id, i.e. on the
-/// coarse key, for frames that have the exact one available — see
-/// [`compiled_frame_inline_chain`] for why that is a fabricated-frame risk and
-/// not merely a precision loss. The walk itself still only READS live stack
-/// memory; it now also reports the address it already had in hand.
-///
-/// # Ordering
-///
-/// The chain is INNERMOST FIRST: element 0 is the deepest inlined callee, the
-/// last element is the outermost one, and the enclosing compiled method (the
-/// tuple's own label and bci) sits one step further out again. That is the
-/// opposite direction from the order `interleave_compiled_frames` emits, which
-/// is outermost-first — see `.agent-requests/A18-stackwalker.txt`, which spells
-/// out the expansion.
-#[allow(clippy::type_complexity)]
-pub fn active_compiled_frames_with_inline_chains(
-) -> Vec<(u32, String, u32, usize, Option<u32>, Vec<(String, u32)>)> {
-    let want_chains = inline_frame_chains_enabled();
-    active_compiled_frames_impl(compiled_frame_bci_enabled())
-        .into_iter()
-        .map(|(depth, label, owner, cm_ptr, bci, native_pc)| {
-            let chain = if want_chains && cm_ptr != 0 && (bci.is_some() || native_pc.is_some()) {
-                compiled_frame_inline_chain(cm_ptr, bci, native_pc)
-            } else {
-                // Neither key available means the walk could not place this
-                // activation at all, and an inline chain is a claim about a
-                // program point. Refusing here rather than inside the lookup
-                // keeps the two refusals — "no program point" and "no chain at
-                // this program point" — from being confused for one another.
-                //
-                // `bci.is_some() || native_pc.is_some()` rather than
-                // `bci.is_some()`: a frame BELOW the innermost one is placed by
-                // its return address, and `compiled_frame_bci` can still answer
-                // `None` for it (an optimizing-tier artifact, or an artifact
-                // with no safepoint-id slot) while the exact key is perfectly
-                // good. Gating the chain on the bci would have made the
-                // inlined-callee frames inherit a refusal that is about LINE
-                // NUMBERS and does not reach them.
-                Vec::new()
-            };
-            (depth, label, owner, cm_ptr, bci, chain)
-        })
-        .collect()
-}
-
-/// The walk. The sixth tuple member is the activation's own RETURN ADDRESS
-/// when the RBP-chain walk read one, and `None` for the innermost activation
-/// (whose return address is not on this stack) and for the boundary fallback.
-/// It is reported because it is the exact key
-/// [`compiled_frame_inline_chain`] needs and the walk already holds it;
-/// [`active_compiled_frames`] and [`active_compiled_frames_with_bci`] drop it
-/// again so no public tuple carries a raw code pointer.
-fn active_compiled_frames_impl(
-    want_bci: bool,
-) -> Vec<(u32, String, u32, usize, Option<u32>, Option<usize>)> {
+pub fn active_compiled_frames() -> Vec<ActiveCompiledFrame> {
     let nested_enabled = nested_trace_frames_enabled();
+    let want_bci = compiled_frame_bci_enabled();
+    let want_chains = inline_frame_chains_enabled();
     let dbg_chain = dbg_swchain_enabled();
     let scanner_sp = current_stack_pointer();
     JIT_ENTRY_CHAIN.with(|c| {
@@ -4746,8 +4383,7 @@ fn active_compiled_frames_impl(
                 chain.len()
             );
         }
-        let mut out: Vec<(u32, String, u32, usize, Option<u32>, Option<usize>)> =
-            Vec::with_capacity(chain.len());
+        let mut out: Vec<ActiveCompiledFrame> = Vec::with_capacity(chain.len());
         for (dbg_i, e) in chain.iter().enumerate() {
             let Some(info) = e.precise else {
                 if dbg_chain {
@@ -4777,23 +4413,34 @@ fn active_compiled_frames_impl(
             // Walk the saved-RBP chain the way `remap_active_jit_frames`'
             // Stage 5 already does, and report every activation.
             //
-            // Whether `exact_rbp` is a frame base a safepoint-id slot may be
-            // read out of. Mirrors `innermost_frame_method`'s own bounds test
-            // exactly, because that function ALSO answers `Some(cm)` when the
-            // RBP is unusable (it falls back to the boundary method) and the
-            // caller cannot tell the two answers apart from the outside.
-            // Reading `[rbp - off]` for an out-of-band RBP would be a wild
-            // read, not merely a wrong line.
-            let exact_rbp_usable = info.exact_rbp != 0
+            // Each activation is carried with the RBP of ITS OWN frame, not
+            // just its method: that is where the safepoint id lives, and it is
+            // the only thing standing between a compiled frame and a line
+            // number. The walk already computes every one of these addresses
+            // to find the next frame — it used to drop them on the floor.
+            //
+            // The THIRD member is that frame's own RETURN ADDRESS, when the
+            // RBP-chain walk read one. It is `None` for the innermost
+            // activation (whose return address is not on this stack) and for
+            // the boundary fallback, and it is the EXACT key the inline-frame
+            // map is recorded under — see `compiled_frame_inline_chain`.
+            //
+            // The RBP is an `Option` because `innermost_frame_method` ALSO
+            // answers `Some(cm)` when the RBP is unusable (it falls back to
+            // the boundary method) and the caller cannot tell the two answers
+            // apart from the outside. Reading `[rbp - sp_id_slot_off]` for an
+            // out-of-band RBP would be a wild read, not merely a wrong line,
+            // so the bound is re-checked here; the walk's own `parent_rbp`
+            // values were bounds-checked in the loop below and need no second
+            // test.
+            let exact_rbp = (info.exact_rbp != 0
                 && info.exact_rbp & 0x7 == 0
                 && info.exact_rbp >= scanner_sp
-                && info.exact_rbp.saturating_add(16) <= entry_sp;
-            // `(artifact, bci, return address)`. The third member is `None`
-            // for the innermost activation and for the boundary fallback —
-            // neither owns a return address on this stack.
+                && info.exact_rbp.saturating_add(16) <= entry_sp)
+                .then_some(info.exact_rbp);
             let mut nested: Vec<(
                 *const cratonvm_jit::CompiledMethod,
-                Option<u32>,
+                Option<usize>,
                 Option<usize>,
             )> = Vec::new();
             if nested_enabled {
@@ -4804,17 +4451,10 @@ fn active_compiled_frames_impl(
                     scanner_sp,
                     info.compiled_method,
                 ) {
-                    // The innermost frame has no return address of its own on
-                    // this stack, so only the safepoint-id slot can place it.
-                    let bci = if want_bci && exact_rbp_usable {
-                        // SAFETY: as the reporting loop at the end of this
-                        // function — the JIT cache holds the owning `Arc` for
-                        // as long as this frame is live on this thread.
-                        compiled_frame_bci(unsafe { &*innermost }, Some(info.exact_rbp), None)
-                    } else {
-                        None
-                    };
-                    nested.push((innermost, bci, None));
+                    // The innermost frame has no return address of its own
+                    // on this stack, so only the safepoint-id slot can place
+                    // it.
+                    nested.push((innermost, exact_rbp, None));
                 }
                 // JIT frames use `push rbp; mov rbp,rsp`, so `[rbp]` is the
                 // caller RBP and `[rbp+8]` the return address INTO that caller.
@@ -4846,27 +4486,16 @@ fn active_compiled_frames_impl(
                         break;
                     }
                     match cratonvm_jit::lookup_jit_code_range(ret_addr) {
-                        Some(cm_ptr) => {
-                            let cm_ptr = cm_ptr as *const cratonvm_jit::CompiledMethod;
-                            // `ret_addr` lies in THIS method and is the
-                            // instruction after the call it is suspended in —
-                            // the exact key `native_pc_offset` is recorded
-                            // under. `parent_rbp` was bounds-checked just
-                            // above, so the sp-id fallback is safe to try too.
-                            let bci = if want_bci {
-                                // SAFETY: `lookup_jit_code_range` only answers
-                                // for a code range still registered in the
-                                // cache, which retains the owning `Arc`.
-                                compiled_frame_bci(
-                                    unsafe { &*cm_ptr },
-                                    Some(parent_rbp),
-                                    Some(ret_addr),
-                                )
-                            } else {
-                                None
-                            };
-                            nested.push((cm_ptr, bci, Some(ret_addr)));
-                        }
+                        // `ret_addr` lies in the PARENT, so the frame this
+                        // method is running in is the one at `parent_rbp`.
+                        // `ret_addr` also lies in THIS method and is the
+                        // instruction after the call it is suspended in — the
+                        // exact key `InlineFrameMap` rows are recorded under.
+                        Some(cm_ptr) => nested.push((
+                            cm_ptr as *const cratonvm_jit::CompiledMethod,
+                            Some(parent_rbp),
+                            Some(ret_addr),
+                        )),
                         // The parent is the interpreter / Rust boundary: this
                         // entry has no further compiled ancestors.
                         None => break,
@@ -4878,14 +4507,8 @@ fn active_compiled_frames_impl(
             // short by a bound, one that never started (`exact_rbp == 0`), and
             // the kill-switch path all still owe the boundary method the chain
             // entry was pushed for.
-            if nested.last().map(|(cm_ptr, _, _)| *cm_ptr) != Some(info.compiled_method) {
-                // No bci on this arm, deliberately: it fires exactly when the
-                // walk could NOT place the frame (`exact_rbp` unusable, a
-                // bound cut the walk short, or the nested walk is switched
-                // off), so `exact_rbp` is not known to belong to this method
-                // and its safepoint-id slot would be read against another
-                // method's frame layout.
-                nested.push((info.compiled_method, None, None));
+            if nested.last().map(|(p, _, _)| *p) != Some(info.compiled_method) {
+                nested.push((info.compiled_method, exact_rbp, None));
             }
             if dbg_chain {
                 let names: Vec<String> = nested
@@ -4914,7 +4537,7 @@ fn active_compiled_frames_impl(
             // `runtime::stackwalker::interleave_compiled_frames` wants
             // outermost-first, and entries sharing an `interp_depth` keep their
             // push order.
-            for (cm_ptr, bci, native_pc) in nested.iter().rev() {
+            for (cm_ptr, frame_rbp, native_pc) in nested.iter().rev() {
                 // SAFETY: exactly the contract documented on
                 // `PreciseFrameInfo::compiled_method` — the JIT cache holds an
                 // owning `Arc` for as long as the body is registered, and the
@@ -4928,23 +4551,30 @@ fn active_compiled_frames_impl(
                 if cm.method_label.is_empty() {
                     continue;
                 }
-                out.push((
-                    e.interp_depth,
-                    cm.method_label.clone(),
-                    cm.owner_class_id,
+                let bci = match frame_rbp {
+                    Some(rbp) if want_bci => activation_bci(*rbp, cm).unwrap_or(-1),
+                    _ => -1,
+                };
+                out.push(ActiveCompiledFrame {
+                    interp_depth: e.interp_depth,
+                    label: cm.method_label.clone(),
+                    owner_class_id: cm.owner_class_id,
                     // The artifact itself, so the trace assembler can ask it
                     // whether an interpreter frame's pc is one of ITS OSR entry
                     // points. Valid for exactly as long as the frame is live,
                     // which is the same window this whole function reads in.
-                    *cm_ptr as usize,
-                    // The program point this activation is standing at, when
-                    // the artifact's own metadata could name it.
-                    *bci,
-                    // This activation's own return address, when the RBP-chain
-                    // walk read one. The EXACT key the inline-frame map is
-                    // recorded under; see `compiled_frame_inline_chain`.
-                    *native_pc,
-                ));
+                    cm_ptr: *cm_ptr as usize,
+                    bci,
+                    // The callees this artifact spliced at that same program
+                    // point. `Vec::new()` does not allocate, so a method that
+                    // inlines nothing — and the whole feature switched off —
+                    // costs one branch.
+                    inline_chain: if want_chains {
+                        compiled_frame_inline_chain(cm, bci, *native_pc)
+                    } else {
+                        Vec::new()
+                    },
+                });
             }
         }
         out
@@ -6999,7 +6629,7 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
     // INTO. The narrowing rests on "their roots are published by their own
     // mechanisms", which does not hold for an object that has been allocated
     // and not yet stored anywhere tracked — see
-    // `docs/known-issues/gc/bug-g1-evacuates-live-jit-reference-20260819.md`.
+    // `bug-g1-evacuates-live-jit-reference-20260819.md`.
     if !frame_bands_enabled() || !scan_compiled_frame_bands(info, scanner_sp, heap, out) {
         scan_one_frame(scanner_sp, info.frame_base, heap, out);
     }

@@ -1179,6 +1179,7 @@ pub const INVENTORY: &[E] = &[
     // Default-ON: `conservative_roots::nested_trace_frames_enabled` treats the
     // key's PRESENCE as "restore the one-frame-per-chain-entry answer".
     E { group: Group::JIT, token: "nested-trace-frames", on_key: None, off_key: Some("CRATONVM_JIT_NO_NESTED_TRACE_FRAMES"), off_word: None, since: "2026-08-18" },
+    E { group: Group::JIT, token: "npe-frame-snapshot", on_key: None, off_key: Some("CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT"), off_word: None, since: "2026-09-01" },
     // Default-ON: `stackwalker::osr_frame_dedupe_enabled` treats the key's
     // PRESENCE as "report the OSR continuation twice again".
     E { group: Group::JIT, token: "osr-frame-dedupe", on_key: None, off_key: Some("CRATONVM_JIT_NO_OSR_FRAME_DEDUPE"), off_word: None, since: "2026-08-20" },
@@ -1259,6 +1260,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "long-box-direct-helpers", on_key: Some("CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS"), off_key: None, off_word: Some("0"), since: "2026-08-19" },
     E { group: Group::JIT, token: "varhandle-read-direct-helpers", on_key: Some("CRATONVM_JIT_VARHANDLE_READ_DIRECT_HELPERS"), off_key: None, off_word: Some("0"), since: "2026-08-20" },
     E { group: Group::JIT, token: "varhandle-cas-direct-helpers", on_key: Some("CRATONVM_JIT_VARHANDLE_CAS_DIRECT_HELPERS"), off_key: None, off_word: Some("0"), since: "2026-08-28" },
+    E { group: Group::JIT, token: "varhandle-ref-read-direct", on_key: Some("CRATONVM_JIT_VARHANDLE_REF_READ_DIRECT"), off_key: None, off_word: Some("0"), since: "2026-09-01" },
     E { group: Group::JIT, token: "varhandle-write-direct-helpers", on_key: Some("CRATONVM_JIT_VARHANDLE_WRITE_DIRECT_HELPERS"), off_key: None, off_word: Some("0"), since: "2026-08-24" },
     E { group: Group::JIT, token: "varhandle-cas-funnel-fast", on_key: Some("CRATONVM_JIT_VARHANDLE_CAS_FUNNEL_FAST"), off_key: None, off_word: Some("0"), since: "2026-08-26" },
     E { group: Group::JIT, token: "longroot-strict", on_key: Some("CRATONVM_LONGROOT_STRICT"), off_key: None, off_word: None, since: "2026-06-09" },

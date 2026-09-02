@@ -3749,12 +3749,20 @@ pub fn execute(
                                 // catch block. The `InternalError` fallback handles the
                                 // rt.jar-not-loaded boot path (no NPE class yet).
                                 let npe_routed = if crate::jit::helpers::take_jit_pending_npe() {
+                                    // Taken BEFORE the construction below, which is
+                                    // what re-captures the (now compiled-frame-free)
+                                    // stack. See `attach_snapshotted_npe_frames`.
+                                    let snapshot =
+                                        crate::jit::helpers::take_jit_pending_npe_compiled_frames();
                                     match crate::runtime::exceptions::throw_runtime_error(
                                         shared,
                                         thread,
                                         RuntimeError::NullPointerException { message: None },
                                     ) {
                                         MethodCallFailed::ExceptionThrown(exc) => {
+                                            crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                                                shared, exc, snapshot,
+                                            );
                                             jit_early_exception = Some(exc);
                                             true
                                         }

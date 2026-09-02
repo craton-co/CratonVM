@@ -577,7 +577,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-263 tokens.
+265 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -676,6 +676,7 @@ export inherited from a parent shell.
 | `reloc-gate-map-incomplete` | `CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE` |
 | `ir-selfrec-direct` | `CRATONVM_JIT_IR_SELFREC_DIRECT` |
 | `nested-trace-frames` | `CRATONVM_JIT_NO_NESTED_TRACE_FRAMES` |
+| `npe-frame-snapshot` | `CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT` |
 | `osr-frame-dedupe` | `CRATONVM_JIT_NO_OSR_FRAME_DEDUPE` |
 | `osr-pc-refresh` | `CRATONVM_JIT_NO_OSR_PC_REFRESH` |
 | `compiled-frame-lines` | `CRATONVM_JIT_NO_COMPILED_FRAME_LINES` |
@@ -696,6 +697,7 @@ export inherited from a parent shell.
 | `long-box-direct-helpers` | `CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS` |
 | `varhandle-read-direct-helpers` | `CRATONVM_JIT_VARHANDLE_READ_DIRECT_HELPERS` |
 | `varhandle-cas-direct-helpers` | `CRATONVM_JIT_VARHANDLE_CAS_DIRECT_HELPERS` |
+| `varhandle-ref-read-direct` | `CRATONVM_JIT_VARHANDLE_REF_READ_DIRECT` |
 | `varhandle-write-direct-helpers` | `CRATONVM_JIT_VARHANDLE_WRITE_DIRECT_HELPERS` |
 | `varhandle-cas-funnel-fast` | `CRATONVM_JIT_VARHANDLE_CAS_FUNNEL_FAST` |
 | `longroot-strict` | `CRATONVM_LONGROOT_STRICT` |
