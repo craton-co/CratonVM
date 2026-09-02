@@ -965,6 +965,37 @@ fn loop_headers(graph: &Graph) -> Vec<(NodeId, NodeId, Vec<NodeId>)> {
     out
 }
 
+/// Control nodes `header` does **not** dominate: everything reachable from the
+/// graph entry with `header` deleted.
+///
+/// One reachability walk, no dominator tree. It is the definition of dominance
+/// read directly — `header` dominates `n` exactly when every path from the
+/// entry to `n` goes through `header`, i.e. when deleting `header` makes `n`
+/// unreachable — and it is what tells a NESTED INNER loop's back edge from its
+/// pre-header, and its body from the enclosing method.
+fn control_not_dominated_by(
+    graph: &Graph,
+    users: &[Vec<NodeId>],
+    header: NodeId,
+) -> FxHashSet<NodeId> {
+    let mut seen: FxHashSet<NodeId> = FxHashSet::default();
+    if (graph.entry as usize) >= graph.nodes.len() {
+        return seen;
+    }
+    seen.insert(graph.entry);
+    let mut work = vec![graph.entry];
+    while let Some(cur) = work.pop() {
+        for &u in &users[cur as usize] {
+            if u == header || seen.contains(&u) || !graph.nodes[u as usize].op.is_control() {
+                continue;
+            }
+            seen.insert(u);
+            work.push(u);
+        }
+    }
+    seen
+}
+
 /// Which of `header`'s control inputs are loop ENTRIES, decided by dominance
 /// rather than by reachability.
 ///
@@ -990,23 +1021,7 @@ fn entry_preds_by_dominance(
     users: &[Vec<NodeId>],
     header: NodeId,
 ) -> (Vec<NodeId>, Vec<NodeId>) {
-    // Control nodes reachable from the graph entry with `header` deleted.
-    let mut seen: FxHashSet<NodeId> = FxHashSet::default();
-    let mut work = vec![graph.entry];
-    seen.insert(graph.entry);
-    while let Some(cur) = work.pop() {
-        for &u in &users[cur as usize] {
-            if u == header || seen.contains(&u) {
-                continue;
-            }
-            let op = &graph.nodes[u as usize].op;
-            if !op.is_control() {
-                continue;
-            }
-            seen.insert(u);
-            work.push(u);
-        }
-    }
+    let seen = control_not_dominated_by(graph, users, header);
     let mut entries = Vec::new();
     let mut backs = Vec::new();
     for &c in graph.nodes[header as usize].inputs.iter() {
@@ -1476,14 +1491,10 @@ fn licm(graph: &mut Graph) -> bool {
         // necessarily input slot 0, since a `Merge` header may carry the
         // back-edge at either slot.
         let preheader = entry_pred;
-        if preheader == NO_NODE || body.contains(&preheader) {
-            // No identifiable pre-header outside the loop → cannot hoist.
-            continue;
-        }
-
         // ── Loop-invariant `Op::ArrayLength` ────────────────────────────────
         //
-        // Run BEFORE the hard-barrier bail below, and deliberately so: an
+        // Run BEFORE the pre-header guard and the hard-barrier bail below, and
+        // deliberately so on both counts. Taking the barrier first: an
         // in-loop `ArrayLength` IS one of those barriers (it is not pure, and
         // it is not a `Load`/`Store`/`Phi`), so a javac counted loop —
         // `for (i = 0; i < a.length; i++)` — disqualified its own LICM by the
@@ -1572,6 +1583,22 @@ fn licm(graph: &mut Graph) -> bool {
                 changed = true;
                 hoisted += 1;
             }
+        }
+
+        if preheader == NO_NODE || body.contains(&preheader) {
+            // No identifiable pre-header outside the loop → cannot hoist.
+            //
+            // Runs AFTER the `ArrayLength` hoist above, and deliberately: for a
+            // nested inner loop `body` over-approximates badly (the sweep drags
+            // the whole enclosing loop in behind the inner exit, pre-header
+            // included), and `loop_headers` has ALREADY established that
+            // `entry_pred` is outside the natural loop — by reachability, or by
+            // dominance for the inner-loop case it added. This guard is a
+            // belt-and-braces check against that over-approximation, not the
+            // structural claim, so the arm above does not owe it. The general
+            // load hoist below still does: it reasons about aliasing against a
+            // body it must not under-read.
+            continue;
         }
 
         // A hard barrier (call / allocation / guard / monitor) could read or
