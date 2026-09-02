@@ -71812,12 +71812,76 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         native_cf_any_of,
     );
 
-    // complete — needed because the real CompletableFuture.complete(null) relies on
-    // the static `NIL` AltResult sentinel, which is effectively null on CratonVM, so
-    // `complete(null)` leaves `result == null` (isDone() stays false). That breaks
-    // e.g. KafkaFuture.allOf(...) whose result is completed with `complete(null)`,
-    // leaving it pending forever (get() hangs).
-    r.register(cf, "complete", "(Ljava/lang/Object;)Z", native_cf_complete);
+    // complete — registered because the real CompletableFuture.complete(null)
+    // relies on the static `NIL` AltResult sentinel, which WAS effectively null
+    // on CratonVM, so `complete(null)` left `result == null` (isDone() stayed
+    // false). That broke e.g. KafkaFuture.allOf(...) whose result is completed
+    // with `complete(null)`, leaving it pending forever (get() hangs).
+    //
+    // **The premise is stale AND the registration is still right.** Both halves
+    // were measured on 2026-09-02, and the second is the surprising one.
+    //
+    // The premise first. Reading the field directly through
+    // `--add-opens java.base/java.util.concurrent`:
+    //
+    //     HotSpot   NIL = java.util.concurrent.CompletableFuture$AltResult@...  NIL.ex = null
+    //     CratonVM  NIL = java.util.concurrent.CompletableFuture$AltResult@4c3  NIL.ex = null
+    //
+    // `NIL` is a proper `AltResult` here now, and with this registration OFF
+    // the real bytecode answers `complete(null) -> true, isDone=true,
+    // get=null` and `allOf(...)` completes — identical to HotSpot. So the hang
+    // this bridge was written to prevent does not reproduce, and "it shadows
+    // real bytecode for a reason that has expired" is a fair reading of it.
+    //
+    // It is still the wrong conclusion. `CompletableFuture` composition is
+    // ~20x HotSpot and this native is 2.50 crossings per chain, which makes it
+    // look exactly like `AtomicReference.compareAndSet`'s synthetic stub —
+    // de-registered on 2026-08-29 for a 1.6x win, on the argument that a stub
+    // over one line of real JDK bytecode is a pure tax. MEASURED here, one
+    // binary, this switch the only difference, six interleaved reps,
+    // `HibfixComposeProbe2` 2 threads x 320 000 chains, load 14-22:
+    //
+    //     registered (default)   20.64-23.55 s cpu   (median 22.16)   34.6 us/chain
+    //     de-registered          66.56-70.49 s cpu   (median 69.52)  108.6 us/chain
+    //
+    // **3.14x SLOWER with the bridge gone**, ranges disjoint, `wrong=0` in all
+    // twelve runs. The native census says why, and it is not "the bytecode is
+    // slow" — the crossing does not disappear, it MULTIPLIES (80 000 chains):
+    //
+    //     CompletableFuture.complete        200 000 ->       0
+    //     CompletableFuture.completeValue         0 -> 200 000   (itself a registered native)
+    //     Unsafe.compareAndSetInt               619 -> 200 000   (+2.5/chain)
+    //     Object.<init>                       2 882 -> 122 174   (+1.5/chain)
+    //
+    // The real `complete` is `completeValue(value)` — which is ANOTHER
+    // registered native, so the boundary is crossed anyway — plus the CAS and
+    // the `AltResult`/`Completion` allocation that this one collapses. This
+    // bridge is not a shadow in front of cheap bytecode; it is a fast path in
+    // front of three more boundary crossings and an allocation.
+    //
+    // The switch is kept because that is a strong claim and it should stay
+    // one run away from being re-checked, not one BUILD away: the "synthetic
+    // stub over a real JDK method is a pure tax" pattern is real, it has paid
+    // out before, and the next person to notice 2.50 crossings per chain here
+    // will reach for it. **Do not flip this default.** If it is ever flipped,
+    // the number above is what has to move first.
+    //
+    // Note also that a class-scoped retirement is the wrong instrument for
+    // this cluster even if the per-triple answer were the other way: this
+    // native serves a SYNTHETIC CompletableFuture too (an Int `done` marker at
+    // slot 1 instead of the real `stack` reference), and retiring a cluster
+    // wholesale is the shape that once left `ConcurrentHashMap` with a retired
+    // constructor and live mutators, silently losing five of six entries (see
+    // `admit_forced_native`'s header).
+    //
+    // `CRATONVM_NATIVE_CF_COMPLETE=0` — do not register it; the real JDK
+    // bytecode runs instead, correctly, and 3.14x slower.
+    if !matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_CF_COMPLETE").as_deref(),
+        Ok("0")
+    ) {
+        r.register(cf, "complete", "(Ljava/lang/Object;)Z", native_cf_complete);
+    }
 
     // completeExceptionally
     r.register(

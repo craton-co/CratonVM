@@ -337,19 +337,24 @@ impl Compiler {
     /// shared null-check stub (sets `JIT_PENDING_NPE`, deopts out) that
     /// array loads/stores already branch to.
     ///
-    /// **This check is the one that survives in a counted `for (int i = 0; i <
-    /// a.length; i++)` loop, and it costs a `TEST`/`JZ` per iteration.** The
-    /// bound's own `arraylength` sits AT the loop header, and the null-check
-    /// dataflow (`crate::null_check_elim`) meets over paths with a bitwise AND:
-    /// the back edge arrives having just dereferenced the array, the pre-header
-    /// does not, so the intersection at the header drops the fact and this
-    /// helper emits. The elision is not wrong — the first iteration genuinely
-    /// has no proof — but the second and every later one pays for it. Closing it
-    /// needs a loop-header-aware proof (peel, or a pre-header null check that
-    /// seeds the header's IN set), which lives in `null_check_elim`, not here.
-    /// Measured at ~2 of the ~21 instructions the `char[]` scan body emits per
-    /// element:
-    /// `docs/known-issues/perf/array-element-load-baseline-codegen-20260901.md`.
+    /// **This check used to be the one that survives in a counted
+    /// `for (int i = 0; i < a.length; i++)` loop, at a `TEST`/`JZ` per
+    /// iteration.** The bound's own `arraylength` sits AT the loop header, and
+    /// the null-check dataflow (`crate::null_check_elim`) meets over paths with
+    /// a bitwise AND: the back edge arrives having just dereferenced the array,
+    /// the pre-header does not, so the intersection at the header drops the
+    /// fact and this helper emitted. The elision was not wrong — the first
+    /// iteration genuinely has no proof — but the second and every later one
+    /// paid for it.
+    ///
+    /// Closed 2026-09-02 by moving the whole sequence instead of proving it
+    /// away: `ArrayLenHoist` (`x64/licm.rs`) computes the invariant
+    /// `arraylength` once in the pre-header and the body reads a frame slot, so
+    /// this null check goes with it and the header no longer emits one at all.
+    /// The dataflow reasoning above still describes what happens at a header
+    /// the hoist declines (a variant receiver, a bypassable header, a site
+    /// outside the header's straight-line prefix), which is why it is kept.
+    /// Sized in array-element-load-baseline-codegen-20260901.
     ///
     /// Unlike the load/store `_at` helpers, the dataflow elision keys on
     /// the directly-preceding `aload`/`aload_<n>` of the array receiver:
@@ -397,17 +402,28 @@ impl Compiler {
     /// `types/src/heap_types.rs` says "8, not 12" above a value of 4 — that one
     /// is still wrong and is not this file's to fix.
     ///
-    /// **R10D is a live OUTPUT of this sequence, not a scratch temporary.**
-    /// `emit_bounds_check_stubs` (`x64/deopt_stubs.rs`) reads R10D as
-    /// `jit_throw_aioobe`'s `length` argument — it is the number in "Index 5 out
-    /// of bounds for length 3". The obvious peephole here is to fold the load
-    /// into the compare (`CMP ECX, [RAX+len]`: one instruction and four bytes
-    /// fewer, and it macro-fuses with the `JAE`), and it is WRONG on its own —
-    /// it leaves the stub reporting whatever R10 last held. It is correct only
-    /// together with a length load added to the cold stub, which makes it a
-    /// two-file change and not a local peephole. Ruled out here for exactly
-    /// that reason; sized in
-    /// `docs/known-issues/perf/array-element-load-baseline-codegen-20260901.md`.
+    /// **The length is loaded by the COLD STUB, not by this sequence.** This
+    /// used to be `MOV R10D, [RAX+len] ; CMP ECX, R10D ; JAE stub` — seven
+    /// bytes and three instructions — because `emit_bounds_check_stubs`
+    /// (`x64/deopt_stubs.rs`) reads R10D as `jit_throw_aioobe`'s `length`
+    /// argument: the number in "Index 5 out of bounds for length 3". Folding
+    /// the load into the compare on its own would have left that stub
+    /// reporting whatever R10 last held, which is why it stood as a
+    /// deliberately-refused peephole with the reason written down.
+    ///
+    /// It is correct **together with** the same load added to the cold stub,
+    /// where RAX still holds the array pointer and nothing is timing-critical.
+    /// That is the pairing now in force, and the two halves must move
+    /// together: if this compare ever stops dereferencing `[RAX+len]`, or the
+    /// stub stops re-loading it, the exception message goes wrong silently.
+    /// `bounds_check_length_is_reloaded_in_the_cold_stub` in
+    /// `x64/flag_and_header_contracts.rs` is the tripwire on that pairing.
+    ///
+    /// The fast path is now `CMP ECX, [RAX+len] ; JAE stub` — three bytes and
+    /// four saved, on **every** emitted bounds check, i.e. everywhere BCE does
+    /// not fire. Faulting behaviour is unchanged: the compare still
+    /// dereferences the same header word the load did, so a null array still
+    /// traps at the same instruction boundary rather than reaching the stub.
     pub(super) fn emit_bounds_check(&mut self, bc_pc: usize) {
         // Skip if loop analysis proved this access is safe.
         //
@@ -431,15 +447,28 @@ impl Compiler {
             return;
         }
 
-        // MOV R10D, DWORD [RAX + ARRAY_LENGTH_OFFSET]  — load array_length from ObjectHeader
-        // Encoding: 44 8B 50 xx (REX.R + MOV r32, r/m32 + ModRM(01, R10, RAX) + disp8)
-        self.buf
-            .emit(&[0x44, 0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // Cast: x86-64 register encoding
-
-        // CMP ECX, R10D  — unsigned compare index vs length
-        // If index >= length (unsigned), JAE to failure stub
-        // Encoding: 41 3B CA (REX.B + CMP r32, r/m32 + ModRM(11, ECX, R10))
-        self.buf.emit(&[0x41, 0x3B, 0xCA]);
+        // CMP ECX, DWORD [RAX + ARRAY_LENGTH_OFFSET]  — unsigned compare of the
+        // index against array_length read straight out of the ObjectHeader.
+        // If index >= length (unsigned, so a negative index compares as huge),
+        // JAE to the failure stub, which re-loads the length for the message.
+        // Encoding: 3B 48 xx (CMP r32, r/m32 + ModRM(01, ECX, RAX) + disp8).
+        // The disp8 is const-asserted to fit in `types/src/heap_types.rs`.
+        // A `const` item, not an inline call: `disp8_const` only rejects an
+        // over-127 layout constant at BUILD time when it is evaluated in a
+        // const context. Inline it would be an ordinary runtime panic, and
+        // codegen must never panic.
+        const LEN_DISP: u8 = crate::x64::disp::disp8_const(ARRAY_LENGTH_OFFSET as i64) as u8;
+        if jit_fused_bounds_load_enabled() {
+            self.buf.emit(&[0x3B, 0x48, LEN_DISP]);
+        } else {
+            // `CRATONVM_JIT_FUSED_BOUNDS_LOAD=0`: the pre-2026-09-02 pair.
+            // MOV R10D, DWORD [RAX + len]  (44 8B 50 xx), then
+            // CMP ECX, R10D               (41 3B CA).
+            // The cold stub re-loads the length either way, so this arm is a
+            // pure instruction-count difference on the fast path.
+            self.buf.emit(&[0x44, 0x8B, 0x50, LEN_DISP]);
+            self.buf.emit(&[0x41, 0x3B, 0xCA]);
+        }
 
         // JAE rel32 — jump if above-or-equal (unsigned >= means out of bounds)
         // The rel32 will be patched to point to the out-of-line stub

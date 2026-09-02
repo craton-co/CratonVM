@@ -1293,6 +1293,51 @@ impl Compiler {
         self.buf.emit_byte(0xC0 | ((reg & 7) << 3) | (reg & 7));
     }
 
+    /// `TEST BYTE [rip+disp32], imm8` — the RIP-relative sibling of
+    /// [`Self::emit_test_mem8_imm8`], for a **fixed absolute address** that is
+    /// within ±2GB of the instruction being emitted.
+    ///
+    /// x86-64 has no `TEST [m64], imm8` form taking a bare 64-bit absolute
+    /// address, which is why the safepoint poll materialized its flag address
+    /// into R11 first. It does have this one: `F6 /0 ib` with ModRM
+    /// `mod=00, rm=101` addresses `[rip + disp32]`, so the whole poll is
+    /// **7 bytes and one instruction** instead of `MOV R11, imm64`
+    /// (10 bytes) + `TEST BYTE [R11+0], 0xFF` (5 bytes), and it needs no
+    /// scratch register at all.
+    ///
+    /// The RIP the CPU adds `disp32` to is the address of the NEXT
+    /// instruction — i.e. past the trailing `imm8`, not past the
+    /// displacement. Getting that wrong reads the flag one byte early, which
+    /// is a silent wrong answer rather than a fault, so the `+ LEN` below is
+    /// load-bearing.
+    ///
+    /// Returns `false` **without emitting anything** when the target is out of
+    /// rel32 reach (the JIT code cache and the VM's data segment are separate
+    /// mappings and nothing guarantees they land within 2GB of each other), so
+    /// the caller can fall back to the register-materializing form. The reach
+    /// test is the same one [`Self::emit_call_absolute`] makes, and rests on
+    /// the same fact: `ExecutableBuffer` is allocated once at a fixed capacity
+    /// and never relocates, so `as_ptr() + pos()` is already this
+    /// instruction's final runtime address.
+    pub(super) fn emit_test_mem8_abs_imm8(&mut self, addr: usize, imm8: u8) -> bool {
+        // F6 05 <disp32> <imm8>
+        const LEN: usize = 7;
+        // Cast: non-negative index/count to usize
+        let here = self.buf.as_ptr() as usize + self.buf.pos();
+        let next_pc = here.wrapping_add(LEN);
+        // Widening: i64/usize -> i128 (no truncation, for range check)
+        let delta: i128 = (addr as i128) - (next_pc as i128);
+        // Widening: i64/usize -> i128 (no truncation, for range check)
+        if delta < i32::MIN as i128 || delta > i32::MAX as i128 {
+            return false;
+        }
+        self.buf.emit(&[0xF6, 0x05]); // TEST r/m8, imm8 with ModRM(00, /0, RIP)
+        self.rip_abs_disp32_patches.push((self.buf.pos(), 1));
+        self.buf.emit(&(delta as i32).to_le_bytes()); // Cast: rel32 displacement
+        self.buf.emit_byte(imm8);
+        true
+    }
+
     /// `TEST BYTE [base+disp], imm8` -- checks a per-object header flag byte
     /// (e.g. `GC_FLAG_COMPACT`) without needing any scratch register: the
     /// memory operand is read and discarded by the CPU, `base` and the

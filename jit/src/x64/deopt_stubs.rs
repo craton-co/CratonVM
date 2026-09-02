@@ -1184,7 +1184,20 @@ impl Compiler {
             let bc_pc = self.orig_bci(bc_pc);
             let stub_offset = self.buf.pos();
 
-            // At this point RAX=array pointer, RCX=index, R10D=array length.
+            // At this point RAX=array pointer and RCX=index; the length is
+            // NOT live in a register. `emit_bounds_check` folded its load into
+            // the compare (`CMP ECX, [RAX+len]`), so this cold path re-loads it
+            // here — RAX still holds the array pointer, and the fast path just
+            // dereferenced that same header word, so the load cannot fault.
+            //
+            // MOV R10D, DWORD [RAX + ARRAY_LENGTH_OFFSET]
+            // Encoding: 44 8B 50 xx (REX.R + MOV r32, r/m32 + ModRM(01, R10, RAX) + disp8)
+            // A `const` item, not an inline call — see the identical binding
+            // in `emit_bounds_check`.
+            const LEN_DISP: u8 =
+                crate::x64::disp::disp8_const(cratonvm_types::ARRAY_LENGTH_OFFSET as i64) as u8;
+            self.buf.emit(&[0x44, 0x8B, 0x50, LEN_DISP]);
+
             // Set up jit_throw_aioobe(index, length, array_ptr, bytecode_pc).
             #[cfg(target_os = "windows")]
             {

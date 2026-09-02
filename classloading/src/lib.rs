@@ -93,7 +93,9 @@ pub use class_manager::synthetic_stub_field_model;
 // because `native-builtins` must register natives for exactly this list —
 // the stub's method table and the registry cannot be allowed to disagree.
 pub use class_manager::{
+    any_annotation_proxy_defined,
     any_class_redefined,
+    any_duplicate_class_name,
     bump_jit_supersede_epoch,
     class_definition_epoch,
     drain_pending_class_hooks,

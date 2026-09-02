@@ -18,16 +18,46 @@
 
 name: cuda-bridge
 
+# WHAT BELONGS IN THE PATH FILTER
+#
+# `cargo check --features cuda` is the only thing standing between
+# `backend_cuda.rs` and silent rot, and it used to run only on changes
+# under `cuda-bridge/`. That misses the two ways it is most likely to
+# break: a `cudarc` bump landing in `Cargo.lock`, and the callers in
+# `vm/src/runtime/offload*.rs` / `gpu_marshal.rs` changing against a
+# backend the default build never compiles. Neither touches this crate's
+# own directory, and both would have reached `main` unbuilt.
+#
+# The consumers are listed rather than the filter dropped, so the job
+# still skips the overwhelming majority of pushes — which is the point of
+# having one. The lists are duplicated rather than shared through a YAML
+# anchor because GitHub Actions' workflow parser does not expand them.
 on:
   push:
     branches: [main]
     paths:
       - 'cuda-bridge/**'
+      - 'jit-cuda/**'
+      - 'craton-gpu/**'
+      - 'vm/src/runtime/offload.rs'
+      - 'vm/src/runtime/offload_jit_gate.rs'
+      - 'vm/src/runtime/gpu_marshal.rs'
+      - 'vm/src/runtime/gpu_residency.rs'
+      - 'vm/src/runtime/kernels/**'
+      - 'Cargo.lock'
       - '.github/workflows/cuda-bridge.yml'
   pull_request:
     branches: [main]
     paths:
       - 'cuda-bridge/**'
+      - 'jit-cuda/**'
+      - 'craton-gpu/**'
+      - 'vm/src/runtime/offload.rs'
+      - 'vm/src/runtime/offload_jit_gate.rs'
+      - 'vm/src/runtime/gpu_marshal.rs'
+      - 'vm/src/runtime/gpu_residency.rs'
+      - 'vm/src/runtime/kernels/**'
+      - 'Cargo.lock'
       - '.github/workflows/cuda-bridge.yml'
   workflow_dispatch:
 
@@ -56,3 +86,23 @@ jobs:
       # rotting against cudarc API changes.
       - name: Check cuda backend
         run: cargo check -p cratonvm-cuda-bridge --features cuda
+
+      # The VM-side consumers, which the path filter now also watches.
+      # `gpu-offload` links the stub backend, so this needs no CUDA
+      # install; it is what catches an offload.rs change that compiles
+      # against the default build and not against this one.
+      - name: Check the VM GPU offload path
+        run: cargo check -p cratonvm-vm --features gpu-offload
+
+      # The lowering tests, which need neither a GPU nor a toolkit.
+      #
+      # `every_modern_target_renders_a_loadable_header` lives here: it
+      # pins that the `.version` a kernel declares admits the `.target`
+      # beside it, for every architecture the VM can probe. That
+      # pairing was wrong for Ada, Hopper and Blackwell for as long as
+      # the crate existed, and the only gate that could have seen it —
+      # the self-hosted GPU job — runs an RTX 2060, the one card where
+      # the old hardcoded version was correct. A public runner can
+      # answer it, so it should.
+      - name: Test the bytecode → PTX lowering
+        run: cargo test -p cratonvm-jit-cuda

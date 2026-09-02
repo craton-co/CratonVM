@@ -82,6 +82,35 @@ pub(crate) fn probe_device(device_ordinal: u32) -> Result<DeviceCaps> {
     })
 }
 
+/// `cuDriverGetVersion`, as `1000 * major + 10 * minor` (e.g. `12080`
+/// for a CUDA 12.8 driver).
+///
+/// The installed driver's version is the ceiling on the PTX ISA version
+/// it can parse, and a module declaring a newer `.version` is rejected
+/// exactly as hard as one naming an unknown `.target`. The VM reads this
+/// once at `OffloadCache` construction and hands it to
+/// `jit_cuda::target::clamp_target_to_isa`; see that module for why both
+/// directions need handling.
+pub(crate) fn driver_cuda_version() -> Result<u32> {
+    // `cuDriverGetVersion` is one of the few driver entry points that is
+    // legal before `cuInit`, but cudarc loads the library lazily, so go
+    // through `lib()` to make sure the symbol table exists. Any failure
+    // is reported rather than papered over: the caller treats an unknown
+    // driver version as "do not clamp", which is the pre-existing
+    // behaviour.
+    let mut version: core::ffi::c_int = 0;
+    // SAFETY: `lib()` returns the loaded driver library; `version` is a
+    // live, aligned `c_int` the call writes exactly once.
+    let res = unsafe { cudarc::driver::sys::lib().cuDriverGetVersion(&mut version) };
+    if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+        return Err(DeviceError::NoDriver);
+    }
+    if version <= 0 {
+        return Err(DeviceError::NoDriver);
+    }
+    Ok(version as u32)
+}
+
 /// AUDIT 2026-05-24 (C32 stream-port fix): inter-stream barrier events
 /// owned by the context. Each is a `CU_EVENT_DISABLE_TIMING` event
 /// created once at context construction and reused for every transfer:
