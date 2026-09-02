@@ -442,6 +442,30 @@ owed", and it is what running the sweep bought.
   where the prose DESCRIBING the rule trips the checker. That one is left
   alone: the fix is a self-exemption whose shape belongs to its author.
 
+* **The Java-level numbers were measured BEFORE the dev merge, and not
+  re-measured after it.** Two fat-LTO links and one non-LTO link were each
+  starved out on a host running at 100% with ten-plus other sessions' `rustc`
+  (plus Windows Defender as the single largest CPU consumer), so the
+  post-merge binary was never produced.
+
+  What makes that a small gap rather than an unmeasured claim: `card_table.rs`,
+  `young_mark.rs`, `arena.rs` and `types/src/flags.rs` are **byte-identical**
+  between the validated commit and the merge result, and dev's 128 added lines
+  in `gen_heap.rs` are purely additive -- one struct, one static, one const and
+  five `pub fn`s for the ZGC ref-store gates -- with **zero** lines touching
+  `collect_garbage_inner` or any function this page describes (verified by
+  diff and by grep). Those gates are inert under `-XX:+UseGenerationalGC`,
+  which is the configuration every number here was taken in. And every suite is
+  green ON the merged tree: 16 gc suites (1,713 unit + integration), 2,134 jit,
+  2,652 vm, 594 types, 56 tier1, plus the native-collections GC relocation
+  tests.
+
+  Still owed, and cheap once a quiet host exists: re-run
+  `bench/OldToYoungEdgeProbe` under `CRATONVM_GC_VERIFY_RSET=1` on a
+  post-merge binary and confirm `edges_verified`, `missing=0` and non-zero
+  `edges`. That is the correctness half; the timing half is already argued
+  above from identical code.
+
 * **Absolute pause numbers.** See Method. The shares and the counters are what
   this page establishes.
 
