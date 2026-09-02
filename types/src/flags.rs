@@ -893,6 +893,30 @@ pub struct GcFlags {
     /// debug build runs both and asserts they agree, so the claim is checked
     /// rather than asserted in prose.
     pub g1_cleanup_walk: bool,
+    /// `CRATONVM_G1_MARK_LOCK_YIELD` — F-10. Make G1's concurrent marker
+    /// release and re-take the regions lock every few objects instead of
+    /// holding it for a whole mark step. Default **ON**
+    /// ([`parse::on_unless_zero`]); `=0` restores the one-acquisition-per-step
+    /// behaviour.
+    ///
+    /// `ConcurrentMarkController`'s worker calls `concurrent_mark_step(256)` in
+    /// a loop, and that call used to take the regions lock once and hold it
+    /// until all 256 objects had been scanned. Everything else that touches the
+    /// region table — every allocation, every write-barrier slow path, and the
+    /// entire stop-the-world pause — waited behind it. "Concurrent" marking was
+    /// therefore taking turns with the mutators rather than racing them, at the
+    /// exact point in the cycle where the heap fills fastest.
+    ///
+    /// With `=1` (the default) the marker holds a READ guard for a short batch
+    /// of objects and drops it between batches. `parking_lot`'s `RwLock` is
+    /// task-fair, so a waiting writer — an STW pause, or a region claim — is
+    /// admitted at the next batch boundary instead of at the end of the step.
+    ///
+    /// `=0` is the bisection lever for any suspected marking-soundness
+    /// regression that appeared with F-10: under it the marker's view of the
+    /// region table is once again atomic for a whole step, which is the
+    /// behaviour every G1 mark cycle before 2026-09-02 ran under.
+    pub g1_mark_lock_yield: bool,
     /// `CRATONVM_G1_DBG_RSET` — after every G1 evacuation pause, verify that
     /// every cross-region reference into a COLLECTABLE region is named in that
     /// region's remembered set. Opt-in diagnostic; whole-heap and O(live
@@ -1166,6 +1190,7 @@ impl GcFlags {
             g1_scrub_free: present(src, "CRATONVM_G1_SCRUB_FREE"),
             g1_narrow_fixup: on_unless_zero(src, "CRATONVM_G1_NARROW_FIXUP"),
             g1_cleanup_walk: present(src, "CRATONVM_G1_CLEANUP_WALK"),
+            g1_mark_lock_yield: on_unless_zero(src, "CRATONVM_G1_MARK_LOCK_YIELD"),
             identity_hash_evict: on_unless_zero(src, "CRATONVM_IDENTITY_HASH_EVICT"),
             g1_dbg_rset: present(src, "CRATONVM_G1_DBG_RSET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
