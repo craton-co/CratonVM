@@ -467,6 +467,35 @@ discharge are `compiled-frame-oop-not-published` and `cross-thread-jit-peer`,
 they must be closed together, and `relocation_on_proven_jit > 0` is the
 acceptance test.
 
+#### The paired control, and why it did not finish
+
+Same binary, same host window, flag off:
+
+| arm | ref-array OOM | arena failures | outcome |
+|---|---:|---:|---|
+| `CRATONVM_ZGC_ASSUME_REWRITABLE=1` | **0** | **0** | reached the assertion, `actual: 99988` |
+| control (flag off) | **6 617** | **13** | `rc=137` (SIGKILL) at 2 489 s, 131 COUNTER timeouts |
+
+`rc=137` is the Linux OOM killer, not the VM: the host was at load 138 with
+**1 GB of 31 GB available** while other tenants built. The control therefore
+never reached its assertion, and its numbers are a lower bound on a truncated
+run rather than a matched endpoint. What it does establish is the only thing it
+is used for here -- that the same binary in the same window produces thousands
+of the exact failure the treatment arm produces none of.
+
+**Host-condition note for anyone rerunning this.** Every arm of this page is
+sensitive to the box in three separate ways, and all three have now bitten:
+
+1. `FOR UPDATE WAIT 0.5` turns CPU contention into `SQLException`s that look
+   like data loss (12 of them even in the good arm);
+2. a run killed by `timeout` prints no `[GC]` summary, so the counters the
+   question turns on vanish;
+3. at load 130+ with memory exhausted the OOM killer takes the JVM (`rc=137`)
+   or `rustc` during a fat-LTO link, and a `cargo build && cp` then copies a
+   STALE binary while printing success.
+
+Record `/proc/loadavg` and `free -g` beside every arm.
+
 ### 2026-09-02 (quiet host): ZERO OOMs, 24 compaction cycles, and the gate never refuses
 
 The 3000 s arms above both capped under contention. This one ran on a quiet host
