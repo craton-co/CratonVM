@@ -1439,6 +1439,34 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "code-ptr-memo", on_key: None, off_key: Some("CRATONVM_JIT_NO_CODE_PTR_MEMO"), off_word: None, since: "2026-08-21" },
     E { group: Group::DBG, token: "invoke-phases", on_key: Some("CRATONVM_DBG_INVOKE_PHASES"), off_key: None, off_word: None, since: "2026-08-19" },
     E { group: Group::JIT, token: "param-tag-scan", on_key: None, off_key: Some("CRATONVM_JIT_NO_PARAM_TAG_SCAN"), off_word: None, since: "2026-08-18" },
+    // ── Interpreter hot-path memoizations, 2026-09-02 ────────────────────
+    // Each of the five below removes work that was being repeated per
+    // operation but is fixed per method, per call site or per process. Each
+    // ships with an off switch for the same reason `code-ptr-memo` above
+    // does: a change worth single-digit nanoseconds, on a host whose
+    // run-to-run spread is 20%, can only be measured by A/B-ing ONE binary.
+    // The `iface-select-memo` switch had to be widened once already -- it
+    // gated the memo but not the short-circuit beside it, so its "off" arm
+    // was not the pre-change path and the first A/B separated nothing.
+    //
+    // `descriptor-facts` — off routes `ParamTags::for_method` and
+    // `Frame::return_tag` back through the per-call descriptor scans they
+    // replaced (`ParamTags::of`, `cratonvm_jit::return_type`).
+    E { group: Group::JIT, token: "descriptor-facts", on_key: None, off_key: Some("CRATONVM_JIT_NO_DESCRIPTOR_FACTS"), off_word: None, since: "2026-09-02" },
+    // `backedge-poll-gate` — off restores the unconditional
+    // `safepoint_check` call on every backward branch.
+    E { group: Group::JIT, token: "backedge-poll-gate", on_key: None, off_key: Some("CRATONVM_JIT_NO_BACKEDGE_POLL_GATE"), off_word: None, since: "2026-09-02" },
+    // `iface-select-memo` — off makes every `invokeinterface` cache hit
+    // retake the class-manager read lock and rewalk the receiver hierarchy
+    // to re-verify maximally-specific selection.
+    E { group: Group::JIT, token: "iface-select-memo", on_key: None, off_key: Some("CRATONVM_JIT_NO_IFACE_SELECT_MEMO"), off_word: None, since: "2026-09-02" },
+    // `dup-name-field-gate` — off makes every instance field access walk
+    // `retarget_instance_field_to_receiver` in full, whether or not any
+    // binary name in this process resolves to two `ClassId`s.
+    E { group: Group::LOADER, token: "dup-name-field-gate", on_key: None, off_key: Some("CRATONVM_LOADER_NO_DUP_NAME_FIELD_GATE"), off_word: None, since: "2026-09-02" },
+    // `ann-proxy-latch` — off restores the epoch-keyed negative in
+    // `ClassRealm::is_annotation_proxy_class`.
+    E { group: Group::LOADER, token: "ann-proxy-latch", on_key: None, off_key: Some("CRATONVM_LOADER_NO_ANN_PROXY_LATCH"), off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "ldc-const-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_LDC_CONST_CACHE"), off_word: None, since: "2026-08-18" },
     E { group: Group::JIT, token: "ir-unresumable-trap-guard", on_key: Some("CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD"), off_key: None, off_word: Some("0"), since: "2026-08-21" },
     E { group: Group::JIT, token: "compiled-ldc-const-cache", on_key: Some("CRATONVM_JIT_COMPILED_LDC_CONST_CACHE"), off_key: None, off_word: Some("0"), since: "2026-08-20" },
@@ -1606,6 +1634,8 @@ pub const INVENTORY: &[E] = &[
     // leaves its canonical spelling ambiguous, which is the whole point of that
     // invariant. Nothing referenced the `CRATONVM_GC=dbg-*` spellings.
     E { group: Group::GC, token: "card-table-only", on_key: Some("CRATONVM_CARD_TABLE_ONLY"), off_key: None, off_word: None, since: "2026-07-16" },
+    E { group: Group::GC, token: "full-rset-scan", on_key: Some("CRATONVM_GC_FULL_RSET_SCAN"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::GC, token: "verify-rset", on_key: Some("CRATONVM_GC_VERIFY_RSET"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "compact-ref-fields", on_key: Some("CRATONVM_COMPACT_REF_FIELDS"), off_key: None, off_word: None, since: "2026-06-22" },
     E { group: Group::GC, token: "pack-fields-by-width", on_key: Some("CRATONVM_PACK_FIELDS_BY_WIDTH"), off_key: None, off_word: None, since: "2026-08-06" },
     E { group: Group::GC, token: "compressed-oops", on_key: Some("CRATONVM_COMPRESSED_OOPS"), off_key: None, off_word: None, since: "2026-07-25" },
@@ -1689,6 +1719,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "promotion-oom-guard-broad", on_key: Some("CRATONVM_PROMOTION_OOM_GUARD_BROAD"), off_key: None, off_word: None, since: "2026-06-23" },
     E { group: Group::GC, token: "selective-promote", on_key: None, off_key: Some("CRATONVM_NO_SELECTIVE_PROMOTE"), off_word: None, since: "2026-06-05" },
     E { group: Group::GC, token: "stress", on_key: Some("CRATONVM_GC_STRESS"), off_key: None, off_word: None, since: "2026-06-18" },
+    E { group: Group::GC, token: "young-trigger-percent", on_key: Some("CRATONVM_GC_YOUNG_TRIGGER_PERCENT"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "sweep-anchor-stride", on_key: Some("CRATONVM_GC_SWEEP_ANCHOR_STRIDE"), off_key: None, off_word: None, since: "2026-07-25" },
     E { group: Group::GC, token: "tlab-gc-trigger", on_key: Some("CRATONVM_TLAB_GC_TRIGGER"), off_key: None, off_word: None, since: "2026-07-24" },
     E { group: Group::GC, token: "weakref-clear", on_key: Some("CRATONVM_WEAKREF_CLEAR"), off_key: None, off_word: None, since: "2026-06-29" },

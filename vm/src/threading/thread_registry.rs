@@ -1092,8 +1092,49 @@ impl ThreadRegistry {
     /// Because it is always a self-lookup, it goes through
     /// [`Self::self_async_slot`] and so takes **no registry lock** after the
     /// calling thread's first safepoint.
+    /// The calling thread's own async-exception slot, as a handle the caller
+    /// can hold and poll directly.
+    ///
+    /// # Why a handle rather than another `take_*` call
+    ///
+    /// [`Self::take_async_exception`] is the *drain*, and draining is a
+    /// read-modify-write on a shared word. The interpreter's back-edge poll
+    /// wants the *question* — "is anything posted?" — which is a plain load,
+    /// and it asks it on every backward branch of every loop. Going through
+    /// [`Self::self_async_slot`] to ask costs a thread-local `RefCell` borrow,
+    /// an `Arc::clone`, the `swap(AcqRel)` and an `Arc` drop: three locked
+    /// read-modify-writes per loop iteration to read a word that is almost
+    /// always zero.
+    ///
+    /// `execute_frame_from_index` acquires this handle **once per invocation**
+    /// (the same hoisting discipline as its `pgo_enabled` /
+    /// `single_step_active` locals) and then polls it with one relaxed load.
+    /// The accepted consequence, identical in shape to those two: a thread
+    /// that registers *after* entering the interpreter loop is observed on the
+    /// next call or return rather than mid-method. That window is not
+    /// reachable in practice — the poster (`post_async_exception`) writes
+    /// through the registry map, so a thread with no entry has nobody who can
+    /// post to it — and every other `safepoint_check` caller still drains
+    /// through the authoritative path regardless.
+    pub fn self_async_slot_handle(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<Arc<std::sync::atomic::AtomicUsize>> {
+        self.self_async_slot(thread_id)
+    }
+
     pub fn take_async_exception(&self, thread_id: ThreadId) -> Option<ObjectRef> {
         let slot = self.self_async_slot(thread_id)?;
+        // Relaxed load before the read-modify-write. This function runs at
+        // every real safepoint arrival on every Java thread, and the slot is
+        // empty on essentially all of them; a `lock xchg` on a word shared
+        // with every potential `Thread.stop` poster is not the right way to
+        // learn that. The load is Relaxed and the swap keeps its `AcqRel`, so
+        // the ordering seen by a caller that actually finds a throwable is
+        // unchanged — the load only decides whether to ask.
+        if slot.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return None;
+        }
         let raw = slot.swap(0, std::sync::atomic::Ordering::AcqRel);
         if raw == 0 {
             None

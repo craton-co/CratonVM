@@ -1794,6 +1794,8 @@ impl<'a> Lowerer<'a> {
             local_oop_mask: None,
             num_locals: 0,
             inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         });
     }
 
@@ -16917,6 +16919,169 @@ mod tests {
         assert_eq!(
             classified, listed,
             "`UNLOWERABLE` and `declared_lowering` disagree"
+        );
+    }
+
+    /// Every `Op::X` named in `regalloc::ir_op_defines_value`'s body.
+    ///
+    /// Read out of the other file's source for the same reason
+    /// [`ops_that_define_a_result_slot`] is read out of this one: the function
+    /// is private, and a copy of its list maintained here would be a fourth
+    /// enumeration of the same question.
+    fn ops_regalloc_calls_value_defining() -> std::collections::BTreeSet<String> {
+        let src = include_str!("regalloc.rs");
+        let body = src
+            .split("fn ir_op_defines_value(op: &Op) -> bool {")
+            .nth(1)
+            .expect("ir_op_defines_value is in regalloc.rs")
+            .split("\n}")
+            .next()
+            .expect("the function ends");
+        let mut out = std::collections::BTreeSet::new();
+        collect_op_names(body, &mut out);
+        assert!(
+            !out.is_empty(),
+            "the regalloc scan found nothing — `ir_op_defines_value`'s shape \
+             changed and this test would now pass vacuously"
+        );
+        out
+    }
+
+    /// The two enumerations of "does this op define a value" are the SAME set.
+    ///
+    /// `regalloc::ir_op_defines_value` calls itself a "verbatim mirror" of
+    /// `op_defines_result_slot`, and until 2026-09-02 it was not one: it omitted
+    /// `Op::ArrayLength` and `Op::NewArray`, and its own doc comment asserted
+    /// they were absent from both. The comment written to prevent the drift was
+    /// the drift.
+    ///
+    /// **What that cost was invisible, which is why this test exists rather
+    /// than a stricter comment.** `plan_register_residency` compares
+    /// `wants_loc` (built from the regalloc predicate) against `node_color`
+    /// (built from this file's), and ONE disagreement declines register
+    /// residency for the whole method. Every counted loop written
+    /// `for (i = 0; i < a.length; i++)` contains an `arraylength`, so every one
+    /// of them declined — silently, because the flag reported only successes.
+    /// Nothing was miscompiled; the optimization was simply unavailable
+    /// wherever arrays are, which is most places.
+    ///
+    /// Compared as sets of names parsed from both sources, so adding an arm to
+    /// one list and forgetting the other fails here instead of turning up as an
+    /// unexplained refusal months later.
+    #[test]
+    fn the_two_value_defining_enumerations_agree() {
+        let here = ops_that_define_a_result_slot();
+        let there = ops_regalloc_calls_value_defining();
+
+        let missing_in_regalloc: Vec<&String> = here.difference(&there).collect();
+        let missing_here: Vec<&String> = there.difference(&here).collect();
+
+        assert!(
+            missing_in_regalloc.is_empty(),
+            "`op_defines_result_slot` names these and `regalloc::ir_op_defines_value` \
+             does not: {missing_in_regalloc:?} — the colourer gives them a home the \
+             liveness model does not know about, so `plan_register_residency` \
+             declines residency for EVERY method containing one",
+        );
+        assert!(
+            missing_here.is_empty(),
+            "`regalloc::ir_op_defines_value` names these and `op_defines_result_slot` \
+             does not: {missing_here:?} — the liveness model expects a home the \
+             colourer never allocates, which is the direction that has no slot to \
+             spill to",
+        );
+    }
+
+    /// A counted loop over `a.length` reaches the register allocator.
+    ///
+    /// The end-to-end form of [`the_two_value_defining_enumerations_agree`],
+    /// and the one that names the consequence rather than the cause.
+    /// `plan_register_residency`'s agreement check compares `wants_loc`
+    /// (`regalloc::ir_op_defines_value`) against `node_color`
+    /// (`op_defines_result_slot`) and declines register residency for the
+    /// WHOLE method on a single disagreement. `Op::ArrayLength` was in the
+    /// second list and not the first, so this shape — the most ordinary
+    /// counted loop in Java — declined every time, and the flag reported
+    /// nothing because it printed only on success.
+    ///
+    /// The bytecode is `static int f(int[] a) { int s = 0; for (int i = 0; i <
+    /// a.length; i++) s += a[i]; return s; }`, assembled by hand so the
+    /// `arraylength` is unmistakably present rather than incidental to a
+    /// fixture.
+    ///
+    /// Asserted on the AGREEMENT, not on a promotion count: whether this
+    /// particular graph ends up with a register is the allocator's business and
+    /// may legitimately change, but the two models must never disagree about
+    /// which values want a home.
+    #[test]
+    fn a_counted_loop_over_array_length_reaches_the_allocator() {
+        use crate::regalloc::build_live_model;
+
+        // 0: iconst_0            s = 0
+        // 1: istore_1
+        // 2: iconst_0            i = 0
+        // 3: istore_2
+        // 4: iload_2         <-- loop head
+        // 5: aload_0
+        // 6: arraylength         THE OP THAT USED TO DECLINE THE METHOD
+        // 7: if_icmpge +15  --> 22
+        // 10: iload_1
+        // 11: aload_0
+        // 12: iload_2
+        // 13: iaload
+        // 14: iadd
+        // 15: istore_1
+        // 16: iinc 2, 1
+        // 19: goto -15      --> 4
+        // 22: iload_1
+        // 23: ireturn
+        let code: [u8; 24] = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x2a, 0xbe, 0xa2, 0x00, 0x0f, 0x1b, 0x2a, 0x1c, 0x2e,
+            0x60, 0x3b, 0x84, 0x02, 0x01, 0xa7, 0xff, 0xf1, 0x1b, 0xac,
+        ];
+        let graph = IrBuilder::new(1, 3)
+            .build(&code, code.len())
+            .expect("the loop builds");
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::ArrayLength)),
+            "the fixture must contain an ArrayLength, or this test proves nothing"
+        );
+
+        let schedule = ir_schedule::schedule(&graph);
+        let plan = plan_slots(&graph, &schedule, None);
+        let live = build_live_model(&graph, &schedule);
+
+        assert_eq!(
+            live.wants_loc.len(),
+            plan.node_color.len(),
+            "the two models disagree about how many nodes there are"
+        );
+        let disagreeing: Vec<(usize, String)> = live
+            .wants_loc
+            .iter()
+            .zip(plan.node_color.iter())
+            .enumerate()
+            .filter(|(_, (wants, color))| **wants != color.is_some())
+            .map(|(id, _)| {
+                (
+                    id,
+                    graph
+                        .nodes
+                        .get(id)
+                        .map(|n| format!("{:?}", n.op))
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert!(
+            disagreeing.is_empty(),
+            "liveness and colourer disagree on {disagreeing:?} — \
+             `plan_register_residency` declines residency for the whole method \
+             on any one of these, so this ordinary counted loop gets no \
+             registers at all",
         );
     }
 

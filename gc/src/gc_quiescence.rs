@@ -841,6 +841,7 @@ pub fn begin_moving_young_coverage_cycle() {
     coverage_incomplete_set(false);
     incomplete_reason_clear();
     unrewritable_peer_state_set(false);
+    CONSERVATIVE_JIT_SCANS.store(0, Ordering::Relaxed);
     // The cross-thread handshake ledger is per-PAUSE and only ever read as
     // "does this account for every peer JIT entry?", so a value carried over
     // from the previous pause would be an over-count — the one direction that
@@ -1612,6 +1613,7 @@ pub fn clear_pinned_jit_roots() {
 /// owned by the calling thread.
 pub fn add_pinned_jit_root(addr: usize) {
     arm_pinned_guard();
+    CONSERVATIVE_JIT_SCANS.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut map) = pinned_jit_map().lock() {
         map.entry(std::thread::current().id())
             .or_default()
@@ -1624,6 +1626,10 @@ pub fn add_pinned_jit_root(addr: usize) {
 /// always reflect its CURRENT live JIT frames.
 pub fn publish_pinned_jit_roots(addrs: &[usize]) {
     arm_pinned_guard();
+    // BEFORE the emptiness test below. "This thread looked and found nothing"
+    // and "this thread never looked" are different facts and the map cannot
+    // hold the difference -- see `conservative_jit_scans`.
+    CONSERVATIVE_JIT_SCANS.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut map) = pinned_jit_map().lock() {
         let tid = std::thread::current().id();
         if addrs.is_empty() {
@@ -1633,6 +1639,32 @@ pub fn publish_pinned_jit_roots(addrs: &[usize]) {
         }
     }
 }
+
+/// How many threads have published a conservative JIT-frame scan since
+/// [`begin_moving_young_coverage_cycle`] reset the count.
+///
+/// # Why a count and not just the pin set
+///
+/// [`pinned_jit_roots_snapshot`] is EMPTY in two completely different
+/// situations: nobody found a conservative root (fine -- there is nothing to
+/// pin), and nobody looked (fatal -- a collector that pins by value would then
+/// pin nothing and relocate everything, believing it was protected).
+///
+/// A consumer that treats the empty set as a licence needs to be able to tell
+/// those apart, and the set itself cannot. This is the discriminator: a zero
+/// here beside live compiled frames means the instrument was armed where it
+/// cannot fire, which is a refusal rather than a pass.
+///
+/// Bumped by both publication paths, including a publication of an EMPTY
+/// vector -- "this thread looked and found nothing" is exactly the fact that
+/// has to be distinguishable.
+pub fn conservative_jit_scans() -> usize {
+    CONSERVATIVE_JIT_SCANS.load(Ordering::Relaxed)
+}
+
+/// Conservative JIT-frame scans published this cycle. See
+/// [`conservative_jit_scans`].
+static CONSERVATIVE_JIT_SCANS: AtomicUsize = AtomicUsize::new(0);
 
 /// Snapshot the conservative-pinned-JIT-root addresses published by ALL
 /// threads. `G1Collector` maps these to regions it must exclude from the

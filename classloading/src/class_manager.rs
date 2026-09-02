@@ -379,6 +379,27 @@ mod loader_lookup_tests {
                 }
                 index
             }
+            /// The condition `loaded_classes_insert` computes to raise
+            /// `ANY_DUPLICATE_CLASS_NAME`: "some name resolves to more than
+            /// one distinct `ClassId`".
+            fn duplicate_via_index(&self) -> bool {
+                self.index.values().any(|ids| ids.len() > 1)
+            }
+            /// The property that condition is supposed to mean, computed the
+            /// slow way straight off the map: two live entries sharing a name
+            /// but not an id. This is exactly the situation
+            /// `retarget_instance_field_to_receiver` exists to handle, so if
+            /// these two ever disagree the field gate is unsound.
+            fn duplicate_linear(&self) -> bool {
+                for ((_, a_name), &a_id) in self.map.iter() {
+                    for ((_, b_name), &b_id) in self.map.iter() {
+                        if a_name == b_name && a_id != b_id {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
             fn check(&self, names: &[&str]) {
                 for name in names {
                     assert_eq!(
@@ -388,6 +409,14 @@ mod loader_lookup_tests {
                     );
                 }
                 assert_eq!(self.index, self.rebuilt(), "incremental index drifted");
+                assert_eq!(
+                    self.duplicate_via_index(),
+                    self.duplicate_linear(),
+                    "the duplicate-name gate condition disagrees with the \
+                     property it stands for; `any_duplicate_class_name` would \
+                     let `retarget_instance_field_to_receiver` skip a receiver \
+                     it must retarget"
+                );
             }
         }
 
@@ -1291,6 +1320,107 @@ static ANY_CLASS_REDEFINED: AtomicBool = AtomicBool::new(false);
 #[inline]
 pub fn any_class_redefined() -> bool {
     ANY_CLASS_REDEFINED.load(Ordering::Relaxed)
+}
+
+/// Set the first time two *distinct* `ClassId`s are simultaneously loaded
+/// under the same binary name — i.e. the first time a loader split produces a
+/// duplicate-name class.
+///
+/// # Why this exists
+///
+/// `interpreter::field_access::retarget_instance_field_to_receiver` runs on
+/// **every** `getfield`/`putfield` whose receiver class differs from the
+/// resolved field's declaring class — the ordinary case for any *inherited*
+/// field, which is most of them in real OO bytecode. Its whole job is the
+/// loader-split case: it bails immediately unless the receiver class and the
+/// resolved declaring class have the **same name** under **different**
+/// `ClassId`s. Reaching that bail costs a `class_manager` read lock, three
+/// class lookups and a constant-pool walk, and it is paid per field access.
+///
+/// Measured on `probes/FieldShape.java` (`--nojit`, min-of-9, arms
+/// interleaved in both orders): an inherited-field get+put pair cost 54 / 78
+/// / 103 ns more than an own-class pair across three runs, with nothing else
+/// differing between the arms. `CRATONVM_DBG_HOTPATH_COUNTS=1` reported
+/// `retarget_field=3000000` on a run with exactly three million field
+/// accesses — one call per access.
+///
+/// This latch answers "can that situation exist at all in this process" with
+/// one relaxed load. It is maintained precisely rather than heuristically:
+/// `ClassManager::name_definitions` already indexes name -> set of defining
+/// `ClassId`s (two loaders mapping one name to the *same* id still reads as
+/// unique, by design), so the condition is exactly "some name has more than
+/// one distinct id".
+///
+/// # Never reset
+///
+/// Unloading a duplicate can take a name back down to one id, but the latch
+/// stays raised. That direction is the safe one: a raised latch merely
+/// restores the pre-latch behaviour (the full retarget walk runs and answers
+/// correctly), whereas a lowered one could skip a retarget that was still
+/// needed. Same policy, and the same reasoning, as [`any_class_redefined`].
+static ANY_DUPLICATE_CLASS_NAME: AtomicBool = AtomicBool::new(false);
+
+/// True once two distinct `ClassId`s have shared a binary name. Single
+/// relaxed load — the fast-path gate for loader-split field retargeting.
+#[inline]
+pub fn any_duplicate_class_name() -> bool {
+    ANY_DUPLICATE_CLASS_NAME.load(Ordering::Relaxed)
+}
+
+/// Set the first time a class named `java/lang/annotation/AnnotationProxy` is
+/// defined anywhere in the process.
+///
+/// # Why a latch, when there is already an epoch-keyed negative
+///
+/// `ClassRealm::is_annotation_proxy_class` gates a correctness decision on
+/// **every** `invokevirtual`/`invokeinterface` that hits the inline cache: an
+/// annotation proxy has no bytecode for the `Annotation` contract, so a cached
+/// virtual target must never serve one. Its own doc says "steady state is one
+/// relaxed load and one `u32` compare" — but that steady state is only reached
+/// once the class *exists*. `AnnotationProxy` is a VM-internal synthetic class
+/// that most programs never mint, so the realm's `annotation_proxy_cid` hint
+/// stays `u32::MAX` for the life of the process and every virtual invoke falls
+/// into the cold resolver.
+///
+/// The cold resolver is `#[cold]` — an out-of-line call — and does two atomic
+/// loads before it can answer, so the advertised "one relaxed load and one
+/// `u32` compare" is not what the common case pays. Its negative cache is
+/// additionally keyed on [`class_definition_epoch`], bumped by **every class
+/// definition**, so while classes are loading the first virtual invoke after
+/// each definition also takes a `class_manager` read lock and probes the name
+/// across the builtin loader delegation chain. (That is O(classes defined),
+/// **not** O(invokes) — the resolver stamps the epoch on its negative. Said
+/// plainly here because the first draft of this note claimed the latter.)
+///
+/// This latch answers the epoch-independent half of the question — *can* the
+/// class exist at all — in one relaxed load. It deliberately does **not**
+/// replace the per-realm `annotation_proxy_cid`: two VMs in one process mint
+/// the class independently and must not share an id. A realm that has not yet
+/// minted one simply performs the same lookup it does today, and only once the
+/// latch is raised.
+///
+/// Never reset, for the same reason as [`ANY_CLASS_REDEFINED`]: a raised latch
+/// restores the pre-latch behaviour exactly, a lowered one could skip a live
+/// annotation proxy.
+static ANY_ANNOTATION_PROXY_DEFINED: AtomicBool = AtomicBool::new(false);
+
+/// True once `java/lang/annotation/AnnotationProxy` has been defined anywhere
+/// in this process. Single relaxed load — the fast-path gate for
+/// `ClassRealm::is_annotation_proxy_class`.
+#[inline]
+pub fn any_annotation_proxy_defined() -> bool {
+    ANY_ANNOTATION_PROXY_DEFINED.load(Ordering::Relaxed)
+}
+
+/// Raise [`ANY_DUPLICATE_CLASS_NAME`]. Called from the two places that can
+/// make a name resolve to a second `ClassId`: the per-insert hook and the
+/// unload path's index rebuild.
+#[inline]
+fn note_duplicate_class_name() {
+    // Relaxed store against a relaxed load: the flag only ever goes
+    // false -> true, and a reader that misses the transition falls back to
+    // the authoritative walk, which is the pre-latch behaviour.
+    ANY_DUPLICATE_CLASS_NAME.store(true, Ordering::Relaxed);
 }
 
 /// Generation of the class-name -> `ClassId` mapping.
@@ -9236,17 +9366,32 @@ impl ClassManager {
             }
         }
         let name = Arc::clone(&key.1);
+        // One name comparison on the class-DEFINITION path (cold: at most a
+        // few thousand times per process) buys `is_annotation_proxy_class` a
+        // one-relaxed-load answer on the virtual-invoke path (hot: millions of
+        // times per second). See `ANY_ANNOTATION_PROXY_DEFINED`.
+        if is_vm_annotation_carrier_name(&name) {
+            ANY_ANNOTATION_PROXY_DEFINED.store(true, Ordering::Relaxed);
+        }
         let displaced = self.loaded_classes.insert(key, id);
         bump_class_definition_epoch();
         if let Some(old) = displaced {
             release_name_definition(&mut self.name_definitions, &name, old);
         }
-        *self
-            .name_definitions
-            .entry(name)
-            .or_default()
-            .entry(id)
-            .or_insert(0) += 1;
+        // `distinct` is the number of *different* `ClassId`s this name now
+        // resolves to. Two loaders mapping one name to the same id keep it at
+        // 1 (the inner map is keyed by id, refcounted by loader), so this is
+        // exactly the loader-split condition `any_duplicate_class_name`
+        // reports. Reading it here costs nothing: the `entry` walk that
+        // maintains the index is already being done.
+        let distinct = {
+            let per_name = self.name_definitions.entry(name).or_default();
+            *per_name.entry(id).or_insert(0) += 1;
+            per_name.len()
+        };
+        if distinct > 1 {
+            note_duplicate_class_name();
+        }
         displaced
     }
 
@@ -9275,6 +9420,9 @@ impl ClassManager {
                 .or_default()
                 .entry(id)
                 .or_insert(0) += 1;
+        }
+        if index.values().any(|ids| ids.len() > 1) {
+            note_duplicate_class_name();
         }
         self.name_definitions = index;
     }
