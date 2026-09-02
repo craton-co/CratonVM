@@ -590,7 +590,7 @@ thread_local! {
 // aborted the process with SIGABRT — on 183 of 206 Hibernate Reactive classes
 // under `--jdk-only`, every one of them *after* the class had already printed
 // its passing `@@RESULT`. See
-// `bug-jdk-only-hibernate-reactive-double-panic-abort-20260830`.
+// `hibernate-reactive-double-panic-abort-FIXED-20260901`.
 //
 // Every thread-local access on the detach path therefore goes through
 // `try_with` with a defined answer for "the thread is already gone". A detach
@@ -8604,7 +8604,7 @@ mod tests {
     /// undefined behaviour, and what it did in practice was abort the process:
     /// 183 of 206 Hibernate Reactive classes on rc=134, each one *after* it had
     /// printed a passing `@@RESULT`. See
-    /// `bug-jdk-only-hibernate-reactive-double-panic-abort-20260830`.
+    /// `hibernate-reactive-double-panic-abort-FIXED-20260901`.
     ///
     /// A regression re-panics inside a TLS destructor, which aborts the test
     /// process — so this fails loudly rather than quietly.

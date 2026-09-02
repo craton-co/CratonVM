@@ -6743,7 +6743,7 @@ fn main() {
         // rc=134 (SIGABRT), and every one of them reporting `thread/
         // current.rs:315:9`, which is the *second* panic and says nothing
         // about the first. See
-        // `bug-jdk-only-hibernate-reactive-double-panic-abort-20260830` and
+        // `hibernate-reactive-double-panic-abort-FIXED-20260901` and
         // `crash_handler::current_thread_name`.
         let thread_name_owned =
             cratonvm_vm::runtime::crash_handler::current_thread_name();
@@ -6755,7 +6755,7 @@ fn main() {
         // `thread_local!`s and PANIC (they do not degrade) once those are
         // gone, and a panic raised inside a panic hook aborts the process
         // immediately. That is the second half of
-        // `bug-jdk-only-hibernate-reactive-double-panic-abort-20260830`:
+        // `hibernate-reactive-double-panic-abort-FIXED-20260901`:
         // after the `std::thread::current()` call above was fixed, this
         // hook printed the real panic correctly and then aborted anyway on
         // its own `tracing::warn!` tail.
