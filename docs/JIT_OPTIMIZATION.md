@@ -395,12 +395,34 @@ stores". On BinTrees d=16 under the default collector it reads `gated=2
 declined=0`, which is the engagement evidence the switch it replaces could not
 produce.
 
-**What is not established:** a wall-clock figure. The host this landed on ran
-at load 30–63 for the second half of the session, where a BinTrees arm swings
-1600–5000 ms and an A/B is meaningless. The claim here is about the emitted
-sequence — a call and six dead compares replaced by three byte tests — and
-about engagement. Someone should put a number on it from a quiet host before
-quoting one.
+**The throughput result is NEUTRAL, and it is stated here rather than left to
+be inferred from the mechanism.** Wall clock was unusable — the host ran at load
+20–63 with four other sessions' VMs on it, and a BinTrees arm swung 1600–5000
+ms — so the arms were priced in **CPU time**, which is what this host's own
+methodology calls for. Eight pairs, alternated with the order flipped on
+alternate pairs, `-Xmx4g`, BinTrees d=16:
+
+| arm | user CPU (s), 8 runs | median |
+|---|---|---:|
+| gated ON | 2.16 2.17 2.16 2.20 2.16 2.20 2.13 2.17 | 2.165 |
+| gated OFF | 2.14 2.19 2.13 2.12 2.21 2.21 2.14 2.17 | 2.165 |
+
+Identical. (System CPU ranged 0.83–2.11 on both arms — GC and page-fault noise,
+not attributable to either.)
+
+Two things explain that without contradicting the change. The census reads
+`gated=2 declined=0`: only two compiled sites in this workload take the
+sequence at all, so the sample is small. And BinTrees builds a tree that
+survives, so `has_old_objects` arms early and the surviving path still calls
+`write_barrier` — the young-receiver floor is what would elide it, and it
+covers only `gc_age == 0`.
+
+So what is established is engagement, correctness and the emitted sequence — a
+call plus six compares that could never pass, replaced by three byte tests —
+and what is **not** established is a throughput win on any workload measured so
+far. It is kept on because the removed compares are provably dead code and the
+off arm is a supported configuration, not because a number says so. A
+call-denser workload on a quiet host is the measurement that would settle it.
 
 ### Call sites: argument staging moved to the cold path
 
