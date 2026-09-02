@@ -2336,6 +2336,36 @@ fn seed_direct_native_engine_services() {
                 "com.sun.crypto.provider.Native",
             );
         }
+        // `KW/PKCS5Padding` and `KWP/NoPadding`, with the JDK's REAL class
+        // names — and the class name is the whole difference between this
+        // working and not.
+        //
+        // `jca-provider-population-gap-20260830.md` §5.2 ran this experiment
+        // ("add six `put_service` rows, rebuild, ask"), got
+        // `NoSuchAlgorithmException` unchanged, and concluded "a service row is
+        // not sufficient even for the one engine that walks the chain". The
+        // conclusion is right about a row carrying the `.Native` MARKER, which
+        // is what the rest of this loop seeds: `try_delegate_cipher_to_chain`
+        // finds such a row, asks `build_jca_impl` to instantiate
+        // `com.sun.crypto.provider.Native`, gets a class-not-found, and moves
+        // on to the next provider — ending at the caller's original refusal,
+        // which is exactly what §5.2 measured.
+        //
+        // A row naming `KeyWrapCipher$AES128_KW_PKCS5Padding` instantiates. The
+        // marker means "a Rust engine answers this"; these six have no Rust
+        // engine and are answered by the platform's own class, which is why
+        // they are the only rows in this loop that carry a real name.
+        for (mode, padding) in [("KW", "PKCS5Padding"), ("KWP", "NoPadding")] {
+            let bits = size.trim_start_matches("AES_");
+            put_service(
+                JCE,
+                "Cipher",
+                &format!("{size}/{mode}/{padding}"),
+                &format!(
+                    "com.sun.crypto.provider.KeyWrapCipher$AES{bits}_{mode}_{padding}"
+                ),
+            );
+        }
     }
     // The `ML-KEM` UMBRELLA was absent for the same reason `ML-DSA` was absent
     // from the `SUN` `KeyFactory` list above, and it was found by the census
@@ -4188,6 +4218,98 @@ fn seed_sunjce_pbe_services() {
                 format!("com.sun.crypto.provider.PBES2Parameters$Hmac{hash_cls}AndAES_{keysize}");
             put_service(P, "AlgorithmParameters", &algo, &cls);
         }
+    }
+}
+
+/// The seventeen SunJCE `Cipher` services this engine does not compute, seeded
+/// with the JDK's REAL implementation classes so the chain walk can serve them.
+///
+/// `Cipher.getInstance`'s anonymous overload already falls to
+/// `try_delegate_cipher_to_chain` when `classify_transformation` refuses a
+/// name — the route added for X.509/PKCS/CMS callers who name their content
+/// cipher by OID. It walks every installed provider and asks `build_jca_impl`
+/// to instantiate the class the service row names, so for a name this VM has
+/// no engine for, the row IS the implementation.
+///
+/// # Why the class name is the whole difference
+///
+/// `jca-provider-population-gap-20260830.md` §5.2 ran exactly this experiment
+/// on six of these rows, measured `NoSuchAlgorithmException` unchanged, and
+/// concluded that "a service row is not sufficient even for the one engine
+/// that walks the chain" — from which §5.3 drew "0 of 84 are clerical".
+///
+/// The conclusion holds only for a row carrying `com.sun.crypto.provider
+/// .Native`, which is what the rest of this file seeds and is not a class at
+/// all: it is the marker meaning "a Rust engine answers this". The chain walk
+/// finds such a row, asks for a class that does not exist, gets a
+/// class-not-found, and moves to the next provider — ending at the caller's
+/// original refusal, which is precisely what §5.2 saw. Rows naming
+/// `KeyWrapCipher$AES128_KW_PKCS5Padding` and its sixteen siblings instantiate,
+/// and all seventeen resolve (measured 2026-09-02).
+///
+/// Three families, none of them an algorithm this crate implements:
+///
+/// * **PBES2** (`PBEWithHmacSHA{384,512,512/224,512/256}AndAES_{128,256}`) —
+///   PBKDF2 with the named PRF, then AES/CBC. The `SHA1`/`SHA224`/`SHA256`
+///   members are computed natively and stay on the marker; these eight are the
+///   PRFs `cipher.rs`'s own `pbes2_params` table has no arm for.
+/// * **PKCS#12 / PKCS#5 v1.5 PBE** (`PBEWithMD5AndDES` and six siblings) — the
+///   PBKDF1 and PKCS#12 B.2 derivations feeding DES, DESede, RC2 and RC4.
+/// * **The rest**: `DESedeWrap` (RFC 3217 CMS key wrap) and `RC2`.
+fn seed_sunjce_delegated_cipher_services() {
+    const P: &str = "SunJCE";
+    // PBES2, `(algorithm PRF spelling, class PRF spelling)` — the same
+    // slash-versus-underscore split every PBES2 table in this file carries.
+    for (algo_hash, class_hash) in [
+        ("SHA384", "SHA384"),
+        ("SHA512", "SHA512"),
+        ("SHA512/224", "SHA512_224"),
+        ("SHA512/256", "SHA512_256"),
+    ] {
+        for keysize in ["128", "256"] {
+            put_service(
+                P,
+                "Cipher",
+                &format!("PBEWithHmac{algo_hash}AndAES_{keysize}"),
+                &format!(
+                    "com.sun.crypto.provider.PBES2Core$Hmac{class_hash}AndAES_{keysize}"
+                ),
+            );
+        }
+    }
+    for (algo, class) in [
+        (
+            "PBEWithMD5AndDES",
+            "com.sun.crypto.provider.PBEWithMD5AndDESCipher",
+        ),
+        (
+            "PBEWithMD5AndTripleDES",
+            "com.sun.crypto.provider.PBEWithMD5AndTripleDESCipher",
+        ),
+        (
+            "PBEWithSHA1AndDESede",
+            "com.sun.crypto.provider.PKCS12PBECipherCore$PBEWithSHA1AndDESede",
+        ),
+        (
+            "PBEWithSHA1AndRC2_40",
+            "com.sun.crypto.provider.PKCS12PBECipherCore$PBEWithSHA1AndRC2_40",
+        ),
+        (
+            "PBEWithSHA1AndRC2_128",
+            "com.sun.crypto.provider.PKCS12PBECipherCore$PBEWithSHA1AndRC2_128",
+        ),
+        (
+            "PBEWithSHA1AndRC4_40",
+            "com.sun.crypto.provider.PKCS12PBECipherCore$PBEWithSHA1AndRC4_40",
+        ),
+        (
+            "PBEWithSHA1AndRC4_128",
+            "com.sun.crypto.provider.PKCS12PBECipherCore$PBEWithSHA1AndRC4_128",
+        ),
+        ("DESedeWrap", "com.sun.crypto.provider.DESedeWrapCipher"),
+        ("RC2", "com.sun.crypto.provider.RC2Cipher"),
+    ] {
+        put_service(P, "Cipher", algo, class);
     }
 }
 
@@ -7451,6 +7573,7 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         seed_sunjce_secret_key_factory_services();
         seed_algorithm_parameter_generator_services();
         seed_sunjce_pbe_mac_services();
+        seed_sunjce_delegated_cipher_services();
         let gi = "sun/security/jca/GetInstance";
         r.register(
             gi,
@@ -8192,6 +8315,10 @@ mod tests {
     fn every_advertised_sunjce_cipher_is_serviceable() {
         let _lock = reset_service_state_for_tests();
         seed_direct_native_engine_services();
+        // The second seeder, for the same reason the `Mac` ratchet calls its
+        // own: a population read out of the registry only covers what the
+        // seeders this test CALLS have put there.
+        seed_sunjce_delegated_cipher_services();
         let advertised: Vec<String> = services()
             .lock()
             .get("SunJCE")
@@ -8205,8 +8332,32 @@ mod tests {
             "the SunJCE Cipher seed looks empty: {advertised:?}"
         );
         for algorithm in &advertised {
+            // SERVICEABLE is a disjunction, and the second arm is what the
+            // seventeen delegated transformations rest on.
+            //
+            // `transformation_is_serviceable` asks whether THIS engine computes
+            // the name. `Cipher.getInstance`'s anonymous overload does not stop
+            // there: on a refusal it walks the chain and instantiates the class
+            // the service row names, which is the whole implementation for a
+            // name with no Rust engine (PBES2 at the PRFs `pbes2_aes_params`
+            // has no arm for, the PKCS#12 PBE family, `DESedeWrap`, `RC2`, and
+            // the six AES key-wrap paddings).
+            //
+            // The second arm has to be a REAL class. A row carrying the
+            // `.Native` MARKER is not one — it means "a Rust engine answers
+            // this" — and a marker row for a name the engine does not compute
+            // is exactly the W7-15 defect. It is also why
+            // `jca-provider-population-gap-20260830.md` §5.2 concluded a
+            // service row could never be sufficient: the six rows it added
+            // carried the marker.
+            let routed = get_service_entry("SunJCE", "Cipher", algorithm)
+                .map(|e| {
+                    let c = e.class_name.trim().to_string();
+                    !c.is_empty() && !c.ends_with(".Native")
+                })
+                .unwrap_or(false);
             assert!(
-                crate::jca::cipher::transformation_is_serviceable(algorithm),
+                crate::jca::cipher::transformation_is_serviceable(algorithm) || routed,
                 "SunJCE advertises Cipher.{algorithm}, but Cipher.getInstance refuses it — \
                  advertising an algorithm the engine cannot compute is the defect W7-15 closed"
             );
