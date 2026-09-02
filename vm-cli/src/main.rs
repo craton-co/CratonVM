@@ -200,6 +200,14 @@ fn maybe_dump_shutdown_reports() {
     // ran at all.
     cratonvm_vm::report_map_view_cache_at_exit();
 
+    // The stale-frame-word oracle's run totals, on `CRATONVM_DBG=remap-residue`.
+    // `local_oop` is the count that names a missed root; the per-frame
+    // `stale_live` number it replaces is an upper bound that includes dead
+    // spill residue, and was twice read as a verdict. `frames` is the
+    // engagement counter. See
+    // `jit::conservative_roots::report_remap_residue_census_at_exit`.
+    cratonvm_vm::jit::conservative_roots::report_remap_residue_census_at_exit();
+
     // The punned-cell watch census, on `CRATONVM_DBG_WATCH_PUN=<class>:<slot>`.
     // `accessor_reads` / `accessor_stores` are the ENGAGEMENT counters: the
     // experiment this watch exists for turns the JIT off, which also removes
