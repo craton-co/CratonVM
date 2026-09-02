@@ -3650,7 +3650,7 @@ pub(super) fn op_putfield(
     // address watch list). See fixed-suite-bugs/h2-suite-bugs/
     // bug-h2-suite-residual-fail-triage-FIXED.md.
     if crate::runtime::env_cache::dbg_field_watch() {
-        diag_putfield_watch(shared, thread, frame_idx, current_class_id, *index, obj_ref, &field, value)?;
+        diag_putfield_watch(shared, thread, frame_idx, current_class_id, *index, obj_ref, &field, value, old_value)?;
     }
     // CRATONVM_DBG_CORRUPT_CELL, the interpreter's own WRITE door.
     // The read doors were instrumented first, and a producer that only
@@ -4618,6 +4618,7 @@ fn diag_putfield_watch(
     obj_ref: ObjectRef,
     field: &ResolvedField,
     value: Value,
+    old_value: Value,
 ) -> Result<(), MethodCallFailed> {
     let index = &index;
     let _ = (frame_idx, thread.thread_id, current_class_id, obj_ref, field.field_index);

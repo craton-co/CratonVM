@@ -4342,8 +4342,8 @@ pub(super) fn execute_invokevirtual_fast_door(
             let tag = if i == 0 { b'L' } else { facts.param_tags[i - 1] };
             let ok = match tag {
                 b'L' | b'[' => cv.is_object() || cv.is_null(),
-                b'J' => kind == ValueStack::KIND_MARK_LONG,
-                b'D' => kind == ValueStack::KIND_MARK_DOUBLE,
+                b'J' => kind == crate::runtime::ValueStack::KIND_MARK_LONG,
+                b'D' => kind == crate::runtime::ValueStack::KIND_MARK_DOUBLE,
                 b'F' => cv.as_float().is_some(),
                 b'I' | b'Z' | b'B' | b'C' | b'S' => cv.as_int().is_some(),
                 _ => false,
