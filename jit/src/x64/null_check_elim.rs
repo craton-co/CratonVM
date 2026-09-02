@@ -466,6 +466,24 @@ pub(super) fn note_receiver_null_check_emitted() {
     RECEIVER_NULL_CHECKS_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+static RECEIVER_NULL_CHECKS_IMPLICIT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(super) fn note_receiver_null_check_implicit() {
+    RECEIVER_NULL_CHECKS_IMPLICIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Sites that dropped the check in favour of the fault.
+///
+/// Deliberately NOT folded into `elided`. An elided site carries a proof and
+/// cannot fault; an implicit site has no proof and depends on the signal
+/// handler to turn its fault into an NPE. One is an optimisation and the other
+/// is a liability, and a single counter covering both would hide which of them
+/// a workload is actually running on.
+pub fn receiver_null_check_implicit_count() -> u64 {
+    RECEIVER_NULL_CHECKS_IMPLICIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `(elided, emitted)` getfield receiver null checks, process-wide.
 ///
 /// The pair, not the ratio: an all-zero pair and a zero-elided pair look the
@@ -566,7 +584,18 @@ mod receiver_elision_reach_tests {
     #[test]
     fn only_the_getfield_arms_consult_the_null_check_dataflow() {
         let src = include_str!("bytecode_walk.rs");
-        let consulting = src.matches("emit_trusted_oop_receiver_check_at(code, pc)").count();
+        let consulting = src.matches("emit_trusted_oop_receiver_check_at(code, pc,").count();
+        let implicit_optin = src
+            .matches("emit_trusted_oop_receiver_check_at(code, pc, true)")
+            .count();
+        assert_eq!(
+            implicit_optin, 1,
+            "exactly ONE arm may opt into the implicit null check, and it must \
+             be the one whose next emitted instruction is unconditionally a \
+             receiver dereference. The second getfield arm emits its GC_FLAGS \
+             read only under `compact_ref_fields_enabled()`, so it must pass \
+             `false`. Found {implicit_optin} opt-ins."
+        );
         assert_eq!(
             consulting, 2,
             "expected exactly the two `getfield` arms to consult the dataflow; \
