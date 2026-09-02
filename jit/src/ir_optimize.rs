@@ -1156,6 +1156,53 @@ fn is_loop_invariant_d(
     }
 }
 
+/// The memory state flowing INTO a loop, as seen at its header.
+///
+/// When the header carries a memory phi, that phi's input for the loop-entry
+/// predecessor is the memory the pre-header ends with; when it does not, memory
+/// is loop-invariant already and the caller's own invariance test answers
+/// first. Used only to re-anchor a node whose alias class conflicts with no
+/// store, so this is an ORDERING choice and never a claim that some other
+/// memory state is equivalent.
+fn loop_entry_memory(graph: &Graph, region: NodeId, entry_pred: NodeId) -> Option<NodeId> {
+    let slot = graph.nodes[region as usize]
+        .inputs
+        .iter()
+        .position(|&p| p == entry_pred)?;
+    graph
+        .nodes
+        .iter()
+        .find(|node| {
+            node.op == Op::Phi
+                && node.ty == IrType::Memory
+                && node.inputs.first() == Some(&region)
+        })
+        // Phi inputs are `[region, v_for_pred0, v_for_pred1, …]`, aligned with
+        // the region's own predecessor list.
+        .and_then(|phi| phi.inputs.get(1 + slot).copied())
+}
+
+/// Can any node anchored at this control token raise an exception?
+///
+/// The question a pre-header hoist has to answer: moving a potentially-throwing
+/// node into that block is only invisible if nothing already there could throw
+/// first. Same classification `loop_has_hard_barrier` uses — not pure, not
+/// control, not `Load`/`Store`/`Phi`/`Dead` — applied to one block instead of a
+/// loop body.
+///
+/// Conservative in both directions that matter: a node this cannot see (one
+/// scheduled into the block by `find_best_block` rather than pinned by its
+/// control input) is a PURE node, which cannot throw; and a node it does see
+/// and cannot classify counts as trapping.
+fn preheader_may_trap(graph: &Graph, preheader: NodeId) -> bool {
+    graph.nodes.iter().any(|node| {
+        node.inputs.first() == Some(&preheader)
+            && !node.op.is_pure()
+            && !node.op.is_control()
+            && !matches!(node.op, Op::Load(_) | Op::Store(_) | Op::Phi | Op::Dead)
+    })
+}
+
 /// True if the loop body contains a *hard* memory barrier — a `Call`,
 /// allocation (`New`/`NewArray`, which run constructor side effects), guard,
 /// monitor, or any other non-pure node that is not a `Store`/`Load`/`Phi`/
@@ -1358,6 +1405,99 @@ fn licm(graph: &mut Graph) -> bool {
         if preheader == NO_NODE || body.contains(&preheader) {
             // No identifiable pre-header outside the loop → cannot hoist.
             continue;
+        }
+
+        // ── Loop-invariant `Op::ArrayLength` ────────────────────────────────
+        //
+        // Run BEFORE the hard-barrier bail below, and deliberately so: an
+        // in-loop `ArrayLength` IS one of those barriers (it is not pure, and
+        // it is not a `Load`/`Store`/`Phi`), so a javac counted loop —
+        // `for (i = 0; i < a.length; i++)` — disqualified its own LICM by the
+        // very node this hoists. Measured on `probes/ArrayElemLoadCost.java`
+        // with `CRATONVM_DBG_LICM=1`: every candidate header reported
+        // `hard_barrier=true, 0 load(s)`, so the pass did nothing at all on the
+        // one loop shape it most needed to.
+        //
+        // What makes this hoistable when the general load hoist below is
+        // blocked:
+        //
+        // * **The value cannot change.** Nothing writes an array's length, so
+        //   `AliasClass::ArrayLength` conflicts with no store (see the alias
+        //   oracle's own note in `ir.rs`). The memory token is therefore pure
+        //   ordering for this node, and re-anchoring it to the loop's ENTRY
+        //   memory is value-preserving rather than a claim about aliasing.
+        //   Without re-anchoring the memory the hoist would be inert:
+        //   `ir_schedule::find_best_block` places a data node in the deepest
+        //   block dominated by ALL its input blocks, so a node still reading
+        //   the loop's memory phi stays in the loop no matter where its control
+        //   points.
+        //
+        // * **The throw point does not move.** `ArrayLength` raises NPE on a
+        //   null receiver, which is why it is impure. It is only taken when its
+        //   control input IS the loop header region — i.e. it executes on every
+        //   entry to the header, so in particular on the first — and the
+        //   pre-header runs immediately before that first execution with
+        //   nothing observable in between. `preheader_may_trap` refuses the
+        //   remaining case, a pre-header block that can itself throw, where
+        //   hoisting could report the NPE ahead of an exception that came first.
+        let al_ids: Vec<NodeId> = body
+            .iter()
+            .copied()
+            .filter(|&id| matches!(graph.nodes[id as usize].op, Op::ArrayLength))
+            .collect();
+        if !al_ids.is_empty() && !preheader_may_trap(graph, preheader) {
+            let entry_mem = loop_entry_memory(graph, region, entry_pred);
+            for al in al_ids {
+                let inputs = graph.nodes[al as usize].inputs.clone();
+                // Only the full `[ctrl, mem, array]` form has a control slot to
+                // repoint; the compact EA-bridge form is already schedulable by
+                // invariance alone.
+                if inputs.len() < 3 {
+                    continue;
+                }
+                if inputs[0] != region {
+                    if dbg {
+                        eprintln!(
+                            "[DBG_LICM] arraylength {al}: skip — control {} is not the header {region}",
+                            inputs[0]
+                        );
+                    }
+                    continue;
+                }
+                let array = inputs[2];
+                if !is_loop_invariant(graph, array, region, &body) {
+                    if dbg {
+                        eprintln!("[DBG_LICM] arraylength {al}: skip — array {array} variant");
+                    }
+                    continue;
+                }
+                let new_mem = if is_loop_invariant(graph, inputs[1], region, &body) {
+                    inputs[1]
+                } else {
+                    match entry_mem {
+                        Some(m) => m,
+                        None => {
+                            if dbg {
+                                eprintln!(
+                                    "[DBG_LICM] arraylength {al}: skip — no loop-entry memory"
+                                );
+                            }
+                            continue;
+                        }
+                    }
+                };
+                if dbg {
+                    eprintln!(
+                        "[DBG_LICM] arraylength {al} (inputs {inputs:?}): HOIST to preheader \
+                         {preheader}, mem {} -> {new_mem}",
+                        inputs[1]
+                    );
+                }
+                graph.nodes[al as usize].inputs[0] = preheader;
+                graph.nodes[al as usize].inputs[1] = new_mem;
+                changed = true;
+                hoisted += 1;
+            }
         }
 
         // A hard barrier (call / allocation / guard / monitor) could read or
@@ -4487,6 +4627,115 @@ mod tests {
         assert_eq!(
             g.nodes[load as usize].inputs[0], region,
             "the load must stay in the loop when the body has a barrier"
+        );
+    }
+
+    /// javac's counted loop — `for (i = 0; i < a.length; i++)` — re-evaluates
+    /// `a.length` at the top of every iteration, and the resulting in-loop
+    /// `Op::ArrayLength` is itself one of the hard barriers that disqualified
+    /// this pass from hoisting anything at all. Measured on
+    /// `probes/ArrayElemLoadCost.java` before the fix: every candidate header
+    /// reported `hard_barrier=true, 0 load(s)`.
+    ///
+    /// Both edges have to move. Re-anchoring only the control leaves the node
+    /// reading the loop's memory phi, and `ir_schedule::find_best_block` places
+    /// a data node in the deepest block dominated by ALL its input blocks — so
+    /// the "hoisted" node would schedule straight back into the loop. This test
+    /// pins both.
+    #[test]
+    fn test_licm_hoists_invariant_arraylength() {
+        let (mut g, region, preheader, _iv) = loop_probe_header(Op::Merge);
+        let entry_mem = 2; // the Start's memory projection
+        let arr = g.add(Op::Param(0), IrType::Ref, vec![g.entry], None);
+        // The loop's memory phi, exactly as the builder emits it:
+        // [region, entry_memory, back_edge_memory]. Its own back edge is
+        // itself here — nothing in this probe writes memory.
+        let mem_phi = g.add(Op::Phi, IrType::Memory, vec![region, entry_mem], None);
+        g.nodes[mem_phi as usize].inputs.push(mem_phi);
+        let len = g.add(
+            Op::ArrayLength,
+            IrType::Int,
+            vec![region, mem_phi, arr],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![region, len], None);
+        g.exit = ret;
+
+        let changed = licm(&mut g);
+
+        assert!(changed, "an invariant arraylength must hoist");
+        assert_eq!(
+            g.nodes[len as usize].inputs[0], preheader,
+            "control must be re-anchored to the pre-header"
+        );
+        assert_eq!(
+            g.nodes[len as usize].inputs[1], entry_mem,
+            "the memory token must be re-anchored to the loop's ENTRY memory — \
+             leaving it on the loop's memory phi schedules the node back into \
+             the loop and the hoist is inert"
+        );
+    }
+
+    /// The receiver decides. An `arraylength` of something the loop itself
+    /// produces is not invariant, and hoisting it would read the length of a
+    /// different array (or of nothing yet).
+    #[test]
+    fn test_licm_does_not_hoist_variant_arraylength() {
+        let (mut g, region, _preheader, iv) = loop_probe_header(Op::Merge);
+        let entry_mem = 2;
+        let mem_phi = g.add(Op::Phi, IrType::Memory, vec![region, entry_mem], None);
+        g.nodes[mem_phi as usize].inputs.push(mem_phi);
+        // A "receiver" that varies with the induction variable.
+        let variant_ref = g.add(Op::Phi, IrType::Ref, vec![region, iv], None);
+        g.nodes[variant_ref as usize].inputs.push(variant_ref);
+        let len = g.add(
+            Op::ArrayLength,
+            IrType::Int,
+            vec![region, mem_phi, variant_ref],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![region, len], None);
+        g.exit = ret;
+
+        licm(&mut g);
+
+        assert_eq!(
+            g.nodes[len as usize].inputs[0], region,
+            "a variant receiver's arraylength must stay in the loop"
+        );
+    }
+
+    /// The hoist moves a node that can raise NPE, so it is only taken when the
+    /// `arraylength` runs on EVERY entry to the header — i.e. its control input
+    /// is the header itself. One behind a conditional inside the body may never
+    /// run at all in the original program, and moving it into the pre-header
+    /// would raise an exception the program never raised.
+    #[test]
+    fn test_licm_does_not_hoist_conditional_arraylength() {
+        let (mut g, region, _preheader, iv) = loop_probe_header(Op::Merge);
+        let entry_mem = 2;
+        let arr = g.add(Op::Param(0), IrType::Ref, vec![g.entry], None);
+        let mem_phi = g.add(Op::Phi, IrType::Memory, vec![region, entry_mem], None);
+        g.nodes[mem_phi as usize].inputs.push(mem_phi);
+        // An in-body branch, with the arraylength on one arm only.
+        let zero = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let cond = g.add(Op::Cmp(CmpOp::Ne), IrType::Int, vec![iv, zero], None);
+        let inner_if = g.add(Op::If, IrType::Control, vec![region, cond], None);
+        let taken = g.add(Op::Proj(0), IrType::Control, vec![inner_if], None);
+        let len = g.add(
+            Op::ArrayLength,
+            IrType::Int,
+            vec![taken, mem_phi, arr],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![taken, len], None);
+        g.exit = ret;
+
+        licm(&mut g);
+
+        assert_eq!(
+            g.nodes[len as usize].inputs[0], taken,
+            "a conditionally-executed arraylength must stay where it is"
         );
     }
 
