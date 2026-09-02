@@ -2324,11 +2324,26 @@ type VacatedLedger = (
 static VACATED_ADDRS: parking_lot::RwLock<Option<VacatedLedger>> = parking_lot::RwLock::new(None);
 
 /// `CRATONVM_DBG_VACATED_FRAMES=1` — arm the vacated-address ledger.
+#[inline]
 pub fn vacated_frames_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VACATED_FRAMES").is_some()
-    })
+    // Interpreter hot paths read this on every operand-stack push and every
+    // heap accessor (`load_and_forward`, `get_field`, ...). A `OnceLock` is
+    // an acquire load plus an out-of-line init check; this is one relaxed
+    // byte load with the init on a cold path. 0 = unset, 1 = off, 2 = on.
+    static STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let s = STATE.load(std::sync::atomic::Ordering::Relaxed);
+    if s != 0 {
+        return s == 2;
+    }
+    vacated_frames_enabled_init(&STATE)
+}
+
+#[cold]
+#[inline(never)]
+fn vacated_frames_enabled_init(state: &std::sync::atomic::AtomicU8) -> bool {
+    let on = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VACATED_FRAMES").is_some();
+    state.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    on
 }
 
 /// Replace the ledger with THIS collection's vacated addresses (the pointer
