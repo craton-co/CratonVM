@@ -104,6 +104,11 @@ mod starts;
 
 /// The sweep: the shard type both drivers fill, and the per-object body they
 /// share. Split out of this file on 2026-09-02.
+/// The per-object extra-root filter: the four global tables a marked
+/// object.s out-edges live in, reduced to two lock-free indexed loads.
+/// Added 2026-09-02.
+mod mark_roots;
+
 mod sweep;
 pub(crate) use sweep::{ZSweepCfg, ZSweepShard};
 
@@ -943,6 +948,9 @@ struct ZgcCounters {
     /// of two call chains ran is the kind of thing that is correct until someone
     /// adds a third. Plain atomics have no such argument to get wrong.
     mark_ref_skip_bloom: Box<[AtomicU64; Z_SKIP_BLOOM_WORDS]>,
+    /// Which objects and classes have edges the heap does not store in them.
+    /// Rebuilt per collection; read once per marked object. See `mark_roots`.
+    mark_root_filter: mark_roots::ZMarkRootFilter,
 
     /// One-shot latch for the "`visit_refs` ran with no skip-set snapshot"
     /// warning. Without it the warning is one line per object visited, which
@@ -1886,6 +1894,7 @@ impl ZgcRealHeap {
                 slot_census: census::ZSlotCensus::new(),
                 mark_ref_skip: parking_lot::RwLock::new(None),
                 mark_ref_skip_bloom: Box::new(std::array::from_fn(|_| AtomicU64::new(0))),
+                mark_root_filter: mark_roots::ZMarkRootFilter::default(),
                 mark_ref_skip_warned: AtomicBool::new(false),
                 dead_scratch: Mutex::new(Vec::new()),
                 forwarding_words_stamped: AtomicUsize::new(0),
@@ -10594,6 +10603,60 @@ impl barrier::ZBarrierContext for ZgcRealHeap {
     }
 }
 
+impl ZgcRealHeap {
+    /// The four edges an object has that are not stored in the object: its
+    /// class's pinned defining loader, and the mirrors and metadata a loader
+    /// owns. Written once and called by all three mark loops, so they cannot
+    /// disagree about what is reachable.
+    ///
+    /// Each of the three tables is a global `RwLock` over a hash map, and each
+    /// answer is overwhelmingly "nothing" -- so the filter is asked first, and
+    /// answers from a lock-free bitmap or bloom. See [`mark_roots`].
+    #[inline]
+    fn visit_pin_edges(&self, base: usize, class_id: u32, f: &mut dyn FnMut(usize)) {
+        let filter = &self.counters.mark_root_filter;
+        if filter.may_pin_loader(class_id) {
+            if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id) {
+                f(loader);
+            }
+        }
+        if !filter.may_own_extra_roots(base) {
+            return;
+        }
+        if let Some(mirrors) = cratonvm_types::mirror_pin::mirrors_for_loader(base) {
+            for m in mirrors {
+                f(m);
+            }
+        }
+        if let Some(metadata) = cratonvm_types::metadata_pin::roots_for_loader(base) {
+            for m in metadata {
+                f(m);
+            }
+        }
+    }
+
+    /// The native collection-overlay edge, behind the same filter.
+    ///
+    /// Split from [`Self::visit_pin_edges`] only because one caller
+    /// (`visit_refs`) carries a long comment about why this edge exists at all
+    /// and it belongs next to the call.
+    #[inline]
+    fn visit_overlay_edges(&self, base: usize, class_id: u32, f: &mut dyn FnMut(usize)) {
+        // The ONE table with no `NON_EMPTY` latch that ever fires:
+        // `native-collections` registers its provider at VM startup, so
+        // `PROVIDER_COUNT` is non-zero on every run and every marked object
+        // used to take the provider lock and that module's own mutex to be
+        // told it owns nothing. This test is what replaces both.
+        if !self.counters.mark_root_filter.may_own_overlay(base) {
+            return;
+        }
+        for overlay_ref in crate::external_roots::external_roots_for_owner(base, Some(class_id)) {
+            f(overlay_ref.as_ptr() as usize);
+        }
+    }
+
+}
+
 impl mark::ZMarkContext for ZgcRealHeap {
     /// [`vaddr::Z_REMAPPED`] — the quiescent good mask, unconditionally.
     ///
@@ -10770,19 +10833,7 @@ impl mark::ZMarkContext for ZgcRealHeap {
         // The pin edges, in `collect_garbage`'s order. `class_id` is read
         // through the shared header view, like every other read here.
         let class_id = self.header_ref(base as *mut u8).class_id.as_u32();
-        if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id) {
-            f(loader as u64);
-        }
-        if let Some(mirrors) = cratonvm_types::mirror_pin::mirrors_for_loader(base) {
-            for m in mirrors {
-                f(m as u64);
-            }
-        }
-        if let Some(metadata) = cratonvm_types::metadata_pin::roots_for_loader(base) {
-            for m in metadata {
-                f(m as u64);
-            }
-        }
+        self.visit_pin_edges(base, class_id, &mut |edge| f(edge as u64));
         // The native collection-overlay edges. `collect_garbage`'s serial loop
         // pushes these and this method did not, which would have been a
         // use-after-free the moment a coordinator drove a real collection
@@ -10794,9 +10845,7 @@ impl mark::ZMarkContext for ZgcRealHeap {
         // `native_roots.rs::scan_collection_overlays` explicitly defers to this
         // loop having run, and rooting every overlay regardless of reachability
         // is what that deferral exists to avoid.
-        for overlay_ref in crate::external_roots::external_roots_for_owner(base, Some(class_id)) {
-            f(overlay_ref.as_ptr() as u64);
-        }
+        self.visit_overlay_edges(base, class_id, &mut |edge| f(edge as u64));
     }
 
     /// The wild-pointer gate: is `addr` the base of a live allocation?
@@ -11722,6 +11771,15 @@ impl GarbageCollector for ZgcRealHeap {
         // below runs from scratch, which is the same fail-closed fallback
         // `mark_with_controller_stw` has always had.
         let mut clock = ZPhaseClock::new(gc_started.is_some());
+        // ARM THE EXTRA-ROOT FILTER, and only here. It answers "this object owns
+        // no mirrors, metadata or overlay" from a snapshot of those tables. key
+        // sets, which is a proof only while nothing can add to them -- true
+        // inside this pause and false during a CONCURRENT phase, where a
+        // mutator defining a class or building a native collection would
+        // register an owner the snapshot has never seen. A stale "no" there
+        // would drop a live edge, so the concurrent marker keeps asking the
+        // real tables: the filter is disarmed everywhere but here.
+        self.counters.mark_root_filter.rebuild();
         let concurrent_off_heap = self.finish_concurrent_mark(roots);
         let marked_concurrently = concurrent_off_heap.is_some();
         let markend_us = clock.lap();
@@ -12069,15 +12127,7 @@ impl GarbageCollector for ZgcRealHeap {
                 }
                 let class_id = header.class_id.as_u32();
                 self.enumerate_references(addr as *mut u8, &mut work, skip_for(addr));
-                if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id) {
-                    work.push(loader);
-                }
-                if let Some(mirrors) = cratonvm_types::mirror_pin::mirrors_for_loader(addr) {
-                    work.extend(mirrors);
-                }
-                if let Some(metadata) = cratonvm_types::metadata_pin::roots_for_loader(addr) {
-                    work.extend(metadata);
-                }
+                self.visit_pin_edges(addr, class_id, &mut |edge| work.push(edge));
                 // Same owner-based propagation Generational's non-moving young
                 // marker and old-gen BFS already do (`gen_heap.rs`): a native
                 // side-table entry is only reachable through the Java collection
@@ -12085,11 +12135,7 @@ impl GarbageCollector for ZgcRealHeap {
                 // owner, not rooted unconditionally for every overlay regardless
                 // of reachability. `native_roots.rs`'s `scan_collection_overlays`
                 // relies on this loop running before it defers to us.
-                for overlay_ref in
-                    crate::external_roots::external_roots_for_owner(addr, Some(class_id))
-                {
-                    work.push(overlay_ref.as_ptr() as usize);
-                }
+                self.visit_overlay_edges(addr, class_id, &mut |edge| work.push(edge));
             }
         }
         if wild_skipped > 0 {
@@ -12146,23 +12192,11 @@ impl GarbageCollector for ZgcRealHeap {
                     }
                     let class_id = h.class_id.as_u32();
                     self.enumerate_references(a as *mut u8, &mut work, skip_for(a));
-                    if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id) {
-                        work.push(loader);
-                    }
-                    if let Some(mirrors) = cratonvm_types::mirror_pin::mirrors_for_loader(a) {
-                        work.extend(mirrors);
-                    }
-                    if let Some(metadata) = cratonvm_types::metadata_pin::roots_for_loader(a) {
-                        work.extend(metadata);
-                    }
+                    self.visit_pin_edges(a, class_id, &mut |edge| work.push(edge));
                     // Same owner-based overlay propagation as the main mark
                     // loop above — a resurrected finalizable object's own
                     // side-table entries must survive with it.
-                    for overlay_ref in
-                        crate::external_roots::external_roots_for_owner(a, Some(class_id))
-                    {
-                        work.push(overlay_ref.as_ptr() as usize);
-                    }
+                    self.visit_overlay_edges(a, class_id, &mut |edge| work.push(edge));
                 }
             }
             if !resurrected.is_empty() {
@@ -13000,6 +13034,8 @@ impl GarbageCollector for ZgcRealHeap {
             }
         }
 
+        // Disarmed before any mutator runs again -- see the rebuild at the top.
+        self.counters.mark_root_filter.disarm();
         GcResult {
             stats: GcStats {
                 objects_copied,

@@ -2589,6 +2589,8 @@ impl ZMarkWorker {
         Self::maybe_share_early(&mut self.local, id, stripes, terminator, stats);
 
         let mut scanned: usize = 0;
+        let mut marked_here: u64 = 0;
+        let mut off_heap_here: u64 = 0;
         while scanned < budget {
             if scanned % Z_MARK_YIELD_CHECK_INTERVAL == 0 && pause.pause_requested() {
                 break;
@@ -2601,6 +2603,13 @@ impl ZMarkWorker {
 
             {
                 let local = &mut self.local;
+                // COUNTED LOCALLY, folded once per drain below. These two are
+                // shared by every worker, so a `fetch_add` per edge is a
+                // contended write to one cache line on the hottest line of the
+                // whole collector -- the sort of shared counter that makes a
+                // parallel marker scale negatively (see this module.s header).
+                let marked = &mut marked_here;
+                let off_heap = &mut off_heap_here;
                 ctx.visit_refs(addr, &mut |child: u64| {
                     if child == 0 {
                         return;
@@ -2610,11 +2619,11 @@ impl ZMarkWorker {
                         // when a mutator is mid-store; refuse rather than
                         // dereference. `ZgcRealHeap::collect_garbage` keeps
                         // the same counter under the name `wild_skipped`.
-                        stats.off_heap_children.fetch_add(1, Ordering::Relaxed);
+                        *off_heap += 1;
                         return;
                     }
                     if ctx.try_mark(child) {
-                        stats.objects_marked.fetch_add(1, Ordering::Relaxed);
+                        *marked += 1;
                         local.push(child);
                     }
                 });
@@ -2629,6 +2638,14 @@ impl ZMarkWorker {
             stats
                 .objects_scanned
                 .fetch_add(scanned as u64, Ordering::Relaxed);
+        }
+        if marked_here > 0 {
+            stats.objects_marked.fetch_add(marked_here, Ordering::Relaxed);
+        }
+        if off_heap_here > 0 {
+            stats
+                .off_heap_children
+                .fetch_add(off_heap_here, Ordering::Relaxed);
         }
         pause.leave_drain();
         scanned
