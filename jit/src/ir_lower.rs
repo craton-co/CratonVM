@@ -5178,6 +5178,7 @@ impl<'a> Lowerer<'a> {
                         self.frame_record,
                     );
                 if !inlined {
+                    crate::runtime_lowering::note_stub_only_alloc();
                     crate::runtime_lowering::emit_new_object_stub(
                         &mut self.buf,
                         self.context_slot_off,

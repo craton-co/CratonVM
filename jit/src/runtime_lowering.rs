@@ -224,6 +224,29 @@ pub(crate) fn emit_new_object_stub(
 /// `emit_new_object_stub`'s target.
 /// What [`emit_inline_tlab_new_ir`] needs from its caller, grouped so the call
 /// site reads as a contract rather than as nine positional arguments.
+/// `Op::New` sites that received the inline bump, and those that declined and
+/// kept the stub.
+///
+/// Both, always. A matching checksum on a workload whose allocations all took
+/// the stub proves nothing about the bump, and this path is unreachable under a
+/// default configuration (`c2_alloc_upgrade_enabled` is opt-in) -- so a zero on
+/// the left is the EXPECTED reading, and it has to be distinguishable from
+/// "emitted and refused".
+static INLINE_TLAB_SITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STUB_ONLY_SITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn note_stub_only_alloc() {
+    STUB_ONLY_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(inline bump, stub only)` counts of compiled `Op::New` sites.
+pub fn ir_alloc_site_counts() -> (u64, u64) {
+    (
+        INLINE_TLAB_SITES.load(std::sync::atomic::Ordering::Relaxed),
+        STUB_ONLY_SITES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 pub(crate) struct InlineTlabPlan {
     /// Frame offset of the cached `*mut JvmThread` that `fetch_current_thread`
     /// wrote in the prologue. `0` declines: a thread nobody fetched must not be
@@ -438,6 +461,7 @@ pub(crate) fn emit_inline_tlab_new_ir(
         frame_record,
     );
     patch_rel32_to_here(buf, done);
+    INLINE_TLAB_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     true
 }
 
