@@ -1195,6 +1195,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "operand-cache", on_key: Some("CRATONVM_JIT_OPERAND_CACHE"), off_key: None, off_word: None, since: "2026-09-02" },
     // Default-ON A/B lever: `ir_lower::reloc_emit_enabled` reads `0`/`false`.
     E { group: Group::JIT, token: "ir-reloc-emit", on_key: Some("CRATONVM_JIT_IR_RELOC_EMIT"), off_key: None, off_word: Some("0"), since: "2026-07-31" },
+    E { group: Group::JIT, token: "ir-cold-arg-stage", on_key: Some("CRATONVM_JIT_IR_COLD_ARG_STAGE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     // Declared 2026-08-30 with the relocation-gate coupling. Default-ON, so a
     // KILL SWITCH: `=0` restores the pre-fix behaviour in which a safepoint map
     // `record_oop_map` had ALREADY judged short was still published as
