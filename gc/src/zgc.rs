@@ -4399,7 +4399,12 @@ impl ZgcRealHeap {
         // length of an assertion has no other way to ask for that -- the
         // variable is process-wide and a test that set it would decide the
         // question for every other test in the binary.
-        self.relocation_enabled.load(Ordering::Relaxed)
+        //
+        // AND the GPU veto: a device DMA against the heap arena that the
+        // collector's bounded wait could not outlast forbids this cycle's
+        // slide. `false` in every build without `gpu-offload`. See
+        // `vm_heap::gpu_relocation_forbidden`.
+        self.relocation_enabled.load(Ordering::Relaxed) && !crate::vm_heap::gpu_relocation_forbidden()
     }
 
     /// Turn the stop-the-world slide on or off for THIS heap.
@@ -4788,7 +4793,9 @@ impl ZgcRealHeap {
         pins: &[usize],
         pairs: &mut Vec<(usize, usize)>,
     ) -> (usize, usize) {
-        if !self.high_compaction_enabled.load(Ordering::Relaxed) {
+        if !self.high_compaction_enabled.load(Ordering::Relaxed)
+            || crate::vm_heap::gpu_relocation_forbidden()
+        {
             return (0, 0);
         }
         let base = arena.base_ptr() as usize;
@@ -5153,7 +5160,30 @@ impl ZgcRealHeap {
             let reclaimed = self.arena.lock().retract_cursor_into_free_tail();
             return (0, reclaimed, cratonvm_types::PointerMap::default());
         }
-        let frames_are_rewritable = refusal.is_none();
+
+        // `CRATONVM_ZGC_ASSUME_REWRITABLE=1` -- **A MEASUREMENT INSTRUMENT, and
+        // unsafe to run with.** It answers the one question this family turns
+        // on and which no per-obligation repair can answer: if every compiled
+        // frame WERE rewritable, would compaction fix the workload at all?
+        //
+        // Discharging obligations one at a time cannot answer it, and two
+        // attempts on record show why. `CRATONVM_XT_JIT_COVERAGE_ASSUME` took
+        // the cross-thread handshake from `accepted=0 refused=1731` to
+        // `accepted=1731 refused=0` and `TestCachedQueryResults` failed
+        // identically, because other obligations still marked the cycle
+        // incomplete. `CRATONVM_XT_HELPER_WINDOW_DISCHARGE` then removed
+        // `xt-helper-window-conservative-scan` outright (12 -> absent on
+        // `TestMultiThread`) and `relocation_on_proven_jit` went 1 -> 0,
+        // because the refusals redistributed to
+        // `compiled-frame-oop-not-published` and `cross-thread-jit-peer`.
+        //
+        // `coverage-proof-incomplete` is a CONJUNCTION. Only forcing the whole
+        // term says whether the conjunction is worth satisfying, and that is
+        // the ONLY thing this flag is for. It relocates under frames nobody
+        // proved rewritable; expect corruption if the answer is no.
+        let assume_rewritable =
+            cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_ASSUME_REWRITABLE").is_some();
+        let frames_are_rewritable = refusal.is_none() || assume_rewritable;
         if compiled_frames_live && !frames_are_rewritable {
             self.counters.relocation_skipped_jit.fetch_add(1, Ordering::Relaxed);
             if let Some(r) = refusal {

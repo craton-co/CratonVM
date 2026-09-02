@@ -372,7 +372,7 @@ impl ReferenceProcessor {
             pending_queues: FxHashMap::default(),
             finalization_queue: std::collections::VecDeque::new(),
             soft_ref_lru_index: BTreeMap::new(),
-            soft_ref_addr_index: FxHashMap::default(),
+            soft_ref_addr_index: cratonvm_types::PointerMap::default(),
             last_observed_clock_ms: 0,
             identity_stamps: FxHashMap::default(),
             referent_class_stamps: FxHashMap::default(),
