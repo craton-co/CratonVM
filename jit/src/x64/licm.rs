@@ -7852,6 +7852,52 @@ pub fn gated_ref_store_enabled() -> bool {
     })
 }
 
+/// The gated inline reference store on the **optimizing (IR) tier** — default
+/// ON, opt out with `CRATONVM_JIT_IR_REF_STORE=0`.
+///
+/// A separate switch from [`gated_ref_store_enabled`] above, and it has to be:
+/// the two tiers emit different code from the same barrier plan, so one lever
+/// covering both could not tell "the plan is wrong" from "the new emitter is
+/// wrong". The single-pass switch stays the lever for the plan itself; this one
+/// is the lever for THIS emitter.
+///
+/// Why the optimizing tier needed its own arm at all: it lowered every
+/// reference store to `jit_putfield_object` unconditionally, so the barrier
+/// plan published on 2026-09-02 was inert exactly where hot loops are compiled.
+/// A probe of nothing but reference stores in a counted loop reported
+/// `gated=0 declined=0` — not "declined", but never asked, because this tier
+/// had no arm to ask with.
+///
+/// Off ⇒ the unconditional helper call this tier emitted before, which is a
+/// supported configuration and the first thing to set if a compiled reference
+/// store is suspected of losing a card or an SATB entry.
+/// `CRATONVM_DBG_IR_REF_STORE_TRACE=1` — count, at RUN time, how many gated
+/// reference stores took the inline path and how many fell through to the
+/// helper. Default off.
+///
+/// The compile-time `gated=N` census cannot answer this, and the difference
+/// matters: a sequence emitted at two sites whose compactness gate never passes
+/// is five extra instructions in front of the same helper call it always made.
+/// Costs a `LOCK INC` per store, so it is a diagnostic arm, never a timed one.
+pub fn ir_ref_store_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_REF_STORE_TRACE").is_some()
+    })
+}
+
+pub fn ir_gated_ref_store_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_REF_STORE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
 /// The deferred operand-stack register cache for **every** method rather than
 /// only for call-free pure kernels — `CRATONVM_JIT_OPERAND_CACHE=1`, default
 /// **OFF**, and this comment is mostly about why.

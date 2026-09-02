@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-511 tokens.
+514 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -573,11 +573,14 @@ export inherited from a parent shell.
 | `zero-ranges` | `CRATONVM_DBG_ZERO_RANGES` |
 | `ir-string` | `CRATONVM_DBG_IR_STRING` |
 | `invoke-phases` | `CRATONVM_DBG_INVOKE_PHASES` |
+| `interp-frames` | `CRATONVM_DBG_INTERP_FRAMES` |
+| `tierup-decline` | `CRATONVM_DBG_TIERUP_DECLINE` |
+| `direct-binds` | `CRATONVM_DBG_DIRECT_BINDS` |
 | `g1-dbg-rset` | `CRATONVM_G1_DBG_RSET` |
 
 ## `CRATONVM_JIT`
 
-293 tokens.
+304 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -617,6 +620,7 @@ export inherited from a parent shell.
 | `c2-supersede` | `CRATONVM_C2_SUPERSEDE` |
 | `callee-oop-flush` | `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH` |
 | `spill-slots-cap` | `CRATONVM_JIT_SPILL_SLOTS_CAP` |
+| `inline-reserve-path` | `CRATONVM_JIT_NO_INLINE_RESERVE_PATH` |
 | `code-cache-max-mb` | `CRATONVM_JIT_CODE_CACHE_MAX_MB` |
 | `conservative-locals` | `CRATONVM_NO_CONSERVATIVE_LOCALS` |
 | `ctor-direct-call` | `CRATONVM_NO_CTOR_DIRECT_CALL` |
@@ -681,6 +685,8 @@ export inherited from a parent shell.
 | `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
 | `gated-ref-store` | `CRATONVM_JIT_GATED_REF_STORE` |
+| `ir-ref-store` | `CRATONVM_JIT_IR_REF_STORE` |
+| `dbg-ir-ref-store-trace` | `CRATONVM_DBG_IR_REF_STORE_TRACE` |
 | `this-nonnull` | `CRATONVM_JIT_THIS_NONNULL` |
 | `receiver-null-elim` | `CRATONVM_JIT_RECEIVER_NULL_ELIM` |
 | `implicit-null-check` | `CRATONVM_JIT_IMPLICIT_NULL_CHECK` |
@@ -792,6 +798,7 @@ export inherited from a parent shell.
 | `field-fast-path` | `CRATONVM_JIT_NO_FIELD_FAST_PATH` |
 | `osr-inline-gate` | `CRATONVM_JIT_NO_OSR_INLINE_GATE` |
 | `invoke-fast-door` | `CRATONVM_JIT_NO_INVOKE_FAST_DOOR` |
+| `nonvirtual-fast-door` | `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` |
 | `iface-select-memo` | `CRATONVM_JIT_NO_IFACE_SELECT_MEMO` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
 | `ir-unresumable-trap-guard` | `CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD` |
@@ -874,10 +881,17 @@ export inherited from a parent shell.
 | `direct-call-arg-maps` | `CRATONVM_JIT_DIRECT_CALL_ARG_MAPS` |
 | `ir-gc-point-maps` | `CRATONVM_JIT_IR_GC_POINT_MAPS` |
 | `zero-spid` | `CRATONVM_JIT_ZERO_SPID` |
+| `int-value-direct` | `CRATONVM_JIT_INT_VALUE_DIRECT` |
+| `indy-lambda-fast` | `CRATONVM_JIT_INDY_LAMBDA_FAST` |
+| `hot-lookup-cache` | `CRATONVM_JIT_HOT_LOOKUP_CACHE` |
+| `virtual-nominate-always` | `CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS` |
+| `virtual-promote-java-util` | `CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL` |
+| `native-cf-postcomplete-skip` | `CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP` |
+| `native-cf-postcomplete-direct` | `CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT` |
 
 ## `CRATONVM_GC`
 
-115 tokens.
+120 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -915,10 +929,15 @@ export inherited from a parent shell.
 | `zgc-markbits` | `CRATONVM_ZGC_MARKBITS` |
 | `zgc-page-pinned-relocate` | `CRATONVM_ZGC_PAGE_PINNED_RELOCATE` |
 | `zgc-parsweep` | `CRATONVM_ZGC_PARSWEEP` |
+| `zgc-bitmap-sweep` | `CRATONVM_ZGC_BITMAP_SWEEP` |
+| `zgc-mark-root-filter` | `CRATONVM_ZGC_MARK_ROOT_FILTER` |
+| `zgc-jit-tlab` | `CRATONVM_ZGC_JIT_TLAB` |
+| `zgc-tlab-tail-sink` | `CRATONVM_ZGC_TLAB_TAIL_SINK` |
 | `g1-reserve-heap` | `CRATONVM_G1_RESERVE_HEAP` |
 | `g1-uncommit` | `CRATONVM_G1_UNCOMMIT` |
 | `g1-card-rset` | `CRATONVM_G1_CARD_RSET` |
 | `g1-card-clean` | `CRATONVM_G1_CARD_CLEAN` |
+| `g1-card-screen-jit-pinned` | `CRATONVM_G1_CARD_SCREEN_JIT_PINNED` |
 | `g1-inline-barrier` | `CRATONVM_G1_INLINE_BARRIER` |
 | `g1-mark-lock-yield` | `CRATONVM_G1_MARK_LOCK_YIELD` |
 | `g1-shared-alloc` | `CRATONVM_G1_SHARED_ALLOC` |
@@ -1124,7 +1143,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-24 tokens.
+25 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1146,6 +1165,7 @@ export inherited from a parent shell.
 | `mockito-legacy-selectors` | `CRATONVM_MOCKITO_LEGACY_SELECTORS` |
 | `stackwalker-jdk-walk` | `CRATONVM_SW_JDK_WALK` |
 | `jdk-random` | `CRATONVM_JDK_RANDOM` |
+| `jdk-scanner` | `CRATONVM_JDK_SCANNER` |
 | `strict-swallows` | `CRATONVM_STRICT_SWALLOWS` |
 | `tomcat-mapper-natives` | `CRATONVM_TOMCAT_MAPPER_NATIVES` |
 | `vh-strict-reference-return` | `CRATONVM_VH_STRICT_REFERENCE_RETURN` |

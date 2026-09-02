@@ -3842,6 +3842,35 @@ pub fn lookup_submission(handle: u64) -> Option<std::sync::Arc<StreamSubmission>
 /// Drop the registry's reference to the submission with this handle.
 /// Safe to call on an unknown handle (no-op). Idempotent. Once
 /// released, [`lookup_submission`] returns `None`.
+///
+/// # NO PRODUCTION CALLER since 2026-09-02 — and do not "fix" that by
+/// deleting this
+///
+/// The `submissions().write().remove(&handle)` below is the **only** remove
+/// from the registry, against exactly one insert in
+/// [`register_submission`]. `b6133b92d` moved the synchronous JIT-caller
+/// path onto `dispatch_method_sync`, which never registers a submission and
+/// therefore has nothing to release — correct in itself, and it happened to
+/// delete the last call to this function. So today **nothing drains the map**
+/// and every async submission leaks its entry, its CUDA stream and its event
+/// for the life of the process.
+///
+/// Putting the call back in the reaper or at the end of
+/// [`finalize_submission`] does not work: both run before or independently of
+/// the Java side reading the result, and `GpuFuture.get()` resolves through
+/// [`lookup_submission`], which answers `None` for a released handle. The old
+/// synchronous caller only got away with it by holding its own `Arc` across
+/// the release, which does not generalise to a handle Java still owns.
+///
+/// The drain has to belong to whoever owns the handle's lifetime —
+/// a `GpuExecutor.releaseSubmission` native (the API the overflow warning in
+/// [`register_submission`] already tells callers to use, and which
+/// `bench-gpu/GpuAsyncChainBench.java` already calls, and which is NOT
+/// registered in `native-builtins/src/craton_gpu.rs`), or an executor-close
+/// path. See
+/// `docs/known-issues/gpu/submission-registry-has-no-drain-20260902.md`, and
+/// `vm/tests/no_test_only_public_api.rs`'s baseline note, which carries the
+/// resulting +1 rather than hiding it.
 #[cfg(feature = "gpu-offload")]
 pub fn release_submission(handle: u64) {
     submissions().write().remove(&handle);
