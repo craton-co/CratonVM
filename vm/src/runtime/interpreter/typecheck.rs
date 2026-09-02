@@ -1586,6 +1586,26 @@ fn recorded_proxy_interface_set(origin: &cratonvm_classloading::ClassOrigin) -> 
 // Helper: name-based type compatibility for synthetic classes
 // ---------------------------------------------------------------------------
 
+/// Does the innermost simple name END with `term` as its final word?
+///
+/// The FAMILY of a JDK collection class is its last word, not any word:
+/// `ConcurrentSkipListSet` is a `Set` and `ConcurrentSkipListMap` is a `Map`,
+/// and both carry `List` in the middle because a skip list is how they are
+/// built. [`simple_name_has_word`] cannot tell those apart — it is deliberately
+/// an any-word test, and its over-admission score is measured as such — so the
+/// call sites that need the family use this to exclude, never to admit.
+///
+/// Kept separate from `simple_name_has_word` rather than folded into it because
+/// that function's 50/266 score is asserted by `scratchpad/c16/verify.rs`
+/// against a verbatim extract; narrowing it would move numbers a probe pins.
+fn simple_name_ends_with_word(obj_name: &str, term: &str) -> bool {
+    let simple = match obj_name.rfind(['$', '/']) {
+        Some(i) => &obj_name[i + 1..],
+        None => obj_name,
+    };
+    simple.ends_with(term)
+}
+
 /// Does the INNERMOST SIMPLE name of `obj_name` contain `term` as a camel-case
 /// word?
 ///
@@ -1638,6 +1658,12 @@ fn recorded_proxy_interface_set(origin: &cratonvm_classloading::ClassOrigin) -> 
 /// `ConcurrentSkipListMap$Values`, …). None of them is a name the synthetic-JDK
 /// fabrication tables in `classloading/src/class_manager.rs` mention, so none is
 /// reachable through this fallback in practice — checked, not assumed.
+///
+/// The 50/266 score is this FUNCTION's, and since 2026-09-02 it is no longer
+/// the caller's: the `java/util/` arms in [`synthetic_implements`] additionally
+/// exclude a name whose FINAL word contradicts the target
+/// ([`simple_name_ends_with_word`]), which is strictly narrower. Re-score the
+/// call site, not this helper, if the question is what the VM admits.
 ///
 /// docs/known-issues/jdk-only/W8-C16-2-synthetic-implements-simple-name.md
 fn simple_name_has_word(obj_name: &str, term: &str) -> bool {
@@ -2008,7 +2034,14 @@ pub(super) fn synthetic_implements(
         return false;
     }
     if target_class_name == "java/lang/Iterable" {
+        // `!…ends_with_word("Map")` is the whole difference between this and
+        // the version before 2026-09-02, which answered `true` for a
+        // `ConcurrentSkipListMap` — a Map is not an Iterable, and the `List` in
+        // its name is the data structure it is built from. Measured with
+        // `apps/probes/CollectionViewTypes`; see the same guard on the
+        // Collection/List arms below.
         return obj_name.starts_with("java/util/")
+            && !simple_name_ends_with_word(&obj_name, "Map")
             && (simple_name_has_word(&obj_name, "List")
                 || simple_name_has_word(&obj_name, "Set")
                 || simple_name_has_word(&obj_name, "Queue")
@@ -2027,16 +2060,34 @@ pub(super) fn synthetic_implements(
     // against the class-name family that actually implements it.
     if obj_name.starts_with("java/util/") {
         let has = |term: &str| simple_name_has_word(&obj_name, term);
+        // The FAMILY is the LAST word. `has` is an any-word test by design, so
+        // these two exclusions are what keep it from reading a class's
+        // implementation out of its name — `ConcurrentSkipListSet` and
+        // `ConcurrentSkipListMap` are a skip LIST in construction and a `Set`
+        // and a `Map` in type. Both were measured wrong here on 2026-09-02
+        // (`apps/probes/CollectionViewTypes`, real-JDK mode, against HotSpot
+        // 25.0.3): `aConcurrentSkipListSet instanceof List` and
+        // `aConcurrentSkipListMap instanceof Collection/List/Iterable` all
+        // answered `true`.
+        //
+        // Excluding rather than switching to a last-word test, which would be
+        // the tidier rule and is wrong: `Collections$SetFromMap` ends in `Map`
+        // and is a `Set`, so a last-word rule loses it. Excluding only from the
+        // arms whose target the suffix contradicts keeps that cell.
+        let ends = |term: &str| simple_name_ends_with_word(&obj_name, term);
         match target_class_name {
             "java/util/Collection" | "java/lang/Iterable" => {
-                if has("List") || has("Set") || has("Queue") || has("Deque") || has("Collection") {
+                if !ends("Map")
+                    && (has("List") || has("Set") || has("Queue") || has("Deque")
+                        || has("Collection"))
+                {
                     return true;
                 }
             }
             "java/util/List" => {
                 // Lists only (ArrayList, LinkedList, CopyOnWriteArrayList,
                 // Arrays$ArrayList, …). A Set/Queue is NOT a List.
-                if has("List") {
+                if has("List") && !ends("Set") && !ends("Map") {
                     return true;
                 }
             }
@@ -2045,8 +2096,17 @@ pub(super) fn synthetic_implements(
                     return true;
                 }
             }
-            "java/util/Queue" | "java/util/Deque" => {
+            // Split, because `Deque extends Queue` and not the reverse: every
+            // `Deque` is a `Queue`, and a `PriorityQueue` is not a `Deque`.
+            // Sharing one arm made `aPriorityQueue instanceof Deque` answer
+            // `true` — same probe, same run as the two above.
+            "java/util/Queue" => {
                 if has("Queue") || has("Deque") {
+                    return true;
+                }
+            }
+            "java/util/Deque" => {
+                if has("Deque") {
                     return true;
                 }
             }

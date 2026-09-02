@@ -11398,22 +11398,49 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
             "java/util/Collection",
             "java/lang/Iterable",
         ],
+        // The SORTED maps, split out for the same reason as the sorted sets
+        // below and the `ArrayList`/`LinkedList` split further down: a group
+        // costs its members the markers that distinguish them. Measured in
+        // `--synthetic-jdk` with `apps/probes/CollectionViewTypes` —
+        // `aTreeMap instanceof SortedMap` was `false`, so `firstKey()`,
+        // `headMap()` and `comparator()` were all unreachable through the
+        // interface and `(SortedMap<?, ?>) aTreeMap` threw.
+        "java/util/TreeMap" | "java/util/concurrent/ConcurrentSkipListMap" => &[
+            "java/util/NavigableMap",
+            "java/util/SortedMap",
+            "java/util/Map",
+            "java/io/Serializable",
+        ],
         "java/util/HashMap"
         | "java/util/LinkedHashMap"
-        | "java/util/TreeMap"
         | "java/util/IdentityHashMap"
         | "java/util/WeakHashMap"
         | "java/util/EnumMap"
-        | "java/util/concurrent/ConcurrentHashMap"
-        | "java/util/concurrent/ConcurrentSkipListMap" => {
+        | "java/util/concurrent/ConcurrentHashMap" => {
             &["java/util/Map", "java/io/Serializable"]
         }
+        // The SORTED sets, split out of the group below for the reason the
+        // `ArrayList`/`LinkedList` split above records: a group costs its
+        // members exactly the markers that distinguish them. `TreeSet` and
+        // `ConcurrentSkipListSet` are `NavigableSet`s (and so `SortedSet`s) on
+        // HotSpot and were neither here — measured with
+        // `apps/probes/CollectionViewTypes` in `--synthetic-jdk`:
+        // `TreeSet instanceof SortedSet` was `false`, so
+        // `(SortedSet<?>) aTreeSet` threw and `first()`/`last()`/`headSet` were
+        // unreachable through the interface. `EnumSet` and
+        // `CopyOnWriteArraySet` are plain `Set`s on HotSpot and stay below.
+        "java/util/TreeSet" | "java/util/concurrent/ConcurrentSkipListSet" => &[
+            "java/util/NavigableSet",
+            "java/util/SortedSet",
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/io/Serializable",
+        ],
         "java/util/HashSet"
         | "java/util/LinkedHashSet"
-        | "java/util/TreeSet"
         | "java/util/EnumSet"
         | "java/util/concurrent/CopyOnWriteArraySet"
-        | "java/util/concurrent/ConcurrentSkipListSet"
         // `newKeySet()`'s product. Without `Set` here the synthetic stub is not
         // `instanceof Set`, and `AbstractSet.equals`'s "a Set equals only
         // another Set" guard answers false for a set that is plainly equal.
@@ -11491,6 +11518,111 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
             "java/io/Serializable",
         ],
         "java/util/Collections$SynchronizedMap" => &["java/util/Map", "java/io/Serializable"],
+        // The UNMODIFIABLE and IMMUTABLE views — `Collections.unmodifiable*`,
+        // `List/Set/Map.of`, `Arrays.asList`.
+        //
+        // None of these names had an arm here, so all of them fell to this
+        // match's `_ => &[]` default and declared NOTHING. That was invisible
+        // because `interpreter::typecheck::synthetic_implements` has a
+        // name-word fallback which reads `List` out of `UnmodifiableList` and
+        // `Set` out of `Set12` — so the coarse questions answered correctly and
+        // only the ones the NAME does not spell got the default. Measured in
+        // `--synthetic-jdk` against HotSpot 25.0.3 with
+        // `apps/probes/CollectionViewTypes` (24 rows x 10 interfaces):
+        //
+        //     unmodifiableList(ArrayList)  Iterable  HotSpot T  CratonVM F
+        //                                  RandomAccess         T          F
+        //     Arrays.asList                RandomAccess         T          F
+        //                                  Serializable         T          F
+        //     List.of(..)                  Iterable             T          F
+        //                                  RandomAccess         T          F
+        //     Set.of(..)                   Iterable             T          F
+        //
+        // A `Collection` that is not an `Iterable` is the worst of those: every
+        // for-each through an erased type is a `checkcast java/lang/Iterable`.
+        //
+        // The sets are FLATTENED, like the `ArrayList` arm above and unlike
+        // HotSpot's own class files, where `$UnmodifiableRandomAccessList`
+        // declares `RandomAccess` alone and inherits the rest. There is no
+        // superclass chain to inherit through here.
+        "java/util/Collections$UnmodifiableRandomAccessList" => &[
+            "java/util/List",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/util/RandomAccess",
+            "java/io/Serializable",
+        ],
+        // The non-random-access twin. Listed separately and NOT grouped with
+        // the arm above: the whole point of the pair is the one marker that
+        // differs, and grouping four list classes that way is what cost
+        // `ArrayList` its `RandomAccess` until 2026-09-02 (see that arm).
+        "java/util/Collections$UnmodifiableList" => &[
+            "java/util/List",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/io/Serializable",
+        ],
+        "java/util/Collections$UnmodifiableCollection" => &[
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/io/Serializable",
+        ],
+        "java/util/Collections$UnmodifiableSet" => &[
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/io/Serializable",
+        ],
+        "java/util/Collections$UnmodifiableSortedSet" => &[
+            "java/util/SortedSet",
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/io/Serializable",
+        ],
+        "java/util/Collections$UnmodifiableNavigableSet" => &[
+            "java/util/NavigableSet",
+            "java/util/SortedSet",
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/io/Serializable",
+        ],
+        "java/util/Collections$UnmodifiableMap" => &["java/util/Map", "java/io/Serializable"],
+        "java/util/Collections$UnmodifiableSortedMap" => &[
+            "java/util/SortedMap",
+            "java/util/Map",
+            "java/io/Serializable",
+        ],
+        // `Arrays.asList`'s view. `RandomAccess` and `Serializable` were the
+        // two the name could not spell.
+        "java/util/Arrays$ArrayList" => &[
+            "java/util/List",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/util/RandomAccess",
+            "java/io/Serializable",
+        ],
+        // `List.of(..)`. Both size forms, because they are supertype-identical
+        // on HotSpot — `List12` and `ListN` each extend
+        // `ImmutableCollections$AbstractImmutableList`, which is where their
+        // `RandomAccess` comes from, and nothing distinguishes them but size.
+        "java/util/ImmutableCollections$List12" | "java/util/ImmutableCollections$ListN" => &[
+            "java/util/List",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/util/RandomAccess",
+            "java/io/Serializable",
+        ],
+        "java/util/ImmutableCollections$Set12" | "java/util/ImmutableCollections$SetN" => &[
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/io/Serializable",
+        ],
+        "java/util/ImmutableCollections$Map1" | "java/util/ImmutableCollections$MapN" => {
+            &["java/util/Map", "java/io/Serializable"]
+        }
         "java/util/Collections$SingletonList" | "java/util/Collections$EmptyList" => &[
             "java/util/List",
             "java/util/Collection",

@@ -775,7 +775,9 @@ makes the encoding right as well as the signature.
   > "8d. One name that reads like the other" below. `apps/probes/RandomAccessProbe`
   > is now byte-identical to HotSpot on twelve rows in `--jdk-only` and in
   > real-JDK mode, across all three doors (`instanceof`, `checkcast`,
-  > `Class.isInstance`) and `getClass()`.
+  > `Class.isInstance`) and `getClass()`. `--synthetic-jdk` had a SECOND,
+  > unrelated cause for the same symptom, and the sweep run to check that one
+  > pair was not a coincidence found five more defects — §8e.
 
 * **`LinkedList` is not a `Deque`** here and is on HotSpot. Deliberately not
   declared: this VM carries most of the deque surface and not all of it, so the
@@ -837,6 +839,81 @@ now runs the same structural rule (`typecheck::object_reaches` and
 `getclass_object_reaches`), descending slot 0, because an unmodifiable view
 carries the marker exactly when the thing it wraps does. Both carry a comment
 saying they are a pair; neither may move alone.
+
+## 8e. The sweep that closed §8c's bullet found five more
+
+Fixing one pair is not evidence about the others, so `apps/probes/CollectionViewTypes`
+asks 24 collection views and 11 concrete classes about 14 interfaces each — 490
+cells, on HotSpot 25.0.3 and on this VM in all three modes, diffed on stdout.
+
+**Real-JDK: 35 of 35 rows now identical.** Three of them were not, and they are
+the OPPOSITE defect from §8d's — over-admissions, where this VM says `true` and
+HotSpot says `false`:
+
+```text
+aConcurrentSkipListSet instanceof List                     CratonVM true   HotSpot false
+aConcurrentSkipListMap instanceof Collection/List/Iterable  true    false
+aPriorityQueue         instanceof Deque                     true    false
+```
+
+`synthetic_implements` has a name-word fallback for classes with no real
+interface data, and it reads the word `List` out of `ConcurrentSkipList`**Set**
+and `ConcurrentSkipList`**Map** — a skip list is how they are BUILT, not what
+they are. This is the family the fallback's own comment already records ("`x
+instanceof List` returned true for a HashSet ... which broke JUnit's
+`Parameterized$RunnersFactory`"), fixed then for Set-versus-List and not for
+these. `PriorityQueue` is a third shape: `Queue` and `Deque` shared one match
+arm, and `Deque extends Queue` rather than the reverse.
+
+An over-admission here is worse than a refusal, because it converts a clean
+`ClassCastException` at the cast into a `NoSuchMethodError` at the first call —
+which is the exact trade §8c's `LinkedList`/`Deque` bullet declines to make. The
+arms now exclude a name whose FINAL word contradicts the target. Not a
+last-word-wins rule, which is tidier and wrong: `Collections$SetFromMap` ends in
+`Map` and is a `Set`.
+
+**`--synthetic-jdk`: every type row that can be measured is identical.** In that
+mode the supertype set comes from `class_manager.rs`'s interface table, and
+NONE of `Collections$Unmodifiable*`, `ImmutableCollections$*` or
+`Arrays$ArrayList` had an arm there — all of them fell to `_ => &[]` and
+declared nothing at all. The coarse questions still answered correctly, because
+the name-word fallback above reads `List` out of `UnmodifiableList`, so only the
+interfaces a name does NOT spell were lost:
+
+```text
+unmodifiableList(ArrayList)  Iterable      HotSpot true  CratonVM false
+                             RandomAccess          true           false
+Arrays.asList                RandomAccess          true           false
+                             Serializable          true           false
+List.of(..) / Set.of(..)     Iterable              true           false
+TreeSet                      SortedSet             true           false
+TreeMap                      SortedMap             true           false
+```
+
+A `Collection` that is not an `Iterable` is the worst of those: every for-each
+through an erased type is a `checkcast java/lang/Iterable`. `TreeSet` and
+`TreeMap` are the `ArrayList`/`LinkedList` split of §8's last bullet happening
+twice more — a group in that table costs its members exactly the markers that
+distinguish them.
+
+### Still open in `--synthetic-jdk`, and not this species
+
+* `Collections.emptyList()`/`emptySet()`/`emptyMap()` hand back a plain
+  `ArrayList`/`HashSet`/`HashMap`. Every type answer is right; the CLASS is
+  wrong (and so `Cloneable` is `true` where HotSpot says `false`). A
+  factory-return question, not a hierarchy one.
+* No `(Collection)` copy constructor for `Vector`, `CopyOnWriteArrayList`,
+  `ConcurrentSkipListSet`, `ConcurrentSkipListMap`, `ArrayDeque` or
+  `PriorityQueue`; no `Collections.unmodifiableSortedMap`; no
+  `DayOfWeek.MONDAY`. Method-surface completeness.
+* `LinkedList` is not a `Deque` — §8c's third bullet, unchanged and deliberate.
+
+The probe prints an `ERROR` row for each of those rather than dying: its first
+version called the factories inline, `unmodifiableSortedMap` raised
+`NoSuchMethodError` at row 22 in that mode, and the fourteen control rows below
+it — every sorted class, the whole reason they are in the probe — silently
+measured nothing. **A probe that stops early does not report less; it reports a
+shorter file that still diffs clean.**
 
 ## 9. How to verify
 
