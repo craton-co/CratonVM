@@ -337,19 +337,24 @@ impl Compiler {
     /// shared null-check stub (sets `JIT_PENDING_NPE`, deopts out) that
     /// array loads/stores already branch to.
     ///
-    /// **This check is the one that survives in a counted `for (int i = 0; i <
-    /// a.length; i++)` loop, and it costs a `TEST`/`JZ` per iteration.** The
-    /// bound's own `arraylength` sits AT the loop header, and the null-check
-    /// dataflow (`crate::null_check_elim`) meets over paths with a bitwise AND:
-    /// the back edge arrives having just dereferenced the array, the pre-header
-    /// does not, so the intersection at the header drops the fact and this
-    /// helper emits. The elision is not wrong — the first iteration genuinely
-    /// has no proof — but the second and every later one pays for it. Closing it
-    /// needs a loop-header-aware proof (peel, or a pre-header null check that
-    /// seeds the header's IN set), which lives in `null_check_elim`, not here.
-    /// Measured at ~2 of the ~21 instructions the `char[]` scan body emits per
-    /// element:
-    /// `docs/known-issues/perf/array-element-load-baseline-codegen-20260901.md`.
+    /// **This check used to be the one that survives in a counted
+    /// `for (int i = 0; i < a.length; i++)` loop, at a `TEST`/`JZ` per
+    /// iteration.** The bound's own `arraylength` sits AT the loop header, and
+    /// the null-check dataflow (`crate::null_check_elim`) meets over paths with
+    /// a bitwise AND: the back edge arrives having just dereferenced the array,
+    /// the pre-header does not, so the intersection at the header drops the
+    /// fact and this helper emitted. The elision was not wrong — the first
+    /// iteration genuinely has no proof — but the second and every later one
+    /// paid for it.
+    ///
+    /// Closed 2026-09-02 by moving the whole sequence instead of proving it
+    /// away: `ArrayLenHoist` (`x64/licm.rs`) computes the invariant
+    /// `arraylength` once in the pre-header and the body reads a frame slot, so
+    /// this null check goes with it and the header no longer emits one at all.
+    /// The dataflow reasoning above still describes what happens at a header
+    /// the hoist declines (a variant receiver, a bypassable header, a site
+    /// outside the header's straight-line prefix), which is why it is kept.
+    /// Sized in array-element-load-baseline-codegen-20260901.
     ///
     /// Unlike the load/store `_at` helpers, the dataflow elision keys on
     /// the directly-preceding `aload`/`aload_<n>` of the array receiver:

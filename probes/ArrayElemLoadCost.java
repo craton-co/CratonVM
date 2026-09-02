@@ -8,8 +8,7 @@
  *
  * Companion to `CharAtCostCurve`, whose `char[]` control arm
  * (`scanArr`) is the row
- * `docs/known-issues/perf/array-element-load-baseline-codegen-20260901.md`
- * is written about. That page reads the emitter and attributes ~5 of a
+ * array-element-load-baseline-codegen-20260901 is written about. That page reads the emitter and attributes ~5 of a
  * 21-instruction body to the un-hoisted `arraylength` and its null check. This
  * probe is the arm that prices the same thing from OUTSIDE, and it does so on a
  * binary that predates the fix: each `*Len` row is the identical loop with

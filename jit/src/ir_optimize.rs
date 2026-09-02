@@ -937,15 +937,89 @@ fn loop_headers(graph: &Graph) -> Vec<(NodeId, NodeId, Vec<NodeId>)> {
                 entry_preds.push(c);
             }
         }
-        // Reducible single-entry loop: one pre-header, ≥1 back-edge. A nested
-        // inner header whose entry is itself control-reachable (both inputs in
-        // `reach`) yields zero pre-headers and is skipped — safe, just not
-        // optimized (same limitation as the unroll pass).
+        // Reducible single-entry loop: one pre-header, >=1 back-edge.
         if entry_preds.len() == 1 && !back_ctrls.is_empty() {
             out.push((id, entry_preds[0], back_ctrls));
+            continue;
+        }
+        // Zero pre-headers is the NESTED INNER LOOP case, and it used to end
+        // here as "safe, just not optimized". It is not a corner: the walk
+        // forward from an inner header leaves through the inner exit, goes
+        // round the OUTER back edge and arrives at the inner loop's own
+        // pre-header, so every input reads as a back edge. Every `for (r…)
+        // for (i…)` in the tree — which is every rep-counted probe and most
+        // real scan loops — offered LICM only its outer header, never the loop
+        // doing the work.
+        //
+        // Dominance answers what reachability cannot; see
+        // `entry_preds_by_dominance`. Applied ONLY here, so a loop the test
+        // above already classifies keeps exactly the answer it had and this
+        // can only ADD loops the pass previously declined.
+        if entry_preds.is_empty() {
+            let (dom_entries, dom_backs) = entry_preds_by_dominance(graph, &users, id);
+            if dom_entries.len() == 1 && !dom_backs.is_empty() {
+                out.push((id, dom_entries[0], dom_backs));
+            }
         }
     }
     out
+}
+
+/// Which of `header`'s control inputs are loop ENTRIES, decided by dominance
+/// rather than by reachability.
+///
+/// A control node is reachable from the graph entry *without passing through
+/// `header`* exactly when `header` does not dominate it — which is the textbook
+/// definition of "not a back edge". Reachability-from-the-header, which
+/// [`loop_headers`] uses first, cannot answer this for a **nested inner loop**:
+/// the walk forward from the inner header leaves through the inner loop's exit,
+/// goes round the OUTER back edge, and arrives at the inner loop's own
+/// pre-header — so every input looks like a back edge, no pre-header is found,
+/// and the inner loop is skipped entirely.
+///
+/// That skip is the documented limitation in `loop_headers`, and it is not a
+/// corner: an inner loop is where the iterations are. Measured on
+/// `probes/ArrayElemLoadCost.java`, whose `for (r…) for (i…)` shape is the same
+/// one every rep-counted probe and most real scan loops have, LICM reported
+/// exactly `1 candidate loop header` per method — the OUTER one — and never saw
+/// the loop doing the work.
+///
+/// Returns `(entry_preds, back_ctrls)`.
+fn entry_preds_by_dominance(
+    graph: &Graph,
+    users: &[Vec<NodeId>],
+    header: NodeId,
+) -> (Vec<NodeId>, Vec<NodeId>) {
+    // Control nodes reachable from the graph entry with `header` deleted.
+    let mut seen: FxHashSet<NodeId> = FxHashSet::default();
+    let mut work = vec![graph.entry];
+    seen.insert(graph.entry);
+    while let Some(cur) = work.pop() {
+        for &u in &users[cur as usize] {
+            if u == header || seen.contains(&u) {
+                continue;
+            }
+            let op = &graph.nodes[u as usize].op;
+            if !op.is_control() {
+                continue;
+            }
+            seen.insert(u);
+            work.push(u);
+        }
+    }
+    let mut entries = Vec::new();
+    let mut backs = Vec::new();
+    for &c in graph.nodes[header as usize].inputs.iter() {
+        if c == NO_NODE {
+            continue;
+        }
+        if seen.contains(&c) {
+            entries.push(c);
+        } else {
+            backs.push(c);
+        }
+    }
+    (entries, backs)
 }
 
 /// Compute the set of nodes that belong to the loop whose header is `region`.
@@ -4627,6 +4701,81 @@ mod tests {
         assert_eq!(
             g.nodes[load as usize].inputs[0], region,
             "the load must stay in the loop when the body has a barrier"
+        );
+    }
+
+    /// `for (r…) { for (i…) { … } }` — and the inner header is the one the
+    /// iterations are in.
+    ///
+    /// `loop_headers` classified a header's control inputs by asking which are
+    /// reachable *forward from the header*. For an inner header that question
+    /// has no useful answer: the walk leaves through the inner exit, goes round
+    /// the OUTER back edge, and arrives back at the inner loop's own
+    /// pre-header — so both inputs read as back edges, the loop yields zero
+    /// pre-headers, and it was dropped. Every nested loop in the tree offered
+    /// LICM only its outer header.
+    #[test]
+    fn test_loop_headers_finds_the_inner_header_of_a_nested_loop() {
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: 0,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        g.entry = start;
+        let c0 = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+
+        // Outer header; its back edge is wired below.
+        let outer = g.add(Op::Merge, IrType::Control, vec![c0], None);
+        let zero = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let r = g.add(Op::Phi, IrType::Int, vec![outer, zero], None);
+        let ten = g.add(Op::Const(10), IrType::Int, vec![], None);
+        let ocond = g.add(Op::Cmp(CmpOp::Lt), IrType::Int, vec![r, ten], None);
+        let oif = g.add(Op::If, IrType::Control, vec![outer, ocond], None);
+        let obody = g.add(Op::Proj(0), IrType::Control, vec![oif], None); // inner pre-header
+        let oexit = g.add(Op::Proj(1), IrType::Control, vec![oif], None);
+
+        // Inner header, entered from the outer body.
+        let inner = g.add(Op::Merge, IrType::Control, vec![obody], None);
+        let i = g.add(Op::Phi, IrType::Int, vec![inner, zero], None);
+        let icond = g.add(Op::Cmp(CmpOp::Lt), IrType::Int, vec![i, ten], None);
+        let iif = g.add(Op::If, IrType::Control, vec![inner, icond], None);
+        let ibody = g.add(Op::Proj(0), IrType::Control, vec![iif], None);
+        let iexit = g.add(Op::Proj(1), IrType::Control, vec![iif], None);
+        let one = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let inext = g.add(Op::Add, IrType::Int, vec![i, one], None);
+        g.nodes[i as usize].inputs.push(inext);
+        g.nodes[inner as usize].inputs.push(ibody); // inner back edge
+
+        // Inner exit closes the outer back edge.
+        let rnext = g.add(Op::Add, IrType::Int, vec![r, one], None);
+        g.nodes[r as usize].inputs.push(rnext);
+        g.nodes[outer as usize].inputs.push(iexit); // outer back edge
+        let ret = g.add(Op::Return, IrType::Void, vec![oexit, r], None);
+        g.exit = ret;
+
+        let headers = loop_headers(&g);
+        let inner_entry = headers
+            .iter()
+            .find(|&&(h, _, _)| h == inner)
+            .map(|&(_, e, _)| e);
+        assert_eq!(
+            inner_entry,
+            Some(obody),
+            "the inner header's pre-header is the outer body's projection, got \
+             headers {:?}",
+            headers.iter().map(|&(h, e, _)| (h, e)).collect::<Vec<_>>()
+        );
+        let outer_entry = headers
+            .iter()
+            .find(|&&(h, _, _)| h == outer)
+            .map(|&(_, e, _)| e);
+        assert_eq!(
+            outer_entry,
+            Some(c0),
+            "the outer header's classification must be unchanged"
         );
     }
 
