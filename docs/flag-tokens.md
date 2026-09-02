@@ -875,7 +875,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-114 tokens.
+115 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -916,6 +916,7 @@ export inherited from a parent shell.
 | `g1-reserve-heap` | `CRATONVM_G1_RESERVE_HEAP` |
 | `g1-uncommit` | `CRATONVM_G1_UNCOMMIT` |
 | `g1-card-rset` | `CRATONVM_G1_CARD_RSET` |
+| `g1-card-clean` | `CRATONVM_G1_CARD_CLEAN` |
 | `g1-inline-barrier` | `CRATONVM_G1_INLINE_BARRIER` |
 | `g1-mark-lock-yield` | `CRATONVM_G1_MARK_LOCK_YIELD` |
 | `g1-shared-alloc` | `CRATONVM_G1_SHARED_ALLOC` |
