@@ -66,6 +66,16 @@
 //! Both are the same mistake — an assertion that cannot distinguish the
 //! mechanism from its surroundings — and neither was visible without
 //! running the control.
+//!
+//! # And then they found something
+//!
+//! Run under `cargo test`'s thread pool rather than one at a time, these
+//! failed 4 of 6 with `got 0`. That was not a flaw in them: it was
+//! `DeviceBuffer::zeros` handing back a buffer whose asynchronous
+//! zeroing memset carried no `last_write` marker, so the memset could
+//! land after the kernel that wrote the buffer. See
+//! `concurrent_dispatch_it.rs`, which isolates the shape and is the
+//! regression test.
 
 #![cfg(feature = "cuda")]
 

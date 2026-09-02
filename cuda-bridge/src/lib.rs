@@ -698,6 +698,28 @@ pub(crate) fn new_last_write_slot() -> LastWriteSlot {
     std::sync::Arc::new(std::sync::Mutex::new(None))
 }
 
+/// A [`LastWriteSlot`] already holding an event recorded on the stream
+/// the allocator's zeroing memset was issued to.
+///
+/// AUDIT 2026-09-02. `DeviceBuffer::zeros` used to hand back an EMPTY
+/// slot, which reads as "nothing has written this buffer yet" — true of
+/// the allocation and false of the memset still in flight. A consumer on
+/// a user stream then had nothing to wait on, and the zeroing could
+/// overwrite the kernel's output. Four threads sharing one context
+/// produced `got 0` in 4 of 4 runs at 4 MiB, and passed 5 of 5 at 1 MiB,
+/// because the window is the length of the memset.
+///
+/// A failure to create the event fails the allocation rather than
+/// silently returning an unordered buffer: the unordered buffer IS the
+/// bug, and a `zeros` that cannot promise its own contents is not one.
+fn alloc_last_write_slot(ctx: &DeviceContext) -> Result<LastWriteSlot> {
+    let event = Event::new(ctx)?;
+    ctx.0.record_alloc_event(&event)?;
+    Ok(std::sync::Arc::new(std::sync::Mutex::new(Some(
+        std::sync::Arc::new(event),
+    ))))
+}
+
 // ── Device-element bound ─────────────────────────────────────────────
 //
 // `DeviceBuffer<T>`'s allocation/transfer methods (`uninit`, `zeros`,
@@ -821,11 +843,18 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     }
 
     /// Allocate `len` elements, zero-initialised.
+    ///
+    /// The zeroing is asynchronous, so the buffer comes back carrying a
+    /// `last_write` marker for it — exactly as an uploaded buffer does.
+    /// Without that marker a following `launch_on_stream` had nothing to
+    /// wait on and the memset could land AFTER the kernel's stores; see
+    /// `record_alloc_event` in the cuda backend for the measurement.
     pub fn zeros(ctx: &DeviceContext, len: usize) -> Result<Self> {
         let _ = Self::ASSERT_DEVICE_REPR;
-        backend::DeviceBufferInner::zeros(&ctx.0, len).map(|inner| Self {
+        let inner = backend::DeviceBufferInner::zeros(&ctx.0, len)?;
+        Ok(Self {
             inner,
-            last_write: new_last_write_slot(),
+            last_write: alloc_last_write_slot(ctx)?,
             _host_uploads: Vec::new(),
         })
     }
@@ -1136,10 +1165,17 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     }
 
     /// Allocate `len` elements, zero-initialised.
+    ///
+    /// The zeroing is asynchronous, so the buffer comes back carrying a
+    /// `last_write` marker for it — exactly as an uploaded buffer does.
+    /// Without that marker a following `launch_on_stream` had nothing to
+    /// wait on and the memset could land AFTER the kernel's stores; see
+    /// `record_alloc_event` in the cuda backend for the measurement.
     pub fn zeros(ctx: &DeviceContext, len: usize) -> Result<Self> {
-        backend::DeviceBufferInner::zeros(&ctx.0, len).map(|inner| Self {
+        let inner = backend::DeviceBufferInner::zeros(&ctx.0, len)?;
+        Ok(Self {
             inner,
-            last_write: new_last_write_slot(),
+            last_write: alloc_last_write_slot(ctx)?,
             _host_uploads: Vec::new(),
         })
     }

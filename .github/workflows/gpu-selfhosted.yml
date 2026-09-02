@@ -86,6 +86,19 @@ jobs:
       # race on hardware. These three are `#[ignore]`d so a machine
       # without a device skips them, which means this job is the only
       # place they ever run.
+      # Concurrent dispatch: one context, many threads — the shape
+      # `OffloadCacheRegistry` gives every dispatching Java thread. This
+      # is the regression test for the 2026-09-02 `DeviceBuffer::zeros`
+      # defect, where an unordered zeroing memset overwrote a kernel's
+      # output. It only reproduces at 4 MiB buffers, so it is sized for
+      # that and must not be shrunk to make it quicker.
+      - name: cuda-bridge concurrent dispatch (real driver)
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target-gpu
+        run: |
+          cargo test --release -p cratonvm-cuda-bridge --features cuda               --test concurrent_dispatch_it -- --ignored --nocapture
+
       - name: cuda-bridge cross-stream ordering (real driver)
         shell: bash
         env:
