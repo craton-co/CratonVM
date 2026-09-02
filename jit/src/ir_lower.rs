@@ -16920,6 +16920,76 @@ mod tests {
         );
     }
 
+    /// Every `Op::X` named in `regalloc::ir_op_defines_value`'s body.
+    ///
+    /// Read out of the other file's source for the same reason
+    /// [`ops_that_define_a_result_slot`] is read out of this one: the function
+    /// is private, and a copy of its list maintained here would be a fourth
+    /// enumeration of the same question.
+    fn ops_regalloc_calls_value_defining() -> std::collections::BTreeSet<String> {
+        let src = include_str!("regalloc.rs");
+        let body = src
+            .split("fn ir_op_defines_value(op: &Op) -> bool {")
+            .nth(1)
+            .expect("ir_op_defines_value is in regalloc.rs")
+            .split("\n}")
+            .next()
+            .expect("the function ends");
+        let mut out = std::collections::BTreeSet::new();
+        collect_op_names(body, &mut out);
+        assert!(
+            !out.is_empty(),
+            "the regalloc scan found nothing — `ir_op_defines_value`'s shape \
+             changed and this test would now pass vacuously"
+        );
+        out
+    }
+
+    /// The two enumerations of "does this op define a value" are the SAME set.
+    ///
+    /// `regalloc::ir_op_defines_value` calls itself a "verbatim mirror" of
+    /// `op_defines_result_slot`, and until 2026-09-02 it was not one: it omitted
+    /// `Op::ArrayLength` and `Op::NewArray`, and its own doc comment asserted
+    /// they were absent from both. The comment written to prevent the drift was
+    /// the drift.
+    ///
+    /// **What that cost was invisible, which is why this test exists rather
+    /// than a stricter comment.** `plan_register_residency` compares
+    /// `wants_loc` (built from the regalloc predicate) against `node_color`
+    /// (built from this file's), and ONE disagreement declines register
+    /// residency for the whole method. Every counted loop written
+    /// `for (i = 0; i < a.length; i++)` contains an `arraylength`, so every one
+    /// of them declined — silently, because the flag reported only successes.
+    /// Nothing was miscompiled; the optimization was simply unavailable
+    /// wherever arrays are, which is most places.
+    ///
+    /// Compared as sets of names parsed from both sources, so adding an arm to
+    /// one list and forgetting the other fails here instead of turning up as an
+    /// unexplained refusal months later.
+    #[test]
+    fn the_two_value_defining_enumerations_agree() {
+        let here = ops_that_define_a_result_slot();
+        let there = ops_regalloc_calls_value_defining();
+
+        let missing_in_regalloc: Vec<&String> = here.difference(&there).collect();
+        let missing_here: Vec<&String> = there.difference(&here).collect();
+
+        assert!(
+            missing_in_regalloc.is_empty(),
+            "`op_defines_result_slot` names these and `regalloc::ir_op_defines_value` \
+             does not: {missing_in_regalloc:?} — the colourer gives them a home the \
+             liveness model does not know about, so `plan_register_residency` \
+             declines residency for EVERY method containing one",
+        );
+        assert!(
+            missing_here.is_empty(),
+            "`regalloc::ir_op_defines_value` names these and `op_defines_result_slot` \
+             does not: {missing_here:?} — the liveness model expects a home the \
+             colourer never allocates, which is the direction that has no slot to \
+             spill to",
+        );
+    }
+
     /// `op_defines_result_slot` names exactly the arms that allocate a slot.
     ///
     /// The direction that matters is *over*-claiming: an op listed here whose
