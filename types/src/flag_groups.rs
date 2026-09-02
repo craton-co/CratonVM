@@ -2211,6 +2211,7 @@ pub const INVENTORY: &[E] = &[
     // so one going wrong in the field must not force the other off.
     E { group: Group::COMPAT, token: "vh-strict-reference-return", on_key: Some("CRATONVM_VH_STRICT_REFERENCE_RETURN"), off_key: None, off_word: Some("0"), since: "2026-08-07" },
     E { group: Group::COMPAT, token: "vh-null-coordinate-npe", on_key: Some("CRATONVM_VH_NULL_COORDINATE_NPE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::COMPAT, token: "vh-unsupported-mode-uoe", on_key: Some("CRATONVM_VH_UNSUPPORTED_MODE_UOE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::TEST, token: "force-win-build", on_key: Some("CRATONVM_FORCE_WIN_BUILD"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::TEST, token: "jdk", on_key: Some("CRATONVM_TEST_JDK"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::TEST, token: "segv", on_key: Some("CRATONVM_TEST_SEGV"), off_key: None, off_word: None, since: "2026-06-01" },
