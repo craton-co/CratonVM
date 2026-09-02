@@ -1206,8 +1206,9 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_GC_NO_OLD_INTERIOR_PINS` | GC | `CRATONVM_GC=old-interior-pins` | opt-out | on | behaviour | snapshot | gc |
 | `CRATONVM_GC_NO_VALIDATE_ONCE` | GC | `CRATONVM_GC=validate-once` | opt-out | on | behaviour | snapshot | gc |
 | `CRATONVM_GC_OVERHEAD_LIMIT` | GC | `CRATONVM_GC=overhead-limit` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_GC_PAR_EVAC` | GC | `CRATONVM_GC=par-evac` | default-on | on | behaviour | snapshot | gc, types |
 | `CRATONVM_GC_PAR_MIN_BYTES` | GC | `CRATONVM_GC=par-min-bytes` | opt-in | off | behaviour | snapshot | types |
-| `CRATONVM_GC_PAR_THREADS` | GC | `CRATONVM_GC=par-threads` | opt-in | off | behaviour | snapshot | types |
+| `CRATONVM_GC_PAR_THREADS` | GC | `CRATONVM_GC=par-threads` | opt-in | off | behaviour | snapshot | gc, types |
 | `CRATONVM_GC_PRECISE_ONLY_ROOTS` | GC | `CRATONVM_GC=precise-only-roots` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_GC_RESERVE` | GC | `CRATONVM_GC=gc-reserve` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_GC_STATS` | DBG | `CRATONVM_DBG=gc-stats` | opt-in | off | diag | snapshot | native-builtins, vm-cli |
