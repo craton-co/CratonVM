@@ -5351,6 +5351,22 @@ fn varhandle_get_and_set_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// through [`vh_box_access_result`], which the erased `Object` call site
 /// requires; `unbox_poly_return` then unwraps it for a primitive call site such
 /// as H2's `([III)I`.
+/// `CRATONVM_VH_UNSUPPORTED_MODE_UOE=0` — restore the pre-2026-09-02 behaviour,
+/// in which an access mode the variable's type does not admit ANSWERED instead
+/// of raising `UnsupportedOperationException`.
+///
+/// Default on, and separate from `CRATONVM_VH_NULL_COORDINATE_NPE` on purpose:
+/// the two rules interact (this one wins, which is HotSpot's order), so a
+/// single switch for both could not isolate either. Each turns silence into an
+/// exception on a path any workload can reach, and a suite that starts failing
+/// has to be bisectable to the RULE rather than to a rebuild.
+fn vh_unsupported_mode_uoe_enabled() -> bool {
+    !matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_VH_UNSUPPORTED_MODE_UOE").as_deref(),
+        Ok("0")
+    )
+}
+
 /// Which family of access mode is being attempted, for
 /// [`vh_check_access_mode_supported`].
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5409,6 +5425,9 @@ fn vh_check_access_mode_supported(
     args: &[Value],
     family: VhModeFamily,
 ) -> Result<(), MethodCallFailed> {
+    if !vh_unsupported_mode_uoe_enabled() {
+        return Ok(());
+    }
     let Some(this) = args.first().and_then(|v| match v {
         Value::Object(Some(o)) => Some(*o),
         _ => None,

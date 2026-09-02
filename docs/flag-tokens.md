@@ -1114,7 +1114,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-22 tokens.
+23 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1140,6 +1140,7 @@ export inherited from a parent shell.
 | `tomcat-mapper-natives` | `CRATONVM_TOMCAT_MAPPER_NATIVES` |
 | `vh-strict-reference-return` | `CRATONVM_VH_STRICT_REFERENCE_RETURN` |
 | `vh-null-coordinate-npe` | `CRATONVM_VH_NULL_COORDINATE_NPE` |
+| `vh-unsupported-mode-uoe` | `CRATONVM_VH_UNSUPPORTED_MODE_UOE` |
 
 ## `CRATONVM_TEST`
 

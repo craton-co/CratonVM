@@ -61,7 +61,11 @@ for tag, jt, fld, lit, cast in TYPES:
 # Not fixed with this rule and not asserted here, because it is not about the
 # variable's TYPE: it needs the handle to record that its field was final,
 # which means field-level access flags reaching a native, which is plumbing
-# across crates rather than a check. Filed separately.
+# across crates rather than a check. Filed as known-issues/jdk-only/
+# varhandle-final-field-handle-performs-the-write-20260902.md, which also
+# records the one thing still unmeasured: where a read-only refusal sits
+# against the OTHER two rules when a final-field handle is also given a null
+# coordinate. Re-add this section when that lands.
 
 # ---- control: modes every type supports ----------------------------------
 for tag, jt, fld, lit, cast in TYPES:
@@ -127,11 +131,34 @@ public class RJdkVarHandleModeSupport {
 
     static int checks = 0;
 
+    /**
+     * Render a value as PURE ASCII.
+     *
+     * <p>Not cosmetic. A {@code char} variable's modes return values like
+     * {@code }, and a raw control byte in the output makes {@code diff}
+     * treat the file as BINARY and refuse to compare it line by line — which
+     * reports "no differences" for two files that differ on 57 rows. The
+     * cross-VM check is a text diff, so the vector owes it text.
+     */
+    static String show(Object v) {
+        String s = String.valueOf(v);
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c < 0x20 || c > 0x7e) {
+                out.append(String.format("<U+%%04x>", (int) c));
+            } else {
+                out.append(c);
+            }
+        }
+        return out.toString();
+    }
+
     static void probe(String label, Body b) {
         String outcome;
         try {
             Object v = b.run();
-            outcome = (v == VOID) ? "returned-normally" : "returned:" + v;
+            outcome = (v == VOID) ? "returned-normally" : "returned:" + show(v);
         } catch (Throwable t) {
             outcome = "threw:" + t.getClass().getName();
         }
