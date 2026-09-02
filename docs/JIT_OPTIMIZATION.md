@@ -623,31 +623,121 @@ out-of-order core hides them behind the load they guard. What the elision buys
 is **code size**, paid entirely at compile time, plus the fact that a check
 that is not emitted cannot be got wrong.
 
-**This is not an implicit null check, and that was the choice, not an
-omission.** The audit item asked for the HotSpot mechanism: let the load fault
-on the null page and translate the signal. `vm/src/runtime/crash_handler.rs`
-can already resume — the Windows VEH rewrites `RIP` and returns
-`EXCEPTION_CONTINUE_EXECUTION`, and the Unix handler has the faulting PC, the
-faulting address and `si_code` — and a lock-free append-only PC table would be
-async-signal-safe. What is missing is **lifetime**: a `CompiledMethod`'s buffer
-is unmapped on invalidation and its address is immediately reusable by the next
-`alloc_executable` (`unregister_jit_method_name` exists for exactly this
-reason), so a stale entry would recover at a PC that now belongs to different
-code. Correct registration therefore has to participate in the code-cache
-lifecycle, which is where that work belongs. Against that, the check being
-removed is `TEST r,r; JZ rel32` — 9 bytes and two well-predicted µops — and
-proving it away costs nothing at runtime and cannot mistranslate a signal.
-Eliding by proof is strictly better than faulting where the proof exists; the
-implicit check is only worth its machinery where it does not.
+Eliding by proof is strictly better than faulting, wherever the proof exists.
+Where it does not, there is the implicit null check.
 
-And the measurement above **bounds** what it could be worth here, which is the
-part that settles it: an implicit null check removes *exactly the same two
-instructions* this elision removes, at the sites where the proof fails. The
-arm that removes them measured the same as the arm that keeps them. Building a
-signal-based recovery path with a code-cache-lifetime dependency to buy an
-effect that a direct A/B cannot resolve is not a trade worth making now — and
-if a workload ever does show the check on its profile, this section is the
-record of what was already tried and what it cost.
+### The implicit null check — the receiver dereference is the check
+
+`CRATONVM_JIT_IMPLICIT_NULL_CHECK=1`, **default OFF**.
+
+Where the dataflow proves nothing, the compact `getfield` arm can drop
+`TEST RAX, RAX; JZ slow` anyway and let the receiver dereference that follows
+it fault. The signal handler translates that fault back into the arm's own slow
+path, which calls the helper that raises the `NullPointerException`. The load
+that would have been guarded *is* the guard.
+
+This is the HotSpot mechanism, and it is the one item of the JIT audit that did
+not land with the rest of its round. The reason was never the signal handler —
+it was lifetime, and it is worth writing down what each of the three hazards
+actually needed.
+
+**Signal safety.** The lookup runs inside the handler, so it cannot use the
+mutex `lookup_jit_method_name` uses. That function is only ever reached while
+the process is already dying, which is what makes a `try_lock` acceptable
+there; here the process is expected to *survive*, and a handler that blocks on
+a lock its own interrupted thread holds deadlocks. The table is a fixed array
+of atomics and the reader does nothing but loads — no allocation, no lock, and
+no call into anything that takes one.
+
+**Lifetime — the hazard that actually blocked it.** A `CompiledMethod`'s buffer
+is unmapped on drop and, in that function's own words, "the address is then
+reusable by the next `alloc_executable`". An entry that outlived its buffer
+would eventually match a PC belonging to *different* code, and the handler
+would resume execution at a stale address inside a live method. That is not a
+crash; it is silent, arbitrary control flow. Two things close it: `Drop` calls
+`implicit_null::unregister_range` beside the `unregister_jit_method_name` that
+exists for exactly the same reason, and **slots are never reused** — retiring
+stores `0` and leaks the slot, because reuse would let a reader that has
+already matched `fault_pc` read a `recover_pc` that a concurrent
+re-registration had since overwritten. Exhaustion *declines*: the site keeps
+its explicit check and `declined` counts it, so the feature turns itself off
+rather than turning unsound.
+
+**Mis-recovery.** A genuine backend bug also faults inside compiled code, and
+silently resuming from one would convert a diagnosable crash into corrupted
+state. Recovery requires all of: a memory-access fault; an `si_code` saying
+`si_addr` is an address at all rather than a union member left over from a
+`kill -SEGV`; a faulting address inside the **null page**; and an **exact**
+registered PC, not merely one inside some compiled method's range. The last two
+are what separate "a null receiver reached a load we chose not to guard" from
+"compiled code dereferenced garbage" — a wild pointer does not land in the
+first page.
+
+#### Fail-closed, twice, because the elision is far from the thing it depends on
+
+The compiler does not trust its own source. `bind_implicit_null_recovery`
+decodes the bytes at the site it declined to guard and requires
+`MOV r32, [RAX + disp32]` with `disp32` inside the same null-page constant the
+handler screens on — so the two agree by construction rather than by two people
+remembering the same number. A second backstop fails any compile that reaches
+the end with a site still unbound. Both discard the artifact and return the
+method to the interpreter.
+
+That is more machinery than the elision itself, and deliberately so: the
+elision happens in one function and the property it depends on — that the next
+instruction dereferences the receiver, and that the slow path is reached —
+lives several hundred lines away in the arm that called it. An edit that broke
+the coupling would not produce a red test, it would produce a crash on a null
+receiver in production.
+
+Only the compact arm opts in. The second `getfield` arm emits its `GC_FLAGS`
+read only under `compact_ref_fields_enabled()`, so it passes `false` rather
+than make the guarantee conditional.
+
+#### Measured
+
+An 800,000-call probe whose receiver is a *parameter* (so the dataflow proves
+nothing and the implicit path is the one taken), with five null calls in the
+middle:
+
+| Arm | census | answer |
+|---|---|---|
+| default (off) | `implicit=0 emitted=1`, `registered=0 recovered=0` | `sum=5600000 caught=5` |
+| `=1` | `implicit=1 emitted=0`, `registered=1 retired=1 recovered=5` | `sum=5600000 caught=5` |
+
+`recovered=5` is the whole feature in one number: five hardware faults, five
+exact-PC matches, five `RIP` redirects, five `NullPointerException`s. The
+400,000 iterations *after* the faults still sum correctly, so recovery does not
+leave the frame damaged, and `retired=1` shows the entry withdrawn when the
+artifact dropped. HotSpot returns the same two numbers.
+
+Note the second row needs `CRATONVM_C2_SUPERSEDE=0` to be reached at all: with
+the default policy the method tiers up before the null calls, the C1 artifact
+is dropped, and the optimizing tier's own explicit check handles them. That is
+worth knowing before reading a `recovered=0` as a broken feature — it is more
+often a measurement of which tier owned the method.
+
+**Throughput is unchanged.** A 120-million-call probe reading a field off a
+parameter, five interleaved reps of CPU time, `CRATONVM_C2_SUPERSEDE=0` so the
+arm under test is the one that runs: medians **5.68 s on and 5.55 s off**,
+ranges 5.22-5.78 and 5.12-5.87. Read that as no detectable difference rather
+than as a regression -- the fast path with the flag on is the fast path with it
+off minus two instructions, so it cannot actually be slower, and the overlap is
+the host.
+
+Which is exactly what the elision A/B above predicted: an implicit check
+removes the same `TEST`/`JZ` pair the proof-based elision removes, and that
+pair did not move the clock either. **The reason to have this is not speed.**
+It is that the sites where no proof exists are precisely the ones the elision
+cannot reach, and this is the only thing that covers them -- and that having it
+built, measured and switchable is worth more than an argument about whether it
+would have helped.
+
+**It is off by default**, and that is not timidity. Every other switch in this
+backend has a wrong arm that produces a wrong answer, which a test can catch.
+This one's wrong arm resumes execution at an address chosen by a stale table,
+which nothing catches. It should soak behind the flag before the default
+moves.
 
 ### Summary table
 
@@ -677,6 +767,7 @@ record of what was already tried and what it cost.
 | Inline TLAB bump in the optimizing tier | **ON** | `CRATONVM_JIT_IR_INLINE_TLAB=0` |
 | `this` seeded non-null at method entry | **ON** | `CRATONVM_JIT_THIS_NONNULL=0` |
 | `getfield` receiver null-check elision | **ON** | `CRATONVM_JIT_RECEIVER_NULL_ELIM=0` |
+| Implicit null check (fault + signal translation) | off — soaks behind the flag first | `CRATONVM_JIT_IMPLICIT_NULL_CHECK=1` |
 
 ### Performance — current status
 

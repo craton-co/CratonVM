@@ -1204,6 +1204,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "this-nonnull", on_key: Some("CRATONVM_JIT_THIS_NONNULL"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     // Drops the getfield receiver TEST/JZ where the dataflow proves it dead.
     E { group: Group::JIT, token: "receiver-null-elim", on_key: Some("CRATONVM_JIT_RECEIVER_NULL_ELIM"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // OPT-IN, and the only switch in this backend whose wrong arm is SILENT:
+    // a stale or mis-shaped entry does not produce a wrong answer, it resumes
+    // execution at an address the table chose. Default off until it has soaked.
+    E { group: Group::JIT, token: "implicit-null-check", on_key: Some("CRATONVM_JIT_IMPLICIT_NULL_CHECK"), off_key: None, off_word: None, since: "2026-09-02" },
     // OPT-IN, and known to miscompile until the ARG_REGS audit lands -- see
     // `x64::operand_cache_enabled`. Declared so the two arms are measurable in
     // one binary, which is what the previous shape (no flag at all) prevented.
@@ -1782,6 +1786,11 @@ pub const INVENTORY: &[E] = &[
     // binary both ways.
     E { group: Group::GC, token: "gpu-host-callback", on_key: Some("CRATONVM_GPU_HOST_CALLBACK"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "gpu-device-pool", on_key: Some("CRATONVM_GPU_DEVICE_POOL"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // `gpu-wait-latch` is DEFAULT-ON with a "0" off-word, same argument as
+    // `gpu-device-pool`: skipping a `cuStreamWaitEvent` on an event that has
+    // already fired has no observable semantics, so the only honest way to
+    // price it is one binary both ways.
+    E { group: Group::GC, token: "gpu-wait-latch", on_key: Some("CRATONVM_GPU_WAIT_LATCH"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "gpu-zerocopy", on_key: None, off_key: Some("CRATONVM_GPU_NO_ZEROCOPY"), off_word: None, since: "2026-06-16" },
     // Measurement lever: root every heap-backed LinkedHashMap overlay entry
     // again, restoring the unbounded young-gen pinning the skip-set removed.
