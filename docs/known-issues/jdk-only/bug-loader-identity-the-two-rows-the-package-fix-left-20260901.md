@@ -2,7 +2,7 @@
 
 **Status: OPEN, MEASURED 2026-09-01.** Both rows were found while closing
 `getDefinedPackage`'s built-in-loader defect (retired to
-`docs/internal/jdk-only/`); neither is that defect, and both are recorded here
+`internal/jdk-only/`); neither is that defect, and both are recorded here
 rather than folded into it because they have different owners and different
 blast radii.
 
