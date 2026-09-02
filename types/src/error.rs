@@ -2847,7 +2847,9 @@ mod tests {
                 method: "fake".into(),
                 descriptor: "(I)Ljava/lang/String;".into(),
                 registered_by: Some("native-builtins/src/lib.rs:1234".into()),
-                survivor: None,
+                // The interesting arm: a refusal that did NOT retire its
+                // method, because an earlier registration still owns the slot.
+                survivor: Some("intrinsic@native-builtins/src/phases_early.rs:21878".into()),
             },
             JdkOnlyViolation::SyntheticNativeInvocation {
                 class: "com/example/Strict".into(),
@@ -3072,10 +3074,6 @@ mod tests {
             method: "fake".into(),
             descriptor: "(I)Ljava/lang/String;".into(),
             registered_by: Some("native-builtins/src/lib.rs:1234".into()),
-            // This fixture asserts `registered_by` provenance and says nothing
-            // about a fall-through survivor, so `None` leaves every assertion
-            // in this test meaning exactly what it meant before the field
-            // existed.
             survivor: None,
         };
         assert!(registered

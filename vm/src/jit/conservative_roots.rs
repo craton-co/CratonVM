@@ -2923,9 +2923,25 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
     // frame reports "not verified", never "verified clean". The gate is on the
     // UNION being live, so a collector that publishes neither table still gets
     // the refusal it had before rather than a quiet pass.
-    if bounds_guard_enabled() && !cratonvm_gc::gen_heap::movable_bounds_are_live() {
-        *reason_out = cratonvm_gc::gc_quiescence::incomplete_reason::YOUNG_BOUNDS_UNPUBLISHED;
-        return true;
+    //
+    // The gate has TWO ways to fire and they are reported apart, because the
+    // second one looks like success from every angle the first is checked
+    // from. A table can be useless because it is empty (nobody published) or
+    // because it is about somebody else: both tables are process-global and
+    // discriminated by slot 0, so each describes exactly ONE heap, and a second
+    // live heap leaves the loser's every address answering `false` to
+    // `addr_is_movable` — published, fresh, and not about these frames. See
+    // `gen_heap::RELOCATABLE_HEAPS_LIVE`.
+    if bounds_guard_enabled() {
+        if !cratonvm_gc::gen_heap::published_bounds_represent_every_live_heap() {
+            *reason_out =
+                cratonvm_gc::gc_quiescence::incomplete_reason::BOUNDS_NOT_REPRESENTATIVE;
+            return true;
+        }
+        if !cratonvm_gc::gen_heap::movable_bounds_are_live() {
+            *reason_out = cratonvm_gc::gc_quiescence::incomplete_reason::YOUNG_BOUNDS_UNPUBLISHED;
+            return true;
+        }
     }
     let scanner_sp = current_stack_pointer();
     let mut unverified = false;
@@ -6308,7 +6324,7 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
     // INTO. The narrowing rests on "their roots are published by their own
     // mechanisms", which does not hold for an object that has been allocated
     // and not yet stored anywhere tracked — see
-    // `docs/known-issues/gc/bug-g1-evacuates-live-jit-reference-20260819.md`.
+    // `bug-g1-evacuates-live-jit-reference-20260819.md`.
     if !frame_bands_enabled() || !scan_compiled_frame_bands(info, scanner_sp, heap, out) {
         scan_one_frame(scanner_sp, info.frame_base, heap, out);
     }
