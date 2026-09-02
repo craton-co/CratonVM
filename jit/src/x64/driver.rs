@@ -2550,7 +2550,7 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
         // report "no cause" for a real one. Adding a variant without adding a
         // column is now a compile error rather than a silent column.
         const _: () = assert!(
-            crate::x64::safepoint::map_incomplete_cause::COUNT == 7,
+            crate::x64::safepoint::map_incomplete_cause::COUNT == 8,
             "map_incomplete_cause gained a variant: add a column to the              frameslot-detail line below, then bump this"
         );
         eprintln!(
@@ -2572,7 +2572,7 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
         eprintln!(
             "[oopcov]   frameslot-detail method={} precise_maps={} sp_id_slot_off={} inline_sites={} \
              safepoints={} mapped={} unmapped_pcs={:?} \
-             causes(marks_inexact={} oop_in_reg={} stack_deep={} local_deep={} staged_deep={}              staged_unmappable={} inline_local_unmappable={})",
+             causes(marks_inexact={} oop_in_reg={} stack_deep={} local_deep={} staged_deep={}              staged_unmappable={} inline_local_unmappable={} local_mask_unreached={})",
             compiler.method_key,
             compiler.precise_maps,
             compiler.sp_id_slot_off,
@@ -2594,6 +2594,7 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
             // must never produce. The 2026-08-30 diagnosis that concluded "One
             // cause, `staged_unmappable`" was made from this line.
             causes[6],
+            causes[7],
         );
     }
     // Shadow-stack — frame offsets + thread-struct offset, so the OSR trampoline

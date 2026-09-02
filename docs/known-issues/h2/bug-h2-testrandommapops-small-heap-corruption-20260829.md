@@ -142,6 +142,51 @@ its shipped default.
 (Measured on both profiles: the witness and its offsets are identical on the
 release binary and on a debug build, so it is not an optimisation artefact.)
 
+### 5. The wrong classification, named: the local-oop mask omits a live reference local
+
+With all eight causes reading zero, the question stopped being *which cause* and
+became *which classification is wrong*. Dumping the inputs `record_oop_map`
+builds from, for the witness method only, answers it in one run.
+
+The frame layout is `local_offset(k) = 8 * (k + 1)`, so locals 0..4 sit at
+offsets 8, 16, 24, 32, 40. For the safepoint that becomes `sp_id=51`:
+
+```text
+[spmap] pc=..  stack_len=0  marks=[]  exact=true  kinds=[]
+        local_mask=Some(19)  param_mask=0x3  slots=[8, 16, 40]
+```
+
+`Some(19)` is `0b10011` — locals **0, 1 and 4**, i.e. offsets 8, 16, 40, which
+is exactly the `mapped=[8, 16, 40]` the residue instrument reports for that
+frame. Every named slot came from the local mask; the operand stack contributed
+nothing (`stack_len=0`).
+
+And the live stale word is at **offset 32 — local 3**, which the mask says is
+not a reference. It is: the residue instrument resolves it through the
+collection's own forwarding table (`stale=0x20019013eb8->0x200102599b8`), and
+the object it names is the same one slot 40 holds after rewriting. Two locals
+hold one reference; the mask names one of them.
+
+**So the defect is a believed-exact classification that is wrong**, and the
+reason nothing catches it is structural: the operand-stack marks carry a
+`stack_oop_marks_exact` flag which seeds `map_incomplete`, and **the local masks
+carry no equivalent**. `local_oop_mask_at_current_pc()` returns a mask and the
+builder trusts it unconditionally. A mask that omits a live reference local is
+therefore invisible to all eight causes, to `unmapped_pcs`, and to the
+fail-closed gate — which is why §2 finds live stale words at the shipped
+default.
+
+That is `Next` item 2, now with the failing classification named rather than
+inferred. The two repair directions the page already states are unchanged, and
+the second one is now specific: give the local masks an exactness flag the way
+the stack marks have one, and seed `map_incomplete` from it.
+
+**Reproducing the dump.** Print `cur_bc_pc`, `stack_oop_marks`,
+`stack_oop_marks_exact`, `local_oop_mask_at_current_pc()`, `local_offset(0..15)`
+and `slots` at the end of `record_oop_map`, gated on the method key, then run
+`probes/SafepointMapResidue.java`. A debug build is enough and takes about two
+minutes; the witness and its offsets are identical to the release binary.
+
 ### Where that leaves the page
 
 * **OPEN**, and the remaining work is `Next` item 2 — unchanged in substance and
