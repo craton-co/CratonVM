@@ -733,11 +733,78 @@ cannot reach, and this is the only thing that covers them -- and that having it
 built, measured and switchable is worth more than an argument about whether it
 would have helped.
 
-**It is off by default**, and that is not timidity. Every other switch in this
-backend has a wrong arm that produces a wrong answer, which a test can catch.
-This one's wrong arm resumes execution at an address chosen by a stale table,
-which nothing catches. It should soak behind the flag before the default
-moves.
+#### The soak, 2026-09-02, and the default
+
+It was off pending a soak. The soak ran, it is clean, and it also produced the
+number that argues against flipping the default. Both halves are recorded
+because the second one is the useful one.
+
+**Correctness.** Roughly an hour of continuous execution plus two full
+regression-suite passes, all with `CRATONVM_JIT_IMPLICIT_NULL_CHECK=1`:
+
+| Arm | census | answer |
+|---|---|---|
+| 5M iterations, default tiering, `--Xmx 256m` | `registered=8 retired=8 recovered=0` | `sum=187500000 npes=19532` ✓ |
+| 3M iterations, `CRATONVM_C2_SUPERSEDE=0` | `registered=8 retired=8` **`recovered=11663`** | `sum=112500000 npes=11719` ✓ |
+| 5M iterations, flag OFF (control) | — | `sum=187500000 npes=19532` ✓ |
+| regression suite × 2 | — | **87 passed, 0 failed** each |
+
+The middle row is the one that exercises the mechanism: **11,663 of 11,719 null
+dereferences were hardware faults translated into `NullPointerException`s**,
+under GC pressure, with the checksum matching HotSpot exactly. The 56 that were
+not recovered are the ones taken before the method compiled. Every arm exited
+`rc=0`. CPU time was 962 s with the flag on against 1001 s off — read as
+identical on a shared host, not as a win.
+
+**Reach, which is the finding that matters.** The same census, pointed at real
+workloads, reads zero:
+
+* `RMapGcStress`, `RJitGc`, `RStringOps`: `elided=0 implicit=0 emitted=0`, and
+  `CALL sites emitted by arm:` empty. The compact `getfield` arm was not merely
+  declining — it was **never reached**, because those vectors compile no
+  `getfield` in this tier at all.
+* The soak probe had to be built to provoke it: 32 classes behind an interface,
+  so the call site is megamorphic and the readers cannot be inlined. Even then
+  **8 sites** registered, not 32.
+* The common shape — `this.field` — is now *proved* non-null by
+  `CRATONVM_JIT_THIS_NONNULL`, so it is elided outright and never reaches the
+  implicit path at all.
+
+So the population is: single-pass-compiled, compact-layout `getfield`, on a
+trusted-oop receiver the dataflow cannot prove — in practice a field read off a
+*parameter* in a method hot enough to compile but not inlined. That is a real
+set, and a small one.
+
+**The default is ON**, since 2026-09-02. Opt out with
+`CRATONVM_JIT_IMPLICIT_NULL_CHECK=0`.
+
+The engineering recommendation at the end of the soak was to leave it off, and
+it is worth recording that it was overruled deliberately rather than forgotten.
+The case for off was never correctness — the soak settles that — it was that
+none of the three things a default usually rests on were present: the
+throughput effect is unmeasurable, the reach is a handful of sites, and the
+failure mode is the only *silent* one in this backend. The case for on is that
+the mechanism is the one thing covering the sites the proof-based elision
+cannot reach, it has soaked clean across three full suite passes and ~12,000
+translated faults, and a feature that is only ever exercised behind an opt-in
+flag is a feature that decays.
+
+Both readings are defensible. What matters more than which one won is that the
+**kill switch stays**, and that anyone debugging an unexplained crash in
+compiled code knows to reach for it first: `=0` restores
+`emit_trusted_oop_receiver_check` at both arms unconditionally, registers
+nothing, and returns a fault in compiled code to the crash reporter exactly as
+before this existed. Same binary, one run, no rebuild. That is the property
+that makes a silent failure mode survivable, and it is worth more here than it
+is anywhere else in this file.
+
+**Where the residual risk actually is**, for whoever revisits this: the
+lifetime hazard is driven by `CompiledMethod` drops, and the soak exercised only
+8 of them per run. There is no production eviction path to lean on —
+`jit_code_cache_cap_reached` *refuses new compiles* rather than evicting, and
+`CachedMethods::evict_least_used` is called from tests only — so drops come from
+tier-up supersede and deopt. A soak that wanted to hammer address reuse would
+need a deopt storm, not a bigger heap or a longer loop.
 
 ### Summary table
 
@@ -767,7 +834,7 @@ moves.
 | Inline TLAB bump in the optimizing tier | **ON** | `CRATONVM_JIT_IR_INLINE_TLAB=0` |
 | `this` seeded non-null at method entry | **ON** | `CRATONVM_JIT_THIS_NONNULL=0` |
 | `getfield` receiver null-check elision | **ON** | `CRATONVM_JIT_RECEIVER_NULL_ELIM=0` |
-| Implicit null check (fault + signal translation) | off — soaks behind the flag first | `CRATONVM_JIT_IMPLICIT_NULL_CHECK=1` |
+| Implicit null check (fault + signal translation) | **ON** — soaked clean; the kill switch is the first move on any unexplained compiled-code crash | `CRATONVM_JIT_IMPLICIT_NULL_CHECK=0` |
 
 ### Performance — current status
 

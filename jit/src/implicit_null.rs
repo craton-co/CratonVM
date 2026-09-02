@@ -115,17 +115,39 @@ static RETIRED: AtomicUsize = AtomicUsize::new(0);
 static RECOVERED: AtomicUsize = AtomicUsize::new(0);
 static DECLINED: AtomicUsize = AtomicUsize::new(0);
 
-/// Is the implicit null check enabled? **Default OFF.**
+/// Is the implicit null check enabled? **Default ON** since 2026-09-02; opt
+/// out with `CRATONVM_JIT_IMPLICIT_NULL_CHECK=0`.
 ///
-/// Opt in with `CRATONVM_JIT_IMPLICIT_NULL_CHECK=1`. It is off by default
-/// because the failure mode of getting it wrong is not a wrong answer, it is
-/// resumed execution at an address chosen by a stale table — and unlike every
-/// other switch in this backend, the arm that is wrong is *silent*.
+/// # What the off arm restores, exactly
+///
+/// `emit_trusted_oop_receiver_check` at both `getfield` arms, unconditionally
+/// — the behaviour of every binary before this feature existed. Nothing
+/// registers, so [`recover`] scans an empty table and answers `None` on the
+/// first load, and a fault in compiled code reaches the crash reporter exactly
+/// as it always did. There is no degraded middle state.
+///
+/// # Read this before deciding the flag is unnecessary
+///
+/// This switch guards the only mechanism in this backend whose wrong arm is
+/// **silent**. Every other one produces a wrong answer, which a test catches;
+/// a stale or mis-shaped entry here resumes execution at an address the table
+/// chose, which nothing catches. That is why the kill switch exists and why it
+/// should keep existing even though the default moved: the first thing anyone
+/// debugging an unexplained crash in compiled code should be able to do is
+/// take this out of the picture in one run, on the same binary.
+///
+/// It was default-off through its soak (see `docs/JIT_OPTIMIZATION.md`): about
+/// an hour of continuous execution plus two full regression-suite passes, with
+/// 11,663 of 11,719 null dereferences recovered as translated hardware faults
+/// under GC pressure, every checksum matching HotSpot, and 87/87 twice.
 pub fn enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IMPLICIT_NULL_CHECK").is_some()
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IMPLICIT_NULL_CHECK").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
     })
 }
 

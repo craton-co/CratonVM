@@ -1098,6 +1098,61 @@ pub struct GcFlags {
     /// Kept, off, because it is sound, tested, and the mechanism a card table
     /// needs the moment the screen's engagement problem is fixed.
     pub g1_card_clean: bool,
+    /// `CRATONVM_G1_CARD_SCREEN_JIT_PINNED` — let Phase 2 apply the card screen
+    /// to a JIT-PINNED source region too, instead of walking it wholesale.
+    /// Default-on with a `=0` opt-out ([`parse::on_unless_zero`]).
+    ///
+    /// # The carve-out this removes, and why it was there
+    ///
+    /// `young_collection`/`mixed_collection` add every JIT-pinned region to the
+    /// remembered set's own source list and pass `card_screen = false` for
+    /// them, so they are walked end to end. The stated reason is that
+    /// "JIT-compiled code may have installed those references through stores
+    /// the collector cannot assume went through `post_write_barrier_rset`" — a
+    /// card screen is derived from that same assumption, so applying it there
+    /// would trust the belt it exists to double.
+    ///
+    /// # Why the assumption no longer holds under G1
+    ///
+    /// Every path by which compiled code can write a reference into the heap
+    /// now reaches `post_write_barrier_rset`, which records the remembered-set
+    /// entry AND dirties the holder's card:
+    ///
+    /// * **`putfield` (reference), every inline arm, both tiers.** G1-2's fix
+    ///   gates each arm on `region_bounds_are_live(...)`, and G1 publishes
+    ///   nothing into `JIT_REGION_BOUNDS` — the emptiness is load-bearing and
+    ///   `publishing_the_g1_barrier_table_does_not_make_region_bounds_live`
+    ///   pins it. So under G1 every arm takes `jit_putfield_object`, which goes
+    ///   through `VmHeap::set_field`.
+    /// * **`putfield` under `CRATONVM_G1_INLINE_BARRIER` (F-08).** The inline
+    ///   filter elides only the two cases whose callee returns without
+    ///   recording (a null value, and a same-region store); everything else
+    ///   still calls `jit_g1_post_write_barrier`.
+    /// * **`aastore`, single-pass tier.** Stores inline, then calls
+    ///   `helpers.write_barrier` (`jit_write_barrier` → `VmHeap::write_barrier`
+    ///   → `post_write_barrier_rset`). The inline card-mark shortcut beside it
+    ///   is generational-only and `inline_card_mark_available()` is a constant
+    ///   `false`.
+    /// * **`aastore`, IR tier.** Refused outright — `ir_lower` latches a
+    ///   bailout rather than emit a barrier-less reference store.
+    /// * **Statics, natives, reflection, `Unsafe`, `VarHandle`, `arraycopy`.**
+    ///   All funnel through the barriered accessors; none is compiled inline.
+    ///
+    /// # What is still true, and why this is safe by construction today
+    ///
+    /// With `CRATONVM_G1_CARD_CLEAN` off (its default), a card is cleared in
+    /// exactly one place — `G1Region::reset`, i.e. when the region is recycled.
+    /// So a dirty card means "some store ever named an object here" and a CLEAN
+    /// card means "no store into this region's contents was ever recorded".
+    /// Skipping an object with a clean card can therefore only skip one that no
+    /// compiled or interpreted store has touched since the region was recycled.
+    ///
+    /// `=0` restores the wholesale walk, and is the first thing to try for a
+    /// lost-edge or dangling-reference defect that appears after 2026-09-02.
+    /// The checkers that would catch one are already wired into every pause:
+    /// `verify_no_dangling_into_cset` (budgeted in release) and
+    /// `dbg_verify_rset_completeness` (`CRATONVM_G1_DBG_RSET=1`).
+    pub g1_card_screen_jit_pinned: bool,
     /// `CRATONVM_G1_INLINE_BARRIER` — F-08: let the JIT emit G1's post-write
     /// barrier inline instead of routing every compiled reference store to the
     /// `jit_putfield_object` helper. Opt-in ([`parse::present`]).
@@ -1503,6 +1558,10 @@ impl GcFlags {
             g1_uncommit: present(src, "CRATONVM_G1_UNCOMMIT"),
             g1_card_rset: on_unless_zero(src, "CRATONVM_G1_CARD_RSET"),
             g1_card_clean: present(src, "CRATONVM_G1_CARD_CLEAN"),
+            g1_card_screen_jit_pinned: on_unless_zero(
+                src,
+                "CRATONVM_G1_CARD_SCREEN_JIT_PINNED",
+            ),
             g1_inline_barrier: present(src, "CRATONVM_G1_INLINE_BARRIER"),
             g1_mark_lock_yield: on_unless_zero(src, "CRATONVM_G1_MARK_LOCK_YIELD"),
             g1_shared_alloc: on_unless_zero(src, "CRATONVM_G1_SHARED_ALLOC"),
