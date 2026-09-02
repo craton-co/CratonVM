@@ -2,9 +2,11 @@
 
 ## Status
 
-**OPEN. Re-measured 2026-09-02, and the decomposition below is right in its
-PROPORTIONS and wrong in three of its conclusions - see the 2026-09-02
-re-measurement section before acting on the plan in this page.** This is the residual of
+**OPEN, and the page's whole model needs replacing. Re-measured 2026-09-02: the
+decomposition below is right in its PROPORTIONS and wrong in its conclusions,
+and the cause is not a "per-native-call floor" at all — the fixture's `read()`
+is not being COMPILED, so it pays the interpreter for everything in it. Section
+9 is the finding; read it before acting on anything above it.** This is the residual of
 `fixed-suite-bugs/hibernate/jpalargeblob-random-state-side-table-FIXED-20260830.md`, which is retired: both of
 that page's own findings are fixed, the test got 1.35x faster, and it still
 fails. What is left is not a defect in `Random`, in blobs, or in H2 — it is this
@@ -127,9 +129,13 @@ an `AtomicLong` whose `get`/`compareAndSet` are themselves natives here". `get`
 is FAST (2.41 ns); `compareAndSet` is **361.3 ns, 27x HotSpot's 13.25**. Running
 `Random.next(int)`'s exact loop on a real `AtomicLong` costs **2265.6 ns**
 against the side table's 273.4 - 8x worse. The premise holds; it named the wrong
-method. **`AtomicLong.compareAndSet` is the blocker**, and it is absent from the
-`ATOMIC_LONG` intrinsic region that already covers `get`, `getAndAdd`,
-`incrementAndGet` and four more. One `LOCK CMPXCHG` in that region unblocks it.
+method.
+
+> **CORRECTION, same day.** This section first concluded that
+> `AtomicLong.compareAndSet` was the blocker, on the strength of that 2265.6 ns.
+> `compareAndSet` WAS 27x and is now fixed (section 8) — and fixing it did not
+> move `lcgNext` at all: 1945 -> 1949 ns across three pairs. The 2265.6 was
+> never the CAS. See section 9.
 
 ## 3. There is no "per-native-call floor"
 
@@ -177,9 +183,9 @@ Long.valueOf(127)` must hold).
 2. **`Random.<init>`** - ~37% of `read()`. Either make the native cheap (drop
    the identity hash and the two global locks; the seed can live in the
    object's own field) or retire the shadow, which first needs (3).
-3. **`AtomicLong.compareAndSet` -> `LOCK CMPXCHG`** in the existing
-   `ATOMIC_LONG` region. 27x on its own, VM-wide, and the precondition for
-   retiring the Random shadow.
+3. ~~**`AtomicLong.compareAndSet` -> `LOCK CMPXCHG`**~~ **DONE, section 8.**
+   34.7x, now 1.23x HotSpot. It was NOT the precondition for retiring the
+   Random shadow — section 9 has the one that is.
 4. **`Atomic*.<init>` synthetic stubs** - `AtomicLong` / `AtomicInteger` /
    `AtomicReference` constructors are `SyntheticStub` natives shadowing a
    one-`putfield` JDK constructor, costing **5.2x** (1640.6 -> 316.4 under
@@ -259,3 +265,82 @@ java -Diters=2000000 -cp . BlobStreamCost      # HotSpot, for the control column
   — the page this came out of: the native-memory leak, the entropy-draw spec
   divergence, the Random-shadow retirement that was built and left off, and the
   measurement mistakes made along the way.
+
+---
+
+# 8. `compareAndSet` is fixed: 34.7x
+
+`AtomicLong` / `AtomicInteger` `compareAndSet` and `weakCompareAndSet` now emit
+one `LOCK CMPXCHG`. One binary, `CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC` as the
+lever, 3/3 pairs:
+
+| | OFF | ON | HotSpot |
+|---|---:|---:|---:|
+| `AtomicLong.compareAndSet` | 565.6 | **16.3** | 13.25 |
+
+27x behind HotSpot before, **1.23x** after. The only thing separating it from
+its `get` (2.41 ns) and `getAndIncrement` (12.02 ns) siblings was membership of
+the intrinsic region.
+
+# 9. The real finding: the method containing the work is not COMPILED
+
+Fixing `compareAndSet` did not move `lcgNext` — the static method whose body is
+one `get` plus one `compareAndSet` — by one nanosecond. That is what exposed
+this, and it is bigger than anything else on this page.
+
+| arm | JIT on | `--nojit` | JIT speedup |
+|---|---:|---:|---:|
+| `AL.compareAndSet` (direct, in the timing loop) | 15.4 | 2226.6 | 145x |
+| the same `get`+CAS loop written INLINE | 18.6 | 2109.4 | 113x |
+| **`lcgNext(AL,32)` — the identical body behind a static call** | **2265.6** | 2500.0 | **1.1x** |
+
+`lcgNext` costs the same whether the JIT is on or off. **Its body runs
+interpreted in both.** The 122x gap between it and the inline version is not the
+CAS, not the do/while, and not a call floor — an ordinary static call measures
+8.67 ns and a virtual call 20.14 ns (`probes/CallFloor.java`).
+
+And the same shape governs THIS page's workload. Two streams differing only in
+the counter's type, both calling a virtual `read()` once per byte:
+
+| arm | JIT on | `--nojit` | JIT speedup |
+|---|---:|---:|---:|
+| `stream prim no Random` | 41.5 | 1692.7 | **40.8x** |
+| `stream boxed no Random` | 2531.3 | 3906.3 | **1.5x** |
+| `stream boxed+new Random` (the fixture) | 4453.1 | 6510.4 | 1.5x |
+
+A `read()` with a primitive counter gets 40x from the JIT. The identical method
+with a boxed counter gets 1.5x — it is barely being compiled at all.
+
+**So the boxing term is not "three native calls at ~300 ns each".** It is that
+the method containing the boxing does not reach compiled code, and therefore
+pays the INTERPRETER for everything in it — the two unboxes, the `valueOf`, the
+field access and the dispatch alike. That is also why section 4's
+`Long.longValue` intrinsic bought 1.6x on a tight counter loop and nothing at
+all on the stream arm: an intrinsic is JIT emission, and there is no JIT here to
+emit it.
+
+## What to ask next
+
+The question is no longer "which native is slow" but **"why does a method whose
+body autoboxes fail to compile, when its primitive twin compiles and runs 40x
+faster?"** Concretely:
+
+* `lcgNext` is called 400 000+ times from an OSR-compiled lambda and the method
+  stats report `still-interpreted=7 c1=0` with **500 total invocations tracked**
+  across the whole run. A method invoked only from COMPILED code may never
+  accumulate the profile counts that admit it — that is a hypothesis this page
+  has evidence for and has not proved, and it is the first thing to test.
+* If it holds, it is not a hibernate bug or a boxing bug. It is a tiering bug,
+  and this test is one of its symptoms.
+
+Until that is answered, the ns/byte arithmetic in sections above — and the
+`~955` target this page opened with — are predictions about a VM that compiles
+the fixture's `read()`. It does not.
+
+# 10. Probes added by sections 8 and 9
+
+* `probes/AtomicCasCost.java` — the CAS arms, plus the inline-vs-behind-a-call
+  pair that isolated section 9.
+* `probes/CallFloor.java` — what an ordinary Java call costs (static 8.67 ns,
+  loop-bodied static 15.67, virtual 20.14, against HotSpot's 0.42 for all
+  three), so "it is the call" can be ruled out rather than assumed.
