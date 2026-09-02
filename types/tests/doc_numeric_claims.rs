@@ -50,7 +50,7 @@
 //!   statement about `gc/src/zgc/barrier.rs` whose refutation is a human
 //!   reading, and a guard that guessed at it would either miss the next
 //!   rewording or fail on an accurate one.
-//! * **`docs/internal/`.** Those pages are history and legitimately record what
+//! * **`docs/internal`.** Those pages are history and legitimately record what
 //!   was once true; `gc-crate-audit.md` still says "default-off `zgc`" and is
 //!   right to. The walk in [`published_markdown`] never descends into it.
 //! * **Row 3 onwards of "Where the surface stands".** The declared count is
@@ -214,7 +214,7 @@ fn workspace_members() -> Vec<String> {
 }
 
 /// Every `*.rs` under `dir`, skipping [`SKIPPED_DIRS`], dotted directories and
-/// `docs/internal/` (relative to `root`).
+/// `docs/internal` (relative to `root`).
 fn collect_rust(dir: &Path, root: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -321,7 +321,7 @@ fn scan_literals(text: &str, quoted_prefix: &str, out: &mut BTreeSet<String>) {
 /// workspace root, all of `gc/`, and the top level of `docs/`.
 ///
 /// The root and `docs/` walks are deliberately non-recursive, which is what
-/// keeps `docs/internal/` — history, and allowed to describe a world that has
+/// keeps `docs/internal` — history, and allowed to describe a world that has
 /// since changed — out of scope without needing a special case.
 fn published_markdown(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -487,7 +487,7 @@ fn no_published_document_calls_zgc_a_default_off_feature() {
         "a published document describes the `zgc` Cargo feature the wrong way \
          round.\n\n  The manifest is the authority: {truth}\n\n  Offending \
          lines (fix the prose, not gc/Cargo.toml):\n  {}\n\n  \
-         `docs/internal/` is exempt and not scanned — those pages are history \
+         `docs/internal` is exempt and not scanned — those pages are history \
          and are allowed to record what was once true.",
         offences.join("\n  ")
     );

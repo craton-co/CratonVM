@@ -808,6 +808,25 @@ impl Arena {
         self.alloc_anchors.fill(usize::MAX);
     }
 
+    /// The epoch's anchors as a strictly-increasing offset list, WITHOUT
+    /// consuming them (gc-genpause F1).
+    ///
+    /// [`Self::take_alloc_anchors`] is the sweep's reader and it drains, which
+    /// is right for a path that owns the epoch. The moving young cycle's
+    /// object-start walk wants the same grid a phase earlier and must not
+    /// disturb it -- a moving cycle can still divert to the non-moving sweep
+    /// mid-flight, and that sweep would then find the anchors gone and fall
+    /// back to a full sequential walk for no reason.
+    ///
+    /// Same contents, same order, same `usize::MAX`-means-empty encoding.
+    pub fn alloc_anchors_snapshot(&self) -> Vec<usize> {
+        self.alloc_anchors
+            .iter()
+            .copied()
+            .filter(|&v| v != usize::MAX)
+            .collect()
+    }
+
     /// Route a block to its size tier. Does NOT touch `max_free_upper` — the
     /// callers that can GROW the true maximum ([`Self::add_free_block`]) bump
     /// it themselves; split remainders are strictly smaller than the block
