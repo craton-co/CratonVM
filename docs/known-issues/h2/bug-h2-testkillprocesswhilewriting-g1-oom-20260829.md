@@ -145,6 +145,90 @@ The candidates it yields (`0x2004520df70`, `+0x20`, `+0x18`, `+0x18`, ...) are
 plausible heap addresses that are not object headers, so the slots are being
 read as references either way.
 
+### 4b. 2026-09-01: what a `class_id=0 kind=Object num_slots=8192` object is -- G1 published the address BEFORE the header
+
+Section 4a's question has an answer, and it does not need a debugger: it is a
+**torn `ObjectHeader` store on an array**, read through a cursor that already
+said an object was there.
+
+`G1Region::bump_alloc` advanced `self.cursor` FIRST and zeroed the span
+afterwards, and all four of G1's header-writing allocation entry points --
+`try_alloc_object`, `try_alloc_array` and the `GarbageCollector`
+`alloc_object` / `alloc_array` -- wrote the `ObjectHeader` **after
+`alloc_in_region` returned**, i.e. after the regions lock had been dropped.
+The humongous path is the same shape with the region TYPE as its publication
+point: it classified the span `HumongousStart` with `cursor = size`, then
+zeroed, then returned for the caller to write the header.
+
+The cursor is what every heap walk in `g1.rs` means by "there is an object
+here" -- `scan_source_region_for_cset_refs`, `locate_in_object_grid` and the
+Phase-4 walks all iterate `[0, cursor)` decoding a header at each step, and
+`classify_candidate_header` accepts any address below it. So there is a window
+in which an address is published and the bytes there are not yet a header.
+
+**Read the layout and the shape falls out.** `ObjectHeader` is `class_id` and
+`shape` in its first eight bytes; `kind` and `element_type` live in the top
+bits of the mark word, in its SECOND eight. The intermediate state of an
+ARRAY header store -- first half retired, second half not -- is therefore
+
+| field | value in the window | why |
+|---|---|---|
+| `class_id` | 0 | a primitive array's class id IS 0 |
+| `shape` | the array LENGTH | `num_slots` and `array_length` share this dword |
+| `kind` | `Object` | the mark word is still the zeroed span; `ObjectKind::Object == 0` |
+| `array_length()` | 0 | it returns 0 for any kind that is not `Array` |
+
+which reads back as, verbatim, the censused holder:
+
+```text
+class_id=0 kind=Object num_slots=8192 array_len=0
+```
+
+A legacy object claims `num_slots * 16` body bytes. `int[8192]` owns 32 KiB and
+claims 128 KiB; `long[8192]` and `Object[8192]` own 64 KiB and claim the same
+128 KiB. `TLAB_MAX_ALLOC` is 32 KiB, so **every array larger than that took
+this out-of-line path unconditionally**, and a TLAB miss sends smaller ones
+down it too. That is also why the walk it drives could be evacuated: at 128 KiB
+it is under the 512 KiB humongous threshold, so the collector copies it whole
+into a fresh Survivor region -- landing at `off=0`, which is where the census
+found it, and at a fixed offset of an Old region once promoted.
+
+#### The default collector already had the invariant, which is the whole of the arm asymmetry
+
+`GenerationalHeap::try_alloc_young_initialized` takes an initializer and its
+SAFETY comment states the contract outright -- *"`init` writes the valid header
+before the arena lock is released"* -- and every `gen_heap` allocation entry
+point builds its `ObjectHeader` inside that closure. The JIT's inline allocator
+states the same thing at length (`emit_inline_tlab_new`: *"no walker can ever
+see a committed-but-unheadered object"*), and `Tlab::alloc_initialized`
+implements it with a Release fence. **G1 was the only backend without it.**
+This page's own control -- "the class passes under the default collector; only
+the explicit `-XX:+UseG1GC` arm fails" -- is that difference.
+
+#### What was fixed
+
+* `G1Region::bump_alloc_initialized` and
+  `G1Collector::alloc_in_region_initialized` run the caller's header write over
+  the fresh span while the regions lock is still held and **before** the cursor
+  (or, for humongous, the region type) is published. All four callers now write
+  their header there. Zeroing moved above the commit with it: a freed region is
+  deliberately not scrubbed (G1AUD-10), so a walker arriving between the cursor
+  bump and the memset read the previous incarnation's bytes.
+* The two evacuation flat walks that also **WRITE** --
+  `scan_and_evacuate_refs` and `scan_source_region_for_cset_refs` -- now take
+  the region clamp `record_outgoing_rset_edges` already applied, with the
+  `SLOT_SIZE` stride `holder_walkable_slots` had grown for exactly them and
+  which no caller was using. Unclamped, those walks do not merely read past the
+  holder: they rewrite `Value` cells past it with forwarded pointers. This is
+  hardening, not the fix -- the censused holder's 128 KiB claim still fits
+  inside its region, so the clamp would not have caught it.
+* `evacuation_candidate_is_an_object` answered one bit where two are needed --
+  verbatim the defect the 2026-08-30 `plausible_mark_scan_target` split fixed
+  on the marking side. It now reports the `HeaderVerdict`, counts the TORN
+  subset separately with its own throttle, and prints the holder's position in
+  its own region's OBJECT GRID plus its raw mark word. `[GC] g1
+  evac_ref_rejected=` carries the split.
+
 ## Status
 
 **OPEN. The OOM face is FIXED (2026-08-30) but the FAILURE MODE MOVED to SIGSEGV -- read the addendum above, section 3, before treating that as an improvement. The 48 617 dangling references are 6 holders, not a rate. Split out 2026-08-29** from
