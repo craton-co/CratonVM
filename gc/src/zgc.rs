@@ -11597,7 +11597,15 @@ impl GarbageCollector for ZgcRealHeap {
         // for the life of the process.
         self.retire_forwarding_words();
         {
-            let released = self.arena.lock().decommit_unbumped_middle();
+            let released = {
+                let mut arena = self.arena.lock();
+                // BOTH HALVES. The middle is the space no allocation ever
+                // reached; the free lists are the space that WAS allocated and
+                // has since been freed, and on a heap whose peak was large
+                // objects that is all of it -- `probes/HeapGiveBack.java`
+                // measured the middle alone returning 2 MiB of a 64 MiB peak.
+                arena.decommit_unbumped_middle() + arena.decommit_free_blocks()
+            };
             if released != 0 {
                 self.counters.bytes_uncommitted.fetch_add(released, Ordering::Relaxed);
                 tracing::debug!(
@@ -13577,6 +13585,62 @@ pub(crate) mod tests {
         assert!(
             committed < peak,
             "committed {committed} did not fall below the {peak} peak"
+        );
+    }
+
+    /// **A peak of LARGE objects comes back too.**
+    ///
+    /// The residual `a_collection_returns_the_unbumped_middle_to_the_os` does
+    /// not cover, and the one a real workload hits. The middle-only give-back
+    /// releases space no allocation ever reached; a large-object peak was
+    /// allocated, freed, and now sits on the HIGH free list, which
+    /// `retract_high_cursor_into_free_head` gives back only the excess of.
+    ///
+    /// Measured before `decommit_free_blocks` existed, on
+    /// `probes/HeapGiveBack.java` at a 64 MiB peak: **2 MiB returned of 64**.
+    /// After: the same probe reports `committed` falling from 71,303,168 to
+    /// 2,097,152.
+    ///
+    /// The exact edit that trips it: dropping `decommit_free_blocks` from
+    /// `collect_garbage`'s give-back.
+    #[test]
+    fn a_peak_of_large_objects_is_returned_to_the_os() {
+        const CAP: usize = 256 * 1024 * 1024;
+        const BIG_BYTES: usize = 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(CAP);
+        heap.set_tlab_enabled(false);
+        if heap.commit_stats().0 == heap.heap_capacity() {
+            eprintln!("[d1] SKIPPED: wholly-committed fallback store");
+            return;
+        }
+        // A peak of megabyte arrays -- above `ZGC_LARGE_OBJECT_MIN`, so every
+        // one is served from the high end.
+        let mut roots: Vec<ObjectRef> = (0..48)
+            .map(|_| heap.alloc_array(ClassId::new(1), ArrayElementType::Byte, BIG_BYTES))
+            .collect();
+        let peak = heap.commit_stats().0;
+        assert!(
+            peak > 32 * 1024 * 1024,
+            "the fixture committed only {peak} bytes; it is not a peak"
+        );
+        // Drop it all and collect. Two cycles: the first sweeps the arrays onto
+        // the high free list, the second's give-back finds them there.
+        roots.clear();
+        {
+            // SAFETY: single-threaded unit test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+        }
+        let (committed, returned) = heap.commit_stats();
+        assert!(
+            returned >= 32 * 1024 * 1024,
+            "a 48 MiB large-object peak returned only {returned} bytes; the \
+             free lists are not being given back"
+        );
+        assert!(
+            committed * 4 < peak,
+            "committed is still {committed} of a {peak} peak"
         );
     }
 

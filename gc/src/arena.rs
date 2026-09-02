@@ -2613,6 +2613,53 @@ impl Arena {
         self.decommit_span(lo, hi)
     }
 
+    /// Hand the whole granules inside every FREE-LIST block back to the OS.
+    ///
+    /// # Why the un-bumped middle is not enough
+    ///
+    /// [`Self::decommit_unbumped_middle`] releases the space between the two
+    /// cursors, which is the space no allocation has ever reached. It cannot
+    /// touch memory that WAS allocated and has since been freed -- and on a
+    /// heap whose peak was large objects, that is all of it: they are served
+    /// from the high end, the sweep returns them to the high free list, and
+    /// `retract_high_cursor_into_free_head` gives back only the excess over
+    /// the reserve. Measured on `probes/HeapGiveBack.java` at a 64 MiB peak:
+    /// the middle-only give-back returned **2 MiB of 64**.
+    ///
+    /// A free-list block is by definition not live, so its granules can go
+    /// back. The bytes come with no obligation either: every path that hands
+    /// one out again goes through [`Self::hand_out`], which commits before it
+    /// returns a pointer, and a re-committed granule reads as zero -- which is
+    /// what a caller of a reused block is entitled to and what `Arena::alloc`'s
+    /// consumers already zero for themselves.
+    ///
+    /// WHOLE granules only, rounded INWARD: a block's ends usually share a
+    /// granule with a live object, and rounding outward would take it too --
+    /// silently, because a decommitted page reads as zero rather than
+    /// faulting on the platforms that map it back on touch.
+    ///
+    /// **Call at a safepoint**, after the sweep has coalesced: the lists are
+    /// then a handful of maximal spans rather than one entry per dead object,
+    /// so this is a walk of tens rather than millions.
+    ///
+    /// Returns the bytes released.
+    pub fn decommit_free_blocks(&mut self) -> usize {
+        let mut released = 0usize;
+        let low: Vec<(usize, usize)> = self.low_blocks_sorted();
+        for (off, size) in low {
+            released += self.decommit_span(off, off + size);
+        }
+        let high: Vec<(usize, usize)> = self
+            .free_high
+            .iter()
+            .map(|b| (b.offset, b.size))
+            .collect();
+        for (off, size) in high {
+            released += self.decommit_span(off, off + size);
+        }
+        released
+    }
+
     /// Is `offset` inside a granule that is currently committed, i.e. safe to
     /// read?
     ///
