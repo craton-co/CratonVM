@@ -577,7 +577,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-280 tokens.
+279 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -680,7 +680,6 @@ export inherited from a parent shell.
 | `gated-ref-store` | `CRATONVM_JIT_GATED_REF_STORE` |
 | `operand-cache` | `CRATONVM_JIT_OPERAND_CACHE` |
 | `ir-reloc-emit` | `CRATONVM_JIT_IR_RELOC_EMIT` |
-| `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `reloc-gate-map-incomplete` | `CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE` |
 | `ir-selfrec-direct` | `CRATONVM_JIT_IR_SELFREC_DIRECT` |
 | `nested-trace-frames` | `CRATONVM_JIT_NO_NESTED_TRACE_FRAMES` |
@@ -1103,7 +1102,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-21 tokens.
+22 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1128,6 +1127,7 @@ export inherited from a parent shell.
 | `strict-swallows` | `CRATONVM_STRICT_SWALLOWS` |
 | `tomcat-mapper-natives` | `CRATONVM_TOMCAT_MAPPER_NATIVES` |
 | `vh-strict-reference-return` | `CRATONVM_VH_STRICT_REFERENCE_RETURN` |
+| `vh-null-coordinate-npe` | `CRATONVM_VH_NULL_COORDINATE_NPE` |
 
 ## `CRATONVM_TEST`
 
