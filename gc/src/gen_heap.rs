@@ -7701,6 +7701,11 @@ impl GenerationalHeap {
                 // SAFETY: every queued address is a destination the seeds above
                 // produced — a live copy in young to-space or in old gen.
                 unsafe { evac.drain(self.evac_pool(par_workers), &mut shards) };
+                // The copy proper ends here. Without this mark the next one
+                // (`map_merge`) covers the drain as well, and a breakdown that
+                // wide is a hypothesis rather than a measurement — the same
+                // mistake `pre_evacuate` made before gc-genpause F0 split it.
+                mv_phase!("evac_drain");
                 for shard in shards.iter_mut() {
                     evac.retire_plab(shard);
                 }
