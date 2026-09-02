@@ -5132,20 +5132,27 @@ mod unsafe_arena {
             // a 60-byte block reserves 64 and has capacity 60.
             if outstanding.is_some() && new_size > bytes.capacity() {
                 let mut fresh: Vec<u8> = Vec::new();
-                if fresh.try_reserve_exact(new_size).is_ok() {
-                    fresh.extend_from_slice(&bytes[..new_size.min(bytes.len())]);
-                    fresh.resize(new_size, 0u8);
-                    inner.insert(
-                        addr,
-                        Arena {
-                            bytes: fresh,
-                            reserved,
-                        },
-                    );
-                    drop(inner);
-                    self.displace(addr, addr, bytes, outstanding, new_size);
-                    return addr;
+                if fresh.try_reserve_exact(new_size).is_err() {
+                    // Fail the resize rather than fall through and let
+                    // `Vec::resize` move the buffer with no way to retain the
+                    // old one. `realloc(3)` leaving the block untouched is a
+                    // contract the caller already handles; a silent dangle is
+                    // not.
+                    inner.insert(addr, Arena { bytes, reserved });
+                    return 0;
                 }
+                fresh.extend_from_slice(&bytes[..new_size.min(bytes.len())]);
+                fresh.resize(new_size, 0u8);
+                inner.insert(
+                    addr,
+                    Arena {
+                        bytes: fresh,
+                        reserved,
+                    },
+                );
+                drop(inner);
+                self.displace(addr, addr, bytes, outstanding, new_size);
+                return addr;
             }
             if new_size > bytes.len()
                 && bytes.try_reserve_exact(new_size - bytes.len()).is_err()
