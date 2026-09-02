@@ -78,6 +78,29 @@ struct EventCuda {
     /// because each one waits on the `last_write` its predecessor
     /// stamped onto the same stream.
     recorded_on: std::sync::atomic::AtomicUsize,
+    /// Latched once this event has been OBSERVED complete.
+    ///
+    /// A CUDA event that has fired can never un-fire, so a
+    /// `cuStreamWaitEvent` on it is provably a no-op from that moment on
+    /// and can be skipped with no driver call at all. That is not a
+    /// corner case: a resident input buffer keeps the `last_write` its
+    /// upload or its zeroing stamped on it FOREVER — nothing rewrites
+    /// the slot, because nothing writes the buffer — so every later
+    /// launch that consumes it waited again on an event that had fired
+    /// long ago. With the dispatch path handing out streams round-robin
+    /// from a pool of four, the same-stream elision below never fires
+    /// for those, and the census read `waits issued=237 elided=0`.
+    ///
+    /// See `Stream::wait_event` for how the two flags are used together.
+    completed: std::sync::atomic::AtomicBool,
+    /// Set once the wait site has spent a `cuEventQuery` on this event.
+    ///
+    /// The probe is what turns an unknown event into a latched one, but
+    /// an event that is genuinely still in flight would otherwise pay a
+    /// query on EVERY wait — a driver call added to the one it was
+    /// meant to remove. Probing at most once per event bounds the cost
+    /// at one query and keeps the win for the case above.
+    probed: std::sync::atomic::AtomicBool,
 }
 
 // # Safety
@@ -169,6 +192,8 @@ impl Event {
                     device,
                     pool,
                     recorded_on: std::sync::atomic::AtomicUsize::new(0),
+                    completed: std::sync::atomic::AtomicBool::new(false),
+                    probed: std::sync::atomic::AtomicBool::new(false),
                 },
                 id: next_event_id(),
             });
@@ -188,6 +213,8 @@ impl Event {
                 device,
                 pool,
                 recorded_on: std::sync::atomic::AtomicUsize::new(0),
+                completed: std::sync::atomic::AtomicBool::new(false),
+                probed: std::sync::atomic::AtomicBool::new(false),
             },
             id: next_event_id(),
         })
@@ -199,9 +226,36 @@ impl Event {
     /// `EventStub::recorded_on`.
     #[cfg(feature = "cuda")]
     pub(crate) fn set_recorded_on(&self, stream: cudarc::driver::sys::CUstream) {
+        // Order matters, and so does clearing FIRST. Recording an event
+        // that had already fired puts it back in flight, and a reader
+        // that saw `completed` between the store and the clear would
+        // skip a wait it needs. Clearing before publishing the new
+        // stream means the worst a racing reader can see is "not
+        // latched", which costs a wait rather than dropping one.
+        self.inner.completed.store(false, Ordering::Release);
+        self.inner.probed.store(false, Ordering::Release);
         self.inner
             .recorded_on
-            .store(stream as usize, Ordering::Relaxed);
+            .store(stream as usize, Ordering::Release);
+    }
+
+    /// Latch this event as observed-complete. See `EventCuda::completed`.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn note_completed(&self) {
+        self.inner.completed.store(true, Ordering::Release);
+    }
+
+    /// Has this event been observed complete? See `EventCuda::completed`.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn is_completed(&self) -> bool {
+        self.inner.completed.load(Ordering::Acquire)
+    }
+
+    /// Claim the one probe this event is allowed at a wait site.
+    /// Returns `true` to the single caller that may spend the query.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn claim_probe(&self) -> bool {
+        !self.inner.probed.swap(true, Ordering::AcqRel)
     }
 
     /// The raw stream this event was last recorded on, or `0`.
@@ -265,7 +319,11 @@ impl Event {
         // CUDA driver treats an unrecorded event as already-complete).
         // SAFETY: the owning device was bound above and keeps this event live.
         unsafe { cudarc::driver::result::event::synchronize(self.inner.cu_event) }
-            .map_err(|e| DeviceError::Driver(format!("cuEventSynchronize: {e:?}")))
+            .map_err(|e| DeviceError::Driver(format!("cuEventSynchronize: {e:?}")))?;
+        // Returning from `cuEventSynchronize` IS an observation of
+        // completion, and the cheapest one there is to record.
+        self.note_completed();
+        Ok(())
     }
 
     /// Returns `true` if the recorded work has completed. Returns
@@ -302,7 +360,13 @@ impl Event {
         // driver error variant; anything else is a genuine failure.
         // SAFETY: the owning device was bound above and keeps this event live.
         match unsafe { cudarc::driver::result::event::query(self.inner.cu_event) } {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                // A fired event never un-fires until something records
+                // it again, and `set_recorded_on` clears this. See
+                // `EventCuda::completed`.
+                self.note_completed();
+                Ok(true)
+            }
             Err(e) => {
                 use cudarc::driver::sys::CUresult;
                 if e.0 == CUresult::CUDA_ERROR_NOT_READY {
@@ -313,6 +377,23 @@ impl Event {
             }
         }
     }
+}
+
+/// `CRATONVM_GPU_WAIT_LATCH=0` turns off the completed-event elision.
+///
+/// Default-on, because eliding a wait on an event that has already fired
+/// is exactly equivalent to issuing it. The switch exists so the change
+/// can be priced on ONE binary, and so a driver that somehow disagrees
+/// with "a fired event never un-fires" can be ruled out in one run
+/// rather than one build.
+#[cfg(feature = "cuda")]
+fn wait_latch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_GPU_WAIT_LATCH")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off"))
+            .unwrap_or(true)
+    })
 }
 
 impl Stream {
@@ -396,6 +477,23 @@ impl Stream {
         if event.recorded_on_raw() == self.raw() as usize {
             cratonvm_types::gpu_event_census::note_wait_elided();
             return Ok(());
+        }
+        // A wait on an event that has ALREADY fired is a no-op, whatever
+        // stream recorded it. The dispatch path hands out streams
+        // round-robin, so the same-stream test above almost never fires
+        // for it, and a resident input buffer keeps one `last_write`
+        // for its whole life — every launch re-waited on an event that
+        // completed long ago. See `EventCuda::completed`.
+        if wait_latch_enabled() {
+            if event.is_completed() {
+                cratonvm_types::gpu_event_census::note_wait_elided_latched();
+                return Ok(());
+            }
+            // At most one query per event: see `EventCuda::probed`.
+            if event.claim_probe() && matches!(event.query(), Ok(true)) {
+                cratonvm_types::gpu_event_census::note_wait_elided_latched();
+                return Ok(());
+            }
         }
         cratonvm_types::gpu_event_census::note_wait_issued();
         // AUDIT 2026-05-29 (SOUND-1 / H10c): bind the owning primary

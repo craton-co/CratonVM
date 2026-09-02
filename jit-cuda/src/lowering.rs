@@ -1692,6 +1692,27 @@ mod tests {
     /// because the failure that matters is one step of the tree going
     /// missing (a wrong sum, not a slow one), and because a second
     /// `red` would mean a thread found a way around the tree.
+    ///
+    /// # A per-BLOCK fold was tried and is not here
+    ///
+    /// Folding the per-warp partials through shared memory would cut the
+    /// atomics by another 8x at a 256-thread block. It was implemented
+    /// and measured on an RTX 2060 the same day: it LOST. On a
+    /// minimum-arithmetic reduction over 2^26 ints (`BlockReduceBench`,
+    /// where the atomics are as large a share as the shape allows) the
+    /// block fold ran 2.74-2.90 ms against 2.25-2.62 without it, losing
+    /// all four interleaved rounds; on the compute-bound `GpuDotBench`
+    /// at the same size it won one round of three and lost two.
+    ///
+    /// The `bar.sync` is why. `red.global.add` returns nothing, so a
+    /// warp issues it and retires; a barrier makes every warp in the
+    /// block wait for the slowest, at the end of the kernel, and that
+    /// costs more than the seven atomics it saves. It also forced the
+    /// bounds-check deopt to stop returning from the middle of the
+    /// kernel, since a thread leaving while its block waits at the
+    /// barrier is a hang rather than a wrong answer.
+    ///
+    /// See `docs/gpu/reductions.md`.
     #[test]
     fn reduction_folds_each_warp_before_the_one_atomic() {
         let m = lower_fixture("EligibleDotProduct", "dot", "([I[I)J");
@@ -1727,6 +1748,14 @@ mod tests {
         );
         assert!(text.contains("L_reduce_zero:\n    mov.s64"), "zero contribution\n{text}");
         assert!(text.contains("L_reduce:"), "join label\n{text}");
+
+        // No barrier, and therefore no rule about where a thread may
+        // exit. The per-block fold that would have needed one was
+        // measured and rejected; see this test's doc comment.
+        assert!(
+            !text.contains("bar.sync"),
+            "the reduction epilogue must not synchronize the block\n{text}"
+        );
     }
 
     #[test]

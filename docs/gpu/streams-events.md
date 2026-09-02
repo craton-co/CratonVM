@@ -516,3 +516,55 @@ without having to thread the actual `Event` through.
   modes, CLI flags.
 - [`cuda-bridge/README.md`](../../cuda-bridge/README.md) — crate-level
   layout, FFI surface, feature flags.
+
+## Eliding a wait on an event that has already fired
+
+**2026-09-02.** `Stream::wait_event` skipped a wait when the event was
+recorded on the waiting stream — a stream is FIFO, so that edge is free.
+The census said what it missed:
+
+```text
+  --gpu auto-offload   stream waits issued=237 elided=0    (0.0%)
+  executor path        stream waits issued=0   elided=7844 (100%)
+```
+
+Two facts produce that split. `OffloadCache::dispatch_stream` hands out
+streams round-robin from a pool of four, so consecutive dispatches are
+almost never on the same stream; and a resident INPUT buffer keeps the
+`last_write` its upload or its zeroing stamped on it for its whole life,
+because nothing ever writes it again. Every launch consuming such a
+buffer issued a fresh `cuStreamWaitEvent` against an event that had
+fired long ago.
+
+A fired event cannot un-fire until something records it again, so
+`Event` latches an observed completion — from `query`, from
+`synchronize`, or from one probe at the wait site — and `wait_event`
+skips a latched event with no driver call at all. `set_recorded_on`
+clears the latch, which is the only way an event re-enters flight, and
+the probe is spent at most once per event so an event that is genuinely
+in flight is not charged a query on every wait.
+`CRATONVM_GPU_WAIT_LATCH=0` is the switch.
+
+### What it is worth, measured
+
+Engagement is unambiguous. `BlockReduceBench` at 2^18 x 2000 dispatches
+on an RTX 2060:
+
+| | waits issued | waits elided |
+|---|---|---|
+| latch on | 1976-1992 | 4010-4026 (67%) |
+| `CRATONVM_GPU_WAIT_LATCH=0` | 6002 | 0 |
+
+**Wall-clock is a wash**: best_ms 0.0485/0.0494/0.0491 with the latch
+against 0.0486/0.0480/0.0480 without, which is noise in both directions.
+Two thirds of a per-launch driver call disappear and the clock does not
+notice, so `cuStreamWaitEvent` on this driver costs well under a
+microsecond and there is no speedup to quote. What the change buys is
+less driver traffic per launch, on a path where the count scales with
+every argument of every dispatch; it is worth re-measuring where the
+driver is slower than this one.
+
+`cuda-bridge/tests/wait_latch_it.rs` covers the three cases, including
+the one that must NOT be elided (an event that fired, was latched, and
+was then re-recorded behind live work), with both negative controls run.
+

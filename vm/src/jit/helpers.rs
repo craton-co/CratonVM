@@ -3027,6 +3027,7 @@ unsafe fn resolve_callee_cached(
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -4070,6 +4071,7 @@ unsafe fn try_resume_trapped_callee(
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -25229,6 +25231,11 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         ref_store_pre_gate: ref_store_gates.0,
         ref_store_post_gate: ref_store_gates.1,
         ref_store_post_young_floor: ref_store_gates.2,
+        // The mask shape of the same plan, as a VALUE. Read from the same
+        // published table and in the same breath as the three addresses above,
+        // so a plan cannot be observed half-applied; a publisher supplies
+        // either this or the floor, never both.
+        ref_store_post_skip_mask: usize::from(cratonvm_gc::jit_ref_store_post_skip_mask()),
         // F-08 -- G1's inline post-write barrier: the geometry table, and the
         // call target its slow arm uses.
         //

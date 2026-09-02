@@ -762,6 +762,17 @@ pub struct GcFlags {
     /// wipe; the first thing to set if a conservative root ever names the
     /// inactive semi-space.
     pub gc_sync_young_wipe: bool,
+    /// `CRATONVM_GC_JIT_REF_STORE_GATES` — let the GENERATIONAL collector
+    /// publish the compiled-reference-store barrier plan, so a compiled
+    /// reference store gates its barriers inline instead of always calling
+    /// `jit_putfield_object`. Default **ON** opt-out
+    /// ([`parse::on_unless_zero`]).
+    ///
+    /// `=0` withholds the plan and every compiled reference store takes the
+    /// full helper path exactly as it did before 2026-09-02 — the A/B lever,
+    /// and the first thing to set if a compiled store is ever suspected of
+    /// missing a card or an SATB entry.
+    pub gc_jit_ref_store_gates: bool,
     /// `CRATONVM_OLD_SWEEP_JIT` — default **ON** opt-out for the old-gen
     /// non-moving sweep. [`parse::on_unless_zero`].
     pub old_sweep_jit: bool,
@@ -1432,6 +1443,7 @@ impl GcFlags {
             full_rset_scan: present(src, "CRATONVM_GC_FULL_RSET_SCAN"),
             verify_rset: present(src, "CRATONVM_GC_VERIFY_RSET"),
             gc_sync_young_wipe: present(src, "CRATONVM_GC_SYNC_YOUNG_WIPE"),
+            gc_jit_ref_store_gates: on_unless_zero(src, "CRATONVM_GC_JIT_REF_STORE_GATES"),
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
             g1_parallel_evac_in_jit: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC_IN_JIT"),

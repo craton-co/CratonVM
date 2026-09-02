@@ -114,7 +114,7 @@ use crate::JitRuntimeHelpers;
 /// (Revision `2` shipped the 60-field table; the `monitor_enter`/`monitor_exit`
 /// append that made it 62 did not bump this constant, because at the time
 /// nothing checked it. `ABI_REVISIONS` is that check.)
-pub const JIT_HELPERS_ABI_VERSION: u32 = 12;
+pub const JIT_HELPERS_ABI_VERSION: u32 = 13;
 
 /// Size in bytes of the helper table under [`JIT_HELPERS_ABI_VERSION`].
 ///
@@ -869,6 +869,17 @@ helper_field_table! {
     // Address of the GC's JIT_G1_BARRIER table, not a call target.
     (g1_barrier_addr,                Constant, false),
     (g1_post_write_barrier,          Function, false),
+    // v12: the post-barrier SKIP MASK, as a VALUE not an address.
+    //
+    // v10's `ref_store_post_young_floor` can only express "young enough" -- an
+    // unsigned compare against `(gc_age << 4) | gc_flags`. The generational
+    // collector's post barrier asks whether the receiver is in the OLD
+    // GENERATION, which is a flag BIT, and the two do not order: an object
+    // allocated straight into old gen has `gc_age == 0`, so its flags byte sits
+    // BELOW the age-zero floor. A value rather than an address because which
+    // collector is running does not change after start-up, so the emitter bakes
+    // it as an immediate; the gate BYTES stay addresses because they do change.
+    (ref_store_post_skip_mask,       Constant, false),
     // Not a pointer: a 0/1 flag saying the collector keeps an object-start
     // registry, so an inline-TLAB allocation must call `tlab_post_init` (which
     // registers it) instead of taking the skip-the-helper fast path.
@@ -893,7 +904,7 @@ const _: () = assert!(
 
 // Pin the literal count so a *removal* also has to touch this line.
 const _: () = assert!(
-    NUM_HELPER_FIELDS == 75,
+    NUM_HELPER_FIELDS == 76,
     "JitRuntimeHelpers field count changed — bump JIT_HELPERS_ABI_VERSION, the \
      literal here, and the size literal below",
 );
@@ -901,8 +912,8 @@ const _: () = assert!(
 // Pin the literal size and alignment. The JIT bakes `disp32` offsets derived
 // from this layout into RWX memory; a silent change here is a wild call.
 const _: () = assert!(
-    JIT_HELPERS_ABI_SIZE == 600,
-    "JitRuntimeHelpers size changed (expected 75 * 8 = 600) — the JIT's baked \
+    JIT_HELPERS_ABI_SIZE == 608,
+    "JitRuntimeHelpers size changed (expected 76 * 8 = 608) — the JIT's baked \
      helper offsets are now wrong; bump JIT_HELPERS_ABI_VERSION deliberately",
 );
 const _: () = assert!(
@@ -1072,7 +1083,8 @@ pub const GOLDEN_HELPER_OFFSETS: [(&str, usize); NUM_HELPER_FIELDS] = [
     ("ref_store_post_young_floor", 568),
     ("g1_barrier_addr", 576),
     ("g1_post_write_barrier", 584),
-    ("tlab_registration_required", 592),
+    ("ref_store_post_skip_mask", 592),
+    ("tlab_registration_required", 600),
 ];
 
 // Every golden row must name the descriptor row at the same index AND agree
@@ -1241,7 +1253,17 @@ pub const ABI_REVISIONS: &[HelperAbiRevision] = &[
         num_fields: 74,
         size: 592,
     },
-    // v12 -- appended `tlab_registration_required`. ZGC's object-start registry
+    // v12 appends `ref_store_post_skip_mask`, which is what lets the
+    // GENERATIONAL collector publish a reference-store plan at all: v10's age
+    // floor cannot express "is the receiver in the old generation", so under
+    // `-XX:+UseGenerationalGC` every compiled reference store was still paying
+    // a full `jit_putfield_object` call.
+    HelperAbiRevision {
+        version: 12,
+        num_fields: 75,
+        size: 600,
+    },
+    // v13 -- appended `tlab_registration_required`. ZGC's object-start registry
     // is its only record that an object exists, and the single-pass inline
     // TLAB `new` has a fast path that skips `tlab_post_init` -- the helper that
     // registers it. That path had been unreachable under ZGC because
@@ -1251,9 +1273,9 @@ pub const ABI_REVISIONS: &[HelperAbiRevision] = &[
     // conservative root scan. Optional: `0` is every previous backend's
     // emission byte for byte.
     HelperAbiRevision {
-        version: 12,
-        num_fields: 75,
-        size: 600,
+        version: 13,
+        num_fields: 76,
+        size: 608,
     },
 ];
 
@@ -1470,7 +1492,7 @@ const _: () = {
          really is a displacement and is range-checked by validate_with",
     );
     assert!(
-        constants == 11,
+        constants == 12,
         "the number of baked-address slots changed — a Constant slot is loaded \
          as data and is NOT range-checked by validate_with, so misclassifying \
          a displacement as one silently removes its only sanity check",
@@ -1855,6 +1877,10 @@ mod tests {
             ("g1_barrier_addr", offset_of!(H, g1_barrier_addr)),
             ("g1_post_write_barrier", offset_of!(H, g1_post_write_barrier)),
             (
+                "ref_store_post_skip_mask",
+                offset_of!(H, ref_store_post_skip_mask),
+            ),
+            (
                 "tlab_registration_required",
                 offset_of!(H, tlab_registration_required),
             ),
@@ -1888,13 +1914,13 @@ mod tests {
     /// loudly rather than be absorbed by a computed expression.
     #[test]
     fn helper_table_size_and_align_are_the_literal_abi_numbers() {
-        assert_eq!(core::mem::size_of::<H>(), 600);
+        assert_eq!(core::mem::size_of::<H>(), 608);
         assert_eq!(core::mem::align_of::<H>(), 8);
-        assert_eq!(JIT_HELPERS_ABI_SIZE, 600);
+        assert_eq!(JIT_HELPERS_ABI_SIZE, 608);
         assert_eq!(JIT_HELPERS_ABI_ALIGN, 8);
         assert_eq!(HELPER_FIELD_STRIDE, 8);
-        assert_eq!(NUM_HELPER_FIELDS, 75);
-        assert_eq!(H::NUM_FIELDS, 75);
+        assert_eq!(NUM_HELPER_FIELDS, 76);
+        assert_eq!(H::NUM_FIELDS, 76);
         // v10's three appended slots are gate ADDRESSES, not call targets, so
         // the callable-slot count stood still while the table grew. v11 (F-08)
         // appended one of each: `g1_barrier_addr` is a table address and
@@ -1903,7 +1929,9 @@ mod tests {
         // v12 appended `tlab_registration_required`, a 0/1 FLAG rather than a
         // call target, so the callable count stands still again.
         assert_eq!(H::NUM_HELPER_FN_FIELDS, 60);
-        assert_eq!(JIT_HELPERS_ABI_VERSION, 12);
+        // v12 appends `ref_store_post_skip_mask`, a Constant (a VALUE this
+        // time, not an address), so the callable count stands still again.
+        assert_eq!(JIT_HELPERS_ABI_VERSION, 13);
     }
 
     /// The golden table is the only name→offset binding in the crate written
@@ -1928,6 +1956,7 @@ mod tests {
         }
         // The last golden offset plus one stride is the whole table.
         let (last_name, last_offset) = GOLDEN_HELPER_OFFSETS[H::NUM_FIELDS - 1];
+        assert_eq!(last_name, "ref_store_post_skip_mask");
         assert_eq!(last_name, "tlab_registration_required");
         assert_eq!(last_offset + HELPER_FIELD_STRIDE, JIT_HELPERS_ABI_SIZE);
     }
@@ -1941,9 +1970,9 @@ mod tests {
         assert_eq!(
             last,
             HelperAbiRevision {
-                version: 12,
-                num_fields: 75,
-                size: 600,
+                version: 13,
+                num_fields: 76,
+                size: 608,
             },
         );
         // Append-only history: each revision strictly grows the table.
@@ -2145,6 +2174,9 @@ mod tests {
         // `g1_post_write_barrier`. So the callable count moved by exactly one
         // across the two revisions and the baked-address count by four, which
         // is the divergence counting them apart exists to show.
+        // v12 appends one more Constant, `ref_store_post_skip_mask` — a baked
+        // VALUE rather than an address, which is why it is a Constant and not
+        // an OptionalPtr: nothing about it is range-checkable as a pointer.
         assert_eq!(constants, 11, "baked-address slots");
         assert_eq!(required, 43, "required slots");
         assert_eq!(functions - required, 17, "optional callable slots");
@@ -2304,6 +2336,10 @@ mod tests {
     fn as_words_matches_the_struct_fields() {
         let mut h = H::default();
         h.newarray = 1;
+        // The LAST field, whatever it currently is — `ref_store_post_skip_mask`
+        // since v12 appended the generational collector's post-barrier mask
+        // after F-08's G1 barrier pair.
+        h.ref_store_post_skip_mask = 2;
         // The LAST field, whatever it currently is — `tlab_registration_required`
         // since v12 appended the flag that keeps an inline-TLAB `new` from
         // skipping the helper that REGISTERS the object on a collector whose
@@ -2312,7 +2348,7 @@ mod tests {
         let w = h.as_words();
         assert_eq!(w[0], 1, "first slot");
         assert_eq!(w[H::NUM_FIELDS - 1], 2, "last slot");
-        assert_eq!(w.len(), 75);
+        assert_eq!(w.len(), 76);
     }
 
     /// Build a table with every *required* slot non-zero and every optional
