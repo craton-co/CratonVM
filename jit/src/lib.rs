@@ -18744,7 +18744,7 @@ fn has_string_intrinsic_site(
 /// callee warm order, caller kind across six shapes, first-compile context,
 /// scale) each refuted by its own measurement without ever converging — because
 /// the one instrument that could name the decision did not report it. See
-/// `string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901.md`.
+/// string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StringPinVerdict {
     /// The pin has no opinion: no `invokevirtual`/`invokeinterface` site at
@@ -21692,7 +21692,7 @@ fn try_compile_inner(
             // to the optimizing pipeline` — which is how five hypotheses about
             // `String.charAt` could each be refuted without ever converging. See
             // `StringPinVerdict` and
-            // `string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901.md`.
+            // string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901.
             //
             // Evaluated here rather than at the top of the block so the earlier
             // arms still short-circuit before it: this one calls the caller's

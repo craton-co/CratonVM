@@ -32,7 +32,7 @@
  *   cratonvm -cp probes CharAtWarmShape
  *   CRATONVM_DBG_JITC=1 cratonvm -cp probes CharAtWarmShape 2>&1 | grep admission
  *
- * See docs/known-issues/perf/string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901.md
+ * See string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901
  */
 public class CharAtWarmShape {
     static String big;

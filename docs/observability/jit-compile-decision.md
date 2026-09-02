@@ -29,7 +29,7 @@ chain **omitted a term the real eligibility conjunction contained** — the
 String-intrinsic pin — so a method the pin declined and a method the pin never
 saw printed the identical `admitted to the optimizing pipeline`. That omission
 is why five measurements could each be correct and the answer still not appear.
-See `docs/known-issues/perf/string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901.md`.
+See string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901.
 
 As a JFR event the same information is something an operator captures from a
 run they already have, with no rebuild and no stderr grep, and "why is this
@@ -570,7 +570,7 @@ case. When you can rebuild and re-run, these are still richer:
   `emit_jit_compile_decision_event`
 * `jit/src/compile_gate.rs` — the three-door table this event's `door` field
   mirrors, and why one-door patches keep failing here
-* `docs/known-issues/perf/string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901.md`
+* string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901
   — the case study this event was built for, including the five refutations and
   the A/B that has not been run
 * `docs/observability/phase-accounting.md` — where a run's wall clock went, once
