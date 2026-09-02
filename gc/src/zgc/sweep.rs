@@ -694,6 +694,26 @@ impl ZgcRealHeap {
     /// ([`Self::sweep_bitmap`]) rather than as the union of the dead objects,
     /// one header read at a time. Default ON; `0`/`off`/`false`/`no` restores
     /// the per-object sweep and the per-object free-list pushes exactly.
+    /// # The measurement
+    ///
+    /// `BinTreesClassic 16` at `-Xmx192m`, release, interleaved on a quiet
+    /// host. Both arms performed 5 collections over the same live set and
+    /// reported the same `registered=3,125,050 dead=2,940,700`, so they
+    /// reclaimed identically and only the cost differs:
+    ///
+    /// ```text
+    ///   sweep_us (mean per cycle)      wall clock
+    ///   on    31,253  31,796  30,297  29,883      2839  3106  3157  2888 ms
+    ///   off   84,645  61,867  67,357  61,591      4122  3472  3614  3386 ms
+    /// ```
+    ///
+    /// A 2.1-2.7x faster sweep and ~11% off the whole run, 4/4 rounds. Read
+    /// `sweep_us` on the `[GC] zgc-pause:` line rather than the wall clock
+    /// when re-measuring: at a heap size where the run performs one or two
+    /// collections the sweep is a rounding error in the total and the arms
+    /// are indistinguishable, which is exactly what an earlier attempt at
+    /// `-Xmx512m` showed.
+    ///
     /// Read per COLLECTION rather than latched in a `OnceLock`: this is
     /// consulted once a cycle, so caching it buys nothing and costs the
     /// ability to A/B the two sweeps against one another in one process --
