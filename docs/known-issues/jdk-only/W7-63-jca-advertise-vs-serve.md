@@ -964,10 +964,50 @@ distinguish them.
   with the wrong exception TYPE, not a silent wrong answer, and registering
   `Set.add` would change dispatch for every Set-typed receiver in the mode —
   a bigger trade than the two rows are worth. Named here rather than fixed.
-* No `(Collection)` copy constructor for `Vector`, `CopyOnWriteArrayList`,
+* ~~No `(Collection)` copy constructor for `Vector`, `CopyOnWriteArrayList`,
   `ConcurrentSkipListSet`, `ConcurrentSkipListMap`, `ArrayDeque` or
-  `PriorityQueue`; no `Collections.unmodifiableSortedMap`; no
-  `DayOfWeek.MONDAY`. Method-surface completeness.
+  `PriorityQueue`~~ — **three of six added 2026-09-02**, and the split is the
+  point. `Vector`, `ArrayDeque` and `PriorityQueue` are fully usable in that
+  mode, so a copy constructor completes them. The other three are not, and
+  adding one would move the failure rather than remove it:
+  `ConcurrentSkipListSet` has no `add` at all, and `ConcurrentSkipListMap`'s
+  native impl is the one `native-collections` documents as disabled in
+  real-JDK mode for storing state in slots the real class does not have.
+  `apps/probes/SynthUsable` is the screen — construct with the no-arg ctor,
+  then `add`/`get`/iterate — and it is what says which three were worth doing.
+
+  `PriorityQueue(Collection)` routes through `native_pq_add` per element rather
+  than copying the source array: a `PriorityQueue` is a HEAP, and one built by
+  copying source ORDER would `poll()` in the source's sequence instead of the
+  comparator's.
+
+* **`Collections.unmodifiableSortedMap` stays absent, and so does
+  `unmodifiableNavigableMap`.** Not an oversight: the registration site records
+  that the plain synthetic `UnmodifiableMap` stamp implements `Map`, not
+  `SortedMap`/`NavigableMap`, so routing these factories to it violates the
+  declared return type and breaks `Charset.availableCharsets()`'s checkcast.
+  Serving them in `--synthetic-jdk` needs a `SortedMap`-typed wrapper stamp,
+  which is a new class rather than a row.
+
+* **`ArrayDeque` iterates ZERO elements in `--synthetic-jdk`** (`apps/probes/AdDispatch`,
+  found 2026-09-02). After `d.add("a")`, `size()` is 1 and `peekFirst()` is
+  `"a"` while a for-each yields nothing — through every declared type and
+  through `addLast`. A silently empty loop, not a `NoSuchMethodError`, and the
+  worst-shaped of the residuals on this list.
+
+  A mode-scoped registration was written and REVERTED. The cheap version mints
+  `java/util/ArrayDeque$Itr`, which `native-collections` already calls "a trap
+  armed for whoever produces one later" — dormant rows keyed on a class nobody
+  mints, which win the slot the moment someone does. Doing it right means
+  minting the real `ArrayDeque$DeqIterator` with the snapshot fields, i.e.
+  putting ArrayDeque back into `VALUES_ITR_CARRIERS`, which it left on
+  2026-08-30; that table's own doc records `DescendingIterator` making
+  `java.base` a second producer of the carrier class the last time it was done.
+  Two measured decisions to reverse and a two-producer hazard to re-open. It
+  belongs to the census that owns that area.
+
+* `DayOfWeek.MONDAY` is a `NoSuchFieldError` in that mode — `java.time` enum
+  constants, a different subsystem from this page's.
 * `LinkedList` is not a `Deque` — §8c's third bullet, unchanged and deliberate.
 
 The probe prints an `ERROR` row for each of those rather than dying: its first

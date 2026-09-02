@@ -259,11 +259,11 @@ better** at 16x the work. So:
 `VarHandle` accesses with a **null coordinate** answer instead of throwing:
 `REF.get((Holder) null)` returns `null`, an `int` read returns `0`, and a `set`
 silently does nothing, where HotSpot raises `NullPointerException` for all
-three. It is pre-existing and unrelated to this page — it reproduces
-identically with `CRATONVM_JIT_VARHANDLE_REF_READ_DIRECT=0`, i.e. with every
-access on the funnel — and closing it means touching every access mode and
-every handle kind, so it is filed rather than folded in:
-[`../../known-issues/jdk-only/varhandle-null-coordinate-answers-instead-of-throwing-20260901.md`](../../known-issues/jdk-only/varhandle-null-coordinate-answers-instead-of-throwing-20260901.md).
+three. It was pre-existing and unrelated to this page — it reproduced identically
+with `CRATONVM_JIT_VARHANDLE_REF_READ_DIRECT=0`, i.e. with every access on the
+funnel — so it was filed rather than folded in. **Fixed 2026-09-02**, and the
+oracle sweep found 75 broken rows where this page had named three:
+[`../fixed-bugs/varhandle-null-coordinate-answers-instead-of-throwing-FIXED-20260902.md`](../fixed-bugs/varhandle-null-coordinate-answers-instead-of-throwing-FIXED-20260902.md).
 
 ## Repro
 
