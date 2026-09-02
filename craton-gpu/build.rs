@@ -214,6 +214,32 @@ fn resolve_java_root() -> PathBuf {
             p.display()
         );
     }
+    // AUDIT 2026-09-02: say when the build depended on a path that is
+    // true of one machine.
+    //
+    // Candidate 3 is an absolute install path — `C:/craton/gpu-java`,
+    // named in `platform_fallback_java_root` after the box it was
+    // written on. When it is what resolved, the annotation classes in
+    // this build came from a directory nothing in this repository
+    // records, at a revision nothing in this repository pins. That is a
+    // reproducibility hazard worth one line of build output: the same
+    // `cargo build` on another machine produces a DIFFERENT artifact,
+    // or an empty one, and today says nothing either way.
+    //
+    // Not an error. A developer on that box is doing nothing wrong, and
+    // failing the build would be worse than the problem. But the two
+    // reproducible resolutions — the env var and the sibling checkout —
+    // stay silent, so the warning only appears when it is telling you
+    // something you could not otherwise know.
+    if resolution.used_absolute_fallback && resolution.path.is_dir() {
+        println!(
+            "cargo:warning=craton-gpu: annotation sources resolved from the machine-specific \
+             install path {}. This build is not reproducible elsewhere — the craton-gpu-java \
+             revision is not pinned by this repository. Set $CRATON_GPU_JAVA_SRC, or check the \
+             project out beside the workspace, to make the source explicit.",
+            resolution.path.display()
+        );
+    }
     resolution.path
 }
 
@@ -221,6 +247,12 @@ fn resolve_java_root() -> PathBuf {
 struct JavaRootResolution {
     path: PathBuf,
     invalid_override: Option<PathBuf>,
+    /// The path came from [`platform_fallback_java_root`]'s absolute
+    /// install locations rather than from the env override or the
+    /// sibling checkout — i.e. from a convention true of one machine.
+    /// See `resolve_java_root` for what is reported and why it is not an
+    /// error.
+    used_absolute_fallback: bool,
 }
 
 fn resolve_java_root_from(
@@ -234,6 +266,7 @@ fn resolve_java_root_from(
             return JavaRootResolution {
                 path: override_path,
                 invalid_override: None,
+                used_absolute_fallback: false,
             };
         }
 
@@ -242,12 +275,14 @@ fn resolve_java_root_from(
             return JavaRootResolution {
                 path: sibling,
                 invalid_override: Some(override_path),
+                used_absolute_fallback: false,
             };
         }
 
         return JavaRootResolution {
             path: platform_fallback_java_root(sibling, is_windows),
             invalid_override: Some(override_path),
+            used_absolute_fallback: is_windows,
         };
     }
 
@@ -256,12 +291,14 @@ fn resolve_java_root_from(
         return JavaRootResolution {
             path: sibling,
             invalid_override: None,
+            used_absolute_fallback: false,
         };
     }
 
     JavaRootResolution {
         path: platform_fallback_java_root(sibling, is_windows),
         invalid_override: None,
+        used_absolute_fallback: is_windows,
     }
 }
 
