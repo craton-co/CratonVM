@@ -212,7 +212,7 @@ fn native_platform_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> M
     set(STDOUT_ENCODING_NDX, stdout_encoding.as_str());
     set(STDERR_ENCODING_NDX, stderr_encoding.as_str());
     set(STDIN_ENCODING_NDX, stdin_encoding.as_str());
-    set(SUN_JNU_ENCODING_NDX, "UTF-8");
+    set(SUN_JNU_ENCODING_NDX, native_encoding.as_str());
     set(SUN_IO_UNICODE_ENCODING_NDX, "UnicodeLittle");
 
     // --- CPU / architecture ---
@@ -463,11 +463,11 @@ fn native_vm_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
         ctx.get_system_property("native.encoding")
             .unwrap_or_else(|| "UTF-8".to_string()),
     ));
-    // NOT derived, deliberately — `sun.jnu.encoding` decides how FILE NAMES
-    // are encoded, so it changes class loading rather than printing. Different
-    // blast radius, different change; see
-    // docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-20260901.md.
-    props.push(("sun.jnu.encoding", "UTF-8".to_string()));
+    props.push((
+        "sun.jnu.encoding",
+        ctx.get_system_property("sun.jnu.encoding")
+            .unwrap_or_else(|| "UTF-8".to_string()),
+    ));
 
     // --- NIO / ZIP toggles to steer the JDK away from native-memory code
     // paths that depend on FileChannelImpl.map0 / direct buffers backed by

@@ -536,14 +536,9 @@ both are given `-Dstdout.encoding=UTF-8`.
 
 ## 11. Still open
 
-1. **`sun.jnu.encoding` is still pinned to `UTF-8`.** HotSpot derives it, so
-   under a C locale the two VMs disagree about that one key. It is left alone
-   on purpose and the reason is the one §9 gave for staging at all: this key
-   decides how FILE NAMES are encoded, so moving it changes class loading
-   rather than printing. `regression-suite/src/REncodingFidelity.java`
-   deliberately does not diff it — a chosen divergence must not become a red
-   gate on every non-UTF-8 host — and `probes/EncodingFidelity.java` prints it
-   so it stays observable.
+1. ~~**`sun.jnu.encoding` is still pinned to `UTF-8`.**~~ **Derived since
+   2026-09-02 — the risk it was staged on was measured, and it is HotSpot's
+   risk, not this VM's.** See §12.
 
 2. ~~**The Windows arm is implemented but not RUN.**~~ **Run 2026-09-02, and
    it was wrong twice.** The `#[cfg(windows)]` arm had never been compiled by
@@ -591,3 +586,54 @@ both are given `-Dstdout.encoding=UTF-8`.
    fd. Capturing those needs console-buffer scraping. The encoder is the same
    code either way — it is driven by the stamped charset, and that charset is
    measured on a real console at two code pages in §10.
+
+
+## 12. 2026-09-02 — `sun.jnu.encoding`, and why its risk was HotSpot's
+
+§9 staged this key out and §11 kept it open, on one sentence: *it decides how
+FILE NAMES are encoded, so moving it changes class loading rather than
+printing.* That sentence is true, and it is true **of HotSpot**. Measured
+rather than reasoned about, with `probes/JnuPaths.java` — create, list, stat
+and read back a file named `жфайл-é.txt`, which cp1251 and UTF-8 can represent
+and US-ASCII cannot:
+
+```text
+                          sun.jnu.encoding   non-ASCII path      CratonVM vs HotSpot
+Windows, ACP 1251         Cp1251 (both)      works on both       byte-identical, 201 B
+Linux, LANG=C.UTF-8       UTF-8 (both)       works on both       byte-identical
+Linux, LC_ALL=C           ANSI_X3.4-1968     HotSpot THROWS      differ, see below
+                          (both)             CratonVM works
+```
+
+HotSpot's failure names the mechanism exactly:
+
+```text
+java.nio.file.InvalidPathException: Malformed input or input contains
+unmappable characters: ?????-?.txt
+    at java.base/sun.nio.fs.UnixPath.encode(UnixPath.java:131)
+```
+
+`UnixPath.encode` reads `sun.jnu.encoding` and refuses a name it cannot
+represent. **CratonVM never reaches that code** — its path handling is
+Rust-side and does not consult the key — so moving the property cannot move
+class loading here. The blast radius the deferral was protecting against does
+not exist in this VM, and the only thing deriving the key changes is the
+answer `System.getProperty` gives.
+
+**What it bought.** Full property parity on the Windows host, which is what
+this page was opened about — all ten rows of `probes/WinEnc.java` now match
+HotSpot, `sun.jnu.encoding = Cp1251` included.
+
+**What it did not break.** Regression suite: 87/87 and 127/127 on Linux, 85/85
+on Windows. Non-ASCII paths byte-identical to HotSpot on Windows and on Linux
+under `C.UTF-8`. `CRATONVM_NATIVE_ENCODING=UTF-8` restores the pinned value in
+one binary — the same lever, because the key now derives from the same source.
+
+**The residual, stated because it is new.** Under a C locale this VM now
+reports `sun.jnu.encoding=ANSI_X3.4-1968` while its own I/O still handles names
+that encoding cannot represent. The property is honest about the platform and
+pessimistic about the VM. That is the trade the page asked for — a program or a
+differential that reads the key gets HotSpot's answer — but a program that
+*acts* on it will underestimate what this VM can open. Nothing in the tree does;
+the only consumer of the key on the JDK side is the path encoder CratonVM
+bypasses.
