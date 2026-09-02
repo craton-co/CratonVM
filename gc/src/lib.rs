@@ -116,6 +116,7 @@ pub mod gc;
 /// [`gc_metrics::collector_decision_report`]).
 pub mod gc_metrics;
 pub mod gc_quiescence;
+mod gen_evac;
 pub mod gen_heap;
 pub mod heap;
 pub mod mark_bitmap;

@@ -756,6 +756,20 @@ pub struct GcFlags {
     /// cost [`Self::full_rset_scan`] used to pay unconditionally. That is the
     /// trade: pay it while you are auditing, not forever.
     pub verify_rset: bool,
+    /// `CRATONVM_GC_PAR_EVAC` — the parallel evacuation engine with promotion
+    /// buffers for the MOVING young collection (`gc::gen_evac`). Default
+    /// **ON** opt-out ([`parse::on_unless_zero`]): `=0` restores the
+    /// sequential Cheney drain and per-object old-gen allocation byte for
+    /// byte, which is the A/B lever for any suspected evacuation regression.
+    /// `CRATONVM_GC_PAR_THREADS=1` keeps the engine and removes only the
+    /// parallelism.
+    pub gc_par_evac: bool,
+    /// `CRATONVM_GC_SYNC_YOUNG_WIPE` — zero the evacuated young semi-space
+    /// INSIDE the pause, as every moving cycle did before 2026-09-02, instead
+    /// of on a helper thread after it. The revert lever for the off-pause
+    /// wipe; the first thing to set if a conservative root ever names the
+    /// inactive semi-space.
+    pub gc_sync_young_wipe: bool,
     /// `CRATONVM_OLD_SWEEP_JIT` — default **ON** opt-out for the old-gen
     /// non-moving sweep. [`parse::on_unless_zero`].
     pub old_sweep_jit: bool,
@@ -1400,6 +1414,8 @@ impl GcFlags {
             card_table_only: present(src, "CRATONVM_CARD_TABLE_ONLY"),
             full_rset_scan: present(src, "CRATONVM_GC_FULL_RSET_SCAN"),
             verify_rset: present(src, "CRATONVM_GC_VERIFY_RSET"),
+            gc_par_evac: on_unless_zero(src, "CRATONVM_GC_PAR_EVAC"),
+            gc_sync_young_wipe: present(src, "CRATONVM_GC_SYNC_YOUNG_WIPE"),
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
             g1_parallel_evac_in_jit: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC_IN_JIT"),

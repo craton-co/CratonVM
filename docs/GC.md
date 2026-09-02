@@ -208,6 +208,8 @@ tracked sources rather than part of the kit above:
 | `CRATONVM_DBG_GC_STRESS=<bytes>` | Force young GCs every N allocated bytes (Generational) |
 | `CRATONVM_GC_PAR_THREADS=<n>` | Generational young-GC worker count. `0`/`1` forces the sequential collector; `>= 2` forces that many workers regardless of heap size. Unset = `min(available_parallelism, 8)` once the young gen passes the size floor. `available_parallelism` follows CPU affinity, so a `taskset -c N` run is automatically sequential |
 | `CRATONVM_GC_PAR_MIN_BYTES=<bytes>` | Young-gen size floor below which the young GC stays sequential (default 16 MiB) |
+| `CRATONVM_GC_PAR_EVAC=0` | Restore the pre-2026-09-02 SEQUENTIAL Cheney drain and per-object old-gen promotion allocation. The default MOVING young cycle now evacuates on `CRATONVM_GC_PAR_THREADS` workers, each with its own to-space chunk and old-gen promotion buffer (`gc/src/gen_evac.rs`); `=0` is the A/B lever for the engine, `CRATONVM_GC_PAR_THREADS=1` keeps the engine and removes only the parallelism. `[gcpause]` reports `evac_workers=`, `evac_to_chunks=`, `evac_plabs=`, `evac_lost_races=` |
+| `CRATONVM_GC_SYNC_YOUNG_WIPE=1` | Zero the evacuated young semi-space INSIDE the pause, as before 2026-09-02. By default the memset runs on a helper thread after the pause (the arena is the next cycle's to-space, which no mutator allocates into) and is joined before the next collection; `[gcpause]` reports `wipe_deferred_bytes=`. The first lever to pull if a conservative root is ever reported inside the inactive semi-space |
 | `CRATONVM_GC_SWEEP_ANCHOR_STRIDE=<bytes>` | Byte spacing of the parallel-sweep anchors (default 8 MiB). Also sizes the MOVING path's parallel object-start-walk chunks. Lower it to drive either on a small young gen under `CRATONVM_DBG_GC_STRESS` |
 | `CRATONVM_GC_VERIFY_RSET=1` | After each young collection's old->young seeding, walk the whole old generation and report `[rset-verify] site=.. edges=N missing=M seeded=S`. `missing > 0` names an edge the card table did not deliver, and the first one's referrer/class/slot. **Read `edges` too**: `missing=0` on a run that found no edges at all is vacuous, not clean. Costs a full old-gen walk per young GC |
 | `CRATONVM_GC_FULL_RSET_SCAN=1` | Restore the pre-2026-09-02 whole-old-generation old->young walk on every young collection. The revert lever for the default flip below; the first thing to try if a premature-reclamation defect is suspected under Generational |
@@ -282,7 +284,13 @@ re-proves its own anchor by requiring its chain to land exactly on the
 next one, and the parallel walker writes nothing — on any grid anomaly
 it is abandoned wholesale and the untouched sequential walk (which owns
 every diagnostic and the unwind/re-anchor recovery) runs from scratch.
-Parallel EVACUATION does not exist here. The moving young gen's
+Parallel EVACUATION exists here since 2026-09-02 (`gc/src/gen_evac.rs`):
+the transitive-closure copy runs on the same worker count as the mark, each
+worker bump-allocating into its own to-space chunk and old-gen promotion
+buffer, claiming each source object by a compare-and-swap of its mark word;
+`CRATONVM_GC_PAR_EVAC=0` restores the sequential drain. The evacuated
+semi-space is zeroed off-pause on a helper thread
+(`CRATONVM_GC_SYNC_YOUNG_WIPE=1` restores the in-pause memset). The moving young gen's
 JIT-held-oop corruption is fixed, and it is now the **default**
 (`types/src/flags.rs::DEFAULT_MOVING_YOUNG`), with
 `CRATONVM_NO_MOVING_YOUNG` as the compatibility opt-out. The flag being
