@@ -1366,6 +1366,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC` | JIT | `CRATONVM_JIT=atomic-long-intrinsic` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_BACKEDGE_POLL_GATE` | JIT | `CRATONVM_JIT=backedge-poll-gate` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_BCE` | JIT | `CRATONVM_JIT=bce` | opt-out | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC` | JIT | `CRATONVM_JIT=box-unbox-intrinsic` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH` | JIT | `CRATONVM_JIT=callee-oop-flush` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_CALL_FRAME_DEDUPE` | JIT | `CRATONVM_JIT=call-frame-dedupe` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_CAST_SITE_CACHE` | JIT | `CRATONVM_JIT=cast-site-cache` | opt-out | on | behaviour | snapshot | vm |
