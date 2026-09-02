@@ -1885,14 +1885,21 @@ fn throwable_suppressed_sentinel(shared: &SharedVm) -> Option<Value> {
 ///
 /// A `None` snapshot (the kill switch, or an NPE with no compiled frames under
 /// it) leaves the throwable exactly as it was.
+///
+/// `frames` is the thread's own frame stack, and it is not optional: a compiled
+/// activation that is the SAME activation as one of those frames — an OSR
+/// continuation is always one — must be dropped, or the trace names it twice.
+/// See `stackwalker::dedupe_compiled_snapshot`.
 pub fn attach_snapshotted_npe_frames(
     shared: &SharedVm,
+    frames: &[crate::runtime::frame::Frame],
     throwable: ObjectRef,
     snapshot: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
 ) {
     let Some(snapshot) = snapshot else {
         return;
     };
+    let snapshot = crate::runtime::stackwalker::dedupe_compiled_snapshot(frames, snapshot);
     if snapshot.is_empty() {
         return;
     }

@@ -3654,6 +3654,7 @@ pub(super) fn try_osr(
             MethodCallFailed::ExceptionThrown(exc) => {
                 crate::runtime::exceptions::attach_snapshotted_npe_frames(
                     shared,
+                    &thread.frames,
                     exc,
                     npe_snapshot,
                 );
@@ -10438,6 +10439,7 @@ pub(super) fn execute_jit_call(
             MethodCallFailed::ExceptionThrown(exc) => {
                 crate::runtime::exceptions::attach_snapshotted_npe_frames(
                     shared,
+                    &thread.frames,
                     exc,
                     npe_snapshot,
                 );
@@ -10926,6 +10928,7 @@ pub(super) fn execute_jit_call_decoded(
             MethodCallFailed::ExceptionThrown(exc) => {
                 crate::runtime::exceptions::attach_snapshotted_npe_frames(
                     shared,
+                    &thread.frames,
                     exc,
                     npe_snapshot,
                 );
@@ -11319,6 +11322,7 @@ pub(super) fn execute_jit_call_oneshot(
             MethodCallFailed::ExceptionThrown(exc) => {
                 crate::runtime::exceptions::attach_snapshotted_npe_frames(
                     shared,
+                    &thread.frames,
                     exc,
                     npe_snapshot,
                 );

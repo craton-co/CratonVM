@@ -3761,7 +3761,7 @@ pub fn execute(
                                     ) {
                                         MethodCallFailed::ExceptionThrown(exc) => {
                                             crate::runtime::exceptions::attach_snapshotted_npe_frames(
-                                                shared, exc, snapshot,
+                                                shared, &thread.frames, exc, snapshot,
                                             );
                                             jit_early_exception = Some(exc);
                                             true

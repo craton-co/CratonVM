@@ -3148,7 +3148,12 @@ fn materialize_implicit_signal(
             // snapshot exists to close. Attaching it in the constructor arm
             // rather than at each door is what stops a fourth door from
             // silently reopening it.
-            crate::runtime::exceptions::attach_snapshotted_npe_frames(vm, exc, npe_frames);
+            crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                vm,
+                &thread.frames,
+                exc,
+                npe_frames,
+            );
             Some(exc)
         }
         ImplicitSignal::Arithmetic => crate::runtime::exceptions::create_exception_object(

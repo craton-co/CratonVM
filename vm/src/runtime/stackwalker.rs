@@ -949,6 +949,44 @@ fn drop_osr_continuations(
     (kept, overrides)
 }
 
+/// Apply the SAME two dedupe rules to a set of compiled frames snapshotted at
+/// an implicit NPE that [`capture_full_trace`] applies to the live ones.
+///
+/// The snapshot is taken inside the JIT helper, so it holds every compiled
+/// activation that was on the stack at the trap — INCLUDING an OSR
+/// continuation, which is the same activation as an interpreter frame that is
+/// still there. Splicing it in unfiltered printed `main` twice:
+///
+/// ```text
+/// HotSpot            after_osr  [big:42 probe:56 main:71]
+/// snapshot, undeduped           [big:42 probe:56 main:71 main:71]
+/// ```
+///
+/// measured 3 of 3 on `probes/StackTraceCompiledCallee` once defect (5)'s other
+/// doors were closed and the frames stopped disappearing — the duplicate was
+/// invisible for as long as the whole set was being lost.
+///
+/// It reuses [`drop_osr_continuations`] rather than restating either rule.
+/// There is exactly one place that decides whether a compiled entry and an
+/// interpreter frame are one activation, so the live path and the snapshot path
+/// cannot drift, and both kill switches
+/// (`CRATONVM_JIT_NO_OSR_FRAME_DEDUPE`, `CRATONVM_JIT_NO_CALL_FRAME_DEDUPE`)
+/// cover both. The bci overrides it computes are discarded here: they exist to
+/// re-point an interpreter frame that the LIVE capture is about to emit, and
+/// this path emits none.
+///
+/// `frames` is the thread's frame stack at CONSTRUCTION time, not at the trap.
+/// The two agree for every shape this can be reached in — a frame popped
+/// between the two would have taken its compiled entry with it — and the rule
+/// fails in the safe direction anyway: a depth that no longer names a matching
+/// frame KEEPS the compiled entry.
+pub(crate) fn dedupe_compiled_snapshot(
+    frames: &[Frame],
+    snapshot: Vec<ActiveCompiledFrame>,
+) -> Vec<ActiveCompiledFrame> {
+    drop_osr_continuations(frames, snapshot).0
+}
+
 /// Display-only replacements for one interpreter frame's own `last_instr_pc`,
 /// keyed by index into `frames`: the bytecode index of the COMPILED half of
 /// that activation, and the callees that half had inlined at the very same
