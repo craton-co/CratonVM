@@ -24,6 +24,16 @@ public class TierOneArm {
         PrimStream(long n) { this.count = n; }
         @Override public int read() { if (count > 0) { count--; return 7; } return -1; }
     }
+    /** The PREDICTION test. Identical to `PrimStream` except that `read()` also
+     *  makes one call to a callee known to be non-inlinable (it touches
+     *  atomics). If "contains a call -> not inlined -> never counted -> never
+     *  compiled" is the chain, this arm must collapse from ~94 ns to interpreter
+     *  cost even though its counter work is still primitive. */
+    static final class PrimStreamWithCall extends InputStream {
+        private long count;
+        PrimStreamWithCall(long n) { this.count = n; }
+        @Override public int read() { if (count > 0) { count--; return lcgNoLoop(AL, 32) & 7; } return -1; }
+    }
     static long addStatic(long a, long b) { long s = 0; for (int i = 0; i < 1; i++) s = a + b; return s; }
     static final java.util.concurrent.atomic.AtomicLong AL =
         new java.util.concurrent.atomic.AtomicLong(1);
@@ -65,6 +75,8 @@ public class TierOneArm {
         long c0 = TB.getCurrentThreadCpuTime();
         switch (arm) {
             case "boxed": { BoxedStream in = new BoxedStream(n);
+                for (int i = 0; i < n; i++) sink += in.read(); break; }
+            case "primcall": { PrimStreamWithCall in = new PrimStreamWithCall(n);
                 for (int i = 0; i < n; i++) sink += in.read(); break; }
             case "prim": { PrimStream in = new PrimStream(n);
                 for (int i = 0; i < n; i++) sink += in.read(); break; }

@@ -2,13 +2,14 @@
 
 ## Status
 
-**OPEN, and the page's model needs replacing. Re-measured 2026-09-02: the
-decomposition below is right in its PROPORTIONS and wrong in its conclusions.
-The cause is not a "per-native-call floor" — it is that an operation which is
-fast when the JIT emits it INLINE stays at interpreter cost when it sits inside
-a CALLEE, however that callee is reached. Section 9 is the finding and section
-9.1 corrects an earlier, wrong version of it. Read both before acting on
-anything above.** This is the residual of
+**OPEN, and this is not a hibernate bug. ROOT CAUSE FOUND 2026-09-02, in
+section 11: a callee invoked from COMPILED code never has its tiered-manager
+invocation counter incremented, so a method that cannot be inlined never
+compiles and runs interpreted for the life of the process. The fixture's
+`read()` autoboxes, autoboxing is a call, a call makes it non-inlinable — so all
+100 000 000 invocations run in the interpreter. Everything above section 11 is
+the trail that led there and several of its conclusions are superseded; read
+section 11 first.** This is the residual of
 `fixed-suite-bugs/hibernate/jpalargeblob-random-state-side-table-FIXED-20260830.md`, which is retired: both of
 that page's own findings are fixed, the test got 1.35x faster, and it still
 fails. What is left is not a defect in `Random`, in blobs, or in H2 — it is this
@@ -368,3 +369,102 @@ not a tier.
   `CRATONVM_DBG=jit-method-stats` describes that arm alone. This is what showed
   the boxed and primitive streams have identical compile counts, and it is the
   harness section 9's elimination table is built from.
+
+---
+
+# 11. ROOT CAUSE: a callee invoked from compiled code is never counted, so it never compiles
+
+## 11.1 The chain, each link measured
+
+`probes/TierOneArm.java`, ONE arm per process, 3 000 000 iterations, CPU clock.
+
+**Link 1 — a method that makes a call collapses 30x.** Two `InputStream`
+subclasses, identical primitive counter, differing only in that one of them
+makes a single call to a helper that touches atomics:
+
+| arm | ns/op |
+|---|---:|
+| `read()` with no calls | **83.3** |
+| `read()` + ONE call | **2494.8** |
+| `read()` that autoboxes (the fixture's shape) | 2708.3 |
+
+**Link 2 — the callee's invocation counter is ZERO after 3 000 000 calls.**
+Run with `CRATONVM_TIER_C1_THRESHOLD=1`, so anything counted even once is
+eligible:
+
+```
+3 distinct methods tracked, 1 ever invoked, ... still-interpreted=2 c1=0 c2=1
+hot_but_stuck_in_interpreter=0
+```
+
+Two of the three tracked methods have `invocation_count == 0`. One of them is
+the callee being invoked three million times. `hot_but_stuck` lists every
+Interpreter-tier method whose count crossed the threshold; with the threshold at
+**1** it is empty.
+
+**Link 3 — the counter is only ever incremented by the interpreter.**
+`on_method_invocation_observed` has six call sites, all under
+`vm/src/runtime/interpreter/`. `vm/src/jit/helpers.rs` — where compiled code
+crosses back to invoke a callee (`jit_invoke_dispatch`, `jit_invoke_virtual_mic`)
+— contains **zero**.
+
+So: compiled code invokes the callee, nothing counts it, it never reaches any
+tier threshold, and it runs interpreted forever. Its own body's natives then
+cost interpreter prices, which is the ~2500 ns (two atomics at ~1150 each).
+
+## 11.2 Why an inlinable callee escapes
+
+`sumLoop` (a real loop, no calls) is 62.5 ns and `addStatic` 83.3. They are not
+counted either — they do not need to be, because they are INLINED into the
+caller and no call happens. That is the whole difference:
+
+* **inlinable callee** -> inlined -> fast, counter irrelevant;
+* **non-inlinable callee** -> real call -> never counted -> never compiled ->
+  interpreted for the life of the process.
+
+And "non-inlinable" is a low bar: *containing a call* is enough. So the cliff
+falls at the first frame of any non-trivial call graph reached from a hot loop.
+
+## 11.3 What this explains
+
+Everything this page has recorded:
+
+* the fixture's `read()` autoboxes; `Long.valueOf` is a call; the call makes
+  `read()` non-inlinable; so `read()` is interpreted, and its boxing, its field
+  access and its dispatch all pay interpreter prices. **That is the 2318
+  ns/byte**, not five native calls at ~300.
+* `Random.next` is the same shape one level down.
+* section 4's `Long.longValue` intrinsic bought 1.6x in a tight counter loop and
+  **nothing** on the stream arm — an intrinsic is JIT emission, and `read()`
+  has no JIT.
+* the primitive twin of every arm is fast because it has no calls and gets
+  inlined.
+
+HotSpot has no cliff: 20.8 ns whether inline, static or virtual.
+
+## 11.4 The fix, and why it is not a one-liner
+
+The obvious repair is to increment the tiered counter from the compiled-code
+dispatch helpers. It is the right shape and it is not free: it makes a large
+population of methods newly eligible for compilation, which costs compile time
+and code-cache pressure that this page has not measured. It wants its own
+change, its own kill switch and its own soak — not a line appended to a
+hibernate investigation.
+
+What this page can say is that the target is now specific, VM-wide, and nothing
+to do with hibernate, blobs, `Random` or boxing.
+
+## 11.5 Two superseded readings, kept
+
+Both were committed to this page the same day and both were wrong; they are left
+because each was refuted by a control that is worth reusing.
+
+* *"The method containing the boxing is not COMPILED."* Correct in effect,
+  wrong in mechanism as stated — it was inferred from a `--nojit` RATIO, and a
+  ratio is not a tier. The per-arm compile counts are identical.
+* *"`compareAndSet` is the blocker for retiring the Random shadow."* Fixing
+  `compareAndSet` (34.7x, section 8) moved `lcgNext` by 0.2%. The 2265 ns was
+  never the CAS.
+* Also refuted, so it is not re-tried: the `&& !statically_bound` gate on
+  `jit_invoke_dispatch`'s compiled-callee-entry cache is not the mechanism — a
+  VIRTUAL callee is equally slow (2474.0 against the static twin's 2546.9).
