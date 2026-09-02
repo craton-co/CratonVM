@@ -709,12 +709,6 @@ impl DeviceModuleInner {
             block_dim: cfg.block,
             shared_mem_bytes: cfg.shared_bytes,
         };
-        // AUDIT 2026-05-17 (PERF Fix 1): launch on the dedicated
-        // compute stream. Buffers uploaded via `DeviceBufferInner::
-        // from_host` recorded an event on `copy_h2d` and made the
-        // compute stream wait on it, so this launch is correctly
-        // ordered behind every input upload without forcing the host
-        // to block.
         // AUDIT 2026-05-17 (PERF Fix 2): rent the thread-local pointer
         // scratch by `take`-ing it out, refilling it, and putting it
         // back via a drop guard. This avoids holding a `RefMut` across
@@ -802,14 +796,8 @@ impl DeviceModuleInner {
         // `launch_args` and this call. The `_keep_alive` binding after
         // the launch ties both objects' lifetimes past this point so the
         // contract is compiler-enforced against future refactors.
-        // AUDIT 2026-05-24 (C32 stream-port fix): launch on the
-        // supplied `stream`. Previously this was hard-coded to
-        // `&ctx.compute`, which broke `DeviceModule::launch_on_stream`
-        // (HIGH-2: user-supplied stream was silently ignored). With
-        // this fix, the default-stream caller (`launch_raw_inner`)
-        // passes `&ctx.compute` and the explicit-stream caller
-        // (`launch_raw_on_stream` / `DeviceModule::launch_on_stream`)
-        // passes the user's `Stream`'s inner cudarc `CudaStream`.
+        // Launch on the caller's `stream` — the only stream a kernel ever
+        // runs on since 2026-09-02.
         let launch_result = unsafe {
             func.clone()
                 .launch_on_stream(stream, cudarc_cfg, &mut launch_args)
@@ -840,32 +828,25 @@ impl DeviceModuleInner {
             *cell.borrow_mut() = ptr_h;
         });
         launch_result?;
-        // AUDIT 2026-05-24 (C32 stream-port fix): post-launch
-        // bookkeeping (recording `e_k`, etc.) is now the caller's
-        // responsibility — `launch_raw_inner` records `e_k` on the
-        // compute stream when `needs_d2h_sync` is set;
-        // `launch_raw_on_stream` does not, leaving the user-supplied
-        // stream's ordering to explicit `Stream::record_event` /
-        // `wait_event` calls.
+        // Post-launch bookkeeping — recording `kernel_done` and stamping
+        // it into every argument's `last_write` — is `launch.rs`'s job.
         Ok(())
     }
 }
 
 /// Round-5: H→D upload helper.
 ///
-/// AUDIT 2026-05-24 (C32 stream-port fix): rewritten. Previously this
-/// called `ctx.dev.htod_sync_copy(host)`, which submits the H→D memcpy
-/// onto cudarc's *default* stream and host-blocks until it completes —
-/// every upload thereby (a) ignored the dedicated `copy_h2d` stream
-/// the context constructs and (b) serialised the entire pipeline at
-/// the host. The new path:
+/// The synchronous upload's device half:
 ///
-///   1. Asynchronously allocates an uninit `CudaSlice<T>` on the
-///      device (the allocation itself does not transfer data).
-///   2. Issues `cuMemcpyHtoDAsync` against `copy_h2d.stream` so the
-///      transfer runs concurrently with any pending compute work.
-///   3. Records `e_h2d` on `copy_h2d` so subsequent kernel launches
-///      can `cuStreamWaitEvent` on it from the compute stream.
+///   1. Takes device storage from the pool, or allocates it.
+///   2. Issues `cuMemcpyHtoDAsync` against `copy_h2d.stream` — from a
+///      page-locked staging slab when `CRATONVM_GPU_PINNED_H2D=1`
+///      (see `PinnedPool`), else straight from `host`.
+///
+/// AUDIT 2026-09-02: this used to also record a context-wide barrier
+/// event after every upload. Nothing had waited on it since the
+/// per-buffer `last_write` events replaced it; it was a driver call
+/// per upload for nothing, and it is gone with the barrier.
 ///
 /// The caller (`DeviceBufferInner::from_host`) is responsible for
 /// host-synchronising before the borrowed `host` slice can be safely
@@ -966,8 +947,8 @@ unsafe fn upload_on_stream<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static
 }
 
 /// A typed device-side allocation backed by cudarc's safe `CudaSlice<T>`.
-/// The buffer also retains the streams it participates in so `to_host`
-/// can host-block on the compute stream before issuing the D→H copy.
+/// The buffer also retains the context's two copy streams for the
+/// synchronous transfers, and the pool its allocation returns to.
 ///
 /// AUDIT 2026-05-22 (UAF fix): the `CudaSlice<T>` is held behind an
 /// `Arc`. The slice owns the device allocation and frees it on `Drop`;
