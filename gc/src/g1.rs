@@ -4161,14 +4161,18 @@ impl G1Collector {
         phase_mark = std::time::Instant::now();
 
         // Phase 4: Update forwarding pointers in non-CSet regions
+        // THE SAME PREDICATE `update_references_in_regions` uses, and it has to
+        // be: this argument decides the walk's WIDTH while the copy in there
+        // decides whether the census is taken at all, so a difference between
+        // them is a whole-heap walk feeding a census nobody asked for. That is
+        // not hypothetical -- the first version of this fix changed only the
+        // other copy and measured `fixup_regions` 831, unmoved from the 845/841
+        // baseline, because this line still said "wide".
         let narrow = self.phase4_regions_to_walk(
             &regions,
             Some(&pre_evac),
             &narrow_sources,
-            gc_flags().g1_eager_humongous
-                && regions
-                    .iter()
-                    .any(|r| r.region_type == RegionType::HumongousStart),
+            self.want_humongous_census(&regions, &pointer_map),
         );
         let census = self.update_references_in_regions(
             &mut regions,
@@ -7033,22 +7037,21 @@ impl G1Collector {
         // generation — to build a `referenced` set that
         // `eager_reclaim_humongous_locked` would then find no span to apply.
         // One pass over the region TYPES (no object walk) settles it.
-        let heap_has_humongous = regions
-            .iter()
-            .any(|r| r.region_type == RegionType::HumongousStart);
         // ...and there is nothing to take a census FOR if eager reclaim is
         // already going to decline. Every gate but `census.complete` is
         // decidable here (see `eager_reclaim_early_decline`), and skipping the
         // census when one of them holds is what lets `phase4_regions_to_walk`
         // narrow: measured 843 regions walked per pause -> 5.
-        let early_decline = self.eager_reclaim_early_decline(pointer_map);
-        if let Some(why) = early_decline {
-            if gc_flags().g1_dbg_reach {
+        //
+        // Shared with the walk-WIDTH decision at the `phase4_regions_to_walk`
+        // call site, through one function, because these two were separate
+        // copies and the first cut of this fix changed only this one.
+        if gc_flags().g1_dbg_reach {
+            if let Some(why) = self.eager_reclaim_early_decline(pointer_map) {
                 eprintln!("[g1][HUMONGOUS] census SKIPPED, eager reclaim would decline: {why}");
             }
         }
-        let want_census =
-            gc_flags().g1_eager_humongous && heap_has_humongous && early_decline.is_none();
+        let want_census = self.want_humongous_census(regions, pointer_map);
         if !rewrite && !want_census {
             return census;
         }
@@ -9956,6 +9959,27 @@ impl G1Collector {
     ///
     /// `census.complete` is deliberately NOT here: it is a property of the walk
     /// itself, so it cannot be known before the walk and stays at the call site.
+    /// Is the humongous census worth taking this pause?
+    ///
+    /// ONE home for a predicate that had two, which is what let them drift.
+    /// The copy at the `phase4_regions_to_walk` call site decides the fix-up
+    /// walk's WIDTH; the copy in `update_references_in_regions` decides whether
+    /// the census is built at all. Changing one and not the other produces a
+    /// whole-heap walk feeding a census nobody reads -- measured, when the
+    /// first cut of this fix moved only the second: `fixup_regions` stayed at
+    /// 831 against an 845/841 baseline.
+    fn want_humongous_census(
+        &self,
+        regions: &[G1Region],
+        pointer_map: &cratonvm_types::PointerMap,
+    ) -> bool {
+        gc_flags().g1_eager_humongous
+            && regions
+                .iter()
+                .any(|r| r.region_type == RegionType::HumongousStart)
+            && self.eager_reclaim_early_decline(pointer_map).is_none()
+    }
+
     fn eager_reclaim_early_decline(
         &self,
         pointer_map: &cratonvm_types::PointerMap,
