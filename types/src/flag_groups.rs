@@ -1673,6 +1673,15 @@ pub const INVENTORY: &[E] = &[
     // `CRATONVM_GC=gpu-critical-wait-ms=250`.
     E { group: Group::GC, token: "gpu-chunk-streams", on_key: Some("CRATONVM_GPU_CHUNK_STREAMS"), off_key: None, off_word: None, since: "2026-08-22" },
     E { group: Group::GC, token: "gpu-chunks", on_key: Some("CRATONVM_GPU_CHUNKS"), off_key: None, off_word: None, since: "2026-08-22" },
+    // AUDIT 2026-09-02. `gpu-dispatch-streams` sizes the round-robin pool the
+    // handle-less dispatch path takes a stream from instead of creating and
+    // destroying one per submission; set it to 1 for the strictest ordering.
+    // `gpu-jit-array-writers=allow` picks the other side of the
+    // JIT-versus-residency-cache trade for a method that stores into a
+    // primitive array — see `vm::runtime::offload_jit_gate::ArrayWriterPolicy`
+    // for the measurement that made blocking the JIT the default.
+    E { group: Group::GC, token: "gpu-dispatch-streams", on_key: Some("CRATONVM_GPU_DISPATCH_STREAMS"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::GC, token: "gpu-jit-array-writers", on_key: Some("CRATONVM_GPU_JIT_ARRAY_WRITERS"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "gpu-critical-lease-ms", on_key: Some("CRATONVM_GPU_CRITICAL_LEASE_MS"), off_key: None, off_word: None, since: "2026-07-31" },
     E { group: Group::GC, token: "gpu-critical-wait-ms", on_key: Some("CRATONVM_GPU_CRITICAL_WAIT_MS"), off_key: None, off_word: None, since: "2026-07-31" },
     E { group: Group::GC, token: "gpu-zerocopy", on_key: None, off_key: Some("CRATONVM_GPU_NO_ZEROCOPY"), off_word: None, since: "2026-06-16" },
