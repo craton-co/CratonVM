@@ -5863,8 +5863,10 @@ fn remap_one_jit_frame(
 ///   `outside_locals` word actionable.
 ///
 /// Only the single-pass x86-64 tier homes local `k` at `[rbp - 8*(k+1)]`, so IR
-/// frames record no mask and no scopes, and report every LIVE word as
-/// `outside_locals`.
+/// frames record no mask and no scopes. They are not silent, though: the IR
+/// lowerer's slot COLOURING publishes every provably-primitive spill slot as
+/// `non_oop_stack_slots`, so `stack_not_oop` is the verdict that speaks for
+/// them.
 fn remap_residue_dbg() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {

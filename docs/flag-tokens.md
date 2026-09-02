@@ -577,7 +577,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-279 tokens.
+278 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -674,12 +674,11 @@ export inherited from a parent shell.
 | `precise-getstatic-checkcast` | `CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST` |
 | `precise-alloc-athrow` | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` |
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
-| `ir-inline-tlab` | `CRATONVM_JIT_IR_INLINE_TLAB` |
-| `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
 | `gated-ref-store` | `CRATONVM_JIT_GATED_REF_STORE` |
 | `operand-cache` | `CRATONVM_JIT_OPERAND_CACHE` |
 | `ir-reloc-emit` | `CRATONVM_JIT_IR_RELOC_EMIT` |
+| `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `reloc-gate-map-incomplete` | `CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE` |
 | `ir-selfrec-direct` | `CRATONVM_JIT_IR_SELFREC_DIRECT` |
 | `nested-trace-frames` | `CRATONVM_JIT_NO_NESTED_TRACE_FRAMES` |

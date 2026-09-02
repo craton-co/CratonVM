@@ -2463,8 +2463,8 @@ impl<'a> Emitter<'a> {
             0x88 => self.conv("cvt.s32.s64", RegKind::S64, RegKind::S32)?, // l2i
             0x89 => self.conv("cvt.rn.f32.s64", RegKind::S64, RegKind::F32)?, // l2f
             0x8A => self.conv("cvt.rn.f64.s64", RegKind::S64, RegKind::F64)?, // l2d
-            0x8B => self.conv("cvt.rzi.s32.f32", RegKind::F32, RegKind::S32)?, // f2i
-            0x8C => self.conv("cvt.rzi.s64.f32", RegKind::F32, RegKind::S64)?, // f2l
+            0x8B => self.conv_float_to_int("cvt.rzi.s32.f32", RegKind::F32, RegKind::S32)?, // f2i
+            0x8C => self.conv_float_to_int("cvt.rzi.s64.f32", RegKind::F32, RegKind::S64)?, // f2l
             // f2d — but see `float_sqrt_triple_at`: when this widen exists
             // only to reach `Math.sqrt(D)D` and is narrowed straight back,
             // leave the value as F32 and let `invokestatic` emit a single
@@ -2472,8 +2472,8 @@ impl<'a> Emitter<'a> {
             // later arms the collapse is in progress.
             0x8D if self.float_sqrt_triple_at(pc) => {}
             0x8D => self.conv("cvt.f64.f32", RegKind::F32, RegKind::F64)?, // f2d
-            0x8E => self.conv("cvt.rzi.s32.f64", RegKind::F64, RegKind::S32)?, // d2i
-            0x8F => self.conv("cvt.rzi.s64.f64", RegKind::F64, RegKind::S64)?, // d2l
+            0x8E => self.conv_float_to_int("cvt.rzi.s32.f64", RegKind::F64, RegKind::S32)?, // d2i
+            0x8F => self.conv_float_to_int("cvt.rzi.s64.f64", RegKind::F64, RegKind::S64)?, // d2l
             // d2f — a no-op when the value on the stack is already F32,
             // which happens only for the collapsed float-sqrt triple.
             0x90 if self.stack.0.last().map(|r| r.kind) == Some(RegKind::F32) => {}
@@ -4116,6 +4116,44 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// A unary float operation — in practice `neg.f32` for `fneg`.
+    ///
+    /// # NaN payloads are NOT preserved, and that is allowed
+    ///
+    /// AUDIT 2026-09-02. Measured on an RTX 2060: every NaN that reaches
+    /// `neg.f32`, `add.f32`, `mul.f32` or `div.rn.f32` comes back as
+    /// `0x7fffffff` — CUDA's canonical NaN — regardless of the payload
+    /// that went in. HotSpot propagates the payload, and for negation it
+    /// flips only the sign bit, so `Float.floatToRawIntBits` sees
+    /// different answers on the two.
+    ///
+    /// This is not a defect and is deliberately not fixed:
+    ///
+    /// * JLS §4.2.3 does not specify which NaN bit pattern an arithmetic
+    ///   operation produces, and the PTX ISA says outright that "NaN
+    ///   inputs yield an unspecified NaN". Both sides are conforming.
+    /// * Nothing an ordinary program does can see it. NaN compares false
+    ///   against everything including itself, `Float.isNaN` is unaffected,
+    ///   and a NaN's payload does not influence any later result's value
+    ///   or its NaN-ness. The single observable is
+    ///   `floatToRawIntBits`/`doubleToRawLongBits`.
+    /// * `fneg` alone COULD be made exact — a `mov.b32` / `xor.b32
+    ///   0x80000000` / `mov.b32` triple is a pure sign flip that
+    ///   preserves the payload, which is what IEEE 754 §5.5.1 actually
+    ///   specifies negation to be. It is not done because it would make
+    ///   one of the four consistent with HotSpot and leave the other
+    ///   three canonicalising, which is a worse thing to document than
+    ///   "none of them preserve payloads": a program that survived
+    ///   `-x` would still be surprised by `x + 0.0f`.
+    ///
+    /// What IS specified, and what this crate therefore does guarantee,
+    /// is the NaN behaviour of float→integer conversion — see
+    /// [`Emitter::conv_float_to_int`], where the device was returning
+    /// MIN_VALUE against a JLS that says zero.
+    ///
+    /// `bench-gpu/arith-differential.sh` measures all of this; the
+    /// payload cases are the ones it reports as differing on the float
+    /// arithmetic kernels and passing everywhere else.
     fn unop_f32(&mut self, mnemonic: &str) -> Result<(), LoweringError> {
         let a = self.stack.pop()?;
         let r = self.regs.fresh_reg(RegKind::F32);
@@ -4179,6 +4217,87 @@ impl<'a> Emitter<'a> {
         let a = self.stack.pop()?;
         let r = self.regs.fresh_reg(to);
         writeln!(self.body, "    {} {}, {};", mnemonic, r.name, a.name).unwrap();
+        self.stack.push(r);
+        Ok(())
+    }
+
+    /// A float→integer narrowing conversion (`f2i`/`f2l`/`d2i`/`d2l`),
+    /// with the NaN case Java specifies and PTX does not.
+    ///
+    /// JLS §5.1.3 is unambiguous: if the value is NaN the result of the
+    /// conversion is **zero**. Everything else about the conversion —
+    /// round toward zero, saturate at the type's extremes — PTX's
+    /// `cvt.rzi` already does, and that half was measured correct.
+    ///
+    /// # AUDIT 2026-09-02: it was returning MIN_VALUE
+    ///
+    /// Found by differentially testing the emitter against HotSpot on an
+    /// RTX 2060 (`test_classes/gpu/GpuArithDifferential.java`). Per
+    /// element, over an input set built from raw bit patterns:
+    ///
+    /// ```text
+    ///   (int)  NaN   HotSpot 0    device -2147483648
+    ///   (long) NaN   HotSpot 0    device -9223372036854775808
+    /// ```
+    ///
+    /// 474 of 4096 elements wrong for `d2i`/`d2l`, 584 for `f2l`, with
+    /// CratonVM's own CPU path matching HotSpot exactly on all of them —
+    /// so the divergence is this lowering and nothing else.
+    ///
+    /// `f2i` (`cvt.rzi.s32.f32`) measured CORRECT on this device: 0 of
+    /// 4096. It gets the guard anyway. The PTX ISA does not promise
+    /// NaN→0 for any of these — it is silent, which is what let three of
+    /// the four differ from the fourth — so "correct on sm_75 today" is
+    /// not a property to build on, and two instructions is not a price
+    /// worth arguing about against a wrong answer.
+    ///
+    /// The guard is `setp.nan` on the SOURCE, not a comparison of the
+    /// result: the result of a NaN conversion is an ordinary integer and
+    /// carries no evidence of where it came from.
+    fn conv_float_to_int(
+        &mut self,
+        mnemonic: &str,
+        from: RegKind,
+        to: RegKind,
+    ) -> Result<(), LoweringError> {
+        let a = self.stack.pop()?;
+        let raw = self.regs.fresh_reg(to);
+        writeln!(self.body, "    {} {}, {};", mnemonic, raw.name, a.name).unwrap();
+        let is_nan = self.regs.fresh_reg(RegKind::Pred);
+        let src_suffix = match from {
+            RegKind::F32 => "f32",
+            RegKind::F64 => "f64",
+            other => {
+                return Err(LoweringError::Internal(format!(
+                    "conv_float_to_int: source must be a float kind, got {other:?}"
+                )))
+            }
+        };
+        // `x != x` is true exactly for NaN, and `setp.nan` says so
+        // directly rather than through a comparison whose own NaN
+        // behaviour would then need arguing about.
+        writeln!(
+            self.body,
+            "    setp.nan.{} {}, {}, {};",
+            src_suffix, is_nan.name, a.name, a.name
+        )
+        .unwrap();
+        let dst_suffix = match to {
+            RegKind::S32 => "s32",
+            RegKind::S64 => "s64",
+            other => {
+                return Err(LoweringError::Internal(format!(
+                    "conv_float_to_int: destination must be a signed integer kind, got {other:?}"
+                )))
+            }
+        };
+        let r = self.regs.fresh_reg(to);
+        writeln!(
+            self.body,
+            "    selp.{} {}, 0, {}, {};",
+            dst_suffix, r.name, raw.name, is_nan.name
+        )
+        .unwrap();
         self.stack.push(r);
         Ok(())
     }
