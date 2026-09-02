@@ -15596,6 +15596,12 @@ impl GarbageCollector for G1Collector {
         // more specific statement, and the coverage lever (opt-in, ~100% rate)
         // subsumes this case whenever it is on, so recording IT here would hide
         // every real instance behind a reason that means almost nothing.
+        // A device DMA against the heap arena that the bounded GPU
+        // critical-section wait could not outlast. G1 has no non-moving
+        // sweep to divert to, so the fail-safe is the same one the two
+        // refusals above use: an empty collection set, every object at its
+        // address. See `vm_heap::gpu_relocation_forbidden`.
+        let gpu_refuse = crate::vm_heap::gpu_relocation_forbidden();
         let (decision, degraded_reason_bit) = if refuse_empty_publication {
             (
                 crate::gc_metrics::decision_reason::NON_MOVING_G1_EMPTY_JIT_PUBLICATION,
@@ -15605,6 +15611,11 @@ impl GarbageCollector for G1Collector {
             (
                 crate::gc_metrics::decision_reason::NON_MOVING_G1_ROOT_COVERAGE_INCOMPLETE,
                 crate::gc_metrics::g1_degraded::ROOT_COVERAGE_INCOMPLETE,
+            )
+        } else if gpu_refuse {
+            (
+                crate::gc_metrics::decision_reason::NON_MOVING_G1_GPU_CRITICAL,
+                crate::gc_metrics::g1_degraded::NONE,
             )
         } else {
             (
@@ -15617,7 +15628,7 @@ impl GarbageCollector for G1Collector {
             decision,
             coverage_incomplete.unwrap_or(crate::gc_quiescence::incomplete_reason::NONE),
         );
-        if refuse.is_some() || refuse_empty_publication {
+        if refuse.is_some() || refuse_empty_publication || gpu_refuse {
             crate::gc_metrics::record_g1_cycle(
                 crate::gc_metrics::g1_cycle_kind::YOUNG,
                 0,

@@ -678,9 +678,19 @@ pub mod decision_reason {
     /// indistinguishable where the CSet is built, and only one of them is safe
     /// to evacuate. See `G1Collector::empty_jit_publication`.
     pub const NON_MOVING_G1_EMPTY_JIT_PUBLICATION: u8 = 11;
+    /// Non-moving: a GPU device was reading or writing the heap arena in
+    /// place — a zero-copy upload or a writeback download — and the
+    /// collector's bounded wait for that window to close expired. The
+    /// generational collector takes its non-moving young sweep; the
+    /// ZGC slide and the large-object compactor stand down for the
+    /// cycle. See `cratonvm_gc::vm_heap::gpu_relocation_forbidden`.
+    pub const NON_MOVING_GPU_CRITICAL: u8 = 12;
+    /// G1's twin of [`NON_MOVING_GPU_CRITICAL`]: an empty collection set,
+    /// because G1 has no non-moving sweep to divert to.
+    pub const NON_MOVING_G1_GPU_CRITICAL: u8 = 13;
 
     /// One past the highest defined code.
-    pub const COUNT: u8 = 12;
+    pub const COUNT: u8 = 14;
 
     /// Human-readable label.
     pub fn label(code: u8) -> &'static str {
@@ -697,6 +707,8 @@ pub mod decision_reason {
             MOVING_BACKEND_ALWAYS_EVACUATES => "moving-backend-always-evacuates",
             NON_MOVING_G1_ROOT_COVERAGE_INCOMPLETE => "g1-no-evacuation-root-coverage-incomplete",
             NON_MOVING_G1_EMPTY_JIT_PUBLICATION => "g1-no-evacuation-empty-jit-publication",
+            NON_MOVING_GPU_CRITICAL => "nonmoving-gpu-critical-section",
+            NON_MOVING_G1_GPU_CRITICAL => "g1-no-evacuation-gpu-critical-section",
             _ => "unknown",
         }
     }

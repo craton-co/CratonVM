@@ -197,16 +197,6 @@ impl DeviceContext {
         &self.0
     }
 
-    /// AUDIT 2026-05-29 (H10b fix): crate-internal constructor wrapping
-    /// an existing backend context. Used by `backend_cuda`'s
-    /// `launch_raw_inner` to build a transient `Event` (which needs a
-    /// `&DeviceContext`) without re-attaching the driver context — the
-    /// backend `DeviceContextInner` is `Clone` (an Arc bump).
-    #[allow(dead_code)]
-    pub(crate) fn from_inner(inner: backend::DeviceContextInner) -> Self {
-        Self(inner)
-    }
-
     /// Stub-only test constructor: build a synthetic `DeviceContext`
     /// without going through the driver. Used by the in-crate stub-mode
     /// event-ordering integration tests in `launch.rs`; exposed to the
@@ -348,20 +338,6 @@ impl DeviceModule {
         {
             backend::DeviceModuleInner::from_ptx(&ctx.0, ptx, &module_name, kernel_names).map(Self)
         }
-    }
-
-    /// Launch a kernel by name with raw argument bytes. The argument
-    /// layout must match the kernel's PTX parameter declarations
-    /// exactly — the bridge does no type checking; the
-    /// [`KernelArgs`] helper builds correct buffers from Rust types.
-    pub fn launch_raw(
-        &self,
-        ctx: &DeviceContext,
-        kernel: &str,
-        cfg: &LaunchConfig,
-        args: KernelArgs,
-    ) -> Result<()> {
-        self.0.launch_raw(&ctx.0, kernel, cfg, args)
     }
 
     /// Build a 1-D elementwise [`LaunchConfig`] for `kernel` sized to
@@ -745,6 +721,42 @@ unsafe impl<T: Send> Send for DeviceBuffer<T> {}
 // SAFETY: shared access never mutates host `T`; CUDA ordering is mediated by
 // driver streams/events, so Sync follows exactly when `T: Sync`.
 unsafe impl<T: Sync> Sync for DeviceBuffer<T> {}
+
+/// Hand the allocation back to the context's pool when the device is
+/// provably done with it.
+///
+/// The buffer's `last_write` event names the last launch or copy that
+/// touched the memory. If it has fired (or was never recorded), nothing
+/// on the device can still be reading or writing the block, and it can
+/// be reused by the next allocation with no stream ordering at all. If
+/// it has NOT fired — a buffer evicted from a residency cache while its
+/// kernel is still running — this waits for it. That wait is the fix
+/// for a latent use-after-free as much as it is the pool's admission
+/// test: the underlying `CudaSlice` frees on its own default stream,
+/// which a kernel on a non-blocking user stream is not ordered against.
+///
+/// See `backend_cuda::AllocPool` for the pool and its kill switch.
+#[cfg(feature = "cuda")]
+impl<T> Drop for DeviceBuffer<T> {
+    fn drop(&mut self) {
+        let last = self
+            .last_write
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        let idle = match last {
+            None => true,
+            Some(ev) => match ev.query() {
+                Ok(true) => true,
+                Ok(false) => ev.synchronize().is_ok(),
+                Err(_) => false,
+            },
+        };
+        if idle {
+            self.inner.set_retire_to_pool();
+        }
+    }
+}
 
 #[cfg(feature = "cuda")]
 impl<T: DeviceElem> DeviceBuffer<T> {

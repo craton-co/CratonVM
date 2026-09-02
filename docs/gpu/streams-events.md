@@ -31,7 +31,7 @@ let args = KernelArgs::new()
     .push_device_ptr(&b)
     .push_device_ptr(&out)
     .push_i32(n as i32);
-module.launch_raw(&ctx, "vector_add", &cfg, args)?;
+module.launch_on_stream(&ctx, "vector_add", &cfg, args, &stream)?;
 out.to_host(&mut host_out)?;                          // blocks
 ```
 
@@ -182,9 +182,8 @@ pool when the last `Arc<Event>` holding it is gone.
 **`Stream::wait_event` skips a wait on its own stream.** An event recorded
 on stream `S` needs no `cuStreamWaitEvent(S, …)`: everything queued on a
 stream before a point is already ordered before everything queued after
-it. `Event` remembers which raw stream last recorded it, and both wait
-sites — `Stream::wait_event` and the compute-stream loop in
-`backend_cuda::launch_raw_inner` — skip that case. It is not a rare one:
+it. `Event` remembers which raw stream last recorded it, and
+`Stream::wait_event` skips that case. It is not a rare one:
 it is every launch in a single-stream chain, and every launch after the
 first in a chunked dispatch, each of which would otherwise wait on the
 `last_write` its predecessor stamped on the same stream.
@@ -343,8 +342,8 @@ configuration upload is unnecessary ceremony.
 
 ## `launch_on_stream`
 
-Non-blocking kernel launch. Same signature as `launch_raw` with a
-`&Stream` appended at the end:
+Non-blocking kernel launch, and since 2026-09-02 the ONLY kernel launch
+the bridge offers:
 
 ```rust,ignore
 module.launch_on_stream(&ctx, "vector_add", &cfg, args, &stream)?;
@@ -362,32 +361,26 @@ completes. To wait for completion, either:
   per output buffer; see [Automatic per-buffer
   ordering](#automatic-per-buffer-ordering-last_write-events) above.
 
-### Under the hood: `launch_raw` is not the CUDA legacy default stream
+### Under the hood: what the context's own streams are for
 
-`DeviceModule::launch_raw` (the plain, non-`_on_stream` entry point
-used by the "synchronous" examples in this document) does not issue
-onto CUDA's actual legacy default stream (stream `0`). `DeviceContext`
-owns three dedicated forked streams — `copy_h2d`, `compute`,
-`copy_d2h` — and `launch_raw` always submits onto `ctx.compute`
-(`cuda-bridge/src/backend_cuda.rs`). The same is true of the
-"synchronous" `DeviceBuffer::from_host` (uploads via `copy_h2d`) and
-`to_host` (downloads via `copy_d2h`): even though these calls block
-the host until their own op completes, internally the context
-pipelines H2D, compute, and D2H across three streams tied together
-with barrier events, so back-to-back synchronous calls still get some
-cross-stage overlap for free. "Blocks until done" describes the
-host-visible contract, not literal serial execution on one stream.
+`DeviceContext` owns two forked streams, `copy_h2d` and `copy_d2h`, and
+they serve only the SYNCHRONOUS copies: `DeviceBuffer::from_host` and
+`copy_from_host` upload on the first and host-block on it before
+returning; `to_host` downloads on the second, after a
+`cuStreamWaitEvent` on the buffer's own `last_write`, and host-blocks on
+it. Neither is CUDA's legacy default stream (stream `0`).
 
-Mixing `launch_raw` and `launch_on_stream` (or the sync and async
-`DeviceBuffer` methods) against the *same buffers* is safe: both
-launch paths gate on and update the same per-buffer `last_write`
-event (`cuda-bridge/src/backend_cuda.rs`'s `launch_raw_inner` mirrors
-`launch.rs`'s choreography exactly, fixed after a race
-through the old context-wide singleton event). The thing to actually
-watch for is scheduling, not correctness: `launch_raw` always competes
-for `ctx.compute`, so a dispatch path that wants true concurrency
-between two kernels should route both through `launch_on_stream` on
-two distinct user-created streams rather than relying on `launch_raw`.
+Until 2026-09-02 the context also owned a `compute` stream and two
+context-wide barrier events, and a `DeviceModule::launch_raw` submitted
+onto that stream. Nothing in the VM called it, but every synchronous
+upload still recorded one of the barrier events for it. Both are gone:
+every kernel goes through `launch_on_stream` on a caller-created
+`Stream`, ordered by the per-buffer `last_write` events, and the
+synchronous copies record nothing.
+
+The context also owns two allocation pools (`AllocPool` for device
+memory, `PinnedPool` for page-locked upload staging) — see
+[`docs/gpu/README.md`](README.md) for their kill switches.
 
 ## Stub-mode op log
 
@@ -450,9 +443,9 @@ fn pipeline_uploads_before_launch() {
 
 | Variant | Recorded by | Carries |
 | --- | --- | --- |
-| `UploadAsync { bytes }` | `DeviceBuffer::from_host_async` (and `launch_raw`'s internal H2D helper, on `ctx.copy_h2d`) | Total byte count of the upload. No destination-pointer or per-element breakdown. |
+| `UploadAsync { bytes }` | `DeviceBuffer::from_host_async` | Total byte count of the upload. No destination-pointer or per-element breakdown. |
 | `DownloadAsync { bytes }` | `DeviceBuffer::to_host_async` | Total byte count of the download. |
-| `Launch { kernel, grid, block }` | `DeviceModule::launch_on_stream` (and `launch_raw`, on `ctx.compute`) | Kernel name (owned `String`), grid dims, block dims. There is no `shared_bytes` field — dynamic shared-memory size is not captured in the op log. |
+| `Launch { kernel, grid, block }` | `DeviceModule::launch_on_stream` | Kernel name (owned `String`), grid dims, block dims. There is no `shared_bytes` field — dynamic shared-memory size is not captured in the op log. |
 | `EventRecord { event_id }` | `Stream::record_event` | Stable per-event id usable to correlate with `EventWait`. |
 | `EventWait { event_id }` | `Stream::wait_event` | The id of the event being waited on. |
 | `Synchronize` | `Stream::synchronize` | (no payload) |
@@ -491,24 +484,15 @@ without having to thread the actual `Event` through.
   `Event::new(&ctx)` is meant to back exactly one `record_event` call.
   Treat events as values produced fresh per synchronization point, not
   handles to re-record.
-- **No host callbacks.** There is no `stream.add_host_callback(...)`
-  hook. To run host code after a stream completes, call
-  `stream.synchronize()?;` and run it inline. (A non-blocking
-  `Event::query()` probe does exist — see [What events do **not**
-  provide](#what-events-do-not-provide) — but nothing in
-  `vm::runtime::offload` consumes it yet; a poll- or callback-driven
-  completion path on top of it is in-progress work elsewhere in the
-  tree, not shipped.)
-- **`launch_raw` competes for one shared stream.** `launch_raw` always
-  submits onto the context's internal `compute` stream (not CUDA's
-  legacy default stream — see [Under the
-  hood](#under-the-hood-launch_raw-is-not-the-cuda-legacy-default-stream)
-  above), so two `launch_raw` calls serialize against each other
-  regardless of buffers touched. Mixing `launch_raw` with
-  `launch_on_stream` on shared buffers is correctness-safe (both paths
-  honor the same per-buffer `last_write` events); it just doesn't buy
-  you concurrency unless the `launch_on_stream` calls use their own
-  distinct streams.
+- **Host callbacks block the stream behind them.**
+  `Stream::add_host_callback` exists (`cuLaunchHostFunc`), and its
+  contract is the CUDA one: the function runs after the work ahead of it
+  and every launch enqueued after it on that stream waits until it
+  returns. That is a host round trip between kernels, which is why the
+  VM's completion reaper stopped registering one per launch on
+  2026-09-02 and polls `Event::query` instead
+  (`CRATONVM_GPU_HOST_CALLBACK=1` restores the callback). Use it for a
+  notification, never per launch in a chain.
 - **No multi-device awareness.** `Stream` is bound to a single
   `DeviceContext`. Multi-GPU pipelines need one stream per context;
   events do not cross contexts.

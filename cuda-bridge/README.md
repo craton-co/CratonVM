@@ -41,7 +41,10 @@ let args = cratonvm_cuda_bridge::KernelArgs::new()
     .push_device_ptr(&b)
     .push_device_ptr(&out)
     .push_i32(4);
-module.launch_raw(&ctx, "vector_add", &cfg, args)?;
+// Every launch goes on a caller-created stream; the buffers' own
+// `last_write` events order it behind their uploads.
+let stream = cratonvm_cuda_bridge::Stream::new(&ctx)?;
+module.launch_on_stream(&ctx, "vector_add", &cfg, args, &stream)?;
 
 let mut host = vec![0i32; 4];
 out.to_host(&mut host)?;
@@ -93,9 +96,16 @@ event on the buffer when `from_host_async` returns; subsequent
 launching the kernel, then record a kernel-completion event on the
 user stream and stash it as the buffer's new last-write. A subsequent
 `to_host_async` waits on that kernel event before issuing the D→H
-copy. The H→D / kernel / D→H pipeline thus has no cross-stream races
-even though the cuda backend internally fans out to three separate
-cudarc streams (`copy_h2d`, `compute`, `copy_d2h`).
+copy. The H→D / kernel / D→H pipeline thus has no cross-stream races.
+The context's own two streams (`copy_h2d`, `copy_d2h`) carry only the
+synchronous `from_host` / `to_host` copies, which host-block before
+returning.
+
+**Pools.** Freed device allocations return to a per-context pool keyed
+by exact size and are reused by the next allocation of that size once
+the buffer's last-write event has fired (`CRATONVM_GPU_DEVICE_POOL=0`
+disables it). `CRATONVM_GPU_PINNED_H2D=1` routes synchronous uploads
+through page-locked staging slabs the context keeps.
 
 ### `Event`
 

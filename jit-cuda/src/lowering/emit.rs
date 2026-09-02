@@ -410,6 +410,14 @@ pub(crate) struct Emitter<'a> {
     /// Local slot used for the kernel result return (scalar return only).
     /// Populated by the post-loop walker when it sees the matching `*return`.
     pub ret_value_reg: Option<Reg>,
+    /// The per-thread contribution a reduction kernel folds across its
+    /// warp before the one atomic per warp. See [`Emitter::finalize_epilogue`].
+    ///
+    /// Created by the first guard emitted for a reduction kernel
+    /// ([`Emitter::guard_exit_label`]), so that a thread the guard
+    /// retires can still join the warp tree carrying a zero rather than
+    /// leave a hole in it. `None` for every other shape.
+    pub reduction_acc: Option<Reg>,
     /// Phase 10 #2 — bit-set of parameter indices the body writes to
     /// via `*astore`. Each `array_store*` arm in the opcode dispatch
     /// resolves the array reference back to its parameter via
@@ -475,6 +483,7 @@ impl<'a> Emitter<'a> {
             if_convert_budget: if_conversion_budget_from_flags(),
             hit_back_branch: false,
             ret_value_reg: None,
+            reduction_acc: None,
             writes_param_mask: 0,
             reads_param_mask: 0,
             cp,
@@ -721,6 +730,7 @@ impl<'a> Emitter<'a> {
             loop_info.iv_stride
         );
         let tid = self.tid_reg.clone().expect("emit_tid was called");
+        let exit = self.guard_exit_label();
         if bound_nonneg {
             let p = self.regs.fresh_reg(RegKind::Pred);
             writeln!(
@@ -729,11 +739,11 @@ impl<'a> Emitter<'a> {
                 p.name, tid.name, bound.name
             )
             .unwrap();
-            writeln!(self.body, "    @{} bra L_done;", p.name).unwrap();
+            writeln!(self.body, "    @{} bra {exit};", p.name).unwrap();
         } else {
             let neg = self.regs.fresh_reg(RegKind::Pred);
             writeln!(self.body, "    setp.lt.s32 {}, {}, 0;", neg.name, tid.name).unwrap();
-            writeln!(self.body, "    @{} bra L_done;", neg.name).unwrap();
+            writeln!(self.body, "    @{} bra {exit};", neg.name).unwrap();
             let p = self.regs.fresh_reg(RegKind::Pred);
             writeln!(
                 self.body,
@@ -741,7 +751,7 @@ impl<'a> Emitter<'a> {
                 p.name, tid.name, bound.name
             )
             .unwrap();
-            writeln!(self.body, "    @{} bra L_done;", p.name).unwrap();
+            writeln!(self.body, "    @{} bra {exit};", p.name).unwrap();
         }
         self.index_proofs.push(IndexProof {
             index: tid.name.clone(),
@@ -821,7 +831,8 @@ impl<'a> Emitter<'a> {
             p.name, tid.name, total.name
         )
         .unwrap();
-        writeln!(self.body, "    @{} bra L_done;", p.name).unwrap();
+        let exit = self.guard_exit_label();
+        writeln!(self.body, "    @{} bra {exit};", p.name).unwrap();
         let i = self.regs.fresh_reg(RegKind::S32);
         let j = self.regs.fresh_reg(RegKind::S32);
         writeln!(
@@ -842,9 +853,77 @@ impl<'a> Emitter<'a> {
         self.tid_reg_inner = Some(j);
     }
 
-    /// Append the bounds-check failure block and the kernel epilogue
-    /// label. The kernel always ends with an unconditional `ret;`.
+    /// Where a dispatch guard sends a thread that has no iteration.
+    ///
+    /// `L_done` for every kernel but a reduction. A reduction folds each
+    /// thread's contribution across its warp with `shfl.sync`, and a
+    /// shuffle reads lanes by NUMBER: a lane that has already returned
+    /// is a hole the tree would read undefined bits from. So a retired
+    /// thread in a reduction kernel does not return — it joins the tree
+    /// at `L_reduce_zero` contributing zero, which is the identity the
+    /// host pre-zeroes the accumulator with. This is also where the
+    /// accumulator register is minted, so both the zero path and the
+    /// real return write the same register.
+    fn guard_exit_label(&mut self) -> &'static str {
+        if !self.sig.is_reduction {
+            return "L_done";
+        }
+        if self.reduction_acc.is_none() {
+            let kind = match self.sig.return_kind {
+                ParamKind::I32 => RegKind::S32,
+                ParamKind::I64 => RegKind::S64,
+                ParamKind::F32 => RegKind::F32,
+                ParamKind::F64 => RegKind::F64,
+                // The analyzer only flags a scalar-returning method as a
+                // reduction; anything else here is a contract violation,
+                // and `scalar_return` will refuse the kind loudly.
+                _ => return "L_done",
+            };
+            self.reduction_acc = Some(self.regs.fresh_reg(kind));
+        }
+        "L_reduce_zero"
+    }
+
+    /// Append the reduction epilogue (when there is one), the bounds-check
+    /// failure block and the kernel epilogue label. The kernel always
+    /// ends with an unconditional `ret;`.
+    ///
+    /// # The reduction epilogue
+    ///
+    /// AUDIT 2026-09-02. Until this date a reduction kernel issued one
+    /// `red.global.add` PER THREAD into the single accumulator: a dot
+    /// product over 2^24 elements was 16.7M atomics to one cache line,
+    /// which is the atomic unit's worst case and the one thing that made
+    /// the emitted kernel unlike anything hand-written. Now each warp
+    /// folds its 32 contributions with five `shfl.sync.down` steps and
+    /// lane 0 issues the one atomic — 32x fewer.
+    ///
+    /// Exact for `int`/`long`: two's-complement addition is associative,
+    /// so reordering the sum changes nothing. Float reductions were
+    /// already excluded from the transparent path for reordering the sum
+    /// (`offload::try_dispatch`); they keep that exclusion.
+    ///
+    /// # Why the mask is all lanes, and what an exited lane means
+    ///
+    /// The dispatch guard sends a thread with no iteration to
+    /// `L_reduce_zero` rather than to `ret` (see
+    /// [`Emitter::guard_exit_label`]), so every lane that could reach the
+    /// tree does, carrying a real value or a zero. The only lanes that
+    /// EXIT before the tree are bounds-failure deopts — and a kernel that
+    /// took one has its whole result discarded by the host, so the
+    /// undefined bits a `shfl.sync` reads from an exited lane cannot reach
+    /// a Java program. On sm_70+ an exited lane named in the mask does
+    /// not stall the shuffle; it simply supplies unspecified data.
+    ///
+    /// The atomic is skipped for a warp whose folded value is zero
+    /// (`setp.ne`): a warp past the end of the iteration space, or a
+    /// float warp that summed to `+0.0`. Adding zero to a pre-zeroed cell
+    /// is a no-op in every case except `-0.0`, and `0.0 + -0.0` is `0.0`
+    /// in Java too, so the skip is invisible.
     pub fn finalize_epilogue(&mut self) {
+        if let Some(acc) = self.reduction_acc.clone() {
+            self.emit_reduction_epilogue(&acc);
+        }
         // Common "done" label — used by the loop guard and the return
         // paths. We just fall through to ret.
         writeln!(self.body, "L_done:").unwrap();
@@ -4559,68 +4638,174 @@ impl<'a> Emitter<'a> {
 
     fn scalar_return(&mut self, kind: RegKind, suffix: &str) -> Result<(), LoweringError> {
         let value = self.stack.pop()?;
-        let ret_ptr = self.regs.fresh_reg(RegKind::U64);
-        writeln!(self.body, "    ld.param.u64 {}, [ret_ptr];", ret_ptr.name).unwrap();
         if self.sig.is_reduction {
             // AUDIT 2026-05-24 (C31): dot-product / sum reduction shape.
             // The element-wise lowering substitutes `iload iv → tid` so
             // each CUDA thread carries one iteration's partial term in
             // `value`. A plain `st.global.<suffix>` would have every
             // thread race-overwrite the single `*ret_ptr` slot — silently
-            // wrong sums. Emit `red.global.add.<atomic_suffix>` so each
-            // thread's partial contribution accumulates correctly.
+            // wrong sums.
             //
-            // `red`, not `atom` (found 2026-07-11 on real hardware): PTX's
-            // `atom` REQUIRES a destination operand for the fetched old
-            // value — the two-operand `atom.global.add [p], v;` form is a
-            // ptxas error ("Arguments mismatch for instruction 'atom'"),
-            // which made every reduction kernel fail module load with
-            // CUDA_ERROR_INVALID_PTX and silently blacklist to CPU. The
-            // fire-and-forget form that discards the old value is the
-            // `red` (reduction) instruction, which is exactly what an
-            // accumulate-only epilogue wants.
-            //
-            // PTX atomic-add type suffixes are NOT identical to the
-            // load/store suffixes: integer atomics use unsigned widths
-            // (`red.add.u32` / `red.add.u64`) — they operate on the raw
-            // bit pattern, which matches Java two's-complement semantics
-            // for signed accumulation. Float atomics use `.f32`
-            // (sm_20+) / `.f64` (sm_60+).
-            //
-            // The host marshaller MUST pre-zero `*ret_ptr` before launch;
-            // `KernelSignature::is_reduction` documents this contract.
-            let atomic_suffix = match kind {
-                RegKind::S32 => ".u32",
-                RegKind::S64 => ".u64",
-                RegKind::F32 => ".f32",
-                RegKind::F64 => ".f64",
-                _ => {
-                    return Err(LoweringError::UnsupportedNode(format!(
-                        "reduction atomic-add for register kind {kind:?} (suffix `{suffix}`) is not supported",
-                    )));
-                }
+            // AUDIT 2026-09-02: the accumulate no longer happens here. The
+            // value is handed to the warp tree in `finalize_epilogue`
+            // through the shared accumulator register, and the guard's
+            // retired threads arrive at the same tree carrying zero. See
+            // `emit_reduction_epilogue` for the atomic and its contract.
+            if !matches!(
+                kind,
+                RegKind::S32 | RegKind::S64 | RegKind::F32 | RegKind::F64
+            ) {
+                return Err(LoweringError::UnsupportedNode(format!(
+                    "reduction accumulate for register kind {kind:?} (suffix `{suffix}`) is not supported",
+                )));
+            }
+            let Some(acc) = self.reduction_acc.clone() else {
+                return Err(LoweringError::Internal(
+                    "reduction return reached with no accumulator; the dispatch \
+                     guard mints it and every reduction has one"
+                        .into(),
+                ));
             };
-            writeln!(
-                self.body,
-                "    red.global.add{} [{}], {};",
-                atomic_suffix, ret_ptr.name, value.name
-            )
-            .unwrap();
-        } else {
-            // Non-reduction scalar return. For a single-thread / straight-line
-            // shape, every thread writes the same value to `*ret_ptr` so
-            // racing on the store is benign. Marshalling pre-allocates a
-            // one-element output buffer.
-            writeln!(
-                self.body,
-                "    st.global{} [{}], {};",
-                suffix, ret_ptr.name, value.name
-            )
-            .unwrap();
+            if acc.kind != value.kind {
+                return Err(LoweringError::Internal(format!(
+                    "reduction accumulator is {:?} but the returned value is {:?}",
+                    acc.kind, value.kind
+                )));
+            }
+            writeln!(self.body, "    mov{} {}, {};", suffix, acc.name, value.name).unwrap();
+            self.ret_value_reg = Some(value);
+            writeln!(self.body, "    bra L_reduce;").unwrap();
+            return Ok(());
         }
+        let ret_ptr = self.regs.fresh_reg(RegKind::U64);
+        writeln!(self.body, "    ld.param.u64 {}, [ret_ptr];", ret_ptr.name).unwrap();
+        // Non-reduction scalar return. For a single-thread / straight-line
+        // shape, every thread writes the same value to `*ret_ptr` so
+        // racing on the store is benign. Marshalling pre-allocates a
+        // one-element output buffer.
+        writeln!(
+            self.body,
+            "    st.global{} [{}], {};",
+            suffix, ret_ptr.name, value.name
+        )
+        .unwrap();
         self.ret_value_reg = Some(value);
         writeln!(self.body, "    bra L_done;").unwrap();
         Ok(())
+    }
+
+    /// The warp tree and the one atomic per warp. See
+    /// [`Emitter::finalize_epilogue`] for the argument.
+    ///
+    /// ```text
+    /// L_reduce_zero:
+    ///     mov acc, 0
+    /// L_reduce:
+    ///     for offset in 16, 8, 4, 2, 1:
+    ///         other = shfl.sync.down(acc, offset)   (two b32 halves for 64-bit)
+    ///         acc = acc + other
+    ///     if laneid == 0 && acc != 0:
+    ///         red.global.add [ret_ptr], acc
+    /// ```
+    ///
+    /// `shfl.sync` moves 32 bits; a 64-bit accumulator is split with
+    /// `mov.b64 {lo, hi}` and rejoined. Floats travel as their bit
+    /// patterns and are added as floats with an explicit `.rn`, which is
+    /// the same rounding every other float add in this emitter carries.
+    ///
+    /// `red`, not `atom` (found 2026-07-11 on real hardware): PTX's `atom`
+    /// requires a destination for the fetched old value, and the
+    /// two-operand form is a `ptxas` error that made every reduction
+    /// kernel fail to load. Integer atomics take the unsigned width
+    /// suffix; the bit pattern is identical and wrapping add is what
+    /// Java does. The host marshaller MUST pre-zero `*ret_ptr` before
+    /// launch — `KernelSignature::is_reduction` documents the contract.
+    fn emit_reduction_epilogue(&mut self, acc: &Reg) {
+        let (add, zero, atomic_suffix, wide) = match acc.kind {
+            RegKind::S32 => ("add.s32", "0", ".u32", false),
+            RegKind::S64 => ("add.s64", "0", ".u64", true),
+            RegKind::F32 => ("add.rn.f32", "0f00000000", ".f32", false),
+            RegKind::F64 => ("add.rn.f64", "0d0000000000000000", ".f64", true),
+            // `guard_exit_label` only mints one of the four kinds above.
+            _ => unreachable!("reduction accumulator of kind {:?}", acc.kind),
+        };
+        let mov_suffix = match acc.kind {
+            RegKind::S32 => ".s32",
+            RegKind::S64 => ".s64",
+            RegKind::F32 => ".f32",
+            _ => ".f64",
+        };
+        writeln!(self.body, "L_reduce_zero:").unwrap();
+        writeln!(self.body, "    mov{mov_suffix} {}, {zero};", acc.name).unwrap();
+        writeln!(self.body, "L_reduce:").unwrap();
+        for offset in [16u32, 8, 4, 2, 1] {
+            let other = self.regs.fresh_reg_with_wide(acc.kind, acc.wide);
+            if wide {
+                let lo = self.regs.fresh_reg(RegKind::U32);
+                let hi = self.regs.fresh_reg(RegKind::U32);
+                let lo2 = self.regs.fresh_reg(RegKind::U32);
+                let hi2 = self.regs.fresh_reg(RegKind::U32);
+                writeln!(self.body, "    mov.b64 {{{}, {}}}, {};", lo.name, hi.name, acc.name)
+                    .unwrap();
+                writeln!(
+                    self.body,
+                    "    shfl.sync.down.b32 {}, {}, {offset}, 0x1f, 0xffffffff;",
+                    lo2.name, lo.name
+                )
+                .unwrap();
+                writeln!(
+                    self.body,
+                    "    shfl.sync.down.b32 {}, {}, {offset}, 0x1f, 0xffffffff;",
+                    hi2.name, hi.name
+                )
+                .unwrap();
+                writeln!(self.body, "    mov.b64 {}, {{{}, {}}};", other.name, lo2.name, hi2.name)
+                    .unwrap();
+            } else {
+                let bits = self.regs.fresh_reg(RegKind::U32);
+                let bits2 = self.regs.fresh_reg(RegKind::U32);
+                writeln!(self.body, "    mov.b32 {}, {};", bits.name, acc.name).unwrap();
+                writeln!(
+                    self.body,
+                    "    shfl.sync.down.b32 {}, {}, {offset}, 0x1f, 0xffffffff;",
+                    bits2.name, bits.name
+                )
+                .unwrap();
+                writeln!(self.body, "    mov.b32 {}, {};", other.name, bits2.name).unwrap();
+            }
+            writeln!(
+                self.body,
+                "    {add} {}, {}, {};",
+                acc.name, acc.name, other.name
+            )
+            .unwrap();
+        }
+        let lane = self.regs.fresh_reg(RegKind::U32);
+        let is_lane0 = self.regs.fresh_reg(RegKind::Pred);
+        let nonzero = self.regs.fresh_reg(RegKind::Pred);
+        let do_add = self.regs.fresh_reg(RegKind::Pred);
+        let ret_ptr = self.regs.fresh_reg(RegKind::U64);
+        writeln!(self.body, "    mov.u32 {}, %laneid;", lane.name).unwrap();
+        writeln!(self.body, "    setp.eq.u32 {}, {}, 0;", is_lane0.name, lane.name).unwrap();
+        writeln!(
+            self.body,
+            "    setp.ne{mov_suffix} {}, {}, {zero};",
+            nonzero.name, acc.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    and.pred {}, {}, {};",
+            do_add.name, is_lane0.name, nonzero.name
+        )
+        .unwrap();
+        writeln!(self.body, "    ld.param.u64 {}, [ret_ptr];", ret_ptr.name).unwrap();
+        writeln!(
+            self.body,
+            "    @{} red.global.add{atomic_suffix} [{}], {};",
+            do_add.name, ret_ptr.name, acc.name
+        )
+        .unwrap();
     }
 }
 
