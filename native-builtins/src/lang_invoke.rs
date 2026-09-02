@@ -5351,7 +5351,134 @@ fn varhandle_get_and_set_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// through [`vh_box_access_result`], which the erased `Object` call site
 /// requires; `unbox_poly_return` then unwraps it for a primitive call site such
 /// as H2's `([III)I`.
+/// Which family of access mode is being attempted, for
+/// [`vh_check_access_mode_supported`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VhModeFamily {
+    /// `getAndAdd`, `getAndAddAcquire`, `getAndAddRelease`.
+    Arithmetic,
+    /// `getAndBitwise{Or,And,Xor}` and their ordering variants.
+    Bitwise,
+}
+
+/// `UnsupportedOperationException` for an access mode the VARIABLE'S TYPE does
+/// not admit.
+///
+/// # The rule, measured rather than assumed
+///
+/// It is not uniform, which is why `RJdkVarHandleModeSupport` sweeps every mode
+/// against every variable type instead of picking a few. On JDK 25:
+///
+/// ```text
+///   variable      getAndAdd*   getAndBitwise*
+///   boolean       UNSUPPORTED  ok
+///   byte char short int long   ok           ok
+///   float double  ok           UNSUPPORTED
+///   any reference UNSUPPORTED  UNSUPPORTED
+/// ```
+///
+/// So arithmetic is the NUMERIC primitives and bitwise is the INTEGRAL ones
+/// plus `boolean` — the two sets differ at both ends, and `boolean` versus
+/// `float` is the pair that catches a guess. The `Acquire`/`Release` variants
+/// follow their base mode exactly (checked for all four of `boolean`, `int`,
+/// `float` and a reference).
+///
+/// # Why it runs BEFORE the null-coordinate check
+///
+/// Because HotSpot's does. Swept across all ten types: where the mode is
+/// unsupported, a null receiver still yields `UnsupportedOperationException`;
+/// where it is supported, the null receiver yields `NullPointerException`. The
+/// two rules never disagree about which wins, so the order here is the whole
+/// of the interaction and `vh_check_leading_coordinate` is called after this.
+///
+/// # What CratonVM did before
+///
+/// Answered. 57 of the sweep's 166 rows raise `UnsupportedOperationException`
+/// on HotSpot, and CratonVM returned a value for every one — `null` 28 times,
+/// a `float` 20 times (a bitwise op on a `float` variable), `false`/`true` 5
+/// times, and two silent write successes.
+///
+/// # Cost
+///
+/// One `Arc` deref and one byte compare on the ordinary path: the meta is
+/// already in the per-thread memo every access mode consults, and the
+/// descriptor's FIRST byte is the whole test. No allocation, and no work at
+/// all for the read/write/CAS families, which do not call this.
+fn vh_check_access_mode_supported(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    family: VhModeFamily,
+) -> Result<(), MethodCallFailed> {
+    let Some(this) = args.first().and_then(|v| match v {
+        Value::Object(Some(o)) => Some(*o),
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+    // A `SegmentVarHandle` is a real JDK class with its own form; its mode
+    // support was not swept, so it keeps today's behaviour.
+    if is_segment_var_handle(ctx, this) {
+        return Ok(());
+    }
+    // The VARIABLE's descriptor, cheapest source first. An array-element
+    // handle minted by the real JDK has no side-table entry, and there the
+    // ELEMENT type is what the rule is about — `real_array_var_handle_descriptors`
+    // is the same accessor `vh_value_and_coordinate_descriptors` reaches for.
+    let meta = vh_meta_get(ctx, this);
+    let first = match meta.as_deref() {
+        Some(m) => m.field_desc.as_bytes().first().copied(),
+        None => match real_array_var_handle_descriptors(ctx, this) {
+            Some((value_desc, _)) => value_desc.as_bytes().first().copied(),
+            None => vh_field_desc(ctx, this).as_bytes().first().copied(),
+        },
+    };
+    // An undeterminable descriptor keeps today's behaviour rather than
+    // inheriting a refusal nothing measured.
+    let Some(first) = first else {
+        return Ok(());
+    };
+    let supported = match family {
+        VhModeFamily::Arithmetic => {
+            matches!(first, b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D')
+        }
+        VhModeFamily::Bitwise => {
+            matches!(first, b'Z' | b'B' | b'C' | b'S' | b'I' | b'J')
+        }
+    };
+    if supported {
+        return Ok(());
+    }
+    let what = match family {
+        VhModeFamily::Arithmetic => "getAndAdd",
+        VhModeFamily::Bitwise => "getAndBitwise",
+    };
+    Err(RuntimeError::UnsupportedOperationException {
+        message: format!(
+            "{what} is not supported for a VarHandle over a variable of type {}",
+            descriptor_to_java_name(first)
+        ),
+    }
+    .into())
+}
+
+/// The Java type name for a descriptor's leading byte, for the message above.
+fn descriptor_to_java_name(first: u8) -> &'static str {
+    match first {
+        b'Z' => "boolean",
+        b'B' => "byte",
+        b'C' => "char",
+        b'S' => "short",
+        b'I' => "int",
+        b'J' => "long",
+        b'F' => "float",
+        b'D' => "double",
+        b'[' => "an array",
+        _ => "a reference",
+    }
+}
+
 fn varhandle_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    vh_check_access_mode_supported(ctx, args, VhModeFamily::Arithmetic)?;
     vh_check_leading_coordinate(ctx, args)?;
     let raw = varhandle_get_and_add_raw(ctx, args);
     vh_box_access_result(ctx, args, raw)
@@ -5533,6 +5660,7 @@ fn varhandle_get_and_bitwise(
     args: &[Value],
     op: VhBitOp,
 ) -> MethodCallResult {
+    vh_check_access_mode_supported(ctx, args, VhModeFamily::Bitwise)?;
     vh_check_leading_coordinate(ctx, args)?;
     let raw = varhandle_get_and_bitwise_raw(ctx, args, op);
     vh_box_access_result(ctx, args, raw)
