@@ -4945,12 +4945,12 @@ impl ZgcRealHeap {
         // the loop's spans miss every survivor is an argument about the
         // partition, not a check on the answer. Cheap beside the slide, and it
         // can only DROP spans — i.e. reclaim less.
-        let moved_to: FxHashMap<usize, usize> = pairs[first_pair..].iter().copied().collect();
+        let moved_to = relocate::ZForwardIndex::from_pairs(&pairs[first_pair..]);
         let mut survivor_now: Vec<usize> = live
             .iter()
             .copied()
             .filter(|b| *b >= high_lo && *b < high_hi)
-            .map(|b| moved_to.get(&b).copied().unwrap_or(b) - base)
+            .map(|b| moved_to.resolve(b) - base)
             .collect();
         survivor_now.sort_unstable();
         let spans_before = vacated.len();
@@ -5240,7 +5240,6 @@ impl ZgcRealHeap {
         // exists to be, and the two would drift on exactly the question that
         // matters: whether an identity entry is recorded for an object that
         // did not move. It is not; only real moves are recorded.
-        let record = relocate::ZRelocationRecord::new(true, live.len());
         let mut pairs: Vec<(usize, usize)> = Vec::new();
         let mut moved = 0usize;
         let mut reclaimed = 0usize;
@@ -5689,14 +5688,14 @@ impl ZgcRealHeap {
                 // RAISE the cursor -- i.e. reclaim less. Losing a cycle's reclaim
                 // is a cost; handing out occupied memory is heap corruption whose
                 // symptom surfaces cycles later in an unrelated subsystem.
-                let moved_to: FxHashMap<usize, usize> = pairs.iter().copied().collect();
+                let moved_to = relocate::ZForwardIndex::from_pairs(&pairs);
                 let mut stranded = 0usize;
                 let mut live_ceiling = base;
                 for &b in live {
                     if b < base || b >= low_end {
                         continue;
                     }
-                    let now = moved_to.get(&b).copied().unwrap_or(b);
+                    let now = moved_to.resolve(b);
                     // An unsizable header cannot be bounded, so it cannot be
                     // proven dead either. Refuse to reclaim past `low_end` rather
                     // than guess -- the same answer `highest_pinned_end` gives an
@@ -5778,7 +5777,7 @@ impl ZgcRealHeap {
                         .copied()
                         .filter(|b| *b >= base && *b < low_end)
                         .map(|b| {
-                            let now = moved_to.get(&b).copied().unwrap_or(b);
+                            let now = moved_to.resolve(b);
                             let end = match Self::alloc_size(self.header_ref(now as *mut u8)) {
                                 Some(sz) => now.saturating_add(sz).min(low_end),
                                 // Unsizable: bound it at the cursor rather than
@@ -5845,7 +5844,6 @@ impl ZgcRealHeap {
             // One batched publish after the slide, not one per object: the
             // record is read by the rewrite pass below, which must see the
             // WHOLE map or it resolves half the graph against a half-built one.
-            record.record_many(&pairs);
             // CRATONVM_DBG_ZGC_CORPSE -- remember what was at each vacated
             // address before the memset erases it. Read AFTER the move (the
             // header now lives at `to`) and before `compact_low_to` has
@@ -5880,11 +5878,15 @@ impl ZgcRealHeap {
         // AFTER the whole slide, not during it: a slot in an already-moved
         // object may point at an object that has not moved yet, so rewriting
         // as we go resolves half the graph against a half-built map.
-        let live_now: Vec<usize> = live.iter().map(|b| record.get(*b).unwrap_or(*b)).collect();
+        // ONE table for the three readers that used to have three: this, the
+        // rewrite loop below, and the walkability/verify pair. Built once, sorted,
+        // answered by a range check and a binary search -- see `ZForwardIndex`.
+        let fwd = relocate::ZForwardIndex::from_pairs(&pairs);
+        let live_now: Vec<usize> = live.iter().map(|b| fwd.resolve(*b)).collect();
         // Everything the rewrite is about to walk must still LOOK like the
         // object the slide thought it was moving.
         //
-        // `live_now` is `record.get(b).unwrap_or(b)` — it keeps the ORIGINAL
+        // `live_now` is `fwd.resolve(b)` — it keeps the ORIGINAL
         // address for any live object the relocation record does not list.
         // That is correct only while an unlisted object is one that genuinely
         // did not move AND whose memory nothing wrote over. If either half
@@ -5896,17 +5898,16 @@ impl ZgcRealHeap {
         // SIGSEGV INSIDE THE COLLECTOR — whose stack names only the collector,
         // so the crash site is worthless as evidence — into a list of
         // offenders with the one fact that discriminates: whether this base is
-        // an address the slide just vacated. `moved_from.contains(base)` says
+        // an address the slide just vacated. `fwd.contains_from(base)` says
         // the object was overwritten; `!contains` says the header was already
         // wrong before the slide, which is a different bug entirely.
         //
         // Unconditional, not behind a debug flag: the cost is one registry
         // probe and one `alloc_size` per survivor, against a walk of every one
         // of its slots, and the failure it prevents is memory corruption.
-        let moved_from: FxHashSet<usize> = pairs.iter().map(|(from, _)| *from).collect();
         let mut unwalkable = 0usize;
         for obj in &live_now {
-            if !self.rewrite_target_is_walkable(*obj, arena_lo, arena_hi, &moved_from) {
+            if !self.rewrite_target_is_walkable(*obj, arena_lo, arena_hi, &fwd) {
                 unwalkable += 1;
                 continue;
             }
@@ -5918,7 +5919,7 @@ impl ZgcRealHeap {
                     if raw == 0 {
                         return;
                     }
-                    if let Some(to) = record.get(raw) {
+                    if let Some(to) = fwd.get(raw) {
                         rewrites.push((slot.slot_addr, to as u64));
                     }
                 });
@@ -6073,10 +6074,12 @@ impl ZgcRealHeap {
                 sizes.insert(b, sz);
             }
         }
-        self.verify_no_dangling_slots_after_slide(&live_now, arena_lo, arena_hi, &moved_from);
+        self.verify_no_dangling_slots_after_slide(&live_now, arena_lo, arena_hi, &fwd);
 
-        let pointer_map: cratonvm_types::PointerMap =
-            record.into_pointer_map().into_iter().collect();
+        // The map is the cycle OUTPUT (monitors, the reference processor, the
+        // VM.s root write-back). Built from the pairs directly rather than
+        // cloned out of a second table nothing else reads any more.
+        let pointer_map: cratonvm_types::PointerMap = pairs.iter().copied().collect();
         (moved, reclaimed, pointer_map)
     }
 
@@ -6411,7 +6414,7 @@ impl ZgcRealHeap {
     /// `was_vacated` discriminates the causes: if THIS slide vacated the exact
     /// address, the object was overwritten by this cycle's bookkeeping.
     ///
-    /// **Read `was_vacated=false` narrowly.** `moved_from` covers one cycle, so
+    /// **Read `was_vacated=false` narrowly.** the index covers one cycle, so
     /// an address vacated nine collections ago also reports `false`. On the
     /// netty repro every offender reported `false` while its "header" decoded
     /// as ASCII — `class_id=0x41524150` is `"PARA"`, `num_slots=0x444f494e` is
@@ -6426,7 +6429,7 @@ impl ZgcRealHeap {
         base: usize,
         arena_lo: usize,
         arena_hi: usize,
-        moved_from: &FxHashSet<usize>,
+        fwd: &relocate::ZForwardIndex,
     ) -> bool {
         // Off-arena survivors are the high-address (large-object) end, which
         // this slide never touches, so there is nothing to check against.
@@ -6458,7 +6461,7 @@ impl ZgcRealHeap {
                 class_id = header.class_id.as_u32(),
                 num_slots = header.num_slots(),
                 array_length = header.array_length(),
-                was_vacated = moved_from.contains(&base),
+                was_vacated = fwd.contains_from(base),
                 arena_hi,
                 "zgc relocate: rewrite target is not walkable -- skipping it rather \
                  than striding a length this header cannot justify"
@@ -6495,7 +6498,7 @@ impl ZgcRealHeap {
         live_now: &[usize],
         arena_lo: usize,
         arena_hi: usize,
-        moved_from: &FxHashSet<usize>,
+        fwd: &relocate::ZForwardIndex,
     ) {
         if !zgc_verify_slide_enabled() {
             return;
@@ -6550,7 +6553,7 @@ impl ZgcRealHeap {
                 //    a reference (the W7-84 family, which this VM already warns
                 //    about separately) that happens to land inside the arena's
                 //    address range. Not the slide's doing, and not fixable here.
-                let missed_rewrite = moved_from.contains(&raw);
+                let missed_rewrite = fwd.contains_from(raw);
                 let aliases_survivor = !missed_rewrite && lands_inside_a_survivor(raw);
                 if missed_rewrite {
                     missed += 1;
