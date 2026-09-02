@@ -1788,6 +1788,12 @@ impl<'a> Lowerer<'a> {
             // be written back through.
             moving_young_coverage_complete: complete,
             live_frame_hi: live_hi,
+            // The IR tier allocates frame slots; it does not home local `k` at
+            // `[rbp - 8*(k+1)]`, so the locals-band oracle does not apply to
+            // these frames and must not answer as if it did.
+            local_oop_mask: None,
+            num_locals: 0,
+            inline_local_scopes: Vec::new(),
         });
     }
 

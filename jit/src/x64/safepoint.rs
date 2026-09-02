@@ -1663,9 +1663,18 @@ impl Compiler {
         // parked mutator remaps itself through, the map is what
         // `remap_active_jit_frames` rewrites, and a moving cycle needs BOTH.
         // A scope that cannot classify its locals fails the safepoint closed.
+        let mut inline_local_scopes: Vec<(i32, u16, u64)> = Vec::new();
         for scope in &self.inline_oop_scopes {
             match scope.mask_at_cur() {
                 Some(mask) => {
+                    // The same record the java-locals oracle keeps, for a band
+                    // it cannot address. Diagnostic only; see
+                    // `OopMapEntry::inline_local_scopes`.
+                    inline_local_scopes.push((
+                        scope.local_base,
+                        u16::try_from(scope.num_locals).unwrap_or(u16::MAX),
+                        mask,
+                    ));
                     for k in 0..scope.num_locals.min(64) {
                         if mask & (1u64 << k) == 0 {
                             continue;
@@ -1769,6 +1778,19 @@ impl Compiler {
                     map_incomplete,
                 ),
                 live_frame_hi,
+                // The oracle a stale-word report needs to say "live". Taken
+                // through the shared accessor so the method-entry poll records
+                // its parameter mask rather than a `None` (see
+                // `local_oop_mask_at_current_pc`), and left `None` when the
+                // masks are unavailable at all (`max_locals > 64`), which is
+                // the same "no claim" the dataflow itself makes there.
+                local_oop_mask: if self.local_oop_masks.is_empty() {
+                    None
+                } else {
+                    self.local_oop_mask_at_current_pc()
+                },
+                num_locals: u16::try_from(self.num_locals).unwrap_or(u16::MAX),
+                inline_local_scopes,
             });
             self.pending_shadow_coverage_complete = false;
         }

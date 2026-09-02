@@ -75,10 +75,28 @@ pub mod a2dbg;
 pub mod arena;
 // The ONE implementation of "a non-reference value was stored into a slot the
 // class declares as a reference" (W7-84-primitive-in-reference-store.md).
-// Crate-private on purpose: it exists so `gen_heap`, `zgc`, `g1` and `heap`
-// cannot drift apart again, and a public re-export would invite a fifth
-// caller with a fifth opinion.
-mod autobox;
+//
+// The STORE and READ primitives -- `box_for_reference_slot`,
+// `unbox_reference_slot`, `needs_reference_box` -- are still `pub(crate)`, and
+// for exactly the original reason: the module exists so `gen_heap`, `zgc`,
+// `g1` and `heap` cannot drift apart again, and exporting the boxing primitive
+// would invite a fifth caller with a fifth opinion. Nothing outside this crate
+// can reach them, and `gc/tests/primitive_in_reference_slot.rs`'s ratchet still
+// pins that exactly four files call them.
+//
+// The MODULE became `pub` on 2026-09-01 for three items that are not stores at
+// all -- `expect_primitive_into_reference`, `ExpectedPrimitiveIntoReference`
+// and `expected_primitive_into_reference_count`. They exist so ONE known
+// producer, `vm/src/vm/vm_object.rs`'s class-mirror populator, can declare its
+// two deliberate `ClassId`-over-`java.lang.Class.cachedConstructor` writes
+// EXPECTED, instead of the W7-84 guard spending its entire default-run
+// rate-limit budget reporting the VM to itself (~33 stores, ~12 stderr WARN
+// lines, on a hello-world -- so a genuine third-party store arrived after the
+// limiter was already spent). A `pub use` re-export here would have worked
+// equally well; `pub mod` was chosen because the module doc is where a reader
+// has to end up anyway to learn what the scope means, and a re-export hides
+// that path.
+pub mod autobox;
 pub mod blocked_access_debug;
 pub mod card_table;
 pub mod class_unloading;

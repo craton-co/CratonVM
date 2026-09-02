@@ -337,6 +337,20 @@ impl Compiler {
     /// shared null-check stub (sets `JIT_PENDING_NPE`, deopts out) that
     /// array loads/stores already branch to.
     ///
+    /// **This check is the one that survives in a counted `for (int i = 0; i <
+    /// a.length; i++)` loop, and it costs a `TEST`/`JZ` per iteration.** The
+    /// bound's own `arraylength` sits AT the loop header, and the null-check
+    /// dataflow (`crate::null_check_elim`) meets over paths with a bitwise AND:
+    /// the back edge arrives having just dereferenced the array, the pre-header
+    /// does not, so the intersection at the header drops the fact and this
+    /// helper emits. The elision is not wrong — the first iteration genuinely
+    /// has no proof — but the second and every later one pays for it. Closing it
+    /// needs a loop-header-aware proof (peel, or a pre-header null check that
+    /// seeds the header's IN set), which lives in `null_check_elim`, not here.
+    /// Measured at ~2 of the ~21 instructions the `char[]` scan body emits per
+    /// element:
+    /// `docs/known-issues/perf/array-element-load-baseline-codegen-20260901.md`.
+    ///
     /// Unlike the load/store `_at` helpers, the dataflow elision keys on
     /// the directly-preceding `aload`/`aload_<n>` of the array receiver:
     /// for `arraylength` there is no index push between the `aload` and
@@ -369,11 +383,31 @@ impl Compiler {
 
     /// Emit an array bounds check. RAX=array ptr, RCX=index (as i64).
     ///
-    /// Loads array length from header offset 12, compares index (unsigned) against length.
-    /// If index >= length (unsigned comparison catches negatives too), jumps to an
-    /// out-of-line stub that calls `jit_throw_aioobe`.
+    /// Loads the array length from the object header, compares the index
+    /// (unsigned, so the compare catches negatives too) against it, and on
+    /// `index >= length` jumps to an out-of-line stub that calls
+    /// `jit_throw_aioobe`. The stub is emitted later by
+    /// `emit_bounds_check_stubs()` after the main code.
     ///
-    /// The stub is emitted later by `emit_bounds_check_stubs()` after the main code.
+    /// The displacement is the named constant, whose value is **4**. The
+    /// "header offset 12" this comment used to state has been wrong since the
+    /// header shrank to 16 bytes and `shape` moved up into `identity_hash_code`'s
+    /// place (2026-08-07); the emitted bytes always took the constant, so only
+    /// the prose was stale. Note that the constant's own comment in
+    /// `types/src/heap_types.rs` says "8, not 12" above a value of 4 — that one
+    /// is still wrong and is not this file's to fix.
+    ///
+    /// **R10D is a live OUTPUT of this sequence, not a scratch temporary.**
+    /// `emit_bounds_check_stubs` (`x64/deopt_stubs.rs`) reads R10D as
+    /// `jit_throw_aioobe`'s `length` argument — it is the number in "Index 5 out
+    /// of bounds for length 3". The obvious peephole here is to fold the load
+    /// into the compare (`CMP ECX, [RAX+len]`: one instruction and four bytes
+    /// fewer, and it macro-fuses with the `JAE`), and it is WRONG on its own —
+    /// it leaves the stub reporting whatever R10 last held. It is correct only
+    /// together with a length load added to the cold stub, which makes it a
+    /// two-file change and not a local peephole. Ruled out here for exactly
+    /// that reason; sized in
+    /// `docs/known-issues/perf/array-element-load-baseline-codegen-20260901.md`.
     pub(super) fn emit_bounds_check(&mut self, bc_pc: usize) {
         // Skip if loop analysis proved this access is safe.
         //

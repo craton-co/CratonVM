@@ -59,11 +59,12 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-508 tokens.
+511 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `a2` | `CRATONVM_DBG_A2` |
+| `aastore-barrier-gate-sites` | `CRATONVM_DBG_AASTORE_BARRIER_GATE` |
 | `a5-census` | `CRATONVM_DBG_A5_CENSUS` |
 | `ffm` | `CRATONVM_DBG_FFM` |
 | `sweep-liveness` | `CRATONVM_DBG_SWEEP_LIVENESS` |
@@ -220,6 +221,7 @@ export inherited from a parent shell.
 | `gcphase` | `CRATONVM_DBG_GCPHASE` |
 | `gcwrite` | `CRATONVM_DBG_GCWRITE` |
 | `getfield-receivers` | `CRATONVM_DBG_GETFIELD_RECEIVERS` |
+| `jit-ref-loads` | `CRATONVM_DBG_JIT_REF_LOADS` |
 | `getresources` | `CRATONVM_DBG_GETRESOURCES` |
 | `getstatic-prof` | `CRATONVM_DBG_GETSTATIC_PROF` |
 | `stack-kinds` | `CRATONVM_DBG_STACK_KINDS` |
@@ -569,12 +571,17 @@ export inherited from a parent shell.
 | `youngscan` | `CRATONVM_DBG_YOUNGSCAN` |
 | `youngstate` | `CRATONVM_DBG_YOUNGSTATE` |
 | `zero-ranges` | `CRATONVM_DBG_ZERO_RANGES` |
+| `ir-string` | `CRATONVM_DBG_IR_STRING` |
 | `invoke-phases` | `CRATONVM_DBG_INVOKE_PHASES` |
 | `g1-dbg-rset` | `CRATONVM_G1_DBG_RSET` |
 
 ## `CRATONVM_JIT`
 
+<<<<<<< HEAD
 257 tokens.
+=======
+265 tokens.
+>>>>>>> origin/dev
 
 | Token | Expands to |
 | --- | --- |
@@ -621,6 +628,7 @@ export inherited from a parent shell.
 | `dispatch-cache-direct-entry` | `CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY` |
 | `dispatch-cache-virtual-direct-entry` | `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY` |
 | `string-intrinsic-pin` | `CRATONVM_JIT_NO_STRING_INTRINSIC_PIN` |
+| `string-pin-fail-closed` | `CRATONVM_JIT_NO_STRING_PIN_FAIL_CLOSED` |
 | `dup-x1` | `CRATONVM_JIT_NO_DUP_X1` |
 | `dup-x2` | `CRATONVM_JIT_NO_DUP_X2` |
 | `dup2-x2` | `CRATONVM_JIT_NO_DUP2_X2` |
@@ -655,6 +663,7 @@ export inherited from a parent shell.
 | `ir-call-special` | `CRATONVM_JIT_IR_CALL_SPECIAL` |
 | `ir-call-virtual` | `CRATONVM_JIT_IR_CALL_VIRTUAL` |
 | `ir-over-intrinsic` | `CRATONVM_JIT_IR_OVER_INTRINSIC` |
+| `ir-string-intrinsics` | `CRATONVM_JIT_IR_STRING_INTRINSICS` |
 | `ir-deopt-resume` | `CRATONVM_IR_DEOPT_RESUME` |
 | `ir-direct-call` | `CRATONVM_JIT_IR_DIRECT_CALL` |
 | `ir-buffer-estimate` | `CRATONVM_JIT_IR_LEGACY_BUFFER_ESTIMATE` |
@@ -675,6 +684,14 @@ export inherited from a parent shell.
 | `nested-trace-frames` | `CRATONVM_JIT_NO_NESTED_TRACE_FRAMES` |
 | `npe-frame-snapshot` | `CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT` |
 | `osr-frame-dedupe` | `CRATONVM_JIT_NO_OSR_FRAME_DEDUPE` |
+| `osr-pc-refresh` | `CRATONVM_JIT_NO_OSR_PC_REFRESH` |
+| `compiled-frame-lines` | `CRATONVM_JIT_NO_COMPILED_FRAME_LINES` |
+| `inline-frame-map` | `CRATONVM_JIT_NO_INLINE_FRAME_MAP` |
+| `inline-miss-edge-poison` | `CRATONVM_JIT_NO_INLINE_MISS_EDGE_POISON` |
+| `ir-string-access-admit` | `CRATONVM_JIT_NO_IR_STRING_ACCESS_ADMIT` |
+| `inline-call-map-at-return` | `CRATONVM_JIT_NO_INLINE_CALL_MAP_AT_RETURN` |
+| `aastore-barrier-gate` | `CRATONVM_JIT_NO_AASTORE_BARRIER_GATE` |
+| `call-frame-dedupe` | `CRATONVM_JIT_NO_CALL_FRAME_DEDUPE` |
 | `strict-install-epoch` | `CRATONVM_JIT_STRICT_INSTALL_EPOCH` |
 | `kernel-reg-locals` | `CRATONVM_JIT_KERNEL_REG_LOCALS` |
 | `kernel-reg-osr` | `CRATONVM_JIT_KERNEL_REG_OSR` |
@@ -838,7 +855,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-85 tokens.
+86 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -911,6 +928,7 @@ export inherited from a parent shell.
 | `xt-jit-coverage-handshake` | `CRATONVM_XT_JIT_COVERAGE_HANDSHAKE` |
 | `osr-coverage-shadow` | `CRATONVM_OSR_COVERAGE_SHADOW` |
 | `zgc-jit-read-bounds` | `CRATONVM_ZGC_NO_JIT_READ_BOUNDS` |
+| `zgc-jit-load-barrier` | `CRATONVM_ZGC_NO_JIT_LOAD_BARRIER` |
 | `zgc-conc-start` | `CRATONVM_ZGC_CONC_START` |
 | `zgc-conc-workers` | `CRATONVM_ZGC_CONC_WORKERS` |
 | `zgc-generational` | `CRATONVM_ZGC_GENERATIONAL` |

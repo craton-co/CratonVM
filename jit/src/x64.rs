@@ -220,6 +220,28 @@ mod inlining;
 /// Engagement count for the splice cursor clamp, for `jit-method-stats`.
 /// A number beside a result is what says whether the guard ran at all.
 pub(crate) use inlining::inline_live_slot_clamps;
+/// The PC -> inline-chain map, and the per-compile session that records it.
+///
+/// NAMED rather than glob re-exported, unlike the ~15 `pub use foo::*;`
+/// siblings above. A glob would be capped at each item's own declared
+/// visibility and so would be sound, but `inlining` is not a lowering module
+/// with one entry point: it is the splice emitter, and most of what is `pub`
+/// in it is a hook the walk calls. These five items ARE its interface to the
+/// rest of the tree -- `jit/src/lib.rs` names `InlineFrameMap` for the
+/// `CompiledMethod` field, `x64/driver.rs` opens and closes the session
+/// around codegen, and `vm/src/jit/conservative_roots.rs` reads
+/// `InlineFrameLevel` out of the finished map to expand a compiled frame into
+/// the inlined callees it is standing inside.
+///
+/// Without this line none of them can name the types at all: the module was
+/// private and unexported, which is why the whole producer shipped inert and
+/// every item in it still carries `#[allow(dead_code)]`. `InlineFrameRow` is
+/// deliberately NOT exported -- it is the emission-order form, consumed by
+/// `finish_inline_frame_recording` and meaningless outside it.
+pub use inlining::{
+    begin_inline_frame_recording, finish_inline_frame_recording, inline_frame_map_enabled,
+    InlineFrameLevel, InlineFrameMap,
+};
 mod arith;
 mod arrays;
 mod deopt_stubs;
