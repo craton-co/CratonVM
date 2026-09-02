@@ -1163,6 +1163,18 @@ impl ValueStack {
         self.slots[self.len - 1]
     }
 
+    /// Peek the raw slot `depth` below the top (`0` is the top) without
+    /// decoding. Used by the quickened `putfield` arm to read the receiver
+    /// under the value before committing either pop.
+    ///
+    /// # Panics
+    /// Panics if fewer than `depth + 1` slots are live.
+    #[inline(always)]
+    pub fn peek_compact_at(&self, depth: usize) -> CompactValue {
+        debug_assert!(self.len > depth, "stack underflow in peek_compact_at");
+        self.slots[self.len - 1 - depth]
+    }
+
     /// B12: checked sibling of [`Self::peek_compact`]. Returns
     /// `Err(IllegalStateException)` on empty stack.
     #[inline(always)]

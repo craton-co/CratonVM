@@ -3379,6 +3379,7 @@ pub(super) fn op_putfield(
     // for the tag-exact value pop below. The loader-aware resolver is
     // stack-neutral, and surfacing a resolution error here (before the
     // value/objectref pop) is spec-compliant for putfield.
+    let ff_epochs = super::field_fast::fill_epochs();
     let mut field = resolve_field_ref_loader_aware(shared, thread, current_class_id, *index)?;
     // K2 (T10.9.E) — tag-exact pop for category-2 primitives.
     //
@@ -3737,7 +3738,7 @@ pub(super) fn op_putfield(
         }
     } // end `if any_field_diag()` — consolidated putfield diagnostics
       // T17.Δ.4 — JVMTI FieldModification watchpoint, scoped to this VM.
-    {
+    if crate::runtime::jvmti::any_field_watchpoint_active() {
         let method_id = synth_method_id(&thread.frames[frame_idx]);
         crate::runtime::jvmti::fire_field_modification_if_watched_for_vm(
             shared.vm_identity,
@@ -3874,6 +3875,16 @@ pub(super) fn op_putfield(
             }
         }
     }
+    super::field_fast::fill_site(
+        shared,
+        thread,
+        current_class_id,
+        *index,
+        obj_ref,
+        &field,
+        ff_epochs,
+        true,
+    );
     // write_barrier fires automatically inside set_field / set_field_volatile.
     // TODO(orchestrator): migrate the remaining `heap.satb_barrier(...)`
     // call sites (interpreter aastore lines ~4093/5164/5961, JIT
@@ -4000,6 +4011,7 @@ pub(super) fn op_getfield(
     // and getfield-loaded-value barriers elsewhere in this file, just
     // never applied to the getfield/putfield RECEIVER itself.
     let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
+    let ff_epochs = super::field_fast::fill_epochs();
     let mut field = resolve_field_ref_loader_aware(shared, thread, current_class_id, *index)?;
     if let Some(retargeted) = retarget_instance_field_to_receiver(
         shared,
@@ -4251,7 +4263,7 @@ pub(super) fn op_getfield(
     // Fast path: no watchpoint registered ⇒ one atomic load; when the
     // process-wide union says some VM is watching, one HashMap read
     // against *this* VM's row returning None.
-    {
+    if crate::runtime::jvmti::any_field_watchpoint_active() {
         let method_id = synth_method_id(&thread.frames[frame_idx]);
         crate::runtime::jvmti::fire_field_access_if_watched_for_vm(
             shared.vm_identity,
@@ -4395,6 +4407,16 @@ pub(super) fn op_getfield(
 
         thread.frames[frame_idx].stack.push(value)?;
     }
+    super::field_fast::fill_site(
+        shared,
+        thread,
+        current_class_id,
+        *index,
+        obj_ref,
+        &field,
+        ff_epochs,
+        false,
+    );
     Ok(())
 }
 
@@ -4428,7 +4450,7 @@ pub(super) fn op_putstatic(
         }
     };
     // T17.Δ.4 — JVMTI FieldModification watchpoint, scoped to this VM.
-    {
+    if crate::runtime::jvmti::any_field_watchpoint_active() {
         let method_id = synth_method_id(&thread.frames[frame_idx]);
         crate::runtime::jvmti::fire_field_modification_if_watched_for_vm(
             shared.vm_identity,
@@ -4496,7 +4518,7 @@ pub(super) fn op_getstatic(
     // gate inside the callee stays as the cheap pre-filter — it may
     // say "yes" because another VM is watching, and the per-VM lookup
     // then answers exactly.
-    {
+    if crate::runtime::jvmti::any_field_watchpoint_active() {
         let method_id = synth_method_id(&thread.frames[frame_idx]);
         crate::runtime::jvmti::fire_field_access_if_watched_for_vm(
             shared.vm_identity,

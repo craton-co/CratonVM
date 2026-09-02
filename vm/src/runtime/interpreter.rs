@@ -3683,6 +3683,7 @@ pub fn execute(
                                         force_native_cache: std::sync::OnceLock::new(),
                                         descriptor_facts_cache: std::sync::OnceLock::new(),
                                         intercept_shape_cache: std::sync::OnceLock::new(),
+                                        interp_invocations: std::sync::atomic::AtomicU32::new(0),
                                         native_callback_cache: std::sync::OnceLock::new(),
                                         invoc_key: std::sync::OnceLock::new(),
                                         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -4017,6 +4018,7 @@ pub fn execute(
                                             force_native_cache: std::sync::OnceLock::new(),
                                             descriptor_facts_cache: std::sync::OnceLock::new(),
                                             intercept_shape_cache: std::sync::OnceLock::new(),
+                                            interp_invocations: std::sync::atomic::AtomicU32::new(0),
                                             native_callback_cache: std::sync::OnceLock::new(),
                                             invoc_key: std::sync::OnceLock::new(),
                                             jit_probe_generation: std::sync::atomic::AtomicU64::new(
@@ -5388,6 +5390,33 @@ fn execute_frame_from_index(
     let backedge_poll_gate_off = crate::runtime::env_cache::no_backedge_poll_gate()
         || crate::runtime::memwatch::is_watching()
         || cratonvm_gc::blocked_access_debug::enabled();
+    // ── Quickened field / array arms (2026-09-02) ───────────────────────
+    // `Some(heap)` iff this frame may take the `getfield` / `putfield` and
+    // primitive `*aload` / `*astore` fast arms; see `field_fast` for the
+    // contract and for what turns them off. Hoisted per `execute_frame`
+    // entry like every other gate above (same pgo-style tradeoff).
+    let fast_field_zgc = field_fast::fast_field_zgc(shared);
+    // ── OSR call floor (2026-09-02) ─────────────────────────────────────
+    // `try_osr_with_backoff` cannot do anything until `Frame::backward_count`
+    // reaches the smallest threshold `Frame::should_try_osr` accepts (the
+    // attempt backoff only raises it), so the four back-edge sites compare
+    // the count against this floor inline and make the out-of-line call only
+    // past it. A virtual thread or `CRATONVM_JIT_OSR=0` makes the call a
+    // guaranteed no-op, so the floor is `u32::MAX`; the arrival trace
+    // (`CRATONVM_DBG_OSR_FRAME_TRACE`) records every arrival inside the
+    // call, so it keeps the floor at 0 and the old call rate.
+    // `CRATONVM_JIT_NO_OSR_INLINE_GATE=1` restores the unconditional call.
+    let osr_call_floor: u32 = if crate::runtime::env_cache::no_osr_inline_gate()
+        || osr_frame_trace::enabled()
+    {
+        0
+    } else if matches!(thread.kind, crate::threading::ThreadKind::Virtual)
+        || !crate::runtime::env_cache::osr_backedge_enabled()
+    {
+        u32::MAX
+    } else {
+        crate::runtime::env_cache::tier_osr_backedge().unwrap_or(OSR_THRESHOLD)
+    };
     macro_rules! backedge_poll_needed {
         () => {
             backedge_poll_gate_off
@@ -5519,7 +5548,9 @@ fn execute_frame_from_index(
                     $frame.backward_count += 1;
 
                     let entry_pc = $frame.pc;
+                    let osr_due = $frame.backward_count >= osr_call_floor;
                     let _ = $frame;
+                    if osr_due {
                     match try_osr_with_backoff(
                         shared,
                         thread,
@@ -5534,6 +5565,7 @@ fn execute_frame_from_index(
                             continue;
                         }
                         OsrBackoffOutcome::Skip => {}
+                    }
                     }
                     if backedge_poll_needed!() {
                         safepoint_check(shared, thread);
@@ -5835,7 +5867,9 @@ fn execute_frame_from_index(
                                         frame.backward_count += 1;
 
                                         let entry_pc = frame.pc;
+                                        let osr_due = frame.backward_count >= osr_call_floor;
                                         let _ = frame;
+                                        if osr_due {
                                         match try_osr_with_backoff(
                                             shared,
                                             thread,
@@ -5851,6 +5885,7 @@ fn execute_frame_from_index(
                                                 continue;
                                             }
                                             OsrBackoffOutcome::Skip => {}
+                                        }
                                         }
                                         if backedge_poll_needed!() {
                                             safepoint_check(shared, thread);
@@ -6176,7 +6211,9 @@ fn execute_frame_from_index(
                         frame.backward_count += 1;
 
                         let entry_pc = frame.pc;
+                        let osr_due = frame.backward_count >= osr_call_floor;
                         let _ = frame; // drop borrow before try_osr
+                        if osr_due {
                         match try_osr_with_backoff(
                             shared,
                             thread,
@@ -6191,6 +6228,7 @@ fn execute_frame_from_index(
                                 continue;
                             }
                             OsrBackoffOutcome::Skip => {}
+                        }
                         }
                         if backedge_poll_needed!() {
                             safepoint_check(shared, thread);
@@ -7132,6 +7170,12 @@ fn execute_frame_from_index(
                             continue;
                         }
                         // Widening: index conversion
+                        if let Some(zgc) = fast_field_zgc {
+                            if field_fast::array_load_prim(zgc, &mut frame.stack, arr_ref, index, opcode) {
+                                frame.pc = saved_pc + 1;
+                                continue;
+                            }
+                        }
                         match shared.mem.heap.get_array_element(arr_ref, index as usize) {
                             Ok(value) => {
                                 frame.stack.push_unchecked(value);
@@ -7167,6 +7211,23 @@ fn execute_frame_from_index(
                 // so the operand-stack tag-erasure cannot regress here.
                 0x4f..=0x52 | 0x54..=0x56 => {
                     let (cv, kind_of_popped) = frame.stack.pop_with_kind_unchecked();
+                    if let Some(zgc) = fast_field_zgc {
+                        if frame.stack.len() >= 2 {
+                            let idx_cv = frame.stack.peek_compact();
+                            let arr_cv = frame.stack.peek_compact_at(1);
+                            if let (Some(index), Some(aptr)) = (idx_cv.as_int(), arr_cv.as_object_ptr()) {
+                                // SAFETY: an `Object`-tagged operand-stack slot holds a
+                                // heap address; `array_store_prim` re-validates it.
+                                let arr_ref = unsafe { ObjectRef::from_raw(aptr as *mut u8) };
+                                if field_fast::array_store_prim(zgc, arr_ref, index, opcode, cv, kind_of_popped) {
+                                    frame.stack.pop_compact();
+                                    frame.stack.pop_compact();
+                                    frame.pc = saved_pc + 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     let value = match opcode {
                         0x50 => Value::Long(cv.as_long_unchecked()),
                         0x52 => {
@@ -7998,15 +8059,59 @@ fn execute_frame_from_index(
                 // these bodies read `frame.pc` back — `monitorenter` and
                 // `monitorexit` snapshot it, and the diagnostic blocks print
                 // it. Advancing after the call would change what they observe.
-                0xb2 | 0xb3 | 0xb4 | 0xb5 | 0xbb | 0xc0 | 0xc1 => {
+                // getfield / putfield — quickened arm first (`field_fast`), the
+                // full handler on any miss. The full handler refills the site.
+                0xb4 | 0xb5 => {
+                    let cp_index = ((b1 as u16) << 8) | (b2 as u16); // Cast: bytecode operand decoding
+                    if let Some(zgc) = fast_field_zgc {
+                        let hit = if opcode == 0xb4 {
+                            field_fast::getfield_fast(
+                                shared,
+                                zgc,
+                                &mut thread.fast_field_sites,
+                                frame,
+                                cp_index,
+                            )
+                        } else {
+                            field_fast::putfield_fast(
+                                zgc,
+                                &mut thread.fast_field_sites,
+                                frame,
+                                cp_index,
+                            )
+                        };
+                        if hit {
+                            frame.pc = saved_pc + 3;
+                            continue;
+                        }
+                    }
+                    let _ = frame;
+                    thread.frames[frame_idx].pc = saved_pc + 3;
+                    let outcome = if opcode == 0xb4 {
+                        op_getfield(shared, thread, frame_idx, cp_index)
+                    } else {
+                        op_putfield(shared, thread, frame_idx, cp_index)
+                    };
+                    if let Err(e) = outcome {
+                        match classify_fastpath_invoke_error(shared, thread, e) {
+                            FastPathInvokeError::Runtime(re) => {
+                                pending_runtime_error = Some((re, saved_pc));
+                            }
+                            FastPathInvokeError::Java(exc) => {
+                                pending_java_exception = Some((exc, saved_pc));
+                            }
+                            FastPathInvokeError::Fatal(e) => return Err(e),
+                        }
+                    }
+                    continue;
+                }
+                0xb2 | 0xb3 | 0xbb | 0xc0 | 0xc1 => {
                     let cp_index = ((b1 as u16) << 8) | (b2 as u16); // Cast: bytecode operand decoding
                     let _ = frame;
                     thread.frames[frame_idx].pc = saved_pc + 3;
                     let outcome = match opcode {
                         0xb2 => op_getstatic(shared, thread, frame_idx, cp_index),
                         0xb3 => op_putstatic(shared, thread, frame_idx, cp_index),
-                        0xb4 => op_getfield(shared, thread, frame_idx, cp_index),
-                        0xb5 => op_putfield(shared, thread, frame_idx, cp_index),
                         0xbb => op_new(shared, thread, frame_idx, cp_index),
                         0xc0 => op_checkcast(shared, thread, frame_idx, cp_index),
                         // 0xc1
@@ -8370,6 +8475,8 @@ fn execute_frame_from_index(
                             .record_backedge_borrowed(cid, mn, md, saved_pc);
                     }
                     thread.frames[frame_idx].backward_count += 1;
+                    let osr_due = thread.frames[frame_idx].backward_count >= osr_call_floor;
+                    if osr_due {
                     match try_osr_with_backoff(
                         shared,
                         thread,
@@ -8384,6 +8491,7 @@ fn execute_frame_from_index(
                             continue;
                         }
                         OsrBackoffOutcome::Skip => {}
+                    }
                     }
                     if backedge_poll_needed!() {
                         safepoint_check(shared, thread);
@@ -8679,14 +8787,15 @@ pub use constants::*;
 // `runtime::resolve::guard` enforces it.
 pub(crate) mod field_access;
 pub use field_access::*;
+mod field_fast;
 // The interpreter's resolved constant pool: per-thread, lock-free site caches
 // for field and method constant-pool references. `pub` so `vm-cli` can print
 // the `CRATONVM_DBG=field-site` tally at exit.
 pub mod invoke_phases;
 pub mod site_cache;
 pub use site_cache::{
-    CastSiteCache, ClassSiteCache, FieldSiteCache, IfaceSelectSiteCache, MethodSiteCache,
-    MethodSiteInfo, ResolvedNewSite,
+    CastSiteCache, ClassSiteCache, FastFieldSite, FastFieldSiteCache, FieldSiteCache,
+    IfaceSelectSiteCache, MethodSiteCache, MethodSiteInfo, ResolvedNewSite,
 };
 // ---------------------------------------------------------------------------
 // Helper: Method invocation
