@@ -7622,40 +7622,25 @@ impl GenerationalHeap {
         };
         let par_plan = if par_workers >= 2 {
             let (to_cursor_addr, to_headroom) = young_to.parallel_evacuation_region();
-            let plan = crate::gen_evac::ParEvac::plan(
+            crate::gen_evac::ParEvac::plan(
                 to_headroom,
                 to_cursor_addr,
                 young_from.used(),
                 par_workers,
-            );
-            // COMMIT the region before any worker writes into it. The parallel
-            // evacuator is the one allocation path that does not go through
-            // `Arena::alloc`, so it never reaches `hand_out` — where every
-            // other path commits the reserved granules it is about to touch.
-            // A to-space granule no cycle has filled yet is reserved but not
-            // mapped, and a `memcpy` into it faults rather than reading zero:
-            // that is the STATUS_ACCESS_VIOLATION the first parallel cycle of
-            // a fresh heap died with. A refused commit means no parallel phase
-            // this cycle; the serial evacuator commits as it allocates.
-            match plan {
-                Some(plan)
-                    if young_to
-                        .commit_evacuation_region(plan.region_end - plan.region_start) =>
-                {
-                    Some(plan)
-                }
-                Some(_) => {
-                    tracing::warn!(
-                        "GC: could not commit the young to-space evacuation region — \
-                         copying serially this cycle"
-                    );
-                    None
-                }
-                None => None,
-            }
+            )
         } else {
             None
         };
+
+        // Map what the workers may touch. The backing store commits lazily
+        // (`crate::reservation`), and the parallel evacuator is the one
+        // hand-out site that does not go through `Arena::hand_out` — it hands
+        // a span to N threads to sub-allocate rather than one object to one
+        // caller. Without this every worker writes into reserved-but-unmapped
+        // memory: STATUS_ACCESS_VIOLATION, every parallel cycle, silently.
+        // A refused commit is an allocation failure, so it takes the serial
+        // path exactly as `hand_out`'s `None` does.
+        let par_plan = par_plan.filter(|p| young_to.commit_parallel_evacuation_region(p.reserved));
 
         if let Some(plan) = par_plan {
             // ------------------- PARALLEL COPY PHASE -------------------

@@ -2620,6 +2620,16 @@ impl Arena {
     /// The tail is returned rather than the whole arena on purpose: the free
     /// list holds spans whose neighbours are live objects, and an evacuator
     /// bumping through those would overwrite them.
+    ///
+    /// # This reports the tail; it does NOT make it writable
+    ///
+    /// The backing store commits lazily, so the span named here is RESERVED
+    /// and mostly not yet mapped. The caller must pass the bytes it will
+    /// actually use to [`Self::commit_parallel_evacuation_region`] before any
+    /// worker writes into it — this is the tenth hand-out site the `hand_out`
+    /// helper's note counts, and the only one that does not go through it,
+    /// because it hands out a span for N threads to sub-allocate rather than a
+    /// single object.
     pub fn parallel_evacuation_region(&self) -> (usize, usize) {
         (
             self.data.as_ptr() as usize + self.cursor,
@@ -2627,28 +2637,24 @@ impl Arena {
         )
     }
 
-    /// Commit the first `bytes` of the tail [`Self::parallel_evacuation_region`]
-    /// handed out, so evacuation workers may write there directly.
+    /// Map the first `bytes` of the tail so N workers may write into it.
     ///
-    /// **The parallel evacuator is the one allocation path in this crate that
-    /// does not reach [`Self::hand_out`]** — it bumps its own atomic cursor
-    /// over the raw region and `memcpy`s into it — and `hand_out` is where
-    /// every other path commits the reserved granules it is about to write.
-    /// Backing store is RESERVED address space committed per granule
-    /// ([`crate::reservation`]), so a write into a granule that has never been
-    /// used does not read as zero: it faults. A young to-space that no cycle
-    /// has filled yet is exactly that, which is why the very first parallel
-    /// cycle of a fresh heap died in `copy_nonoverlapping` with
-    /// STATUS_ACCESS_VIOLATION and every later one would have survived.
+    /// Returns `false` if the OS refused the commit, which the caller must
+    /// treat exactly as `hand_out` does — as an allocation failure, here
+    /// meaning "run the serial copy phase instead". Returning `true` anyway
+    /// would hand the workers memory that faults on first write.
     ///
-    /// Returns `false` if the OS refuses the commit, which the caller must
-    /// treat as "no parallel copy phase this cycle" rather than proceeding —
-    /// the serial evacuator allocates through `alloc` and commits as it goes.
-    #[must_use = "an uncommitted evacuation region must not be written to"]
-    pub fn commit_evacuation_region(&mut self, bytes: usize) -> bool {
-        let start = self.cursor;
-        let len = bytes.min(self.data.len().saturating_sub(start));
-        self.data.commit_range(start, len)
+    /// # Why this is separate from the region query
+    ///
+    /// `bytes` is the evacuation's own reservation (survivors + per-worker
+    /// buffers + its abandoned-tail allowance), which is computed AFTER the
+    /// tail is known. Committing the whole tail instead would work and would
+    /// throw away what the lazy backing store is for: on a 128 MB to-space
+    /// whose cycle copies 400 KB, the difference is the whole arena.
+    #[must_use = "a refused commit must send the cycle down the serial path"]
+    pub fn commit_parallel_evacuation_region(&mut self, bytes: usize) -> bool {
+        debug_assert!(bytes <= self.low_bump_headroom());
+        self.data.commit_range(self.cursor, bytes)
     }
 
     /// Publish the outcome of a parallel evacuation: `bytes` were consumed

@@ -134,8 +134,8 @@ const SLACK_TO_BUFFERS_DIV: usize = 2;
 /// remainder re-pushed, the sorted free-list cache invalidated, and a
 /// `memset` of the block that the copy then overwrote byte for byte. A
 /// worker now carves a buffer with `OldGen::alloc_unzeroed` — the copy is the
-/// write — and bumps promoted objects out of it; the mutex is taken once per
-/// buffer instead of once per object.
+/// write — and bumps promoted objects out of it, so the mutex is taken once
+/// per buffer instead of once per object.
 const OLD_PLAB_MIN: usize = 16 * 1024;
 /// The promotion buffer's ceiling; each refill doubles up to this.
 const OLD_PLAB_MAX: usize = 256 * 1024;
@@ -422,12 +422,6 @@ pub(crate) struct EvacPlan {
     /// Absolute address of the first byte workers may allocate.
     pub(crate) region_start: usize,
     /// One past the last byte workers may allocate.
-    ///
-    /// Also exactly what the driver must COMMIT before opening the phase —
-    /// see [`crate::arena::Arena::commit_evacuation_region`]. It is a bound on
-    /// what the phase can consume, not the whole to-space tail, so committing
-    /// it does not charge the reservation for a semi-space the cycle will not
-    /// touch.
     pub(crate) region_end: usize,
     /// Bytes each worker claims per to-space buffer, sized against what this
     /// cycle has to copy. See [`PLAB_LIVE_DIVISOR`].
@@ -438,6 +432,13 @@ pub(crate) struct EvacPlan {
     /// Workers this cycle can actually afford buffers for, which may be FEWER
     /// than the policy asked for. See [`ParEvac::plan`].
     pub(crate) workers: usize,
+    /// Bytes of the to-space tail the workers may touch — survivors, one live
+    /// buffer per worker, and the abandoned-tail allowance.
+    ///
+    /// The driver must COMMIT this much (`Arena::commit_parallel_evacuation_region`)
+    /// before dispatching: the backing store maps lazily, so an uncommitted
+    /// write faults rather than reading zero.
+    pub(crate) reserved: usize,
 }
 
 struct DrainState {
@@ -611,26 +612,28 @@ impl<'a> ParEvac<'a> {
             n if n < PLAB_FLOOR_BYTES => 0,
             n => n,
         };
-        let buffers = plab_bytes * workers;
-        // The abandoned-tail allowance is BOUNDED rather than "whatever the
-        // buffers did not take", because `region_end` is now a promise the
-        // driver has to make good in committed memory (see below): an
-        // allowance of the whole slack would commit the entire to-space on
-        // every cycle and undo the reservation's lazy commit.
-        let waste_allowance = (slack - buffers).min(buffers.max(PLAB_MIN_BYTES));
-        // EVERY byte this phase can consume, and therefore every byte the
-        // driver must commit before a worker writes: one exact span per
-        // survivor (at most `from_used`), one in-flight buffer tail per worker
-        // (`buffers`), and the abandoned tails the allowance permits. Nothing
-        // else takes region. The `min` is a belt — `waste_allowance` is capped
-        // at `slack - buffers`, so the sum cannot exceed `to_headroom`.
-        let region_bytes = (from_used + buffers + waste_allowance).min(to_headroom);
+        // The allowance is CAPPED at one more buffer per worker rather than
+        // taking all the remaining slack. Two reasons, and the second is not
+        // optional: a bigger allowance buys nothing once a worker can refill
+        // once, and the reservation below is COMMITTED up front — the backing
+        // store maps lazily, so an allowance of "all the slack" would map the
+        // whole to-space tail on every cycle and throw away exactly what the
+        // lazy store is for.
+        let waste_allowance = (slack - plab_bytes * workers).min(plab_bytes * workers);
+        // Everything a worker can touch: the survivors themselves, one live
+        // buffer each, and the tails the allowance lets them abandon.
+        let reserved = from_used + plab_bytes * workers + waste_allowance;
+        debug_assert!(reserved <= to_headroom);
         Some(EvacPlan {
             region_start: to_cursor_addr,
-            region_end: to_cursor_addr + region_bytes,
+            // The workers' ceiling is the RESERVATION, not the tail: past it
+            // the backing store is reserved but unmapped, and a write there
+            // faults rather than reading zero.
+            region_end: to_cursor_addr + reserved,
             plab_bytes,
             waste_allowance,
             workers,
+            reserved,
         })
     }
 
@@ -790,12 +793,14 @@ impl<'a> ParEvac<'a> {
     }
 
     /// Return the never-written tail of the worker's promotion buffer to the
-    /// old generation's free list. `OldGen::release_unused_tail` does not
-    /// stamp the reclaim epoch: the tail never held an object, so no
-    /// concurrent-mark remark snapshot can name an address in it, and a young
-    /// cycle retiring its buffers does not invalidate an in-flight old-gen
-    /// sweep. The tail is 0 or at least `HEADER_SIZE` by [`Self::old_lab_alloc`]'s
-    /// rule, so it is always a legal free block.
+    /// old generation's free list.
+    ///
+    /// `OldGen::release_unused_tail` deliberately does NOT stamp the reclaim
+    /// epoch: the tail never held an object, so no concurrent-mark remark
+    /// snapshot can name an address in it, and a young cycle retiring its
+    /// buffers must not invalidate an in-flight old-gen sweep. The tail is 0
+    /// or at least `HEADER_SIZE` by [`Self::old_lab_alloc`]'s rule, so it is
+    /// always a legal free block.
     fn retire_old_plab(&self, shard: &mut EvacShard) {
         let (cur, end) = (shard.old_plab.cursor, shard.old_plab.end);
         shard.old_plab.cursor = 0;
@@ -808,7 +813,11 @@ impl<'a> ParEvac<'a> {
             );
             // SAFETY: `[cur, end)` is the unused remainder of a block this
             // worker carved with `alloc_unzeroed`; nothing was written there.
-            unsafe { self.old_gen.lock().release_unused_tail(cur as *mut u8, tail) };
+            unsafe {
+                self.old_gen
+                    .lock()
+                    .release_unused_tail(cur as *mut u8, tail)
+            };
         }
     }
 
@@ -818,11 +827,11 @@ impl<'a> ParEvac<'a> {
     /// `HEADER_SIZE`) nor carry an `int[]` filler, so the buffer is retired
     /// with a tail of at least 24 bytes instead.
     fn old_lab_alloc(shard: &mut EvacShard, size: usize) -> Option<usize> {
-        let after = shard.old_plab.cursor.checked_add(size)?;
-        if after > shard.old_plab.end || shard.old_plab.cursor == 0 {
+        if shard.old_plab.cursor == 0 {
             return None;
         }
-        if shard.old_plab.end - after == 8 {
+        let after = shard.old_plab.cursor.checked_add(size)?;
+        if after > shard.old_plab.end || shard.old_plab.end - after == 8 {
             return None;
         }
         let p = shard.old_plab.cursor;
@@ -837,7 +846,11 @@ impl<'a> ParEvac<'a> {
     /// to-space, exactly as the serial path does.
     fn promote_alloc(&self, shard: &mut EvacShard, size: usize) -> Option<usize> {
         if size >= OLD_PLAB_DIRECT_MIN {
-            return self.old_gen.lock().alloc_unzeroed(size, 8).map(|p| p as usize);
+            return self
+                .old_gen
+                .lock()
+                .alloc_unzeroed(size, 8)
+                .map(|p| p as usize);
         }
         if let Some(p) = Self::old_lab_alloc(shard, size) {
             return Some(p);
@@ -1486,15 +1499,17 @@ mod tests {
         assert!(ParEvac::plan(head, 0x1004, 4096, 2).is_none());
         let plan = ParEvac::plan(head, 0x1008, 4096, 2).expect("an aligned cursor is accepted");
         assert_eq!(plan.region_start, 0x1008);
-        // The region is the phase's CONSUMPTION BOUND, not the whole tail:
-        // since 2026-09-02 the driver must commit it before a worker writes
-        // (`Arena::commit_evacuation_region`), and committing the tail would
-        // charge the reservation for a semi-space this cycle never touches.
-        assert_eq!(
-            plan.region_end - plan.region_start,
-            4096 + 2 * plan.plab_bytes + plan.waste_allowance,
+        // The workers' ceiling is the RESERVATION, not the whole tail: the
+        // backing store maps lazily, and only `reserved` bytes get committed.
+        assert_eq!(plan.region_end, 0x1008 + plan.reserved);
+        assert!(
+            plan.reserved <= head,
+            "the reservation must fit inside the tail it was cut from",
         );
-        assert!(plan.region_end <= 0x1008 + head, "and never past the tail");
+        assert!(
+            plan.reserved >= 4096,
+            "it must at least cover the survivors",
+        );
     }
 
     /// The per-worker buffer must track the live set, not sit at a constant.
