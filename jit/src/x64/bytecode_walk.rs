@@ -5426,7 +5426,7 @@ impl Compiler {
                             self.emit_test_r64_r64(RAX);
                             (Vec::new(), Some(self.emit_jcc_rel32_patch(0x84))) // JE
                         } else if receiver_is_trusted_oop {
-                            (self.emit_trusted_oop_receiver_check(), None)
+                            (self.emit_trusted_oop_receiver_check_at(code, pc), None)
                         } else {
                             (
                                 self.emit_guarded_getfield_receiver_check(
@@ -5650,7 +5650,7 @@ impl Compiler {
                             self.emit_test_r64_r64(RAX);
                             (Vec::new(), Some(self.emit_jcc_rel32_patch(0x84))) // JE
                         } else if receiver_is_trusted_oop {
-                            (self.emit_trusted_oop_receiver_check(), None)
+                            (self.emit_trusted_oop_receiver_check_at(code, pc), None)
                         } else {
                             (
                                 self.emit_guarded_getfield_receiver_check(

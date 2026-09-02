@@ -266,6 +266,15 @@ fn maybe_dump_shutdown_reports() {
             // printing both is what separates that from "emitted and refused".
             let (bump, stub) = cratonvm_jit::runtime_lowering::ir_alloc_site_counts();
             eprintln!("[cratonvm] optimizing-tier allocations: inline-bump={bump} stub-only={stub}");
+            // getfield receiver null checks. The PAIR, never the ratio: an
+            // all-zero pair means the trusted-oop arm was never reached at all
+            // (no inline getfield compiled), while zero-elided-with-nonzero-
+            // emitted means it WAS reached and the dataflow proved nothing.
+            // Those look identical as a percentage and want opposite fixes.
+            let (nn_elided, nn_emitted) = cratonvm_jit::x64::receiver_null_check_counts();
+            eprintln!(
+                "[cratonvm] getfield receiver null checks: elided={nn_elided} emitted={nn_emitted}"
+            );
         }
         // Reference loads whose slot did NOT hold a reference, contained by
         // `GETFIELD_EXPECT_REFERENCE` instead of being handed to compiled code

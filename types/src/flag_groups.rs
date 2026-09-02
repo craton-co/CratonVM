@@ -1195,6 +1195,15 @@ pub const INVENTORY: &[E] = &[
     // the default collector, because the path it disabled was already
     // unreachable there.
     E { group: Group::JIT, token: "gated-ref-store", on_key: Some("CRATONVM_JIT_GATED_REF_STORE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // Seeds `this` non-null at method entry. Kept separate from
+    // `receiver-null-elim` below because the blast radii differ: this one
+    // widens a fact THREE consumers already read (array null-check elision,
+    // ifnull/ifnonnull branch elision, and the getfield receiver guard), while
+    // that one only adds the third consumer. One switch for both would have
+    // made them indistinguishable in a bisect.
+    E { group: Group::JIT, token: "this-nonnull", on_key: Some("CRATONVM_JIT_THIS_NONNULL"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // Drops the getfield receiver TEST/JZ where the dataflow proves it dead.
+    E { group: Group::JIT, token: "receiver-null-elim", on_key: Some("CRATONVM_JIT_RECEIVER_NULL_ELIM"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     // OPT-IN, and known to miscompile until the ARG_REGS audit lands -- see
     // `x64::operand_cache_enabled`. Declared so the two arms are measurable in
     // one binary, which is what the previous shape (no flag at all) prevented.

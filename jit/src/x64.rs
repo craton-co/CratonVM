@@ -250,6 +250,7 @@ mod deopt_stubs;
 mod objects;
 pub(crate) use objects::note_ungated_ref_store;
 pub use objects::ref_store_site_counts;
+pub use null_check_elim::receiver_null_check_counts;
 mod osr;
 mod simd;
 

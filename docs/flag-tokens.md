@@ -577,7 +577,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-284 tokens.
+286 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -678,6 +678,8 @@ export inherited from a parent shell.
 | `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
 | `gated-ref-store` | `CRATONVM_JIT_GATED_REF_STORE` |
+| `this-nonnull` | `CRATONVM_JIT_THIS_NONNULL` |
+| `receiver-null-elim` | `CRATONVM_JIT_RECEIVER_NULL_ELIM` |
 | `operand-cache` | `CRATONVM_JIT_OPERAND_CACHE` |
 | `ir-reloc-emit` | `CRATONVM_JIT_IR_RELOC_EMIT` |
 | `reloc-gate-map-incomplete` | `CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE` |
