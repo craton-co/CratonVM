@@ -4315,6 +4315,9 @@ mod concurrent_mark_controller_tests {
     #[test]
     fn the_zgc_arm_of_refill_tlab_carves_a_chunk_and_takes_its_tail_back() {
         let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::new_shared(16 * 1024 * 1024));
+        if let VmHeap::Zgc(z) = &heap {
+            z.set_vm_tlab_enabled(true);
+        }
         let (ptr, size) = heap
             .refill_tlab(64 * 1024)
             .expect("ZGC must hand the VM thread's TLAB a chunk");

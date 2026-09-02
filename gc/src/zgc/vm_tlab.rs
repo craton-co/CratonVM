@@ -69,10 +69,13 @@
 //! collection, so the reservation error is bounded by `threads * chunk` and
 //! never survives a cycle.
 //!
-//! # Kill switch
+//! # Switch
 //!
-//! `CRATONVM_ZGC_JIT_TLAB=0` restores `refill_tlab -> None` exactly; nothing
-//! else in this module then runs, because no chunk is ever handed out.
+//! OPT-IN: `CRATONVM_ZGC_JIT_TLAB=1` turns it on, and unset means
+//! `refill_tlab -> None` exactly as before -- nothing else in this module then
+//! runs, because no chunk is ever handed out. See
+//! [`zgc_vm_tlab_enabled_by_default`] for the measurement that set that
+//! default.
 
 use std::sync::atomic::Ordering;
 
@@ -80,16 +83,35 @@ use cratonvm_types::ClassId;
 
 use super::{zgc_corpse_enabled, ZgcRealHeap, ZGC_TLAB_ALIGN};
 
-/// `CRATONVM_ZGC_JIT_TLAB`: hand the VM thread's TLAB a chunk on this
-/// backend. Default on; `0`/`off`/`false`/`no` restores the pre-2026-09-02
-/// `None` arm.
+/// `CRATONVM_ZGC_JIT_TLAB`: hand the VM thread's TLAB a chunk on this backend.
+///
+/// **Default OFF, and the measurement is why.** The arm is correct — the
+/// probes and both suites are green with it on — but on BinTreesClassic 16 at
+/// `-Xmx512m`, release build, interleaved on a quiet host, it is *slower*
+/// every round: 2841/3049/2746/2564 ms with it on against 2218/2188/2172/2007
+/// ms with it off, identical checksums, and FEWER collections on the slow arm
+/// (1 vs 2), so it is the allocation path itself and not collection frequency.
+///
+/// The cost is structural and is worth stating precisely, because it is what
+/// the next attempt has to remove. This collector finds objects through an
+/// allocation-base registry, so every inline allocation must be ANNOUNCED, and
+/// the only existing announcement point is `jit_post_tlab_init` — a helper
+/// that also mints an identity hash, looks up the class's compact layout and
+/// dispatches primitive-field initialisation. The other two backends skip that
+/// call entirely for a class that needs none of it (`skip_post_init_helper`),
+/// so ZGC pays a call per allocation that they do not, and it costs more than
+/// the `jit_new_object` preamble the inline bump saves.
+///
+/// The win needs a register-only helper in the JIT's ABI — one call that does
+/// nothing but set the start bit — at which point this becomes a candidate for
+/// default-on again, against this same measurement.
 pub(crate) fn zgc_vm_tlab_enabled_by_default() -> bool {
     match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_JIT_TLAB") {
         Some(raw) => {
             let v = raw.to_string_lossy().trim().to_ascii_lowercase();
-            !matches!(v.as_str(), "0" | "off" | "false" | "no")
+            matches!(v.as_str(), "1" | "on" | "true" | "yes")
         }
-        None => true,
+        None => false,
     }
 }
 
@@ -302,6 +324,7 @@ mod tests {
     #[test]
     fn a_shared_heap_hands_the_vm_a_zeroed_chunk_inside_its_arena() {
         let heap = ZgcRealHeap::new_shared(16 * 1024 * 1024);
+        heap.set_vm_tlab_enabled(true);
         let (ptr, size) = heap
             .refill_tlab(64 * 1024)
             .expect("a fresh 16 MiB heap must serve a 64 KiB chunk");
@@ -317,8 +340,9 @@ mod tests {
     }
 
     #[test]
-    fn the_kill_switch_and_a_heap_without_an_arc_identity_both_refuse() {
+    fn the_switch_and_a_heap_without_an_arc_identity_both_refuse() {
         let plain = ZgcRealHeap::with_capacity(16 * 1024 * 1024);
+        plain.set_vm_tlab_enabled(true);
         assert!(
             plain.refill_tlab(64 * 1024).is_none(),
             "no sink can be registered for a heap that is not shared, so no chunk"
@@ -328,10 +352,29 @@ mod tests {
         assert!(shared.refill_tlab(64 * 1024).is_none());
         shared.set_vm_tlab_enabled(true);
         assert!(shared.refill_tlab(64 * 1024).is_some());
-        cratonvm_types::flags::with_thread_overrides(
-            &[("CRATONVM_ZGC_JIT_TLAB", Some("0"))],
-            || assert!(!zgc_vm_tlab_enabled_by_default()),
+    }
+
+    /// OPT-IN, and the default is the measured one — see
+    /// [`zgc_vm_tlab_enabled_by_default`] for the numbers. A future change
+    /// that flips this has to move that comment too, which is the point.
+    #[test]
+    fn the_vm_tlab_is_opt_in_and_the_switch_reads_both_ways() {
+        assert!(
+            !zgc_vm_tlab_enabled_by_default(),
+            "unset must mean OFF: the arm measured slower than the helper path"
         );
+        for on in ["1", "on", "true", "yes"] {
+            cratonvm_types::flags::with_thread_overrides(
+                &[("CRATONVM_ZGC_JIT_TLAB", Some(on))],
+                || assert!(zgc_vm_tlab_enabled_by_default(), "`{on}` must enable it"),
+            );
+        }
+        for off in ["0", "off", "false", "no", ""] {
+            cratonvm_types::flags::with_thread_overrides(
+                &[("CRATONVM_ZGC_JIT_TLAB", Some(off))],
+                || assert!(!zgc_vm_tlab_enabled_by_default(), "`{off}` must not"),
+            );
+        }
     }
 
     /// The seam that keeps the JIT's inline allocator announcing what it
@@ -341,7 +384,10 @@ mod tests {
     #[test]
     fn a_shared_heap_tells_the_jit_that_tlab_objects_must_be_announced() {
         cratonvm_types::set_jit_tlab_registration_required(false);
-        let heap = ZgcRealHeap::new_shared(16 * 1024 * 1024);
+        let heap = cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_JIT_TLAB", Some("1"))],
+            || ZgcRealHeap::new_shared(16 * 1024 * 1024),
+        );
         assert!(
             cratonvm_types::jit_tlab_registration_required(),
             "a ZGC heap that hands out VM TLABs must require the announcing call"
@@ -353,6 +399,7 @@ mod tests {
     #[test]
     fn objects_laid_out_in_the_vm_tlab_are_registered_and_collected_like_any_other() {
         let heap = ZgcRealHeap::new_shared(16 * 1024 * 1024);
+        heap.set_vm_tlab_enabled(true);
         let (ptr, size) = heap.refill_tlab(64 * 1024).expect("chunk");
         let mut tlab = unsafe { crate::tlab::Tlab::new(ptr, size) };
         let kept = tlab_new_object(&heap, &mut tlab, ClassId::new(7), 2).expect("fits");
@@ -380,6 +427,7 @@ mod tests {
     #[test]
     fn retiring_the_vm_tlab_returns_its_tail_to_the_arena() {
         let heap = ZgcRealHeap::new_shared(16 * 1024 * 1024);
+        heap.set_vm_tlab_enabled(true);
         let (ptr, size) = heap.refill_tlab(64 * 1024).expect("chunk");
         let mut tlab = unsafe { crate::tlab::Tlab::new(ptr, size) };
         let _ = tlab_new_object(&heap, &mut tlab, ClassId::new(7), 4).expect("fits");

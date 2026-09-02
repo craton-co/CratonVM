@@ -20074,6 +20074,7 @@ pub(crate) mod tests {
         // way `refill_tlab` would, pretend the peer bumped 4 KiB into it, and
         // publish the rest as its reserved tail.
         heap.set_tlab_enabled(true);
+        heap.set_vm_tlab_enabled(true);
         let (ptr, size) = heap.refill_tlab(64 * 1024).expect("a fresh chunk");
         let used = 4096usize;
         let tail = (ptr as usize + used, ptr as usize + size);
