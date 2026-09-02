@@ -170,10 +170,9 @@
 //! compiler as its reader, for the reason [`CompileDoor::builds_direct_calls`]
 //! gives: a fourth door has to answer it before the crate builds.
 //!
-//! Two things a reader of the counters must know about today's answers. The
-//! OSR and eager-first-call doors still do not ask — they live in `vm/**`,
-//! outside the lane that moved this — so `not-asked` is their whole row. And
-//! at those two doors the pin's decision is, today, *vacuous*: both reach
+//! One thing a reader of the counters must know about today's answers. All
+//! three doors ask as of 2026-09-01, but at the OSR and eager-first-call doors
+//! the pin's decision is, today, *vacuous*: both reach
 //! `x64::compile_with_param_slots` (the single-pass backend) unconditionally
 //! and have no route to the optimizing tier at all, so "keep this method off
 //! the optimizing tier" is already true there. That is incidental correctness
@@ -287,16 +286,22 @@ impl CompileDoor {
             // admission token.
             CompileDoor::MethodEntry => true,
             // `vm/src/runtime/interpreter.rs` — reaches
-            // `x64::compile_with_param_slots` directly. It also passes
-            // `string_layout: None`, so the pin's own `BlindNoLayout` arm
-            // (fail OPEN, and counted) is the answer it would get.
-            CompileDoor::EagerFirstCall => false,
+            // `x64::compile_with_param_slots` directly, and ASKS as of
+            // 2026-09-01. It passes the same `string_layout: None` the backend
+            // call below it passes, so the answer is always `BlindNoLayout` —
+            // fail OPEN, and counted. Deliberate: without a layout the
+            // single-pass backend emits no intrinsic either, so pinning would
+            // cost a C2 body and buy nothing, and `BlindNoLayout` is the arm
+            // that says so. `BlindNoResolver` would not.
+            CompileDoor::EagerFirstCall => true,
             // `vm/src/runtime/interpreter/jit_bridge.rs` — reaches
-            // `x64::compile_with_param_slots` directly. It DOES resolve a
-            // `java/lang/String` field layout (`osr_string_layout`) and it DOES
-            // walk the constant pool per invoke site, so it can supply both of
-            // the pin's inputs; it has simply never been asked to.
-            CompileDoor::Osr => false,
+            // `x64::compile_with_param_slots` directly. It resolves a
+            // `java/lang/String` field layout (`osr_string_layout`) and walks
+            // the constant pool per invoke site, so it supplies BOTH of the
+            // pin's inputs and can reach `Pinned`, not merely a blind arm. It
+            // asks as of 2026-09-01; before that it never had been, which is
+            // exactly why `fired=0` on the probe the pin exists for.
+            CompileDoor::Osr => true,
         }
     }
 
@@ -1234,17 +1239,24 @@ mod tests {
     /// written after a door bound a helper nobody knew it bound; this one after
     /// a door compiled a whole population the pin never saw.
     #[test]
-    fn exactly_one_door_asks_the_string_intrinsic_pin_today() {
+    fn every_door_asks_the_string_intrinsic_pin() {
         let asking: Vec<&str> = CompileDoor::ALL
             .iter()
             .filter(|d| d.asks_string_intrinsic_pin())
             .map(|d| d.label())
             .collect();
         assert_eq!(
-            asking,
-            vec![CompileDoor::MethodEntry.label()],
-            "if a door was taught to ask (or stopped), change this test and say \
-             why in the record — the count is the finding, not an incidental"
+            asking.len(),
+            CompileDoor::ALL.len(),
+            "a door stopped asking the String-intrinsic pin. This test was once \
+             `exactly_one_door_asks_the_string_intrinsic_pin_today` and asserted \
+             the OPPOSITE, because for a while exactly one door did: the pin \
+             lived in `try_compile_inner`, which only `MethodEntry` reaches, and \
+             the population that motivated the pin took the OSR door. That cost \
+             five refuted hypotheses and was visible only as `fired=0` on the \
+             very probe the pin exists for. If you are removing a door from this \
+             set, the burden is to say why the counter it stops producing is not \
+             the one somebody needs next. Asking: {asking:?}"
         );
     }
 

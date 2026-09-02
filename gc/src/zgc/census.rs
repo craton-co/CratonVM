@@ -387,63 +387,39 @@ impl ZSlotShape {
     ///   longer TORN" — but a reader who sees `volatile` and thinks `AtomicU64`
     ///   will classify this row wrong, which is why it is written out here.
     ///
-    ///   This one IS on the arming path. Step 5 below routes a barrier through
-    ///   `vm::get_static_shared`, and step 5's own text already records the
-    ///   consequence: a static slot cannot be CAS-healed, so it may need a
-    ///   NON-HEALING barrier kind rather than the self-healing one.
+    ///   This one IS on the arming path. Step 5 of the ordered sequence routes
+    ///   a barrier through `vm::get_static_shared`, and that step's own text
+    ///   already records the consequence: a static slot cannot be CAS-healed,
+    ///   so it may need a NON-HEALING barrier kind rather than the
+    ///   self-healing one.
     ///
-    /// # The ordered sequence this table serves, and where it stands
+    /// # The ordered sequence this table serves
     ///
-    /// Kept here, beside the classification, rather than in an agent scratch
-    /// file that gets deleted. The canonical long form is the work list on
-    /// `cratonvm_gc::vm_heap::VmHeap::load_ref_slot_barriered`; this is its
-    /// status as of 2026-09-01. Where the two disagree, re-read the code —
-    /// step 1 there still describes itself as "NOT DONE — the blocker" and
-    /// quotes a plain `(ptr as *mut u64).write(addr)` that
-    /// `types/src/narrow_oop.rs` no longer contains.
+    /// **The authority is the doc comment on
+    /// `cratonvm_gc::vm_heap::VmHeap::load_ref_slot_barriered`.** Every step's
+    /// status is written there and nowhere else.
     ///
-    /// * **Step 1 — DONE (2026-09-01).** `narrow_oop::read_ref_slot` /
-    ///   `write_ref_slot` are relaxed atomics in both widths. This is what
-    ///   moved the `ArrayElement` and `CompactField` rows above.
-    /// * **Step 2 — DONE.** The armed test, `ZgcRealHeap::load_barrier_armed`.
-    /// * **Step 3 — DONE.** The `gc/` barrier seam,
-    ///   `VmHeap::load_ref_slot_barriered`, with its P1 (slot width), P3 (null
-    ///   versus heap offset 0) and P4 (`on_forward_failure`) questions decided
-    ///   in its own doc.
-    /// * **Step 3, extended — DONE (2026-09-01), this crate.** The three
-    ///   ZGC-internal accesses to a word the barrier would CAS:
-    ///   `ZgcRealHeap::relocate_stw`'s compaction slot-rewrite STORE, and the
-    ///   legacy payload READS in `ZgcRealHeap::visit_strong_refs_at` and in
-    ///   this module's `reference_slots` (all `gc/src/zgc.rs`). The compaction
-    ///   store is the one that mattered: its SAFETY note rested on "the world
-    ///   is stopped", which is precisely the property step 7 removes.
-    /// * **Step 4 — NOT DONE.** The JIT read-helper SEAM exists —
-    ///   `vm/src/jit/helpers.rs`'s `jit_load_ref_slot` is the single chokepoint
-    ///   and both slot-holding sites (A and B of `zgc-jit-load-barrier.md`
-    ///   2.5.1) funnel through it — but its body is still a raw
-    ///   `read_ref_slot` under a `TODO(zgc)`. `jit_aaload` receives no
-    ///   `vm_ptr`, so reaching a `&VmHeap` from the hotter of the two sites is
-    ///   the actual work, not the call itself.
-    /// * **Step 5 — NOT DONE.** Sites D/E/F, which hold an `ObjectRef` rather
-    ///   than a slot: `types/src/value.rs`'s `read_value_atomic` reference arm
-    ///   and `vm::get_static_shared`. Blocked on the `StaticField` row above.
-    /// * **Step 6 — NOT DONE.** The `aastore` emitter coverage gate.
-    ///   `jit/src/x64/bytecode_walk.rs` opcode `0x53` emits the slot load and
-    ///   the element store inline (`jit/src/x64/arrays.rs`'s
-    ///   `emit_ref_aload_regs` / `emit_ref_astore_regs`) without consulting
-    ///   `narrow_oops_block_inline_fields()`, which the two compact arms do
-    ///   consult. This is NOT the UB of step 1 — an aligned qword `mov` is not
-    ///   a Rust access and cannot tear against a `lock cmpxchg` — it is a
-    ///   COVERAGE hole: an armed cycle would read a coloured word with no
-    ///   colour test and write a plain pointer into a slot the barrier next
-    ///   classifies as `Good` and truncates to 42 bits. Also outstanding under
-    ///   this step: the tier-2/tier-3 collector writers on the `LegacyField`
-    ///   row, if that shape is ever shared with a ZGC heap.
-    /// * **Step 7 — NOT DONE.** Only then flip `RELOCATION_REQUESTED`
-    ///   (`vm/src/vm/vm_init.rs`). Arming must additionally happen where no
-    ///   Java thread is inside compiled code, i.e. at a safepoint: an
-    ///   emission-time gate cannot reach ALREADY COMPILED inline sequences.
-    ///   That obligation is recorded on `ZgcRealHeap::set_barrier_color`.
+    /// This function used to carry a second copy of that list. The two drifted
+    /// apart inside three weeks, and on 2026-09-01 each was telling its reader
+    /// the other one was stale — while both were behind the code: step 4's
+    /// site B had started routing through the seam and step 6's `aastore` gate
+    /// had landed. Two copies of an ordered sequence is how that recurs, so the
+    /// copy is gone rather than merely corrected. Do not restore it.
+    ///
+    /// What belongs HERE is only what this table knows and that list does not:
+    /// which step each row above was moved by, or is blocked on.
+    ///
+    /// * [`ZSlotShape::CompactField`] and [`ZSlotShape::ArrayElement`] read
+    ///   `true` because of step 1 — `narrow_oop::read_ref_slot` /
+    ///   `write_ref_slot` became relaxed atomics on 2026-09-01 — together with
+    ///   the three ZGC-internal conversions folded into step 3.
+    /// * [`ZSlotShape::LegacyField`] reads `false` on the collector side, and
+    ///   is tracked under step 1 as NOT blocking: those writers are the
+    ///   Generational and G1 evacuation loops, which never run over a
+    ///   `ZgcRealHeap`.
+    /// * [`ZSlotShape::StaticField`] reads `false` and is ON the arming path,
+    ///   as step 5's own text records: a static slot cannot be CAS-healed, so
+    ///   it may need a non-healing barrier kind.
     ///
     /// Nothing in steps 1-3 changes behaviour on a default run. The barrier is
     /// unarmed for the life of every shipping process

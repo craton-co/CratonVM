@@ -1164,6 +1164,108 @@ pub(super) fn compile_osr_artifact(
             // takes that same lock, and a recursive read on a `parking_lot`
             // RwLock can deadlock against a queued writer.
             let osr_string_layout = super::dispatch_static::resolve_string_field_layout(shared);
+            // -- The String-intrinsic pin, ASKED at this door -- D1, 2026-09-01
+            //
+            // Measured on the built branch, ONE binary, two probes:
+            //
+            //     CharAtCostCurve   JIT String-intrinsic pin: fired=2   (method entry)
+            //     CharAtWarmShape   JIT String-intrinsic pin: fired=0   (OSR)
+            //
+            // `CharAtWarmShape`'s entire body is `charAt`. Its `fired=0` was
+            // never a method that FAILED the pin's test -- it was a method the
+            // pin was never shown. The pin was a term of `try_compile_inner`'s
+            // eligibility conjunction, i.e. of `CompileDoor::MethodEntry` and
+            // of nothing else, and this door reaches
+            // `x64::compile_with_param_slots` directly. A zero from a one-door
+            // counter is indistinguishable from "there was nothing to pin",
+            // and that is what let the five hypotheses in
+            // `string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901`
+            // each be refuted without converging: every one of them varied the
+            // METHOD, and the discriminator was the DOOR.
+            //
+            // # The answer is INERT at this door today -- stated, not implied
+            //
+            // The pin means "keep this method on the backend that HAS the
+            // inline `charAt` decode", i.e. do not promote it to the optimizing
+            // tier. This door has no promotion to refuse. `compile_osr_artifact`
+            // reaches `x64::compile_with_param_slots` -- the single-pass backend
+            // -- unconditionally; the only production call of
+            // `ir_lower::lower_inner` in the tree is inside `try_compile_inner`,
+            // and nothing under `vm/**` names `ir_lower` at all. So "do not tier
+            // this up" is already true here BY TOPOLOGY, and there is no machine
+            // code this ask can change today. The ~3x that LIFTING the pin
+            // bought at the method-entry door is not available here, because
+            // there is nothing here to refuse -- do not read this as closing a
+            // live hole.
+            //
+            // What is not inert is the ASKING. `string_pin_asked(Osr)` and
+            // `string_pin_declined(Osr)` now say how much of the population the
+            // pin governs is compiled through this door, and
+            // `string_pin_not_asked(Osr)` stops being this door's whole row --
+            // the one number that would have named the defect above in a single
+            // run. This is a COUNTER, deliberately, and not a fix.
+            //
+            // It stops being inert if either half of the topology moves: an OSR
+            // route to the optimizing tier (then this answer must GATE it), or
+            // an IR String-intrinsic emitter (which retires the pin instead).
+            // The `if` below is the tripwire for the first, and is silent today.
+            //
+            // What this does NOT claim: a method OSR-compiled here can still be
+            // promoted later through `try_jit_upgrade_with_gate`, which goes
+            // through `try_compile_with_invokespecial_resolver` -- the
+            // method-entry door, which DOES ask the pin. Nothing on that route
+            // changed.
+            //
+            // COST: once per OSR compile, never per back-edge. The back-edge
+            // counter reaches a cached artifact; `compile_osr_artifact` runs
+            // once per (method, entry_pc) compile, and this sits on that path,
+            // not on the loop. The resolver takes the `class_manager` read lock
+            // per site -- the same shape as `c_invoke_resolver` in this file --
+            // and `string_intrinsic_pin_verdict` calls it only for
+            // `invokevirtual`/`invokeinterface` sites, stops at the first
+            // String-family receiver, and asks nothing at all for a method with
+            // no `0xb6`/`0xb9` site. No lock is held at this point:
+            // `resolve_string_field_layout` above took and released its own,
+            // and the invoke loop below takes its own AFTER this -- never
+            // nested, which is the recursive-read deadlock the comment above
+            // warns about.
+            let osr_pin_invoke_resolver = |cp_idx: u16| -> Option<(String, String, String)> {
+                let cm = shared.classes.class_manager.read();
+                let class = cm.get_class(class_id)?;
+                let (class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
+                    Some(ConstantPoolEntry::MethodReference {
+                        class_index,
+                        name_and_type_index,
+                        ..
+                    }) => (*class_index, *name_and_type_index),
+                    Some(ConstantPoolEntry::InterfaceMethodReference {
+                        class_index,
+                        name_and_type_index,
+                        ..
+                    }) => (*class_index, *name_and_type_index),
+                    _ => return None,
+                };
+                let target_class = class.constant_pool.get_class_name(class_idx)?;
+                let (mn, desc) = class.constant_pool.get_name_and_type(nat_idx)?;
+                Some((target_class.to_string(), mn.to_string(), desc.to_string()))
+            };
+            // The SAME `osr_string_layout` the invoke loop below screens with
+            // and that `compile_with_param_slots` is handed. Asking the pin
+            // about a different layout than the one this compile uses would
+            // make the census describe a compile that did not happen.
+            let osr_string_pin_declines = admission.string_intrinsic_pin_declines(
+                &scan.invoke_ops,
+                Some(&osr_pin_invoke_resolver),
+                osr_string_layout,
+            );
+            if osr_string_pin_declines && crate::runtime::env_cache::dbg_jitc() {
+                eprintln!(
+                    "[cratonvm-jitc] osr String-intrinsic pin declines the optimizing tier for \
+                     {}.{}{} -- INERT at this door, which is single-pass only. If this door ever \
+                     gains a route to the optimizing tier, THIS is the answer that must gate it.",
+                    class_name, method_name, method_descriptor,
+                );
+            }
             if !scan.invoke_ops.is_empty() {
                 let cm_lock = shared.classes.class_manager.read();
                 let class = cm_lock.get_class(class_id)?;

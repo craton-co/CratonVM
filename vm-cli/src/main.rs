@@ -7129,6 +7129,20 @@ use cratonvm_vm::runtime::container::{
 /// * **`--diff-ignore <PATTERN>`**, repeatable, for the residue only the user
 ///   can name.
 ///
+/// # Bytes, not lossily-decoded text
+///
+/// The two children are compared on what they actually wrote. HotSpot follows
+/// the console's charset on `System.out` while CratonVM emits UTF-8, so the
+/// reference side routinely produces bytes that are not valid UTF-8 — and
+/// `String::from_utf8_lossy` would replace *HotSpot's own correct output* with
+/// U+FFFD and blame the VM for a defect in this harness's decoder. `capture`
+/// therefore uses `decode_lossless`, an injective byte-to-text escape, so
+/// comparing the decoded strings is exactly as strong as comparing the byte
+/// streams. When the two sides then differ only outside ASCII the report says
+/// so and names the one-token re-run that settles it — a *hint*, never a
+/// masker: a charset difference is a program-observable one, and forgiving it
+/// would trade a false positive for a false negative.
+///
 /// See `docs/testing/diff-hotspot.md`.
 mod diff_hotspot {
     use super::*;
@@ -7574,13 +7588,168 @@ mod diff_hotspot {
         };
         let stdout = out_thread.join().unwrap_or_default();
         let stderr = err_thread.join().unwrap_or_default();
+        // `decode_lossless`, never `from_utf8_lossy`: the reference JDK's own
+        // correct output is routinely not valid UTF-8 (it follows the console
+        // charset), and a lossy decode would corrupt it into a divergence the
+        // harness invented. See `decode_lossless`.
         Ok(Capture {
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            stdout: decode_lossless(&stdout),
+            stderr: decode_lossless(&stderr),
             exit_code: status.code(),
             timed_out,
             wall_ms: start.elapsed().as_millis() as u64,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // Decoding the captured bytes without damaging either side
+    // -----------------------------------------------------------------------
+
+    /// The one character [`decode_lossless`] ever inserts. It introduces a
+    /// two-hex-digit escape standing for exactly one raw byte that was not part
+    /// of a valid UTF-8 sequence.
+    ///
+    /// `U+FDD0` is a Unicode *noncharacter*: permanently unassigned, and
+    /// specified as never to be interchanged. Nothing a program under
+    /// comparison prints is expected to contain it — but "expected" is not
+    /// "guaranteed", and this design leans on the escape being unambiguous, so
+    /// [`decode_lossless`] escapes it too.
+    const BYTE_ESCAPE: char = '\u{FDD0}';
+
+    const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+
+    /// Append the escape for one raw byte. Uppercase hex, so the rendering a
+    /// reader sees (`\xE9`) matches how every hex dump in this tree spells one.
+    fn push_byte_escape(out: &mut String, b: u8) {
+        out.push(BYTE_ESCAPE);
+        out.push(HEX_UPPER[(b >> 4) as usize] as char);
+        out.push(HEX_UPPER[(b & 0x0f) as usize] as char);
+    }
+
+    /// Copy `s`, escaping any literal [`BYTE_ESCAPE`] the *program* printed as
+    /// that character's own three UTF-8 bytes. Without this the sentinel would
+    /// be ambiguous and the decode would stop being injective.
+    fn push_escaping_sentinel(out: &mut String, s: &str) {
+        if !s.contains(BYTE_ESCAPE) {
+            out.push_str(s);
+            return;
+        }
+        let mut buf = [0u8; 4];
+        let sentinel_bytes = BYTE_ESCAPE.encode_utf8(&mut buf).as_bytes().to_vec();
+        for c in s.chars() {
+            if c == BYTE_ESCAPE {
+                for b in &sentinel_bytes {
+                    push_byte_escape(out, *b);
+                }
+            } else {
+                out.push(c);
+            }
+        }
+    }
+
+    /// Decode a child's raw stream into text **without losing a byte**.
+    ///
+    /// The obvious spelling — `String::from_utf8_lossy` — was the original one,
+    /// and it corrupts the *reference* side rather than CratonVM's. HotSpot
+    /// derives `stdout.encoding` from the host (JEP 400 pinned `file.encoding`
+    /// and deliberately left this one alone), so on a cp1252-style Windows
+    /// console an `é` leaves HotSpot as the single byte `0xE9`, which is not
+    /// valid UTF-8; `from_utf8_lossy` replaces it with U+FFFD and the harness
+    /// then reports a divergence against a line HotSpot never wrote. CratonVM
+    /// emits UTF-8 unconditionally, so its side decoded cleanly and only the
+    /// reference side was damaged — the least defensible way for a differential
+    /// harness to be wrong. Measured on Linux, no Windows box needed:
+    /// `java -Dstdout.encoding=ISO-8859-1` writes `e9 3f 3f` where the UTF-8
+    /// arm writes `c3 a9 e4 b8 ad f0 9f 98 80`. See
+    /// `docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-20260901.md`.
+    ///
+    /// **Decoding each side with its own declared charset was the alternative,
+    /// and was rejected.** The launcher links no charset library; "its own
+    /// declared charset" would have to be discovered by starting a further JVM
+    /// to ask; and the verdict would then rest on an *interpretation* of the
+    /// bytes, which is exactly what a byte-exact verdict must not do.
+    ///
+    /// So: every byte that is part of a valid UTF-8 sequence decodes normally,
+    /// and every byte that is not becomes a [`BYTE_ESCAPE`] plus two hex
+    /// digits. The mapping is **injective**, and that is the whole point —
+    /// comparing two decoded strings is exactly as strong as comparing the two
+    /// byte streams, so the byte-exact verdict is genuinely byte-exact while
+    /// every stage downstream (the line split, the maskers, `--diff-ignore`,
+    /// the report) keeps working on `str` and is unchanged.
+    ///
+    /// Injectivity, spelled out, because it is the load-bearing claim:
+    ///
+    /// * A stream with no invalid byte and no literal sentinel maps to itself,
+    ///   and its image contains no sentinel — so it cannot collide with
+    ///   anything the escaping path produces.
+    /// * A literal sentinel becomes the three escapes `EF`, `B7`, `90` in a
+    ///   row. Three *invalid* bytes can never produce that: `EF B7 90` adjacent
+    ///   **is** a valid sequence, so the walk below decodes it rather than
+    ///   reaching the escape path.
+    /// * Escapes are fixed width, so no escape is a prefix of another.
+    ///
+    /// The escapes never contain `\r` or `\n` (those bytes are valid UTF-8 and
+    /// are never escaped), so `lines_of`'s CRLF and trailing-whitespace
+    /// normalisation is unaffected and keeps operating on text exactly as
+    /// before.
+    fn decode_lossless(bytes: &[u8]) -> String {
+        // Fast path: a clean UTF-8 stream with no sentinel — which is every
+        // run on a UTF-8 host — costs one validation scan and one copy.
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            if !s.contains(BYTE_ESCAPE) {
+                return s.to_string();
+            }
+        }
+        let mut out = String::with_capacity(bytes.len());
+        let mut rest = bytes;
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(s) => {
+                    push_escaping_sentinel(&mut out, s);
+                    return out;
+                }
+                Err(e) => {
+                    let good = e.valid_up_to();
+                    // `valid_up_to` is a char boundary by construction; the
+                    // `unwrap_or` is unreachable and costs nothing to be safe.
+                    let head = std::str::from_utf8(&rest[..good]).unwrap_or("");
+                    push_escaping_sentinel(&mut out, head);
+                    // `error_len() == None` means the input ended mid-sequence.
+                    // Escape one byte and let the loop re-derive the rest, so
+                    // there is one rule rather than two.
+                    let bad = e.error_len().unwrap_or(1).max(1);
+                    let end = (good + bad).min(rest.len());
+                    for b in &rest[good..end] {
+                        push_byte_escape(&mut out, *b);
+                    }
+                    // `end > good >= 0`, so `rest` shrinks every iteration.
+                    rest = &rest[end..];
+                }
+            }
+        }
+    }
+
+    /// Render a compared line for human eyes: the raw-byte escapes become
+    /// `\xNN`, which is readable, where the sentinel itself would print as a
+    /// replacement box and tell the reader nothing.
+    ///
+    /// Display only. This is deliberately *not* injective — a program that
+    /// literally prints the four characters `\xE9` renders identically — and
+    /// nothing downstream of this function compares its result. Every
+    /// comparison in this module runs on the decoded string, not on this.
+    fn for_display(s: &str) -> String {
+        if !s.contains(BYTE_ESCAPE) {
+            return s.to_string();
+        }
+        let mut out = String::with_capacity(s.len() + 8);
+        for c in s.chars() {
+            if c == BYTE_ESCAPE {
+                out.push_str("\\x");
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 
     // -----------------------------------------------------------------------
@@ -7832,6 +8001,93 @@ mod diff_hotspot {
             }
         }
         (cur, fired)
+    }
+
+    // -----------------------------------------------------------------------
+    // Naming a divergence that is shaped like a charset disagreement
+    //
+    // A hint, never a masker. The five entries in `RELAX_RULES` exist because
+    // identity hashes and addresses are *unspecified* observables that two
+    // conforming JVMs may legitimately disagree about. The characters a program
+    // prints are not in that category — they are precisely what a JVM
+    // differential is for — so nothing below ever changes a verdict or an exit
+    // code. It only tells the reader which one-token re-run settles it.
+    // -----------------------------------------------------------------------
+
+    /// The ASCII skeleton of a compared line, plus whether the line held
+    /// anything outside ASCII at all.
+    ///
+    /// Every maximal run of "this position held something the charset could not
+    /// carry" collapses to a single `\u{0}`; everything else is kept verbatim.
+    /// Three spellings count as such a position, because three different layers
+    /// produce them:
+    ///
+    /// * a raw-byte escape from [`decode_lossless`] — a cp1252 `é` that reached
+    ///   us as the single byte `0xE9`. Its two hex digits are swallowed with
+    ///   it, so it counts as **one** position and not as three characters;
+    /// * any other non-ASCII character — the UTF-8 side, which carries the
+    ///   character intact;
+    /// * `?` and `\u{1A}` (SUB) — what a JDK `CharsetEncoder` substitutes when
+    ///   it cannot represent a character. `U+FFFD`, what a *decoder*
+    ///   substitutes, is already covered by the non-ASCII arm.
+    ///
+    /// That is what lets HotSpot's `hello, ??? world` line up against
+    /// CratonVM's `hello, é中😀 world`.
+    fn ascii_skeleton(s: &str) -> (String, bool) {
+        let mut out = String::with_capacity(s.len());
+        let mut saw_non_ascii = false;
+        let mut in_run = false;
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            let mark = if c == BYTE_ESCAPE {
+                for _ in 0..2 {
+                    if matches!(chars.peek(), Some(d) if d.is_ascii_hexdigit()) {
+                        chars.next();
+                    }
+                }
+                saw_non_ascii = true;
+                true
+            } else if !c.is_ascii() {
+                saw_non_ascii = true;
+                true
+            } else {
+                c == '?' || c == '\u{1A}'
+            };
+            if mark {
+                if !in_run {
+                    out.push('\u{0}');
+                    in_run = true;
+                }
+            } else {
+                in_run = false;
+                out.push(c);
+            }
+        }
+        (out, saw_non_ascii)
+    }
+
+    /// Whether two differing lines differ **only** outside ASCII — the shape a
+    /// charset disagreement makes.
+    ///
+    /// The `saw_non_ascii` guard is what keeps this from firing on an ordinary
+    /// ASCII difference: `x?y` against `x??y` has the same skeleton, but
+    /// neither side left ASCII, so encoding cannot be the explanation and the
+    /// hint stays quiet.
+    ///
+    /// It is a heuristic and is allowed to be, because it decides nothing. It
+    /// over-fires on a genuine character-level divergence — CratonVM printing
+    /// `é` where HotSpot prints `ü` is a real bug and this returns `true` for
+    /// it — and the cost of that is one extra paragraph in a report that still
+    /// says `DIVERGENCE` and still exits `1`. The re-run the paragraph asks for
+    /// is what separates the two cases, and it separates them by *proof*: pin
+    /// the charset on both sides and a real divergence survives.
+    fn differs_only_outside_ascii(cvm: &str, java: &str) -> bool {
+        if cvm == java {
+            return false;
+        }
+        let (skel_c, non_ascii_c) = ascii_skeleton(cvm);
+        let (skel_j, non_ascii_j) = ascii_skeleton(java);
+        (non_ascii_c || non_ascii_j) && skel_c == skel_j
     }
 
     /// `--diff-ignore` matching: a plain substring, with `*` standing for any
@@ -8188,7 +8444,11 @@ mod diff_hotspot {
             );
             for (i, u) in unstable_out.iter().enumerate() {
                 if *u {
-                    println!("          stdout {:>5} | {}", i + 1, at(&cvm_out[0], i));
+                    println!(
+                        "          stdout {:>5} | {}",
+                        i + 1,
+                        for_display(&at(&cvm_out[0], i))
+                    );
                 }
             }
             println!();
@@ -8207,6 +8467,20 @@ mod diff_hotspot {
         let out_diff = first_line_diff(&c_out, &h_out);
         let err_diff = first_line_diff(&c_err, &h_err);
         let exit_diff = !exit_unstable && c_exit != h_exit;
+
+        // Make the decode visible when it did anything. Non-UTF-8 bytes on
+        // either side are the norm on a legacy Windows console, and a reader
+        // who sees `\xE9` in the report below is owed the sentence that says
+        // what it is and that it was compared and not repaired.
+        if [&cvm[0].stdout, &cvm[0].stderr, &hs.stdout, &hs.stderr]
+            .iter()
+            .any(|s| s.contains(BYTE_ESCAPE))
+        {
+            println!(
+                "  note           : one side wrote bytes that are not valid UTF-8. They are \
+                 compared\n                   exactly, byte for byte, and shown below as \\xNN."
+            );
+        }
 
         let exit_word = if exit_diff {
             format!("DIFFER (cratonvm {c_exit}, java {h_exit})")
@@ -8285,13 +8559,20 @@ mod diff_hotspot {
         }
 
         // --- A real divergence. Report the first one, with context. ---------
+        //
+        // `encoding_shaped` names the cause when the two sides agree on every
+        // ASCII character and differ only outside it. It changes neither the
+        // verdict nor the exit code — see `print_encoding_hint`.
         println!("VERDICT: DIVERGENCE.");
+        let mut encoding_shaped = false;
         if let Some(i) = r_out_diff {
             println!("  first divergence: stdout, line {}", i + 1);
             print_context(i, &c_out, &h_out);
+            encoding_shaped = differs_only_outside_ascii(&at(&c_out, i), &at(&h_out, i));
         } else if let Some(i) = r_err_diff {
             println!("  first divergence: stderr, line {}", i + 1);
             print_context(i, &c_err, &h_err);
+            encoding_shaped = differs_only_outside_ascii(&at(&c_err, i), &at(&h_err, i));
         } else {
             println!(
                 "  first divergence: exit status — cratonvm {c_exit}, reference java {h_exit}; \
@@ -8301,11 +8582,15 @@ mod diff_hotspot {
             if !tail.is_empty() {
                 println!("  last lines of the CratonVM stderr:");
                 for l in tail.into_iter().rev() {
-                    println!("    {l}");
+                    println!("    {}", for_display(l));
                 }
             }
         }
         println!();
+        if encoding_shaped {
+            print_encoding_hint();
+            println!();
+        }
         println!(
             "  Before filing this: identity hash codes, HashMap iteration order on some \
              shapes,\n  timestamps, thread interleaving and absolute paths differ legitimately \
@@ -8332,10 +8617,38 @@ mod diff_hotspot {
     fn print_context(idx: usize, c: &[String], h: &[String]) {
         let start = idx.saturating_sub(3);
         for i in start..idx {
-            println!("      {:>5} | {}", i + 1, at(c, i));
+            println!("      {:>5} | {}", i + 1, for_display(&at(c, i)));
         }
-        println!("    cratonvm {:>5} | {}", idx + 1, at(c, idx));
-        println!("    java     {:>5} | {}", idx + 1, at(h, idx));
+        println!("    cratonvm {:>5} | {}", idx + 1, for_display(&at(c, idx)));
+        println!("    java     {:>5} | {}", idx + 1, for_display(&at(h, idx)));
+    }
+
+    /// Name a divergence whose two sides differ only outside ASCII, and point
+    /// at the one re-run that settles whether it is encoding or semantics.
+    ///
+    /// **This is a hint, not a masker.** It is printed *after* the verdict, the
+    /// verdict is still `DIVERGENCE`, and the exit code is still
+    /// [`EXIT_DIVERGED`]. Nothing here can turn a red run green — see the
+    /// comment above `ascii_skeleton` for why an encoding difference must not
+    /// be forgiven the way an identity hash is.
+    fn print_encoding_hint() {
+        println!(
+            "  Those two lines are identical everywhere except outside ASCII. That is the\n  \
+             shape a *charset* disagreement makes, not the shape a semantic one makes.\n  \
+             HotSpot derives stdout.encoding from the host — JEP 400 pinned file.encoding\n  \
+             and deliberately left this one alone — while CratonVM answers UTF-8\n  \
+             unconditionally, so on a non-UTF-8 console the two VMs write the same\n  \
+             characters as different bytes. Settle it in one run; -D properties are\n  \
+             forwarded to both sides, and UTF-8 is the one value the specification\n  \
+             blesses for these keys:\n\n      \
+             cratonvm --diff-hotspot -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8 \
+             <the same arguments>\n\n  \
+             If the divergence disappears, it was encoding and the characters agreed all\n  \
+             along. If it survives, it is a real finding. This paragraph is a hint and not\n  \
+             a mask: the verdict above is still DIVERGENCE and the exit code is still 1.\n  \
+             Background: docs/testing/diff-hotspot.md and the known-issue page\n  \
+             stdout-encoding-differs-from-hotspot-on-windows-20260901.md."
+        );
     }
 
     #[cfg(test)]
@@ -8375,6 +8688,53 @@ mod diff_hotspot {
                 "read Foo.txt ok"
             );
             assert_eq!(mask_abs_path("ratio 3/4 ok"), "ratio 3/4 ok");
+        }
+
+        /// The bug this decode replaced: `String::from_utf8_lossy` turned
+        /// HotSpot's *own correct* cp1252/ISO-8859-1 `é` — the single byte
+        /// `0xE9` — into U+FFFD, and the harness then reported a divergence
+        /// against a line HotSpot never wrote. Nothing is lost now, and the
+        /// mapping is injective, which is what makes the byte-exact verdict
+        /// byte-exact.
+        #[test]
+        fn a_non_utf8_reference_byte_survives_the_decode() {
+            assert_eq!(for_display(&decode_lossless(b"h\xE9llo")), "h\\xE9llo");
+            // Injective: two different byte streams cannot decode alike.
+            assert_ne!(decode_lossless(b"h\xE9llo"), decode_lossless(b"h\xEAllo"));
+            // Valid UTF-8 is untouched, so the common path is unchanged.
+            assert_eq!(decode_lossless("héllo".as_bytes()), "héllo");
+            // A truncated sequence escapes byte by byte and still terminates.
+            assert_eq!(for_display(&decode_lossless(b"a\xEF\xB7b")), "a\\xEF\\xB7b");
+        }
+
+        /// The sentinel is escaped as its own three bytes, or a program that
+        /// printed U+FDD0 would be indistinguishable from a raw byte.
+        #[test]
+        fn the_escape_sentinel_escapes_itself() {
+            let decoded = decode_lossless("a\u{FDD0}b".as_bytes());
+            assert_eq!(for_display(&decoded), "a\\xEF\\xB7\\x90b");
+            assert_ne!(decoded, "a\u{FDD0}b");
+        }
+
+        /// A hint, and only where it belongs: the encoding shape is recognised
+        /// on the witness from the known-issue page (both the `?`-substituting
+        /// and the raw-byte spellings of the reference side), and an ordinary
+        /// ASCII difference does not trip it.
+        #[test]
+        fn an_encoding_shaped_divergence_is_recognised_and_an_ascii_one_is_not() {
+            assert!(differs_only_outside_ascii(
+                "hello, é中😀 world",
+                "hello, ??? world"
+            ));
+            // cp1252: `é` reaches us as one raw byte, the rest substitute.
+            assert!(differs_only_outside_ascii(
+                "hello, é中😀 world",
+                &decode_lossless(b"hello, \xE9?? world")
+            ));
+            // A numeric divergence is not encoding, and neither is a `?` count.
+            assert!(!differs_only_outside_ascii("0.3", "0.30000000000000004"));
+            assert!(!differs_only_outside_ascii("x?y", "x??y"));
+            assert!(!differs_only_outside_ascii("same", "same"));
         }
 
         #[test]

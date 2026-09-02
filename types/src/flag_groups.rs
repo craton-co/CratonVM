@@ -175,6 +175,14 @@ pub const SCALARS: &[&str] = &[
     // the `-XX:StartFlightRecording:+<Event>#enabled=true` spelling is parsed in
     // `vm-cli`, which an embedder does not link.
     "CRATONVM_JFR_ENABLE_EVENTS",
+    // D3 (2026-09-01): override the host-derived `native.encoding`. A scalar,
+    // not an `E` row, because it carries a VALUE and the `E` model is
+    // presence-only. Unset = derived from the LC_ALL/LC_CTYPE/LANG chain the
+    // JDK itself uses; `=UTF-8` restores the constant this VM used to hard-code
+    // under a comment wrongly claiming JEP 400 required it (JEP 400 pinned
+    // `file.encoding` only, and `System.java` specifies `native.encoding` as
+    // host-derived and command-line-immune).
+    "CRATONVM_NATIVE_ENCODING",
 ];
 
 /// One knob: a token in a group, and the legacy key(s) it expands to.
@@ -1195,6 +1203,16 @@ pub const INVENTORY: &[E] = &[
     // emitted. Sits beside `compiled-frame-lines`, the structurally identical
     // sibling added on the same branch for defect 1 of the same page.
     E { group: Group::JIT, token: "inline-frame-map", on_key: None, off_key: Some("CRATONVM_JIT_NO_INLINE_FRAME_MAP"), off_word: None, since: "2026-09-01" },
+    // D2: a guarded-virtual site emits guard, splice AND miss edge under ONE
+    // safepoint bci, and the miss edge records no inline-frame row -- so that
+    // bci held exactly one chain, was never poisoned, and the innermost frame
+    // could be handed the chain of a splice THAT DID NOT RUN. A fabricated
+    // frame is worse than a missing one, because a reader cannot tell. The fix
+    // emits an empty-chain row at the miss edge so the EXISTING disagreement
+    // rule poisons the bci. Needs its own name rather than riding
+    // `inline-frame-map`: that switch kills the whole producer and so cannot
+    // separate "the poison took this frame" from "the map never had it".
+    E { group: Group::JIT, token: "inline-miss-edge-poison", on_key: None, off_key: Some("CRATONVM_JIT_NO_INLINE_MISS_EDGE_POISON"), off_word: None, since: "2026-09-01" },
     // B1: the IR tier grew a String-access expander (length/isEmpty/charAt),
     // but the invoke-planning gate still refused EVERY `java/lang/String`
     // invoke, so the expander was unreachable and its documented A/B measured

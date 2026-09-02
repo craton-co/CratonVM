@@ -398,6 +398,198 @@ fn restamp_outcome(
 /// the same one test.
 const INLINE_FRAME_MAX_BCI: usize = 65_536;
 
+// ---------------------------------------------------------------------------
+// The guarded-virtual MISS EDGE, and why it has to poison its own bci
+// ---------------------------------------------------------------------------
+//
+// A guarded virtual/interface site (PGO-02) emits, at ONE `cur_bc_pc`: the
+// receiver load and null test, a `CMP`/`JNE` guard per admitted variant, each
+// variant's SPLICED BODY, and -- reached when every guard misses -- the
+// ordinary dispatch call, emitted by `bytecode_walk`'s unchanged
+// normal-dispatch tail. Confirmed against the source 2026-09-01: the
+// `0xb6 | 0xb7 | 0xb9` arm's guard chain calls `try_emit_inline_site(pc, site)`
+// once per variant and then falls THROUGH to that tail, and `self.cur_bc_pc`
+// is assigned once per outer bytecode at the top of the walk and is not moved
+// by the inline walk. Every one of those program points therefore carries the
+// same safepoint id.
+//
+// THE MISS EDGE RECORDS NO ROW OF ITS OWN. `record_inline_frame_row` is
+// called from exactly two places -- `emit_inline_direct_call` and
+// `emit_inline_dispatch_call` -- and both are calls emitted from INSIDE a
+// spliced body. The top-level dispatch tail does not call it, and could not
+// usefully: `build_inline_frame_chain` answers `None` on an empty scope stack,
+// and at the miss edge the stack IS empty, because `try_emit_inline_site`
+// popped its scope before returning.
+//
+// That leaves the bci holding exactly ONE chain -- the splice's -- so
+// `from_rows` never sees a disagreement to poison it with. An innermost
+// compiled frame (the only kind that keys on the safepoint id, because it owns
+// no return address on this stack) suspended on the miss edge is then handed
+// the chain of a splice THAT DID NOT RUN. A trace naming a method the program
+// was never inside is worse than a missing frame: a missing frame reads as
+// missing, a fabricated one reads as true. It is the exact outcome
+// `conservative_roots::compiled_frame_inline_chain`'s own doc says this area
+// refuses, and the exact-key rule stated there protects only frames that HAVE
+// the exact key -- which the innermost frame never does.
+//
+// THE REMEDY IS EVIDENCE, NOT A SECOND MECHANISM. A row is pushed for the
+// guarded splice carrying that same `safepoint_bci` and an EMPTY chain. The
+// disagreement rule already in `from_rows` then does the work it was written
+// for: two rows under one bci that do not agree, so the slot goes to `None`
+// and `chain_for_safepoint_bci` refuses. Nothing new decides anything, and
+// key 1 is untouched -- the empty-chain row lands at its own exact
+// `native_offset`, where "no inlined frames here" is the correct answer for
+// the guard bytes it names.
+//
+// WHY THE EMITTER AND NOT THE WALK. The walk holds one safepoint id and
+// nothing else; it cannot tell the miss edge from the splice beside it. Only
+// the emitter knows a miss edge exists under that bci. The blunt walk-side
+// alternative -- refuse key 2 whenever the artifact holds any guarded site --
+// would take the inlined callees back out of every innermost frame in the
+// common case, which is the regression this workstream exists to prevent.
+//
+// WHY THIS CANNOT DISTURB THE 2026-09-01 WITNESS. `probes/StackTraceAfterOsr.java`
+// reports `len=5 [leaf:25 mid:26 outer:27 probe:42 main:66]`, and `probe` IS
+// the innermost compiled frame, so `leaf`/`mid`/`outer` do come from key 2 --
+// "poison more" is precisely the direction that could break it. It cannot, for
+// two independent reasons, either one sufficient on its own:
+//
+//   * the witness's chain is `probe -> outer -> mid -> leaf` and every one of
+//     those calls is `invokestatic` (0xb8). The guard chain lives in the
+//     `0xb6 | 0xb7 | 0xb9` arm and is entered only for `op != 0xb7`; 0xb8 is a
+//     different arm entirely, which splices through `try_emit_inline(pc)` with
+//     no guard, no variants and no miss edge -- the splice REPLACES the call.
+//     A statically bound splice is not gated in below and pushes no row;
+//   * `inline_guard_variants` -- the map this poison is gated on, and the same
+//     map `bytecode_walk`'s guard chain is driven from -- is populated only
+//     for `plan.is_speculative()`, i.e. only at virtual/interface sites, and
+//     only when `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` is set, which is
+//     default-OFF and documented "unsoaked". On the default path that map is
+//     empty for every pc in every method, so the gate is false everywhere and
+//     not one extra row is recorded in the entire run.
+//
+// The change can only make a reported chain SHORTER, never longer or
+// different, and only at a pc that carries a receiver guard.
+
+/// `CRATONVM_JIT_NO_INLINE_MISS_EDGE_POISON=1` -- measurement-only escape
+/// hatch that stops the guarded-splice poison row being recorded, so a frame
+/// that vanished from a trace is attributable in one RUN rather than one
+/// BUILD.
+///
+/// It gets its own name rather than riding `CRATONVM_JIT_NO_INLINE_FRAME_MAP`:
+/// that switch turns the WHOLE producer off, so it cannot separate "the poison
+/// took this frame" from "the map never had it". Setting this one reinstates
+/// the fabricated frame and is not a supported configuration -- it exists so
+/// those two hypotheses are one variable apart.
+///
+/// Cached, like `inline_call_map_at_return_disabled` above: the question is
+/// asked once per guarded splice emitted, which is a compile-time path, and
+/// the answer cannot change within a process.
+fn inline_miss_edge_poison_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_MISS_EDGE_POISON").is_some()
+    })
+}
+
+/// Cached `CRATONVM_DBG_JITC`, for the one site below that is reached on a
+/// THROW rather than at compile time. Re-reading the environment during a
+/// stack walk would be the only runtime cost this change has. The key is
+/// REUSED, not minted -- this file already prints its splice decisions under
+/// it -- so the flag surface grows by exactly one name.
+fn inline_frame_dbg() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some())
+}
+
+/// Census of the miss-edge poison, index-parallel with
+/// [`INLINE_MISS_EDGE_POISON_COUNTS`].
+///
+/// Five numbers rather than one, for the reason
+/// [`INLINE_CALL_MAP_AT_RETURN_NAMES`] gives at length: a poison that never
+/// fires and a poison that fires constantly are indistinguishable without a
+/// number, and this project has repeatedly been bitten by an instrument armed
+/// where it cannot fire. On the default path
+/// (`CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` unset) every entry here is EXPECTED
+/// to read zero, and that zero is the positive evidence the witness is
+/// untouched rather than an absence of evidence.
+///
+/// * `rows-emitted` -- guarded splices that pushed a poison row. Compile-time
+///   engagement: the fix is compiled in AND a guarded splice happened.
+/// * `bcis-poisoned` -- safepoint bcis a finished map left at `None`, from ANY
+///   cause. The denominator: it counts the pre-existing
+///   two-calls-under-one-splice disagreement too, so "the poison fired" and
+///   "the bci was already ambiguous" stay separable.
+/// * `bcis-poisoned-by-miss-edge` -- of those, the ones a poison row
+///   contributed to. This is the fix's own engagement, and it is deliberately
+///   NOT expected to equal `rows-emitted`: a guarded splice whose body emitted
+///   no call of its own leaves that bci holding a single empty-chain row,
+///   which is `Some([])` and not poisoned -- and `Some([])` is the same "no
+///   inlined frames here" answer the bci already gave when it held no row at
+///   all, so nothing is lost in that case.
+/// * `lookups-refused` -- innermost-frame key-2 lookups that found a poisoned
+///   slot. Runtime engagement: each one is a frame the trace deliberately does
+///   not show, and would have shown WRONGLY before.
+/// * `reverted` -- `CRATONVM_JIT_NO_INLINE_MISS_EDGE_POISON` was set, so no
+///   row was pushed. Counted at the site the row would have been pushed at, so
+///   a reverted run still reports how often the fix WOULD have engaged.
+#[allow(dead_code)]
+pub const INLINE_MISS_EDGE_POISON_NAMES: [&str; 5] = [
+    "rows-emitted",
+    "bcis-poisoned",
+    "bcis-poisoned-by-miss-edge",
+    "lookups-refused",
+    "reverted",
+];
+
+static INLINE_MISS_EDGE_POISON_COUNTS: [std::sync::atomic::AtomicU64; 5] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Index into [`INLINE_MISS_EDGE_POISON_NAMES`]: a poison row was pushed.
+const INLINE_MISS_EDGE_ROWS: usize = 0;
+/// Index: a finished map left a safepoint bci at `None`, from any cause.
+const INLINE_MISS_EDGE_BCIS_POISONED: usize = 1;
+/// Index: ...and a poison row contributed to that bci.
+const INLINE_MISS_EDGE_BCIS_BY_MISS: usize = 2;
+/// Index: a key-2 lookup found a poisoned slot and refused.
+const INLINE_MISS_EDGE_LOOKUPS_REFUSED: usize = 3;
+/// Index: the kill switch is set, so the pre-fix (unpoisoned) map stands.
+const INLINE_MISS_EDGE_REVERTED: usize = 4;
+
+/// One bump, taken by every path so the counter cannot be forgotten at one of
+/// them. `by == 0` returns early: `from_rows` calls this once per finished map
+/// with a per-artifact total, and the overwhelming majority of artifacts have
+/// nothing to add.
+fn note_inline_miss_edge(slot: usize, by: u64) {
+    if by == 0 {
+        return;
+    }
+    if let Some(c) = INLINE_MISS_EDGE_POISON_COUNTS.get(slot) {
+        c.fetch_add(by, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Read the census. Wiring it into `jit-method-stats` is the same two-line
+/// re-export/format pair `inline_live_slot_clamps` already has, and both of
+/// those files belong to other agents on 2026-09-01, so the edits are written
+/// out in `.agent-requests/D2-flags.txt` rather than made here. Until they
+/// land the census is readable in ONE run under `CRATONVM_DBG_JITC`, which
+/// prints a line per compiled artifact that recorded rows and a line per
+/// refused lookup.
+#[allow(dead_code)]
+pub fn inline_miss_edge_poison_counts() -> [u64; 5] {
+    let mut out = [0u64; 5];
+    for (i, slot) in INLINE_MISS_EDGE_POISON_COUNTS.iter().enumerate() {
+        out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
 /// One level of an inline chain: a spliced callee, and the bytecode index --
 /// in THAT callee's own code -- of the call leading one level further in.
 ///
@@ -476,7 +668,25 @@ impl InlineFrameMap {
             .by_safepoint_bci
             .binary_search_by_key(&safepoint_bci, |(b, _)| *b)
             .ok()?;
-        self.by_safepoint_bci[i].1.as_deref()
+        let chain = self.by_safepoint_bci[i].1.as_deref();
+        if chain.is_none() {
+            // A POISONED bci: a frame this trace deliberately does not show.
+            // Counted -- and named under the debug key -- because a lost frame
+            // has to be attributable to this refusal in ONE run. A silent
+            // shortening reads exactly like the pre-map behaviour it replaced,
+            // which is the shape that let the defect this poison closes go
+            // unseen in the first place. The `.ok()?` above is NOT counted:
+            // "no row under this bci" is a different fact from "the rows under
+            // it disagreed", and only the second is a frame given up.
+            note_inline_miss_edge(INLINE_MISS_EDGE_LOOKUPS_REFUSED, 1);
+            if inline_frame_dbg() {
+                eprintln!(
+                    "[cratonvm-jitc] inline-frame-map REFUSED safepoint_bci={safepoint_bci} (two program points under one bci disagree) census={:?}",
+                    inline_miss_edge_poison_counts(),
+                );
+            }
+        }
+        chain
     }
 
     /// Collapse the raw emission-order rows into the two lookup tables.
@@ -505,23 +715,65 @@ impl InlineFrameMap {
         let mut by_native_offset: Vec<(u32, Vec<InlineFrameLevel>)> =
             Vec::with_capacity(kept.len());
         let mut by_safepoint_bci: Vec<(u32, Option<Vec<InlineFrameLevel>>)> = Vec::new();
+        // Parallel to `by_safepoint_bci` while it is being built: did a
+        // guarded-splice MISS-EDGE row contribute to this slot? Census only --
+        // the poisoning itself is the ordinary disagreement rule below,
+        // unchanged. An EMPTY chain identifies such a row unambiguously and
+        // needs no extra field: `build_inline_frame_chain` answers `None` on
+        // an empty scope stack and otherwise yields at least one level, so a
+        // row recorded by `record_inline_frame_row` can never be empty.
+        let mut saw_miss_edge: Vec<bool> = Vec::new();
         for r in &kept {
             by_native_offset.push((r.native_offset, r.chain.clone()));
+            let is_miss_edge = r.chain.is_empty();
+            // `position` rather than `find`, so the parallel vector above can
+            // be indexed with the same slot. Same lookup, same order.
             match by_safepoint_bci
-                .iter_mut()
-                .find(|(b, _)| *b == r.safepoint_bci)
+                .iter()
+                .position(|(b, _)| *b == r.safepoint_bci)
             {
-                Some(slot) => {
-                    let agrees = match &slot.1 {
+                Some(i) => {
+                    let agrees = match &by_safepoint_bci[i].1 {
                         Some(existing) => *existing == r.chain,
                         None => false,
                     };
                     if !agrees {
-                        slot.1 = None;
+                        by_safepoint_bci[i].1 = None;
+                    }
+                    if is_miss_edge {
+                        saw_miss_edge[i] = true;
                     }
                 }
-                None => by_safepoint_bci.push((r.safepoint_bci, Some(r.chain.clone()))),
+                None => {
+                    by_safepoint_bci.push((r.safepoint_bci, Some(r.chain.clone())));
+                    saw_miss_edge.push(is_miss_edge);
+                }
             }
+        }
+        // Census BEFORE the sort, which reorders `by_safepoint_bci` and would
+        // desync the parallel vector. Two numbers, because "this bci is
+        // ambiguous" and "the miss-edge poison is what made it ambiguous" are
+        // different readings and one total cannot separate them.
+        let mut poisoned = 0u64;
+        let mut poisoned_by_miss_edge = 0u64;
+        for (i, (_, chain)) in by_safepoint_bci.iter().enumerate() {
+            if chain.is_none() {
+                poisoned += 1;
+                if saw_miss_edge.get(i).copied().unwrap_or(false) {
+                    poisoned_by_miss_edge += 1;
+                }
+            }
+        }
+        note_inline_miss_edge(INLINE_MISS_EDGE_BCIS_POISONED, poisoned);
+        note_inline_miss_edge(INLINE_MISS_EDGE_BCIS_BY_MISS, poisoned_by_miss_edge);
+        if inline_frame_dbg() && !kept.is_empty() {
+            eprintln!(
+                "[cratonvm-jitc] inline-frame-map rows={} bcis={} poisoned={poisoned} by-miss-edge={poisoned_by_miss_edge} {:?}={:?}",
+                kept.len(),
+                by_safepoint_bci.len(),
+                INLINE_MISS_EDGE_POISON_NAMES,
+                inline_miss_edge_poison_counts(),
+            );
         }
         by_native_offset.sort_by_key(|(o, _)| *o);
         by_safepoint_bci.sort_by_key(|(b, _)| *b);
@@ -741,6 +993,66 @@ fn record_inline_frame_row(native_offset: usize, safepoint_bci: usize) {
     });
 }
 
+/// Record the guarded-virtual site's MISS-EDGE row: the splice's
+/// `safepoint_bci`, and an EMPTY chain, so `from_rows` poisons that bci.
+///
+/// See the block comment above [`inline_miss_edge_poison_disabled`] for the
+/// whole argument. Three details of the call:
+///
+///  * `safepoint_bci` MUST be the same `self.cur_bc_pc` the calls inside the
+///    body are recorded under, not the site `pc` the caller happens to hold.
+///    They are equal today (the walk assigns `cur_bc_pc = pc` once per outer
+///    bytecode and the inline walk does not move it), but poisoning a bci the
+///    splice's own rows are not filed under would leave the real one intact
+///    and the fabricated frame in place -- a fix that reads as applied and is
+///    not;
+///  * `native_offset` is the buffer position at the START of the splice. That
+///    is the only program point inside this bci this file can name -- the miss
+///    edge's own bytes are emitted by `bytecode_walk`'s dispatch tail. It is a
+///    legal key for `by_native_offset`: key 1 is an EXACT match, so it answers
+///    for that offset and nothing else, and the answer it gives there (an
+///    empty chain, i.e. no inlined frames) is the truth for the guard bytes it
+///    points at;
+///  * it is pushed BEFORE the body is walked, so the row list stays ascending
+///    in `native_offset` and `from_rows`' rewind backstop keeps every row the
+///    splice goes on to record. Were two rows ever to share an offset, the
+///    backstop would drop the EARLIER one, which loses a chain rather than
+///    inventing one -- fail-closed in the same direction as everything else
+///    here.
+fn record_inline_frame_miss_edge_row(native_offset: usize, safepoint_bci: usize) {
+    if !inline_frame_recording() {
+        return;
+    }
+    if inline_miss_edge_poison_disabled() {
+        // Counted even when reverted, so an A/B pair reports the same
+        // engagement on both arms and a zero on the treatment arm cannot be
+        // mistaken for "the guarded site never happened".
+        note_inline_miss_edge(INLINE_MISS_EDGE_REVERTED, 1);
+        return;
+    }
+    if safepoint_bci >= INLINE_FRAME_MAX_BCI {
+        // The same JVMS 4.9.1 screen `record_inline_frame_row` applies. A bci
+        // this file would refuse to record a chain under is one no chain can
+        // be found under either, so there is nothing to poison.
+        return;
+    }
+    let native_offset = match u32::try_from(native_offset) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    note_inline_miss_edge(INLINE_MISS_EDGE_ROWS, 1);
+    INLINE_FRAME_ROWS.with(|r| {
+        r.borrow_mut().push(InlineFrameRow {
+            native_offset,
+            // Cast: guarded above by the JVMS 4.9.1 bound.
+            safepoint_bci: safepoint_bci as u32,
+            // The whole point: a chain that agrees with no other chain, so the
+            // existing disagreement rule in `from_rows` poisons this bci.
+            chain: Vec::new(),
+        })
+    });
+}
+
 fn record_merge_state(
     states: &mut [Option<(usize, Vec<bool>)>],
     target: usize,
@@ -877,6 +1189,35 @@ impl Compiler {
         // CALLEE's identity, which is what a stack trace has to name.
         let inline_frame_rows_checkpoint = inline_frame_rows_len();
         push_inline_frame_scope(inline_site_label(site), pc);
+        // The guarded-virtual MISS EDGE's poison row. In one line: a
+        // receiver-guarded site emits guard, splice and miss edge under ONE
+        // `cur_bc_pc`; the miss edge records no row of its own; without this
+        // the innermost frame's key-2 lookup hands a frame suspended on the
+        // miss edge the chain of a splice that did not run. The long form,
+        // including why this cannot disturb the 2026-09-01 witness, is the
+        // block comment above `inline_miss_edge_poison_disabled`.
+        //
+        // `inline_guard_variants` is the gate because it is the SAME map
+        // `bytecode_walk`'s guard chain is driven from: populated only for
+        // `plan.is_speculative()` and only under
+        // `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE`, so it is true for exactly the
+        // sites that HAVE a miss edge and empty for every site on the default
+        // path. A statically bound splice (`invokestatic` / `invokespecial`,
+        // which is what the witness inlines) REPLACES its call and has no miss
+        // edge, so it is not gated in and gives up nothing.
+        //
+        // `self.cur_bc_pc`, not `pc`: the row has to be filed under the same
+        // key the calls inside the body are, and that is what those record.
+        //
+        // Pushed here rather than after the walk for two reasons. The row
+        // order stays ascending in `native_offset`, which is what `from_rows`'
+        // rewind backstop reads; and the rollback below already truncates to
+        // `inline_frame_rows_checkpoint`, so a refused splice takes its poison
+        // row with it -- there is no miss edge to protect where there was no
+        // splice.
+        if self.inline_guard_variants.contains_key(&pc) {
+            record_inline_frame_miss_edge_row(buf_checkpoint, self.cur_bc_pc);
+        }
         let walk_at_checkpoint = self.inline_walk_at;
         self.inline_walk_at = (usize::MAX, 0);
         // The callee-local oop scope this splice pushes lives exactly as long
@@ -3177,6 +3518,28 @@ impl Compiler {
         self.stack = stack_checkpoint.clone();
         self.stack_oop_marks = oop_marks_checkpoint.clone();
         self.next_spill_offset = spill_checkpoint;
+        // THIS miss edge needs no poison row, unlike the TOP-LEVEL guarded
+        // site's (see `record_inline_frame_miss_edge_row`), and the reason is
+        // worth writing down because the two look identical from a distance.
+        //
+        // This one is emitted from INSIDE a spliced body, so the scope stack
+        // is not empty here: `try_emit_nested_inline` popped the hit arm's
+        // scope, leaving the ENCLOSING splice's, whose `cur_pc` still names
+        // this invoke (`set_inline_frame_scope_pc` is not clobbered by a
+        // nested walk -- that is why it exists). `emit_inline_invoke_into_rax`
+        // therefore reaches `record_inline_frame_row` and records a REAL row
+        // for this program point, describing the enclosing chain, which is the
+        // correct answer for it. That row is strictly shorter than any row the
+        // hit arm recorded -- the hit arm's chains carry the nested callee on
+        // top of the same enclosing levels -- so the two disagree under one
+        // bci and `from_rows` poisons it already.
+        //
+        // The remaining case, a hit arm that recorded no row at all (a leaf
+        // callee with no calls of its own), leaves this row alone under the
+        // bci. It names the ENCLOSING splice, which did run; a frame suspended
+        // inside the leaf body would be reported one level short. That is a
+        // MISSING frame, not a fabricated one, and it is what the map already
+        // does everywhere it has no row.
         if !self.emit_inline_invoke_into_rax(resolved) {
             // The miss edge cannot be emitted, so the guard has nowhere to land
             // and the whole construct is unusable. Rewind everything, including

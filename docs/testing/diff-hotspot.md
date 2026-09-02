@@ -162,7 +162,8 @@ line is printed with the rule that accounts for it, and the exit code is `0`.
 | `absolute-path` | `/`- or `X:\`-rooted paths, reduced to the last segment | A wrong path in an exception message |
 
 Because these run only as a *second opinion*, none of them can silently mask a
-strict-equality pass. A run that prints `no divergence` compared byte-for-byte.
+strict-equality pass. A run that prints `no divergence` compared byte-for-byte —
+literally so, see §5.1.
 
 **3. `--diff-ignore <PATTERN>`** for the residue only you can name. Masking
 replaces the line rather than deleting it, so both sides keep the same indices
@@ -182,6 +183,80 @@ and a reported line number still means something.
   prints one of those three tokens on stderr loses that line from the
   comparison. Same three shapes as the fuzzer's `vm-diagnostics` rule
   (`difftest/src/normalize.rs`).
+
+### 5.1 Character encoding: compared exactly, named when it diverges, never masked
+
+**The comparison is on bytes, not on lossily-decoded text.** This matters
+because *HotSpot's own correct output is frequently not valid UTF-8.* HotSpot
+derives `stdout.encoding` from the host — JEP 400 pinned `file.encoding` and
+deliberately left this one alone — so on a cp1252-style Windows console an `é`
+leaves HotSpot as the single byte `0xE9`. CratonVM emits UTF-8
+unconditionally. An earlier version of this harness decoded both children with
+`String::from_utf8_lossy`, which turned that `0xE9` into `U+FFFD` and then
+reported a divergence against a line HotSpot never wrote — the harness blaming
+the VM for a defect in its own decoder, and on the *reference* side, which is
+the least defensible place for a differential tool to be wrong.
+
+`capture` now decodes with an **injective** byte-to-text escape: valid UTF-8
+decodes normally, and every byte that is not part of a valid sequence becomes a
+fixed-width escape rendered in the report as `\xNN`. Because the mapping is
+injective, comparing the decoded strings is exactly as strong as comparing the
+byte streams, so §5's claim that a `no divergence` verdict "compared
+byte-for-byte" is now literally true. The three always-on normalisations are
+unchanged and still operate on text: an escape never contains `\r` or `\n` (both
+are valid UTF-8 and are never escaped), so CRLF→LF, the trailing-whitespace trim
+and the `[cratonvm]` chatter filter behave exactly as before. Two consequences
+worth knowing: the report prints `\xE9` where a byte could not be decoded, and a
+`--diff-ignore` pattern cannot match a byte that arrived undecodable — match on
+the ASCII around it instead.
+
+**When a divergence is encoding-shaped, the report says so.** If the two sides
+agree on every ASCII character and differ only outside ASCII — HotSpot's
+`hello, ??? world` against CratonVM's `hello, é中😀 world` — the report names
+the cause and prints the fix:
+
+```bash
+cratonvm --diff-hotspot -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8 <the same arguments>
+```
+
+`-D` properties are forwarded to both sides by the ordinary rule in §6, and
+`UTF-8` is the one value the specification blesses for these keys
+(`java.lang.System`'s property table: starting the runtime with
+`stdout.encoding` set to anything *else* is unspecified behaviour). Measured:
+this collapses all ten of the known-issue page's Windows divergences to zero.
+
+**It is a hint, not a masker.** The verdict stays `DIVERGENCE` and the exit code
+stays `1`. There is no `--diff-ignore-encoding`, deliberately:
+
+* The five maskers in §5 exist because identity hashes and addresses are
+  *unspecified* observables that two conforming JVMs may legitimately disagree
+  about. The characters a program prints are not in that category — they are
+  precisely what a JVM differential is for. Forgiving them would trade a false
+  positive for a false negative, which is strictly worse for this tool.
+* The detector is a heuristic and would have to stay one. It collapses each run
+  of non-representable positions to a placeholder, so CratonVM printing `é`
+  where HotSpot prints `ü` is *also* "different only outside ASCII" — a real
+  bug. As a hint that costs one extra paragraph; as a pass it would be a
+  silenced defect.
+* The workaround is strictly stronger evidence and costs less than the flag
+  would. Pinning the charset on both sides **proves** the difference was
+  encoding, because a real one survives the pin. A flag would only ever assert
+  it.
+* `--diff-ignore <PATTERN>` already exists for a line the user has personally
+  inspected and is willing to name.
+
+**Pinning `-Dstdout.encoding=UTF-8` automatically on both sides was also
+rejected.** It would silently hide the very divergence the known-issue page
+records, and it would change the program under test. The user asks for it or
+nobody does.
+
+Full investigation, including the ten-row Windows witness and why CratonVM's
+`stdout.encoding` is a constant:
+`docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-20260901.md`.
+It reproduces on Linux with no Windows box — `LC_ALL=C java -cp probes
+StdoutEncoding` gives the `?`-substituting side, and
+`java -Dstdout.encoding=ISO-8859-1 …` gives the raw-`0xE9` side that the lossy
+decode used to destroy.
 
 ---
 
@@ -284,6 +359,44 @@ VERDICT: no divergence on the comparable output, but the CratonVM side was not
 $ cratonvm --diff-hotspot --diff-ignore 'elapsed*ms' -cp out Bench   # → exit 0
 ```
 
+And a divergence that is only about which bytes carry the characters is named
+as such — still `DIVERGENCE`, still exit `1`, but with the one-token fix
+attached instead of two lines of mojibake:
+
+```text
+  note           : one side wrote bytes that are not valid UTF-8. They are compared
+                   exactly, byte for byte, and shown below as \xNN.
+  stdout DIFFER    stderr agree     exit-status agree (0)
+  wall           : cratonvm 231 ms, java 98 ms
+
+VERDICT: DIVERGENCE.
+  first divergence: stdout, line 1
+    cratonvm     1 | hello, é中😀 world
+    java         1 | hello, \xE9?? world
+
+  Those two lines are identical everywhere except outside ASCII. That is the
+  shape a *charset* disagreement makes, not the shape a semantic one makes.
+  HotSpot derives stdout.encoding from the host — JEP 400 pinned file.encoding
+  and deliberately left this one alone — while CratonVM answers UTF-8
+  unconditionally, so on a non-UTF-8 console the two VMs write the same
+  characters as different bytes. Settle it in one run; -D properties are
+  forwarded to both sides, and UTF-8 is the one value the specification
+  blesses for these keys:
+
+      cratonvm --diff-hotspot -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8 <the same arguments>
+
+  If the divergence disappears, it was encoding and the characters agreed all
+  along. If it survives, it is a real finding. This paragraph is a hint and not
+  a mask: the verdict above is still DIVERGENCE and the exit code is still 1.
+  Background: docs/testing/diff-hotspot.md and the known-issue page
+  stdout-encoding-differs-from-hotspot-on-windows-20260901.md.
+```
+
+```bash
+$ cratonvm --diff-hotspot -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8 \
+      -cp probes StdoutEncoding                                   # → exit 0
+```
+
 ---
 
 ## 8. Limits, stated rather than papered over
@@ -307,3 +420,11 @@ $ cratonvm --diff-hotspot --diff-ignore 'elapsed*ms' -cp out Bench   # → exit 
 * **One configuration.** This mode runs the command line you gave, twice. It
   does not fan out across the execution-path modes; that is
   `cratonvm-difftest run --modes …`.
+* **Encoding is compared, never interpreted.** The harness does not know either
+  side's charset and does not ask — discovering it would mean starting a further
+  JVM, and a byte-exact verdict must not rest on an interpretation of the bytes.
+  So the encoding hint of §5.1 is pattern-matched on the two lines, not derived
+  from the reference JDK's `stdout.encoding`. It is right about the shape and
+  says nothing about the cause that the recommended re-run does not settle
+  definitively; it also fires on a genuine character-level divergence, which is
+  why it never changes the verdict.

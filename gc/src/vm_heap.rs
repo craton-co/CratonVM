@@ -624,12 +624,19 @@ impl VmHeap {
     ///   peer root — the VM pins those via
     ///   [`crate::gc_quiescence::add_pinned_jit_root`]) are excluded from the
     ///   CSet, so nothing a frozen peer can address moves.
-    /// - ZGC (INT-3 residual): trivially safe — `ZgcRealHeap` is a
-    ///   non-moving STW mark-sweep whose sweep walks the allocation-base
-    ///   REGISTRY (never linear memory), and [`Self::refill_tlab`] never
-    ///   hands ZGC mutators a TLAB, so un-retired tails cannot exist. A
-    ///   frozen peer's conservative roots are ordinary (pinned-by-design)
-    ///   mark roots.
+    /// - ZGC (INT-3 residual): safe for the reason this protocol is actually
+    ///   about — [`Self::refill_tlab`] returns `None` on the `Zgc` arm, so ZGC
+    ///   mutators are never handed a TLAB and un-retired tails cannot exist —
+    ///   and the sweep walks the allocation-base REGISTRY, never linear
+    ///   memory. A frozen peer's conservative roots are ordinary
+    ///   (pinned-by-design) mark roots.
+    ///   Do NOT reuse the "non-moving STW mark-sweep" justification that stood
+    ///   here until 2026-09-01: `ZgcRealHeap` COMPACTS by default
+    ///   (`CRATONVM_ZGC_RELOCATE`, default-on since 2026-08-13). Whether a
+    ///   frozen in-JIT peer is safe against a MOVING cycle is a separate
+    ///   question, decided by `zgc_relocation_permitted` and
+    ///   `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT` in `gc/src/zgc.rs` and not
+    ///   by this predicate.
     ///
     /// The collector only engages the forcible in-JIT-peer take-over when
     /// this is `true` — now on every backend.
@@ -1101,44 +1108,101 @@ impl VmHeap {
     /// answer -- the `!` return type is the whole point. Whoever makes
     /// relocation real owns that decision at `ZgcRealHeap::forward`.
     ///
-    /// # Ordered work list, folded in from `.agent-requests/A9-gc-barrier.txt`
+    /// # Ordered work list -- THIS FILE IS THE AUTHORITY
     ///
-    /// The steps that must complete, in order, before
-    /// `vm/src/vm/vm_init.rs`'s `RELOCATION_REQUESTED` may be flipped:
+    /// Folded in from `.agent-requests/A9-gc-barrier.txt`. These are the steps
+    /// that must complete, in order, before `vm/src/vm/vm_init.rs`'s
+    /// `RELOCATION_REQUESTED` may be flipped.
     ///
-    /// 1. **NOT DONE -- the blocker.** Every other writer of a slot this
-    ///    barrier may CAS must be atomic.
-    ///    `cratonvm_types::narrow_oop::write_ref_slot` still does a plain
-    ///    `(ptr as *mut u64).write(addr)`, and a plain write racing
-    ///    `load_barrier_slow`'s `compare_exchange` on the same location is a
-    ///    data race -- undefined behaviour, not merely a lost update. The
-    ///    JIT-emitted inline reference stores under `jit/src/x64/` bypass
-    ///    `write_ref_slot` entirely and need the same treatment. Nothing may
-    ///    proceed past this; the exact requirement is written out in
-    ///    `.agent-requests/A16-vm-stores.txt`.
+    /// **Status changes go HERE and nowhere else.**
+    /// `gc/src/zgc/census.rs`'s `ZSlotShape::word_is_atomically_accessed_today`
+    /// carried a second copy of this sequence until 2026-09-01. The two drifted
+    /// apart inside three weeks and ended up each describing the other as the
+    /// stale one, which is what two copies of an ordered sequence buy. That
+    /// copy is now a pointer to this list plus the per-shape facts only it
+    /// knows; do not start a third. If another file needs the status, cite this
+    /// item.
+    ///
+    /// Status as of 2026-09-01. Every label below is a one-command check and
+    /// the command is named; re-run it rather than trusting the label.
+    ///
+    /// 1. **DONE for the Rust writers (2026-09-01).** Every other writer of a
+    ///    slot this barrier may CAS must be atomic: a plain write racing
+    ///    `load_barrier_slow`'s `compare_exchange` on one location is a data
+    ///    race, and the defect is the NON-ATOMICITY, not the ordering.
+    ///    `cratonvm_types::narrow_oop::read_ref_slot` / `write_ref_slot` are
+    ///    now `Relaxed` atomics in the wide (`AtomicU64`) and narrow
+    ///    (`AtomicU32`) arms alike, with the four-part argument for `Relaxed`
+    ///    rather than something stronger written out above them in
+    ///    `types/src/narrow_oop.rs`. This item quoted a plain
+    ///    `(ptr as *mut u64).write(addr)` until 2026-09-01; that write no
+    ///    longer exists, and `grep -n 'mut u64).write' types/src/narrow_oop.rs`
+    ///    is the check.
+    ///    Still open under this heading, and tracked on the `LegacyField` row
+    ///    of `zgc::census::ZSlotShape::atomicity_debt_note`: the collector-side
+    ///    16-byte `Value` writers in `gc/src/gc.rs`, `gc/src/gen_heap.rs` and
+    ///    `gc/src/g1.rs` are still plain `ptr::write` / `ptr::write_unaligned`.
+    ///    Tracked, not blocking -- those are the Generational and G1 evacuation
+    ///    loops, which never run over a `ZgcRealHeap`, so they are not slots
+    ///    this barrier can reach and CAS.
+    ///    The JIT-emitted inline reference stores under `jit/src/x64/` are NOT
+    ///    this item's problem and never were: machine code is not a Rust memory
+    ///    access, an aligned qword `mov` cannot tear against a `lock cmpxchg`,
+    ///    and no Rust UB is in play. What they have is a COVERAGE obligation,
+    ///    which is step 6.
     /// 2. **DONE.** The armed test:
     ///    [`crate::zgc::ZgcRealHeap::load_barrier_armed`] already existed, so
     ///    no new accessor was needed. Only its slot helper had to widen from
     ///    private to `pub(crate)`.
     /// 3. **DONE.** This function, with P1/P3/P4 decided above.
-    /// 4. **NOT DONE.** `vm/`: route `helpers::jit_load_ref_slot`'s
-    ///    `read_ref_slot(slot)` through this call. Note the gap A9's own
-    ///    comment records: `jit_aaload` receives no `vm_ptr`, so that seam has
-    ///    no `&VmHeap` to call this on and must reach one some other way (a
-    ///    thread-local heap handle, or a `vm_ptr` parameter threaded into the
-    ///    helper and its emission sites). This is NOT a one-line change, and
-    ///    the census `ref_load_census::COLORED_WORDS_SEEN` is what proves
-    ///    afterwards that no Category-A site was missed.
+    ///    **Extended, DONE (2026-09-01), inside `gc/`:** the three
+    ///    ZGC-internal accesses to a word the barrier would CAS --
+    ///    `ZgcRealHeap::relocate_stw`'s compaction slot-rewrite STORE, and the
+    ///    legacy payload READS in `ZgcRealHeap::visit_strong_refs_at` and in
+    ///    `zgc::census::reference_slots` (all `gc/src/zgc.rs`). The compaction
+    ///    store is the one that mattered: its SAFETY note rested on "the world
+    ///    is stopped", which is precisely the property step 7 removes.
+    /// 4. **HALF DONE.** `vm/`: route `helpers::jit_load_ref_slot`'s
+    ///    `read_ref_slot(slot)` through this call. That seam is the single
+    ///    chokepoint and both slot-holding sites funnel through it; it now
+    ///    calls `VmHeap::load_ref_slot_barriered` on its `Some(&VmHeap)` arm
+    ///    and falls back to a raw `read_ref_slot` on its `None` arm.
+    ///    Site B, the compact-reference field load, is DONE (2026-09-01):
+    ///    `jit_getfield` takes `vm_ptr` and has `vm` bound already, so it
+    ///    passes `Some(&vm.mem.heap)` and dispatches here.
+    ///    Site A, `jit_aaload`, is NOT, and cannot be without an ABI change --
+    ///    it receives no `vm_ptr` and so has no route to a `&VmHeap`, and takes
+    ///    the seam's raw arm. The exact change is written out in
+    ///    `.agent-requests/B8-abi.txt` and is IN FLIGHT, not landed; check the
+    ///    signature (`grep -n 'fn jit_aaload' vm/src/jit/helpers.rs`) before
+    ///    believing either state. The census
+    ///    `ref_load_census::COLORED_WORDS_SEEN` is what proves afterwards that
+    ///    no Category-A site was missed.
     /// 5. **NOT DONE.** Sites D/E/F of `zgc-jit-load-barrier.md` 2.5.1, which
     ///    hold an `ObjectRef` rather than a slot: their barriers belong
     ///    upstream at `types/src/value.rs`'s `read_value_atomic` reference arm
     ///    and at `vm::get_static_shared`, where they are shared with the
     ///    interpreter rather than duplicated. A static slot is not atomic
     ///    today and so may not be CAS-healable -- it may need a non-healing
-    ///    barrier kind.
-    /// 6. **NOT DONE.** The nine Category-A inline emission points of 2.3, or
-    ///    keep them routed to the helpers by
-    ///    `x64::zgc_read_barrier_blocks_inline_fields`.
+    ///    barrier kind. Blocked on the `StaticField` row of
+    ///    `zgc::census::ZSlotShape::word_is_atomically_accessed_today`.
+    /// 6. **DONE for the emitters (2026-09-01); the residual it names is not
+    ///    closable here.** The nine Category-A inline emission points of 2.3
+    ///    are kept routed to the helpers by
+    ///    `x64::narrow_oops_block_inline_fields()`, which is
+    ///    `narrow_oops_enabled() || zgc_read_barrier_blocks_inline_fields()`
+    ///    (`jit/src/x64/licm.rs`). `aastore` was the one site that emitted the
+    ///    slot load and the element store inline without consulting it -- not
+    ///    the UB of step 1 but a coverage hole, since an armed cycle would read
+    ///    a coloured word with no colour test and write a plain pointer into a
+    ///    slot the barrier next classifies as `Good` and truncates to 42 bits.
+    ///    That gate landed at the `0x53` arm of
+    ///    `jit/src/x64/bytecode_walk.rs`, with `AASTORE_SITES_WALKED` as the
+    ///    denominator that makes its expected ZERO fallback count readable as
+    ///    "consulted and correctly declined" rather than "never reached".
+    ///    The residual: an emission-time gate cannot reach ALREADY COMPILED
+    ///    sequences, so arming must happen at a safepoint. That is step 7's
+    ///    obligation, and it is recorded on `ZgcRealHeap::set_barrier_color`.
     /// 7. **NOT DONE.** Only then flip `RELOCATION_REQUESTED`.
     ///
     /// # Safety
@@ -3471,8 +3535,10 @@ impl VmHeap {
             // several dead objects — so a *dead* object's pre-GC base becomes
             // an interior address of an innocent LIVE object, and the extent
             // walk answered `true` for it. Reference processing then read that
-            // as "the referent survived", and because ZGC's `pointer_map` is
-            // always empty (`zgc.rs:2489`, non-moving) the consumer at
+            // as "the referent survived", and because ZGC's `pointer_map`
+            // was always empty when this arm was written — the collector was
+            // non-moving until 2026-08-13, and `relocate_stw` now returns a
+            // NON-EMPTY map on a default run — the consumer at
             // `interpreter/gc_and_alloc.rs:2287` falls back to the stale
             // address and does `set_field(obj, 0, Value::Object(None))` on it
             // — a null written into the middle of a live object, and at the
@@ -3740,8 +3806,14 @@ impl VmHeap {
     ///   exact. This closes the G1/ZGC hole where the old young-only guard
     ///   was hardwired inert and stale finalize/cleaner addresses flowed to
     ///   `run_finalizers` (UAF on recycled CSet memory).
-    /// - ZGC: non-moving — dead means gone from the registry
-    ///   (`is_addr_live` false).
+    /// - ZGC: dead means gone from the registry (`is_addr_live` false). The
+    ///   moved case never reaches that arm: the `pointer_map` test at the top
+    ///   of this function answers first. That is what keeps the arm correct
+    ///   now that ZGC compacts by default (`CRATONVM_ZGC_RELOCATE`, on since
+    ///   2026-08-13); the bullet gave "non-moving" as its reason until
+    ///   2026-09-01, and the reason had expired even though the answer had
+    ///   not. The R6 audit note further down this file reaches the same
+    ///   finding by reading the two arms rather than the collector.
     pub fn pre_gc_addr_did_not_survive(
         &self,
         addr: usize,

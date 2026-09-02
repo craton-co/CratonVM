@@ -6198,9 +6198,17 @@ fn jit_decode_ref_word(raw: u64, site: &'static str) -> i64 {
 /// bit set: a stale `0x8D8D8D8D8D8D8D8D` has bit 63 set but fails that, so a
 /// `--features zgc` build running Generational or G1 keeps the old degrade for
 /// real garbage. This bit-pattern test is used instead of "is ZGC the selected
-/// backend?" deliberately: `jit_aaload` receives no `vm_ptr` at all, and
-/// `cratonvm_gc::vm_heap::VmHeap` exposes no backend accessor — see the report
-/// accompanying this change.
+/// backend?" deliberately: `cratonvm_gc::vm_heap::VmHeap` exposes no backend
+/// accessor, and three of the five sites that reach this arm (`jit_getfield`'s
+/// legacy 16-byte `Value` cell and `jit_getstatic`'s two) no longer hold the
+/// SLOT by the time they get here, so they cannot dispatch through
+/// [`jit_load_ref_slot`] at all -- see the report accompanying this change.
+///
+/// The clause that used to lead that sentence -- "`jit_aaload` receives no
+/// `vm_ptr` at all" -- stopped being true on 2026-09-01, when that helper
+/// gained a leading `vm_ptr` and site A became barriered. It is named here
+/// rather than silently deleted, because a rationale that has quietly stopped
+/// holding misdirects the next reader more than no rationale would.
 #[cold]
 #[inline(never)]
 fn jit_ref_word_implausible(raw: u64, site: &'static str) -> i64 {
@@ -6423,21 +6431,28 @@ pub mod ref_load_census {
     /// `&VmHeap` to reach the barrier through.
     ///
     /// **Expected `0`, and ungated so a non-zero value cannot hide behind an
-    /// unset diagnostic flag.** The only caller that passes `None` is
-    /// `jit_aaload`, whose helper slot no emitter calls -- `aaload` is lowered
-    /// inline by `x64::arrays::emit_ref_aload_regs`, and `helpers.aaload`
-    /// appears nowhere in `jit/src` -- so in a real run this helper is reached
-    /// only from this file's own unit tests. A non-zero count therefore says
-    /// something started calling the helper form of site A and that those
-    /// reference loads were NOT barriered: harmless while nothing arms the
-    /// barrier, and exactly risk J1 of
-    /// `docs/feature-designs/zgc-jit-load-barrier.md` the moment something
-    /// does.
+    /// unset diagnostic flag.** Since 2026-09-01 there is NO caller that passes
+    /// `None`: `jit_getfield`'s compact-reference arm always had a `vm_ptr`,
+    /// and `jit_aaload` gained one (`.agent-requests/B8-abi.txt`), so both of
+    /// this file's slot-holding sites pass `Some(..)`.
+    ///
+    /// That changed what a zero MEANS here, and the difference is the whole
+    /// value of the number. It used to read "the only `None` caller is a helper
+    /// no emitter calls, so nothing reached the raw route". It now reads "no
+    /// `None` route exists in this tree at all". A non-zero count is therefore
+    /// no longer merely surprising: it says a NEW call site of the seam was
+    /// added without a heap to dispatch on, and that those reference loads were
+    /// not barriered -- harmless while nothing arms the barrier, and exactly
+    /// risk J1 of `docs/feature-designs/zgc-jit-load-barrier.md` the moment
+    /// something does.
     ///
     /// Ungated is affordable precisely because it is not on a hot path: the
-    /// seam is `#[inline(always)]` and `heap` is a compile-time constant at
-    /// both call sites, so this increment is compiled into `jit_aaload` alone
-    /// and folded out of `jit_getfield`'s arm entirely.
+    /// seam is `#[inline(always)]` and `heap` is a compile-time `Some` at both
+    /// call sites, so in a release build the `!barriered` branch folds out of
+    /// both and this increment is emitted nowhere at all. Keeping the `None`
+    /// arm (rather than narrowing the seam to a bare `&VmHeap`) is deliberate:
+    /// it is what makes a future third call site declare, in its own argument
+    /// list, whether it can reach the barrier -- and fail loudly here if not.
     pub static UNBARRIERED_LOADS: AtomicU64 = AtomicU64::new(0);
 
     /// Is anything going to READ the per-site counters this run?
@@ -6487,10 +6502,10 @@ pub mod ref_load_census {
     /// count, so the hot `getfield` arm pays one cached-flag read in total,
     /// exactly what it paid before this existed. [`UNBARRIERED_LOADS`] is
     /// ungated, which is affordable because `barriered` is a compile-time
-    /// constant at every call site of the `#[inline(always)]` seam: in a
-    /// release build the increment is emitted only into the `None` caller
-    /// (`jit_aaload`, which no emitter calls) and folded away entirely in the
-    /// `Some` one. An expected-zero tripwire that only a diagnostic flag can
+    /// constant at every call site of the `#[inline(always)]` seam: since both
+    /// callers pass `Some(..)` (2026-09-01) the increment folds out of a
+    /// release build entirely, and it would be emitted only into a future
+    /// `None` caller. An expected-zero tripwire that only a diagnostic flag can
     /// reveal is not much of a tripwire.
     #[inline(always)]
     pub fn note_route(slot: usize, barriered: bool) {
@@ -6707,16 +6722,22 @@ fn warn_once_jit_load_barrier_suppressed(raw: u64, site: &'static str) {
 /// implementation gets wrong -- the 42-bit-offset-to-address conversion that
 /// `gc/src/zgc/relocate.rs` and `gc/src/zgc/mark.rs` both carry warnings about.
 ///
-/// What is still missing is not the barrier. It is a `&VmHeap` at ONE of the
-/// two call sites:
+/// Both call sites are wired. Site B (`jit_getfield`'s compact-reference arm)
+/// always had a `&VmHeap`: that helper takes `vm_ptr` and binds
+/// `vm = &*(vm_ptr as *const SharedVm)`, so it passes `Some(&vm.mem.heap)`.
+/// Site A (`jit_aaload`) was the last gap -- declared `(array_ptr, index)` with
+/// no `vm_ptr`, so it had nothing to reach a heap through and could only pass
+/// `None`. On 2026-09-01 it gained a leading `vm_ptr`
+/// (`.agent-requests/B8-abi.txt`) and passes `Some(heap_from_vm(vm_ptr))`. The
+/// ABI change was affordable because no emitter calls `helpers.aaload`; the
+/// row's own comment in `jit-api/src/helpers_abi.rs` carries that argument.
 ///
-///  * Site B (`jit_getfield`'s compact-reference arm) already has one: that
-///    helper takes `vm_ptr` and binds `vm = &*(vm_ptr as *const SharedVm)`, so
-///    it passes `Some(&vm.mem.heap)` and is barriered.
-///  * Site A (`jit_aaload`) is declared `(array_ptr, index)` with no `vm_ptr`,
-///    so it passes `None` and still takes the raw read. Closing that is an ABI
-///    change to a JIT-called helper, which is written down in
-///    `.agent-requests/B8-abi.txt` rather than guessed at here.
+/// So `heap` is `Some(..)` at every call site in this file, and
+/// [`ref_load_census::UNBARRIERED_LOADS`] is expected `0` for a STRONGER reason
+/// than before: there is no `None` route left to take, rather than one that
+/// nothing happens to reach. The `None` arm is kept anyway -- see that
+/// counter's own doc for why a future caller has to say so in its argument
+/// list rather than be given a global to reach for.
 ///
 /// # Why `None` and not a cached heap handle
 ///
@@ -6766,6 +6787,16 @@ fn warn_once_jit_load_barrier_suppressed(raw: u64, site: &'static str) {
 /// `RELOCATION_REQUESTED` should meet this before their first run rather than
 /// after: the base is a per-cycle constant and wants to be hoisted out of the
 /// lock, not taken 10^9 times.
+///
+/// Site A raises the stakes rather than adding a new hazard. `jit_aaload` is a
+/// reference-ARRAY element read -- the body of `for (Object o : arr)` -- so an
+/// armed barrier takes and releases that one mutex per loop iteration, on every
+/// mutator thread at once; and the deadlock arm is reachable from anything that
+/// walks references while already holding the arena (a relocation or marking
+/// helper that re-enters compiled code). Neither is an argument for leaving
+/// site A unbarriered: an unbarriered read under an ARMED barrier is a wrong
+/// ANSWER, while a slow correct one is recoverable. They are the argument for
+/// hoisting the base out of `heap_base()` BEFORE the first armed run.
 ///
 /// # The precondition a caller must already satisfy for that to be legal
 ///
@@ -6834,10 +6865,24 @@ unsafe fn jit_load_ref_slot(
 }
 
 
-// SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap
-// pointer to a reference array object. Null triggers a pending NPE + `i64::MIN`
-// deopt sentinel; out-of-bounds is handled gracefully by the bounds check below.
-pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
+// SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm
+// pointer -- the universal JIT-helper caller contract, the same one jit_aastore
+// and jit_getfield state. It is read only on the successful element-read path:
+// the null/implausible-array arm and the out-of-bounds arm both return before
+// `heap_from_vm` is reached, which is what lets the null-array unit test below
+// call this helper with a vm_ptr of 0. array_ptr must be 0 (null) or a
+// valid heap pointer to a reference array object. Null triggers a pending NPE +
+// `i64::MIN` deopt sentinel; out-of-bounds is handled gracefully by the bounds
+// check below.
+//
+// vm_ptr is FIRST, matching `jit_aastore(vm_ptr, array_ptr, index, val)` and
+// `jit_getfield(vm_ptr, obj_ptr, field_index)`: every VM-touching helper in the
+// table puts the VM in arg0, and a helper that put it last would be exactly the
+// asymmetry `accessor_name_matches_field` exists to catch the consequences of.
+// The C declaration lives in `jit-api/src/helpers_abi.rs`; the two halves are
+// pinned together by `let _: HelperFnAaload = jit_aaload;` further down this
+// file, which is why this change could not land half done.
+pub unsafe extern "C" fn jit_aaload(vm_ptr: i64, array_ptr: i64, index: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -6869,7 +6914,7 @@ pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
     // the JIT will deref -> SIGSEGV (the `0x8D8D..`-class stale ref). Mirrors
     // `read_prim_element`'s Reference arm; valid refs (or 0=null) pass through.
     //
-    // TODO(zgc) -- site A ("raw reference-array element load", Category A of
+    // Site A ("raw reference-array element load", Category A of
     // `docs/feature-designs/zgc-jit-load-barrier.md` 2.3, and site A of its
     // 2.5.1 table). This is one of only TWO arms in this file that still hold
     // the SLOT when the plausibility filter runs, so it is one of the two that
@@ -6877,29 +6922,40 @@ pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
     // [`jit_load_ref_slot`], the file's single seam, rather than through a
     // ZGC test of its own.
     //
-    // STILL UNBARRIERED, and now the ONLY slot-holding site in this file that
-    // is: the seam's barrier call needs a `&VmHeap`, and this helper receives
-    // no `vm_ptr`, so there is nothing here to reach one through. A cached
-    // thread-local or process-global heap handle was considered and rejected
-    // as a use-after-free -- the argument is on [`jit_load_ref_slot`] -- so
-    // closing this is an ABI change: give `jit_aaload` a leading `vm_ptr`
-    // exactly as `jit_aastore` already has one, and pass
-    // `Some(&(*(vm_ptr as *const SharedVm)).mem.heap)` below. The exact change
-    // is written out in `.agent-requests/B8-abi.txt`, and it is smaller than
-    // "JIT helper ABI change" sounds: ONE line in `jit-api/src/helpers_abi.rs`
-    // plus this file, because no emitter calls `helpers.aaload` at all today
-    // (`aaload` is lowered inline by `x64::arrays::emit_ref_aload_regs`, and
-    // `grep -rn "helpers\.aaload" jit/src` is empty).
+    // BARRIERED as of 2026-09-01. This was the LAST unbarriered slot-holding
+    // reference read in the file. The seam's barrier call needs a `&VmHeap`;
+    // this helper used to receive no `vm_ptr`, so it had nothing to reach one
+    // through and passed `None`. A cached thread-local or process-global heap
+    // handle was considered and rejected as a use-after-free -- the argument is
+    // on [`jit_load_ref_slot`] -- so the gap was closed the way
+    // `.agent-requests/B8-abi.txt` wrote out: a leading `vm_ptr`, exactly as
+    // `jit_aastore` already has one, plus ONE line in
+    // `jit-api/src/helpers_abi.rs`. It cost nothing at any emitter, because no
+    // emitter calls `helpers.aaload` -- `aaload` is lowered inline by
+    // `x64::arrays::emit_ref_aload_regs`, and `grep -rn "helpers\.aaload"
+    // jit/src` is empty -- so there was no emitted `call` whose argument
+    // registers had to be rearranged.
     //
-    // Passing `None` is NOT silent. The raw read still hands its word to
-    // `jit_decode_ref_word`, so a colored word arriving here trips the
-    // missing-barrier panic by name instead of being degraded to null, and
-    // `ref_load_census::UNBARRIERED_LOADS` counts every load that took this
-    // route -- ungated, and expected `0` precisely because nothing calls this
-    // helper.
+    // `heap_from_vm(vm_ptr)` rather than an open-coded
+    // `&(*(vm_ptr as *const SharedVm)).mem.heap`: it is the same deref plus the
+    // `debug_assert!(vm_ptr != 0)` every other VM-touching helper in this file
+    // already relies on, so the caller contract stays stated in ONE place. It
+    // is evaluated HERE, after both guard arms, which is why the `vm_ptr == 0`
+    // the null-array unit test passes is never dereferenced. And the heap it yields is by
+    // construction the one that OWNS `elem_ptr` -- `array_ptr` was handed to us
+    // by compiled code running against this same VM -- which is the seam's
+    // `Some(..)` contract.
+    //
+    // The tripwire behind this call is NOT retired by the barrier; it is what
+    // proves no site was missed. A colored word reaching `jit_decode_ref_word`
+    // still panics naming the site rather than being degraded to null (risk
+    // J1), and `plausible_heap_pointer` is still not weakened to admit one. The
+    // panic simply became UNREACHABLE from here, because the word the seam now
+    // hands it is an unmasked address -- and the plausibility test runs on that
+    // unmasked address, never on the colored word.
     jit_load_ref_slot(
         elem_ptr,
-        None,
+        Some(heap_from_vm(vm_ptr)),
         ref_load_census::AALOAD_ELEMENT,
         "jit_aaload/element",
     )
@@ -8182,8 +8238,10 @@ unsafe fn jit_getfield_impl(
             // word. `&vm.mem.heap` reuses the reference this function has
             // already dereferenced instead of adding a second raw deref of
             // `vm_ptr`, and it is by construction the heap that OWNS `ptr`,
-            // which is the seam's `Some(..)` contract. Site A cannot do this:
-            // `jit_aaload` receives no `vm_ptr` at all.
+            // which is the seam's `Some(..)` contract. Site A does the same
+            // since 2026-09-01, via `heap_from_vm(vm_ptr)`; it had no `vm_ptr`
+            // at all until then, which is what made this arm the only barriered
+            // slot-holding read in the file for a day.
             //
             // This is the hottest reference read in the VM, which is why the
             // seam is `#[inline(always)]` and why its census increment is
@@ -22763,10 +22821,18 @@ mod tests {
 
     #[test]
     fn jit_aaload_null_sets_pending_npe() {
-        // SAFETY: array_ptr is 0 (null), so the function returns early without dereferencing.
-        // JVMS §aaload: NPE on null array.
+        // SAFETY: array_ptr is 0 (null), so the function returns early without
+        // dereferencing. JVMS §aaload: NPE on null array.
+        //
+        // `vm_ptr` is deliberately 0, and that is sound ONLY because of the
+        // ordering: `plausible_heap_pointer(0)` is false, so the helper takes
+        // the NPE arm and returns before `heap_from_vm(vm_ptr)` is reached.
+        // State it rather than leaving a bare 0 -- if that ordering ever
+        // changes, this argument becomes a null deref instead of a wrong
+        // answer. Pass a real `SharedVm` (as `jit_aaload_oob_sets_pending_aioobe`
+        // does) if this test ever grows past the guard arm.
         let _ = take_jit_pending_npe();
-        let result = unsafe { jit_aaload(0, 0) };
+        let result = unsafe { jit_aaload(0, 0, 0) };
         assert_eq!(result, i64::MIN);
         assert!(
             take_jit_pending_npe(),
@@ -23092,9 +23158,14 @@ mod tests {
     #[test]
     fn jit_aaload_oob_sets_pending_aioobe() {
         let _ = take_jit_pending_aioobe();
-        let (_vm, arr_ptr) = alloc_test_array(ArrayElementType::Reference, 3);
-        // SAFETY: arr_ptr is a live Object[3]; index 3 is OOB.
-        let r = unsafe { jit_aaload(arr_ptr, 3) };
+        let (vm, arr_ptr) = alloc_test_array(ArrayElementType::Reference, 3);
+        let vm_ptr = &*vm as *const crate::vm::SharedVm as i64;
+        // SAFETY: arr_ptr is a live Object[3]; index 3 is OOB, so the helper
+        // returns on the bounds check BEFORE the element read and never reaches
+        // `heap_from_vm`. Unlike the null-array test above, this one has a VM in
+        // hand, so it passes a live `vm_ptr` and does not depend on that
+        // ordering to be sound.
+        let r = unsafe { jit_aaload(vm_ptr, arr_ptr, 3) };
         assert_eq!(r, i64::MIN, "aaload OOB must return the deopt sentinel");
         assert_eq!(take_jit_pending_aioobe(), Some((3, 3)));
     }

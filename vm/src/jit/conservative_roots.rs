@@ -4125,6 +4125,204 @@ fn plausible_bci(recorded: u32) -> Option<u32> {
     (recorded < MAX_CODE_LENGTH).then_some(recorded)
 }
 
+/// Census of [`compiled_frame_bci`]'s two evidence sources, and of the ways it
+/// refuses.
+///
+/// # Why this exists
+///
+/// Every direct compiled-to-compiled call in the x64 single-pass backend filed
+/// its oop map 9-25 bytes PAST the return address, because the emitter ran
+/// `emit_post_call_rbp_republish` between the `CALL` and
+/// `emit_oop_map_for_safepoint` and the map records `native_pc_offset =
+/// buf.pos()` at the moment it runs. So [`compiled_frame_bci`]'s exact
+/// `native_pc_offset` lookup -- evidence source 1, the precise one -- missed
+/// EVERY time it was attempted, and fell through to the coarser safepoint-id
+/// slot, which answered. The function returned a bci either way.
+///
+/// Nobody noticed for as long as the defect existed, and the reason is the only
+/// lesson worth keeping: a silent fallback that produces a plausible answer is
+/// indistinguishable, from the outside, from the precise path working. There
+/// was no number that could have disagreed. Two atomics beside that `find`
+/// would have named it years earlier (`.agent-requests/B5-wiring.txt` (4)), so
+/// here they are.
+///
+/// # How to read it
+///
+/// The reading that matters is `exact_missed_fell_back` against `exact_hit`. A
+/// large `exact_missed_fell_back` with a near-zero `exact_hit` is the defect
+/// above, or a fresh instance of it: the map keys and the return addresses do
+/// not agree. `fallback_sp_id_hit` is deliberately NOT named as a success --
+/// it is the count of frames whose line number came from the coarser evidence,
+/// which is a correct answer arrived at through a degraded route.
+///
+/// `exact_unavailable` is the CONTROL, and it is why a raw miss count would
+/// mislead: the innermost activation of every chain owns no return address on
+/// this stack, so its `native_pc` is `None` by construction and it can only
+/// ever use the safepoint-id slot. Those frames are not misses. Without this
+/// bucket they would be indistinguishable from them, and the ratio the first
+/// paragraph asks you to read would be wrong by however deep the walk went.
+///
+/// The emitter half of the same census is
+/// `jit::x64::inline_call_map_at_return_counts()` (`stamped-at-return`,
+/// `already-at-return`, `no-map`, `refused`, `reverted`). One run carrying both
+/// is what confirms the emitter's `stamped-at-return` is actually being SPENT:
+/// its stamps and this module's `exact_hit` should move together.
+///
+/// # Invariant, so a reading can be checked rather than trusted
+///
+/// Exactly one TERMINAL outcome is counted per call:
+///
+/// ```text
+/// calls = exact_hit + fallback_sp_id_hit + refused_ir_backend
+///       + refused_no_sp_id_slot + refused_implausible_bci + refused_no_evidence
+/// ```
+///
+/// and, orthogonally, exactly one ROUTE is counted for every call that got past
+/// the two up-front refusals:
+///
+/// ```text
+/// calls - refused_ir_backend - refused_no_sp_id_slot
+///       = exact_hit + exact_missed_fell_back + exact_unavailable
+/// ```
+///
+/// A snapshot that violates either has a counting bug, not a finding.
+///
+/// # Why the counters are ungated
+///
+/// Unlike `jit::helpers::ref_load_census` -- whose per-site counts sit behind a
+/// cached flag read because they ride the hottest reference read in the VM --
+/// [`compiled_frame_bci`] runs once per compiled frame per STACK CAPTURE
+/// (a throw, a `getStackTrace`, a `StackWalker`), and only when
+/// `compiled_frame_bci_enabled()` already said yes. A relaxed increment there
+/// is far below the `String` clone the same walk performs per frame. Ungated
+/// buys the property that matters here: a zero is a real zero, and cannot be a
+/// counter nobody switched on. Only the PER-EVENT detail is gated, on the
+/// existing `CRATONVM_DBG_SWCHAIN` -- the flag that already dumps this exact
+/// walk, including "how the innermost frame resolved" -- rather than on a new
+/// name.
+pub mod bci_lookup_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Evidence source 1 answered: the frame's return address hit an oop map
+    /// recorded under that exact `native_pc_offset`, and its `bytecode_pc` was
+    /// a plausible bci. The precise route.
+    pub const EXACT_HIT: usize = 0;
+    /// Evidence source 1 was ATTEMPTED and produced nothing, so the lookup fell
+    /// back to the safepoint-id slot. **This is the number the defect above
+    /// would have shown.** It is a fallback, not a success, whatever the call
+    /// went on to return.
+    pub const EXACT_MISSED_FELL_BACK: usize = 1;
+    /// Evidence source 1 could not be attempted: no `native_pc` (the innermost
+    /// activation of a chain owns no return address on this stack), or one
+    /// outside the artifact's body. The control arm -- see the module doc.
+    pub const EXACT_UNAVAILABLE: usize = 2;
+    /// The safepoint-id slot answered. A correct bci by the coarser route.
+    pub const FALLBACK_HIT: usize = 3;
+    /// Refused: an optimizing-IR-backend artifact, whose `bytecode_pc` is a
+    /// monotonic safepoint counter and not a bci at all.
+    pub const REFUSED_IR_BACKEND: usize = 4;
+    /// Refused: the artifact carries no safepoint-id slot (`sp_id_slot_off ==
+    /// 0`) -- compiled without the precise gate, or aarch64.
+    pub const REFUSED_NO_SP_ID_SLOT: usize = 5;
+    /// Refused: the recovered value is outside the spec's bci range (>= 65536).
+    /// See `plausible_bci`; both synthetic pcs the backend stamps land here.
+    pub const REFUSED_IMPLAUSIBLE_BCI: usize = 6;
+    /// Refused: no validated `rbp`, or the slot held no id, or the artifact's
+    /// own table never recorded the id it held. Not one of the three documented
+    /// refusals -- it is the residue that makes the invariant in the module doc
+    /// balance, and a rising count here is a stack-walk finding rather than a
+    /// metadata one.
+    pub const REFUSED_NO_EVIDENCE: usize = 7;
+
+    const N: usize = 8;
+    const NAMES: [&str; N] = [
+        "exact_hit",
+        "exact_missed_fell_back",
+        "exact_unavailable",
+        "fallback_sp_id_hit",
+        "refused_ir_backend",
+        "refused_no_sp_id_slot",
+        "refused_implausible_bci",
+        "refused_no_evidence",
+    ];
+
+    static COUNTS: [AtomicU64; N] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    /// Count one outcome, one of the constants above. Relaxed and advisory: it
+    /// carries no happens-before relationship with the metadata it describes.
+    #[inline]
+    pub(super) fn note(slot: usize) {
+        if let Some(c) = COUNTS.get(slot) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// One `[swchain] bci ...` line per lookup, on `CRATONVM_DBG_SWCHAIN=1`.
+    ///
+    /// The flag is REUSED rather than minted: it already gates the dump of this
+    /// same walk, including how the innermost frame resolved, so a run
+    /// diagnosing a wrong line gets both halves from one variable. The counters
+    /// above are unaffected by it -- only this per-event detail is gated.
+    pub(super) fn trace(
+        outcome: &str,
+        cm: &cratonvm_jit::CompiledMethod,
+        native_offset: Option<u32>,
+        bci: Option<u32>,
+    ) {
+        if !super::dbg_swchain_enabled() {
+            return;
+        }
+        let off = match native_offset {
+            Some(o) => o.to_string(),
+            None => String::from("-"),
+        };
+        let b = match bci {
+            Some(v) => v.to_string(),
+            None => String::from("-"),
+        };
+        eprintln!(
+            "[swchain] bci {outcome} method={} native_off={off} bci={b} maps={}",
+            cm.method_label,
+            cm.oop_maps.len(),
+        );
+    }
+
+    /// The eight counters, in the order of the constants above.
+    ///
+    /// Always real numbers, unlike `jit::helpers::ref_load_census::snapshot`'s
+    /// `Option` -- these are ungated, so there is no "switched off" state for a
+    /// zero to be confused with. See the module doc for why that trade goes the
+    /// other way here.
+    pub fn snapshot() -> Vec<(&'static str, u64)> {
+        NAMES
+            .iter()
+            .zip(COUNTS.iter())
+            .map(|(n, c)| (*n, c.load(Ordering::Relaxed)))
+            .collect()
+    }
+
+    /// One `[JIT_BCI_LOOKUPS]` line on stderr.
+    ///
+    /// Prints `exact_missed_fell_back` beside `exact_hit` deliberately: the
+    /// pair is the reading, and a total would hide it.
+    pub fn report() {
+        let mut line = String::from("[JIT_BCI_LOOKUPS]");
+        for (name, n) in snapshot() {
+            line.push_str(&format!(" {name}={n}"));
+        }
+        eprintln!("{line}");
+    }
+}
+
 /// The bytecode index a live compiled frame is standing at — the same one a
 /// deopt at this point would resume the interpreter at — or `None` when it
 /// cannot be established from evidence the artifact itself vouches for.
@@ -4178,34 +4376,96 @@ fn plausible_bci(recorded: u32) -> Option<u32> {
 /// `rbp` must already have been validated as a live, aligned frame base inside
 /// this thread's `[scanner_sp, entry_sp)` band by the caller; pass `None` when
 /// it has not been. That is why it is an `Option` rather than a bare address.
+///
+/// # Every outcome is counted
+///
+/// The exact lookup below missed EVERY time it was attempted for as long as the
+/// oop-map-after-republish defect existed, and fell through to the safepoint-id
+/// slot, which answered -- so the function returned a plausible bci and nothing
+/// observable said which evidence produced it. [`bci_lookup_census`] is that
+/// missing number: `exact_hit` against `exact_missed_fell_back`, with
+/// `exact_unavailable` separating the innermost frames that never had a return
+/// address to look up. Read its module doc before reading its numbers; the
+/// fallback is counted AS a fallback on purpose.
 fn compiled_frame_bci(
     cm: &cratonvm_jit::CompiledMethod,
     rbp: Option<usize>,
     native_pc: Option<usize>,
 ) -> Option<u32> {
-    if cm.used_ir_backend || cm.sp_id_slot_off == 0 {
+    // `self::` is required: in edition 2021 a bare `use` path is resolved from
+    // the crate root, so `use bci_lookup_census` would not find the sibling
+    // module this function sits beside.
+    use self::bci_lookup_census as census;
+    // The two up-front refusals, separated: an IR-backend artifact carries
+    // safepoint ids where a bci would be, and an artifact with no safepoint-id
+    // slot was compiled without the precise gate (or is aarch64). Counting them
+    // apart is what stops "this workload gets no compiled lines" being one
+    // undifferentiated silence.
+    if cm.used_ir_backend {
+        census::note(census::REFUSED_IR_BACKEND);
+        census::trace("refused-ir-backend", cm, None, None);
         return None;
     }
+    if cm.sp_id_slot_off == 0 {
+        census::note(census::REFUSED_NO_SP_ID_SLOT);
+        census::trace("refused-no-sp-id-slot", cm, None, None);
+        return None;
+    }
+    // Whether evidence source 1 was even available at this frame, as opposed to
+    // available and unhelpful. Without the distinction a miss count is
+    // contaminated by every innermost activation, which owns no return address
+    // on this stack and could never have used the exact key.
+    let mut exact_attempted = false;
     if let Some(pc) = native_pc {
         let entry = cm.entry_ptr() as usize;
         let end = entry.saturating_add(cm.code_len());
         // A return address is strictly INSIDE the body (there is at least a
         // call instruction before it) and at most one past its last byte.
         if entry != 0 && pc > entry && pc <= end {
+            exact_attempted = true;
             // Cast: bounded by `code_len()`, which is a JIT buffer position.
             let off = (pc - entry) as u32;
             if let Some(map) = cm.oop_maps.iter().find(|m| m.native_pc_offset == off) {
                 if let Some(bci) = plausible_bci(map.bytecode_pc) {
+                    census::note(census::EXACT_HIT);
+                    census::trace("exact-hit", cm, Some(off), Some(bci));
                     return Some(bci);
                 }
             }
         }
     }
-    let sp_id = active_safepoint_id(rbp?, cm)?;
+    // Past this point the answer, if any, comes from the COARSER evidence. That
+    // is the fact the census exists to make visible: the code below returns a
+    // bci that reads exactly like the precise one.
+    if exact_attempted {
+        census::note(census::EXACT_MISSED_FELL_BACK);
+    } else {
+        census::note(census::EXACT_UNAVAILABLE);
+    }
+    let Some(sp_id) = rbp.and_then(|r| active_safepoint_id(r, cm)) else {
+        census::note(census::REFUSED_NO_EVIDENCE);
+        census::trace("refused-no-sp-id", cm, None, None);
+        return None;
+    };
     // The artifact's own table is the oracle: an id it never recorded is a
     // stale or non-id word, not a program point.
-    cm.find_oop_map_for_safepoint_id(sp_id)?;
-    plausible_bci(sp_id)
+    if cm.find_oop_map_for_safepoint_id(sp_id).is_none() {
+        census::note(census::REFUSED_NO_EVIDENCE);
+        census::trace("refused-unrecorded-sp-id", cm, None, None);
+        return None;
+    }
+    match plausible_bci(sp_id) {
+        Some(bci) => {
+            census::note(census::FALLBACK_HIT);
+            census::trace("fallback-sp-id", cm, None, Some(bci));
+            Some(bci)
+        }
+        None => {
+            census::note(census::REFUSED_IMPLAUSIBLE_BCI);
+            census::trace("refused-implausible-bci", cm, None, None);
+            None
+        }
+    }
 }
 
 pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
