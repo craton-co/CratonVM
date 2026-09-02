@@ -535,6 +535,33 @@ impl Compiler {
     /// Module` reference to a young child left on a CLEAN card. Different
     /// mechanism, different table, different collector; the two are kept
     /// separate so that re-enabling one never silently re-enables the other.
+    /// # Which methods this can reach at all (F-08 residual, measured)
+    ///
+    /// Only the ones compiled by THIS tier. `ir_lower` — the IR tier — has no
+    /// reference-store site whatsoever; its own `read_bounds_addr` doc says so
+    /// in as many words ("this tier emits no inline reference STORE... The
+    /// store question... has no site here to ask it"), and it asks only the
+    /// read-side mapped-address question. A method the IR tier compiles
+    /// therefore keeps the out-of-line `putfield_object` helper no matter what
+    /// this predicate answers.
+    ///
+    /// That is visible from outside, and was measured rather than assumed. With
+    /// `RUST_LOG=cratonvm_jit=info`, the ACTIVE line below appears exactly once
+    /// on `apps/g1_probe/G1CardChurn` with the flag on and never with it off —
+    /// and never on `probes/G1ChurnPauseProbe` in either arm, whose hot stores
+    /// are constructor field writes in a method this tier does not own.
+    ///
+    /// So the barrier's reach is bounded by which tier compiles the storing
+    /// method, and the workload that exhibits the barrier and the workload that
+    /// exhibits pause behaviour are not the same one. That is the honest reason
+    /// F-08 still has no pause-level number, and it is a `jit/` change to fix,
+    /// not a `gc/` one.
+    ///
+    /// (A note on measuring this: a bare `RUST_LOG=info` shows nothing. The
+    /// launcher builds its filter as `from_default_env().add_directive(WARN)`,
+    /// and a global WARN ties with a global `info` on specificity, resolving
+    /// last-added-wins. A target-scoped `RUST_LOG=cratonvm_jit=info` is more
+    /// specific and wins. Getting that wrong reads as "the arm never engages".)
     pub(super) fn g1_inline_barrier_available(&self) -> bool {
         g1_inline_barrier_enabled()
             && g1_barrier_table_live(self.helpers.g1_barrier_addr)

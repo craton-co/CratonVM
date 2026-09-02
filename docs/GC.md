@@ -420,25 +420,46 @@ is always paid in full and it is the one p99 reports. A latency-sensitive
 workload may still want the median improvement — turn it on and measure your
 own pause distribution.
 
-**That table is now stale, and the flag's default is an open question.** The
-+4.2 % wall-clock is the cost of taking MORE pauses at the per-pause price of
-the day, and that price has since changed: the parallel evacuator now runs on
-JIT-warm pauses instead of falling back to serial (F-01), forwarding moved out
-of a side hash map (F-02), collection-set membership stopped being a SipHash
-lookup on the innermost loop (F-03), the parallel driver stopped taking the
-whole-heap fix-up (F-04), and cleanup stopped walking the heap (F-06). If the
-per-pause cost fell enough, the trade inverts and this should be a default.
+**That table predates five findings, and it was re-run.** The +4.2 % wall-clock
+is the cost of taking MORE pauses at the per-pause price of the day, and that
+price changed: the parallel evacuator now runs on JIT-warm pauses instead of
+falling back to serial (F-01), forwarding moved out of a side hash map (F-02),
+collection-set membership stopped being a SipHash lookup on the innermost loop
+(F-03), the parallel driver stopped taking the whole-heap fix-up (F-04), and
+cleanup stopped walking the heap (F-06).
 
-Re-running it is the work, not re-reasoning about it: `probes/G1ChurnPauseProbe 96 900`
-at `-Xmx2048m`, medians of 3 interleaved reps, flag OFF vs ON, on a QUIET host —
-a contended one inverts an A/B of this size, and every number in the table above
-was taken on an idle machine for that reason.
+Re-run 2026-09-02 on the same probe and heap, RELEASE build, eight interleaved
+reps per arm, medians:
+
+| | flag OFF | flag ON | delta |
+|---|---|---|---|
+| p50 pause | 644 ms | 580 ms | **&minus;10 %** |
+| max pause | 826 ms | 749 ms | **&minus;9 %** |
+| total pause | 2074 ms | 2007 ms | &minus;3 % |
+| wall | 8102 ms | 8258 ms | **+1.9 %** |
+| pauses | 3 | 5 | +2 |
+
+The trade improved in the predicted direction and by roughly the predicted
+amount: the wall-clock cost more than halved (+4.2 % &rarr; +1.9 %), total pause
+went from a cost to a small saving, and the reduction now reaches the MAXIMUM
+pause as well as the median — which is what a pause goal is actually about, and
+what the original measurement could not show.
+
+**It still ships opt-in, and the reason is the host, not the numbers.**
+`/proc/loadavg` read 28&ndash;44 throughout, from other work on the machine, and
+this document's own rule — the one every number in the older table was taken
+under — is that a contended host inverts an A/B of this size. A +1.9 % wall cost
+measured at load 40 is not evidence that the default should change. What would
+settle it is the same eight reps on an idle machine; the harness and the probe
+are both in the tree now, so that is a twenty-minute job rather than a
+reconstruction.
 
 One obstacle had to be cleared first: **the probe was not in the tree**. It was
 committed with the measurement, then deleted along with the rest of `probes/` by
 a "major doc consistency update" while every citation of it survived — including
 this document's, which also named the wrong directory. It is restored, and its
-`checksum` line is there so a run can be diffed against a real JDK's.
+`checksum` line is there so a run can be diffed against a real JDK's — all
+sixteen runs above produced `checksum=2063754854400`, identical to JDK 25's.
 
 *Where a young pause actually goes.* Every `--verbose:gc`
 `[GC-STAT]` line now carries a per-phase breakdown — `roots_us`, `rset_us`,
@@ -496,6 +517,28 @@ inter-object padding can exist because every object size is a multiple of
 itself 152 -> 18 ms. `CRATONVM_G1_SCRUB_FREE=1` restores it, and that is
 the first thing to try if a G1 heap-corruption investigation wants the old
 "a freed region reads as zeros" world back.
+
+*The inline G1 write barrier reaches only one of the two JIT tiers.*
+`CRATONVM_G1_INLINE_BARRIER=1` emits a real G1 post-write barrier inline
+(null test, same-region test, out-of-line helper for anything those two cannot
+dismiss) from all four reference-store emitters in the single-pass /
+bytecode-walk tier. It cannot reach the IR tier at all: `ir_lower` has **no
+reference-store site**, as its own `read_bounds_addr` doc states — it asks only
+the read-side "is this address mapped" question — so a method the IR tier
+compiles keeps the out-of-line `putfield_object` helper whatever the flag says.
+
+Measured, not inferred. With `RUST_LOG=cratonvm_jit=info` the emitter logs
+`jit: G1 inline post-write barrier ACTIVE` once per process: it appears on
+`apps/g1_probe/G1CardChurn` with the flag on and never with it off, and never on
+`probes/G1ChurnPauseProbe` in either arm. So the workload that exhibits the
+barrier and the workload that exhibits pause behaviour are different ones, which
+is why the flag ships opt-in with no pause-level number — a `jit/` gap, not a
+`gc/` one.
+
+Watch the log filter when checking this: a bare `RUST_LOG=info` shows nothing,
+because the launcher builds its filter as
+`from_default_env().add_directive(WARN)` and a global WARN ties with a global
+`info` on specificity, resolving last-added-wins. Use the target-scoped form.
 
 *Free-region search: measured, and still linear.* Both searches
 (`find_free_region_from`, `find_contiguous_free`) are O(regions), and the
