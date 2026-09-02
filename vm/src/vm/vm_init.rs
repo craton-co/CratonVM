@@ -3553,12 +3553,45 @@ impl SharedVm {
         // class-file major version for JDK 25 = 69 (45 + feature 24? → JDK 25 = 69).
         sys_props.insert("java.class.version".to_string(), "69.0".to_string());
 
-        // Encodings — JDK 18+ pinned to UTF-8 for stdout/stderr/file/native.
+        // Encodings. JEP 400 (JDK 18) pinned `file.encoding` to UTF-8 and
+        // pinned ONLY `file.encoding`: `native.encoding` is the platform's own
+        // text encoding, and the three stream encodings follow the console on
+        // Windows and the locale on Unix. This table used to pin all five to
+        // UTF-8 under a comment asserting JDK 18 had done so, which is the
+        // residual §5 of
+        // `docs/known-issues/jdk-only/bug-printstream-charset-answers-the-
+        // abstract-base-20260825.md` left open. MEASURED against Temurin
+        // 25.0.3+9 under `LANG=C`: HotSpot answers `ANSI_X3.4-1968` for the
+        // four non-`file` keys and writes `?` for a character US-ASCII cannot
+        // map; CratonVM answered `UTF-8` and wrote the UTF-8 bytes.
+        //
+        // `cratonvm_native_api::os_encoding` is the one place that asks the
+        // host; `native-builtins`' bootstrap property table asks the same
+        // helper, because the two tables overlap without agreeing and a key
+        // added to one is added to neither.
         sys_props.insert("file.encoding".to_string(), "UTF-8".to_string());
-        sys_props.insert("native.encoding".to_string(), "UTF-8".to_string());
-        sys_props.insert("sun.jnu.encoding".to_string(), "UTF-8".to_string());
-        sys_props.insert("stdout.encoding".to_string(), "UTF-8".to_string());
-        sys_props.insert("stderr.encoding".to_string(), "UTF-8".to_string());
+        sys_props.insert(
+            "native.encoding".to_string(),
+            cratonvm_native_api::os_encoding::native_encoding().to_string(),
+        );
+        sys_props.insert(
+            "sun.jnu.encoding".to_string(),
+            cratonvm_native_api::os_encoding::native_encoding().to_string(),
+        );
+        sys_props.insert(
+            "stdout.encoding".to_string(),
+            cratonvm_native_api::os_encoding::stream_encoding(
+                cratonvm_native_api::os_encoding::StdStream::Out,
+            )
+            .to_string(),
+        );
+        sys_props.insert(
+            "stderr.encoding".to_string(),
+            cratonvm_native_api::os_encoding::stream_encoding(
+                cratonvm_native_api::os_encoding::StdStream::Err,
+            )
+            .to_string(),
+        );
         // Session 108 (Cluster D v2 — Console.<clinit> companion fix):
         // `java/io/Console.<clinit>` calls
         // `Charset.forName(System.getProperty("stdin.encoding"), UTF_8)`. The
@@ -3567,9 +3600,17 @@ impl SharedVm {
         // `Charset.lookup(null)` throws — so a null property here trips the
         // Console.<clinit> swallow we observed in Session 108. The
         // `stdin.encoding` key was missing from the bootstrap seed (only
-        // `stdout.encoding` / `stderr.encoding` were pinned). Mirror what
-        // HotSpot's launcher native code does: pin to UTF-8 unconditionally.
-        sys_props.insert("stdin.encoding".to_string(), "UTF-8".to_string());
+        // `stdout.encoding` / `stderr.encoding` were pinned). It must stay
+        // non-null; it need not be UTF-8, and on HotSpot it is the console's
+        // own code page — `cp866` on the 1251 Windows host measured above,
+        // where `stdout.encoding` was the redirected `Cp1251`.
+        sys_props.insert(
+            "stdin.encoding".to_string(),
+            cratonvm_native_api::os_encoding::stream_encoding(
+                cratonvm_native_api::os_encoding::StdStream::In,
+            )
+            .to_string(),
+        );
 
         // Force BufferedInputStream/etc. to use synchronized blocks instead
         // of InternalLock/ReentrantLock. This avoids potential issues with

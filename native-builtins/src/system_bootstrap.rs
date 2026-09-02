@@ -319,11 +319,30 @@ fn native_vm_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
 
     // Misc
     props.push(("java.awt.headless", "true".to_string()));
+    // Only `file.encoding` is pinned to UTF-8 (JEP 400, JDK 18). The stream
+    // encodings and `native.encoding` follow the host — see
+    // `cratonvm_native_api::os_encoding`, and the twin table in
+    // `vm/src/vm/vm_init.rs` that this one has to agree with.
     props.push(("file.encoding", "UTF-8".to_string()));
-    props.push(("sun.stdout.encoding", "UTF-8".to_string()));
-    props.push(("sun.stderr.encoding", "UTF-8".to_string()));
-    props.push(("stdout.encoding", "UTF-8".to_string()));
-    props.push(("stderr.encoding", "UTF-8".to_string()));
+    // NOT pushed: `sun.stdout.encoding` / `sun.stderr.encoding`. They were the
+    // JDK 8..18 spelling and JDK 19 replaced them with the unprefixed keys;
+    // MEASURED on Temurin 25.0.3+9, both read **null**. Seeding them here made
+    // a CratonVM run answer a string where a JDK run answers null, which is
+    // the same class of drift this block is fixing in the other direction.
+    props.push((
+        "stdout.encoding",
+        cratonvm_native_api::os_encoding::stream_encoding(
+            cratonvm_native_api::os_encoding::StdStream::Out,
+        )
+        .to_string(),
+    ));
+    props.push((
+        "stderr.encoding",
+        cratonvm_native_api::os_encoding::stream_encoding(
+            cratonvm_native_api::os_encoding::StdStream::Err,
+        )
+        .to_string(),
+    ));
     // Session 108: stdin.encoding is consulted by `java/io/Console.<clinit>`
     // (JDK 21+) when computing STDIN_CHARSET. The bytecode is
     // `Charset.forName(System.getProperty("stdin.encoding"), UTF_8)` which
@@ -332,9 +351,21 @@ fn native_vm_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     // IllegalArgumentException("Null charset name") which is NOT caught,
     // tripping a Console.<clinit> swallow in real-JDK mode. Setting the
     // property explicitly mirrors what HotSpot's launcher native code does.
-    props.push(("stdin.encoding", "UTF-8".to_string()));
-    props.push(("native.encoding", "UTF-8".to_string()));
-    props.push(("sun.jnu.encoding", "UTF-8".to_string()));
+    props.push((
+        "stdin.encoding",
+        cratonvm_native_api::os_encoding::stream_encoding(
+            cratonvm_native_api::os_encoding::StdStream::In,
+        )
+        .to_string(),
+    ));
+    props.push((
+        "native.encoding",
+        cratonvm_native_api::os_encoding::native_encoding().to_string(),
+    ));
+    props.push((
+        "sun.jnu.encoding",
+        cratonvm_native_api::os_encoding::native_encoding().to_string(),
+    ));
 
     // --- NIO / ZIP toggles to steer the JDK away from native-memory code
     // paths that depend on FileChannelImpl.map0 / direct buffers backed by

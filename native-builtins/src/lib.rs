@@ -28137,6 +28137,30 @@ fn route_write_through_out(ctx: &mut dyn NativeContext, args: &[Value], bytes: &
 /// path through `String.getBytes(Charset)`, which is the JDK's own encoder and
 /// therefore right for every charset this VM can load, at the cost of one
 /// String allocation on a path that is by construction rare.
+/// The charset name a `PrintStream` with no usable `charset` field should be
+/// repaired to.
+///
+/// `System.out` / `System.err` answer their OWN stream encoding; every other
+/// `PrintStream` answers `Charset.defaultCharset()`, which JEP 400 pins to
+/// UTF-8. MEASURED on Temurin 25.0.3+9 under `LANG=C`, in ONE run:
+/// `System.out.charset()` is `US-ASCII` and `new PrintStream(baos).charset()`
+/// is `UTF-8`. A single constant here cannot be right for both.
+fn printstream_repair_encoding(ctx: &dyn NativeContext, this: Option<ObjectRef>) -> String {
+    if let Some(this) = this {
+        for (stream, key) in [("out", "stdout.encoding"), ("err", "stderr.encoding")] {
+            if let Some(canonical) = ctx.get_system_stream(stream) {
+                if std::ptr::eq(canonical.as_ptr(), this.as_ptr()) {
+                    return ctx
+                        .get_system_property(key)
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| "UTF-8".to_string());
+                }
+            }
+        }
+    }
+    "UTF-8".to_string()
+}
+
 fn printstream_encode(ctx: &mut dyn NativeContext, args: &[Value], text: &str) -> Option<Vec<u8>> {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -28148,9 +28172,28 @@ fn printstream_encode(ctx: &mut dyn NativeContext, args: &[Value], text: &str) -
     };
     let cid = ctx.class_id_of_object(cs);
     match ctx.class_name_arc_of_id(cid).as_deref() {
-        // The abstract stand-in `install_charset` stamps at bootstrap answers
-        // UTF-8 through `PrintStream.charset()`, so it means UTF-8 here too.
-        None | Some("sun/nio/cs/UTF_8") | Some("java/nio/charset/Charset") => None,
+        None | Some("sun/nio/cs/UTF_8") => None,
+        // The abstract stand-in a synthetic-JDK image falls back to. It used
+        // to be read as "UTF-8" unconditionally, which was true only while
+        // `install_charset` stamped a hard-coded UTF-8; now that the stamp
+        // carries the HOST's encoding, a stand-in named `US-ASCII` that still
+        // emitted UTF-8 bytes would be the one outcome worse than either
+        // honest answer — a stream lying about its own wire format. Its `name`
+        // slot is the only thing it has, so encode through the VM's own engine
+        // by that name.
+        Some("java/nio/charset/Charset") => {
+            let name = match ctx.get_field(cs, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            match cratonvm_native_api::charset::canonical_charset_name(&name) {
+                None | Some("UTF-8") => None,
+                Some(canon) => {
+                    let units: Vec<u16> = text.encode_utf16().collect();
+                    Some(cratonvm_native_api::charset::encode_chars_lossy(canon, &units))
+                }
+            }
+        }
         Some("sun/nio/cs/ISO_8859_1") => Some(
             text.chars()
                 .map(|c| if (c as u32) < 0x100 { c as u8 } else { b'?' })
@@ -36216,7 +36259,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             ("UTF_16LE", "UTF-16LE"),
         ];
         for (field_name, charset_name) in charsets {
-            let obj = charset_alloc(ctx, charset_name)?;
+            let obj = charset_concrete_or_synthetic(ctx, charset_name)?;
             ctx.set_static_field_by_name(
                 "java/nio/charset/StandardCharsets",
                 field_name,
@@ -36920,7 +36963,8 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                 // Abstract stand-in: replace it, and write the repair back so
                 // the direct `getfield charset` that real `PrintStream` bytecode
                 // performs sees the concrete one too.
-                let fixed = charset_concrete_or_synthetic(ctx, "UTF-8")?;
+                let want = printstream_repair_encoding(&*ctx, Some(this));
+                let fixed = charset_concrete_or_synthetic(ctx, &want)?;
                 ctx.set_field_by_name(this, "charset", Value::Object(Some(fixed)));
                 return Ok(Some(Value::Object(Some(fixed))));
             }
@@ -36930,7 +36974,8 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             // charset and then calls `newEncoder()` on it — abstract on the
             // fabricated base, so a stand-in here trades the NPE this override
             // exists to prevent for an `AbstractMethodError` one call later.
-            let cs = charset_concrete_or_synthetic(ctx, "UTF-8")?;
+            let want = printstream_repair_encoding(&*ctx, Some(this));
+            let cs = charset_concrete_or_synthetic(ctx, &want)?;
             ctx.set_field_by_name(this, "charset", Value::Object(Some(cs)));
             Ok(Some(Value::Object(Some(cs))))
         },
@@ -37260,8 +37305,12 @@ fn throw_unsupported_charset_exception(
 }
 
 fn native_charset_default(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let charset = charset_alloc(ctx, "UTF-8");
-    Ok(Some(Value::Object(Some(charset?))))
+    // CONCRETE, for the same reason `PrintStream.charset()` is: the caller's
+    // next move is `newEncoder()`, which is abstract on the fabricated base.
+    // JEP 400 pins this to UTF-8 regardless of the platform encoding — it
+    // follows `file.encoding`, not `native.encoding`.
+    let charset = charset_concrete_or_synthetic(ctx, "UTF-8")?;
+    Ok(Some(Value::Object(Some(charset))))
 }
 
 /// `Charset.availableCharsets()` — return a real-JDK TreeMap populated
@@ -37303,7 +37352,7 @@ fn native_charset_available_charsets(
     )?;
     let map_pin = ctx.pin_native_root(map);
     for name in charsets {
-        let value = charset_alloc(ctx, name)?;
+        let value = charset_concrete_or_synthetic(ctx, name)?;
         let value_pin = ctx.pin_native_root(value);
         let key = ctx.create_string(name);
         let map = ctx.read_native_pin(map_pin, map);
@@ -37400,22 +37449,34 @@ fn native_charset_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_std_charset_utf8(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(charset_alloc(ctx, "UTF-8")?))))
+    Ok(Some(Value::Object(Some(charset_concrete_or_synthetic(
+        ctx, "UTF-8",
+    )?))))
 }
 fn native_std_charset_utf16(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(charset_alloc(ctx, "UTF-16")?))))
+    Ok(Some(Value::Object(Some(charset_concrete_or_synthetic(
+        ctx, "UTF-16",
+    )?))))
 }
 fn native_std_charset_utf16be(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(charset_alloc(ctx, "UTF-16BE")?))))
+    Ok(Some(Value::Object(Some(charset_concrete_or_synthetic(
+        ctx, "UTF-16BE",
+    )?))))
 }
 fn native_std_charset_utf16le(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(charset_alloc(ctx, "UTF-16LE")?))))
+    Ok(Some(Value::Object(Some(charset_concrete_or_synthetic(
+        ctx, "UTF-16LE",
+    )?))))
 }
 fn native_std_charset_ascii(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(charset_alloc(ctx, "US-ASCII")?))))
+    Ok(Some(Value::Object(Some(charset_concrete_or_synthetic(
+        ctx, "US-ASCII",
+    )?))))
 }
 fn native_std_charset_latin1(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(charset_alloc(ctx, "ISO-8859-1")?))))
+    Ok(Some(Value::Object(Some(charset_concrete_or_synthetic(
+        ctx, "ISO-8859-1",
+    )?))))
 }
 
 /// Normalize a charset name to its canonical form, or return empty if unsupported.

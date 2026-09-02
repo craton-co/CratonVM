@@ -2485,7 +2485,42 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
                 // with no "direct" pool in it and direct-buffer allocation was
                 // not observable from Java at all.
                 "java/lang/management/BufferPoolMXBean" => {
-                    crate::shared_secrets_bridge::alloc_all_buffer_pools(ctx)?
+                    let pools = crate::shared_secrets_bridge::alloc_all_buffer_pools(ctx)?;
+                    // Empty means `--jdk-only` refused the `cratonvm/internal/
+                    // BufferPool` carrier, which is the policy working as
+                    // designed: strict mode forbids compatibility stand-ins.
+                    // Answering an EMPTY LIST is not, and it is the exact harm
+                    // `docs/known-issues/jdk-only/bug-the-bufferpool-refusal-
+                    // takes-out-the-whole-platform-mbean-server-20260822.md`
+                    // argued a loud refusal was preferable to.
+                    //
+                    // MEASURED on 2026-09-01, `probes/JmxBlast.java`, one
+                    // binary, the two modes:
+                    //
+                    //   compatible   pools = 3, direct count 0 -> 1 on a
+                    //                1 MiB allocateDirect
+                    //   --jdk-only   pools = 0
+                    //
+                    // Strict mode HAS a real class library, so there is a real
+                    // answer to hand: `ManagementFactoryHelper` builds its
+                    // three beans over `Bits.BUFFER_POOL` and the two
+                    // `FileChannelImpl` mapped pools, which is what HotSpot
+                    // answers with. It is only reachable BECAUSE
+                    // `JavaNioAccess.getDirectBufferPool` was retired
+                    // (`ba798eca7`) — the shim that used to sit in front of it
+                    // is what took out the whole platform MBean server. This
+                    // is the delegation that fix made possible.
+                    if pools.is_empty() {
+                        // The JDK could not answer either (a synthetic image,
+                        // where there is no `ManagementFactoryHelper`) — fall
+                        // through to the empty list, which is what this arm did
+                        // before and is still better than a throwable out of a
+                        // `<clinit>`.
+                        crate::shared_secrets_bridge::jdk_buffer_pools_in_hotspot_order(ctx)
+                            .unwrap_or(pools)
+                    } else {
+                        pools
+                    }
                 }
                 "java/lang/management/MemoryPoolMXBean" => vec![
                     alloc_memory_pool_impl(ctx, "Eden Space", true)?,
