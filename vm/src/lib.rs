@@ -74,6 +74,11 @@ pub use cratonvm_native_collections::report_map_view_cache_at_exit;
 /// two DENOMINATORS are why it exists: a watch that reports no punned cell has
 /// said nothing until it also says how many times it looked.
 pub use cratonvm_gc::zgc::report_punned_watch_at_exit;
+/// The collector's own account of the last cycle and the decision histogram
+/// behind it. Re-exported because `vm-cli` prints it at shutdown under
+/// `--verbose:gc` / `CRATONVM_GC_STATS` and does not depend on `cratonvm-gc`
+/// directly.
+pub use cratonvm_gc::gc_metrics::collector_decision_report;
 
 // ---------------------------------------------------------------------------
 // T17.E.2 — Windows test-harness teardown shim
@@ -283,9 +288,19 @@ pub mod harness_exit_shim {
         // ignores corrupted CRT state, and it returns the exit code we
         // want cargo to see.
         //
-        // `thread::current()` allocates on first call for an *unnamed*
-        // thread; libtest's workers and `main` are both already named,
-        // so on the paths that matter here this is a cached TLS read.
+        // The name comes from the OS, NOT from `std::thread::current()`.
+        //
+        // This filter runs on a thread that has just faulted, and
+        // `std::thread::current()` PANICS -- it does not return `None` --
+        // once that thread's thread-local data has been destroyed. This
+        // function is `extern "system"`, so an unwind out of it is undefined
+        // behaviour rather than a diagnosable failure, and the panic would
+        // arrive while the process is already reporting a crash.
+        //
+        // Same species as the panic-hook site that aborted 183 Hibernate
+        // Reactive classes on rc=134 while trying to *report* their first
+        // panic; see `crash_handler::current_thread_name`, whose whole reason
+        // for existing is that a handler must not call an API that panics.
         //
         // libtest runs each concurrent test on its own thread named
         // after the test, and does result collection on `main` — so the
@@ -293,8 +308,8 @@ pub mod harness_exit_shim {
         // `--test-threads=1` tests run inline on `main` and the two are
         // indistinguishable; the exit code is 101 either way, so the
         // worst case is a slightly wrong explanation, not a wrong verdict.
-        let thread = std::thread::current();
-        let on_worker = matches!(thread.name(), Some(name) if name != "main");
+        let thread_name = crate::runtime::crash_handler::current_thread_name();
+        let on_worker = matches!(thread_name.as_deref(), Some(name) if name != "main");
         // The hardware-fault handler installed alongside this filter has
         // already printed the faulting PC, the thread name and a
         // symbolized backtrace.

@@ -479,7 +479,7 @@ impl CrashInfo {
             .location()
             .map(|loc| format!("{}:{}", loc.file(), loc.line()));
 
-        let thread_name = std::thread::current().name().map(String::from);
+        let thread_name = current_thread_name();
 
         Self {
             signal: 0,
@@ -502,7 +502,7 @@ impl CrashInfo {
             pid: get_pid(),
             tid: get_tid(),
             timestamp: SystemTime::now(),
-            thread_name: std::thread::current().name().map(String::from),
+            thread_name: current_thread_name(),
             panic_message: None,
             panic_location: None,
         }
@@ -1103,10 +1103,11 @@ mod windows_fault {
             captured as usize
         };
 
-        let tname = std::thread::current()
-            .name()
-            .map(String::from)
-            .unwrap_or_else(|| "<unnamed>".to_string());
+        // `super::`, because this is `mod windows_fault` and the function is at
+        // file scope. Unqualified it compiles on no platform — the module is
+        // `#[cfg(windows)]`, so a Linux build never type-checks this body and
+        // the break reaches Windows only.
+        let tname = super::current_thread_name().unwrap_or_else(|| "<unnamed>".to_string());
         let pid = std::process::id();
 
         let mut report = String::with_capacity(4096);
@@ -1142,7 +1143,7 @@ mod windows_fault {
         // not name, and `CRATONVM_SYMBOLIZE` resolves an RVA against WHATEVER
         // binary it is handed — a near-miss build answers with plausible,
         // entirely wrong function names and four-digit offsets. That is exactly
-        // how `known-issues/hibernate/hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md`
+        // how `internal/fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md`
         // spent two sessions unable to symbolize eight of its own crash logs:
         // by the time anyone looked, nothing recorded which build produced
         // them, and ten surviving binaries all disagreed.
@@ -1174,6 +1175,82 @@ mod windows_fault {
                              carrying BOTH of these)",
                             timestamp, size_of_image
                         );
+                        // ...and WHICH PDB resolves them.
+                        //
+                        // `timestamp` + `size_of_image` identify the EXE, which
+                        // is what you need if you still have ten candidate
+                        // binaries to sort through. The RSDS record in the
+                        // debug directory identifies the **PDB**, by the same
+                        // GUID+age key every symbol server and every debugger
+                        // uses — so a crash log carrying it stays symbolizable
+                        // when the exe is long gone, which is the state the
+                        // JSON/XML page spent two sessions stuck in. 40 bytes
+                        // here replaces "keep a 165 MB binary beside every run
+                        // log".
+                        //
+                        // Bounds: `debug_rva`/`debug_size` and every offset
+                        // derived from them are checked against `size_of_image`
+                        // before use. A fault inside a fault handler is a lost
+                        // report, so nothing here trusts a header field.
+                        let soi = size_of_image as usize;
+                        // IMAGE_OPTIONAL_HEADER64.DataDirectory[6] (Debug) is
+                        // at NT + 24 + 112 + 6*8.
+                        let dd = nt + 24 + 112 + 6 * 8;
+                        let debug_rva =
+                            core::ptr::read_unaligned(dd as *const u32) as usize;
+                        let debug_size =
+                            core::ptr::read_unaligned((dd + 4) as *const u32) as usize;
+                        // IMAGE_DEBUG_DIRECTORY is 28 bytes.
+                        if debug_rva != 0
+                            && debug_size >= 28
+                            && debug_rva.saturating_add(debug_size) <= soi
+                        {
+                            let mut off = 0usize;
+                            while off + 28 <= debug_size {
+                                let e = module_base + debug_rva + off;
+                                // .Type at +12, .SizeOfData at +16,
+                                // .AddressOfRawData at +20.
+                                let ty = core::ptr::read_unaligned((e + 12) as *const u32);
+                                let sz =
+                                    core::ptr::read_unaligned((e + 16) as *const u32) as usize;
+                                let raw =
+                                    core::ptr::read_unaligned((e + 20) as *const u32) as usize;
+                                // 2 == IMAGE_DEBUG_TYPE_CODEVIEW. An RSDS
+                                // record is 4 (magic) + 16 (GUID) + 4 (age) +
+                                // a NUL-terminated pdb path.
+                                if ty == 2
+                                    && sz >= 24
+                                    && raw != 0
+                                    && raw.saturating_add(sz) <= soi
+                                    && core::ptr::read_unaligned(
+                                        (module_base + raw) as *const u32,
+                                    ) == 0x5344_5352
+                                {
+                                    let g = module_base + raw + 4;
+                                    let d1 = core::ptr::read_unaligned(g as *const u32);
+                                    let d2 = core::ptr::read_unaligned((g + 4) as *const u16);
+                                    let d3 = core::ptr::read_unaligned((g + 6) as *const u16);
+                                    let d4: [u8; 8] =
+                                        core::ptr::read_unaligned((g + 8) as *const [u8; 8]);
+                                    let age =
+                                        core::ptr::read_unaligned((g + 16) as *const u32);
+                                    let mut guid = String::with_capacity(40);
+                                    let _ = write!(guid, "{d1:08X}{d2:04X}{d3:04X}");
+                                    for b in d4 {
+                                        let _ = write!(guid, "{b:02X}");
+                                    }
+                                    let _ = writeln!(
+                                        report,
+                                        "#  exe pdb id: {guid}{age:X} \
+                                         (the symbol-server key — a PDB with this \
+                                         GUID+age symbolizes every RVA above, \
+                                         with or without the exe)"
+                                    );
+                                    break;
+                                }
+                                off += 28;
+                            }
+                        }
                     }
                 }
             }
@@ -1260,7 +1337,7 @@ mod windows_fault {
             // fault, and it answers the question a raw register dump makes the
             // reader answer by hand. It is not hypothetical: all eight crash
             // logs behind
-            // `known-issues/hibernate/hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md`
+            // `internal/fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md`
             // satisfy `fault == r10 + rax*4` — a jump-table load with a
             // garbage index — and nothing said so, so two sessions read the
             // scattered addresses as random corruption instead.
@@ -1592,7 +1669,7 @@ pub fn symbolize_rvas(_rvas: &[usize]) -> Vec<(usize, Option<String>)> {
 ///
 /// A register dump alone leaves this to the reader, and the reader does not do
 /// it: all eight crash logs behind
-/// `docs/known-issues/hibernate/hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md`
+/// `internal/fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md`
 /// satisfy `fault == r10 + rax*4` — an unchecked jump-table load with a garbage
 /// index — and because nothing said so, two sessions read the wildly scattered
 /// fault addresses as random corruption and looked for an environmental cause.
@@ -1696,6 +1773,60 @@ mod indexed_load_decode_tests {
     }
 
     /// A zero index would make every base "explain" the address.
+    /// `current_thread_name` is called from panic hooks and signal handlers,
+    /// so it must stay callable on a thread whose thread-local data has
+    /// already been destroyed. `std::thread::current()` is not — it panics
+    /// there, and a panic from a TLS destructor aborts the whole process, so
+    /// a regression in this helper fails this test unmissably rather than
+    /// subtly.
+    ///
+    /// The ordering matters and is set up deliberately: destructors registered
+    /// through `__cxa_thread_atexit_impl` run in reverse registration order, so
+    /// the probe touches its own `thread_local!` FIRST and `std::thread::
+    /// current()` SECOND. That makes std's `CURRENT` handle the first thing
+    /// torn down and the probe's `Drop` the last — i.e. the probe runs in
+    /// exactly the state that produced `thread/current.rs:315:9`.
+    #[test]
+    fn current_thread_name_survives_tls_teardown() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::Mutex;
+
+        static RAN: AtomicBool = AtomicBool::new(false);
+        static SEEN: Mutex<Option<String>> = Mutex::new(None);
+
+        struct Probe;
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let name = super::current_thread_name();
+                *SEEN.lock().unwrap() = name;
+                RAN.store(true, AtomicOrdering::SeqCst);
+            }
+        }
+        thread_local! {
+            static PROBE: Probe = const { Probe };
+        }
+
+        std::thread::Builder::new()
+            // <= 15 bytes: Linux stores only TASK_COMM_LEN - 1, and this test
+            // asserts on the exact string.
+            .name("tlsprobe".to_string())
+            .spawn(|| {
+                PROBE.with(|_| ());
+                let _ = std::thread::current().name().map(String::from);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert!(RAN.load(AtomicOrdering::SeqCst), "the TLS destructor never ran");
+        #[cfg(any(unix, windows))]
+        assert_eq!(
+            SEEN.lock().unwrap().as_deref(),
+            Some("tlsprobe"),
+            "the OS thread name should still be readable after TLS teardown"
+        );
+    }
+
     #[test]
     fn zero_index_and_zero_base_are_not_explanations() {
         let regs = [("rax", 0u64), ("r10", 0x1000)];
@@ -2289,7 +2420,7 @@ fn install_signal_handlers() {
             // done since 2026-08-22, which Linux did not have. That is not a
             // hypothetical gap: all eight logs behind
             // known-issues/hibernate/
-            // hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md
+            // hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md
             // satisfy `fault == r10 + rax*4`, an unchecked jump-table load with
             // a garbage index, and two sessions read the scattered addresses as
             // random corruption because nothing said so.
@@ -2727,8 +2858,8 @@ not an address\n",
 /// the faulting instruction and not only its base. The eight hibernate-orm
 /// JSON/XML crashes were decoded by testing `fault_address == r10 + rax*4` --
 /// which the Linux report could not have answered, because it never printed
-/// `rax` (docs/known-issues/hibernate/
-/// hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md).
+/// `rax` (internal/fixed-bugs/
+/// hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md).
 #[cfg(unix)]
 const GREG_RAX: usize = 0;
 #[cfg(unix)]
@@ -3009,6 +3140,105 @@ pub fn hex_into_buf(buf: &mut [u8], n: u64) -> usize {
         buf[i] = scratch[len - 1 - i];
     }
     out_len
+}
+
+// ── Panic-safe thread naming ───────────────────────────────────────────────
+
+/// The calling thread's name, obtained **without** `std::thread::current()`.
+///
+/// `std::thread::current()` does not return `None` once the calling thread's
+/// thread-local data has been destroyed — it *panics*
+/// (`library/std/src/thread/current.rs`: "use of std::thread::current() is not
+/// possible after the thread's local data has been destroyed"). A thread
+/// running its own exit path is in exactly that state, and so is any code a
+/// TLS destructor reaches.
+///
+/// That matters here because every caller of this function is a panic hook or
+/// a signal handler. A panic raised **inside** a panic hook is a
+/// panic-while-panicking: Rust cannot unwind twice, so it prints
+/// `thread panicked while processing panic. aborting.` and calls `abort()`
+/// immediately — *before* the hook has printed the original panic. So one
+/// convenience call for a cosmetic name did two things at once: it turned
+/// every late-in-thread-lifetime panic into a SIGABRT, and it destroyed the
+/// evidence of what that panic actually was. Everything the log could still
+/// show was the *second* panic's fixed message, which is identical no matter
+/// what the first one was.
+///
+/// The OS thread name is TLS-free, so it is safe from a hook, a TLS
+/// destructor and a signal handler alike. Two measured caveats, both accepted
+/// deliberately (`/tmp/tn.rs`, glibc 2.39 / Linux 6.17):
+///
+/// * Linux stores only `TASK_COMM_LEN - 1` = 15 bytes, so
+///   `vert.x-eventloop-thread-3` reports as `vert.x-eventloo`.
+/// * A thread that was never named inherits its **parent's** `comm`, so an
+///   unnamed worker reports the name of the pool thread that spawned it
+///   rather than `<unnamed>`. That is still true provenance — an unnamed
+///   child of `vert.x-eventloo` is a vert.x thread — and the crash report
+///   carries the exact `tid` beside it.
+///
+/// Windows has neither caveat — `GetThreadDescription` returns the full name a
+/// `thread::Builder::name()` set, `main` for the main thread, and nothing at
+/// all for a thread that was never named (compile-checked and run on Win11 with
+/// the same 1.97.1 toolchain).
+///
+/// `std::thread::try_current()` would avoid the Linux caveats too, but is
+/// unstable as of the 1.97.1 toolchain this tree builds with.
+pub fn current_thread_name() -> Option<String> {
+    #[cfg(unix)]
+    {
+        // 64 is comfortably above Linux's 16-byte buffer and macOS's 64.
+        let mut buf = [0u8; 64];
+        // SAFETY: `buf` is a valid, writable buffer of `buf.len()` bytes, and
+        // `pthread_getname_np` is documented to NUL-terminate within it.
+        let rc =
+            unsafe { libc::pthread_getname_np(libc::pthread_self(), buf.as_mut_ptr().cast(), buf.len()) };
+        if rc != 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        if end == 0 {
+            return None;
+        }
+        return core::str::from_utf8(&buf[..end]).ok().map(str::to_owned);
+    }
+    #[cfg(windows)]
+    {
+        use core::ffi::c_void;
+        extern "system" {
+            // `isize`, not `*mut c_void`, and the crate has no choice about
+            // it: `jit::helpers` declares the same symbol that way — "this
+            // module treats handles as `isize`" — and
+            // `clashing_extern_declarations` is `--deny`ed, so two spellings
+            // of one import fail the build. Windows-only, which is why it
+            // reached this tree at all.
+            fn GetCurrentThread() -> isize;
+            fn GetThreadDescription(thread: isize, out: *mut *mut u16) -> i32;
+            fn LocalFree(mem: *mut c_void) -> *mut c_void;
+        }
+        let mut wide: *mut u16 = core::ptr::null_mut();
+        // SAFETY: `GetThreadDescription` writes a LocalAlloc'd, NUL-terminated
+        // UTF-16 buffer into `wide` on success; we free it below.
+        let hr = unsafe { GetThreadDescription(GetCurrentThread(), &mut wide) };
+        if hr < 0 || wide.is_null() {
+            return None;
+        }
+        // SAFETY: `wide` is a NUL-terminated UTF-16 string owned by us.
+        let mut len = 0usize;
+        while unsafe { *wide.add(len) } != 0 {
+            len += 1;
+        }
+        let slice = unsafe { core::slice::from_raw_parts(wide, len) };
+        let name = String::from_utf16_lossy(slice);
+        unsafe { LocalFree(wide.cast()) };
+        if name.is_empty() {
+            return None;
+        }
+        return Some(name);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
 }
 
 // ── Platform helpers ───────────────────────────────────────────────────────

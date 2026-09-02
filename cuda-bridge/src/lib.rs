@@ -118,6 +118,23 @@ pub fn probe_device(device_ordinal: u32) -> Result<DeviceCaps> {
     backend::probe_device(device_ordinal)
 }
 
+/// The installed driver's CUDA version, as `1000 * major + 10 * minor`
+/// (e.g. `12080` for CUDA 12.8).
+///
+/// This is the ceiling on the PTX ISA version the driver's JIT can
+/// parse. A module whose `.version` exceeds it is rejected exactly as a
+/// module naming an unknown `.target` is — so the lowering has to know
+/// it before it picks either directive. See `jit_cuda::target` for what
+/// the caller does with the answer.
+///
+/// `Err(DeviceError::NoDriver)` when there is no driver, or when the
+/// crate was built without the `cuda` feature. The caller reads that as
+/// "do not clamp", which leaves the target exactly where the device
+/// probe put it.
+pub fn driver_cuda_version() -> Result<u32> {
+    backend::driver_cuda_version()
+}
+
 /// A CUDA context bound to one device. Cheap to clone; the underlying
 /// driver handle is shared via Arc.
 #[derive(Clone)]

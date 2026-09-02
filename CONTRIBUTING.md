@@ -88,7 +88,7 @@ entries you saw — a *new* name in the output is the signal.
 | `cuda-bridge` | Thin CUDA Driver API bridge for GPU offload |
 | `craton-gpu` | Build-time Java annotation sources (`@Parallel` etc.) for GPU offload |
 | `classloading` | Class loading & bytecode verification |
-| `gc` | Generational GC default (young/old; Cheney moving + non-moving sweep); opt-in G1 region collector (`-XX:+UseG1GC`, experimental); `ZgcRealHeap`, a real memory-backed STW non-moving mark-sweep that `-XX:+UseZGC` genuinely selects, but compiled in only behind the default-off `zgc` feature, so absent from a stock build |
+| `gc` | **ZGC is the default collector** since 2026-08-10 (`GcAlgorithm::Zgc` in `vm/src/config.rs`, behind the default-ON `zgc` feature in `gc/Cargo.toml`): `ZgcRealHeap` plus `zgc_concurrent.rs` and the twelve `src/zgc/` modules — colored pointers (`vaddr`), a load barrier (`barrier::z_load`), concurrent marking (`CRATONVM_ZGC_CONC_START`), compaction (`relocate`, kill switch `CRATONVM_ZGC_RELOCATE=0`) and an opt-in generational mode (`CRATONVM_ZGC_GENERATIONAL=1`). Generational (young/old; Cheney moving + non-moving sweep) stays available via `-XX:+UseGenerationalGC` and is the default in a `--no-default-features` build; G1 is opt-in via `-XX:+UseG1GC` (experimental) |
 | `jfr` | Java Flight Recorder |
 | `vm` | VM runtime engine |
 | `vm-cli` | Command-line entry point |
@@ -134,7 +134,9 @@ When your PR adds a feature, fixes a bug, or changes behavior:
 ### Larger Projects
 
 - ARM64 JIT backend (`jit/src/aarch64.rs`)
-- Concurrent garbage collector
+- ZGC production hardening — concurrent marking and compaction already exist and
+  ZGC is the default collector; the open work is arming the colored-pointer load
+  barrier, which is plumbed but inert (see [ROADMAP.md](ROADMAP.md))
 - Full JNI implementation
 - Module system support
 
@@ -225,6 +227,55 @@ When your PR adds a feature, fixes a bug, or changes behavior:
 
 5. **Test it** — add a `#[test]` in the same file using `TestNativeContext` from
    `native-builtins/src/test_utils.rs`.
+
+### How to Add a New `CRATONVM_*` Flag
+
+A `CRATONVM_*` name touches **four files**, and the guards that enforce that are
+`cargo test` assertions rather than compile errors — so `cargo build
+--all-targets` stays green while any of them is missing. Editing two of the four
+and stopping is how this has gone red before.
+
+1. **`types/src/flag_groups.rs`** — an `E` row in `INVENTORY` (or a `SCALARS`
+   entry). This is the only file that makes a name *declared*. The row carries a
+   **`since:` date** in ISO `YYYY-MM-DD`; for a new knob that is today's date,
+   and it is not a guess — if you cannot say when the name arrived, it arrived
+   now. `tests::every_row_states_when_it_arrived` enforces the format.
+2. **`types/tests/flag-surface.txt`** — the name, in sort order. Compared
+   byte-for-byte, so match the file's existing line endings.
+3. **`docs/flag-tokens.md`** — a `` | `token` | `KEY` | `` row in the group's
+   section, and that section's "N tokens." count.
+4. **`docs/config/flag-inventory.md`** — a Full-inventory row, the "N rows: D
+   declared, A allowlisted." header, and the **declared** count in "Where the
+   surface stands".
+
+Files 3 and 4 are **generated**: `tools/flag-census/render-tokens.sh` and
+`render-inventory.sh` write them from the table in file 1, and running them
+beats hand-editing. `types/tests/flag_declaration_guard.rs` catches a literal
+with no declaration, `flag_surface.rs` checks 1 against 2 in both directions,
+and `flag_docs_generated.rs` checks 1 against 3 and 4 in both directions.
+
+A name is not free-standing in either direction: a literal with no row fails the
+guard, and a row with no read site fails check 5 of
+`tools/flag-census/check-surface.sh`. **Land the declaration and its consumer in
+the same change.** The read site must use `flags::runtime_var[_os]` — a raw
+`std::env::var` on a declared name trips check 4 of the same script, because
+declaring a name is what routes it through the latched snapshot that
+`CRATONVM_DBG=token` and `flags::with_thread_overrides` reach.
+
+**A `DBG` knob now has to justify its continued existence.**
+`types/src/flag_groups.rs`'s own `mod tests` carries a retirement horizon: a
+`DBG` row whose `since:` is on or after **2026-08-01** must be referenced
+somewhere outside `types/`, the internal tree and the two generated flag
+documents, or `a_dbg_knob_declared_since_the_horizon_has_a_live_consumer` fails
+naming it. Either land the consumer or delete the row and its four-file
+footprint. The horizon is measured, not chosen: it is the first month boundary
+above the newest consumer-less `DBG` row, and moving it *earlier* is the
+retirement work itself. The population it deliberately grandfathers is published
+in [`docs/config/flag-retirement-candidates-20260901.md`](docs/config/flag-retirement-candidates-20260901.md)
+— of 995 declared knobs, 488 had no operator- or CI-facing mention and 63 of
+those had at most one Rust read site, which is where removal starts. Nothing in
+this repository has ever removed a flag; the date field exists so that the first
+removal can be argued rather than guessed.
 
 ### Adding a Compatibility Stub
 

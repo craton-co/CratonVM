@@ -35,7 +35,7 @@ artifacts that reproduce identically under real HotSpot.
 Verified on Azure Linux (`20.80.105.49`, JDK 25 Temurin), branch
 `test/azure-recheck-fails-20260817` off `dev`, cross-checked on Windows the same
 day. Full detail in
-[hibernate-orm-hql-parser-memory-overhead-20260817.md](hibernate-orm-hql-parser-memory-overhead-20260817.md).
+[hibernate-orm-hql-parser-memory-overhead-20260817.md](hibernate-orm-hql-parser-memory-overhead.md).
 
 | Class | CratonVM | Real HotSpot | Verdict |
 |---|---|---|---|
@@ -53,7 +53,7 @@ CratonVM-specific:
 Same shape as the 2026-08-17 figures (41.9 s / 5.4 s), so nothing about it has
 drifted. This remains the one entry on this page that is a real CratonVM
 characteristic rather than a host artifact, and it stays open —
-[hibernate-orm-hql-parser-memory-overhead-20260817.md](hibernate-orm-hql-parser-memory-overhead-20260817.md)
+[hibernate-orm-hql-parser-memory-overhead-20260817.md](hibernate-orm-hql-parser-memory-overhead.md)
 is the detail.
 | `annotations.uniqueconstraint.UniqueConstraintBatchingTest` | PASS | PASS | No longer reproduces |
 | `query.hql.FunctionTests` | PASS (124/118/6skip) | PASS (124/118/6skip) | Host locale — see below |

@@ -250,14 +250,16 @@ impl Compiler {
                 self.stack.push(top);
                 self.stack_oop_marks.push(top_is_oop);
             }
-            StackSlot::Scratch(reg) => {
+            StackSlot::Scratch(reg, ..) => {
                 let avail = SCRATCH_REGS.iter().copied().find(|&sr| {
                     sr != reg
                         && !self
                             .stack
                             .iter()
-                            .any(|s| matches!(s, StackSlot::Scratch(r) if *r == sr))
+                            .any(|s| matches!(s, StackSlot::Scratch(r, ..) if *r == sr))
                 });
+                // Its OWN home: two stack positions sharing one would have the
+                // second flush overwrite the first.
                 if let Some(sr) = avail {
                     self.emit_mov_reg_reg(sr, reg);
                     self.stack.push(StackSlot::Scratch(sr));
@@ -725,7 +727,7 @@ impl Compiler {
         match slot {
             StackSlot::Frame(off) => self.emit_load_local(RAX, off),
             StackSlot::CalleeSaved(reg) => self.emit_mov_reg_reg(RAX, reg),
-            StackSlot::Scratch(reg) => self.emit_mov_reg_reg(RAX, reg),
+            StackSlot::Scratch(reg, ..) => self.emit_mov_reg_reg(RAX, reg),
             StackSlot::Xmm(xmm) => self.emit_movq_rax_from_xmm(xmm),
         }
     }
@@ -736,7 +738,7 @@ impl Compiler {
         match slot {
             StackSlot::Frame(off) => self.emit_load_local(RCX, off),
             StackSlot::CalleeSaved(reg) => self.emit_mov_reg_reg(RCX, reg),
-            StackSlot::Scratch(reg) => self.emit_mov_reg_reg(RCX, reg),
+            StackSlot::Scratch(reg, ..) => self.emit_mov_reg_reg(RCX, reg),
             StackSlot::Xmm(xmm) => self.emit_movq_gpr_from_xmm(RCX, xmm),
         }
     }
@@ -747,18 +749,38 @@ impl Compiler {
     /// instead of being stored to the frame, avoiding the memory round-trip when
     /// the next bytecode immediately consumes the value.
     pub(super) fn push_from_rax(&mut self) {
-        // The broad R8/R9 experiment regressed call-heavy methods because each
-        // call flushed live scratch values. Pure kernels contain no calls,
-        // allocation, fields, or other GC-capable operations; their counted
-        // loop back edges arrive with an empty operand stack. Restrict the
-        // deferred cache to that proven shape.
-        if self.kernel_operand_cache {
-            if let Some(reg) = SCRATCH_REGS.iter().copied().find(|&candidate| {
+        // ── Why this is pure-kernel-only ────────────────────────────────
+        //
+        // The comment here used to read *"the broad R8/R9 experiment regressed
+        // call-heavy methods because each call flushed live scratch values"*,
+        // which reads as a cost argument and is not one: a flush emits the
+        // store `push_stack` would have emitted anyway, only later.
+        //
+        // The real blocker is a REGISTER COLLISION. `SCRATCH_REGS` is
+        // `[R8, R9]` and `ARG_REGS` contains both on either ABI, so every
+        // helper call marshalling three or four arguments destroys a live
+        // scratch value unless a flush precedes it — and the emitter has many
+        // more `emit_call_absolute` sites than flush sites. `pure_kernel`
+        // excludes every one of them, which is why it works. See
+        // `operand_cache_enabled` for the full statement and for what widening
+        // it would actually take; the flag is opt-in so the two arms can be
+        // measured in one binary.
+        //
+        // A SECOND defect is real and still OPEN: `flush_scratch_registers`
+        // reserves a fresh spill word per flushed value, so a stretch with
+        // several calls grows the region once per call until
+        // `spill-range-exhausted` fails the compile. Reserving the home at PUSH
+        // time instead was tried on 2026-09-02 and reverted the same day: it
+        // made this function advance the spill cursor, which shipped a
+        // nondeterministic heap corruption. See `StackSlot::Scratch`.
+        if self.kernel_operand_cache || operand_cache_enabled() {
+            let free = SCRATCH_REGS.iter().copied().find(|&candidate| {
                 !self
                     .stack
                     .iter()
-                    .any(|slot| matches!(slot, StackSlot::Scratch(r) if *r == candidate))
-            }) {
+                    .any(|slot| matches!(slot, StackSlot::Scratch(r, ..) if *r == candidate))
+            });
+            if let Some(reg) = free {
                 self.emit_mov_reg_reg(reg, RAX);
                 self.stack_push(StackSlot::Scratch(reg), false);
                 return;
@@ -787,7 +809,7 @@ impl Compiler {
     /// returns `fallback`.
     pub(super) fn slot_to_gpr(&mut self, slot: StackSlot, fallback: u8) -> u8 {
         match slot {
-            StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg) => reg,
+            StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg, ..) => reg,
             StackSlot::Frame(off) => {
                 self.emit_load_local(fallback, off);
                 fallback
@@ -803,7 +825,7 @@ impl Compiler {
     pub(super) fn load_slot_to_reg(&mut self, dst: u8, slot: StackSlot) {
         match slot {
             StackSlot::Frame(off) => self.emit_load_local(dst, off),
-            StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg) => {
+            StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg, ..) => {
                 if dst != reg {
                     self.emit_mov_reg_reg(dst, reg);
                 }
@@ -818,6 +840,12 @@ impl Compiler {
     pub(super) fn flush_scratch_registers(&mut self) {
         // Collect scratch slots first to avoid double-mutable-borrow of self
         // (iterating &mut self.stack while calling self.emit_store_local).
+        //
+        // Each entry carries the home the PUSH reserved for it, and the flush
+        // stores there rather than reserving another. That is the whole
+        // difference between this and the shape that made a call-heavy method
+        // grow its spill region once per call until the range was exhausted —
+        // see `push_from_rax`.
         let scratch_slots: Vec<(usize, u8)> = self
             .stack
             .iter()
@@ -974,7 +1002,7 @@ impl Compiler {
         let needs_spill = self
             .stack
             .iter()
-            .any(|s| matches!(s, StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) if *r == reg));
+            .any(|s| matches!(s, StackSlot::CalleeSaved(r) | StackSlot::Scratch(r, ..) if *r == reg));
         if !needs_spill {
             return;
         }
@@ -986,7 +1014,7 @@ impl Compiler {
         // Update all CalleeSaved/Scratch entries for this register to the shared spill slot
         for slot in &mut self.stack {
             match *slot {
-                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) if r == reg => {
+                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r, ..) if r == reg => {
                     *slot = StackSlot::Frame(off);
                 }
                 _ => {}

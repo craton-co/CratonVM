@@ -2566,7 +2566,7 @@ pub fn unbox_poly_return_checked(
 /// fire on disjoint method names (`invokeExact` versus the `VarHandle` access
 /// modes) and share only the funnel they sit in, so one going wrong in the
 /// field must not force the other off.
-fn vh_strict_reference_return() -> bool {
+pub(crate) fn vh_strict_reference_return() -> bool {
     static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *STRICT.get_or_init(|| {
         !matches!(
@@ -2608,6 +2608,16 @@ fn boxed_primitive_supertypes(wrapper: &str) -> &'static [&'static str] {
         "java/lang/Character" | "java/lang/Boolean" => &[OBJ, CMP, SER, CONSTABLE],
         _ => &[],
     }
+}
+
+/// Is `name` one of the eight primitive wrapper classes?
+///
+/// The predicate half of [`PRIMITIVE_WRAPPER_CLASSES`], exposed because the
+/// `VarHandle` reference-read thin direct bind reproduces W6-1 on its own cold
+/// arm (`jit::helpers::varhandle_strict_reference_return_check`) and the two
+/// must fire on exactly the same eight classes.
+pub(crate) fn is_primitive_wrapper_class_name(name: &str) -> bool {
+    PRIMITIVE_WRAPPER_CLASSES.contains(&name)
 }
 
 /// The `VarHandle` access modes that RETURN the accessed variable, paired with
@@ -9947,6 +9957,22 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .module_registry
             .module_for_package(pkg)
             .map(|s| s.to_string())
+    }
+
+    fn any_loaded_class_in_package(&self, package_slash: &str) -> bool {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .any_loaded_class_in_package(package_slash)
+    }
+
+    fn any_loaded_class_in_package_for_loader(&self, package_slash: &str, loader_id: u32) -> bool {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .any_loaded_class_in_package_for_loader(package_slash, loader_id)
     }
 
     fn set_class_hidden(&mut self, class_id: ClassId) {
@@ -17670,15 +17696,28 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
             return;
         };
         let mut recorder = self.shared.debug.flight_recorder.lock();
-        let Some(recording) = recorder.get_recording_mut(id) else {
-            return;
-        };
-        recording.settings.enabled_event_names =
-            enabled_names.map(|names| names.iter().cloned().collect());
-        recording.settings.event_thresholds_by_name = thresholds
-            .iter()
-            .map(|(name, nanos)| (name.clone(), *nanos))
-            .collect();
+        {
+            let Some(recording) = recorder.get_recording_mut(id) else {
+                return;
+            };
+            recording.settings.enabled_event_names =
+                enabled_names.map(|names| names.iter().cloned().collect());
+            recording.settings.event_thresholds_by_name = thresholds
+                .iter()
+                .map(|(name, nanos)| (name.clone(), *nanos))
+                .collect();
+        }
+        // A14/A8 (2026-09-01): re-arm the `cratonvm.JitCompileDecision` producer
+        // gate. That event is armed only when a RUNNING recording names it, and
+        // the gate is otherwise refreshed by `refresh_running_ids` — which runs
+        // on start, not on a settings change. Every Java-side settings edit
+        // funnels through this function (`native-builtins/src/jfr.rs`), and
+        // `Recording.enable(...)` changes no recording STATE, so without this
+        // line `r.start()` followed by `r.enable(...)` leaves the producer
+        // permanently dark while the reverse order works — an argument-order
+        // dependence nothing would explain. The `recording` borrow is scoped
+        // above so `recorder` is free to be re-borrowed here.
+        cratonvm_jfr::jit_decision::sync_jit_decision_gate(&recorder);
     }
 
     fn jfr_set_java_output(&mut self, path: &str) {

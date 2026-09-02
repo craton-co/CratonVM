@@ -41,90 +41,160 @@ proptest = "1"
 loom = "0.7"
 
 [features]
-# `zgc` is DEFAULT-ON as of 2026-08-10, because `GcAlgorithm`'s default is now
-# `Zgc` (`vm/src/config.rs`) and that variant is `#[cfg(feature = "zgc")]`. A
-# `--no-default-features` build still compiles: the default falls back to
-# `Generational` under the matching `cfg(not(...))`, and `-XX:+UseGenerationalGC`
-# remains the always-available escape hatch in either build.
+# `zgc` is DEFAULT-ON, and has been since 2026-08-10, because `GcAlgorithm`'s
+# default is now `Zgc` (`vm/src/config.rs`) and that variant is
+# `#[cfg(feature = "zgc")]`. `cratonvm-vm` carries it in its own default set for
+# the same reason (`vm/Cargo.toml`: `default = ["awt", "management", "zgc"]`),
+# so a stock `cargo build` of `cratonvm-cli` both compiles this collector and
+# selects it. A `--no-default-features` build still compiles: the default falls
+# back to `Generational` under the matching `cfg(not(...))`, and
+# `-XX:+UseGenerationalGC` remains the always-available escape hatch in either
+# build.
 default = ["zgc"]
 # GPU-offload coordination primitives (Part F of the GPU offload plan).
 # Enables `safepoint::SafepointToken`, `Heap::enter_gpu_critical`, and
 # GC-delay logic that pauses collection while a token is held. With this
 # feature off the crate compiles to identical bytes as before the GPU work.
 gpu-offload = []
-# The Z Garbage Collector backend. As of 2026-08-10 this is `src/zgc.rs`,
-# `src/zgc_concurrent.rs` and the TWELVE modules of `src/zgc/`: vaddr, page,
-# barrier, forwarding, metrics, remembered, mark, generation, relocate, tlab,
-# census, adapters. (`adapters` was the undeclared file this comment warned
-# about on 2026-08-07; it is declared now, so the count moved 11 -> 12 — which
-# is the whole reason the recount command below exists.)
-# Whole-feature unit tests: ~380 and rising as of 2026-08-07 (91 `zgc.rs` + 12
-# `zgc_concurrent.rs` + ~275 across the declared modules; it moved 368 -> 379
-# during the afternoon this comment was written).
-# Quote the MODULE COUNT, not the test total. Recount only what actually
+# The Z Garbage Collector backend — THE DEFAULT COLLECTOR OF THIS VM. As of
+# 2026-08-10 it is `src/zgc.rs`, `src/zgc_concurrent.rs` and the TWELVE modules
+# of `src/zgc/`: vaddr, page, barrier, forwarding, metrics, remembered, mark,
+# generation, relocate, tlab, census, adapters. (`adapters` was the undeclared
+# file this comment warned about on 2026-08-07; it is declared now, so the count
+# moved 11 -> 12 — which is the whole reason the recount command below exists.)
+#
+# WHY THE FEATURE EXISTS AT ALL, given that it is on by default. It is the
+# compile-time seam for the FALLBACK, not a maturity marker. It gates the
+# `GcAlgorithm::Zgc` variant, `parse_gc_algorithm`'s "z" | "zgc" arm,
+# `GcBackend::Zgc` and `VmHeap`'s `Zgc` arm, so `--no-default-features` yields a
+# VM that cannot name this collector at all and falls back to `Generational`.
+# That is what keeps the fallback buildable and bisectable. Reading "optional
+# feature" as "experimental" is the mistake this paragraph exists to stop, and
+# it was written into this very file until 2026-09-01.
+#
+# Quote the MODULE COUNT, not a test total. Recount only what actually
 # compiles — the `pub mod` block in `src/zgc.rs` is the authority:
-#   grep -c '#\[test\]' gc/src/zgc.rs gc/src/zgc_concurrent.rs \
-#     $(sed -n 's/^pub mod \(.*\);$/gc\/src\/zgc\/\1.rs/p' gc/src/zgc.rs)
+#   sed -n 's/^pub mod \(.*\);$/\1/p' gc/src/zgc.rs | wc -l
 # Do NOT glob `gc/src/zgc/*.rs`: UNDECLARED files land in that directory and a
 # glob counts them as if they were live. On 2026-08-07 `adapters.rs` sat there
 # undeclared — 11 tests that never ran, and a glob inflated the total by 11.
-# `gc/tests/zgc_module_integration.rs` (25 tests) is a separate integration
-# target and is in neither figure.
-# THREE things of very different maturity sit behind this one flag, and
-# conflating them has already produced a wrong comment here once:
 #
-#  * `ZgcRealHeap` is REAL, not a stub. It backs every allocation with owned
-#    memory (an `Arena` per page tier), writes real `ObjectHeader`s, and
-#    implements the `collector::GarbageCollector` trait with the same
-#    bounds-checked field/array semantics as `gen_heap::GenerationalHeap` and
-#    `g1::G1Collector`. `collect_garbage` is a genuine stop-the-world
-#    mark-sweep: it traces the live graph from the supplied roots, marks
-#    survivors in the header and reclaims dead objects onto a free list. It is
-#    non-moving, so it reclaims but does not compact.
-#  * `ZgcCollector` / `ZgcHeap` / `GenerationalZgc` / `ColoredPointer` /
-#    `LoadBarrier` remain a metadata-only SIMULATION of OpenJDK ZGC's model:
-#    synthetic `u64` page addresses with no backing storage, a forwarding
-#    table that copies no bytes, and a `&mut self` load barrier rather than an
-#    atomic self-healing CAS. Selecting one emits a one-time `tracing::warn!`
-#    so it can never masquerade as production ZGC. The module docs enumerate
-#    exactly what is deferred.
+# TEST COUNTS ARE DATED HISTORY, NOT A CLAIM ABOUT NOW. 368 on 2026-08-07 (91
+# `zgc.rs` + 12 `zgc_concurrent.rs` + 265 across the declared modules; it moved
+# 368 -> 379 during the afternoon that figure was written). 554 on 2026-09-01
+# (219 + 13 + 322). Recount rather than quote either:
+#   grep -c '#\[test\]' gc/src/zgc.rs gc/src/zgc_concurrent.rs \
+#     $(sed -n 's/^pub mod \(.*\);$/gc\/src\/zgc\/\1.rs/p' gc/src/zgc.rs)
+# `gc/tests/zgc_module_integration.rs` (25 tests on 2026-09-01) is a separate
+# integration target and is in neither figure.
+#
+# THREE things of very different maturity sit behind this one flag, and
+# conflating them has already produced a wrong comment here twice:
+#
+#  * `ZgcRealHeap` is the PRODUCTION collector, not a stub. It backs every
+#    allocation with owned memory (an `Arena` per page tier), writes real
+#    `ObjectHeader`s, and implements the `collector::GarbageCollector` trait
+#    with the same bounds-checked field/array semantics as
+#    `gen_heap::GenerationalHeap` and `g1::G1Collector`. `collect_garbage`
+#    traces the live graph from the supplied roots, marks survivors in the
+#    header and reclaims dead objects onto a free list.
+#    It also COMPACTS. `ZgcRealHeap::relocate_stw` slides the small-object
+#    region down and rewrites every reference slot in every survivor, and it is
+#    DEFAULT-ON: see `relocation_requested_by_default` in `src/zgc.rs`
+#    ("DEFAULT-ON since 2026-08-13"), with `CRATONVM_ZGC_RELOCATE=0` as the kill
+#    switch. Do NOT say "non-moving, so it reclaims but does not compact" —
+#    that sentence stood here for three weeks after it stopped being true.
+#    Two further capabilities are BUILT and reachable but DEFAULT-OFF, which is
+#    a different statement from "not implemented":
+#      - CONCURRENT marking (`src/zgc_concurrent.rs`). Default
+#        `Z_CONC_START_PERCENT_DEFAULT = 0`, i.e. never;
+#        `CRATONVM_ZGC_CONC_START=60` opts in. The 2026-08-16 measurement behind
+#        that default (pause down 38-58%, cycle count roughly doubled, wall
+#        clock up 37-55%) is written out on that constant.
+#      - GENERATIONAL mode (`src/zgc/generation.rs`). Default off;
+#        `CRATONVM_ZGC_GENERATIONAL=1` opts in.
+#    So "the feature is not concurrent and not generational", which this file
+#    said until 2026-09-01, was wrong about both: they are off, not absent.
+#  * The SIMULATION is GONE (2026-09-02). `ZgcCollector` / `ZgcHeap` /
+#    `GenerationalZgc` / `ColoredPointer` / `LoadBarrier` were a metadata-only
+#    model of OpenJDK ZGC -- synthetic `u64` page addresses with no backing
+#    storage, a forwarding table that copied no bytes, a `&mut self` load
+#    barrier rather than an atomic self-healing CAS -- kept as scaffolding for
+#    the real modules and loud about what it was. The real modules landed, so
+#    the scaffolding became 1,250 lines of a production file that nothing
+#    outside its own tests referenced. Every concept in it now has an honest
+#    implementation: `zgc::vaddr`, `zgc::barrier`, `zgc::page`,
+#    `zgc::generation`.
 #  * The twelve `src/zgc/` modules are real, compiling and unit-tested, and
-#    HALF of them are now adopted by `ZgcRealHeap`. Counting uses in
-#    `src/zgc.rs` outside its `mod tests` (2026-08-10):
-#      census 24 · mark 15 · tlab 12 · vaddr 7 · page 2 · metrics 1  ADOPTED
-#      barrier · forwarding · remembered · generation · relocate · adapters NOT
+#    most of the twelve are used by `src/zgc.rs` outside its `mod tests`.
+#    DO NOT WRITE THE NUMBERS HERE. A census in this comment and its twin in
+#    `src/zgc.rs` have each been wrong twice, and one of the wrong ones was
+#    carried into
+#    `docs/known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md`
+#    and used to discount a suite result. Since 2026-09-02 the count is
+#    derived rather than written: `scripts/zgc-submodule-adoption.sh` produces
+#    it, `types/tests/zgc-submodule-adoption.txt` records it, and
+#    `zgc_submodule_adoption_matches_the_recorded_census` fails the build when
+#    they disagree. Read it there.
+#    ONE CAVEAT THE COUNT CANNOT CARRY, kept from the census it replaces: a
+#    grep cannot tell a call from a mention. `metrics 1` is a `TODO(zgc)`
+#    COMMENT, so `metrics` is the module still genuinely unadopted even though
+#    it counts as 1. Check what a number refers to before quoting it as
+#    adoption.
 #    The TLAB is default-ON and serves `alloc_object`/`alloc_array` via
 #    `alloc_raw_tlab`, so do NOT say "not wired into the real allocator" —
 #    that phrasing was carried out of this file into
 #    `docs/known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md`
-#    and used to discount a suite result. What is still true is the COLLECTOR:
-#    `ZgcRealHeap` remains a stop-the-world non-moving mark-sweep, the six
-#    unadopted modules are exactly the moving/generational/concurrent
-#    machinery, and `vm_init.rs` hard-codes `RELOCATION_REQUESTED = false`.
-#    The feature is not concurrent and not generational. Remaining adoption is
-#    tracked in `docs/feature-designs/zgc-production-implementation-plan.md`.
-#    Recount before quoting, from the repo root:
-#      awk '/^mod tests \{/{exit} {print}' gc/src/zgc.rs | grep -c '\bcensus::'
+#    and used to discount a suite result.
 #
-# IT HAS IN-TREE CONSUMERS. `vm_heap.rs` carries a `VmHeap::Zgc` arm behind
-# `#[cfg(feature = "zgc")]`, and `cratonvm-vm` forwards the feature
-# (`cratonvm-vm/zgc` -> `GcAlgorithm::Zgc`, `GcBackend::Zgc`, and the
-# `parse_gc_algorithm` "z" | "zgc" arm) so `-XX:+UseZGC` really selects this
-# collector.
+# WIRED IS NOT RUNNING, and the two claims must never be collapsed. The
+# colored-pointer LOAD BARRIER is plumbed end to end and is INERT BY
+# CONSTRUCTION in every shipping process: `VmHeap::load_ref_slot_barriered`
+# (`src/vm_heap.rs`) is the backend-dispatching seam and
+# `vm/src/jit/helpers.rs::jit_load_ref_slot` calls it — but
+# `vm/src/vm/vm_init.rs` pins `const RELOCATION_REQUESTED: bool = false`,
+# `ZgcRealHeap::set_barrier_color` (the sole writer of the coloured state) has
+# no non-test caller, and `barrier_good_mask` never leaves `Z_REMAPPED`, so
+# `load_barrier_armed()` is false for the process lifetime. The compaction
+# described above is a STOP-THE-WORLD slide and needs no barrier; the barrier is
+# for the CONCURRENT relocation that has not landed. The ordered work list that
+# must complete before anything arms it is the doc comment on
+# `VmHeap::load_ref_slot_barriered`, which is the AUTHORITY for that sequence —
+# this file deliberately keeps no second copy of it. Remaining adoption is
+# tracked in `docs/feature-designs/zgc-production-implementation-plan.md`.
 #
-# DEFAULT-OFF because it is not yet at pass-rate parity with `Generational`,
-# NOT because nothing uses it. The first full Spring Boot suite comparison
-# (2026-08-07, same binary, same 1975 classes) measured 1860 PASS / 49 HANG /
-# 22 FAIL under `-XX:+UseZGC` against 1902 / 18 / 11 on the default collector
-# — see `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`.
+# IT HAS IN-TREE CONSUMERS — now the unremarkable half of the story.
+# `vm_heap.rs` carries a `VmHeap::Zgc` arm behind `#[cfg(feature = "zgc")]`, and
+# `cratonvm-vm` forwards the feature (`cratonvm-vm/zgc` -> `GcAlgorithm::Zgc`,
+# `GcBackend::Zgc`, and the `parse_gc_algorithm` "z" | "zgc" arm), so
+# `-XX:+UseZGC` names this collector explicitly and the default names it
+# implicitly.
 #
-# DEFAULT-OFF IS NOT UNCOMPILED. A configuration nothing builds rots: this one
-# stopped compiling entirely (E0063) when `ZgcRealHeap::with_capacity()` was
-# not given the `layout_domain` field its three sibling collectors gained on
-# 2026-08-05. ci.yml's `experimental-features` job now builds the
-# `cratonvm-cli` BINARY under the feature and runs this crate's unit tests
-# with it, so a break of that class fails CI instead of waiting for a suite
-# run to notice.
+# WHY IT WAS ONCE DEFAULT-OFF, KEPT AS DATED HISTORY. The first full Spring Boot
+# suite comparison (2026-08-07, same binary, same 1975 classes) measured
+# 1860 PASS / 49 HANG / 22 FAIL under `-XX:+UseZGC` against 1902 / 18 / 11 on
+# the then-default collector — see
+# `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`.
+# That gap is why the feature was off, and the measurement is worth keeping. It
+# is NOT a description of today: the default flipped three days later, on
+# 2026-08-10, and this file went on saying "DEFAULT-OFF because it is not yet at
+# pass-rate parity" for three more weeks, in the same `[features]` block as
+# `default = ["zgc"]`.
+# No comparable post-flip suite figure is recorded here, so treat the parity
+# question as UNMEASURED IN THIS FILE as of 2026-09-01 rather than answered.
+#
+# WHAT ROTS NOW IS THE OTHER SIDE. A configuration nothing builds rots: this
+# feature stopped compiling entirely (E0063) when `ZgcRealHeap::with_capacity()`
+# was not given the `layout_domain` field its three sibling collectors gained on
+# 2026-08-05. ci.yml's `experimental-features` job builds the `cratonvm-cli`
+# BINARY under `--features zgc` and runs this crate's tests with it, which is
+# what caught that class of break — but since 2026-08-10 both of those resolve
+# to the DEFAULT feature set, so for `zgc` that job no longer compiles anything
+# the ordinary jobs do not. The configuration now at risk is the fallback:
+#   grep -n 'no-default-features' .github/workflows/ci.yml
+# returns nothing, so no job compiles the `--no-default-features` build this
+# feature exists to preserve. Whether that build currently compiles is
+# UNVERIFIED as of 2026-09-01 — this manifest is not the place to assert it.
 zgc = []
 
 [lints]

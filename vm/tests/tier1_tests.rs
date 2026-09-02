@@ -353,6 +353,11 @@ fn t1_oop_map_round_trip_in_compiled_method() {
         frame_slot_offsets: vec![-8i16, -16],
         moving_young_coverage_complete: false,
         live_frame_hi: 0,
+        local_oop_mask: None,
+        num_locals: 0,
+        inline_local_scopes: Vec::new(),
+        non_oop_stack_slots: Vec::new(),
+        stack_marks_exact: false,
     };
     let entry_b = OopMapEntry {
         bytecode_pc: 0,
@@ -360,6 +365,11 @@ fn t1_oop_map_round_trip_in_compiled_method() {
         frame_slot_offsets: vec![-8i16, -24, -32],
         moving_young_coverage_complete: false,
         live_frame_hi: 0,
+        local_oop_mask: None,
+        num_locals: 0,
+        inline_local_scopes: Vec::new(),
+        non_oop_stack_slots: Vec::new(),
+        stack_marks_exact: false,
     };
     // Sanity on the entry constructors themselves.
     assert_eq!(entry_a.slot_count(), 2);
@@ -422,6 +432,11 @@ fn t1_oop_map_end_to_end_push_and_find() {
             frame_slot_offsets: vec![-8, -16],
             moving_young_coverage_complete: false,
             live_frame_hi: 0,
+            local_oop_mask: None,
+            num_locals: 0,
+            inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         },
         OopMapEntry {
             bytecode_pc: 0,
@@ -429,6 +444,11 @@ fn t1_oop_map_end_to_end_push_and_find() {
             frame_slot_offsets: vec![-8, -24],
             moving_young_coverage_complete: false,
             live_frame_hi: 0,
+            local_oop_mask: None,
+            num_locals: 0,
+            inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         },
         OopMapEntry {
             bytecode_pc: 0,
@@ -436,6 +456,11 @@ fn t1_oop_map_end_to_end_push_and_find() {
             frame_slot_offsets: vec![-16, -32, -40],
             moving_young_coverage_complete: false,
             live_frame_hi: 0,
+            local_oop_mask: None,
+            num_locals: 0,
+            inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         },
     ];
     // slot counts must round-trip
@@ -467,6 +492,11 @@ fn t1_oop_map_handles_inlined_callee_pattern() {
             frame_slot_offsets: vec![-8], // caller's `this`
             moving_young_coverage_complete: false,
             live_frame_hi: 0,
+            local_oop_mask: None,
+            num_locals: 0,
+            inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         },
         OopMapEntry {
             bytecode_pc: 0,
@@ -474,6 +504,11 @@ fn t1_oop_map_handles_inlined_callee_pattern() {
             frame_slot_offsets: vec![-8, -24], // caller's this + callee's arg
             moving_young_coverage_complete: false,
             live_frame_hi: 0,
+            local_oop_mask: None,
+            num_locals: 0,
+            inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         },
         OopMapEntry {
             bytecode_pc: 0,
@@ -481,6 +516,11 @@ fn t1_oop_map_handles_inlined_callee_pattern() {
             frame_slot_offsets: vec![-8, -48], // caller's this + return value
             moving_young_coverage_complete: false,
             live_frame_hi: 0,
+            local_oop_mask: None,
+            num_locals: 0,
+            inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         },
     ];
     // Each entry is independent and addressable by native_pc_offset.
@@ -525,6 +565,11 @@ fn t1_oop_map_property_random_slot_sets_round_trip() {
             frame_slot_offsets: slots,
             moving_young_coverage_complete: false,
             live_frame_hi: 0,
+            local_oop_mask: None,
+            num_locals: 0,
+            inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         });
     }
     // Every entry is addressable + its slot list is preserved.
@@ -1052,6 +1097,11 @@ fn t1_aarch64_oop_map_data_shape() {
         frame_slot_offsets: vec![-16],
         moving_young_coverage_complete: false,
         live_frame_hi: 0,
+        local_oop_mask: None,
+        num_locals: 0,
+        inline_local_scopes: Vec::new(),
+        non_oop_stack_slots: Vec::new(),
+        stack_marks_exact: false,
     };
     assert_eq!(entry.slot_count(), 1);
     assert_eq!(entry.frame_slot_offsets[0], -16);

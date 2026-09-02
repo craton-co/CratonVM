@@ -1667,6 +1667,16 @@ fn caller_bundle_class_loader(
     // application builds an isolated loader, and HotSpot resolves a bundle
     // through it. Classes owned by the built-in loaders report `null` here or
     // the app singleton, and both keep the established `-cp` path.
+    // The PLATFORM loader is built-in too, and since `Class.getClassLoader()`
+    // began reporting it for platform-module classes (`java.sql`,
+    // `java.scripting`, ...) a JDK caller reaches here holding it. It has no
+    // application resource path of its own, so treating it as a custom loader
+    // would route a bundle lookup through a loader that can only answer for the
+    // image -- the opposite of what the comment above intends by "built-in
+    // loaders keep the established `-cp` path".
+    if crate::classloader::is_platform_loader_object(ctx, loader) {
+        return Ok(None);
+    }
     let app = crate::classloader::get_or_create_app_loader(ctx)?;
     if loader.as_ptr() == app.as_ptr() {
         return Ok(None);

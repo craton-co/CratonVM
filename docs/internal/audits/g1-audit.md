@@ -37,7 +37,41 @@ which this change does not own; they are written out verbatim in §8.
 | **G1-8** | The remembered set is *additive* and its only pruning is `cleanup`'s Free-source pass. A source region recycled into a live type is re-walked **wholesale**, resurrecting its dead objects' referents. | Medium (over-retention, not unsoundness) | **Fixed** (G1AUD-5) — an rset entry is now `(source_index, generation)` rather than a bare source index. `G1Region::recycled_in_generation` records when a region was last reset, `rset_cache_epoch` doubles as the monotone reclassification clock, and an entry is dead exactly when `stamp < source.recycled_in_generation`. Both the scan side (`live_rset_sources`) and `cleanup` (`retain_sources_in_generation`) now ask that sharper question instead of "is the source Free *right now*". Entries recorded without a generation get `RSET_GENERATION_PINNED` (`u64::MAX`) and are never aged out — over-retain rather than under-scan. The staleness test is a strict `<`, so an edge recorded in the same generation that later resets the source survives one extra cycle, again in the fail-safe direction. |
 | **G1-9** | The parallel young evacuator's object scan ignored compact field layouts, so a compact object's reference fields were never visited: its referents were not evacuated and its slots were not rewritten, and Phase 5 then freed the region they pointed into. | **Critical** (live-object loss / UAF under `CRATONVM_GC=g1-parallel-evac`) | **Fixed** 2026-08-13. `SharedEvac::process_object` and `seed_source_region` strode `HEADER_SIZE + slot_idx * SLOT_SIZE` over `num_slots()`, i.e. assumed the legacy uniform 16-byte cell body for every object, while every other reference walk in `g1.rs` — the serial evacuator, the Phase-4 remap, the mark scan, this audit's own V7b verifier — goes through `for_each_flat_object_reference`, which dispatches on `is_compact_object` and walks the registered `CompactLayout::field_offsets`. Both scans now do the same. Two corrections to this row's previous wording, both load-bearing for anyone re-reading the history: the defect was **not non-deterministic** (10/10 runs, and identical at `CRATONVM_G1_WORKERS=1`) and it was **not a race** — chasing it as a CAS race is why it stayed open. `num_slots()` is the hierarchy-wide field count, so the old stride also addressed 320 bytes of a 19-field compact object that occupies 152, reading and — on a decode that happened to look like `Value::Object` — writing past it. The G1AUD-6 source-set divergence recorded below was real and is still fixed, but it was **not** this. Regression: `parallel_evacuation_scans_compact_object_reference_fields`, which registers a `CompactLayout` with references at packed offsets and fails on the pre-fix scan — the coverage gap that hid this, since every other gc unit test allocates with no layout registered and is therefore legacy-layout, for which the old stride was accidentally correct. |
 | **G1-10** | Humongous spans were reclaimed by `cleanup` and nothing else, so humongous garbage survived until a concurrent mark cycle happened to fire. On a heap sized for the live set, IHOP may never be crossed and the answer is "never". | Medium (over-retention, not unsoundness) | **Fixed** 2026-08-13 — `eager_reclaim_humongous_locked` runs after Phase 5 of every young/mixed pause and frees any span neither a root nor the Phase-4 reference walk reaches. See §4 for the gates and for the ordering trap (asking the *remembered set* here frees a live span, because the pause has just recycled the Eden region its only entry names). `CRATONVM_G1_EAGER_HUMONGOUS=0` restores the old behaviour. |
-| **G1-11** | Under `-XX:+UseG1GC` with the **JIT warm** and a heap tight enough to force sustained collection, the VM takes `EXCEPTION_ACCESS_VIOLATION` reading one page past a heap arena boundary (`read at address 0x…010000`), then reports "thread 'main-vm' has overflowed its stack". | **Critical** (memory unsafety under `-XX:+UseG1GC`) | **OPEN — not this branch's.** Found by finally running §9 item 8 (below). Reproduces with every G1 flag this branch added turned off (`CRATONVM_G1_EAGER_HUMONGOUS=0 CRATONVM_G1_PARALLEL_EVAC=0 CRATONVM_G1_RSET_SOURCE_CAP=0`), so it is not attributable to the parallel evacuator, the worker pool, the eager humongous reclaim or the rset bound — though it was NOT bisected against a `dev` build, so "pre-existing" is an inference from the flag arms, not a measurement. Repro and the four discriminating arms are in item 8. |
+| **G1-11** | Under `-XX:+UseG1GC` with the **JIT warm** and a heap tight enough to force sustained collection, the VM takes `EXCEPTION_ACCESS_VIOLATION` reading one page past a heap arena boundary (`read at address 0x…010000`), then reports "thread 'main-vm' has overflowed its stack". | **Critical** (memory unsafety under `-XX:+UseG1GC`) | **OPEN — not this branch's.** Found by finally running §9 item 8 (below). Reproduces with every G1 flag this branch added turned off (`CRATONVM_G1_EAGER_HUMONGOUS=0 CRATONVM_G1_PARALLEL_EVAC=0 CRATONVM_G1_RSET_SOURCE_CAP=0`), so it is not attributable to the parallel evacuator, the worker pool, the eager humongous reclaim or the rset bound — though it was NOT bisected against a `dev` build, so "pre-existing" is an inference from the flag arms, not a measurement. Repro and the four discriminating arms are in item 8. **BISECTED 2026-09-02** — see below. |
+
+**G1-11, the dev bisect this row asked for (2026-09-02).** The row says
+"pre-existing" was an inference from the flag arms rather than a measurement.
+It is a measurement now. A plain `origin/dev` binary was built in its own
+worktree and run interleaved against the nineteen-findings branch on
+`StringNativeAllocationChurn` under `-XX:+UseG1GC -Xmx256m`, three load
+conditions, same JDK, exit codes read directly (not through a pipeline, whose
+status is the last command's):
+
+| condition | branch | plain dev |
+|---|---|---|
+| idle host | 0/10 | **1/10** |
+| four CPU spinners | 0/12 | 0/12 |
+| during a release build | 0/10 | 0/10 |
+
+0/32 against 1/32. The one failure is on PLAIN DEV, so the crash class is not
+introduced by that branch — which is what this row wanted to know and could not
+say.
+
+Two cautions on reading it further. The rate is far too low for 32 reps to
+distinguish anything beyond that, and CPU load — the variable the tree's own
+notes say surfaces this kind of defect — did not raise it here, so whatever the
+trigger is, four spinners are not it.
+
+And the observation that started this bisect was not G1-11 at all. An earlier
+run of the same workload failed 2/10 on the branch, and both failures were
+downstream of a `debug_assert!` that branch had added too strongly (F-06's
+cleanup cross-check asserted equality between two counts that are keyed
+differently). The VM catches a native panic and continues, so an assertion that
+aborts a collection mid-pause leaves a half-collected heap for the next
+dereference to find. Correcting the assertion took the same workload to 0/32.
+That is worth recording as its own lesson: a debug assertion that fires inside a
+GC pause does not merely report a problem, it manufactures one that looks like a
+different problem.
 
 Nothing in G1's SATB **pre**-write barrier was found missing on the paths this
 crate owns, and — contrary to the hypothesis this audit started from — the JIT
@@ -538,7 +572,22 @@ Ordered. Each item is a precondition for the next being meaningful.
    the coarsening bound above is confirmed as insurance for the O(regions²)
    ceiling rather than as relief from present pressure.
 
-   Getting a reading took a purpose-built probe (`apps/g1_probe/RsetChurn.java`, committed so the number stays
+   **The probe named below was NOT in the tree, and could not have been.** This
+   item says it was "committed so the number stays reproducible"; the commit
+   that wrote that sentence touched no `.java` file at all. The cause is
+   mechanical rather than careless — `apps/` is in `.gitignore` (line 12), so
+   `git add apps/g1_probe/RsetChurn.java` silently added nothing and the commit
+   went out claiming a file it did not carry. From that day until 2026-09-02 the
+   number could not be reproduced by anyone.
+
+   The probe is reconstructed from this paragraph's own description of it and
+   now lives at `probes/RsetChurn.java`, which is tracked. That matters because
+   F-05 revisits the conclusion drawn here: `rset_bytes_per_live_byte` answers
+   the SPACE question, and it was read as also answering the TIME one — what it
+   costs to ACT on an entry, which for a region-granular set is a linear walk of
+   the whole source region.
+
+   Getting a reading took a purpose-built probe (`probes/RsetChurn.java`, committed so the number stays
    reproducible: four retained
    depth-12 trees whose leaves are re-pointed at fresh young arrays every
    round, so the edges are old→young and load-bearing) and three corrections
@@ -567,6 +616,43 @@ Ordered. Each item is a precondition for the next being meaningful.
    the reading item 2's `cset_verify_truncated` counter exists to make possible,
    and it means `dangling=0` here is "nothing found in 995,328 objects
    sampled", not "the heap was exhaustively clean at any instant".
+
+   **F-05 (2026-09-02) — the SPACE reading above answered the wrong question,
+   and a card table shipped for the other one.** `rset_bytes_per_live_byte =
+   0.000034` says the remembered set is cheap to STORE. It says nothing about
+   what it costs to USE, and that is where the cost was: an entry names a source
+   REGION, so acting on one remembered edge meant `scan_source_region_for_cset_refs`
+   walking the whole source — every header validated, every reference slot read,
+   an `evacuation_candidate_is_an_object` check and a `region_for_ptr` binary
+   search per candidate — i.e. a cost proportional to BYTES IN THE SOURCE rather
+   than to the number of edges. A single edge into a 1 MiB Old region cost a
+   megabyte walk, and a COARSENED rset makes every live region a nominal source.
+   `gc/src/g1_cards.rs` adds a per-arena byte-per-512-bytes card table maintained
+   by the same three producers that maintain the rset, and Phase 2 now skips a
+   source with no dirty card outright and steps over any object that touches no
+   dirty card. `CRATONVM_G1_CARD_RSET=0` restores the whole-region walk.
+   Measured on the unit fixture (one holder among hundreds of fillers in a 1 MiB
+   source): `scanned=512 skipped=1048064` — 99.95% of the source walk removed.
+   The region-index rset is unchanged and still decides WHICH regions a pause
+   looks at; the cards decide WHERE INSIDE one. Residual: no block-start table,
+   so the walk still steps object-by-object (see the long comment at the
+   per-object screen for why `bump_alloc` cannot maintain one across a TLAB
+   carve), and a card is cleaned only at `G1Region::reset`, so a long-lived Old
+   region's cards saturate.
+
+   **END-TO-END, 2026-09-02.** `G1CardChurn 11 200` (four retained depth-11
+   trees whose leaves are re-pointed at fresh young `int[]` every round, so the
+   edges are old->young and the checksum is computed from data reachable ONLY
+   through them) at `-Xmx24m -XX:InitiatingHeapOccupancyPercent=15 --nojit`:
+   42 pauses, young and mixed, `checksum=82273920000` — byte-identical to
+   HotSpot and to the same binary under `CRATONVM_G1_CARD_RSET=0`. Engagement
+   on the mixed pauses reads `rset_scanned=2406256 rset_skipped=86240`, i.e.
+   about 3.5% of the source walk removed. That number is small and it is the
+   honest one for this probe: it re-points EVERY leaf every round, so nearly
+   every card in the holder regions is dirty by construction. It is the
+   worst case for a card screen, not the case it is for. The 99.95% figure
+   above is the other end of the same distribution (one holder among hundreds
+   of clean fillers), and a real application sits between them.
 6. ~~**Decide the JNI-pinned-source policy explicitly.**~~ **DONE.** Stated in
    `a_jni_pinned_region_is_an_ordinary_rset_source_not_a_wholesale_one`, which
    pins both halves: a JNI-pinned region is held out of the CSet but is an
@@ -658,3 +744,69 @@ routes to the helper, so the disable is fail-safe. Re-enabling it — with
 end-to-end coverage for every compiled store form and the card-table lifecycle —
 is what would give G1 back an inline post barrier, for old and fresh receivers
 alike.
+
+### F-08 (2026-09-02) — G1 got an inline post barrier of its own, and it is NOT the card mark
+
+The paragraph above is right that the generational inline card mark is the way
+to give the GENERATIONAL collector its inline barrier back, and it stays
+disabled: `inline_card_mark_available()` is still a constant `false` and this
+change does not touch it. What it got wrong is treating that as G1's only
+recovery path. G1's post barrier is a different mechanism with different inputs,
+and it does not need the card mark, the `GC_FLAG_OLD_GEN` bit, or the
+`JIT_REGION_BOUNDS` table whose emptiness closes G1-2:
+
+```
+if dst == null                              -> nothing to remember
+if (src - base) >> shift == (dst - base) >> shift  -> nothing to remember
+otherwise                                   -> record the edge
+```
+
+Both elided cases are exactly the cases `post_write_barrier_rset` returns from
+without touching anything, so the inline filter removes calls whose callee
+would have returned and never a call that would have recorded. Everything else
+— an address outside the arena, a Free destination region, an edge this thread
+already recorded — is left to the callee.
+
+Shipped as `jit/src/x64/objects.rs::emit_g1_barrier_filter` plus a lean
+`jit_g1_post_write_barrier` helper, against a **fourth** process-global table
+(`gc/src/gen_heap.rs::JIT_G1_BARRIER`: arena base, arena length, region mask,
+and F-05's card table base and shift). A fourth table rather than a fourth use
+of an existing one, for the third time and the same reason: `JIT_REGION_BOUNDS`
+must stay empty under G1 or G1-2 re-opens, and `publishing_the_g1_barrier_table_does_not_make_region_bounds_live`
+is the test that says so.
+
+Two things it deliberately does NOT do. It does not dirty the F-05 card inline,
+because the remembered-set ENTRY still has to be recorded and that is a hash-map
+insert keyed on a (source, target) region pair with no inline form — dirtying
+inline and calling anyway is duplicated work, and the callee dirties on the way
+through. Making the barrier fully inline would additionally require Phase 2 to
+take its source set from the card table rather than from the region-index
+remembered set, which is a collector policy change and not an emitter one; the
+table carries the card base and shift so that work starts from the numbers
+rather than from a table migration. And it does not use the trusted-oop
+receiver check, whose premise ("with bounds live the backend is Generational")
+is precisely what this arm falsifies.
+
+`CRATONVM_G1_INLINE_BARRIER`, **default OFF**. The soundness argument above is a
+proof about which calls are elided rather than a claim about behaviour, and the
+executable unit test pins the four cases the filter separates — including the
+one that only exists because G1's arena is malloc-aligned rather than
+region-aligned, where a base-free `(obj ^ val) & mask` would call two addresses
+either side of a real region boundary "same region" and lose the edge. It still
+ships off, because this is a code-generation change on an experimental
+collector and because the last inline barrier this JIT had was disabled by a
+production audit rather than by a review. The flag is how it gets measured
+before it becomes a default; §10's own advice ("it should be measured under the
+reliability gate rather than assumed small") applies to the recovery as much as
+to the cost.
+
+**END-TO-END, 2026-09-02.** `G1CardChurn 11 60` at `-Xmx24m` with the JIT WARM
+(no `--nojit`), which is the arm every earlier G1 result in this document was
+missing: `checksum=7616601600` with `CRATONVM_G1_INLINE_BARRIER=1`, identical to
+the same binary with it off and to HotSpot. The arm was verified to have been
+TAKEN rather than merely enabled — `emit_g1_barrier_filter` logs
+`jit: G1 inline post-write barrier ACTIVE` once per process at `info`, present
+in the flag-on run and absent in the flag-off control. A checksum from a gated
+path nobody confirmed was entered is the "a subsystem kill switch passing 6/6 is
+not a diagnosis" failure, and this file has been on the receiving end of it
+before.

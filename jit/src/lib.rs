@@ -1574,6 +1574,67 @@ pub struct OopMapEntry {
     /// object pointers in reclaimed spill slots as un-rewritable roots.
     /// `0` means "unknown" and makes the verifier scan the whole region.
     pub live_frame_hi: i32,
+    /// DIAGNOSTIC ORACLE -- the forward "must be oop" local dataflow mask that
+    /// was in force when this map was built, as a bitmask over JVM local slots
+    /// (bit `k` = local `k`, whose canonical home is `[rbp - 8*(k+1)]`).
+    ///
+    /// `None` means the dataflow never reached this safepoint's bci, i.e. the
+    /// map named NO locals at all (`map_incomplete_cause::LOCAL_MASK_UNREACHED`).
+    /// That is a different statement from `Some(0)`, which says the dataflow DID
+    /// reach here and proved no local holds a reference, and the two must not be
+    /// folded together: the first makes a stale word in the locals band
+    /// unexplained, the second explains it as dead storage.
+    ///
+    /// Recorded so a stale-word report can say **live**. `live_frame_hi` is a
+    /// spill watermark, not a liveness bound, so "below the watermark and not in
+    /// the map" is an upper bound on missed roots and cannot be acted on; this
+    /// mask is the in-tree oracle that turns such a word into one of "the
+    /// dataflow proves this local is a reference" (a real miss) or "the dataflow
+    /// proves it is not" (dead storage). See
+    /// `bug-h2-testrandommapops-small-heap-corruption-20260829.md` §5.
+    ///
+    /// x86-64 single-pass only. The IR tier allocates frame slots rather than
+    /// homing locals at `8*(k+1)`, so it records `None` and the oracle stays
+    /// silent there rather than answering about the wrong frame layout.
+    pub local_oop_mask: Option<u64>,
+    /// Number of JVM locals of the frame `local_oop_mask` describes, so a word
+    /// at `[rbp - 8*(k+1)]` with `k >= num_locals` can be told apart from a
+    /// local the mask declined to name. `0` when there is no mask.
+    pub num_locals: u16,
+    /// The same oracle for the locals of each LIVE INLINE SPLICE, as
+    /// `(base_off, num_locals, oop_mask)`: spliced callee local `k` is homed at
+    /// `[rbp - (base_off + 8*k)]`.
+    ///
+    /// A splice's locals are allocated out of the operand-SPILL band
+    /// (`reserve_spill_slots`), not the java-locals band, so `local_oop_mask`
+    /// above cannot speak for them and every such word would otherwise read as
+    /// unclassifiable spill. That matters because the frames this oracle exists
+    /// for carry splices: "a spliced callee's locals are named by no oop map"
+    /// is a defect this repo has already paid for once.
+    ///
+    /// Only scopes whose mask is known are recorded; a scope that cannot
+    /// classify its locals already fails the safepoint closed
+    /// (`map_incomplete_cause::INLINE_LOCAL_UNMAPPABLE`) and contributes
+    /// nothing here, so a word in its band stays honestly unattributed.
+    pub inline_local_scopes: Vec<(i32, u16, u64)>,
+    /// Frame-resident OPERAND-STACK slots this safepoint's own stack model
+    /// classified as NOT holding a reference.
+    ///
+    /// The marked ones are already in `frame_slot_offsets`; these are their
+    /// complement, and they are what lets a stale word in the operand-spill
+    /// band be read as dead storage rather than merely unexplained. Measured
+    /// need: on `org.h2.test.store.TestRandomMapOps`, 36 of the 37 stale words
+    /// below `live_frame_hi` sit in `region=operand-spill`, where the locals
+    /// oracle above is silent.
+    ///
+    /// Only meaningful when `stack_marks_exact`; a mark vector that nobody
+    /// classified was PADDED with "not an oop", which is a default and not a
+    /// proof.
+    pub non_oop_stack_slots: Vec<i16>,
+    /// Whether the mark vector behind `non_oop_stack_slots` was exact
+    /// (`Compiler::stack_oop_marks_exact`). False turns every entry above from
+    /// a proof into a guess, so the report must not spend it.
+    pub stack_marks_exact: bool,
 }
 
 impl OopMapEntry {
@@ -1587,6 +1648,11 @@ impl OopMapEntry {
             frame_slot_offsets: Vec::new(),
             moving_young_coverage_complete: false,
             live_frame_hi: 0,
+            local_oop_mask: None,
+            num_locals: 0,
+            inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         }
     }
 
@@ -2702,6 +2768,71 @@ pub struct CompiledMethod {
     /// from the artifact rather than needing a new thread through
     /// `try_compile_inner`'s ~40 return paths.
     pub inline_tally: InlineDecisionTally,
+    /// PC -> inline-chain map: at each call emitted from inside a spliced
+    /// body, the callees this artifact inlined at that point, INNERMOST
+    /// FIRST. Produced by `x64::inlining` during codegen and attached by
+    /// `x64::driver::compile_with_param_slots`; read by
+    /// `vm/src/jit/conservative_roots.rs` to give a warmed-up stack trace the
+    /// frames an inlined callee otherwise contributes none of (defect 2 of
+    /// `jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902`).
+    ///
+    /// Introspection and diagnosis ONLY. Never read by codegen, never by the
+    /// GC root walk, never by deopt. A level here names a method and a bci and
+    /// carries no locals, so it cannot be mistaken for a resume state -- which
+    /// is the whole reason it is a separate side table rather than a
+    /// correction to `DeoptimizationPoint::frame_state.caller`. That chain
+    /// looks like the same fact and is not: every level stamps the COMPILING
+    /// method's key because `build_frame_state_at` has no other identity to
+    /// stamp, and a nested scope's locals are captured out of the compiling
+    /// method's frame, so the scope is malformed as a whole. Correcting only
+    /// the NAME there would flip a sound reject into a resume with garbage
+    /// locals; see `.agent-requests/A18-jit-lib.txt`.
+    ///
+    /// COST on a method that splices nothing -- the overwhelming majority --
+    /// is exactly `InlineFrameMap::default()`: two empty `Vec`s, 48 bytes
+    /// inline in the artifact, zero heap and zero allocation. Such a method
+    /// never enters `x64::inlining` at all, so it records nothing either.
+    /// `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` makes even a splicing method
+    /// retain nothing, so the retained metadata and the extra trace frames
+    /// are A/B-able together inside one binary.
+    pub inline_frame_map: crate::x64::InlineFrameMap,
+    /// Where each of this artifact's INLINE NULL CHECKS would raise: the
+    /// trapping bci in this method's own code, plus the spliced callees around
+    /// it, keyed by the id its cold trampoline passes to
+    /// `jit_npe_with_action`.
+    ///
+    /// The one program point a compiled frame reaches with no safepoint id to
+    /// its name, and therefore the one an `ActiveCompiledFrame` could not put a
+    /// line on. See `x64::NpeTrapSite`. Empty -- and allocation-free -- for
+    /// every method with no inline null check and for
+    /// `CRATONVM_JIT_NO_NPE_TRAP_LINES=1`.
+    ///
+    /// Introspection and diagnosis ONLY: read exactly once, by
+    /// `vm/src/jit/helpers.rs` while it snapshots the frames for an implicit
+    /// NPE. Never by codegen, the GC root walk or deopt.
+    pub npe_trap_map: crate::x64::NpeTrapMap,
+    /// Optimizing-tier safepoint id -> the BYTECODE INDEX that safepoint sits
+    /// at, ascending by id. Empty for every single-pass artifact.
+    ///
+    /// `OopMapEntry::bytecode_pc` is not a bci on this backend: `ir_lower`
+    /// stores a monotonic safepoint counter starting at 1 there, because an IR
+    /// safepoint is a NODE and several nodes can share one bci. Those counters
+    /// are small integers indistinguishable from plausible bcis, and the
+    /// artifact's own table records them -- so a stack walk that trusted the
+    /// slot would print a confidently WRONG line rather than none, which is why
+    /// `conservative_roots::activation_bci` refused an `used_ir_backend`
+    /// artifact outright and every optimizing-tier frame reported
+    /// `(Unknown Source)`. This is the translation that refusal was waiting
+    /// for: one `(id, bci)` pair per emitted safepoint, filled by
+    /// `Lowerer::emit_safepoint_map` from the same `cur_bci` the deopt machinery
+    /// already keys throw sites on, and passed through `resume_bci` so a
+    /// safepoint inside an IR-spliced callee reports the ENCLOSING invoke
+    /// rather than a pc that does not exist in this method's code.
+    ///
+    /// Introspection and diagnosis ONLY -- never read by codegen, the GC root
+    /// walk or deopt. It is a translation of an id the GC already keys on, not
+    /// a second source of truth about it.
+    pub safepoint_bci_table: Vec<(u32, u32)>,
     /// Deoptimization points: native code offsets where deopt can occur.
     /// Used by the deopt framework to reconstruct interpreter state.
     pub deopt_points: Vec<deopt::DeoptimizationPoint>,
@@ -3096,6 +3227,11 @@ impl CompiledMethod {
             used_ir_backend: false,
             inlined_methods: Vec::new(),
             inline_tally: InlineDecisionTally::default(),
+            // Two empty `Vec`s. No allocation, and none unless this compile
+            // actually splices something.
+            inline_frame_map: Default::default(),
+            npe_trap_map: Default::default(),
+            safepoint_bci_table: Vec::new(),
             deopt_points: Vec::new(),
             _deopt_point_boxes: Vec::new(),
             oop_maps: Vec::new(),
@@ -3175,6 +3311,11 @@ impl CompiledMethod {
             used_ir_backend: false,
             inlined_methods: Vec::new(),
             inline_tally: InlineDecisionTally::default(),
+            // Two empty `Vec`s. No allocation, and none unless this compile
+            // actually splices something.
+            inline_frame_map: Default::default(),
+            npe_trap_map: Default::default(),
+            safepoint_bci_table: Vec::new(),
             deopt_points: Vec::new(),
             _deopt_point_boxes: Vec::new(),
             oop_maps: Vec::new(),
@@ -3301,6 +3442,20 @@ impl CompiledMethod {
         self.oop_maps
             .iter()
             .find(|map| map.bytecode_pc == bytecode_pc)
+    }
+
+    /// The bytecode index an OPTIMIZING-tier safepoint id names, if this
+    /// artifact recorded one. See [`Self::safepoint_bci_table`].
+    ///
+    /// `None` for every single-pass artifact (the table is empty there, and the
+    /// id IS the bci) and for an id the lowerer emitted no translation for. A
+    /// caller must treat `None` as "no line available", never as bci 0.
+    #[inline]
+    pub fn safepoint_bci(&self, safepoint_id: u32) -> Option<u32> {
+        self.safepoint_bci_table
+            .binary_search_by_key(&safepoint_id, |(id, _)| *id)
+            .ok()
+            .map(|i| self.safepoint_bci_table[i].1)
     }
 
     /// real-frame-deopt: locate the deopt point for an exact native PC offset.
@@ -6228,6 +6383,22 @@ pub struct InlineSite {
     pub needs_heap: bool,
     /// Class name of the inlined callee (for invalidation tracking).
     pub class_name: String,
+    /// `ClassId` of [`Self::class_name`], or `0` when the producer did not
+    /// supply one (every hand-built test fixture).
+    ///
+    /// The resolver knows this id -- it is what it looked the body up by -- and
+    /// used to drop it. That is why an inlined level in a stack walk carried
+    /// only a NAME, and why `stackwalker::frame_class_ids_with_compiled` could
+    /// not expand one: that walk answers in `ClassId`, takes no `ClassStore`,
+    /// and resolving a JIT label by name to answer the JEP 403 deep-reflection
+    /// gate would be a security-relevant GUESS. Carried here it is not a guess:
+    /// it is the same id the splice's own invalidation dependency is recorded
+    /// against.
+    ///
+    /// `0` is the "unknown" sentinel, matching
+    /// [`NestedInlineSite::guard_class_id`]'s use of it, and a consumer must
+    /// REFUSE on it rather than substitute anything.
+    pub class_id: u32,
     /// Method name of the inlined callee.
     pub method_name: String,
     /// Descriptor of the inlined callee.
@@ -6832,10 +7003,18 @@ pub fn inline_site_expansion_cost_tiered(site: &InlineSite, site_is_hot: bool) -
 
 /// Maximum nesting depth of inlined scopes. HotSpot's `MaxInlineLevel`.
 ///
-/// The single-pass emitter cannot nest today (it bails on any callee invoke
-/// that is not a resolver-proven elidable super-`<init>`), so the wiring passes
-/// `depth = 1` and this never binds. It is enforced anyway so a nesting
-/// emitter inherits a limit instead of needing one added.
+/// **This comment used to say the single-pass emitter cannot nest.** It can:
+/// `try_emit_nested_inline` / `emit_guarded_nested_inline` splice inside a
+/// splice, `InlineSite::nested_sites` carries the plan, and
+/// [`MAX_INLINE_NEST_DEPTH`] bounds it at 3 — the depth the JUnit assert chain
+/// needs to collapse. The sentence about the emitter bailing on any callee
+/// invoke that is not a resolver-proven elidable super-`<init>`, and the
+/// `depth = 1` that followed from it, describe the tree before nesting landed.
+///
+/// What is still true is that this constant does not bind: 3 is the live limit
+/// and it is the smaller of the two. Kept as HotSpot's `MaxInlineLevel` so a
+/// resolver that ever plans deeper inherits a ceiling rather than needing one
+/// added.
 pub const INLINE_MAX_DEPTH: usize = 9;
 
 /// Maximum number of copies of the SAME method allowed on one inline stack —
@@ -7678,6 +7857,7 @@ mod profile_guided_inlining_tests {
             ldc2w_info: Vec::new(),
             needs_heap: false,
             class_name: class.to_string(),
+            class_id: 0,
             method_name: method.to_string(),
             descriptor: "()I".to_string(),
             elided_invoke_pcs: Vec::new(),
@@ -8463,6 +8643,7 @@ mod inline_selection_tests {
             ldc2w_info: Vec::new(),
             needs_heap,
             class_name: "InlineCost".to_string(),
+            class_id: 0,
             method_name: "leaf".to_string(),
             descriptor: "()V".to_string(),
             elided_invoke_pcs: Vec::new(),
@@ -10595,15 +10776,44 @@ pub fn long_box_direct_helper_sites() -> (u64, u64) {
 /// the per-call floor `Preconditions.checkIndex` and
 /// `Reference.reachabilityFence` were taken off for 143 -> 23 ns.
 ///
-/// **Scope: primitive returns only.** A reference-returning read is left on
-/// the funnel deliberately. The generic path applies
-/// `unbox_poly_return_checked`, whose W6-1 rule turns *a boxed primitive
-/// reaching a non-`Object` reference return* into a `WrongMethodTypeException`
-/// — and that rule reads the CALL SITE's own descriptor, which a thin helper
-/// does not have (a baked direct call has no `JitInvokeInfo`). The synthetic
-/// call site these helpers fall back through carries an erased
-/// `(Ljava/lang/Object;)X` descriptor, which is indistinguishable from the real
-/// one for a primitive `X` and is NOT for a reference one.
+/// **Scope: primitive returns, and reference returns in two classified kinds.**
+/// Reference returns were out of scope until 2026-09-01, on the argument that
+/// the generic path applies `unbox_poly_return_checked`, whose W6-1 rule turns
+/// *a boxed primitive reaching a non-`Object` reference return* into a
+/// `WrongMethodTypeException` — and that rule reads the CALL SITE's own
+/// descriptor, which a thin helper does not have (a baked direct call has no
+/// `JitInvokeInfo`), so the synthetic call site these helpers fall back through
+/// carries an erased `(Ljava/lang/Object;)X` descriptor, indistinguishable from
+/// the real one for a primitive `X` and NOT for a reference one.
+///
+/// That argument was right about the erased descriptor and wrong about the
+/// conclusion, because it priced only the COLD arm. Two facts settle it:
+///
+/// * the FAST arm cannot lose W6-1. `varhandle_instance_field_read_bits`
+///   refuses unless the variable's own kind agrees with the site's — a
+///   reference site over a PRIMITIVE variable, which is W6-1's entire fire
+///   set, is declined there. The identical refusal already governs
+///   `try_varhandle_instance_field_read`, the funnel's copy of this read,
+///   which has served reference returns since it was written and returns raw
+///   bits WITHOUT reaching `unbox_poly_return_checked` at all. So compiled
+///   code's reference reads are already outside W6-1 today; binding them
+///   changes their cost, not their semantics;
+/// * the COLD arm keeps W6-1 by CLASSIFYING the site at compile time instead
+///   of carrying its descriptor. A boxed primitive is assignable to exactly
+///   fourteen reference types — `java/lang/Object`, the five shared wrapper
+///   supertypes and the eight wrappers themselves. So a reference site is one
+///   of three things, and only the third would need the descriptor it cannot
+///   have: `Ljava/lang/Object;` ([`VARHANDLE_READ_KIND_REF_OBJECT`]), where
+///   the erased stand-in IS the real descriptor and W6-1 can never fire; one
+///   of the other thirteen ([`VARHANDLE_BOX_ACCEPTING_RETURNS`]), where the
+///   answer depends on WHICH wrapper arrived, so the site is not bound at all;
+///   and anything else ([`VARHANDLE_READ_KIND_REF_STRICT`]), where NO boxed
+///   primitive is assignable, so "the cold arm produced a box" is a W6-1 fire
+///   with no further information needed — which is what
+///   `varhandle_read_direct_impl` checks and raises on.
+///
+/// `RJdkHandles`' `String bogus = (String) vi.get(h)` over an `int` field is a
+/// `REF_STRICT` site, and the vector that holds this honest.
 pub static VARHANDLE_READ_DIRECT_FNS: [std::sync::atomic::AtomicUsize; VARHANDLE_READ_SLOTS] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; VARHANDLE_READ_SLOTS];
 
@@ -10615,11 +10825,108 @@ pub static VARHANDLE_READ_DIRECT_FNS: [std::sync::atomic::AtomicUsize; VARHANDLE
 pub const VARHANDLE_READ_MODES: [&str; 4] = ["get", "getVolatile", "getOpaque", "getAcquire"];
 
 /// The primitive return kinds served by [`VARHANDLE_READ_DIRECT_FNS`], in
-/// slot-minor order. `L` and `[` are absent on purpose — see the cells' own doc.
+/// slot-minor order, occupying kinds `0..8`. The two REFERENCE kinds follow
+/// them at [`VARHANDLE_READ_KIND_REF_OBJECT`] and
+/// [`VARHANDLE_READ_KIND_REF_STRICT`]; `[` is still absent, because an array
+/// return is outside `varhandle_reference_return_mismatch`'s fire set today and
+/// a stand-in descriptor would have to reproduce that exclusion for no measured
+/// caller.
 pub const VARHANDLE_READ_RETURNS: [u8; 8] = [b'Z', b'B', b'C', b'S', b'I', b'J', b'F', b'D'];
 
-/// `VARHANDLE_READ_MODES.len() * VARHANDLE_READ_RETURNS.len()`.
-pub const VARHANDLE_READ_SLOTS: usize = 32;
+/// Slot-minor kind for a site whose declared return is exactly
+/// `Ljava/lang/Object;`. The helpers' erased stand-in descriptor is that site's
+/// real descriptor, so nothing is lost on either arm.
+pub const VARHANDLE_READ_KIND_REF_OBJECT: usize = 8;
+
+/// Slot-minor kind for a site whose declared return is a reference type no
+/// boxed primitive is assignable to. The cold arm may therefore treat "a box
+/// came back" as a W6-1 mismatch without knowing which class the site named.
+pub const VARHANDLE_READ_KIND_REF_STRICT: usize = 9;
+
+/// Slot-minor kinds: the eight primitives plus the two reference kinds.
+pub const VARHANDLE_READ_KINDS: usize = 10;
+
+/// `VARHANDLE_READ_MODES.len() * VARHANDLE_READ_KINDS`.
+pub const VARHANDLE_READ_SLOTS: usize = 40;
+
+/// The thirteen reference types, besides `java/lang/Object`, that a boxed
+/// primitive can legally arrive at: the five shared wrapper supertypes and the
+/// eight wrappers themselves.
+///
+/// A site returning one of these is NOT bound. Whether a box satisfies it
+/// depends on WHICH wrapper the access produced (`Character` at a
+/// `java/lang/Number` site is a mismatch, `Integer` is not), and that is the
+/// one question neither slot kind can answer without the site's descriptor.
+///
+/// The list is the union of `vm::vm_exec::boxed_primitive_supertypes`' rows
+/// minus `java/lang/Object`, plus its `PRIMITIVE_WRAPPER_CLASSES`. A name added
+/// there and not here can only cost a bind, never correctness: the
+/// classification errs towards `REF_STRICT`, and `REF_STRICT` throws where the
+/// funnel would have thrown.
+pub const VARHANDLE_BOX_ACCEPTING_RETURNS: [&str; 13] = [
+    "java/lang/Number",
+    "java/lang/Comparable",
+    "java/io/Serializable",
+    "java/lang/constant/Constable",
+    "java/lang/constant/ConstantDesc",
+    "java/lang/Boolean",
+    "java/lang/Byte",
+    "java/lang/Character",
+    "java/lang/Short",
+    "java/lang/Integer",
+    "java/lang/Long",
+    "java/lang/Float",
+    "java/lang/Double",
+];
+
+/// The access-mode half of a slot.
+pub const fn varhandle_read_slot_mode(slot: usize) -> usize {
+    slot / VARHANDLE_READ_KINDS
+}
+
+/// The return-kind half of a slot.
+pub const fn varhandle_read_slot_kind(slot: usize) -> usize {
+    slot % VARHANDLE_READ_KINDS
+}
+
+/// The `return_type` byte a slot's call site carries: the primitive char for
+/// kinds `0..8`, and `L` for both reference kinds.
+pub const fn varhandle_read_slot_return(slot: usize) -> u8 {
+    let kind = varhandle_read_slot_kind(slot);
+    if kind < VARHANDLE_READ_RETURNS.len() {
+        VARHANDLE_READ_RETURNS[kind]
+    } else {
+        b'L'
+    }
+}
+
+/// Is this slot one of the two REFERENCE-returning kinds?
+pub const fn varhandle_read_slot_is_reference(slot: usize) -> bool {
+    varhandle_read_slot_kind(slot) >= VARHANDLE_READ_RETURNS.len()
+}
+
+/// `CRATONVM_JIT_VARHANDLE_REF_READ_DIRECT=0` — keep binding the PRIMITIVE read
+/// kinds and send the two REFERENCE kinds back to the generic funnel, which
+/// serves them through `try_varhandle_instance_field_read`.
+///
+/// Separate from `CRATONVM_JIT_VARHANDLE_READ_DIRECT_HELPERS` on purpose: the
+/// reference half landed twelve days after the primitive half, and the A/B that
+/// prices it has to be a single binary with one switch between the arms — the
+/// rule the whole `varhandle` family of switches beside it exists for. Turning
+/// the WHOLE read bind off would move the primitive rows too and price the
+/// wrong change. Default ON.
+pub fn varhandle_ref_read_direct_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_VARHANDLE_REF_READ_DIRECT")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
 
 /// The single-reference-coordinate, primitive-return shape this bind serves,
 /// as a slot into [`VARHANDLE_READ_DIRECT_FNS`], or `None` when the site is
@@ -10664,12 +10971,31 @@ pub fn varhandle_read_helper_slot(method: &str, descriptor: &str) -> Option<usiz
     if !one_reference_param {
         return None;
     }
-    let ret = descriptor[close + 1..].as_bytes();
-    if ret.len() != 1 {
+    let ret = &descriptor[close + 1..];
+    let kind = if ret.len() == 1 {
+        VARHANDLE_READ_RETURNS
+            .iter()
+            .position(|r| *r == ret.as_bytes()[0])?
+    } else if !varhandle_ref_read_direct_enabled() {
+        // The reference half's kill switch is read HERE rather than at the emit
+        // sites, so all three doors (single-pass, OSR, and the IR
+        // intrinsic-site test) refuse together and the primitive half is
+        // untouched by it. Three doors that disagree about one bind is the
+        // defect `try_compile is NOT the only compile door` is written about.
         return None;
-    }
-    let kind = VARHANDLE_READ_RETURNS.iter().position(|r| *r == ret[0])?;
-    Some(mode * VARHANDLE_READ_RETURNS.len() + kind)
+    } else if ret == "Ljava/lang/Object;" {
+        VARHANDLE_READ_KIND_REF_OBJECT
+    } else if ret.starts_with('L') && is_single_object_descriptor(ret) {
+        let class = &ret[1..ret.len() - 1];
+        if VARHANDLE_BOX_ACCEPTING_RETURNS.contains(&class) {
+            return None;
+        }
+        VARHANDLE_READ_KIND_REF_STRICT
+    } else {
+        // `V`, an array return, or a malformed descriptor.
+        return None;
+    };
+    Some(mode * VARHANDLE_READ_KINDS + kind)
 }
 
 /// `Lfoo/Bar;` and nothing after it — one object descriptor consuming the
@@ -16656,6 +16982,52 @@ pub fn mark_jit_bail_listed_with_site(class_name: &str, method_name: &str, descr
             site.0, site.1, site.2,
         );
     }
+    // JFR `cratonvm.JitCompileDecision`, OSR door.
+    //
+    // This door reaches `x64::compile_with_param_slots` directly and never
+    // passes through `try_compile_with_invokespecial_resolver`, so the single
+    // event that funnel emits cannot see it at all — and by the argument in
+    // this function's own doc comment above, an OSR bail is the one that
+    // matters most. `Refused` is unambiguous here: this function is only ever
+    // called on the arm where the OSR backend returned `None`.
+    //
+    // Gate first, as everywhere: `record_jit_compile_decision` re-checks it,
+    // but only a caller-side check can refund what the caller already built.
+    if cratonvm_jfr::jit_decision::jit_decision_enabled() {
+        use cratonvm_jfr::jit_decision as jd;
+        // `(0, 0)` is `note_jit_bail_site`'s "not one bytecode's fault"
+        // encoding. 0 is a legal bci AND a legal opcode (`nop`), so it has to
+        // become the sentinel rather than be passed through as a coordinate a
+        // reader would believe.
+        let (bail_bci, bail_opcode) = if site.1 == 0 && site.2 == 0 {
+            (jd::NO_BAIL_SITE, jd::NO_BAIL_SITE)
+        } else {
+            (
+                i32::try_from(site.1).unwrap_or(jd::NO_BAIL_SITE),
+                i32::try_from(site.2).unwrap_or(jd::NO_BAIL_SITE),
+            )
+        };
+        jd::record_jit_compile_decision(&jd::JitCompileDecision {
+            class_name,
+            method_name,
+            method_descriptor: descriptor,
+            door: jd::CompileDoor::Osr,
+            outcome: jd::CompileOutcome::Refused,
+            // Every `note_jit_bail_site*` name is a literal, so the reason on
+            // this path allocates nothing.
+            reason: jd::DecisionText::Static(site.0),
+            bail_bci,
+            bail_opcode,
+            // NOT IN SCOPE at this door. The caller
+            // (`vm/src/runtime/interpreter/jit_bridge.rs`) hands over three
+            // name strings and nothing else, and widening its signature is not
+            // this change's to make. Reported as 0 rather than as a fabricated
+            // measurement; the funnel's events carry the real size.
+            bytecode_size: 0,
+            start_time_ns: jit_decision_now_nanos(),
+            duration_ns: 0,
+        });
+    }
 }
 
 /// Record why a compile was refused BEFORE the jit crate was ever entered.
@@ -16783,6 +17155,144 @@ pub fn note_jit_bail_site_at(site: &'static str, pc: usize, opcode: u8) {
 pub fn take_jit_bail_site() -> Option<(&'static str, u32, u32)> {
     JIT_BAIL_SITE.with(|c| c.take())
 }
+
+// ---------------------------------------------------------------------------
+// The `cratonvm.JitCompileDecision` producer (JFR)
+// ---------------------------------------------------------------------------
+//
+// `cratonvm-jit` has no `FlightRecorder`. The recorder is
+// `SharedVm::debug.flight_recorder` in `cratonvm-vm`, and a `jit -> vm` edge
+// would cycle, so `cratonvm_jfr::jit_decision` holds an installed sink that
+// `Vm::new` fills in at boot — the same shape as
+// `cratonvm_gc::install_gc_start_hook`. Everything below is the producer half:
+// it decides WHAT to say, and pays nothing at all when nobody is listening.
+//
+// ONE EVENT PER COMPILE, EMITTED AT THE FUNNEL — the judgement call this wiring
+// had to make, written down because the alternative reads as an oversight.
+// The admission verdict is built in `try_compile_inner` BEFORE the optimizing
+// pipeline runs, and a method the chain admitted can still fall back to the
+// single-pass backend inside that pipeline. So the verdict is a PREDICTION of
+// which backend will run; the FACT is `CompiledMethod::used_ir_backend`, and
+// that is known only at the completion funnel in
+// `try_compile_with_invokespecial_resolver`. Emitting at both places would put
+// two events with contradicting `outcome` values in the dump for every admitted
+// method, and a reader asking `jfr print` "which backend actually compiled this
+// method?" would have to know to join them and to prefer the second. So the
+// verdict is CARRIED FORWARD to the funnel in the thread-local below — exactly
+// the way `JIT_BAIL_SITE` above already carries a refusal reason across the
+// same boundary — and the single event the funnel emits pairs the authoritative
+// `outcome` with the verdict that explains it.
+//
+// The OSR door is the one exception, and it is not a second event for the same
+// compile: `mark_jit_bail_listed_with_site` is a DIFFERENT compile, at a door
+// that reaches the backend directly and never passes through that funnel.
+
+thread_local! {
+    /// The admission verdict of each compile currently in flight on this
+    /// thread, innermost last.
+    ///
+    /// A stack rather than the plain `Cell` [`JIT_BAIL_SITE`] uses, because
+    /// compiles NEST: `callee_compiler` re-enters
+    /// `try_compile_with_invokespecial_resolver` on this same thread for an
+    /// inlining candidate, which is the whole reason `JitCompileStackGuard`
+    /// exists. With one slot the callee's verdict would overwrite the caller's
+    /// and then be consumed by the callee's own funnel, leaving the caller —
+    /// the method the operator actually asked about — reporting nothing.
+    ///
+    /// Only ever pushed while `jit_decision_enabled()`, so a default run never
+    /// allocates this `Vec` at all.
+    static JIT_ADMISSION_VERDICT: std::cell::RefCell<Vec<Option<String>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One frame of [`JIT_ADMISSION_VERDICT`], popped on every exit of the compile
+/// that pushed it.
+///
+/// RAII rather than a take at the funnel, because
+/// `try_compile_with_invokespecial_resolver` has early `return None` exits that
+/// never reach the funnel, and a frame left behind would be read by the NEXT
+/// compile on this thread — the same stale-reason failure mode that
+/// `take_jit_pipeline_stage`'s reset-even-on-success exists to prevent.
+struct JitDecisionFrame {
+    /// Whether this frame actually pushed. Recorded rather than re-derived on
+    /// drop: the gate is process-global and another thread may flip it
+    /// mid-compile, and a push/pop pair decided by two separate reads of it
+    /// would unbalance the stack.
+    pushed: bool,
+}
+
+impl JitDecisionFrame {
+    fn enter() -> Self {
+        let pushed = cratonvm_jfr::jit_decision::jit_decision_enabled();
+        if pushed {
+            JIT_ADMISSION_VERDICT.with(|v| v.borrow_mut().push(None));
+        }
+        Self { pushed }
+    }
+}
+
+impl Drop for JitDecisionFrame {
+    fn drop(&mut self) {
+        if self.pushed {
+            JIT_ADMISSION_VERDICT.with(|v| {
+                let _ = v.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+/// Hand the admission verdict to the compile's own frame.
+///
+/// A no-op when the event is not armed (no frame was pushed), which is what
+/// makes it safe to call from the verdict site without a second gate check.
+fn note_jit_admission_verdict(verdict: &str) {
+    JIT_ADMISSION_VERDICT.with(|v| {
+        if let Some(top) = v.borrow_mut().last_mut() {
+            *top = Some(verdict.to_owned());
+        }
+    });
+}
+
+/// The verdict recorded for the compile currently innermost on this thread.
+fn current_jit_admission_verdict() -> Option<String> {
+    JIT_ADMISSION_VERDICT.with(|v| v.borrow().last().cloned().flatten())
+}
+
+/// Nanos since the UNIX epoch, for the decision event's `start_time`.
+///
+/// Deliberately the same expression the `emit_compilation_event_arc` call sites
+/// in `vm/src/runtime/interpreter.rs` and
+/// `vm/src/runtime/interpreter/jit_bridge.rs` use, rather than a second clock:
+/// a `cratonvm.JitCompileDecision` and the `jdk.Compilation` for the same
+/// method have to be joinable in one dump, and two clocks disagreeing by even a
+/// boot offset would make that join silently wrong instead of visibly absent.
+fn jit_decision_now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64 // Cast: duration to u64 nanoseconds
+}
+
+/// Map the compile gate's door onto the JFR event's structural mirror of it.
+///
+/// `cratonvm-jfr` cannot depend on `cratonvm-jit`, so `CompileDoor` is
+/// redeclared there with identical spellings; this is the one place the two
+/// meet, and it is an exhaustive `match` on purpose. `compile_gate` exists
+/// *because* patching one door and shipping was a repeated failure mode here,
+/// so a fourth door has to be a compile error at this line rather than a silent
+/// `MethodEntry`.
+fn jfr_compile_door(door: compile_gate::CompileDoor) -> cratonvm_jfr::jit_decision::CompileDoor {
+    match door {
+        compile_gate::CompileDoor::MethodEntry => {
+            cratonvm_jfr::jit_decision::CompileDoor::MethodEntry
+        }
+        compile_gate::CompileDoor::EagerFirstCall => {
+            cratonvm_jfr::jit_decision::CompileDoor::EagerFirstCall
+        }
+        compile_gate::CompileDoor::Osr => cratonvm_jfr::jit_decision::CompileDoor::Osr,
+    }
+}
+
 
 thread_local! {
     /// The furthest stage of the compile pipeline this thread has entered for
@@ -17451,6 +17961,154 @@ pub(crate) fn note_jit_bail_shortcircuit() {
     JIT_BAIL_SHORTCIRCUITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Why each compiled frame in a stack trace got, or did not get, a line.
+///
+/// Lives in this crate rather than beside its only writer
+/// (`vm::jit::conservative_roots::activation_bci`) so that
+/// [`tiered::dump_method_stats_to_stderr`] can print it: the `vm` crate depends
+/// on this one, not the other way round.
+///
+/// **This is a refusal census, not a hit rate**, and the distinction is the
+/// whole point. The audit branch's `bci_lookup_census` was dropped in the
+/// 2026-09-01 merge along with the two-source lookup it described, and the
+/// lesson recorded in its place was that *a silent fallback producing a
+/// plausible answer is indistinguishable, from the outside, from the precise
+/// path working*. A bare `answered/total` pair has the same defect one level
+/// up: it cannot say whether the frames with no line are aarch64 artifacts, an
+/// optimizing tier with no translation table, frames stopped between
+/// safepoints, or a kill switch someone left set in an environment. Each of
+/// those wants a different fix and three of them are invisible in a trace,
+/// which prints `(Unknown Source)` for all of them.
+///
+/// Slots, in the order [`compiled_frame_line_counts`] returns them:
+///
+/// | # | name | meaning |
+/// |---|---|---|
+/// | 0 | `single-pass` | answered from the safepoint-id slot directly |
+/// | 1 | `ir` | answered through `CompiledMethod::safepoint_bci_table` |
+/// | 2 | `npe-trap` | answered from an inline null check's trap site |
+/// | 3 | `no-sp-id` | no usable safepoint id: no slot reserved (`sp_id_slot_off == 0`, which is also every aarch64 artifact), an out-of-band RBP, or the prologue's unset sentinel |
+/// | 4 | `id-unrecorded` | the id named no safepoint of this artifact's own |
+/// | 5 | `ir-untranslated` | an optimizing-tier id with no `(id, bci)` row |
+/// | 6 | `out-of-range` | the recovered value is not a spec-legal bci |
+/// | 7 | `switched-off` | `CRATONVM_JIT_NO_COMPILED_FRAME_LINES` or `CRATONVM_JIT_NO_IR_FRAME_LINES` |
+///
+/// Slots 3-7 are the populations the page
+/// `jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902` had to
+/// reason about with no instrument at all.
+static COMPILED_FRAME_LINE_COUNTS: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Index into [`COMPILED_FRAME_LINE_COUNTS`]: answered from the safepoint-id
+/// slot, single-pass backend.
+pub const FRAME_LINE_ANSWERED_SINGLE_PASS: usize = 0;
+/// Answered through the optimizing tier's `(id, bci)` table.
+pub const FRAME_LINE_ANSWERED_IR: usize = 1;
+/// Answered from an inline null check's recorded trap site.
+pub const FRAME_LINE_ANSWERED_NPE_TRAP: usize = 2;
+/// No usable safepoint id in the frame.
+pub const FRAME_LINE_REFUSED_NO_SP_ID: usize = 3;
+/// The id named no safepoint this artifact recorded.
+pub const FRAME_LINE_REFUSED_ID_UNRECORDED: usize = 4;
+/// An optimizing-tier id with no translation.
+pub const FRAME_LINE_REFUSED_IR_UNTRANSLATED: usize = 5;
+/// The recovered value is not a spec-legal bci.
+pub const FRAME_LINE_REFUSED_OUT_OF_RANGE: usize = 6;
+/// A kill switch is set.
+pub const FRAME_LINE_REFUSED_SWITCHED_OFF: usize = 7;
+
+/// Human names, parallel to the slot indices, so the dump and any future
+/// consumer cannot disagree about which column is which.
+pub const FRAME_LINE_SLOT_NAMES: [&str; 8] = [
+    "single-pass",
+    "ir",
+    "npe-trap",
+    "no-sp-id",
+    "id-unrecorded",
+    "ir-untranslated",
+    "out-of-range",
+    "switched-off",
+];
+
+/// Record one verdict. One bump, taken by every arm of `activation_bci`, so a
+/// new refusal cannot be added without choosing a column for it.
+#[inline]
+pub fn note_compiled_frame_line(slot: usize) {
+    if let Some(c) = COMPILED_FRAME_LINE_COUNTS.get(slot) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Read the census. See [`COMPILED_FRAME_LINE_COUNTS`] for the columns.
+pub fn compiled_frame_line_counts() -> [u64; 8] {
+    let mut out = [0u64; 8];
+    for (i, slot) in COMPILED_FRAME_LINE_COUNTS.iter().enumerate() {
+        out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
+/// How often each of `stackwalker::drop_osr_continuations`' two rules removed a
+/// compiled entry that was the SAME ACTIVATION as an interpreter frame.
+///
+/// | # | name | rule |
+/// |---|---|---|
+/// | 0 | `osr-authoritative` | rule 1, decided by the live-OSR-continuation registry |
+/// | 1 | `osr-heuristic` | rule 1, decided by `can_osr_enter(frame.pc)` because the registry had nothing to say |
+/// | 2 | `call-opcode` | rule 2, an ordinary compiled activation whose interpreter frame is not suspended at an `invoke*` |
+///
+/// Rule 2 is why this exists. Its revert shape is asserted by no test, and
+/// deliberately so: the only place it was ever "observed" was behind
+/// `CRATONVM_JIT_NO_INLINE=1`, a variable that does not exist and never did, so
+/// that arm ran the default configuration and isolated nothing. The shipped fix
+/// therefore rests on an opcode PROOF rather than on a measurement, and a check
+/// whose expected output nobody has measured is a false red waiting to happen.
+///
+/// A counter is what an unmeasurable claim can honestly have instead: it cannot
+/// say the rule is right, but it can say whether it ever FIRES, which is the
+/// question "does this code do anything at all" that no green test answers. A
+/// permanent zero across real workloads is itself a finding.
+static STACK_WALK_DEDUPE_COUNTS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Rule 1, decided by the live-OSR-continuation registry.
+pub const DEDUPE_OSR_AUTHORITATIVE: usize = 0;
+/// Rule 1, decided by the `can_osr_enter` pc heuristic.
+pub const DEDUPE_OSR_HEURISTIC: usize = 1;
+/// Rule 2, the ordinary compiled activation.
+pub const DEDUPE_CALL_OPCODE: usize = 2;
+
+/// Names parallel to the slot indices. See [`STACK_WALK_DEDUPE_COUNTS`].
+pub const DEDUPE_SLOT_NAMES: [&str; 3] = ["osr-authoritative", "osr-heuristic", "call-opcode"];
+
+/// Record one dedupe. See [`STACK_WALK_DEDUPE_COUNTS`].
+#[inline]
+pub fn note_stack_walk_dedupe(slot: usize) {
+    if let Some(c) = STACK_WALK_DEDUPE_COUNTS.get(slot) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Read the dedupe census. See [`STACK_WALK_DEDUPE_COUNTS`].
+pub fn stack_walk_dedupe_counts() -> [u64; 3] {
+    let mut out = [0u64; 3];
+    for (i, slot) in STACK_WALK_DEDUPE_COUNTS.iter().enumerate() {
+        out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct JitCompileMethodKey {
     class_name: String,
@@ -17720,12 +18378,242 @@ pub fn force_c2_enabled() -> bool {
 /// in-binary A/B and the kill switch if a method is ever found where the
 /// optimizing body wins despite losing the intrinsic.
 ///
+/// # The premise this whole mechanism rested on, and what is left of it
+///
+/// The pin was only worth anything because the optimizing tier had NO String
+/// access intrinsic — not a worse one, none. That was carried as a belief for
+/// months before it was written down as a grep, and the grep has since gone
+/// off. It no longer holds unconditionally:
+///
+/// ```text
+/// $ grep -c 'fn try_string_access_intrinsic' jit/src/ir.rs
+/// 1
+/// $ grep -c 'StringCharAt' jit/src/ir_lower.rs
+/// 0
+/// $ grep -rln StringCharAt jit/src/
+/// jit/src/lib.rs
+/// jit/src/ir.rs
+/// jit/src/x64/bytecode_walk.rs
+/// ```
+///
+/// Re-read 2026-09-01, the same day the original reading was recorded. The
+/// first reading was `jit/src/ir.rs:0` and a two-file list; `ir.rs` has since
+/// grown `IrBuilder::try_string_access_intrinsic`, which expands
+/// `String.length()`, `String.isEmpty()` and `String.charAt(int)` into
+/// ordinary IR nodes.
+///
+/// RE-KEYED, because the old tripwire could no longer fire. It watched
+/// `ir_lower.rs`, and the emitter deliberately landed in `ir.rs` instead: a
+/// new `Op::StringCharAt` would have to be added to `ir_verify`'s exhaustive
+/// `expected_arity` match, so the expansion emits existing nodes and
+/// `ir_lower.rs` stays at 0 forever. A tripwire keyed to a file the feature
+/// cannot touch is not a tripwire. It is keyed to the expander's own name
+/// now, which is what actually moves.
+///
+/// What the pin still protects, and how it retires: the expander handles
+/// three ACCESSORS on an UNGUARDED (`java/lang/String`) receiver, outside a
+/// splice, and only when a `StringFieldLayout` was published. Everything else
+/// the single-pass region emits — `hashCode`, `equals`, `compareTo`, both
+/// `indexOf` forms, and every `java/lang/CharSequence` site — is still lost
+/// by admitting the method, and still gets the full `charAt -> isLatin1 ->
+/// StringLatin1.charAt -> String.checkIndex -> Preconditions.checkIndex`
+/// chain whose tail is a registered NATIVE. The day
+/// `try_string_access_intrinsic` covers those too, the pin,
+/// `ir_over_intrinsic_enabled`, [`ir_string_access_expander_handles`] and the
+/// fail-closed rule in [`string_intrinsic_pin_declines`] retire together.
+///
+/// Note that the pin is NOT the only door in front of the expander, and was
+/// not the one that made it unreachable: see
+/// [`ir_string_access_expander_handles`] for the invoke-planning gate that
+/// bailed the whole method before a graph existed, which is why switching the
+/// pin off alone measured nothing.
+///
+/// # The pin is asked at ONE of the three doors, and this population takes
+/// # another — MEASURED 2026-09-01
+///
+/// `probes/CharAtWarmShape.java`, one binary, three arms:
+///
+/// ```text
+/// arm A  default (pin on)                                314-336 ns/char
+/// arm B  CRATONVM_JIT_NO_STRING_INTRINSIC_PIN=1           66-108 ns/char  ~3x faster
+/// arm C  pin off + CRATONVM_JIT_IR_STRING_INTRINSICS=0       421 ns/char  (control)
+/// ```
+///
+/// and the ENGAGEMENT census on arm A, the same workload:
+///
+/// ```text
+/// [cratonvm] JIT String-intrinsic pin: fired=0 blind-no-layout=0
+///            blind-no-resolver=0 fail-closed=0
+///
+/// [cratonvm-jitc] bg-compile  CharAtWarmShape.scanBig(...)I tier=C2 optimized=true osr_bci=12
+/// [cratonvm-jitc] OSR-compile CharAtWarmShape.scanBig(...)I entry_pc=12
+/// ```
+///
+/// **All four of the pin's counters read zero on the very workload the pin
+/// exists to govern**, in a run where switching the pin off moved that workload
+/// 3x. That is the falsifying evidence for the belief that this pin governs
+/// this population. It does not: the pin is a term of `try_compile_inner`'s
+/// eligibility conjunction, `try_compile_inner` is
+/// `compile_gate::CompileDoor::MethodEntry`, and the third line above says this
+/// method is compiled through the OSR door — which `jit/src/compile_gate.rs`'s
+/// own header records reaching `x64::compile_with_param_slots` DIRECTLY,
+/// never through `try_compile_inner`. A counter installed at one door reports
+/// zero for traffic through another, and a zero reads as *correctly inert*.
+///
+/// Arm C is the control that keeps the DECISION intact: lifting the pin
+/// *without* the IR String emitter is worse than the default (421 against 336),
+/// which independently reproduces the 504-vs-135 ns/call reading recorded at
+/// the conjunction in `try_compile_inner`. The pin is right; its placement was
+/// not. So the asking moved to the one object all three doors already hold —
+/// `compile_gate::CompileAdmission::string_intrinsic_pin_declines`, with a
+/// per-door `asked` / `pinned` / `NOT asked` breakdown
+/// ([`string_intrinsic_pin_door_census_line`]). Nothing this function returns
+/// changed, and nothing [`string_intrinsic_pin_declines`] decides changed.
+///
+/// The lesson is worth stating flatly, because the audit that preceded this
+/// spent five hypotheses on it: every one of the five was about which *method*
+/// takes the fast shape — OSR versus method entry as a property of the method,
+/// callee warm order, caller kind across six shapes, first-compile context,
+/// scale — and each was refuted by its own measurement without ever
+/// converging. The discriminator was not a property of the method. It was
+/// which DOOR compiled it, and no instrument in the tree reported the pin per
+/// door.
+///
 /// NOT `OnceLock`-cached, matching `ir_direct_calls_enabled` and
 /// `x64::guarded_inline_getfield_enabled`: this is read at compile time only,
 /// never on a runtime hot path, and caching would make the flag racy against
 /// whichever thread compiles first.
 fn string_intrinsic_pin_enabled() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_STRING_INTRINSIC_PIN").is_none()
+}
+
+/// A `java/lang/String` field layout that exists ONLY so
+/// [`try_resolve_string_intrinsic`] can be asked the half of its policy that
+/// is about the callee's identity rather than about the heap.
+///
+/// That function's first act after the class-name test is
+/// `let layout = string_layout?;`, so handing it `None` makes it answer `None`
+/// for EVERY name and descriptor -- such a probe cannot tell `charAt` from
+/// `substring`, and any predicate built on it is vacuously false. Only two
+/// fields below are read by the name/descriptor ladder: `has_coder` (a legacy
+/// `char[]` String bails to native dispatch) and `string_class_id` (a
+/// `java/lang/CharSequence` site with no resolved String class id is refused
+/// for a reason that has nothing to do with the callee's name). Every offset
+/// is zero and this value MUST NOT reach codegen -- it describes no real
+/// object. It is consumed by [`ir_string_access_expander_handles`] and
+/// nothing else.
+const STRING_INTRINSIC_NAME_PROBE: StringFieldLayout = StringFieldLayout {
+    value_field_index: 0,
+    value_compact_offset: 0,
+    value_compact_is_narrow: false,
+    value_legacy_offset: 0,
+    hash_field_index: 0,
+    hash_compact_offset: 0,
+    hash_legacy_offset: 0,
+    has_coder: true,
+    coder_field_index: 0,
+    coder_compact_offset: 0,
+    coder_legacy_offset: 0,
+    coder_compact_is_byte: false,
+    // Non-zero purely so a CharSequence site is not refused for want of an id;
+    // the caller then rejects every guarded site anyway. Never an object's
+    // real class id, and never compared against one.
+    string_class_id: 1,
+};
+
+/// Does the OPTIMIZING tier's own String-access expander handle this exact
+/// `(class, name, descriptor)`?
+///
+/// # The third door
+///
+/// `ir.rs`'s `IrBuilder::try_string_access_intrinsic` expands
+/// `String.length()`, `String.isEmpty()` and `String.charAt(int)` into
+/// ordinary IR nodes. It is offered the site from `IrBuilder::build`'s `0xb6`
+/// arm -- but only AFTER `self.invoke_info.get(&pc)`, which returns
+/// `bail_invoke` on a miss. And `invoke_info` is left unset for the WHOLE
+/// method whenever the invoke-planning loop in `try_compile_inner` marks any
+/// one site non-emittable. That loop's `is_intrinsic_site` carried a bare
+/// unconditional `cn == "java/lang/String"`, so a method containing any
+/// `java/lang/String` call at all bailed to the single-pass backend before a
+/// graph was ever built, and the expander could not be entered by ANY input.
+///
+/// The consequence was not a slow path, it was an unmeasurable one:
+/// `ir.rs`'s own section header documents a one-flag settling arm
+/// (`CRATONVM_JIT_NO_STRING_INTRINSIC_PIN=1`) that could never have reached
+/// the emitter it is meant to price. Reaching it additionally needed
+/// `CRATONVM_JIT_IR_OVER_INTRINSIC=1`, which switches this gate off for every
+/// intrinsic family at once -- FFM element accessors, `AtomicInteger`,
+/// `VarHandle`, the `ByteBuffer` byte accessors -- and so measures a
+/// different program.
+///
+/// This is the three-doors failure `jit/src/compile_gate.rs` exists for. The
+/// pin ([`string_intrinsic_pin_enabled`]), the eligibility conjunction, and
+/// this invoke-planning gate are three independent refusals of the same
+/// method, and opening two of them is indistinguishable from opening none.
+///
+/// # Why the carve-out is narrow, and stays narrow
+///
+/// The policy is [`try_resolve_string_intrinsic`]'s, CALLED and not re-listed
+/// -- the same discipline `ir.rs` keeps, and the reason a third copy of the
+/// name/descriptor table does not exist here. On top of it this asks the two
+/// questions the expander asks and the resolver does not:
+///
+///   * the resolved entry must be one of the three ACCESSORS. The resolver
+///     also admits `hashCode`, `equals`, `compareTo` and both `indexOf`
+///     forms; the expander answers `SI_NOT_ACCESSOR` for all of them (each is
+///     a loop or a lazy-cache protocol, needing control flow the expansion
+///     cannot open mid-bytecode), so a method containing one must keep
+///     bailing to the single-pass backend that CAN emit it. Nothing about
+///     their cost changes here.
+///   * the site must be UNGUARDED (`guard_class_id == 0`, i.e. declared on
+///     `java/lang/String`, which is final). The expander refuses a
+///     `java/lang/CharSequence` receiver (`SI_GUARDED_REFUSED`) because no IR
+///     node reads an `ObjectHeader` class id, so admitting one would trade an
+///     emitted guarded decode for a plain dispatch.
+///
+/// Everything else declared on `java/lang/String` -- `substring`, `concat`,
+/// `split`, every method the single-pass backend has no intrinsic for at all
+/// -- still answers `false` here and still bails, byte-for-byte as before.
+/// Whether the blanket was over-broad for those is a separate question with
+/// its own measurement; this predicate is scoped to the three sites the
+/// expander can actually emit, because those are the three where the gate is
+/// demonstrably refusing a method the other tier is ready to serve.
+///
+/// Row 1 of `is_intrinsic_site`, `try_resolve_intrinsic`, cannot defeat this:
+/// its String section registers nothing for `java/lang/String` on purpose
+/// (the family needs a `StringFieldLayout` and that ladder is
+/// layout-independent), so the carve-out is not re-closed one line above it.
+///
+/// # The switch
+///
+/// `CRATONVM_JIT_NO_IR_STRING_ACCESS_ADMIT=1` restores the blanket class-name
+/// refusal exactly, so the fix and the pre-existing behaviour are A/B-able
+/// inside ONE binary -- which is the only way to attribute a `charAt` reading
+/// to this change rather than to a rebuild. Note that with the default
+/// (`string_intrinsic_pin_enabled`) pin ON, a method with a String accessor
+/// site never reaches this loop anyway, so the switch changes nothing until
+/// the pin is also off; that is deliberate, and it is why this carve-out does
+/// not need a default-OFF of its own.
+///
+/// NOT `OnceLock`-cached, matching [`string_intrinsic_pin_enabled`] beside
+/// it: read at compile time only, never on a runtime hot path, and caching
+/// would make the flag racy against whichever thread compiles first.
+fn ir_string_access_expander_handles(class: &str, name: &str, descriptor: &str) -> bool {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_IR_STRING_ACCESS_ADMIT").is_some() {
+        return false;
+    }
+    match try_resolve_string_intrinsic(class, name, descriptor, Some(STRING_INTRINSIC_NAME_PROBE)) {
+        Some((entry, _num_params, _ret, guard_class_id)) => {
+            // Compared against the sentinels rather than `from_entry`, which
+            // only classifies the CRC32 family -- the same identification
+            // `ir.rs` and the single-pass region both make.
+            guard_class_id == 0
+                && (entry == JitIntrinsic::StringLength.as_entry()
+                    || entry == JitIntrinsic::StringIsEmpty.as_entry()
+                    || entry == JitIntrinsic::StringCharAt.as_entry())
+        }
+        None => false,
+    }
 }
 
 /// Does this method contain a call site the single-pass backend would replace
@@ -17755,6 +18643,377 @@ fn has_string_intrinsic_site(
                     .is_some()
             })
     })
+}
+
+/// What the String-intrinsic pin decided about one method — and, when it
+/// decided nothing, whether that was because there was nothing to decide or
+/// because it was asked with an input missing.
+///
+/// # Why a bool was not enough
+///
+/// [`has_string_intrinsic_site`] answers `false` — "do not pin" — for two
+/// completely different facts: "this method has no String access site" and "I
+/// was handed a `None` and cannot tell". The pin is a term of the real
+/// eligibility conjunction in `try_compile_inner`, but was absent from the
+/// verdict chain that prints WHY a method was or was not admitted, so a method
+/// the pin declined, a method the pin never saw, and a method with no site at
+/// all all printed the identical `admitted to the optimizing pipeline`.
+///
+/// That is what made `String.charAt` unfalsifiable: a flat 186-196 ns/char from
+/// 200,000 to 100,000,000 characters, against 3.0-3.5 ns/char for a
+/// byte-identical body in a different probe on the SAME binary, and five
+/// separate hypotheses about what selects the fast shape (OSR vs method entry,
+/// callee warm order, caller kind across six shapes, first-compile context,
+/// scale) each refuted by its own measurement without ever converging — because
+/// the one instrument that could name the decision did not report it. See
+/// `string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StringPinVerdict {
+    /// The pin has no opinion: no `invokevirtual`/`invokeinterface` site at
+    /// all, or every site resolved and none of them is a String intrinsic.
+    NoSite,
+    /// A String access intrinsic site is present and the pin declined the
+    /// optimizing tier for this method.
+    Pinned,
+    /// A String access intrinsic site is present and
+    /// `CRATONVM_JIT_NO_STRING_INTRINSIC_PIN=1` switched the pin off, so the
+    /// method IS admitted and WILL lose the inline decode. Not a defect — it is
+    /// the B arm of the A/B — but it must never read as "no site here", because
+    /// the two produce the same admission line and opposite conclusions.
+    DisabledByFlag,
+    /// A site is declared on `java/lang/String` / `java/lang/CharSequence`, but
+    /// no String field layout resolved at this door, so the pin could not
+    /// evaluate it.
+    BlindNoLayout,
+    /// The method has candidate call sites and this door supplied no
+    /// constant-pool invoke resolver, so the pin could not read a single callee
+    /// name.
+    BlindNoResolver,
+}
+
+impl StringPinVerdict {
+    /// The half of the verdict that QUALIFIES an admission rather than
+    /// replacing it.
+    ///
+    /// [`StringPinVerdict::Pinned`] is a refusal and gets its own arm in the
+    /// verdict chain; the other three all end with the method on the optimizing
+    /// tier, and what separates them is what the pin saw — or failed to see —
+    /// on the way past. Appending them to the admission line rather than
+    /// replacing it keeps `metrics::CompilationReport::admission` meaning
+    /// "admitted", which is what its consumers read it as.
+    fn admission_note(self) -> Option<&'static str> {
+        match self {
+            StringPinVerdict::NoSite | StringPinVerdict::Pinned => None,
+            StringPinVerdict::DisabledByFlag => Some(
+                "CRATONVM_JIT_NO_STRING_INTRINSIC_PIN=1 and the method has a String \
+                 intrinsic site, so the inline decode is lost here",
+            ),
+            StringPinVerdict::BlindNoLayout => Some(
+                "no String field layout resolved at this door, so the pin could not see \
+                 the site — and neither would the single-pass backend have emitted the \
+                 intrinsic, so nothing was lost by admitting it",
+            ),
+            StringPinVerdict::BlindNoResolver => Some(
+                "no constant-pool invoke resolver at this door, so the pin could not see \
+                 the site",
+            ),
+        }
+    }
+}
+
+/// Classify a method for the String-intrinsic pin.
+///
+/// PURE: no counters, no output, no allocation beyond whatever the caller's own
+/// resolver returns. That is a requirement, not a preference — the verdict chain
+/// in `try_compile_inner` calls this under `CRATONVM_DBG_JITC` / metrics only,
+/// and a diagnostic that perturbs the compile it is describing is worse than no
+/// diagnostic at all. The counting lives in [`string_intrinsic_pin_declines`],
+/// which the real conjunction calls exactly once per compile attempt.
+fn string_intrinsic_pin_verdict(
+    invoke_ops: &[(usize, u16, u8)],
+    cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
+    layout: Option<StringFieldLayout>,
+) -> StringPinVerdict {
+    // Only the two opcodes the registration path considers can be a blind spot
+    // at all; a method with no `invokevirtual`/`invokeinterface` could never
+    // have been intrinsified whatever the inputs were, so it must not be
+    // reported as one. Cheap, and it keeps the two `Blind*` counters a count of
+    // METHODS AT RISK rather than a count of compiles.
+    if !invoke_ops
+        .iter()
+        .any(|&(_, _, opcode)| matches!(opcode, 0xb6 | 0xb9))
+    {
+        return StringPinVerdict::NoSite;
+    }
+    let Some(resolver) = cp_invoke_resolver else {
+        // Reported ahead of a missing layout because it is the stronger
+        // blindness: with no callee names, nothing whatever can be said about
+        // these sites — including whether a layout would have mattered.
+        return StringPinVerdict::BlindNoResolver;
+    };
+    if layout.is_none() {
+        // Narrow the report to methods that actually call something DECLARED on
+        // a String-family receiver. `try_resolve_string_intrinsic` tests the
+        // class name and returns `None` before it ever looks at the layout
+        // (`let layout = string_layout?;` comes after), so this is the same
+        // first test it makes — and without it "no layout at this door" would be
+        // printed against essentially every method in the program, which is how
+        // a diagnostic becomes noise instead of evidence.
+        return if invoke_ops.iter().any(|&(_, cp_idx, opcode)| {
+            matches!(opcode, 0xb6 | 0xb9)
+                && resolver(cp_idx).is_some_and(|(class_name, _, _)| {
+                    class_name == "java/lang/String" || class_name == "java/lang/CharSequence"
+                })
+        }) {
+            StringPinVerdict::BlindNoLayout
+        } else {
+            StringPinVerdict::NoSite
+        };
+    }
+    if !has_string_intrinsic_site(invoke_ops, cp_invoke_resolver, layout) {
+        return StringPinVerdict::NoSite;
+    }
+    if string_intrinsic_pin_enabled() {
+        StringPinVerdict::Pinned
+    } else {
+        StringPinVerdict::DisabledByFlag
+    }
+}
+
+/// Compiles at which the pin actually declined the optimizing tier.
+///
+/// The zero is the reading that matters. `CRATONVM_JIT_NO_STRING_INTRINSIC_PIN=1`
+/// measured 326.3 / 328.6 ns/char against a default of 329.5 / 333.7 on
+/// `probes/CharAtCostCurve.java` — switching the pin OFF cost nothing, which is
+/// what "it was never on" looks like from the outside. A timing cannot tell "the
+/// pin fired and did not help" from "the pin never fired"; this can.
+static STRING_PIN_FIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Compiles that reached the pin with candidate sites and no resolved
+/// `java/lang/String` field layout.
+static STRING_PIN_BLIND_NO_LAYOUT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Compiles that reached the pin with candidate sites and no constant-pool
+/// invoke resolver.
+///
+/// All three production doors (the eager-first-call, inline-mutator and
+/// tiered-worker `try_compile_with_invokespecial_resolver` call sites in
+/// `vm/src/runtime/interpreter/jit_bridge.rs`) pass `Some(&invoke_resolver)`, so
+/// this is EXPECTED to read zero on a real workload — which is exactly why it is
+/// worth counting. A zero kills the resolver hypothesis outright and sends the
+/// next reader to [`STRING_PIN_BLIND_NO_LAYOUT`]; a non-zero one names a door
+/// nobody knew existed. Neither answer was available before, at any price.
+static STRING_PIN_BLIND_NO_RESOLVER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Compiles the fail-closed rule actually held back — the blast radius of
+/// [`string_pin_fail_closed_enabled`]. Separate from
+/// [`STRING_PIN_BLIND_NO_RESOLVER`] because the blind count is a fact about the
+/// doors and this one is a fact about the POLICY: it is the number a revert
+/// would give back.
+static STRING_PIN_FAIL_CLOSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(pin fired, blind: no layout, blind: no resolver, held back by fail-closed)`.
+///
+/// Same shape and same purpose as [`byte_element_helper_calls`]: a site count
+/// and an engagement count answer different questions, and the gap between them
+/// is where a mechanism hides.
+///
+/// `jit/src/tiered.rs::dump_method_stats_to_stderr` now prints all four on one
+/// line — `JIT String-intrinsic pin: fired=… blind-no-layout=…
+/// blind-no-resolver=… fail-closed=…` — at exit under
+/// `CRATONVM_DBG=jit-method-stats` (`flags().jit.method_stats`, dispatched from
+/// `vm-cli/src/main.rs`), and this accessor is what it reads. The line was
+/// added with the counters; the sentence that used to stand here said "nothing
+/// prints it yet", which was true for about a day and is exactly the
+/// instrument-drift the counters exist to catch. The per-method verdict under
+/// `CRATONVM_DBG_JITC` reports the same four states one method at a time.
+///
+/// # These four are PROCESS-GLOBAL, and that is how they read zero — 2026-09-01
+///
+/// All four read `0` on `probes/CharAtWarmShape.java` — the workload the pin
+/// exists to govern — in a run where lifting the pin moved that workload 3x
+/// (314-336 ns/char to 66-108). Nothing was wrong with the counting. The pin
+/// is asked in `try_compile_inner`, i.e. at `CompileDoor::MethodEntry`, and
+/// that method is compiled through the OSR door, which reaches the backend
+/// without passing `try_compile_inner` at all. A counter installed at one door
+/// reports zero for traffic through another.
+///
+/// So read [`string_intrinsic_pin_door_census_line`] FIRST. These four only
+/// mean anything for the doors whose per-door `asked` is non-zero; for every
+/// other door they are silence, not evidence. See
+/// [`string_intrinsic_pin_enabled`] for the three-arm measurement.
+pub fn string_intrinsic_pin_census() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // The per-door line is emitted HERE, from the getter, which is a
+    // deliberate compromise and not an oversight. Its only caller is
+    // `jit/src/tiered.rs::dump_method_stats_to_stderr`, which formats the four
+    // globals below into the `JIT String-intrinsic pin:` line — and that file
+    // was outside the lane that added the per-door counters, so the new line
+    // could not be written beside the old one. Emitting it from the one
+    // function the printer calls is what keeps both numbers in the same run's
+    // output; the alternative was a per-door census nothing prints, which is
+    // exactly the instrument-drift the paragraph above records happening once
+    // already ("nothing prints it yet" was true for about a day).
+    //
+    // Guarded twice so it can perturb nothing else: on
+    // `flags().jit.method_stats`, the same flag that gates the only caller, so
+    // a unit test reading the census prints nothing; and on a `Once`, so a
+    // second call cannot double the line. Move it into
+    // `dump_method_stats_to_stderr` beside its sibling the moment that file is
+    // in scope, and delete this paragraph with it.
+    if cratonvm_types::flags().jit.method_stats {
+        static PER_DOOR_LINE: std::sync::Once = std::sync::Once::new();
+        PER_DOOR_LINE.call_once(|| eprintln!("{}", string_intrinsic_pin_door_census_line()));
+    }
+    (
+        STRING_PIN_FIRED.load(Relaxed),
+        STRING_PIN_BLIND_NO_LAYOUT.load(Relaxed),
+        STRING_PIN_BLIND_NO_RESOLVER.load(Relaxed),
+        STRING_PIN_FAIL_CLOSED.load(Relaxed),
+    )
+}
+
+/// The per-door half of [`string_intrinsic_pin_census`], as one line.
+///
+/// # Why a per-door breakdown exists at all
+///
+/// `fired=0` is the whole lesson. It was read as "the pin is correctly inert"
+/// on a workload where lifting the pin was worth 3x, and it meant "this
+/// traffic went through a door that never asks the pin". The four global
+/// counters cannot express that: *asked and found nothing to pin*, *never
+/// asked*, and *the conjunction short-circuited before the pin term* all
+/// produce the identical zero. These can, because per door
+/// `asked + NOT-asked == admitted` is an exact identity — `admitted` is
+/// `compile_gate::admissions`, `asked` is bumped by the first ask on each
+/// admission token, and `NOT-asked` is charged by that token's `Drop`.
+///
+/// Shape:
+///
+/// ```text
+/// [cratonvm] JIT String-intrinsic pin by door: method-entry: admitted=812 asked=44 pinned=7 NOT-asked=768 | eager-first-call: admitted=3 asked=0 pinned=0 NOT-asked=3 | osr: admitted=61 asked=0 pinned=0 NOT-asked=61
+/// ```
+///
+/// How to read a row:
+///
+///   * `asked == admitted` — this door puts the question on every compilation.
+///   * `NOT-asked == admitted` and `admitted > 0` — this door has never been
+///     taught the question, and every global pin counter is blind to
+///     everything it compiled. That is the state of `osr` and
+///     `eager-first-call` as this lands; both are in `vm/**`.
+///   * `NOT-asked > 0` at `method-entry` — compiles whose eligibility
+///     conjunction short-circuited before the pin term, or that bailed before
+///     reaching it. Worth seeing: a short-circuit is the *other* way a pin
+///     term produces no census, and it is indistinguishable from the first in
+///     the global four.
+///   * `pinned` — the per-door half of the global `fired`, and the only number
+///     here that says the pin changed an outcome.
+pub fn string_intrinsic_pin_door_census_line() -> String {
+    use crate::compile_gate::{
+        admissions, string_pin_asked, string_pin_declined, string_pin_not_asked, CompileDoor,
+    };
+    let rows: Vec<String> = CompileDoor::ALL
+        .iter()
+        .map(|d| {
+            format!(
+                "{}: admitted={} asked={} pinned={} NOT-asked={}",
+                d.label(),
+                admissions(*d),
+                string_pin_asked(*d),
+                string_pin_declined(*d),
+                string_pin_not_asked(*d),
+            )
+        })
+        .collect();
+    format!(
+        "[cratonvm] JIT String-intrinsic pin by door: {}",
+        rows.join(" | ")
+    )
+}
+
+/// Does the pin FAIL CLOSED when the compile door supplied no constant-pool
+/// invoke resolver? Default ON; `CRATONVM_JIT_NO_STRING_PIN_FAIL_CLOSED=1`
+/// restores the historical fail-open behaviour so the trade is A/B-able in one
+/// binary.
+///
+/// NOT `OnceLock`-cached, matching [`string_intrinsic_pin_enabled`] beside it:
+/// compile-time only, never a runtime hot path, and caching would make the flag
+/// racy against whichever thread compiles first.
+fn string_pin_fail_closed_enabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_STRING_PIN_FAIL_CLOSED").is_none()
+}
+
+/// The pin's decision for the real eligibility conjunction: `true` = keep this
+/// method off the optimizing tier. Counts, so it must run at most once per
+/// compile attempt — which the conjunction's short-circuit guarantees.
+///
+/// # Why the two missing-input cases are decided DIFFERENTLY
+///
+/// They look like one case and they are not.
+///
+/// **No layout — keep failing open.** `resolved_string_layout` is resolved once
+/// per compilation and the SAME value is threaded into the single-pass
+/// registration loop's `try_resolve_string_intrinsic` call and into
+/// `x64::compile`'s `compiler.string_layout`. With `None` that function returns
+/// `None` at `let layout = string_layout?;` for every site, so the single-pass
+/// backend registers no String sentinel and emits no inline decode either.
+/// Pinning would buy a C1 body with no intrinsic in it in place of a C2 body — a
+/// pure downgrade. The pin's original argument ("pinning would cost a C2 body
+/// and buy nothing") holds here exactly, and was re-checked against the
+/// registration loop rather than taken on trust. It is still COUNTED, because
+/// "the layout did not resolve" is a hypothesis about the whole `charAt`
+/// population that nothing has ever been able to test.
+///
+/// **No resolver — fail closed.** This is not evidence about the method, it is a
+/// missing input at one door. The layout resolved, so the intrinsic is
+/// emittable; the pin simply cannot read the callee names to find the sites, and
+/// promoting on that promotes to the tier that provably cannot keep them (see
+/// the grep in [`string_intrinsic_pin_enabled`]).
+///
+/// The cost is bounded, and was checked rather than assumed: with
+/// `scan.invoke_ops` non-empty and no resolver, the single-pass path takes
+/// `jitc_bail!("cp_invoke_resolver")`, which does NOT set `backend_attempted`
+/// and so does NOT put the method on the permanent bail-list. The worst case is
+/// one abandoned compile attempt, retried later — and since the resolver's
+/// absence is a property of the DOOR, not of the method, a retry through any of
+/// the three production doors succeeds. That is the same trade the
+/// compiled-local-handler safety net in `try_compile` already makes: one wasted
+/// compile rather than a permanently wrong body. The alternative is worse than
+/// it looks, because a compiled body is installed and kept — an intrinsic-less
+/// body produced at a blind door is not a slow first attempt, it is the body for
+/// the life of the process.
+///
+/// Subordinate to [`string_intrinsic_pin_enabled`]: switching the pin off has to
+/// switch the fail-closed rule off with it, or the B arm of the A/B would still
+/// be pinning methods and the arms would not differ by one thing.
+fn string_intrinsic_pin_declines(
+    invoke_ops: &[(usize, u16, u8)],
+    cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
+    layout: Option<StringFieldLayout>,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match string_intrinsic_pin_verdict(invoke_ops, cp_invoke_resolver, layout) {
+        StringPinVerdict::NoSite | StringPinVerdict::DisabledByFlag => false,
+        StringPinVerdict::Pinned => {
+            STRING_PIN_FIRED.fetch_add(1, Relaxed);
+            true
+        }
+        StringPinVerdict::BlindNoLayout => {
+            STRING_PIN_BLIND_NO_LAYOUT.fetch_add(1, Relaxed);
+            false
+        }
+        StringPinVerdict::BlindNoResolver => {
+            STRING_PIN_BLIND_NO_RESOLVER.fetch_add(1, Relaxed);
+            let fail_closed = string_intrinsic_pin_enabled()
+                && layout.is_some()
+                && string_pin_fail_closed_enabled();
+            if fail_closed {
+                STRING_PIN_FAIL_CLOSED.fetch_add(1, Relaxed);
+            }
+            fail_closed
+        }
+    }
 }
 
 fn single_pass_only_lowering_for(
@@ -18593,6 +19852,12 @@ pub fn try_compile_with_invokespecial_resolver(
     // The one-shot bail-site clear that used to sit here is `compile_gate::
     // admit`'s job now — same discipline, every door.
     let _compile_stack_guard = JitCompileStackGuard::enter(cached);
+    // Open this compile's slot in `JIT_ADMISSION_VERDICT` so the verdict
+    // `try_compile_inner` builds can reach the funnel below. RAII, so an early
+    // `return None` between here and the funnel cannot leave a verdict behind
+    // for the next compile on this thread. Costs nothing, and allocates
+    // nothing, unless `cratonvm.JitCompileDecision` is armed.
+    let _jit_decision_frame = JitDecisionFrame::enter();
 
     // Inner pipeline: returns None on either a transient resolver miss
     // OR a permanent backend bail.  Only the latter pollutes the bail-
@@ -18724,6 +19989,88 @@ pub fn try_compile_with_invokespecial_resolver(
         let _ = take_jit_pipeline_stage();
         None
     };
+
+    // JFR `cratonvm.JitCompileDecision` — THE one event for this compile.
+    //
+    // Here because this is the only point at which all three terms the audit
+    // could not get out of stderr are simultaneously true and in scope:
+    //
+    //   * WHICH BACKEND actually produced the body — `used_ir_backend`, not the
+    //     admission verdict's prediction of it. An admitted method can still
+    //     fall back to single-pass inside the pipeline, and that gap is exactly
+    //     the shape of the `String.charAt` finding: a method that is compiled,
+    //     is fast-ish, never appears in a bail list, and has silently lost every
+    //     optimization the IR tier would have applied.
+    //   * WHICH DOOR asked — read straight off `admission.door()`, the gate's
+    //     own token, which is already threaded through this whole function.
+    //     That beats a thread-local mirror: it cannot drift from
+    //     `compile_gate`'s three-door table, it cannot be forgotten by a door
+    //     that neglects to set it, and it adds no fourth spelling of a term
+    //     `compile_gate` exists to keep singular.
+    //   * WHY — the bail site on a refusal, or the carried-forward admission
+    //     verdict on a success.
+    //
+    // Gate checked before anything is built. `current_jit_admission_verdict`
+    // clones a `String`, and the entire point of the producer-side gate is that
+    // a default run never pays for one.
+    if cratonvm_jfr::jit_decision::jit_decision_enabled() {
+        use cratonvm_jfr::jit_decision as jd;
+        // A verdict only survives to here for a compile that reached the
+        // admission chain. A refusal is better described by its bail site
+        // anyway, so the verdict is consulted only on the success arm.
+        let verdict = current_jit_admission_verdict();
+        let (reason, bail_bci, bail_opcode) = match site {
+            // `(0, 0)` is `note_jit_bail_site`'s "not one bytecode's fault"
+            // encoding, and 0 is a legal bci AND a legal opcode (`nop`), so it
+            // must map to the sentinel rather than be passed through as a
+            // coordinate a reader would believe.
+            Some((s, 0, 0)) => (
+                jd::DecisionText::Static(s),
+                jd::NO_BAIL_SITE,
+                jd::NO_BAIL_SITE,
+            ),
+            Some((s, pc, op)) => (
+                jd::DecisionText::Static(s),
+                i32::try_from(pc).unwrap_or(jd::NO_BAIL_SITE),
+                i32::try_from(op).unwrap_or(jd::NO_BAIL_SITE),
+            ),
+            None => (
+                match verdict.as_deref() {
+                    Some(v) => jd::DecisionText::Borrowed(v),
+                    // No verdict means the compile never reached the admission
+                    // chain — `optimize` was not even asked. That is a fact
+                    // about this compile, not a gap in the instrument.
+                    None => jd::DecisionText::Static("compiled"),
+                },
+                jd::NO_BAIL_SITE,
+                jd::NO_BAIL_SITE,
+            ),
+        };
+        let outcome = match result.as_ref() {
+            None => jd::CompileOutcome::Refused,
+            Some(cm) if cm.used_ir_backend => jd::CompileOutcome::Optimizing,
+            Some(_) => jd::CompileOutcome::SinglePass,
+        };
+        jd::record_jit_compile_decision(&jd::JitCompileDecision {
+            // `&*` rather than `&`: these three fields are `Arc<str>` on
+            // `CachedBytecodeMethod` and the event wants `&str`.
+            class_name: &*cached.class_name,
+            method_name: &*cached.method_name,
+            method_descriptor: &*cached.method_descriptor,
+            door: jfr_compile_door(admission.door()),
+            outcome,
+            reason,
+            bail_bci,
+            bail_opcode,
+            bytecode_size: i32::try_from(cached.code.len()).unwrap_or(i32::MAX),
+            start_time_ns: jit_decision_now_nanos(),
+            // Not measured at this site. The event is registered with
+            // `threshold: None` precisely so a zero-duration decision is never
+            // silently filtered out of the chunk.
+            duration_ns: 0,
+        });
+    }
+
     // A code-buffer overflow is a MEASUREMENT, not a verdict: the backend now
     // records the size it wanted and the next attempt allocates from that
     // measurement instead of the heuristic (`code_buffer_hint`). Bail-listing
@@ -20160,6 +21507,36 @@ fn try_compile_inner(
     // for anything it cannot lower, exactly as it does when the tier manager
     // asks for C2 of its own accord.
     let optimize = optimize || force_c2_enabled();
+    // `java/lang/String`'s field layout, resolved ONCE for the whole
+    // compilation. THREE consumers: the printed admission verdict just below,
+    // the optimizing-tier gate after it (`string_intrinsic_pin_declines`) and
+    // `try_resolve_string_intrinsic` in the single-pass invoke loop near the end
+    // of this function. The SAME resolver feeds `x64::compile`'s
+    // `compiler.string_layout`, so the matcher's "registered" decision and the
+    // codegen's "can emit inline" decision never disagree — a String sentinel is
+    // never registered for a site whose codegen would then bail to a raw `CALL`.
+    //
+    // Resolved here, above the verdict block, rather than between the verdict
+    // and the gate: the verdict has to be able to report what the gate decided,
+    // and it cannot do that without the gate's own input. The move costs
+    // nothing — this line already ran unconditionally on every compile a few
+    // statements further down.
+    let resolved_string_layout: Option<StringFieldLayout> =
+        string_layout_resolver.and_then(|r| r());
+    // A10 (2026-09-01): hand the layout to the IR tier's String-access emitter.
+    // `IrBuilder` has no route to it otherwise — it is resolved here and passed
+    // only to `x64::Compiler` — so without this line the emitter is inert and
+    // reports `no_layout=N, emitted_charAt=0`.
+    //
+    // A `OnceLock` publish is sound for the FOUR fields the emitter reads
+    // (`value_field_index`, `coder_field_index`, `has_coder`, `string_class_id`):
+    // they are properties of the loaded `java/lang/String` class and fixed for
+    // the process. The byte OFFSETS beside them are NOT — `StringFieldLayout::new`'s
+    // compact arm falls back to legacy addresses before a `CompactLayout` is
+    // registered — which is exactly why the emitter reads none of them.
+    if let Some(layout) = resolved_string_layout {
+        ir::publish_string_layout(layout);
+    }
     // The admission chain below is a conjunction of six independent terms, and
     // failing any one of them falls silently through to the single-pass
     // backend. That silence is what left "why does the optimizing tier produce
@@ -20175,7 +21552,17 @@ fn try_compile_inner(
     // never see method X?" is answerable structurally instead of by grepping
     // this line out of stderr. `metrics.is_enabled()` is one relaxed atomic
     // load, and the verdict is still built only when somebody will read it.
-    if ir_stage_reporting() || metrics.is_enabled() {
+    //
+    // Third disjunct: a JFR consumer of `cratonvm.JitCompileDecision` is the
+    // third reader of this verdict, and without it here the verdict would never
+    // be BUILT for that consumer, so every decision event would carry the
+    // fallback reason "compiled" and the event would answer nothing.
+    // `jit_decision_enabled()` is one `Acquire` load of a `bool` that is false
+    // forever on a default run.
+    if ir_stage_reporting()
+        || metrics.is_enabled()
+        || cratonvm_jfr::jit_decision::jit_decision_enabled()
+    {
         let verdict = if !optimize {
             "optimize=false — the C1/fast tier was requested, not C2".to_string()
         } else if moving_young_disables_optimizing_tier() {
@@ -20203,19 +21590,73 @@ fn try_compile_inner(
                 k.label()
             )
         } else {
-            let cat2 = method_uses_category2(code, code_len, &cached.method_descriptor);
-            let fp = method_uses_fp(code, code_len, &cached.method_descriptor);
-            if (!cat2 && !fp) || (ir_emit_long && !fp) || (ir_emit_fp && fp_in_body(code, code_len))
-            {
-                "admitted to the optimizing pipeline".to_string()
+            // The String-intrinsic pin, in the position it occupies in the real
+            // conjunction below: immediately after `single_pass_only_lowering_for`,
+            // which is the last refusal this chain tests before the value shape.
+            // (This chain reports the exception-table and precise-frame terms
+            // EARLIER than the conjunction evaluates them; that mismatch predates
+            // this term and only decides which reason gets printed when two apply
+            // at once, so it is left alone.)
+            //
+            // It was missing from this chain entirely, so a method the pin
+            // declined and a method the pin never saw printed the same `admitted
+            // to the optimizing pipeline` — which is how five hypotheses about
+            // `String.charAt` could each be refuted without ever converging. See
+            // `StringPinVerdict` and
+            // `string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901.md`.
+            //
+            // Evaluated here rather than at the top of the block so the earlier
+            // arms still short-circuit before it: this one calls the caller's
+            // constant-pool resolver once per invoke site, which is the most
+            // expensive step in the chain and pointless for a method already
+            // refused. `string_intrinsic_pin_verdict` is deliberately the PURE
+            // half of the pair — the counters live in
+            // `string_intrinsic_pin_declines`, which the real conjunction calls,
+            // so switching a diagnostic flag on cannot move a census.
+            let string_pin = string_intrinsic_pin_verdict(
+                &scan.invoke_ops,
+                cp_invoke_resolver,
+                resolved_string_layout,
+            );
+            if string_pin == StringPinVerdict::Pinned {
+                "pinned to the single-pass backend: it has a String access intrinsic here \
+                 and the IR tier has none"
+                    .to_string()
             } else {
-                format!(
-                    "value shape not admitted (category2={cat2} fp={fp} \
-                     ir_emit_long={ir_emit_long} ir_emit_fp={ir_emit_fp})"
-                )
+                let cat2 = method_uses_category2(code, code_len, &cached.method_descriptor);
+                let fp = method_uses_fp(code, code_len, &cached.method_descriptor);
+                let shape = if (!cat2 && !fp)
+                    || (ir_emit_long && !fp)
+                    || (ir_emit_fp && fp_in_body(code, code_len))
+                {
+                    "admitted to the optimizing pipeline".to_string()
+                } else {
+                    format!(
+                        "value shape not admitted (category2={cat2} fp={fp} \
+                         ir_emit_long={ir_emit_long} ir_emit_fp={ir_emit_fp})"
+                    )
+                };
+                // The remaining three pin states do not REFUSE the method, they
+                // qualify what happened to it on the way through — the pin was
+                // switched off by flag, or it was asked with an input missing and
+                // could not see the sites at all. Appended rather than
+                // substituted so `admission` keeps meaning "admitted", and so the
+                // two silent failures the whole investigation turned on are named
+                // in the same line that used to hide them.
+                match string_pin.admission_note() {
+                    Some(note) => format!("{shape} ({note})"),
+                    None => shape,
+                }
             }
         };
         metrics.set_admission(&verdict);
+        // Carry the verdict to the compile funnel in
+        // `try_compile_with_invokespecial_resolver`, which is where this
+        // compile's single `cratonvm.JitCompileDecision` is emitted. See
+        // `JIT_ADMISSION_VERDICT` for why the event is emitted THERE and not
+        // here: only the funnel knows `used_ir_backend`, and this verdict is a
+        // prediction of it, not the fact. A no-op unless the event is armed.
+        note_jit_admission_verdict(&verdict);
         if ir_stage_reporting() {
             eprintln!(
                 "[ir] admission {}.{}{}: {verdict}",
@@ -20223,17 +21664,6 @@ fn try_compile_inner(
             );
         }
     }
-    // `java/lang/String`'s field layout, resolved ONCE for the whole
-    // compilation. Two consumers: the optimizing-tier gate immediately below
-    // (`has_string_intrinsic_site`) and `try_resolve_string_intrinsic` in the
-    // single-pass invoke loop near the end of this function. The SAME resolver
-    // feeds `x64::compile`'s `compiler.string_layout`, so the matcher's
-    // "registered" decision and the codegen's "can emit inline" decision never
-    // disagree — a String sentinel is never registered for a site whose codegen
-    // would then bail to a raw `CALL`. Hoisted here (it used to be resolved
-    // just above the invoke loop) so the gate can ask the same question.
-    let resolved_string_layout: Option<StringFieldLayout> =
-        string_layout_resolver.and_then(|r| r());
     if optimize
         // IR lowering has no exact-RBP or safepoint-map publication, so a
         // mapless IR frame must never be live while the young collector
@@ -20316,12 +21746,31 @@ fn try_compile_inner(
         // is faster — is the one PERF-01 already names. Opt out with
         // `CRATONVM_JIT_NO_STRING_INTRINSIC_PIN=1` to A/B one binary against
         // itself.
-        && !(string_intrinsic_pin_enabled()
-            && has_string_intrinsic_site(
-                &scan.invoke_ops,
-                cp_invoke_resolver,
-                resolved_string_layout,
-            ))
+        //
+        // The predicate moved from a bare `has_string_intrinsic_site` to
+        // `string_intrinsic_pin_declines`, which is the same test plus two
+        // things it could not do: it COUNTS (so "the pin never fires" stops
+        // being a belief — the A/B that motivated this reads 326.3 ns/char with
+        // the pin off against 329.5 with it on, and a null result like that is
+        // exactly what a pin that never engages looks like), and it FAILS CLOSED
+        // when the door supplied no constant-pool invoke resolver. It shares its
+        // classification with the printed verdict above, so the reason a run
+        // reports and the decision a run takes cannot drift apart again.
+        //
+        // Asked THROUGH the admission token since 2026-09-01, rather than as a
+        // free call. The decision is the same function and the same answer;
+        // what the token adds is that the question is now a PER-DOOR fact, and
+        // that a door which never asks it is a number instead of an inference.
+        // `fired=0` on `probes/CharAtWarmShape.java` — the workload this pin
+        // exists to govern, and one the OSR door compiles — is what a one-door
+        // counter looks like from three doors away. See
+        // `string_intrinsic_pin_enabled` for the three-arm measurement and
+        // `compile_gate`'s "installed at ONE door" section for the topology.
+        && !admission.string_intrinsic_pin_declines(
+            &scan.invoke_ops,
+            cp_invoke_resolver,
+            resolved_string_layout,
+        )
         // STUB-S8 (was: `cached.exception_table.is_empty()`) — the optimizing
         // tier used to refuse EVERY method with a `try`/`catch`, which is an
         // enormous population of ordinary Java and cost ~7x on each of them
@@ -21109,8 +22558,34 @@ fn try_compile_inner(
                             || cn == "java/util/concurrent/atomic/AtomicInteger"
                             || try_resolve_atomic_long_intrinsic(&cn, &mn, &desc, 0).is_some()
                             || cn == "java/util/concurrent/atomic/AtomicLong"
+                            // Always `None` today, and left that way on
+                            // purpose. `try_resolve_string_intrinsic` returns
+                            // before its name ladder when the layout is `None`
+                            // (`let layout = string_layout?;`), so this row
+                            // cannot fire for any callee and the class-name row
+                            // below is what actually covers String -- the
+                            // "asked in its most permissive form" claim above
+                            // is true of the two Atomic probes and NOT of this
+                            // one. Handing it a probe layout would newly catch
+                            // `java/lang/CharSequence` accessor sites, which
+                            // reach the optimizing tier today, and DEMOTE them;
+                            // that is a widening with its own measurement, not
+                            // part of the String-expander fix.
                             || try_resolve_string_intrinsic(&cn, &mn, &desc, None).is_some()
-                            || cn == "java/lang/String"
+                            // Every `java/lang/String` invoke EXCEPT the three
+                            // accessors the optimizing tier can now expand for
+                            // itself. Without the exception `ir.rs`'s
+                            // `try_string_access_intrinsic` is unreachable by
+                            // any input: this gate unsets `invoke_info` for the
+                            // whole method, and `IrBuilder::build`'s `0xb6` arm
+                            // bails on the missing entry BEFORE it offers the
+                            // site to the expander. See
+                            // `ir_string_access_expander_handles` for why the
+                            // carve-out is exactly three names and one receiver
+                            // kind, and for the kill switch that restores the
+                            // blanket.
+                            || (cn == "java/lang/String"
+                                && !ir_string_access_expander_handles(&cn, &mn, &desc))
                             // FFM element accessors. Registered by their OWN
                             // arm in the single-pass scan rather than by
                             // `try_resolve_intrinsic` (they carry a dispatch
@@ -24116,8 +25591,7 @@ fn try_compile_inner(
                                     entry,
                                     needs_context: true,
                                     num_params: 1,
-                                    return_type: VARHANDLE_READ_RETURNS
-                                        [slot % VARHANDLE_READ_RETURNS.len()],
+                                    return_type: varhandle_read_slot_return(slot),
                                     guard_class_id: 0,
                                 },
                             ));
@@ -26449,10 +27923,36 @@ mod varhandle_read_direct_bind_tests {
         for (mode, name) in VARHANDLE_READ_MODES.iter().enumerate() {
             assert_eq!(
                 varhandle_read_helper_slot(name, desc),
-                Some(mode * VARHANDLE_READ_RETURNS.len() + int_slot),
+                Some(mode * VARHANDLE_READ_KINDS + int_slot),
                 "{name} on the netty refCnt descriptor",
             );
         }
+    }
+
+    /// Every slot's canonical call-site descriptor, in slot order.
+    ///
+    /// The primitive kinds are `(Ljava/lang/Object;)X`; the two reference kinds
+    /// are the `Object` return and one concrete `REF_STRICT` stand-in
+    /// (`java/lang/String` — the class `RJdkHandles`' wrong-type vector uses).
+    fn canonical_descriptors() -> Vec<(usize, String, &'static str)> {
+        let mut out = Vec::new();
+        for (mode, name) in VARHANDLE_READ_MODES.iter().enumerate() {
+            for kind in 0..VARHANDLE_READ_KINDS {
+                let ret = if kind < VARHANDLE_READ_RETURNS.len() {
+                    (VARHANDLE_READ_RETURNS[kind] as char).to_string()
+                } else if kind == VARHANDLE_READ_KIND_REF_OBJECT {
+                    "Ljava/lang/Object;".to_string()
+                } else {
+                    "Ljava/lang/String;".to_string()
+                };
+                out.push((
+                    mode * VARHANDLE_READ_KINDS + kind,
+                    format!("(Ljava/lang/Object;){ret}"),
+                    *name,
+                ));
+            }
+        }
+        out
     }
 
     /// Every slot is reachable and no two shapes share one.
@@ -26464,16 +27964,96 @@ mod varhandle_read_direct_bind_tests {
     #[test]
     fn every_mode_return_pair_has_its_own_slot() {
         let mut seen = std::collections::HashSet::new();
-        for name in VARHANDLE_READ_MODES {
-            for ret in VARHANDLE_READ_RETURNS {
-                let desc = format!("(Ljava/lang/Object;){}", ret as char);
-                let slot = varhandle_read_helper_slot(name, &desc)
-                    .unwrap_or_else(|| panic!("{name}{desc} was not recognised"));
-                assert!(slot < VARHANDLE_READ_SLOTS);
-                assert!(seen.insert(slot), "{name}{desc} collided on slot {slot}");
-            }
+        for (expected, desc, name) in canonical_descriptors() {
+            let slot = varhandle_read_helper_slot(name, &desc)
+                .unwrap_or_else(|| panic!("{name}{desc} was not recognised"));
+            assert_eq!(slot, expected, "{name}{desc} landed on the wrong slot");
+            assert!(slot < VARHANDLE_READ_SLOTS);
+            assert!(seen.insert(slot), "{name}{desc} collided on slot {slot}");
         }
         assert_eq!(seen.len(), VARHANDLE_READ_SLOTS);
+    }
+
+    /// The three-way classification of a REFERENCE return, which is the whole
+    /// of how the cold arm keeps W6-1 without the site's descriptor.
+    ///
+    /// The middle row is the one that is easy to lose: a site returning
+    /// `java/lang/Number` must NOT bind, because whether a box satisfies it
+    /// depends on which wrapper arrived (`Integer` yes, `Character` no) and
+    /// neither reference slot can answer that. Binding it as `REF_STRICT`
+    /// would throw where HotSpot does not.
+    #[test]
+    fn a_reference_return_is_classified_three_ways() {
+        assert_eq!(
+            varhandle_read_helper_slot("get", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+            Some(VARHANDLE_READ_KIND_REF_OBJECT),
+        );
+        for accepting in VARHANDLE_BOX_ACCEPTING_RETURNS {
+            let desc = format!("(Ljava/lang/Object;)L{accepting};");
+            assert_eq!(
+                varhandle_read_helper_slot("get", &desc),
+                None,
+                "{accepting} accepts SOME box, so its site cannot be REF_STRICT",
+            );
+        }
+        for strict in [
+            "java/lang/String",
+            "java/lang/CharSequence",
+            "java/util/concurrent/CompletableFuture$Completion",
+            "HibfixVarHandleProbe$Node",
+        ] {
+            let desc = format!("(Ljava/lang/Object;)L{strict};");
+            assert_eq!(
+                varhandle_read_helper_slot("get", &desc),
+                Some(VARHANDLE_READ_KIND_REF_STRICT),
+                "{strict} accepts no box and must bind strictly",
+            );
+        }
+    }
+
+    /// The kill switch reaches the recogniser itself, so all three doors refuse
+    /// together — and it must leave the PRIMITIVE half alone, which is the
+    /// whole reason it is a separate switch from the read bind's own.
+    ///
+    /// Read through the recogniser rather than the `OnceLock`, because the
+    /// process-wide latch cannot be flipped twice in one test binary.
+    #[test]
+    fn the_reference_half_has_its_own_switch() {
+        // The switch is a `OnceLock` on an env var, so this test asserts the
+        // SHAPE of the decision the recogniser makes, not the latch: a slot
+        // >= VARHANDLE_READ_RETURNS.len() is a reference kind, and every one of
+        // them is reached through the `varhandle_ref_read_direct_enabled()`
+        // arm, while no primitive kind is.
+        let primitive = varhandle_read_helper_slot("get", "(Ljava/lang/Object;)I").unwrap();
+        assert!(!varhandle_read_slot_is_reference(primitive));
+        for desc in [
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            "(Ljava/lang/Object;)Ljava/lang/String;",
+        ] {
+            let slot = varhandle_read_helper_slot("get", desc)
+                .expect("the reference kinds bind by default");
+            assert!(varhandle_read_slot_is_reference(slot), "{desc}");
+        }
+    }
+
+    /// `varhandle_read_slot_return` is what three emit sites now use in place
+    /// of the old `slot % RETURNS.len()`, and it has to agree with the
+    /// descriptor the slot's synthetic call site carries.
+    #[test]
+    fn a_slots_return_byte_matches_its_descriptor() {
+        for (slot, desc, _) in canonical_descriptors() {
+            let want = desc.as_bytes()[desc.find(')').unwrap() + 1];
+            assert_eq!(
+                varhandle_read_slot_return(slot),
+                want,
+                "slot {slot} ({desc})",
+            );
+        }
+        assert_eq!(varhandle_read_slot_mode(VARHANDLE_READ_SLOTS - 1), 3);
+        assert_eq!(
+            varhandle_read_slot_kind(VARHANDLE_READ_SLOTS - 1),
+            VARHANDLE_READ_KIND_REF_STRICT
+        );
     }
 
     /// The shapes that must NOT bind, each for its own reason.
@@ -26485,7 +28065,7 @@ mod varhandle_read_direct_bind_tests {
     /// that assumes `[handle, receiver]` an argument list of a different
     /// shape.
     #[test]
-    fn only_a_single_reference_coordinate_with_a_primitive_return_binds() {
+    fn only_a_single_reference_coordinate_with_a_servable_return_binds() {
         // A static-field handle: no coordinates at all.
         assert_eq!(varhandle_read_helper_slot("get", "()I"), None);
         // An array-element handle: (array, index).
@@ -26508,15 +28088,21 @@ mod varhandle_read_direct_bind_tests {
         );
         // A primitive coordinate is not an instance-field receiver.
         assert_eq!(varhandle_read_helper_slot("get", "(I)I"), None);
-        // Reference returns are out of scope — `unbox_poly_return_checked`'s
-        // W6-1 rule reads the SITE's declared class, which a baked direct call
-        // cannot carry. See `VARHANDLE_READ_DIRECT_FNS`.
+        // An ARRAY return is still out of scope: it is outside
+        // `varhandle_reference_return_mismatch`'s fire set today, so neither
+        // reference kind describes it and a stand-in would have to reproduce
+        // that exclusion for no measured caller.
         assert_eq!(
-            varhandle_read_helper_slot("get", "(Ljava/lang/Object;)Ljava/lang/String;"),
+            varhandle_read_helper_slot("get", "(Ljava/lang/Object;)[I"),
             None
         );
         assert_eq!(
-            varhandle_read_helper_slot("get", "(Ljava/lang/Object;)[I"),
+            varhandle_read_helper_slot("get", "(Ljava/lang/Object;)[Ljava/lang/String;"),
+            None
+        );
+        // Two object descriptors run together is not one return type.
+        assert_eq!(
+            varhandle_read_helper_slot("get", "(Ljava/lang/Object;)Lfoo;Lbar;"),
             None
         );
         // `void` is not a read.
@@ -26567,16 +28153,13 @@ mod varhandle_read_direct_bind_tests {
     fn the_slots_are_registered_in_recognition_order() {
         let addrs: [usize; VARHANDLE_READ_SLOTS] = std::array::from_fn(|i| 0x1000 + i * 0x10);
         set_varhandle_read_direct_fns(&addrs);
-        for name in VARHANDLE_READ_MODES {
-            for ret in VARHANDLE_READ_RETURNS {
-                let desc = format!("(Ljava/lang/Object;){}", ret as char);
-                let slot = varhandle_read_helper_slot(name, &desc).unwrap();
-                assert_eq!(
-                    VARHANDLE_READ_DIRECT_FNS[slot].load(std::sync::atomic::Ordering::Relaxed),
-                    addrs[slot],
-                    "{name}{desc} -> slot {slot}",
-                );
-            }
+        for (_, desc, name) in canonical_descriptors() {
+            let slot = varhandle_read_helper_slot(name, &desc).unwrap();
+            assert_eq!(
+                VARHANDLE_READ_DIRECT_FNS[slot].load(std::sync::atomic::Ordering::Relaxed),
+                addrs[slot],
+                "{name}{desc} -> slot {slot}",
+            );
         }
         // Leave the cells as `build_helpers` would find them — `0` is the
         // "use the generic dispatch helper" sentinel, and a fake address left
@@ -27343,6 +28926,77 @@ mod tests {
         );
     }
 
+    /// The two `None` inputs are DIFFERENT facts, and the pin now says which.
+    ///
+    /// `has_string_intrinsic_site` answers `false` — "do not pin" — for "no
+    /// String site here", for "no layout resolved" and for "no resolver at this
+    /// door" alike, so the admission line could not tell a method the pin
+    /// declined from one the pin never saw. That is why five separate
+    /// hypotheses about which methods keep the inline `charAt` decode were each
+    /// refuted by their own measurement without converging on an answer. These
+    /// assertions are the whole difference, and the reason the arms may not be
+    /// collapsed back into a bool.
+    ///
+    /// Deliberately env-independent: `Pinned` vs `DisabledByFlag` turns on
+    /// `CRATONVM_JIT_NO_STRING_INTRINSIC_PIN`, which any other test in the
+    /// process can be holding, and a test that reads the ambient environment is
+    /// a flake with a good excuse.
+    #[test]
+    fn a_missing_pin_input_is_reported_as_a_blind_spot_not_as_no_site() {
+        let layout = super::StringFieldLayout::new(0, Some(1), 2, 7);
+        let resolve = |idx: u16| -> Option<(String, String, String)> {
+            match idx {
+                1 => Some((
+                    "java/lang/String".to_string(),
+                    "charAt".to_string(),
+                    "(I)C".to_string(),
+                )),
+                _ => Some((
+                    "java/lang/Math".to_string(),
+                    "sqrt".to_string(),
+                    "(D)D".to_string(),
+                )),
+            }
+        };
+        // invokevirtual @pc=0 -> cp #1 (String.charAt), invokestatic @pc=3.
+        let with_string: [(usize, u16, u8); 2] = [(0, 1, 0xb6), (3, 2, 0xb8)];
+        // invokestatic only — nothing the registration path would ever consider.
+        let plain: [(usize, u16, u8); 1] = [(3, 2, 0xb8)];
+
+        assert_eq!(
+            super::string_intrinsic_pin_verdict(&with_string, Some(&resolve), None),
+            super::StringPinVerdict::BlindNoLayout,
+            "a String-declared site with no resolved layout is a blind spot, not an absence"
+        );
+        assert_eq!(
+            super::string_intrinsic_pin_verdict(&with_string, None, Some(layout)),
+            super::StringPinVerdict::BlindNoResolver,
+            "with no resolver not one callee name is readable, so nothing can be concluded"
+        );
+        // The narrowing that keeps this diagnostic from becoming noise: a method
+        // with no `invokevirtual`/`invokeinterface` at all is not blind, it has
+        // nothing to be blind about. Without this, "no layout at this door"
+        // would print against essentially every method in the program.
+        assert_eq!(
+            super::string_intrinsic_pin_verdict(&plain, Some(&resolve), None),
+            super::StringPinVerdict::NoSite,
+        );
+        assert_eq!(
+            super::string_intrinsic_pin_verdict(&plain, None, Some(layout)),
+            super::StringPinVerdict::NoSite,
+        );
+
+        // Each blind arm names the input that was missing, because "the pin did
+        // not fire" and "the pin could not look" want different fixes.
+        assert!(super::StringPinVerdict::BlindNoLayout
+            .admission_note()
+            .is_some_and(|n| n.contains("String field layout")));
+        assert!(super::StringPinVerdict::BlindNoResolver
+            .admission_note()
+            .is_some_and(|n| n.contains("constant-pool invoke resolver")));
+        assert!(super::StringPinVerdict::NoSite.admission_note().is_none());
+    }
+
     /// Two VMs, two answers — the property JDK-ONLY-WAVE2 §2 was filed about.
     ///
     /// `direct_native_helper`'s policy input used to be the process-global
@@ -27765,6 +29419,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -27993,6 +29648,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -28072,6 +29728,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -29326,6 +30983,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -29470,6 +31128,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -29581,6 +31240,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -29702,6 +31362,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -29827,6 +31488,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -29894,6 +31556,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -29973,6 +31636,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -33367,6 +35031,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -34007,6 +35672,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -34027,6 +35693,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -34161,6 +35828,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),

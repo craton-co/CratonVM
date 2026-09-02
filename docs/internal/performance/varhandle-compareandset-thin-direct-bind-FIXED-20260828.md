@@ -29,7 +29,7 @@ window available. Both agree.
 | `set` reference (CONTROL) | 51.1 | 51.0 | 1.5 | **1.00x** | 34.1x |
 
 Against HotSpot the reference CAS goes **29.6x -> 9.8x**. The residual is
-[`../../known-issues/perf/juc-primitives-and-composition-after-the-compile-refusals-20260828.md`](../../known-issues/perf/juc-primitives-and-composition-after-the-compile-refusals-20260828.md).
+[`juc-primitives-and-composition-after-the-compile-refusals-CLOSED-20260901.md`](juc-primitives-and-composition-after-the-compile-refusals-CLOSED-20260901.md).
 
 ## What the cost actually was
 
@@ -208,5 +208,5 @@ a `VarHandle.get` and then the CAS, which is why the isolated probe exists.
 - `performance/varhandle-writes-and-cas-have-no-fast-path-FIXED-20260827.md`
   — the `set` bind, the global mutex, the in-funnel CAS this replaces at the
   bound sites, and the stripe pool.
-- [`../../known-issues/perf/juc-primitives-and-composition-after-the-compile-refusals-20260828.md`](../../known-issues/perf/juc-primitives-and-composition-after-the-compile-refusals-20260828.md)
+- [`juc-primitives-and-composition-after-the-compile-refusals-CLOSED-20260901.md`](juc-primitives-and-composition-after-the-compile-refusals-CLOSED-20260901.md)
   — the residual, where `VarHandle.get` on a reference field is now the top row.

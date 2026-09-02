@@ -16,15 +16,54 @@ phantom reference processing, compact and compressed object headers
 `GarbageCollector` trait abstracts the backend so the VM can swap
 collectors at startup.
 
-`ZgcRealHeap` is a real, memory-backed collector and `-XX:+UseZGC`
+`ZgcRealHeap` is a real, memory-backed collector, `-XX:+UseZGC`
 genuinely selects it (`GcAlgorithm::Zgc` → `GcBackend::Zgc` →
-`VmHeap::Zgc`) — but it is compiled in only behind the default-off `zgc`
-feature, so a stock build does not contain it and `-XX:+UseZGC` there
-warns and falls back to Generational. It is also not production ZGC: a
-stop-the-world, non-moving, whole-heap mark-sweep, with no colored
-pointers, load barriers, concurrency, or compaction. The colored-pointer
-code above it in `src/zgc.rs` is a metadata-only simulation with no
-production consumer.
+`VmHeap::Zgc`), and **it is the default**: the `zgc` feature has been
+default-ON since 2026-08-10 and `VmConfig`'s default `gc_algorithm` is
+`Zgc`. A `--no-default-features` build falls back to Generational, and
+`-XX:+UseGenerationalGC` is the escape hatch in every build.
+
+The colored-pointer code is no longer a simulation. `src/zgc/vaddr.rs`
+mints colored words, `src/zgc/barrier.rs::z_load` is the load barrier,
+`src/zgc_concurrent.rs` runs concurrent marking (`CRATONVM_ZGC_CONC_START`),
+`src/zgc/relocate.rs` compacts (kill switch `CRATONVM_ZGC_RELOCATE=0`),
+and `src/zgc/generation.rs` implements the opt-in generational mode
+(`CRATONVM_ZGC_GENERATIONAL=1`).
+
+What is *not* yet production ZGC: the colored-pointer load barrier is
+**plumbed but not armed**, and the two halves of that sentence have to be read
+together.
+
+*Plumbed.* `src/vm_heap.rs::load_ref_slot_barriered` is the backend-dispatching
+seam — it delegates to `ZgcRealHeap::load_barrier_slot` on the `Zgc` arm, and
+refuses under compressed oops because a colored word does not fit in a 4-byte
+slot (VM init refuses that combination anyway). `cratonvm-types`'
+`narrow_oop::read_ref_slot` / `write_ref_slot`, and this crate's own compaction
+slot-rewrite in `ZgcRealHeap::relocate_stw`, are now `Relaxed` atomics rather
+than plain accesses, because a plain write racing the barrier's self-healing
+`compare_exchange` is undefined behaviour rather than a lost update. On the VM
+side, the JIT's compact-field reference read routes through the seam and the
+inline `aastore` arm consults the same armed gate its compact-field siblings
+already did.
+
+*Not armed.* `vm/src/vm/vm_init.rs` pins `const RELOCATION_REQUESTED: bool =
+false`, `ZgcRealHeap::set_barrier_color` — the sole writer of the colored state
+— has no non-test caller, and `barrier_good_mask` never leaves `Z_REMAPPED`. So
+`load_barrier_armed()` is false for the life of every shipping process, every
+reachable configuration evaluates the same plain read it evaluated before, and
+none of the wiring above has yet executed. Treat it as staged, not as done.
+
+Still open, in order: `vm/src/jit/helpers.rs::jit_aaload` receives no `vm_ptr`
+and so cannot reach a `&VmHeap` without an ABI change — it is the hotter of the
+two slot-holding sites, and takes the raw read today, counted by
+`ref_load_census::UNBARRIERED_LOADS`; the sites that hold an `ObjectRef` rather
+than a slot (`types/src/value.rs::read_value_atomic`'s reference arm and
+`vm::get_static_shared`) are blocked on static and legacy slots not being
+atomic; and arming must happen at a safepoint, because an emission-time gate
+cannot reach code that is already compiled. The step-by-step list with each
+step's current status is the doc comment on
+`VmHeap::load_ref_slot_barriered`; the design is
+`docs/feature-designs/zgc-jit-load-barrier.md`.
 
 ## Non-goals
 

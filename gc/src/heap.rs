@@ -1807,14 +1807,34 @@ impl FieldCoercionSite {
     }
 }
 
-/// One counter per (species, access kind). Flat so the increment is a single
-/// relaxed `fetch_add` on a cold path.
-static COERCION_LOSSES: [[AtomicU64; FieldAccessKind::COUNT]; FieldCoercionLoss::COUNT] = [
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
-];
+// The (species, access kind) counter matrix used to be a `static` here. It
+// now lives in `cratonvm_types::compact_value::coercion_census`, and the
+// accessors below read it from there.
+//
+// It moved for ONE reason, and not for tidiness: the count has to be printed
+// from `native-builtins`' `System.exit` shutdown trailer, and
+// `cratonvm-native-builtins` does not depend on `cratonvm-gc`. A summary the
+// shutdown trailer cannot call is a summary a JUnit runner never prints --
+// which is the failure `cell_census` was moved into `cratonvm-types` to fix,
+// after a 1975-class sweep produced its line in zero of 1975 logs and read as
+// a clean run. Keeping a second copy of the counters here and mirroring into
+// the census was the alternative, and was rejected: any skew between the two
+// would be indistinguishable from a real miscount, which is the argument
+// `DEGRADATION_COUNTS` already makes for defining its total as a sum rather
+// than keeping a fourth atomic.
+//
+// The two tables must stay the same width. A mismatch would silently drop a
+// species (the census ignores an out-of-range index rather than panicking on
+// a path that has already lost a value), so make it a compile error here,
+// where the enums are.
+const _: () = assert!(
+    FieldCoercionLoss::COUNT == cratonvm_types::compact_value::coercion_census::SPECIES,
+    "FieldCoercionLoss and coercion_census::SPECIES must be widened together"
+);
+const _: () = assert!(
+    FieldAccessKind::COUNT == cratonvm_types::compact_value::coercion_census::KINDS,
+    "FieldAccessKind and coercion_census::KINDS must be widened together"
+);
 
 /// How many times each (species, access kind) pair has fired in this process.
 ///
@@ -1822,22 +1842,12 @@ static COERCION_LOSSES: [[AtomicU64; FieldAccessKind::COUNT]; FieldCoercionLoss:
 /// [`FieldAccessKind`]. Intended for a shutdown summary or the native-registry
 /// dump; see [`field_coercion_loss_report`] for a rendered form.
 pub fn field_coercion_loss_counts() -> [[u64; FieldAccessKind::COUNT]; FieldCoercionLoss::COUNT] {
-    let mut out = [[0u64; FieldAccessKind::COUNT]; FieldCoercionLoss::COUNT];
-    for (r, row) in COERCION_LOSSES.iter().enumerate() {
-        for (c, cell) in row.iter().enumerate() {
-            out[r][c] = cell.load(Ordering::Relaxed);
-        }
-    }
-    out
+    cratonvm_types::compact_value::coercion_census::counts()
 }
 
 /// Total number of value-destroying descriptor coercions in this process.
 pub fn field_coercion_loss_total() -> u64 {
-    COERCION_LOSSES
-        .iter()
-        .flatten()
-        .map(|c| c.load(Ordering::Relaxed))
-        .sum()
+    cratonvm_types::compact_value::coercion_census::total()
 }
 
 /// A one-line-per-species rendering of [`field_coercion_loss_counts`], or
@@ -1876,11 +1886,11 @@ pub fn field_coercion_loss_report() -> Option<String> {
     Some(s)
 }
 
-/// `CRATONVM_DBG_COERCION=1` — log EVERY loss with a backtrace instead of the
-/// rate-limited sample.
+/// `CRATONVM_DBG_COERCION=1` — log EVERY loss with a backtrace.
 ///
-/// Read once. This is the flag a lane repairing individual sites wants; the
-/// default sample is for a reader who did not know the defect existed.
+/// Read once. This is the flag a lane repairing individual sites wants. Since
+/// 2026-09-01 it is also the only way to get a per-occurrence line at all; see
+/// [`note_field_coercion_loss`] and [`coercion_loss_sampled`].
 fn coercion_loss_verbose() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -1897,10 +1907,57 @@ fn coercion_loss_verbose() -> bool {
     })
 }
 
-/// The instrument. Counts always; warns on a rate-limited sample.
+/// `CRATONVM_DBG_OVERLAY=1` — keep the escalating per-occurrence SAMPLE
+/// (occurrence 0, 1, 2, 4, 8, … per species) without the backtrace.
 ///
-/// Rate limit is `n < 4 || n.is_power_of_two()`, PER SPECIES — the same shape
-/// as `autobox::observe_primitive_into_reference_field` and the sibling
+/// The escalating dedup is a good design and is kept, just not on by default:
+/// it bounds a boot that coerces thousands of times to about a dozen lines,
+/// which is the right budget for a reader who has ASKED to watch slot-level
+/// damage. `CRATONVM_DBG_OVERLAY` rather than a flag of its own because that
+/// is the lane that already reads these rows — the overlay hunter in
+/// `vm/src/vm/vm_exec.rs` reports a native writing a value whose tag
+/// contradicts the model, which is the same event this guard sees one layer
+/// down, and having to arm two flags to see two halves of one story is how
+/// half of it gets missed.
+fn coercion_loss_sampled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        // `flags::runtime_var_os`, not `std::env::var_os`, for the reason
+        // spelled out in `coercion_loss_verbose`: a DECLARED name read raw is
+        // served by a live `getenv` instead of the latched snapshot, so
+        // `CRATONVM_DBG=overlay` would silently do nothing here.
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY").is_some()
+    })
+}
+
+/// The instrument. Counts always; on a DEFAULT run says nothing at all.
+///
+/// # 2026-09-01: this became a counter, and the reason is a measurement
+///
+/// A stock `cratonvm Hello` — a one-line hello-world — printed 28 lines of
+/// internal diagnostics to stderr where HotSpot prints zero, and 24 of the 28
+/// came from this one function. The `primitive-into-reference` read species
+/// reaches occurrence 2048 during boot (an ordinary `HashSet.add` reading
+/// `java.util.HashMap.table`, which the real JDK layout declares
+/// `[Ljava/util/HashMap$Node;` and CratonVM's synthetic init writes
+/// `Int(capacity)` into), and even the escalating sample turns that into a
+/// dozen WARN lines with the full paragraph attached.
+///
+/// That is no longer an instrument. It is the background against which a real
+/// warning has to be noticed, and any tool reading this VM's stderr — CI, a
+/// build script, a subprocess consumer, a test harness — sees it. So: the
+/// counter is unchanged and always runs, the per-occurrence rows moved behind
+/// [`coercion_loss_verbose`] / [`coercion_loss_sampled`], and the numbers are
+/// printed once by
+/// `cratonvm_types::compact_value::coercion_census::exit_summary`.
+///
+/// **Nothing about the coercion itself changed.** Every arm still returns the
+/// byte-identical `Value` it returned before; see the `b'L' | b'['` arm of
+/// [`coerce_field_value_for_slot`] for why that rule is load-bearing.
+///
+/// Rate limit — when a flag has asked for the rows at all — is
+/// `n < 4 || n.is_power_of_two()`, PER SPECIES: the same shape as
+/// `autobox::observe_primitive_into_reference_field` and the sibling
 /// `cratonvm::gc::guard` records, chosen so a boot that coerces thousands of
 /// times costs ~a dozen lines rather than minutes of stderr. Per species
 /// rather than globally so a high-frequency benign read population (see
@@ -1924,9 +1981,36 @@ fn note_field_coercion_loss(
     value: Value,
     desc_byte: u8,
 ) {
-    let n = COERCION_LOSSES[loss.index()][site.kind.index()].fetch_add(1, Ordering::Relaxed);
+    use cratonvm_types::compact_value::coercion_census;
+
+    // The census carries the locator as well as the count, because a count
+    // with no locator is not actionable: "2048 coercions" and "2048
+    // coercions, all of them class 64 slot 2 at descriptor `[`" are different
+    // findings and only the second one can be repaired. `NO_CLASS`/`NO_INDEX`
+    // are the sentinels for a caller that has no provenance (every collector
+    // on the live `VmHeap` dispatch path is still one of those, G30
+    // NOMINATION 1); they render as the same `-1` the WARN below prints, so
+    // old and new logs grep alike. A slot index is truncated to 16 bits in
+    // the census key, which is lossless for every real field table.
+    let class_key = site
+        .class_id
+        .map(|c| c.as_u32())
+        .unwrap_or(coercion_census::NO_CLASS);
+    let index_key = site
+        .index
+        .map(|i| u32::try_from(i).unwrap_or(coercion_census::NO_INDEX))
+        .unwrap_or(coercion_census::NO_INDEX);
+    let n = coercion_census::note(
+        loss.index(),
+        site.kind.index(),
+        desc_byte,
+        class_key,
+        index_key,
+    );
+
+    // DEFAULT RUN RETURNS HERE — silent, counted, reported once at exit.
     let verbose = coercion_loss_verbose();
-    if !verbose && !(n < 4 || n.is_power_of_two()) {
+    if !verbose && !(coercion_loss_sampled() && (n < 4 || n.is_power_of_two())) {
         return;
     }
     let descriptor = desc_byte as char;
@@ -2213,6 +2297,21 @@ pub fn coerce_field_value_for_slot(value: Value, desc_byte: u8, site: FieldCoerc
             // fired in silence, so the 374 callers writing an `Int` at a
             // reference slot could not tell they were writing null. The
             // instrument below is the whole of the change.
+            //
+            // 2026-09-01, WHERE THE REAL FIX IS. The instrument is now a
+            // counter: it says nothing per occurrence and contributes one
+            // line at exit (`coercion_census::exit_summary`). That is a
+            // change to the REPORT, not to the defect, and it deliberately
+            // makes the defect smaller on screen while leaving it exactly as
+            // large in the program. The defect is the writer population —
+            // ~374 callers, `native-collections`' `HashMap`/`HashSet` model
+            // among them, that store an `Int` into a slot the real JDK layout
+            // declares as a reference. The number this census prints IS the
+            // size of that population's traffic, and the population is what
+            // should shrink; a repair that made the number smaller by any
+            // other route (quieting the guard further, narrowing what counts,
+            // or "fixing" this arm) would be measuring its own reporting.
+            // Repairs are nominated per writer, not here.
             Value::Int(_) | Value::Long(_) => {
                 note_field_coercion_loss(
                     FieldCoercionLoss::PrimitiveIntoReference,
@@ -4235,6 +4334,51 @@ mod tests {
 
     fn g30_count(loss: FieldCoercionLoss, kind: FieldAccessKind) -> u64 {
         field_coercion_loss_counts()[loss.index()][kind.index()]
+    }
+
+    /// The census's name tables are a COPY of these two enums' `name()`, and
+    /// the copy is what the one line a default run prints is labelled with.
+    ///
+    /// `cratonvm-gc` depends on `cratonvm-types` and not the reverse, so the
+    /// summary printed from the `System.exit` trailer cannot ask the enums for
+    /// their own names — it has to carry duplicates. Drift would fail nothing
+    /// at runtime; it would mislabel a species in the only line the guard now
+    /// emits, which is the hardest kind of wrong to notice, and the census's
+    /// module comment cites this test as the reason duplicating the names is
+    /// acceptable at all. Pinned here, on the side that owns the enums.
+    #[test]
+    fn the_census_tables_match_the_coercion_enums() {
+        use cratonvm_types::compact_value::coercion_census as census;
+
+        for (loss, expected) in [
+            (FieldCoercionLoss::PrimitiveIntoReference, 0usize),
+            (FieldCoercionLoss::PrimitiveIntoReferenceUncoerced, 1usize),
+            (FieldCoercionLoss::NullIntoPrimitive, 2usize),
+            (FieldCoercionLoss::PointerIntoPrimitive, 3usize),
+        ] {
+            assert_eq!(loss.index(), expected, "{} moved row", loss.name());
+            assert_eq!(
+                census::SPECIES_NAMES[expected],
+                loss.name(),
+                "coercion_census::SPECIES_NAMES row {expected} no longer names                  the species the exit summary will attribute its count to",
+            );
+        }
+
+        for (kind, expected) in [
+            (FieldAccessKind::Read, 0usize),
+            (FieldAccessKind::Store, 1usize),
+            (FieldAccessKind::Unattributed, 2usize),
+        ] {
+            assert_eq!(kind.index(), expected, "{} moved column", kind.name());
+            assert_eq!(
+                census::KIND_NAMES[expected],
+                kind.name(),
+                "coercion_census::KIND_NAMES column {expected} no longer names                  the access direction the exit summary will report",
+            );
+        }
+
+        assert_eq!(census::SPECIES_NAMES.len(), FieldCoercionLoss::COUNT);
+        assert_eq!(census::KIND_NAMES.len(), FieldAccessKind::COUNT);
     }
 
     /// THE PIN. `java.util.HashMap.table` is declared

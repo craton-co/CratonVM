@@ -709,11 +709,27 @@ pub mod incomplete_reason {
     /// This is the only reason code produced by *checking the answer* rather
     /// than by failing to establish a precondition.
     pub const COVERAGE_ORACLE_REFUTED: usize = 15;
+    /// The frame-band verifier could not run for the OPPOSITE reason to
+    /// [`YOUNG_BOUNDS_UNPUBLISHED`]: the tables it tests ARE published, and are
+    /// published about a different heap.
+    ///
+    /// `gen_heap::JIT_REGION_BOUNDS` and `gen_heap::MOVABLE_BOUNDS` are
+    /// process-global and discriminated by slot 0, so each describes exactly
+    /// one heap. With a second heap alive — a second embedded VM, an init-time
+    /// heap not yet dropped — whichever heap lost the slot has every one of its
+    /// addresses answer `false` to `gen_heap::addr_is_movable`, and the
+    /// verifier reports "nothing unpublished" over frames it never classified.
+    ///
+    /// Separated from [`YOUNG_BOUNDS_UNPUBLISHED`] because the operator action
+    /// differs: that one says a collector publishes nothing and is expected on
+    /// G1; this one says the process holds more heaps than the tables can
+    /// describe, which no production configuration does.
+    pub const BOUNDS_NOT_REPRESENTATIVE: usize = 16;
 
     /// One past the highest defined reason code. Sizes the per-reason counter
     /// array; a new variant must bump it (asserted by
     /// `every_incomplete_reason_has_a_label`).
-    pub const COUNT: usize = 16;
+    pub const COUNT: usize = 17;
 
     /// Human-readable label for a reason code (for the fallback diagnostic).
     pub fn label(code: usize) -> &'static str {
@@ -733,6 +749,7 @@ pub mod incomplete_reason {
             UNBOUNDED_FRAME_BAND => "compiled-frame-band-unbounded",
             FOREIGN_INNERMOST_RBP => "innermost-rbp-belongs-to-unguarded-callee",
             YOUNG_BOUNDS_UNPUBLISHED => "young-bounds-unpublished-verifier-vacuous",
+            BOUNDS_NOT_REPRESENTATIVE => "published-bounds-describe-another-heap",
             JIT_RELOCATION_UNSUPPORTED => "jit-relocation-contract-unproven",
             _ => "unknown",
         }
@@ -751,6 +768,7 @@ pub mod incomplete_reason {
 // reason as every other counter in this module.
 #[cfg(not(test))]
 static MOVING_YOUNG_REASON_COUNTS: [AtomicUsize; incomplete_reason::COUNT] = [
+    AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
@@ -823,6 +841,7 @@ pub fn begin_moving_young_coverage_cycle() {
     coverage_incomplete_set(false);
     incomplete_reason_clear();
     unrewritable_peer_state_set(false);
+    CONSERVATIVE_JIT_SCANS.store(0, Ordering::Relaxed);
     // The cross-thread handshake ledger is per-PAUSE and only ever read as
     // "does this account for every peer JIT entry?", so a value carried over
     // from the previous pause would be an over-count — the one direction that
@@ -1594,6 +1613,7 @@ pub fn clear_pinned_jit_roots() {
 /// owned by the calling thread.
 pub fn add_pinned_jit_root(addr: usize) {
     arm_pinned_guard();
+    CONSERVATIVE_JIT_SCANS.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut map) = pinned_jit_map().lock() {
         map.entry(std::thread::current().id())
             .or_default()
@@ -1606,6 +1626,10 @@ pub fn add_pinned_jit_root(addr: usize) {
 /// always reflect its CURRENT live JIT frames.
 pub fn publish_pinned_jit_roots(addrs: &[usize]) {
     arm_pinned_guard();
+    // BEFORE the emptiness test below. "This thread looked and found nothing"
+    // and "this thread never looked" are different facts and the map cannot
+    // hold the difference -- see `conservative_jit_scans`.
+    CONSERVATIVE_JIT_SCANS.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut map) = pinned_jit_map().lock() {
         let tid = std::thread::current().id();
         if addrs.is_empty() {
@@ -1615,6 +1639,32 @@ pub fn publish_pinned_jit_roots(addrs: &[usize]) {
         }
     }
 }
+
+/// How many threads have published a conservative JIT-frame scan since
+/// [`begin_moving_young_coverage_cycle`] reset the count.
+///
+/// # Why a count and not just the pin set
+///
+/// [`pinned_jit_roots_snapshot`] is EMPTY in two completely different
+/// situations: nobody found a conservative root (fine -- there is nothing to
+/// pin), and nobody looked (fatal -- a collector that pins by value would then
+/// pin nothing and relocate everything, believing it was protected).
+///
+/// A consumer that treats the empty set as a licence needs to be able to tell
+/// those apart, and the set itself cannot. This is the discriminator: a zero
+/// here beside live compiled frames means the instrument was armed where it
+/// cannot fire, which is a refusal rather than a pass.
+///
+/// Bumped by both publication paths, including a publication of an EMPTY
+/// vector -- "this thread looked and found nothing" is exactly the fact that
+/// has to be distinguishable.
+pub fn conservative_jit_scans() -> usize {
+    CONSERVATIVE_JIT_SCANS.load(Ordering::Relaxed)
+}
+
+/// Conservative JIT-frame scans published this cycle. See
+/// [`conservative_jit_scans`].
+static CONSERVATIVE_JIT_SCANS: AtomicUsize = AtomicUsize::new(0);
 
 /// Snapshot the conservative-pinned-JIT-root addresses published by ALL
 /// threads. `G1Collector` maps these to regions it must exclude from the

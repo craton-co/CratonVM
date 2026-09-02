@@ -177,6 +177,53 @@ GC stress is the right instrument for a soak and the wrong one for a throughput
 measurement — it maximises the number of cycles while minimising the work in
 each, which is exactly where a parallel copy has least to offer.
 
+### 2026-09-02 The loop-invariant `arraylength` is hoisted, and it was worth 5.4x
+
+`for (int i = 0; i < a.length; i++)` re-evaluates `a.length` at the top of
+every iteration, because that is what javac emits and neither x86-64 backend
+moved it. Both do now — `ArrayLenHoist` in the single-pass backend
+(`jit/src/x64/licm.rs`), `Op::ArrayLength` support in the optimizing tier's
+LICM (`jit/src/ir_optimize.rs`) — and one bounds-checked `char[]` element read
+in a compiled counted loop goes from **3.46 to 0.64 ns/char** — onto the
+hand-hoisted control, and from 24.7x HotSpot to 4.6x on the same host and run.
+
+The size is the finding. `array-element-load-baseline-codegen-20260901` sized
+this at ~5 instructions of 21 by reading the emitter, concluded "44x to about
+14x", and never ran the one-method control — the same loop with `a.length` in a
+local — that prices it. It was the whole gap. Two things the reading could not
+see:
+
+* the traced emitter is not the one that ran. The optimizing tier is *better*
+  than the single-pass backend on the local-bound loop and **3x worse** on the
+  `arraylength`-bound one, and the routing sends the second shape to it;
+* in that tier, `Op::ArrayLength` is impure, so `loop_has_hard_barrier` counted
+  it and a javac counted loop **disqualified its own LICM by the very node it
+  needed hoisted** — `CRATONVM_DBG_LICM=1` reported `hard_barrier=true,
+  0 load(s)` on every candidate header.
+
+That pass also never saw an inner loop at all: it classified a header's inputs
+by forward reachability, which for a nested inner header wraps round the outer
+back edge and makes every input look like a back edge. Dominance answers it —
+one reachability walk with the header deleted — applied only where the old test
+found no pre-header, so every loop it already handled keeps its answer.
+
+Neither hoist needs a deopt: both take only sites that run unconditionally on
+the first pass through the header, so a null receiver throws the NPE the body
+would have thrown, at the same instant and through the same stub.
+
+Also on this path: the array bounds check's length load moved into its cold
+stub (`CMP ECX,[RAX+len] ; JAE` — one instruction and four bytes fewer on every
+emitted bounds check), the safepoint poll became a single RIP-relative `TEST`
+where the flag is in reach, and `ARRAY_LENGTH_OFFSET`'s comment — which said
+"8, not 12" above a value of 4 — is now a const assert against
+`offset_of!(ObjectHeader, shape)`.
+
+Default-on with a switch each: `CRATONVM_DISABLE_ARRAYLEN_LICM`,
+`CRATONVM_JIT_LICM=0`, `CRATONVM_JIT_RIP_SAFEPOINT_POLL=0`,
+`CRATONVM_JIT_FUSED_BOUNDS_LOAD=0`. Probe:
+`probes/ArrayElemLoadCost.java`. See
+`array-element-load-baseline-codegen-FIXED-20260902.md`.
+
 ### 2026-08-06 The `ThreadPoolExecutor.execute` receiver-shape special case is gone
 
 Nine dispatch sites across four files decided whether to run

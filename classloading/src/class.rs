@@ -2582,6 +2582,89 @@ mod tests {
         );
     }
 
+    /// The two name-based walks are NOT interchangeable, and the pair of
+    /// asserts below is the whole reason to prefer one at a call site.
+    ///
+    /// `is_subclass_of_by_name` exists for exception `catch_type` matching,
+    /// where the target is never an interface, so it walks only the superclass
+    /// chain. Its name does not say so, and a caller asking about an INTERFACE
+    /// gets a silent, permanent `false` rather than an error — which is
+    /// indistinguishable from a correct negative and so cannot be noticed
+    /// without a test like this one.
+    ///
+    /// It has been read the wrong way twice. The `Path.toString()` branch in
+    /// `vm/src/runtime/invokedynamic.rs` carries the first write-up (that
+    /// version "never actually fires"); the second was
+    /// `interpreter::typecheck::unmod_backing_reaches`, which decides between
+    /// `Collections$UnmodifiableList` and `Collections$UnmodifiableRandomAccessList`
+    /// for the class the `instanceof`/`checkcast` opcodes consult. It asked
+    /// about `java/util/RandomAccess` — an interface — so it answered `false`
+    /// for every list, and `x instanceof RandomAccess` disagreed with both
+    /// `RandomAccess.class.isInstance(x)` and `x.getClass()`.
+    ///
+    /// The hierarchy below is `ArrayList`'s, shortened to the part that
+    /// matters: the marker is reached through `interfaces`, and there is no
+    /// route to it through `superclass` at all.
+    #[test]
+    fn the_supers_only_name_walk_cannot_see_an_interface_the_dag_walk_finds() {
+        let mut store = ClassStore::new();
+
+        let random_access = store.next_id();
+        store.add(make_class(
+            random_access,
+            "java/util/RandomAccess",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+        let abstract_list = store.next_id();
+        store.add(make_class(
+            abstract_list,
+            "java/util/AbstractList",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+        let array_list = store.next_id();
+        store.add(make_class(
+            array_list,
+            "java/util/ArrayList",
+            Some(abstract_list),
+            vec![random_access],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+
+        let al = store.get(array_list).expect("ArrayList present");
+
+        // The superclass leg: both walks agree, because a superclass IS on the
+        // supers-only path. Asserted so the negative below reads as "interface"
+        // and not as "this walk is broken".
+        assert!(al.is_subclass_of_by_name("java/util/AbstractList", &store));
+        assert!(al.is_assignable_to_name("java/util/AbstractList", &store));
+
+        // The interface leg: they diverge. This is the trap.
+        assert!(
+            !al.is_subclass_of_by_name("java/util/RandomAccess", &store),
+            "if this starts passing, `is_subclass_of_by_name` grew an interface              walk — which is a behaviour change for every exception-`catch_type`              caller and must be justified there, not discovered here",
+        );
+        assert!(
+            al.is_assignable_to_name("java/util/RandomAccess", &store),
+            "the DAG walk is the one a caller asking about an interface must use",
+        );
+
+        // Still a real check in both directions.
+        assert!(!al.is_assignable_to_name("java/util/Deque", &store));
+    }
+
     /// Reordering must not disturb which *index* names which field: the storage
     /// kind recorded at index `i` is still field `i`'s, whatever offset it got.
     #[test]

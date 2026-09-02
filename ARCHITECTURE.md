@@ -29,7 +29,7 @@ cratonvm/
   cuda-bridge/         cuda-bridge                  Thin CUDA Driver API bridge for GPU offload
   craton-gpu/          craton-gpu                   Build-time-only: packages the @GpuKernel/@Parallel Java annotation sources into a jar for jit-cuda's build script; no runtime code
   classloading/        cratonvm-classloading        Class loading & bytecode verification
-  gc/                  cratonvm-gc                  Garbage collectors (default generational semi-space; G1 region-based; ZgcRealHeap STW mark-sweep behind the default-off `zgc` feature)
+  gc/                  cratonvm-gc                  Garbage collectors (ZGC is the DEFAULT since 2026-08-10: concurrent-marking, compacting, optionally generational, behind the default-ON `zgc` feature; generational semi-space and G1 remain selectable)
   jfr/                 cratonvm-jfr                 Java Flight Recorder
   vm/                  cratonvm-vm                  VM runtime engine
   vm-cli/              cratonvm-cli                 CLI entry point
@@ -82,7 +82,7 @@ independently to inspect `.class` files.
 
 ## vm — Virtual Machine
 
-The VM is the core of the project (~1,350,000 Rust LoC across the 22 workspace
+The VM is the core of the project (~2,020,000 Rust LoC across the 22 workspace
 member crates, plus the separate `fuzz` harness workspace).
 It contains six major subsystems (several now extracted into their own
 crates).
@@ -99,20 +99,26 @@ find <the 22 member dirs> -name '*.rs' -type f \
   | xargs -0 cat | wc -l
 ```
 
-which reports roughly 1,350,000 lines across about 700 files.
+which reports roughly 2,020,000 lines (2,018,468 on 2026-09-01) across about
+920 files. Re-measure before quoting it: this figure and the table below stood
+at 1,350,000 for long enough to be wrong by 49%, because nothing regenerates
+them. If you change this paragraph, change the table too — they are derived
+from the same command.
 
 Rough size distribution, largest first, so newcomers know where the mass
 actually is:
 
+Measured 2026-09-02 with the command above, one directory at a time.
+
 | Crate | LoC | Crate | LoC |
 |-------|----:|-------|----:|
-| `native-builtins` | 552,000 | `native-awt` | 18,000 |
-| `vm` | 343,000 | `types` | 17,000 |
-| `jit` | 110,000 | `native-api` | 17,000 |
-| `gc` | 64,000 | `reader` | 14,000 |
-| `classloading` | 57,000 | `jfr` | 14,000 |
-| `native-collections` | 55,000 | `jit-cuda` | 10,000 |
-| `native-io` | 55,000 | remaining 9 | < 7,000 each |
+| `native-builtins` | 742,000 | `native-awt` | 18,000 |
+| `vm` | 453,000 | `types` | 39,000 |
+| `jit` | 237,000 | `native-api` | 36,000 |
+| `gc` | 166,000 | `reader` | 17,000 |
+| `native-collections` | 86,000 | `jfr` | 20,000 |
+| `native-io` | 82,000 | `jit-cuda` | 14,000 |
+| `classloading` | 74,000 | remaining 9 | < 13,000 each |
 
 Several individual files are far larger than is comfortable. The two worst have
 been split at the section banners they already carried:
@@ -201,6 +207,30 @@ The bytecode execution engine.
 - **`call_stack.rs`** — Per-thread call stack of frames.
 - **`value_stack.rs`** — Typed operand stack (SoA encoded).
 - **`exceptions.rs`** — Java exception creation and throw handling.
+- **`stackwalker.rs`** — `Throwable.fillInStackTrace` / `getStackTrace` and
+  `java.lang.StackWalker`. A JIT-compiled method pushes no `Frame`, so this
+  splices the active compiled frames back in at the interpreter depth each was
+  entered at, and expands the callees an artifact inlined — methods that are
+  genuinely executing and that previously contributed no frame at all. As of
+  2026-09-01 a warmed-up trace matches HotSpot byte-for-byte on the checked-in
+  witness `probes/StackTraceAfterOsr.java`.
+
+  The design point worth knowing is the OSR case. An OSR transfer hands the
+  whole rest of a method to compiled code while that activation's interpreter
+  `Frame` stays parked at the back-edge it tiered up from, so its `pc` is stale
+  for the entire window and only the compiled half knows where control is. The
+  bci read out of the compiled half is therefore carried to the surviving frame
+  as a **display-only** override that reaches the trace assembler and nothing
+  else: it is deliberately never written into `Frame::pc`, because
+  `Frame::live_locals_mask_here` computes the per-bci live-locals **GC root
+  filter** from `[pc, last_instr_pc]`, so advancing `pc` would stop every slot
+  that dies in between being a root — on exactly the frame whose locals the
+  conservative half of the JIT root scan is leaning on. (The OSR safe-reject
+  exit is also correct only because `frame.pc` is still `entry_pc`.) The
+  override is produced only on the arm where the OSR entry site itself named the
+  artifact, never on the pc-shape heuristic, and
+  `CRATONVM_JIT_NO_OSR_PC_REFRESH=1` reverts the decision and the line together
+  inside one binary.
 - **`invokedynamic.rs`** — Lambda/method-ref bootstrap via LambdaMetafactory.
 
 ### Typed Bootstrap (`vm/src/vm/vm_init.rs`)
@@ -242,9 +272,9 @@ Implements JVMS Ch. 5: loading, linking, and initialization. Extracted into the
 
 ### Memory (`gc/` crate)
 
-Garbage collectors, extracted into the `cratonvm-gc` crate. The default is the generational collector with the Cheney moving young gen **enabled** — but see **"When the default does not compact"** below: requesting a moving cycle is not the same as running one, because each cycle must still carry a per-cycle root-coverage proof. A region-based G1 collector is also present and opt-in selectable via `-XX:+UseG1GC` (experimental; Generational remains the default safety net during G1 maturation — see `docs/feature-designs/concurrent-gc-maturation.md`). ZGC is feature-gated (`zgc`, not part of the default feature set) and holds two things of very different maturity. `ZgcRealHeap` (`gc/src/zgc.rs:1396`) is a real, memory-backed collector — `Arena` storage, real `ObjectHeader`s, real `java.lang.ref` processing — and it **is** wired end to end: `GcAlgorithm::Zgc` → `GcBackend::Zgc` → `VmHeap::Zgc`, so `-XX:+UseZGC` really selects it. Above it in the same file sits a metadata-only *simulation* of OpenJDK's colored-pointer model (`ZgcCollector` / `ColoredPointer` / `LoadBarrier` / `GenerationalZgc`) with no production consumer. What ZGC is **not** is present in a stock build: the feature is default-off, so `GcAlgorithm::Zgc` and its `parse_gc_algorithm` arm do not exist unless you build `cargo build --release -p cratonvm-cli --features zgc`, and `-XX:+UseZGC` otherwise warns and falls back to Generational. Nor is it production ZGC — it is stop-the-world, non-moving, non-generational, non-compacting, TLAB-less. It stays default-off for pass-rate parity: on the 1975-class Spring Boot suite, same binary with only the collector toggled, it measures 1860 PASS / 49 HANG / 22 FAIL against the default collector's 1902 / 18 / 11. The path to a real one is `docs/feature-designs/zgc-production-implementation-plan.md`.
+Garbage collectors, extracted into the `cratonvm-gc` crate. **ZGC is the default collector**, and has been since 2026-08-10: `gc/Cargo.toml` carries `default = ["zgc"]` and `vm/src/config.rs` defaults `gc_algorithm` to `GcAlgorithm::Zgc`, so a stock `cargo build` both contains ZGC and runs it. `ZgcRealHeap` (`gc/src/zgc.rs`, with `gc/src/zgc_concurrent.rs` and the twelve modules of `gc/src/zgc/`) is a real, memory-backed collector — `Arena` storage, real `ObjectHeader`s, real `java.lang.ref` processing, a default-ON TLAB serving `alloc_object` / `alloc_array` — wired end to end as `GcAlgorithm::Zgc` → `GcBackend::Zgc` → `VmHeap::Zgc`, so `-XX:+UseZGC` also names it explicitly. It has colored pointers (`zgc/vaddr.rs`), a load barrier (`zgc/barrier.rs::z_load`), concurrent marking (`zgc_concurrent.rs`, `CRATONVM_ZGC_CONC_START`), compaction (`zgc/relocate.rs`, kill switch `CRATONVM_ZGC_RELOCATE=0`) and an opt-in generational mode (`zgc/generation.rs`, `CRATONVM_ZGC_GENERATIONAL=1`). The generational collector — young + old gen, with the Cheney moving young gen *requested* by default on that backend, but see **"When the generational backend does not compact"** below — stays selectable with `-XX:+UseGenerationalGC` and is what a `--no-default-features` build falls back to. A region-based G1 collector is opt-in via `-XX:+UseG1GC` (experimental — see `docs/feature-designs/concurrent-gc-maturation.md`). Above `ZgcRealHeap` in the same file sits a metadata-only *simulation* of OpenJDK's colored-pointer model (`ZgcCollector` / `ColoredPointer` / `LoadBarrier` / `GenerationalZgc`) with no production consumer; do not read those type names as the shipping path.
 
-> `ZgcRealHeap` **is** wired into backend dispatch — `gc/src/vm_heap.rs` imports it and `VmHeap::Zgc` has real arms. What gates it is the default-off Cargo feature, restated above. The working build command is `-p cratonvm-cli --features zgc`; `--features cratonvm-vm/zgc` also reaches the gated code.
+> **The colored-pointer load barrier is plumbed but not armed, and that distinction is the entire status.** *Plumbed:* `gc/src/vm_heap.rs::load_ref_slot_barriered` is the backend-dispatching seam, delegating to `ZgcRealHeap::load_barrier_slot` on the `Zgc` arm and refusing under compressed oops, because a colored word does not fit in a 4-byte slot (ZGC and compressed oops are mutually refused at VM init in any case). `types/src/narrow_oop.rs`'s `read_ref_slot` / `write_ref_slot` and ZGC's own compaction slot-rewrite are now `Relaxed` atomics rather than plain accesses, because a plain write racing the barrier's self-healing `compare_exchange` is undefined behaviour and not merely a lost update. The JIT's compact-field reference read routes through the seam, and the inline `aastore` arm (`jit/src/x64/bytecode_walk.rs`, opcode `0x53`) now consults the same armed gate its compact-field siblings already did, falling back to the fully chokepointed `jit_aastore` helper. *Not armed:* `vm/src/vm/vm_init.rs` pins `const RELOCATION_REQUESTED: bool = false`, `ZgcRealHeap::set_barrier_color` — the sole writer of the colored state — has no non-test caller, and `barrier_good_mask` never leaves `Z_REMAPPED`, so every shipping configuration evaluates the same plain read it did before and all of the above is inert by construction. Still open, in order: `jit_aaload` receives no `vm_ptr` and so cannot reach a `&VmHeap` without an ABI change, and it is the hotter of the two slot-holding sites; the sites that hold an `ObjectRef` rather than a slot (`types/src/value.rs::read_value_atomic`'s reference arm, `vm::get_static_shared`) are blocked on static and legacy slots not being atomic; and arming must happen at a safepoint, because an emission-time gate cannot reach already-compiled code. The ordered work list with each step's status is the doc comment on `VmHeap::load_ref_slot_barriered`; the counters that would show the barrier had actually run are `vm/src/jit/helpers.rs::ref_load_census` (`BARRIERED_LOADS`, `UNBARRIERED_LOADS`, `COLORED_WORDS_SEEN`). Design: `docs/feature-designs/zgc-jit-load-barrier.md`; the rest of the plan: `docs/feature-designs/zgc-production-implementation-plan.md`.
 
 - **`heap.rs`** — Object/array layout and allocation (semi-space).
 - **`gen_heap.rs`** — Generational heap: young gen (copying) + old gen.
@@ -255,8 +285,8 @@ Garbage collectors, extracted into the `cratonvm-gc` crate. The default is the g
 - **`roots.rs`** — Root scanning and pointer remapping.
 - **`old_gen.rs`** — Old generation management.
 
-**When the default does not compact.** The flag gate is gone; the per-cycle
-proof is not. Read both before reasoning about allocation-path or GC-pause code.
+**When the generational backend does not compact.** The flag gate is gone; the
+per-cycle proof is not. Read both before reasoning about allocation-path or GC-pause code.
 
 1. `moving_young` is an **opt-out** flag that defaults to **true** —
    `types/src/flags.rs::DEFAULT_MOVING_YOUNG`, shaped as
@@ -291,8 +321,8 @@ proof is not. Read both before reasoning about allocation-path or GC-pause code.
    never run a moving cycle under a live JIT frame, the only case the feature
    exists for. That term and the `CRATONVM_ALLOW_MOVING_YOUNG` flag are gone.)
 
-So on a JIT-warm workload a default build can still spend cycles in the
-**generational non-moving mark-sweep with selective promotion** path — that is
+So on a JIT-warm workload a run on the generational backend can still spend
+cycles in the **generational non-moving mark-sweep with selective promotion** path — that is
 what a nonzero `coverage_fallbacks` count means, and it is the number to read
 before attributing a pause profile to compaction.
 
@@ -311,7 +341,7 @@ collector and the workload that justifies it. The open items are the `pointer_ma
 
 **Object layout:**
 ```
-[ObjectHeader (32 bytes)] [field0] [field1] ...
+[ObjectHeader (16 bytes)] [field0] [field1] ...
 ```
 
 Field cell width depends on the field's type and on the layout in force
@@ -329,12 +359,19 @@ Field cell width depends on the field's type and on the layout in force
 (`ref_offsets`). The interpreter/native `Value` enum is a boundary type, not
 the physical instance-field representation.
 
-The 32-byte header (`ObjectHeader`, `types/src/heap_types.rs`) is the current
-compatibility contract. A 24- or 16-byte header would require a separate object
-model: folding forwarding state into the mark word couples collector relocation
-to thin/inflated monitor state, while removing the identity hash alone saves no
-space after alignment. Header compression is therefore an experiment, not an
-unfinished requirement of the compact field layout.
+The header is **16 bytes** (`HEADER_SIZE`, `types/src/heap_types.rs`):
+`class_id` (4) + `shape` (4) + `mark_word` (8).
+
+This paragraph used to describe a 32-byte header and call compression "an
+experiment, not an unfinished requirement", listing the two reasons it could not
+shrink: folding forwarding state into the mark word would couple relocation to
+monitor state, and removing the identity hash alone saves nothing after
+alignment. Both were answered rather than avoided. The mark word absorbed the
+header three times over 2026-08-06/07 -- `forwarding_ptr` (32 -> 24), then
+`identity_hash_code`, then the `kind` / `element_type` / `gc_age` / `gc_flags`
+quartet into bits 48..63 (24 -> 16). The identity-hash fold is the instructive
+one: it did buy zero on its own, exactly as the old paragraph said, and it was
+the prerequisite for the eight bytes the quartet's move then paid out.
 
 Arrays use compact element sizes (1/2/4/8 bytes per element depending on type;
 `element_byte_size`), with reference elements at `REF_ELEMENT_SIZE` = 8 B.
