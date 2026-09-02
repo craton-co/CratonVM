@@ -229,6 +229,35 @@ fn speculation_cost(text: &str) -> Option<u32> {
     Some(cost)
 }
 
+/// `CRATONVM_GPU_BLOCK_REDUCE=0` stops the reduction epilogue after the
+/// warp fold, so each warp issues its own atomic.
+///
+/// Default-on. The block stage combines the per-warp partials through
+/// shared memory so the whole block issues ONE `red.global.add` instead
+/// of one per warp -- at the 256-thread block the occupancy query
+/// usually picks, 8x fewer atomics into the single accumulator cell.
+/// The switch exists because this is codegen: it prices the change on
+/// one binary, and it is the arm to reach for if a reduction ever
+/// disagrees with HotSpot.
+/// Name of the per-block scratch the reduction's block stage folds
+/// through. One 8-byte slot per warp; 32 warps is the most a CTA can
+/// have (1024 threads), so 256 bytes covers every legal launch.
+const REDUCE_SMEM: &str = "cvm_reduce_partials";
+
+/// The declaration for [`REDUCE_SMEM`], emitted at the top of a kernel
+/// body only when the block stage is present. `.align 8` because the
+/// widest slot is a `long` or a `double`.
+pub(crate) const REDUCE_SMEM_DECL: &str = "    .shared .align 8 .b8 cvm_reduce_partials[256];\n";
+
+fn block_reduce_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_GPU_BLOCK_REDUCE")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off"))
+            .unwrap_or(true)
+    })
+}
+
 /// The budget `CRATONVM_GPU_IF_CONVERT=1` selects: the least-bad setting
 /// the sweep found, which is a tie with the feature off rather than a win.
 /// Everything cheaper and everything dearer measured worse.
@@ -418,6 +447,11 @@ pub(crate) struct Emitter<'a> {
     /// retires can still join the warp tree carrying a zero rather than
     /// leave a hole in it. `None` for every other shape.
     pub reduction_acc: Option<Reg>,
+    /// Set when the reduction epilogue emitted its block stage, so
+    /// `finalize_epilogue` knows to declare [`REDUCE_SMEM`] and to route
+    /// the bounds-fail exit through the barrier. See
+    /// [`Emitter::emit_block_fold`].
+    pub(crate) uses_reduce_smem: bool,
     /// Phase 10 #2 — bit-set of parameter indices the body writes to
     /// via `*astore`. Each `array_store*` arm in the opcode dispatch
     /// resolves the array reference back to its parameter via
@@ -484,6 +518,7 @@ impl<'a> Emitter<'a> {
             hit_back_branch: false,
             ret_value_reg: None,
             reduction_acc: None,
+            uses_reduce_smem: false,
             writes_param_mask: 0,
             reads_param_mask: 0,
             cp,
@@ -947,7 +982,19 @@ impl<'a> Emitter<'a> {
                 flag_ptr.name, one.name
             )
             .unwrap();
-            writeln!(self.body, "    ret;").unwrap();
+            if self.uses_reduce_smem {
+                // NOT `ret`. The reduction's block stage has a `bar.sync`,
+                // and a thread that returns from the middle of the kernel
+                // while its block waits at that barrier is a hang. The
+                // failing thread contributes a zero and arrives with
+                // everyone else; the host throws the whole result away on
+                // the flag this block just raised, so its contribution
+                // cannot be observed — only its arrival matters. See
+                // `emit_block_fold`.
+                writeln!(self.body, "    bra L_reduce_zero;").unwrap();
+            } else {
+                writeln!(self.body, "    ret;").unwrap();
+            }
         }
     }
 
@@ -4738,6 +4785,43 @@ impl<'a> Emitter<'a> {
         writeln!(self.body, "L_reduce_zero:").unwrap();
         writeln!(self.body, "    mov{mov_suffix} {}, {zero};", acc.name).unwrap();
         writeln!(self.body, "L_reduce:").unwrap();
+        self.emit_warp_fold(acc, add, wide);
+        if block_reduce_enabled() {
+            self.emit_block_fold(acc, add, wide, mov_suffix, zero);
+        }
+        let lane = self.regs.fresh_reg(RegKind::U32);
+        let is_lane0 = self.regs.fresh_reg(RegKind::Pred);
+        let nonzero = self.regs.fresh_reg(RegKind::Pred);
+        let do_add = self.regs.fresh_reg(RegKind::Pred);
+        let ret_ptr = self.regs.fresh_reg(RegKind::U64);
+        writeln!(self.body, "L_reduce_atomic:").unwrap();
+        writeln!(self.body, "    mov.u32 {}, %laneid;", lane.name).unwrap();
+        writeln!(self.body, "    setp.eq.u32 {}, {}, 0;", is_lane0.name, lane.name).unwrap();
+        writeln!(
+            self.body,
+            "    setp.ne{mov_suffix} {}, {}, {zero};",
+            nonzero.name, acc.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    and.pred {}, {}, {};",
+            do_add.name, is_lane0.name, nonzero.name
+        )
+        .unwrap();
+        writeln!(self.body, "    ld.param.u64 {}, [ret_ptr];", ret_ptr.name).unwrap();
+        writeln!(
+            self.body,
+            "    @{} red.global.add{atomic_suffix} [{}], {};",
+            do_add.name, ret_ptr.name, acc.name
+        )
+        .unwrap();
+        writeln!(self.body, "L_reduce_done:").unwrap();
+    }
+
+    /// Fold a warp's 32 lanes into lane 0 with five `shfl.sync.down`
+    /// steps. See [`Emitter::finalize_epilogue`] for the mask argument.
+    fn emit_warp_fold(&mut self, acc: &Reg, add: &str, wide: bool) {
         for offset in [16u32, 8, 4, 2, 1] {
             let other = self.regs.fresh_reg_with_wide(acc.kind, acc.wide);
             if wide {
@@ -4780,32 +4864,104 @@ impl<'a> Emitter<'a> {
             )
             .unwrap();
         }
+    }
+
+    /// Combine the per-warp partials through shared memory so the whole
+    /// block issues one atomic instead of one per warp.
+    ///
+    /// Lane 0 of each warp stores its folded value into
+    /// `cvm_reduce_partials[warpid]`; after one `bar.sync` warp 0 loads
+    /// the `nwarps` slots (zero beyond them) and folds those the same
+    /// way. Thread 0 then carries the block total into the atomic tail.
+    ///
+    /// # The barrier is why the bounds-fail exit had to move
+    ///
+    /// `bar.sync` is satisfied when the block's threads arrive, and the
+    /// bounds-check deopt used to `ret` straight out of the middle of the
+    /// kernel. One thread taking that exit while its neighbours wait is a
+    /// HANG rather than a wrong answer -- the worst failure this file can
+    /// produce. `finalize_epilogue` therefore ends that block with a jump
+    /// to `L_reduce_zero` instead: the failing thread raises the flag,
+    /// contributes a zero and reaches the barrier with everyone else. The
+    /// host discards the whole result when the flag is up, so what it
+    /// contributes cannot matter -- only that it arrives.
+    ///
+    /// # One warp per block skips all of it
+    ///
+    /// `ntid.x <= 32` means the warp fold already produced the block
+    /// total. Branching past the block stage also keeps a
+    /// smaller-than-a-warp block away from a barrier it does not need.
+    fn emit_block_fold(
+        &mut self,
+        acc: &Reg,
+        add: &str,
+        wide: bool,
+        mem_suffix: &str,
+        zero: &str,
+    ) {
+        self.uses_reduce_smem = true;
+        let ntid = self.regs.fresh_reg(RegKind::U32);
+        let single_warp = self.regs.fresh_reg(RegKind::Pred);
+        writeln!(self.body, "    mov.u32 {}, %ntid.x;", ntid.name).unwrap();
+        writeln!(
+            self.body,
+            "    setp.le.u32 {}, {}, 32;",
+            single_warp.name, ntid.name
+        )
+        .unwrap();
+        writeln!(self.body, "    @{} bra L_reduce_atomic;", single_warp.name).unwrap();
+
+        let tid = self.regs.fresh_reg(RegKind::U32);
+        let warpid = self.regs.fresh_reg(RegKind::U32);
         let lane = self.regs.fresh_reg(RegKind::U32);
         let is_lane0 = self.regs.fresh_reg(RegKind::Pred);
-        let nonzero = self.regs.fresh_reg(RegKind::Pred);
-        let do_add = self.regs.fresh_reg(RegKind::Pred);
-        let ret_ptr = self.regs.fresh_reg(RegKind::U64);
+        let smem = self.regs.fresh_reg(RegKind::U64);
+        let off = self.regs.fresh_reg(RegKind::U64);
+        let addr = self.regs.fresh_reg(RegKind::U64);
+        writeln!(self.body, "    mov.u32 {}, %tid.x;", tid.name).unwrap();
+        writeln!(self.body, "    shr.u32 {}, {}, 5;", warpid.name, tid.name).unwrap();
         writeln!(self.body, "    mov.u32 {}, %laneid;", lane.name).unwrap();
         writeln!(self.body, "    setp.eq.u32 {}, {}, 0;", is_lane0.name, lane.name).unwrap();
+        writeln!(self.body, "    mov.u64 {}, {};", smem.name, REDUCE_SMEM).unwrap();
+        writeln!(self.body, "    mul.wide.u32 {}, {}, 8;", off.name, warpid.name).unwrap();
+        writeln!(self.body, "    add.u64 {}, {}, {};", addr.name, smem.name, off.name).unwrap();
         writeln!(
             self.body,
-            "    setp.ne{mov_suffix} {}, {}, {zero};",
-            nonzero.name, acc.name
+            "    @{} st.shared{mem_suffix} [{}], {};",
+            is_lane0.name, addr.name, acc.name
         )
         .unwrap();
+        writeln!(self.body, "    bar.sync 0;").unwrap();
+
+        // Everything past here belongs to warp 0; the rest of the block
+        // has arrived at the barrier and is done.
+        let not_warp0 = self.regs.fresh_reg(RegKind::Pred);
+        writeln!(self.body, "    setp.gt.u32 {}, {}, 31;", not_warp0.name, tid.name).unwrap();
+        writeln!(self.body, "    @{} bra L_reduce_done;", not_warp0.name).unwrap();
+
+        let nwarps = self.regs.fresh_reg(RegKind::U32);
+        let rounded = self.regs.fresh_reg(RegKind::U32);
+        let has_slot = self.regs.fresh_reg(RegKind::Pred);
+        let off2 = self.regs.fresh_reg(RegKind::U64);
+        let addr2 = self.regs.fresh_reg(RegKind::U64);
+        writeln!(self.body, "    add.u32 {}, {}, 31;", rounded.name, ntid.name).unwrap();
+        writeln!(self.body, "    shr.u32 {}, {}, 5;", nwarps.name, rounded.name).unwrap();
         writeln!(
             self.body,
-            "    and.pred {}, {}, {};",
-            do_add.name, is_lane0.name, nonzero.name
+            "    setp.lt.u32 {}, {}, {};",
+            has_slot.name, tid.name, nwarps.name
         )
         .unwrap();
-        writeln!(self.body, "    ld.param.u64 {}, [ret_ptr];", ret_ptr.name).unwrap();
+        writeln!(self.body, "    mov{mem_suffix} {}, {};", acc.name, zero).unwrap();
+        writeln!(self.body, "    mul.wide.u32 {}, {}, 8;", off2.name, tid.name).unwrap();
+        writeln!(self.body, "    add.u64 {}, {}, {};", addr2.name, smem.name, off2.name).unwrap();
         writeln!(
             self.body,
-            "    @{} red.global.add{atomic_suffix} [{}], {};",
-            do_add.name, ret_ptr.name, acc.name
+            "    @{} ld.shared{mem_suffix} {}, [{}];",
+            has_slot.name, acc.name, addr2.name
         )
         .unwrap();
+        self.emit_warp_fold(acc, add, wide);
     }
 }
 

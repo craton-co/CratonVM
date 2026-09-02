@@ -1773,6 +1773,15 @@ pub const INVENTORY: &[E] = &[
     // binary both ways.
     E { group: Group::GC, token: "gpu-host-callback", on_key: Some("CRATONVM_GPU_HOST_CALLBACK"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "gpu-device-pool", on_key: Some("CRATONVM_GPU_DEVICE_POOL"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // `gpu-wait-latch` is DEFAULT-ON with a "0" off-word, same argument as
+    // `gpu-device-pool`: skipping a `cuStreamWaitEvent` on an event that has
+    // already fired has no observable semantics, so the only honest way to
+    // price it is one binary both ways.
+    E { group: Group::GC, token: "gpu-wait-latch", on_key: Some("CRATONVM_GPU_WAIT_LATCH"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // `gpu-block-reduce` is the codegen arm: with it off a reduction stops
+    // after the warp fold and each warp issues its own atomic. Default-on,
+    // "0" off-word, same one-binary argument as the two above.
+    E { group: Group::GC, token: "gpu-block-reduce", on_key: Some("CRATONVM_GPU_BLOCK_REDUCE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "gpu-zerocopy", on_key: None, off_key: Some("CRATONVM_GPU_NO_ZEROCOPY"), off_word: None, since: "2026-06-16" },
     // Measurement lever: root every heap-backed LinkedHashMap overlay entry
     // again, restoring the unbounded young-gen pinning the skip-set removed.
