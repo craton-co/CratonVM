@@ -577,7 +577,11 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
+<<<<<<< HEAD
+257 tokens.
+=======
 265 tokens.
+>>>>>>> origin/dev
 
 | Token | Expands to |
 | --- | --- |
@@ -672,6 +676,8 @@ export inherited from a parent shell.
 | `precise-alloc-athrow` | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` |
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
+| `gated-ref-store` | `CRATONVM_JIT_GATED_REF_STORE` |
+| `operand-cache` | `CRATONVM_JIT_OPERAND_CACHE` |
 | `ir-reloc-emit` | `CRATONVM_JIT_IR_RELOC_EMIT` |
 | `reloc-gate-map-incomplete` | `CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE` |
 | `ir-selfrec-direct` | `CRATONVM_JIT_IR_SELFREC_DIRECT` |
