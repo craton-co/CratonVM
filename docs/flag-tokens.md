@@ -580,7 +580,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-297 tokens.
+300 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -619,6 +619,7 @@ export inherited from a parent shell.
 | `c2-first-call` | `CRATONVM_JIT_C2_FIRST_CALL` |
 | `c2-supersede` | `CRATONVM_C2_SUPERSEDE` |
 | `callee-oop-flush` | `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH` |
+| `spill-slots-cap` | `CRATONVM_JIT_SPILL_SLOTS_CAP` |
 | `code-cache-max-mb` | `CRATONVM_JIT_CODE_CACHE_MAX_MB` |
 | `conservative-locals` | `CRATONVM_NO_CONSERVATIVE_LOCALS` |
 | `ctor-direct-call` | `CRATONVM_NO_CTOR_DIRECT_CALL` |
@@ -654,6 +655,8 @@ export inherited from a parent shell.
 | `inclusive-bce` | `CRATONVM_JIT_INCLUSIVE_BCE` |
 | `inline-allow-static` | `CRATONVM_INLINE_ALLOW_STATIC` |
 | `inline-getfield` | `CRATONVM_JIT_INLINE_GETFIELD` |
+| `string-access-inline-rows` | `CRATONVM_JIT_NO_STRING_ACCESS_INLINE_ROWS` |
+| `licm-read-hoist` | `CRATONVM_JIT_NO_LICM_READ_HOIST` |
 | `inline-live-slot-clamp` | `CRATONVM_JIT_NO_INLINE_LIVE_SLOT_CLAMP` |
 | `inline-new` | `CRATONVM_JIT_DISABLE_INLINE_NEW` |
 | `inline-putfield` | `CRATONVM_NO_JIT_INLINE_PUTFIELD` |
@@ -884,7 +887,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-114 tokens.
+119 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -922,9 +925,14 @@ export inherited from a parent shell.
 | `zgc-markbits` | `CRATONVM_ZGC_MARKBITS` |
 | `zgc-page-pinned-relocate` | `CRATONVM_ZGC_PAGE_PINNED_RELOCATE` |
 | `zgc-parsweep` | `CRATONVM_ZGC_PARSWEEP` |
+| `zgc-bitmap-sweep` | `CRATONVM_ZGC_BITMAP_SWEEP` |
+| `zgc-mark-root-filter` | `CRATONVM_ZGC_MARK_ROOT_FILTER` |
+| `zgc-jit-tlab` | `CRATONVM_ZGC_JIT_TLAB` |
+| `zgc-tlab-tail-sink` | `CRATONVM_ZGC_TLAB_TAIL_SINK` |
 | `g1-reserve-heap` | `CRATONVM_G1_RESERVE_HEAP` |
 | `g1-uncommit` | `CRATONVM_G1_UNCOMMIT` |
 | `g1-card-rset` | `CRATONVM_G1_CARD_RSET` |
+| `g1-card-clean` | `CRATONVM_G1_CARD_CLEAN` |
 | `g1-inline-barrier` | `CRATONVM_G1_INLINE_BARRIER` |
 | `g1-mark-lock-yield` | `CRATONVM_G1_MARK_LOCK_YIELD` |
 | `g1-shared-alloc` | `CRATONVM_G1_SHARED_ALLOC` |
@@ -1130,7 +1138,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-23 tokens.
+25 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1152,11 +1160,13 @@ export inherited from a parent shell.
 | `mockito-legacy-selectors` | `CRATONVM_MOCKITO_LEGACY_SELECTORS` |
 | `stackwalker-jdk-walk` | `CRATONVM_SW_JDK_WALK` |
 | `jdk-random` | `CRATONVM_JDK_RANDOM` |
+| `jdk-scanner` | `CRATONVM_JDK_SCANNER` |
 | `strict-swallows` | `CRATONVM_STRICT_SWALLOWS` |
 | `tomcat-mapper-natives` | `CRATONVM_TOMCAT_MAPPER_NATIVES` |
 | `vh-strict-reference-return` | `CRATONVM_VH_STRICT_REFERENCE_RETURN` |
 | `vh-null-coordinate-npe` | `CRATONVM_VH_NULL_COORDINATE_NPE` |
 | `vh-unsupported-mode-uoe` | `CRATONVM_VH_UNSUPPORTED_MODE_UOE` |
+| `vh-read-only-handle-uoe` | `CRATONVM_VH_READ_ONLY_HANDLE_UOE` |
 
 ## `CRATONVM_TEST`
 

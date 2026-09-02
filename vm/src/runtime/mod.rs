@@ -71,7 +71,6 @@ pub mod stackwalker;
 pub mod gpu_marshal;
 
 #[cfg(feature = "gpu-offload")]
-pub mod gpu_residency;
 
 /// Built-in device kernels shipped as PTX, for work the bytecode
 /// lowering cannot express (see the module docs).

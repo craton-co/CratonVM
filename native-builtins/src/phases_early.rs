@@ -11719,6 +11719,34 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(tu)),
             );
         }
+        // `$VALUES`, which `Class.getEnumConstants` and through it
+        // `EnumSet.allOf` read. Without it `EnumSet.allOf(TimeUnit.class)`
+        // answered 0 against HotSpot's 7 while every direct use of the enum
+        // worked (`apps/probes/SyntheticEnumSurface`).
+        //
+        // RE-READ from the statics rather than filled from the refs minted
+        // above: `new_ref_array` allocates and can move them. The re-read is
+        // also what makes `values()[i] == CONSTANT`, which `Enum.valueOf`,
+        // `getEnumConstants` and `EnumSet` all rely on. Same obligation
+        // `publish_synthetic_enum_constants` states for the enums that use it;
+        // this clinit predates that helper and keeps its own by-name writes
+        // because real `TimeUnit` interleaves static `long` scalars with the
+        // enum refs, so slot-index writes misplace them.
+        if let Some(cid) = ctx.class_id_by_name("java/util/concurrent/TimeUnit") {
+            let values = ctx.new_ref_array(cid, NAMES.len());
+            for (i, name) in NAMES.iter().enumerate() {
+                let published = match ctx.static_field_index_by_name(cid, name) {
+                    Some(slot) => ctx.get_static_field(cid, slot),
+                    None => Value::Object(None),
+                };
+                ctx.set_array_element(values, i, published);
+            }
+            ctx.set_static_field_by_name(
+                "java/util/concurrent/TimeUnit",
+                "$VALUES",
+                Value::Object(Some(values)),
+            );
+        }
         Ok(None)
     });
     r.register(

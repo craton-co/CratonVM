@@ -19301,7 +19301,7 @@ fn linked_list_add_all() {
 ///
 /// Kept rather than deleted for the reason the census gives: the assertions are
 /// the right ones if an ArrayDeque iterator is ever minted here again.
-/// `docs/internal/fixed-suite-bugs/iterator-carrier-census-20260902.md`.
+/// `fixed-suite-bugs/iterator-carrier-census-20260902.md`.
 #[ignore = "ArrayDeque.iterator() and ArrayDeque$Itr are both deliberately             unregistered; see the iterator-carrier census"]
 #[test]
 fn array_deque_iterator() {
@@ -28692,7 +28692,7 @@ fn countdown_latch_extra_countdown_noop() {
     assert_eq!(count, Value::Long(0));
 }
 
-#[ignore = "STALE: the test passes a NULL TimeUnit and expects `false`. HotSpot throws NullPointerException: Cannot invoke \"java.util.concurrent.TimeUnit.toNanos(long)\" because \"unit\" is null -- verified on 25.0.3 -- and CratonVM now throws the identical message, so the CURRENT behaviour is correct and the assertion is not. It passed only while a synthetic CountDownLatch.await native ignored its TimeUnit argument. Triaged 2026-09-02 as part of the supposed enum-constant cluster; it is not an enum defect. docs/internal/fixed-suite-bugs/synthetic-jdk-enum-surface-20260902.md"]
+#[ignore = "STALE: the test passes a NULL TimeUnit and expects `false`. HotSpot throws NullPointerException: Cannot invoke \"java.util.concurrent.TimeUnit.toNanos(long)\" because \"unit\" is null -- verified on 25.0.3 -- and CratonVM now throws the identical message, so the CURRENT behaviour is correct and the assertion is not. It passed only while a synthetic CountDownLatch.await native ignored its TimeUnit argument. Triaged 2026-09-02 as part of the supposed enum-constant cluster; it is not an enum defect. fixed-suite-bugs/synthetic-jdk-enum-surface-20260902.md"]
 #[test]
 fn countdown_latch_await_timeout_returns_result() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -28998,7 +28998,7 @@ fn semaphore_fair_mode() {
     assert_eq!(fair, Value::Int(1));
 }
 
-#[ignore = "STALE: CyclicBarrier natives are registered only in synthetic-AQS mode or at runtime under --synthetic-jdk; the real-AQS default (which this harness builds) runs the real JDK class. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. docs/internal/fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
+#[ignore = "STALE: CyclicBarrier natives are registered only in synthetic-AQS mode or at runtime under --synthetic-jdk; the real-AQS default (which this harness builds) runs the real JDK class. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
 #[test]
 fn cyclic_barrier_basic() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -29100,7 +29100,7 @@ fn cb_await_waiting_count(shared: &Arc<SharedVm>, barrier: ObjectRef, want: i32)
 /// parties on three threads. Each gets a distinct arrival index and the
 /// set of them is exactly {2, 1, 0}, which subsumes the old assertion
 /// without depending on which thread arrives first.
-#[ignore = "STALE: CyclicBarrier natives are registered only in synthetic-AQS mode or at runtime under --synthetic-jdk; the real-AQS default (which this harness builds) runs the real JDK class. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. docs/internal/fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
+#[ignore = "STALE: CyclicBarrier natives are registered only in synthetic-AQS mode or at runtime under --synthetic-jdk; the real-AQS default (which this harness builds) runs the real JDK class. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
 #[test]
 fn cyclic_barrier_await_sequence() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -29191,7 +29191,7 @@ fn cyclic_barrier_await_sequence() {
 /// honouring the rendezvous. Resetting a barrier nobody is waiting on
 /// also tested nothing — the interesting case is precisely the one with
 /// a parked waiter, which is what this now sets up.
-#[ignore = "STALE: CyclicBarrier natives are registered only in synthetic-AQS mode or at runtime under --synthetic-jdk; the real-AQS default (which this harness builds) runs the real JDK class. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. docs/internal/fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
+#[ignore = "STALE: CyclicBarrier natives are registered only in synthetic-AQS mode or at runtime under --synthetic-jdk; the real-AQS default (which this harness builds) runs the real JDK class. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
 #[test]
 fn cyclic_barrier_reset() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -29293,7 +29293,7 @@ fn countdown_latch_negative_count_throws() {
     assert!(result.is_err());
 }
 
-#[ignore = "STALE: CyclicBarrier natives are registered only in synthetic-AQS mode or at runtime under --synthetic-jdk; the real-AQS default (which this harness builds) runs the real JDK class. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. docs/internal/fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
+#[ignore = "STALE: CyclicBarrier natives are registered only in synthetic-AQS mode or at runtime under --synthetic-jdk; the real-AQS default (which this harness builds) runs the real JDK class. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
 #[test]
 fn cyclic_barrier_zero_parties_throws() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -37214,7 +37214,7 @@ fn enum_set_basic_operations() {
     assert_eq!(size, Value::Int(1));
 }
 
-#[ignore = "STALE: the test passes a NULL Class to EnumMap(Class) and expects it to construct. HotSpot throws NullPointerException: Cannot invoke \"java.lang.Class.getEnumConstantsShared()\" because \"klass\" is null -- verified on 25.0.3 -- and CratonVM throws the identical message. Not an enum defect either; the real EnumMap gap it was thought to expose (put's erased descriptor is (Ljava/lang/Enum;Ljava/lang/Object;), not (Object,Object)) was found by probe and is FIXED. docs/internal/fixed-suite-bugs/synthetic-jdk-enum-surface-20260902.md"]
+#[ignore = "STALE: the test passes a NULL Class to EnumMap(Class) and expects it to construct. HotSpot throws NullPointerException: Cannot invoke \"java.lang.Class.getEnumConstantsShared()\" because \"klass\" is null -- verified on 25.0.3 -- and CratonVM throws the identical message. Not an enum defect either; the real EnumMap gap it was thought to expose (put's erased descriptor is (Ljava/lang/Enum;Ljava/lang/Object;), not (Object,Object)) was found by probe and is FIXED. fixed-suite-bugs/synthetic-jdk-enum-surface-20260902.md"]
 #[test]
 fn enum_map_put_get_size() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -46344,7 +46344,7 @@ fn abstract_map_equals_is_deliberately_not_registered_p60() {
     }
 }
 
-#[ignore = "STALE: The HttpClient enum CONSTANTS are not populated here. Same root cause as countdown_latch_await_timeout_returns_result (null TimeUnit) and enum_map_put_get_size (getEnumConstantsShared) — see the triage doc, which keeps those two LIVE. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. docs/internal/fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
+#[ignore = "STALE: The HttpClient enum CONSTANTS are not populated here. Same root cause as countdown_latch_await_timeout_returns_result (null TimeUnit) and enum_map_put_get_size (getEnumConstantsShared) — see the triage doc, which keeps those two LIVE. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
 #[test]
 fn http_version_enums_p60() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -46373,7 +46373,7 @@ fn http_version_enums_p60() {
     assert!(v2.as_object().is_some());
 }
 
-#[ignore = "STALE: The HttpClient enum CONSTANTS are not populated here. Same root cause as countdown_latch_await_timeout_returns_result (null TimeUnit) and enum_map_put_get_size (getEnumConstantsShared) — see the triage doc, which keeps those two LIVE. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. docs/internal/fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
+#[ignore = "STALE: The HttpClient enum CONSTANTS are not populated here. Same root cause as countdown_latch_await_timeout_returns_result (null TimeUnit) and enum_map_put_get_size (getEnumConstantsShared) — see the triage doc, which keeps those two LIVE. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
 #[test]
 fn http_redirect_enums_p60() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -53638,7 +53638,7 @@ fn thread_state_value_of_p71() {
     }
 }
 
-#[ignore = "STALE: ThreadGroup's 19 natives were retired 2026-08-23 (80d60e911) as a FIX, not a removal: activeCount() was a VM-WIDE count that ignored its receiver. 17 checks, identical to HotSpot after. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. docs/internal/fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
+#[ignore = "STALE: ThreadGroup's 19 natives were retired 2026-08-23 (80d60e911) as a FIX, not a removal: activeCount() was a VM-WIDE count that ignored its receiver. 17 checks, identical to HotSpot after. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
 #[test]
 fn thread_group_basics_p71() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -56390,7 +56390,7 @@ fn character_is_emoji_p64() {
     assert_eq!(result4, Some(Value::Int(1)));
 }
 
-#[ignore = "STALE: Removed by the wave-3 constant-stub sweep (077c84a18) or a later jdk-only wave; the real bytecode serves it now. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. docs/internal/fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
+#[ignore = "STALE: Removed by the wave-3 constant-stub sweep (077c84a18) or a later jdk-only wave; the real bytecode serves it now. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
 #[test]
 fn sb_repeat_string_p64() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -59782,7 +59782,7 @@ fn input_stream_transfer_to_p72() {
 }
 
 /// InputStream.readAllBytes() collects all remaining bytes into a new array.
-#[ignore = "STALE: Removed by the wave-3 constant-stub sweep (077c84a18) or a later jdk-only wave; the real bytecode serves it now. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. docs/internal/fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
+#[ignore = "STALE: Removed by the wave-3 constant-stub sweep (077c84a18) or a later jdk-only wave; the real bytecode serves it now. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
 #[test]
 fn input_stream_read_all_bytes_p72() {
     let mut vm = Vm::new(VmConfig::default());
@@ -65488,7 +65488,7 @@ fn m3_function_identity_apply() {
     }
 }
 
-#[ignore = "STALE: The seven java.util.function default/static stubs were deleted 2026-08-20 (b81aae8fc): javap shows none is ACC_NATIVE and all have real bodies. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. docs/internal/fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
+#[ignore = "STALE: The seven java.util.function default/static stubs were deleted 2026-08-20 (b81aae8fc): javap shows none is ACC_NATIVE and all have real bodies. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
 #[test]
 fn m3_consumer_and_then_creates_composite() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -65606,7 +65606,7 @@ fn m3_function_compose_apply_chains_correctly() {
     }
 }
 
-#[ignore = "STALE: The seven java.util.function default/static stubs were deleted 2026-08-20 (b81aae8fc): javap shows none is ACC_NATIVE and all have real bodies. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. docs/internal/fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
+#[ignore = "STALE: The seven java.util.function default/static stubs were deleted 2026-08-20 (b81aae8fc): javap shows none is ACC_NATIVE and all have real bodies. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
 #[test]
 fn m3_predicate_and_creates_composite() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -65629,7 +65629,7 @@ fn m3_predicate_and_creates_composite() {
     );
 }
 
-#[ignore = "STALE: The seven java.util.function default/static stubs were deleted 2026-08-20 (b81aae8fc): javap shows none is ACC_NATIVE and all have real bodies. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. docs/internal/fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
+#[ignore = "STALE: The seven java.util.function default/static stubs were deleted 2026-08-20 (b81aae8fc): javap shows none is ACC_NATIVE and all have real bodies. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
 #[test]
 fn m3_predicate_or_creates_composite() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -65652,7 +65652,7 @@ fn m3_predicate_or_creates_composite() {
     );
 }
 
-#[ignore = "STALE: The seven java.util.function default/static stubs were deleted 2026-08-20 (b81aae8fc): javap shows none is ACC_NATIVE and all have real bodies. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. docs/internal/fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
+#[ignore = "STALE: The seven java.util.function default/static stubs were deleted 2026-08-20 (b81aae8fc): javap shows none is ACC_NATIVE and all have real bodies. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
 #[test]
 fn m3_predicate_negate_creates_composite() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -65778,6 +65778,38 @@ fn m4_tlab_refill_from_heap() {
     let (ptr, size) = result.unwrap();
     assert!(!ptr.is_null());
     assert!(size > 0);
+}
+
+/// The `Zgc` arm of `refill_tlab` returned `None` until 2026-09-02, which left
+/// the JIT's inline allocator dead on the default collector. It now carves a
+/// zeroed chunk, and a retire of the VM buffer hands the unused tail back to
+/// the arena rather than leaving an unregistered filler nothing can reclaim.
+#[cfg(feature = "zgc")]
+#[test]
+fn zgc_refill_tlab_carves_a_chunk_and_retire_returns_the_tail() {
+    use cratonvm_gc::{GcBackend, VmHeap};
+    let heap = VmHeap::new(GcBackend::Zgc, 16 * 1024 * 1024);
+    let (ptr, size) = heap
+        .refill_tlab(64 * 1024)
+        .expect("ZGC must hand the VM thread's TLAB a chunk");
+    assert!(!ptr.is_null());
+    assert!(size >= 8 * 1024 && size <= 64 * 1024, "chunk of {size} bytes");
+    let mut tlab = unsafe { cratonvm_gc::Tlab::new(ptr, size) };
+    assert!(tlab.alloc(128, 8).is_some());
+    // The chunk was charged whole at refill; the retire credits the tail back.
+    let allocated_before = heap.allocated_bytes();
+    tlab.retire();
+    assert!(tlab.is_retired());
+    assert_eq!(
+        allocated_before - heap.allocated_bytes(),
+        size - 128,
+        "the retired tail must be credited back to the heap"
+    );
+    let VmHeap::Zgc(z) = &heap else {
+        panic!("GcBackend::Zgc must build a Zgc heap");
+    };
+    let (refills, refill_bytes, tails, tail_bytes) = z.vm_tlab_engagement();
+    assert_eq!((refills, refill_bytes, tails, tail_bytes), (1, size, 1, size - 128));
 }
 
 #[test]
@@ -72412,7 +72444,7 @@ fn p86_shared_with_builtins() -> Arc<SharedVm> {
     shared
 }
 
-#[ignore = "STALE: ThreadGroup's 19 natives were retired 2026-08-23 (80d60e911) as a FIX, not a removal: activeCount() was a VM-WIDE count that ignored its receiver. 17 checks, identical to HotSpot after. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. docs/internal/fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
+#[ignore = "STALE: ThreadGroup's 19 natives were retired 2026-08-23 (80d60e911) as a FIX, not a removal: activeCount() was a VM-WIDE count that ignored its receiver. 17 checks, identical to HotSpot after. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
 #[test]
 fn p86_thread_group_hierarchy() {
     // Verify ThreadGroup parent-child hierarchy: system → main.
@@ -72518,7 +72550,7 @@ fn p86_thread_group_hierarchy() {
     }
 }
 
-#[ignore = "STALE: ThreadGroup's 19 natives were retired 2026-08-23 (80d60e911) as a FIX, not a removal: activeCount() was a VM-WIDE count that ignored its receiver. 17 checks, identical to HotSpot after. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. docs/internal/fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
+#[ignore = "STALE: ThreadGroup's 19 natives were retired 2026-08-23 (80d60e911) as a FIX, not a removal: activeCount() was a VM-WIDE count that ignored its receiver. 17 checks, identical to HotSpot after. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
 #[test]
 fn p86_thread_group_active_count() {
     // Register threads, verify activeCount reflects alive threads.
@@ -72595,7 +72627,7 @@ fn p86_thread_group_active_count() {
     assert_eq!(count, 2, "activeCount should be 2 after one thread dies");
 }
 
-#[ignore = "STALE: ThreadGroup's 19 natives were retired 2026-08-23 (80d60e911) as a FIX, not a removal: activeCount() was a VM-WIDE count that ignored its receiver. 17 checks, identical to HotSpot after. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. docs/internal/fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
+#[ignore = "STALE: ThreadGroup's 19 natives were retired 2026-08-23 (80d60e911) as a FIX, not a removal: activeCount() was a VM-WIDE count that ignored its receiver. 17 checks, identical to HotSpot after. This module's tests were written against a native surface the tree has since deliberately REDUCED. A registered native shadows the Java bytecode for its class+method+descriptor, so the jdk-only campaign has been deleting stubs that silently replaced working methods; these tests assert those stubs still exist. They have been failing since the retirement named below and nobody saw it, because this whole `#[cfg(all(test, feature = \"synthetic-jdk\"))]` module did not compile from the day `InlineSite` grew a field until 2026-09-02. fixed-suite-bugs/synthetic-jdk-vm-test-triage-20260902.md"]
 #[test]
 fn p86_thread_group_enumerate() {
     // Register threads with Java Thread objects, verify enumerate fills array.
