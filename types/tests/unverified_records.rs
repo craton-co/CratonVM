@@ -328,14 +328,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "RUN 2026-09-02 via CloseFlushSwallowProbe on --synthetic-jdk (the probe both records name); shares W7-57's result",
     ),
     (
-        "docs/known-issues/jdk-only/W7-72-ssc-socket-and-filechannel.md",
-        "status block says: **Nothing here was built or run as CratonVM.** Every JDK field layout is",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-74-short-object-repairs.md",
-        "status block says: Branch `fix/short-thread-objects-20260812`. **Nothing here was built or run",
-    ),
-    (
         "docs/known-issues/jdk-only/W7-81-write-route-three-way.md",
         "RUN 2026-09-02 via CloseFlushSwallowProbe on --synthetic-jdk (the probe both records name); shares W7-57's result",
     ),
