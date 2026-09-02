@@ -1,6 +1,25 @@
 # The JCA provider chain advertises algorithms it will not serve — and serves names it never advertised
 
-**Status: FIXED in source 2026-08-12. VERIFIED AGAINST A BINARY 2026-08-30.**
+**Status: FIXED in source 2026-08-12. VERIFIED AGAINST A BINARY 2026-08-30.
+§8's OPEN LIST CLOSED 2026-09-02 — see §8, §8a, §8b and §8c.**
+
+> **Three of §8's six open items had stopped being true before anyone worked
+> them**, and each cost one command to check. The `KeyGenerator` default sizes,
+> the ML-DSA `getProvider()` NPE and `SUN.getServices()` were all fixed
+> elsewhere and had aged into falsehoods on this page. That is §4a's lesson
+> turned on this record itself: an open list is a hypothesis with a date on it,
+> and `apps/probes/W763Residuals` asks all six in one run.
+>
+> Of the three that were live: the nine advertised-and-refused `Signature`
+> names turned out to be **twenty-six** — nobody had asked SunEC the same
+> question, and seventeen of its twenty names failed the same way. All
+> twenty-six work now, verified on the signature BYTES. And `--synthetic-jdk`,
+> which §8 records as never built by any lane, builds — the first run of it
+> refuted this page's claim about `Collections.unmodifiableSet` and found
+> `ArrayList` missing `RandomAccess`.
+>
+> What is left is five `SunTls*` `KeyGenerator` services, and the reason is
+> structural rather than clerical (§8c).
 
 > **The verification this page asked for, run at last.** The original status
 > said: "This lane could not build or run Rust. Every Rust change below is
@@ -520,22 +539,69 @@ size, and the length is the only observation that can see it. That
 
 ## 8. What this record does NOT close
 
+> **CLOSED 2026-09-02.** All six bullets were asked directly, on a binary,
+> before any of them was worked. Three were already fixed and had aged into
+> falsehoods; two were closed by this pass; one is narrowed to a named
+> structural residual. The measurements are in "§8, remeasured" immediately
+> below, and `apps/probes/W763Residuals` is the one command.
+>
+> The pattern is this page's own §4a, one level up: **three of the six bullets
+> were claims about VM behaviour that had stopped being true**, and each cost
+> one command to check. A record's open list is a hypothesis with a date on it.
+
 * `KeyGenerator` reads its algorithm string once and never again; every name
   succeeds and yields the same default size. `DESede` gives 16 bytes where
   SunJCE gives 24. W4-3 recorded it without a patch; still open, and the probe's
   `keylen` column is now the instrument for it.
+
+  > **STALE — fixed before this pass.** `keygen_default_bits`,
+  > `keygen_byte_len` and `des_set_odd_parity` are in the tree and their own
+  > comments record the measurement. Every `KeyGenerator` default is identical
+  > to HotSpot: `AES` 32 bytes, `DESede` **24** with odd parity per byte, `DES`
+  > 8, `HmacSHA512` 64, `Blowfish` 16.
+
 * Nine `SunRsaSign` `Signature` names are advertised, admitted, and fail at
   `sign()` — §3 #5. Ordinary unimplemented-algorithm gap.
+
+  > **CLOSED, and it was twenty-six names rather than nine.** All nine RSA names
+  > sign and verify byte-identically to HotSpot; see "The twenty-six signature
+  > names" below. The count was nine because nobody asked SunEC the same
+  > question: seventeen of its twenty `Signature` names failed the same way,
+  > fourteen of them after `getInstance` had accepted the name.
+
 * `KeyFactory.getInstance("ML-DSA-44").getProvider()` NPEs; `Signature`'s
   ML-DSA objects return a null provider. W7-29 found both; neither is an
   advertise-versus-serve gap.
+
+  > **STALE — fixed before this pass.** All four `ML-DSA` names answer `SUN`
+  > from both engines, matching HotSpot.
+
 * `SUN.getServices()` answers 35 rows where HotSpot answers 65. A milder
   under-advertisement, untouched. Do not read it as evidence the §3 #3 wrapper
   landed badly.
+
+  > **STALE — `SUN` matches HotSpot exactly.** The under-advertisement had moved
+  > to the other providers by 2026-09-02 and is closed too: across `SUN`,
+  > `SunRsaSign`, `SunJCE`, `SunEC` and `SunJSSE` this VM now answers **330 of
+  > HotSpot's 335** services, advertising nothing HotSpot does not. The five are
+  > the `SunTls*` `KeyGenerator` KDFs — see "What is still open" below.
+
 * **`Collections.unmodifiableSet` is the IDENTITY function in
-  `--synthetic-jdk`, so §3 #3 is inert there.** Found while wiring
-  `wrap_unmodifiable`. The name has three registrations and registration is
-  last-write-wins:
+  `--synthetic-jdk`, so §3 #3 is inert there.**
+
+  > **REFUTED by building the mode.** In `--synthetic-jdk`, on the same probe:
+  > `identityOfSource=false`, `mutate=UnsupportedOperationException`, and the
+  > view's class is `java.util.Collections$UnmodifiableSet` — the same as
+  > HotSpot's. §3 #3 is inert in no mode, and the vacuous-green trap this bullet
+  > warns of (a probe reading `class=java.util.HashSet add=SUCCEEDED`) cannot
+  > happen.
+
+  Found while wiring `wrap_unmodifiable`. The name has three registrations and
+  registration is last-write-wins. The rest of this bullet's detail — the three
+  registrars, the `SyntheticStub` window, and the three-arm correction of
+  2026-08-12 — is preserved verbatim below, because the mechanism it describes
+  is real even though its verdict for `--synthetic-jdk` no longer is.
+
   * `native-collections`'s `register_collections_extras_natives` →
     `native_collections_unmodifiable_set`, a genuine read-only view. Live in
     real-JDK and `--jdk-only`.
@@ -581,15 +647,144 @@ size, and the length is the only observation that can see it. That
   > tell that from "the wrapper was never applied". Anyone retagging that window
   > away from `SyntheticStub` re-opens §3 #3 in strict mode without touching a
   > line of this record's code.
+
 * `--synthetic-jdk` has never been built by any lane, so #6's live half has
   never been observed — only reasoned about.
 
+  > **BUILT AND RUN, 2026-09-02.**
+  > `cargo build -p cratonvm-cli --bin cratonvm --features synthetic-jdk`,
+  > then `--synthetic-jdk` at runtime. It builds clean and runs the probes.
+  > And the first run found something no amount of reasoning had: **`ArrayList`
+  > did not implement `RandomAccess`**, because the synthetic interface table
+  > grouped it with `LinkedList`, which deliberately lacks that marker.
+  >
+  > `Collections.unmodifiableList` picks its view class BY that marker, so it
+  > handed back `$UnmodifiableList` where HotSpot gives
+  > `$UnmodifiableRandomAccessList` — and `Collections.binarySearch`,
+  > `reverse`, `shuffle` and `fill` each branch on it to choose indexed access
+  > over an iterator, so every one of them silently took the linked-list path
+  > over an `ArrayList`. Fixed, with `Cloneable`, which all four declare and
+  > none carried.
+
+## 8a. §8, remeasured — one command, six answers
+
+`apps/probes/W763Residuals`, run on both VMs with a fixed RSA key pair so the
+deterministic signatures are comparable, and diffed on stdout. Every row below
+is identical to HotSpot 25.0.3 unless said otherwise.
+
+| §8 bullet | asked as | 2026-09-02 |
+|---|---|---|
+| `KeyGenerator` defaults | `getInstance(a).generateKey().getEncoded().length` | identical, incl. `DESede`=24 |
+| nine `SunRsaSign` names | sign + verify + the signature BYTES | identical, all 13 PKCS#1 v1.5 names |
+| ML-DSA `getProvider()` | `KeyFactory`/`Signature` `.getProvider().getName()` | identical, all four names |
+| `SUN.getServices()` | per-provider service counts | identical for SUN, SunRsaSign, SunEC, SunJSSE; SunJCE 189 vs 194 |
+| `unmodifiableSet` | identity, mutation, class, in all three modes | identical |
+| `--synthetic-jdk` never built | it is now | builds, runs, one defect found |
+
+The one differing row is the five `SunTls*` services. Nothing else in the
+record's open list survives.
+
+## 8b. The twenty-six signature names
+
+§3 #5's disposition — "the name is real, the advertisement is truthful, and the
+failure is closed and catchable ... an ordinary unimplemented-algorithm gap" —
+was a defensible call about nine names. Two things were wrong with it as a
+place to stop.
+
+**It was a policy about one provider, and the same shape held for another
+nobody counted.** `JcaResolveAll` asks the services HotSpot has and this VM does
+NOT enumerate. A name advertised HERE and failing at `sign()` is invisible to
+it — which is precisely the nine. Asking SunEC the same way found seventeen
+more:
+
+```text
+of SunEC's twenty Signature names, THREE worked
+  NONEwithECDSA, SHA1withECDSA, SHA224withECDSA           fail at sign()
+  all four SHA3-*withECDSA                                fail at sign()
+  all ten inP1363Format twins                             fail (4 not advertised)
+```
+
+**And none of the twenty-six needed cryptography.** PKCS#1 v1.5 over RSA is a
+digest, a `DigestInfo` whose only per-name inputs are an OID and a length, and
+block type 1 — and every one of the nine digests was already in this tree,
+MD2 by *this record's own §3 #1*, which implemented it precisely because
+"`SunRsaSign` and `SunMSCAPI` both advertise `MD2withRSA`". ECDSA is not
+computed here at all: the three names that worked were already the platform's
+own SPI, and the other seventeen are the same drive against a sibling class.
+
+Both families are DERIVED now rather than tabulated — the SPI class is a
+function of the caller's spelling, and the seed list comes from the same
+function the engine resolves through, so the advertised set and the served set
+are one list by construction. That is not a stylistic preference: `seed_sunec_services`
+carried sixteen hand-written `(name, class)` pairs where HotSpot has twenty,
+and the four missing ones were `SHA3-*withECDSAinP1363Format`. A transcribed
+list drifts; a derived one cannot.
+
+Verified on the bytes, not on the absence of an exception:
+
+```text
+RSA    all 13 PKCS#1 v1.5 signatures byte-identical to HotSpot
+       (the scheme is deterministic, so a wrong DigestInfo prefix cannot
+        hide behind a round trip — which is why the prefixes are generated
+        from an OID and a length, with a test asserting the generator
+        reproduces RFC 8017's four published blobs)
+ECDSA  all 20 names verify=true, and DER vs P1363 encodings distinct
+       (ECDSA draws a nonce, so the bytes are not comparable; the encoding
+        and the round trip are)
+```
+
+Ten of the twenty ECDSA names are `inP1363Format` twins, and they are not a
+formatting flag this engine could have applied: the JDK implements the
+fixed-width `r || s` encoding by SUBCLASSING, so routing to the class is what
+makes the encoding right as well as the signature.
+
+## 8c. What is still open
+
+* **Five `SunTls*` `KeyGenerator` services.** `SunTlsPrf`, `SunTls12Prf`,
+  `SunTlsMasterSecret`, `SunTlsKeyMaterial`, `SunTlsRsaPremasterSecret` — the
+  TLS-internal KDFs, which take `TlsKeyMaterialParameterSpec`-family specs this
+  engine's two-field synthetic `KeyGenerator` cannot carry. Serving them means
+  handing back a real `javax.crypto.KeyGenerator` over the platform's SPI and
+  teaching all nine natives registered on that class to recognise a receiver
+  they did not build (the `skf_receiver_is_ours` shape). An engine change, not
+  a row, and `every_keygenerator_the_engine_implements_is_advertised` asserts
+  they stay absent until it is made.
+* **`Collections.unmodifiableList(x) instanceof RandomAccess`** is `true` in
+  `--jdk-only`, where real bytecode builds the view, and `false` in the two
+  modes where `alloc_unmod_wrapper` fabricates it — the fabricated class does
+  not re-declare the marker its own NAME promises.
+  `apps/probes/RandomAccessProbe` is the three-line reproducer. Belongs to
+  whoever owns `native-collections`' wrapper minting.
+* **`LinkedList` is not a `Deque`** here and is on HotSpot. Deliberately not
+  declared: this VM carries most of the deque surface and not all of it, so the
+  interface would turn a clean `ClassCastException` into a missing method at
+  the point of use.
+
 ## 9. How to verify
 
-Build, then in **both** arms. Note that `--synthetic-jdk` is NOT a valid arm
-for the `D.` rows: `Collections.unmodifiableSet` is the identity function there
-(§8), so those rows will read `HashSet` / `SUCCEEDED` for a reason that has
-nothing to do with this change.
+Build, then in **both** arms.
+
+> **The `--synthetic-jdk` exclusion below is withdrawn (2026-09-02).** It said
+> that mode "is NOT a valid arm for the `D.` rows: `Collections.unmodifiableSet`
+> is the identity function there". It is not: measured in all three modes, the
+> view is `java.util.Collections$UnmodifiableSet`, `add` raises
+> `UnsupportedOperationException`, and the object is not the source. All three
+> arms are valid, and `apps/probes/UnmodifiableSetProbe` is the smaller
+> instrument for exactly this question.
+>
+> **Three arms, one build each:**
+>
+> ```bash
+> cargo build --release -p cratonvm-cli --bin cratonvm
+> cargo build --release -p cratonvm-cli --bin cratonvm --features synthetic-jdk >       --target-dir target-synth
+> cratonvm            --java-home <jdk25> -cp <out> UnmodifiableSetProbe
+> cratonvm --jdk-only --java-home <jdk25> -cp <out> UnmodifiableSetProbe
+> target-synth/.../cratonvm --synthetic-jdk -cp <out> UnmodifiableSetProbe
+> ```
+>
+> The `synthetic-jdk` build takes its own `--target-dir`: it is a different
+> feature set, and sharing one with the default build makes every switch a full
+> rebuild.
 
 ```
 java -cp <out> JcaAdvertisedVsServedProbe > cratonvm-<arm>.txt
