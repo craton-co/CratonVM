@@ -504,6 +504,48 @@ Nothing here is a corruption claim, and none of it is affected by the root fix
 in 4d -- it is the same shape the OOM face's `degraded=empty-collection-set`
 chain was reported against in 2026-08-29, now priced.
 
+#### The census is DISCARDED on every pause, and the reason is always the same
+
+A `CRATONVM_G1_DBG_REACH=1` run settles what the census is FOR. Of 15 638
+`[GC-STAT]` lines it produced 15 639 of these:
+
+```text
+[g1][HUMONGOUS] eager reclaim declined: an object registered for finalization
+    is awaiting finalize()
+```
+
+**Every pause.** The first gate in `eager_reclaim_humongous_locked` is
+`finalizer_pause`, and one registered, not-yet-finalized object holds it true
+for the whole run -- so the whole-heap walk is paid for on every pause to build
+a census that is thrown away before it is read. That is the 2026-08-29 line
+(`spans=0 bytes=0 declined_pauses=16103`) seen from the other end.
+
+Every gate that function declines on -- except `census.complete`, which is a
+property of the walk itself -- is decidable BEFORE Phase 4. They now live in
+one `eager_reclaim_early_decline` that both the reclaim and `want_census`
+consult, so a census is not paid for when the reclaim is already going to
+refuse it. The two cannot drift, which matters because a census paid for and
+then declined looks exactly like a census that was needed.
+
+The A/B that bounds the win, one binary, interleaved, 900 s:
+
+| arm | mean `fixup_regions` | mean `fixup_us` | mean `pause_us` | rc |
+|---|---:|---:|---:|---|
+| `CRATONVM_G1_EAGER_HUMONGOUS=1` rep 1 / 2 | 845 / 841 | 3 764 / 4 178 | 8 682 / 9 704 | 124 / 124 |
+| `CRATONVM_G1_EAGER_HUMONGOUS=0` rep 1 / 2 | **5 / 5** | 864 / 1 196 | 5 315 / 7 263 | 124 / 124 |
+
+(The `=0` rep 2 ran through a loadavg-414 excursion, so read its TIMES with
+suspicion; `fixup_regions` is structural and is not affected.)
+
+#### The rate is a separate question, and it is the one left
+
+Neither arm passes. Turning the walk off entirely still leaves **61 000 -
+80 000 young pauses per 900 s** -- one every 11-15 ms, each freeing about
+0.5 MB of a 1 GiB heap, against 88 Mixed pauses in 2400 s. `young_target_regions`
+starts at 60% of the heap, so the young generation is not supposed to be
+collected at that granularity. Why the trigger fires that often, and why Mixed
+almost never runs, is the next question on this page.
+
 ## Status
 
 **OPEN. The OOM face is FIXED (2026-08-30) and held on 2026-09-02 (section 4c: 0 real `OutOfMemoryError` on both G1 arms, and the default-collector control PASSES in 811 s the same day, so the cap is a failure and not a slow host). The ROOT CAUSE of the corruption family is found and fixed (section 4d): G1 evacuated a CSet root pointing INSIDE a reference array and manufactured an object out of the element -- `num_slots=512` was the top half of a heap address, not a shape. Every downstream implausible-header site went to ZERO and V7b dangling references to 0, but the class STILL CAPS at 900 s, so the cap face is untouched. A separate allocation-publication defect was also fixed (section 4b) and did not close anything on its own. The FAILURE MODE MOVED to SIGSEGV in 2026-08-30's arm -- read section 3 before treating that as an improvement. The 48 617 dangling references are 6 holders, not a rate. Split out 2026-08-29** from
