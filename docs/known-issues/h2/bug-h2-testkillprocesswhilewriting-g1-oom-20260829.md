@@ -408,8 +408,39 @@ Three G1 reps and a same-day control, one binary, quiet host:
 | `-XX:+UseG1GC` rep 3 | 124 (cap) | 900 | 12 | 0 | 20 | 12 | **0** |
 | default collector | **0 (PASS)** | 403 | 0 | 0 | 0 | 0 | 0 |
 
+Re-measured after moving the refusal before CSet selection (see below), 3 reps
+plus control: `124 / 124 / 124` and `0 (PASS)` in 554 s, `skipped=0` throughout
+because the roots no longer reach the root loop at all, `v7b=0` throughout.
+
 The control passing in 403 s on the same host and binary is what makes the cap
 a failure rather than a slow machine, and it is the arm this page asserts.
+
+#### ...and the refusal belongs one layer EARLIER, before the collection set is chosen
+
+Refusing in the root loop is a backstop. The mechanism that is supposed to keep
+a conservatively-discovered root's region out of the CSet in the first place is
+`pinned_region_set_including_non_object_roots`, which runs BEFORE selection --
+and it gated on `candidate_header_is_plausible` alone, the same screen an
+interior address passes. So the region joined the CSet, and the root loop was
+the only thing left to catch it.
+
+With both screens there (`addr_is_followable_object`), the region is simply
+pinned out: nothing in it moves, the interior root stays valid, and the root
+loop never sees it. Measured, 3 reps, quiet host:
+
+| | root-loop fix only | pinned out before selection |
+|---|---:|---:|
+| implausible at `cset-root` | 11-12 | **0** |
+| implausible at `root-pin-scan` | -- | 14-15 (with a matching "pinning region" line each) |
+| roots SKIPPED in the root loop | 11-12 | **0** |
+| `[SECURITY V7b]` | 0 | **0** |
+
+The same commit also removed a pin the root-loop fix had introduced:
+`G1Region::pinned` is the JNI-critical pin, cleared only by a matching
+`unpin_region` or by `reset`, and a pinned region is never collected so it is
+never reset. Setting it from the root loop leaked the region for the life of
+the process -- and bought nothing even for the current pause, because the CSet
+is already chosen by then.
 
 #### What is NOT fixed
 
