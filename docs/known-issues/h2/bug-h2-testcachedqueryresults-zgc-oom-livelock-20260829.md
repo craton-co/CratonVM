@@ -413,6 +413,43 @@ so the next work is those two, together, with `relocation_on_proven_jit` as the
 only acceptance test -- and `CRATONVM_ZGC_ASSUME_REWRITABLE=1` as the upper
 bound that says what winning looks like.
 
+### 2026-09-02 (quiet host): ZERO OOMs, 24 compaction cycles, and the gate never refuses
+
+The 3000 s arms above both capped under contention. This one ran on a quiet host
+(load 7.64 / 6.02 / 5.79) and **exited cleanly**, so it carries the `[GC]`
+summary the capped runs could not:
+
+```text
+CRATONVM_ZGC_ASSUME_REWRITABLE=1     rc=1   3575 s
+    arena allocation failed          0
+    native reference array OOM       0
+    java.lang.OutOfMemoryError       0
+    relocation_skipped_jit           0
+    relocation_on_proven_jit         24
+    compaction_cycles                24     objects_relocated=641125
+    zgc-relocation-skip-reason:      (none)
+```
+
+**Zero OutOfMemoryError of any kind, and the relocation gate refuses nothing.**
+Against the same binary with the flag off, which produced an 11.6 MB error log
+of exactly the OOM this page is about. So the heap defect is not merely reduced
+by compaction; under compaction it does not occur.
+
+**The class still fails, and the remaining reason is the INSTRUMENT, not the
+heap.** `rc=1` here is `Timeout trying to lock table "COUNTER"` again -- but this
+arm ran at load 7.6, so contention is no longer a sufficient explanation. The
+likelier cause is that this binary is built `--profile livedbg`
+(`opt-level = 1`, `lto = false`), chosen because the fat-LTO release link was
+being OOM-killed by other tenants at load 130+. An `opt-level=1` VM is several
+times slower than release, which is enough on its own to trip H2's
+`FOR UPDATE WAIT 0.5`. The release build reaches the ASSERTION
+(`Expected: 100000 actual: 98304`) in 641 s; this one never gets that far.
+
+So the pass/fail verdict needs `--profile release` **and** the flag. Until that
+run exists this page claims exactly what is measured: **compaction removes the
+OOM entirely**, and the class's remaining failure under the instrument is not
+attributable to the heap.
+
 ### 2026-09-02 (later): the discharge WORKS and changes nothing -- `coverage-proof-incomplete` is a conjunction
 
 `CRATONVM_XT_HELPER_WINDOW_DISCHARGE=1` gates BOTH refusal sites off one
