@@ -2568,6 +2568,30 @@ pub struct G1Collector {
     old_gen_bytes: AtomicUsize,
     /// Byte threshold at which to initiate concurrent marking.
     marking_threshold_bytes: AtomicUsize,
+    /// F-15 — `(when, old_gen_bytes)` at the last `start_concurrent_mark`, or
+    /// `None` outside a cycle. The two measurements adaptive IHOP is built on —
+    /// how long marking takes, and how fast the old generation grew while it
+    /// ran — are both differences against this.
+    mark_cycle_start: Mutex<Option<(std::time::Instant, usize)>>,
+    /// F-15 — decaying estimate of concurrent-mark duration, milliseconds.
+    /// Zero until a cycle has completed.
+    mark_ms_ema: AtomicU64,
+    /// F-15 — decaying estimate of old-generation growth during marking, in
+    /// KiB per millisecond. KiB rather than bytes so the product with a
+    /// duration cannot overflow on a long cycle. Zero until measured.
+    alloc_rate_kib_per_ms: AtomicU64,
+    /// F-15 — safety multiplier on the computed headroom, as a percentage.
+    ///
+    /// Starts at 100 (trust the measurement). Every pause that runs out of
+    /// to-space raises it — that is the collector's own evidence that the last
+    /// cycle started too late — and every cycle that completes without one
+    /// decays it back. This is the feedback loop pause time used to stand in
+    /// for, connected to the thing it is actually about.
+    ihop_headroom_percent: AtomicU64,
+    /// F-15 — how many pauses reported to-space exhaustion, i.e. how many times
+    /// the threshold has been told it was too high. A gauge nobody can read is
+    /// a gauge nobody can tune.
+    ihop_late_events: AtomicU64,
 
     /// String deduplication table: hash -> canonical object address.
     /// T10.9.B: FxHashMap — key is Java String hash from loaded bytecode.
@@ -3085,6 +3109,11 @@ impl G1Collector {
             evac_ns_per_byte: AtomicU64::new(4),
             old_gen_bytes: AtomicUsize::new(0),
             marking_threshold_bytes: AtomicUsize::new(ihop_threshold),
+            mark_cycle_start: Mutex::new(None),
+            mark_ms_ema: AtomicU64::new(0),
+            alloc_rate_kib_per_ms: AtomicU64::new(0),
+            ihop_headroom_percent: AtomicU64::new(100),
+            ihop_late_events: AtomicU64::new(0),
             string_dedup_table: Mutex::new(FxHashMap::default()),
             gc_log_enabled: AtomicBool::new(false),
             marking_complete: AtomicBool::new(false),
@@ -3599,6 +3628,14 @@ impl G1Collector {
             .filter(|(k, v)| k == v)
             .filter_map(|(k, _)| self.lookup_region_for_addr(*k))
             .collect();
+
+        // F-15 — an evacuation failure IS "the heap filled before the
+        // collector could reclaim it", and it is the only direct observation of
+        // that available from inside a pause. Feed it to adaptive IHOP so the
+        // next cycle starts earlier. See `note_to_space_exhausted`.
+        if !failed.is_empty() && gc_flags().g1_adaptive_ihop {
+            self.note_to_space_exhausted();
+        }
 
         let mut bytes_freed = 0usize;
         // G1AUD-5: every pause bumps `rset_cache_epoch` before it reclassifies
@@ -8650,6 +8687,11 @@ impl G1Collector {
     /// state is lost (an orphaned controller slot) so the completion gate
     /// in the VM does not spin forever on a cycle nobody is driving.
     pub fn abort_concurrent_mark(&self) {
+        // F-15: an aborted cycle measures nothing — its duration is the time to
+        // the abort, not the time marking would have taken, and folding that in
+        // would bias the prediction short and make every later cycle start too
+        // late. Drop the window without updating the estimates.
+        *self.mark_cycle_start.lock() = None;
         // F-06: an aborted cycle's bitmap is discarded, so the byte
         // accumulator derived from it must be discarded too — and `mark_start`
         // with it, or the next `cleanup` driven outside a cycle would read a
@@ -8701,6 +8743,10 @@ impl G1Collector {
     ///
     /// [`StopTheWorldToken`]: crate::collector::StopTheWorldToken
     pub fn start_concurrent_mark(&self, _stw: &crate::collector::StopTheWorldToken) {
+        // F-15: open the measurement window adaptive IHOP is built on. Must be
+        // the first thing, so the duration covers the whole cycle including the
+        // bitmap clear below.
+        self.note_mark_cycle_start();
         self.gc_state.set_phase(ConcurrentGcPhase::InitialMark);
         self.satb_queue.activate();
         // Round-2 fix (HIGH — GC #5): clear every per-region bitmap so a
@@ -10024,6 +10070,24 @@ impl G1Collector {
         self.mixed_gc_remaining
             .store(self.config.mixed_gc_count_target as u64, Ordering::Relaxed);
 
+        // F-15 — close the adaptive-IHOP measurement window and re-plan the
+        // next cycle's start from what this one measured.
+        //
+        // Here rather than earlier in `cleanup` for two reasons: the duration
+        // should cover the whole cycle including this pause, and the
+        // old-generation growth must be read AFTER `recompute_old_gen_bytes`
+        // above has applied the in-place frees and the humongous reclaim — the
+        // number the model wants is how much the old generation grew NET of
+        // what the cycle got back, not the gross promotion.
+        if gc_flags().g1_adaptive_ihop {
+            self.note_mark_cycle_end();
+        } else {
+            // The legacy arm still has to close the window, or the next cycle's
+            // `note_mark_cycle_start` measures from the wrong instant should the
+            // flag be flipped mid-run by a test.
+            *self.mark_cycle_start.lock() = None;
+        }
+
         // State what this cleanup decided, including any fail-safe it took.
         // Without this an operator watching G1 fail to reclaim old gen cannot
         // tell "the closure was abandoned" from "there is no garbage".
@@ -10438,7 +10502,212 @@ impl G1Collector {
         old_bytes >= threshold
     }
 
-    /// Adaptively adjust IHOP based on actual pause time.
+    /// F-15 — the static ceiling: the configured `-XX:InitiatingHeapOccupancyPercent`
+    /// as a byte count.
+    ///
+    /// The adaptive threshold may float BELOW this and recover back up to it,
+    /// never above. G1 has no full-GC fallback, so letting the threshold drift
+    /// upward means dead promoted objects accumulate in Old unreclaimed until
+    /// the heap is exhausted — observed on the SteadyChurn recreation, where
+    /// ~7 ms pauses raised the old pause-time-driven threshold 5% per
+    /// collection to its cap, concurrent marking never started across 61k young
+    /// collections, and every heap size died with a true OOM while >80% of Old
+    /// was garbage.
+    #[inline]
+    fn ihop_static_ceiling(&self) -> usize {
+        self.config.heap_size * self.config.ihop_percent as usize / 100
+    }
+
+    /// F-15 — the floor the threshold may never decay below: 1% of the heap, or
+    /// one region, whichever is larger.
+    ///
+    /// Without a floor, a chronically-late collector decays the threshold to 0
+    /// through integer truncation, and the VM-side trigger gate
+    /// (`vm_heap::g1_should_start_marking` requires `marking_threshold_bytes() > 0`)
+    /// then reads a zero threshold as "marking disabled" — permanently.
+    #[inline]
+    fn ihop_floor(&self) -> usize {
+        (self.config.heap_size / 100).max(self.config.region_size)
+    }
+
+    /// F-15 — record the start of a concurrent mark cycle.
+    pub(crate) fn note_mark_cycle_start(&self) {
+        *self.mark_cycle_start.lock() = Some((
+            std::time::Instant::now(),
+            self.old_gen_bytes.load(Ordering::Relaxed),
+        ));
+    }
+
+    /// F-15 — close the cycle opened by [`Self::note_mark_cycle_start`], fold
+    /// its duration and the old-generation growth that happened during it into
+    /// the running estimates, and recompute the threshold from them.
+    ///
+    /// Called at the end of `cleanup`, which is the point at which both
+    /// quantities are known and the cycle's reclamation has been applied.
+    pub(crate) fn note_mark_cycle_end(&self) {
+        let Some((started, old_at_start)) = self.mark_cycle_start.lock().take() else {
+            return;
+        };
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let old_now = self.old_gen_bytes.load(Ordering::Relaxed);
+        // Saturating: cleanup may have freed more than the cycle promoted, in
+        // which case the growth rate for this cycle is zero, not negative.
+        let grew = old_now.saturating_sub(old_at_start);
+        self.fold_mark_cycle_sample(elapsed_ms, grew);
+    }
+
+    /// F-15 — the measurable core of [`Self::note_mark_cycle_end`]: fold one
+    /// `(duration, growth)` sample into the running estimates and re-plan.
+    ///
+    /// Split from the wrapper because the wrapper reads a real clock. A test
+    /// that drove it would have to sleep, and would then be asserting on
+    /// whatever the scheduler did — this is the arithmetic, stated directly.
+    pub(crate) fn fold_mark_cycle_sample(&self, elapsed_ms: u64, grew_bytes: usize) {
+        // A cycle too short to time says nothing about either quantity; folding
+        // a zero-millisecond sample in would drag both estimates toward zero
+        // and quietly disable the headroom.
+        if elapsed_ms == 0 {
+            return;
+        }
+        let rate_kib_per_ms = (grew_bytes / 1024) as u64 / elapsed_ms;
+
+        // Exponential moving average, 1/4 weight on the newest sample. Slow
+        // enough that one anomalous cycle does not re-plan the heap, fast
+        // enough to follow a phase change within a handful of cycles.
+        let blend = |old: u64, new: u64| if old == 0 { new } else { (old * 3 + new) / 4 };
+        self.mark_ms_ema
+            .store(blend(self.mark_ms_ema.load(Ordering::Relaxed), elapsed_ms), Ordering::Relaxed);
+        self.alloc_rate_kib_per_ms.store(
+            blend(
+                self.alloc_rate_kib_per_ms.load(Ordering::Relaxed),
+                rate_kib_per_ms,
+            ),
+            Ordering::Relaxed,
+        );
+
+        // A cycle that completed without running out of to-space is evidence
+        // the current margin is adequate; give a quarter of any accumulated
+        // penalty back, so a transient burst does not permanently pessimise the
+        // threshold.
+        let boost = self.ihop_headroom_percent.load(Ordering::Relaxed);
+        if boost > 100 {
+            self.ihop_headroom_percent
+                .store((boost - (boost - 100) / 4).max(100), Ordering::Relaxed);
+        }
+
+        self.recompute_marking_threshold();
+    }
+
+    /// F-15 — a pause ran out of to-space.
+    ///
+    /// This is the signal the old model was missing. "Did the concurrent cycle
+    /// start early enough that marking finished before the heap filled?" has
+    /// exactly one direct observation, and it is this one: an evacuation
+    /// failure means the collector could not find room for the objects it was
+    /// obliged to copy, which is what running out of heap looks like from
+    /// inside a pause.
+    ///
+    /// Raises the headroom multiplier by 25% (capped), so the next recompute
+    /// starts marking correspondingly earlier, and recomputes immediately —
+    /// waiting for the next cycle boundary would be waiting for the thing that
+    /// is already late.
+    pub(crate) fn note_to_space_exhausted(&self) {
+        self.ihop_late_events.fetch_add(1, Ordering::Relaxed);
+        let boost = self.ihop_headroom_percent.load(Ordering::Relaxed);
+        // 800% is four doublings of the margin; past that the threshold is
+        // pinned to its floor anyway and the multiplier is just a counter.
+        self.ihop_headroom_percent
+            .store((boost + boost / 4).min(800), Ordering::Relaxed);
+        self.recompute_marking_threshold();
+    }
+
+    /// F-15 — set the marking threshold from the allocation rate and the
+    /// predicted mark duration.
+    ///
+    /// # Why the old model could not work
+    ///
+    /// `update_ihop` moved the threshold on YOUNG PAUSE TIME: over the pause
+    /// goal, lower it; under half of it, raise it. Pause time is a property of
+    /// the young live set and has no causal relationship to the question IHOP
+    /// answers. A workload with fast young pauses and a fast-filling old
+    /// generation got its threshold RAISED, which is exactly backwards — and
+    /// the code's own comment records that failure mode being hit in production
+    /// and then fixed by clamping the ceiling rather than by changing the
+    /// signal.
+    ///
+    /// # The model
+    ///
+    /// Marking takes `mark_ms`, during which the old generation grows at
+    /// `alloc_rate`. To finish before the heap fills, the cycle must start with
+    /// at least `alloc_rate * mark_ms` of room left — plus a margin, which is
+    /// what `ihop_headroom_percent` carries and what to-space exhaustion
+    /// raises.
+    ///
+    /// Until a cycle has been measured both estimates are zero and this leaves
+    /// the statically configured threshold alone. That is the right default:
+    /// with no measurement, the operator's number is the best available one.
+    pub(crate) fn recompute_marking_threshold(&self) {
+        let mark_ms = self.mark_ms_ema.load(Ordering::Relaxed);
+        let rate_kib_per_ms = self.alloc_rate_kib_per_ms.load(Ordering::Relaxed);
+        let ceiling = self.ihop_static_ceiling();
+        if mark_ms == 0 || rate_kib_per_ms == 0 {
+            // Nothing measured (or a workload that promotes nothing during
+            // marking): the configured IHOP stands, less any lateness penalty —
+            // an evacuation failure is evidence about the threshold whether or
+            // not a mark cycle has been timed yet.
+            let boost = self.ihop_headroom_percent.load(Ordering::Relaxed).max(100);
+            let threshold = ((ceiling as u64) * 100 / boost) as usize;
+            self.marking_threshold_bytes.store(
+                threshold.clamp(self.ihop_floor(), ceiling.max(self.ihop_floor())),
+                Ordering::Relaxed,
+            );
+            return;
+        }
+        let headroom =
+            (rate_kib_per_ms.saturating_mul(mark_ms) as usize).saturating_mul(1024);
+
+        // What the measurement asks for: start with at least one mark cycle's
+        // worth of allocation still available.
+        let planned = self.config.heap_size.saturating_sub(headroom);
+
+        // The operator's IHOP is a CEILING on that, never a floor. G1 has no
+        // full-GC fallback, so a threshold that floats up on thin evidence is
+        // how a heap ends up OOMing while mostly dead.
+        let capped = planned.min(ceiling);
+
+        // The lateness penalty applies to the RESULT, not to the headroom.
+        //
+        // Scaling the headroom instead was the first shape and it does not
+        // work: on a heap whose configured IHOP already sits well below
+        // `heap - headroom` — the common case, since the default is 70% — the
+        // ceiling swallows the whole adjustment, so an evacuation failure moved
+        // the threshold not at all. The one signal that directly means "the
+        // last cycle started too late" has to be able to bite whatever the
+        // measurement happened to plan.
+        let boost = self.ihop_headroom_percent.load(Ordering::Relaxed).max(100);
+        let threshold = ((capped as u64) * 100 / boost) as usize;
+
+        let threshold = threshold.clamp(self.ihop_floor(), ceiling.max(self.ihop_floor()));
+        self.marking_threshold_bytes
+            .store(threshold, Ordering::Relaxed);
+    }
+
+    /// F-15 diagnostics: `(predicted mark ms, old-gen growth KiB/ms, headroom
+    /// percent, to-space exhaustion events)`.
+    pub fn ihop_model_state(&self) -> (u64, u64, u64, u64) {
+        (
+            self.mark_ms_ema.load(Ordering::Relaxed),
+            self.alloc_rate_kib_per_ms.load(Ordering::Relaxed),
+            self.ihop_headroom_percent.load(Ordering::Relaxed),
+            self.ihop_late_events.load(Ordering::Relaxed),
+        )
+    }
+
+    /// LEGACY (pre-F-15) pause-time-driven IHOP, retained as the `=0` arm of
+    /// `CRATONVM_G1_ADAPTIVE_IHOP` so the change has a single-binary A/B.
+    ///
+    /// See [`Self::recompute_marking_threshold`] for why this signal cannot
+    /// answer the question it was wired to.
     pub fn update_ihop(&self, actual_pause_ms: u64) {
         let target = self.config.max_gc_pause_ms;
         let current_threshold = self.marking_threshold_bytes.load(Ordering::Relaxed);
@@ -13435,9 +13704,20 @@ impl GarbageCollector for G1Collector {
         //    cycle, so triggering belongs to the VM layer alone; this premature
         //    phase-flip is removed.
 
-        // 3. Adaptive IHOP: feed the *pause time* of this collection (not
-        //    the bytes freed) — see `update_ihop` doc for the contract.
-        if pause_ms > 0 {
+        // 3. Adaptive IHOP.
+        //
+        //    F-15: pause time no longer moves the MARKING threshold. It is a
+        //    property of the young live set and says nothing about whether the
+        //    concurrent cycle started early enough — it does still drive the
+        //    young-generation size, which is the thing it actually describes
+        //    (`update_young_target`, called from `record_collection_with_phases`).
+        //    The marking threshold is now recomputed from the measured mark
+        //    duration and old-generation growth rate at each cycle boundary
+        //    (`note_mark_cycle_end`) and tightened on to-space exhaustion
+        //    (`note_to_space_exhausted`, from Phase 5).
+        //
+        //    `CRATONVM_G1_ADAPTIVE_IHOP=0` restores the pause-time model.
+        if pause_ms > 0 && !gc_flags().g1_adaptive_ihop {
             self.update_ihop(pause_ms);
         }
 
@@ -16668,6 +16948,156 @@ mod tests {
         gc.update_ihop(0);
         let after = gc.marking_threshold_bytes();
         assert!(after >= before);
+    }
+
+    // -- F-15: adaptive IHOP on the allocation rate --
+
+    #[test]
+    fn an_unmeasured_ihop_leaves_the_configured_threshold_alone() {
+        let mut cfg = small_config();
+        cfg.ihop_percent = 50;
+        let gc = G1Collector::new(cfg.clone());
+        gc.recompute_marking_threshold();
+        assert_eq!(
+            gc.marking_threshold_bytes(),
+            cfg.heap_size / 2,
+            "with no cycle measured, the operator's number is the best one \
+             available and must stand"
+        );
+        assert_eq!(gc.ihop_model_state(), (0, 0, 100, 0));
+    }
+
+    #[test]
+    fn a_measured_allocation_rate_starts_marking_earlier() {
+        // A high configured IHOP, so the ceiling is not what decides the
+        // answer: the point of this test is the MEASUREMENT binding, and with
+        // the default 45% ceiling on an 8 MiB heap the operator's number is
+        // already earlier than any rate this test would state.
+        let cfg = G1CollectorConfig {
+            ihop_percent: 95,
+            ..small_config()
+        };
+        let gc = G1Collector::new(cfg.clone());
+        let ceiling = gc.marking_threshold_bytes();
+
+        // A cycle that took 100 ms during which the old generation grew by
+        // 1 MiB: 10 KiB/ms. The next cycle must start with at least that much
+        // room left, so the threshold drops below the configured ceiling.
+        gc.fold_mark_cycle_sample(100, 1024 * 1024);
+        let after = gc.marking_threshold_bytes();
+        assert!(
+            after < ceiling,
+            "a measured growth rate must reserve headroom (ceiling {ceiling}, \
+             threshold {after})"
+        );
+        let (mark_ms, rate, boost, late) = gc.ihop_model_state();
+        assert_eq!((mark_ms, rate, boost, late), (100, 10, 100, 0));
+        assert_eq!(
+            after,
+            cfg.heap_size - 10 * 100 * 1024,
+            "threshold is heap minus (rate x duration x margin)"
+        );
+    }
+
+    /// The finding itself: the OLD model raised the threshold when pauses were
+    /// fast, regardless of how fast the old generation was filling. The new one
+    /// must not — that combination is precisely the workload that OOMs with a
+    /// mostly-dead heap.
+    #[test]
+    fn a_fast_pause_no_longer_raises_the_marking_threshold() {
+        let gc = G1Collector::new(G1CollectorConfig {
+            ihop_percent: 95,
+            ..small_config()
+        });
+        gc.fold_mark_cycle_sample(100, 1024 * 1024);
+        let planned = gc.marking_threshold_bytes();
+
+        // The legacy arm, for contrast: a pause well under half the goal raises
+        // the threshold on no evidence about the old generation at all.
+        gc.update_ihop(0);
+        assert!(
+            gc.marking_threshold_bytes() > planned,
+            "test setup: the legacy pause-time model is supposed to raise here"
+        );
+
+        // The new model re-plans from the same measurement and puts it back.
+        gc.recompute_marking_threshold();
+        assert_eq!(
+            gc.marking_threshold_bytes(),
+            planned,
+            "pause time must not move the marking threshold"
+        );
+    }
+
+    #[test]
+    fn running_out_of_to_space_makes_the_next_cycle_start_earlier() {
+        let gc = G1Collector::new(small_config());
+        gc.fold_mark_cycle_sample(100, 1024 * 1024);
+        let before = gc.marking_threshold_bytes();
+        assert_eq!(
+            before,
+            gc.ihop_static_ceiling(),
+            "test setup: on this heap the configured ceiling is earlier than the              measured rate asks for, so the threshold sits AT the ceiling --              which is exactly the case in which a headroom-scaled penalty was              swallowed and moved nothing"
+        );
+
+        gc.note_to_space_exhausted();
+        let after = gc.marking_threshold_bytes();
+        assert!(
+            after < before,
+            "an evacuation failure is the one direct observation that the last \
+             cycle started too late ({before} -> {after})"
+        );
+        let (_, _, boost, late) = gc.ihop_model_state();
+        assert_eq!((boost, late), (125, 1), "the margin grows and is counted");
+
+        // ...and a cycle that completes without one gives a quarter of the
+        // penalty back, so a transient burst does not pessimise it forever.
+        gc.fold_mark_cycle_sample(100, 1024 * 1024);
+        let (_, _, boost_after, _) = gc.ihop_model_state();
+        assert!(
+            (100..125).contains(&boost_after),
+            "a clean cycle must decay the penalty toward 100 (got {boost_after})"
+        );
+    }
+
+    #[test]
+    fn the_adaptive_threshold_stays_between_its_floor_and_the_configured_ceiling() {
+        let mut cfg = small_config();
+        cfg.ihop_percent = 50;
+        let gc = G1Collector::new(cfg.clone());
+        let ceiling = cfg.heap_size / 2;
+        let floor = (cfg.heap_size / 100).max(cfg.region_size);
+
+        // A growth rate that would demand more headroom than the whole heap.
+        gc.fold_mark_cycle_sample(1000, cfg.heap_size * 4);
+        assert_eq!(
+            gc.marking_threshold_bytes(),
+            floor,
+            "the threshold must not decay to zero — the VM reads a zero \
+             threshold as 'marking disabled', permanently"
+        );
+
+        // A workload that promotes nothing during marking asks for no headroom,
+        // and must not be allowed to float above the configured IHOP: G1 has no
+        // full-GC fallback.
+        let quiet = G1Collector::new(cfg.clone());
+        quiet.fold_mark_cycle_sample(1000, 0);
+        assert_eq!(quiet.marking_threshold_bytes(), ceiling);
+    }
+
+    #[test]
+    fn an_untimed_mark_cycle_is_not_folded_in() {
+        let gc = G1Collector::new(small_config());
+        gc.fold_mark_cycle_sample(100, 1024 * 1024);
+        let planned = gc.marking_threshold_bytes();
+        let state = gc.ihop_model_state();
+
+        // A cycle that completed inside one millisecond measures neither
+        // quantity; folding a zero would drag both estimates toward zero and
+        // quietly retire the headroom.
+        gc.fold_mark_cycle_sample(0, 64 * 1024 * 1024);
+        assert_eq!(gc.marking_threshold_bytes(), planned);
+        assert_eq!(gc.ihop_model_state(), state);
     }
 
     // T19.3.G1 — GC allocation-storm follow-ups.

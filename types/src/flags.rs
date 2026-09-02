@@ -893,6 +893,27 @@ pub struct GcFlags {
     /// debug build runs both and asserts they agree, so the claim is checked
     /// rather than asserted in prose.
     pub g1_cleanup_walk: bool,
+    /// `CRATONVM_G1_ADAPTIVE_IHOP` — set the concurrent-marking threshold from
+    /// the measured old-generation ALLOCATION RATE and mark duration, instead
+    /// of from young-pause time. Default **ON** ([`parse::on_unless_zero`]);
+    /// `=0` restores the pause-time model.
+    ///
+    /// IHOP answers one question: did the concurrent cycle start early enough
+    /// that marking finished before the heap filled? The inputs to that are how
+    /// fast the old generation grows and how long marking takes. The previous
+    /// model fed it young-pause time, which is a property of the young live set
+    /// and has no causal relationship to the question — a workload with fast
+    /// young pauses and a fast-filling old generation got its threshold RAISED,
+    /// which is exactly backwards. The code's own comment records that failure
+    /// mode reaching production (61k young collections, no mark cycle, OOM with
+    /// >80% of Old dead) and being fixed by clamping the ceiling rather than by
+    /// changing the signal.
+    ///
+    /// `=0` is the bisection lever and the single-binary A/B. Both arms keep
+    /// the same static ceiling (`-XX:InitiatingHeapOccupancyPercent`) and the
+    /// same floor, so the difference between them is only which evidence moves
+    /// the threshold between the two.
+    pub g1_adaptive_ihop: bool,
     /// `CRATONVM_G1_DBG_RSET` — after every G1 evacuation pause, verify that
     /// every cross-region reference into a COLLECTABLE region is named in that
     /// region's remembered set. Opt-in diagnostic; whole-heap and O(live
@@ -1166,6 +1187,7 @@ impl GcFlags {
             g1_scrub_free: present(src, "CRATONVM_G1_SCRUB_FREE"),
             g1_narrow_fixup: on_unless_zero(src, "CRATONVM_G1_NARROW_FIXUP"),
             g1_cleanup_walk: present(src, "CRATONVM_G1_CLEANUP_WALK"),
+            g1_adaptive_ihop: on_unless_zero(src, "CRATONVM_G1_ADAPTIVE_IHOP"),
             identity_hash_evict: on_unless_zero(src, "CRATONVM_IDENTITY_HASH_EVICT"),
             g1_dbg_rset: present(src, "CRATONVM_G1_DBG_RSET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
