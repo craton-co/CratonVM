@@ -7406,6 +7406,77 @@ pub fn jit_getfield_primitive_in_ref_slot() -> u64 {
     JIT_GETFIELD_PRIMITIVE_IN_REF_SLOT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Corrupt legacy `Value` cells this crate has decoded at a JIT helper door.
+///
+/// Also increments `cratonvm_types::cell_census`, so the process-wide total
+/// stays right; kept separately because "a JIT helper read one" and "a
+/// collector read one" want different searches.
+pub static JIT_CORRUPT_VALUE_CELLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`JIT_CORRUPT_VALUE_CELLS`].
+pub fn jit_corrupt_value_cells() -> u64 {
+    JIT_CORRUPT_VALUE_CELLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Read one legacy 16-byte `Value` cell with its discriminant SCREENED — the
+/// VM-crate counterpart of `gc::heap::read_value_cell_checked`.
+///
+/// # Why a raw `read_value_atomic` is not acceptable here
+///
+/// `read_value_atomic` loads two words and `transmute`s them into a `Value`
+/// with no validation. If those 16 bytes were not a `Value` — array payload
+/// read through the flat-object path, or a punned/torn write — the result is an
+/// enum holding an out-of-range discriminant, which is UB *the instant it
+/// exists*, before anything looks at it.
+///
+/// What that UB costs is neither hypothetical nor a fault at the read. A
+/// `match` on a Rust enum needs no default arm and therefore gets **no bounds
+/// check**: LLVM indexes its jump table directly — `movsxd rax, [r10 + rax*4]`
+/// — because a valid discriminant is in range by construction. The garbage tag
+/// becomes the index. That is the decoded faulting instruction of the eight
+/// hibernate-orm JSON/XML `hs_err` files, and it sits in
+/// `gc::heap::coerce_field_value_for_slot` — one frame ABOVE the reader that
+/// built the bad `Value`, which is why auditing read sites for jump tables
+/// found nothing at the read sites themselves. See
+/// `internal/fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md` §3.
+///
+/// Screening at the read turns that into `Value::Object(None)` plus a counted,
+/// rate-limited report naming the slot and both raw words.
+///
+/// # Safety
+/// `ptr` must name 16 readable, 8-byte-aligned bytes inside a live allocation.
+#[inline]
+unsafe fn jit_read_value_cell_checked(ptr: *const Value, site: &'static str) -> Value {
+    match cratonvm_types::read_value_checked_atomic(ptr) {
+        Some(v) => v,
+        None => {
+            JIT_CORRUPT_VALUE_CELLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let n = cratonvm_types::cell_census::note_decoded();
+            if n < 32 {
+                cratonvm_types::cell_census::note_reported();
+                // SAFETY: caller contract — 16 readable, 8-byte-aligned bytes.
+                // Per-word atomic so the diagnostic cannot tear against a
+                // concurrent plain writer.
+                let raw0 = (*(ptr as *const std::sync::atomic::AtomicU64))
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let raw1 = (*((ptr as *const u8).add(8) as *const std::sync::atomic::AtomicU64))
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    target: "cratonvm::jit::guard",
+                    slot = ?ptr,
+                    raw0 = format!("{raw0:#018x}"),
+                    raw1 = format!("{raw1:#018x}"),
+                    "{site}: corrupt Value cell (out-of-range discriminant) — \
+                     returning null instead of a UB-on-match Value. Heap \
+                     reference-integrity defect (see HIB-CV-32).",
+                );
+            }
+            Value::Object(None)
+        }
+    }
+}
+
 /// Calls that arrived with `GETFIELD_RECEIVER_PROVEN_OOP` set — the engagement
 /// counter for the trusted-receiver arm, printed beside the total so "adopted"
 /// and "helped" stay separable.
@@ -7586,7 +7657,12 @@ unsafe fn jit_getfield_impl(
     // PLAIN-SLOT TEARING FIX (2026-07-06): see the matching note on the
     // compact-layout branch above -- was `std::ptr::read(ptr as *const
     // Value)`, non-atomic, tearable against a concurrent plain putfield.
-    let val: Value = cratonvm_types::read_value_atomic(ptr as *const Value);
+    // DISCRIMINANT-SCREENED, and the `match` below is why. `read_value_atomic`
+    // would `transmute` these 16 bytes into a `Value` unconditionally; the
+    // multi-arm `match val` a hundred lines down then indexes a jump table by
+    // the tag with no bounds check. See `jit_read_value_cell_checked`, and
+    // `coerce_field_value_for_slot` for the crash that shape produced.
+    let val: Value = jit_read_value_cell_checked(ptr as *const Value, "jit_getfield/legacy-slot");
     // A REFERENCE load whose slot does not hold a reference.
     //
     // The legacy 16-byte slot carries its own discriminant, so unlike the
@@ -7784,10 +7860,11 @@ unsafe fn jit_getfield_impl(
         Value::Float(f) => f.to_bits() as i64,
         Value::Double(d) => d.to_bits() as i64,
         Value::Object(Some(r)) => {
-            // Live filter, unlike the compact-layout twin above:
-            // `read_value_atomic` (types/src/value.rs:1570) is a raw
-            // `transmute` of two relaxed word loads and validates nothing, so
-            // this `ObjectRef` can hold arbitrary bits straight off the slot.
+            // Live filter, unlike the compact-layout twin above. The read is
+            // now discriminant-screened (`jit_read_value_cell_checked`), which
+            // rules out an invalid TAG — it says nothing about the payload, so
+            // this `ObjectRef` can still hold arbitrary bits straight off the
+            // slot and the plausibility gate below is still load-bearing.
             //
             // TODO(zgc): legacy 16-byte reference field. Under `VmHeap::Zgc`
             // the barrier belongs on the slot read, i.e. before the `Value` is
@@ -7958,7 +8035,10 @@ pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i
         let existing = if let Some(storage) = storage {
             cratonvm_types::read_compact_field(ptr, storage, std::sync::atomic::Ordering::Relaxed)
         } else {
-            cratonvm_types::read_value_atomic(ptr as *const Value)
+            // Screened even though this is diagnostic-only: `{:?}` on a `Value`
+            // is itself a `match` over the discriminant, so an unscreened read
+            // here would crash the very run that armed the trace.
+            jit_read_value_cell_checked(ptr as *const Value, "jit_putfield_int/pfi-trace")
         };
         let cid_off = obj_ptr as *const u8;
         let cid: u32 = std::ptr::read(cid_off as *const u32);
@@ -8208,7 +8288,11 @@ pub unsafe extern "C" fn jit_putfield_object(
     // Atomic per-word read/write: the slot is read concurrently by the GC
     // marker and (possibly) written by another mutator thread; pair both ends
     // through the atomic helpers so the access is well-defined and tear-free.
-    let old_value: Value = cratonvm_types::read_value_atomic(ptr as *const Value);
+    // Screened: a corrupt cell decodes to `Object(None)` and is skipped by the
+    // `if let` below, rather than becoming an invalid `Value` and then an
+    // `ObjectRef` pushed onto the mark queue.
+    let old_value: Value =
+        jit_read_value_cell_checked(ptr as *const Value, "jit_putfield_ref/satb-pre");
     if let Value::Object(Some(_)) = old_value {
         let heap = heap_from_vm(vm_ptr);
         heap.satb_barrier(old_value);
@@ -25600,7 +25684,7 @@ const FFM_CARRIER_SLOTS: u32 = 6;
 // `HEADER_SIZE + index * SLOT_SIZE` lies inside the allocation.
 unsafe fn ffm_read_long_slot(obj_ptr: i64, index: usize) -> Option<i64> {
     let ptr = (obj_ptr as *const u8).add(HEADER_SIZE + index * SLOT_SIZE);
-    match cratonvm_types::read_value_atomic(ptr as *const Value) {
+    match jit_read_value_cell_checked(ptr as *const Value, "ffm_read_long_slot") {
         Value::Long(v) => Some(v),
         _ => None,
     }

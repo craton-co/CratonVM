@@ -16,15 +16,25 @@ phantom reference processing, compact and compressed object headers
 `GarbageCollector` trait abstracts the backend so the VM can swap
 collectors at startup.
 
-`ZgcRealHeap` is a real, memory-backed collector and `-XX:+UseZGC`
+`ZgcRealHeap` is a real, memory-backed collector, `-XX:+UseZGC`
 genuinely selects it (`GcAlgorithm::Zgc` → `GcBackend::Zgc` →
-`VmHeap::Zgc`) — but it is compiled in only behind the default-off `zgc`
-feature, so a stock build does not contain it and `-XX:+UseZGC` there
-warns and falls back to Generational. It is also not production ZGC: a
-stop-the-world, non-moving, whole-heap mark-sweep, with no colored
-pointers, load barriers, concurrency, or compaction. The colored-pointer
-code above it in `src/zgc.rs` is a metadata-only simulation with no
-production consumer.
+`VmHeap::Zgc`), and **it is the default**: the `zgc` feature has been
+default-ON since 2026-08-10 and `VmConfig`'s default `gc_algorithm` is
+`Zgc`. A `--no-default-features` build falls back to Generational, and
+`-XX:+UseGenerationalGC` is the escape hatch in every build.
+
+The colored-pointer code is no longer a simulation. `src/zgc/vaddr.rs`
+mints colored words, `src/zgc/barrier.rs::z_load` is the load barrier,
+`src/zgc_concurrent.rs` runs concurrent marking (`CRATONVM_ZGC_CONC_START`),
+`src/zgc/relocate.rs` compacts (kill switch `CRATONVM_ZGC_RELOCATE=0`),
+and `src/zgc/generation.rs` implements the opt-in generational mode
+(`CRATONVM_ZGC_GENERATIONAL=1`).
+
+What is *not* yet production ZGC: the **JIT-side load barrier is
+unwired**. `vm/src/jit/helpers.rs` and `heap.rs::ref_element_word_implausible`
+still reach raw reference words and panic as a deliberate tripwire when a
+colored one arrives. See
+`docs/feature-designs/zgc-jit-load-barrier.md`.
 
 ## Non-goals
 

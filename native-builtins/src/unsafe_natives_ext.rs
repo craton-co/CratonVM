@@ -1965,18 +1965,25 @@ fn ctx_caller_name(ctx: &mut dyn NativeContext) -> Option<String> {
     Some(out.join(" <- "))
 }
 
+/// Returns `true` when the offset is UNCLASSIFIED, i.e. the caller must refuse.
+///
+/// The three classified cases -- an arena-tagged handle, a synthetic offset, a
+/// registered static field -- return `false` and keep the private side store.
+/// Those are the paths that unblocked `ConcurrentHashMap.initTable` and the
+/// lazy-init hangs, and they are deliberately untouched.
 pub(crate) fn note_unsafe_side_store_offset(
     ctx: &mut dyn NativeContext,
     offset: usize,
     site: u32,
     nargs: usize,
-) {
+) -> bool {
     use std::sync::atomic::{AtomicU64, Ordering};
     if crate::unsafe_arena_addr_is_tagged(offset as i64)
         || crate::is_synthetic_offset(offset)
         || unsafe_static_field_target(offset).is_some()
     {
-        return;
+        // Classified: a legitimate user of the side store. Not a refusal.
+        return false;
     }
     static UNCLASSIFIED: AtomicU64 = AtomicU64::new(0);
     let n = UNCLASSIFIED.fetch_add(1, Ordering::Relaxed);
@@ -2005,6 +2012,7 @@ pub(crate) fn note_unsafe_side_store_offset(
             "UNCLASSIFIED-NULL-BASE: an Unsafe access with a null base whose              offset is neither an arena handle, nor a synthetic offset, nor a              registered static field. HotSpot reads this as an absolute address              and faults; here it lands in a private side store, so a CAS can              report success having written nowhere a reader can see. L1 R5."
         );
     }
+    true
 }
 
 fn unsafe_static_field_target(offset: usize) -> Option<(ClassId, usize)> {
@@ -2620,7 +2628,17 @@ pub(crate) fn native_unsafe_cas_int(
             if let Some(ok) = unsafe_static_cas(ctx, offset, expected, new_val) {
                 return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let cur = *map.entry(offset).or_insert(0);
             let ex = if let Value::Int(e) = expected { e } else { 0 };
@@ -2674,7 +2692,17 @@ pub(crate) fn native_unsafe_cas_long(
                 }
                 return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let cur = *map.entry(offset).or_insert(0);
             let ex = if let Value::Long(e) = expected { e } else { 0 };
@@ -2830,7 +2858,17 @@ pub(crate) fn native_unsafe_cas_object(
             if let Some(ok) = unsafe_static_cas(ctx, offset, expected, new_val) {
                 return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let mut map = lock_unsafe_shard_usize(static_obj_store(), offset);
             let cur = *map.entry(offset).or_insert(None);
             let ex = if let Value::Object(e) = expected {
@@ -2921,7 +2959,17 @@ pub(crate) fn native_unsafe_get_int_volatile(
                     _ => Value::Int(0),
                 }));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let map = lock_unsafe_shard_usize(static_int_store(), offset);
             return Ok(Some(Value::Int(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -2955,7 +3003,17 @@ pub(crate) fn native_unsafe_put_int_volatile(
             if unsafe_static_put(ctx, offset, Value::Int(v)) {
                 return Ok(None);
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             lock_unsafe_shard_usize(static_int_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -2990,7 +3048,17 @@ pub(crate) fn native_unsafe_get_long_volatile(
                     _ => Value::Long(0),
                 }));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let map = lock_unsafe_shard_usize(static_long_store(), offset);
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -3025,7 +3093,17 @@ pub(crate) fn native_unsafe_put_long_volatile(
             if unsafe_static_put(ctx, offset, Value::Long(v)) {
                 return Ok(None);
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -3056,7 +3134,17 @@ fn native_unsafe_get_object_volatile(
             if let Some(v) = unsafe_static_get(ctx, offset) {
                 return Ok(Some(recover_object_arg(v)));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let map = lock_unsafe_shard_usize(static_obj_store(), offset);
             return Ok(Some(Value::Object(
                 map.get(&offset).copied().unwrap_or(None),
@@ -3093,7 +3181,17 @@ fn native_unsafe_put_object_volatile(
             if unsafe_static_put(ctx, offset, Value::Object(v)) {
                 return Ok(None);
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             lock_unsafe_shard_usize(static_obj_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -3124,7 +3222,17 @@ pub(crate) fn native_unsafe_get_object(
             if let Some(v) = unsafe_static_get(ctx, offset) {
                 return Ok(Some(recover_object_arg(v)));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let map = lock_unsafe_shard_usize(static_obj_store(), offset);
             return Ok(Some(Value::Object(
                 map.get(&offset).copied().unwrap_or(None),
@@ -3159,7 +3267,17 @@ pub(crate) fn native_unsafe_put_object(
             if unsafe_static_put(ctx, offset, Value::Object(v)) {
                 return Ok(None);
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             lock_unsafe_shard_usize(static_obj_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -3479,7 +3597,17 @@ pub(crate) fn native_unsafe_get_int(
                     _ => Value::Int(0),
                 }));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let map = lock_unsafe_shard_usize(static_int_store(), offset);
             return Ok(Some(Value::Int(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -3513,7 +3641,17 @@ pub(crate) fn native_unsafe_put_int(
             if unsafe_static_put(ctx, offset, Value::Int(v)) {
                 return Ok(None);
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             lock_unsafe_shard_usize(static_int_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -3656,7 +3794,17 @@ pub(crate) fn native_unsafe_get_long(
                     _ => Value::Long(0),
                 }));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let map = lock_unsafe_shard_usize(static_long_store(), offset);
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -3698,7 +3846,17 @@ pub(crate) fn native_unsafe_put_long(
             if unsafe_static_put(ctx, offset, Value::Long(v)) {
                 return Ok(None);
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -3873,7 +4031,17 @@ pub(crate) fn native_unsafe_get_and_add_int(
             if let Some(old) = unsafe_static_get_and_add_int(ctx, offset, delta) {
                 return Ok(Some(Value::Int(old)));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let slot = map.entry(offset).or_insert(0);
             let old = *slot;
@@ -3940,7 +4108,17 @@ fn native_unsafe_get_and_set_int(ctx: &mut dyn NativeContext, args: &[Value]) ->
             if let Some(prev) = unsafe_static_get_and_set_int(ctx, offset, nv) {
                 return Ok(Some(Value::Int(prev)));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(0);
             return Ok(Some(Value::Int(prev)));
@@ -4314,7 +4492,17 @@ fn native_unsafe_get_and_add_long(ctx: &mut dyn NativeContext, args: &[Value]) -
             // Static-field semantics (null receiver). Maintain a per-offset
             // counter so callers like Thread$ThreadIdentifiers.next() get
             // monotonically-increasing values rather than a VM panic.
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let slot = map.entry(offset).or_insert(0);
             let old = *slot;
@@ -4379,7 +4567,17 @@ fn native_unsafe_get_and_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -
             if let Some(prev) = unsafe_static_get_and_set_long(ctx, offset, nv) {
                 return Ok(Some(Value::Long(prev)));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(0);
             return Ok(Some(Value::Long(prev)));
@@ -4429,7 +4627,17 @@ fn native_unsafe_get_and_set_object(
             if let Some(prev) = unsafe_static_get_and_set_object(ctx, offset, nv) {
                 return Ok(Some(Value::Object(prev)));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let mut map = lock_unsafe_shard_usize(static_obj_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(None);
             return Ok(Some(Value::Object(prev)));
@@ -5623,12 +5831,54 @@ pub(crate) fn native_unsafe_object_field_offset1(
     let cname = resolved_cid
         .and_then(|cid| ctx.class_name_of_id(cid))
         .unwrap_or_default();
-    let synthetic = synthetic_offset_for(&cname, &field_name);
-    tracing::warn!(
-        target: "cratonvm::unsafe",
-        "objectFieldOffset1: field {field_name:?} not found on class {cname:?} — minting synthetic offset {synthetic:#x} (CAS routed via side store)"
-    );
-    Ok(Some(Value::Long(synthetic as i64)))
+    // A STATIC field, asked for by its plain name. HotSpot accepts this at
+    // this door and CratonVM must too -- measured: `internal oFO(Class,String)
+    // static name` is `no-throw` on HotSpot.
+    //
+    // The `static:`-prefixed branch above is for a caller that mis-dispatches;
+    // this is the ordinary spelling. Registering the offset (rather than
+    // merely numbering it, which is what the old mint did) is what makes a
+    // later get/CAS reach the REAL static instead of a phantom slot -- the
+    // same distinction the memory-access latch repair turned on.
+    if let Some(cid0) = resolved_cid {
+        let mut cid_opt = Some(cid0);
+        while let Some(cid) = cid_opt {
+            let mut static_idx = 0usize;
+            for f in &ctx.declared_fields(cid) {
+                if f.is_static {
+                    if f.name == field_name {
+                        let cname = ctx.class_name_of_id(cid).unwrap_or_default();
+                        let offset =
+                            synthetic_offset_for(&cname, &format!("static:{field_name}"));
+                        remember_unsafe_static_field_offset(offset, cid, static_idx);
+                        return Ok(Some(Value::Long(offset as i64)));
+                    }
+                    static_idx += 1;
+                }
+            }
+            cid_opt = ctx.superclass_of(cid);
+        }
+    }
+
+    // REFUSE, as HotSpot does. This used to mint a synthetic offset and route
+    // it through a per-object side store, so a lazy-init guard ran against a
+    // phantom field and its CAS reported success against nothing any reader
+    // can see.
+    //
+    // The mint's two documented consumers were measured away (record §14:
+    // `Class$Atomic` resolves its three real names on JDK 25;
+    // `AbstractClassLoaderValue` references `Unsafe` zero times), and the path
+    // takes 0 mints across 120 regression vectors, 136 Netty buffer/util
+    // classes, both DoD workloads and both H2 vectors -- each with a firing
+    // positive control (`MintReachProbe`, 2).
+    //
+    // WildFly/Keycloak/Elasticsearch are not runnable on this host. If one of
+    // them does reach here, this now names the class and the field in a
+    // catchable `InternalError` instead of diverging silently.
+    Err(RuntimeError::InternalError {
+        message: format!("no such field {field_name:?} on class {cname:?}"),
+    }
+    .into())
 }
 
 pub(crate) fn unsafe_compare_exchange_static_field(
@@ -6135,7 +6385,7 @@ mod unsafe_static_field_offset_tests {
         let offset = thread_next_tid_offset();
         // `&mut ctx`: this test OWNS its MockNativeContext, unlike the 21
         // production call sites which already hold a `&mut dyn NativeContext`.
-        note_unsafe_side_store_offset(&mut ctx, offset, line!(), 3);
+        let _ = note_unsafe_side_store_offset(&mut ctx, offset, line!(), 3);
         lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, 1);
 
         let first = native_unsafe_get_and_add_long(
