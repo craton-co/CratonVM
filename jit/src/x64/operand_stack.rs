@@ -42,6 +42,49 @@ pub fn spill_slots_cap() -> Option<usize> {
     })
 }
 
+/// Why a spill word is being taken.
+///
+/// A parameter rather than a convention, for the reason the frame-line census
+/// gives one function every verdict: the first cut of the spill census
+/// attributed three call sites by hand and left 22-30% of reservations in an
+/// unnamed remainder -- and an unnamed remainder is exactly where the inline
+/// reserve was hiding when it took 280 words to hold 7. With this, a new
+/// `reserve_spill_slots` call site does not compile until someone has said
+/// which column it belongs in, and `res-total` is the sum of the named columns
+/// by construction rather than by hope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpillReason {
+    /// The ordinary operand push.
+    Push,
+    /// `flush_scratch_registers` giving a register-resident operand a home.
+    Flush,
+    /// `invalidate_callee_saved` re-homing every entry that aliases a register.
+    Invalidate,
+    /// An inlined callee's local frame.
+    InlineLocals,
+    /// An inlined body's branch-merge area.
+    InlineMerge,
+    /// The direct-call argument-service copy.
+    CallService,
+    /// A helper's argument buffer or out-parameter (intrinsic dispatch, FFM,
+    /// the monitor receiver).
+    HelperArgs,
+}
+
+impl SpillReason {
+    fn column(self) -> usize {
+        match self {
+            SpillReason::Push => crate::SPILL_RES_PUSH,
+            SpillReason::Flush => crate::SPILL_RES_FLUSH,
+            SpillReason::Invalidate => crate::SPILL_RES_INVALIDATE,
+            SpillReason::InlineLocals => crate::SPILL_RES_INLINE_LOCALS,
+            SpillReason::InlineMerge => crate::SPILL_RES_INLINE_MERGE,
+            SpillReason::CallService => crate::SPILL_RES_CALL_SERVICE,
+            SpillReason::HelperArgs => crate::SPILL_RES_HELPER_ARGS,
+        }
+    }
+}
+
 impl Compiler {
     pub(super) fn checked_spill_range_end(&mut self, start: i32, slots: usize) -> Option<i32> {
         let bytes = slots.checked_mul(8).and_then(|n| i32::try_from(n).ok());
@@ -65,11 +108,11 @@ impl Compiler {
         Some(end)
     }
 
-    pub(super) fn reserve_spill_slots(&mut self, slots: usize) -> Option<i32> {
-        // Every reservation, so the three attributed columns can be read as a
-        // fraction of a whole rather than as three numbers with an unknown
-        // remainder beside them.
+    pub(super) fn reserve_spill_slots(&mut self, slots: usize, why: SpillReason) -> Option<i32> {
+        // Every reservation, and every reservation named. `res-total` and the
+        // per-reason columns are written together here so they cannot disagree.
         crate::note_spill_cursor(crate::SPILL_RES_TOTAL, slots as u64);
+        crate::note_spill_cursor(why.column(), slots as u64);
         let start = self.next_spill_offset;
         let end = self.checked_spill_range_end(start, slots)?;
         self.next_spill_offset = end;
@@ -99,8 +142,7 @@ impl Compiler {
         if self.stack.is_empty() && self.stack_oop_marks.is_empty() {
             self.stack_oop_marks_exact = true;
         }
-        crate::note_spill_cursor(crate::SPILL_RES_PUSH, 1);
-        let offset = self.reserve_spill_slots(1)?;
+        let offset = self.reserve_spill_slots(1, SpillReason::Push)?;
         let slot = StackSlot::Frame(offset);
         self.stack.push(slot);
         self.stack_oop_marks.push(false);
@@ -910,7 +952,7 @@ impl Compiler {
     /// this again should read `spill_cursor_counts()` first.
     fn flush_home(&mut self, _idx: usize) -> Option<i32> {
         crate::note_spill_cursor(crate::SPILL_FLUSH_RESERVED, 1);
-        self.reserve_spill_slots(1)
+        self.reserve_spill_slots(1, SpillReason::Flush)
     }
 
     pub(super) fn flush_scratch_registers(&mut self) {
@@ -1044,7 +1086,7 @@ impl Compiler {
             // All scratch XMMs busy — fall back to frame spill.
             // Direct MOVQ [rbp-off], XMM0 — RCX is left untouched, which
             // helps callers that have RCX live across this flush.
-            let Some(off) = self.reserve_spill_slots(1) else {
+            let Some(off) = self.reserve_spill_slots(1, SpillReason::Flush) else {
                 return;
             };
             self.emit_movq_mem_rbp_from_xmm(off, 0);
@@ -1083,8 +1125,7 @@ impl Compiler {
             return;
         }
         // Spill the register value once
-        crate::note_spill_cursor(crate::SPILL_RES_INVALIDATE, 1);
-        let Some(off) = self.reserve_spill_slots(1) else {
+        let Some(off) = self.reserve_spill_slots(1, SpillReason::Invalidate) else {
             return;
         };
         self.emit_store_local(off, reg);

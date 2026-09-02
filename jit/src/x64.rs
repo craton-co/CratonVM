@@ -272,6 +272,7 @@ mod emit;
 mod frames;
 mod operand_stack;
 pub use operand_stack::spill_slots_cap;
+pub(crate) use operand_stack::SpillReason;
 pub mod safepoint;
 // ---------------------------------------------------------------------------
 // Compile bytecode to x86-64

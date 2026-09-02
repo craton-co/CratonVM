@@ -1409,6 +1409,29 @@ fn the_spill_census_is_wired_to_the_cursor() {
         after[crate::SPILL_MIN_HEADROOM] < u64::MAX,
         "min-headroom is still its unset sentinel after a successful          reservation, so nothing is recording it"
     );
+    // The claim `res-total` makes: the named columns account for ALL of it.
+    // The first cut of this census attributed three call sites by hand and left
+    // 22-30% of reservations unnamed -- and an unnamed remainder is exactly
+    // where the inline reserve was hiding. `SpillReason` is a parameter now, so
+    // this is checkable rather than aspirational.
+    let named: u64 = [
+        crate::SPILL_RES_PUSH,
+        crate::SPILL_RES_FLUSH,
+        crate::SPILL_RES_INVALIDATE,
+        crate::SPILL_RES_INLINE_LOCALS,
+        crate::SPILL_RES_INLINE_MERGE,
+        crate::SPILL_RES_CALL_SERVICE,
+        crate::SPILL_RES_HELPER_ARGS,
+    ]
+    .iter()
+    .map(|&c| after[c])
+    .sum();
+    assert_eq!(
+        named, after[crate::SPILL_RES_TOTAL],
+        "the per-reason columns must partition `res-total` ({named} named vs {} total).          A reservation reached the cursor without a `SpillReason` that maps to a column.",
+        after[crate::SPILL_RES_TOTAL]
+    );
+
     assert_eq!(
         after[crate::SPILL_FLUSH_CANONICAL],
         0,
