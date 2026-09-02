@@ -4,13 +4,10 @@
 The rule under test is "which access modes does a VarHandle support, given the
 type of the variable" — and it is NOT uniform, which is why this is a generated
 sweep and not a handful of hand-picked rows. Every arithmetic and bitwise mode
-against every variable type, plus the ORDER question that an implementation
-has to answer: does an unsupported mode beat a null coordinate? (HotSpot: yes,
-uniformly, across all ten types.)
-
-A third rule found by the same sweep -- a read-only, final-field handle
-refuses every WRITE mode -- is recorded in the comment below and deliberately
-not asserted here; it is not about the variable's type.
+against every variable type, plus the read-only (final-field) rule and the
+ORDER between all three. HotSpot's precedence, measured: read-only beats an
+unsupported mode beats a null coordinate -- though the first two both raise
+UnsupportedOperationException, so only the second boundary is observable.
 """
 
 # (tag, java type, field name, literal, cast-for-return)
@@ -32,6 +29,16 @@ BITS = [f"getAndBitwise{op}{suf}"
         for op in ("Or", "And", "Xor") for suf in ("", "Acquire", "Release")]
 MODES = ARITH + BITS
 
+# The remaining families, needed by the read-only section: a read-only handle
+# refuses EVERY write mode, not just the arithmetic ones.
+READ = ["get", "getVolatile", "getOpaque", "getAcquire"]
+WRITE = ["set", "setVolatile", "setOpaque", "setRelease"]
+CAS = ["compareAndSet", "weakCompareAndSet", "weakCompareAndSetPlain",
+       "weakCompareAndSetAcquire", "weakCompareAndSetRelease"]
+CAE = ["compareAndExchange", "compareAndExchangeAcquire",
+       "compareAndExchangeRelease"]
+GAS = ["getAndSet", "getAndSetAcquire", "getAndSetRelease"]
+
 def case(label, expr):
     return f'        probe("{label}", () -> {{ {expr} }});\n'
 
@@ -51,21 +58,53 @@ for tag, jt, fld, lit, cast in TYPES:
         lines.append(case(f"null-recv.{tag}.{m}",
                           f'return {cast}VH_{fld.upper()}.{m}((H) null, {lit});'))
 
-# ---- READ-ONLY (final-field) handles are deliberately ABSENT ------------
-# A third rule, reached by a different route: `findVarHandle` on a final field
-# yields a handle whose WRITE modes are unsupported, and HotSpot answers
-# UnsupportedOperationException for set / setVolatile / getAndSet /
-# compareAndSet / getAndAdd on one. CratonVM performs the write -- measured,
-# `final-int.set` stores 5 into a final field and `getAndSet` returns 5.
-#
-# Not fixed with this rule and not asserted here, because it is not about the
-# variable's TYPE: it needs the handle to record that its field was final,
-# which means field-level access flags reaching a native, which is plumbing
-# across crates rather than a check. Filed as known-issues/jdk-only/
-# varhandle-final-field-handle-performs-the-write-20260902.md, which also
-# records the one thing still unmeasured: where a read-only refusal sits
-# against the OTHER two rules when a final-field handle is also given a null
-# coordinate. Re-add this section when that lands.
+# ---- READ-ONLY handles: a final field ------------------------------------
+# `findVarHandle` on a final field yields a handle whose WRITE modes are
+# unsupported. Swept over every write family, plus the read modes as the
+# control (those stay legal), plus the STATIC final field, whose handle is
+# read-only for the same reason by a different lookup.
+RO_WRITE = (
+    [("set", "VH_FIN.{m}(h, 5); return VOID;")] +
+    [(m, "VH_FIN.{m}(h, 5); return VOID;") for m in WRITE[1:]] +
+    [(m, "return VH_FIN.{m}(h, 9, 5);") for m in CAS] +
+    [(m, "return (int) VH_FIN.{m}(h, 9, 5);") for m in CAE] +
+    [(m, "return (int) VH_FIN.{m}(h, 5);") for m in GAS + ARITH] +
+    [(m, "return (int) VH_FIN.{m}(h, 5);") for m in BITS]
+)
+for m, tpl in RO_WRITE:
+    lines.append(case(f"final-int.{m}", tpl.format(m=m)))
+# the reads must still work -- a read-only handle is read-only, not dead
+for m in READ:
+    lines.append(case(f"final-int.{m}", f'return (int) VH_FIN.{m}(h);'))
+
+# a final REFERENCE field, to show read-only-ness is about the HANDLE and not
+# about the variable's type
+for m in ("set", "getAndSet", "compareAndSet"):
+    if m == "compareAndSet":
+        lines.append(case(f"final-ref.{m}", f'return VH_FINREF.{m}(h, null, "y");'))
+    elif m == "set":
+        lines.append(case(f"final-ref.{m}", f'VH_FINREF.{m}(h, "y"); return VOID;'))
+    else:
+        lines.append(case(f"final-ref.{m}", f'return VH_FINREF.{m}(h, "y");'))
+lines.append(case("final-ref.get", 'return VH_FINREF.get(h);'))
+
+# a STATIC final field
+lines.append(case("static-final.set", 'VH_SFIN.set(5); return VOID;'))
+lines.append(case("static-final.getAndSet", 'return (int) VH_SFIN.getAndSet(5);'))
+lines.append(case("static-final.get", 'return (int) VH_SFIN.get();'))
+
+# ---- ORDER: read-only vs a NULL coordinate -------------------------------
+# The one interaction that is OBSERVABLE. Read-only and unsupported-mode both
+# raise UnsupportedOperationException, so their relative order cannot be seen
+# from the exception class; read-only against a null coordinate is UOE against
+# NullPointerException, and something has to win.
+for m in ("set", "getAndSet", "compareAndSet", "getAndAdd"):
+    if m == "set":
+        lines.append(case(f"null-final.{m}", 'VH_FIN.set((H) null, 5); return VOID;'))
+    elif m == "compareAndSet":
+        lines.append(case(f"null-final.{m}", 'return VH_FIN.compareAndSet((H) null, 9, 5);'))
+    else:
+        lines.append(case(f"null-final.{m}", f'return (int) VH_FIN.{m}((H) null, 5);'))
 
 # ---- control: modes every type supports ----------------------------------
 for tag, jt, fld, lit, cast in TYPES:
@@ -109,19 +148,27 @@ public class RJdkVarHandleModeSupport {
     static class H {
 %s
         final int fin = 9;
+        final Object finRef = "seed";
     }
+
+    static final int SFIN = 9;
 
     static final H h = new H();
     static final H h2 = new H();
 
 %s
     static final VarHandle VH_FIN;
+    static final VarHandle VH_FINREF;
+    static final VarHandle VH_SFIN;
 
     static {
         try {
             MethodHandles.Lookup l = MethodHandles.lookup();
 %s
             VH_FIN = l.findVarHandle(H.class, "fin", int.class);
+            VH_FINREF = l.findVarHandle(H.class, "finRef", Object.class);
+            VH_SFIN = l.findStaticVarHandle(
+                RJdkVarHandleModeSupport.class, "SFIN", int.class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }

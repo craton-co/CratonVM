@@ -494,17 +494,35 @@ fn poll_submission_status_unknown_handle_returns_none() {
 // actually uses via `GcCriticalGuard`/`shared.mem.heap.enter_gpu_critical()`),
 // rather than a synthetic per-test counter. Added here.
 //
-// NOTE on "via ResidencyTracker if applicable" (task item d): it is not
-// applicable. `gpu_residency::PrimitiveType` has exactly four variants
-// (I32, I64, F32, F64) -- there is no Short/Byte variant, so a
-// `craton.gpu.GpuArray`/`ResidencyTracker` handle cannot carry a `short[]`
-// or `byte[]` today. The i16/i8 marshalling added in
-// `vm/src/runtime/gpu_marshal.rs` is reachable only through the direct
-// array-arg path in `dispatch_method_from_native`'s marshal loop
-// (`Value::Object` -> `array_element_type` -> `marshal_array_arg`), never
-// through `Native.arrayWrapInt`-style residency wrapping. Flagging this
-// as a real (if minor) API-surface gap rather than silently working
-// around it.
+// NOTE on "via ResidencyTracker if applicable" (task item d), REWRITTEN
+// 2026-09-02. The original note said the i16/i8 marshalling was
+// "reachable only through the direct array-arg path in
+// `dispatch_method_from_native`'s marshal loop". It was reachable
+// through NOTHING: that marshal loop's `match element_type` had arms
+// for Int/Long/Float/Double and a catch-all that returned
+// "submitMethod: unsupported array element type", so every `short[]` or
+// `byte[]` kernel was admitted by the analyzer, lowered to PTX, and then
+// refused at marshalling and silently re-run on the interpreter. The
+// note asserted a reachability it never exercised, and that is why the
+// gap survived: `gpu_marshal`'s `direct_xfer!(upload_obj_i16, ...)` and
+// `host_view_i16`/`write_back_i16` were fully written, unit-tested at
+// this altitude, and called by no one.
+//
+// The Short/Byte arms landed the same day; `bench-gpu/marshal-stress.sh`
+// is the end-to-end cover, and it asserts a per-kernel H2D byte count so
+// an arm that stops dispatching fails loudly instead of quietly matching
+// the interpreter it fell back to.
+//
+// The `ResidencyTracker` half of the original note was doubly moot:
+// `vm/src/runtime/gpu_residency.rs` was dead code (removed 2026-09-02 --
+// its `device_bytes` field was only ever written as `None`, so
+// `is_resident` could not return true, and nothing outside its own tests
+// constructed one). The live `GpuArray` surface is
+// `native-builtins/src/craton_gpu.rs` plus `offload.rs`'s `device_cache`.
+// That surface DOES register `arrayWrapShort` ("([S)J"), but its
+// `CachedBuffer::I16` carries fp16 bit patterns for the built-in kernels
+// rather than a general `short[]`, so `resident_arm!` having no Short arm
+// is deliberate and is NOT the same gap as the one fixed above.
 // ═════════════════════════════════════════════════════════════════════
 
 #[test]

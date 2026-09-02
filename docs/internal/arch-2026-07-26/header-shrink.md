@@ -339,6 +339,15 @@ be converted before the shrink, as a standalone no-op commit.**
 
 ### 6.6 `jit/src/ir_lower.rs` — a second emitter the tripwire never covered
 
+*2026-09-02: `jit/src/lib.rs` gained one more `HEADER_SIZE` use — the
+String-access compact rows `try_compile_inner` installs for the IR
+expander's `value` / `coder` loads. It is a SUBTRACTION that
+`ir_lower::emit_inline_compact_getfield` immediately re-adds, so the header
+size cancels and no displacement is baked at this site; the shrink has
+nothing to visit here. Counted in the `lib.rs` inventory row (7 -> 8)
+because the ratchet counts uses, not hazards. See
+`layout-constant-hazards.md` §3 for the full site list.*
+
 `header_offset_emission_site_inventory_matches_the_doc` scans only `x64.rs`. `ir_lower.rs`
 is a second x64 emitter with header-offset emission sites that were invisible to the
 audit the shrink was planned from:
