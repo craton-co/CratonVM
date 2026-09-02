@@ -347,6 +347,21 @@ const SIG_NONE_RSA: i32 = 22;
 /// OID for the pair). SunJSSE serves it, not SunRsaSign, and netty's
 /// `JdkDelegatingPrivateKeyMethod` maps `SSL_SIGN_RSA_PKCS1_MD5_SHA1` onto it.
 const SIG_MD5_SHA1_RSA: i32 = 23;
+/// Every OTHER member of the `sun.security.provider.DSA` family — the eighteen
+/// names `SHA1withDSA` and `SHA256withDSA` are the only two of, plus their
+/// `inP1363Format` twins.
+///
+/// ONE index for all of them, because the concrete SPI class is a pure function
+/// of the caller's own spelling (`dsa_family_spi_class`) and this engine
+/// computes none of them itself: the whole of a DSA signature here is
+/// `construct the JDK's SPI, init, update, sign/verify`. Eighteen constants
+/// would be eighteen names for the same behaviour, and every switch on them
+/// would have eighteen identical arms.
+///
+/// `SHA1withDSA` and `SHA256withDSA` keep their own indices above so nothing
+/// that already resolves changes route — their `algo_idx` arms are matched
+/// first, and `algo_name` still answers for them.
+const SIG_DSA_REAL: i32 = 24;
 
 fn algo_idx(name: &str) -> i32 {
     let upper = name.to_ascii_uppercase();
@@ -402,8 +417,106 @@ fn algo_idx(name: &str) -> i32 {
         // id-dsa-with-sha1 / dsaWithSHA256:
         "1.2.840.10040.4.3" => SIG_SHA1_DSA,
         "2.16.840.1.101.3.4.3.2" => SIG_SHA256_DSA,
+        // The rest of the `sun.security.provider.DSA` family — `NONEwithDSA`,
+        // `SHA{224,384,512}withDSA`, `SHA3-{224,256,384,512}withDSA` and the
+        // nine `inP1363Format` twins. Last, so every explicit arm above wins.
+        other if dsa_family_spi_class(other).is_some() => SIG_DSA_REAL,
         _ => -1,
     }
+}
+
+/// The real JDK `sun.security.provider.DSA$*` SPI class for a DSA-family
+/// signature name, or `None` when the name is not one.
+///
+/// Derived from the name rather than tabulated, because the JDK's own nested
+/// class names are the algorithm names with two mechanical substitutions: the
+/// digest's `-` becomes `_` (`SHA3-256withDSA` ->
+/// `DSA$SHA3_256withDSA`, since `-` is not a Java identifier character), and
+/// `NONEwithDSA` is spelled `RawDSA`. Verified against HotSpot 25's own
+/// `Security.getProvider("SUN").getServices()` output rather than recalled —
+/// every string below appears there verbatim as a service's `getClassName()`.
+///
+/// The `inP1363Format` variants are NOT a formatting flag this engine could
+/// apply itself: they are separate SPI classes emitting the IEEE P1363 fixed-
+/// width `r || s` instead of the DER `SEQUENCE`, and the JDK implements them by
+/// subclassing. Routing to the class is therefore also what makes the FORMAT
+/// right.
+fn dsa_family_spi_class(name: &str) -> Option<&'static str> {
+    let upper = name.to_ascii_uppercase();
+    let (digest, p1363) = match upper.strip_suffix("INP1363FORMAT") {
+        Some(rest) => (rest.strip_suffix("WITHDSA")?, true),
+        None => (upper.as_str().strip_suffix("WITHDSA")?, false),
+    };
+    Some(match (digest, p1363) {
+        ("NONE", false) => "sun/security/provider/DSA$RawDSA",
+        ("NONE", true) => "sun/security/provider/DSA$RawDSAinP1363Format",
+        ("SHA1", false) | ("SHA-1", false) => "sun/security/provider/DSA$SHA1withDSA",
+        ("SHA1", true) | ("SHA-1", true) => {
+            "sun/security/provider/DSA$SHA1withDSAinP1363Format"
+        }
+        ("SHA224", false) | ("SHA-224", false) => "sun/security/provider/DSA$SHA224withDSA",
+        ("SHA224", true) | ("SHA-224", true) => {
+            "sun/security/provider/DSA$SHA224withDSAinP1363Format"
+        }
+        ("SHA256", false) | ("SHA-256", false) => "sun/security/provider/DSA$SHA256withDSA",
+        ("SHA256", true) | ("SHA-256", true) => {
+            "sun/security/provider/DSA$SHA256withDSAinP1363Format"
+        }
+        ("SHA384", false) | ("SHA-384", false) => "sun/security/provider/DSA$SHA384withDSA",
+        ("SHA384", true) | ("SHA-384", true) => {
+            "sun/security/provider/DSA$SHA384withDSAinP1363Format"
+        }
+        ("SHA512", false) | ("SHA-512", false) => "sun/security/provider/DSA$SHA512withDSA",
+        ("SHA512", true) | ("SHA-512", true) => {
+            "sun/security/provider/DSA$SHA512withDSAinP1363Format"
+        }
+        ("SHA3-224", false) => "sun/security/provider/DSA$SHA3_224withDSA",
+        ("SHA3-224", true) => "sun/security/provider/DSA$SHA3_224withDSAinP1363Format",
+        ("SHA3-256", false) => "sun/security/provider/DSA$SHA3_256withDSA",
+        ("SHA3-256", true) => "sun/security/provider/DSA$SHA3_256withDSAinP1363Format",
+        ("SHA3-384", false) => "sun/security/provider/DSA$SHA3_384withDSA",
+        ("SHA3-384", true) => "sun/security/provider/DSA$SHA3_384withDSAinP1363Format",
+        ("SHA3-512", false) => "sun/security/provider/DSA$SHA3_512withDSA",
+        ("SHA3-512", true) => "sun/security/provider/DSA$SHA3_512withDSAinP1363Format",
+        _ => return None,
+    })
+}
+
+/// Every DSA-family signature name this engine offers, in the spelling HotSpot
+/// advertises. The seed list and [`dsa_family_spi_class`] are kept one set by
+/// `every_dsa_family_signature_name_maps_to_an_spi_class`.
+pub(crate) const DSA_FAMILY_SIGNATURE_NAMES: &[&str] = &[
+    "NONEwithDSA",
+    "SHA1withDSA",
+    "SHA224withDSA",
+    "SHA256withDSA",
+    "SHA384withDSA",
+    "SHA512withDSA",
+    "SHA3-224withDSA",
+    "SHA3-256withDSA",
+    "SHA3-384withDSA",
+    "SHA3-512withDSA",
+    "NONEwithDSAinP1363Format",
+    "SHA1withDSAinP1363Format",
+    "SHA224withDSAinP1363Format",
+    "SHA256withDSAinP1363Format",
+    "SHA384withDSAinP1363Format",
+    "SHA512withDSAinP1363Format",
+    "SHA3-224withDSAinP1363Format",
+    "SHA3-256withDSAinP1363Format",
+    "SHA3-384withDSAinP1363Format",
+    "SHA3-512withDSAinP1363Format",
+];
+
+/// The JDK class each name in [`DSA_FAMILY_SIGNATURE_NAMES`] resolves to, for
+/// the seed rows — `Provider.getServices()` reports the implementation class,
+/// and reporting the marker string there would leave the enumeration diff open
+/// on twenty rows this change is closing.
+pub(crate) fn dsa_family_service_class(name: &str) -> Option<String> {
+    // Internal (`/`-separated) to source (`.`-separated) form. The `$` that
+    // separates the nested class stays as it is — that is how the JDK spells it
+    // in `Provider.Service.getClassName()` too.
+    dsa_family_spi_class(name).map(|c| c.replace('/', "."))
 }
 
 fn algo_name(idx: i32) -> &'static str {
@@ -879,13 +992,23 @@ fn eddsa_real_spi_class(alg: i32) -> Option<&'static str> {
 ///
 /// Kill-switch `CRATONVM_SYNTHETIC_DSA=1` restores the legacy (always-false)
 /// behavior for debugging / regression bisecting.
-fn dsa_real_spi_class(alg: i32) -> Option<&'static str> {
+///
+/// `SIG_DSA_REAL` covers the other eighteen names of the family and resolves its
+/// SPI from the caller's own spelling, which is why this takes `ctx`/`this`:
+/// one index, eighteen classes, and `sig_algorithm_name` is where the spelling
+/// survived (the `algorithm` field `getInstance` set).
+fn dsa_real_spi_class(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    alg: i32,
+) -> Option<&'static str> {
     if !crate::route_dsa_to_real() {
         return None;
     }
     match alg {
         SIG_SHA256_DSA => Some("sun/security/provider/DSA$SHA256withDSA"),
         SIG_SHA1_DSA => Some("sun/security/provider/DSA$SHA1withDSA"),
+        SIG_DSA_REAL => dsa_family_spi_class(&sig_algorithm_name(ctx, this)),
         _ => None,
     }
 }
@@ -1986,7 +2109,7 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         return drive_real_signature_spi(ctx, this, spi_class, None);
     }
     // DSA: drive the real sun.security.provider.DSA$* SPI (no native DSA crypto).
-    if let Some(spi_class) = dsa_real_spi_class(alg) {
+    if let Some(spi_class) = dsa_real_spi_class(ctx, this, alg) {
         return drive_real_signature_spi(ctx, this, spi_class, None);
     }
     // ML-DSA: drive the real SUN ML_DSA_Impls$SIG* SPI (real lattice signature).
@@ -2139,7 +2262,7 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         return drive_real_signature_spi(ctx, this, spi_class, Some(provided));
     }
     // DSA: drive the real sun.security.provider.DSA$* SPI (no native DSA crypto).
-    if let Some(spi_class) = dsa_real_spi_class(alg) {
+    if let Some(spi_class) = dsa_real_spi_class(ctx, this, alg) {
         let provided = match args.get(1) {
             Some(Value::Object(Some(arr))) => read_byte_array_full(ctx, *arr),
             _ => Vec::new(),
@@ -2782,6 +2905,63 @@ mod tests {
     /// (matching `key_factory::pqc_spi_classes`' 2/3/5 NIST-category suffixes),
     /// and a non-ML-DSA name rejects.
     #[test]
+    /// The seed list and the SPI map are ONE set, in both directions.
+    ///
+    /// They are separate declarations — one is what `Security.getAlgorithms`
+    /// reports, the other is what `sign()` drives — and a name in the first
+    /// without an arm in the second is precisely the defect
+    /// `W7-63-jca-advertise-vs-serve.md` is named for: a provider advertising
+    /// an algorithm it will not serve. `seed_direct_native_engine_services`
+    /// would panic on that (`.expect`), which is a loud failure at VM start
+    /// rather than a quiet one at `getInstance` — but only if a VM is started,
+    /// so it is asserted here too.
+    ///
+    /// The reverse direction is the one that would rot silently: an SPI arm
+    /// nothing advertises serves a name `Security.getAlgorithms("Signature")`
+    /// says does not exist.
+    #[test]
+    fn every_dsa_family_signature_name_maps_to_an_spi_class() {
+        for name in DSA_FAMILY_SIGNATURE_NAMES {
+            assert!(
+                dsa_family_spi_class(name).is_some(),
+                "{name} is advertised and has no SPI class",
+            );
+            assert_eq!(
+                algo_idx(name),
+                if *name == "SHA1withDSA" {
+                    SIG_SHA1_DSA
+                } else if *name == "SHA256withDSA" {
+                    SIG_SHA256_DSA
+                } else {
+                    SIG_DSA_REAL
+                },
+                "{name} must resolve to a DSA index, or getInstance refuses it",
+            );
+        }
+        // Every spelling the map accepts is advertised under its canonical
+        // name. Case and the `SHA-256` hyphenation are accepted as INPUT
+        // (JCA lookup is case-insensitive and callers spell both ways) and are
+        // deliberately not separate advertised names.
+        for name in DSA_FAMILY_SIGNATURE_NAMES {
+            assert_eq!(
+                dsa_family_spi_class(&name.to_ascii_lowercase()),
+                dsa_family_spi_class(name),
+                "{name} must resolve case-insensitively",
+            );
+        }
+        assert_eq!(DSA_FAMILY_SIGNATURE_NAMES.len(), 20);
+        // Not a DSA name; must not be captured by the suffix test.
+        assert_eq!(dsa_family_spi_class("SHA256withECDSA"), None);
+        assert_eq!(dsa_family_spi_class("SHA256withRSA"), None);
+        assert_eq!(dsa_family_spi_class("DSA"), None);
+        // The two encodings are different classes, which is the whole reason
+        // the `inP1363Format` names route rather than being a flag.
+        assert_ne!(
+            dsa_family_spi_class("SHA256withDSA"),
+            dsa_family_spi_class("SHA256withDSAinP1363Format"),
+        );
+    }
+
     fn mldsa_spi_class_for_name_maps_parameter_sets() {
         assert_eq!(
             mldsa_spi_class_for_name("ML-DSA-44"),

@@ -2154,18 +2154,40 @@ fn seed_direct_native_engine_services() {
             "sun.security.provider.SecureRandom",
         );
     }
-    for algorithm in [
-        "DSA",
-        "SHA1withDSA",
-        "SHA256withDSA",
-        "ML-DSA",
-        "ML-DSA-44",
-        "ML-DSA-65",
-        "ML-DSA-87",
-    ] {
+    for algorithm in ["ML-DSA", "ML-DSA-44", "ML-DSA-65", "ML-DSA-87"] {
         put_service(SUN, "Signature", algorithm, "sun.security.provider.Native");
     }
-    put_alias(SUN, "Signature", "DSS", "DSA");
+    // The WHOLE `sun.security.provider.DSA` family — twenty names, of which
+    // this list carried two.
+    //
+    // The eighteen missing ones are not a different kind of thing from the two
+    // that were here: this engine computes NO DSA signature itself
+    // (`crypto_impl` has no DSA arm at all), so `SHA1withDSA` was already the
+    // JDK's own SPI driven from `signature::drive_real_signature_spi`, and the
+    // other eighteen are the same drive against a sibling class that
+    // `dsa_family_spi_class` derives from the caller's own spelling. Nine of
+    // them are the `inP1363Format` twins, which are NOT a formatting flag this
+    // engine could apply — the JDK implements the IEEE P1363 fixed-width
+    // `r || s` encoding by subclassing, so routing to the class is what makes
+    // the format right too.
+    //
+    // The class name is the REAL one per row, not the `.Native` marker: this is
+    // a family the JDK actually implements for us, and `getServices()` reports
+    // `getClassName()`, so a marker here would leave twenty rows differing from
+    // HotSpot's enumeration for no reason.
+    for algorithm in crate::jca::signature::DSA_FAMILY_SIGNATURE_NAMES {
+        let cls = crate::jca::signature::dsa_family_service_class(algorithm)
+            .expect("DSA_FAMILY_SIGNATURE_NAMES is exactly dsa_family_spi_class's domain");
+        put_service(SUN, "Signature", algorithm, &cls);
+    }
+    // `DSA` and `DSS` are ALIASES of `SHA1withDSA` on HotSpot, not services.
+    // Seeding `DSA` as a primary made `Security.getAlgorithms("Signature")`
+    // report a name HotSpot does not — measured 2026-09-02, it was the only
+    // row this VM advertised and HotSpot did not. `getInstance("DSA")` is
+    // unaffected: `algo_idx` maps it directly, and the alias table resolves it
+    // for the named-provider gate.
+    put_alias(SUN, "Signature", "DSA", "SHA1withDSA");
+    put_alias(SUN, "Signature", "DSS", "SHA1withDSA");
 
     const RSA: &str = "SunRsaSign";
     for algorithm in ["RSA", "RSASSA-PSS"] {
