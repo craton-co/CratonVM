@@ -15,7 +15,7 @@ Subject: `regression-suite/src/RArrayStoreTiers.java`,
 Follows on from
 [`W8-E15-1-the-fourth-broken-oracle-the-unscheduled-vector-and-the-reach-ratchet.md`](W8-E15-1-the-fourth-broken-oracle-the-unscheduled-vector-and-the-reach-ratchet.md)
 — its NOM-1 is §3 below, its NOM-2 is §1, its NOM-3 is §2 — and from
-[`W8-E9-1-three-broken-oracles-and-the-suite-denominator.md`](W8-E9-1-three-broken-oracles-and-the-suite-denominator.md),
+`W8-E9-1-three-broken-oracles-and-the-suite-denominator.md` (retired: `W8-E9-1-three-broken-oracles-and-the-suite-denominator`),
 whose NOM-4 is the standing judgement §4 addresses.
 
 Oracle: HotSpot **25.0.3+9** (Microsoft build 25.0.3+9-LTS, Windows), the same
