@@ -1844,6 +1844,11 @@ pub const INVENTORY: &[E] = &[
     // binary both ways.
     E { group: Group::GC, token: "gpu-host-callback", on_key: Some("CRATONVM_GPU_HOST_CALLBACK"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "gpu-device-pool", on_key: Some("CRATONVM_GPU_DEVICE_POOL"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // How many carriers the FFM element fast path remembers per thread. `1`
+    // is the single slot it replaced, which is the control arm: kfusion's
+    // integration alternates the TSDF volume with the images it reads, and
+    // one slot published 38.3M native verdicts for 129M consults.
+    E { group: Group::JIT, token: "ffm-verdict-ways", on_key: Some("CRATONVM_FFM_VERDICT_WAYS"), off_key: None, off_word: None, since: "2026-09-02" },
     // `gpu-wait-latch` is DEFAULT-ON with a "0" off-word, same argument as
     // `gpu-device-pool`: skipping a `cuStreamWaitEvent` on an event that has
     // already fired has no observable semantics, so the only honest way to
