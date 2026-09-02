@@ -200,6 +200,14 @@ fn maybe_dump_shutdown_reports() {
     // ran at all.
     cratonvm_vm::report_map_view_cache_at_exit();
 
+    // The stale-frame-word oracle's run totals, on `CRATONVM_DBG=remap-residue`.
+    // `local_oop` is the count that names a missed root; the per-frame
+    // `stale_live` number it replaces is an upper bound that includes dead
+    // spill residue, and was twice read as a verdict. `frames` is the
+    // engagement counter. See
+    // `jit::conservative_roots::report_remap_residue_census_at_exit`.
+    cratonvm_vm::jit::conservative_roots::report_remap_residue_census_at_exit();
+
     // The punned-cell watch census, on `CRATONVM_DBG_WATCH_PUN=<class>:<slot>`.
     // `accessor_reads` / `accessor_stores` are the ENGAGEMENT counters: the
     // experiment this watch exists for turns the JIT off, which also removes
@@ -591,6 +599,23 @@ default run can be censused before strict mode is switched on):
   --explain-jdk-only            Print the long-form explanation for each
                                 violation, and leave absolute paths unredacted
                                 in the reports.
+
+Differential mode (docs/testing/diff-hotspot.md):
+  --diff-hotspot                Run this same program under CratonVM and under a
+                                reference JDK and report the FIRST divergence in
+                                stdout / stderr / exit status. Exit 0 identical,
+                                1 diverged, 2 no usable reference JDK, 3 the
+                                CratonVM side was not self-consistent.
+  --diff-ignore <PATTERN>       Mask any output line containing PATTERN on both
+                                sides ('*' is a wildcard). Repeatable.
+  --diff-runs <N>               CratonVM-side runs used to detect the program's
+                                own nondeterminism before blaming HotSpot
+                                (default 2; 1 disables the check).
+  --diff-timeout <SECONDS>      Per-child wall clock (default 120).
+  --diff-java-arg <ARG>         Extra argument for the reference `java` only.
+                                Repeatable.
+  --diff-strict                 Report a difference that only the built-in
+                                nondeterminism maskers explain as a failure.
 ";
 
 /// CratonVM - A Java Virtual Machine implemented in Rust.
@@ -2443,6 +2468,38 @@ fn extract_hotspot_flags(raw: Vec<String>) -> (Vec<String>, HotspotFlags) {
 /// hard error — a typo'd sub-option here has no other layer that will ever
 /// catch it, and JFR's whole failure mode in this audit is options that
 /// silently do nothing.
+/// Collect `+<EventName>#enabled=<bool>` tokens out of a
+/// `-XX:StartFlightRecording:` option string.
+///
+/// B10 (2026-09-01). Split from [`parse_jfr_start_recording_opts`] rather than
+/// folded into it because the two answer different questions about the same
+/// string — that one builds a `JfrStartRecordingConfig`, this one names events
+/// on `VmConfig` — and because the grammar itself belongs to
+/// `cratonvm_vm::config::apply_jfr_event_setting`, which the jcmd `JFR.start`
+/// surface calls too. One grammar, two callers; the spelling is HotSpot's own.
+///
+/// Naming an event **narrows** the recording to exactly the names given:
+/// `RecordingSettings::enabled_event_names` is simultaneously the producer
+/// arming set and the drain whitelist, so there is no way to say "arm this one
+/// and keep everything else". `Recording.enable(...)` from Java behaves the
+/// same way, so the two routes agree rather than diverging.
+fn parse_jfr_event_settings(raw: &str) -> Result<Option<Vec<String>>, String> {
+    let mut events: Option<Vec<String>> = None;
+    for pair in raw.split(',') {
+        let pair = pair.trim();
+        if !pair.starts_with('+') {
+            continue;
+        }
+        let (key, value) = pair.split_once('=').ok_or_else(|| {
+            format!(
+                "-XX:StartFlightRecording: event setting `{pair}` is missing `=value`                  (expected `+<EventName>#enabled=true`)"
+            )
+        })?;
+        cratonvm_vm::config::apply_jfr_event_setting(&mut events, key, value)?;
+    }
+    Ok(events)
+}
+
 fn parse_jfr_start_recording_opts(
     raw: &str,
 ) -> Result<cratonvm_vm::config::JfrStartRecordingConfig, String> {
@@ -2461,6 +2518,14 @@ fn parse_jfr_start_recording_opts(
         let (key, value) = pair.split_once('=').ok_or_else(|| {
             format!("-XX:StartFlightRecording: option `{pair}` is missing `=value`")
         })?;
+        // B10: an event setting, not a recording option. `apply_jfr_event_setting`
+        // in `cratonvm_vm::config` owns the grammar; `parse_jfr_event_settings`
+        // below makes the second pass that collects them. Skipping here rather
+        // than erroring is what lets one comma-separated option string carry both
+        // kinds, exactly as HotSpot's does.
+        if key.starts_with('+') {
+            continue;
+        }
         match key {
             "filename" => cfg.filename = Some(value.to_string()),
             "duration" => cfg.duration = Some(parse_jfr_duration(value)?),
@@ -2483,7 +2548,7 @@ fn parse_jfr_start_recording_opts(
             }
             other => {
                 return Err(format!(
-                    "-XX:StartFlightRecording: unrecognized option `{other}`                      (supported: filename, duration, maxage, maxevents, dumponexit)"
+                    "-XX:StartFlightRecording: unrecognized option `{other}`                      (supported: filename, duration, maxage, maxevents, dumponexit, +<EventName>#enabled=true)"
                 ))
             }
         }
@@ -4542,6 +4607,13 @@ fn run() -> Result<()> {
     if let Some(raw) = &hotspot_flags.jfr_start_recording {
         config.jfr_start_recording =
             Some(parse_jfr_start_recording_opts(raw).map_err(|e| anyhow::anyhow!("{e}"))?);
+        // B10: the same string also carries `+<EventName>#enabled=true` tokens.
+        // Collected in a second pass so a bad event name is an `Err` here rather
+        // than a silently-ignored token — a typo that produces an empty dump is
+        // indistinguishable from "the event never fired", which is precisely the
+        // ambiguity this event was added to remove.
+        config.jfr_enabled_events =
+            parse_jfr_event_settings(raw).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
     // T6.3.3 — `-agentlib:`, `-agentpath:`, `-javaagent:`. The options
@@ -6474,6 +6546,27 @@ fn run() -> Result<()> {
 }
 
 fn main() {
+    // `--diff-hotspot`: run this same program under CratonVM and under a
+    // reference JDK and report the FIRST divergence, then exit. Handled here,
+    // as the very first statement of `main`, for three reasons:
+    //
+    //  * this mode boots no VM in *this* process — it spawns one CratonVM child
+    //    and one `java` — so it must not install flags, expand the grouped
+    //    configuration variables, or latch the immutable snapshot the child
+    //    under test will latch for itself;
+    //  * `diff_hotspot::scan` removes its own `--diff-*` tokens before
+    //    `expand_argfiles` / `insert_program_args_separator` ever see them, so
+    //    the pre-clap argv pipeline (and its ~60 positional-semantics tests) is
+    //    untouched by this feature;
+    //  * on a normal launch it costs one pass over argv and returns `None`.
+    //
+    // See `docs/testing/diff-hotspot.md`.
+    if let Some(code) = diff_hotspot::maybe_run() {
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        std::process::exit(code);
+    }
+
     // Install the immutable runtime configuration before crash handlers or
     // any other subsystem can read a CratonVM flag. `--nojit` is detected
     // from the launcher portion of the expanded argv (never from Java program
@@ -6892,6 +6985,17 @@ fn main() {
             // `System.exit` printer sits in the shutdown trailer, and this is
             // the arm a program that returns from `main` takes instead.
             cratonvm_types::stale_remap_census::exit_summary();
+            // A3 (2026-09-01): the coercion / ref-word degradation censuses,
+            // on the arm a program that returns from `main` takes. Same pair as
+            // the shutdown trailer in `lang_system.rs`; both are `Once`-guarded,
+            // so whichever exit path runs first prints and the other is a no-op.
+            cratonvm_types::compact_value::coercion_census::exit_summary();
+            cratonvm_types::compact_value::degradation_exit_summary();
+            // The JVMS 6.5 uninstantiable-receiver census (A12), on the arm a
+            // program that returns from `main` takes. `Once`-guarded and silent
+            // unless a native handed back an abstract/interface receiver, so
+            // having it on both exit paths is correct.
+            cratonvm_native_api::instantiable::exit_summary();
             match result {
                 Ok(()) => {
                     cratonvm_vm::jit::conservative_roots::report_a5_engagement();
@@ -7011,6 +7115,1767 @@ fn physical_ram_bytes() -> Option<u64> {
 use cratonvm_vm::runtime::container::{
     clamp_ergonomic_heap, ergonomic_default_max_heap, MAX_ERGONOMIC_HEAP,
 };
+
+// ---------------------------------------------------------------------------
+// `--diff-hotspot` — one program, two VMs, the first divergence
+// ---------------------------------------------------------------------------
+
+/// The differential launcher mode.
+///
+/// # Why this lives in the launcher and not in `difftest/`
+///
+/// `cratonvm-difftest` already owns the *corpus* door: it compiles a directory
+/// of seeds, fans CratonVM across a mode matrix, diffs eight dimensions against
+/// one HotSpot run, and gates the result against a committed ledger. What it
+/// does not have — and what an independent audit asked for on 2026-09-01, after
+/// 273 differential assertions against HotSpot 25 found zero divergences — is a
+/// door anyone can point at **their own** program:
+///
+/// ```text
+/// cratonvm --diff-hotspot -cp build/classes com.example.Main --arg
+/// ```
+///
+/// Two constraints put that door here rather than in the fuzzer. First, the
+/// fuzzer's two-VM executor takes a classpath and a main class and **no program
+/// arguments**, and knows nothing about `--jar`; a real workload needs both.
+/// Second, `cratonvm-cli` must not link `cratonvm-difftest`: the dependency runs
+/// the wrong way (the fuzzer drives *this* binary as a subprocess), and the
+/// shipped launcher has no business carrying a testing crate. So the comparison
+/// is reimplemented here, small and self-contained, and the two doors are
+/// documented as siblings in `docs/testing/diff-hotspot.md`.
+///
+/// # Why both sides are subprocesses
+///
+/// The CratonVM side is a re-exec of `current_exe()` with the diff flags
+/// removed, not an in-process `Vm::new`. Three reasons, all of which showed up
+/// in this tree's own differential history:
+///
+/// 1. **Capture.** A Java program writes through the VM's own fd table to the
+///    real stdout. Comparing streams means owning the pipe, which means owning
+///    the process.
+/// 2. **No configuration skew.** `vm/tests/differential.rs` records a live bug
+///    where an in-process embedder that never called a launcher setter produced
+///    a "divergence" that was purely configuration. A re-exec runs the *same*
+///    launcher through the *same* argv pipeline, so the side under test is by
+///    construction the side a user would have run.
+/// 3. **A crash is an observation.** A SEGV or an OOM abort in the VM under
+///    test has to be reportable, not fatal to the comparison.
+///
+/// # The nondeterminism problem, and why this mode does not cry wolf
+///
+/// Identity hash codes, `HashMap` iteration order on some shapes, thread names,
+/// wall-clock timestamps and absolute paths differ legitimately between any two
+/// JVMs. A tool that reports those as bugs gets switched off, which is worse
+/// than not shipping it. Three defences, in order of strength:
+///
+/// * **Self-consistency first.** CratonVM is run twice by default
+///   (`--diff-runs`). A line that differs between two CratonVM runs cannot be a
+///   HotSpot divergence — it is the *program* being nondeterministic. Those
+///   lines are excluded from the verdict and reported as `unstable`.
+/// * **Strict first, relaxed only to explain.** The verdict is byte-exact. Only
+///   when it fails is the pair re-compared with the five nondeterminism maskers
+///   on; if that makes the difference vanish, the finding is downgraded to
+///   `noise` and the masked line is printed with the rule that accounts for it.
+///   `--diff-strict` keeps it a failure.
+/// * **`--diff-ignore <PATTERN>`**, repeatable, for the residue only the user
+///   can name.
+///
+/// # Bytes, not lossily-decoded text
+///
+/// The two children are compared on what they actually wrote. HotSpot follows
+/// the console's charset on `System.out` while CratonVM emits UTF-8, so the
+/// reference side routinely produces bytes that are not valid UTF-8 — and
+/// `String::from_utf8_lossy` would replace *HotSpot's own correct output* with
+/// U+FFFD and blame the VM for a defect in this harness's decoder. `capture`
+/// therefore uses `decode_lossless`, an injective byte-to-text escape, so
+/// comparing the decoded strings is exactly as strong as comparing the byte
+/// streams. When the two sides then differ only outside ASCII the report says
+/// so and names the one-token re-run that settles it — a *hint*, never a
+/// masker: a charset difference is a program-observable one, and forgiving it
+/// would trade a false positive for a false negative.
+///
+/// See `docs/testing/diff-hotspot.md`.
+mod diff_hotspot {
+    use super::*;
+    // Explicit (anonymous) trait import for `Args::try_parse_from`. The parent
+    // module already has `use clap::Parser`, which `use super::*` re-exports
+    // here, but naming it is cheaper than depending on that.
+    use clap::Parser as _;
+    use std::io::Read as _;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// Both sides agreed on every compared observable.
+    pub const EXIT_IDENTICAL: i32 = 0;
+    /// A divergence that survived the nondeterminism maskers.
+    pub const EXIT_DIVERGED: i32 = 1;
+    /// The comparison could not be performed: no usable reference JDK, the
+    /// CratonVM child could not be spawned, or the invocation was rejected.
+    /// Distinct from `1` so a CI job can tell "HotSpot is missing on this
+    /// runner" from "the VM is wrong".
+    pub const EXIT_NO_REFERENCE: i32 = 2;
+    /// CratonVM disagreed with *itself* across `--diff-runs`, and nothing
+    /// outside that instability diverged. No verdict was reached on the
+    /// unstable lines; a real divergence elsewhere still reports as `1`.
+    pub const EXIT_UNSTABLE: i32 = 3;
+
+    /// Set on the CratonVM child so a `--diff-hotspot` that somehow survived
+    /// the argv strip below cannot recurse. Belt to the strip's braces: the
+    /// strip is what actually prevents recursion, this is what makes a mistake
+    /// in the strip terminate instead of forking forever. The one path that can
+    /// still reach it is a nested argument file — `expand_argfiles` is
+    /// deliberately non-recursive, so an `@outer` containing `@inner` leaves
+    /// `@inner` in the child's argv for the child to expand.
+    ///
+    /// **Deliberately not spelled `CRATONVM_*`.** That prefix is a declared
+    /// configuration surface (`types/src/flag_groups.rs::INVENTORY`, enforced by
+    /// `tools/flag-census/check-surface.sh` and `types/tests/flag_surface.rs`),
+    /// and this is not configuration — it is one process telling the child it
+    /// just spawned that it is under comparison. Adding it to the inventory
+    /// would put a piece of private plumbing in `docs/CONFIG.md`, which is how
+    /// that surface reached 692 identifiers in the first place.
+    const CHILD_GUARD: &str = "CVM_DIFF_HOTSPOT_CHILD";
+
+    /// Diff-mode options that consume the following argv token as their value.
+    /// Mirrors [`super::VALUE_TAKING_OPTS`]'s role for the launcher proper —
+    /// the scan below has to know these so `--diff-ignore Foo` cannot leave
+    /// `Foo` looking like the bare main-class token that ends the launcher
+    /// section.
+    const DIFF_VALUE_OPTS: &[&str] = &[
+        "--diff-ignore",
+        "--diff-java-arg",
+        "--diff-runs",
+        "--diff-timeout",
+    ];
+
+    /// Default per-child wall clock. Same number as the fuzzer's
+    /// `runner::DEFAULT_TIMEOUT`, for the same reason: a CratonVM run that
+    /// never finishes while HotSpot does is itself the finding, and it has to
+    /// be *reported*, not waited on forever.
+    const DEFAULT_TIMEOUT_SECS: u64 = 120;
+
+    /// A parsed `--diff-hotspot` invocation.
+    struct Request {
+        /// argv for the CratonVM child, with every `--diff-*` token removed and
+        /// everything else — `-XX:`, `-D`, `-cp`, `--jar`, the main class and
+        /// the program's own arguments — preserved verbatim and in order.
+        child_argv: Vec<String>,
+        ignores: Vec<String>,
+        java_extra: Vec<String>,
+        runs: usize,
+        timeout: Duration,
+        strict: bool,
+    }
+
+    /// One captured child process.
+    struct Capture {
+        stdout: String,
+        stderr: String,
+        exit_code: Option<i32>,
+        timed_out: bool,
+        wall_ms: u64,
+    }
+
+    impl Capture {
+        /// The exit channel's comparison token. A timeout and a signal kill are
+        /// distinct, never-matching words, so neither can ever compare equal to
+        /// a clean exit — the failure mode where a hang reads as `0`.
+        fn exit_token(&self) -> String {
+            if self.timed_out {
+                "<timeout>".to_string()
+            } else {
+                match self.exit_code {
+                    Some(c) => c.to_string(),
+                    None => "<signal>".to_string(),
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Entry point
+    // -----------------------------------------------------------------------
+
+    /// Scan argv; if `--diff-hotspot` was requested, perform the whole
+    /// comparison and return the process exit code. `None` means "this is a
+    /// normal launch, carry on".
+    ///
+    /// Called as the first statement of `main`, ahead of `install_flags` and
+    /// `expand_process_env`, because this mode boots no VM in *this* process
+    /// and must not be able to perturb the immutable configuration snapshot the
+    /// child under test will latch for itself.
+    pub fn maybe_run() -> Option<i32> {
+        if std::env::var_os(CHILD_GUARD).is_some() {
+            // We are the child of a comparison. Nothing to do — the parent
+            // already removed the flags, so reaching here at all would mean the
+            // strip missed one, and recursing would be worse than ignoring it.
+            return None;
+        }
+        let raw: Vec<String> = std::env::args().collect();
+        let request = match scan(&raw)? {
+            Ok(r) => r,
+            Err(msg) => {
+                eprintln!("[diff-hotspot] {msg}");
+                return Some(EXIT_NO_REFERENCE);
+            }
+        };
+        Some(execute(request))
+    }
+
+    // -----------------------------------------------------------------------
+    // Argument scan
+    // -----------------------------------------------------------------------
+
+    /// Extract the `--diff-*` options from the **launcher portion** of argv.
+    ///
+    /// This deliberately does *not* teach the existing pre-clap pipeline about
+    /// the new flags. `insert_program_args_separator` finds the program
+    /// selector by walking option tokens and stopping at the first bare one; a
+    /// value-taking option it does not know about would make that option's
+    /// value look like the main class. Rather than extend `VALUE_TAKING_OPTS` —
+    /// which is load-bearing for `java` positional semantics and has ~60 unit
+    /// tests behind it — the diff options are removed here, before any of that
+    /// runs, so the pipeline sees exactly the argv it would have seen without
+    /// this feature.
+    ///
+    /// The walk mirrors `insert_program_args_separator`'s structure on purpose:
+    /// `-jar <x>` and the first bare token both end the launcher section, and
+    /// everything after is the program's own — so a Java program is still free
+    /// to take an argument spelled `--diff-ignore`.
+    fn scan(raw: &[String]) -> Option<Result<Request, String>> {
+        // Cheap pre-filter: no `--diff-hotspot` on the command line and no
+        // argument file that could contain one means this costs one scan of
+        // argv on every normal launch and nothing else.
+        let literal = raw.iter().any(|a| a == "--diff-hotspot");
+        let argfile = raw.iter().skip(1).any(|a| a.starts_with('@'));
+        if !literal && !argfile {
+            return None;
+        }
+        let argv = expand_argfiles(raw.to_vec());
+        if argv.is_empty() || !argv.iter().any(|a| a == "--diff-hotspot") {
+            return None;
+        }
+
+        let mut kept: Vec<String> = vec![argv[0].clone()];
+        let mut ignores: Vec<String> = Vec::new();
+        let mut java_extra: Vec<String> = Vec::new();
+        let mut runs: usize = 2;
+        let mut timeout_secs: u64 = DEFAULT_TIMEOUT_SECS;
+        let mut strict = false;
+        let mut enabled = false;
+
+        let mut i = 1usize;
+        while i < argv.len() {
+            let a = argv[i].clone();
+            let a = a.as_str();
+
+            // An explicit separator: everything past it is the program's.
+            if a == "--" {
+                kept.extend_from_slice(&argv[i..]);
+                break;
+            }
+
+            if a == "--diff-hotspot" {
+                enabled = true;
+                i += 1;
+                continue;
+            }
+            if a == "--diff-strict" {
+                strict = true;
+                i += 1;
+                continue;
+            }
+            if let Some(name) = DIFF_VALUE_OPTS.iter().copied().find(|n| is_opt(a, n)) {
+                let value = match take_value(&argv, &mut i, name) {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
+                match name {
+                    "--diff-ignore" => ignores.push(value),
+                    "--diff-java-arg" => java_extra.push(value),
+                    "--diff-runs" => match value.parse::<usize>() {
+                        Ok(n) if n >= 1 => runs = n,
+                        _ => {
+                            return Some(Err(format!(
+                                "--diff-runs expects a positive integer, got {value:?}"
+                            )))
+                        }
+                    },
+                    "--diff-timeout" => match value.parse::<u64>() {
+                        Ok(n) if n >= 1 => timeout_secs = n,
+                        _ => {
+                            return Some(Err(format!(
+                                "--diff-timeout expects a positive number of seconds, \
+                                 got {value:?}"
+                            )))
+                        }
+                    },
+                    _ => {}
+                }
+                continue;
+            }
+
+            // `-jar <jar>` selects the program: it and everything after it are
+            // copied verbatim.
+            if (a == "-jar" || a == "--jar") && i + 1 < argv.len() {
+                kept.extend_from_slice(&argv[i..]);
+                break;
+            }
+            if a.starts_with("-jar=") || a.starts_with("--jar=") {
+                kept.extend_from_slice(&argv[i..]);
+                break;
+            }
+            // A launcher option that consumes the next token: copy both, keep
+            // scanning; the value is not the main-class name.
+            if VALUE_TAKING_OPTS.contains(&a) {
+                kept.push(argv[i].clone());
+                if i + 1 < argv.len() {
+                    kept.push(argv[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if a.starts_with('-') {
+                kept.push(argv[i].clone());
+                i += 1;
+                continue;
+            }
+            // First bare token: the main class. The launcher section ends.
+            kept.extend_from_slice(&argv[i..]);
+            break;
+        }
+
+        if !enabled {
+            // `--diff-hotspot` appeared, but only in the program's own argument
+            // tail. It is that program's argument, not ours.
+            return None;
+        }
+
+        Some(Ok(Request {
+            child_argv: kept,
+            ignores,
+            java_extra,
+            runs,
+            timeout: Duration::from_secs(timeout_secs),
+            strict,
+        }))
+    }
+
+    /// Whether `tok` is `name` or `name=<value>`.
+    fn is_opt(tok: &str, name: &str) -> bool {
+        tok == name
+            || (tok.len() > name.len()
+                && tok.starts_with(name)
+                && tok.as_bytes()[name.len()] == b'=')
+    }
+
+    /// Read the value of `name` at `argv[*i]`, accepting both the
+    /// `--opt=value` and the `--opt value` spellings, and advance `*i` past
+    /// every token consumed.
+    fn take_value(argv: &[String], i: &mut usize, name: &str) -> Result<String, String> {
+        let tok = argv[*i].clone();
+        if tok == name {
+            return match argv.get(*i + 1) {
+                Some(v) => {
+                    *i += 2;
+                    Ok(v.clone())
+                }
+                None => {
+                    *i += 1;
+                    Err(format!("{name} requires a value"))
+                }
+            };
+        }
+        *i += 1;
+        Ok(tok[name.len() + 1..].to_string())
+    }
+
+    // -----------------------------------------------------------------------
+    // Reference JDK resolution (docs/CONFIG.md's four-step precedence)
+    // -----------------------------------------------------------------------
+
+    /// Where a resolved `java` came from, for the report and for the failure
+    /// message that has to name all four steps.
+    struct Reference {
+        java: PathBuf,
+        source: String,
+        banner: String,
+    }
+
+    fn java_in(home: &str) -> PathBuf {
+        let exe = if cfg!(windows) { "java.exe" } else { "java" };
+        Path::new(home).join("bin").join(exe)
+    }
+
+    /// Resolve the reference `java` exactly as `docs/CONFIG.md` documents the
+    /// `--java-home` precedence: the flag, then `CRATONVM_JAVA_HOME`, then
+    /// `JAVA_HOME`, then `java` on `PATH`. Inventing a fifth rule here would
+    /// make the reference JDK a different JDK from the one the CratonVM side
+    /// loads its class library from, which is the one skew this mode can least
+    /// afford.
+    ///
+    /// A candidate is rejected — and the walk continues to the next step —
+    /// when `<java> -version` fails, **or** when the banner identifies
+    /// CratonVM. That second case is not hypothetical: this repository ships a
+    /// `java`-named alias binary (`--features java-bin-alias`) and a Maven
+    /// shim tree, and `CRATONVM_JAVA_HOME` exists precisely because `JAVA_HOME`
+    /// routinely points at one. Comparing CratonVM against CratonVM would
+    /// report a serene, meaningless "no divergence".
+    fn resolve_reference(
+        explicit_home: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Reference, String> {
+        let mut tried: Vec<String> = Vec::new();
+        let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+        if let Some(h) = explicit_home {
+            candidates.push((format!("--java-home {h}"), java_in(h)));
+        }
+        if let Ok(h) = std::env::var("CRATONVM_JAVA_HOME") {
+            candidates.push((format!("CRATONVM_JAVA_HOME={h}"), java_in(&h)));
+        }
+        if let Ok(h) = std::env::var("JAVA_HOME") {
+            candidates.push((format!("JAVA_HOME={h}"), java_in(&h)));
+        }
+        candidates.push(("java on PATH".to_string(), PathBuf::from("java")));
+
+        for (source, java) in candidates {
+            let mut cmd = Command::new(&java);
+            cmd.arg("-version");
+            let cap = match capture(cmd, timeout) {
+                Ok(c) => c,
+                Err(e) => {
+                    tried.push(format!("{source}: cannot run {} ({e})", java.display()));
+                    continue;
+                }
+            };
+            if cap.timed_out || cap.exit_code != Some(0) {
+                tried.push(format!(
+                    "{source}: `{} -version` exited {}",
+                    java.display(),
+                    cap.exit_token()
+                ));
+                continue;
+            }
+            // HotSpot prints the banner on stderr; read both and be tolerant.
+            let banner_all = format!("{}\n{}", cap.stderr.trim(), cap.stdout.trim());
+            if banner_all.to_ascii_lowercase().contains("cratonvm") {
+                tried.push(format!(
+                    "{source}: {} is a CratonVM launcher, not a reference JDK",
+                    java.display()
+                ));
+                continue;
+            }
+            let banner = banner_all
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("<no version banner>")
+                .to_string();
+            return Ok(Reference {
+                java,
+                source,
+                banner,
+            });
+        }
+
+        Err(format!(
+            "no usable reference JDK. The four places looked at, in order:\n  \
+             1. --java-home <PATH>\n  \
+             2. CRATONVM_JAVA_HOME\n  \
+             3. JAVA_HOME\n  \
+             4. `java` on PATH\n\
+             What each one gave:\n  {}",
+            tried.join("\n  ")
+        ))
+    }
+
+    // -----------------------------------------------------------------------
+    // Subprocess capture
+    // -----------------------------------------------------------------------
+
+    /// Spawn `cmd` and capture stdout/stderr/exit status under `timeout`.
+    ///
+    /// Both pipes are drained on their own threads: a child that fills a 64 KiB
+    /// pipe buffer would otherwise block forever while the parent polls for an
+    /// exit that can never happen. On overrun the child is killed and
+    /// `timed_out` is set — which the exit channel renders as a word that never
+    /// compares equal to a clean exit.
+    fn capture(mut cmd: Command, timeout: Duration) -> std::io::Result<Capture> {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let start = Instant::now();
+        let mut child = cmd.spawn()?;
+        let mut out_pipe = child.stdout.take().expect("stdout piped");
+        let mut err_pipe = child.stderr.take().expect("stderr piped");
+        let out_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out_pipe.read_to_end(&mut buf);
+            buf
+        });
+        let err_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = err_pipe.read_to_end(&mut buf);
+            buf
+        });
+
+        let mut timed_out = false;
+        let status = loop {
+            match child.try_wait()? {
+                Some(st) => break st,
+                None => {
+                    if start.elapsed() > timeout {
+                        let _ = child.kill();
+                        let st = child.wait()?;
+                        timed_out = true;
+                        break st;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        };
+        let stdout = out_thread.join().unwrap_or_default();
+        let stderr = err_thread.join().unwrap_or_default();
+        // `decode_lossless`, never `from_utf8_lossy`: the reference JDK's own
+        // correct output is routinely not valid UTF-8 (it follows the console
+        // charset), and a lossy decode would corrupt it into a divergence the
+        // harness invented. See `decode_lossless`.
+        Ok(Capture {
+            stdout: decode_lossless(&stdout),
+            stderr: decode_lossless(&stderr),
+            exit_code: status.code(),
+            timed_out,
+            wall_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Decoding the captured bytes without damaging either side
+    // -----------------------------------------------------------------------
+
+    /// The one character [`decode_lossless`] ever inserts. It introduces a
+    /// two-hex-digit escape standing for exactly one raw byte that was not part
+    /// of a valid UTF-8 sequence.
+    ///
+    /// `U+FDD0` is a Unicode *noncharacter*: permanently unassigned, and
+    /// specified as never to be interchanged. Nothing a program under
+    /// comparison prints is expected to contain it — but "expected" is not
+    /// "guaranteed", and this design leans on the escape being unambiguous, so
+    /// [`decode_lossless`] escapes it too.
+    const BYTE_ESCAPE: char = '\u{FDD0}';
+
+    const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+
+    /// Append the escape for one raw byte. Uppercase hex, so the rendering a
+    /// reader sees (`\xE9`) matches how every hex dump in this tree spells one.
+    fn push_byte_escape(out: &mut String, b: u8) {
+        out.push(BYTE_ESCAPE);
+        out.push(HEX_UPPER[(b >> 4) as usize] as char);
+        out.push(HEX_UPPER[(b & 0x0f) as usize] as char);
+    }
+
+    /// Copy `s`, escaping any literal [`BYTE_ESCAPE`] the *program* printed as
+    /// that character's own three UTF-8 bytes. Without this the sentinel would
+    /// be ambiguous and the decode would stop being injective.
+    fn push_escaping_sentinel(out: &mut String, s: &str) {
+        if !s.contains(BYTE_ESCAPE) {
+            out.push_str(s);
+            return;
+        }
+        let mut buf = [0u8; 4];
+        let sentinel_bytes = BYTE_ESCAPE.encode_utf8(&mut buf).as_bytes().to_vec();
+        for c in s.chars() {
+            if c == BYTE_ESCAPE {
+                for b in &sentinel_bytes {
+                    push_byte_escape(out, *b);
+                }
+            } else {
+                out.push(c);
+            }
+        }
+    }
+
+    /// Decode a child's raw stream into text **without losing a byte**.
+    ///
+    /// The obvious spelling — `String::from_utf8_lossy` — was the original one,
+    /// and it corrupts the *reference* side rather than CratonVM's. HotSpot
+    /// derives `stdout.encoding` from the host (JEP 400 pinned `file.encoding`
+    /// and deliberately left this one alone), so on a cp1252-style Windows
+    /// console an `é` leaves HotSpot as the single byte `0xE9`, which is not
+    /// valid UTF-8; `from_utf8_lossy` replaces it with U+FFFD and the harness
+    /// then reports a divergence against a line HotSpot never wrote. CratonVM
+    /// emits UTF-8 unconditionally, so its side decoded cleanly and only the
+    /// reference side was damaged — the least defensible way for a differential
+    /// harness to be wrong. Measured on Linux, no Windows box needed:
+    /// `java -Dstdout.encoding=ISO-8859-1` writes `e9 3f 3f` where the UTF-8
+    /// arm writes `c3 a9 e4 b8 ad f0 9f 98 80`. See
+    /// `docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-20260901.md`.
+    ///
+    /// **Decoding each side with its own declared charset was the alternative,
+    /// and was rejected.** The launcher links no charset library; "its own
+    /// declared charset" would have to be discovered by starting a further JVM
+    /// to ask; and the verdict would then rest on an *interpretation* of the
+    /// bytes, which is exactly what a byte-exact verdict must not do.
+    ///
+    /// So: every byte that is part of a valid UTF-8 sequence decodes normally,
+    /// and every byte that is not becomes a [`BYTE_ESCAPE`] plus two hex
+    /// digits. The mapping is **injective**, and that is the whole point —
+    /// comparing two decoded strings is exactly as strong as comparing the two
+    /// byte streams, so the byte-exact verdict is genuinely byte-exact while
+    /// every stage downstream (the line split, the maskers, `--diff-ignore`,
+    /// the report) keeps working on `str` and is unchanged.
+    ///
+    /// Injectivity, spelled out, because it is the load-bearing claim:
+    ///
+    /// * A stream with no invalid byte and no literal sentinel maps to itself,
+    ///   and its image contains no sentinel — so it cannot collide with
+    ///   anything the escaping path produces.
+    /// * A literal sentinel becomes the three escapes `EF`, `B7`, `90` in a
+    ///   row. Three *invalid* bytes can never produce that: `EF B7 90` adjacent
+    ///   **is** a valid sequence, so the walk below decodes it rather than
+    ///   reaching the escape path.
+    /// * Escapes are fixed width, so no escape is a prefix of another.
+    ///
+    /// The escapes never contain `\r` or `\n` (those bytes are valid UTF-8 and
+    /// are never escaped), so `lines_of`'s CRLF and trailing-whitespace
+    /// normalisation is unaffected and keeps operating on text exactly as
+    /// before.
+    fn decode_lossless(bytes: &[u8]) -> String {
+        // Fast path: a clean UTF-8 stream with no sentinel — which is every
+        // run on a UTF-8 host — costs one validation scan and one copy.
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            if !s.contains(BYTE_ESCAPE) {
+                return s.to_string();
+            }
+        }
+        let mut out = String::with_capacity(bytes.len());
+        let mut rest = bytes;
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(s) => {
+                    push_escaping_sentinel(&mut out, s);
+                    return out;
+                }
+                Err(e) => {
+                    let good = e.valid_up_to();
+                    // `valid_up_to` is a char boundary by construction; the
+                    // `unwrap_or` is unreachable and costs nothing to be safe.
+                    let head = std::str::from_utf8(&rest[..good]).unwrap_or("");
+                    push_escaping_sentinel(&mut out, head);
+                    // `error_len() == None` means the input ended mid-sequence.
+                    // Escape one byte and let the loop re-derive the rest, so
+                    // there is one rule rather than two.
+                    let bad = e.error_len().unwrap_or(1).max(1);
+                    let end = (good + bad).min(rest.len());
+                    for b in &rest[good..end] {
+                        push_byte_escape(&mut out, *b);
+                    }
+                    // `end > good >= 0`, so `rest` shrinks every iteration.
+                    rest = &rest[end..];
+                }
+            }
+        }
+    }
+
+    /// Render a compared line for human eyes: the raw-byte escapes become
+    /// `\xNN`, which is readable, where the sentinel itself would print as a
+    /// replacement box and tell the reader nothing.
+    ///
+    /// Display only. This is deliberately *not* injective — a program that
+    /// literally prints the four characters `\xE9` renders identically — and
+    /// nothing downstream of this function compares its result. Every
+    /// comparison in this module runs on the decoded string, not on this.
+    fn for_display(s: &str) -> String {
+        if !s.contains(BYTE_ESCAPE) {
+            return s.to_string();
+        }
+        let mut out = String::with_capacity(s.len() + 8);
+        for c in s.chars() {
+            if c == BYTE_ESCAPE {
+                out.push_str("\\x");
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    // -----------------------------------------------------------------------
+    // Text hygiene and the nondeterminism maskers
+    // -----------------------------------------------------------------------
+
+    /// CRLF -> LF plus a trailing-whitespace trim, then split into lines.
+    ///
+    /// This is the one transform that is always on, and it is what keeps a
+    /// trailing newline or a Windows line ending from ever being reported as a
+    /// divergence. Its risk is stated rather than hidden: a program whose last
+    /// byte is *deliberately* a bare `\r` or a trailing space cannot be
+    /// distinguished from one whose last byte is not.
+    fn lines_of(s: &str) -> Vec<String> {
+        s.replace("\r\n", "\n")
+            .trim_end()
+            .lines()
+            .map(|l| l.trim_end_matches('\r').to_string())
+            .collect()
+    }
+
+    /// Whether a captured stderr line is CratonVM narrating itself rather than
+    /// program output.
+    ///
+    /// Not optional, and not a user-facing knob: the launcher prints
+    /// `[cratonvm] main-vm run() returned Ok` on **every** clean exit, so
+    /// without this the stderr channel would report a divergence on every
+    /// single run and the mode would be useless on its first invocation. The
+    /// cost is stated in the docs — a program that itself prints `[cratonvm]`
+    /// on stderr loses that line from the comparison.
+    ///
+    /// Same three shapes as the fuzzer's `vm-diagnostics` normalization rule
+    /// (`difftest/src/normalize.rs`), kept in step deliberately.
+    fn is_vm_diagnostic(line: &str) -> bool {
+        let t = line.trim();
+        t.contains("[cratonvm]") || t.contains("[NativeBridge]") || t.contains("cratonvm_")
+    }
+
+    fn is_hex(c: char) -> bool {
+        c.is_ascii_hexdigit()
+    }
+
+    fn is_ident(c: char) -> bool {
+        c.is_alphanumeric() || c == '_' || c == '$'
+    }
+
+    /// `Object.toString` identity hashes: `java.lang.Object@1b6d3586`.
+    ///
+    /// `System.identityHashCode` is explicitly unspecified — HotSpot derives it
+    /// from a thread-local PRNG, CratonVM from the object address — so the two
+    /// can never agree and neither number is a semantic observable. Requires at
+    /// least four hex digits and a non-identifier terminator so `user@ab` and
+    /// `foo@deadbeefzz` are left alone.
+    fn mask_identity_hash(s: &str) -> String {
+        let ch: Vec<char> = s.chars().collect();
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0usize;
+        while i < ch.len() {
+            if ch[i] == '@' && i > 0 && is_ident(ch[i - 1]) {
+                let mut j = i + 1;
+                while j < ch.len() && is_hex(ch[j]) {
+                    j += 1;
+                }
+                if j - i - 1 >= 4 && (j >= ch.len() || !is_ident(ch[j])) {
+                    out.push_str("@<idhash>");
+                    i = j;
+                    continue;
+                }
+            }
+            out.push(ch[i]);
+            i += 1;
+        }
+        out
+    }
+
+    /// Bare `0x…` address blobs, as printed by Unsafe / DirectByteBuffer /
+    /// MemorySegment diagnostics and JNI handles. Two VMs with different
+    /// allocators can never agree on one.
+    fn mask_hex_address(s: &str) -> String {
+        let ch: Vec<char> = s.chars().collect();
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0usize;
+        while i < ch.len() {
+            let starts_token = i == 0 || !is_ident(ch[i - 1]);
+            if starts_token
+                && ch[i] == '0'
+                && i + 2 < ch.len()
+                && (ch[i + 1] == 'x' || ch[i + 1] == 'X')
+                && is_hex(ch[i + 2])
+            {
+                let mut j = i + 2;
+                while j < ch.len() && is_hex(ch[j]) {
+                    j += 1;
+                }
+                out.push_str("0x<addr>");
+                i = j;
+                continue;
+            }
+            out.push(ch[i]);
+            i += 1;
+        }
+        out
+    }
+
+    /// Thread / pool / process ordinals. Two VMs schedule differently, so
+    /// `pool-1-thread-3` on one side is `pool-1-thread-2` on the other for
+    /// reasons that are not the program's semantics.
+    fn mask_thread_id(s: &str) -> String {
+        const MARKERS: &[&str] = &[
+            "Thread-", "thread-", "worker-", "pool-", "pid=", "tid=", "nid=",
+        ];
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        loop {
+            let mut best: Option<(usize, &str)> = None;
+            for &m in MARKERS {
+                if let Some(k) = rest.find(m) {
+                    if best.map_or(true, |(bk, _)| k < bk) {
+                        best = Some((k, m));
+                    }
+                }
+            }
+            let (k, m) = match best {
+                Some(v) => v,
+                None => break,
+            };
+            let after = k + m.len();
+            let digits = rest[after..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .count();
+            out.push_str(&rest[..after]);
+            if digits > 0 {
+                out.push_str("<n>");
+                rest = &rest[after + digits..];
+            } else {
+                rest = &rest[after..];
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn digits_at(ch: &[char], at: usize, n: usize) -> bool {
+        at + n <= ch.len() && (at..at + n).all(|k| ch[k].is_ascii_digit())
+    }
+
+    /// ISO-8601-shaped dates and clock times. A wall-clock reading is not a
+    /// property of the program under test.
+    fn mask_timestamp(s: &str) -> String {
+        let ch: Vec<char> = s.chars().collect();
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0usize;
+        while i < ch.len() {
+            // yyyy-mm-dd
+            if i + 10 <= ch.len()
+                && digits_at(&ch, i, 4)
+                && ch[i + 4] == '-'
+                && digits_at(&ch, i + 5, 2)
+                && ch[i + 7] == '-'
+                && digits_at(&ch, i + 8, 2)
+            {
+                out.push_str("<date>");
+                i += 10;
+                continue;
+            }
+            // hh:mm:ss[.fff…]
+            if i + 8 <= ch.len()
+                && digits_at(&ch, i, 2)
+                && ch[i + 2] == ':'
+                && digits_at(&ch, i + 3, 2)
+                && ch[i + 5] == ':'
+                && digits_at(&ch, i + 6, 2)
+            {
+                let mut j = i + 8;
+                if j < ch.len() && ch[j] == '.' {
+                    let mut k = j + 1;
+                    while k < ch.len() && ch[k].is_ascii_digit() {
+                        k += 1;
+                    }
+                    if k > j + 1 {
+                        j = k;
+                    }
+                }
+                out.push_str("<time>");
+                i = j;
+                continue;
+            }
+            out.push(ch[i]);
+            i += 1;
+        }
+        out
+    }
+
+    /// Absolute filesystem paths, reduced to their last segment. The build
+    /// directory a program was run from is not an observable of the program.
+    fn mask_abs_path(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for piece in s.split_inclusive(char::is_whitespace) {
+            let trimmed = piece.trim_end();
+            let (tok, ws) = piece.split_at(trimmed.len());
+            out.push_str(&reduce_path(tok));
+            out.push_str(ws);
+        }
+        out
+    }
+
+    fn reduce_path(tok: &str) -> String {
+        let posix = tok.starts_with('/') && tok.matches('/').count() >= 2;
+        let win = {
+            let b: Vec<char> = tok.chars().take(3).collect();
+            b.len() == 3
+                && b[0].is_ascii_alphabetic()
+                && b[1] == ':'
+                && (b[2] == '\\' || b[2] == '/')
+        };
+        if !posix && !win {
+            return tok.to_string();
+        }
+        let last = tok
+            .rsplit(|c: char| c == '/' || c == '\\')
+            .next()
+            .unwrap_or(tok);
+        if last.is_empty() {
+            tok.to_string()
+        } else {
+            last.to_string()
+        }
+    }
+
+    /// The maskers, in application order, each with the name the report prints.
+    const RELAX_RULES: &[(&str, fn(&str) -> String)] = &[
+        ("identity-hash", mask_identity_hash),
+        ("hex-address", mask_hex_address),
+        ("thread-id", mask_thread_id),
+        ("timestamp", mask_timestamp),
+        ("absolute-path", mask_abs_path),
+    ];
+
+    /// Apply every masker, reporting which ones actually changed the line.
+    fn relax_line(line: &str) -> (String, Vec<&'static str>) {
+        let mut cur = line.to_string();
+        let mut fired: Vec<&'static str> = Vec::new();
+        for &(id, f) in RELAX_RULES {
+            let next = f(&cur);
+            if next != cur {
+                fired.push(id);
+                cur = next;
+            }
+        }
+        (cur, fired)
+    }
+
+    // -----------------------------------------------------------------------
+    // Naming a divergence that is shaped like a charset disagreement
+    //
+    // A hint, never a masker. The five entries in `RELAX_RULES` exist because
+    // identity hashes and addresses are *unspecified* observables that two
+    // conforming JVMs may legitimately disagree about. The characters a program
+    // prints are not in that category — they are precisely what a JVM
+    // differential is for — so nothing below ever changes a verdict or an exit
+    // code. It only tells the reader which one-token re-run settles it.
+    // -----------------------------------------------------------------------
+
+    /// The ASCII skeleton of a compared line, plus whether the line held
+    /// anything outside ASCII at all.
+    ///
+    /// Every maximal run of "this position held something the charset could not
+    /// carry" collapses to a single `\u{0}`; everything else is kept verbatim.
+    /// Three spellings count as such a position, because three different layers
+    /// produce them:
+    ///
+    /// * a raw-byte escape from [`decode_lossless`] — a cp1252 `é` that reached
+    ///   us as the single byte `0xE9`. Its two hex digits are swallowed with
+    ///   it, so it counts as **one** position and not as three characters;
+    /// * any other non-ASCII character — the UTF-8 side, which carries the
+    ///   character intact;
+    /// * `?` and `\u{1A}` (SUB) — what a JDK `CharsetEncoder` substitutes when
+    ///   it cannot represent a character. `U+FFFD`, what a *decoder*
+    ///   substitutes, is already covered by the non-ASCII arm.
+    ///
+    /// That is what lets HotSpot's `hello, ??? world` line up against
+    /// CratonVM's `hello, é中😀 world`.
+    fn ascii_skeleton(s: &str) -> (String, bool) {
+        let mut out = String::with_capacity(s.len());
+        let mut saw_non_ascii = false;
+        let mut in_run = false;
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            let mark = if c == BYTE_ESCAPE {
+                for _ in 0..2 {
+                    if matches!(chars.peek(), Some(d) if d.is_ascii_hexdigit()) {
+                        chars.next();
+                    }
+                }
+                saw_non_ascii = true;
+                true
+            } else if !c.is_ascii() {
+                saw_non_ascii = true;
+                true
+            } else {
+                c == '?' || c == '\u{1A}'
+            };
+            if mark {
+                if !in_run {
+                    out.push('\u{0}');
+                    in_run = true;
+                }
+            } else {
+                in_run = false;
+                out.push(c);
+            }
+        }
+        (out, saw_non_ascii)
+    }
+
+    /// Whether two differing lines differ **only** outside ASCII — the shape a
+    /// charset disagreement makes.
+    ///
+    /// The `saw_non_ascii` guard is what keeps this from firing on an ordinary
+    /// ASCII difference: `x?y` against `x??y` has the same skeleton, but
+    /// neither side left ASCII, so encoding cannot be the explanation and the
+    /// hint stays quiet.
+    ///
+    /// It is a heuristic and is allowed to be, because it decides nothing. It
+    /// over-fires on a genuine character-level divergence — CratonVM printing
+    /// `é` where HotSpot prints `ü` is a real bug and this returns `true` for
+    /// it — and the cost of that is one extra paragraph in a report that still
+    /// says `DIVERGENCE` and still exits `1`. The re-run the paragraph asks for
+    /// is what separates the two cases, and it separates them by *proof*: pin
+    /// the charset on both sides and a real divergence survives.
+    fn differs_only_outside_ascii(cvm: &str, java: &str) -> bool {
+        if cvm == java {
+            return false;
+        }
+        let (skel_c, non_ascii_c) = ascii_skeleton(cvm);
+        let (skel_j, non_ascii_j) = ascii_skeleton(java);
+        (non_ascii_c || non_ascii_j) && skel_c == skel_j
+    }
+
+    /// `--diff-ignore` matching: a plain substring, with `*` standing for any
+    /// run of characters. Deliberately **not** a regular expression — the
+    /// launcher links no regex engine, and promising regex syntax it cannot
+    /// honour would be worse than saying plainly what this is.
+    fn pattern_matches(pat: &str, line: &str) -> bool {
+        if pat.is_empty() {
+            return false;
+        }
+        if !pat.contains('*') {
+            return line.contains(pat);
+        }
+        let mut pos = 0usize;
+        for part in pat.split('*') {
+            if part.is_empty() {
+                continue;
+            }
+            match line[pos..].find(part) {
+                Some(k) => pos += k + part.len(),
+                None => return false,
+            }
+        }
+        true
+    }
+
+    // -----------------------------------------------------------------------
+    // Comparison
+    // -----------------------------------------------------------------------
+
+    /// Which line indices differ across two or more runs of the *same* VM.
+    ///
+    /// This is the load-bearing part of not crying wolf. A line that CratonVM
+    /// does not reproduce against itself carries no information about HotSpot,
+    /// and reporting it as a divergence is how a differential tool earns a
+    /// reputation for noise and stops being run.
+    ///
+    /// When two runs disagree on line *count* the alignment past that point is
+    /// gone, so everything from the first disagreement to the end is marked
+    /// unstable — an honest over-approximation, and one the report states.
+    fn instability(runs: &[Vec<String>]) -> Vec<bool> {
+        let n = runs.iter().map(Vec::len).max().unwrap_or(0);
+        let mut unstable = vec![false; n];
+        if runs.len() < 2 {
+            return unstable;
+        }
+        let base = &runs[0];
+        let mut lengths_differ = false;
+        for r in runs.iter().skip(1) {
+            if r.len() != base.len() {
+                lengths_differ = true;
+            }
+            for (i, flag) in unstable.iter_mut().enumerate() {
+                if base.get(i) != r.get(i) {
+                    *flag = true;
+                }
+            }
+        }
+        if lengths_differ {
+            if let Some(k) = unstable.iter().position(|u| *u) {
+                for flag in unstable.iter_mut().skip(k) {
+                    *flag = true;
+                }
+            }
+        }
+        unstable
+    }
+
+    /// One stream, prepared for comparison: VM chatter removed (stderr only),
+    /// `--diff-ignore` lines blanked, unstable lines blanked.
+    ///
+    /// Masking replaces a line rather than deleting it, so both sides keep the
+    /// same indices and a reported line number still means something.
+    fn prepare(
+        lines: &[String],
+        drop_vm_chatter: bool,
+        ignores: &[String],
+        unstable: &[bool],
+    ) -> Vec<String> {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                if drop_vm_chatter && is_vm_diagnostic(l) {
+                    return "<vm-diagnostic>".to_string();
+                }
+                if unstable.get(i).copied().unwrap_or(false) {
+                    return "<unstable>".to_string();
+                }
+                if ignores.iter().any(|p| pattern_matches(p, l)) {
+                    return "<ignored>".to_string();
+                }
+                l.clone()
+            })
+            .collect()
+    }
+
+    /// The first index at which two prepared streams differ.
+    fn first_line_diff(a: &[String], b: &[String]) -> Option<usize> {
+        for i in 0..a.len().max(b.len()) {
+            if a.get(i) != b.get(i) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn at(lines: &[String], i: usize) -> String {
+        lines
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| "<no such line>".to_string())
+    }
+
+    // -----------------------------------------------------------------------
+    // The reference-side command line
+    // -----------------------------------------------------------------------
+
+    /// Build the `java` argv for the reference side from the *same* parse the
+    /// CratonVM side will perform.
+    ///
+    /// [`Args`] is reached through the identical pre-clap pipeline the real run
+    /// uses (`insert_program_args_separator` -> `normalize_java_launcher_argv`
+    /// -> `extract_system_properties` -> `extract_hotspot_flags` -> clap), so
+    /// the two sides cannot disagree about which token was the main class or
+    /// where the program's own arguments began. That skew is the classic way a
+    /// differential harness blames the VM for its own bug.
+    ///
+    /// Only options that can change *program-observable* behaviour are
+    /// forwarded: `-D` system properties, `-ea`, `-Xmx`, the module-system
+    /// flags, `--enable-preview` and `--enable-native-access`. CratonVM-only
+    /// options and the `-XX:` / `-agentlib:` family that `extract_hotspot_flags`
+    /// removes before clap are deliberately *not* forwarded — see
+    /// `docs/testing/diff-hotspot.md` — and `--diff-java-arg` is the escape
+    /// hatch for the rest.
+    fn reference_argv(
+        parsed: &Args,
+        sysprops: &[(String, String)],
+        assertions: Option<bool>,
+        extra: &[String],
+    ) -> Result<Vec<String>, String> {
+        if parsed.synthetic_jdk {
+            return Err(
+                "--synthetic-jdk cannot be compared against HotSpot: the synthetic class \
+                 library is a deliberately different implementation of java.*, so every \
+                 difference it produces is expected and the comparison would measure \
+                 nothing. Drop --synthetic-jdk (or use --jdk-only, which stays on the real \
+                 class library and IS meaningful here)."
+                    .to_string(),
+            );
+        }
+        let mut out: Vec<String> = Vec::new();
+        for (k, v) in sysprops {
+            out.push(format!("-D{k}={v}"));
+        }
+        if assertions == Some(true) {
+            out.push("-ea".to_string());
+        }
+        if let Some(mx) = &parsed.max_heap {
+            out.push(format!("-Xmx{mx}"));
+        }
+        if let Some(mp) = &parsed.module_path {
+            out.push("--module-path".to_string());
+            out.push(mp.clone());
+        }
+        for (flag, values) in [
+            ("--add-reads", &parsed.add_reads),
+            ("--add-exports", &parsed.add_exports),
+            ("--add-opens", &parsed.add_opens),
+            ("--add-modules", &parsed.add_modules),
+        ] {
+            for v in values.iter() {
+                out.push(flag.to_string());
+                out.push(v.clone());
+            }
+        }
+        if parsed.enable_preview {
+            out.push("--enable-preview".to_string());
+        }
+        if let Some(v) = &parsed.enable_native_access {
+            out.push(format!("--enable-native-access={v}"));
+        }
+        out.extend(extra.iter().cloned());
+
+        // `--jar` wins over `-cp`, exactly as the launcher itself does: the
+        // classpath comes from the jar and its manifest `Class-Path`, so both
+        // sides get the same jar and neither gets a stray `-cp`.
+        if let Some(jar) = &parsed.jar {
+            out.push("-jar".to_string());
+            out.push(jar.clone());
+        } else {
+            match &parsed.class_name {
+                Some(c) => {
+                    if let Some(cp) = &parsed.classpath {
+                        out.push("-cp".to_string());
+                        out.push(cp.clone());
+                    }
+                    // Accept the internal slash spelling the launcher allows.
+                    out.push(c.replace('/', "."));
+                }
+                None => {
+                    return Err(
+                        "--diff-hotspot needs a program to compare: pass a main class \
+                         (`-cp <CP> <MainClass>`) or `--jar <FILE.jar>`."
+                            .to_string(),
+                    )
+                }
+            }
+        }
+        out.extend(parsed.args.iter().cloned());
+        Ok(out)
+    }
+
+    // -----------------------------------------------------------------------
+    // Driver
+    // -----------------------------------------------------------------------
+
+    #[allow(clippy::too_many_lines)]
+    fn execute(req: Request) -> i32 {
+        // Parse the child argv through the launcher's own pipeline, so the
+        // reference side is built from the identical understanding of argv.
+        let staged = insert_program_args_separator(req.child_argv.clone());
+        let assertions = launcher_assertions_requested(&staged);
+        let normalized = normalize_java_launcher_argv(staged);
+        let (normalized, sysprops) = extract_system_properties(normalized);
+        let (normalized, _hotspot_flags) = extract_hotspot_flags(normalized);
+        let parsed = match Args::try_parse_from(normalized) {
+            Ok(a) => a,
+            Err(e) => {
+                // clap renders `--help` / `--version` as an `Err` whose `Display`
+                // *is* the banner, so print it verbatim rather than wrapping a
+                // help screen inside a diagnostic sentence, then say why the run
+                // stopped.
+                eprint!("{e}");
+                eprintln!(
+                    "[diff-hotspot] those arguments do not parse as a launcher command \
+                     line, so there is nothing to compare."
+                );
+                return EXIT_NO_REFERENCE;
+            }
+        };
+
+        let ref_args = match reference_argv(&parsed, &sysprops, assertions, &req.java_extra) {
+            Ok(a) => a,
+            Err(msg) => {
+                eprintln!("[diff-hotspot] {msg}");
+                return EXIT_NO_REFERENCE;
+            }
+        };
+
+        let reference = match resolve_reference(parsed.java_home.as_deref(), req.timeout) {
+            Ok(r) => r,
+            Err(msg) => {
+                eprintln!("[diff-hotspot] {msg}");
+                return EXIT_NO_REFERENCE;
+            }
+        };
+
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[diff-hotspot] cannot locate this launcher's own binary: {e}");
+                return EXIT_NO_REFERENCE;
+            }
+        };
+
+        let program = match (&parsed.jar, &parsed.class_name) {
+            (Some(j), _) => format!("--jar {j}"),
+            (None, Some(c)) => c.clone(),
+            (None, None) => "<none>".to_string(),
+        };
+
+        println!("=== cratonvm --diff-hotspot ===");
+        println!("  program        : {program}");
+        if let Some(cp) = &parsed.classpath {
+            println!("  classpath      : {cp}");
+        }
+        println!("  cratonvm       : {}", exe.display());
+        println!(
+            "  reference java : {}  [{}]",
+            reference.java.display(),
+            reference.source
+        );
+        println!("                   {}", reference.banner);
+        println!(
+            "  runs           : cratonvm x{}, java x1, timeout {}s",
+            req.runs,
+            req.timeout.as_secs()
+        );
+        if !req.ignores.is_empty() {
+            println!("  --diff-ignore  : {}", req.ignores.join(" | "));
+        }
+        println!();
+
+        // --- CratonVM side, `--diff-runs` times ----------------------------
+        let mut cvm: Vec<Capture> = Vec::with_capacity(req.runs);
+        for n in 0..req.runs {
+            let mut cmd = Command::new(&exe);
+            cmd.args(&req.child_argv[1..]);
+            cmd.env(CHILD_GUARD, "1");
+            match capture(cmd, req.timeout) {
+                Ok(c) => cvm.push(c),
+                Err(e) => {
+                    eprintln!(
+                        "[diff-hotspot] could not run the CratonVM side (run {}): {e}",
+                        n + 1
+                    );
+                    return EXIT_NO_REFERENCE;
+                }
+            }
+        }
+
+        // --- Reference side, once ------------------------------------------
+        let mut cmd = Command::new(&reference.java);
+        cmd.args(&ref_args);
+        let hs = match capture(cmd, req.timeout) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "[diff-hotspot] could not run the reference JDK ({}): {e}",
+                    reference.java.display()
+                );
+                return EXIT_NO_REFERENCE;
+            }
+        };
+
+        // --- Stability of the CratonVM side --------------------------------
+        let cvm_out: Vec<Vec<String>> = cvm.iter().map(|c| lines_of(&c.stdout)).collect();
+        let cvm_err: Vec<Vec<String>> = cvm.iter().map(|c| lines_of(&c.stderr)).collect();
+        let unstable_out = instability(&cvm_out);
+        let unstable_err = instability(&cvm_err);
+        let exit_unstable = cvm.iter().any(|c| c.exit_token() != cvm[0].exit_token());
+        let any_unstable =
+            exit_unstable || unstable_out.iter().any(|u| *u) || unstable_err.iter().any(|u| *u);
+
+        if any_unstable {
+            let n_out = unstable_out.iter().filter(|u| **u).count();
+            let n_err = unstable_err.iter().filter(|u| **u).count();
+            let exit_note = if exit_unstable {
+                ", and the exit status"
+            } else {
+                ""
+            };
+            println!(
+                "unstable: the CratonVM side did not reproduce itself across {} runs \
+                 ({n_out} stdout line(s), {n_err} stderr line(s){exit_note}).",
+                req.runs
+            );
+            println!(
+                "          Those lines carry no verdict and are excluded below — a line that \
+                 differs\n          between two CratonVM runs is the *program* being \
+                 nondeterministic, not a\n          HotSpot divergence. Mask them with \
+                 --diff-ignore for a clean run."
+            );
+            for (i, u) in unstable_out.iter().enumerate() {
+                if *u {
+                    println!(
+                        "          stdout {:>5} | {}",
+                        i + 1,
+                        for_display(&at(&cvm_out[0], i))
+                    );
+                }
+            }
+            println!();
+        }
+
+        // --- Prepare both sides ---------------------------------------------
+        let hs_out_raw = lines_of(&hs.stdout);
+        let hs_err_raw = lines_of(&hs.stderr);
+        let c_out = prepare(&cvm_out[0], false, &req.ignores, &unstable_out);
+        let h_out = prepare(&hs_out_raw, false, &req.ignores, &unstable_out);
+        let c_err = prepare(&cvm_err[0], true, &req.ignores, &unstable_err);
+        let h_err = prepare(&hs_err_raw, true, &req.ignores, &unstable_err);
+        let c_exit = cvm[0].exit_token();
+        let h_exit = hs.exit_token();
+
+        let out_diff = first_line_diff(&c_out, &h_out);
+        let err_diff = first_line_diff(&c_err, &h_err);
+        let exit_diff = !exit_unstable && c_exit != h_exit;
+
+        // Make the decode visible when it did anything. Non-UTF-8 bytes on
+        // either side are the norm on a legacy Windows console, and a reader
+        // who sees `\xE9` in the report below is owed the sentence that says
+        // what it is and that it was compared and not repaired.
+        if [&cvm[0].stdout, &cvm[0].stderr, &hs.stdout, &hs.stderr]
+            .iter()
+            .any(|s| s.contains(BYTE_ESCAPE))
+        {
+            println!(
+                "  note           : one side wrote bytes that are not valid UTF-8. They are \
+                 compared\n                   exactly, byte for byte, and shown below as \\xNN."
+            );
+        }
+
+        let exit_word = if exit_diff {
+            format!("DIFFER (cratonvm {c_exit}, java {h_exit})")
+        } else {
+            format!("agree ({c_exit})")
+        };
+        println!(
+            "  stdout {:<9} stderr {:<9} exit-status {}",
+            verdict_word(out_diff.is_none()),
+            verdict_word(err_diff.is_none()),
+            exit_word
+        );
+        println!(
+            "  wall           : cratonvm {} ms, java {} ms",
+            cvm[0].wall_ms, hs.wall_ms
+        );
+        println!();
+
+        if out_diff.is_none() && err_diff.is_none() && !exit_diff {
+            if any_unstable {
+                println!(
+                    "VERDICT: no divergence on the comparable output, but the CratonVM side was \
+                     not\n         self-consistent — see the unstable lines above. Exit {}.",
+                    EXIT_UNSTABLE
+                );
+                return EXIT_UNSTABLE;
+            }
+            println!(
+                "VERDICT: no divergence. CratonVM and the reference JDK agree on stdout, \
+                 stderr and exit status."
+            );
+            return EXIT_IDENTICAL;
+        }
+
+        // --- Something differed. Is it only known nondeterminism? -----------
+        let relax = |v: &[String]| -> Vec<String> { v.iter().map(|l| relax_line(l).0).collect() };
+        let rc_out = relax(&c_out);
+        let rh_out = relax(&h_out);
+        let rc_err = relax(&c_err);
+        let rh_err = relax(&h_err);
+        let r_out_diff = first_line_diff(&rc_out, &rh_out);
+        let r_err_diff = first_line_diff(&rc_err, &rh_err);
+
+        if r_out_diff.is_none() && r_err_diff.is_none() && !exit_diff {
+            let idx = out_diff.or(err_diff).unwrap_or(0);
+            let (c, h) = if out_diff.is_some() {
+                (&c_out, &h_out)
+            } else {
+                (&c_err, &h_err)
+            };
+            let stream = if out_diff.is_some() { "stdout" } else { "stderr" };
+            let rules = relax_line(&at(c, idx)).1;
+            let rule_list = if rules.is_empty() {
+                "masked".to_string()
+            } else {
+                rules.join(", ")
+            };
+            println!(
+                "VERDICT: no semantic divergence. The output differs only in shapes that are \
+                 not\n         program-observable ({rule_list}). First such line, on \
+                 {stream}:"
+            );
+            print_context(idx, c, h);
+            println!();
+            println!(
+                "         Identity hash codes, addresses, thread ordinals, timestamps and \
+                 absolute\n         paths differ legitimately between any two JVMs. Pass \
+                 --diff-strict to treat\n         this as a failure, or --diff-ignore \
+                 <PATTERN> to mask the line outright."
+            );
+            return if req.strict {
+                EXIT_DIVERGED
+            } else {
+                EXIT_IDENTICAL
+            };
+        }
+
+        // --- A real divergence. Report the first one, with context. ---------
+        //
+        // `encoding_shaped` names the cause when the two sides agree on every
+        // ASCII character and differ only outside it. It changes neither the
+        // verdict nor the exit code — see `print_encoding_hint`.
+        println!("VERDICT: DIVERGENCE.");
+        let mut encoding_shaped = false;
+        if let Some(i) = r_out_diff {
+            println!("  first divergence: stdout, line {}", i + 1);
+            print_context(i, &c_out, &h_out);
+            encoding_shaped = differs_only_outside_ascii(&at(&c_out, i), &at(&h_out, i));
+        } else if let Some(i) = r_err_diff {
+            println!("  first divergence: stderr, line {}", i + 1);
+            print_context(i, &c_err, &h_err);
+            encoding_shaped = differs_only_outside_ascii(&at(&c_err, i), &at(&h_err, i));
+        } else {
+            println!(
+                "  first divergence: exit status — cratonvm {c_exit}, reference java {h_exit}; \
+                 stdout and stderr agree."
+            );
+            let tail: Vec<&String> = cvm_err[0].iter().rev().take(10).collect();
+            if !tail.is_empty() {
+                println!("  last lines of the CratonVM stderr:");
+                for l in tail.into_iter().rev() {
+                    println!("    {}", for_display(l));
+                }
+            }
+        }
+        println!();
+        if encoding_shaped {
+            print_encoding_hint();
+            println!();
+        }
+        println!(
+            "  Before filing this: identity hash codes, HashMap iteration order on some \
+             shapes,\n  timestamps, thread interleaving and absolute paths differ legitimately \
+             between any\n  two JVMs. The five maskers (identity-hash, hex-address, thread-id, \
+             timestamp,\n  absolute-path) were applied and the difference survived them, and \
+             {} CratonVM run(s)\n  agreed with each other on this line — but a program-level \
+             race can still defeat\n  both. Re-run with --diff-runs 5 if you are unsure.",
+            req.runs
+        );
+        EXIT_DIVERGED
+    }
+
+    fn verdict_word(agree: bool) -> String {
+        if agree {
+            "agree".to_string()
+        } else {
+            "DIFFER".to_string()
+        }
+    }
+
+    /// The differing line and the three before it. A wall of diff is what
+    /// people already have; one line with its lead-in is what makes a report
+    /// usable without opening a second terminal.
+    fn print_context(idx: usize, c: &[String], h: &[String]) {
+        let start = idx.saturating_sub(3);
+        for i in start..idx {
+            println!("      {:>5} | {}", i + 1, for_display(&at(c, i)));
+        }
+        println!("    cratonvm {:>5} | {}", idx + 1, for_display(&at(c, idx)));
+        println!("    java     {:>5} | {}", idx + 1, for_display(&at(h, idx)));
+    }
+
+    /// Name a divergence whose two sides differ only outside ASCII, and point
+    /// at the one re-run that settles whether it is encoding or semantics.
+    ///
+    /// **This is a hint, not a masker.** It is printed *after* the verdict, the
+    /// verdict is still `DIVERGENCE`, and the exit code is still
+    /// [`EXIT_DIVERGED`]. Nothing here can turn a red run green — see the
+    /// comment above `ascii_skeleton` for why an encoding difference must not
+    /// be forgiven the way an identity hash is.
+    fn print_encoding_hint() {
+        println!(
+            "  Those two lines are identical everywhere except outside ASCII. That is the\n  \
+             shape a *charset* disagreement makes, not the shape a semantic one makes.\n  \
+             HotSpot derives stdout.encoding from the host — JEP 400 pinned file.encoding\n  \
+             and deliberately left this one alone — while CratonVM answers UTF-8\n  \
+             unconditionally, so on a non-UTF-8 console the two VMs write the same\n  \
+             characters as different bytes. Settle it in one run; -D properties are\n  \
+             forwarded to both sides, and UTF-8 is the one value the specification\n  \
+             blesses for these keys:\n\n      \
+             cratonvm --diff-hotspot -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8 \
+             <the same arguments>\n\n  \
+             If the divergence disappears, it was encoding and the characters agreed all\n  \
+             along. If it survives, it is a real finding. This paragraph is a hint and not\n  \
+             a mask: the verdict above is still DIVERGENCE and the exit code is still 1.\n  \
+             Background: docs/testing/diff-hotspot.md and the known-issue page\n  \
+             stdout-encoding-differs-from-hotspot-on-windows-20260901.md."
+        );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_trailing_newline_is_not_a_divergence() {
+            assert_eq!(lines_of("a\nb\n"), lines_of("a\nb"));
+            assert_eq!(lines_of("a\r\nb\r\n"), lines_of("a\nb"));
+        }
+
+        #[test]
+        fn identity_hashes_are_masked_but_short_at_suffixes_are_not() {
+            assert_eq!(
+                mask_identity_hash("java.lang.Object@1b6d3586 end"),
+                "java.lang.Object@<idhash> end"
+            );
+            assert_eq!(mask_identity_hash("user@ab"), "user@ab");
+            assert_eq!(mask_identity_hash("@1b6d3586"), "@1b6d3586");
+        }
+
+        #[test]
+        fn addresses_and_thread_ordinals_are_masked() {
+            assert_eq!(mask_hex_address("at 0xdeadbeef!"), "at 0x<addr>!");
+            assert_eq!(
+                mask_thread_id("pool-1-thread-13 ran"),
+                "pool-<n>-thread-<n> ran"
+            );
+        }
+
+        #[test]
+        fn timestamps_and_absolute_paths_are_masked() {
+            assert_eq!(mask_timestamp("2026-09-01T12:34:56.789Z"), "<date>T<time>Z");
+            assert_eq!(
+                mask_abs_path("read /home/me/x/Foo.txt ok"),
+                "read Foo.txt ok"
+            );
+            assert_eq!(mask_abs_path("ratio 3/4 ok"), "ratio 3/4 ok");
+        }
+
+        /// The bug this decode replaced: `String::from_utf8_lossy` turned
+        /// HotSpot's *own correct* cp1252/ISO-8859-1 `é` — the single byte
+        /// `0xE9` — into U+FFFD, and the harness then reported a divergence
+        /// against a line HotSpot never wrote. Nothing is lost now, and the
+        /// mapping is injective, which is what makes the byte-exact verdict
+        /// byte-exact.
+        #[test]
+        fn a_non_utf8_reference_byte_survives_the_decode() {
+            assert_eq!(for_display(&decode_lossless(b"h\xE9llo")), "h\\xE9llo");
+            // Injective: two different byte streams cannot decode alike.
+            assert_ne!(decode_lossless(b"h\xE9llo"), decode_lossless(b"h\xEAllo"));
+            // Valid UTF-8 is untouched, so the common path is unchanged.
+            assert_eq!(decode_lossless("héllo".as_bytes()), "héllo");
+            // A truncated sequence escapes byte by byte and still terminates.
+            assert_eq!(for_display(&decode_lossless(b"a\xEF\xB7b")), "a\\xEF\\xB7b");
+        }
+
+        /// The sentinel is escaped as its own three bytes, or a program that
+        /// printed U+FDD0 would be indistinguishable from a raw byte.
+        #[test]
+        fn the_escape_sentinel_escapes_itself() {
+            let decoded = decode_lossless("a\u{FDD0}b".as_bytes());
+            assert_eq!(for_display(&decoded), "a\\xEF\\xB7\\x90b");
+            assert_ne!(decoded, "a\u{FDD0}b");
+        }
+
+        /// A hint, and only where it belongs: the encoding shape is recognised
+        /// on the witness from the known-issue page (both the `?`-substituting
+        /// and the raw-byte spellings of the reference side), and an ordinary
+        /// ASCII difference does not trip it.
+        #[test]
+        fn an_encoding_shaped_divergence_is_recognised_and_an_ascii_one_is_not() {
+            assert!(differs_only_outside_ascii(
+                "hello, é中😀 world",
+                "hello, ??? world"
+            ));
+            // cp1252: `é` reaches us as one raw byte, the rest substitute.
+            assert!(differs_only_outside_ascii(
+                "hello, é中😀 world",
+                &decode_lossless(b"hello, \xE9?? world")
+            ));
+            // A numeric divergence is not encoding, and neither is a `?` count.
+            assert!(!differs_only_outside_ascii("0.3", "0.30000000000000004"));
+            assert!(!differs_only_outside_ascii("x?y", "x??y"));
+            assert!(!differs_only_outside_ascii("same", "same"));
+        }
+
+        #[test]
+        fn ignore_patterns_are_substrings_with_a_star_wildcard() {
+            assert!(pattern_matches("elapsed", "total elapsed 5ms"));
+            assert!(pattern_matches("took*ms", "it took 5 ms"));
+            assert!(!pattern_matches("took*ns", "it took 5 ms"));
+        }
+
+        #[test]
+        fn a_line_that_moves_between_two_cratonvm_runs_is_unstable() {
+            let a = vec!["x".to_string(), "1".to_string()];
+            let b = vec!["x".to_string(), "2".to_string()];
+            assert_eq!(instability(&[a, b]), vec![false, true]);
+        }
+
+        /// The whole point of the dedicated scan: a `--diff-hotspot` in the
+        /// program's own argument tail belongs to the program, and the flags
+        /// this mode owns never reach the launcher's argv pipeline.
+        #[test]
+        fn the_scan_leaves_a_normal_launch_alone_and_strips_only_its_own_flags() {
+            let normal: Vec<String> = ["cratonvm", "-cp", "b", "Main", "--diff-hotspot"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            assert!(scan(&normal).is_none());
+
+            let asked: Vec<String> = [
+                "cratonvm",
+                "--diff-hotspot",
+                "--diff-ignore",
+                "noise",
+                "-cp",
+                "b",
+                "Main",
+                "--diff-hotspot",
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+            let req = scan(&asked).expect("requested").expect("parsed");
+            assert_eq!(req.ignores, vec!["noise".to_string()]);
+            assert_eq!(req.runs, 2);
+            assert_eq!(
+                req.child_argv,
+                vec![
+                    "cratonvm".to_string(),
+                    "-cp".to_string(),
+                    "b".to_string(),
+                    "Main".to_string(),
+                    "--diff-hotspot".to_string(),
+                ]
+            );
+        }
+
+        /// `--opt=value` and `--opt value` both work, and a `--jar` selector
+        /// ends the launcher section just as it does for the real parse.
+        #[test]
+        fn inline_values_and_the_jar_selector() {
+            let asked: Vec<String> = [
+                "cratonvm",
+                "--diff-hotspot",
+                "--diff-runs=1",
+                "--diff-strict",
+                "--jar",
+                "app.jar",
+                "--diff-ignore",
+                "mine",
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+            let req = scan(&asked).expect("requested").expect("parsed");
+            assert_eq!(req.runs, 1);
+            assert!(req.strict);
+            // The `--diff-ignore` after the jar is the program's argument.
+            assert!(req.ignores.is_empty());
+            assert_eq!(
+                req.child_argv,
+                vec![
+                    "cratonvm".to_string(),
+                    "--jar".to_string(),
+                    "app.jar".to_string(),
+                    "--diff-ignore".to_string(),
+                    "mine".to_string(),
+                ]
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

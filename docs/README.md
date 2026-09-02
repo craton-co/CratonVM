@@ -61,7 +61,12 @@ feature exists; unresolved defects live under
 
 - [Deployment and Operations](book/src/operations/deployment.md)
 - [Observability](book/src/operations/observability.md) ·
-  [phase accounting](observability/phase-accounting.md)
+  [phase accounting](observability/phase-accounting.md) ·
+  [`cratonvm.JitCompileDecision`](observability/jit-compile-decision.md) — the
+  JIT's per-method admission verdict (which door asked, which backend produced
+  the body, and the reason it was admitted or declined) as a JFR event, so
+  "why is this method slow?" can be answered from a recording instead of a
+  rebuild with a debug flag set.
 - [Incident Response](book/src/operations/incident-response.md)
 - [Profiling](PROFILING.md) · [manual chapter](book/src/performance/profiling.md)
 - [Debugging](book/src/user-guide/debugging.md)
@@ -221,6 +226,10 @@ CI publishes its dumps under `target/jdk-only-audit/`.
 - [Differential testing](testing/differential.md) — what is compared, and how
   to trust the answer. No divergence is currently open. ·
   [opcode coverage](testing/opcode-coverage.md)
+- [`--diff-hotspot`](testing/diff-hotspot.md) — the single-program door to the
+  same comparison: run *your* class or JAR under CratonVM and a reference JDK
+  and be told the first divergence, or that there is none. `differential.md`
+  covers the corpus-and-CI door; this is the one you point at your own code.
 - [Code coverage](COVERAGE.md) — the project does not claim a minimum
   percentage until a reproducible baseline has been measured.
 - [Release readiness](RELEASE_READINESS.md) — the evidence a release candidate
