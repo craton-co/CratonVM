@@ -7871,6 +7871,22 @@ pub fn gated_ref_store_enabled() -> bool {
 /// Off ⇒ the unconditional helper call this tier emitted before, which is a
 /// supported configuration and the first thing to set if a compiled reference
 /// store is suspected of losing a card or an SATB entry.
+/// `CRATONVM_DBG_IR_REF_STORE_TRACE=1` — count, at RUN time, how many gated
+/// reference stores took the inline path and how many fell through to the
+/// helper. Default off.
+///
+/// The compile-time `gated=N` census cannot answer this, and the difference
+/// matters: a sequence emitted at two sites whose compactness gate never passes
+/// is five extra instructions in front of the same helper call it always made.
+/// Costs a `LOCK INC` per store, so it is a diagnostic arm, never a timed one.
+pub fn ir_ref_store_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_REF_STORE_TRACE").is_some()
+    })
+}
+
 pub fn ir_gated_ref_store_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();

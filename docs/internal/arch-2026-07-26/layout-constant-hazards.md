@@ -127,6 +127,7 @@ pre-session numbers from `header-shrink.md` §6.6 are in parentheses):
 | `jit/src/lib.rs` `AtomicLongFieldLayout::new` (new 2026-08-28) | `(HEADER_SIZE + idx * SLOT_SIZE) as i32 + FIELD_CELL_PAYLOAD64_OFFSET` — legacy `AtomicLong.value` cell | disp32 |
 | `jit/src/ir_lower.rs` `emit_inline_getstatic` (new 2026-08-03, cov-01) | direct `getstatic`: `field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD{32,64}_OFFSET` from the class's statics-block base | disp32 |
 | `jit/src/ir_lower.rs` `emit_gated_ir_ref_putfield` (new 2026-09-02) | gated compact reference **store**, `HEADER_SIZE + packed_body_offset` — the mirror of the compact `getfield` read, `MOV [RAX+disp32], RDX` | disp32 |
+| `jit/src/ir_lower.rs` `emit_gated_ir_ref_putfield`, LEGACY shape (new 2026-09-02) | the same store into the uniform 16-byte cell, `HEADER_SIZE + field_index * SLOT_SIZE` plus the tag and `FIELD_CELL_PAYLOAD64_OFFSET` biases; picked per OBJECT on `GC_FLAG_COMPACT`, so a shrink must move it and the compact shape together | disp32 |
 | `jit/src/ir_lower.rs` `emit_inline_compact_getfield`, LEGACY branch (new 2026-08-18) | `HEADER_SIZE + field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD{32,64}_OFFSET` — the uniform 16-byte `Value` cell, four emitted forms (ref / `J`\|`D` qword, `F` zero-extending dword, int-category `MOVSXD`) | disp32 |
 
 **2026-08-03, COV-02** (`docs/internal/cov-02-array-element-access-RETIRED-20260803.md`)
@@ -196,7 +197,7 @@ layout constants this crate could plausibly emit:
 | | `HEADER_SIZE` | `ARRAY_LENGTH_OFFSET` | `SLOT_SIZE` | `REF_ELEMENT_SIZE` | `MARK_WORD_OFFSET` | `IDENTITY_HASH_CODE_OFFSET` | `FIELD_CELL_PAYLOAD32_OFFSET` | `FIELD_CELL_PAYLOAD64_OFFSET` |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `jit/src/lib.rs` | 7 | 1 | 4 | 1 | 0 | 0 | 2 | 2 |
-| `jit/src/ir_lower.rs` | 14 | 4 | 6 | 0 | 0 | 0 | 6 | 4 |
+| `jit/src/ir_lower.rs` | 17 | 4 | 7 | 0 | 0 | 0 | 6 | 6 |
 
 (The `ir_lower.rs` row read `7 | 3 | …` when this section was written, went to
 `8` with the 2026-07-31 guarded inline compact `getfield`, to `10 | 4` with

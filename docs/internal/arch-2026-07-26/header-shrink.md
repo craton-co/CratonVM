@@ -391,6 +391,17 @@ audit the shrink was planned from:
   to keep in step: a non-compact receiver leaves this arm for
   `jit_putfield_object`, which resolves the offset itself, so a smaller header
   has one site here and not two.
+- `ir_lower.rs::emit_gated_ir_ref_putfield`, LEGACY shape (added 2026-09-02)
+  — `HEADER_SIZE + field_index * SLOT_SIZE` plus `FIELD_CELL_TAG_OFFSET` and
+  `FIELD_CELL_PAYLOAD64_OFFSET`, the uniform 16-byte `Value` cell, emitted as
+  two disp32 stores (`4C 89 90 disp32` for the tag qword, `48 89 90 disp32`
+  for the pointer payload). So the note above about there being no legacy twin
+  is superseded: there is one, added the same day and for the measured reason
+  that the compact shape alone fired **zero** times out of 16,384,000 (the TLAB
+  fast path writes legacy headers unconditionally). The arm now picks between
+  the two shapes per OBJECT on `GC_FLAG_COMPACT`, exactly as the inline
+  `getfield` read does, so a smaller header must move BOTH or the legacy shape
+  writes the wrong cell.
 - `ir_lower.rs::emit_inline_getstatic` (added 2026-08-03, cov-01) — the direct
   `getstatic` read: `field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD{32,64}_OFFSET`
   as a disp32, from the class's **statics block** base. It bakes the field-cell

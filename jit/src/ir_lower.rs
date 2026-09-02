@@ -2747,6 +2747,21 @@ impl<'a> Lowerer<'a> {
         self.patch_rel32_to_here(ok1);
     }
 
+    /// `LOCK INC qword [counter]` when the reference-store path trace is on,
+    /// and nothing at all otherwise.
+    ///
+    /// Uses R11, which is free at both call sites, and clobbers flags — which
+    /// is why it is only ever emitted where the next instruction does not read
+    /// them (immediately before the value load on the inline path, and before
+    /// the argument marshal on the helper path).
+    fn emit_ref_store_path_trace(&mut self, counter: &'static std::sync::atomic::AtomicU64) {
+        if !crate::x64::ir_ref_store_trace_enabled() {
+            return;
+        }
+        self.emit_mov_reg_imm64(R11, counter as *const _ as u64);
+        self.buf.emit(&[0xF0, 0x49, 0xFF, 0x03]); // LOCK INC qword [R11]
+    }
+
     /// COV-03 — the optimizing tier's **gated** compact reference `putfield`.
     ///
     /// The caller has already loaded the receiver into RAX and emitted the
@@ -2793,7 +2808,12 @@ impl<'a> Lowerer<'a> {
         value: NodeId,
         field_index: i64,
     ) -> bool {
-        if !crate::x64::ir_gated_ref_store_enabled() {
+        // Both switches, because both mean "do not store a reference field
+        // inline". `CRATONVM_NO_JIT_INLINE_PUTFIELD` is the older, broader one
+        // and the single-pass gated arm honours it; an emitter that ignored it
+        // would leave someone who set it to chase a lost store still getting
+        // inline stores, from the tier they were least likely to look at.
+        if !crate::x64::ir_gated_ref_store_enabled() || !crate::x64::inline_putfield_enabled() {
             crate::metrics::note_ir_ref_store_decline(0);
             return false;
         }
@@ -2846,10 +2866,16 @@ impl<'a> Lowerer<'a> {
             return false;
         }
 
-        // RAX holds the non-null receiver on entry.
-        let mut bail: Vec<usize> = Vec::new();
+        // RAX holds the non-null receiver on entry. The bail sets are kept
+        // APART rather than in one vector so the run-time trace can say which
+        // gate refused — see `IR_REF_STORE_BAIL`. Without the trace they are
+        // concatenated and every one of them lands on the same helper label,
+        // which is what they did before this split and what they cost.
+        let mut bail_recv: Vec<usize> = Vec::new();
+        let mut bail_pre: Vec<usize> = Vec::new();
+        let mut bail_barrier: Vec<usize> = Vec::new();
         if !trusted_oop_receiver {
-            self.emit_receiver_align_and_containment(&mut bail);
+            self.emit_receiver_align_and_containment(&mut bail_recv);
         }
 
         // -- SATB pre-barrier gate --------------------------------------
@@ -2857,20 +2883,16 @@ impl<'a> Lowerer<'a> {
         // which is the helper's job. Armed only during a concurrent mark phase.
         self.emit_mov_reg_imm64(R11, pre as u64);
         self.buf.emit(&[0x41, 0x80, 0x3B, 0x00]); // CMP byte [R11], 0
-        bail.push(self.emit_jcc_rel32(0x85)); // JNE -> helper
+        bail_pre.push(self.emit_jcc_rel32(0x85)); // JNE -> helper
 
-        // -- layout guard, out of ONE header byte ------------------------
+        // -- the receiver flags byte, read ONCE --------------------------
         // `GC_FLAGS_BYTE_OFFSET` carries the GC flags in bits 0..3 and `gc_age`
-        // in bits 4..7, so this single byte answers both the compactness
-        // question here and the young-receiver question below. A class with a
-        // registered compact layout can still have legacy-cell instances — the
-        // TLAB fast path writes a legacy header unconditionally — so this is
-        // not a formality.
+        // in bits 4..7, so this single byte answers both the young-receiver
+        // question the post gate asks and the per-object layout question the
+        // store shape below asks.
         self.buf.emit(&[0x0F, 0xB6, 0x88]); // MOVZX ECX, byte [RAX + disp32]
         self.buf
             .emit(&(cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32).to_le_bytes());
-        self.buf.emit(&[0xF6, 0xC1, cratonvm_types::GC_FLAG_COMPACT]); // TEST CL, imm8
-        bail.push(self.emit_jcc_rel32(0x84)); // JZ -> helper (legacy cell layout)
 
         // -- slot bounds ------------------------------------------------
         // `field_index < num_slots`, which for a compact object is the FIELD
@@ -2911,26 +2933,84 @@ impl<'a> Lowerer<'a> {
         self.buf.emit(&[0x41, 0x80, 0x3B, 0x00]); // CMP byte [R11], 0
         inline_store.push(self.emit_jcc_rel32(0x84)); // JZ -> no old objects
                                                       // Neither gate ruled the barrier out: the helper does the store.
-        bail.push(self.emit_jmp_rel32());
+        bail_barrier.push(self.emit_jmp_rel32());
 
-        // -- the barrier-free store --------------------------------------
-        // A compact reference field is the bare 8-byte pointer at the cell
-        // base, which is exactly what the inline `getfield` arm reads back.
+        // -- the barrier-free store, in whichever shape this OBJECT has --
+        //
+        // Both layouts store inline. A compact-only arm would be an arm that
+        // almost never fires: `init_object_header`, the TLAB fast path that
+        // serves nearly every allocation for the interpreter and
+        // `jit_new_object` alike, writes a LEGACY header unconditionally --
+        // `array_length = 0`, no `GC_FLAG_COMPACT` -- regardless of whether the
+        // class has a registered compact layout, because it never consults
+        // `plan_object_alloc`. The run-time census says so exactly: with only
+        // the compact shape emitted, `RefStoreLoopProbe` took this arm 0 times
+        // out of 16,384,000 and bailed at the compactness test every time, on
+        // Generational and ZGC alike. It is the same trap the inline `getfield`
+        // read fell into and climbed out of on 2026-08-18, and the fix is the
+        // same: emit both shapes and pick per OBJECT, exactly as that arm and
+        // `jit_putfield_object` itself do.
         for patch in inline_store {
             self.patch_rel32_to_here(patch);
         }
+        self.emit_ref_store_path_trace(&crate::metrics::IR_REF_STORE_INLINE_TAKEN);
+        self.gp_load_value(RDX, value);
+        self.buf.emit(&[0xF6, 0xC1, cratonvm_types::GC_FLAG_COMPACT]); // TEST CL, imm8
+        let legacy_shape = self.emit_jcc_rel32(0x84); // JZ -> the 16-byte cell
+        // COMPACT: a reference field is the bare 8-byte pointer at the cell
+        // base, which is exactly what the inline `getfield` arm reads back.
+        //
         // Cast: a compact field offset plus the header is bounded by the
         // object size.
         let cell_off = (HEADER_SIZE + c_off as usize) as i32;
-        self.gp_load_value(RDX, value);
         self.buf.emit(&[0x48, 0x89, 0x90]); // MOV [RAX + disp32], RDX
         self.buf.emit(&cell_off.to_le_bytes());
         let stored = self.emit_jmp_rel32();
 
+        // LEGACY: the uniform 16-byte `Value` cell -- tag dword (with its pad)
+        // then the pointer payload. Transcribed from the single-pass backend's
+        // own legacy inline reference store, so the two cannot disagree about
+        // which half of the cell holds what; the bounds check above is what
+        // makes `field_index * SLOT_SIZE` addressable, since for a legacy
+        // object `num_slots` counts exactly these cells.
+        self.patch_rel32_to_here(legacy_shape);
+        let legacy_off = (HEADER_SIZE + field_index as usize * SLOT_SIZE) as i32;
+        self.emit_mov_reg_imm64(R10, u64::from(cratonvm_types::FIELD_CELL_TAG_OBJECT));
+        self.buf.emit(&[0x4C, 0x89, 0x90]); // MOV [RAX + disp32], R10
+        self.buf
+            .emit(&(legacy_off + cratonvm_types::FIELD_CELL_TAG_OFFSET as i32).to_le_bytes());
+        self.buf.emit(&[0x48, 0x89, 0x90]); // MOV [RAX + disp32], RDX
+        self.buf
+            .emit(&(legacy_off + FIELD_CELL_PAYLOAD64_OFFSET as i32).to_le_bytes());
+        let stored_legacy = self.emit_jmp_rel32();
+
         // -- helper fallback: the full SATB + store + post barrier --------
-        for patch in bail {
+        //
+        // With the trace on, each bail set gets a one-instruction stub that
+        // names it before joining the helper; without it they all land here
+        // directly and cost nothing.
+        let bail_groups = [(bail_recv, 0usize), (bail_pre, 1), (bail_barrier, 3)];
+        let mut to_helper: Vec<usize> = Vec::new();
+        if crate::x64::ir_ref_store_trace_enabled() {
+            for (patches, reason) in bail_groups {
+                if patches.is_empty() {
+                    continue;
+                }
+                for patch in patches {
+                    self.patch_rel32_to_here(patch);
+                }
+                self.emit_ref_store_path_trace(&crate::metrics::IR_REF_STORE_BAIL[reason]);
+                to_helper.push(self.emit_jmp_rel32());
+            }
+        } else {
+            for (patches, _) in bail_groups {
+                to_helper.extend(patches);
+            }
+        }
+        for patch in to_helper {
             self.patch_rel32_to_here(patch);
         }
+        self.emit_ref_store_path_trace(&crate::metrics::IR_REF_STORE_HELPER_TAKEN);
         self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
         self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
         self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as i64 as u64);
@@ -2940,6 +3020,7 @@ impl<'a> Lowerer<'a> {
 
         self.patch_rel32_to_here(oob);
         self.patch_rel32_to_here(stored);
+        self.patch_rel32_to_here(stored_legacy);
         crate::metrics::note_ir_ref_store_gated();
         true
     }
@@ -12748,6 +12829,54 @@ mod tests {
         assert!(
             contains_seq(&with, &(COMPACT_REF_PUTFIELD_HELPER as u64).to_le_bytes()),
             "the gated arm must keep `jit_putfield_object` as its fallback"
+        );
+    }
+
+    /// The gated arm emits BOTH store shapes and picks between them per object.
+    ///
+    /// A compact-only arm is an arm that almost never fires. `init_object_header`
+    /// — the TLAB fast path serving nearly every allocation for the interpreter
+    /// and `jit_new_object` alike — writes a LEGACY header unconditionally, no
+    /// `GC_FLAG_COMPACT`, whatever layout the class has registered. Measured on
+    /// `RefStoreLoopProbe` with only the compact shape emitted: 16,384,000
+    /// executions, `inline=0`, every one bailing at the compactness test, on
+    /// Generational and ZGC alike. This asserts the shape that fixed it.
+    #[test]
+    fn the_gated_arm_emits_the_legacy_cell_store_as_well_as_the_compact_one() {
+        let code = lower_compact_ref_putfield(true, 8);
+        // The legacy 16-byte `Value` cell for field 0: tag qword then the
+        // pointer payload, both at `HEADER_SIZE + 0 * SLOT_SIZE`.
+        // `i32::try_from`, not the bare cast: the audit in
+        // `flag_and_header_contracts` counts that cast form as an EMISSION
+        // site, and a test expectation is not one -- including in this comment,
+        // which is why it does not spell the form out.
+        let legacy_off = i32::try_from(HEADER_SIZE).expect("the header fits an i32");
+        let mut tag_store: Vec<u8> = vec![0x4C, 0x89, 0x90]; // MOV [RAX+disp32], R10
+        tag_store.extend_from_slice(
+            &(legacy_off + cratonvm_types::FIELD_CELL_TAG_OFFSET as i32).to_le_bytes(),
+        );
+        assert!(
+            contains_seq(&code, &tag_store),
+            "the legacy shape must write the cell's TAG — a payload written \
+             without it leaves a cell whose discriminant still says whatever \
+             the field held before, and the reader believes the discriminant"
+        );
+        let mut pay_store: Vec<u8> = vec![0x48, 0x89, 0x90]; // MOV [RAX+disp32], RDX
+        pay_store.extend_from_slice(
+            &(legacy_off + FIELD_CELL_PAYLOAD64_OFFSET as i32).to_le_bytes(),
+        );
+        assert!(
+            contains_seq(&code, &pay_store),
+            "the legacy shape must write the 64-bit pointer payload"
+        );
+        // And the compact shape is still there — this is a two-shape arm, not a
+        // replacement of one dead shape by another.
+        let mut compact_store: Vec<u8> = vec![0x48, 0x89, 0x90];
+        compact_store.extend_from_slice(&((HEADER_SIZE + 8usize) as i32).to_le_bytes());
+        assert!(
+            contains_seq(&code, &compact_store),
+            "the compact shape must survive: the receiver's own header decides, \
+             and a genuinely compact object stores the bare pointer"
         );
     }
 

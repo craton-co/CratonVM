@@ -274,6 +274,19 @@ fn maybe_dump_shutdown_reports() {
             for (name, count) in cratonvm_jit::metrics::ir_ref_store_declines() {
                 eprintln!("[cratonvm]   ir ref-store declined {name}: {count}");
             }
+            // The DYNAMIC split, only under CRATONVM_DBG_IR_REF_STORE_TRACE=1.
+            // `gated=N` above is a count of emitted sequences; this is a count
+            // of executions, and a sequence whose compactness gate never
+            // passes has the first without the second.
+            let (inline_taken, helper_taken) = cratonvm_jit::metrics::ir_ref_store_path_counts();
+            if inline_taken != 0 || helper_taken != 0 {
+                eprintln!(
+                    "[cratonvm]   ir ref-store executions: inline={inline_taken} helper={helper_taken}"
+                );
+                for (name, count) in cratonvm_jit::metrics::ir_ref_store_bails() {
+                    eprintln!("[cratonvm]     ir ref-store bail {name}: {count}");
+                }
+            }
             // Optimizing-tier allocation. A zero on the left is the EXPECTED
             // reading under a default configuration -- `c2_alloc_upgrade` is
             // opt-in, so no method containing a `new` reaches that tier -- and
