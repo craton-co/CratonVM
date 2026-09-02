@@ -370,7 +370,7 @@ is no longer blocked on an unknown:
 Step 3 is the one to be careful with: discharging only the labelled site is what
 made the first attempt look like progress while engagement did not move at all.
 
-### 2026-09-02 (decisive): COMPACTION FIXES IT. The obstacle is entirely the coverage conjunction
+### 2026-09-02 (decisive): compaction relieves the OOM -- but see the 32-core correction below before reading this as a fix
 
 `CRATONVM_ZGC_ASSUME_REWRITABLE=1` forces the whole relocation gate. One binary,
 `--Xmx 1g`, 3000 s cap:
@@ -412,6 +412,63 @@ zgc-relocation-coverage-reason: cross-thread-jit-peer=5
 so the next work is those two, together, with `relocation_on_proven_jit` as the
 only acceptance test -- and `CRATONVM_ZGC_ASSUME_REWRITABLE=1` as the upper
 bound that says what winning looks like.
+
+
+### 2026-09-02 (32-core local box): the baseline reproduces EXACTLY, and forcing relocation CORRUPTS
+
+Moved off the shared Azure host, which spent the day between load 1 and 477 and
+twice had H2's `target/` deleted underneath a run. This box is 32 cores /
+64 GB, uncontended, with the corpus pinned locally. Release binary, `--Xmx 1g`,
+`TestCachedQueryResults`:
+
+| arm | secs | `actual` | ref-array OOM | arena | COUNTER | **NPE** | relocation |
+|---|---:|---:|---:|---:|---:|---:|---|
+| baseline | 1519 | **98 304** | 1 497 | 11 | 199 | **0** | skipped 1539, proven 1 |
+| `ASSUME_REWRITABLE=1` | **629** | 99 952 | **0** | **0** | **0** | **48** | skipped 0, proven 24 |
+
+**The baseline reproduces this page's number to the digit** -- `actual: 98304` --
+so the local box is a faithful reproduction and every earlier arm can be
+re-read against it.
+
+**And the forced arm CORRUPTS.** Its 48 missing entries are not OOM and not lock
+timeouts; they are
+
+```text
+General error: "java.lang.NullPointerException"; SQL statement:
+SELECT counter FROM Counter WHERE id = 1 FOR UPDATE WAIT 0.5
+```
+
+**48 in the forced arm against 0 in the baseline**, same binary, same corpus,
+one flag apart. That is what `CRATONVM_ZGC_ASSUME_REWRITABLE`'s own doc
+promises -- *"it relocates under frames nobody proved rewritable; expect
+corruption if the answer is no"* -- and this is the first run where the
+corruption is visible rather than theoretical. The Azure arms did not show it
+(their residual was exactly their COUNTER count); 32 cores and a 2.4x faster
+run expose the race that 8 contended cores hid.
+
+### What that corrects, and it is a correction to this page's own 2026-09-02 entry
+
+The earlier entry said compaction "fixes" the class and called the forced arm an
+upper bound on what winning looks like. Half of that stands and half does not:
+
+* **Stands:** compaction eliminates the OOM. 1 497 reference-array failures and
+  11 arena failures go to ZERO, and the wall clock more than halves. The
+  fragmentation diagnosis is right and relocation is the relief.
+* **Does NOT stand:** the forced arm is not a preview of a correct fix. A
+  correct fix must have **zero NPEs as well as zero OOMs**, and this arm trades
+  one for the other.
+
+So the coverage conjunction is **load-bearing, not over-conservative**. The
+obligations cannot be bypassed to buy compaction; they have to be SATISFIED so
+that the frames really are rewritable. That makes the remaining work narrower
+and strictly harder than the previous entry implied:
+
+1. discharge `compiled-frame-oop-not-published` and `cross-thread-jit-peer` by
+   making the frames genuinely provable -- not by skipping the proof;
+2. the acceptance test is `relocation_on_proven_jit > 0` **with 0 NPE and 0
+   OOM**, which no arm has yet produced together;
+3. `ASSUME_REWRITABLE` remains useful for exactly one thing: showing that the
+   OOM is relievable at all. It is not a target.
 
 ### 2026-09-02 (idle host): the OOM is gone and the RESIDUAL IS PAUSE DURATION, not the heap
 
@@ -543,43 +600,6 @@ sensitive to the box in three separate ways, and all three have now bitten:
    STALE binary while printing success.
 
 Record `/proc/loadavg` and `free -g` beside every arm.
-
-### 2026-09-02 (quiet host): ZERO OOMs, 24 compaction cycles, and the gate never refuses
-
-The 3000 s arms above both capped under contention. This one ran on a quiet host
-(load 7.64 / 6.02 / 5.79) and **exited cleanly**, so it carries the `[GC]`
-summary the capped runs could not:
-
-```text
-CRATONVM_ZGC_ASSUME_REWRITABLE=1     rc=1   3575 s
-    arena allocation failed          0
-    native reference array OOM       0
-    java.lang.OutOfMemoryError       0
-    relocation_skipped_jit           0
-    relocation_on_proven_jit         24
-    compaction_cycles                24     objects_relocated=641125
-    zgc-relocation-skip-reason:      (none)
-```
-
-**Zero OutOfMemoryError of any kind, and the relocation gate refuses nothing.**
-Against the same binary with the flag off, which produced an 11.6 MB error log
-of exactly the OOM this page is about. So the heap defect is not merely reduced
-by compaction; under compaction it does not occur.
-
-**The class still fails, and the remaining reason is the INSTRUMENT, not the
-heap.** `rc=1` here is `Timeout trying to lock table "COUNTER"` again -- but this
-arm ran at load 7.6, so contention is no longer a sufficient explanation. The
-likelier cause is that this binary is built `--profile livedbg`
-(`opt-level = 1`, `lto = false`), chosen because the fat-LTO release link was
-being OOM-killed by other tenants at load 130+. An `opt-level=1` VM is several
-times slower than release, which is enough on its own to trip H2's
-`FOR UPDATE WAIT 0.5`. The release build reaches the ASSERTION
-(`Expected: 100000 actual: 98304`) in 641 s; this one never gets that far.
-
-So the pass/fail verdict needs `--profile release` **and** the flag. Until that
-run exists this page claims exactly what is measured: **compaction removes the
-OOM entirely**, and the class's remaining failure under the instrument is not
-attributable to the heap.
 
 ### 2026-09-02 (quiet host): ZERO OOMs, 24 compaction cycles, and the gate never refuses
 
