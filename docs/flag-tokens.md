@@ -577,7 +577,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-289 tokens.
+290 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -680,6 +680,7 @@ export inherited from a parent shell.
 | `gated-ref-store` | `CRATONVM_JIT_GATED_REF_STORE` |
 | `this-nonnull` | `CRATONVM_JIT_THIS_NONNULL` |
 | `receiver-null-elim` | `CRATONVM_JIT_RECEIVER_NULL_ELIM` |
+| `implicit-null-check` | `CRATONVM_JIT_IMPLICIT_NULL_CHECK` |
 | `operand-cache` | `CRATONVM_JIT_OPERAND_CACHE` |
 | `ir-reloc-emit` | `CRATONVM_JIT_IR_RELOC_EMIT` |
 | `reloc-gate-map-incomplete` | `CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE` |
@@ -873,7 +874,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-112 tokens.
+114 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -930,6 +931,7 @@ export inherited from a parent shell.
 | `gpu-critical-wait-ms` | `CRATONVM_GPU_CRITICAL_WAIT_MS` |
 | `gpu-host-callback` | `CRATONVM_GPU_HOST_CALLBACK` |
 | `gpu-device-pool` | `CRATONVM_GPU_DEVICE_POOL` |
+| `gpu-wait-latch` | `CRATONVM_GPU_WAIT_LATCH` |
 | `gpu-zerocopy` | `CRATONVM_GPU_NO_ZEROCOPY` |
 | `lhm-root-all` | `CRATONVM_LHM_ROOT_ALL` |
 | `max-inflated-bytes` | `CRATONVM_MAX_INFLATED_BYTES` |
@@ -952,6 +954,7 @@ export inherited from a parent shell.
 | `par-evac` | `CRATONVM_GC_PAR_EVAC` |
 | `par-threads` | `CRATONVM_GC_PAR_THREADS` |
 | `sync-young-wipe` | `CRATONVM_GC_SYNC_YOUNG_WIPE` |
+| `jit-ref-store-gates` | `CRATONVM_GC_JIT_REF_STORE_GATES` |
 | `promotion-guard` | `CRATONVM_NO_GC_PROMOTION_GUARD` |
 | `promotion-oom-guard-broad` | `CRATONVM_PROMOTION_OOM_GUARD_BROAD` |
 | `selective-promote` | `CRATONVM_NO_SELECTIVE_PROMOTE` |
