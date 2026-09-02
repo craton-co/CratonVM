@@ -3085,7 +3085,7 @@ impl<'a> Lowerer<'a> {
         let arg2 =
             cratonvm_jit_api::getfield_index_arg(field_index as u32, ref_node, base_is_proven_oop);
         self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
-        self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
+        self.gp_load_value(CALL_ARG_REGS[1], base);
         self.emit_mov_reg_imm64(CALL_ARG_REGS[2], arg2);
         self.emit_mov_reg_imm64(RAX, self.getfield as u64);
         self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
@@ -3495,6 +3495,25 @@ impl<'a> Lowerer<'a> {
         self.buf.emit(bytes.as_slice());
     }
 
+    /// `MOV qword [RBP - offset], imm32` (sign-extended), or `false` when the
+    /// value needs all 64 bits and the caller must go through a register.
+    ///
+    /// A constant's home word is still written — a deopt frame may name it,
+    /// and a handful of sites read home slots directly — but since every
+    /// READER materialises a constant as an immediate
+    /// (`ir_const_imm_enabled`), nothing needs it in RAX on the way there.
+    /// One instruction instead of two, at every `Op::Const` in every method.
+    fn emit_store_frame_imm32(&mut self, offset: i32, val: i64) -> bool {
+        let Ok(imm) = i32::try_from(val) else {
+            return false;
+        };
+        self.buf.emit_byte(0x48); // REX.W
+        self.buf.emit_byte(0xC7); // MOV r/m64, imm32 (/0)
+        self.emit_rbp_modrm_disp(0, offset);
+        self.buf.emit(&imm.to_le_bytes());
+        true
+    }
+
     /// MOV RAX, imm64
     fn emit_mov_rax_imm64(&mut self, val: i64) {
         if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
@@ -3803,7 +3822,7 @@ impl<'a> Lowerer<'a> {
         self.load_reg_from_frame(abi[0], self.context_slot_off); // vm_ptr
         for i in 0..num_args {
             let arg = inputs[2 + i];
-            self.load_reg_from_frame(abi[1 + i], self.slot_of(arg)); // Java arg i
+            self.gp_load_value(abi[1 + i], arg); // Java arg i
         }
         // Direct CALL rel32 to entry (code offset 0), patched at finalize.
         self.buf.emit(&[0xE8]);
@@ -5155,8 +5174,8 @@ impl<'a> Lowerer<'a> {
         // Otherwise the collector's own write_barrier(vm, obj, val). A leaf:
         // no frame republish, exactly as the single-pass site emits it.
         self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
-        self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
-        self.load_reg_from_frame(CALL_ARG_REGS[2], self.slot_of(value));
+        self.gp_load_value(CALL_ARG_REGS[1], base);
+        self.gp_load_value(CALL_ARG_REGS[2], value);
         self.emit_mov_reg_imm64(RAX, barrier as u64);
         self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
         done.push(self.emit_jmp_rel32());
@@ -5166,9 +5185,9 @@ impl<'a> Lowerer<'a> {
             self.patch_rel32_to_here(b);
         }
         self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
-        self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
+        self.gp_load_value(CALL_ARG_REGS[1], base);
         self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as i64 as u64);
-        self.load_reg_from_frame(CALL_ARG_REGS[3], self.slot_of(value));
+        self.gp_load_value(CALL_ARG_REGS[3], value);
         self.emit_mov_reg_imm64(RAX, self.putfield_object as u64);
         self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
         for d in done {
@@ -5253,15 +5272,26 @@ impl<'a> Lowerer<'a> {
         }
         let mut fused_cmp = vec![false; n];
         if ir_fused_branch_enabled() {
-            // The compare must be the LAST scheduled node of the block its
-            // `If` terminates. Fusing moves the reads of the compare's inputs
-            // from the compare's own position to the terminator's; the
-            // register allocator's liveness model ends those inputs' ranges
-            // at the compare, so any value DEFINED between the two could be
-            // handed one of their registers (the ternary test caught exactly
-            // that: `a` and the constant `1` shared RBX). With nothing
-            // scheduled between them the two positions are adjacent and the
-            // model still holds.
+            // Fusing moves the reads of the compare's inputs from the
+            // compare's own position to the terminator's, so it is legal
+            // exactly while nothing scheduled in between can overwrite where
+            // those inputs live. Two things can:
+            //
+            // * a value sharing an input's HOME COLOUR — `plan_slots` packs
+            //   values into shared frame words by live range, and the
+            //   allocator's model ends an input's range at the compare;
+            // * a value promoted into an input's REGISTER, for the same
+            //   reason. `test_lower_ternary_lt_phi` caught exactly that: `a`
+            //   and the constant `1` were handed the same RBX.
+            //
+            // Both are checked against the plans this lowering was handed,
+            // rather than approximated by requiring the compare to be the last
+            // scheduled node — which is what the first cut did, and it
+            // declined `fib`, whose two subtractions sit between its compare
+            // and its branch.
+            let color_of = |plan: &SlotPlan, id: NodeId| -> Option<u32> {
+                plan.node_color.get(id as usize).copied().flatten()
+            };
             for block in &self.schedule.blocks {
                 let Some(term) = block.terminator else {
                     continue;
@@ -5275,9 +5305,12 @@ impl<'a> Lowerer<'a> {
                 let Some(&cond) = if_node.inputs.get(1) else {
                     continue;
                 };
-                if cond == NO_NODE || block.nodes.last().copied() != Some(cond) {
+                if cond == NO_NODE {
                     continue;
                 }
+                let Some(pos) = block.nodes.iter().position(|&id| id == cond) else {
+                    continue;
+                };
                 let Some(cmp) = self.graph.nodes.get(cond as usize) else {
                     continue;
                 };
@@ -5285,6 +5318,24 @@ impl<'a> Lowerer<'a> {
                     continue;
                 }
                 if use_count[cond as usize] != 1 || deopt_named[cond as usize] {
+                    continue;
+                }
+                let (a, b) = (cmp.inputs[0], cmp.inputs[1]);
+                let in_colors = [color_of(&self.slot_plan, a), color_of(&self.slot_plan, b)];
+                // Through the sanctioned accessors, never `reg_of` directly:
+                // `the_register_read_path_is_gated_on_publication` is what
+                // keeps "assigned" and "published" from drifting apart.
+                let in_gp = [self.assigned_gpr(a), self.assigned_gpr(b)];
+                let in_fp = [self.assigned_xmm(a), self.assigned_xmm(b)];
+                let clobbered = block.nodes[pos + 1..].iter().any(|&later| {
+                    let c = color_of(&self.slot_plan, later);
+                    let g = self.assigned_gpr(later);
+                    let f = self.assigned_xmm(later);
+                    (c.is_some() && in_colors.contains(&c))
+                        || (g.is_some() && in_gp.contains(&g))
+                        || (f.is_some() && in_fp.contains(&f))
+                });
+                if clobbered {
                     continue;
                 }
                 fused_cmp[cond as usize] = true;
@@ -5350,9 +5401,12 @@ impl<'a> Lowerer<'a> {
         let node = &self.graph.nodes[id as usize];
         match &node.op {
             Op::Const(val) => {
+                let val = *val;
                 let slot = self.alloc_slot(id);
-                self.emit_mov_rax_imm64(*val);
-                self.store_rax(slot);
+                if !ir_const_imm_enabled() || !self.emit_store_frame_imm32(slot, val) {
+                    self.emit_mov_rax_imm64(val);
+                    self.store_rax(slot);
+                }
             }
             Op::Param(idx) => {
                 let slot = self.alloc_slot(id);
@@ -6085,7 +6139,7 @@ impl<'a> Lowerer<'a> {
                 if self.getfield != 0 {
                     crate::metrics::note_getfield_arm(5);
                     self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
-                    self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
+                    self.gp_load_value(CALL_ARG_REGS[1], base);
                     // Reference loads must carry `GETFIELD_EXPECT_REFERENCE` at
                     // EVERY arm, not just the one that crashed — this is the
                     // inline-compact fallback arm. No receiver proof is claimed
@@ -6207,9 +6261,9 @@ impl<'a> Lowerer<'a> {
                     // Unlike every other putfield helper it takes the context
                     // pointer; `scan_frame_needs` reserves the slot for it.
                     self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
-                    self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
+                    self.gp_load_value(CALL_ARG_REGS[1], base);
                     self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as i64 as u64);
-                    self.load_reg_from_frame(CALL_ARG_REGS[3], self.slot_of(value));
+                    self.gp_load_value(CALL_ARG_REGS[3], value);
                     self.emit_mov_reg_imm64(RAX, self.putfield_object as u64);
                     self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
                     return;
@@ -6230,9 +6284,9 @@ impl<'a> Lowerer<'a> {
                     self.gp_load_value(RAX, base);
                     self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
                     self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
-                    self.load_reg_from_frame(CALL_ARG_REGS[0], self.slot_of(base));
+                    self.gp_load_value(CALL_ARG_REGS[0], base);
                     self.emit_mov_reg_imm64(CALL_ARG_REGS[1], field_index as i64 as u64);
-                    self.load_reg_from_frame(CALL_ARG_REGS[2], self.slot_of(value));
+                    self.gp_load_value(CALL_ARG_REGS[2], value);
                     self.emit_mov_reg_imm64(RAX, helper as u64);
                     self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
                     return;
@@ -6256,9 +6310,9 @@ impl<'a> Lowerer<'a> {
                     // Receiver first: `load_reg_from_frame` into arg0 would be
                     // clobbered by nothing here, but keep the order arg0..arg2
                     // so a future stack-arg spill sees a conventional sequence.
-                    self.load_reg_from_frame(CALL_ARG_REGS[0], self.slot_of(base));
+                    self.gp_load_value(CALL_ARG_REGS[0], base);
                     self.emit_mov_reg_imm64(CALL_ARG_REGS[1], field_index as i64 as u64);
-                    self.load_reg_from_frame(CALL_ARG_REGS[2], self.slot_of(value));
+                    self.gp_load_value(CALL_ARG_REGS[2], value);
                     self.emit_mov_reg_imm64(RAX, self.putfield_int as u64);
                     self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
                     return;
@@ -6358,7 +6412,7 @@ impl<'a> Lowerer<'a> {
                         ));
                         return;
                     }
-                    self.load_reg_from_frame(RDX, self.slot_of(node.inputs[4])); // value → RDX
+                    self.gp_load_value(RDX, node.inputs[4]); // value → RDX
                     self.gp_load_value(RAX, node.inputs[2]); // array → RAX
                     self.gp_load_value(RCX, node.inputs[3]); // index → RCX
                     self.emit_array_null_bounds_guards(bci);
@@ -6419,8 +6473,8 @@ impl<'a> Lowerer<'a> {
             Op::LambdaIntToDouble => {
                 let slot = self.alloc_slot(id);
                 self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
-                self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(node.inputs[2]));
-                self.load_reg_from_frame(CALL_ARG_REGS[2], self.slot_of(node.inputs[3]));
+                self.gp_load_value(CALL_ARG_REGS[1], node.inputs[2]);
+                self.gp_load_value(CALL_ARG_REGS[2], node.inputs[3]);
                 self.emit_mov_reg_imm64(RAX, self.lambda_int_to_double as u64);
                 self.buf.emit(&[0xFF, 0xD0]);
                 self.store_rax(slot);
@@ -6746,7 +6800,7 @@ impl<'a> Lowerer<'a> {
                 if let Some(tag) = prim_array_tag {
                     crate::CHECKCAST_INLINE_SITES_PRIM_ARRAY
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    self.load_reg_from_frame(RAX, self.slot_of(obj));
+                    self.gp_load_value(RAX, obj);
                     self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
                     let null_slow = self.emit_jcc_rel32(0x84); // JZ → helper
                                                                // CMP BYTE [RAX+KIND_TAGS_BYTE_OFFSET], tag (80 /7 ib).
@@ -6764,7 +6818,7 @@ impl<'a> Lowerer<'a> {
                 } else if let Some(cid) = target_class_id {
                     crate::CHECKCAST_INLINE_SITES_IR
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    self.load_reg_from_frame(RAX, self.slot_of(obj));
+                    self.gp_load_value(RAX, obj);
                     self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
                     let null_slow = self.emit_jcc_rel32(0x84); // JZ → helper
                                                                // ARRAY RECEIVERS MUST NOT REACH THE COMPARE — see the
@@ -6809,7 +6863,7 @@ impl<'a> Lowerer<'a> {
 
                 self.emit_safepoint_map(sp_live_hi);
                 self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off); // vm_ptr
-                self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(obj)); // obj_ptr
+                self.gp_load_value(CALL_ARG_REGS[1], obj); // obj_ptr
                 self.emit_mov_reg_imm64(CALL_ARG_REGS[2], name_ptr as u64); // name_ptr
                 self.emit_mov_reg_imm64(CALL_ARG_REGS[3], name_len as u64); // name_len
                 self.emit_mov_reg_imm64(RAX, self.checkcast as u64);
@@ -6842,7 +6896,7 @@ impl<'a> Lowerer<'a> {
                 self.emit_safepoint_map(sp_live_hi);
                 let slot = self.alloc_slot(id);
                 self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off); // vm_ptr
-                self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(obj)); // obj_ptr
+                self.gp_load_value(CALL_ARG_REGS[1], obj); // obj_ptr
                 self.emit_mov_reg_imm64(CALL_ARG_REGS[2], name_ptr as u64); // name_ptr
                 self.emit_mov_reg_imm64(CALL_ARG_REGS[3], name_len as u64); // name_len
                 self.emit_mov_reg_imm64(RAX, self.instanceof_check as u64);
@@ -7171,7 +7225,7 @@ impl<'a> Lowerer<'a> {
             // a no-op for this arm and keeps the stub's contract uniform.
             Op::Throw => {
                 let exc = node.inputs[2];
-                self.load_reg_from_frame(CALL_ARG_REGS[0], self.slot_of(exc));
+                self.gp_load_value(CALL_ARG_REGS[0], exc);
                 // `athrow` is refused inside a spliced body today; translating
                 // anyway keeps the rule "a bci handed to the interpreter goes
                 // through `resume_bci`" without an exception to remember.
@@ -10823,10 +10877,54 @@ fn plan_register_residency(
     // and `skip_phi` in particular is the one that decides whether this file
     // can ever reach a LOOP COUNTER -- which is a phi, at every loop header.
     let (mut skip_split, mut skip_bank, mut skip_home, mut skip_phi) = (0usize, 0, 0, 0);
+    // 2026-09-02, measured: promotion is not free, and two populations pay for
+    // it without ever collecting.
+    //
+    // A register costs a PROLOGUE SAVE and a restore at every exit (the file is
+    // callee-saved by construction), plus one publish load at the definition.
+    // It repays that at each READ it turns into a register move. So a value
+    // read once breaks even at best, and on a small call-heavy method the
+    // saves dominate: `FibProbe.fib` promoted five registers, was measured
+    // 145-149 ms against 110-133 ms for the same binary with the file off, and
+    // the disassembly showed why -- four of the five registers were published
+    // and never read.
+    //
+    // A CONSTANT is worse than break-even: since `ir_const_imm_enabled` every
+    // reader materialises it as an immediate, so its register can never be
+    // read at all.
+    let mut use_count = vec![0u32; n];
+    for node in &graph.nodes {
+        for &input in &node.inputs {
+            if input != NO_NODE {
+                if let Some(c) = use_count.get_mut(input as usize) {
+                    *c = c.saturating_add(1);
+                }
+            }
+        }
+    }
+    let (mut skip_const, mut skip_single_use) = (0usize, 0usize);
     for id in 0..n {
         let Some(segs) = alloc.segments.get(id) else {
             continue;
         };
+        if ir_residency_pays_enabled() {
+            match graph.nodes.get(id).map(|node| &node.op) {
+                Some(Op::Const(_)) => {
+                    skip_const += 1;
+                    continue;
+                }
+                // A phi is exempt: its reads are inside the loop it carries a
+                // value around, which is the whole population this file exists
+                // for, and its "definition" is an edge copy that is already
+                // paying the store.
+                Some(Op::Phi) => {}
+                _ if use_count.get(id).copied().unwrap_or(0) < 2 => {
+                    skip_single_use += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
         // ONE segment, and it holds a register. Anything else — a split, a
         // spill, a reload, a home-slot stretch in the middle — is refused
         // rather than emitted: this wiring has no reload machinery, so a value
@@ -11003,7 +11101,8 @@ fn plan_register_residency(
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
         eprintln!(
             "[ir-ls] skipped: split_or_spilled={skip_split} \
-             wrong_bank_or_type={skip_bank} no_home={skip_home} phi={skip_phi}"
+             wrong_bank_or_type={skip_bank} no_home={skip_home} phi={skip_phi} \
+             const={skip_const} single_use={skip_single_use}"
         );
     }
     if promoted == 0 {
@@ -12332,6 +12431,17 @@ pub(crate) fn lower_inner_with_scopes(
 /// under `phi=`.
 fn ir_phi_residency_enabled() -> bool {
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PHI_RESIDENCY") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
+/// Promote only where a register can repay its prologue save -- **default
+/// ON**, opt out with `CRATONVM_JIT_IR_RESIDENCY_PAYS=0` to promote every
+/// candidate the allocator hands back, which is what this file did before
+/// 2026-09-02 and what made `FibProbe.fib` slower with the file on than off.
+fn ir_residency_pays_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_RESIDENCY_PAYS") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => true,
     }
@@ -14084,10 +14194,23 @@ mod tests {
             .expect("lower baseline")
             .code_bytes()
             .to_vec();
-        assert!(
-            contains_seq(&base_code, &[0x0F, 0x84]),
-            "baseline IR branch should emit JE (0F 84)"
-        );
+        // 2026-09-02: with the compare FUSED into the branch, the emitted
+        // condition is the compare's own inverse rather than `TEST` on a
+        // materialised boolean, so the concrete byte for this `ifeq` shape is
+        // `JNE` (0F 85) where it used to be `JE` (0F 84). What this test is
+        // for -- the hint INVERTS the branch, and only the hint does -- is
+        // unchanged, and is asserted as the property below rather than as one
+        // of the two bytes. Both polarities must appear across the arms, or
+        // the "inversion" being checked is vacuous.
+        let base_polarity = if contains_seq(&base_code, &[0x0F, 0x84]) {
+            0x84u8
+        } else {
+            assert!(
+                contains_seq(&base_code, &[0x0F, 0x85]),
+                "the baseline IR branch emitted neither JE nor JNE"
+            );
+            0x85u8
+        };
 
         // "usually not taken" at the ifeq PC (1): inverted to `JNE` (0F 85),
         // and a different code buffer.
@@ -14099,15 +14222,15 @@ mod tests {
             .code_bytes()
             .to_vec();
         assert!(
-            contains_seq(&hint_code, &[0x0F, 0x85]),
-            "usually-not-taken hint should invert the IR branch to JNE (0F 85)"
+            contains_seq(&hint_code, &[0x0F, base_polarity ^ 1]),
+            "a not-taken hint must invert the branch polarity"
         );
         assert_ne!(
             base_code, hint_code,
             "branch-bias hint must change the emitted code"
         );
 
-        // "usually taken" keeps the default JE layout (byte-identical).
+        // "usually taken" keeps the default layout (byte-identical).
         let mut taken_hints = HashMap::new();
         taken_hints.insert(1usize, true);
         let (g2, s2) = build();
@@ -14117,7 +14240,7 @@ mod tests {
             .to_vec();
         assert_eq!(
             base_code, taken_code,
-            "usually-taken hint must reproduce the default JE layout byte-for-byte"
+            "usually-taken hint must reproduce the default layout byte-for-byte"
         );
     }
 
@@ -17058,11 +17181,18 @@ mod tests {
             residency.reg_of[idx as usize], None,
             "an int took a register, but this file's register set is XMM-only"
         );
+        // `elem`, not `doubled`: since `ir_residency_pays_enabled` a value read
+        // ONCE is not promoted (its register cannot repay the prologue save it
+        // costs), and `doubled` is read once, by the return. `elem` is read
+        // twice — it is both inputs of the `Add` — so it is the FP value this
+        // graph can promote, and asserting on it keeps the two checks above
+        // non-vacuous for the reason they were written.
         assert!(
-            residency.reg_of[doubled as usize].is_some(),
+            residency.reg_of[elem as usize].is_some(),
             "the FP value must be promoted, or the two assertions above are \
              vacuous"
         );
+        let _ = doubled;
     }
 
     /// A value live across a helper call must not keep a caller-saved register.
