@@ -1323,6 +1323,10 @@ impl Frame {
     /// `CachedBytecodeMethod`, so the scan happens once per method. An
     /// `Owned` frame has no such record and keeps the scan — those are the
     /// uncached, reflective and synthetic pushes, not the hot path.
+    ///
+    /// `CachedBytecodeMethod::return_tag` honours
+    /// `CRATONVM_JIT_NO_DESCRIPTOR_FACTS`, so the switch reverts this to the
+    /// per-return scan on both arms.
     #[inline]
     pub fn return_tag(&self) -> u8 {
         match &self.inner {

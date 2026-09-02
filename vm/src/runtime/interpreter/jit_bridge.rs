@@ -9668,7 +9668,7 @@ pub(super) fn jit_saved_args_to_values(
     let is_static = cached.is_static;
     let mut out = Vec::with_capacity(np);
     // ONE forward scan, hoisted out of this per-argument loop.
-    let param_tags = ParamTags::from_facts(cached.descriptor_facts());
+    let param_tags = ParamTags::for_method(&cached);
     for i in 0..np {
         let (cv, kind) = saved_args[i];
         let desc_byte = if is_static {
@@ -9852,7 +9852,7 @@ pub(super) fn execute_jit_call(
     let mut saved_args: [(CompactValue, u8); JIT_ABI_MAX_JAVA_ARGS] =
         [(CompactValue::zero(), 0u8); JIT_ABI_MAX_JAVA_ARGS];
     // ONE forward scan, hoisted out of this per-argument loop.
-    let param_tags = ParamTags::from_facts(cached.descriptor_facts());
+    let param_tags = ParamTags::for_method(&cached);
     for i in (0..np).rev() {
         let (cv, kind) = thread.frames[frame_idx].stack.pop_with_kind_unchecked();
         saved_args[i] = (cv, kind);

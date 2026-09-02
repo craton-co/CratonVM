@@ -250,6 +250,35 @@ pub struct DescriptorFacts {
     pub ret_tag: u8,
 }
 
+/// Kill switch for every [`DescriptorFacts`] consumer
+/// (`CRATONVM_JIT_NO_DESCRIPTOR_FACTS=1`, or
+/// `CRATONVM_JIT=-descriptor-facts`). Set, `ParamTags` and the return tag go
+/// back through the per-call descriptor scans they replaced, so the change can
+/// be priced inside one binary — a cross-binary comparison is not an A/B on a
+/// host whose run-to-run spread exceeds the effect.
+#[inline]
+pub fn descriptor_facts_disabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_DESCRIPTOR_FACTS").is_some()
+    })
+}
+
+/// The per-call return-tag scan [`CachedBytecodeMethod::return_tag`] replaces,
+/// kept here so the kill switch can restore the old cost exactly. Byte-for-byte
+/// the same answer as `cratonvm_jit::return_type`, which this crate cannot
+/// name (the dependency runs the other way).
+#[inline]
+fn scan_return_tag(descriptor: &str) -> u8 {
+    let bytes = descriptor.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b')' && i + 1 < bytes.len() {
+            return bytes[i + 1];
+        }
+    }
+    b'V'
+}
+
 impl DescriptorFacts {
     /// Kept at 8 to match the inline width `ParamTags` was measured into: at
     /// 16, the fixed setup cost regressed zero-argument calls in 7 of 8 paired
@@ -619,6 +648,9 @@ impl CachedBytecodeMethod {
     /// without the per-call scan.
     #[inline]
     pub fn return_tag(&self) -> u8 {
+        if descriptor_facts_disabled() {
+            return scan_return_tag(&self.method_descriptor);
+        }
         self.descriptor_facts().ret_tag
     }
 

@@ -5281,13 +5281,19 @@ fn execute_frame_from_index(
     // four call sites sit inside `&mut thread` borrows and a closure capturing
     // `shared`/`async_exception_slot` would still have to be called in a
     // position where `thread` is reborrowed.
+    //
+    // `CRATONVM_JIT_NO_BACKEDGE_POLL_GATE=1` (or `CRATONVM_JIT=-backedge-poll-
+    // gate`) makes the macro answer `true` unconditionally, restoring the
+    // unconditional call so the two arms can be priced inside one binary.
+    let backedge_poll_gate_off = crate::runtime::env_cache::no_backedge_poll_gate();
     macro_rules! backedge_poll_needed {
         () => {
-            shared
-                .mem
-                .gc_barrier
-                .stw_requested
-                .load(std::sync::atomic::Ordering::Acquire)
+            backedge_poll_gate_off
+                || shared
+                    .mem
+                    .gc_barrier
+                    .stw_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
                 || async_exception_slot
                     .as_ref()
                     .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed) != 0)

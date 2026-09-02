@@ -39,6 +39,21 @@ pub const LAMBDA_PROXY_ID_BASE: u32 = 0x8000_0000;
 /// [`ClassRealm::is_annotation_proxy_class`] answer from a single `ClassId`
 /// instead of a name comparison under the class-manager lock.
 pub const ANNOTATION_PROXY_CLASS: &str = "java/lang/annotation/AnnotationProxy";
+
+/// Kill switch for the `any_annotation_proxy_defined()` fast path in
+/// [`ClassRealm::is_annotation_proxy_class`]
+/// (`CRATONVM_LOADER_NO_ANN_PROXY_LATCH=1`, or
+/// `CRATONVM_LOADER=-ann-proxy-latch`). Set, the gate falls through to the
+/// epoch-keyed resolver on every call, exactly as it did before the latch —
+/// which is what makes the two arms comparable inside one binary.
+#[inline]
+fn ann_proxy_latch_disabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_LOADER_NO_ANN_PROXY_LATCH").is_some()
+    })
+}
+
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
@@ -684,7 +699,7 @@ impl ClassRealm {
         if hint != u32::MAX {
             return class_id.as_u32() == hint;
         }
-        if !crate::classloading::any_annotation_proxy_defined() {
+        if !ann_proxy_latch_disabled() && !crate::classloading::any_annotation_proxy_defined() {
             return false;
         }
         self.resolve_annotation_proxy_cid() == Some(class_id)

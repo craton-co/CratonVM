@@ -2810,6 +2810,20 @@ impl ParamTags {
     // method; wider ones take the fallback and are unchanged.
     const INLINE: usize = 8;
 
+    /// The tags for a resolved method, read from the per-method memo on its
+    /// `CachedBytecodeMethod` rather than rescanned for this call.
+    ///
+    /// This is the constructor the invoke paths want. `CRATONVM_JIT_NO_
+    /// DESCRIPTOR_FACTS=1` routes it back through [`Self::of`], restoring the
+    /// per-call scan exactly, so the memo can be priced on one binary.
+    #[inline]
+    pub(super) fn for_method(cached: &cratonvm_jit_api::CachedBytecodeMethod) -> Self {
+        if cratonvm_jit_api::descriptor_facts_disabled() {
+            return Self::of(&cached.method_descriptor);
+        }
+        Self::from_facts(cached.descriptor_facts())
+    }
+
     /// Adopt a [`cratonvm_jit_api::DescriptorFacts`] that was tokenised once
     /// per *method* and cached on the `CachedBytecodeMethod`, instead of
     /// rescanning the descriptor for this one call.
@@ -2821,6 +2835,11 @@ impl ParamTags {
     ///
     /// `CRATONVM_JIT_NO_PARAM_TAG_SCAN` still bypasses to the per-index
     /// rescan, so the kill switch means the same thing on both constructors.
+    ///
+    /// Prefer [`Self::for_method`] at call sites that hold the whole
+    /// `CachedBytecodeMethod`: it also honours
+    /// `CRATONVM_JIT_NO_DESCRIPTOR_FACTS`, which this constructor cannot,
+    /// having no descriptor string to fall back to.
     #[inline]
     pub(super) fn from_facts(facts: &cratonvm_jit_api::DescriptorFacts) -> Self {
         if param_tag_scan_disabled() {
@@ -5094,6 +5113,32 @@ mod param_tags_tests {
                     "descriptor {d:?} index {n}"
                 );
             }
+        }
+
+        // The memoized tokenisation must answer identically to the per-call
+        // one, on every descriptor above including the malformed and the
+        // overflowing. `DescriptorFacts::of` is this scan moved to where it
+        // can be cached on `CachedBytecodeMethod`; if the two ever drift, the
+        // invoke path decodes an argument against the wrong tag, which is a
+        // silent wrong value rather than a crash — exactly the failure mode
+        // `nth_param_tag_byte`'s own call sites exist to prevent.
+        for d in &descriptors {
+            let facts = cratonvm_jit_api::DescriptorFacts::of(d);
+            let from_facts = ParamTags::from_facts(&facts);
+            let scanned = ParamTags::of(d);
+            for n in 0..64 {
+                assert_eq!(
+                    from_facts.get(d, n),
+                    scanned.get(d, n),
+                    "DescriptorFacts disagrees with ParamTags::of for {d:?} index {n}"
+                );
+            }
+            // And the return tag against the scan it replaced.
+            assert_eq!(
+                facts.ret_tag,
+                crate::jit::return_type(d),
+                "DescriptorFacts::ret_tag disagrees with jit::return_type for {d:?}"
+            );
         }
     }
 

@@ -574,7 +574,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-255 tokens.
+257 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -756,6 +756,8 @@ export inherited from a parent shell.
 | `cast-site-cache` | `CRATONVM_JIT_NO_CAST_SITE_CACHE` |
 | `code-ptr-memo` | `CRATONVM_JIT_NO_CODE_PTR_MEMO` |
 | `param-tag-scan` | `CRATONVM_JIT_NO_PARAM_TAG_SCAN` |
+| `descriptor-facts` | `CRATONVM_JIT_NO_DESCRIPTOR_FACTS` |
+| `backedge-poll-gate` | `CRATONVM_JIT_NO_BACKEDGE_POLL_GATE` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
 | `ir-unresumable-trap-guard` | `CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD` |
 | `compiled-ldc-const-cache` | `CRATONVM_JIT_COMPILED_LDC_CONST_CACHE` |
@@ -964,10 +966,12 @@ export inherited from a parent shell.
 
 ## `CRATONVM_LOADER`
 
-14 tokens.
+16 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `dup-name-field-gate` | `CRATONVM_LOADER_NO_DUP_NAME_FIELD_GATE` |
+| `ann-proxy-latch` | `CRATONVM_LOADER_NO_ANN_PROXY_LATCH` |
 | `allow-jsr-ret` | `CRATONVM_ALLOW_JSR_RET` |
 | `enforce-native-shadow` | `CRATONVM_ENFORCE_NATIVE_SHADOW` |
 | `cf-delegating-yield` | `CRATONVM_CF_DELEGATING_YIELD` |

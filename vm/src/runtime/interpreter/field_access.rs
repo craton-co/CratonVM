@@ -577,7 +577,8 @@ pub(super) fn resolve_field_in_class(
 }
 
 /// Kill switch for the duplicate-class-name gate below
-/// (`CRATONVM_NO_DUP_NAME_FIELD_GATE=1`), so the change can be A/B'd on one
+/// (`CRATONVM_LOADER_NO_DUP_NAME_FIELD_GATE=1`, or
+/// `CRATONVM_LOADER=-dup-name-field-gate`), so the change can be A/B'd on one
 /// binary. Set, the gate is skipped and every call walks the authoritative
 /// path exactly as it did before the gate existed — a cross-binary comparison
 /// is not an A/B.
@@ -585,7 +586,7 @@ pub(super) fn resolve_field_in_class(
 fn dup_name_field_gate_disabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_DUP_NAME_FIELD_GATE").is_some()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_LOADER_NO_DUP_NAME_FIELD_GATE").is_some()
     })
 }
 

@@ -920,7 +920,7 @@ pub(super) fn execute_invokevirtual_vtable_fast(
     // ONE forward scan for the whole descriptor. This closure used to call
     // `nth_param_tag_byte` per argument, and that rescans from `(` each time,
     // so popping N args cost O(N^2) tokenising of a string fixed per call site.
-    let param_tags = ParamTags::from_facts(entry_cached.descriptor_facts());
+    let param_tags = ParamTags::for_method(&entry_cached);
     let arg_desc_byte =
         |i: usize| -> u8 { param_tags.get_with_receiver(&entry_cached.method_descriptor, i) };
     let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
@@ -1857,7 +1857,7 @@ pub(super) fn execute_invokevirtual_cached(
                     // gaps/bc-ec-mod-mododdinverse-investigation.md.
                     // ONE forward scan; the per-argument form rescanned from `(` each time.
 
-                    let param_tags = ParamTags::from_facts(cached.descriptor_facts());
+                    let param_tags = ParamTags::for_method(&cached);
 
                     let arg_desc_byte = |i: usize| -> u8 {
                         param_tags.get_with_receiver(&cached.method_descriptor, i)
@@ -2645,7 +2645,7 @@ pub(super) fn execute_invokevirtual_cached(
             // pattern long args. See gaps/bc-ec-mod-mododdinverse-investigation.md.
             // ONE forward scan; the per-argument form rescanned from `(` each time.
 
-            let param_tags = ParamTags::from_facts(cached.descriptor_facts());
+            let param_tags = ParamTags::for_method(&cached);
 
             let arg_desc_byte =
                 |i: usize| -> u8 { param_tags.get_with_receiver(&cached.method_descriptor, i) };

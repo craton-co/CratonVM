@@ -1269,6 +1269,28 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "code-ptr-memo", on_key: None, off_key: Some("CRATONVM_JIT_NO_CODE_PTR_MEMO"), off_word: None },
     E { group: Group::DBG, token: "invoke-phases", on_key: Some("CRATONVM_DBG_INVOKE_PHASES"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "param-tag-scan", on_key: None, off_key: Some("CRATONVM_JIT_NO_PARAM_TAG_SCAN"), off_word: None },
+    // ── Interpreter hot-path memoizations, 2026-09-02 ────────────────────
+    // Each of the four below removes work that was being repeated per
+    // operation but is fixed per method or per process. Each ships with an
+    // off switch for the same reason `code-ptr-memo` above does: a change
+    // worth single-digit nanoseconds, on a host whose run-to-run spread is
+    // 20%, can only be measured by A/B-ing ONE binary.
+    //
+    // `descriptor-facts` — off routes `ParamTags::from_facts` and
+    // `Frame::return_tag` back through the per-call descriptor scans they
+    // replaced (`ParamTags::of`, `cratonvm_jit::return_type`).
+    E { group: Group::JIT, token: "descriptor-facts", on_key: None, off_key: Some("CRATONVM_JIT_NO_DESCRIPTOR_FACTS"), off_word: None },
+    // `backedge-poll-gate` — off restores the unconditional
+    // `safepoint_check` call on every backward branch.
+    E { group: Group::JIT, token: "backedge-poll-gate", on_key: None, off_key: Some("CRATONVM_JIT_NO_BACKEDGE_POLL_GATE"), off_word: None },
+    // `dup-name-field-gate` — off makes every instance field access walk
+    // `retarget_instance_field_to_receiver` in full, whether or not any
+    // binary name in this process resolves to two `ClassId`s.
+    E { group: Group::LOADER, token: "dup-name-field-gate", on_key: None, off_key: Some("CRATONVM_LOADER_NO_DUP_NAME_FIELD_GATE"), off_word: None },
+    // `ann-proxy-latch` — off restores the epoch-keyed negative in
+    // `ClassRealm::is_annotation_proxy_class`: a class-manager read lock and
+    // a name probe per virtual invoke for as long as classes keep loading.
+    E { group: Group::LOADER, token: "ann-proxy-latch", on_key: None, off_key: Some("CRATONVM_LOADER_NO_ANN_PROXY_LATCH"), off_word: None },
     E { group: Group::JIT, token: "ldc-const-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_LDC_CONST_CACHE"), off_word: None },
     E { group: Group::JIT, token: "ir-unresumable-trap-guard", on_key: Some("CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "compiled-ldc-const-cache", on_key: Some("CRATONVM_JIT_COMPILED_LDC_CONST_CACHE"), off_key: None, off_word: Some("0") },

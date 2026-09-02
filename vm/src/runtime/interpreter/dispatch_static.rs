@@ -1826,7 +1826,7 @@ pub(super) fn execute_invokestatic_cached(
                 &mut []
             } else if num_params <= MAX_INLINE_ARGS {
                 // ONE forward scan; the per-argument form rescanned from `(` each time.
-                let param_tags = ParamTags::from_facts(cached.descriptor_facts());
+                let param_tags = ParamTags::for_method(&cached);
                 args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
                 for i in (0..num_params).rev() {
                     args_buf[i] = thread.frames[frame_idx]
@@ -1837,7 +1837,7 @@ pub(super) fn execute_invokestatic_cached(
                 }
                 &mut args_buf[..num_params]
             } else {
-                let param_tags = ParamTags::from_facts(cached.descriptor_facts());
+                let param_tags = ParamTags::for_method(&cached);
                 args_vec.resize(num_params, Value::Uninitialized);
                 for i in (0..num_params).rev() {
                     args_vec[i] = thread.frames[frame_idx]
