@@ -2658,11 +2658,6 @@ fn per_tid_jit_depth()
 /// recycled thread a fresh slot while some cycle still holds the old `Arc`
 /// would split one tid's depth across two cells.
 pub fn register_self_jit_depth_slot(os_tid: u32) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
-    if let Ok(map) = per_tid_jit_depth().read() {
-        if let Some(slot) = map.get(&os_tid) {
-            return std::sync::Arc::clone(slot);
-        }
-    }
     let mut map = match per_tid_jit_depth().write() {
         Ok(m) => m,
         // A poisoned registry means some thread panicked mid-publish. Hand back
@@ -2671,10 +2666,29 @@ pub fn register_self_jit_depth_slot(os_tid: u32) -> std::sync::Arc<std::sync::at
         // refusing. Degrading to the old behaviour is the safe direction.
         Err(_) => return std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
-    std::sync::Arc::clone(
+    let slot = std::sync::Arc::clone(
         map.entry(os_tid)
             .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0))),
-    )
+    );
+    // Reset on (re-)registration. An entry can survive its owner: OS tids are
+    // recycled, and a thread that died without running its TLS destructor
+    // leaves its last depth behind. Handing the recycled thread that value
+    // would credit depth NOBODY holds -- the over-credit direction. The caller
+    // stores its real depth immediately after this returns.
+    slot.store(0, std::sync::atomic::Ordering::Release);
+    slot
+}
+
+/// Drop `os_tid`'s slot when its owning thread exits.
+///
+/// Without this a dead thread's last depth stays readable under a tid the OS
+/// will hand to someone else, and a recycled thread that never enters JIT never
+/// overwrites it -- so the initiator would credit phantom depth for a peer with
+/// no compiled frames at all.
+pub fn unregister_jit_depth_slot(os_tid: u32) {
+    if let Ok(mut map) = per_tid_jit_depth().write() {
+        map.remove(&os_tid);
+    }
 }
 
 /// The JIT depth `os_tid` last published, or `None` if it never registered.
@@ -2837,15 +2851,34 @@ mod pinned_peer_depth_tests {
         assert_eq!(jit_depth_of_tid(0xFEED_0002), None);
     }
 
-    /// Re-registering a recycled OS tid must hand back the SAME cell, or one
-    /// tid's depth would be split across two of them.
+    /// Re-registering a recycled OS tid hands back the SAME cell -- one tid's
+    /// depth must never be split across two of them -- but RESET, because the
+    /// previous owner may be dead and its leftover depth is held by nobody.
     #[test]
-    fn re_registering_a_tid_returns_the_same_slot() {
+    fn re_registering_a_tid_returns_the_same_slot_reset_to_zero() {
         let tid = 0xFEED_0003;
         let a = register_self_jit_depth_slot(tid);
         a.store(4, Ordering::Release);
         let b = register_self_jit_depth_slot(tid);
-        assert_eq!(b.load(Ordering::Acquire), 4);
-        assert!(std::sync::Arc::ptr_eq(&a, &b));
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "one tid, one cell");
+        assert_eq!(
+            b.load(Ordering::Acquire),
+            0,
+            "a recycled tid must not inherit the dead thread's depth"
+        );
+    }
+
+    /// A departed thread leaves nothing readable behind.
+    #[test]
+    fn unregistering_removes_the_slot() {
+        let tid = 0xFEED_0004;
+        register_self_jit_depth_slot(tid).store(7, Ordering::Release);
+        assert_eq!(jit_depth_of_tid(tid), Some(7));
+        unregister_jit_depth_slot(tid);
+        assert_eq!(
+            jit_depth_of_tid(tid),
+            None,
+            "a dead thread's depth must read as UNKNOWN, not as a stale number"
+        );
     }
 }

@@ -437,6 +437,22 @@ pub fn xt_pinned_peer_depth_enabled() -> bool {
     })
 }
 
+/// `CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY=1` -- publish per-thread depths and
+/// deposit them, but credit NOTHING to the coverage account.
+///
+/// The bisect lever for the segfault this feature produced on
+/// `TestCachedQueryResults`: with one flag gating both the publisher (a TLS
+/// `Arc` written on every JIT chain mutation) and the decision (relocating on
+/// cycles that used to refuse), a crash cannot be attributed to either. This
+/// arm runs the whole mechanism EXCEPT the decision, so a crash here indicts
+/// the publisher and a crash only without it indicts the relocation.
+pub fn xt_pinned_peer_publish_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY").is_some()
+    })
+}
+
 /// This thread's OS tid, in the same namespace `blocked_os_tids` reports and
 /// `helper_window_pass` enumerates -- the key the initiator will look this
 /// thread's depth up by.
@@ -461,12 +477,28 @@ fn self_os_tid() -> u32 {
     0
 }
 
+/// Owns this thread's registry entry so it is REMOVED when the thread exits.
+///
+/// A leftover entry is readable under a tid the OS will recycle, and a recycled
+/// thread that never enters JIT never overwrites it -- so the initiator would
+/// credit depth nobody holds. `register_self_jit_depth_slot` also resets on
+/// re-registration, which covers the threads whose destructors never run.
+struct JitDepthSlot {
+    os_tid: u32,
+    cell: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for JitDepthSlot {
+    fn drop(&mut self) {
+        cratonvm_gc::gc_quiescence::unregister_jit_depth_slot(self.os_tid);
+    }
+}
+
 thread_local! {
     /// This thread's published JIT-depth cell, resolved once. `None` until the
     /// first chain mutation with the credit enabled.
-    static SELF_JIT_DEPTH_SLOT: std::cell::RefCell<
-        Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
-    > = const { std::cell::RefCell::new(None) };
+    static SELF_JIT_DEPTH_SLOT: std::cell::RefCell<Option<JitDepthSlot>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Publish this thread's current `JIT_ENTRY_CHAIN` length so a GC initiator
@@ -480,7 +512,10 @@ fn publish_self_jit_depth(depth: usize) {
     if !xt_pinned_peer_depth_enabled() {
         return;
     }
-    SELF_JIT_DEPTH_SLOT.with(|c| {
+    // `try_with`, not `with`: `pop_jit_entry` can run while this thread is
+    // tearing down, and `with` on an already-destroyed thread-local PANICS.
+    // A skipped publish only under-credits.
+    let _ = SELF_JIT_DEPTH_SLOT.try_with(|c| {
         // `try_borrow_mut`: this runs on the JIT entry/exit path, which a panic
         // unwind can re-enter. Skipping a publish is safe (the initiator then
         // reads a stale-SMALLER depth and under-credits, refusing a cycle it
@@ -488,10 +523,14 @@ fn publish_self_jit_depth(depth: usize) {
         let Ok(mut slot) = c.try_borrow_mut() else {
             return;
         };
-        let cell = slot.get_or_insert_with(|| {
-            cratonvm_gc::gc_quiescence::register_self_jit_depth_slot(self_os_tid())
+        let held = slot.get_or_insert_with(|| {
+            let os_tid = self_os_tid();
+            JitDepthSlot {
+                os_tid,
+                cell: cratonvm_gc::gc_quiescence::register_self_jit_depth_slot(os_tid),
+            }
         });
-        cell.store(depth, std::sync::atomic::Ordering::Release);
+        held.cell.store(depth, std::sync::atomic::Ordering::Release);
     });
 }
 
@@ -3983,6 +4022,7 @@ pub fn refresh_moving_young_coverage_for_collection() -> bool {
         // `xt_cycle_pinned_jit_depth` applies the third condition itself: it
         // returns 0 if any pinned peer's depth was unknown.
         let pinned = if xt_pinned_peer_depth_enabled()
+            && !xt_pinned_peer_publish_only()
             && crate::jit::xt_root_scan::helper_windows_all_pinned_this_cycle()
         {
             cratonvm_gc::gc_quiescence::xt_cycle_pinned_jit_depth()
