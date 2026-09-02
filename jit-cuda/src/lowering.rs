@@ -1682,6 +1682,82 @@ mod tests {
         assert!(text.contains("[ret_ptr]"));
     }
 
+    /// A reduction folds each warp with shuffles and issues ONE atomic
+    /// per warp, from lane 0, and every thread the guard retires joins
+    /// the tree carrying zero instead of returning.
+    ///
+    /// AUDIT 2026-09-02. Until this date every thread issued its own
+    /// `red.global.add` into the single accumulator: 2^24 atomics to one
+    /// line for a 2^24-element dot product. Asserted as exact counts,
+    /// because the failure that matters is one step of the tree going
+    /// missing (a wrong sum, not a slow one), and because a second
+    /// `red` would mean a thread found a way around the tree.
+    ///
+    /// # A per-BLOCK fold was tried and is not here
+    ///
+    /// Folding the per-warp partials through shared memory would cut the
+    /// atomics by another 8x at a 256-thread block. It was implemented
+    /// and measured on an RTX 2060 the same day: it LOST. On a
+    /// minimum-arithmetic reduction over 2^26 ints (`BlockReduceBench`,
+    /// where the atomics are as large a share as the shape allows) the
+    /// block fold ran 2.74-2.90 ms against 2.25-2.62 without it, losing
+    /// all four interleaved rounds; on the compute-bound `GpuDotBench`
+    /// at the same size it won one round of three and lost two.
+    ///
+    /// The `bar.sync` is why. `red.global.add` returns nothing, so a
+    /// warp issues it and retires; a barrier makes every warp in the
+    /// block wait for the slowest, at the end of the kernel, and that
+    /// costs more than the seven atomics it saves. It also forced the
+    /// bounds-check deopt to stop returning from the middle of the
+    /// kernel, since a thread leaving while its block waits at the
+    /// barrier is a hang rather than a wrong answer.
+    ///
+    /// See `docs/gpu/reductions.md`.
+    #[test]
+    fn reduction_folds_each_warp_before_the_one_atomic() {
+        let m = lower_fixture("EligibleDotProduct", "dot", "([I[I)J");
+        let text = m.render();
+        // A `long` accumulator travels as two 32-bit halves, five steps
+        // each: 16, 8, 4, 2, 1.
+        assert_eq!(
+            text.matches("shfl.sync.down.b32").count(),
+            10,
+            "five tree steps of two halves each\n{text}"
+        );
+        for offset in [16, 8, 4, 2, 1] {
+            assert!(
+                text.contains(&format!(", {offset}, 0x1f, 0xffffffff;")),
+                "tree step with offset {offset} missing\n{text}"
+            );
+        }
+        assert_eq!(
+            text.matches("red.global.add.u64").count(),
+            1,
+            "exactly one atomic, from lane 0\n{text}"
+        );
+        assert!(text.contains("%laneid"), "lane 0 is chosen by %laneid\n{text}");
+        // The retired-thread path: the guard branches to the zero label,
+        // never straight to `L_done`, and that label feeds the tree.
+        assert!(
+            text.contains("bra L_reduce_zero;"),
+            "the dispatch guard must send a retired thread into the tree with a zero\n{text}"
+        );
+        assert!(
+            !text.contains("bra L_done;\n") || text.matches("bra L_done;").count() == 0,
+            "a reduction kernel has no path that skips the warp tree\n{text}"
+        );
+        assert!(text.contains("L_reduce_zero:\n    mov.s64"), "zero contribution\n{text}");
+        assert!(text.contains("L_reduce:"), "join label\n{text}");
+
+        // No barrier, and therefore no rule about where a thread may
+        // exit. The per-block fold that would have needed one was
+        // measured and rejected; see this test's doc comment.
+        assert!(
+            !text.contains("bar.sync"),
+            "the reduction epilogue must not synchronize the block\n{text}"
+        );
+    }
+
     #[test]
     #[ignore = "diagnostic — prints PTX to stdout; run with --nocapture"]
     fn dump_vector_add_ptx() {

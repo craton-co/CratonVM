@@ -5426,7 +5426,10 @@ impl Compiler {
                             self.emit_test_r64_r64(RAX);
                             (Vec::new(), Some(self.emit_jcc_rel32_patch(0x84))) // JE
                         } else if receiver_is_trusted_oop {
-                            (self.emit_trusted_oop_receiver_check(), None)
+                            (
+                                self.emit_trusted_oop_receiver_check_at(code, pc, true),
+                                None,
+                            )
                         } else {
                             (
                                 self.emit_guarded_getfield_receiver_check(
@@ -5568,6 +5571,12 @@ impl Compiler {
                             for p in slow_patches {
                                 self.patch_rel32_to_here(p);
                             }
+                            // The implicit null check's recovery address is
+                            // THIS point. The slow path reloads the receiver
+                            // from its frame slot rather than reusing RAX, so
+                            // a fault recovered into here needs no register
+                            // repair — only the instruction pointer moves.
+                            self.bind_implicit_null_recovery();
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.load_slot_to_reg(ARG_REGS[1], obj_slot);
                             self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag);
@@ -5650,7 +5659,10 @@ impl Compiler {
                             self.emit_test_r64_r64(RAX);
                             (Vec::new(), Some(self.emit_jcc_rel32_patch(0x84))) // JE
                         } else if receiver_is_trusted_oop {
-                            (self.emit_trusted_oop_receiver_check(), None)
+                            (
+                                self.emit_trusted_oop_receiver_check_at(code, pc, false),
+                                None,
+                            )
                         } else {
                             (
                                 self.emit_guarded_getfield_receiver_check(

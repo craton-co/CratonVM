@@ -70,7 +70,7 @@ const DEFAULT_YOUNG_SEMI_SIZE: usize = 64 * 1024 * 1024;
 const DEFAULT_OLD_GEN_SIZE: usize = 128 * 1024 * 1024;
 
 /// Number of minor GC survivals before an object is promoted to old gen.
-const PROMOTION_AGE: u8 = 3;
+pub(crate) const PROMOTION_AGE: u8 = 3;
 
 /// GC threshold: trigger minor GC when young from-space usage exceeds this %.
 const YOUNG_GC_THRESHOLD_PERCENT: usize = 50;
@@ -2132,6 +2132,8 @@ pub fn addr_in_published_young_regions(addr: usize) -> bool {
 
 impl Drop for GenerationalHeap {
     fn drop(&mut self) {
+        // The wipe thread holds raw addresses into an arena this drop frees.
+        self.join_evacuated_wipe();
         // The guarded inline getfield's safety argument is "anything inside the
         // published bounds points at a mapped arena". Once this heap's arenas
         // free, that stops holding — so the global tables must not keep naming
@@ -2419,6 +2421,23 @@ pub struct GenerationalHeap {
     /// Held as a field rather than registered by a matched pair of calls so the
     /// count cannot drift on an early return or an unwind.
     _bounds_registration: RelocatableHeapRegistration,
+    /// The helper thread zeroing the semi-space the last moving cycle
+    /// evacuated (gen-gc-five, 2026-09-02). `Arena::reset` used to `memset`
+    /// the whole allocated from-space INSIDE the pause — up to the semi-space
+    /// capacity per cycle, and every one of those bytes is zeroed again by
+    /// the TLAB refill or the old-gen allocator before an object lands on
+    /// it. The evacuated arena is the next cycle's to-space: no mutator
+    /// allocates into it, so the wipe can run while they execute. It is
+    /// joined at the top of every collection, before anything reads or writes
+    /// that arena, and by `Drop`.
+    evacuated_wipe: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// State of the pause-goal feedback loop between collections; see
+    /// [`next_young_trigger`].
+    young_trigger_feedback: Mutex<TriggerFeedback>,
+    /// Set while [`Self::evacuated_wipe`] is running. `is_object_address`
+    /// then declines the inactive semi-space: a conservative candidate there
+    /// could otherwise parse a header the wipe is halfway through.
+    wipe_in_flight: std::sync::atomic::AtomicBool,
 }
 
 // SAFETY: Same reasoning as Heap — raw pointers are to internally owned
@@ -2502,6 +2521,96 @@ fn copy_tally_arm(reencounter: bool) {
         a[if reencounter { 4 } else { 5 }] += 1;
         t.set(a);
     });
+}
+
+/// The pause-goal loop's memory between two collections. See
+/// [`next_young_trigger`].
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct TriggerFeedback {
+    /// A halving under trial: the threshold it replaced and the pause that
+    /// provoked it. Judged by the next collection's pause.
+    trial: Option<(usize, u64)>,
+    /// The survivor volume at which a halving was found not to help. While a
+    /// later over-goal pause copies within a factor of two of it, the nursery
+    /// is known not to be the lever and the trigger is left alone.
+    latched_copied: Option<u64>,
+}
+
+/// The pause-goal decision, pure so it can be tested against the sequence of
+/// pauses that exposed it.
+///
+/// * `pause > goal`, no trial pending, no latch: halve and open a trial.
+/// * `pause > goal` with a trial pending: the halving is judged. If the pause
+///   fell by at least a quarter it helped — halve again and keep trialling.
+///   If not, the survivors were the pause: RESTORE the threshold the trial
+///   replaced and latch on this survivor volume.
+/// * `pause > goal` while latched and the survivor volume is within 2x of the
+///   latched one: leave the trigger alone. A volume that has moved by more
+///   than that re-arms the loop.
+/// * `pause * 4 < goal`: additive increase, as before.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn next_young_trigger(
+    fb: &mut TriggerFeedback,
+    current: usize,
+    floor: usize,
+    ceiling: usize,
+    capacity: usize,
+    pause_ms: u64,
+    goal_ms: u64,
+    bytes_copied: u64,
+) -> usize {
+    let within_2x = |a: u64, b: u64| a / 2 <= b && b <= a.saturating_mul(2);
+    if pause_ms > goal_ms {
+        if let Some((restore_to, provoking_pause)) = fb.trial.take() {
+            if pause_ms.saturating_mul(4) >= provoking_pause.saturating_mul(3) {
+                // The halving did not buy a quarter of the pause: the live
+                // set is what this collection costs, and a smaller nursery
+                // only adds collections.
+                fb.latched_copied = Some(bytes_copied);
+                return restore_to.clamp(floor, ceiling);
+            }
+            fb.trial = Some((current, pause_ms));
+            return (current / 2).max(floor);
+        }
+        if let Some(latched) = fb.latched_copied {
+            if within_2x(latched, bytes_copied) {
+                return current;
+            }
+            fb.latched_copied = None;
+        }
+        // Overshot: copy less next time. Multiplicative decrease, because the
+        // overshoot can be large (872 ms against a 500 ms goal) and a linear
+        // back-off would take many over-budget cycles to converge — each of
+        // which is a missed deadline.
+        fb.trial = Some((current, pause_ms));
+        (current / 2).max(floor)
+    } else if pause_ms.saturating_mul(4) < goal_ms {
+        // Comfortably inside: give the trigger room back, additively, so a
+        // workload that transiently spiked does not stay permanently
+        // throttled. Slower than the decrease on purpose.
+        fb.trial = None;
+        (current + capacity / 32).min(ceiling)
+    } else {
+        fb.trial = None;
+        current
+    }
+}
+
+/// `CRATONVM_GC_SYNC_YOUNG_WIPE` — zero the evacuated semi-space inside the
+/// pause, as every cycle did before 2026-09-02.
+fn sync_young_wipe_enabled() -> bool {
+    gc_flags().gc_sync_young_wipe
+}
+
+/// `CRATONVM_GC_JIT_REF_STORE_GATES` — publish the compiled-reference-store
+/// barrier plan from the generational collector. Default **ON**; `=0` withholds
+/// the plan, so every compiled reference store takes the full
+/// `jit_putfield_object` path exactly as it did before 2026-09-02.
+///
+/// The A/B lever for this change, and the first thing to set if a compiled
+/// store is ever suspected of missing a card or an SATB entry.
+fn jit_ref_store_gates_enabled() -> bool {
+    gc_flags().gc_jit_ref_store_gates
 }
 
 /// Fold one parallel-evacuation shard's tally into the driver's.
@@ -2641,12 +2750,88 @@ impl GenerationalHeap {
             young_trigger_floor: std::sync::atomic::AtomicUsize::new(0),
             jit_tlab_skip_regions: Mutex::new(Vec::new()),
             _bounds_registration: RelocatableHeapRegistration::new(),
+            evacuated_wipe: Mutex::new(None),
+            young_trigger_feedback: Mutex::new(TriggerFeedback::default()),
+            wipe_in_flight: std::sync::atomic::AtomicBool::new(false),
         };
         // Publish the initial region bounds so the lock-free
         // `is_object_address` containment check is correct from the first
         // allocation (before any GC has run to refresh them).
         heap.refresh_region_bounds();
+        // Let compiled reference stores gate their barriers inline.
+        //
+        // Until 2026-09-02 only ZGC published a plan, so under
+        // `-XX:+UseGenerationalGC` every compiled reference store paid a full
+        // `jit_putfield_object` call — measured as `gated=0 declined=2` against
+        // ZGC's `gated=2 declined=0` on the same workload and the same sites.
+        // The blocker was the gate SHAPE, not the collector: see
+        // `JitRefStoreGates::post_skip_mask`.
+        //
+        // `GC_FLAG_OLD_GEN` is exactly this collector's post-barrier question —
+        // `write_barrier` cards a store only when the receiver lies in the
+        // old-generation arena, and that arena's objects are the ones carrying
+        // the flag. A receiver without it is young, and a young receiver needs
+        // no card.
+        if jit_ref_store_gates_enabled() {
+            publish_jit_ref_store_plan_masked(GC_FLAG_OLD_GEN);
+            // "There may be old objects" is left permanently armed: the mask
+            // above already skips the young receivers, which is the case that
+            // matters, and an accurate `post_active` would need a hook on every
+            // path that creates an old object for a win it has already taken.
+            set_jit_ref_store_post_active(true);
+        }
         heap
+    }
+
+    /// Start zeroing `spans` (absolute `(addr, len)` pairs inside the inactive
+    /// young semi-space) on a helper thread. See [`Self::evacuated_wipe`].
+    ///
+    /// Sound because the spans are owned by nobody until
+    /// [`Self::join_evacuated_wipe`] returns: the arena they lie in is the
+    /// inactive semi-space, which no mutator allocates into and which the next
+    /// collection joins this thread before touching; `is_object_address`
+    /// declines it while [`Self::wipe_in_flight`] is set; and `Drop` joins
+    /// before the backing is freed. If the OS cannot spawn a thread the wipe
+    /// runs here, inside the pause, exactly as `Arena::reset` did.
+    fn spawn_evacuated_wipe(&self, spans: Vec<(usize, usize)>) {
+        if spans.is_empty() {
+            return;
+        }
+        // Never two in flight: the previous one was joined at the top of
+        // this cycle, but a caller that reaches here twice must not race.
+        self.join_evacuated_wipe();
+        self.wipe_in_flight.store(true, Ordering::Release);
+        let job = spans.clone();
+        let spawned = std::thread::Builder::new()
+            .name("cratonvm-gc-young-wipe".into())
+            .spawn(move || {
+                for (addr, len) in job {
+                    // SAFETY: the span is committed memory of the inactive
+                    // young semi-space, reserved for this thread until the
+                    // heap joins it (see the method doc).
+                    unsafe { std::ptr::write_bytes(addr as *mut u8, 0, len) };
+                }
+            });
+        match spawned {
+            Ok(handle) => *self.evacuated_wipe.lock() = Some(handle),
+            Err(_) => {
+                for (addr, len) in spans {
+                    // SAFETY: as above, on the calling thread instead.
+                    unsafe { std::ptr::write_bytes(addr as *mut u8, 0, len) };
+                }
+                self.wipe_in_flight.store(false, Ordering::Release);
+            }
+        }
+    }
+
+    /// Wait for the off-pause wipe, if one is running. Idempotent and cheap
+    /// when none is.
+    fn join_evacuated_wipe(&self) {
+        let handle = self.evacuated_wipe.lock().take();
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+        self.wipe_in_flight.store(false, Ordering::Release);
     }
 
     /// Republish the lock-free [`region_bounds`] cache from the live arenas.
@@ -4017,7 +4202,16 @@ impl GenerationalHeap {
         // concurrent GC/allocator. The bounds can only change during a STW GC,
         // when no mutator is reading; the `Acquire` loads pair with the GC's
         // `Release` stores.
-        let in_region = self.region_bounds.iter().any(|(base, end)| {
+        //
+        // Slot 1 is the INACTIVE semi-space. While the off-pause wipe is
+        // zeroing it, its bytes are neither the objects they were nor yet
+        // zero, so a candidate there is declined outright. No live object is
+        // ever in the inactive semi-space, so this changes no valid answer.
+        let skip_inactive = self.wipe_in_flight.load(Ordering::Acquire);
+        let in_region = self.region_bounds.iter().enumerate().any(|(i, (base, end))| {
+            if skip_inactive && i == 1 {
+                return false;
+            }
             let b = base.load(Ordering::Acquire);
             let e = end.load(Ordering::Acquire);
             addr >= b && addr < e
@@ -6064,7 +6258,11 @@ impl GenerationalHeap {
         let t0 = (goal > 0).then(std::time::Instant::now);
         let out = self.collect_garbage_inner(roots, finalizer_addrs, monitors);
         if let (Some(t0), true) = (t0, goal > 0) {
-            self.adapt_young_trigger_to_pause(t0.elapsed().as_millis() as u64, goal);
+            self.adapt_young_trigger_to_pause(
+                t0.elapsed().as_millis() as u64,
+                goal,
+                out.0.stats.bytes_copied as u64,
+            );
         }
         out
     }
@@ -6098,7 +6296,22 @@ impl GenerationalHeap {
     /// MOVING branch only — so on a JIT-heavy workload, where the trigger
     /// predicts "non-moving" at essentially every allocation, this whole
     /// feedback loop moved a number nothing read.
-    fn adapt_young_trigger_to_pause(&self, pause_ms: u64, goal_ms: u64) {
+    ///
+    /// **gen-gc-five (2026-09-02): a halving is a TRIAL, not a policy.** Once
+    /// the refill-time trigger was made reachable on compiled code (the entry
+    /// gate in `tlab_alloc_object_inner`), this loop was observed doing what
+    /// `gen-gc-minor-pause-20260902` predicted: on `OldGenRsetProbe`, whose
+    /// tenure cycles copy a fixed 1.2M-object live set, it halved the trigger
+    /// 136 MB -> 67 -> 33 -> 19 MB across consecutive cycles without the pause
+    /// moving at all, and the run took 88 collections where 14 would do. A
+    /// moving pause is `a * survivors + b * allocated`; the nursery size only
+    /// reaches the second term, and when the first dominates a smaller nursery
+    /// buys nothing but more collections. So each halving is now checked
+    /// against the pause it produces ([`next_young_trigger`]): one that did
+    /// not cut the pause by a quarter is REVERTED, and the loop latches on the
+    /// survivor volume it saw until that volume changes by a factor of two —
+    /// which is the signal that the live set, not the nursery, was the pause.
+    fn adapt_young_trigger_to_pause(&self, pause_ms: u64, goal_ms: u64, bytes_copied: u64) {
         let capacity = self.young_from.lock().capacity();
         if capacity == 0 {
             return;
@@ -6110,20 +6323,18 @@ impl GenerationalHeap {
         let ceiling = capacity * young_trigger_percent() / 100;
         let mut threshold = self.young_gc_threshold.lock();
         let current = (*threshold).clamp(floor, ceiling.max(floor));
-        *threshold = if pause_ms > goal_ms {
-            // Overshot: copy less next time. Multiplicative decrease, because
-            // the overshoot can be large (872 ms against a 500 ms goal) and a
-            // linear back-off would take many over-budget cycles to converge —
-            // each of which is a missed deadline.
-            (current / 2).max(floor)
-        } else if pause_ms * 4 < goal_ms {
-            // Comfortably inside: give the trigger room back, additively, so a
-            // workload that transiently spiked does not stay permanently
-            // throttled. Slower than the decrease on purpose.
-            (current + capacity / 32).min(ceiling.max(floor))
-        } else {
-            current
-        };
+        let mut feedback = self.young_trigger_feedback.lock();
+        *threshold = next_young_trigger(
+            &mut feedback,
+            current,
+            floor,
+            ceiling.max(floor),
+            capacity,
+            pause_ms,
+            goal_ms,
+            bytes_copied,
+        );
+        drop(feedback);
         if gc_flags().dbg_gcpause && *threshold != current {
             eprintln!(
                 "[gcpause] young trigger {}KB -> {}KB (pause={pause_ms}ms goal={goal_ms}ms)",
@@ -6147,7 +6358,11 @@ impl GenerationalHeap {
         let t0 = (goal > 0).then(std::time::Instant::now);
         let out = self.collect_garbage_inner(roots, &[], monitors).0;
         if let Some(t0) = t0 {
-            self.adapt_young_trigger_to_pause(t0.elapsed().as_millis() as u64, goal);
+            self.adapt_young_trigger_to_pause(
+                t0.elapsed().as_millis() as u64,
+                goal,
+                out.stats.bytes_copied as u64,
+            );
         }
         out
     }
@@ -6541,16 +6756,25 @@ impl GenerationalHeap {
         let divert_for_incomplete_moving_coverage =
             moving_young_requested && (force_non_moving_jit_roots || coverage_incomplete);
         let moving_young = moving_young_requested && !divert_for_incomplete_moving_coverage;
+        // A device DMA against the heap arena that the bounded GPU
+        // critical-section wait could not outlast. Nothing may move this
+        // cycle, and not even the debug force-moving flag overrides it: the
+        // veto is a correctness fact, not a policy. See
+        // `vm_heap::gpu_relocation_forbidden`.
+        let gpu_relocation_forbidden = crate::vm_heap::gpu_relocation_forbidden();
         let divert_non_moving = (has_conservative_roots && !moving_young)
             || honor_promotion_oom_risk
             || divert_for_incomplete_moving_coverage
-            || explicit_full_gc;
+            || explicit_full_gc
+            || gpu_relocation_forbidden;
         if watchref_dbg() {
             eprintln!(
                 "[watchref] collect_garbage_inner: has_conservative_roots={has_conservative_roots} moving_young_requested={moving_young_requested} divert_non_moving={divert_non_moving} force_moving={force_moving}"
             );
         }
-        if divert_non_moving && (!force_moving || divert_for_incomplete_moving_coverage) {
+        if divert_non_moving
+            && (!force_moving || divert_for_incomplete_moving_coverage || gpu_relocation_forbidden)
+        {
             if divert_for_incomplete_moving_coverage {
                 // Warn-level and ON BY DEFAULT (see the function's doc): a
                 // silent slide back to the non-moving sweep is the failure mode
@@ -6580,6 +6804,11 @@ impl GenerationalHeap {
                 } else if honor_promotion_oom_risk {
                     (
                         dr::NON_MOVING_PROMOTION_OOM_RISK,
+                        crate::gc_quiescence::incomplete_reason::NONE,
+                    )
+                } else if gpu_relocation_forbidden && !explicit_full_gc {
+                    (
+                        dr::NON_MOVING_GPU_CRITICAL,
                         crate::gc_quiescence::incomplete_reason::NONE,
                     )
                 } else {
@@ -6634,6 +6863,11 @@ impl GenerationalHeap {
             );
         }
 
+        // The previous cycle's off-pause wipe must be complete before this
+        // cycle reads or writes the arena it covers (it is this cycle's
+        // to-space). Normally long finished: the wipe takes tens of
+        // milliseconds and cycles are seconds apart.
+        self.join_evacuated_wipe();
         let mut young_from = self.young_from.lock();
         let mut young_to = self.young_to.lock();
         let mut old_gen = self.old_gen.lock();
@@ -7431,6 +7665,16 @@ impl GenerationalHeap {
             None
         };
 
+        // Map what the workers may touch. The backing store commits lazily
+        // (`crate::reservation`), and the parallel evacuator is the one
+        // hand-out site that does not go through `Arena::hand_out` — it hands
+        // a span to N threads to sub-allocate rather than one object to one
+        // caller. Without this every worker writes into reserved-but-unmapped
+        // memory: STATUS_ACCESS_VIOLATION, every parallel cycle, silently.
+        // A refused commit is an allocation failure, so it takes the serial
+        // path exactly as `hand_out`'s `None` does.
+        let par_plan = par_plan.filter(|p| young_to.commit_parallel_evacuation_region(p.reserved));
+
         if let Some(plan) = par_plan {
             // ------------------- PARALLEL COPY PHASE -------------------
             crate::gen_evac::note_par_evac_cycle();
@@ -7489,6 +7733,11 @@ impl GenerationalHeap {
                 // SAFETY: every queued address is a destination the seeds above
                 // produced — a live copy in young to-space or in old gen.
                 unsafe { evac.drain(self.evac_pool(par_workers), &mut shards) };
+                // The copy proper ends here. Without this mark the next one
+                // (`map_merge`) covers the drain as well, and a breakdown that
+                // wide is a hypothesis rather than a measurement — the same
+                // mistake `pre_evacuate` made before gc-genpause F0 split it.
+                mv_phase!("evac_drain");
                 for shard in shards.iter_mut() {
                     evac.retire_plab(shard);
                 }
@@ -7537,8 +7786,7 @@ impl GenerationalHeap {
                 objects_copied += shard.objects_copied;
                 copy_tally_merge(&shard.tally);
                 deferred_dirty_cards.extend(shard.deferred_dirty_cards.iter().copied());
-                for &(old, new) in &shard.forwards {
-                    pointer_map.insert(old, new);
+                for &(_, new) in &shard.forwards {
                     if new >= to_base && new < to_cap_end {
                         // perf/gc-oracle-anchors: a to-space destination is an
                         // object base, and after the swap this arena is the
@@ -7549,6 +7797,18 @@ impl GenerationalHeap {
                     }
                 }
             }
+            // gen-gc-five item 5: the shards' pair lists become the map on
+            // `par_workers` threads rather than one insert at a time here.
+            // With the copy itself parallel this fold was the largest
+            // sequential term left in the pause (`map_merge` 15-25 ms of
+            // ~105 ms on the r1 A/B); see `cratonvm_types::pointer_map`.
+            let forwards: Vec<Vec<(usize, usize)>> = shards
+                .iter_mut()
+                .map(|s| std::mem::take(&mut s.forwards))
+                .collect();
+            pointer_map.par_extend_pairs(&forwards, par_workers);
+            drop(forwards);
+            mv_phase!("map_merge");
             // The parallel drain reached a fixpoint over BOTH destinations, so
             // everything below the cursor is scanned. Phase 2.5b's resurrection
             // scan appends above it.
@@ -8155,6 +8415,7 @@ impl GenerationalHeap {
                 );
             }
         }
+        let mut deferred_wipe: Option<crate::arena::DeferredWipe> = None;
         if crate::stale_objref_debug::enabled() {
             let cycles = crate::stale_objref_debug::quarantine_cycles();
             let mut reuse = if quarantine.len() >= cycles {
@@ -8172,8 +8433,13 @@ impl GenerationalHeap {
             std::mem::swap(&mut *young_from, &mut reuse);
             // `reuse` now holds this cycle's just-evacuated from-space.
             quarantine.push_back(reuse);
-        } else {
+        } else if sync_young_wipe_enabled() {
             young_from.reset();
+        } else {
+            // gen-gc-five: the metadata reset now, the memset after the pause
+            // (`spawn_evacuated_wipe`, at the end of this cycle once a
+            // possible `grow` has settled where the backing lives).
+            deferred_wipe = Some(young_from.reset_deferring_zero());
         }
 
         // CRIT-P2 (2026-08-07): the conversion this used to do is gone.
@@ -8467,6 +8733,19 @@ impl GenerationalHeap {
         self.store_region_bounds_locked(&young_from, &young_to, &old_gen);
 
         mv_phase!("heap_expand");
+        // gen-gc-five: hand the evacuated semi-space's zeroing to the wipe
+        // thread. After the swap that arena is `young_to`, and the expansion
+        // above is the last thing this cycle does to it, so its backing is
+        // final here. The bytes are zero long before the next cycle needs
+        // them, and `collect_garbage_inner` joins the thread before it looks.
+        if let Some(wipe) = deferred_wipe {
+            let spans = young_to.deferred_wipe_spans(&wipe);
+            if mv_phase_on {
+                let bytes: usize = spans.iter().map(|&(_, l)| l).sum();
+                moving_phase_count_push("wipe_deferred_bytes", bytes as u128);
+            }
+            self.spawn_evacuated_wipe(spans);
+        }
         // Phase H (RH.1): commit per-cycle counters to the lifetime
         // accumulator. Do this at the end so tests can observe GC
         // statistics after the call returns.
@@ -15831,7 +16110,7 @@ fn cell_corrupt_diag_enabled() -> bool {
 /// victim's pre-copy (young, often bootstrap-page-stable) address — the
 /// address a follow-up `CRATONVM_DBG_WATCH_CELL` run must watch to catch the
 /// forming write. Rate-capped; no-op unless the gate is set.
-fn validate_copy_source_cells(obj_ptr: *const u8, header: &ObjectHeader, site: &str) {
+pub(crate) fn validate_copy_source_cells(obj_ptr: *const u8, header: &ObjectHeader, site: &str) {
     if !cell_corrupt_diag_enabled()
         || header.kind() != ObjectKind::Object
         || is_compact_object(header)
@@ -15989,14 +16268,14 @@ fn desc_trace_enabled() -> bool {
 /// candidates whose header class_id does NOT resolve (false interior/stale
 /// roots that would get a forwarding_ptr smashed into live-object interiors).
 #[inline]
-fn fwdguard_enabled() -> bool {
+pub(crate) fn fwdguard_enabled() -> bool {
     gc_flags().dbg_fwdguard
 }
 
 /// Cached `CRATONVM_FWD_RESOLVE_STRICT` gate: REJECT (leave unmoved, no
 /// forwarding install) forward_object candidates with unresolvable class_id.
 #[inline]
-fn fwd_resolve_strict() -> bool {
+pub(crate) fn fwd_resolve_strict() -> bool {
     gc_flags().fwd_resolve_strict
 }
 
@@ -22699,6 +22978,12 @@ mod tests {
         let full_scan = GenerationalHeap::full_old_rset_scan_enabled();
         let mut gc_roots = vec![promoted];
         heap.collect_garbage(&stw(), &mut gc_roots, &monitors);
+        // gen-gc-five: the evacuated semi-space is zeroed AFTER the pause, on
+        // a helper thread. "Survived" below is read through the stale field,
+        // i.e. out of that semi-space, so wait for the wipe first — otherwise
+        // the dead object's bytes are still readable for a few milliseconds
+        // and the predicate measures the wipe's timing, not the collection.
+        heap.join_evacuated_wipe();
         let survived = matches!(
             heap.get_field(gc_roots[0], 0),
             Value::Object(Some(s)) if heap.get_field(s, 0).as_int() == Some(31337)
@@ -23775,6 +24060,293 @@ mod tests {
         for root in &roots {
             let _ = heap.get_field(*root, 0);
         }
+    }
+
+    /// A full binary tree of `depth` levels: three fields per node (left,
+    /// right, value), values distinct so a wrong rewrite changes the sum.
+    fn build_tree(heap: &GenerationalHeap, depth: u32, seed: i32) -> ObjectRef {
+        let node = heap.alloc_object(ClassId::new(0), 3);
+        heap.set_field(node, 2, Value::Int(seed));
+        if depth > 0 {
+            let l = build_tree(heap, depth - 1, seed * 2);
+            heap.set_field(node, 0, Value::Object(Some(l)));
+            let r = build_tree(heap, depth - 1, seed * 2 + 1);
+            heap.set_field(node, 1, Value::Object(Some(r)));
+        }
+        node
+    }
+
+    fn tree_sum(heap: &GenerationalHeap, node: ObjectRef) -> i64 {
+        let mut s = i64::from(heap.get_field(node, 2).as_int().unwrap_or(i32::MIN));
+        for f in 0..2 {
+            if let Value::Object(Some(c)) = heap.get_field(node, f) {
+                s += tree_sum(heap, c);
+            }
+        }
+        s
+    }
+
+    /// gen-gc-five: the parallel evacuation engine, on several workers, must
+    /// leave exactly the graph the sequential drain would — through the
+    /// young-to-young copies of the first cycles, the promotion cycle where
+    /// every node goes through a promotion buffer, and the cycles after it
+    /// where the tree is old and only the churn is collected.
+    #[test]
+    fn parallel_evacuation_preserves_a_large_graph_across_promotion() {
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_GC_PAR_THREADS", Some("4"))],
+            || {
+                let heap = GenerationalHeap::with_sizes(4 * 1024 * 1024, 8 * 1024 * 1024);
+                let monitors = NoOpMonitors;
+                let root = build_tree(&heap, 12, 1);
+                let nodes = (1usize << 13) - 1;
+                let expected = tree_sum(&heap, root);
+                let mut roots = vec![root];
+                for cycle in 0..(PROMOTION_AGE as usize + 2) {
+                    let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
+                    assert_eq!(
+                        tree_sum(&heap, roots[0]),
+                        expected,
+                        "cycle {cycle}: the tree read back differently after evacuation"
+                    );
+                    if cycle < PROMOTION_AGE as usize {
+                        assert_eq!(
+                            result.stats.objects_copied, nodes,
+                            "cycle {cycle}: every node is live and must be copied exactly once"
+                        );
+                    }
+                    for i in 0..2000 {
+                        let g = heap.alloc_object(ClassId::new(0), 2);
+                        heap.set_field(g, 0, Value::Int(i));
+                    }
+                }
+                assert!(
+                    heap.is_in_old(roots[0].as_ptr()),
+                    "after PROMOTION_AGE cycles the root has tenured"
+                );
+                heap.join_evacuated_wipe();
+            },
+        );
+    }
+
+    /// gen-gc-five: with several workers, objects referenced from MANY places
+    /// are reached by more than one worker at once, which is the forwarding
+    /// race the CAS decides and the losers' `undo` path cleans up after. A
+    /// wide tree whose every node also points at one of 64 shared objects
+    /// gives 8191 references to 64 targets across 4 workers; the graph must
+    /// read back identically and each shared object must have exactly one
+    /// post-collection address.
+    #[test]
+    fn parallel_evacuation_survives_forwarding_races_on_shared_targets() {
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_GC_PAR_THREADS", Some("4"))],
+            || {
+                let heap = GenerationalHeap::with_sizes(4 * 1024 * 1024, 8 * 1024 * 1024);
+                let monitors = NoOpMonitors;
+                let shared: Vec<ObjectRef> = (0..64)
+                    .map(|i| {
+                        let o = heap.alloc_object(ClassId::new(0), 1);
+                        heap.set_field(o, 0, Value::Int(1000 + i));
+                        o
+                    })
+                    .collect();
+                // Nodes: left, right, value, shared-target.
+                fn build(heap: &GenerationalHeap, shared: &[ObjectRef], depth: u32, seed: i32) -> ObjectRef {
+                    let n = heap.alloc_object(ClassId::new(0), 4);
+                    heap.set_field(n, 2, Value::Int(seed));
+                    heap.set_field(n, 3, Value::Object(Some(shared[(seed as usize) % shared.len()])));
+                    if depth > 0 {
+                        let l = build(heap, shared, depth - 1, seed * 2);
+                        heap.set_field(n, 0, Value::Object(Some(l)));
+                        let r = build(heap, shared, depth - 1, seed * 2 + 1);
+                        heap.set_field(n, 1, Value::Object(Some(r)));
+                    }
+                    n
+                }
+                fn check(heap: &GenerationalHeap, n: ObjectRef, addrs: &mut Vec<Vec<usize>>) -> i64 {
+                    let seed = heap.get_field(n, 2).as_int().unwrap_or(i32::MIN);
+                    let mut s = i64::from(seed);
+                    let Value::Object(Some(t)) = heap.get_field(n, 3) else {
+                        panic!("node {seed} lost its shared target");
+                    };
+                    let slot = (seed as usize) % addrs.len();
+                    assert_eq!(
+                        heap.get_field(t, 0).as_int(),
+                        Some(1000 + slot as i32),
+                        "node {seed} points at the wrong shared object"
+                    );
+                    addrs[slot].push(t.as_ptr() as usize);
+                    for f in 0..2 {
+                        if let Value::Object(Some(c)) = heap.get_field(n, f) {
+                            s += check(heap, c, addrs);
+                        }
+                    }
+                    s
+                }
+                let root = build(&heap, &shared, 12, 1);
+                let mut expected_addrs = vec![Vec::new(); 64];
+                let expected = check(&heap, root, &mut expected_addrs);
+                let mut roots = vec![root];
+                for cycle in 0..(PROMOTION_AGE as usize + 1) {
+                    heap.collect_garbage(&stw(), &mut roots, &monitors);
+                    let mut addrs = vec![Vec::new(); 64];
+                    assert_eq!(check(&heap, roots[0], &mut addrs), expected, "cycle {cycle}");
+                    for (i, a) in addrs.iter().enumerate() {
+                        a.iter().for_each(|&x| {
+                            assert_eq!(x, a[0], "cycle {cycle}: shared object {i} has two addresses")
+                        });
+                    }
+                }
+                heap.join_evacuated_wipe();
+            },
+        );
+    }
+
+    /// gen-gc-five: the pause-goal loop halves the trigger as a TRIAL and
+    /// reverts a halving that did not move the pause.
+    #[test]
+    fn a_halving_that_does_not_move_the_pause_is_reverted_and_latched() {
+        let mut fb = TriggerFeedback::default();
+        let (floor, ceiling, cap) = (16usize << 20, 128usize << 20, 256usize << 20);
+        // A fixed live set: every pause is 300 ms against a 200 ms goal.
+        let t1 = next_young_trigger(&mut fb, 128 << 20, floor, ceiling, cap, 300, 200, 50 << 20);
+        assert_eq!(t1, 64 << 20, "first overshoot halves");
+        let t2 = next_young_trigger(&mut fb, t1, floor, ceiling, cap, 295, 200, 50 << 20);
+        assert_eq!(t2, 128 << 20, "the halving bought nothing: restored");
+        let t3 = next_young_trigger(&mut fb, t2, floor, ceiling, cap, 305, 200, 52 << 20);
+        assert_eq!(t3, 128 << 20, "latched on that survivor volume: left alone");
+        // The live set shrinks by more than 2x: the loop re-arms.
+        let t4 = next_young_trigger(&mut fb, t3, floor, ceiling, cap, 250, 200, 10 << 20);
+        assert_eq!(t4, 64 << 20, "a changed survivor volume re-arms the trial");
+        // And a halving that DOES help keeps going.
+        let t5 = next_young_trigger(&mut fb, t4, floor, ceiling, cap, 150, 200, 10 << 20);
+        assert_eq!(t5, 64 << 20, "under the goal: trial closed, threshold kept");
+        let t6 = next_young_trigger(&mut fb, t5, floor, ceiling, cap, 40, 200, 10 << 20);
+        assert_eq!(t6, (64 << 20) + cap / 32, "comfortably under: additive room back");
+        let mut fb2 = TriggerFeedback::default();
+        let a = next_young_trigger(&mut fb2, 128 << 20, floor, ceiling, cap, 400, 200, 8 << 20);
+        let b = next_young_trigger(&mut fb2, a, floor, ceiling, cap, 220, 200, 8 << 20);
+        assert_eq!(b, 32 << 20, "a responsive pause keeps halving");
+    }
+
+    /// The FIRST parallel cycle of a fresh heap writes into a to-space no
+    /// cycle has filled yet.
+    ///
+    /// That to-space is RESERVED address space whose granules are committed on
+    /// demand, and the parallel evacuator is the one allocation path that does
+    /// not go through `Arena::alloc` — so nothing committed the granules it
+    /// `memcpy`s into, and the copy faulted (STATUS_ACCESS_VIOLATION, 2026-09-02,
+    /// reproduced on a pristine dev tip). Every LATER cycle survived, because
+    /// by then the arena had been written as a from-space, which is why a
+    /// long-running workload never showed it and a unit test always did.
+    ///
+    /// The heap must be at least one reservation granule (2 MiB) for the
+    /// backing store to be a reservation at all; below that it is a plain
+    /// committed block and the bug is unreachable.
+    #[test]
+    fn the_first_parallel_cycle_of_a_fresh_heap_commits_before_it_copies() {
+        cratonvm_types::flags::with_thread_overrides(
+            &[
+                ("CRATONVM_GC_PAR_THREADS", Some("4")),
+                ("CRATONVM_GC_PAR_EVAC", Some("1")),
+            ],
+            || {
+                let heap = GenerationalHeap::with_sizes(4 * 1024 * 1024, 4 * 1024 * 1024);
+                let monitors = NoOpMonitors;
+                let live = heap.alloc_object(ClassId::new(31), 1);
+                heap.set_field(live, 0, Value::Int(0x5EED));
+                let mut roots = vec![live];
+                // The cycle that used to fault: nothing has ever been written
+                // into this heap's to-space.
+                heap.collect_garbage(&stw(), &mut roots, &monitors);
+                assert_eq!(
+                    heap.get_field(roots[0], 0).as_int(),
+                    Some(0x5EED),
+                    "the survivor must have been copied into to-space intact",
+                );
+                heap.join_evacuated_wipe();
+            },
+        );
+    }
+
+    /// Constructing a generational heap publishes the compiled-reference-store
+    /// barrier plan, in the MASK shape — the whole point of the mask, since the
+    /// age floor cannot express "is the receiver in the old generation".
+    #[test]
+    fn constructing_the_heap_publishes_a_masked_ref_store_plan() {
+        let _heap = GenerationalHeap::with_sizes(64 * 1024, 64 * 1024);
+        let (pre, post, floor) = jit_ref_store_gate_addrs();
+        assert_ne!(pre, 0, "the pre gate must be published");
+        assert_ne!(post, 0, "the post gate must be published");
+        assert_eq!(
+            floor, 0,
+            "a mask publisher must NOT hand over the floor ADDRESS — the emitter
+             reads that as a second, contradictory post-barrier shape and declines",
+        );
+        assert_eq!(
+            jit_ref_store_post_skip_mask(),
+            GC_FLAG_OLD_GEN,
+            "the mask is this collector's post-barrier question",
+        );
+    }
+
+    /// gen-gc-five: the semi-space a moving cycle evacuated is zeroed by the
+    /// helper thread, and reads as zero once that thread is joined.
+    #[test]
+    fn the_evacuated_semispace_is_zero_once_the_wipe_is_joined() {
+        let heap = GenerationalHeap::with_sizes(1024 * 1024, 1024 * 1024);
+        let monitors = NoOpMonitors;
+        let keep = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(keep, 0, Value::Int(7));
+        for i in 0..2000 {
+            let g = heap.alloc_object(ClassId::new(0), 3);
+            heap.set_field(g, 2, Value::Int(i));
+        }
+        let used_before = heap.young_from.lock().used();
+        let mut roots = vec![keep];
+        heap.collect_garbage(&stw(), &mut roots, &monitors);
+        assert_eq!(heap.get_field(roots[0], 0).as_int(), Some(7));
+        heap.join_evacuated_wipe();
+        let to = heap.young_to.lock();
+        assert_eq!(to.used(), 0, "the evacuated arena is the empty to-space");
+        let base = to.base_ptr();
+        let stale = (0..used_before)
+            .step_by(8)
+            // SAFETY: `[0, used_before)` was the allocated prefix of this arena
+            // and is still mapped.
+            .filter(|&off| unsafe { std::ptr::read(base.add(off) as *const u64) } != 0)
+            .count();
+        assert_eq!(stale, 0, "{stale} non-zero words remain in the evacuated semi-space");
+    }
+
+    /// `CRATONVM_GC_SYNC_YOUNG_WIPE` restores the in-pause memset: no helper
+    /// thread, and the arena is zero the moment the collection returns.
+    #[test]
+    fn the_sync_wipe_flag_zeroes_inside_the_pause() {
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_GC_SYNC_YOUNG_WIPE", Some("1"))],
+            || {
+                let heap = GenerationalHeap::with_sizes(256 * 1024, 256 * 1024);
+                let monitors = NoOpMonitors;
+                let keep = heap.alloc_object(ClassId::new(0), 1);
+                for _ in 0..500 {
+                    heap.alloc_object(ClassId::new(0), 3);
+                }
+                let used_before = heap.young_from.lock().used();
+                let mut roots = vec![keep];
+                heap.collect_garbage(&stw(), &mut roots, &monitors);
+                assert!(heap.evacuated_wipe.lock().is_none(), "no wipe thread was spawned");
+                assert!(!heap.wipe_in_flight.load(Ordering::Acquire));
+                let to = heap.young_to.lock();
+                let base = to.base_ptr();
+                let stale = (0..used_before)
+                    .step_by(8)
+                    // SAFETY: as in the async test above.
+                    .filter(|&off| unsafe { std::ptr::read(base.add(off) as *const u64) } != 0)
+                    .count();
+                assert_eq!(stale, 0);
+            },
+        );
     }
 
     #[test]
@@ -25334,6 +25906,24 @@ pub struct JitRefStoreGates {
     /// a value of `age << 4` is an exact unsigned test of `gc_age < age`: the
     /// flags nibble is at most 15 and cannot carry `a << 4` up to `(a+1) << 4`.
     pub young_floor: AtomicU8,
+    /// A receiver none of whose `GC_FLAGS_BYTE_OFFSET` bits fall in this mask
+    /// provably needs no post barrier. `0` disables the test.
+    ///
+    /// **The alternative to [`Self::young_floor`], not a refinement of it**, and
+    /// the reason the generational collector could not use the floor at all.
+    /// The floor is an unsigned `<` on `(gc_age << 4) | gc_flags`, so it can
+    /// only express "young enough". Generational's post barrier asks a
+    /// different question — *is the receiver in the old generation* — which it
+    /// answers with `GC_FLAG_OLD_GEN`, a bit in the flags nibble. Those do not
+    /// order: an object allocated directly in old gen has `gc_age == 0` and so
+    /// a flags byte of `0x01`, BELOW the age-zero floor `0x10`, while a young
+    /// object that has survived three collections is `0x30`, above it. A single
+    /// threshold would therefore have told compiled code to skip the card on
+    /// exactly the receivers that need one.
+    ///
+    /// Same conservative direction as every other gate: a set bit means "there
+    /// may be work" (call the collector's own barrier), never "no work".
+    pub post_skip_mask: AtomicU8,
     /// Whether a plan is published at all. Separate from the three gates so
     /// "published, and all three currently say no work" is distinguishable
     /// from "nobody published", which is the difference between an emitted
@@ -25345,8 +25935,69 @@ pub static JIT_REF_STORE_GATES: JitRefStoreGates = JitRefStoreGates {
     pre_active: AtomicU8::new(0),
     post_active: AtomicU8::new(0),
     young_floor: AtomicU8::new(0),
+    post_skip_mask: AtomicU8::new(0),
     published: AtomicU8::new(0),
 };
+
+/// Markers currently in a phase whose SATB pre-barrier must run, across every
+/// heap in the process, plus ZGC's own boolean.
+///
+/// [`set_jit_ref_store_pre_active`] is a plain boolean and has exactly one
+/// writer today (ZGC). `ConcurrentGcState` does not: it is shared by the
+/// generational collector AND G1, and a process can hold several heaps at once
+/// (the unit-test binaries routinely do). A second boolean writer would let one
+/// heap leaving its mark phase CLEAR the gate while another is still marking —
+/// compiled code would then skip an SATB pre-barrier that is live, which loses
+/// the overwritten reference from the snapshot. Counting markers instead makes
+/// the gate "armed while ANY marker is armed", which is the only direction that
+/// is safe to be wrong in.
+static JIT_REF_STORE_PRE_MARKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// ZGC's boolean half of the same gate. See [`JIT_REF_STORE_PRE_MARKERS`].
+static JIT_REF_STORE_PRE_ZGC: AtomicU8 = AtomicU8::new(0);
+
+/// Recompute the published `pre_active` byte from both sources.
+///
+/// Re-reads both, so the last writer publishes the true disjunction; a racing
+/// pair can only leave the gate armed for longer than needed, never shorter.
+fn refresh_jit_ref_store_pre_active() {
+    let armed = JIT_REF_STORE_PRE_MARKERS.load(Ordering::Acquire) > 0
+        || JIT_REF_STORE_PRE_ZGC.load(Ordering::Acquire) != 0;
+    JIT_REF_STORE_GATES
+        .pre_active
+        .store(u8::from(armed), Ordering::Release);
+}
+
+/// A marker is entering a phase whose SATB barrier must run.
+///
+/// Call BEFORE the phase becomes observable, so the gate is armed no later than
+/// the barrier it mirrors. See [`JIT_REF_STORE_PRE_MARKERS`].
+pub fn arm_jit_ref_store_marker() {
+    JIT_REF_STORE_PRE_MARKERS.fetch_add(1, Ordering::AcqRel);
+    refresh_jit_ref_store_pre_active();
+}
+
+/// A marker has left such a phase.
+///
+/// Call AFTER the phase has stopped being observable, so the gate is disarmed
+/// no earlier than the barrier it mirrors.
+pub fn disarm_jit_ref_store_marker() {
+    // `fetch_update` rather than `fetch_sub`: an unmatched disarm would wrap an
+    // unsigned counter to a huge value, i.e. a gate armed for the life of the
+    // process — safe, but it would silently withdraw the fast path everywhere
+    // and look like the feature simply not paying.
+    let _ = JIT_REF_STORE_PRE_MARKERS.fetch_update(
+        Ordering::AcqRel,
+        Ordering::Acquire,
+        |n| Some(n.saturating_sub(1)),
+    );
+    refresh_jit_ref_store_pre_active();
+}
+
+/// Markers currently counted as armed. Diagnostics and tests.
+pub fn jit_ref_store_armed_markers() -> usize {
+    JIT_REF_STORE_PRE_MARKERS.load(Ordering::Acquire)
+}
 
 /// `gc_age == 0` expressed in the `GC_FLAGS_BYTE_OFFSET` byte's units.
 ///
@@ -25372,11 +26023,41 @@ pub fn jit_ref_store_gate_addrs() -> (usize, usize, usize) {
     (
         &base.pre_active as *const _ as usize,
         &base.post_active as *const _ as usize,
-        &base.young_floor as *const _ as usize,
+        // The floor's ADDRESS only when this plan actually uses the floor.
+        //
+        // The address of a `static` is non-zero whatever the byte holds, so
+        // handing it over unconditionally would tell the emitter that BOTH
+        // post-barrier shapes are published — and it declines that, because for
+        // a mask publisher the floor is not merely redundant but WRONG (an
+        // old-gen object with `gc_age == 0` sits below it). Gating on the value
+        // keeps "which shape is this" answerable from the three words the
+        // helper table carries.
+        if JIT_REF_STORE_GATES.young_floor.load(Ordering::Acquire) == 0 {
+            0
+        } else {
+            &base.young_floor as *const _ as usize
+        },
     )
 }
 
-/// Announce that this process's collector maintains the gates.
+/// The published post-barrier skip MASK, as a value rather than an address.
+///
+/// Baked into generated code as an immediate, which is why it is read as a
+/// value: the mask is a property of which collector is running, and a process
+/// does not change collector after start-up. The gate BYTES stay addresses
+/// because they change while the process runs; this does not.
+///
+/// `0` means no mask is published — either nothing is published at all, or the
+/// publisher uses [`JitRefStoreGates::young_floor`] instead.
+pub fn jit_ref_store_post_skip_mask() -> u8 {
+    if JIT_REF_STORE_GATES.published.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    JIT_REF_STORE_GATES.post_skip_mask.load(Ordering::Acquire)
+}
+
+/// Announce that this process's collector maintains the gates, using the
+/// unsigned age FLOOR to rule the post barrier out.
 ///
 /// Both gates are armed here and only ever relaxed by a later publisher call:
 /// a plan that starts armed can never be observed permissive before its owner
@@ -25384,9 +26065,27 @@ pub fn jit_ref_store_gate_addrs() -> (usize, usize, usize) {
 pub fn publish_jit_ref_store_plan(young_floor: u8) {
     JIT_REF_STORE_GATES.pre_active.store(1, Ordering::Release);
     JIT_REF_STORE_GATES.post_active.store(1, Ordering::Release);
+    JIT_REF_STORE_GATES.post_skip_mask.store(0, Ordering::Release);
     JIT_REF_STORE_GATES
         .young_floor
         .store(young_floor, Ordering::Release);
+    JIT_REF_STORE_GATES.published.store(1, Ordering::Release);
+}
+
+/// Announce a plan that rules the post barrier out by a flags MASK rather than
+/// an age floor — see [`JitRefStoreGates::post_skip_mask`] for why the
+/// generational collector needs this shape and cannot use the floor.
+///
+/// The floor is explicitly zeroed: publishing both would emit two independent
+/// skips for one question, and the age floor is WRONG for a mask publisher (an
+/// old-gen object with `gc_age == 0` sits below it).
+pub fn publish_jit_ref_store_plan_masked(post_skip_mask: u8) {
+    JIT_REF_STORE_GATES.pre_active.store(1, Ordering::Release);
+    JIT_REF_STORE_GATES.post_active.store(1, Ordering::Release);
+    JIT_REF_STORE_GATES.young_floor.store(0, Ordering::Release);
+    JIT_REF_STORE_GATES
+        .post_skip_mask
+        .store(post_skip_mask, Ordering::Release);
     JIT_REF_STORE_GATES.published.store(1, Ordering::Release);
 }
 
@@ -25396,6 +26095,7 @@ pub fn clear_jit_ref_store_plan() {
     JIT_REF_STORE_GATES.pre_active.store(1, Ordering::Release);
     JIT_REF_STORE_GATES.post_active.store(1, Ordering::Release);
     JIT_REF_STORE_GATES.young_floor.store(0, Ordering::Release);
+    JIT_REF_STORE_GATES.post_skip_mask.store(0, Ordering::Release);
     JIT_REF_STORE_GATES.published.store(0, Ordering::Release);
 }
 
@@ -25403,9 +26103,8 @@ pub fn clear_jit_ref_store_plan() {
 /// caller must set this BEFORE arming the real flag and clear it AFTER
 /// disarming.
 pub fn set_jit_ref_store_pre_active(active: bool) {
-    JIT_REF_STORE_GATES
-        .pre_active
-        .store(u8::from(active), Ordering::Release);
+    JIT_REF_STORE_PRE_ZGC.store(u8::from(active), Ordering::Release);
+    refresh_jit_ref_store_pre_active();
 }
 
 /// Mirror "this heap contains at least one old object". Same ordering rule as

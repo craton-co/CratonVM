@@ -4399,7 +4399,12 @@ impl ZgcRealHeap {
         // length of an assertion has no other way to ask for that -- the
         // variable is process-wide and a test that set it would decide the
         // question for every other test in the binary.
-        self.relocation_enabled.load(Ordering::Relaxed)
+        //
+        // AND the GPU veto: a device DMA against the heap arena that the
+        // collector's bounded wait could not outlast forbids this cycle's
+        // slide. `false` in every build without `gpu-offload`. See
+        // `vm_heap::gpu_relocation_forbidden`.
+        self.relocation_enabled.load(Ordering::Relaxed) && !crate::vm_heap::gpu_relocation_forbidden()
     }
 
     /// Turn the stop-the-world slide on or off for THIS heap.
@@ -4788,7 +4793,9 @@ impl ZgcRealHeap {
         pins: &[usize],
         pairs: &mut Vec<(usize, usize)>,
     ) -> (usize, usize) {
-        if !self.high_compaction_enabled.load(Ordering::Relaxed) {
+        if !self.high_compaction_enabled.load(Ordering::Relaxed)
+            || crate::vm_heap::gpu_relocation_forbidden()
+        {
             return (0, 0);
         }
         let base = arena.base_ptr() as usize;
@@ -9366,6 +9373,14 @@ fn zgc_corpse_enabled() -> bool {
 /// Written for `SQLChar.rawData` — declared `[C`, found holding `Int(1)`, and
 /// the cell a compiled `arraylength` dereferenced as the pointer 1. Watch it
 /// with `CRATONVM_DBG_WATCH_PUN=SQLChar:1`.
+/// Whether `CRATONVM_DBG_WATCH_PUN` is armed. The interpreter's quickened field
+/// arms bypass `get_field` / `set_field`, where the watch reports, so they stay
+/// off while it is armed (see `vm::runtime::interpreter::field_fast`).
+#[inline]
+pub fn punned_store_watch_armed() -> bool {
+    punned_store_watch().is_some()
+}
+
 fn punned_store_watch() -> Option<&'static (String, usize)> {
     static W: std::sync::OnceLock<Option<(String, usize)>> = std::sync::OnceLock::new();
     W.get_or_init(|| {

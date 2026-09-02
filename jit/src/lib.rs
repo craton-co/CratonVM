@@ -119,6 +119,7 @@ pub mod platform;
 pub mod profile;
 pub mod range_analysis;
 pub mod regalloc;
+pub mod implicit_null;
 pub mod runtime_lowering;
 pub mod scev;
 pub mod tiered;
@@ -3120,6 +3121,13 @@ impl Drop for CompiledMethod {
         // this artifact owns is unmapped as soon as this function returns, and
         // the address is then reusable by the next `alloc_executable`.
         unregister_jit_method_name(entry);
+        // Third withdrawal, same sentence as the two above, and the one whose
+        // absence is not a degraded diagnostic but arbitrary control flow: an
+        // implicit null-check entry that outlived its buffer would eventually
+        // match a PC belonging to whatever `alloc_executable` handed out next,
+        // and the signal handler would resume execution at a stale address
+        // inside a live method.
+        crate::implicit_null::unregister_range(entry, self._buffer.pos());
         if let Some(owners) = JIT_ENTRY_OWNERS.get() {
             let mut owners = owners.lock();
             if owners
@@ -18146,6 +18154,84 @@ pub static PRIVATE_INVOKEVIRTUAL_PINNED: std::sync::atomic::AtomicU64 =
 pub static FINAL_INVOKEVIRTUAL_PINNED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Call sites where the static-bind rewrite YIELDED to a call-site intrinsic.
+///
+/// `java/lang/String` is `final`, so `invokevirtual_site_final_owner` answers
+/// for every `String.charAt`/`length`/`isEmpty`/`hashCode` site in the tree and
+/// the rewrite below turns `invoke_kind` 0 into 1. That is a correct statement
+/// about dispatch and it was catastrophic here: the instance call-site
+/// intrinsic gate a few hundred lines down is `invoke_kind == 0 ||
+/// invoke_kind == 2`, and the inline/direct-bind ladder that kind-1 sites take
+/// FIRST ends in a `continue`. So the site was bound to a real call to
+/// `String.charAt` and never offered the inline decode — not declined, not
+/// counted, not printed by any of the three `string-intrinsic` diagnostics,
+/// because it left the loop before reaching them.
+///
+/// Measured on `probes/CharAtDoorProbe.java`, one class, one run, five
+/// byte-identical bodies: the arm called straight from `main` read **349.64
+/// ns/char** and the four reached through a functional interface (which the
+/// OSR door compiles, and which never runs this rewrite) read 3.2-4.3.
+/// `CRATONVM_JIT_FINAL_DEVIRT=0` on the SAME binary moved the first arm to
+/// **6.85** — 51x from one flag, and the flag is not the fix, it is the proof.
+///
+/// A non-zero reading here is the count of sites this rule handed back.
+pub static DEVIRT_YIELDED_TO_INTRINSIC: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`DEVIRT_YIELDED_TO_INTRINSIC`].
+pub fn devirt_yielded_to_intrinsic_count() -> u64 {
+    DEVIRT_YIELDED_TO_INTRINSIC.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `CRATONVM_JIT_NO_DEVIRT_INTRINSIC_YIELD=1` — restore the pre-2026-09-02
+/// ordering, in which a `final`-class devirtualisation took a call site away
+/// from an intrinsic that would have inlined it.
+///
+/// Default OFF (the yield is ON). The B arm of an in-binary A/B: with this set,
+/// `probes/CharAtDoorProbe.java`'s `direct-from-main` row returns to ~350
+/// ns/char while every other arm is unchanged, which is the whole finding in
+/// one line.
+///
+/// NOT `OnceLock`-cached, matching `string_intrinsic_pin_enabled`: read at
+/// compile time only, never on a runtime hot path.
+fn devirt_intrinsic_yield_enabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_DEVIRT_INTRINSIC_YIELD").is_none()
+}
+
+/// Would an inline call-site intrinsic take this `invokevirtual` site?
+///
+/// The two matchers between them are exactly the set the instance-intrinsic
+/// gate accepts, asked the same way it asks: `try_resolve_intrinsic` is the
+/// layout-independent one and `try_resolve_string_intrinsic` the layout-aware
+/// `java/lang/String` / `java/lang/CharSequence` one. Answering `true` keeps the
+/// site at `invoke_kind == 0` so that gate can still see it.
+///
+/// **The blast radius is narrower than it looks.** The caller only consults
+/// this where `cp_invokespecial_owner_resolver` would otherwise have answered
+/// — a PRIVATE target, or a `final` one. No intrinsic matches a private method,
+/// so the JVMS 5.4.6 correctness rule is untouched and what is left is exactly
+/// "a final class with an instance intrinsic". `java/lang/String` is the
+/// measured member of that set and the whole of the 100x; any other is the same
+/// defect by construction and is not measured here.
+///
+/// A site that yields and is then declined at registration (the CRC32
+/// guard-class-id rule, the CharSequence receiver-profile filter) falls to
+/// ordinary MIC/PIC dispatch rather than a static bind. On a final class that
+/// cache is monomorphic, so the cost is a cache probe, not a dispatch walk.
+fn site_yields_to_call_site_intrinsic(
+    class: &str,
+    name: &str,
+    descriptor: &str,
+    string_layout: Option<StringFieldLayout>,
+) -> bool {
+    if !devirt_intrinsic_yield_enabled() {
+        return false;
+    }
+    try_resolve_intrinsic(class, name, descriptor).is_some()
+        || try_resolve_string_intrinsic(class, name, descriptor, string_layout).is_some()
+}
+
+
 /// `checkcast` sites that got the inline class-id compare, and the two reasons
 /// the rest did not.
 ///
@@ -19050,7 +19136,7 @@ fn has_string_intrinsic_site(
 /// callee warm order, caller kind across six shapes, first-compile context,
 /// scale) each refuted by its own measurement without ever converging — because
 /// the one instrument that could name the decision did not report it. See
-/// `string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901.md`.
+/// string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StringPinVerdict {
     /// The pin has no opinion: no `invokevirtual`/`invokeinterface` site at
@@ -19171,6 +19257,17 @@ fn string_intrinsic_pin_verdict(
 /// `probes/CharAtCostCurve.java` — switching the pin OFF cost nothing, which is
 /// what "it was never on" looks like from the outside. A timing cannot tell "the
 /// pin fired and did not help" from "the pin never fired"; this can.
+///
+/// Both halves of that A/B are **superseded and pre-emitter**, and are kept
+/// because they are what motivated the counter. Two things have since happened
+/// to the numbers: the optimizing tier gained a String access expander (arm B,
+/// 66-108 ns/char), and — the larger one — `java/lang/String` being `final`
+/// meant the method-entry door's devirtualisation took every String access site
+/// away from the inline intrinsic before the gate could claim it, so BOTH arms
+/// of that A/B were measuring a program with no String intrinsic in it at all.
+/// With that fixed the same rows read ~3.2 ns/char. Do not quote 326/329 as
+/// current; see `DEVIRT_YIELDED_TO_INTRINSIC` and
+/// string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901.
 static STRING_PIN_FIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Compiles that reached the pin with candidate sites and no resolved
@@ -21987,7 +22084,7 @@ fn try_compile_inner(
             // to the optimizing pipeline` — which is how five hypotheses about
             // `String.charAt` could each be refuted without ever converging. See
             // `StringPinVerdict` and
-            // `string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901.md`.
+            // string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901.
             //
             // Evaluated here rather than at the top of the block so the earlier
             // arms still short-circuit before it: this one calls the caller's
@@ -24959,7 +25056,39 @@ fn try_compile_inner(
             //
             // A private target is not a dispatch site, so it takes the same
             // route `invokespecial` does: bind exactly, at the resolved owner.
-            let class_name = if invoke_kind == 0 {
+            //
+            // ...UNLESS an inline call-site intrinsic would take this site.
+            // Statically binding it is a correct claim about DISPATCH and a
+            // disastrous one about CODEGEN: the instance-intrinsic gate below
+            // is `invoke_kind == 0 || invoke_kind == 2`, and a kind-1 site
+            // reaches the inline/direct-bind ladder first and leaves the loop
+            // through its `continue`. `java/lang/String` is `final`, so this
+            // rule answers for EVERY `String.charAt`/`length`/`isEmpty`/
+            // `hashCode` site in the tree — and every one of them was bound to
+            // a real call instead of the inline decode, silently: not declined,
+            // not counted, and invisible to all three `string-intrinsic`
+            // diagnostics, which sit past the point the site left.
+            //
+            // Measured on `probes/CharAtDoorProbe.java`, one class, one run,
+            // five byte-identical bodies — the arm called straight from `main`
+            // 349.64 ns/char against 3.2-4.3 for the four the OSR door
+            // compiles, and 6.85 on the same binary with
+            // `CRATONVM_JIT_FINAL_DEVIRT=0`.
+            //
+            // So the site is handed back. `try_resolve_intrinsic` is the
+            // layout-independent matcher and `try_resolve_string_intrinsic` the
+            // layout-aware one; between them they are exactly the set the gate
+            // below would accept, asked the same way it asks. A PRIVATE target
+            // is not affected: no intrinsic matches a private method, so the
+            // JVMS 5.4.6 correctness rule above keeps every site it had.
+            let yields_to_intrinsic = invoke_kind == 0
+                && site_yields_to_call_site_intrinsic(
+                    &class_name,
+                    &method_name,
+                    &descriptor,
+                    resolved_string_layout,
+                );
+            let class_name = if invoke_kind == 0 && !yields_to_intrinsic {
                 match cp_invokespecial_owner_resolver.and_then(|r| r(cp_idx, opcode)) {
                     Some(owner) => {
                         invoke_kind = 1;
@@ -24970,6 +25099,14 @@ fn try_compile_inner(
                     None => class_name,
                 }
             } else {
+                if yields_to_intrinsic {
+                    DEVIRT_YIELDED_TO_INTRINSIC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                        eprintln!(
+                            "[cratonvm-jitc] devirt YIELDS to intrinsic {class_name}.{method_name}{descriptor} @pc={pc}"
+                        );
+                    }
+                }
                 class_name
             };
             let invoke_kind = invoke_kind;
@@ -29863,6 +30000,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -30092,6 +30230,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -30172,6 +30311,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -31427,6 +31567,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -31572,6 +31713,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -31684,6 +31826,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -31806,6 +31949,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -31932,6 +32076,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -32000,6 +32145,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -32080,6 +32226,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -35475,6 +35622,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -36116,6 +36264,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -36137,6 +36286,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -36272,6 +36422,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -38629,3 +38780,101 @@ pub fn jit_gate_pass_census() -> (u64, u64) {
 
 /// See [`ir_lower::ic_frame_republish_sites`].
 pub use ir_lower::ic_frame_republish_sites;
+
+#[cfg(test)]
+mod devirt_intrinsic_yield_tests {
+    use super::*;
+
+    /// `java/lang/String` is `final`, so `invokevirtual_site_final_owner`
+    /// answers for every one of its call sites and `try_compile_inner` used to
+    /// rewrite `invoke_kind` 0 -> 1 on that answer — putting the site into the
+    /// inline/direct-bind ladder, which `continue`s, past an instance-intrinsic
+    /// gate that is `invoke_kind == 0 || invoke_kind == 2`.
+    ///
+    /// The result was a real `CALL` into `String.charAt` on every character,
+    /// and it was invisible: the three `string-intrinsic` diagnostics all sit
+    /// past the point the site left. Measured on `probes/CharAtDoorProbe.java`
+    /// at 349.64 ns/char against 3.2-4.3 for four byte-identical siblings the
+    /// OSR door compiled.
+    #[test]
+    fn the_three_string_accessors_hold_the_site_back_from_a_static_bind() {
+        let layout = Some(STRING_INTRINSIC_NAME_PROBE);
+        for (name, desc) in [("charAt", "(I)C"), ("length", "()I"), ("isEmpty", "()Z")] {
+            assert!(
+                site_yields_to_call_site_intrinsic("java/lang/String", name, desc, layout),
+                "String.{name}{desc} must keep its call-site intrinsic"
+            );
+        }
+    }
+
+    /// The JVMS 5.4.6 rule the rewrite exists for is untouched, and this is why:
+    /// no intrinsic matches a private method, so a private target never yields
+    /// and stays pinned to its declaring class. `String.isLatin1()Z` is the
+    /// concrete one — private, and reached constantly from the very chain the
+    /// missing intrinsic sends the program down.
+    #[test]
+    fn a_private_target_never_yields_so_the_dispatch_rule_is_intact() {
+        let layout = Some(STRING_INTRINSIC_NAME_PROBE);
+        for (name, desc) in [("isLatin1", "()Z"), ("coder", "()B"), ("checkIndex", "(II)V")] {
+            assert!(
+                !site_yields_to_call_site_intrinsic("java/lang/String", name, desc, layout),
+                "String.{name}{desc} is not an intrinsic and must stay statically bound"
+            );
+        }
+    }
+
+    /// Without a resolved `StringFieldLayout` the intrinsic cannot be emitted
+    /// either, so there is nothing to hold the site back FOR — it keeps the
+    /// static bind it had. Handing `None` is exactly what a door with no
+    /// layout resolver does.
+    #[test]
+    fn no_layout_means_no_yield() {
+        assert!(
+            !site_yields_to_call_site_intrinsic("java/lang/String", "charAt", "(I)C", None),
+            "with no layout the intrinsic is unemittable; do not cost the site its bind"
+        );
+    }
+
+    /// An ordinary method on a non-intrinsic class is unaffected in both
+    /// directions — this predicate must not become a blanket "never
+    /// devirtualise".
+    #[test]
+    fn an_ordinary_site_is_untouched() {
+        let layout = Some(STRING_INTRINSIC_NAME_PROBE);
+        assert!(!site_yields_to_call_site_intrinsic(
+            "com/example/Widget",
+            "charAt",
+            "(I)C",
+            layout
+        ));
+        assert!(!site_yields_to_call_site_intrinsic(
+            "java/lang/String",
+            "trim",
+            "()Ljava/lang/String;",
+            layout
+        ));
+    }
+
+    /// `CRATONVM_JIT_NO_DEVIRT_INTRINSIC_YIELD=1` is the B arm, and it has to
+    /// restore the old ordering exactly — otherwise the A/B compares two
+    /// things. Read through the flag machinery's thread override so the test
+    /// does not depend on the developer's ambient environment.
+    #[test]
+    fn the_kill_switch_restores_the_static_bind() {
+        let layout = Some(STRING_INTRINSIC_NAME_PROBE);
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_JIT_NO_DEVIRT_INTRINSIC_YIELD", Some("1"))],
+            || {
+                assert!(
+                    !site_yields_to_call_site_intrinsic(
+                        "java/lang/String",
+                        "charAt",
+                        "(I)C",
+                        layout
+                    ),
+                    "the opt-out must hand the site back to the static bind"
+                );
+            },
+        );
+    }
+}

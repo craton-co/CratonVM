@@ -1358,6 +1358,38 @@ pub fn any_class_redefined() -> bool {
 /// restores the pre-latch behaviour (the full retarget walk runs and answers
 /// correctly), whereas a lowered one could skip a retarget that was still
 /// needed. Same policy, and the same reasoning, as [`any_class_redefined`].
+/// One bit per dense class id: "this class's internal name starts with
+/// `java/util/`". Set once at definition; read lock-free by the interpreter's
+/// virtual-invoke tier-up gate, which used to take a class-manager read lock
+/// and do a string prefix compare on every cache hit to answer the same
+/// question (`receiver_is_java_util`). Ids at or beyond the covered range
+/// (proxies live at `0x8000_0000+`) answer `None`, and the caller keeps the
+/// old locked path for them.
+const JAVA_UTIL_BITMAP_WORDS: usize = 1 << 14; // 1 M class ids, 128 KiB
+#[allow(clippy::declare_interior_mutable_const)]
+const JAVA_UTIL_ZERO: AtomicU64 = AtomicU64::new(0);
+static JAVA_UTIL_CLASS_BITS: [AtomicU64; JAVA_UTIL_BITMAP_WORDS] = [JAVA_UTIL_ZERO; JAVA_UTIL_BITMAP_WORDS];
+
+/// Record that `id` names a `java/util/` class (no-op out of range).
+fn note_java_util_class(id: ClassId) {
+    let i = id.as_u32() as usize;
+    if i >> 6 < JAVA_UTIL_BITMAP_WORDS {
+        JAVA_UTIL_CLASS_BITS[i >> 6].fetch_or(1u64 << (i & 63), Ordering::Relaxed);
+    }
+}
+
+/// Whether class `id` was defined under `java/util/`: `Some(bool)` for ids the
+/// bitmap covers, `None` otherwise. One relaxed load, no lock.
+#[inline]
+pub fn class_is_java_util(id: ClassId) -> Option<bool> {
+    let i = id.as_u32() as usize;
+    if i >> 6 < JAVA_UTIL_BITMAP_WORDS {
+        Some(JAVA_UTIL_CLASS_BITS[i >> 6].load(Ordering::Relaxed) & (1u64 << (i & 63)) != 0)
+    } else {
+        None
+    }
+}
+
 static ANY_DUPLICATE_CLASS_NAME: AtomicBool = AtomicBool::new(false);
 
 /// True once two distinct `ClassId`s have shared a binary name. Single
@@ -9372,6 +9404,9 @@ impl ClassManager {
         // times per second). See `ANY_ANNOTATION_PROXY_DEFINED`.
         if is_vm_annotation_carrier_name(&name) {
             ANY_ANNOTATION_PROXY_DEFINED.store(true, Ordering::Relaxed);
+        }
+        if name.starts_with("java/util/") {
+            note_java_util_class(id);
         }
         let displaced = self.loaded_classes.insert(key, id);
         bump_class_definition_epoch();

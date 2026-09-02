@@ -1100,8 +1100,8 @@ pub fn gc_scan_channel_roots(roots: &mut Vec<ObjectRef>) {
     }
 }
 
-pub fn channel_fields_update_after_gc<S: std::hash::BuildHasher>(
-    pointer_map: &std::collections::HashMap<usize, usize, S>,
+pub fn channel_fields_update_after_gc(
+    pointer_map: &cratonvm_types::PointerMap,
 ) {
     if pointer_map.is_empty() {
         return;
@@ -5754,8 +5754,8 @@ pub fn gc_scan_ssc_socket_cache_roots(roots: &mut Vec<ObjectRef>) {
 /// is stable across a move; the `ObjectRef` discriminator is not, and must be
 /// rewritten or the next lookup silently misses — and a later object landing at
 /// the old address would match instead.
-pub fn ssc_socket_cache_update_after_gc<S: std::hash::BuildHasher>(
-    pointer_map: &std::collections::HashMap<usize, usize, S>,
+pub fn ssc_socket_cache_update_after_gc(
+    pointer_map: &cratonvm_types::PointerMap,
 ) {
     if pointer_map.is_empty() {
         return;
@@ -5846,8 +5846,8 @@ pub fn gc_scan_ss_back_ref_roots(roots: &mut Vec<ObjectRef>) {
 /// Relocate both receiver and channel references after moving GC. The
 /// identity-hash bucket remains stable while its ObjectRef discriminator must
 /// be updated to preserve collision-safe lookup.
-pub fn ss_back_ref_update_after_gc<S: std::hash::BuildHasher>(
-    pointer_map: &std::collections::HashMap<usize, usize, S>,
+pub fn ss_back_ref_update_after_gc(
+    pointer_map: &cratonvm_types::PointerMap,
 ) {
     if pointer_map.is_empty() {
         return;

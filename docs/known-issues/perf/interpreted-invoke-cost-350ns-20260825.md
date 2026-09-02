@@ -351,6 +351,68 @@ whose time actually sits in these operations — the Tomcat annotation scan the
 retired predecessor page was built around is the obvious candidate, and it was
 not run here.
 
+## Five suite vectors were already red on dev when this pass landed
+
+Recorded here, on the page whose branch was in flight at the time, so the next
+reader does not spend a session attributing them to it. **None of them is
+caused by the 2026-09-02 interpreter work**, and the control that proves it is
+a build, not an argument.
+
+| vector | signature |
+|---|---|
+| `RJitMultiArrayClass` | `s20-serial-roundtrip` COLD and HOT: `want=[[D] got=[threw-java.lang.ArrayIndexOutOfBoundsException]` |
+| `RMapGcStress` | `rc=1: no output` |
+| `RJdkIntrinsics3` | `NoSuchMethodError java/lang/StringBuilder.close()V`, then `ServiceConfigurationError: Locale provider adapter "CLDR" cannot be instantiated` |
+| `REncodingFidelity` | output differs from HotSpot |
+| `RBufferPoolCount` | `routeA.pools=[mapped, direct, mapped …]` |
+
+### The control
+
+`4be7404d6` is the dev tip immediately **before** the interpreter branch
+merged; `git merge-base --is-ancestor` confirms none of the branch's commits
+are in it. Built as `cratonvm-devctl-4be7404d6.exe` and run against the same
+compiled vectors: **all five fail, with identical signatures.**
+
+Three weaker checks agreed beforehand and are kept because each rules out a
+different thing:
+
+* All five still fail on the merged binary with **all five kill switches set**
+  — so no switched change causes them.
+* Three of the five (`RJitMultiArrayClass`, `RMapGcStress`, `RJdkIntrinsics3`)
+  **pass** on a binary carrying the branch's changes against the older dev,
+  including `push_args_to_locals`, the one change with **no** kill switch. That
+  is the only way to exonerate an unswitched change, and it is why the binary
+  was kept.
+* The symptoms sit in unrelated subsystems: a locale provider, a charset
+  fidelity diff, an NIO buffer-pool census. None of them touches interpreter
+  dispatch, frame locals or the invoke path.
+
+### What `RJitMultiArrayClass` actually is
+
+Worth writing down because it is the one with a clean handle on it.
+
+`--nojit` makes it **pass**, on pure dev and on the merged binary alike, so it
+is a JIT defect. It is also not a property of the serialization scenario: s20
+run **alone** passes, and 700 iterations of the same round-trip in isolation
+pass. Any *single* preceding scenario — 3000 iterations of multi-dimensional
+array work — is enough to make s20's very first (cold) call throw. So the
+trigger is compilation of the array shapes, not anything serialization does.
+
+`probes/` has no vector for this; the reproduction is the suite's own, with a
+scenario filter:
+
+```bash
+# fails
+cratonvm --java-home <JDK 25> -c regression-suite/build RJitMultiArrayClass
+# passes — same binary, same class
+cratonvm --java-home <JDK 25> --nojit -c regression-suite/build RJitMultiArrayClass
+```
+
+dev merged `perf/jit-six-findings-20260902` (a GP register file for the
+optimizing tier, and reference stores that stop paying a call) inside the same
+window. That is the obvious first place to look; it is a lead, not a finding —
+no bisect was run.
+
 ### What this pass did NOT find, so nobody re-derives it
 
 * **Fast-path arms for `tableswitch` / `lookupswitch` are not a lever.** Both do
@@ -582,6 +644,284 @@ between 1.4 and 178. The **same binary and configuration** measured 2237 and
   profiles on the retired page were read wrong this way. Calibrated:
   `InvokeAttributionProbe` puts 37 of 69 samples (53.6%) at `callee`
   `pc=0 last_pc=0` and **one** anywhere in `callee`'s body.
+
+## The 2026-09-02 second pass: seven findings, and the allocation shape that hid the biggest one
+
+The first pass above priced the interpreter operation by operation and removed
+five costs that were fixed per method and paid per operation. This pass read the
+code under the three worst rows of that table — instance field access at ~170x,
+the invoke at 19-40x, straight-line bytecode at 12.8x — and found seven more of
+the same shape. All seven are implemented on `perf/interp-seven-20260902`.
+
+Every number below is an **internal control**: one Azure host at load 13-18
+(`free -g` showed 5-13 GB free throughout), three arms in the same process
+family, interleaved in both directions across four passes. The three arms are:
+
+| arm | binary | switches |
+|---|---|---|
+| `base` | `origin/dev` at `209d3825a` | — |
+| `new` | this branch | none set |
+| `off` | this branch | `CRATONVM_JIT_NO_FIELD_FAST_PATH=1 CRATONVM_JIT_NO_OSR_INLINE_GATE=1 CRATONVM_JIT_NO_INVOKE_FAST_DOOR=1` |
+
+Both binaries were built with `CARGO_PROFILE_RELEASE_LTO=off
+CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16` — the fat-LTO `native-builtins` compile
+was OOM-killed twice on this host, once at load 74 and once at `-j 1`. Same
+settings for both arms, so the comparison holds; absolute figures are not
+comparable to a fat-LTO build.
+
+**`off` is not the same as `base`**, and the difference is the point: three of
+the seven items are pure deletions with no kill switch (items 4, 6, 7), so the
+`off` arm keeps them. `base → off` therefore measures those three, and
+`off → new` measures the three that are switched (items 1, 3, 5). Read the
+tables that way.
+
+### 1. Instance field access had no fast path — and the first version never fired
+
+`getfield` / `putfield` reached `op_getfield` / `op_putfield` on every
+execution. Per read that handler decoded the receiver into a 16-byte `Value`
+through a closure-carrying pop, forwarded it twice, probed the field-site cache
+and cloned the `ResolvedField`, read about ten diagnostic gates, hashed the
+method name for a JVMTI watchpoint that was not set (item 6), then went through
+`VmHeap::get_field` — two quiescence gates, a collector dispatch, a field-index
+check, a punned-store watch, a thread-local layout lookup and an
+`Arc<CompactLayout>` clone — and finally narrowed the result by descriptor,
+forwarded it and pushed a `Value`. Six address probes, two refcount round trips,
+one string hash and two representation conversions to load one word.
+
+The fix is the classic quickened field access: the slow handler, on the access
+that resolved the field, records the receiver's `(class id, num_slots)` shape
+and the field's byte offset in a new per-thread `SiteCache`
+(`JvmThread::fast_field_sites`, same key and epoch validation as `field_sites`),
+and the dispatch arm compares the next receiver's header against the site and
+loads or stores directly. `vm/src/runtime/interpreter/field_fast.rs` carries the
+contract; everything it cannot prove verbatim falls back to the full handler,
+which refills the site.
+
+**The first version of it measured `fast-field: get hit=0 miss=1801267` — it
+never fired once**, and the reason is worth recording because it is not
+discoverable from the class side. A ZGC object body is one of two shapes:
+
+* a **compact** body, fields packed at their natural widths at the offsets of
+  the class's registered `CompactLayout`, marked `GC_FLAG_COMPACT`;
+* a **legacy** body, one 16-byte tagged `Value` cell per field, no flag.
+
+`CRATONVM_DBG_LAYOUT=1` says the probe's classes *have* compact layouts
+(`FieldShape$Base cid=468 body=8 refs=0 fields=1`), which is what sent the first
+version down the compact path only. But layouts are consulted by
+`GarbageCollector::alloc_object`, and the interpreter does not allocate through
+it: `interpreter::alloc_object_shared` calls `VmHeap::try_alloc_object`, and
+`ZgcRealHeap::try_alloc_object` sizes the allocation `num_fields * SLOT_SIZE`
+and **never calls `set_compact_shape`**. So on this collector essentially every
+object the interpreter allocates is legacy, whatever its class's layout says.
+The arms now carry both shapes, chosen per site by the receiver's compact flag
+and re-checked on every access. (Whether `try_alloc_object` *should* build
+compact bodies is a separate question with a much wider blast radius; it is not
+touched here. The two halves are self-consistent today — a legacy body carries
+no flag, and every reader checks the flag before striding a body.)
+
+Engagement after the fix, `probes/FieldShape.java`, 200k x 2:
+
+```
+fast-field: get hit=800869 miss=39 fill=57 put hit=800993 miss=119 fill=107 unusable=0
+```
+
+`probes/FieldShape.java` at 300k x 5, ns per read+write pair over its own
+no-field control, four interleaved passes:
+
+| arm | own field | inherited field | static field (control) |
+|---|---|---|---|
+| base | 311 / 307 / 281 / 273 | 316 / 310 / 278 / 266 | 138 / 146 / 121 / 125 |
+| **new** | **68 / 68 / 65 / 64** | **58 / 78 / 63 / 64** | 94 / 116 / 107 / 109 |
+| off | 272 / 280 / 297 / 298 | 274 / 268 / 286 / 272 | 120 / 109 / 125 / 110 |
+
+4/4 with no overlap: `new`'s worst pair (68) is a quarter of `off`'s best (272).
+**`getstatic` / `putstatic` are untouched by this change and are the internal
+control** — they move within noise across all three arms while the instance
+arms move 4.3x. The `off` arm sitting with `base` is what says the kill switch
+restores the old path.
+
+The same file gives primitive `*aload` / `*astore` an inline arm (header kind,
+element type and length checked directly, element read or written at its
+address). Reference arrays keep the barrier-aware path.
+
+### 2. Frame construction copied every argument twice and zero-filled the stack
+
+Arguments went `CompactValue → Value → CompactValue` through a 256-byte
+`[Value; 16]` on every invoke, and `ValueStack::from_pooled` cleared and
+zero-filled `max_stack + 24` words of a pooled buffer whose contents no reader
+looks at above `len` (the GC scans, the pointer rewrite and freeze/thaw all stop
+at `len`, and a slot below `len` is written by a push first).
+
+`Frame::new_pooled_cached_compact` now takes `(slot, descriptor tag)` pairs read
+straight off the caller's operand stack and writes each once, with the same
+category-2 filler `copy_args_to_locals` wrote, so the locals are bit-identical
+to the general path's. `from_pooled` hands a long-enough buffer over as it is
+and grows (zero-filling the tail) only a short one. Measured as part of item 3,
+which is the only caller of the compact constructor.
+
+### 3. Per-call constants were recomputed in the virtual dispatcher
+
+Every warm `invokevirtual` / `invokeinterface` hit cloned the cache entry (two
+`Arc` increments and two decrements, because `RedefineGate` carries its own
+`Arc<AtomicU32>`), decoded every argument to run an interception chain whose
+every question is a constant of the callee, took a class-manager read lock and
+did a string prefix compare to ask whether the receiver is a `java.util` class,
+and paid a sharded read lock plus a hash lookup for the invocation counter.
+
+`execute_invokevirtual_fast_door` now handles the monomorphic bytecode hit with
+a borrowed entry, a header compare on the receiver, the callee's memoized
+intercept shape (the three name-matched intercepts set a fourth bit in it), the
+`NativeCallSite` memo for "has a registered native", a lock-free per-class-id
+bitmap (`class_is_java_util`, set at definition) for the `java.util` question,
+and an invocation counter on the `CachedBytecodeMethod` itself
+(`interp_invocations`, one relaxed `fetch_add`) credited to the profile store
+sixteen calls at a time, so the census and `hot_but_stuck_in_interpreter` still
+see every call. A trivial instance getter answers from the quickened field site
+of its own class without a frame. Anything the door cannot prove returns `None`
+with the operand stack untouched and `execute_invokevirtual_cached` runs exactly
+as before.
+
+`probes/Dispatch.java` at 200k x 5, ns/iteration, four interleaved passes:
+
+| arm | base | new | off |
+|---|---|---|---|
+| `nocall` (control) | 65 62 61 64 | 50 52 51 51 | 52 51 48 51 |
+| `static0` (control) | 265 266 256 257 | 228 245 234 258 | 261 233 237 239 |
+| `special1` (control) | 487 475 444 446 | 419 425 414 492 | 457 430 397 406 |
+| **`virtual1`** | 472 493 470 478 | **246 236 240 258** | 469 431 456 466 |
+| **`ifaceInherited`** | 537 571 495 498 | **262 249 249 276** | 506 473 432 455 |
+| `iface1` | 517 543 489 452 | 280 244 259 **420** | 493 461 448 468 |
+
+`virtual1` and `ifaceInherited`: 4/4, no overlap, **~215 ns and ~200 ns off a
+call**. `iface1` is 3/4 clean with one 420 outlier that still sits below the
+`off` arm's best (448) — recorded, not smoothed.
+
+**`invokestatic` and `invokespecial` are not wired to the door and are the
+internal controls**: `static0` and `special1` overlap across all three arms.
+`probes/Arity.java` reproduces it independently — `virtual1` base 465/485/474,
+off 443/491/467, new 246/249/269 — while its `static0..static6` ladder shows no
+door effect at all.
+
+### 4. The loop top ran nine branches before reading the opcode
+
+Two of them are gone. The two pending-signal slots (`pending_java_exception`,
+`pending_runtime_error`) were two `Option` discriminant loads and two branches
+per bytecode; they are now one `if a.is_some() | b.is_some()` — a single test of
+the OR — with the runtime arm moved above the safepoint poll, which is what the
+Java arm already did and which strictly improves its GC-pin argument (the
+throwable `throw_runtime_error` allocates is stored into a handler frame before
+any safepoint can observe it).
+
+And the stack-dump hook, an atomic load per bytecode, is now skipped wholesale
+on a hoisted bool. Nothing can set `stack_dump_requested` unless a watchdog or
+sampler was armed, and both are armed before Java starts running, so a run with
+neither — every run that is not being debugged — pays nothing.
+`SharedVm::arm_stack_dump_watch` is a one-way latch set at **spawn** time rather
+than fire time, because the thread a watchdog exists to photograph is by
+definition one that has been inside a single `execute_frame` for a long while
+and would never re-read a per-frame gate.
+
+### 5. Every backward branch made an out-of-line call — and this one did not separate
+
+`try_osr_with_backoff` read three gates and linearly scanned
+`osr_attempt_counts` on every back edge before deciding to do nothing. It cannot
+do anything until `Frame::backward_count` reaches the smallest threshold
+`should_try_osr` accepts, so the four back-edge sites now compare against that
+floor inline (hoisted per `execute_frame`; `u32::MAX` on a virtual thread or
+with OSR off, `0` while the arrival trace is armed so it keeps its rate) and
+call out only past it.
+
+**It did not separate.** `probes/BackEdge.java` at 3M x 7, derived per-back-edge
+cost in ns: new 14.0 / 11.1 / 11.1 / 12.1, off 17.6 / 14.2 / 9.0 / 15.9, base
+13.2 / 14.2 / 14.6 / 10.8 — three overlapping distributions. That metric is a
+small difference between two large arms, and after the first pass's back-edge
+poll gate the remaining call was already cheap. It is kept as a deletion with a
+kill switch, not recorded as a win.
+
+### 6 and 7. Fixed costs and diagnostic density, measured together
+
+* The four field opcodes hashed the method name (`synth_method_id`, an FNV over
+  the bytes) *before* testing whether any JVMTI field watchpoint exists. The
+  hash is now inside the gate.
+* `check_vacated_compact` on every operand-stack push, and `load_and_forward` /
+  `get_field` on every heap access, read `vacated_frames_enabled` through a
+  `OnceLock`; it is a relaxed byte load now, as is `invoke_phases::on`, which
+  the value-return arm reads five times per return.
+* The five consolidated diagnostic blocks of `op_getfield` / `op_putfield` —
+  the stray-stack probe, the `any_field_diag` union, the field watch, ~370 lines
+  with their own closures and backtraces — moved verbatim into
+  `#[cold] #[inline(never)]` helpers. The handler keeps one gate load per block
+  and none of the code.
+
+These three have no kill switch (they are deletions), so they are what
+`base → off` isolates, on the two arms that are pure straight-line bytecode:
+
+| probe / arm | base | off | new |
+|---|---|---|---|
+| `Dispatch` `nocall` ns/iter | 65 62 61 64 | 52 51 48 51 | 50 52 51 51 |
+| `Arity` `nocall` ns/iter | 57 66 60 | 51 47 51 53 | 50 50 50 51 |
+| `BackEdge` `tight` ns/element | 61.3 63.0 64.6 60.4 | 53.4 50.6 50.9 54.3 | 52.0 48.1 51.0 50.6 |
+
+4/4 with no overlap on all three (`base`'s best is worse than `off`'s worst in
+every row): **~15-18% off straight-line interpreted bytecode**, from removing
+one atomic load and one branch per dispatch and shrinking the two field
+handlers. `new` and `off` agree, which is the expected shape — the switched
+items do not touch these arms.
+
+### What did NOT separate, so nobody re-derives it
+
+* **The OSR inline gate** (item 5), above.
+* **The per-extra-argument slope.** `probes/Arity.java`: base 29.9/29.0/30.2,
+  new 27.7/21.9/29.6/27.7, off 24.6/30.1/22.0/21.6. The compact argument
+  transfer serves the virtual door, and this probe's slope is computed from the
+  `invokestatic` ladder, which the door does not handle. The first pass recorded
+  the same non-separation for the same reason.
+* **`invokestatic` and `invokespecial`** are untouched. `static0` at ~250 ns and
+  `special1` at ~430 ns are now the two worst interpreted call shapes by a wide
+  margin, and they are the obvious next target: `0xb8` has a cached dispatcher
+  of its own (`execute_invokestatic_cached`) that pays the same per-call
+  constants the virtual door now memoizes.
+
+### Still open
+
+* **The frame arena.** Item 2 removed the argument round trip and the stack
+  memset; the frame still owns four heap buffers and is moved by value on push.
+  A single per-thread value arena in which the callee's locals overlap the
+  caller's outgoing arguments is the structural change that removes the rest of
+  the frame-lifecycle share, and it touches every reader of `Frame::locals` and
+  `ValueStack` — the GC scans, freeze/thaw, deopt.
+* **Polymorphic sites** thrash the fast field site and the invoke door alike;
+  both fall back on every receiver change, which is the pre-existing shape of
+  the monomorphic inline cache.
+* **`ZgcRealHeap::try_alloc_object` builds legacy bodies** while the class
+  system builds compact layouts for the same classes. Making the TLAB path
+  compact-aware would halve object footprint and let the packed-width field arm
+  serve everything, but it changes the layout of every ZGC-allocated object.
+
+### The probes
+
+`probes/FieldShape.java`, `probes/Dispatch.java`, `probes/Arity.java`,
+`probes/BackEdge.java`. All self-time, interleave their arms in both directions
+on alternating rounds, and report min-of-N; each carries a control arm in the
+same process.
+
+```bash
+javac -d /tmp/probe probes/FieldShape.java probes/Dispatch.java \
+    probes/Arity.java probes/BackEdge.java
+
+for arm in base new off; do
+  case $arm in
+    base) BIN=<dev binary>; ENV= ;;
+    new)  BIN=<branch binary>; ENV= ;;
+    off)  BIN=<branch binary>; ENV="CRATONVM_JIT_NO_FIELD_FAST_PATH=1 \
+          CRATONVM_JIT_NO_OSR_INLINE_GATE=1 CRATONVM_JIT_NO_INVOKE_FAST_DOOR=1" ;;
+  esac
+  env $ENV $BIN --java-home <JDK 25> --nojit -c /tmp/probe FieldShape 300000 5
+done
+```
+
+`CRATONVM_DBG_FIELD_SITE=1` adds the `fast-field:` census and names the first
+few reasons a site could not be quickened.
 
 ## Exit criteria
 
