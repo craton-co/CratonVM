@@ -19,9 +19,17 @@
 //!    flips a `bool` — **no socket, named pipe, or `.attach_pid<N>` file is
 //!    ever created**. `jcmd <pid> ...` / `jstack <pid>` / `jmap <pid>` from
 //!    another process therefore cannot connect to a CratonVM at all.
-//!  * [`JcmdProcessor`] is constructed only in `#[cfg(test)]` code
-//!    (`vm/src/vm/vm_init.rs`, past the `#[cfg(test)]` at line ~5734, and
-//!    this file's own tests). Nothing in the VM bootstrap builds one.
+//!  * ~~[`JcmdProcessor`] is constructed only in `#[cfg(test)]` code.~~
+//!    **STALE, and by same-day work: `obsaudit D15` (2026-07-26) wired it
+//!    up. `Vm::new` builds one via `new_with_vm_state` (vm_init.rs), and
+//!    `AttachListener::start_listening` really does `bind` a Unix socket at
+//!    `/tmp/.java_pid<pid>` (0600) and spawn a polling accept thread, so the
+//!    first bullet above is stale too: the attach surface IS reachable.
+//!    What remains true is narrower and is why two wrappers here are
+//!    `#[cfg(test)]`: the live path is `handle_attach_connection`, which
+//!    duplicates the command lookup rather than calling `process_command`
+//!    or `dispatch_command`. Corrected 2026-09-02 while closing the
+//!    test-only-public-api gate.**
 //!  * [`hsdb_start_listener`] / [`HsdbListener`] have no callers outside this
 //!    file's tests.
 //!
@@ -291,6 +299,10 @@ impl AttachListener {
 
     /// Look up `name` and execute it with `args` under a single read-lock
     /// acquisition. Returns `None` for an unregistered command name.
+    // Test-only for the same reason: `handle_attach_connection` duplicates
+    // this lookup instead of calling it, so gating `process_command` leaves
+    // this one with #[test] callers only.
+    #[cfg(test)]
     pub fn dispatch_command(&self, name: &str, args: &[String]) -> Option<CommandResult> {
         self.commands
             .read()
@@ -1176,6 +1188,10 @@ impl JcmdProcessor {
     }
 
     /// Process a jcmd command line (e.g. "Thread.print" or "GC.heap_dump /tmp/dump.hprof").
+    // Test-only. The LIVE attach path is `handle_attach_connection`, which
+    // does its own `.find(|c| c.name == name).map(|c| c.execute(..))` rather
+    // than calling this; every caller here and in `vm_init.rs` is a #[test].
+    #[cfg(test)]
     pub fn process_command(&self, command_line: &str) -> CommandResult {
         let parts: Vec<&str> = command_line.trim().splitn(2, ' ').collect();
         let cmd_name = parts[0];

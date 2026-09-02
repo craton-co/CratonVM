@@ -7580,6 +7580,10 @@ impl SharedVm {
 
     /// Drain the cleaner queue and return the addresses of cleaner actions
     /// to execute.  The caller is responsible for actually running them.
+    // Test-only: the sole caller is `m19_cleaner_actions_drained`. The
+    // scanner could not see that until the region splitter stopped counting
+    // braces inside string literals (2026-09-02).
+    #[cfg(test)]
     pub fn drain_cleaners(&self) -> Vec<usize> {
         self.mem.cleaner_thread.drain_actions()
     }

@@ -2117,6 +2117,9 @@ pub fn validate_native_coverage(shared: &SharedVm) -> NativeCoverageReport {
 }
 
 /// Scan a single class for its ACC_NATIVE methods.
+// Test-only: every caller is a #[test] in `vm_init.rs`. Revealed when the
+// region splitter stopped closing a test region early on a string brace.
+#[cfg(test)]
 pub fn scan_class_natives(shared: &SharedVm, class_name: &str) -> Vec<NativeMethodInfo> {
     let cm = shared.classes.class_manager.read();
     let class_id = match cm.get_loaded_class_id(class_name) {
