@@ -1552,8 +1552,6 @@ pub const INVENTORY: &[E] = &[
     // `nonvirtual-fast-door` — off routes every monomorphic `invokestatic`
     // and `invokespecial` cache hit through the general dispatcher.
     E { group: Group::JIT, token: "nonvirtual-fast-door", on_key: None, off_key: Some("CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR"), off_word: None, since: "2026-09-02" },
-    // `frame-fill-fast` — off restores the three-pass locals build.
-    E { group: Group::JIT, token: "frame-fill-fast", on_key: None, off_key: Some("CRATONVM_JIT_NO_FRAME_FILL_FAST"), off_word: None, since: "2026-09-02" },
     // `iface-select-memo` — off makes every `invokeinterface` cache hit
     // retake the class-manager read lock and rewalk the receiver hierarchy
     // to re-verify maximally-specific selection.
