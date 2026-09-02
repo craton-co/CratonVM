@@ -176,7 +176,7 @@ public class RJitVarHandleRefRead {
         // vector red for a reason it does not test.
         //
         // Filed as
-        // known-issues/jdk-only/varhandle-null-coordinate-answers-instead-of-throwing-20260901.md.
+        // fixed-bugs/varhandle-null-coordinate-answers-instead-of-throwing-FIXED-20260902.md.
 
         // The count line carries the COUNT and nothing else: harness guard G6
         // reads it with `harness_check_count`, and a second `key=value` on it

@@ -560,6 +560,31 @@ new finding.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** The banner says "Nothing here was
+> built or run". §5's ratchet has now been run, on a build from this tree, by
+> name:
+>
+> ```text
+> cargo test -p cratonvm-native-api --test layout_alias_coverage \
+>     the_unresolved_class_fallback_population_only_shrinks
+> 1 passed, 0 failed, 12 filtered out
+> ```
+>
+> Run by NAME, not by file: a file that passes says nothing about whether the
+> test a record cites still exists under that name. The whole file is green as
+> well (13 passed).
+>
+> **The 28 still holds.** `const BOUND: usize = 28` at
+> `native-api/tests/layout_alias_coverage.rs:953`, and both the doc comment and
+> the failure message still read "12 of today's 28" / "12 of the 28". So the
+> ratchet this record left at 28 has neither shrunk nor been relaxed in the three
+> weeks since — which is the one thing a population-only-shrinks ratchet cannot
+> tell you by passing, and the reason to read the constant rather than the result
+> line.
+>
+> Unchanged: the twelve latent rows are still classified rather than repaired,
+> and this note does not touch that.
+
 ## 5. The ratchet
 
 `native-api/tests/layout_alias_coverage.rs::the_unresolved_class_fallback_population_only_shrinks`,

@@ -260,6 +260,12 @@ fn maybe_dump_shutdown_reports() {
             eprintln!(
                 "[cratonvm] compiled reference stores: gated={gated} declined={declined}"
             );
+            // Optimizing-tier allocation. A zero on the left is the EXPECTED
+            // reading under a default configuration -- `c2_alloc_upgrade` is
+            // opt-in, so no method containing a `new` reaches that tier -- and
+            // printing both is what separates that from "emitted and refused".
+            let (bump, stub) = cratonvm_jit::runtime_lowering::ir_alloc_site_counts();
+            eprintln!("[cratonvm] optimizing-tier allocations: inline-bump={bump} stub-only={stub}");
         }
         // Reference loads whose slot did NOT hold a reference, contained by
         // `GETFIELD_EXPECT_REFERENCE` instead of being handed to compiled code
@@ -5774,9 +5780,13 @@ fn run() -> Result<()> {
             let resig = cratonvm_vm::jit::xt_root_scan::XT_PEER_RESIGNALS.load(O::Relaxed);
             let saved =
                 cratonvm_vm::jit::xt_root_scan::XT_PEERS_CLASSIFIED_AFTER_RETRY.load(O::Relaxed);
+            let hw_pin =
+                cratonvm_vm::jit::xt_root_scan::XT_HELPER_WINDOWS_PINNED.load(O::Relaxed);
+            let hw_ref =
+                cratonvm_vm::jit::xt_root_scan::XT_HELPER_WINDOWS_REFUSED.load(O::Relaxed);
             eprintln!(
                 "[GC] xt_peer_scan: unclassified_peers={peers} cycles_with_unclassified={cycles} \
-                 taken_over={taken} xt_roots={roots} helper_windows={hw} \
+                 taken_over={taken} xt_roots={roots} helper_windows={hw} hw_pinned={hw_pin} hw_refused={hw_ref} \
                  resignals={resig} classified_after_retry={saved} enabled={}",
                 cratonvm_vm::jit::xt_root_scan::enabled(),
             );
