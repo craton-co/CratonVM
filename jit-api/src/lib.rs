@@ -1711,6 +1711,30 @@ pub struct JitRuntimeHelpers {
     /// emitted. Appended at the END of the struct so all prior golden offsets
     /// stay stable.
     pub g1_post_write_barrier: usize,
+    /// The post-barrier SKIP MASK, as a VALUE — not an address like the three
+    /// gate slots above it.
+    ///
+    /// A receiver none of whose `GC_FLAGS_BYTE_OFFSET` bits fall in this mask
+    /// provably needs no post barrier, so compiled code can skip the call with
+    /// a single `test r8, imm8`. `0` means the publisher uses
+    /// `ref_store_post_young_floor` instead, or that nothing is published.
+    ///
+    /// **This is what let the GENERATIONAL collector publish a plan at all.**
+    /// The floor is an unsigned compare on `(gc_age << 4) | gc_flags` and so
+    /// can only say "young enough"; that collector's post barrier asks whether
+    /// the receiver is in the OLD GENERATION, which is a flag bit
+    /// (`GC_FLAG_OLD_GEN`). The two do not order — an object allocated straight
+    /// into old gen has `gc_age == 0` and therefore a flags byte BELOW the
+    /// age-zero floor — so a threshold would have told compiled code to skip
+    /// the card on exactly the receivers that need one.
+    ///
+    /// A value rather than an address because which collector is running does
+    /// not change after start-up, so the emitter bakes it as an immediate. The
+    /// gate bytes stay addresses because they do change while the process runs.
+    ///
+    /// `0` = not wired (hand-built test tables). Appended at the END of the
+    /// struct so all prior golden offsets stay stable.
+    pub ref_store_post_skip_mask: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -1914,6 +1938,9 @@ helper_fields! {
     // immediate by the inline G1 post-write barrier. 0 = not wired.
     (g1_barrier_addr,                FieldKind::Offset),
     (g1_post_write_barrier,          FieldKind::OptionalPtr),
+    // A VALUE (a flags mask), not a pointer: `Constant` in the ABI table and
+    // deliberately not range-checked as an address here.
+    (ref_store_post_skip_mask,       FieldKind::Offset),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -1939,7 +1966,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 74,
+    JitRuntimeHelpers::NUM_FIELDS == 75,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -2345,6 +2372,7 @@ mod tests {
             ref_store_post_young_floor: 0x1200,
             g1_barrier_addr: 0x1208,
             g1_post_write_barrier: 0x1210,
+            ref_store_post_skip_mask: 0x1,
         }
     }
 
@@ -2591,6 +2619,7 @@ mod tests {
             ref_store_post_young_floor: 0,
             g1_barrier_addr: 0,
             g1_post_write_barrier: 0,
+            ref_store_post_skip_mask: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -2767,10 +2796,11 @@ mod tests {
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
         // And the macro-driven count is the canonical one for this ABI
-        // revision -- 74 as of v11. v10 appended dev's three reference-store
+        // revision -- 75 as of v12. v10 appended dev's three reference-store
         // barrier gates; F-08 appended the two G1 inline-barrier words after
-        // them, so both sets of golden offsets below stay where they were.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 74);
+        // them; v12 appended the generational collector's post-barrier skip
+        // mask, so every earlier golden offset below stays where it was.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 75);
     }
 
     #[test]
@@ -3138,6 +3168,11 @@ mod tests {
                 "g1_post_write_barrier",
                 std::mem::offset_of!(JitRuntimeHelpers, g1_post_write_barrier),
             ),
+            (
+                74,
+                "ref_store_post_skip_mask",
+                std::mem::offset_of!(JitRuntimeHelpers, ref_store_post_skip_mask),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -3193,7 +3228,9 @@ mod tests {
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 43, "required-pointer count drifted");
         assert_eq!(opt, 17, "optional-pointer count drifted");
-        assert_eq!(off, 14, "offset-field count drifted");
+        // v12's `ref_store_post_skip_mask` is an Offset (a baked VALUE), which
+        // is why this moves and the two pointer counts do not.
+        assert_eq!(off, 15, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }
 

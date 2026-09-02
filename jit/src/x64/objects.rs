@@ -36,6 +36,42 @@ pub(crate) fn note_ungated_ref_store() {
     UNGATED_REF_STORE_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `(pre, post, young_floor)` when a collector has published a usable
+/// reference-store barrier plan.
+///
+/// Both gate bytes, plus EXACTLY ONE of the two post-barrier shapes. A
+/// publisher that supplied neither has no way to rule the post barrier out; one
+/// that supplied both would emit two independent skips for one question — and
+/// for a mask publisher the floor is not merely redundant but WRONG (an old-gen
+/// object with `gc_age == 0` sits below it), which is the whole reason the mask
+/// shape exists.
+///
+/// A free function so the rule can be tested against a helper table alone,
+/// without standing up a `Compiler`.
+pub(crate) fn ref_store_gates_of(
+    helpers: &cratonvm_jit_api::JitRuntimeHelpers,
+) -> Option<(usize, usize, usize)> {
+    let pre = helpers.ref_store_pre_gate;
+    let post = helpers.ref_store_post_gate;
+    let floor = helpers.ref_store_post_young_floor;
+    let mask = helpers.ref_store_post_skip_mask;
+    let one_post_shape = (floor != 0) ^ (mask != 0);
+    (pre != 0 && post != 0 && one_post_shape).then_some((pre, post, floor))
+}
+
+/// The published post-barrier skip mask, when the plan uses that shape.
+///
+/// A VALUE, baked as an immediate: which collector is running cannot change
+/// after start-up. See `JitRuntimeHelpers::ref_store_post_skip_mask`.
+pub(crate) fn ref_store_post_skip_mask_of(
+    helpers: &cratonvm_jit_api::JitRuntimeHelpers,
+) -> Option<u8> {
+    let mask = helpers.ref_store_post_skip_mask;
+    // A mask wider than the flags byte would be a publisher bug, and baking it
+    // would test bits that byte does not have.
+    (mask != 0 && mask <= u8::MAX as usize).then_some(mask as u8)
+}
+
 /// `(gated, declined)` reference-store site counts.
 pub fn ref_store_site_counts() -> (u64, u64) {
     (
@@ -1563,10 +1599,12 @@ impl Compiler {
     /// nobody maintains, so the tuple is destructured as a unit and a single
     /// zero declines the whole fast path.
     pub(super) fn ref_store_gates(&self) -> Option<(usize, usize, usize)> {
-        let pre = self.helpers.ref_store_pre_gate;
-        let post = self.helpers.ref_store_post_gate;
-        let floor = self.helpers.ref_store_post_young_floor;
-        (pre != 0 && post != 0 && floor != 0).then_some((pre, post, floor))
+        ref_store_gates_of(&self.helpers)
+    }
+
+    /// The published post-barrier skip mask, when the plan uses that shape.
+    pub(super) fn ref_store_post_skip_mask(&self) -> Option<u8> {
+        ref_store_post_skip_mask_of(&self.helpers)
     }
 
     /// Emit a compact reference `putfield` whose barriers are **gated inline**
@@ -1674,14 +1712,29 @@ impl Compiler {
         self.emit_mov_mem_disp32_r64(RAX, RDX, cell_off);
 
         // ── post-barrier gates ──────────────────────────────────────────
-        // CL still holds the receiver's flags byte. `age << 4 | flags` compared
-        // unsigned against `promotion_floor << 4` is an EXACT test of
-        // `gc_age < promotion_floor`, because the flags nibble is at most 15
-        // and cannot carry `a << 4` up to `(a + 1) << 4`.
+        // CL still holds the receiver's flags byte, which carries `gc_age` in
+        // bits 4..7 and the GC flags in bits 0..3. Two shapes can rule the post
+        // barrier out, and a publisher supplies exactly one of them
+        // (`ref_store_gates` enforces that).
         let mut done: Vec<usize> = Vec::new();
-        self.emit_mov_imm64_full(R11, floor as i64);
-        self.emit_cmp_r8_mem8(RCX, R11, 0);
-        done.push(self.emit_jcc_rel32_patch(0x82)); // JB → young receiver, no card
+        if let Some(mask) = self.ref_store_post_skip_mask() {
+            // MASK — "the receiver carries none of the bits that could make a
+            // post barrier necessary". The generational collector's shape:
+            // `GC_FLAG_OLD_GEN` clear means the receiver is young, and a young
+            // receiver needs no card. One `test r8, imm8` with no memory
+            // operand, because the mask is a property of which collector is
+            // running and that cannot change after start-up.
+            self.emit_test_r8_imm8(RCX, mask);
+            done.push(self.emit_jcc_rel32_patch(0x84)); // JZ → young receiver, no card
+        } else {
+            // FLOOR — `age << 4 | flags` compared unsigned against
+            // `promotion_floor << 4` is an EXACT test of
+            // `gc_age < promotion_floor`, because the flags nibble is at most
+            // 15 and cannot carry `a << 4` up to `(a + 1) << 4`.
+            self.emit_mov_imm64_full(R11, floor as i64);
+            self.emit_cmp_r8_mem8(RCX, R11, 0);
+            done.push(self.emit_jcc_rel32_patch(0x82)); // JB → young receiver, no card
+        }
 
         self.emit_mov_imm64_full(R11, post as i64);
         self.emit_cmp_mem8_imm8(R11, 0, 0);

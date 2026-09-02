@@ -875,7 +875,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-113 tokens.
+114 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -955,6 +955,7 @@ export inherited from a parent shell.
 | `par-evac` | `CRATONVM_GC_PAR_EVAC` |
 | `par-threads` | `CRATONVM_GC_PAR_THREADS` |
 | `sync-young-wipe` | `CRATONVM_GC_SYNC_YOUNG_WIPE` |
+| `jit-ref-store-gates` | `CRATONVM_GC_JIT_REF_STORE_GATES` |
 | `promotion-guard` | `CRATONVM_NO_GC_PROMOTION_GUARD` |
 | `promotion-oom-guard-broad` | `CRATONVM_PROMOTION_OOM_GUARD_BROAD` |
 | `selective-promote` | `CRATONVM_NO_SELECTIVE_PROMOTE` |
@@ -1120,7 +1121,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-22 tokens.
+23 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1146,6 +1147,7 @@ export inherited from a parent shell.
 | `tomcat-mapper-natives` | `CRATONVM_TOMCAT_MAPPER_NATIVES` |
 | `vh-strict-reference-return` | `CRATONVM_VH_STRICT_REFERENCE_RETURN` |
 | `vh-null-coordinate-npe` | `CRATONVM_VH_NULL_COORDINATE_NPE` |
+| `vh-unsupported-mode-uoe` | `CRATONVM_VH_UNSUPPORTED_MODE_UOE` |
 
 ## `CRATONVM_TEST`
 

@@ -2602,6 +2602,17 @@ fn sync_young_wipe_enabled() -> bool {
     gc_flags().gc_sync_young_wipe
 }
 
+/// `CRATONVM_GC_JIT_REF_STORE_GATES` — publish the compiled-reference-store
+/// barrier plan from the generational collector. Default **ON**; `=0` withholds
+/// the plan, so every compiled reference store takes the full
+/// `jit_putfield_object` path exactly as it did before 2026-09-02.
+///
+/// The A/B lever for this change, and the first thing to set if a compiled
+/// store is ever suspected of missing a card or an SATB entry.
+fn jit_ref_store_gates_enabled() -> bool {
+    gc_flags().gc_jit_ref_store_gates
+}
+
 /// Fold one parallel-evacuation shard's tally into the driver's.
 ///
 /// `shard` is `COPY_TALLY`'s own layout — `copy_tally_add`'s four counters
@@ -2747,6 +2758,28 @@ impl GenerationalHeap {
         // `is_object_address` containment check is correct from the first
         // allocation (before any GC has run to refresh them).
         heap.refresh_region_bounds();
+        // Let compiled reference stores gate their barriers inline.
+        //
+        // Until 2026-09-02 only ZGC published a plan, so under
+        // `-XX:+UseGenerationalGC` every compiled reference store paid a full
+        // `jit_putfield_object` call — measured as `gated=0 declined=2` against
+        // ZGC's `gated=2 declined=0` on the same workload and the same sites.
+        // The blocker was the gate SHAPE, not the collector: see
+        // `JitRefStoreGates::post_skip_mask`.
+        //
+        // `GC_FLAG_OLD_GEN` is exactly this collector's post-barrier question —
+        // `write_barrier` cards a store only when the receiver lies in the
+        // old-generation arena, and that arena's objects are the ones carrying
+        // the flag. A receiver without it is young, and a young receiver needs
+        // no card.
+        if jit_ref_store_gates_enabled() {
+            publish_jit_ref_store_plan_masked(GC_FLAG_OLD_GEN);
+            // "There may be old objects" is left permanently armed: the mask
+            // above already skips the young receivers, which is the case that
+            // matters, and an accurate `post_active` would need a hook on every
+            // path that creates an old object for a win it has already taken.
+            set_jit_ref_store_post_active(true);
+        }
         heap
     }
 
@@ -24236,6 +24269,27 @@ mod tests {
         );
     }
 
+    /// Constructing a generational heap publishes the compiled-reference-store
+    /// barrier plan, in the MASK shape — the whole point of the mask, since the
+    /// age floor cannot express "is the receiver in the old generation".
+    #[test]
+    fn constructing_the_heap_publishes_a_masked_ref_store_plan() {
+        let _heap = GenerationalHeap::with_sizes(64 * 1024, 64 * 1024);
+        let (pre, post, floor) = jit_ref_store_gate_addrs();
+        assert_ne!(pre, 0, "the pre gate must be published");
+        assert_ne!(post, 0, "the post gate must be published");
+        assert_eq!(
+            floor, 0,
+            "a mask publisher must NOT hand over the floor ADDRESS — the emitter
+             reads that as a second, contradictory post-barrier shape and declines",
+        );
+        assert_eq!(
+            jit_ref_store_post_skip_mask(),
+            GC_FLAG_OLD_GEN,
+            "the mask is this collector's post-barrier question",
+        );
+    }
+
     /// gen-gc-five: the semi-space a moving cycle evacuated is zeroed by the
     /// helper thread, and reads as zero once that thread is joined.
     #[test]
@@ -25852,6 +25906,24 @@ pub struct JitRefStoreGates {
     /// a value of `age << 4` is an exact unsigned test of `gc_age < age`: the
     /// flags nibble is at most 15 and cannot carry `a << 4` up to `(a+1) << 4`.
     pub young_floor: AtomicU8,
+    /// A receiver none of whose `GC_FLAGS_BYTE_OFFSET` bits fall in this mask
+    /// provably needs no post barrier. `0` disables the test.
+    ///
+    /// **The alternative to [`Self::young_floor`], not a refinement of it**, and
+    /// the reason the generational collector could not use the floor at all.
+    /// The floor is an unsigned `<` on `(gc_age << 4) | gc_flags`, so it can
+    /// only express "young enough". Generational's post barrier asks a
+    /// different question — *is the receiver in the old generation* — which it
+    /// answers with `GC_FLAG_OLD_GEN`, a bit in the flags nibble. Those do not
+    /// order: an object allocated directly in old gen has `gc_age == 0` and so
+    /// a flags byte of `0x01`, BELOW the age-zero floor `0x10`, while a young
+    /// object that has survived three collections is `0x30`, above it. A single
+    /// threshold would therefore have told compiled code to skip the card on
+    /// exactly the receivers that need one.
+    ///
+    /// Same conservative direction as every other gate: a set bit means "there
+    /// may be work" (call the collector's own barrier), never "no work".
+    pub post_skip_mask: AtomicU8,
     /// Whether a plan is published at all. Separate from the three gates so
     /// "published, and all three currently say no work" is distinguishable
     /// from "nobody published", which is the difference between an emitted
@@ -25863,8 +25935,69 @@ pub static JIT_REF_STORE_GATES: JitRefStoreGates = JitRefStoreGates {
     pre_active: AtomicU8::new(0),
     post_active: AtomicU8::new(0),
     young_floor: AtomicU8::new(0),
+    post_skip_mask: AtomicU8::new(0),
     published: AtomicU8::new(0),
 };
+
+/// Markers currently in a phase whose SATB pre-barrier must run, across every
+/// heap in the process, plus ZGC's own boolean.
+///
+/// [`set_jit_ref_store_pre_active`] is a plain boolean and has exactly one
+/// writer today (ZGC). `ConcurrentGcState` does not: it is shared by the
+/// generational collector AND G1, and a process can hold several heaps at once
+/// (the unit-test binaries routinely do). A second boolean writer would let one
+/// heap leaving its mark phase CLEAR the gate while another is still marking —
+/// compiled code would then skip an SATB pre-barrier that is live, which loses
+/// the overwritten reference from the snapshot. Counting markers instead makes
+/// the gate "armed while ANY marker is armed", which is the only direction that
+/// is safe to be wrong in.
+static JIT_REF_STORE_PRE_MARKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// ZGC's boolean half of the same gate. See [`JIT_REF_STORE_PRE_MARKERS`].
+static JIT_REF_STORE_PRE_ZGC: AtomicU8 = AtomicU8::new(0);
+
+/// Recompute the published `pre_active` byte from both sources.
+///
+/// Re-reads both, so the last writer publishes the true disjunction; a racing
+/// pair can only leave the gate armed for longer than needed, never shorter.
+fn refresh_jit_ref_store_pre_active() {
+    let armed = JIT_REF_STORE_PRE_MARKERS.load(Ordering::Acquire) > 0
+        || JIT_REF_STORE_PRE_ZGC.load(Ordering::Acquire) != 0;
+    JIT_REF_STORE_GATES
+        .pre_active
+        .store(u8::from(armed), Ordering::Release);
+}
+
+/// A marker is entering a phase whose SATB barrier must run.
+///
+/// Call BEFORE the phase becomes observable, so the gate is armed no later than
+/// the barrier it mirrors. See [`JIT_REF_STORE_PRE_MARKERS`].
+pub fn arm_jit_ref_store_marker() {
+    JIT_REF_STORE_PRE_MARKERS.fetch_add(1, Ordering::AcqRel);
+    refresh_jit_ref_store_pre_active();
+}
+
+/// A marker has left such a phase.
+///
+/// Call AFTER the phase has stopped being observable, so the gate is disarmed
+/// no earlier than the barrier it mirrors.
+pub fn disarm_jit_ref_store_marker() {
+    // `fetch_update` rather than `fetch_sub`: an unmatched disarm would wrap an
+    // unsigned counter to a huge value, i.e. a gate armed for the life of the
+    // process — safe, but it would silently withdraw the fast path everywhere
+    // and look like the feature simply not paying.
+    let _ = JIT_REF_STORE_PRE_MARKERS.fetch_update(
+        Ordering::AcqRel,
+        Ordering::Acquire,
+        |n| Some(n.saturating_sub(1)),
+    );
+    refresh_jit_ref_store_pre_active();
+}
+
+/// Markers currently counted as armed. Diagnostics and tests.
+pub fn jit_ref_store_armed_markers() -> usize {
+    JIT_REF_STORE_PRE_MARKERS.load(Ordering::Acquire)
+}
 
 /// `gc_age == 0` expressed in the `GC_FLAGS_BYTE_OFFSET` byte's units.
 ///
@@ -25890,11 +26023,41 @@ pub fn jit_ref_store_gate_addrs() -> (usize, usize, usize) {
     (
         &base.pre_active as *const _ as usize,
         &base.post_active as *const _ as usize,
-        &base.young_floor as *const _ as usize,
+        // The floor's ADDRESS only when this plan actually uses the floor.
+        //
+        // The address of a `static` is non-zero whatever the byte holds, so
+        // handing it over unconditionally would tell the emitter that BOTH
+        // post-barrier shapes are published — and it declines that, because for
+        // a mask publisher the floor is not merely redundant but WRONG (an
+        // old-gen object with `gc_age == 0` sits below it). Gating on the value
+        // keeps "which shape is this" answerable from the three words the
+        // helper table carries.
+        if JIT_REF_STORE_GATES.young_floor.load(Ordering::Acquire) == 0 {
+            0
+        } else {
+            &base.young_floor as *const _ as usize
+        },
     )
 }
 
-/// Announce that this process's collector maintains the gates.
+/// The published post-barrier skip MASK, as a value rather than an address.
+///
+/// Baked into generated code as an immediate, which is why it is read as a
+/// value: the mask is a property of which collector is running, and a process
+/// does not change collector after start-up. The gate BYTES stay addresses
+/// because they change while the process runs; this does not.
+///
+/// `0` means no mask is published — either nothing is published at all, or the
+/// publisher uses [`JitRefStoreGates::young_floor`] instead.
+pub fn jit_ref_store_post_skip_mask() -> u8 {
+    if JIT_REF_STORE_GATES.published.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    JIT_REF_STORE_GATES.post_skip_mask.load(Ordering::Acquire)
+}
+
+/// Announce that this process's collector maintains the gates, using the
+/// unsigned age FLOOR to rule the post barrier out.
 ///
 /// Both gates are armed here and only ever relaxed by a later publisher call:
 /// a plan that starts armed can never be observed permissive before its owner
@@ -25902,9 +26065,27 @@ pub fn jit_ref_store_gate_addrs() -> (usize, usize, usize) {
 pub fn publish_jit_ref_store_plan(young_floor: u8) {
     JIT_REF_STORE_GATES.pre_active.store(1, Ordering::Release);
     JIT_REF_STORE_GATES.post_active.store(1, Ordering::Release);
+    JIT_REF_STORE_GATES.post_skip_mask.store(0, Ordering::Release);
     JIT_REF_STORE_GATES
         .young_floor
         .store(young_floor, Ordering::Release);
+    JIT_REF_STORE_GATES.published.store(1, Ordering::Release);
+}
+
+/// Announce a plan that rules the post barrier out by a flags MASK rather than
+/// an age floor — see [`JitRefStoreGates::post_skip_mask`] for why the
+/// generational collector needs this shape and cannot use the floor.
+///
+/// The floor is explicitly zeroed: publishing both would emit two independent
+/// skips for one question, and the age floor is WRONG for a mask publisher (an
+/// old-gen object with `gc_age == 0` sits below it).
+pub fn publish_jit_ref_store_plan_masked(post_skip_mask: u8) {
+    JIT_REF_STORE_GATES.pre_active.store(1, Ordering::Release);
+    JIT_REF_STORE_GATES.post_active.store(1, Ordering::Release);
+    JIT_REF_STORE_GATES.young_floor.store(0, Ordering::Release);
+    JIT_REF_STORE_GATES
+        .post_skip_mask
+        .store(post_skip_mask, Ordering::Release);
     JIT_REF_STORE_GATES.published.store(1, Ordering::Release);
 }
 
@@ -25914,6 +26095,7 @@ pub fn clear_jit_ref_store_plan() {
     JIT_REF_STORE_GATES.pre_active.store(1, Ordering::Release);
     JIT_REF_STORE_GATES.post_active.store(1, Ordering::Release);
     JIT_REF_STORE_GATES.young_floor.store(0, Ordering::Release);
+    JIT_REF_STORE_GATES.post_skip_mask.store(0, Ordering::Release);
     JIT_REF_STORE_GATES.published.store(0, Ordering::Release);
 }
 
@@ -25921,9 +26103,8 @@ pub fn clear_jit_ref_store_plan() {
 /// caller must set this BEFORE arming the real flag and clear it AFTER
 /// disarming.
 pub fn set_jit_ref_store_pre_active(active: bool) {
-    JIT_REF_STORE_GATES
-        .pre_active
-        .store(u8::from(active), Ordering::Release);
+    JIT_REF_STORE_PRE_ZGC.store(u8::from(active), Ordering::Release);
+    refresh_jit_ref_store_pre_active();
 }
 
 /// Mirror "this heap contains at least one old object". Same ordering rule as

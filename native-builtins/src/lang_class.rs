@@ -20701,6 +20701,77 @@ pub(crate) fn native_class_get_type_name(
     Ok(Some(Value::Object(Some(ctx.create_string(&type_name)))))
 }
 
+/// `java.lang.Enum.valueOf(Class, String)` — **`--synthetic-jdk` only**.
+///
+/// `java/lang/Enum`'s five natives were retired on 2026-08-23 (`80d60e911`),
+/// correctly: the retirement was measured against the real-JDK regression
+/// suite, where `Enum.valueOf`'s real bytecode serves every call and a native
+/// only shadows it.
+///
+/// `--synthetic-jdk` has no bytecode to fall back on, so the same retirement
+/// left `Enum.valueOf` an `UnsatisfiedLinkError` in that mode — for EVERY enum,
+/// including user-defined ones. Measured 2026-09-02 with
+/// `apps/probes/SyntheticEnumSurface`: real-JDK identical to HotSpot on all 20
+/// rows, `--synthetic-jdk` failing this one on a three-constant local enum
+/// whose `values()`, `name()`, `ordinal()` and `getEnumConstants()` all worked.
+///
+/// That is the third time this session one retirement has behaved this way
+/// (`ArrayDeque.iterator()` and `Collections.unmodifiableSortedMap` are the
+/// others): **a native retired because real bytecode covers it is retired in
+/// BOTH modes, and only one of them has the bytecode.** Hence the `cfg` —
+/// real-JDK keeps the retirement exactly as measured.
+///
+/// Built on the same `$VALUES` path as `native_class_get_enum_constants`
+/// rather than a second constant source, so the two cannot disagree about
+/// which constants an enum has.
+#[cfg(feature = "synthetic-jdk")]
+pub(crate) fn native_enum_value_of(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let (cls, name_obj) = match (args.first(), args.get(1)) {
+        (Some(Value::Object(Some(c))), Some(Value::Object(Some(n)))) => (*c, *n),
+        // Both arguments are `@NotNull` in the JDK and it NPEs on either.
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Name is null".to_string()),
+            }
+            .into())
+        }
+    };
+    let wanted = ctx.read_string(name_obj).unwrap_or_default();
+    let class_name = mirror_class_id(ctx, cls)
+        .and_then(|id| ctx.class_name_of_id(id))
+        .unwrap_or_default();
+
+    // Reuse the shared constant source; `Some(array)` here is exactly what
+    // `Class.getEnumConstants()` would hand back.
+    let constants = native_class_get_enum_constants(ctx, &[Value::Object(Some(cls))])?;
+    if let Some(Value::Object(Some(arr))) = constants {
+        let n = ctx.array_length(arr);
+        for i in 0..n {
+            let Value::Object(Some(k)) = ctx.get_array_element(arr, i) else {
+                continue;
+            };
+            // Slot 0 is `Enum.name` — the same index `classloader.rs`'s
+            // `resolve_field_index("java/lang/Enum", "name")` test pins.
+            if let Value::Object(Some(nm)) = ctx.get_field(k, 0) {
+                if ctx.read_string(nm).as_deref() == Some(wanted.as_str()) {
+                    return Ok(Some(Value::Object(Some(k))));
+                }
+            }
+        }
+    }
+    // HotSpot's exact wording, so a caller matching on the message still works:
+    //   No enum constant com.example.Colour.MAUVE
+    Err(
+        cratonvm_types::error::RuntimeError::IllegalArgumentException {
+            message: format!("No enum constant {}.{wanted}", class_name.replace('/', ".")),
+        }
+        .into(),
+    )
+}
+
 pub(crate) fn native_class_get_enum_constants(
     ctx: &mut dyn NativeContext,
     args: &[Value],
