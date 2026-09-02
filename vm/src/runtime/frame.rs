@@ -588,10 +588,19 @@ fn init_locals_from_parts(
     // overwrites any stale recycled content so no kind leaks across reuse.
     let mut locals = u64_vec_to_compact(vals);
     locals.clear();
-    locals.resize(n, CompactValue::uninitialized());
     kinds.clear();
+    // Arguments first, filler second, so every slot is written exactly once.
+    // The previous order (`resize` to `n`, then overwrite the leading argument
+    // slots) wrote each argument slot twice on every frame push — nine bytes
+    // per slot, on the hottest path in the VM. The end state is identical:
+    // `push_args_to_locals` lays down exactly the slots `copy_args_to_locals`
+    // would have, and the `resize` below fills exactly the ones it would have
+    // left as filler.
+    push_args_to_locals(&mut locals, &mut kinds, args, n);
+    locals.resize(n, CompactValue::uninitialized());
     kinds.resize(n, LKIND_OTHER);
-    copy_args_to_locals(&mut locals, &mut kinds, args);
+    debug_assert_eq!(locals.len(), n, "locals must be exactly max_locals long");
+    debug_assert_eq!(kinds.len(), n, "kinds must parallel locals");
     (locals, kinds, eff)
 }
 
@@ -728,6 +737,50 @@ fn tls_soa_pool_clear() {
     });
 }
 
+/// Append the argument slots to freshly-cleared `locals` / `kinds`, in the
+/// JVMS layout (category-2 values take two slots, the upper one unset).
+///
+/// # Why this exists beside [`copy_args_to_locals`]
+///
+/// [`init_locals_from_parts`] used to `resize` both buffers to `max_locals`
+/// and then overwrite the leading argument slots — so every argument slot was
+/// written **twice** on every frame push, once with the filler and once with
+/// the argument. Pushing the arguments first and resizing the *remainder*
+/// writes each slot exactly once, which is the same end state by construction:
+/// the filler value is identical (`CompactValue::uninitialized()` /
+/// `LKIND_OTHER`) and it now only ever lands in slots no argument occupies.
+///
+/// `cap` is `effective_max_locals`, which is already clamped to at least the
+/// slots the arguments need, so the bound below is defensive rather than
+/// load-bearing — it preserves [`copy_args_to_locals`]'s clamp exactly.
+fn push_args_to_locals(
+    locals: &mut Vec<CompactValue>,
+    kinds: &mut Vec<u8>,
+    args: &[Value],
+    cap: usize,
+) {
+    for arg in args {
+        if locals.len() >= cap {
+            return;
+        }
+        // Paired with the `lkind_of_value` mark below — a `double` argument
+        // keeps its NaN payload across the call boundary.
+        locals.push(CompactValue::from_value_kinded(*arg));
+        kinds.push(lkind_of_value(arg));
+        // Category 2 values (long, double) occupy two slots; the upper half is
+        // left uninitialised by JVM convention.
+        if arg.is_category2() && locals.len() < cap {
+            locals.push(CompactValue::uninitialized());
+            kinds.push(LKIND_OTHER);
+        }
+    }
+}
+
+/// In-place argument copy into already-sized buffers.
+///
+/// Retained for the callers that hand over a slice they did not just build
+/// (deopt resume, frozen-frame rehydration). The frame-push path uses
+/// [`push_args_to_locals`] instead — see that function for why.
 fn copy_args_to_locals(locals: &mut [CompactValue], kinds: &mut [u8], args: &[Value]) {
     let mut slot = 0;
     for arg in args {
@@ -2673,6 +2726,91 @@ impl From<FrameStack> for Vec<Frame> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the frame-push locals layout against the resize-then-overwrite form
+    /// it replaced.
+    ///
+    /// `init_locals_from_parts` used to size both buffers to `max_locals` and
+    /// then copy the arguments over the leading slots; it now pushes the
+    /// arguments and resizes the remainder, so each slot is written once. The
+    /// two must produce byte-identical buffers, or a frame starts life with the
+    /// wrong local — which is a silent wrong value, and for a reference slot a
+    /// GC-root question.
+    ///
+    /// Covers the three shapes that make the layouts differ: category-2
+    /// arguments (two slots, upper one filler), a tail of unset locals, and the
+    /// defensive clamp where the arguments alone would overrun `max_locals`.
+    #[test]
+    fn pushed_locals_match_the_resize_then_copy_layout() {
+        fn reference(max_locals: u16, args: &[Value]) -> (Vec<CompactValue>, Vec<u8>) {
+            let n = effective_max_locals(max_locals, args) as usize;
+            let mut locals = vec![CompactValue::uninitialized(); n];
+            let mut kinds = vec![LKIND_OTHER; n];
+            copy_args_to_locals(&mut locals, &mut kinds, args);
+            (locals, kinds)
+        }
+
+        let obj_free_cases: Vec<(u16, Vec<Value>)> = vec![
+            (0, vec![]),
+            (4, vec![]),
+            (4, vec![Value::Int(7)]),
+            (4, vec![Value::Int(1), Value::Int(2)]),
+            // Category-2: each takes two slots with the upper half unset.
+            (4, vec![Value::Long(0x1234_5678_9abc_def0)]),
+            (4, vec![Value::Double(-0.0)]),
+            (6, vec![Value::Long(1), Value::Int(2), Value::Double(3.5)]),
+            // Mixed with a null reference, and with a retaddr.
+            (5, vec![Value::Object(None), Value::Int(9)]),
+            (5, vec![Value::ReturnAddress(11), Value::Float(1.5)]),
+            // Declared max_locals SMALLER than the arguments need: the
+            // effective count is clamped up, and both forms must agree on it.
+            (1, vec![Value::Long(5), Value::Long(6)]),
+            (0, vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+        ];
+
+        for (max_locals, args) in obj_free_cases {
+            let (want_locals, want_kinds) = reference(max_locals, &args);
+            let (got_locals, got_kinds, eff) = init_locals_from_parts(max_locals, &args, None);
+            assert_eq!(
+                eff as usize,
+                want_locals.len(),
+                "effective_max_locals for max_locals={max_locals} args={args:?}"
+            );
+            assert_eq!(
+                got_locals.iter().map(|c| c.raw_bits()).collect::<Vec<_>>(),
+                want_locals.iter().map(|c| c.raw_bits()).collect::<Vec<_>>(),
+                "locals differ for max_locals={max_locals} args={args:?}"
+            );
+            assert_eq!(
+                got_kinds, want_kinds,
+                "local kinds differ for max_locals={max_locals} args={args:?}"
+            );
+        }
+    }
+
+    /// The same equivalence when the buffers come from the pool with stale
+    /// content in them — the recycled bytes must not survive into either form.
+    #[test]
+    fn pushed_locals_do_not_leak_recycled_slots() {
+        let args = vec![Value::Int(3)];
+        let dirty_vals: Vec<u64> = vec![0xDEAD_BEEF_DEAD_BEEF; 16];
+        let dirty_kinds: Vec<u8> = vec![LKIND_LONG; 16];
+        let (locals, kinds, eff) =
+            init_locals_from_parts(4, &args, Some((dirty_vals, dirty_kinds)));
+        assert_eq!(eff, 4);
+        assert_eq!(locals.len(), 4);
+        assert_eq!(kinds.len(), 4);
+        assert_eq!(locals[0].as_int(), Some(3));
+        assert_eq!(kinds[0], LKIND_OTHER);
+        for i in 1..4 {
+            assert_eq!(
+                locals[i].raw_bits(),
+                CompactValue::uninitialized().raw_bits(),
+                "slot {i} kept recycled content"
+            );
+            assert_eq!(kinds[i], LKIND_OTHER, "kind {i} kept recycled content");
+        }
+    }
 
     #[test]
     fn frame_creation_with_args() {

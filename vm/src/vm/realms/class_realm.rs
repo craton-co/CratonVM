@@ -674,25 +674,38 @@ impl ClassRealm {
     /// class, and compared an `Arc<str>` against a literal, once per virtual
     /// invoke.
     ///
-    /// # The `u32::MAX` state is the common one, and it used to be the slow one
+    /// # The `u32::MAX` state is the common one, and it is not the fast one
     ///
     /// "Steady state" above meant *once the class exists*. `AnnotationProxy` is
     /// a VM-internal synthetic class that most programs never mint, so the hint
-    /// stayed `u32::MAX` for the whole process and every virtual invoke reached
-    /// [`Self::resolve_annotation_proxy_cid`] — whose negative cache is keyed
-    /// on `class_definition_epoch()`, bumped by *every* class definition.
-    /// During class loading (Tomcat's annotation scan, Spring cold start — the
-    /// phase that runs interpreted) the epoch never holds still, so the
-    /// negative never held and each virtual invoke took the class-manager read
-    /// lock and probed the name across the builtin loader delegation chain.
+    /// stays `u32::MAX` for the whole process and every virtual invoke reaches
+    /// [`Self::resolve_annotation_proxy_cid`] — which is `#[cold]`, hence an
+    /// out-of-line call, and which does two atomic loads before it can answer.
+    /// That is what the advertised "one relaxed load and one `u32` compare"
+    /// actually costs in the overwhelmingly common case.
     ///
-    /// `any_annotation_proxy_defined()` closes that: a process-global one-way
-    /// latch raised by `loaded_classes_insert` the first time the name is
-    /// defined *anywhere*, so it is immune to the epoch. False ⇒ no realm has
-    /// the class ⇒ no `class_id` can be it. It gates only the *lookup*, never
-    /// the answer — the per-realm `annotation_proxy_cid` still decides
-    /// identity, because two VMs in one process mint the class independently
-    /// and must not share an id.
+    /// **Stated precisely, because the first version of this note overstated
+    /// it.** The cold resolver *stamps* the epoch on its negative, so it is
+    /// **not** true that every virtual invoke took the class-manager read lock
+    /// while classes were loading: only the first invoke after each class
+    /// definition did. The lock traffic is therefore O(classes defined), not
+    /// O(invokes) — a real cost during a Spring or Tomcat start, but a much
+    /// smaller one than "per invoke", and the difference matters to anyone
+    /// budgeting against this line.
+    ///
+    /// `any_annotation_proxy_defined()` removes both halves: it is a
+    /// process-global one-way latch raised by `loaded_classes_insert` the first
+    /// time the name is defined *anywhere*, so it is immune to the epoch.
+    /// False ⇒ no realm has the class ⇒ no `class_id` can be it, in one relaxed
+    /// load with no call. It gates only the *lookup*, never the answer — the
+    /// per-realm `annotation_proxy_cid` still decides identity, because two VMs
+    /// in one process mint the class independently and must not share an id.
+    ///
+    /// Not separately measured: the effect is a few nanoseconds on a path whose
+    /// run-to-run spread on the development host is tens. It is kept because it
+    /// strictly removes work and adds one `bool`, not because a probe resolved
+    /// it. `CRATONVM_LOADER_NO_ANN_PROXY_LATCH=1` is there for whoever gets a
+    /// quiet host.
     #[inline]
     pub fn is_annotation_proxy_class(&self, class_id: ClassId) -> bool {
         let hint = self.annotation_proxy_cid.load(Ordering::Relaxed);

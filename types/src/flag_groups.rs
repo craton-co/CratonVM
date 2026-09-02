@@ -1283,6 +1283,10 @@ pub const INVENTORY: &[E] = &[
     // `backedge-poll-gate` — off restores the unconditional
     // `safepoint_check` call on every backward branch.
     E { group: Group::JIT, token: "backedge-poll-gate", on_key: None, off_key: Some("CRATONVM_JIT_NO_BACKEDGE_POLL_GATE"), off_word: None },
+    // `iface-select-memo` — off makes every `invokeinterface` cache hit
+    // retake the class-manager read lock and rewalk the receiver hierarchy to
+    // re-verify maximally-specific selection.
+    E { group: Group::JIT, token: "iface-select-memo", on_key: None, off_key: Some("CRATONVM_JIT_NO_IFACE_SELECT_MEMO"), off_word: None },
     // `dup-name-field-gate` — off makes every instance field access walk
     // `retarget_instance_field_to_receiver` in full, whether or not any
     // binary name in this process resolves to two `ClassId`s.

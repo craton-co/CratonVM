@@ -8583,7 +8583,8 @@ pub use field_access::*;
 pub mod invoke_phases;
 pub mod site_cache;
 pub use site_cache::{
-    CastSiteCache, ClassSiteCache, FieldSiteCache, MethodSiteCache, MethodSiteInfo, ResolvedNewSite,
+    CastSiteCache, ClassSiteCache, FieldSiteCache, IfaceSelectSiteCache, MethodSiteCache,
+    MethodSiteInfo, ResolvedNewSite,
 };
 // ---------------------------------------------------------------------------
 // Helper: Method invocation

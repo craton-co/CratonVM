@@ -1382,13 +1382,15 @@ pub fn any_duplicate_class_name() -> bool {
 /// stays `u32::MAX` for the life of the process and every virtual invoke falls
 /// into the cold resolver.
 ///
-/// The cold resolver's negative cache is keyed on
-/// [`class_definition_epoch`], which is bumped by **every class definition**.
-/// So during class loading — Tomcat's annotation scan, Spring cold start,
-/// precisely the phase that runs interpreted — the epoch moves constantly, the
-/// negative never holds, and each virtual invoke pays a `class_manager` read
-/// lock plus a name-keyed probe walked across the builtin loader delegation
-/// chain.
+/// The cold resolver is `#[cold]` — an out-of-line call — and does two atomic
+/// loads before it can answer, so the advertised "one relaxed load and one
+/// `u32` compare" is not what the common case pays. Its negative cache is
+/// additionally keyed on [`class_definition_epoch`], bumped by **every class
+/// definition**, so while classes are loading the first virtual invoke after
+/// each definition also takes a `class_manager` read lock and probes the name
+/// across the builtin loader delegation chain. (That is O(classes defined),
+/// **not** O(invokes) — the resolver stamps the epoch on its negative. Said
+/// plainly here because the first draft of this note claimed the latter.)
 ///
 /// This latch answers the epoch-independent half of the question — *can* the
 /// class exist at all — in one relaxed load. It deliberately does **not**

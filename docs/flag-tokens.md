@@ -574,7 +574,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-257 tokens.
+258 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -758,6 +758,7 @@ export inherited from a parent shell.
 | `param-tag-scan` | `CRATONVM_JIT_NO_PARAM_TAG_SCAN` |
 | `descriptor-facts` | `CRATONVM_JIT_NO_DESCRIPTOR_FACTS` |
 | `backedge-poll-gate` | `CRATONVM_JIT_NO_BACKEDGE_POLL_GATE` |
+| `iface-select-memo` | `CRATONVM_JIT_NO_IFACE_SELECT_MEMO` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
 | `ir-unresumable-trap-guard` | `CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD` |
 | `compiled-ldc-const-cache` | `CRATONVM_JIT_COMPILED_LDC_CONST_CACHE` |
