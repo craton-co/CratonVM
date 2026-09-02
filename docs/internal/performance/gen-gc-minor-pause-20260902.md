@@ -305,7 +305,7 @@ number. Parallel evacuation — the real answer to the remaining
 
 ---
 
-## F5 — the write barrier, both halves
+## F5 — the write barrier: one half shipped, one half withdrawn
 
 **The Rust half** went through a TLS lookup, an `Arc` deref, a
 `parking_lot::Mutex`, a linear scan of a table-id vec-map and a `Vec::push`
@@ -326,34 +326,31 @@ already-dirty byte writes a line every other storing mutator may hold, so an
 unconditional mark ping-pongs the card line between cores on exactly the
 workload where the barrier is hottest.
 
-**The JIT half** bailed to `jit_putfield_object` on ANY non-null old field
-value, unconditionally — while `satb_barrier`, the thing it bailed *to*, asks
-whether marking is active first and returns in two instructions. Overwriting a
-non-null reference field is one of the most common stores in Java. The receiver
-at that point has already been proven young (the old-generation test bails
-first), so with no mark cycle running it owes no barrier at all.
+**The JIT half was written here and then WITHDRAWN.** It bailed to
+`jit_putfield_object` on ANY non-null old field value, unconditionally, while
+`satb_barrier` -- the thing it bailed *to* -- asks whether marking is active
+first and returns in two instructions. An inline gate for that was built
+(`satb_armed_addr`, a process-global arming counter, plus a shared
+`emit_satb_pre_barrier_gate` and a four-state test), and then merging dev
+showed `perf/jit-six-findings-20260902` had already landed
+`ref_store_pre_gate` at helper ABI v10: the same address, the same
+initial-mark-STW soundness argument, and a strict SUPERSET -- it gates the post
+barrier and a young-age floor too, and does not require the old value to be
+null at all.
 
-**Fixed** by publishing a process-global SATB arming counter
-(`cratonvm_gc::satb_armed_addr`, helper-ABI v10) and testing it inline
-(`Compiler::emit_satb_pre_barrier_gate`, one gate shared by all three call
-sites so they cannot drift).
+So the duplicate was reverted rather than shipped. Two mechanisms answering one
+question in the same emitter is precisely how `region_bounds_addr` came to mean
+two different things at once, which that same page's comments call out.
 
-Two things make this sound rather than a race:
-
-* the address is baked, the **value** is read at runtime, so a cycle that arms
-  after a method is compiled is seen — pinned by case 5 of
-  `inline_ref_putfield_satb_bail_is_gated_on_a_live_mark_cycle`, which disarms
-  the counter and gets the fast path back *in the same compiled body*;
-* a mutator cannot read a stale zero and then store into a live mark cycle. The
-  counter is armed by `set_phase(ConcurrentMark)` inside
-  `ConcurrentMarker::initial_mark`, which runs during the initial-mark STW
-  pause with every mutator parked. This is the same guarantee the interpreter's
-  `satb_barrier` already relies on.
-
-It is a **counter**, not a flag, because a VM host may own more than one heap;
-a bare flag would let heap A leaving its mark phase disarm the barrier while
-heap B is still marking. Every way the count can be wrong (conservatively high,
-or leaked by a heap dropped mid-mark) runs *more* barrier code, not less.
+**The residual this leaves.** Those gates are published by ZGC only.
+`Compiler::ref_store_gates()` requires all three slots non-zero, and dev's own
+doc explains why Generational cannot fill the third: it keys its post barrier
+on `GC_FLAG_OLD_GEN`, a mask test, where the gate wants an unsigned age FLOOR.
+So under `-XX:+UseGenerationalGC` every compiled reference store still pays the
+full helper call, and the win this section was chasing is still on the table --
+it just needs the young-floor expressibility problem solved, not a second
+arming flag. Wiring `ConcurrentGcState` into `set_jit_ref_store_pre_active`
+alone buys nothing, because the whole plan is declined when the floor is zero.
 
 ---
 
@@ -430,11 +427,20 @@ owed", and it is what running the sweep bought.
   the duplicates are *avoided* by the conditional store rather than counted.
   The counter is not broken; there is nothing left for it to see on this path.
 
-* **F5 is not separately measured.** The probes here are JIT-allocating and
-  old-receiver-light, so neither the lock-free card mark nor the inline SATB
-  gate shows up as a pause number. Both are argued from the instruction
-  sequences and pinned by tests; a barrier-heavy throughput measurement is
-  owed.
+* **F5's shipped half is not separately measured.** The probes here are
+  JIT-allocating and old-receiver-light, so the lock-free card mark does not
+  show up as a pause number. It is argued from the instruction sequence and
+  pinned by `the_lockfree_barrier_dirties_the_same_cards_as_the_buffered_path`;
+  a barrier-heavy throughput measurement is owed.
+
+* **Two pre-existing dev breakages were met on the way, and only one was
+  touched.** `docs/config/flag-inventory.md` and `docs/flag-tokens.md` had
+  conflict markers COMMITTED to dev, which blocks their generators; they are
+  regenerated here (and `dab05b556` fixed the same thing in parallel).
+  `no_source_file_links_into_docs_internal` is red on pristine dev -- all five
+  offending lines are in `CONTRIBUTING.md` and `types/tests/doc_numeric_claims.rs`,
+  where the prose DESCRIBING the rule trips the checker. That one is left
+  alone: the fix is a self-exemption whose shape belongs to its author.
 
 * **Absolute pause numbers.** See Method. The shares and the counters are what
   this page establishes.

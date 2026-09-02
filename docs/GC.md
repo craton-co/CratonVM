@@ -319,12 +319,17 @@ Five things changed:
   growable `Vec` per reference store, with no deduplication; it now performs
   the same conditional byte store the JIT's inline barrier emits, so there is
   one card-marking rule in the VM instead of two.
-* **The compiled reference store asks whether marking is running.** It used to
-  bail to `jit_putfield_object` on ANY non-null old field value -- while
-  `satb_barrier`, the thing it bailed to, asks that question first and returns.
-  The backend now tests the SATB arming counter inline
-  (`JitRuntimeHelpers::satb_armed_addr`), so a young receiver with no mark
-  cycle running takes no helper call at all.
+* **The compiled reference store is NOT part of this batch.** An inline SATB
+  gate was written for it here and then withdrawn: `ref_store_pre_gate` (helper
+  ABI v10) had landed on dev first and is a strict superset -- it gates the
+  post barrier and a young-age floor as well, and does not require the field's
+  old value to be null. Shipping a second mechanism into the same emitter is
+  how `region_bounds_addr` came to mean two things at once. Note that those
+  gates are published by ZGC only: `ref_store_gates()` requires all three
+  slots and Generational cannot express its post-barrier as an age floor (it
+  keys on `GC_FLAG_OLD_GEN`, a mask test), so under `-XX:+UseGenerationalGC`
+  every compiled reference store still pays the helper call. Closing that is
+  its own piece of work.
 
 *Young sizing.* `CRATONVM_GC_YOUNG_TRIGGER_PERCENT` (default 50) is the
 percentage of from-space occupancy that triggers a moving collection. The 50 %
