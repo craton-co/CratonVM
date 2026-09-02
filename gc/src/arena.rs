@@ -2565,11 +2565,41 @@ impl Arena {
     /// The tail is returned rather than the whole arena on purpose: the free
     /// list holds spans whose neighbours are live objects, and an evacuator
     /// bumping through those would overwrite them.
+    ///
+    /// # This reports the tail; it does NOT make it writable
+    ///
+    /// The backing store commits lazily, so the span named here is RESERVED
+    /// and mostly not yet mapped. The caller must pass the bytes it will
+    /// actually use to [`Self::commit_parallel_evacuation_region`] before any
+    /// worker writes into it — this is the tenth hand-out site the `hand_out`
+    /// helper's note counts, and the only one that does not go through it,
+    /// because it hands out a span for N threads to sub-allocate rather than a
+    /// single object.
     pub fn parallel_evacuation_region(&self) -> (usize, usize) {
         (
             self.data.as_ptr() as usize + self.cursor,
             self.low_bump_headroom(),
         )
+    }
+
+    /// Map the first `bytes` of the tail so N workers may write into it.
+    ///
+    /// Returns `false` if the OS refused the commit, which the caller must
+    /// treat exactly as `hand_out` does — as an allocation failure, here
+    /// meaning "run the serial copy phase instead". Returning `true` anyway
+    /// would hand the workers memory that faults on first write.
+    ///
+    /// # Why this is separate from the region query
+    ///
+    /// `bytes` is the evacuation's own reservation (survivors + per-worker
+    /// buffers + its abandoned-tail allowance), which is computed AFTER the
+    /// tail is known. Committing the whole tail instead would work and would
+    /// throw away what the lazy backing store is for: on a 128 MB to-space
+    /// whose cycle copies 400 KB, the difference is the whole arena.
+    #[must_use = "a refused commit must send the cycle down the serial path"]
+    pub fn commit_parallel_evacuation_region(&mut self, bytes: usize) -> bool {
+        debug_assert!(bytes <= self.low_bump_headroom());
+        self.data.commit_range(self.cursor, bytes)
     }
 
     /// Publish the outcome of a parallel evacuation: `bytes` were consumed

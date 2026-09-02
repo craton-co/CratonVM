@@ -408,6 +408,13 @@ pub(crate) struct EvacPlan {
     /// Workers this cycle can actually afford buffers for, which may be FEWER
     /// than the policy asked for. See [`ParEvac::plan`].
     pub(crate) workers: usize,
+    /// Bytes of the to-space tail the workers may touch — survivors, one live
+    /// buffer per worker, and the abandoned-tail allowance.
+    ///
+    /// The driver must COMMIT this much (`Arena::commit_parallel_evacuation_region`)
+    /// before dispatching: the backing store maps lazily, so an uncommitted
+    /// write faults rather than reading zero.
+    pub(crate) reserved: usize,
 }
 
 struct DrainState {
@@ -581,14 +588,28 @@ impl<'a> ParEvac<'a> {
             n if n < PLAB_FLOOR_BYTES => 0,
             n => n,
         };
+        // The allowance is CAPPED at one more buffer per worker rather than
+        // taking all the remaining slack. Two reasons, and the second is not
+        // optional: a bigger allowance buys nothing once a worker can refill
+        // once, and the reservation below is COMMITTED up front — the backing
+        // store maps lazily, so an allowance of "all the slack" would map the
+        // whole to-space tail on every cycle and throw away exactly what the
+        // lazy store is for.
+        let waste_allowance = (slack - plab_bytes * workers).min(plab_bytes * workers);
+        // Everything a worker can touch: the survivors themselves, one live
+        // buffer each, and the tails the allowance lets them abandon.
+        let reserved = from_used + plab_bytes * workers + waste_allowance;
+        debug_assert!(reserved <= to_headroom);
         Some(EvacPlan {
             region_start: to_cursor_addr,
-            region_end: to_cursor_addr + to_headroom,
+            // The workers' ceiling is the RESERVATION, not the tail: past it
+            // the backing store is reserved but unmapped, and a write there
+            // faults rather than reading zero.
+            region_end: to_cursor_addr + reserved,
             plab_bytes,
-            // Whatever the buffers did not take. Spent by `plab_alloc` on
-            // abandoned tails, and then exhausted — never exceeded.
-            waste_allowance: slack - plab_bytes * workers,
+            waste_allowance,
             workers,
+            reserved,
         })
     }
 
@@ -1361,7 +1382,17 @@ mod tests {
         assert!(ParEvac::plan(head, 0x1004, 4096, 2).is_none());
         let plan = ParEvac::plan(head, 0x1008, 4096, 2).expect("an aligned cursor is accepted");
         assert_eq!(plan.region_start, 0x1008);
-        assert_eq!(plan.region_end, 0x1008 + head);
+        // The workers' ceiling is the RESERVATION, not the whole tail: the
+        // backing store maps lazily, and only `reserved` bytes get committed.
+        assert_eq!(plan.region_end, 0x1008 + plan.reserved);
+        assert!(
+            plan.reserved <= head,
+            "the reservation must fit inside the tail it was cut from",
+        );
+        assert!(
+            plan.reserved >= 4096,
+            "it must at least cover the survivors",
+        );
     }
 
     /// The per-worker buffer must track the live set, not sit at a constant.

@@ -7431,6 +7431,16 @@ impl GenerationalHeap {
             None
         };
 
+        // Map what the workers may touch. The backing store commits lazily
+        // (`crate::reservation`), and the parallel evacuator is the one
+        // hand-out site that does not go through `Arena::hand_out` — it hands
+        // a span to N threads to sub-allocate rather than one object to one
+        // caller. Without this every worker writes into reserved-but-unmapped
+        // memory: STATUS_ACCESS_VIOLATION, every parallel cycle, silently.
+        // A refused commit is an allocation failure, so it takes the serial
+        // path exactly as `hand_out`'s `None` does.
+        let par_plan = par_plan.filter(|p| young_to.commit_parallel_evacuation_region(p.reserved));
+
         if let Some(plan) = par_plan {
             // ------------------- PARALLEL COPY PHASE -------------------
             crate::gen_evac::note_par_evac_cycle();

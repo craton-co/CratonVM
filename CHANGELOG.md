@@ -147,29 +147,38 @@ to 49,855 at 16) — so the extra workers really do take work rather than merely
 existing. Two runs reported `cycles=0`; the census says so rather than letting
 a vacuous run read as a pass.
 
-**Copy-phase cost**, `cheney_drain` out of the `CRATONVM_DBG_GCPAUSE=1`
-breakdown, on `BinT` depth 18 at `-Xmx512m` — one large cycle copying ~1.0-1.5M
-objects out of a 128 MB from-space. ABBA-interleaved (P S S P), first pair
-discarded as cold, `objects_copied` checked equal within every pair:
+**Measured on the merged tree**, `BinT` depth 18 at `-Xmx512m` — one large
+cycle copying ~1.5M objects out of a 128 MB from-space. ABBA-interleaved
+(P S S P), first pair discarded as cold, `objects_copied` checked equal within
+every pair, and runs that took the NON-moving sweep retried rather than counted
+(only about half of them take the moving path).
 
-| arm | n | min | median | max |
-|---|---|---|---|---|
-| parallel, 8 workers | 8 | 2,198 ms | **3,554 ms** | 5,243 ms |
-| serial | 8 | 7,002 ms | **14,100 ms** | 16,720 ms |
+| | arm | n | min | median | max |
+|---|---|---|---|---|---|
+| `cheney_drain` | parallel, 8 workers | 8 | 2,304 ms | **3,008 ms** | 3,601 ms |
+| `cheney_drain` | serial | 8 | 8,693 ms | **11,560 ms** | 14,098 ms |
+| whole pause | parallel, 8 workers | 6 | 2,035 ms | **2,664 ms** | 2,901 ms |
+| whole pause | serial | 5 | 6,316 ms | **9,760 ms** | 12,412 ms |
 
-The ranges are DISJOINT — parallel's worst sample beats serial's best — which
-is what makes this a result on a shared host rather than a ratio between two
-noisy medians. Median 3.97x; the pessimal pairing is still 1.34x.
+Both pairs of ranges are DISJOINT — the parallel arm's worst sample beats the
+serial arm's best — which is what makes this a result on a shared host rather
+than a ratio between two noisy medians. Copy phase: median 3.84x, pessimal
+pairing 2.41x. Whole pause: median 3.66x, pessimal 2.18x. Taken with the host
+at 100% CPU throughout, and the parallel arm's spread was TIGHTER than in an
+earlier quiet-host run (1.6x against 2.4x), so contention is not what produced
+the separation.
 
-Read with three caveats, none of which the numbers above state on their own.
-This is a **debug build**: the per-object copy is unoptimised on both arms, and
-release is likely to narrow the ratio, since optimisation makes the copy cheaper
-while the coordination stays. It is **one workload**, chosen because it is
-survivor-heavy and therefore the best case for parallel copying. And it is the
-copy PHASE, not the pause: in the same breakdown `pre_evacuate` costs 3,174 ms,
-so after this change **`pre_evacuate` — the from-space object-start walk — is
-the largest phase of a moving young pause**, and is where the next pause work
-should go.
+The pause tracks the phase now because `pre_evacuate` — the from-space
+object-start walk, 3,174 ms and the largest phase when this change was first
+measured on its own branch — is **0 ms** on the merged tree: another lane
+parallelised it. An earlier draft of this entry named it as the next place to
+work; that was true of the branch and is not true of `dev`.
+
+Two caveats the numbers do not state. This is a **debug build**: the
+per-object copy is unoptimised on both arms, and release is likely to narrow
+the ratio, since optimisation makes the copy cheaper while the coordination
+stays. And it is **one workload**, chosen because it is survivor-heavy and
+therefore the best case for parallel copying.
 
 An earlier wall-clock A/B under `CRATONVM_DBG_GC_STRESS` was discarded rather
 than reported: it showed a 6x spread WITHIN one arm against an 11% median gap.
