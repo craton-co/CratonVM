@@ -526,32 +526,14 @@ impl<'a> Emitter<'a> {
     /// same trade, and the same reason: there is no IR to insert into.
     pub(crate) fn into_body(mut self) -> String {
         if self.bounds_prologue.is_empty() {
-            return self.with_shared_decls(self.body.clone());
+            return self.body;
         }
         let at = self.prologue_splice_at.expect(
             "a bounds precondition was emitted without a dispatch guard to \n             splice it after; only a guarded shape can prove an index, so \n             this is unreachable unless `prove_index_within_param` grew a \n             new caller",
         );
         let prologue = std::mem::take(&mut self.bounds_prologue);
         self.body.insert_str(at, &prologue);
-        self.with_shared_decls(self.body.clone())
-    }
-
-    /// Prepend any function-scoped `.shared` declarations the body needs.
-    ///
-    /// LAST, after every splice. `prologue_splice_at` is a byte offset
-    /// into `body` recorded while walking it, so anything inserted ahead
-    /// of that offset moves the splice point: an earlier version put the
-    /// reduction scratch at `body[0]` from `finalize_epilogue` and the
-    /// bounds prologue landed in the middle of the dispatch guard's own
-    /// `setp`, which ptxas rejected with a syntax error at the seam.
-    fn with_shared_decls(&self, body: String) -> String {
-        if !self.uses_reduce_smem {
-            return body;
-        }
-        let mut out = String::with_capacity(body.len() + crate::lowering::emit::REDUCE_SMEM_DECL.len());
-        out.push_str(crate::lowering::emit::REDUCE_SMEM_DECL);
-        out.push_str(&body);
-        out
+        self.body
     }
 
     pub(crate) fn emit_reg_decls(&self) -> Vec<RegDecl> {
@@ -1700,31 +1682,47 @@ mod tests {
         assert!(text.contains("[ret_ptr]"));
     }
 
-    /// A reduction folds each warp with shuffles, folds the warps
-    /// against each other through shared memory, and issues ONE atomic
-    /// per BLOCK — and every thread the guard retires joins the tree
-    /// carrying zero instead of returning.
+    /// A reduction folds each warp with shuffles and issues ONE atomic
+    /// per warp, from lane 0, and every thread the guard retires joins
+    /// the tree carrying zero instead of returning.
     ///
     /// AUDIT 2026-09-02. Until this date every thread issued its own
     /// `red.global.add` into the single accumulator: 2^24 atomics to one
-    /// line for a 2^24-element dot product. The warp fold cut that by
-    /// 32x; the block stage added later the same day cuts it by the
-    /// number of warps in a block again (8 more at a 256-thread block).
-    /// Asserted as exact counts, because the failure that matters is one
-    /// step of a tree going missing (a wrong sum, not a slow one), and
-    /// because a second `red` would mean a thread found a way around
-    /// them.
+    /// line for a 2^24-element dot product. Asserted as exact counts,
+    /// because the failure that matters is one step of the tree going
+    /// missing (a wrong sum, not a slow one), and because a second
+    /// `red` would mean a thread found a way around the tree.
+    ///
+    /// # A per-BLOCK fold was tried and is not here
+    ///
+    /// Folding the per-warp partials through shared memory would cut the
+    /// atomics by another 8x at a 256-thread block. It was implemented
+    /// and measured on an RTX 2060 the same day: it LOST. On a
+    /// minimum-arithmetic reduction over 2^26 ints (`BlockReduceBench`,
+    /// where the atomics are as large a share as the shape allows) the
+    /// block fold ran 2.74-2.90 ms against 2.25-2.62 without it, losing
+    /// all four interleaved rounds; on the compute-bound `GpuDotBench`
+    /// at the same size it won one round of three and lost two.
+    ///
+    /// The `bar.sync` is why. `red.global.add` returns nothing, so a
+    /// warp issues it and retires; a barrier makes every warp in the
+    /// block wait for the slowest, at the end of the kernel, and that
+    /// costs more than the seven atomics it saves. It also forced the
+    /// bounds-check deopt to stop returning from the middle of the
+    /// kernel, since a thread leaving while its block waits at the
+    /// barrier is a hang rather than a wrong answer.
+    ///
+    /// See `docs/gpu/reductions.md`.
     #[test]
-    fn reduction_folds_each_warp_then_each_block_before_the_one_atomic() {
+    fn reduction_folds_each_warp_before_the_one_atomic() {
         let m = lower_fixture("EligibleDotProduct", "dot", "([I[I)J");
         let text = m.render();
         // A `long` accumulator travels as two 32-bit halves, five steps
-        // each: 16, 8, 4, 2, 1 — and there are TWO folds now, the warp
-        // one and warp 0 folding the per-warp partials.
+        // each: 16, 8, 4, 2, 1.
         assert_eq!(
             text.matches("shfl.sync.down.b32").count(),
-            20,
-            "two five-step trees of two halves each\n{text}"
+            10,
+            "five tree steps of two halves each\n{text}"
         );
         for offset in [16, 8, 4, 2, 1] {
             assert!(
@@ -1751,32 +1749,12 @@ mod tests {
         assert!(text.contains("L_reduce_zero:\n    mov.s64"), "zero contribution\n{text}");
         assert!(text.contains("L_reduce:"), "join label\n{text}");
 
-        // The block stage: one barrier, a shared slot per warp, and the
-        // single-warp shortcut that keeps a one-warp block away from it.
-        assert_eq!(
-            text.matches("bar.sync 0;").count(),
-            1,
-            "exactly one barrier — a second would be a second block stage\n{text}"
-        );
+        // No barrier, and therefore no rule about where a thread may
+        // exit. The per-block fold that would have needed one was
+        // measured and rejected; see this test's doc comment.
         assert!(
-            text.contains(".shared .align 8 .b8 cvm_reduce_partials[256];"),
-            "the block stage needs its shared scratch declared\n{text}"
-        );
-        assert!(
-            text.contains("st.shared.s64") && text.contains("ld.shared.s64"),
-            "the per-warp partials go through shared memory\n{text}"
-        );
-        assert!(
-            text.contains("setp.le.u32") && text.contains("bra L_reduce_atomic;"),
-            "a one-warp block must skip the block stage and its barrier\n{text}"
-        );
-        // The hazard the barrier introduces: a thread that fails its
-        // bounds check must NOT return out of the middle of the kernel,
-        // or the rest of its block waits at `bar.sync` forever.
-        assert_eq!(
-            text.matches("ret;").count(),
-            1,
-            "a reduction kernel with a barrier has exactly one exit\n{text}"
+            !text.contains("bar.sync"),
+            "the reduction epilogue must not synchronize the block\n{text}"
         );
     }
 
