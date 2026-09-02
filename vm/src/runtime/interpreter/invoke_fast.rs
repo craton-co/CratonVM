@@ -56,6 +56,7 @@
 //! (`CRATONVM_JIT=-nonvirtual-fast-door`) turns off both doors in this file.
 //! The virtual door keeps its own `CRATONVM_JIT_NO_INVOKE_FAST_DOOR`.
 
+use super::site_cache::site_stats;
 use super::*;
 
 /// Arguments read off the operand stack, paired with the descriptor tag that
@@ -267,6 +268,31 @@ pub(super) fn callee_has_compiled_body(shared: &SharedVm, cached: &CachedBytecod
     true
 }
 
+/// Engagement census for the two doors. `CRATONVM_DBG_FIELD_SITE=1` prints
+/// `door: static hit/miss special hit/miss` with the rest of the site caches,
+/// and names the first few reasons a door declined — a door that never fires
+/// is invisible on a wall clock, which is how the field fast path shipped its
+/// first version measuring nothing.
+#[cold]
+#[inline(never)]
+fn report_decline(kind: &'static str, why: &'static str) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static REPORTED: AtomicU32 = AtomicU32::new(0);
+    if !site_stats::on() || REPORTED.fetch_add(1, Ordering::Relaxed) >= 12 {
+        return;
+    }
+    eprintln!("[invoke-door] {kind} declined: {why}");
+}
+
+/// Note a decline and return `None`, in one expression.
+macro_rules! decline {
+    ($kind:literal, $miss:expr, $why:literal) => {{
+        site_stats::bump($miss);
+        report_decline($kind, $why);
+        return None;
+    }};
+}
+
 // ── invokestatic (0xb8) ──────────────────────────────────────────────────
 
 /// Monomorphic `invokestatic` fast door. See the module note for the contract.
@@ -277,39 +303,47 @@ pub(super) fn execute_invokestatic_fast_door(
     frame_idx: usize,
     cp_index: u16,
 ) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    const MISS: usize = site_stats::DOOR_STATIC_MISS;
     if crate::classloading::any_class_redefined() {
-        return None;
+        decline!("static", MISS, "a class was redefined");
     }
     let caller_class_id = thread.frames[frame_idx].class_id;
     let cached = match thread.invoke_cache.get(caller_class_id, cp_index, false) {
         Some(CachedInvokeTarget::Bytecode { cached, gate }) => {
             // A redefined target keeps the general path, which re-resolves.
             if gate.generation != 0 {
-                return None;
+                decline!("static", MISS, "the target class has been redefined");
             }
             Arc::clone(cached)
         }
-        _ => return None,
+        Some(_) => decline!("static", MISS, "cached target is not plain bytecode"),
+        None => decline!("static", MISS, "inline cache miss"),
     };
     if !cached.is_static {
-        return None;
+        decline!("static", MISS, "cached target is not static");
     }
     let num_params = cached.num_params as usize;
-    let facts = callee_is_plain_bytecode(&cached, num_params)?;
+    let Some(facts) = callee_is_plain_bytecode(&cached, num_params) else {
+        decline!(
+            "static",
+            MISS,
+            "callee is synchronized, native-backed, intercepted, or over-arity"
+        );
+    };
     // The loader-split guard the general path applies to every static hit.
     // Bitmap-gated: two relaxed loads when no defining loader is registered.
     if cached_static_owner_stale(shared, caller_class_id, &cached) {
-        return None;
+        decline!("static", MISS, "loader-split owner");
     }
     if thread.frames.len() >= shared.config.max_stack_depth {
-        return None;
+        decline!("static", MISS, "frame stack is full");
     }
     if !crate::runtime::env_cache::disable_jit() {
         if callee_has_compiled_body(shared, &cached) {
-            return None;
+            decline!("static", MISS, "callee has a compiled body");
         }
         if !note_invocation_for_tierup(shared, &cached) {
-            return None;
+            decline!("static", MISS, "an inline tier-up attempt is due");
         }
     }
     let mut slots = empty_arg_slots();
@@ -320,60 +354,107 @@ pub(super) fn execute_invokestatic_fast_door(
         false,
         &mut slots,
     ) {
-        return None;
+        decline!("static", MISS, "an argument slot needs coercion");
     }
+    site_stats::bump(site_stats::DOOR_STATIC_HIT);
     dbg_invoke_stats_record(0);
     Some(Ok(push_frame_verbatim(
         shared, thread, frame_idx, cached, &slots, num_params,
     )))
 }
 
-// ── invokespecial (0xb7) ─────────────────────────────────────────────────
+// -- non-virtual dispatch (0xb7, and 0xb6 on a non-virtual target) -------
 
-/// Monomorphic `invokespecial` fast door. See the module note for the
-/// contract.
+/// Fast door for a call whose target is **not** virtually dispatched: every
+/// cached `invokespecial`, and every `invokevirtual` whose target resolved to
+/// a fixed method rather than a vtable slot.
+///
+/// That second case is not a corner: `javac` 25 emits `invokevirtual` for a
+/// private instance method (JEP 181 nestmates), and the resolver caches such
+/// a target as `CachedInvokeTarget::Bytecode` — no receiver class, no vtable
+/// index. `execute_invokevirtual_fast_door` only accepts `VirtualBytecode`,
+/// so before this door those calls reached the general dispatcher's
+/// `Bytecode` arm and measured ~430 ns against a virtual call's ~245 ns.
+///
+/// See the module note for the contract.
 ///
 /// **This door does not count invocations, because the path it replaces does
-/// not either.** `execute_invokevirtual_cached`'s `Bytecode` arm — where every
-/// cached `invokespecial` lands — has no tier-up block at all, and the
-/// `if !is_special` above it gates the call-site profiling. Adding counting
-/// here would widen which methods reach the optimizing tier, which is a
-/// separate project with its own blast radius (see the "untaken levers" note
-/// on `docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`).
-/// A door must not change tier-up policy on its way past.
+/// not either.** Neither arm of `execute_invokevirtual_cached` that a cached
+/// `invokespecial` can land in has a tier-up block: the `VirtualBytecode`
+/// arm's is guarded by `!is_special`, and the `Bytecode` arm has none at all.
+/// Adding counting here would widen which methods reach the optimizing tier,
+/// which is a separate project with its own blast radius (see the "untaken
+/// levers" note on
+/// `docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`). A door
+/// must not change tier-up policy on its way past.
+///
+/// An `invokespecial` site caches as either target shape depending on which
+/// resolver filled it, so both are accepted. For `VirtualBytecode` the
+/// receiver's class is re-checked against the entry exactly as the general
+/// path does: the target of an `invokespecial` does not depend on the
+/// receiver's class, but the entry records one and a mismatch is the general
+/// path's polymorphic route.
 #[inline]
-pub(super) fn execute_invokespecial_fast_door(
+pub(super) fn execute_nonvirtual_fast_door(
     shared: &SharedVm,
     thread: &mut JvmThread,
     frame_idx: usize,
     cp_index: u16,
+    is_special: bool,
 ) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    const MISS: usize = site_stats::DOOR_SPECIAL_MISS;
     if crate::classloading::any_class_redefined() {
-        return None;
-    }
-    // Under loader-aware resolution the general path re-checks the owner on
-    // every special hit; leave that mode to it entirely.
-    if crate::runtime::env_cache::loader_aware_resolution() {
-        return None;
+        decline!("special", MISS, "a class was redefined");
     }
     let caller_class_id = thread.frames[frame_idx].class_id;
-    let cached = match thread.invoke_cache.get(caller_class_id, cp_index, true) {
+    let (cached, expected_receiver) =
+        match thread.invoke_cache.get(caller_class_id, cp_index, is_special) {
         Some(CachedInvokeTarget::Bytecode { cached, gate }) => {
             if gate.generation != 0 {
-                return None;
+                decline!("special", MISS, "the target class has been redefined");
             }
-            Arc::clone(cached)
+            (Arc::clone(cached), None)
         }
-        _ => return None,
+        Some(CachedInvokeTarget::VirtualBytecode {
+            cached,
+            gate,
+            receiver_class_id,
+        }) if is_special => {
+            if gate.generation != 0 {
+                decline!("special", MISS, "the target class has been redefined");
+            }
+            (Arc::clone(cached), Some(*receiver_class_id))
+        }
+        Some(_) => decline!("special", MISS, "cached target is not plain bytecode"),
+        None => decline!("special", MISS, "inline cache miss"),
     };
     if cached.is_static {
-        return None;
+        decline!("special", MISS, "cached target is static");
+    }
+    // The owner re-check the general path makes on every special hit under
+    // loader-aware resolution, which is the DEFAULT. `lookup_loader_initiated`
+    // early-returns on a one-way latch when no user-defined loader has
+    // registered a defining class, so this is one relaxed load for an
+    // ordinary application and exactly the general path's cost otherwise.
+    // A mismatch declines; the general dispatcher runs next and evicts.
+    if is_special
+        && crate::runtime::env_cache::loader_aware_resolution()
+        && lookup_loader_initiated(shared, caller_class_id, cached.class_name.as_ref())
+            .is_some_and(|owner_cid| owner_cid != cached.declaring_class_id)
+    {
+        decline!("special", MISS, "loader-split owner");
     }
     let num_params = cached.num_params as usize;
     let total_args = num_params + 1;
-    let facts = callee_is_plain_bytecode(&cached, num_params)?;
+    let Some(facts) = callee_is_plain_bytecode(&cached, num_params) else {
+        decline!(
+            "special",
+            MISS,
+            "callee is synchronized, native-backed, intercepted, or over-arity"
+        );
+    };
     if thread.frames.len() >= shared.config.max_stack_depth {
-        return None;
+        decline!("special", MISS, "frame stack is full");
     }
     let mut slots = empty_arg_slots();
     if !read_args_verbatim(
@@ -383,14 +464,30 @@ pub(super) fn execute_invokespecial_fast_door(
         true,
         &mut slots,
     ) {
-        return None;
+        decline!("special", MISS, "an argument slot needs coercion");
     }
     // A null receiver is the general path's business: it builds the helpful
     // NPE. `read_args_verbatim` accepts a null in slot 0 because a reference
     // parameter may legitimately be null; the receiver may not.
-    if slots[0].0.is_null() {
-        return None;
+    let Some(recv_ptr) = slots[0].0.as_object_ptr() else {
+        decline!("special", MISS, "null or non-object receiver");
+    };
+    if let Some(expected) = expected_receiver {
+        if shared
+            .mem
+            .heap
+            .is_object_address(recv_ptr as usize)
+            .is_none()
+        {
+            decline!("special", MISS, "receiver is not a live heap object");
+        }
+        // SAFETY: `recv_ptr` is a registered object start on this heap.
+        let header = unsafe { &*(recv_ptr as *const cratonvm_gc::ObjectHeader) };
+        if header.class_id != expected {
+            decline!("special", MISS, "receiver class differs from the entry");
+        }
     }
+    site_stats::bump(site_stats::DOOR_SPECIAL_HIT);
     dbg_invoke_stats_record(0);
     Some(Ok(push_frame_verbatim(
         shared, thread, frame_idx, cached, &slots, total_args,

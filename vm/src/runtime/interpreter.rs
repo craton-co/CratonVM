@@ -7519,6 +7519,31 @@ fn execute_frame_from_index(
                             None => {}
                         }
                     }
+                    if nonvirtual_fast_door_on {
+                        match invoke_fast::execute_nonvirtual_fast_door(
+                            shared, thread, frame_idx, cp_index, false,
+                        ) {
+                            Some(Ok(CachedCallResult::FramePushed)) => {
+                                frame_idx = thread.frames.len() - 1;
+                                continue;
+                            }
+                            Some(Ok(_)) => {
+                                continue;
+                            }
+                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e) {
+                                FastPathInvokeError::Runtime(re) => {
+                                    pending_runtime_error = Some((re, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Java(exc) => {
+                                    pending_java_exception = Some((exc, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Fatal(e) => return Err(e),
+                            },
+                            None => {}
+                        }
+                    }
                     // PERF: consult the cheap thread-local inline cache FIRST.
                     // A warm monomorphic site hits here and dispatches with one
                     // class-id compare + arg decode + frame push — no locks, no
@@ -7606,8 +7631,8 @@ fn execute_frame_from_index(
                     let _ = frame;
                     thread.frames[frame_idx].pc = saved_pc + 3;
                     if nonvirtual_fast_door_on {
-                        match invoke_fast::execute_invokespecial_fast_door(
-                            shared, thread, frame_idx, cp_index,
+                        match invoke_fast::execute_nonvirtual_fast_door(
+                            shared, thread, frame_idx, cp_index, true,
                         ) {
                             Some(Ok(CachedCallResult::FramePushed)) => {
                                 frame_idx = thread.frames.len() - 1;
