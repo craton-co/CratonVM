@@ -153,6 +153,86 @@ def rows(root):
     return out, declared
 
 
+# The two "Where the surface stands" rows this file did NOT used to write.
+#
+# They are hand-maintained numbers over a scan of the tree, so they went stale
+# every time anyone added a flag anywhere — `flag_inventory_surface_counts_are_
+# current` caught them drifting by 350 once, and by 1 four times in the two days
+# before this was written, each time from an unrelated branch. A number that
+# only a human can refresh, in a file a generator rewrites, is a red build
+# waiting for the next commit. Now the generator writes them.
+#
+# These reimplement `types/tests/doc_numeric_claims.rs`'s `collect_rust`,
+# `scan_identifiers` and `scan_literals` EXACTLY, because that test is what
+# enforces the result: same skipped directories (including `docs/internal`,
+# which the shell recipe in the test's failure message does not exclude), same
+# "prefix plus at least one [A-Z0-9_]" rule, same members-with-a-src-dir walk
+# for row 2, and the same silent skip of a file that is not valid UTF-8.
+SKIPPED_DIRS = {'target', '.git', 'vendor', 'node_modules'}
+IDENT_RE = re.compile(r'CRATONVM_[A-Z0-9_]+')
+LITERAL_RE = re.compile(r'"(CRATONVM_[A-Z0-9_]+)"')
+
+
+def _rust_files(root, start):
+    """Every `*.rs` under `start`, with the test's exclusions."""
+    docs_internal = os.path.join(root, 'docs', 'internal')
+    found = []
+    for dirpath, dirnames, filenames in os.walk(start):
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in SKIPPED_DIRS
+            and not d.startswith('.')
+            and os.path.join(dirpath, d) != docs_internal
+        ]
+        found += [os.path.join(dirpath, f) for f in filenames if f.endswith('.rs')]
+    return found
+
+
+def _read_utf8(path):
+    """The test uses `read_to_string`, which SKIPS a non-UTF-8 file rather than
+    lossily decoding it. Matching that matters: a lossy decode could invent or
+    destroy a name and move the count by one with nothing to point at."""
+    try:
+        with open(path, encoding='utf-8') as fh:
+            return fh.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def surface_counts(root):
+    """`(row 1, row 2)` of the "Where the surface stands" table."""
+    identifiers = set()
+    for path in _rust_files(root, root):
+        text = _read_utf8(path)
+        if text is not None:
+            identifiers.update(IDENT_RE.findall(text))
+
+    literals = set()
+    for member in _workspace_members(root):
+        src = os.path.join(root, member, 'src')
+        if not os.path.isdir(src):
+            continue
+        for path in _rust_files(root, src):
+            text = _read_utf8(path)
+            if text is not None:
+                literals.update(LITERAL_RE.findall(text))
+
+    return len(identifiers), len(literals)
+
+
+def _workspace_members(root):
+    """The `members = [...]` list, the way the test reads it."""
+    with open(os.path.join(root, 'Cargo.toml'), encoding='utf-8') as fh:
+        manifest = fh.read()
+    open_at = manifest.index('members = [')
+    rest = manifest[open_at + len('members = ['):]
+    return [
+        m.strip().strip('"')
+        for m in rest[:rest.index(']')].split(',')
+        if m.strip().strip('"')
+    ]
+
+
 def main():
     table, declared = rows(ROOT)
 
@@ -202,10 +282,24 @@ def main():
         r'(\| \*\*declared\*\* in `flag_groups::INVENTORY` \+ scalars \+ '
         r'group variables \| \*\*)\d+(\*\* \|)',
         r'\g<1>%d\g<2>' % len(declared), head)
+    # Rows 1 and 2 of the same table, which used to be hand-maintained. Written
+    # with thousands separators because that is the spelling already in the
+    # document and `parse_count` on the test side accepts it.
+    row1, row2 = surface_counts(ROOT)
+    head = re.sub(
+        r'(\| distinct `CRATONVM_\*` identifiers appearing anywhere in Rust '
+        r'source \| )[0-9,]+( \|)',
+        r'\g<1>%s\g<2>' % format(row1, ',d'), head)
+    head = re.sub(
+        r'(\| exact string literals \(i\.e\. actually named by code, not '
+        r'prose\) \| )[0-9,]+( \|)',
+        r'\g<1>%s\g<2>' % format(row2, ',d'), head)
     with open(OUT, 'w', encoding='utf-8', newline='\n') as fh:
         fh.write(head + header + '\n'.join(body) + '\n')
-    print('wrote %s (%d rows: %d declared, %d allowlisted)'
-          % (OUT, len(table), len(declared), len(ALLOWLISTED)))
+    print('wrote %s (%d rows: %d declared, %d allowlisted; '
+          'surface %s identifiers / %s literals)'
+          % (OUT, len(table), len(declared), len(ALLOWLISTED),
+             format(row1, ',d'), format(row2, ',d')))
 
 
 if __name__ == '__main__':
