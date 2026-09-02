@@ -9439,6 +9439,86 @@ impl Compiler {
                         }
                         // ===== INTRINSIC REGION END: ATOMIC_INT =====
 
+                        // ===== INTRINSIC REGION BEGIN: ATOMIC_INT_CAS =====
+                        // `compareAndSet` / `weakCompareAndSet` as one
+                        // `LOCK CMPXCHG [value], RDX`.
+                        //
+                        // Operand placement differs from the `XADD` arms above
+                        // and has to: `CMPXCHG` compares the memory operand
+                        // against RAX IMPLICITLY, so RAX belongs to the
+                        // EXPECTED value and the receiver moves to RCX. Getting
+                        // that backwards compiles and silently compares the
+                        // object pointer against the field.
+                        //
+                        // The result is ZF, not the field, so the arm ends
+                        // `SETZ AL` / `MOVZX EAX, AL` — and on failure RAX
+                        // holds the value CMPXCHG read, which is deliberately
+                        // discarded: `compareAndSet` returns only the boolean
+                        // (`compareAndExchange`, which returns the witness, is
+                        // NOT claimed here and keeps its native).
+                        if !intrinsic_handled
+                            && callee_entry == crate::JitIntrinsic::AtomicIntCompareAndSet.as_entry()
+                        {
+                            if let Some(layout) = crate::AtomicIntFieldLayout::new(0, guard_class_id) {
+                                self.flush_scratch_registers();
+                                if crate::deopt_real_enabled() {
+                                    self.snapshot_pre_intrinsic_call(
+                                        pc,
+                                        crate::deopt::DeoptReason::ReceiverTypeChanged,
+                                    );
+                                }
+                                let mut bail: Vec<usize> = Vec::new();
+                                // Deepest first on the operand stack: receiver,
+                                // expected, update. Popped in reverse.
+                                let update_slot = self.pop_stack();
+                                let expect_slot = self.pop_stack();
+                                let recv_slot = self.pop_stack();
+
+                                // RCX = receiver; null -> deopt.
+                                self.load_slot_to_reg(RCX, recv_slot);
+                                self.emit_test_r64_r64(RCX);
+                                bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+
+                                // Exact receiver class guard:
+                                // CMP DWORD [RCX + 0], guard_class_id ; JNE
+                                self.buf.emit(&[0x81, 0x79, 0x00]);
+                                self.buf.emit(&guard_class_id.to_le_bytes());
+                                bail.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+
+                                // RAX = expected (the implicit comparand),
+                                // RDX = update. Loaded AFTER the guard so a
+                                // deopt path does not depend on them.
+                                self.load_slot_to_reg(RAX, expect_slot);
+                                self.load_slot_to_reg(RDX, update_slot);
+
+                                // Per-object layout branch, as the arms above.
+                                self.emit_test_mem8_imm8(
+                                    RCX,
+                                    cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
+                                    cratonvm_types::GC_FLAG_COMPACT,
+                                );
+                                let legacy = self.emit_jcc_rel32_patch(0x84); // JZ
+                                self.buf.emit(&[0xF0, 0x0F, 0xB1, 0x91]);
+                                self.buf.emit(&layout.value_compact_offset.to_le_bytes());
+                                let done = self.emit_jmp_rel32_patch();
+                                self.patch_rel32_to_here(legacy);
+                                self.buf.emit(&[0xF0, 0x0F, 0xB1, 0x91]);
+                                self.buf.emit(&layout.value_legacy_offset.to_le_bytes());
+                                self.patch_rel32_to_here(done);
+
+                                // ZF = "the swap happened".
+                                self.buf.emit(&[0x0F, 0x94, 0xC0]); // SETZ AL
+                                self.buf.emit(&[0x0F, 0xB6, 0xC0]); // MOVZX EAX, AL
+                                self.push_from_rax();
+
+                                for p in bail {
+                                    self.deopt_stubs.push((p, pc, 6));
+                                }
+                                intrinsic_handled = true;
+                            }
+                        }
+                        // ===== INTRINSIC REGION END: ATOMIC_INT_CAS =====
+
                         // ===== INTRINSIC REGION BEGIN: ATOMIC_LONG =====
                         // `AtomicLong`, emitted as ONE REX.W `LOCK XADD
                         // [value], RCX`. Structurally identical to the 32-bit
@@ -9594,6 +9674,86 @@ impl Compiler {
                             }
                         }
                         // ===== INTRINSIC REGION END: ATOMIC_LONG =====
+
+                        // ===== INTRINSIC REGION BEGIN: ATOMIC_LONG_CAS =====
+                        // `compareAndSet` / `weakCompareAndSet` as one
+                        // REX.W `LOCK CMPXCHG [value], RDX`.
+                        //
+                        // Operand placement differs from the `XADD` arms above
+                        // and has to: `CMPXCHG` compares the memory operand
+                        // against RAX IMPLICITLY, so RAX belongs to the
+                        // EXPECTED value and the receiver moves to RCX. Getting
+                        // that backwards compiles and silently compares the
+                        // object pointer against the field.
+                        //
+                        // The result is ZF, not the field, so the arm ends
+                        // `SETZ AL` / `MOVZX EAX, AL` — and on failure RAX
+                        // holds the value CMPXCHG read, which is deliberately
+                        // discarded: `compareAndSet` returns only the boolean
+                        // (`compareAndExchange`, which returns the witness, is
+                        // NOT claimed here and keeps its native).
+                        if !intrinsic_handled
+                            && callee_entry == crate::JitIntrinsic::AtomicLongCompareAndSet.as_entry()
+                        {
+                            if let Some(layout) = crate::AtomicLongFieldLayout::new(0, guard_class_id) {
+                                self.flush_scratch_registers();
+                                if crate::deopt_real_enabled() {
+                                    self.snapshot_pre_intrinsic_call(
+                                        pc,
+                                        crate::deopt::DeoptReason::ReceiverTypeChanged,
+                                    );
+                                }
+                                let mut bail: Vec<usize> = Vec::new();
+                                // Deepest first on the operand stack: receiver,
+                                // expected, update. Popped in reverse.
+                                let update_slot = self.pop_stack();
+                                let expect_slot = self.pop_stack();
+                                let recv_slot = self.pop_stack();
+
+                                // RCX = receiver; null -> deopt.
+                                self.load_slot_to_reg(RCX, recv_slot);
+                                self.emit_test_r64_r64(RCX);
+                                bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+
+                                // Exact receiver class guard:
+                                // CMP DWORD [RCX + 0], guard_class_id ; JNE
+                                self.buf.emit(&[0x81, 0x79, 0x00]);
+                                self.buf.emit(&guard_class_id.to_le_bytes());
+                                bail.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+
+                                // RAX = expected (the implicit comparand),
+                                // RDX = update. Loaded AFTER the guard so a
+                                // deopt path does not depend on them.
+                                self.load_slot_to_reg(RAX, expect_slot);
+                                self.load_slot_to_reg(RDX, update_slot);
+
+                                // Per-object layout branch, as the arms above.
+                                self.emit_test_mem8_imm8(
+                                    RCX,
+                                    cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
+                                    cratonvm_types::GC_FLAG_COMPACT,
+                                );
+                                let legacy = self.emit_jcc_rel32_patch(0x84); // JZ
+                                self.buf.emit(&[0xF0, 0x48, 0x0F, 0xB1, 0x91]);
+                                self.buf.emit(&layout.value_compact_offset.to_le_bytes());
+                                let done = self.emit_jmp_rel32_patch();
+                                self.patch_rel32_to_here(legacy);
+                                self.buf.emit(&[0xF0, 0x48, 0x0F, 0xB1, 0x91]);
+                                self.buf.emit(&layout.value_legacy_offset.to_le_bytes());
+                                self.patch_rel32_to_here(done);
+
+                                // ZF = "the swap happened".
+                                self.buf.emit(&[0x0F, 0x94, 0xC0]); // SETZ AL
+                                self.buf.emit(&[0x0F, 0xB6, 0xC0]); // MOVZX EAX, AL
+                                self.push_from_rax();
+
+                                for p in bail {
+                                    self.deopt_stubs.push((p, pc, 6));
+                                }
+                                intrinsic_handled = true;
+                            }
+                        }
+                        // ===== INTRINSIC REGION END: ATOMIC_LONG_CAS =====
 
                         // ===== INTRINSIC REGION BEGIN: BOX_UNBOX =====
                         // `Long.longValue()J` and `Integer.intValue()I` — the

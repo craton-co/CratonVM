@@ -9427,6 +9427,19 @@ pub enum JitIntrinsic {
     AtomicIntDecrementAndGet, // decrementAndGet()I  -> old - 1
     AtomicIntGetAndAdd,       // getAndAdd(I)I       -> old
     AtomicIntAddAndGet,       // addAndGet(I)I       -> old + delta
+    /// `compareAndSet(II)Z` / `weakCompareAndSet(II)Z` — one `LOCK CMPXCHG`.
+    ///
+    /// Unlike the six `XADD` forms above this one has a RESULT that is not the
+    /// field: `CMPXCHG` reports success in ZF, so the arm ends `SETZ`/`MOVZX`
+    /// rather than moving the payload out. It also has to place its operands
+    /// differently — `CMPXCHG` compares against RAX implicitly, so the
+    /// receiver moves to RCX and the expected value takes RAX.
+    ///
+    /// `weakCompareAndSet` is the same instruction: the spec permits it to fail
+    /// spuriously and `LOCK CMPXCHG` never does, and a strictly-stronger
+    /// implementation is a legal one (the registered native makes the same
+    /// choice — both triples call `compare_and_swap_field`).
+    AtomicIntCompareAndSet,
     // ===== INTRINSIC REGION END: ATOMIC_INT =====
 
     // ===== INTRINSIC REGION BEGIN: ATOMIC_LONG =====
@@ -9462,6 +9475,21 @@ pub enum JitIntrinsic {
     AtomicLongDecrementAndGet, // decrementAndGet()J  -> old - 1
     AtomicLongGetAndAdd,       // getAndAdd(J)J       -> old
     AtomicLongAddAndGet,       // addAndGet(J)J       -> old + delta
+    /// The 64-bit twin of [`JitIntrinsic::AtomicIntCompareAndSet`] — one
+    /// REX.W `LOCK CMPXCHG`.
+    ///
+    /// MEASURED before this existed, `probes/AtomicCasCost.java` on this host:
+    /// `AtomicLong.compareAndSet` **361.3 ns/op against HotSpot's 13.25**, a
+    /// 27x gap, while its `get` (2.41) and `getAndIncrement` (12.02) siblings —
+    /// which ARE in this region — sit at 1.3-5x. The whole difference between
+    /// them was membership of this list.
+    ///
+    /// It is also the measured blocker for retiring the `java.util.Random`
+    /// shadow: `Random.next(int)` is a `get` + `compareAndSet` loop, and
+    /// running that loop on a real `AtomicLong` cost 2265.6 ns against the
+    /// VM's side-table `nextInt` at 273.4. See
+    /// `known-issues/hibernate/jpalargeblobtest-per-native-call-floor-20260830.md`.
+    AtomicLongCompareAndSet,
     // ===== INTRINSIC REGION END: ATOMIC_LONG =====
 
     // ===== INTRINSIC REGION BEGIN: BOX_UNBOX =====
@@ -12221,6 +12249,8 @@ pub fn try_resolve_atomic_intrinsic(
         ("incrementAndGet", "()I") => Some((JitIntrinsic::AtomicIntIncrementAndGet, 0)),
         ("decrementAndGet", "()I") => Some((JitIntrinsic::AtomicIntDecrementAndGet, 0)),
         ("getAndAdd", "(I)I") => Some((JitIntrinsic::AtomicIntGetAndAdd, 1)),
+        ("compareAndSet", "(II)Z") => Some((JitIntrinsic::AtomicIntCompareAndSet, 2)),
+        ("weakCompareAndSet", "(II)Z") => Some((JitIntrinsic::AtomicIntCompareAndSet, 2)),
         ("addAndGet", "(I)I") => Some((JitIntrinsic::AtomicIntAddAndGet, 1)),
         _ => None,
     };
@@ -12238,7 +12268,17 @@ pub fn try_resolve_atomic_intrinsic(
             layout.value_legacy_offset,
         );
     }
-    Some((intrinsic.as_entry(), num_params, b'I', layout.class_id))
+    // `compareAndSet` is the one member of this family whose result is not the
+    // field: it reports success, so its tag is `Z`. Everything else returns the
+    // 32-bit payload. (`Z` and `I` take the same `push_from_rax` arm in the
+    // emitter's return ladder — only `D`/`F` and `L`/`[` are special-cased —
+    // so this is about the SIGNATURE the caller sees, not the encoding.)
+    let ret = if matches!(intrinsic, JitIntrinsic::AtomicIntCompareAndSet) {
+        b'Z'
+    } else {
+        b'I'
+    };
+    Some((intrinsic.as_entry(), num_params, ret, layout.class_id))
 }
 
 /// Call sites the `AtomicLong` intrinsic has claimed this process.
@@ -12310,6 +12350,8 @@ pub fn try_resolve_atomic_long_intrinsic(
         ("incrementAndGet", "()J") => Some((JitIntrinsic::AtomicLongIncrementAndGet, 0)),
         ("decrementAndGet", "()J") => Some((JitIntrinsic::AtomicLongDecrementAndGet, 0)),
         ("getAndAdd", "(J)J") => Some((JitIntrinsic::AtomicLongGetAndAdd, 1)),
+        ("compareAndSet", "(JJ)Z") => Some((JitIntrinsic::AtomicLongCompareAndSet, 2)),
+        ("weakCompareAndSet", "(JJ)Z") => Some((JitIntrinsic::AtomicLongCompareAndSet, 2)),
         ("addAndGet", "(J)J") => Some((JitIntrinsic::AtomicLongAddAndGet, 1)),
         _ => None,
     };
@@ -12327,7 +12369,13 @@ pub fn try_resolve_atomic_long_intrinsic(
             layout.value_legacy_offset,
         );
     }
-    Some((intrinsic.as_entry(), num_params, b'J', layout.class_id))
+    // See the `Z` note on the 32-bit twin above.
+    let ret = if matches!(intrinsic, JitIntrinsic::AtomicLongCompareAndSet) {
+        b'Z'
+    } else {
+        b'J'
+    };
+    Some((intrinsic.as_entry(), num_params, ret, layout.class_id))
 }
 
 /// Sites the BOX_UNBOX intrinsic has claimed this process, split by class.
@@ -12436,6 +12484,81 @@ pub fn try_resolve_box_unbox_intrinsic(
 #[cfg(test)]
 mod atomic_accessor_intrinsic_tests {
     use super::*;
+
+    /// `compareAndSet` must be reachable for BOTH spellings and for both
+    /// widths, and must be the ONLY member of the family whose tag is `Z`.
+    ///
+    /// The tag matters beyond documentation: it is what the caller's return
+    /// ladder uses, and a `compareAndSet` advertised as `J` would push the
+    /// 64-bit RAX — which after a FAILED `CMPXCHG` is the value the field held,
+    /// i.e. a plausible-looking wrong answer rather than a crash.
+    #[test]
+    fn compare_and_set_is_claimed_for_both_widths_and_returns_z() {
+        const CID: u32 = 12345;
+        for (class, name, desc) in [
+            ("java/util/concurrent/atomic/AtomicLong", "compareAndSet", "(JJ)Z"),
+            ("java/util/concurrent/atomic/AtomicLong", "weakCompareAndSet", "(JJ)Z"),
+        ] {
+            let (_, num_params, ret, guard) =
+                try_resolve_atomic_long_intrinsic(class, name, desc, CID)
+                    .unwrap_or_else(|| panic!("{class}.{name}{desc} not claimed"));
+            assert_eq!(num_params, 2, "{name}: receiver-excluded arity");
+            assert_eq!(ret, b'Z', "{name}: must be tagged boolean, not the field width");
+            assert_eq!(guard, CID);
+        }
+        for (class, name, desc) in [
+            ("java/util/concurrent/atomic/AtomicInteger", "compareAndSet", "(II)Z"),
+            ("java/util/concurrent/atomic/AtomicInteger", "weakCompareAndSet", "(II)Z"),
+        ] {
+            let (_, num_params, ret, guard) =
+                try_resolve_atomic_intrinsic(class, name, desc, CID)
+                    .unwrap_or_else(|| panic!("{class}.{name}{desc} not claimed"));
+            assert_eq!(num_params, 2, "{name}: receiver-excluded arity");
+            assert_eq!(ret, b'Z', "{name}: must be tagged boolean, not the field width");
+            assert_eq!(guard, CID);
+        }
+        // The siblings must NOT have become `Z` along the way.
+        let (_, _, ret, _) =
+            try_resolve_atomic_long_intrinsic("java/util/concurrent/atomic/AtomicLong", "get", "()J", CID).unwrap();
+        assert_eq!(ret, b'J');
+        let (_, _, ret, _) =
+            try_resolve_atomic_intrinsic("java/util/concurrent/atomic/AtomicInteger", "get", "()I", CID).unwrap();
+        assert_eq!(ret, b'I');
+    }
+
+    /// `compareAndExchange` returns the WITNESS, not a boolean, so a
+    /// `CMPXCHG`-plus-`SETZ` arm cannot serve it. It must keep its native.
+    #[test]
+    fn compare_and_exchange_is_not_claimed() {
+        const CID: u32 = 12345;
+        assert!(try_resolve_atomic_long_intrinsic(
+            "java/util/concurrent/atomic/AtomicLong", "compareAndExchange", "(JJ)J", CID).is_none());
+        assert!(try_resolve_atomic_intrinsic(
+            "java/util/concurrent/atomic/AtomicInteger", "compareAndExchange", "(II)I", CID).is_none());
+    }
+
+    /// The two CAS variants must not collide with each other or with the seven
+    /// `XADD`/load forms they sit beside — the emitter dispatches on
+    /// `as_entry` alone and picks the OPERAND WIDTH from it.
+    #[test]
+    fn compare_and_set_entries_are_distinct() {
+        let all = [
+            JitIntrinsic::AtomicIntCompareAndSet.as_entry(),
+            JitIntrinsic::AtomicLongCompareAndSet.as_entry(),
+            JitIntrinsic::AtomicIntGet.as_entry(),
+            JitIntrinsic::AtomicLongGet.as_entry(),
+            JitIntrinsic::AtomicIntGetAndAdd.as_entry(),
+            JitIntrinsic::AtomicLongGetAndAdd.as_entry(),
+            JitIntrinsic::AtomicIntAddAndGet.as_entry(),
+            JitIntrinsic::AtomicLongAddAndGet.as_entry(),
+            JitIntrinsic::LongLongValue.as_entry(),
+            JitIntrinsic::IntegerIntValue.as_entry(),
+        ];
+        let mut v = all.to_vec();
+        v.sort_unstable();
+        v.dedup();
+        assert_eq!(v.len(), all.len(), "two atomic/box intrinsics share an `as_entry`");
+    }
 
     // ===== INTRINSIC REGION BEGIN: BOX_UNBOX =====
 

@@ -83,6 +83,55 @@ public class AtomicCorrectness {
         for (Thread t : us) t.join();
         eq("AtomicLong contended CAS loop", d.get(), 200_000);
 
+        // --- compareAndSet specifics, warm enough to be COMPILED ----------
+        // The inline arm is one `LOCK CMPXCHG`, and the two mistakes it can
+        // make are invisible to a single cold call: comparing against the
+        // wrong register (the receiver instead of the expected value), and
+        // returning the witness instead of ZF. Both show up as a wrong
+        // BOOLEAN, so every assertion here checks the boolean AND the field.
+        AtomicLong cas = new AtomicLong(0);
+        long hits = 0, misses = 0;
+        for (int k = 0; k < 400_000; k++) {
+            long want = cas.get();
+            if (cas.compareAndSet(want, want + 1)) hits++;
+            // A CAS against a value the field does NOT hold must fail and must
+            // leave the field alone.
+            if (cas.compareAndSet(want - 7, 999)) misses++;
+        }
+        eq("CAS hits", hits, 400_000);
+        eq("CAS bogus-expect successes", misses, 0);
+        eq("CAS final value", cas.get(), 400_000);
+
+        AtomicInteger icas = new AtomicInteger(0);
+        long ihits = 0, imisses = 0;
+        for (int k = 0; k < 400_000; k++) {
+            int want = icas.get();
+            if (icas.compareAndSet(want, want + 1)) ihits++;
+            if (icas.compareAndSet(want - 7, 999)) imisses++;
+        }
+        eq("int CAS hits", ihits, 400_000);
+        eq("int CAS bogus-expect successes", imisses, 0);
+        eq("int CAS final value", icas.get(), 400_000);
+
+        // weakCompareAndSet shares the emitter arm; `LOCK CMPXCHG` never fails
+        // spuriously, so a warmed loop must reach the target exactly.
+        AtomicLong weak = new AtomicLong(0);
+        for (int k = 0; k < 200_000; k++) {
+            long w;
+            do { w = weak.get(); } while (!weak.weakCompareAndSet(w, w + 1));
+        }
+        eq("weakCAS final value", weak.get(), 200_000);
+
+        // Boundary values: the 64-bit arm must not be reading 32 bits.
+        AtomicLong wide = new AtomicLong(0);
+        for (int k = 0; k < 100_000; k++) {
+            wide.set(0x0123456789ABCDEFL);
+            if (!wide.compareAndSet(0x0123456789ABCDEFL, Long.MIN_VALUE)) fails++;
+            eq("wide CAS result", wide.get(), Long.MIN_VALUE);
+            if (wide.compareAndSet(0x89ABCDEFL, 1)) fails++;   // low 32 bits only
+            if (fails > 10) break;
+        }
+
         System.out.println("CK AtomicCorrectness fails=" + fails);
     }
 }

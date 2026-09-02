@@ -43,6 +43,19 @@ public class AtomicCasCost {
         time("AL.compareAndSet(v,v)",n -> { long s=0; for(int i=0;i<n;i++){ long v=AL.get(); if(AL.compareAndSet(v,v+1)) s++; } return s; });
         time("AL.getAndIncrement()", n -> { long s=0; for(int i=0;i<n;i++) s+=AL.getAndIncrement(); return s; });
         time("lcgNext(AL,32)  [= Random.next]", n -> { long s=0; for(int i=0;i<n;i++) s+=lcgNext(AL,32); return s; });
+        // The same loop body INLINE, with no static-method boundary. If this is
+        // fast and `lcgNext` above is not, the cost is the call, not the CAS.
+        time("lcg loop inline (no call)", n -> {
+            long s=0;
+            for(int i=0;i<n;i++){
+                long oldseed, nextseed;
+                do { oldseed = AL.get(); nextseed = (oldseed * 0x5DEECE66DL + 0xBL) & ((1L<<48)-1); }
+                while(!AL.compareAndSet(oldseed, nextseed));
+                s += (int)(nextseed >>> 16);
+            }
+            return s; });
+        // A CAS loop that can never fail, to price the do/while shape itself.
+        time("CAS in a do/while (1 iter)", n -> { long s=0; for(int i=0;i<n;i++){ long v; do { v=AL.get(); } while(!AL.compareAndSet(v, v+1)); s++; } return s; });
         System.out.println("CK sink="+(sink==0?0:1));
     }
 }
