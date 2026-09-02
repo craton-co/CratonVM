@@ -339,7 +339,12 @@ binary.
 * **The wipe lost all three rounds of the r6 A/B and tied on r5.** Read that
   as host noise, not as a cost — §7.
 * Absolute pause numbers are this host's under load — see Method.
-* `OldToYoungEdgeProbe` shows the item-7 shape the review named and this page
-  does not touch: with dirty cards near the end of a large old gen,
-  `scan_dirty_cards` is O(old objects) (137–161 ms spikes in the r1 A/B's
-  `PAR_EVAC=0` arm). A block-offset table is its own change.
+* ~~`OldToYoungEdgeProbe` shows the item-7 shape … `scan_dirty_cards` is
+  O(old objects) (137–161 ms spikes in the r1 A/B's `PAR_EVAC=0` arm). A
+  block-offset table is its own change.~~ **WITHDRAWN 2026-09-02** — see
+  [`gen-gc-card-scan-refuted-20260902.md`](gen-gc-card-scan-refuted-20260902.md).
+  Those spikes belonged to the pause-goal shrink pathology that arm was running
+  with (bloated old gen, 203–219 collections instead of 29), which §6's own fix
+  removed. On the merged binary the same probe reports 0.48 ms per collection,
+  and two new probes built to expose the prefix walk and the whole-array rescan
+  find both flat across 8× and 16× growths. The scan is under 1% of a pause.

@@ -254,7 +254,10 @@ terminal test was `GetConsoleMode` where HotSpot's is `isatty`, and `chcp 65001`
 was spelled `cp65001` where HotSpot spells it `UTF-8`. See
 `stdout-encoding-differs-from-hotspot-on-windows-20260901.md` §11. The
 `MS932`/`GBK`/`MS949`/`MS950` ANSI rows are still the JDK's table and not a
-host's, and no CratonVM binary has been BUILT on Windows.
+host's. A CratonVM binary WAS then built on Windows (2026-09-02) and its whole
+849-byte `REncodingFidelity` output is byte-identical to HotSpot's on that host,
+`println("[Ж]")` included — `5b c6 5d`, the single cp1251 byte, where this VM
+used to write the UTF-8 pair `5b d0 96 5d`.
 
 And a real degradation, stated because it is a behaviour change and not a
 theoretical one: if the host names an encoding this image has no charset for

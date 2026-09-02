@@ -3710,7 +3710,7 @@ impl SharedVm {
         let native_encoding = derive_native_encoding();
         sys_props.insert("file.encoding".to_string(), "UTF-8".to_string());
         sys_props.insert("native.encoding".to_string(), native_encoding.clone());
-        sys_props.insert("sun.jnu.encoding".to_string(), "UTF-8".to_string());
+        sys_props.insert("sun.jnu.encoding".to_string(), native_encoding.clone());
         sys_props.insert(
             "stdout.encoding".to_string(),
             cratonvm_native_api::os_encoding::stream_encoding(

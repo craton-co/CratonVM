@@ -351,6 +351,68 @@ whose time actually sits in these operations — the Tomcat annotation scan the
 retired predecessor page was built around is the obvious candidate, and it was
 not run here.
 
+## Five suite vectors were already red on dev when this pass landed
+
+Recorded here, on the page whose branch was in flight at the time, so the next
+reader does not spend a session attributing them to it. **None of them is
+caused by the 2026-09-02 interpreter work**, and the control that proves it is
+a build, not an argument.
+
+| vector | signature |
+|---|---|
+| `RJitMultiArrayClass` | `s20-serial-roundtrip` COLD and HOT: `want=[[D] got=[threw-java.lang.ArrayIndexOutOfBoundsException]` |
+| `RMapGcStress` | `rc=1: no output` |
+| `RJdkIntrinsics3` | `NoSuchMethodError java/lang/StringBuilder.close()V`, then `ServiceConfigurationError: Locale provider adapter "CLDR" cannot be instantiated` |
+| `REncodingFidelity` | output differs from HotSpot |
+| `RBufferPoolCount` | `routeA.pools=[mapped, direct, mapped …]` |
+
+### The control
+
+`4be7404d6` is the dev tip immediately **before** the interpreter branch
+merged; `git merge-base --is-ancestor` confirms none of the branch's commits
+are in it. Built as `cratonvm-devctl-4be7404d6.exe` and run against the same
+compiled vectors: **all five fail, with identical signatures.**
+
+Three weaker checks agreed beforehand and are kept because each rules out a
+different thing:
+
+* All five still fail on the merged binary with **all five kill switches set**
+  — so no switched change causes them.
+* Three of the five (`RJitMultiArrayClass`, `RMapGcStress`, `RJdkIntrinsics3`)
+  **pass** on a binary carrying the branch's changes against the older dev,
+  including `push_args_to_locals`, the one change with **no** kill switch. That
+  is the only way to exonerate an unswitched change, and it is why the binary
+  was kept.
+* The symptoms sit in unrelated subsystems: a locale provider, a charset
+  fidelity diff, an NIO buffer-pool census. None of them touches interpreter
+  dispatch, frame locals or the invoke path.
+
+### What `RJitMultiArrayClass` actually is
+
+Worth writing down because it is the one with a clean handle on it.
+
+`--nojit` makes it **pass**, on pure dev and on the merged binary alike, so it
+is a JIT defect. It is also not a property of the serialization scenario: s20
+run **alone** passes, and 700 iterations of the same round-trip in isolation
+pass. Any *single* preceding scenario — 3000 iterations of multi-dimensional
+array work — is enough to make s20's very first (cold) call throw. So the
+trigger is compilation of the array shapes, not anything serialization does.
+
+`probes/` has no vector for this; the reproduction is the suite's own, with a
+scenario filter:
+
+```bash
+# fails
+cratonvm --java-home <JDK 25> -c regression-suite/build RJitMultiArrayClass
+# passes — same binary, same class
+cratonvm --java-home <JDK 25> --nojit -c regression-suite/build RJitMultiArrayClass
+```
+
+dev merged `perf/jit-six-findings-20260902` (a GP register file for the
+optimizing tier, and reference stores that stop paying a call) inside the same
+window. That is the obvious first place to look; it is a lead, not a finding —
+no bisect was run.
+
 ### What this pass did NOT find, so nobody re-derives it
 
 * **Fast-path arms for `tableswitch` / `lookupswitch` are not a lever.** Both do
