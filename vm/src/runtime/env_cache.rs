@@ -1115,6 +1115,19 @@ pub fn bg_compile() -> bool {
 // the interpreter hot loop and all codegen are byte-for-byte unchanged unless
 // opted in. See `docs/feature-designs/wire-tiered-manager.md` (Step 4).
 cached_is_set!(tier_pgo, "CRATONVM_TIER_PGO");
+/// Receiver-type and call-site recording in the interpreter -- **default ON**
+/// since 2026-09-02, opt out with `CRATONVM_TIER_PGO_RECEIVERS=0`. The two
+/// profile maps every speculative-inlining decision reads
+/// (`classify_receiver_shape`, `CallSiteEvidence`) are recorded at invoke
+/// sites only, which is cheap enough to leave on; branch and back-edge
+/// recording stays behind `CRATONVM_TIER_PGO`.
+pub fn tier_pgo_receivers() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var("CRATONVM_TIER_PGO_RECEIVERS")
+            .map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("false"))
+    })
+}
 // Invocation-count tier-up for INSTANCE methods (invokevirtual/invokeinterface).
 //
 // DEFAULT-ON. It was turned off wholesale in `c28bdd687` because the
@@ -2104,7 +2117,7 @@ pub fn jit_guarded_virtual_inline() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_GUARDED_VIRTUAL_INLINE")
-            .is_ok_and(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("false"))
     })
 }
 

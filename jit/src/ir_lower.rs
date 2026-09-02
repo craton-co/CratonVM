@@ -876,6 +876,20 @@ struct Lowerer<'a> {
     /// definition arm costs an optimization and can never produce a read of a
     /// register nothing wrote.
     gp_reg_live: Vec<bool>,
+    /// Number of input references to each node, over every input of every
+    /// node. Filled by `prepare_fusion_tables` before the first block lowers.
+    use_count: Vec<u32>,
+    /// `Op::Cmp` nodes whose only use is the `Op::If` terminator consuming
+    /// them, lowered as one fused compare-and-branch by that terminator; the
+    /// compare's own arm emits nothing (`ir_fused_branch_enabled`).
+    fused_cmp: Vec<bool>,
+    /// Nodes named by some safepoint snapshot. Their home word must hold the
+    /// value at that bci, so such a compare is never fused away.
+    deopt_named: Vec<bool>,
+    /// Per-block CSE of the mapped-receiver guard (null, alignment, the six
+    /// read-bounds compares): receivers already proven in the block being
+    /// lowered. Cleared at every block entry (`ir_receiver_guard_cse_enabled`).
+    guarded_receivers: Vec<NodeId>,
     /// Register → memory transitions this backend EMITTED for resident values
     /// (one per resident definition, because the wiring is write-through).
     /// Reported as `CompilationReport::spills`.
@@ -1274,6 +1288,10 @@ impl<'a> Lowerer<'a> {
             reg_live: Vec::new(),
             gp_reg_of: Vec::new(),
             gp_reg_live: Vec::new(),
+            use_count: Vec::new(),
+            fused_cmp: Vec::new(),
+            deopt_named: Vec::new(),
+            guarded_receivers: Vec::new(),
             ls_spills: 0,
             ls_reloads: 0,
             mir: None,
@@ -1442,6 +1460,20 @@ impl<'a> Lowerer<'a> {
     /// which is a missed optimization and never wrong code: the home word is
     /// written unconditionally.
     fn gp_load_value(&mut self, dst: u8, id: NodeId) {
+        // 2026-09-02: a constant is an IMMEDIATE, not a frame word. The
+        // `Op::Const` arm still writes its home (a deopt frame may name it,
+        // and some sites still read slots directly), but no reader of a
+        // constant has to wait on that store any more: `fib` materialised
+        // `1` and `2` into frame words and reloaded them on every call.
+        if ir_const_imm_enabled() {
+            if let Some(node) = self.graph.nodes.get(id as usize) {
+                if let Op::Const(val) = &node.op {
+                    let val = *val;
+                    self.emit_mov_reg_imm_smart(dst, val);
+                    return;
+                }
+            }
+        }
         match self.resident_gpr(id) {
             Some(src) => self.emit_mov_reg_reg64(dst, src),
             None => {
@@ -1963,34 +1995,8 @@ impl<'a> Lowerer<'a> {
 
         // Gather (phi_slot, value_id) pairs first to avoid borrowing `self`
         // immutably while emitting (which borrows `self` mutably).
-        let mut copies: Vec<(i32, i32)> = Vec::new();
-        for id in 0..self.graph.nodes.len() {
-            let node = &self.graph.nodes[id];
-            if !matches!(node.op, Op::Phi) {
-                continue;
-            }
-            // Only value phis materialise a frame slot; memory/control phis
-            // are bookkeeping tokens with no machine value to copy.
-            if matches!(node.ty, IrType::Memory | IrType::Control | IrType::Void) {
-                continue;
-            }
-            // phi.inputs = [merge, val_0, val_1, …]
-            if node.inputs.first().copied() != Some(merge_ctrl) {
-                continue;
-            }
-            // merge.inputs[k] is the control token for phi value k (= input k+1).
-            let merge_node = &self.graph.nodes[merge_ctrl as usize];
-            for (k, &ctrl_in) in merge_node.inputs.iter().enumerate() {
-                if self.block_of_ctrl(ctrl_in) != Some(pred_block) {
-                    continue;
-                }
-                if let Some(&val_id) = node.inputs.get(k + 1) {
-                    if val_id != NO_NODE {
-                        copies.push((self.slot_of(id as NodeId), self.slot_of(val_id)));
-                    }
-                }
-            }
-        }
+        let gathered = self.gather_phi_copies(pred_block, succ_block);
+        let copies: Vec<(i32, i32)> = gathered.iter().map(|&(_, dst, src)| (dst, src)).collect();
 
         // Phi copies are a PARALLEL assignment, not a sequence.
         //
@@ -2033,6 +2039,24 @@ impl<'a> Lowerer<'a> {
             if let Err(bailout) = self.emit_copy_op(op) {
                 self.latch_bailout(bailout);
                 return;
+            }
+        }
+        // 2026-09-02: a register-resident phi is PUBLISHED here, at every
+        // incoming edge, from the home word the copies just wrote. This is the
+        // definition site a phi never had, and it is what lets a loop counter
+        // or accumulator -- a phi at every loop header -- be read from a
+        // register inside the loop (`ir_phi_residency_enabled`). Reads before
+        // the first published edge (in emission order) still take the home
+        // word; every edge publishes, so the register is valid on entry to the
+        // block whichever predecessor ran.
+        if ir_phi_residency_enabled() {
+            for &(phi, dst, _) in &gathered {
+                if self.assigned_gpr(phi).is_some() {
+                    self.publish_gp_from_slot(phi, dst);
+                } else if self.assigned_xmm(phi).is_some() {
+                    let is_double = self.graph.nodes[phi as usize].ty == IrType::Double;
+                    self.publish_fp_from_slot(phi, dst, is_double);
+                }
             }
         }
     }
@@ -2865,10 +2889,20 @@ impl<'a> Lowerer<'a> {
         let mut slow: Vec<usize> = Vec::new();
 
         self.gp_load_value(RAX, base);
-        // 1. null → slow (the helper raises the NPE).
-        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
-        slow.push(self.emit_jcc_rel32(0x84)); // JZ
-        if guarded && !raw_mode && !trusted_oop_receiver {
+        // 2026-09-02: a receiver this block already proved (null-tested and,
+        // where the guard applies, mapped) is not re-proved. Same SSA value,
+        // same block, and no way for it to become null or unmapped in between:
+        // a relocating collector rewrites the home word to the object's new
+        // address, which is still mapped. `itemCheck` proved `n` once per
+        // field it read (`ir_receiver_guard_cse_enabled`).
+        let receiver_proven = self.receiver_already_guarded(base);
+        if !receiver_proven {
+            // 1. null → slow (the helper raises the NPE).
+            self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+            slow.push(self.emit_jcc_rel32(0x84)); // JZ
+        }
+        if guarded && !raw_mode && !trusted_oop_receiver && !receiver_proven {
+            self.note_receiver_guarded(base);
             // 2. alignment: the low three bits must be clear.
             self.buf.emit(&[0x48, 0x89, 0xC1]); // MOV RCX, RAX
             self.buf.emit(&[0x48, 0x83, 0xE1, 0x07]); // AND RCX, 7
@@ -3657,6 +3691,9 @@ impl<'a> Lowerer<'a> {
 
     fn lower_block(&mut self, block_idx: usize) {
         self.block_offsets[block_idx] = self.buf.pos();
+        // A receiver proof is block-local: control can enter this block from a
+        // predecessor that never proved it.
+        self.guarded_receivers.clear();
 
         let block = &self.schedule.blocks[block_idx];
 
@@ -5058,27 +5095,31 @@ impl<'a> Lowerer<'a> {
         // RAX = receiver, non-null. Every bail below lands on the helper call.
         let mut bail: Vec<usize> = Vec::new();
         // Alignment + published-bounds containment (the READ table: "is this
-        // address mapped"), same six compares the getfield fast path uses.
-        self.buf.emit(&[0x48, 0x89, 0xC1]); // MOV RCX, RAX
-        self.buf.emit(&[0x48, 0x83, 0xE1, 0x07]); // AND RCX, 7
-        bail.push(self.emit_jcc_rel32(0x85)); // JNZ
-        self.emit_mov_reg_imm64(RDX, self.read_bounds_addr as u64);
-        self.emit_cmp_rax_mem_rdx(0);
-        let below_b0 = self.emit_jcc_rel32(0x82);
-        self.emit_cmp_rax_mem_rdx(8);
-        let ok0 = self.emit_jcc_rel32(0x82);
-        self.patch_rel32_to_here(below_b0);
-        self.emit_cmp_rax_mem_rdx(16);
-        let below_b1 = self.emit_jcc_rel32(0x82);
-        self.emit_cmp_rax_mem_rdx(24);
-        let ok1 = self.emit_jcc_rel32(0x82);
-        self.patch_rel32_to_here(below_b1);
-        self.emit_cmp_rax_mem_rdx(32);
-        bail.push(self.emit_jcc_rel32(0x82));
-        self.emit_cmp_rax_mem_rdx(40);
-        bail.push(self.emit_jcc_rel32(0x83));
-        self.patch_rel32_to_here(ok0);
-        self.patch_rel32_to_here(ok1);
+        // address mapped"), same six compares the getfield fast path uses --
+        // skipped for a receiver this block already proved.
+        if !self.receiver_already_guarded(base) {
+            self.note_receiver_guarded(base);
+            self.buf.emit(&[0x48, 0x89, 0xC1]); // MOV RCX, RAX
+            self.buf.emit(&[0x48, 0x83, 0xE1, 0x07]); // AND RCX, 7
+            bail.push(self.emit_jcc_rel32(0x85)); // JNZ
+            self.emit_mov_reg_imm64(RDX, self.read_bounds_addr as u64);
+            self.emit_cmp_rax_mem_rdx(0);
+            let below_b0 = self.emit_jcc_rel32(0x82);
+            self.emit_cmp_rax_mem_rdx(8);
+            let ok0 = self.emit_jcc_rel32(0x82);
+            self.patch_rel32_to_here(below_b0);
+            self.emit_cmp_rax_mem_rdx(16);
+            let below_b1 = self.emit_jcc_rel32(0x82);
+            self.emit_cmp_rax_mem_rdx(24);
+            let ok1 = self.emit_jcc_rel32(0x82);
+            self.patch_rel32_to_here(below_b1);
+            self.emit_cmp_rax_mem_rdx(32);
+            bail.push(self.emit_jcc_rel32(0x82));
+            self.emit_cmp_rax_mem_rdx(40);
+            bail.push(self.emit_jcc_rel32(0x83));
+            self.patch_rel32_to_here(ok0);
+            self.patch_rel32_to_here(ok1);
+        }
 
         // pre_active == 0, else the SATB pre-barrier has work: helper.
         self.emit_mov_reg_imm64(R11, pre as u64);
@@ -5135,6 +5176,157 @@ impl<'a> Lowerer<'a> {
         }
         crate::x64::note_gated_ref_store();
         true
+    }
+
+    /// The `(phi, dst_slot, src_slot)` copies the edge `pred_block ->
+    /// succ_block` carries: one per value phi of the successor's merge whose
+    /// input for this edge is a real node. Pure; `emit_phi_copies` emits
+    /// exactly these and `edge_has_phi_copies` asks whether there are any.
+    fn gather_phi_copies(&self, pred_block: usize, succ_block: usize) -> Vec<(NodeId, i32, i32)> {
+        let merge_ctrl = self.schedule.blocks[succ_block].ctrl;
+        if !matches!(
+            self.graph.nodes[merge_ctrl as usize].op,
+            Op::Merge | Op::Region
+        ) {
+            return Vec::new();
+        }
+        let mut out: Vec<(NodeId, i32, i32)> = Vec::new();
+        for id in 0..self.graph.nodes.len() {
+            let node = &self.graph.nodes[id];
+            if !matches!(node.op, Op::Phi) {
+                continue;
+            }
+            // Only value phis materialise a frame slot; memory/control phis
+            // are bookkeeping tokens with no machine value to copy.
+            if matches!(node.ty, IrType::Memory | IrType::Control | IrType::Void) {
+                continue;
+            }
+            // phi.inputs = [merge, val_0, val_1, …]
+            if node.inputs.first().copied() != Some(merge_ctrl) {
+                continue;
+            }
+            // merge.inputs[k] is the control token for phi value k (= input k+1).
+            let merge_node = &self.graph.nodes[merge_ctrl as usize];
+            for (k, &ctrl_in) in merge_node.inputs.iter().enumerate() {
+                if self.block_of_ctrl(ctrl_in) != Some(pred_block) {
+                    continue;
+                }
+                if let Some(&val_id) = node.inputs.get(k + 1) {
+                    if val_id != NO_NODE {
+                        out.push((id as NodeId, self.slot_of(id as NodeId), self.slot_of(val_id)));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether the edge `pred_block -> succ_block` carries any phi copy.
+    fn edge_has_phi_copies(&self, pred_block: usize, succ_block: usize) -> bool {
+        !self.gather_phi_copies(pred_block, succ_block).is_empty()
+    }
+
+    /// Fill `use_count`, `deopt_named` and `fused_cmp` before the first block
+    /// lowers. A compare is fused into its `If` when that `If` is its ONLY
+    /// use, no safepoint snapshot names it, and the switch is on.
+    fn prepare_fusion_tables(&mut self) {
+        let n = self.graph.nodes.len();
+        let mut use_count = vec![0u32; n];
+        for node in &self.graph.nodes {
+            for &input in &node.inputs {
+                if input != NO_NODE {
+                    if let Some(c) = use_count.get_mut(input as usize) {
+                        *c = c.saturating_add(1);
+                    }
+                }
+            }
+        }
+        let mut deopt_named = vec![false; n];
+        for sp in &self.graph.safepoints {
+            for &v in sp.locals.iter().chain(sp.stack.iter()) {
+                if v != NO_NODE {
+                    if let Some(cell) = deopt_named.get_mut(v as usize) {
+                        *cell = true;
+                    }
+                }
+            }
+        }
+        let mut fused_cmp = vec![false; n];
+        if ir_fused_branch_enabled() {
+            // The compare must be the LAST scheduled node of the block its
+            // `If` terminates. Fusing moves the reads of the compare's inputs
+            // from the compare's own position to the terminator's; the
+            // register allocator's liveness model ends those inputs' ranges
+            // at the compare, so any value DEFINED between the two could be
+            // handed one of their registers (the ternary test caught exactly
+            // that: `a` and the constant `1` shared RBX). With nothing
+            // scheduled between them the two positions are adjacent and the
+            // model still holds.
+            for block in &self.schedule.blocks {
+                let Some(term) = block.terminator else {
+                    continue;
+                };
+                let Some(if_node) = self.graph.nodes.get(term as usize) else {
+                    continue;
+                };
+                if !matches!(if_node.op, Op::If) {
+                    continue;
+                }
+                let Some(&cond) = if_node.inputs.get(1) else {
+                    continue;
+                };
+                if cond == NO_NODE || block.nodes.last().copied() != Some(cond) {
+                    continue;
+                }
+                let Some(cmp) = self.graph.nodes.get(cond as usize) else {
+                    continue;
+                };
+                if !matches!(cmp.op, Op::Cmp(_)) || cmp.inputs.len() < 2 {
+                    continue;
+                }
+                if use_count[cond as usize] != 1 || deopt_named[cond as usize] {
+                    continue;
+                }
+                fused_cmp[cond as usize] = true;
+            }
+        }
+        self.use_count = use_count;
+        self.deopt_named = deopt_named;
+        self.fused_cmp = fused_cmp;
+    }
+
+    /// `MOV reg, imm` in the shortest encoding that reproduces `val` in all 64
+    /// bits: `mov r32, imm32` (zero-extends) for 0..=u32::MAX, `mov r64,
+    /// simm32` for the rest of the i32 range, `mov r64, imm64` otherwise.
+    fn emit_mov_reg_imm_smart(&mut self, reg: u8, val: i64) {
+        if (0..=i64::from(u32::MAX)).contains(&val) {
+            if reg >= 8 {
+                self.buf.emit_byte(0x41); // REX.B
+            }
+            self.buf.emit_byte(0xB8 + (reg & 7));
+            self.buf.emit(&(val as u32).to_le_bytes());
+        } else if i32::try_from(val).is_ok() {
+            let rex = 0x48 | if reg >= 8 { 0x01 } else { 0 };
+            self.buf.emit_byte(rex);
+            self.buf.emit_byte(0xC7); // MOV r/m64, simm32
+            self.buf.emit_byte(0xC0 | (reg & 7));
+            self.buf.emit(&(val as i32).to_le_bytes());
+        } else {
+            self.emit_mov_reg_imm64(reg, val as u64);
+        }
+    }
+
+    /// Whether `base` was already null-tested and mapped-proved in the block
+    /// being lowered (`ir_receiver_guard_cse_enabled`).
+    fn receiver_already_guarded(&self, base: NodeId) -> bool {
+        ir_receiver_guard_cse_enabled() && self.guarded_receivers.contains(&base)
+    }
+
+    /// Record that the block being lowered has just proved `base`.
+    fn note_receiver_guarded(&mut self, base: NodeId) {
+        if ir_receiver_guard_cse_enabled() && !self.guarded_receivers.contains(&base) {
+            self.guarded_receivers.push(base);
+        }
     }
 
     fn lower_data_node(&mut self, id: NodeId) {
@@ -5660,6 +5852,11 @@ impl<'a> Lowerer<'a> {
                 self.store_rax(slot);
             }
             Op::Cmp(cc) => {
+                // Fused into its consuming `Op::If` (see `lower_terminator`):
+                // nothing to materialise here.
+                if self.fused_cmp.get(id as usize).copied().unwrap_or(false) {
+                    return;
+                }
                 let slot = self.alloc_slot(id);
                 self.gp_load_value(RAX, node.inputs[0]);
                 self.gp_load_value(RCX, node.inputs[1]);
@@ -7025,11 +7222,43 @@ impl<'a> Lowerer<'a> {
                 self.emit_epilogue();
             }
             Op::If => {
-                // Load condition into RAX
                 let cond_id = node.inputs[1];
-                self.gp_load_value(RAX, cond_id);
-                // TEST EAX, EAX  (does not disturb RAX; sets ZF)
-                self.buf.emit(&[0x85, 0xC0]);
+                // 2026-09-02: a compare whose only consumer is this `If` is
+                // lowered HERE as `cmp; jcc` instead of `setcc; movzx; store;
+                // reload; test; jcc`. `fused_cc` is the Jcc condition byte
+                // under which the branch is TAKEN (the `Op::Cmp` result is
+                // nonzero); `None` keeps the boolean-in-RAX shape.
+                let fused_cc: Option<u8> = match self.graph.nodes.get(cond_id as usize) {
+                    Some(cmp_node)
+                        if self.fused_cmp.get(cond_id as usize).copied().unwrap_or(false) =>
+                    {
+                        match cmp_node.op {
+                            Op::Cmp(cc) => {
+                                let a = cmp_node.inputs[0];
+                                let b = cmp_node.inputs[1];
+                                let ref_cmp =
+                                    matches!(self.graph.nodes[a as usize].ty, IrType::Ref)
+                                        || matches!(self.graph.nodes[b as usize].ty, IrType::Ref);
+                                self.gp_load_value(RAX, a);
+                                self.gp_load_value(RCX, b);
+                                if ref_cmp {
+                                    self.buf.emit(&[0x48, 0x39, 0xC8]); // CMP RAX, RCX
+                                } else {
+                                    self.buf.emit(&[0x39, 0xC8]); // CMP EAX, ECX
+                                }
+                                Some(cc.x64_cc())
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if fused_cc.is_none() {
+                    // Load condition into RAX
+                    self.gp_load_value(RAX, cond_id);
+                    // TEST EAX, EAX  (does not disturb RAX; sets ZF)
+                    self.buf.emit(&[0x85, 0xC0]);
+                }
 
                 // Snapshot successor block indices (immutable borrow ends
                 // here so `emit_phi_copies` can borrow `self` mutably).
@@ -7037,7 +7266,50 @@ impl<'a> Lowerer<'a> {
                 let succ1 = self.schedule.blocks[block_idx].successors.get(1).copied();
 
                 match (succ0, succ1) {
+                    (Some(true_block), Some(false_block))
+                        if ir_fused_branch_enabled()
+                            && !self.edge_has_phi_copies(block_idx, true_block)
+                            && !self.edge_has_phi_copies(block_idx, false_block) =>
+                    {
+                        // 2026-09-02: neither edge carries phi copies, so the
+                        // branch needs no trampolines at all -- one Jcc to
+                        // the far edge, and the near edge either falls
+                        // through into the next emitted block or takes one
+                        // JMP. Same polarity rule as the general layout below:
+                        // the taken (true) edge is the near one unless the
+                        // profile says this branch is usually not taken.
+                        let favor_false = node
+                            .bytecode_pc
+                            .and_then(|pc| self.branch_hints.get(&pc).copied())
+                            == Some(false);
+                        // Jcc byte under which control goes to the FAR edge.
+                        let (jcc_far, near_block, far_block) = match fused_cc {
+                            Some(cc) if favor_false => (cc, false_block, true_block),
+                            Some(cc) => (cc ^ 1, true_block, false_block),
+                            None if favor_false => (0x85u8, false_block, true_block), // JNE
+                            None => (0x84u8, true_block, false_block),               // JE
+                        };
+                        self.buf.emit(&[0x0F, jcc_far]);
+                        let far_patch = self.buf.pos();
+                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                        self.branch_patches.push((far_patch, far_block));
+                        if near_block != block_idx + 1 {
+                            self.buf.emit_byte(0xE9); // JMP near_block
+                            let near_patch = self.buf.pos();
+                            self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                            self.branch_patches.push((near_patch, near_block));
+                        }
+                    }
                     (Some(true_block), Some(false_block)) => {
+                        // A fused compare leaves the flags for `cc`; the
+                        // general layout below wants "ZF set ⇔ condition
+                        // false" (a TEST on the boolean). Rebuild that
+                        // contract from the flags with one SETcc + TEST so
+                        // the phi-copy trampolines stay exactly as they were.
+                        if let Some(cc) = fused_cc {
+                            self.buf.emit(&[0x0F, cc + 0x10, 0xC0]); // SETcc AL
+                            self.buf.emit(&[0x84, 0xC0]); // TEST AL, AL
+                        }
                         // BUG FIX [jit-irlower #2]: phi copies must execute on
                         // the edge actually taken, so the conditional branch
                         // splits the critical edges. Default layout:
@@ -10214,9 +10486,13 @@ fn linear_scan_enabled() -> bool {
             return forced;
         }
     }
-    matches!(
+    // 2026-09-02: DEFAULT ON. The enumeration disagreement that declined the
+    // file on every array-touching method was reconciled the same day, phis
+    // are admitted (`ir_phi_residency_enabled`), and the census below says
+    // where the file engages. `=0` is the kill switch.
+    !matches!(
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_LINEAR_SCAN").as_deref(),
-        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
     )
 }
 
@@ -10422,6 +10698,10 @@ fn plan_register_residency(
     // — which this file must not read, and does not: every home offset comes
     // from `plan_slots`, which keeps every pin, through `alloc_slot_checked`.
     let released = live.release_deopt_pins(graph);
+    // Phis too, when their edges publish them (see `emit_phi_copies`).
+    if ir_phi_residency_enabled() {
+        live.release_phi_pins(graph);
+    }
 
     // ── Agreement check: two liveness models, one program ────────────
     //
@@ -10615,7 +10895,12 @@ fn plan_register_residency(
             .nodes
             .get(id)
             .is_some_and(|node| matches!(node.op, Op::Phi));
-        if is_phi {
+        // 2026-09-02: with `ir_phi_residency_enabled`, `emit_phi_copies` IS
+        // the publishing site (every incoming edge reloads the register from
+        // the home word it just wrote), so a phi is admitted like any other
+        // value; the allocator's structural pin was released by
+        // `release_phi_pins` above on the same condition.
+        if is_phi && !ir_phi_residency_enabled() {
             skip_phi += 1;
             continue;
         }
@@ -11595,6 +11880,7 @@ pub(crate) fn lower_inner_with_scopes(
     lowerer.emit_safepoint_poll();
 
     // Emit blocks in order
+    lowerer.prepare_fusion_tables();
     for block_idx in 0..schedule.blocks.len() {
         lowerer.lower_block(block_idx);
     }
@@ -12038,6 +12324,46 @@ pub(crate) fn lower_inner_with_scopes(
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
+
+/// Loop-carried values (phis) may be register-resident -- **default ON**, opt
+/// out with `CRATONVM_JIT_IR_PHI_RESIDENCY=0`. `emit_phi_copies` publishes a
+/// promoted phi's register at every incoming edge; off, phis stay home-bound
+/// as they were before 2026-09-02 and the residency census reports them
+/// under `phi=`.
+fn ir_phi_residency_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PHI_RESIDENCY") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
+/// A constant is read as an immediate rather than from its home word --
+/// **default ON**, opt out with `CRATONVM_JIT_IR_CONST_IMM=0`.
+fn ir_const_imm_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CONST_IMM") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
+/// A compare whose only use is its `If` lowers as one `cmp; jcc`, and a
+/// branch with no phi copies on either edge emits no trampolines -- **default
+/// ON**, opt out with `CRATONVM_JIT_IR_FUSED_BRANCH=0`.
+fn ir_fused_branch_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_FUSED_BRANCH") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
+/// The null + mapped receiver guard is emitted once per receiver per block --
+/// **default ON**, opt out with `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE=0`.
+fn ir_receiver_guard_cse_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_RECEIVER_GUARD_CSE") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
 
 /// Inline gated reference stores in the optimizing tier -- **default ON**,
 /// opt out with `CRATONVM_JIT_IR_GATED_REF_STORE=0`. Off restores the
@@ -15821,8 +16147,10 @@ mod tests {
             "frame bytes only fell from {before} to {after} on a 512-link chain",
         );
         // The residual is the fixed part of the frame — bookkeeping slots, the
-        // stack-arg reserve and the ABI shadow space — not spill.
-        assert!(after <= 160, "{after} bytes for a 4-slot working set");
+        // stack-arg reserve, the ABI shadow space and, since the register file
+        // went default-on (2026-09-02), the estimate's reservation for the
+        // callee-saved GP save area — not spill.
+        assert!(after <= 192, "{after} bytes for a 4-slot working set");
     }
 
     /// The node ceiling the frame bound implies, before and after.
@@ -18515,8 +18843,12 @@ mod tests {
     /// nothing can hand out is a regression with no upside, and `frame_size`
     /// feeds `DEFAULT_MAX_FRAME_BYTES`, so it would also decline methods that
     /// used to compile.
+    ///
+    /// 2026-09-02: the file is default-ON now, so this pins the OFF arm
+    /// (`CRATONVM_JIT_IR_LINEAR_SCAN=0`) rather than the process default.
     #[test]
     fn the_default_configuration_reserves_no_save_area() {
+        let _off = LsForce::off();
         assert_eq!(
             ir_saved_xmm_bytes(),
             0,
@@ -18729,4 +19061,5 @@ pub static IC_FRAME_REPUBLISH_SITES: std::sync::atomic::AtomicUsize =
 pub fn ic_frame_republish_sites() -> usize {
     IC_FRAME_REPUBLISH_SITES.load(std::sync::atomic::Ordering::Relaxed)
 }
+
 

@@ -8320,7 +8320,7 @@ pub const IR_MAX_STATIC_FIELD_OPS: usize = 64;
 /// eliminate AND how many surviving allocations may be lowered through the
 /// shared `emit_new_object_stub` (which costs the baseline tier's inline TLAB
 /// bump). It never applied to arrays, which are refused outright.
-pub const IR_MAX_ALLOCATIONS: usize = 16;
+pub const IR_MAX_ALLOCATIONS: usize = 64;
 
 /// cov-06: maximum `anewarray` sites. Same budget posture as
 /// [`IR_MAX_ALLOCATIONS`] — every admitted REFERENCE-array site is always

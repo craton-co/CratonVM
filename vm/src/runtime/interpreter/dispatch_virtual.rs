@@ -915,7 +915,7 @@ pub(super) fn execute_invokevirtual_vtable_fast(
         )));
     }
 
-    if crate::jit::profile::is_profiling_enabled() {
+    if crate::jit::profile::is_receiver_profiling_enabled() {
         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
         shared.jit.profile_store.record_receiver_borrowed(
             cid,
@@ -1723,7 +1723,7 @@ pub(super) fn execute_invokevirtual_cached(
     // Bytecode/Native" elsewhere in this function). Same placement rationale
     // as execute_invokestatic_cached: after every early CacheMiss eviction
     // above, right before the dispatch match.
-    if is_special && crate::jit::profile::is_profiling_enabled() {
+    if is_special && crate::jit::profile::is_receiver_profiling_enabled() {
         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
         shared
             .jit
@@ -1764,7 +1764,7 @@ pub(super) fn execute_invokevirtual_cached(
                         return Ok(CachedCallResult::CacheMiss);
                     }
                     let actual_class_id = shared.mem.heap.class_id_of(obj_ref);
-                    if crate::jit::profile::is_profiling_enabled() {
+                    if crate::jit::profile::is_receiver_profiling_enabled() {
                         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
                         shared.jit.profile_store.record_receiver_borrowed(
                             cid,
@@ -2451,7 +2451,7 @@ pub(super) fn execute_invokevirtual_cached(
                         return Ok(CachedCallResult::CacheMiss);
                     }
                     let actual_class_id = shared.mem.heap.class_id_of(obj_ref);
-                    if crate::jit::profile::is_profiling_enabled() {
+                    if crate::jit::profile::is_receiver_profiling_enabled() {
                         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
                         shared.jit.profile_store.record_receiver_borrowed(
                             cid,
@@ -2620,7 +2620,7 @@ pub(super) fn execute_invokevirtual_cached(
                             return Ok(CachedCallResult::CacheMiss);
                         }
                         let actual_class_id = shared.mem.heap.class_id_of(obj_ref);
-                        if crate::jit::profile::is_profiling_enabled() {
+                        if crate::jit::profile::is_receiver_profiling_enabled() {
                             let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
                             shared.jit.profile_store.record_receiver_borrowed(
                                 cid,

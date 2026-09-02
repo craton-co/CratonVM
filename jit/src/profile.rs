@@ -90,6 +90,30 @@ pub fn is_profiling_enabled() -> bool {
     PROFILING_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Receiver-type and call-site recording, independently of the master gate.
+///
+/// 2026-09-02: the master gate (`CRATONVM_TIER_PGO`) had never been on by
+/// default, so `classify_receiver_shape` always saw `None` and every
+/// speculative inlining decision that reads a receiver profile was inert in a
+/// default run. The two maps that decision reads are recorded at INVOKE sites
+/// only -- a fraction of the interpreter's branch rate -- so they are cheap
+/// enough to record by default; branch and back-edge recording (a per-method
+/// lock on every conditional branch) stays behind the master gate.
+static RECEIVER_PROFILING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+pub fn enable_receiver_profiling(b: bool) {
+    RECEIVER_PROFILING_ENABLED.store(b, Ordering::Relaxed);
+}
+
+/// Whether receiver-type and call-site recording is on: the master gate OR the
+/// receiver gate.
+#[inline(always)]
+pub fn is_receiver_profiling_enabled() -> bool {
+    PROFILING_ENABLED.load(Ordering::Relaxed) || RECEIVER_PROFILING_ENABLED.load(Ordering::Relaxed)
+}
+
+
 // ---------------------------------------------------------------------------
 // Key type
 // ---------------------------------------------------------------------------
@@ -1177,7 +1201,7 @@ impl ProfileStore {
         pc: usize,
         receiver_class_id: u32,
     ) {
-        if !is_profiling_enabled() {
+        if !is_receiver_profiling_enabled() {
             return;
         }
         let slot = self.get_or_insert_borrowed(class_id, method_name, descriptor);
@@ -1197,7 +1221,7 @@ impl ProfileStore {
         descriptor: &Arc<str>,
         pc: usize,
     ) {
-        if !is_profiling_enabled() {
+        if !is_receiver_profiling_enabled() {
             return;
         }
         let slot = self.get_or_insert_borrowed(class_id, method_name, descriptor);

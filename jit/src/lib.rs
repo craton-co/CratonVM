@@ -6143,7 +6143,14 @@ fn call_site_is_hot(
 fn c2_alloc_upgrade_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_C2_ALLOC_UPGRADE").is_some()
+        // 2026-09-02: DEFAULT ON. The optimizing tier lowers `Op::New` through an
+        // inline TLAB bump (`emit_inline_tlab_new_ir`) and reference stores
+        // through the gated inline store, so a promoted allocation no longer
+        // compiles WORSE than its single-pass body. `=0` is the kill switch.
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_C2_ALLOC_UPGRADE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
     })
 }
 
@@ -37738,7 +37745,7 @@ mod layout_constant_inventory {
         // the legacy cell address is `field_index * SLOT_SIZE`, a use of its
         // own and not a reuse of the compact arm's — which this comment claimed
         // until the inventory test refused the count and said so.
-        ("ir_lower.rs", [11, 4, 6, 0, 0, 0, 6, 4]),
+        ("ir_lower.rs", [12, 4, 6, 0, 0, 0, 6, 4]),
     ];
 
     fn source(file: &str) -> &'static str {

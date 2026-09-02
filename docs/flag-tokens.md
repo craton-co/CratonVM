@@ -577,7 +577,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-280 tokens.
+288 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -675,6 +675,13 @@ export inherited from a parent shell.
 | `precise-alloc-athrow` | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` |
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
 | `ir-inline-tlab` | `CRATONVM_JIT_IR_INLINE_TLAB` |
+| `ir-gated-ref-store` | `CRATONVM_JIT_IR_GATED_REF_STORE` |
+| `tls-thread-fetch` | `CRATONVM_JIT_TLS_THREAD_FETCH` |
+| `ir-receiver-guard-cse` | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE` |
+| `ir-fused-branch` | `CRATONVM_JIT_IR_FUSED_BRANCH` |
+| `ir-const-imm` | `CRATONVM_JIT_IR_CONST_IMM` |
+| `ir-phi-residency` | `CRATONVM_JIT_IR_PHI_RESIDENCY` |
+| `merged-call-sentinel` | `CRATONVM_JIT_MERGED_CALL_SENTINEL` |
 | `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
 | `gated-ref-store` | `CRATONVM_JIT_GATED_REF_STORE` |
@@ -836,6 +843,7 @@ export inherited from a parent shell.
 | `tier-osr-backedge` | `CRATONVM_TIER_OSR_BACKEDGE` |
 | `tier-osr-threshold` | `CRATONVM_TIER_OSR_THRESHOLD` |
 | `tier-pgo` | `CRATONVM_TIER_PGO` |
+| `tier-pgo-receivers` | `CRATONVM_TIER_PGO_RECEIVERS` |
 | `tiered` | `CRATONVM_TIER_ENABLED` |
 | `tlab-zero-elision` | `CRATONVM_NO_JIT_TLAB_ZERO_ELISION` |
 | `trivial-getter` | `CRATONVM_TRIVIAL_GETTER` |
