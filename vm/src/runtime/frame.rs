@@ -2668,6 +2668,16 @@ impl FrameStack {
     /// to grow the buffer — see [`Self::reserve_stable`] to rule that out.
     #[inline(always)]
     pub fn push(&mut self, frame: Frame) {
+        // `CRATONVM_DBG_INTERP_FRAMES=1` — the census of what actually runs
+        // interpreted. One relaxed load when unarmed; see
+        // `crate::runtime::interp_census`.
+        if crate::runtime::interp_census::interp_frames_enabled() {
+            crate::runtime::interp_census::record_interp_frame(
+                frame.class_name(),
+                frame.method_name(),
+                frame.method_descriptor(),
+            );
+        }
         self.reserve_stable(1);
         self.buf.push(frame);
     }

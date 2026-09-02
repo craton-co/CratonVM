@@ -660,6 +660,26 @@ impl ClassRealm {
             && self.lambda_proxies.read().contains_key(&class_id)
     }
 
+    /// The lambda call site for `class_id`, or `None` for an ordinary class.
+    ///
+    /// The value-returning sibling of [`Self::is_lambda_proxy_class`], and it
+    /// exists for the same reason: `NativeContextImpl::invoke_virtual` took
+    /// `lambda_proxies.read()` and probed the map on EVERY native->Java
+    /// callback, to answer "no" for every ordinary receiver. The id-range test
+    /// in front is exact — see [`Self::is_lambda_proxy_class`] — so an ordinary
+    /// receiver now costs one `u32` compare instead of an `RwLock` acquisition
+    /// and a hash probe. On `HibfixComposeProbe2` that path is
+    /// `CompletableFuture.complete`'s `postComplete()` callback, 2.5 times per
+    /// composition chain.
+    #[inline]
+    pub fn lambda_call_site_for(&self, class_id: ClassId) -> Option<Arc<LambdaCallSite>> {
+        if class_id.as_u32() < LAMBDA_PROXY_ID_BASE && crate::runtime::env_cache::hot_lookup_cache()
+        {
+            return None;
+        }
+        self.lambda_proxies.read().get(&class_id).cloned()
+    }
+
     /// Is `class_id` the VM-internal [`ANNOTATION_PROXY_CLASS`]?
     ///
     /// Annotation proxies have no real bytecode for the `Annotation` contract
