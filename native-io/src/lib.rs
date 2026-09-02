@@ -2176,21 +2176,53 @@ fn native_fis_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // buffer at a sane chunk size to bound memory), so loop until `n`
     // bytes have been skipped or EOF is reached. Return the actual
     // number of bytes skipped, matching `java.io.FileInputStream.skip`.
-    // NOT REPAIRED HERE, AND THE REGISTRY SAYS WHY. HotSpot's `skip` past end
-    // of file answers the requested count (its `skip0` is one `lseek`), and
-    // this body answers 0. A seek was added here and MEASURED INERT: under
-    // `--jdk-only` the `skip(J)J` triple is not registered at all, and in the
-    // default mode it is registered with `invocations: 0`. So is `skip0(J)J`,
-    // in both. What actually answers is `java.io.InputStream.skip`'s
-    // read-and-discard default — the invocation counts prove it
-    // (`readBytes` +4 for two skips over a 2-byte file, `skip0` +0).
+    // NOT REPAIRED HERE, AND THE REASON HAS BEEN RE-MEASURED (2026-08-30).
+    // The conclusion below stands; both pieces of evidence the previous note
+    // gave for it were wrong, which is why they are replaced rather than kept.
     //
-    // That is a RESOLUTION finding, not a body one: `FileInputStream.skip`
-    // resolves to its superclass's method, so no change to either native here
-    // can move the answer. Recorded as a nomination rather than fixed with an
-    // edit that cannot fire. The answer is contract-legal in the meantime —
-    // `InputStream.skip` is specified to "skip over some smaller number of
-    // bytes, possibly zero".
+    // THE DEFECT IS THREE ROWS, NOT ONE. `FileInputStream.skip` is not
+    // `InputStream.skip`: its javadoc says it "may skip more bytes than what
+    // are remaining in the backing file ... the number of bytes skipped may
+    // include some number of bytes that were beyond the EOF", because HotSpot's
+    // `skip0` is one `lseek`. Read-and-discard can only answer what is there:
+    //
+    //   4-byte file at EOF   skip(4)    HotSpot 4     this VM 0
+    //   4-byte file, 1 left  skip(100)  HotSpot 100   this VM 1
+    //   at position 0        skip(-1)   HotSpot IOException   this VM 0
+    //
+    // WRONG EVIDENCE #1 — "the `skip(J)J` triple is not registered at all under
+    // `--jdk-only`, and `skip0(J)J` has `invocations: 0` in both". The registry
+    // now reads `skip 0 / skip0 5` for a five-`skip` program. That number is
+    // real and it is not entry: an `eprintln!` placed in THIS body printed
+    // nothing, in `--jdk-only` AND in the default mode. The counter counts a
+    // dispatch ATTEMPT; the body was never reached. (Same family as
+    // `a-zero-invocation-count-is-evidence-about-a-counter`, from the other
+    // side: a NON-zero count is evidence about a counter too.)
+    //
+    // WRONG EVIDENCE #2 — "`FileInputStream.skip` resolves to its superclass's
+    // method". It does not. Measured through reflection, identical to HotSpot:
+    //
+    //   FileInputStream.class.getMethod("skip", long.class).getDeclaringClass()
+    //     HotSpot   java.io.FileInputStream
+    //     this VM   java.io.FileInputStream
+    //
+    // and `getDeclaredMethods` lists `skip` AND `skip0` on the class, exactly
+    // as HotSpot does. RESOLUTION is correct; what differs is the body
+    // `invokevirtual` actually enters. The three answers above are precisely
+    // `InputStream.skip`'s read-and-discard default, so that is the bytecode
+    // running.
+    //
+    // So this is a DISPATCH finding — the superclass body is entered for a
+    // method the subclass declares and overrides — and no edit to either native
+    // in this file can move it. A seek-based body was written and measured
+    // inert twice, most recently on 2026-08-30; it is not carried here, because
+    // code that cannot run is worse than the absence of it. Nominated out of
+    // this lane.
+    //
+    // Contract-legal in the meantime only in the weak sense: `InputStream.skip`
+    // may "skip over some smaller number of bytes, possibly zero", but
+    // `FileInputStream` overrides that contract, and it is the override a
+    // caller holding a `FileInputStream` is entitled to.
     const CHUNK: usize = 8192;
     let mut remaining = n as u64;
     let mut total_skipped: u64 = 0;
@@ -8504,10 +8536,56 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
     //
     //   RJdkIntrinsics3: findWithinHorizon(String, 0) expected "42", got null
     //
-    // So a correct classification does NOT imply the registrar can be retagged.
-    // That needs the state to move first (G88-1 §5) — retiring the Rust
-    // tokenizer, which is wave-2 work.
-    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // MEASURED 2026-08-30 (lane L3), and the paragraph above is WRONG about the
+    // blocker. `apps/probes/ScannerShadowSweep` is the first differential
+    // coverage this class has ever had -- 94 rows, 43 owning registrations, and
+    // it found 25 wrong rows IDENTICAL in both modes:
+    //
+    //   * `new Scanner("a").locale()` is NULL, where HotSpot answers the
+    //     default -- an NPE in any caller that compares it;
+    //   * `nextBigInteger()`, `hasNextBigInteger()`, `hasNextShort()` and
+    //     `hasNextByte()` reach the parse path with RADIX 0
+    //     (`IllegalArgumentException: radix:0`);
+    //   * `nextBigDecimal()`, `nextBigInteger(radix)`, `skip(String)` and
+    //     `findAll(String)` NPE on `this.matcher` / `this.patternCache`, real
+    //     fields our `<init>` never populates;
+    //   * `new Scanner("a,b,,c").useDelimiter(",")` walks `[a][b]` where HotSpot
+    //     walks `[a][b][][c]` -- it drops the empty token AND everything after
+    //     it;
+    //   * `1,234` does not parse as a grouped int in any locale;
+    //   * nine rows carry invented exception messages ("no more elements",
+    //     "token mismatch") where HotSpot's are null or carry the
+    //     `NumberFormatException` text.
+    //
+    // AND REFUSING THE FAMILY FIXES 24 OF THEM. Run under
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/Scanner`, the probe goes from 25
+    // wrong rows to 12. The recorded objection -- "the real bytecode runs
+    // against a Scanner whose real fields were never populated" -- described a
+    // refusal that left `<init>` shadowed. Refuse the WHOLE family and the real
+    // constructor runs, so the state is the JDK's and there is nothing left to
+    // populate.
+    //
+    // The 11 rows that broke under the dial were not a missing capability
+    // either. Scanner native invocations fell 186 -> 17 under it, and the 17
+    // that SURVIVED are exactly the `findWithinHorizon` and `match` rows below:
+    // the dial refuses `Bridge` and does not refuse `Intrinsic`. So real
+    // `nextLine`/`findInLine` bytecode was calling a still-shadowed
+    // `findWithinHorizon` that did not understand the real Scanner's state.
+    // Both candidate capabilities were ruled out by measurement rather than
+    // argument: `apps/probes/MatcherRegionProbe` is 39 of 40 rows clean on the
+    // region-bounded `Matcher` API `findPatternInBuffer` runs on -- `region`,
+    // `usePattern`, transparent and anchoring bounds, `hitEnd`, a `CharBuffer`
+    // input and Scanner's own line pattern -- and `apps/probes/ReadableProbe` is
+    // 0-diff on all 15 rows of `Readable.read(CharBuffer)`, the loop it drives.
+    //
+    // `SyntheticStub`, therefore, and the three `Intrinsic` rows below go with
+    // it -- a family that is refused in part is the configuration that produced
+    // the false blocker. `--jdk-only` now drops all 43 and runs java.base's own
+    // `Scanner`. COMPATIBLE MODE IS UNCHANGED: `NativeKind::allowed_in` returns
+    // an unconditional `true` there, so this moves the default mode by zero and
+    // the 25 rows stay open in it, against the day the Rust tokenizer is retired
+    // outright.
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let c = "java/util/Scanner";
 
     // Constructors
@@ -8659,23 +8737,24 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
     // it, which is the category the implementation in `phases_early.rs` used
     // before it moved here.
     //
-    // The other 35 registrations in this function are still `Bridge` by
-    // inheritance and still wrong for the same reason — see the
-    // JDK-ONLY-CLASSIFY note above. Re-tagging them moves the ratchet in the
-    // GOOD direction and belongs with whoever re-freezes it.
+    // The other 35 registrations in this function are `SyntheticStub` by
+    // inheritance as of 2026-08-30, and these three now match them. Leaving
+    // them `Intrinsic` is what made a partial refusal look like a missing
+    // capability: under the enforce dial these were the only Scanner natives
+    // still running, and real `nextLine` bytecode called them.
     registry.register_with_kind(
         c,
         "findWithinHorizon",
         "(Ljava/lang/String;I)Ljava/lang/String;",
         native_scanner_find_within_horizon_string,
-        cratonvm_native_api::NativeKind::Intrinsic,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
     registry.register_with_kind(
         c,
         "findWithinHorizon",
         "(Ljava/util/regex/Pattern;I)Ljava/lang/String;",
         native_scanner_find_within_horizon_pattern,
-        cratonvm_native_api::NativeKind::Intrinsic,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
     // `match()` is Intrinsic for the same reason as `findWithinHorizon` above:
     // `java.util.Scanner` declares no ACC_NATIVE method, so contract §1.5's
@@ -8686,7 +8765,7 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
         "match",
         "()Ljava/util/regex/MatchResult;",
         native_scanner_match,
-        cratonvm_native_api::NativeKind::Intrinsic,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
 
     // Interface dispatch: Iterator

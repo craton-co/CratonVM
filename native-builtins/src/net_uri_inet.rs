@@ -1410,44 +1410,59 @@ impl<'a> Ipv6Scanner<'a> {
         }
         let mut p = start;
         let mut q = start;
-        loop {
+        // Run-once block, NOT an iteration. The JDK writes this as `for (;;)`
+        // whose body contains nothing but `break`s and one `return`: an IPv4
+        // address is exactly four bytes, so the scan is fully unrolled, and the
+        // `for (;;)` exists only so that any failed step can jump to the shared
+        // `fail("Malformed IPv4 address", q)` tail below. Transcribing it as a
+        // Rust `loop` kept the shape but said something untrue about the
+        // control flow, and `clippy::never_loop` — deny-by-default — failed the
+        // crate on `dev` from 2026-08-29 until this was straightened out. A
+        // labelled block is the construct that actually means "run once,
+        // `break` to the tail", so the step-for-step correspondence with
+        // `java.net.URI.Parser.scanIPv4Address` this file is written to
+        // preserve survives, and the lint agrees with the code.
+        'scan: {
             q = self.scan_byte(p, m);
             if q <= p {
-                break;
+                break 'scan;
             }
             p = q;
             q = self.scan_char(p, m, b'.');
             if q <= p {
-                break;
+                break 'scan;
             }
             p = q;
             q = self.scan_byte(p, m);
             if q <= p {
-                break;
+                break 'scan;
             }
             p = q;
             q = self.scan_char(p, m, b'.');
             if q <= p {
-                break;
+                break 'scan;
             }
             p = q;
             q = self.scan_byte(p, m);
             if q <= p {
-                break;
+                break 'scan;
             }
             p = q;
             q = self.scan_char(p, m, b'.');
             if q <= p {
-                break;
+                break 'scan;
             }
             p = q;
             q = self.scan_byte(p, m);
             if q <= p {
-                break;
+                break 'scan;
             }
-            p = q;
+            // The JDK assigns `p = q` a fourth time here. It is dead in both
+            // languages — everything after this point reads `q`, never `p` —
+            // and outside a loop the compiler can see that, so it is dropped
+            // rather than carried as an unused assignment.
             if q < m {
-                break;
+                break 'scan;
             }
             return Ok(Some(q));
         }

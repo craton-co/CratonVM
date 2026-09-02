@@ -1,6 +1,12 @@
 # WORKER-5 NOTE 8 — `getDefinedPackage` answers for packages the loader did not DEFINE, and it is why `RLangPackages` fails on a binary built from the integrated tree
 
-**Status: FIXED, MEASURED.** Lane WORKER-5, 2026-08-22. Found on
+**Status: FIXED, MEASURED.** Lane WORKER-5, 2026-08-22. **Its two open items
+closed 2026-09-01** — N3b (§7.4's platform-module residual) and, with them, a
+REGRESSION §7.3's own table did not catch: `Package.getPackage("java.lang")`
+read `null` on dev a week later, because the class-path segment probe this fix
+narrowed to cannot answer for a jimage-backed loader at all. Both are measured
+and closed in the companion record,
+`bug-getdefinedpackage-answers-visibility-not-definition-for-builtin-loaders-20260822.md`. Found on
 `C:/craton/cratonvm-w5.exe` and fixed on `C:/craton/cratonvm-w5b.exe` — two
 Windows `cargo build --release -p cratonvm-cli` builds of the integrated tree,
 made by this lane precisely because no prebuilt binary matched the tree. Oracle:
@@ -179,6 +185,16 @@ The probe now matches the oracle on every row:
 `getPackage` still resolving is the check that says the fix narrowed
 `getDefinedPackage` specifically rather than breaking package lookup.
 
+> **2026-09-01: that last row did not hold.** On dev one week later,
+> `Package.getPackage("java.lang")` answered `null`. The row is the right row —
+> it is precisely the caller that notices when the boot loader stops answering —
+> but a single non-null check taken once, on the binary that made the change,
+> cannot say the property SURVIVED. The companion record's closing section has
+> the cause (the narrowed probe silenced the boot loader for the whole image)
+> and a second one under it (`java.lang.ClassLoader.parent` and
+> `BuiltinClassLoader.parent` are two different fields, and only the second was
+> ever written), plus the vector that now asserts the walk on every run.
+
 **§5 said the strong control was missing. It is not any more.** A class in a
 genuinely app-classpath-defined named package, which is the regression that
 would matter (blinding the app loader would re-open the Spring
@@ -201,7 +217,7 @@ before:  AssertionError at check 1 of 27
 after:   PASS RLangPackages (27 checks)      <- the count HotSpot publishes
 ```
 
-### 7.4 The residual this fix KNOWINGLY carries
+### 7.4 The residual this fix KNOWINGLY carries — CLOSED 2026-09-01, see N3b
 
 This VM does not model the JDK's platform **module** set, only an "extension"
 class-path segment which is empty on a normal run. So a genuinely
@@ -265,9 +281,18 @@ already narrowing it there.
   binary built from that tree. It passes now, but the question stands: whoever
   measured green should say which binary and which commit, because one of the
   two measurements was about a different artefact and that can recur.
-* **N3b — the platform module set (§7.4).** `java.sql` and its siblings now
-  answer `null` on the platform loader. Whoever owns the module model should
-  decide whether that is worth closing.
+* ~~**N3b — the platform module set (§7.4).**~~ **DONE 2026-09-01.** It was
+  worth closing, and it was wider than `java.sql`: the segment probe answers for
+  NO built-in loader, because the boot image is a jimage and a
+  `java/lang/*.class` glob over it returns nothing. `RLangPackages` stayed green
+  through that because every assertion it makes about a built-in loader is a
+  NEGATIVE. Closed by asking the JDK's own
+  `ModuleLoaderMap$Modules.{bootModules,platformModules}` tables which loader
+  DEFINES a package, ANDed with "a class in it is loaded" — module membership
+  alone is a capability, and `plat.getDefinedPackage("javax.smartcardio")` is
+  `null` on HotSpot until a class arrives. New vector:
+  `regression-suite/src/RBuiltinLoaderPackages.java`, 22 checks, green on both
+  VMs.
 * **N3 — do NOT add `RLangPackages` to `harness-uncounted.txt`** (§3). The `[G3]`
   flag is correct; silencing it would hide the failure that causes it.
 

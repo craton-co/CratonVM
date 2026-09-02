@@ -7557,6 +7557,27 @@ fn dbb_read_integral(shared: &SharedVm, obj: ObjectRef, index: usize) -> Option<
     }
 }
 
+/// The capacity `GetDirectBufferCapacity` answers for this buffer.
+///
+/// Factored out because `GetDirectBufferAddress` now needs the SAME number to
+/// bound the pointer it publishes (see `direct_buffer_native_address`). Two
+/// copies of this resolution would be two chances for the pair to disagree,
+/// which is precisely the failure the bound is there to prevent.
+///
+/// A capacity of 0 is legal (`NewDirectByteBuffer(addr, 0)`), so unlike the
+/// address there is no "non-zero means present" test available. Resolution
+/// decides: if the class has a real `capacity` field, that field is
+/// authoritative; otherwise slot 1 is. The `or_else` covers the
+/// stub-upgraded-under-a-live-object case, as in the address getter.
+fn dbb_capacity(shared: &SharedVm, oref: ObjectRef, class_id: ClassId) -> Option<i64> {
+    match dbb_slots(shared, class_id) {
+        Some((_, cap_idx)) => {
+            dbb_read_integral(shared, oref, cap_idx).or_else(|| dbb_read_integral(shared, oref, 1))
+        }
+        None => dbb_read_integral(shared, oref, 1),
+    }
+}
+
 // Index 229: NewDirectByteBuffer
 extern "C" fn jni_new_direct_byte_buffer(
     _env: JNIEnv,
@@ -7707,12 +7728,30 @@ fn is_direct_buffer(shared: &SharedVm, oref: ObjectRef) -> bool {
     false
 }
 
-fn direct_buffer_native_address(raw: i64) -> Option<*mut u8> {
+/// The real address `GetDirectBufferAddress` may publish for `raw`, given that
+/// `GetDirectBufferCapacity` is about to answer `capacity` for the same buffer.
+///
+/// The two JNI entry points ARE the bound: the spec's contract is that a native
+/// may touch `capacity` bytes starting at the address, so publishing them
+/// separately without checking they agree hands out a pointer with a bound
+/// nobody enforced. That is what
+/// `zgc-rewrite-pass-walks-off-a-reference-array-20260815.md` recorded as "the
+/// handle TRANSLATED, and the bound dropped" — `unsafe_arena_real_ptr` knows
+/// how many bytes are left in the block and this call site used to discard it.
+///
+/// A tagged handle whose block cannot cover `capacity` is refused, not clamped:
+/// the capacity getter reads a Java field this function cannot correct, so the
+/// only self-consistent pair on offer is `(NULL, capacity)` — and NULL is the
+/// answer natives already check for.
+fn direct_buffer_native_address(raw: i64, capacity: i64) -> Option<*mut u8> {
     if raw == 0 {
         return None;
     }
     if cratonvm_native_builtins::unsafe_arena_addr_is_tagged(raw) {
-        return cratonvm_native_builtins::unsafe_arena_real_ptr(raw).map(|(ptr, _len)| ptr);
+        // A negative capacity is not a length; treat it as zero rather than
+        // wrapping it into a colossal `usize` that refuses every buffer.
+        let want = usize::try_from(capacity).unwrap_or(0);
+        return cratonvm_native_builtins::unsafe_arena_real_ptr_bounded(raw, want);
     }
     Some(raw as *mut u8)
 }
@@ -7738,12 +7777,18 @@ extern "C" fn jni_get_direct_buffer_address(_env: JNIEnv, buf: JObject) -> *mut 
         // `None` falls through — a named slot that reads a real value is always
         // preferred, so a real `Buffer`'s `mark` can never be mistaken for an
         // address.
+        // The capacity this buffer is about to advertise through
+        // `GetDirectBufferCapacity`. A buffer that cannot answer one at all
+        // gets 0, which bounds nothing away: an arena block always covers zero
+        // bytes, so such a buffer behaves exactly as it did before the bound
+        // was carried.
+        let capacity = dbb_capacity(shared, oref, class_id).unwrap_or(0);
         match dbb_slots(shared, class_id) {
             Some((addr_idx, _)) => dbb_read_integral(shared, oref, addr_idx)
                 .or_else(|| dbb_read_integral(shared, oref, 0)),
             None => dbb_read_integral(shared, oref, 0),
         }
-        .and_then(direct_buffer_native_address)
+        .and_then(|raw| direct_buffer_native_address(raw, capacity))
     })
     .flatten()
     .unwrap_or(std::ptr::null_mut())
@@ -7764,16 +7809,7 @@ extern "C" fn jni_get_direct_buffer_capacity(_env: JNIEnv, buf: JObject) -> JLon
             return None;
         }
         let class_id = shared.mem.heap.class_id_of(oref);
-        // A capacity of 0 is legal (`NewDirectByteBuffer(addr, 0)`), so unlike
-        // the address there is no "non-zero means present" test available.
-        // Resolution decides: if the class has a real `capacity` field, that
-        // field is authoritative; otherwise slot 1 is. The `or_else` covers the
-        // stub-upgraded-under-a-live-object case, as in the address getter.
-        match dbb_slots(shared, class_id) {
-            Some((_, cap_idx)) => dbb_read_integral(shared, oref, cap_idx)
-                .or_else(|| dbb_read_integral(shared, oref, 1)),
-            None => dbb_read_integral(shared, oref, 1),
-        }
+        dbb_capacity(shared, oref, class_id)
     })
     .flatten()
     .unwrap_or(-1)
@@ -10552,6 +10588,73 @@ mod tests {
             0,
             "a zero capacity must read back as 0, not -1"
         );
+        clear_jni_context();
+    }
+
+    /// **`GetDirectBufferAddress` refuses an arena block that cannot cover the
+    /// capacity `GetDirectBufferCapacity` advertises for the same buffer.**
+    ///
+    /// The two entry points ARE the bound: the JNI contract says a native may
+    /// touch `capacity` bytes from the address, so publishing them separately
+    /// without checking they agree hands out a pointer with a bound nobody
+    /// enforced. `unsafe_arena_real_ptr` has always known how many bytes were
+    /// left in the block and this call site used to discard it -- recorded as
+    /// "the handle TRANSLATED, and the bound dropped" in
+    /// `zgc-rewrite-pass-walks-off-a-reference-array-20260815`.
+    ///
+    /// The accepting half is asserted first and on the SAME block: a guard that
+    /// refuses every tagged handle would pass a refusal-only test while
+    /// breaking every direct buffer netty and lz4-java hand to C.
+    #[test]
+    fn jni_direct_buffer_address_refuses_a_block_shorter_than_its_capacity() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        set_jni_context_arc(shared.clone());
+        let env = get_jni_env();
+
+        let handle = cratonvm_native_builtins::unsafe_arena_allocate(64);
+        assert!(
+            cratonvm_native_builtins::unsafe_arena_addr_is_tagged(handle),
+            "the arena must hand back a tagged handle, or this test proves nothing"
+        );
+        let as_ptr = handle as usize as *mut u8;
+
+        // Exactly covered: the pointer is published, and it is the REAL
+        // address, not the handle -- returning the handle is the SIGSEGV in
+        // third-party C that the translation exists to prevent.
+        let ok = jni_new_direct_byte_buffer(env, as_ptr, 64);
+        assert_ne!(ok, 0);
+        let published = jni_get_direct_buffer_address(env, ok);
+        assert!(!published.is_null(), "a block that covers its capacity must publish");
+        assert!(
+            !cratonvm_native_builtins::unsafe_arena_addr_is_tagged(published as i64),
+            "the published address must be translated, not the handle again"
+        );
+        assert_eq!(jni_get_direct_buffer_capacity(env, ok), 64);
+
+        // One byte more than the block holds. That byte is the bug: a native
+        // following the contract writes it, and it lands outside the block.
+        let short = jni_new_direct_byte_buffer(env, as_ptr, 65);
+        assert_ne!(short, 0);
+        assert_eq!(
+            jni_get_direct_buffer_capacity(env, short),
+            65,
+            "the capacity getter still answers what the object says"
+        );
+        assert!(
+            jni_get_direct_buffer_address(env, short).is_null(),
+            "and the address getter must refuse, because the pair would be a lie"
+        );
+
+        // An interior handle is bounded from its offset, so the same block
+        // refuses a capacity it accepted from the base.
+        let mid = jni_new_direct_byte_buffer(env, (handle + 32) as usize as *mut u8, 32);
+        assert!(!jni_get_direct_buffer_address(env, mid).is_null());
+        let mid_over = jni_new_direct_byte_buffer(env, (handle + 32) as usize as *mut u8, 33);
+        assert!(jni_get_direct_buffer_address(env, mid_over).is_null());
+
+        cratonvm_native_builtins::unsafe_arena_free(handle);
         clear_jni_context();
     }
 

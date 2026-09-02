@@ -2410,6 +2410,16 @@ pub struct ZgcRealHeap {
     /// as it did before domains existed.
     layout_domain: std::sync::atomic::AtomicU32,
 
+    /// This heap's entry in the process-global live-heap registry.
+    ///
+    /// RAII only — see `gen_heap::RELOCATABLE_HEAPS_LIVE`. This collector
+    /// publishes its arena envelope into `MOVABLE_BOUNDS`, which is
+    /// single-tenant by slot-0 ownership, so a SECOND live heap leaves one of
+    /// the two unrepresented and the frame-band verifier's residency test then
+    /// answers `false` for every one of its addresses — a vacuous pass, not an
+    /// absence of movable words.
+    _bounds_registration: crate::gen_heap::RelocatableHeapRegistration,
+
     /// Backing storage for all objects.
     arena: Mutex<Arena>,
     /// Immutable arena envelope, captured at construction — see
@@ -3547,6 +3557,7 @@ impl ZgcRealHeap {
         crate::gen_heap::publish_movable_bounds(0, arena_base, arena_end);
         let heap = Self {
             layout_domain: std::sync::atomic::AtomicU32::new(cratonvm_types::FIRST_LAYOUT_DOMAIN),
+            _bounds_registration: crate::gen_heap::RelocatableHeapRegistration::new(),
             arena_base,
             arena_end,
             arena: Mutex::new(arena),
@@ -17266,7 +17277,7 @@ pub(crate) mod tests {
     /// reads a "header" made of the new tenant's payload. That is the failure
     /// `rewrite_target_is_walkable` reports, and it has been seen in
     /// production with the offending headers decoding as String character
-    /// data (`docs/known-issues/gc/zgc-rewrite-pass-walks-off-a-reference-array-20260815.md`).
+    /// data (`zgc-rewrite-pass-walks-off-a-reference-array-20260815.md`).
     ///
     /// **Read this test for what it is.** It asserts the property that failure
     /// violates; it does not reproduce that failure. The guard it covers HAS
