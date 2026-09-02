@@ -81,6 +81,7 @@ use crate::heap::{
     array_data_size, read_prim_element, write_prim_element, ArrayElementType, ObjectHeader,
     ObjectKind, ARRAY_DATA_OFFSET, GC_FLAG_MARKED, HEADER_SIZE, SLOT_SIZE,
 };
+use cratonvm_types::MARK_WORD_OFFSET;
 use crate::reference::{ReferenceProcessingResult, ReferenceProcessor, ReferenceType};
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
@@ -3673,6 +3674,12 @@ pub struct ZgcRealHeap {
     /// Seeded from `CRATONVM_ZGC_PARSWEEP` at construction and owned by this
     /// instance thereafter, the same shape as `tlab_enabled`.
     sweep_worker_count: AtomicUsize,
+
+    /// Forwarding words the slide has stamped into vacated tails, and answers
+    /// [`Self::forwarded_after_slide`] served from one rather than from
+    /// [`Self::relocations`]. See [`Self::forwarding_word_engagement`].
+    forwarding_words_stamped: AtomicUsize,
+    forwarding_words_read: AtomicUsize,
 }
 
 // SAFETY: identical argument to `Heap`/`G1Collector` (heap.rs:143). The only
@@ -3939,6 +3946,8 @@ impl ZgcRealHeap {
             tlab_enabled: AtomicBool::new(zgc_tlab_enabled_by_default()),
             dead_scratch: Mutex::new(Vec::new()),
             sweep_worker_count: AtomicUsize::new(Self::sweep_workers_requested()),
+            forwarding_words_stamped: AtomicUsize::new(0),
+            forwarding_words_read: AtomicUsize::new(0),
             // THE SAME TWO NUMBERS as `registry` above, through the same
             // constructor. Any drift between the two grids would make an
             // address the registry accepts unrepresentable in the mark bitmap,
@@ -6639,6 +6648,9 @@ impl ZgcRealHeap {
         // runs after the guard is dropped.
         let mut arena_lo = 0usize;
         let mut arena_hi = 0usize;
+        // The span `compact_low_to` is about to zero, captured for
+        // `stamp_forwarding_words`. Empty when no low slide ran.
+        let mut forwardable_tail = 0usize..0usize;
 
         {
             let mut arena = self.arena.lock();
@@ -7208,6 +7220,13 @@ impl ZgcRealHeap {
                     self.vacated_bytes_published
                         .fetch_add(bytes, Ordering::Relaxed);
                 }
+                // WHERE A FORWARDING WORD CAN LIVE. `compact_low_to` zeroes
+                // `[new_cursor, cursor)` and the slide packed every survivor
+                // BELOW `new_cursor`, so that span is provably empty afterwards
+                // -- which makes it the one part of the vacated region where a
+                // record can be stamped without writing into a live object. See
+                // `stamp_forwarding_words`.
+                forwardable_tail = (base + new_cursor)..(base + arena.used_low_for_compaction());
                 reclaimed = arena.compact_low_to(new_cursor, touched, &vacated);
             }
 
@@ -7324,6 +7343,10 @@ impl ZgcRealHeap {
             // sites above are the ones instrumented.
             self.registry.insert(*to);
         }
+
+        // A REAL FORWARDING WORD, wherever one fits. See
+        // `stamp_forwarding_words`; the table below is what covers the rest.
+        self.stamp_forwarding_words(&pairs, &forwardable_tail);
 
         // Publish this slide's moves so the forwarding barrier has something to
         // read. See `ZgcRealHeap::relocations`.
@@ -9014,7 +9037,161 @@ impl ZgcRealHeap {
     ///
     /// See [`Self::relocations`] for why this exists and why a re-issued
     /// address cannot reach it.
+    /// Leave a real `MARK_FORWARDED` word at every vacated address the slide
+    /// emptied and did not immediately refill.
+    ///
+    /// # Why this collector had none, and what that cost
+    ///
+    /// `VmHeap::load_and_forward` repairs a possibly-stale reference by reading
+    /// a FORWARDING WORD at the old address. Every other moving collector in
+    /// this tree leaves one; the ZGC slide left none, because
+    /// `Arena::compact_low_to` zeroes the span above the new cursor and the
+    /// memmove overwrites everything below it. So the barrier was a silent
+    /// no-op at all 46 of its call sites -- every one of which exists because
+    /// its caller holds an `ObjectRef` somewhere no root scan can see. That is
+    /// what [`Self::relocations`] was added to paper over, at the cost of a
+    /// global mutex and a hash probe per miss.
+    ///
+    /// It also destroyed the evidence: a stale read landed on a well-formed
+    /// ALL-ZERO object (`class_id=0`, `num_slots=0`) and the reader walked off
+    /// the end of a zero-length object with every identifying byte gone. That
+    /// is the whole reason [`Self::corpse_ledger`] exists.
+    ///
+    /// # Which addresses can carry one, and why only those
+    ///
+    /// **A sliding compactor's from-space IS its to-space.** Survivors are
+    /// packed down into the space lower-addressed survivors vacated, so an old
+    /// address below the new cursor now holds a DIFFERENT LIVE OBJECT, and
+    /// stamping a word there would corrupt it. Nothing can be done for that
+    /// class here -- it is a limit of sliding, not of this function, and it is
+    /// what a page-evacuating collector would remove.
+    ///
+    /// `[new_cursor, old_cursor)` is different: the slide packed every survivor
+    /// strictly below `new_cursor` (`live_ceiling` is a check on exactly that
+    /// answer) and `compact_low_to` has just zero-filled the whole span. It is
+    /// provably empty, so a record stamped in it can overwrite nothing. The
+    /// registry membership test below is belt-and-braces on top of that
+    /// argument, not a substitute for it.
+    ///
+    /// # Why a stamped word cannot outlive its truth
+    ///
+    /// The span is handed back to the allocator -- as un-bumped tail, or on the
+    /// free list through `vacated`. Both hand-out paths zero what they serve
+    /// (`alloc_raw` per object, `tlab_refill` per chunk), so the first reuse of
+    /// those bytes erases the record. A stamped word is therefore readable
+    /// exactly as long as nothing has claimed the space, which is precisely as
+    /// long as it is true.
+    ///
+    /// # What a conservative scan sees
+    ///
+    /// The same thing it saw before: not an object. The registry bit was
+    /// cleared by the rebuild above, so `is_object_address` refuses the address
+    /// whether it holds zeroes or a forwarding word. The zero-fill's stated
+    /// purpose -- "a conservative scanner that met one would resurrect a
+    /// corpse" -- is served by the registry, and always was.
+    fn stamp_forwarding_words(&self, pairs: &[(usize, usize)], tail: &std::ops::Range<usize>) {
+        if tail.is_empty() {
+            return;
+        }
+        let mut stamped = 0usize;
+        for &(from, to) in pairs {
+            // Inside the zeroed, provably-empty tail...
+            if from < tail.start || from >= tail.end {
+                continue;
+            }
+            // ...with room for a whole mark word...
+            if from.saturating_add(MARK_WORD_OFFSET + 8) > self.arena_end {
+                continue;
+            }
+            // ...and not an address the rebuild has just re-issued to a
+            // survivor. Cannot happen given the argument above; asserted by
+            // construction rather than trusted, because the cost of being wrong
+            // is a live object's mark word replaced by a forwarding pointer,
+            // which destroys its lock state.
+            if self.registry.contains(from) {
+                continue;
+            }
+            // SAFETY: `from` is an 8-aligned address inside the arena envelope
+            // (it was an allocation base until this slide), `from + 16` is
+            // bounded above, and the span is zero-filled and unreferenced by
+            // any live object. The write is one aligned `u64`.
+            unsafe {
+                let mark = (from + MARK_WORD_OFFSET) as *const AtomicU64;
+                (*mark).store(
+                    cratonvm_types::ObjectHeader::make_forwarded(0, to),
+                    Ordering::Relaxed,
+                );
+            }
+            stamped += 1;
+        }
+        self.forwarding_words_stamped
+            .fetch_add(stamped, Ordering::Relaxed);
+    }
+
+    /// Read a forwarding word stamped by [`Self::stamp_forwarding_words`].
+    ///
+    /// `None` unless `addr` is an 8-aligned, non-registered address inside this
+    /// arena whose mark word is in `MARK_FORWARDED` state and whose target is a
+    /// live object base. Every one of those is load-bearing:
+    ///
+    /// * **8-aligned and in-arena** bounds the read. Callers hand this
+    ///   addresses that are already suspect -- that is the point of the barrier
+    ///   -- so a wild read here would be the very crash it exists to prevent.
+    /// * **not registered** because a LIVE object's mark word is its own lock
+    ///   or hash word. Nothing but this function's stamp ever writes
+    ///   `MARK_FORWARDED` on this collector, but the screen means a future
+    ///   producer cannot turn a locked object into a forwarding record by
+    ///   accident.
+    /// * **the target is a live base** because a stale record whose target has
+    ///   since died must answer `None`, not hand back a freed address. The
+    ///   table lookup this parallels ends with the identical check.
+    fn forwarding_word_at(&self, addr: usize) -> Option<usize> {
+        if addr < self.arena_base
+            || addr.saturating_add(MARK_WORD_OFFSET + 8) > self.arena_end
+            || (addr - self.arena_base) & 7 != 0
+            || self.registry.contains(addr)
+        {
+            return None;
+        }
+        // SAFETY: bounded above, 8-aligned, and inside a `Vec<u8>` that lives
+        // for as long as this heap. Reading a `u64` out of initialised arena
+        // bytes is well-defined whatever they hold.
+        let mark = unsafe { (*((addr + MARK_WORD_OFFSET) as *const AtomicU64)).load(Ordering::Relaxed) };
+        if !cratonvm_types::ObjectHeader::is_forwarded_mark(mark) {
+            return None;
+        }
+        let target = cratonvm_types::ObjectHeader::forwarding_target(mark) as usize;
+        self.registry.contains(target).then_some(target)
+    }
+
+    /// How many forwarding words the slides have stamped, and how many
+    /// `forwarded_after_slide` answers came from one rather than from the
+    /// table.
+    ///
+    /// The engagement counter for the pair. `stamped` at zero on a run with
+    /// relocations means every vacated address was below the new cursor, i.e.
+    /// the slide refilled everything it emptied; `from_word` at zero with
+    /// `stamped` high means the barrier is never asked about the tail, and the
+    /// table is carrying the whole load after all.
+    pub fn forwarding_word_engagement(&self) -> (usize, usize) {
+        (
+            self.forwarding_words_stamped.load(Ordering::Relaxed),
+            self.forwarding_words_read.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn forwarded_after_slide(&self, addr: usize) -> Option<usize> {
+        // THE STAMPED WORD FIRST. It is a bounds check, an aligned load and a
+        // tag test -- no lock, no hash, no allocation -- and it is the answer
+        // for every address the slide emptied and did not refill. The table
+        // below covers the rest: an old address BELOW the new cursor, where a
+        // survivor now sits and no record can be stamped. See
+        // `stamp_forwarding_words` for why that split is a property of sliding
+        // compaction rather than of this function.
+        if let Some(target) = self.forwarding_word_at(addr) {
+            self.forwarding_words_read.fetch_add(1, Ordering::Relaxed);
+            return Some(target);
+        }
         let reloc = self.relocations.lock();
         if reloc.is_empty() {
             return None;
@@ -16322,6 +16499,159 @@ pub(crate) mod tests {
         heap.collect_garbage(&stw, &mut roots, monitors);
         let still = addrs.iter().filter(|a| heap.registry.contains(**a)).count();
         (addrs, still)
+    }
+
+    // ---- D6: a real forwarding word at the vacated address ----------------
+
+    /// Build a heap whose low region compacts, and return
+    /// `(heap, pre_slide_bases, pointer_map)`.
+    ///
+    /// Every survivor is rooted, so the caller can ask what each one's old
+    /// address answers afterwards.
+    fn slide_a_low_region() -> (
+        ZgcRealHeap,
+        Vec<usize>,
+        Vec<ObjectRef>,
+        cratonvm_types::PointerMap,
+    ) {
+        const PAGE: usize = ZgcRealHeap::Z_LOGICAL_PAGE_BYTES;
+        const FIELDS: usize = 500;
+        let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+        let per_page = PAGE / (HEADER_SIZE + FIELDS * SLOT_SIZE);
+        // Sparse pages: one survivor in every eight objects, so the relocation
+        // set selects the pages and the slide has a long tail to empty.
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        for _page in 0..4 {
+            for i in 0..per_page {
+                let o = heap.alloc_object(ClassId::new(1), FIELDS);
+                if i % 8 == 0 {
+                    roots.push(o);
+                }
+            }
+        }
+        let before: Vec<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+        let live: Vec<usize> = before.clone();
+        let (_moved, _reclaimed, map) = heap.relocate_stw_for_test(&live);
+        (heap, before, roots, map)
+    }
+
+    /// **A vacated address in the emptied tail answers with a forwarding
+    /// word, not with silence.**
+    ///
+    /// `VmHeap::load_and_forward` repairs a stale reference by reading a
+    /// forwarding word at the old address, and this collector left none -- so
+    /// the barrier was a silent no-op at all 46 of its call sites. Every
+    /// address the slide emptied and did not refill now carries one, and
+    /// `forwarded_after_slide` reads it with no lock and no hash probe.
+    ///
+    /// The exact edit that trips it: removing the `stamp_forwarding_words` call
+    /// from `relocate_stw`, or widening `forwardable_tail` past the new cursor
+    /// in either direction (too low and the stamp lands in a live object; too
+    /// high and it lands outside the zeroed span).
+    #[test]
+    fn a_vacated_tail_address_carries_a_forwarding_word_to_the_survivor() {
+        let (heap, before, _roots, map) = slide_a_low_region();
+        let (stamped, _) = heap.forwarding_word_engagement();
+        assert!(
+            stamped > 0,
+            "the slide emptied a tail and stamped no forwarding word at all"
+        );
+        let mut repaired_by_word = 0usize;
+        let mut checked = 0usize;
+        for old in &before {
+            let Some(expected) = map.get(old).copied() else {
+                continue; // did not move
+            };
+            if heap.registry.contains(*old) {
+                continue; // a survivor was packed onto it -- no word can fit
+            }
+            checked += 1;
+            assert_eq!(
+                heap.forwarded_after_slide(*old),
+                Some(expected),
+                "0x{old:x} moved to 0x{expected:x} and the barrier could not \
+                 follow it"
+            );
+            if heap.forwarding_word_at(*old).is_some() {
+                repaired_by_word += 1;
+            }
+        }
+        assert!(checked > 0, "no survivor's old address was left free");
+        assert!(
+            repaired_by_word > 0,
+            "{checked} vacated addresses were repairable but every one of them \
+             came from the table, so the stamped words are not being read"
+        );
+    }
+
+    /// **A stamped word never lands on a live object.**
+    ///
+    /// The one way this feature could corrupt the heap: a forwarding word
+    /// written over a survivor's mark word destroys its lock state and its
+    /// identity hash, and for an INFLATED word it strands the monitor. The
+    /// argument is that `[new_cursor, old_cursor)` is provably empty after
+    /// `compact_low_to` zeroes it; this is the check on the answer.
+    #[test]
+    fn no_survivor_mark_word_was_overwritten_by_a_forwarding_stamp() {
+        let (heap, _before, _roots, _map) = slide_a_low_region();
+        let mut forwarded_live = Vec::new();
+        for base in heap.registry.bases() {
+            if heap.header_ref(base as *mut u8).is_forwarded() {
+                forwarded_live.push(base);
+            }
+        }
+        assert!(
+            forwarded_live.is_empty(),
+            "{} LIVE object(s) carry a MARK_FORWARDED word after a slide; the \
+             first is 0x{:x}. A forwarding stamp landed inside the compacted \
+             region.",
+            forwarded_live.len(),
+            forwarded_live.first().copied().unwrap_or(0)
+        );
+    }
+
+    /// **A stamped word is invalidated by reuse rather than outliving its
+    /// truth.**
+    ///
+    /// The span the stamps live in goes straight back to the allocator, and
+    /// both hand-out paths zero what they serve. So the record is readable for
+    /// exactly as long as nothing has claimed the space -- which is exactly as
+    /// long as it is true. A record that survived reuse would redirect a
+    /// perfectly good reference to the NEW occupant's predecessor.
+    #[test]
+    fn reallocating_a_vacated_address_erases_its_forwarding_word() {
+        let (heap, before, _roots, map) = slide_a_low_region();
+        let Some(&stale) = before
+            .iter()
+            .find(|b| map.contains_key(*b) && heap.forwarding_word_at(**b).is_some())
+        else {
+            panic!("the slide left no readable forwarding word to test");
+        };
+        assert!(heap.forwarded_after_slide(stale).is_some());
+        // Refill the arena until an allocation's SPAN covers that address --
+        // not until one starts exactly there, which depends on how the packing
+        // happened to divide and would make the test a coin flip.
+        let mut covered = false;
+        for _ in 0..200_000 {
+            let o = heap.alloc_object(ClassId::new(2), 4);
+            let lo = o.as_ptr() as usize;
+            let hi = lo + ZgcRealHeap::alloc_size(heap.header_ref(o.as_ptr())).unwrap_or(0);
+            if (lo..hi).contains(&stale) {
+                covered = true;
+                break;
+            }
+        }
+        assert!(
+            covered,
+            "the allocator never served 0x{stale:x} again; the test cannot say \
+             anything about reuse"
+        );
+        assert_eq!(
+            heap.forwarding_word_at(stale),
+            None,
+            "0x{stale:x} still reads as forwarded after being handed out again"
+        );
     }
 
     // ---- D2c: the sweep, sharded ------------------------------------------
