@@ -31,7 +31,6 @@ pub mod gc_integration;
 pub mod heartbeat_watch;
 pub mod hprof;
 pub mod jdk_layout;
-pub mod jit_integration;
 pub mod jvmti;
 pub mod lambda_proxy;
 pub mod lock_order;
