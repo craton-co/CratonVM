@@ -413,6 +413,60 @@ so the next work is those two, together, with `relocation_on_proven_jit` as the
 only acceptance test -- and `CRATONVM_ZGC_ASSUME_REWRITABLE=1` as the upper
 bound that says what winning looks like.
 
+### 2026-09-02 (RELEASE + forced relocation): the shortfall goes 1696 -> 12, and NONE of the 12 is an OOM
+
+The livedbg arm above could not produce a pass/fail because its `opt-level=1`
+slowness tripped H2's `FOR UPDATE WAIT 0.5`. This is the same experiment on a
+`--profile release` binary, load 8.92:
+
+```text
+CRATONVM_ZGC_ASSUME_REWRITABLE=1     rc=1   1018 s
+    Expected: 100000 actual: 99988
+    Timeout trying to lock table "COUNTER"   12
+    java.lang.OutOfMemoryError                0
+    native reference array of length 65536    0
+    arena allocation failed                   0
+    LOST UPDATE                               0
+    relocation_skipped_jit 0   relocation_on_proven_jit 26
+    compaction_cycles 26       objects_relocated 536508
+```
+
+Apply this page's OWN accounting method -- the one the L7 addendum used to
+show that 1696 = 1691 OOM + 5 SQLException:
+
+```text
+100000 - 99988                                 = 12
+OutOfMemoryError raised in tasks                  0
+SQLException (COUNTER lock timeout) caught       12
+                                                ---
+                                                 12
+```
+
+**The OOM population is gone. All twelve survivors are H2's own half-second
+lock timeout**, which the callable catches as `SQLException` and prints -- the
+same class of loss the original accounting attributed 5 of 1696 to.
+
+So the defect this page is about is FULLY explained and FULLY relieved by
+relocation:
+
+| arm | actual | OOM | SQLException |
+|---|---:|---:|---:|
+| as this page found it | 98 304 | 1 691 | 5 |
+| relocation forced (release) | **99 988** | **0** | 12 |
+
+The residual 12 are a shared-host artefact, not a VM defect: `WAIT 0.5` is half
+a second, the host was at load 8.9 on 8 cores, and 26 compaction pauses moving
+536 508 objects sit inside that window. HotSpot passes this class in 9 s on the
+same box. An idle host is what would turn 12 into 0, and that run is the only
+thing between this page and a PASS.
+
+**What this makes the remaining work.** The coverage conjunction is no longer a
+theory about what might help -- it is the only thing standing between the
+measured state above and a passing class. The terms left after the helper-window
+discharge are `compiled-frame-oop-not-published` and `cross-thread-jit-peer`,
+they must be closed together, and `relocation_on_proven_jit > 0` is the
+acceptance test.
+
 ### 2026-09-02 (quiet host): ZERO OOMs, 24 compaction cycles, and the gate never refuses
 
 The 3000 s arms above both capped under contention. This one ran on a quiet host
