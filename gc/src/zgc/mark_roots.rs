@@ -66,6 +66,21 @@ pub(crate) const Z_ROOT_BLOOM_WORDS: usize = 512;
 /// sends every lookup down the slow path, which is correct and merely slower.
 pub(crate) const Z_ROOT_CLASS_WORDS: usize = 1024;
 
+/// `CRATONVM_ZGC_MARK_ROOT_FILTER`: consult the filter before the four global
+/// tables. Default on; `0`/`off`/`false`/`no` asks them per object as before.
+///
+/// Read per COLLECTION, not latched, so both arms can run in one process --
+/// which is what `the_filter_and_the_tables_agree_about_every_object` needs.
+pub(crate) fn filter_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_MARK_ROOT_FILTER") {
+        Some(raw) => {
+            let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no")
+        }
+        None => true,
+    }
+}
+
 /// Which objects and classes have edges the heap does not store in them.
 ///
 /// Rebuilt at the start of every mark. Reading it never takes a lock, which is
@@ -120,7 +135,16 @@ impl std::fmt::Debug for ZMarkRootFilter {
 impl ZMarkRootFilter {
     /// Snapshot the four tables' KEY SETS. Called once, at mark start, with
     /// the world stopped or the tables otherwise quiescent.
+    ///
+    /// `CRATONVM_ZGC_MARK_ROOT_FILTER=0` leaves it disarmed, which restores
+    /// the per-object lookups exactly -- the arms differ only in whether a
+    /// question is asked of a bloom or of four global tables, so the switch is
+    /// a clean A/B rather than a different collector.
     pub(crate) fn rebuild(&self) {
+        if !filter_enabled() {
+            self.disarm();
+            return;
+        }
         for w in self.class_bits.iter() {
             w.store(0, Ordering::Relaxed);
         }
@@ -313,6 +337,32 @@ mod tests {
         if !filter.any_addr.load(Ordering::Relaxed) {
             assert!(!filter.may_own_overlay(0x1000));
         }
+    }
+
+    /// The switch must leave the filter DISARMED, not merely empty. An empty
+    /// armed filter answers "definitely not" to everything, which is the
+    /// opposite of the fallback it is supposed to restore.
+    #[test]
+    fn the_kill_switch_disarms_rather_than_emptying() {
+        let filter = ZMarkRootFilter::default();
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_MARK_ROOT_FILTER", Some("0"))],
+            || {
+                assert!(!filter_enabled());
+                filter.rebuild();
+            },
+        );
+        assert!(
+            filter.may_own_extra_roots(0x4000) && filter.may_pin_loader(3),
+            "the switched-off filter excluded something; it must prove nothing"
+        );
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_MARK_ROOT_FILTER", Some("1"))],
+            || {
+                assert!(filter_enabled());
+                filter.rebuild();
+            },
+        );
     }
 
     /// An unbuilt filter must answer "maybe" to everything: a caller that
