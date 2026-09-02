@@ -2490,9 +2490,9 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
                     // BufferPool` carrier, which is the policy working as
                     // designed: strict mode forbids compatibility stand-ins.
                     // Answering an EMPTY LIST is not, and it is the exact harm
-                    // `docs/known-issues/jdk-only/bug-the-bufferpool-refusal-
-                    // takes-out-the-whole-platform-mbean-server-20260822.md`
-                    // argued a loud refusal was preferable to.
+                    // `bug-the-bufferpool-refusal-takes-out-the-whole-platform-
+                    // mbean-server-20260822-FIXED-20260901.md` argued a loud
+                    // refusal was preferable to.
                     //
                     // MEASURED on 2026-09-01, `probes/JmxBlast.java`, one
                     // binary, the two modes:

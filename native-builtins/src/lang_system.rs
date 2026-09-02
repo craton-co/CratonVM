@@ -4931,7 +4931,9 @@ pub(crate) fn native_system_init_phase1(
         // caller that encodes through this stream dies with
         // `AbstractMethodError` rather than the NPE this helper exists to
         // prevent -- a worse error, one frame further from the cause. See
-        // `docs/known-issues/jdk-only/bug-printstream-charset-answers-the-abstract-base-20260825.md`.
+        // `bug-printstream-charset-answers-the-abstract-base-20260825-FIXED-20260901.md`
+        // (retired 2026-09-01 with both of its residuals closed; the stamp
+        // below is one of them).
         //
         // This runs during `initPhase1`, which is why the hand-allocated stub
         // was reached for in the first place, so the real call is attempted

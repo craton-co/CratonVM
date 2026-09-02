@@ -3513,10 +3513,29 @@ mod tests {
     }
 
     #[test]
-    fn the_whole_surface_is_fifteen_variables() {
+    fn the_whole_surface_is_eighteen_variables() {
         // This is the number the refactor exists to hold down. Raising it wants
         // an argument, not a merge.
-        assert_eq!(Group::ALL.len() + SCALARS.len(), 15);
+        //
+        // 15 -> 17 -> 18 on 2026-09-01, and every argument was made at the
+        // entry itself, in `SCALARS`, by the change that added it:
+        // `CRATONVM_JFR_ENABLE_EVENTS` (B10), the `native.encoding` override
+        // (D3), and `CRATONVM_STDOUT_ENCODING`.
+        //
+        // The argument for the third, since this is where it is owed: it is the
+        // opt-out for deriving `stdout.encoding` / `stderr.encoding` /
+        // `stdin.encoding` from the host instead of pinning UTF-8, which
+        // `docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-
+        // 20260901.md` §9 asked for by name when it recommended following the
+        // host — that key decides the `Charset` stamped on `System.out`, so the
+        // change moves BYTES and not only a property string, and a change that
+        // moves bytes on every non-UTF-8 host needs a same-binary way back.
+        // A scalar rather than an `INVENTORY` token for the same reason as the
+        // two above: it carries a VALUE, and the `E` model is presence-only.
+        //
+        // Two GROUPS were not added — `Group::ALL` is still ten. Adding one of
+        // those is the move that would want a fresh argument.
+        assert_eq!(Group::ALL.len() + SCALARS.len(), 18);
     }
     /// The repository's first commit. No knob can predate it, so a `since:`
     /// earlier than this is a typo rather than a very old flag.
