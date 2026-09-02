@@ -6541,16 +6541,25 @@ impl GenerationalHeap {
         let divert_for_incomplete_moving_coverage =
             moving_young_requested && (force_non_moving_jit_roots || coverage_incomplete);
         let moving_young = moving_young_requested && !divert_for_incomplete_moving_coverage;
+        // A device DMA against the heap arena that the bounded GPU
+        // critical-section wait could not outlast. Nothing may move this
+        // cycle, and not even the debug force-moving flag overrides it: the
+        // veto is a correctness fact, not a policy. See
+        // `vm_heap::gpu_relocation_forbidden`.
+        let gpu_relocation_forbidden = crate::vm_heap::gpu_relocation_forbidden();
         let divert_non_moving = (has_conservative_roots && !moving_young)
             || honor_promotion_oom_risk
             || divert_for_incomplete_moving_coverage
-            || explicit_full_gc;
+            || explicit_full_gc
+            || gpu_relocation_forbidden;
         if watchref_dbg() {
             eprintln!(
                 "[watchref] collect_garbage_inner: has_conservative_roots={has_conservative_roots} moving_young_requested={moving_young_requested} divert_non_moving={divert_non_moving} force_moving={force_moving}"
             );
         }
-        if divert_non_moving && (!force_moving || divert_for_incomplete_moving_coverage) {
+        if divert_non_moving
+            && (!force_moving || divert_for_incomplete_moving_coverage || gpu_relocation_forbidden)
+        {
             if divert_for_incomplete_moving_coverage {
                 // Warn-level and ON BY DEFAULT (see the function's doc): a
                 // silent slide back to the non-moving sweep is the failure mode
@@ -6580,6 +6589,11 @@ impl GenerationalHeap {
                 } else if honor_promotion_oom_risk {
                     (
                         dr::NON_MOVING_PROMOTION_OOM_RISK,
+                        crate::gc_quiescence::incomplete_reason::NONE,
+                    )
+                } else if gpu_relocation_forbidden && !explicit_full_gc {
+                    (
+                        dr::NON_MOVING_GPU_CRITICAL,
                         crate::gc_quiescence::incomplete_reason::NONE,
                     )
                 } else {

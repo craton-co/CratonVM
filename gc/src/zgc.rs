@@ -4399,7 +4399,12 @@ impl ZgcRealHeap {
         // length of an assertion has no other way to ask for that -- the
         // variable is process-wide and a test that set it would decide the
         // question for every other test in the binary.
-        self.relocation_enabled.load(Ordering::Relaxed)
+        //
+        // AND the GPU veto: a device DMA against the heap arena that the
+        // collector's bounded wait could not outlast forbids this cycle's
+        // slide. `false` in every build without `gpu-offload`. See
+        // `vm_heap::gpu_relocation_forbidden`.
+        self.relocation_enabled.load(Ordering::Relaxed) && !crate::vm_heap::gpu_relocation_forbidden()
     }
 
     /// Turn the stop-the-world slide on or off for THIS heap.
@@ -4788,7 +4793,9 @@ impl ZgcRealHeap {
         pins: &[usize],
         pairs: &mut Vec<(usize, usize)>,
     ) -> (usize, usize) {
-        if !self.high_compaction_enabled.load(Ordering::Relaxed) {
+        if !self.high_compaction_enabled.load(Ordering::Relaxed)
+            || crate::vm_heap::gpu_relocation_forbidden()
+        {
             return (0, 0);
         }
         let base = arena.base_ptr() as usize;
