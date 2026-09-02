@@ -810,3 +810,60 @@ in the flag-on run and absent in the flag-off control. A checksum from a gated
 path nobody confirmed was entered is the "a subsystem kill switch passing 6/6 is
 not a diagnosis" failure, and this file has been on the receiving end of it
 before.
+
+## 11. The ten findings (2026-09-02)
+
+*Written against `perf/g1-ten-findings-20260902`, branched from `origin/dev`
+at `5a6247661` — the first tip that carried the nineteen-findings merge
+(`001acd84f`). A full read of the collector after that merge produced ten more
+findings, each of which is now landed with a unit test. Where a finding changed
+pause complexity it is listed first; the allocation-path items follow.*
+
+| # | Finding | Fix | Kill switch | Test |
+|---|---|---|---|---|
+| 1 | Any humongous span made every young pause walk the whole old generation: the eager-reclaim census was "a whole-heap question" and `phase4_regions_to_walk` refused to narrow while one was wanted. | Liveness comes from the spans' REMEMBERED SETS. The Phase-4 rebuild records humongous targets as rset edges (card included), and `humongous_spans_referenced_by_rset` walks a span's live sources, card-screened, to see whether a reference is still there; more than `EAGER_RECLAIM_MAX_SOURCES` (8) sources retains the span until cleanup. A wide walk still takes the exact census. | `CRATONVM_G1_NARROW_FIXUP=0` (wide walk, census path) | `a_humongous_span_held_by_an_untouched_old_object_survives_a_narrow_pause` |
+| 2 | Mixed pauses were always whole-heap, and up to eight of them ran per mark cycle whether or not any old region was selected. | The mixed fix-up is narrowed by the young rule (both mixed paths); `collect_garbage` ends the mixed phase at the first pause with no candidate (`mixed_phase_has_work`, `end_mixed_phase`). | `CRATONVM_G1_NARROW_FIXUP=0` | `a_narrow_mixed_pause_still_records_the_edges_a_later_young_pause_needs`, `the_mixed_phase_ends_early_when_no_old_region_is_worth_collecting` |
+| 3 | Old-region selection had no live threshold and no waste bound: a 98%-live region was evacuated at nearly a full copy for 2% reclaim. | `mixed_gc_live_threshold_percent` (85) and `heap_waste_percent` (5) on `G1CollectorConfig`; `-XX:G1MixedGCLiveThresholdPercent`, `-XX:G1HeapWastePercent`. | the knobs | `the_mixed_phase_respects_the_live_threshold_and_the_waste_floor` |
+| 4 | The evacuation scans validated the referent's HEADER before testing CSet membership — one cold line per old->old slot in every source walk. | Region index and bitset test first; the plausibility screen runs only for a CSet resident. The dead "already forwarded" branch for non-CSet slots is gone (the pointer map only ever names CSet residents). | — (pure reorder) | the existing evacuation suite |
+| 5 | `G1Region` was ~3 KiB: two inline 32-entry diagnostic rings, streamed by every linear pass over the table. | The rings are `Vec`s that stay empty until `CRATONVM_G1_DBG_REACH=1` records into them. | — | `a_region_table_entry_stays_small` (≤ 512 bytes) |
+| 6 | Two full region-table scans per Eden region claimed, under the exclusive lock (`refill_tlab`'s reserve check and `note_region_consumed_locked`). | The Free/young counters are maintained at the claim funnel (`note_free_regions_claimed`); the pause-end census is the backstop. | — | `the_free_region_count_tracks_claims_without_a_rescan` |
+| 7 | TLAB carves and humongous spans were zeroed under the exclusive guard, stalling every other allocator for the memset. | The fresh-Eden refill downgrades to the shared guard before carving; a humongous claim types its regions with the start cursor at 0 and publishes the cursor only after zeroing under the shared guard. | — | `a_reused_humongous_span_is_zeroed_before_it_is_handed_out` |
+| 8 | Eden regions and humongous spans were both first-fit from index 0, so Eden claims fragmented the contiguous runs humongous allocation needs. | Young claims come from the TOP of the committed prefix (`claim_free_region_young`), Old and humongous from the bottom — HotSpot's head/tail split. Lazy commit is preserved: the prefix grows only when it holds no Free region. | — | `young_regions_claim_from_the_top_and_humongous_from_the_bottom`, `young_claims_do_not_grow_the_committed_prefix_while_it_has_room` |
+| 9 | The concurrent marker scanned a whole reference array under one hold of the region guard, and parked workers polled every 5 ms. | Arrays are marked in 4096-element chunks (a gray entry carries a chunk index in its top 16 bits); the collector wakes parked workers on a SATB spill, a keep-alive push and remark seeding, with the poll a 250 ms fallback. | — | `a_long_reference_array_is_marked_in_chunks`, `a_seed_wakes_a_parked_marker_without_waiting_for_the_poll` |
+| 10 | The pause-time goal was opt-in, and the mixed copy budget priced only the copying. | `CRATONVM_G1_YOUNG_PAUSE_TARGET` is default-on; the mixed budget is the goal minus a decaying estimate of the fix-up walk (`old_cset_copy_budget_ns`). | `CRATONVM_G1_YOUNG_PAUSE_TARGET=0` | `the_mixed_copy_budget_is_charged_for_the_fix_up_walk` |
+
+### 11.1 Why item 1 is sound without the census
+
+The census was exact because Phase 4 walked every non-CSet region. The
+replacement rests on one claim: **every reference into a humongous span from
+outside it is recorded in the span's remembered set, and every recording path
+dirties the holder's card.** The producers are the same three §2.1 lists —
+the mutator post-write barrier (`post_write_barrier_rset` records to any
+non-Free target and dirties `src_addr`), the Phase-4 rebuild for the regions
+it walks (which now pushes `(span, holder)` for a humongous target and dirties
+the holder), and the evacuation-failure fix-up (`record_outgoing_rset_edges`,
+same). A GC-created edge — an evacuated copy holding a reference to a span —
+lives in a to-space region, which is in the narrow set because its cursor
+changed, so the rebuild records it in the same pause. A dead young holder's
+entry goes stale the moment Phase 5 resets its region (`recycled_in_generation`
+advances past the entry's generation), which is before eager reclaim runs.
+JIT-pinned regions are walked wholesale, unscreened, for the reason Phase 2
+walks them wholesale. What the rset cannot prove it does not claim: a
+coarsened set, more than eight live sources, or a source walk that breaks on an
+unsizeable header all RETAIN the span, and `debug_assert_no_reference_into_spans`
+still re-derives the verdict over every non-Free region in debug builds.
+
+### 11.2 Why item 2 is sound without the wide walk
+
+F-04 kept the mixed fix-up wide because the old members' rsets are "maintained
+by this very walk's rebuild half". The young CSet's rsets are maintained by the
+same three producers and the young walk has been narrow since G1AUD-11; what
+makes either sound is that every slot needing a rewrite lives in a region that
+is a recorded source of some CSet member or a region the pause wrote into. The
+rebuild only ever ADDS edges for the regions it walks, which a narrow walk also
+does, and a region it does not walk keeps the entries it had. It has never been
+what makes THIS pause sound (§2.1: a missing barrier entry is a UAF in this
+pause and a repair for the next); it still repairs for later pauses.
+`a_narrow_mixed_pause_still_records_the_edges_a_later_young_pause_needs` drives
+the case that would break first — the copy of an object reachable only through
+an Old holder, collected by a rootless young pause immediately after.
