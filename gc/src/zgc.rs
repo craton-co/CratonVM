@@ -3424,6 +3424,37 @@ pub struct ZgcRealHeap {
     /// already handed out must still be closed and returned, or their tails
     /// leak.
     tlab_enabled: AtomicBool,
+
+    /// Reused backing store for the sweep's dead-address slice.
+    ///
+    /// # Why a field and not a local `Vec`
+    ///
+    /// The sweep pushes one `usize` per reclaimed object, and it is the only
+    /// producer. A fresh `Vec::new()` per collection pays, inside the pause,
+    /// for ~24 doubling reallocations and the memcpy of every one of them --
+    /// and on the 13.0M-dead-object whole-heap cycle this file's own pause
+    /// anatomy is written against, the final allocation alone is **104 MB**.
+    /// That is the same shape as the `bases()` allocation the 2026-08-17
+    /// anatomy measured at 13% of the pause and which
+    /// [`ZObjectStartsSnapshot::for_each_base`] exists to remove; the fix
+    /// never reached this vector.
+    ///
+    /// Held across collections so the capacity is paid once, at the high-water
+    /// mark, instead of once per cycle. `clear()` keeps the allocation and
+    /// drops the length, and `usize` has no destructor, so the reuse is a
+    /// single store.
+    ///
+    /// # And it is usually not filled at all
+    ///
+    /// [`MonitorCleanup::wants_dead_addresses`] is asked once per collection,
+    /// before the sweep. The VM's monitor table answers `false` whenever no
+    /// monitor is inflated and no CAS lock is held -- which its own comment
+    /// calls the common case -- and then the sweep pushes nothing and this
+    /// stays at whatever capacity a previous contended cycle left it.
+    ///
+    /// A `Mutex` because `collect_garbage` takes `&self`. Uncontended by
+    /// construction: the only lock site is inside the stop-the-world pause.
+    dead_scratch: Mutex<Vec<usize>>,
 }
 
 // SAFETY: identical argument to `Heap`/`G1Collector` (heap.rs:143). The only
@@ -3688,6 +3719,7 @@ impl ZgcRealHeap {
             // grepping `ZgcRealHeap {` across the workspace.
             tlabs: ZArenaTlabRegistry::for_capacity(cap),
             tlab_enabled: AtomicBool::new(zgc_tlab_enabled_by_default()),
+            dead_scratch: Mutex::new(Vec::new()),
         };
         // G2c: seed the arena's allocation policy to match the mode the flag just
         // chose. `set_generational_enabled` keeps them in step afterwards; doing
@@ -13752,7 +13784,29 @@ impl GarbageCollector for ZgcRealHeap {
         let refs_us = clock.lap();
 
         // ---- Sweep phase -------------------------------------------------
-        let mut dead: Vec<usize> = Vec::new();
+        //
+        // DOES ANYTHING DOWNSTREAM ACTUALLY WANT THE DEAD ADDRESSES?
+        //
+        // Asked once, here, and not inside the loop. `MonitorCleanup::
+        // wants_dead_addresses` is the shard survey `prune_dead` already runs
+        // -- moved to before the sweep, because that is where the cost is. On
+        // a workload with no inflated monitor and no held CAS lock (its own
+        // comment: the common case) the slice would be consumed to remove
+        // nothing, and building it is one `usize` per reclaimed object inside
+        // the pause: 104 MB on the 13.0M-dead-object cycle this file's pause
+        // anatomy is written against.
+        //
+        // The registry prune does NOT depend on this. It used to be driven
+        // from the same slice, which is why the slice looked unconditional; it
+        // now happens in the sweep loop, where the base is already in hand.
+        let want_dead = monitors.wants_dead_addresses();
+        let mut dead_guard = self.dead_scratch.lock();
+        let dead: &mut Vec<usize> = &mut dead_guard;
+        dead.clear();
+        // Reclaimed objects, counted whether or not they are collected. The
+        // `--verbose:gc` line reported `dead.len()`, which would now read 0 on
+        // every uncontended run and look like a sweep that freed nothing.
+        let mut dead_count = 0usize;
         // Identity hashes of the dead, for the native side tables keyed by
         // them (`cratonvm_types::identity_side_tables`). Collected HERE and
         // not from `dead` afterwards, because by then the header is gone:
@@ -13941,7 +13995,34 @@ impl GarbageCollector for ZgcRealHeap {
                         }
                     }
                     bytes_freed += size;
-                    dead.push(base);
+                    dead_count += 1;
+                    // THE REGISTRY PRUNE, IN PLACE.
+                    //
+                    // It used to run after the loop, over the collected `dead`
+                    // slice -- which is what made that slice unconditional. The
+                    // base is already in hand here, so the second pass over
+                    // 104 MB of cold `usize`s bought nothing but the ordering
+                    // note below, which still holds:
+                    //
+                    // the prune is a REMOVAL, never a wholesale replacement of
+                    // the structure by the mark snapshot's survivors. An
+                    // allocation registered by another path between the mark
+                    // snapshot and here would be erased by a replacement --
+                    // leaking its memory forever (unsweepable) and, worse,
+                    // making `is_object_address` deny it so conservative
+                    // rooting drops it while reachable.
+                    //
+                    // No mutator is running (`retire_all_tlabs` ran before the
+                    // snapshot and this is inside the stop-the-world pause), so
+                    // nothing can allocate into the span this iteration is
+                    // freeing. Lock order is arena -> registry, and no path in
+                    // this file takes them the other way round: `alloc_raw`
+                    // releases the arena guard before `registry.insert`, and
+                    // `is_object_address` takes the registry alone.
+                    self.registry.remove(base);
+                    if want_dead {
+                        dead.push(base);
+                    }
                 }
             });
             // The last run has no successor to flush it. Missing this leaks the
@@ -14131,15 +14212,10 @@ impl GarbageCollector for ZgcRealHeap {
                 );
             }
         }
-        // Prune DEAD bases from the registry IN PLACE (never wholesale-
-        // replace it with the mark snapshot's survivors): an allocation
-        // registered by another path between the mark snapshot and this
-        // publish would be erased by a replacement — leaking its memory
-        // forever (unsweepable) and, worse, making is_object_address deny it
-        // so conservative rooting drops it while reachable.
-        for d in &dead {
-            self.registry.remove(*d);
-        }
+        // The registry prune used to be here, over the collected `dead` slice.
+        // It now happens inside the sweep loop, where the base is already in
+        // hand -- see the note at that site, which carries the in-place
+        // argument this comment used to.
         // Memory hygiene for the forwarding table, on the same pass that
         // decided which addresses are live. See `prune_relocations`.
         self.prune_relocations();
@@ -14280,7 +14356,7 @@ impl GarbageCollector for ZgcRealHeap {
                  mark_us={mark_us} resurrect_us={resurrect_us} refs_us={refs_us} \
                  sweep_us={sweep_us} registered={} dead={}",
                 registered_count,
-                dead.len(),
+                dead_count,
             );
         }
 
@@ -14430,7 +14506,12 @@ impl GarbageCollector for ZgcRealHeap {
         // a wrong-monitor bug. `io.netty.util.ResourceLeakDetectorTest` went
         // from FAIL to CRASH on it. Ordering fixes both; screening fixes one
         // and creates the other.
-        monitors.prune_dead(&dead);
+        // EMPTY WHEN `wants_dead_addresses` SAID SO, and that is not a
+        // silently weakened prune: the same shard survey answered it, one
+        // phase earlier, under the same stop-the-world token. `prune_dead`
+        // early-returns on an empty slice, which is the identical outcome its
+        // own survey reaches.
+        monitors.prune_dead(dead.as_slice());
         monitors.remap_after_gc(&pointer_map);
 
         // THE NATIVE SIDE TABLES KEYED BY IDENTITY HASH DIE HERE TOO.
@@ -15556,6 +15637,137 @@ pub(crate) mod tests {
     struct NoMonitors;
     impl MonitorCleanup for NoMonitors {
         fn remap_after_gc(&self, _: &cratonvm_types::PointerMap) {}
+    }
+
+    /// A `MonitorCleanup` that records what the sweep handed it, and can
+    /// answer either way to `wants_dead_addresses`.
+    struct RecordingMonitors {
+        wants: bool,
+        /// `Some(n)` once `prune_dead` has been called, with the slice length.
+        seen: std::sync::Mutex<Option<usize>>,
+    }
+    impl RecordingMonitors {
+        fn new(wants: bool) -> Self {
+            Self {
+                wants,
+                seen: std::sync::Mutex::new(None),
+            }
+        }
+        fn seen_len(&self) -> Option<usize> {
+            *self.seen.lock().unwrap()
+        }
+    }
+    impl MonitorCleanup for RecordingMonitors {
+        fn remap_after_gc(&self, _: &cratonvm_types::PointerMap) {}
+        fn prune_dead(&self, dead: &[usize]) {
+            *self.seen.lock().unwrap() = Some(dead.len());
+        }
+        fn wants_dead_addresses(&self) -> bool {
+            self.wants
+        }
+    }
+
+    /// Allocate `n` objects, root none of them, collect, and report
+    /// `(dead_bases_before, still_registered_after)`.
+    fn sweep_a_heap_of_garbage(
+        heap: &ZgcRealHeap,
+        monitors: &dyn MonitorCleanup,
+        n: usize,
+    ) -> (Vec<usize>, usize) {
+        let mut addrs = Vec::with_capacity(n);
+        for _ in 0..n {
+            addrs.push(heap.alloc_object(ClassId::new(3), 2).as_ptr() as usize);
+        }
+        let stw = unsafe { StopTheWorldToken::new_unchecked() };
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        heap.collect_garbage(&stw, &mut roots, monitors);
+        let still = addrs.iter().filter(|a| heap.registry.contains(**a)).count();
+        (addrs, still)
+    }
+
+    /// **The registry prune does not depend on the dead SLICE.**
+    ///
+    /// It used to: the sweep collected every dead base into a `Vec` and then
+    /// walked it to clear the registry, which is what made the slice
+    /// unconditional and cost 104 MB inside a whole-heap pause. The prune now
+    /// happens in the sweep loop. A cleanup that declines the slice must
+    /// therefore still see every dead base leave the registry.
+    ///
+    /// The exact edit that trips it: gating `self.registry.remove(base)` on
+    /// `want_dead` alongside the `dead.push`.
+    #[test]
+    fn declining_the_dead_slice_still_prunes_the_registry() {
+        let heap = ZgcRealHeap::with_capacity(4 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+        let monitors = RecordingMonitors::new(false);
+        let (addrs, still) = sweep_a_heap_of_garbage(&heap, &monitors, 400);
+        assert_eq!(
+            still, 0,
+            "{} of {} unrooted objects are still registered after a sweep that \
+             was not asked for the dead addresses",
+            still,
+            addrs.len()
+        );
+        // ...and the slice really was empty, so the saving is real rather than
+        // the gate being inert.
+        assert_eq!(
+            monitors.seen_len(),
+            Some(0),
+            "prune_dead was handed a non-empty slice by a cleanup that answered \
+             `wants_dead_addresses() == false`"
+        );
+    }
+
+    /// **A cleanup that asks for the addresses still gets all of them.**
+    ///
+    /// The companion to the test above, and the one that says the gate is a
+    /// gate rather than a deletion. `wants_dead_addresses` defaults to `true`
+    /// precisely so that an implementation which forgets it is not silently
+    /// handed nothing.
+    #[test]
+    fn asking_for_the_dead_slice_yields_every_swept_base() {
+        let heap = ZgcRealHeap::with_capacity(4 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+        let monitors = RecordingMonitors::new(true);
+        let (addrs, still) = sweep_a_heap_of_garbage(&heap, &monitors, 400);
+        assert_eq!(still, 0, "unrooted objects survived the sweep");
+        assert_eq!(
+            monitors.seen_len(),
+            Some(addrs.len()),
+            "the sweep reclaimed {} objects but handed prune_dead {:?}",
+            addrs.len(),
+            monitors.seen_len()
+        );
+    }
+
+    /// **The scratch buffer is reused, not reallocated per cycle.**
+    ///
+    /// The whole point of holding it on the heap. Capacity is the observable:
+    /// after a cycle that filled it, a second cycle must not have to grow it
+    /// again, and the buffer must be handed to the next `prune_dead` EMPTY
+    /// rather than carrying the previous cycle's addresses -- which would be a
+    /// use-after-free, since those bases have been reissued.
+    #[test]
+    fn the_dead_scratch_is_cleared_and_its_capacity_reused() {
+        let heap = ZgcRealHeap::with_capacity(4 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+        let monitors = RecordingMonitors::new(true);
+        let (first, _) = sweep_a_heap_of_garbage(&heap, &monitors, 400);
+        let cap_after_first = heap.dead_scratch.lock().capacity();
+        assert!(cap_after_first >= first.len());
+        // A second, SMALLER cycle. The slice must be exactly this cycle's
+        // dead set, and the capacity must not have been thrown away.
+        let (second, _) = sweep_a_heap_of_garbage(&heap, &monitors, 10);
+        assert_eq!(
+            monitors.seen_len(),
+            Some(second.len()),
+            "the second cycle's slice carried the first cycle's addresses"
+        );
+        assert_eq!(
+            heap.dead_scratch.lock().capacity(),
+            cap_after_first,
+            "the scratch buffer was reallocated between cycles"
+        );
     }
 
     #[test]
