@@ -1956,7 +1956,6 @@ mod tests {
         }
         // The last golden offset plus one stride is the whole table.
         let (last_name, last_offset) = GOLDEN_HELPER_OFFSETS[H::NUM_FIELDS - 1];
-        assert_eq!(last_name, "ref_store_post_skip_mask");
         assert_eq!(last_name, "tlab_registration_required");
         assert_eq!(last_offset + HELPER_FIELD_STRIDE, JIT_HELPERS_ABI_SIZE);
     }
@@ -2177,7 +2176,7 @@ mod tests {
         // v12 appends one more Constant, `ref_store_post_skip_mask` — a baked
         // VALUE rather than an address, which is why it is a Constant and not
         // an OptionalPtr: nothing about it is range-checkable as a pointer.
-        assert_eq!(constants, 11, "baked-address slots");
+        assert_eq!(constants, 12, "baked-address slots");
         assert_eq!(required, 43, "required slots");
         assert_eq!(functions - required, 17, "optional callable slots");
         assert_eq!(functions + offsets + constants, H::NUM_FIELDS);
