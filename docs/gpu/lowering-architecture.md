@@ -92,6 +92,38 @@ loaded once in the prologue instead of per access; `mad.wide.s32`
 instead of `cvt`+`mul`+`add`; and retiring the check entirely against
 what the dispatch guard already proved (`Emitter::prove_index_within_param`).
 
+### What that is worth on hardware
+
+Measured on an RTX 2060 (driver 610.88, CUDA 13.3) against a binary
+built from the same tree at the branch point, five interleaved rounds —
+interleaved because this box runs other builds and a
+whole-arm-then-whole-arm layout measures whatever the load did in
+between. Medians of `best_ms`:
+
+| workload | base | new | |
+|---|---:|---:|---|
+| transfer floor, 2.76M (control) | 1.47 | 1.52 | unchanged |
+| ray tracer 640x480 | 0.367 | 0.330 | faster 5/5 |
+| ray tracer 1280x960 | 0.844 | 0.791 | faster 4/5 |
+| ray tracer 1920x1440 | 1.605 | 1.487 | faster 5/5 |
+| GpuWarm 2^24 | 7 ms | 8 ms | unchanged |
+| GpuCompute 2^26 | ~410 ms | ~402 ms | within noise |
+
+Every checksum matched between the two binaries, on every workload, in
+every round.
+
+The shape of that table is the result, not the ray tracer's 7-10%. The
+control does not move, which is what makes the rest readable. The two
+arms that do not move are the two where the overhead removed is not what
+the kernel spends its time on: `GpuWarm` is transfer-dominated with a
+warm residency cache, and `GpuCompute` is 128 data-dependent multiplies
+per element, against which twenty-odd instructions of address and bounds
+arithmetic is noise. `GpuCompute` first appeared to regress 5/5 by ~4%;
+re-measured with more rounds it reversed to 3/4 the other way, which is
+what a 12-22% run-to-run spread does to a 4% difference. The ray tracer
+is the arm with real index arithmetic per pixel and it is the arm that
+moves — and its variance collapses too (1.40-1.51 against 1.54-2.54).
+
 The last of those is a bounds-check elimination, and it is worth naming
 what kind: a single dominance fact, hand-checked, for one shape. It is
 not `bce.rs`. It does not know about `a[i+1]`, or an index derived from

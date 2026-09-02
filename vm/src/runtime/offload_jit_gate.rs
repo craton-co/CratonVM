@@ -34,26 +34,32 @@
 //! `Op::ArrayStore` to a raw inline `MOVSS`/`MOVSD` with no helper to
 //! hook.
 //!
-//! Until 2026-09-02 this gate resolved that by refusing to compile such
-//! a method. It is sound, and it is enormously broad — it fired on any
-//! method writing a primitive array, kernel-adjacent or not, so
-//! attaching a GPU de-optimised the CPU half of every mixed workload.
-//! This module's own note conceded it was "the common case for the
-//! *producer* method rather than the caller", i.e. it fired far more
-//! often than the invokestatic reason it shares this file with.
+//! This gate resolves that by refusing to compile such a method, which
+//! is sound and enormously broad — it fires on any method writing a
+//! primitive array, kernel-adjacent or not, so attaching a GPU
+//! de-optimises the CPU half of a mixed workload. This module's own
+//! note concedes it is "the common case for the *producer* method
+//! rather than the caller", i.e. it fires far more often than the
+//! invokestatic reason it shares this file with.
 //!
-//! The trade is now inverted: admitting such a method calls
-//! [`crate::runtime::offload::input_cache::disable_for_jit_array_writer`],
-//! which drops the cache and refuses further entries, and the method is
-//! compiled. Both directions are sound; this one puts the cost on the
-//! path that benefits from the cache (one H2D copy per submit for an
-//! array re-submitted unchanged) instead of on unrelated CPU code.
+//! The other direction is equally sound and available:
+//! [`ArrayWriterPolicy::AllowJit`] compiles the method and gives up the
+//! residency cache instead, via
+//! [`crate::runtime::offload::input_cache::disable_for_jit_array_writer`].
 //!
-//! It is also decided lazily rather than up front. A program that never
-//! JIT-compiles an array writer keeps the cache exactly as before; one
-//! that does keeps its native code and loses the cache from that moment.
-//! Neither ever pays both. See that function for why admission is early
-//! enough to be safe.
+//! **AUDIT 2026-09-02: it was tried as the default, and measured, and
+//! the measurement sent it back.** On an RTX 2060 against a binary from
+//! the same tree without the change, `GpuWarm f 2^22 5` went from
+//! `warm_ms=2` to `warm_ms=10`, and `CRATONVM_GPU_TRACE_BYTES=1` showed
+//! exactly why: 48 MB uploaded once and then zero, against 48 MB on
+//! every single submit. The residency cache exists for a workload that
+//! re-submits the same arrays, and on one it is worth 5x — while
+//! nothing in that run made the CPU-side benefit visible, because there
+//! was no CPU-side work left to speed up.
+//!
+//! So the trade stays where it was, and the inversion is a flag with the
+//! numbers attached. See [`ArrayWriterPolicy`] for which shape each
+//! answer is for.
 //!
 //! The FIRST reason still refuses: a method containing an `invokestatic`
 //! to an offload-eligible target is still kept interpreted, because the
@@ -267,6 +273,17 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
         return false;
     }
 
+    // AUDIT 2026-09-02: with `--nojit` there is nothing to admit, so
+    // there is nothing to decide — and nothing to trade away either.
+    // This is not merely an optimisation: `compute` is still consulted
+    // on that path, and under `ArrayWriterPolicy::AllowJit` it was
+    // giving up the residency cache to buy compilation that could never
+    // happen. Measured on GpuWarm at 2^22, `--gpu --nojit` re-uploaded
+    // 48 MB on every submit instead of zero.
+    if crate::runtime::env_cache::disable_jit() {
+        return false;
+    }
+
     let cm = shared.classes.class_manager.read();
     let Some(class) = cm.get_class(class_id) else {
         return false;
@@ -278,36 +295,26 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
         return false;
     };
 
-    // Phase 10 #2, JIT half — INVERTED, AUDIT 2026-09-02.
+    // Phase 10 #2, JIT half. Two sound answers; which one is a POLICY,
+    // and the default is the measured one — see
+    // [`ArrayWriterPolicy`].
     //
-    // A method writing an int/long/float/double array used to be refused
-    // outright, because the IR pipeline's inline `MOVSS`/`MOVSD` store
-    // has no hook to invalidate the input-residency cache from. That is
-    // sound and enormously broad: the reason has nothing to do with
-    // whether the method has ever seen a kernel, so `--gpu` de-optimised
-    // the CPU half of every mixed workload — a ray tracer's setup loops,
-    // an inference pipeline's array fills — to keep coherent a cache
-    // most of those methods will never touch. It was also, by the
-    // module's own note, "the common case for the *producer* method
-    // rather than the caller", i.e. it fired far more often than the
-    // reason it shares this function with.
-    //
-    // Both sides of the trade are sound; the question is which pays.
-    // Now the CACHE stands down instead: admitting this method disables
-    // the residency cache and drops what it holds, and the method gets
-    // compiled. Ordering is the argument — this runs at admission,
-    // strictly before the compiled code can execute a store, so there is
-    // no window in which a compiled store meets a live entry.
-    //
-    // A program that never JIT-compiles an array writer keeps the cache
-    // exactly as before; one that does keeps its native code and pays
-    // one H2D copy per submit for arrays it re-submits unchanged.
-    // Neither pays both, and nothing had to be decided up front.
+    // A method writing an int/long/float/double array cannot run
+    // compiled while the input-residency cache is live, because the IR
+    // pipeline's inline `MOVSS`/`MOVSD` store has no hook to invalidate
+    // it from. Either the method stays interpreted, or the cache stands
+    // down. Both are correct; they cost different things.
     if method_writes_primitive_array(&code_attr.code) {
-        crate::runtime::offload::input_cache::disable_for_jit_array_writer();
-        // Fall through to the invokestatic scan: this method may ALSO
-        // contain a call to an offload-eligible kernel, which is the
-        // other, narrower reason to refuse it, and that one still holds.
+        match array_writer_policy() {
+            ArrayWriterPolicy::KeepCache => return true,
+            ArrayWriterPolicy::AllowJit => {
+                crate::runtime::offload::input_cache::disable_for_jit_array_writer();
+                // Fall through to the invokestatic scan: this method may
+                // ALSO call an offload-eligible kernel, which is the
+                // other, narrower reason to refuse it, and that one
+                // still holds.
+            }
+        }
     }
 
     let cp_indices = scan_invokestatic_cp_indices(&code_attr.code);
@@ -519,6 +526,60 @@ fn scan_code(code: &[u8]) -> (Vec<u16>, bool) {
 /// This costs nothing on a CPU-only build (module not compiled), and
 /// nothing on a `gpu-offload` build running without a usable `--gpu`
 /// device, because [`caller_blocks_jit`] checks that first.
+/// Which side of the array-writer trade this process takes.
+///
+/// # The measurement
+///
+/// Both answers are sound. The default is the one that was measured, on
+/// an RTX 2060 against a binary built from the same tree without the
+/// change, `GpuWarm f 2^22 5`, `CRATONVM_GPU_TRACE_BYTES=1`:
+///
+/// | | warm_ms | H2D per submit |
+/// |---|---:|---:|
+/// | `KeepCache` (default) | 2 | 48 MB once, then 0 |
+/// | `AllowJit` | 10 | 48 MB, every submit |
+///
+/// The residency cache exists precisely for a workload that re-submits
+/// the same arrays, and on one it is worth 5x. Nothing in that run made
+/// the CPU-side benefit of compiling the array writer visible, because
+/// there was no CPU-side work left to speed up.
+///
+/// That does not make `AllowJit` wrong — it makes it wrong AS A DEFAULT.
+/// The case it is for is the opposite shape: a mixed workload whose CPU
+/// half fills, transforms and post-processes arrays around a kernel that
+/// runs once. There, blocking the JIT de-optimises code that has nothing
+/// to do with the device, to keep coherent a cache with nothing in it.
+/// This is the knob for measuring which shape you have.
+///
+/// `CRATONVM_GPU_JIT_ARRAY_WRITERS=allow` selects it; anything else, or
+/// unset, keeps the cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrayWriterPolicy {
+    /// Keep the input-residency cache; leave a method that writes a
+    /// primitive array interpreted. The pre-2026-09-02 behaviour, and
+    /// the measured default.
+    KeepCache,
+    /// Compile the method; give up the residency cache for the rest of
+    /// the process. See
+    /// [`crate::runtime::offload::input_cache::disable_for_jit_array_writer`].
+    AllowJit,
+}
+
+/// See [`ArrayWriterPolicy`]. Read once per process.
+fn array_writer_policy() -> ArrayWriterPolicy {
+    use std::sync::OnceLock;
+    static P: OnceLock<ArrayWriterPolicy> = OnceLock::new();
+    *P.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_GPU_JIT_ARRAY_WRITERS")
+            .ok()
+            .as_deref()
+        {
+            Some("allow") => ArrayWriterPolicy::AllowJit,
+            _ => ArrayWriterPolicy::KeepCache,
+        }
+    })
+}
+
 /// Whether `code` contains `iastore` / `lastore` / `fastore` / `dastore`
 /// — a store into an array shape the GPU input-residency cache can hold.
 ///
@@ -589,9 +650,13 @@ mod tests {
 
         /// The residency cache stands down for the JIT, and stays down.
     ///
-    /// AUDIT 2026-09-02. This pins the inverted trade described in
-    /// `offload_jit_gate`'s module docs: admitting a method that writes a
-    /// primitive array disables the cache instead of refusing the method.
+    /// AUDIT 2026-09-02. This pins the mechanism behind
+    /// [`ArrayWriterPolicy::AllowJit`]: when that policy is selected,
+    /// admitting a method that writes a primitive array disables the
+    /// cache instead of refusing the method. The DEFAULT does not reach
+    /// it — see the module docs for the measurement that put it behind a
+    /// flag — so this test calls the mechanism directly rather than
+    /// going through `compute`.
     ///
     /// # What this can and cannot reach without a device
     ///

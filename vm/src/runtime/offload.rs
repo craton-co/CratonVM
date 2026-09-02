@@ -6053,22 +6053,26 @@ pub(crate) mod input_cache {
     /// pipeline's array fills — to keep coherent a cache most of those
     /// methods will never touch.
     ///
-    /// AUDIT 2026-09-02 inverts it. Both directions are sound; the
-    /// question is which side pays. Blocking the JIT costs native code
-    /// on methods that may have no connection to the device. Disabling
-    /// the cache costs one H2D copy per submit on arrays that are
-    /// re-submitted unchanged — real, but bounded by PCIe bandwidth and
-    /// paid only by the GPU path that benefits from it.
+    /// AUDIT 2026-09-02 made the choice explicit rather than implicit,
+    /// and measured it. Both directions are sound; the question is which
+    /// side pays. Blocking the JIT costs native code on methods that may
+    /// have no connection to the device. Disabling the cache costs one
+    /// H2D copy per submit on arrays that are re-submitted unchanged.
     ///
-    /// And it does not have to be chosen up front. The flag flips at JIT
-    /// ADMISSION of the first array-writing method, which is strictly
-    /// before that method's compiled code can run, so:
+    /// The second sounded bounded — "it is only PCIe bandwidth" — and on
+    /// the workload the cache exists for it is 5x. `GpuWarm f 2^22 5` on
+    /// an RTX 2060: `warm_ms` 2 with the cache, 10 without, and
+    /// `CRATONVM_GPU_TRACE_BYTES=1` showing 48 MB once against 48 MB
+    /// every submit. So blocking the JIT remains the default and this
+    /// path is reached only under
+    /// `CRATONVM_GPU_JIT_ARRAY_WRITERS=allow`, for the opposite shape:
+    /// a mixed workload whose CPU half does real array work around a
+    /// kernel that runs once.
     ///
-    /// * a program that never JIT-compiles an array writer keeps the
-    ///   cache, exactly as today;
-    /// * one that does keeps its native code and loses the cache from
-    ///   that moment;
-    /// * neither ever pays both.
+    /// It is still decided lazily rather than up front. The flag flips
+    /// at JIT ADMISSION of the first array-writing method, which is
+    /// strictly before that method's compiled code can run, so a program
+    /// that never compiles one keeps the cache even under `allow`.
     ///
     /// The existing entries are dropped at the same moment
     /// ([`disable_for_jit_array_writer`]), because an array cached a
