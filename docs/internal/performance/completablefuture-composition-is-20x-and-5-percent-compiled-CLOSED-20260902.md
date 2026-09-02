@@ -1,4 +1,4 @@
-# `CompletableFuture` composition — the three residuals discharged, and 1.19x
+# `CompletableFuture` composition — the three residuals discharged, and 1.21x
 
 ## Status
 **CLOSED, 2026-09-02.** Opened 2026-09-01 as the successor to
@@ -13,7 +13,7 @@ number:
 | #2 `Integer.intValue` at 3.99 crossings per chain, bind not engaging | **FIXED** — the bind was refused at COMPILE time at every door, by a pin added for an unrelated rule. `sites_bound=0 served=0` becomes `4 / 159 178`, worth **1.026x**. See "#2" |
 | #3 name-keyed lookup, 8.2 % | **FIXED in the half that dominated it, and the page's attribution of the other half was wrong.** A native stub called `postComplete` by NAME 2.5 times per chain; that is **1.154x** on its own. See "#3" |
 
-Composition is **1.193x faster** and the three refutations the page opened with
+Composition is **1.21x faster** and the four refutations the page opened with
 still stand. What it was ABOUT — that composition is ~20x — is not fixed, for
 the reason the page itself gave: the cost is flat and structural. The part of
 that which is now newly askable has its own page:
@@ -52,6 +52,19 @@ build, and nothing in it is unaccounted for.
 1.154 x 1.026 x 1.021 = **1.209**, against 1.200 measured for all-switches-off.
 The three that separate account for the whole change; the other three are noise
 either way and ship on their merits, not on a number.
+
+### Re-measured after merging dev
+
+`dev` moved 100+ commits between the branch point and the merge, so the table
+was re-taken on the MERGED tree — the rule that a 3/3 pass can become a 2/2 fail
+on same-day dev. Eight interleaved reps, one binary, the same five switches:
+
+| arm | user-cpu range (s) | median | us/chain | ratio |
+|---|---|---:|---:|---:|
+| shipping default | 16.15-16.87 | **16.42** | **25.66** | 1.000x |
+| every switch off | 19.71-20.66 | 19.89 | 31.08 | **1.211x** |
+
+1.193x before the merge, 1.211x after, ranges disjoint both times.
 
 ## #1 — why is there so little compiled code, and why that is the wrong question
 
@@ -243,7 +256,7 @@ path got the id-range guard its sibling `is_lambda_proxy_class` already had.
 **And it is worth 0.995x — nothing.** That was a hypothesis, it had a switch
 built for it precisely so it could be priced rather than asserted, and the
 switch refuted it. It ships anyway because it is strictly less work for an
-identical answer, but **no part of the 1.193x is this**, and a reader taking the
+identical answer, but **no part of the 1.21x is this**, and a reader taking the
 8.2 % bucket as "the native registry" would have spent the day in the wrong
 crate. Recorded because the correction is worth more than the row.
 
@@ -251,7 +264,7 @@ crate. Recorded because the correction is worth more than the row.
 
 * **Composition is still ~25 us/chain against HotSpot's sub-microsecond.** The
   page's own diagnosis stands: the cost is flat, uniform across the dispatch and
-  GC support stack, and structural. 1.193x is a real 1.193x and it is not a
+  GC support stack, and structural. 1.21x is a real 1.21x and it is not a
   dent in the ratio.
 * **`getNow` is still one interpreted frame per chain.** It is nominated and
   compiled under the opt-in and never promoted, by design.
@@ -303,8 +316,27 @@ have disjoint ranges on their own and say so.
 
 ## Gates
 
-Regression suite **85/85 scheduled vectors, 0 failures, 0 harness-blindness
-flags**, on the shipping default.
+Regression suite **88/88 scheduled vectors, 0 failures, 0 harness-blindness
+flags** on the merged tree (85/85 before the merge; dev added three vectors).
+
+`cargo test` over the eight crates this touches leaves exactly the failures a
+pristine `origin/dev` worktree produces, and no others. Three were this
+branch's and are fixed here:
+
+* `flag_declaration_guard` — nine new switches read by code and declared
+  nowhere. An undeclared flag is served by a live `getenv` rather than the
+  latched `VmFlags` snapshot, so `CRATONVM_<GROUP>=token` cannot reach it and
+  `flags::with_thread_overrides` cannot arrange it in a test;
+* `doc_numeric_claims` — the two hand-maintained surface counts in
+  `config/flag-inventory.md`;
+* `no_unallowlisted_metadata_table_bypass_exists` — the frame-free indy fast
+  path is an eighth `.resolution_cache` site in `invokedynamic.rs`. It is the
+  same probe the seven above it make, from the compiled door rather than the
+  interpreted one, so the row's count moves and its reason names the new site.
+
+`gc_native_pins`' `ArrayDeque.iterator` row looked like a fourth and is not:
+dev `#[ignore]`d it on 2026-08-30, after this branch's fork point. The control
+run is what said so.
 
 Three new default-off diagnostics (`CRATONVM_DBG_INTERP_FRAMES`,
 `CRATONVM_DBG_TIERUP_DECLINE`, `CRATONVM_DBG_DIRECT_BINDS`), each one relaxed

@@ -4,7 +4,7 @@
 **OPEN, opened 2026-09-02.** The two things left by
 `performance/completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`
 (internal), which discharged all three of its own residuals and measured
-**1.193x** on composition. Neither item below is composition-specific, which is
+**1.21x** on composition. Neither item below is composition-specific, which is
 why they are a page rather than a section there.
 
 This page inherits that one's whole "already excluded" list — the four
