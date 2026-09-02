@@ -3750,6 +3750,9 @@ pub struct ZgcRealHeap {
     /// every object born black; this counts the ones that cost an atomic. A run
     /// where the two are equal is one where the per-chunk path is inert.
     conc_black_claims: AtomicUsize,
+    /// Cycles that relocated the unpinned pages despite an incomplete coverage
+    /// proof. See [`Self::coverage_incompleteness_is_page_pinnable`].
+    relocation_on_page_pins: AtomicUsize,
     /// Is [`Self::conc_start_bytes`] recomputed from measured allocation rate
     /// and mark duration, rather than fixed at a percentage?
     /// `CRATONVM_ZGC_CONC_START=auto`.
@@ -4035,6 +4038,7 @@ impl ZgcRealHeap {
             forwarding_words_stamped: AtomicUsize::new(0),
             forwarding_words_read: AtomicUsize::new(0),
             conc_black_claims: AtomicUsize::new(0),
+            relocation_on_page_pins: AtomicUsize::new(0),
             conc_start_adaptive: AtomicBool::new(conc_start_is_adaptive()),
             rate_sample_bytes: AtomicU64::new(0),
             rate_sample_nanos: AtomicU64::new(0),
@@ -6445,6 +6449,158 @@ impl ZgcRealHeap {
 /// collection, so the cost is nothing, and a latch would make the switch
 /// untestable -- the first test to touch it would decide the answer for every
 /// later test in the binary.
+/// `CRATONVM_ZGC_PAGE_PINNED_RELOCATE=0` -- restore the per-CYCLE relocation
+/// refusal. Default ON.
+///
+/// The kill switch for [`ZgcRealHeap::coverage_incompleteness_is_page_pinnable`].
+/// With it off, any incomplete coverage proof refuses the whole cycle again,
+/// which is what the collector did before -- so a bisect is a re-run rather
+/// than a rebuild, and anything that appears with this on is this change.
+///
+/// Read per cycle rather than latched, for `zgc_relocate_under_proven_jit`'s
+/// reason: it is consulted once per collection, so the cost is nothing, and a
+/// latch would let the first test to touch it decide the answer for every later
+/// test in the binary.
+fn zgc_page_pinned_relocate() -> bool {
+    match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_PAGE_PINNED_RELOCATE") {
+        Some(raw) => {
+            let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no")
+        }
+        None => true,
+    }
+}
+
+impl ZgcRealHeap {
+    /// Incompleteness reasons that page pinning **cannot** cover, as a mask
+    /// over [`crate::gc_quiescence::incomplete_reason`].
+    ///
+    /// Everything not in here is a reason of the form "this collector cannot
+    /// prove where the oops in that frame are" -- which is precisely the regime
+    /// pin-by-value was designed for, and precisely what
+    /// `pinned_jit_roots_snapshot` already withholds a page for.
+    const UNPINNABLE_COVERAGE_REASONS: usize = {
+        use crate::gc_quiescence::incomplete_reason as r;
+        // A peer OS-SUSPENDED in JIT code, and a blocked peer's helper window.
+        // `unrewritable_peer_state`'s own doc scopes the 2026-07-03 promotion
+        // gate to exactly these two and says why: such a peer is excused from
+        // the safepoint barrier, so it never re-reads its own registers -- and
+        // a register holding only a DERIVED/interior pointer names no base, so
+        // pin-by-value does not protect the base. The resumed peer then keeps
+        // loading through a stale derived pointer.
+        (1 << r::XT_TAKEOVER)
+            | (1 << r::XT_HELPER_WINDOW)
+            // A blanket statement that the JIT's relocation contract is not
+            // strong enough. It is not a claim about one frame, so no per-page
+            // decision can answer it.
+            | (1 << r::JIT_RELOCATION_UNSUPPORTED)
+            // A JIT frame with no `JitEntryGuard` is a frame the scan does not
+            // know is there. Already its own term in the refusal chain; kept
+            // here so the mask alone is a complete statement.
+            | (1 << r::UNREGISTERED_JIT_FRAME)
+            // The runtime oracle caught a frame whose `fully_oop_covered` bit
+            // was false. Conservative scanning would in fact find such an
+            // address, but a proof that has been directly refuted is not
+            // evidence for anything, so this stays a refusal.
+            | (1 << r::COVERAGE_ORACLE_REFUTED)
+    };
+
+    /// May this cycle relocate the pages that are NOT pinned, despite an
+    /// incomplete coverage proof?
+    ///
+    /// # The refusal this replaces, and what it cost
+    ///
+    /// `relocate_stw`'s gate refused the WHOLE CYCLE whenever
+    /// `moving_young_coverage_incomplete()` was true, and the dominant reason
+    /// is [`CROSS_THREAD_JIT_PEER`](crate::gc_quiescence::incomplete_reason::CROSS_THREAD_JIT_PEER)
+    /// -- "some peer is somewhere inside compiled code", which is true of
+    /// nearly every cycle in a warmed-up server workload. `relocate_stw`'s own
+    /// comment says so: "it marks CROSS_THREAD_JIT_PEER incomplete whenever any
+    /// thread OTHER than the collection initiator is in compiled code, so a
+    /// many-threaded workload still compacts rarely."
+    ///
+    /// On this collector compaction is also the only defragmentation there is,
+    /// so that refusal is why the default configuration accumulated
+    /// `CRATONVM_ZGC_TARGETED_COMPACTION`, `CRATONVM_ZGC_HIGH_COMPACTION`,
+    /// `CRATONVM_ZGC_PUBLISH_VACATED` and `CRATONVM_ZGC_TLAB_STARVED_RECYCLE` --
+    /// four repairs for fragmentation that compaction was supposed to handle.
+    /// The first of them is documented as engaging ZERO times on every workload
+    /// measured.
+    ///
+    /// # Why a per-page answer is available, and was already built
+    ///
+    /// `relocate_stw` **already withholds** every logical page that a
+    /// conservatively-discovered JIT root lands on -- that is the
+    /// `pinned_jit_roots_snapshot()` consumer added when compaction shipped,
+    /// after G1 learned the same lesson on 2026-08-11. Pinning by raw ADDRESS
+    /// VALUE is exactly what protects a frame whose oops the collector cannot
+    /// locate: it does not matter whether the address is a base, an interior
+    /// pointer or a `long` that happens to look like one, because the page it
+    /// falls in is not evacuated either way.
+    ///
+    /// So the machinery for a graceful answer was in place and the gate in
+    /// front of it was binary. This makes the gate ask the question the pin set
+    /// can actually answer.
+    ///
+    /// # The three things it still refuses
+    ///
+    /// 1. **State pin-by-value cannot protect.**
+    ///    [`Self::UNPINNABLE_COVERAGE_REASONS`] carries the argument per code;
+    ///    the load-bearing pair is the OS-suspended peer, whose registers may
+    ///    hold a derived pointer that names no base. `unrewritable_peer_state()`
+    ///    is checked as well as the mask, because it is set through a path of
+    ///    its own and the two are not redundant.
+    ///
+    /// 2. **An incompleteness with no reason recorded.**
+    ///    `mark_moving_young_coverage_incomplete` sets the flag and records
+    ///    nothing, so the mask is zero and there is no obligation to reason
+    ///    about. Everything below is an argument about WHICH obligation failed;
+    ///    with none named, the fail-closed answer is the old refusal.
+    ///
+    /// 3. **A pin set that is empty because nobody looked.** An empty
+    ///    `pinned_jit_roots_snapshot` means either "no conservative root
+    ///    exists" or "no conservative scan ran", and the set cannot tell them
+    ///    apart -- so a consumer that treats empty as a licence would relocate
+    ///    everything while believing it was protected. That is the
+    ///    zero-from-an-instrument-armed-where-it-cannot-fire shape, and
+    ///    `gc_quiescence::conservative_jit_scans()` is the discriminator: with
+    ///    compiled frames live and no scan published, this refuses.
+    fn coverage_incompleteness_is_page_pinnable(&self) -> bool {
+        if !zgc_page_pinned_relocate() {
+            return false;
+        }
+        if crate::gc_quiescence::unrewritable_peer_state() {
+            return false;
+        }
+        let mask = crate::gc_quiescence::moving_young_incomplete_reason_mask();
+        // AN UNREASONED INCOMPLETENESS IS UNPINNABLE. `mark_moving_young_
+        // coverage_incomplete` sets the flag without recording anything, so a
+        // zero mask means "the proof failed and nobody said why" -- and the
+        // whole argument below is an argument about WHICH obligation failed.
+        // With no obligation named there is nothing to reason from, and the
+        // fail-closed answer is the old refusal.
+        if mask == 0 || mask & Self::UNPINNABLE_COVERAGE_REASONS != 0 {
+            return false;
+        }
+        // THE VACUOUS-ZERO SCREEN. See point 2 above.
+        if crate::gc_quiescence::is_active() && crate::gc_quiescence::conservative_jit_scans() == 0 {
+            return false;
+        }
+        true
+    }
+
+    /// Cycles that relocated the unpinned pages despite an incomplete coverage
+    /// proof, because page pinning covered the shortfall.
+    ///
+    /// The engagement counter for [`Self::coverage_incompleteness_is_page_pinnable`].
+    /// Zero on a run whose `relocation_skip_reasons[COVERAGE_INCOMPLETE]` is
+    /// high means the new path never opened and the finding is unfixed; high
+    /// with `skipped_jit` low means it is carrying the workload.
+    pub fn relocation_on_page_pins(&self) -> usize {
+        self.relocation_on_page_pins.load(Ordering::Relaxed)
+    }
+}
+
 fn zgc_relocate_under_proven_jit() -> bool {
     match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT") {
         Some(raw) => {
@@ -6900,7 +7056,9 @@ impl ZgcRealHeap {
             Some(relocation_skip_reason::SWITCH_OFF)
         } else if !crate::gc_quiescence::moving_young_enabled() {
             Some(relocation_skip_reason::MOVING_YOUNG_DISABLED)
-        } else if crate::gc_quiescence::moving_young_coverage_incomplete() {
+        } else if crate::gc_quiescence::moving_young_coverage_incomplete()
+            && !self.coverage_incompleteness_is_page_pinnable()
+        {
             Some(relocation_skip_reason::COVERAGE_INCOMPLETE)
         } else if crate::gc_quiescence::force_non_moving_jit_roots() {
             Some(relocation_skip_reason::FORCED_NON_MOVING_ROOTS)
@@ -6931,6 +7089,13 @@ impl ZgcRealHeap {
         if compiled_frames_live {
             self.relocation_on_proven_jit
                 .fetch_add(1, Ordering::Relaxed);
+        }
+        // WHICH of the two licences this cycle used. `relocation_on_proven_jit`
+        // counts "relocated with a compiled frame live" and cannot separate a
+        // cycle whose proof PASSED from one whose proof failed on a reason page
+        // pinning covers -- and those are different claims about the collector.
+        if crate::gc_quiescence::moving_young_coverage_incomplete() {
+            self.relocation_on_page_pins.fetch_add(1, Ordering::Relaxed);
         }
         // A RETAINED TLAB CHUNK WAS THE OBVIOUS SUSPECT HERE, AND IT IS RULED
         // OUT. `retire_all_tlabs` skips a cell it cannot `try_lock`, and on a
@@ -16878,6 +17043,251 @@ pub(crate) mod tests {
         (addrs, still)
     }
 
+    // ---- D5: the relocation refusal, per page rather than per cycle -------
+
+    /// Serialises every test that mutates `gc_quiescence`'s PROCESS-GLOBAL
+    /// coverage state.
+    ///
+    /// `enter`/`leave`, `begin_moving_young_coverage_cycle`,
+    /// `mark_moving_young_coverage_incomplete_because` and
+    /// `publish_pinned_jit_roots` all write statics shared by the whole test
+    /// binary, and `cargo test` runs tests on many threads at once. A test that
+    /// asserts a REFUSAL survives the interference (another test's state can
+    /// only make the gate more conservative); a test that asserts the gate
+    /// PERMITTED something does not, and the failure is intermittent -- which
+    /// is the worst kind to leave in a suite.
+    static QUIESCENCE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// Take [`QUIESCENCE_TEST_LOCK`] and reset the state this test is about to
+    /// depend on, so a previous holder's leftovers cannot decide the answer.
+    fn quiescence_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+        let guard = QUIESCENCE_TEST_LOCK.lock();
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::publish_pinned_jit_roots(&[]);
+        guard
+    }
+
+    /// A sparse 4-page fixture: 1-in-12 live keeps page occupancy near 8%,
+    /// well under the selector's 0.25 `max_live_occupancy`, so every page is
+    /// worth evacuating and anything that does NOT move was withheld.
+    fn sparse_pages_for_relocation() -> (ZgcRealHeap, Vec<ObjectRef>, Vec<usize>) {
+        const PAGE: usize = ZgcRealHeap::Z_LOGICAL_PAGE_BYTES;
+        const FIELDS: usize = 500;
+        let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+        let per_page = PAGE / (HEADER_SIZE + FIELDS * SLOT_SIZE);
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        for _page in 0..4 {
+            for i in 0..per_page {
+                let o = heap.alloc_object(ClassId::new(1), FIELDS);
+                if i % 12 == 0 {
+                    roots.push(o);
+                }
+            }
+        }
+        let pre: Vec<usize> = roots.iter().map(|o| o.as_ptr() as usize).collect();
+        (heap, roots, pre)
+    }
+
+    fn moved_of(roots: &[ObjectRef], pre: &[usize]) -> usize {
+        roots
+            .iter()
+            .zip(pre.iter())
+            .filter(|(now, was)| now.as_ptr() as usize != **was)
+            .count()
+    }
+
+    /// **A cooperatively-parked peer in compiled code no longer refuses the
+    /// whole cycle.**
+    ///
+    /// `CROSS_THREAD_JIT_PEER` means only "some peer is somewhere inside
+    /// compiled code", which is true of nearly every cycle in a warmed-up
+    /// server workload -- and it was refusing every compaction. Such a peer is
+    /// parked cooperatively: it deposits a conservative scan of its own JIT
+    /// frames, `relocate_stw` withholds every page one of those addresses lands
+    /// on, and it remaps its shadow stack on resume. `gc_quiescence`'s own
+    /// `unrewritable_peer_state` doc makes exactly that argument, one
+    /// abstraction level up, about selective promotion.
+    ///
+    /// The exact edit that trips it: removing
+    /// `coverage_incompleteness_is_page_pinnable` from the gate, or adding
+    /// `CROSS_THREAD_JIT_PEER` to `UNPINNABLE_COVERAGE_REASONS`.
+    #[test]
+    fn a_cooperatively_parked_peer_no_longer_refuses_the_whole_cycle() {
+        let _serial = quiescence_test_guard();
+        let (heap, mut roots, pre) = sparse_pages_for_relocation();
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        let _depth = crate::gc_quiescence::enter();
+        assert!(crate::gc_quiescence::is_active());
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+            crate::gc_quiescence::incomplete_reason::CROSS_THREAD_JIT_PEER,
+        );
+        // The peer looked and found nothing -- which is a DIFFERENT fact from
+        // nobody looking, and the gate refuses the second. See
+        // `gc_quiescence::conservative_jit_scans`.
+        crate::gc_quiescence::publish_pinned_jit_roots(&[]);
+        cratonvm_types::flags::with_thread_overrides(
+            // The licence is pinned ON rather than inherited: a suite run with
+            // `CRATONVM_ZGC_PAGE_PINNED_RELOCATE=0` in the environment must
+            // still check that it works, or the one configuration where the
+            // kill switch matters is the one where the feature goes untested.
+            &[
+                ("CRATONVM_ZGC_RELOCATE", Some("1")),
+                ("CRATONVM_ZGC_PAGE_PINNED_RELOCATE", Some("1")),
+            ],
+            || {
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            },
+        );
+        crate::gc_quiescence::leave();
+        crate::gc_quiescence::publish_pinned_jit_roots(&[]);
+        assert!(
+            moved_of(&roots, &pre) > 0,
+            "nothing moved behind a cooperatively-parked peer; the per-cycle \
+             refusal is still in force and compaction is still off for every \
+             multi-threaded workload"
+        );
+        assert!(
+            heap.relocation_on_page_pins() > 0,
+            "objects moved but the page-pinning licence never fired -- the \
+             cycle was permitted for some other reason and this test proves \
+             nothing"
+        );
+    }
+
+    /// **A conservatively-pinned address still withholds its page, on exactly
+    /// the cycle the new licence permits.**
+    ///
+    /// The licence is only sound because the pin set is honoured, so the two
+    /// must be asserted together: permitting the cycle while ignoring the pins
+    /// is the failure mode, and it looks identical from outside.
+    #[test]
+    fn the_new_licence_still_withholds_a_conservatively_pinned_page() {
+        let _serial = quiescence_test_guard();
+        let (heap, mut roots, pre) = sparse_pages_for_relocation();
+        // Pin the FIRST survivor by raw address, the way a conservative JIT
+        // frame scan does.
+        let pinned = pre[0];
+        let stw = unsafe { StopTheWorldToken::new() };
+        let _depth = crate::gc_quiescence::enter();
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+            crate::gc_quiescence::incomplete_reason::CROSS_THREAD_JIT_PEER,
+        );
+        crate::gc_quiescence::publish_pinned_jit_roots(&[pinned]);
+        cratonvm_types::flags::with_thread_overrides(
+            // The licence is pinned ON rather than inherited: a suite run with
+            // `CRATONVM_ZGC_PAGE_PINNED_RELOCATE=0` in the environment must
+            // still check that it works, or the one configuration where the
+            // kill switch matters is the one where the feature goes untested.
+            &[
+                ("CRATONVM_ZGC_RELOCATE", Some("1")),
+                ("CRATONVM_ZGC_PAGE_PINNED_RELOCATE", Some("1")),
+            ],
+            || {
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            },
+        );
+        crate::gc_quiescence::leave();
+        crate::gc_quiescence::publish_pinned_jit_roots(&[]);
+        assert_eq!(
+            roots[0].as_ptr() as usize, pinned,
+            "the conservatively-pinned object MOVED; a JIT frame's register or \
+             spill slot now names a vacated span"
+        );
+        assert!(
+            moved_of(&roots, &pre) > 0,
+            "nothing moved at all, so the withholding above is vacuous"
+        );
+    }
+
+    /// **An OS-suspended peer still refuses the whole cycle.**
+    ///
+    /// The one class page pinning cannot cover, and the reason
+    /// `UNPINNABLE_COVERAGE_REASONS` is a mask rather than an absence of
+    /// checks. Such a peer is excused from the safepoint barrier, so it never
+    /// re-reads its own registers -- and a register holding only a DERIVED
+    /// pointer names no base, so pin-by-value does not protect the base. The
+    /// resumed peer then keeps loading through a stale derived pointer.
+    #[test]
+    fn an_os_suspended_peer_still_refuses_the_whole_cycle() {
+        for reason in [
+            crate::gc_quiescence::incomplete_reason::XT_TAKEOVER,
+            crate::gc_quiescence::incomplete_reason::XT_HELPER_WINDOW,
+            crate::gc_quiescence::incomplete_reason::JIT_RELOCATION_UNSUPPORTED,
+        ] {
+            let _serial = quiescence_test_guard();
+        let (heap, mut roots, pre) = sparse_pages_for_relocation();
+            let stw = unsafe { StopTheWorldToken::new() };
+            let _depth = crate::gc_quiescence::enter();
+            crate::gc_quiescence::begin_moving_young_coverage_cycle();
+            crate::gc_quiescence::mark_moving_young_coverage_incomplete_because(reason);
+            crate::gc_quiescence::publish_pinned_jit_roots(&[]);
+            cratonvm_types::flags::with_thread_overrides(
+                &[
+                    ("CRATONVM_ZGC_RELOCATE", Some("1")),
+                    ("CRATONVM_ZGC_PAGE_PINNED_RELOCATE", Some("1")),
+                ],
+                || {
+                    heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+                },
+            );
+            crate::gc_quiescence::leave();
+            crate::gc_quiescence::publish_pinned_jit_roots(&[]);
+            let moved = moved_of(&roots, &pre);
+            assert_eq!(
+                moved,
+                0,
+                "{moved} object(s) moved under reason {} -- pin-by-value cannot \
+                 protect a base named only by a derived pointer in a register \
+                 nobody will re-read",
+                crate::gc_quiescence::incomplete_reason::label(reason)
+            );
+        }
+    }
+
+    /// **`CRATONVM_ZGC_PAGE_PINNED_RELOCATE=0` restores the per-cycle
+    /// refusal.**
+    ///
+    /// The bisect lever, asserted rather than promised. Same fixture and the
+    /// same reason as the permitting test, so the only difference is the
+    /// switch.
+    #[test]
+    fn the_page_pinned_licence_has_a_working_kill_switch() {
+        let _serial = quiescence_test_guard();
+        let (heap, mut roots, pre) = sparse_pages_for_relocation();
+        let stw = unsafe { StopTheWorldToken::new() };
+        let _depth = crate::gc_quiescence::enter();
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+            crate::gc_quiescence::incomplete_reason::CROSS_THREAD_JIT_PEER,
+        );
+        crate::gc_quiescence::publish_pinned_jit_roots(&[]);
+        cratonvm_types::flags::with_thread_overrides(
+            &[
+                ("CRATONVM_ZGC_RELOCATE", Some("1")),
+                ("CRATONVM_ZGC_PAGE_PINNED_RELOCATE", Some("0")),
+            ],
+            || {
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            },
+        );
+        crate::gc_quiescence::leave();
+        crate::gc_quiescence::publish_pinned_jit_roots(&[]);
+        assert_eq!(
+            moved_of(&roots, &pre),
+            0,
+            "the kill switch did not restore the per-cycle refusal"
+        );
+        assert_eq!(
+            heap.relocation_on_page_pins(),
+            0,
+            "the licence counted an engagement while switched off"
+        );
+    }
+
     // ---- D3: the concurrent window, and allocate-black per chunk ----------
 
     /// **`set_range` sets exactly the grid slots inside the range.**
@@ -22387,6 +22797,13 @@ pub(crate) mod tests {
                 .count()
         };
 
+        // SERIALISED against every other test that writes `gc_quiescence`'s
+        // process-global coverage state. This test only asserts REFUSALS, so
+        // interference could not make it fail -- but it can make a concurrent
+        // test that asserts PERMISSION fail, by marking an unreasoned
+        // incompleteness in the middle of that test's collection. See
+        // `QUIESCENCE_TEST_LOCK`.
+        let _serial = quiescence_test_guard();
         // --- 1. frame live, coverage INCOMPLETE: nothing may move ----------
         let (heap, mut roots, pre) = build();
         // SAFETY: these unit tests run the heap single-threaded.
@@ -22833,6 +23250,10 @@ pub(crate) mod tests {
         // Index 1, not 0: object 0 sits at the bottom and would not move
         // anyway, which would make this pass for the wrong reason.
         let pinned_addr = roots[1].as_ptr() as usize;
+        // Serialised for `QUIESCENCE_TEST_LOCK`'s reason: the pin map is
+        // process-global, and a concurrent test that publishes over it would
+        // silently un-pin this address.
+        let _serial = quiescence_test_guard();
         crate::gc_quiescence::clear_pinned_jit_roots();
         crate::gc_quiescence::add_pinned_jit_root(pinned_addr);
 
