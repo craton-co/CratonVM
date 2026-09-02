@@ -1268,7 +1268,15 @@ as originally written, and this sentence was a false claim about
 After the fix, the `ClinitProbe` diff against HotSpot loses both rows: bci 157
 and bci 166 now match.
 
-### 17.2 What is deliberately NOT fixed
+### 17.2 What is deliberately NOT fixed — SUPERSEDED by §19
+
+> **This section is now WRONG and is kept for its reasoning, not its
+> conclusion.** The latch pair WAS repaired in §19: the R5 warn is 0 on
+> both H2 vectors and on the 40-line repro. What the text below gets
+> right is the mechanism; what it gets wrong is calling it unreachable,
+> because it assumed the repair had to SYNTHESISE an offset encoding.
+> It does not — `staticFieldOffset` mints AND REGISTERS, and making
+> the same call is what fixed it.
 
 `MEMORY_ACCESS_WARNED_BASE`/`_OFFSET` (bci 185/195) still hold their defaults,
 so the R5 warn still fires. Backfilling them needs the class mirror and this
@@ -1537,7 +1545,14 @@ files.
 their per-vector flags and classpath entries, so 4 of 120 exited non-zero and
 exercised less than the suite gives them.
 
-### 21.2 What this does and does not license
+### 21.2 What this does and does not license — SUPERSEDED by §24
+
+> **The refusal this section declines to make HAS since been made
+> (§24).** Two things changed: the count was widened to 136 Netty
+> buffer/util classes, and—the load-bearing correction—the rescues this
+> section is protecting run through the CLASSIFIED paths, not through
+> the case being refused. Re-reading the classifier instead of its
+> summary is what settled it.
 
 **Discharged for four workload families**: the regression corpus, H2, Spring
 Boot and Tomcat+SSL. Nothing in any of them reaches the fallback, and the
@@ -1744,3 +1759,89 @@ baseline ran at load average 2.3, the comparison at **17.85 with 42 users**, so
 the two numbers are not comparable at all and the netty pass-count should not be
 read as a before/after. The landing evidence is the arms, gates, both DoD
 workloads and both H2 vectors, all green on this binary.
+
+## 24. The null-base refusal — §4.5's own fix, finally made
+
+§4.5 wrote this fix down two years of sessions ago in campaign time:
+
+> classify the offset in the null-base arm — arena-tagged, known static,
+> synthetic, or none of those — and refuse the fourth case with the
+> `IllegalArgumentException` that `setMemory`/`copyMemory` at address 0 already
+> produce. **The prerequisite is a count of what reaches the fallback on a real
+> workload.**
+
+§21 produced that count and §23 widened it to Netty. It is 0 everywhere, with a
+firing positive control in every population.
+
+### 24.1 What I had wrong, and it was the load-bearing part
+
+I twice declined this change citing §4.5's own warning that the fallback
+"unblocked the `ConcurrentHashMap.initTable` livelock and the WildFly/Spring
+Boot lazy-init hangs". **Those rescues do not run through the case being
+refused.** They run through the *classified* paths — an arena-tagged handle, a
+synthetic offset, a registered static field — and the classifier returns early
+for all three. Only the FOURTH case, an offset that is none of those, refuses.
+Re-reading the classifier rather than its summary is what changed the decision.
+
+So the change is much narrower than "refuse null-base accesses": the side store
+keeps every consumer it was built for.
+
+### 24.2 What the refused case actually was
+
+```text
+compareAndSwapInt(null, <unrecognised offset>, 0, 1)   ->   true
+```
+
+A CAS reporting success for a write nowhere any reader can see — the one thing
+a lock-free algorithm must never be told. HotSpot SIGSEGVs on it. Throwing is
+better than both, and it is what this VM already does for `setMemory`/
+`copyMemory` at address 0 (rows 27 and 28 of the same probe).
+
+### 24.3 Result
+
+`NullBaseControl` now exits 1 instead of printing `read |0| cas |true|`, and
+the probe rows moved:
+
+```text
+before   22 sun getInt(null, real offset)           |0|
+         24 sun compareAndSwapInt(null, real offset) |true|
+after    22 ... |THREW java.lang.IllegalArgumentException|
+         24 ... |THREW java.lang.IllegalArgumentException|
+```
+
+**The residual line count does not move, and that is expected**: HotSpot dies
+here, so a row can never match. What changed is the CATEGORY. All ten null rows
+are now §4.4's settled shape — *HotSpot SIGSEGVs, CratonVM throws a proper
+exception, CratonVM is better* — instead of one open question and five rows of
+silent success.
+
+### 24.4 A netty run that proves nothing, and how that was established
+
+The post-change netty run reported `NOTESTS=136` — every class finding zero
+tests. That is not a regression and not a pass: **the same fixture reports
+`found=0` on HOTSPOT too**, for both an abstract and a concrete class, right
+now. The netty test tree stopped yielding tests for either VM between the
+earlier run and this one — another lane rebuilding it is the obvious candidate,
+and it is not this lane's to chase.
+
+Recorded rather than quietly dropped, because "0 refusals fired" out of that run
+would have looked like supporting evidence and is worth nothing. The netty
+evidence that counts is the earlier run, when the suite really executed: 136
+classes, 187k captured lines, a 710-line denominator, **0 unclassified null-base
+hits** — which is precisely the measurement that says this refusal cannot fire
+there.
+
+### 24.5 Standing evidence for the change
+
+| check | result |
+| --- | --- |
+| gates | 5/5 RC=0, PERGATE-BAD=0 |
+| arms | 119 / 119 / 79, 0 failed |
+| mode drift | 0 on all three probes |
+| Spring Boot + Tomcat/SSL (DoD) | both `DOD RESULT OK` |
+| H2 `TestFullText` + `TestRecovery` | both rc=0 |
+| `NullBaseControl` (positive control) | fires — rc=1 |
+
+**Not run: WildFly, Keycloak, Elasticsearch** — not checked out on this host.
+The failure mode if one of them does reach the refused case is now a named
+`IllegalArgumentException` quoting the offset, rather than a CAS that lies.
