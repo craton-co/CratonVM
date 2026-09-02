@@ -57,6 +57,20 @@ pub(crate) fn zgc_tlab_enabled_by_default() -> bool {
     }
 }
 
+thread_local! {
+    /// Set while THIS heap is retiring one of its OWN `ZArenaTlab` cells.
+    ///
+    /// `ZArenaTlab` contains a `Tlab`, and `Tlab::retire` offers its reserved
+    /// tail to the globally registered tail-return hooks — which is how a
+    /// MUTATOR thread's TLAB gives its tail back. `tlab_retire_locked` returns
+    /// its own cell's tail itself, so without this the same span would go on
+    /// the free list twice, and two later allocations would be handed the same
+    /// memory. That is not a leak: it is one object's fields landing inside
+    /// another's, which is what `RJitMapTierDiff` crashed on (a reference read
+    /// back as `0x2800`).
+    static IN_OWN_TLAB_RETIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Process-wide mirror of the per-heap mutator-TLAB counters, so the exit
 /// statistics (printed after the VM is gone) can still say whether the inline
 /// bump engaged: `(refills, refill bytes, objects registered, tail bytes
@@ -784,7 +798,10 @@ impl ZgcRealHeap {
         // arena free list shared with every other allocator in this crate, the
         // write is one header, and "walkable" is the state the rest of the tree
         // assumes of arena bytes below the cursor.
+        // The hook must not also free this tail: this function does it below.
+        IN_OWN_TLAB_RETIRE.with(|f| f.set(true));
         tlab.inner.retire();
+        IN_OWN_TLAB_RETIRE.with(|f| f.set(false));
         tlab.stats.retires += 1;
         debug_assert!(tlab.inner.reserved_tail().is_none());
         let Some((tail_start, tail_end)) = tail else {
@@ -919,6 +936,12 @@ impl ZgcRealHeap {
     /// `false` when the tail is not this heap's, so another hook may take it.
     pub fn return_mutator_tail(&self, tail_start: usize, tail_end: usize) -> bool {
         if tail_end <= tail_start {
+            return false;
+        }
+        // One of this heap's OWN cells is retiring; `tlab_retire_locked` owns
+        // that tail and frees it itself. Answering `true` here as well is a
+        // DOUBLE FREE. See `IN_OWN_TLAB_RETIRE`.
+        if IN_OWN_TLAB_RETIRE.with(|f| f.get()) {
             return false;
         }
         let mut arena = self.arena.lock();

@@ -1187,7 +1187,7 @@ pub const INVENTORY: &[E] = &[
     // TLAB bump is unreachable until `CRATONVM_JIT_C2_ALLOC_UPGRADE` opens the
     // optimizing tier to allocation-bearing methods, which is what having it
     // makes possible.
-    E { group: Group::JIT, token: "ir-inline-tlab", on_key: Some("CRATONVM_JIT_IR_INLINE_TLAB"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::JIT, token: "ir-inline-tlab", on_key: Some("CRATONVM_JIT_IR_INLINE_TLAB"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "ir-gated-ref-store", on_key: Some("CRATONVM_JIT_IR_GATED_REF_STORE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "tls-thread-fetch", on_key: Some("CRATONVM_JIT_TLS_THREAD_FETCH"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "ir-receiver-guard-cse", on_key: Some("CRATONVM_JIT_IR_RECEIVER_GUARD_CSE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
@@ -1494,7 +1494,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "self-cache-inherit", on_key: None, off_key: Some("CRATONVM_JIT_NO_SELF_CACHE_INHERIT"), off_word: None, since: "2026-07-14" },
     E { group: Group::JIT, token: "atomic-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_ATOMIC_INTRINSIC"), off_word: None, since: "2026-08-13" },
     E { group: Group::JIT, token: "ffm-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_FFM_INTRINSIC"), off_word: None, since: "2026-08-26" },
-    E { group: Group::JIT, token: "c2-alloc-upgrade", on_key: Some("CRATONVM_JIT_C2_ALLOC_UPGRADE"), off_key: None, off_word: Some("0"), since: "2026-08-27" },
+    E { group: Group::JIT, token: "c2-alloc-upgrade", on_key: Some("CRATONVM_JIT_C2_ALLOC_UPGRADE"), off_key: None, off_word: None, since: "2026-08-27" },
     E { group: Group::JIT, token: "ir-inline", on_key: Some("CRATONVM_JIT_IR_INLINE"), off_key: None, off_word: None, since: "2026-08-27" },
     E { group: Group::JIT, token: "field-site-cache", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE"), off_key: None, off_word: Some("0"), since: "2026-08-04" },
     E { group: Group::JIT, token: "cast-site-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_CAST_SITE_CACHE"), off_word: None, since: "2026-08-18" },

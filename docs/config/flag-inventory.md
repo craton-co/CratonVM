@@ -1254,7 +1254,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_BULK_BYTE_LOOPS` | JIT | `CRATONVM_JIT=bulk-byte-loops` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_BYTECODE_LOOP_XFORM` | JIT | `CRATONVM_JIT=bytecode-loop-xform` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_C1_VECTOR_VETO` | JIT | `CRATONVM_JIT=c1-vector-veto` | default-on | on | behaviour | snapshot | jit |
-| `CRATONVM_JIT_C2_ALLOC_UPGRADE` | JIT | `CRATONVM_JIT=c2-alloc-upgrade` | default-on | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_C2_ALLOC_UPGRADE` | JIT | `CRATONVM_JIT=c2-alloc-upgrade` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_C2_FIRST_CALL` | JIT | `CRATONVM_JIT=c2-first-call` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_CACHED_ENTRY_OWNER_REUSE` | JIT | `CRATONVM_JIT=cached-entry-owner-reuse` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_CALLEE_IDENTITY` | JIT | `CRATONVM_JIT=callee-identity` | default-on | on | behaviour | snapshot | jit |
@@ -1310,7 +1310,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_IR_GATED_REF_STORE` | JIT | `CRATONVM_JIT=ir-gated-ref-store` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_GC_POINT_MAPS` | JIT | `CRATONVM_JIT=ir-gc-point-maps` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_INLINE` | JIT | `CRATONVM_JIT=ir-inline` | opt-in | off | behaviour | snapshot | jit |
-| `CRATONVM_JIT_IR_INLINE_TLAB` | JIT | `CRATONVM_JIT=ir-inline-tlab` | default-on | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_IR_INLINE_TLAB` | JIT | `CRATONVM_JIT=ir-inline-tlab` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_ISEL_EMIT` | JIT | `CRATONVM_JIT=ir-isel-emit` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_ISEL_SHADOW` | JIT | `CRATONVM_JIT=ir-isel-shadow` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_ISEL_VERIFY` | JIT | `CRATONVM_JIT=ir-isel-verify` | opt-in | off | behaviour | snapshot | jit |

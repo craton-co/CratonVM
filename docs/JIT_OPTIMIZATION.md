@@ -666,15 +666,20 @@ own spread is reported as neutral rather than as a win.
 
 | phase | all-off | all-on | |
 |---|---:|---:|---|
-| HashMap (10M put/get) | 12,231 ms | **8,312 ms** | **1.47x** |
-| String/Regex (100K) | 405 ms | **345 ms** | 1.17x |
-| Binary Trees (d=18) | 20,511 ms | **18,897 ms** | 1.09x |
-| Matrix 1280² | 2,343 ms | 2,339 ms | neutral |
-| Arithmetic (2B ops) | 7,554 ms | 7,364 ms | neutral |
+| HashMap (10M put/get) | 8,112 ms | **5,004 ms** | **1.62x** |
+| Binary Trees (d=18) | 14,010 ms | **10,020 ms** | **1.40x** |
+| Matrix 1280² | 3,289 ms | 3,191 ms | neutral |
+| Arithmetic (2B ops) | 5,768 ms | 5,804 ms | neutral |
+| String/Regex (100K) | 239 ms | 251 ms | neutral (a 250 ms phase; ±5% is this host's floor) |
 | Fibonacci(44), Sieve | — | — | inside the noise band |
 
 Checksums identical on every row of every arm (`1549999915000000`,
-`5000050000`, `68332206`, `173943680`, `9592`).
+`68332206`, `173943680`, `5000050000`, `9592`).
+
+Measured on the configuration that actually ships — i.e. with the optimizing
+tier's own inline TLAB bump and `CRATONVM_JIT_C2_ALLOC_UPGRADE` left opt-in,
+for the reason given below. An earlier reading of this table with those two ON
+is not reproduced here, because it is not what a default run does.
 
 The shape of that result is the point: the rows that move are the
 allocation- and call-heavy ones, which is what the findings were about. Matrix
@@ -690,6 +695,24 @@ object in ZGC's object-start registry, which is that collector's only record
 that an object exists. 8 of 86 regression-suite vectors failed; the same
 binary with `CRATONVM_ZGC_MUTATOR_TLAB=0` passed 86 of 86, which located it in
 one run. See `JitRuntimeHelpers::tlab_registration_required` (helper ABI v12).
+
+**One finding is only half closed, and this says which half.** Finding 4 was
+"allocation and reference stores in the optimizing tier are helper calls". The
+reference stores are fixed (`emit_gated_compact_ref_store`), and compiled
+allocation under the default collector is fixed where it mattered most — the
+single-pass inline TLAB bump, which had been dead under ZGC because
+`VmHeap::refill_tlab` answered `None` there. The optimizing tier's OWN bump
+(`emit_inline_tlab_new_ir`) stays opt-in: turning it on makes
+`regression-suite` vector `RJitMapTierDiff` SIGSEGV 4 runs in 10, inside VM
+code, on a reference read back as `0x2800`. What was ruled out: the header
+writes (read out of a disassembly, they match the single-pass sequence field
+for field) and relocation (4/4 with `CRATONVM_ZGC_RELOCATE=0`). One real
+defect was found and fixed on the way — the reserved tail was freed twice,
+once by `Tlab::retire`'s hook and once by `tlab_retire_locked`, because ZGC's
+own `ZArenaTlab` contains a `Tlab` — and it is not this one.
+`CRATONVM_JIT_C2_ALLOC_UPGRADE` stays opt-in with it, because with that bump
+off a promoted allocation lowers through the stub's CALL again, which is the
+downgrade that gate was shut for.
 
 **Residuals, in the order they are worth taking.**
 
@@ -744,7 +767,7 @@ one run. See `JitRuntimeHelpers::tlab_registration_required` (helper ABI v12).
 | IR-tier fused compare-and-branch, trampoline-free branches | **ON** | `CRATONVM_JIT_IR_FUSED_BRANCH=0` |
 | IR-tier receiver-guard CSE (once per receiver per block) | **ON** | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE=0` |
 | IR-tier gated inline reference stores | **ON** where a collector publishes a plan | `CRATONVM_JIT_IR_GATED_REF_STORE=0` |
-| IR-tier inline TLAB bump for `Op::New` | **ON** | `CRATONVM_JIT_IR_INLINE_TLAB=0` |
+| IR-tier inline TLAB bump for `Op::New` | off — the sequence has a defect `RJitMapTierDiff` reproduces 4/10; see `ir_inline_tlab_enabled` | `CRATONVM_JIT_IR_INLINE_TLAB=1` |
 | Thread pointer fetched from a TLS mirror (both tiers) | **ON** where the probe succeeds | `CRATONVM_JIT_TLS_THREAD_FETCH=0` |
 | One post-call sentinel compare (both tiers) | **ON** | `CRATONVM_JIT_MERGED_CALL_SENTINEL=0` |
 | ZGC mutator TLAB (the chunk the inline bump bumps) | **ON** | `CRATONVM_ZGC_MUTATOR_TLAB=0` |
@@ -752,7 +775,7 @@ one run. See `JitRuntimeHelpers::tlab_registration_required` (helper ABI v12).
 | Guarded virtual inlining on receiver profiles | **ON** | `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE=0` |
 | Gated inline reference stores | **ON** where a collector publishes a plan | `CRATONVM_JIT_GATED_REF_STORE=0` |
 | Operand-stack register cache beyond pure kernels | off (see the section above for the ARG_REGS collision) | `CRATONVM_JIT_OPERAND_CACHE=1` |
-| Optimizing tier for allocation-bearing methods | **ON** since the eight-finding pass (the tier has an inline TLAB bump AND gated inline reference stores, so a promoted allocation no longer compiles worse) | `CRATONVM_JIT_C2_ALLOC_UPGRADE=0` |
+| Optimizing tier for allocation-bearing methods | off — the tier's own bump is off, so a promoted allocation would lower through the stub's CALL again | `CRATONVM_JIT_C2_ALLOC_UPGRADE=1` |
 | `this` seeded non-null at method entry | **ON** | `CRATONVM_JIT_THIS_NONNULL=0` |
 | `getfield` receiver null-check elision | **ON** | `CRATONVM_JIT_RECEIVER_NULL_ELIM=0` |
 

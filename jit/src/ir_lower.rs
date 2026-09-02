@@ -12504,10 +12504,35 @@ fn ir_gated_ref_store_enabled() -> bool {
 /// which now passes because the bump exists rather than because the gate is
 /// shut.
 fn ir_inline_tlab_enabled() -> bool {
-    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_INLINE_TLAB") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    }
+    // 2026-09-02, the eight-finding pass: BACK TO OPT-IN, with a repro.
+    //
+    // This bump had never executed. Its own gate was shut, and underneath that
+    // `VmHeap::refill_tlab` answered `None` on the default collector, so
+    // `thread.tlab` was always empty and the limit compare always failed.
+    // Giving ZGC mutators a chunk made it live for the first time, and
+    // `regression-suite` vector `RJitMapTierDiff` then SIGSEGVs 4 runs in 10,
+    // inside VM code, on a reference read back as a small integer (`0x2800`)
+    // — i.e. an object whose contents are not what its allocator promised.
+    //
+    // Three switches each take the crash rate to zero, and they are the three
+    // that gate this sequence executing at all: `CRATONVM_ZGC_MUTATOR_TLAB=0`
+    // (no chunk to bump), this flag (the stub instead), and
+    // `CRATONVM_JIT_C2_ALLOC_UPGRADE=0` (no allocating method reaches this
+    // tier). It is NOT the `Op::New` header writes, which were read out of a
+    // disassembly and match the single-pass sequence field for field, and it
+    // is NOT relocation (4/4 with `CRATONVM_ZGC_RELOCATE=0`). One real defect
+    // WAS found and fixed on the way (`IN_OWN_TLAB_RETIRE`, a double free of
+    // the reserved tail); it is not this one.
+    //
+    // So: the capability stays, behind its switch, with the repro written
+    // down — and `c2_alloc_upgrade_enabled` stays opt-in with it, because a
+    // promoted allocation lowering through `emit_new_object_stub` is a CALL
+    // where the single-pass body bumps inline, which is the downgrade that
+    // gate was shut for in the first place.
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_INLINE_TLAB").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
 }
 
 #[cfg(test)]

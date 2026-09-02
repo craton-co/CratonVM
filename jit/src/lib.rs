@@ -6143,14 +6143,14 @@ fn call_site_is_hot(
 fn c2_alloc_upgrade_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        // 2026-09-02: DEFAULT ON. The optimizing tier lowers `Op::New` through an
-        // inline TLAB bump (`emit_inline_tlab_new_ir`) and reference stores
-        // through the gated inline store, so a promoted allocation no longer
-        // compiles WORSE than its single-pass body. `=0` is the kill switch.
-        !matches!(
-            cratonvm_types::flags::runtime_var("CRATONVM_JIT_C2_ALLOC_UPGRADE").as_deref(),
-            Ok("0") | Ok("false") | Ok("off") | Ok("no")
-        )
+        // Still OPT-IN, and the reason moved rather than went away. The tier
+        // does now have an inline TLAB bump and gated inline reference stores,
+        // so the ORIGINAL reason (a promoted allocation compiling worse than
+        // its single-pass body) is answerable — but the bump has a defect that
+        // `RJitMapTierDiff` reproduces 4 runs in 10, and with the bump off the
+        // old reason applies again unchanged. See `ir_inline_tlab_enabled`
+        // for the repro and for what was ruled out.
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_C2_ALLOC_UPGRADE").is_some()
     })
 }
 
