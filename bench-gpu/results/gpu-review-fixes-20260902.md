@@ -43,11 +43,19 @@ round-trip tests in `jit-cuda` pass, including `ptxas_round_trip_dot_reduction`.
 Same binary, only the switch differs. 400 launches of a 64 Ki-int vecAdd on
 resident `GpuArray`s, awaited once.
 
-| arm | best_total_ms | us/launch |
+Final interleaved run on the merged tree, quiet host (load 60, no other
+compile running), four rounds of each arm, us/launch:
+
+| round | poll (default) | `CRATONVM_GPU_HOST_CALLBACK=1` |
 |---|---|---|
-| NEW poll (default) | 20.66 | 51.6 |
-| NEW `CRATONVM_GPU_HOST_CALLBACK=1` | 24.45 | 61.1 |
-| OLD (callback era) | 26.25 | 65.6 |
+| 1 | 58.1 | 59.5 |
+| 2 | 57.9 | 62.7 |
+| 3 | 62.1 | 72.2 |
+| 4 | 49.7 | 70.1 |
+
+Poll wins every round; best-of-four 49.7 against 59.5. The 2026-08-29
+binary, which had no switch, ran 65.6 on the same bench. Checksum
+`8589869056` in every run.
 
 `SpontaneousCompletionCheck 4194304`: PASS — the reaper completes a
 submission with no future call on it.
