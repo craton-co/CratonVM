@@ -1152,6 +1152,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_G1_ADAPTIVE_TENURING` | GC | `CRATONVM_GC=g1-adaptive-tenuring` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_G1_CARD_CLEAN` | GC | `CRATONVM_GC=g1-card-clean` | opt-in | off | behaviour | snapshot | gc, types |
 | `CRATONVM_G1_CARD_RSET` | GC | `CRATONVM_GC=g1-card-rset` | default-on | on | behaviour | snapshot | types |
+| `CRATONVM_G1_CARD_SCREEN_JIT_PINNED` | GC | `CRATONVM_GC=g1-card-screen-jit-pinned` | default-on | on | behaviour | snapshot | gc, types |
 | `CRATONVM_G1_CLEANUP_WALK` | GC | `CRATONVM_GC=g1-cleanup-walk` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_G1_COVERAGE_PIN` | GC | `CRATONVM_GC=g1-coverage-pin` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_G1_DBG_GRAY_PROV` | DBG | `CRATONVM_DBG=g1-dbg-gray-prov` | opt-in | off | diag | snapshot | gc |
