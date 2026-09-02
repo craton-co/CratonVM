@@ -1847,6 +1847,18 @@ pub fn movable_bounds_are_live() -> bool {
 /// matched pair of calls, so a heap cannot forget to deregister and an unwind
 /// out of a partially-built heap cannot leak a count that would disable
 /// moving-young for the life of the process.
+///
+/// # It is process-global under `cfg(test)` too, deliberately
+///
+/// Most counters in this crate are thread-local under `cfg(test)`. This one is
+/// not, because the true count is the whole point: a test that saw only its own
+/// thread's heaps would report `1` in a `libtest` binary that has two hundred
+/// heaps alive across a thread per core, and would therefore assert the gate
+/// OPEN in exactly the state the gate exists to close. The consequence is the
+/// one `gc/tests/published_bounds_isolation.rs` was created for and documents in
+/// its header: **a test that observes this count, or any gate built on it,
+/// belongs in that integration file** — Cargo gives it a process, which is the
+/// only mechanism that removes the peer constructions.
 static RELOCATABLE_HEAPS_LIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// A live heap's entry in the registry [`RELOCATABLE_HEAPS_LIVE`] counts.

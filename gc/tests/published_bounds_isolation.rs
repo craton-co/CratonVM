@@ -55,6 +55,14 @@
 //! of the table's absolute contents. Process isolation makes the absolute form
 //! safe *today*; the identity-scoped form stays correct if this file ever grows
 //! a test that builds two heaps at once.
+//!
+//! It has, as of 2026-09-01:
+//! `a_second_live_heap_makes_the_published_bounds_gate_fail_closed` and
+//! `every_backend_registers_in_the_live_heap_registry`. Anything that reads
+//! `gen_heap::live_relocatable_heaps`, or a gate built on it, belongs here for
+//! the same reason the six original tests do — that count is process-global
+//! under `cfg(test)` (deliberately; see its doc comment), so in the lib binary
+//! it reports the ~220 peer heaps and every gate built on it reads closed.
 
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
