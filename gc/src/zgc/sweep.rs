@@ -140,6 +140,9 @@ pub(crate) struct ZSweepCfg {
     /// the low tier while covering high-region bytes, and the arena would serve
     /// the same memory from the free list and the high cursor both.
     pub(crate) high_floor: usize,
+    /// The low bump cursor as an arena offset: the end of the region
+    /// [`ZgcRealHeap::sweep_bitmap`] computes a complement over.
+    pub(crate) low_cursor: usize,
     pub(crate) zero_header_only: bool,
     pub(crate) merge_dead_runs: bool,
     /// Are the mark bits cleared in bulk after the sweep? When they are, the
@@ -301,6 +304,273 @@ impl ZgcRealHeap {
         }
     }
 
+    /// The sweep as a **streaming pass over two bitmaps**, computing free
+    /// space as the complement of the live set instead of as the union of the
+    /// dead objects.
+    ///
+    /// # What it stops doing
+    ///
+    /// [`Self::sweep_one`] reads a header for every registered object -- live
+    /// or dead -- to size it. On a heap where a few percent survive that is
+    /// one cache miss per DEAD object to learn something the two bitmaps
+    /// already imply: a start bit with no mark bit is garbage, and the bytes
+    /// between one live object's end and the next live object's start are free
+    /// whatever used to be in them. So this reads headers for LIVE objects
+    /// only.
+    ///
+    /// It also stops removing dead bases one at a time: `starts &= marks`,
+    /// word by word, is the same prune at one `fetch_and` per 512 arena bytes
+    /// ([`super::ZObjectStarts::retain_marked`]).
+    ///
+    /// # Why the complement is exact rather than optimistic
+    ///
+    /// Every byte below the low cursor is covered by a live object, covered by
+    /// a dead one, or already on the free list, and the last two are both
+    /// reclaimable. "Not covered by a live object" is therefore precisely the
+    /// reclaimable set -- and it is *more* precise than the per-object sweep,
+    /// which can only free what it can size and so leaks the bytes of every
+    /// object whose header it refuses (`unsizable`).
+    ///
+    /// That is also why the free list is REPLACED rather than added to: this
+    /// recomputes what was already free along with what has just become free,
+    /// in address order, already merged
+    /// ([`crate::arena::Arena::rebuild_low_free_list`]).
+    ///
+    /// # The four things it must not free, and how each is kept
+    ///
+    /// * **The large-object end.** Objects above the high cursor are packed
+    ///   downward from the top of the arena and have their own free list; they
+    ///   take the per-object path here, as before.
+    /// * **A live object whose header cannot be sized.** Its extent is
+    ///   unknown, so the pass claims everything up to the next live base and
+    ///   frees nothing it cannot account for.
+    /// * **An un-retired TLAB tail** published by the stop-the-world protocol
+    ///   for a peer frozen in compiled code: it holds no live object, so the
+    ///   complement would hand it out from under its owner.
+    /// * **The bytes above the last live object.** Those are not free-listed
+    ///   at all -- the cursor is lowered onto them instead, which is what
+    ///   `retract_cursor_into_free_tail` did with a full sort.
+    ///
+    /// Returns `(shard, free spans as arena offsets, new low cursor)`, or
+    /// `None` when the shape is unavailable -- no mark bitmap (the header
+    /// arm) or a hash registry with no words to walk -- and the caller takes
+    /// the per-object sweep.
+    pub(crate) fn sweep_bitmap(
+        &self,
+        registered: &ZObjectStartsSnapshot,
+        cfg: &ZSweepCfg,
+    ) -> Option<(ZSweepShard, Vec<(usize, usize)>, usize)> {
+        let marks = self.mark_bits.as_ref()?;
+        if registered.words.is_empty() {
+            return None; // the hash arm has no word structure to stream
+        }
+        let base = cfg.arena_base;
+        let low_end = base.checked_add(cfg.low_cursor)?;
+        let high_floor = base.saturating_add(cfg.high_floor);
+
+        let mut sh = ZSweepShard::default();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        // Absolute end of the last live extent seen: everything between this
+        // and the next live base is free.
+        let mut prev_end = base;
+        // A live object whose size its header could not justify. Its extent
+        // runs to the next live base, whatever that turns out to be.
+        let mut unsizable_live = false;
+
+        let skips = self.jit_tlab_skip_regions();
+        let words = registered.words.len().min(marks.word_count());
+        for w in 0..words {
+            let start_w = registered.words[w];
+            if start_w == 0 {
+                continue; // 512 arena bytes holding no allocation base
+            }
+            let word_base = registered.base + (w << 9);
+            let mark_w = marks.word_at(w);
+
+            // --- the dead: addresses only, no header read -----------------
+            let mut dead_w = start_w & !mark_w;
+            while dead_w != 0 {
+                let bit = dead_w.trailing_zeros() as usize;
+                dead_w &= dead_w - 1;
+                let addr = word_base + (bit << 3);
+                sh.swept += 1;
+                if addr >= high_floor {
+                    // The large-object end keeps the per-object protocol: its
+                    // free list is not the one this pass rebuilds.
+                    self.sweep_one_high(addr, cfg, &mut sh);
+                    continue;
+                }
+                sh.dead_count += 1;
+                if cfg.collect_dead_hashes {
+                    let h = cratonvm_types::ObjectHeader::neutral_hash(
+                        self.header_ref(addr as *mut u8)
+                            .mark_word
+                            .load(Ordering::Relaxed),
+                    );
+                    if h != 0 {
+                        sh.dead_hashes.push(h);
+                    }
+                }
+                if cfg.want_dead {
+                    sh.dead.push(addr);
+                }
+                // A pure write, and only of the header -- the body is left for
+                // the next allocation to zero. Same contract as `sweep_one`'s
+                // `zero_header_only`, which is default-on; the full-body arm
+                // cannot be served here because the size is exactly what this
+                // pass declines to read.
+                unsafe { std::ptr::write_bytes(addr as *mut u8, 0, HEADER_SIZE) };
+            }
+
+            // --- the live: one header read, extent, and the complement ----
+            let mut live_w = start_w & mark_w;
+            while live_w != 0 {
+                let bit = live_w.trailing_zeros() as usize;
+                live_w &= live_w - 1;
+                let addr = word_base + (bit << 3);
+                sh.swept += 1;
+                let header = self.header_mut(addr as *mut u8);
+                let size = match Self::alloc_size(header) {
+                    Some(size) => {
+                        sh.bytes_copied += size;
+                        sh.objects_copied += 1;
+                        Some(size)
+                    }
+                    None => {
+                        sh.unsizable += 1;
+                        None
+                    }
+                };
+                if cfg.gen_on && self.age_survivor(addr, header, cfg.promo_age) {
+                    sh.gen_promoted += 1;
+                }
+                if addr >= high_floor {
+                    continue; // accounted, but not part of the low complement
+                }
+                if unsizable_live {
+                    // The previous survivor ends at or before this base.
+                    unsizable_live = false;
+                    prev_end = prev_end.max(addr);
+                }
+                if addr > prev_end {
+                    spans.push((prev_end - base, addr - prev_end));
+                }
+                match size {
+                    Some(size) => prev_end = prev_end.max(addr.saturating_add(size)),
+                    None => {
+                        unsizable_live = true;
+                        prev_end = prev_end.max(addr);
+                    }
+                }
+            }
+        }
+
+        if unsizable_live {
+            // Nothing past the last survivor can be justified, so nothing past
+            // it is reclaimed this cycle.
+            prev_end = low_end;
+        }
+        let new_cursor = prev_end.min(low_end);
+        if !skips.is_empty() {
+            Self::withhold_skip_regions(&mut spans, &skips, base);
+        }
+        // THE PRUNE, in one `fetch_and` per 512 arena bytes rather than one
+        // `remove` per dead object. It has to run against the LIVE registry
+        // rather than the snapshot the walk above read, because an object
+        // allocated black after that snapshot was taken is registered, marked,
+        // and must stay registered -- `starts &= marks` keeps exactly those.
+        self.registry.retain_marked(marks)?;
+        sh.dead_in_runs = sh.dead_count;
+        Some((sh, spans, new_cursor - base))
+    }
+
+    /// Spans below the low cursor that hold no live object and must still not
+    /// be reclaimed.
+    ///
+    /// Empty on this backend today, and the reason is worth stating rather
+    /// than assuming: `VmHeap::refill_tlab` returns `None` on the `Zgc` arm, so
+    /// ZGC mutators are never handed a TLAB and the stop-the-world protocol's
+    /// published reserved tails (`set_jit_tlab_skip_regions`) are always empty
+    /// here. The complement sweep is the FIRST consumer for which that would
+    /// stop being a curiosity and become a correctness dependency: a tail its
+    /// owner will resume bumping into holds no live object, so the complement
+    /// would hand those bytes to another thread.
+    ///
+    /// `feat/zgc-jit-tlab-20260902` is the branch that changes the premise. It
+    /// gives this backend VM TLABs and consumes the published list in the
+    /// slide; when the two meet, this body is what it has to fill in, and the
+    /// conflict here is the prompt.
+    fn jit_tlab_skip_regions(&self) -> Vec<(usize, usize)> {
+        Vec::new()
+    }
+
+    /// Clip published TLAB tails out of the free spans. A frozen peer resumes
+    /// bumping into its tail, so the complement must not offer those bytes to
+    /// anyone else. The list is empty unless a peer was frozen mid-allocation,
+    /// which is what makes an O(spans x skips) pass the right shape.
+    fn withhold_skip_regions(
+        spans: &mut Vec<(usize, usize)>,
+        skips: &[(usize, usize)],
+        base: usize,
+    ) {
+        let mut out: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+        for &(off, len) in spans.iter() {
+            let mut pieces = vec![(off, off + len)];
+            for &(s, e) in skips {
+                let (s, e) = (s.saturating_sub(base), e.saturating_sub(base));
+                let mut next = Vec::with_capacity(pieces.len() + 1);
+                for (lo, hi) in pieces {
+                    if e <= lo || s >= hi {
+                        next.push((lo, hi));
+                        continue;
+                    }
+                    if lo < s {
+                        next.push((lo, s));
+                    }
+                    if e < hi {
+                        next.push((e, hi));
+                    }
+                }
+                pieces = next;
+            }
+            out.extend(pieces.into_iter().map(|(lo, hi)| (lo, hi - lo)));
+        }
+        *spans = out;
+    }
+
+    /// The dead half of [`Self::sweep_one`] for an object in the large-object
+    /// end, whose free list this pass does not rebuild.
+    fn sweep_one_high(&self, base: usize, cfg: &ZSweepCfg, sh: &mut ZSweepShard) {
+        let header = self.header_mut(base as *mut u8);
+        let Some(size) = Self::alloc_size(header) else {
+            sh.unsizable += 1;
+            return;
+        };
+        sh.dead_count += 1;
+        if cfg.collect_dead_hashes {
+            let h =
+                cratonvm_types::ObjectHeader::neutral_hash(header.mark_word.load(Ordering::Relaxed));
+            if h != 0 {
+                sh.dead_hashes.push(h);
+            }
+        }
+        let zero = if cfg.zero_header_only {
+            HEADER_SIZE.min(size)
+        } else {
+            size
+        };
+        unsafe { std::ptr::write_bytes(base as *mut u8, 0, zero) };
+        if base >= cfg.arena_base {
+            sh.flush();
+            sh.spans.push((base - cfg.arena_base, size));
+        }
+        sh.bytes_freed += size;
+        if cfg.want_dead {
+            sh.dead.push(base);
+        }
+        self.registry.remove(base);
+    }
+
     /// The sweep, on this thread.
     pub(crate) fn sweep_serial(
         &self,
@@ -419,6 +689,52 @@ impl ZgcRealHeap {
     /// and writes the remembered set -- shared state whose concurrency this
     /// change has not audited. A young cycle also has nothing to gain: its
     /// sweep is 6.3 ms of a 112 ms pause, because the floor already bounds it.
+    /// `CRATONVM_ZGC_BITMAP_SWEEP`: compute free space as the complement of
+    /// the live set in one streaming pass over the two bitmaps
+    /// ([`Self::sweep_bitmap`]) rather than as the union of the dead objects,
+    /// one header read at a time. Default ON; `0`/`off`/`false`/`no` restores
+    /// the per-object sweep and the per-object free-list pushes exactly.
+    /// # The measurement
+    ///
+    /// `BinTreesClassic 16` at `-Xmx192m`, release, interleaved on a quiet
+    /// host. Both arms performed 5 collections over the same live set and
+    /// reported the same `registered=3,125,050 dead=2,940,700`, so they
+    /// reclaimed identically and only the cost differs:
+    ///
+    /// ```text
+    ///   sweep_us (mean per cycle)      wall clock
+    ///   on    31,253  31,796  30,297  29,883      2839  3106  3157  2888 ms
+    ///   off   84,645  61,867  67,357  61,591      4122  3472  3614  3386 ms
+    /// ```
+    ///
+    /// A 2.1-2.7x faster sweep and ~11% off the whole run, 4/4 rounds. Read
+    /// `sweep_us` on the `[GC] zgc-pause:` line rather than the wall clock
+    /// when re-measuring: at a heap size where the run performs one or two
+    /// collections the sweep is a rounding error in the total and the arms
+    /// are indistinguishable, which is exactly what an earlier attempt at
+    /// `-Xmx512m` showed.
+    ///
+    /// The regression suite is 87/0 on BOTH arms, release binary, quiet host.
+    /// Runs against the DEBUG binary while the box was building something else
+    /// showed 5-7 failures per arm whose sets differed in both directions --
+    /// three vectors failed only with this feature OFF, which it cannot cause --
+    /// and every one of them passed in isolation afterwards. That is the
+    /// host, not the sweep, and it is worth knowing before reading a red one.
+    ///
+    /// Read per COLLECTION rather than latched in a `OnceLock`: this is
+    /// consulted once a cycle, so caching it buys nothing and costs the
+    /// ability to A/B the two sweeps against one another in one process --
+    /// which is the only way to assert they agree.
+    pub(crate) fn bitmap_sweep_enabled(&self) -> bool {
+        match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_BITMAP_SWEEP") {
+            Some(raw) => {
+                let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+                !matches!(v.as_str(), "0" | "off" | "false" | "no")
+            }
+            None => true,
+        }
+    }
+
     pub(crate) fn sweep_workers(&self, gen_on: bool) -> usize {
         if gen_on {
             return 1;
