@@ -1108,15 +1108,19 @@ pub fn compile_with_param_slots(
         .max()
         .unwrap_or(0);
     // Inlining allocates extra spill slots for each inlined callee's locals
-    // and operand stack ON TOP of the caller's `max_stack` (and, since the
-    // inline epilogue keeps the return value rather than reclaiming the callee
-    // locals, sequential inlines accumulate). `spill_size` is derived purely
-    // from `max_stack`, so without this reserve the inlined code writes past
-    // the spill region into the callee-saved / shadow area — corrupting live
-    // values (observed as a `ClassCastException: …$TaskOption not an enum` when
-    // a clobbered slot fed an enum-typed field). Reserve, per site,
-    // `callee_max_locals + callee_code_len` (the latter bounds the callee's own
-    // operand depth); the total is bounded by `MAX_INLINE_BUDGET`.
+    // and operand stack ON TOP of the caller's `max_stack`. `spill_size` is
+    // derived purely from `max_stack`, so without this reserve the inlined code
+    // writes past the spill region into the callee-saved / shadow area —
+    // corrupting live values (observed as a `ClassCastException: …$TaskOption
+    // not an enum` when a clobbered slot fed an enum-typed field). Reserve, per
+    // site, `callee_max_locals + callee_code_len` (the latter bounds the
+    // callee's own operand depth).
+    //
+    // This used to read "...and, since the inline epilogue keeps the return
+    // value rather than reclaiming the callee locals, sequential inlines
+    // accumulate", and summed the per-site figures on that basis. The epilogue
+    // reclaims now — see `inline_reserve_path_enabled` below for the evidence
+    // and for what replaced the sum.
     let inline_stack_reserve_sum: usize = inline_sites
         .values()
         .chain(extra_guard_bodies())
