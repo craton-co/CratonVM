@@ -2811,9 +2811,6 @@ impl Compiler {
                             // another scratch register, else spill original to frame
                             // and push another frame copy.
                             //
-                            // The duplicate needs its OWN home: the two entries
-                            // are separate stack positions and a shared home
-                            // would have one flush overwrite the other.
                             let avail = SCRATCH_REGS.iter().copied().find(|&sr| {
                                 sr != reg
                                     && !self
@@ -2821,10 +2818,9 @@ impl Compiler {
                                         .iter()
                                         .any(|s| matches!(s, StackSlot::Scratch(r, ..) if *r == sr))
                             });
-                            let dup_home = avail.and_then(|_| self.reserve_spill_slots(1));
-                            if let (Some(sr), Some(home)) = (avail, dup_home) {
+                            if let Some(sr) = avail {
                                 self.emit_mov_reg_reg(sr, reg);
-                                self.stack.push(StackSlot::Scratch(sr, home));
+                                self.stack.push(StackSlot::Scratch(sr));
                                 self.stack_oop_marks.push(top_is_oop);
                             } else {
                                 // No scratch available — load to RAX and push via frame

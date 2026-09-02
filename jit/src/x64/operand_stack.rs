@@ -260,10 +260,9 @@ impl Compiler {
                 });
                 // Its OWN home: two stack positions sharing one would have the
                 // second flush overwrite the first.
-                let dup_home = avail.and_then(|_| self.reserve_spill_slots(1));
-                if let (Some(sr), Some(home)) = (avail, dup_home) {
+                if let Some(sr) = avail {
                     self.emit_mov_reg_reg(sr, reg);
-                    self.stack.push(StackSlot::Scratch(sr, home));
+                    self.stack.push(StackSlot::Scratch(sr));
                     self.stack_oop_marks.push(top_is_oop);
                 } else {
                     self.emit_mov_reg_reg(RAX, reg);
@@ -767,12 +766,13 @@ impl Compiler {
         // it would actually take; the flag is opt-in so the two arms can be
         // measured in one binary.
         //
-        // What IS fixed here, and unconditionally: a scratch push claims its
-        // home slot once, exactly as the frame push would have, so the spill
-        // cursor advances once per push either way. `flush_scratch_registers`
-        // stores into that home instead of reserving another — which is what
-        // stops a stretch with several calls from growing the spill region once
-        // per call until `spill-range-exhausted` fails the compile.
+        // A SECOND defect is real and still OPEN: `flush_scratch_registers`
+        // reserves a fresh spill word per flushed value, so a stretch with
+        // several calls grows the region once per call until
+        // `spill-range-exhausted` fails the compile. Reserving the home at PUSH
+        // time instead was tried on 2026-09-02 and reverted the same day: it
+        // made this function advance the spill cursor, which shipped a
+        // nondeterministic heap corruption. See `StackSlot::Scratch`.
         if self.kernel_operand_cache || operand_cache_enabled() {
             let free = SCRATCH_REGS.iter().copied().find(|&candidate| {
                 !self
@@ -781,15 +781,9 @@ impl Compiler {
                     .any(|slot| matches!(slot, StackSlot::Scratch(r, ..) if *r == candidate))
             });
             if let Some(reg) = free {
-                // Claim the home BEFORE committing to the register: a
-                // reservation failure here must fall through to the ordinary
-                // frame push, not leave a value in a register with nowhere to
-                // spill it.
-                if let Some(home) = self.reserve_spill_slots(1) {
-                    self.emit_mov_reg_reg(reg, RAX);
-                    self.stack_push(StackSlot::Scratch(reg, home), false);
-                    return;
-                }
+                self.emit_mov_reg_reg(reg, RAX);
+                self.stack_push(StackSlot::Scratch(reg), false);
+                return;
             }
         }
         match self.push_stack() {
@@ -852,19 +846,22 @@ impl Compiler {
         // difference between this and the shape that made a call-heavy method
         // grow its spill region once per call until the range was exhausted —
         // see `push_from_rax`.
-        let scratch_slots: Vec<(usize, u8, i32)> = self
+        let scratch_slots: Vec<(usize, u8)> = self
             .stack
             .iter()
             .enumerate()
             .filter_map(|(i, slot)| {
-                if let StackSlot::Scratch(reg, home) = *slot {
-                    Some((i, reg, home))
+                if let StackSlot::Scratch(reg) = *slot {
+                    Some((i, reg))
                 } else {
                     None
                 }
             })
             .collect();
-        for (idx, reg, off) in scratch_slots {
+        for (idx, reg) in scratch_slots {
+            let Some(off) = self.reserve_spill_slots(1) else {
+                return;
+            };
             self.emit_store_local(off, reg);
             self.stack[idx] = StackSlot::Frame(off);
         }
