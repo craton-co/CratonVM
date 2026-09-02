@@ -577,7 +577,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-286 tokens.
+287 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -616,6 +616,7 @@ export inherited from a parent shell.
 | `c2-first-call` | `CRATONVM_JIT_C2_FIRST_CALL` |
 | `c2-supersede` | `CRATONVM_C2_SUPERSEDE` |
 | `callee-oop-flush` | `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH` |
+| `spill-slots-cap` | `CRATONVM_JIT_SPILL_SLOTS_CAP` |
 | `code-cache-max-mb` | `CRATONVM_JIT_CODE_CACHE_MAX_MB` |
 | `conservative-locals` | `CRATONVM_NO_CONSERVATIVE_LOCALS` |
 | `ctor-direct-call` | `CRATONVM_NO_CTOR_DIRECT_CALL` |
