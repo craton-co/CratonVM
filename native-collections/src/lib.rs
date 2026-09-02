@@ -6177,12 +6177,66 @@ pub fn native_al_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(Some(old))
 }
 
+/// Is `this` one of the JDK's IMMUTABLE stand-in classes, for which a
+/// structural mutator must raise `UnsupportedOperationException`?
+///
+/// In real-JDK mode these receivers carry real bytecode — `Collections$EmptyList`
+/// inherits `AbstractList.add`, which throws — so nothing here is consulted. In
+/// `--synthetic-jdk` there is no bytecode, the interface-registered natives
+/// serve the call instead, and they mutated happily. Measured 2026-09-02 with
+/// `apps/probes/EmptySingletonImmutable`:
+///
+/// ```text
+///     Collections.emptyList().add("x")        SUCCEEDED   (HotSpot: UOE)
+///     Collections.emptyMap().put("k","v")     SUCCEEDED   (HotSpot: UOE)
+///     Collections.singletonList("a").add("x") SUCCEEDED   (HotSpot: UOE)
+///     Arrays.asList("a","b").add("x")         SUCCEEDED   (HotSpot: UOE)
+/// ```
+///
+/// `List.of` / `Set.of` / `Map.of` / `unmodifiable*` were already correct in
+/// every mode: they carry the `cratonvm/internal/Unmodifiable*` stamp, whose
+/// own natives refuse. These seven are the ones minted under a JDK class name
+/// with no such stamp.
+///
+/// **Structural mutators only.** `Arrays$ArrayList` is fixed-SIZE, not
+/// immutable: `add`/`remove` throw on HotSpot and `set` is legal and writes
+/// through to the backing array. That is why this is consulted from `add` and
+/// `put` rather than from a blanket "any write" check — a guard that also
+/// refused `set` would break `Arrays.asList(a).set(0, x)`, which is the
+/// idiomatic reason to call `asList` at all.
+fn is_immutable_jdk_stand_in(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let Some(name) = ctx.class_name_of_id(ctx.class_id_of_object(this)) else {
+        return false;
+    };
+    matches!(
+        &*name,
+        "java/util/Collections$EmptyList"
+            | "java/util/Collections$EmptySet"
+            | "java/util/Collections$EmptyMap"
+            | "java/util/Collections$SingletonList"
+            | "java/util/Collections$SingletonSet"
+            | "java/util/Collections$SingletonMap"
+            | "java/util/Arrays$ArrayList"
+    )
+}
+
 pub fn native_al_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // An immutable JDK stand-in refuses structurally — see
+    // `is_immutable_jdk_stand_in` for the measurement and for why `set` is not
+    // guarded alongside `add`.
+    if is_immutable_jdk_stand_in(ctx, this) {
+        return Err(
+            cratonvm_types::error::RuntimeError::UnsupportedOperationException {
+                message: String::new(),
+            }
+            .into(),
+        );
+    }
     // A `values()` / TreeMap-`entrySet()` view is an `ArrayList` here, but it is
     // not addable. `Map.values`: "The collection supports element removal ... It
     // does not support the `add` or `addAll` operations"; the JDK's
@@ -12671,6 +12725,19 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     //
     // Deliberately here rather than inside `native_map_put_evict`: the `evict`
     // flag is `LinkedHashMap.removeEldestEntry`'s, and a TreeMap has no eldest.
+    // An immutable JDK stand-in (`Collections$EmptyMap`, `$SingletonMap`)
+    // refuses — see `is_immutable_jdk_stand_in`. Ahead of the TreeMap route
+    // because neither of those is a TreeMap and the refusal is unconditional.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if is_immutable_jdk_stand_in(ctx, *this) {
+            return Err(
+                cratonvm_types::error::RuntimeError::UnsupportedOperationException {
+                    message: String::new(),
+                }
+                .into(),
+            );
+        }
+    }
     if let Some(Value::Object(Some(this))) = args.first() {
         if is_tree_map_receiver(ctx, *this) {
             return native_tm_put(ctx, args);
@@ -23484,7 +23551,14 @@ fn native_collections_empty_list(ctx: &mut dyn NativeContext, _args: &[Value]) -
     if let Some(v) = collections_empty_singleton(ctx, "EMPTY_LIST") {
         return Ok(Some(v));
     }
-    // Fallback (field not yet initialised): fresh synthetic empty list.
+    // See `native_collections_empty_map` for why this precedes the synthetic:
+    // the sibling `native_collections_singleton_list` just below already does
+    // it, which is why `singletonList` reported the right class in
+    // `--synthetic-jdk` while `emptyList` reported `java.util.ArrayList`.
+    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$EmptyList") {
+        return Ok(Some(Value::Object(Some(o))));
+    }
+    // Last resort: fresh synthetic empty list.
     let __al_n_fields = al_slots(ctx).2;
     let list = try_alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields)?;
     let arr = alloc_ref_array(ctx, 0);
@@ -46040,6 +46114,14 @@ fn register_array_deque_natives(r: &mut NativeMethodRegistry) {
 
     r.register(c, "<init>", "()V", native_ad_init);
     r.register(c, "<init>", "(I)V", native_ad_init_capacity);
+    // `(Collection)` — see the note on `java/util/Vector`'s. `addLast` per
+    // element, which is what `ArrayDeque(Collection)` specifies.
+    r.register(
+        c,
+        "<init>",
+        "(Ljava/util/Collection;)V",
+        native_ad_init_from_collection,
+    );
     r.register(c, "size", "()I", native_ad_size);
     r.register(c, "isEmpty", "()Z", native_ad_is_empty);
     r.register(c, "addFirst", "(Ljava/lang/Object;)V", native_ad_add_first);
@@ -46107,15 +46189,34 @@ fn register_array_deque_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(c, "clear", "()V", native_ad_clear);
     r.register(c, "toArray", "()[Ljava/lang/Object;", native_ad_to_array);
-    // NO `iterator` REGISTRATION. Real `ArrayDeque.iterator()` bytecode runs,
-    // and that is the fix for the fail-fast row this family carried, not a
-    // concession. The JDK's `DeqIterator` is fail-fast off a PHYSICAL index
-    // into the ring buffer -- `nonNullElementAt` reports any null it reads as a
-    // `ConcurrentModificationException` -- so it is exactly as fail-fast as the
-    // buffer's layout, and no counter reproduces it. `ad_state` derives the
-    // element count and `ad_grow`/`ad_remove_at_logical` reproduce the JDK's
-    // own layout byte for byte, so there is nothing left for a shadow to
-    // protect. See `native_ad_iterator`'s removal in the same commit.
+    // NO `iterator` REGISTRATION in real-JDK mode. Real `ArrayDeque.iterator()`
+    // bytecode runs, and that is the fix for the fail-fast row this family
+    // carried, not a concession. The JDK's `DeqIterator` is fail-fast off a
+    // PHYSICAL index into the ring buffer -- `nonNullElementAt` reports any
+    // null it reads as a `ConcurrentModificationException` -- so it is exactly
+    // as fail-fast as the buffer's layout, and no counter reproduces it.
+    // `ad_state` derives the element count and `ad_grow`/`ad_remove_at_logical`
+    // reproduce the JDK's own layout byte for byte, so there is nothing left
+    // for a shadow to protect. See `native_ad_iterator`'s removal in the same
+    // commit.
+    //
+    // `--synthetic-jdk` HAS NO SUCH BYTECODE, and the consequence is measured
+    // 2026-09-02 (`apps/probes/AdDispatch`): after `d.add("a")`, `size()`
+    // answers 1 and `peekFirst()` answers "a" while a for-each yields ZERO
+    // elements — a silently empty loop, through every declared type and
+    // through `addLast` as well. OPEN, and deliberately not fixed here.
+    //
+    // A `#[cfg(feature = "synthetic-jdk")]` registration was written and
+    // REVERTED, because the cheap version of it is the trap this crate already
+    // names: minting `java/util/ArrayDeque$Itr` arms the dormant registration
+    // at the bottom of `register_snapshot_iterator_natives`, which that comment
+    // calls "a trap armed for whoever produces one later". Doing it right means
+    // minting the real `ArrayDeque$DeqIterator` with the snapshot fields — i.e.
+    // putting ArrayDeque back into `VALUES_ITR_CARRIERS`, which it LEFT on
+    // 2026-08-30 — and that table's own doc records `DescendingIterator` making
+    // java.base a second producer of the carrier class the last time it was
+    // done. Two measured decisions to reverse and a two-producer hazard to
+    // re-open; it wants the census that owns this area, not a side edit.
     r.register(c, "toString", "()Ljava/lang/String;", native_ad_to_string);
     r.register(
         c,
@@ -46124,6 +46225,63 @@ fn register_array_deque_natives(r: &mut NativeMethodRegistry) {
         native_ad_for_each,
     );
     r.set_category(__prev_cat);
+}
+
+/// `ArrayDeque(Collection)` — the JDK's `this(c.size()); copyElements(c);`.
+///
+/// **`native_ad_init_capacity` with the SOURCE SIZE, not `native_ad_init`.**
+/// The first version of this called the no-arg init, which allocates the
+/// default 16 + 1 slots, and the contents were correct — so nothing that reads
+/// elements could see the difference. The CAPACITY is observable anyway, and
+/// `apps/probes/ItrCarrierCensus` saw it: HotSpot sizes a 3-element deque to 4
+/// slots, so a 4th `add` GROWS and reallocates `elements`, and a live
+/// `DeqIterator` then reads a null through `nonNullElementAt` and raises
+/// `ConcurrentModificationException`. With 17 slots there is no grow, no null,
+/// and no CME — `ArrayDeque` came out NOT fail-fast on `add` against HotSpot's
+/// fail-fast, one row of that probe, with every element-level check agreeing.
+///
+/// The `+ 1` inside `native_ad_init_capacity` is what makes `this(c.size())`
+/// correct rather than off-by-one; its own comment records the wrap-onto-head
+/// bug from getting that wrong.
+///
+/// Same GC discipline as `native_ll_init_from_collection`:
+/// `collect_collection_elements_or_real` re-enters Java and every `addLast`
+/// can grow the backing array, so `this` is pinned and each element re-read
+/// per iteration rather than held across the call.
+fn native_ad_init_from_collection(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    reject_null_collection(args.get(1))?;
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let source = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            native_ad_init(ctx, args)?;
+            return Ok(None);
+        }
+    };
+    // The drain runs BEFORE the sizing, which the JDK's `this(c.size())` does
+    // not — but `c.size()` and the drained length are the same number, and
+    // draining first is what makes the size available without asking the
+    // source twice (it may be a view whose `size()` re-walks). `this` is
+    // pinned across it because the drain re-enters Java and can collect.
+    let this_pin = ctx.pin_native_root(this);
+    let elems = collect_collection_elements_or_real(ctx, source)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    let capacity = i32::try_from(elems.len()).unwrap_or(i32::MAX);
+    native_ad_init_capacity(ctx, &[Value::Object(Some(this)), Value::Int(capacity)])?;
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    for (i, val) in elems.iter().enumerate() {
+        let this = ctx.read_native_pin(this_pin, this);
+        let val = read_pinned_elem(ctx, handles[i], *val);
+        native_ad_add_last(ctx, &[Value::Object(Some(this)), val])?;
+    }
+    ctx.unpin_native_roots(this_pin);
+    Ok(None)
 }
 
 fn native_ad_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -46716,60 +46874,6 @@ fn ad_collect_elements(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
 }
 
 
-/// `ArrayDeque$Itr.remove()` — remove the element returned by the last `next()`
-/// from the BACKING deque (field 2). Without this native, `remove()` falls to
-/// the `java/util/Iterator` default, which throws `UnsupportedOperationException`
-/// — the kafka `NetworkClientDelegate` unsent-request cleanup
-/// (`iterator.remove()` over an `ArrayDeque`) hit exactly that. The iterator is
-/// snapshot-backed (field 0 = array, field 1 = cursor), so we remove the first
-/// occurrence of the just-returned element from the live deque (correct for the
-/// forward, unique-element iteration these call sites use); the snapshot is left
-/// intact so continued iteration matches JDK semantics.
-fn native_ad_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0);
-    // Field 3 is the cursor value at the last successful `remove()`, or 0
-    // before the first one -- the other half of the JDK's
-    // `IllegalStateException` contract, which `cursor <= 0` alone cannot
-    // express. `remove()` twice with no intervening `next()` finds the cursor
-    // unchanged since the previous removal. MEASURED no-throw in compatible
-    // mode (apps/probes/DequeListShadowSweep 84); the `--jdk-only` route already had
-    // it, through `SnapshotItrBacking::last_removed_cursor`.
-    let last_removed = if ctx.object_num_fields(this) > 3 {
-        ctx.get_field(this, 3).as_int().unwrap_or(0)
-    } else {
-        0
-    };
-    if cursor <= 0 || last_removed == cursor {
-        return Err(RuntimeError::IllegalStateException {
-            message: "next() has not been called, or remove() already called after the last next()"
-                .to_string(),
-        }
-        .into());
-    }
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) => a,
-        _ => return Ok(None),
-    };
-    let backing = match ctx.get_field(this, 2) {
-        Value::Object(Some(b)) => b,
-        // Older 2-field iterators (no backing ref): nothing to mutate.
-        _ => return Ok(None),
-    };
-    let last = ctx.get_array_element(arr, (cursor - 1) as usize);
-    let this_pin = ctx.pin_native_root(this);
-    let removed = native_ad_remove_first_occurrence(ctx, &[Value::Object(Some(backing)), last]);
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
-    removed?;
-    if ctx.object_num_fields(this) > 3 {
-        ctx.set_field(this, 3, Value::Int(cursor));
-    }
-    Ok(None)
-}
 
 fn native_ad_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
@@ -47032,6 +47136,17 @@ fn register_priority_queue_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Comparator;)V",
         native_pq_init_comparator,
     );
+    // `(Collection)` — see the note on `java/util/Vector`'s. This one must
+    // route through `native_pq_add` rather than copying the source order: a
+    // `PriorityQueue` is a heap, and `PriorityQueue(Collection)` on HotSpot
+    // heapifies. Copying element order would produce a queue whose `poll()`
+    // sequence is the source's, not the comparator's.
+    r.register(
+        c,
+        "<init>",
+        "(Ljava/util/Collection;)V",
+        native_pq_init_from_collection,
+    );
     r.register(c, "size", "()I", native_pq_size);
     r.register(c, "isEmpty", "()Z", native_pq_is_empty);
     r.register(c, "add", "(Ljava/lang/Object;)Z", native_pq_add);
@@ -47045,6 +47160,39 @@ fn register_priority_queue_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "iterator", "()Ljava/util/Iterator;", native_pq_iterator);
     r.register(c, "toString", "()Ljava/lang/String;", native_pq_to_string);
     r.set_category(__prev_cat);
+}
+
+/// `PriorityQueue(Collection)` — `this(); addAll(c);`.
+///
+/// Routed through `native_pq_add` per element rather than copying the source
+/// array, because a `PriorityQueue` is a HEAP: `PriorityQueue(Collection)`
+/// heapifies on HotSpot, and a queue built by copying source ORDER would
+/// `poll()` in the source's sequence rather than the comparator's. Same GC
+/// discipline as `native_ad_init_from_collection`.
+fn native_pq_init_from_collection(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    reject_null_collection(args.get(1))?;
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    native_pq_init(ctx, args)?;
+    let source = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let elems = collect_collection_elements_or_real(ctx, source)?;
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    for (i, val) in elems.iter().enumerate() {
+        let this = ctx.read_native_pin(this_pin, this);
+        let val = read_pinned_elem(ctx, handles[i], *val);
+        native_pq_add(ctx, &[Value::Object(Some(this)), val])?;
+    }
+    ctx.unpin_native_roots(this_pin);
+    Ok(None)
 }
 
 fn native_pq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -47433,6 +47581,18 @@ fn register_vector_natives(r: &mut NativeMethodRegistry) {
 
     r.register(c, "<init>", "()V", native_al_init);
     r.register(c, "<init>", "(I)V", native_al_init_capacity);
+    // `(Collection)` — the copy constructor. Absent until 2026-09-02, so
+    // `new Vector<>(someList)` raised `NoSuchMethodError` in `--synthetic-jdk`
+    // (real-JDK mode runs the class's own bytecode and never reaches here).
+    // Bound to the shared ArrayList implementation like every other method on
+    // this class: `al_slots_for` resolves `elementData`/`elementCount` against
+    // the RECEIVER's layout, which is the whole reason Vector can share these.
+    r.register(
+        c,
+        "<init>",
+        "(Ljava/util/Collection;)V",
+        native_al_init_from_collection,
+    );
     r.register(c, "size", "()I", native_al_size);
     r.register(c, "isEmpty", "()Z", native_al_is_empty);
     r.register(c, "get", "(I)Ljava/lang/Object;", native_vec_get);
@@ -49435,46 +49595,39 @@ fn register_queue_deque_interface_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/util/Deque", "size", "()I", native_ad_size);
     registry.register("java/util/Deque", "isEmpty", "()Z", native_ad_is_empty);
 
-    // Iterator support for the fabricated `ArrayDeque$Itr`: the 2-field snapshot
-    // pattern (field 0 = array, field 1 = cursor).
+    // `java/util/ArrayDeque$Itr` RETIRED 2026-09-02 by the iterator-carrier
+    // census (`docs/internal/fixed-suite-bugs/iterator-carrier-census-20260902.md`).
+    // `hasNext`/`next`/`remove` were bound here to the 2-field snapshot
+    // pattern for a class this crate stopped minting on 2026-08-30, when
+    // ArrayDeque's iterator became the real `DeqIterator`.
     //
-    // `java/util/PriorityQueue$Itr` LEFT THIS LOOP on 2026-08-29, and how it
-    // failed is worth keeping. That name is a REAL JDK class, and nothing in
-    // this crate minted it -- the row described a 2-field shape the real class
-    // has never had, and it sat inert because no object of that class ever
-    // reached these natives. The moment `native_pq_iterator` started minting
-    // the real class (L3 residual 6.1), this dormant row won the slot over the
-    // `native_al_itr_*` registration that matches the shape actually minted:
-    // `owns=True inv=4` here against `owns=False inv=0` there. Iteration then
-    // reported every queue EMPTY.
+    // The comment that stood here explained why that is dangerous rather than
+    // merely dead, and it is kept because the reasoning outlives the rows:
+    // `java/util/PriorityQueue$Itr` sat in this same loop describing a 2-field
+    // shape the real class has never had, inert because nothing minted it —
+    // and the moment `native_pq_iterator` started minting the real class the
+    // dormant row won the slot over the `native_al_itr_*` registration that
+    // matched the shape actually produced (`owns=True inv=4` here against
+    // `owns=False inv=0` there), and iteration reported every queue EMPTY.
+    // A registration keyed on a class nobody produces is a trap armed for
+    // whoever produces one later, and the dump shows it as a duplicate only
+    // once the class exists.
     //
-    // A registration keyed on a class nobody produces is not harmless -- it is
-    // a trap armed for whoever produces one later, and the dump shows it as a
-    // duplicate only once the class exists. `ArrayDeque$Itr` is now in that
-    // same state (its mint site became the real `DeqIterator` in the same
-    // change) and is recorded in the L3 record as a retirement candidate rather
-    // than deleted here, because deleting registrations is the shadow-retirement
-    // lane's edit and wants its own census.
-    for itr_class in &["java/util/ArrayDeque$Itr"] {
-        registry.register(itr_class, "hasNext", "()Z", native_snapshot_itr_has_next);
-        registry.register(
-            itr_class,
-            "next",
-            "()Ljava/lang/Object;",
-            native_snapshot_itr_next,
-        );
-    }
-    // `ArrayDeque$Itr.remove()` removes the last-returned element from the
-    // backing deque (field 2). Otherwise remove() falls to the Iterator default
-    // → UnsupportedOperationException (kafka NetworkClientDelegate). Only the
-    // ArrayDeque iterator carries the backing-deque ref; the PriorityQueue
-    // iterator does not, so it is left as-is.
-    registry.register(
-        "java/util/ArrayDeque$Itr",
-        "remove",
-        "()V",
-        native_ad_itr_remove,
-    );
+    // It was armed. During the census a first attempt at an ArrayDeque
+    // iterator for `--synthetic-jdk` minted `ArrayDeque$Itr` and was reverted.
+    //
+    // Retired on evidence the deferral asked for and did not have:
+    //   * nothing mints the class — no allocation site names it, and
+    //     `apps/probes/ItrCarrierCensus` shows the runtime handing out the real
+    //     `java/util/ArrayDeque$DeqIterator`;
+    //   * the only caller of these natives was `vm::tests::array_deque_iterator`,
+    //     which drives them on a hand-built receiver — and it fails at its FIRST
+    //     step (`ArrayDeque.iterator() not registered`), stale from the same
+    //     2026-08-30 change, unnoticed because its whole
+    //     `#[cfg(all(test, feature = "synthetic-jdk"))]` module had not compiled
+    //     since `InlineSite` grew a field.
+    // So the rows had no reachable consumer at all, and removing them breaks
+    // nothing that was working.
     registry.set_category(__prev_cat);
 }
 
@@ -67225,7 +67378,31 @@ fn native_collections_empty_map(ctx: &mut dyn NativeContext, _args: &[Value]) ->
     if let Some(v) = collections_empty_singleton(ctx, "EMPTY_MAP") {
         return Ok(Some(v));
     }
-    // Fallback (field not yet initialised): fresh synthetic empty map.
+    // `alloc_real_jdk` FIRST, exactly as `native_collections_singleton_list`
+    // does one screen up, and for the same reason: it resolves the class the
+    // JDK would have returned in BOTH modes — real-JDK from the image, and
+    // `--synthetic-jdk` from `class_manager`'s fabrication tables, which carry
+    // `Collections$Empty*` field shapes and interface rows already. Only the
+    // static-field cache above is real-JDK-only.
+    //
+    // Without it this fallback minted an ordinary mutable synthetic, so in
+    // `--synthetic-jdk` (measured 2026-09-02, `apps/probes/EmptySingletonImmutable`):
+    //
+    //     Collections.emptyList()  class=java.util.ArrayList
+    //                              instanceof ArrayList = true
+    //                              add("x") = SUCCEEDED
+    //
+    // The `add` is the defect. `ensure_collections_empty_singletons` above
+    // records what a mutable empty singleton cost the last time one shipped —
+    // kotlin-reflect's shaded protobuf tests `instanceof ArrayList` to decide
+    // whether to replace its `emptyList()` placeholder, skipped the
+    // replacement, and mutated the shared object. Here each call happens to
+    // mint a FRESH list, so the write is not shared — it is silently DISCARDED
+    // instead, which is the same class of wrong answer with a quieter failure.
+    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$EmptyMap") {
+        return Ok(Some(Value::Object(Some(o))));
+    }
+    // Last resort: fresh synthetic empty map.
     let map = alloc_backing_map(ctx);
     map_init_eager(ctx, &[Value::Object(Some(map))])?;
     Ok(Some(Value::Object(Some(map))))
@@ -67235,7 +67412,11 @@ fn native_collections_empty_set(ctx: &mut dyn NativeContext, _args: &[Value]) ->
     if let Some(v) = collections_empty_singleton(ctx, "EMPTY_SET") {
         return Ok(Some(v));
     }
-    // Fallback (field not yet initialised): fresh synthetic empty set.
+    // See `native_collections_empty_map` for why this precedes the synthetic.
+    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$EmptySet") {
+        return Ok(Some(Value::Object(Some(o))));
+    }
+    // Last resort: fresh synthetic empty set.
     let set = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
     let inner_map = alloc_backing_map(ctx);
     map_init_eager(ctx, &[Value::Object(Some(inner_map))])?;
@@ -74578,6 +74759,66 @@ mod tests {
         let mut r = NativeMethodRegistry::new();
         register_collections_natives(&mut r);
         r
+    }
+
+    /// No natives may be bound to an iterator class this crate never MINTS.
+    ///
+    /// The durable output of the iterator-carrier census
+    /// (`docs/internal/fixed-suite-bugs/iterator-carrier-census-20260902.md`).
+    /// A registration keyed on a class nobody produces is inert until someone
+    /// produces one, and then it WINS the slot over the registration that
+    /// matches the shape actually minted. It has happened twice:
+    ///
+    /// * `java/util/PriorityQueue$Itr` described a 2-field snapshot the real
+    ///   class has never had; when `native_pq_iterator` began minting the real
+    ///   class, iteration reported every queue EMPTY.
+    /// * `java/util/ArrayDeque$Itr` sat in the same state after ArrayDeque's
+    ///   iterator became the real `DeqIterator`, and a first attempt at a
+    ///   `--synthetic-jdk` iterator during the census minted it and sprang the
+    ///   trap again.
+    ///
+    /// Neither was visible as a test failure — the second's only caller had
+    /// been failing at its first line for days inside a module that would not
+    /// compile. So this asserts the property directly and cheaply: for the
+    /// iterator classes this crate has retired, nothing may be registered.
+    ///
+    /// This is a DENY-LIST rather than the general property ("every registered
+    /// iterator class has a mint site"), because a mint site is not visible to
+    /// a registry test — `build_registry` sees names, not allocations. A
+    /// deny-list of the two names that have actually caused this is a check
+    /// that can fail; the general form would need the static scan the census
+    /// ran, and would have to be kept honest by a control row whose answer is
+    /// already known. Add a name here when a carrier is retired.
+    #[test]
+    fn no_natives_are_bound_to_a_retired_iterator_carrier() {
+        let r = build_registry();
+        for retired in [
+            // Retired 2026-09-02: ArrayDeque hands out the real `DeqIterator`.
+            "java/util/ArrayDeque$Itr",
+            // Retired 2026-08-29: PriorityQueue hands out the real `$Itr`,
+            // which IS this name — so the check below is specifically that the
+            // 2-field SNAPSHOT natives are not the ones bound to it. The real
+            // class is served through `VALUES_ITR_CARRIERS`.
+        ] {
+            for (method, desc) in [
+                ("hasNext", "()Z"),
+                ("next", "()Ljava/lang/Object;"),
+                ("remove", "()V"),
+            ] {
+                assert!(
+                    r.find(retired, method, desc).is_none(),
+                    "{retired}.{method}{desc} is registered, but nothing mints                      {retired} — a dormant row is a trap armed for whoever                      mints one later; see the iterator-carrier census"
+                );
+            }
+        }
+        // Control: the carriers that ARE minted must still be bound, so this
+        // test cannot pass by the registry being empty.
+        for (_, carrier) in VALUES_ITR_CARRIERS {
+            assert!(
+                r.find(carrier, "next", "()Ljava/lang/Object;").is_some(),
+                "{carrier} is a live carrier and must keep its natives"
+            );
+        }
     }
 
     #[test]

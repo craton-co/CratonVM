@@ -15,7 +15,7 @@
  *   CRATONVM_JIT_NO_STRING_INTRINSIC_PIN=1 cratonvm -cp probes CharAtCostCurve
  *   CRATONVM_JIT_IR_OVER_INTRINSIC=1       cratonvm -cp probes CharAtCostCurve
  *
- * See docs/known-issues/perf/string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901.md
+ * See string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901
  */
 public class CharAtCostCurve {
     static String big;

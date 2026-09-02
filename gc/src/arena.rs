@@ -118,6 +118,22 @@ fn mask_last(mask: &[u64; SMALL_MASK_WORDS]) -> Option<usize> {
     None
 }
 
+/// The extents [`Arena::reset_deferring_zero`] left un-zeroed, as arena
+/// offsets: `[0, low_end)` below the old low cursor and `[high_start, len)`
+/// above the old high one.
+#[derive(Debug, Clone, Copy)]
+pub struct DeferredWipe {
+    low_end: usize,
+    high_start: usize,
+}
+
+impl DeferredWipe {
+    /// Bytes the wipe covers before committed-granule filtering.
+    pub fn extent_bytes(&self, capacity: usize) -> usize {
+        self.low_end.min(capacity) + capacity.saturating_sub(self.high_start)
+    }
+}
+
 pub struct Arena {
     /// Backing storage for `capacity` bytes.
     ///
@@ -2506,6 +2522,45 @@ impl Arena {
         self.clear_alloc_anchors();
     }
 
+    /// [`Self::reset`] with the zeroing handed back to the caller.
+    ///
+    /// The metadata reset is identical (cursors, free list, anchors); what
+    /// this does NOT do is the `memset` of everything below the low cursor
+    /// and above the high one. The returned [`DeferredWipe`] names those
+    /// extents as OFFSETS, and [`Self::deferred_wipe_spans`] turns them into
+    /// absolute spans against the arena's backing at the time it is called —
+    /// so a `grow` between the two, which may move the backing (and carries
+    /// the committed bytes, stale contents included, with it), is handled by
+    /// asking late rather than early.
+    ///
+    /// The caller owns the contract `reset` used to discharge: until every
+    /// returned span is zeroed, nothing may read this arena's bytes as
+    /// objects. `GenerationalHeap` keeps the arena INACTIVE (the evacuated
+    /// semi-space is the next cycle's to-space, allocated into by no mutator)
+    /// and joins the wipe before the next collection touches it.
+    pub fn reset_deferring_zero(&mut self) -> DeferredWipe {
+        crate::zero_forensics::record(2, 0, self.data.as_ptr() as usize, self.cursor);
+        let wipe = DeferredWipe {
+            low_end: self.cursor,
+            high_start: self.high_cursor,
+        };
+        self.cursor = 0;
+        self.high_cursor = self.data.len();
+        self.clear_free_list();
+        self.clear_alloc_anchors();
+        wipe
+    }
+
+    /// The absolute `(addr, len)` spans a [`DeferredWipe`] must zero, over
+    /// the arena's CURRENT backing and only its committed granules (an
+    /// uncommitted granule already reads as zero and must not be written).
+    pub fn deferred_wipe_spans(&self, wipe: &DeferredWipe) -> Vec<(usize, usize)> {
+        let len = self.data.len();
+        let mut spans = self.data.committed_spans(0, wipe.low_end.min(len));
+        spans.extend(self.data.committed_spans(wipe.high_start.min(len), len));
+        spans
+    }
+
     /// Reset the arena without zeroing memory.
     ///
     /// # Safety
@@ -2549,6 +2604,82 @@ impl Arena {
     /// The total capacity in bytes.
     pub fn capacity(&self) -> usize {
         self.data.len()
+    }
+
+    /// The LOW bump tail as `(first free address, byte count)` — the span a
+    /// parallel evacuation may carve into per-worker buffers.
+    ///
+    /// # Why an evacuator cannot just call `alloc`
+    ///
+    /// [`Self::alloc`] takes `&mut self`, which is precisely what makes a
+    /// copying collector's copy phase single-threaded. Handing the un-bumped
+    /// tail out as two plain words lets N workers bump a shared atomic cursor
+    /// inside it instead, with the arena itself untouched until
+    /// [`Self::commit_parallel_evacuation`] publishes the result.
+    ///
+    /// The tail is returned rather than the whole arena on purpose: the free
+    /// list holds spans whose neighbours are live objects, and an evacuator
+    /// bumping through those would overwrite them.
+    ///
+    /// # This reports the tail; it does NOT make it writable
+    ///
+    /// The backing store commits lazily, so the span named here is RESERVED
+    /// and mostly not yet mapped. The caller must pass the bytes it will
+    /// actually use to [`Self::commit_parallel_evacuation_region`] before any
+    /// worker writes into it — this is the tenth hand-out site the `hand_out`
+    /// helper's note counts, and the only one that does not go through it,
+    /// because it hands out a span for N threads to sub-allocate rather than a
+    /// single object.
+    pub fn parallel_evacuation_region(&self) -> (usize, usize) {
+        (
+            self.data.as_ptr() as usize + self.cursor,
+            self.low_bump_headroom(),
+        )
+    }
+
+    /// Map the first `bytes` of the tail so N workers may write into it.
+    ///
+    /// Returns `false` if the OS refused the commit, which the caller must
+    /// treat exactly as `hand_out` does — as an allocation failure, here
+    /// meaning "run the serial copy phase instead". Returning `true` anyway
+    /// would hand the workers memory that faults on first write.
+    ///
+    /// # Why this is separate from the region query
+    ///
+    /// `bytes` is the evacuation's own reservation (survivors + per-worker
+    /// buffers + its abandoned-tail allowance), which is computed AFTER the
+    /// tail is known. Committing the whole tail instead would work and would
+    /// throw away what the lazy backing store is for: on a 128 MB to-space
+    /// whose cycle copies 400 KB, the difference is the whole arena.
+    #[must_use = "a refused commit must send the cycle down the serial path"]
+    pub fn commit_parallel_evacuation_region(&mut self, bytes: usize) -> bool {
+        debug_assert!(bytes <= self.low_bump_headroom());
+        self.data.commit_range(self.cursor, bytes)
+    }
+
+    /// Publish the outcome of a parallel evacuation: `bytes` were consumed
+    /// from the tail [`Self::parallel_evacuation_region`] handed out.
+    ///
+    /// The caller must already have made every byte below the new cursor
+    /// walkable — object copies, and a filler over every retired per-worker
+    /// buffer's tail (`gen_evac::install_gap_filler`). This method deliberately
+    /// does NOT take the gaps and push them on the free list instead: a free
+    /// block is invisible to `walk_objects` and friends, and this arena is
+    /// about to become the next cycle's FROM-space, where several walks
+    /// reconstruct the object grid without consulting the free list at all.
+    ///
+    /// # Panics
+    /// If `end_addr` is outside the tail that was handed out — below its start
+    /// would lose live copies, above it would put the cursor past the arena's
+    /// own capacity.
+    pub fn commit_parallel_evacuation(&mut self, end_addr: usize) {
+        let (start, len) = self.parallel_evacuation_region();
+        assert!(
+            end_addr >= start && end_addr <= start + len,
+            "parallel evacuation ended at {end_addr:#x}, outside the tail [{start:#x},{:#x})",
+            start + len,
+        );
+        self.cursor += end_addr - start;
     }
 
     /// Retract the bump cursor into a free span that ends exactly at it,

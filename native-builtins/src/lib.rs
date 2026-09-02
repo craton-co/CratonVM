@@ -45188,6 +45188,18 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/Object;",
         native_class_get_enum_constants,
     );
+    // `Enum.valueOf(Class, String)` — synthetic-JDK only. See
+    // `lang_class::native_enum_value_of`: `java/lang/Enum`'s natives were
+    // retired against the real-JDK suite, where the real bytecode serves them,
+    // and this mode has none. Registered here beside the constant source it
+    // shares so the two stay together.
+    #[cfg(feature = "synthetic-jdk")]
+    registry.register(
+        "java/lang/Enum",
+        "valueOf",
+        "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;",
+        crate::lang_class::native_enum_value_of,
+    );
     // Package-private `Class.getEnumConstantsShared()` — backs
     // `EnumMap.getKeyUniverse` via `SharedSecrets.getJavaLangAccess()`.
     // The real JDK implements it in Java using reflection (getMethod +

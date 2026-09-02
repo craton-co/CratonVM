@@ -12948,6 +12948,19 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // `vh_array_index` is the worked example.
         let _out_of_range = self.shared.mem.heap.set_array_element(obj, index, value);
         // write_barrier fires automatically inside set_array_element for ref arrays
+        //
+        // Phase 10 #2: the host just wrote this array, so any device
+        // buffer mirroring it is stale.
+        //
+        // AUDIT 2026-09-02: native code writes arrays too, and none of it
+        // went through an interpreter `*astore` arm. `System.arraycopy`
+        // lands here for its per-element shapes, and every other native
+        // array writer that reaches `NativeHeapAccess` does as well. This
+        // is the chokepoint for all of them, which is why the fix is here
+        // rather than in `native-builtins` — that crate cannot see
+        // `input_cache`, and its `gpu-offload` feature is empty.
+        #[cfg(feature = "gpu-offload")]
+        crate::runtime::offload::input_cache::invalidate(obj);
     }
 
     // -- Bulk primitive-array intrinsics (perf override) --------------------
@@ -13409,6 +13422,21 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 }
             }
         }
+        // Phase 10 #2: `dst` has just been overwritten in bulk, so any
+        // device buffer mirroring it is stale.
+        //
+        // AUDIT 2026-09-02: this is the FAST path — `System.arraycopy`
+        // for same-type primitive arrays takes it and never touches
+        // `set_array_element`, so invalidating there alone left this hole
+        // open. `GpuRuntimeStress`'s `bulk_writes` scenario is the one
+        // that found it: a `System.arraycopy` into a kernel's input array
+        // between submits, after which the next submit computed from the
+        // device copy the host had replaced.
+        //
+        // `src` is not invalidated: a copy READS it and leaves it byte
+        // for byte as the device already has it.
+        #[cfg(feature = "gpu-offload")]
+        crate::runtime::offload::input_cache::invalidate(dst);
         true
     }
 

@@ -1461,6 +1461,13 @@ pub fn dump_method_stats_to_stderr() {
     // and no timing can tell that apart from "it fired and did not help".
     // `fired=0` can, in one line, at the end of any run.
     //
+    // Those two numbers are pre-emitter and pre-2026-09-02 and must not be
+    // quoted as current: `java/lang/String` is final, so the method-entry
+    // door's devirtualisation was taking every String access site away from
+    // the intrinsic before the gate saw it, and BOTH arms of that A/B measured
+    // a program with no String intrinsic in it. The same rows read ~3.2
+    // ns/char once the rewrite yields. That is the line printed below this one.
+    //
     // The other three counts are printed beside it because they are the
     // candidate REASONS for a `fired=0`: no resolved `java/lang/String` field
     // layout, no constant-pool invoke resolver at the door that asked, or the
@@ -1473,6 +1480,20 @@ pub fn dump_method_stats_to_stderr() {
     eprintln!(
         "[cratonvm] JIT String-intrinsic pin: fired={sp_fired} blind-no-layout={sp_no_layout} \
          blind-no-resolver={sp_no_resolver} fail-closed={sp_fail_closed}"
+    );
+    // Sites the `final`-class devirtualisation handed BACK to a call-site
+    // intrinsic (`crate::devirt_yielded_to_intrinsic_count`).
+    //
+    // Printed beside the pin because it answers the question the pin's four
+    // counters could not: `java/lang/String` is final, so before 2026-09-02
+    // every String access site was statically bound and left the invoke loop
+    // BEFORE the instance-intrinsic gate, which is `invoke_kind == 0 || == 2`.
+    // Not declined, not blind, not counted -- gone. `probes/CharAtDoorProbe`
+    // read 349.64 ns/char on the arm that took this path against 3.2-4.3 on
+    // four byte-identical siblings that did not.
+    eprintln!(
+        "[cratonvm] JIT devirt yielded to intrinsic: {}",
+        crate::devirt_yielded_to_intrinsic_count()
     );
     // Methods sealed out of compilation BEFORE any attempt, by reason. A
     // different and larger population than `hot_but_stuck` — a Spring Boot

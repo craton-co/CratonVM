@@ -5147,6 +5147,7 @@ fn register_enum_set_natives_with_category(
         "(Ljava/lang/Class;)Ljava/util/EnumSet;",
         native_es_all_of,
     );
+    r.register(c, "toString", "()Ljava/lang/String;", native_es_to_string);
     r.register(
         c,
         "of",
@@ -6077,6 +6078,55 @@ fn native_es_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(None)
 }
 
+/// `EnumSet.toString()`.
+///
+/// In real-JDK mode `AbstractCollection.toString()` bytecode runs and nothing
+/// here is consulted. `--synthetic-jdk` has no bytecode, so with no
+/// registration the call reached `Object.toString` and printed
+/// `java.util.EnumSet@9` where HotSpot prints `[ALPHA, GAMMA]` — measured
+/// 2026-09-02, `apps/probes/SyntheticEnumSurface`.
+///
+/// Built on `native_es_iterator`'s snapshot rather than on the backing array
+/// directly, so the two cannot disagree about which elements the set holds or
+/// in what order — the same reason `native_es_size` reads the size through the
+/// backing instead of counting.
+fn native_es_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let cls = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
+    if cls == "java/util/RegularEnumSet" || cls == "java/util/JumboEnumSet" {
+        return cratonvm_native_collections::native_al_to_string(ctx, args);
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(backing) = es_get_backing(ctx, this) {
+        let size = match ctx.get_field(backing, 1) {
+            Value::Int(n) if n > 0 => n as usize,
+            _ => 0,
+        };
+        if let Value::Object(Some(data)) = ctx.get_field(backing, 0) {
+            for i in 0..size.min(ctx.array_length(data)) {
+                let elem = ctx.get_array_element(data, i);
+                let rendered = match elem {
+                    Value::Object(Some(o)) => {
+                        // An enum's `toString()` is its `name()` unless the enum
+                        // overrides it; slot 0 is `Enum.name`, which is what
+                        // `native_enum_value_of` matches on.
+                        match ctx.get_field(o, 0) {
+                            Value::Object(Some(n)) => ctx.read_string(n).unwrap_or_default(),
+                            _ => String::from("null"),
+                        }
+                    }
+                    _ => String::from("null"),
+                };
+                parts.push(rendered);
+            }
+        }
+    }
+    let out = format!("[{}]", parts.join(", "));
+    Ok(Some(Value::Object(Some(ctx.create_string(&out)))))
+}
+
 fn native_es_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let cls = ctx
@@ -6270,6 +6320,25 @@ pub(crate) fn register_enum_map_natives(r: &mut NativeMethodRegistry) {
         c,
         "put",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_em_put,
+    );
+    // The descriptor javac ACTUALLY emits. `EnumMap<K extends Enum<K>, V>`
+    // erases `K` to `java/lang/Enum`, not to `java/lang/Object`, so a real call
+    // site emits `put(Ljava/lang/Enum;Ljava/lang/Object;)Ljava/lang/Object;`
+    // (`javap -s`) and never matched the row above. Measured 2026-09-02 with
+    // `apps/probes/SyntheticEnumSurface`: `new EnumMap<>(Local.class).put(k, v)`
+    // was `NoSuchMethodError: java.util.EnumMap.put(java.lang.Enum, java.lang.Object)`
+    // in `--synthetic-jdk`, while `get`/`remove`/`containsKey` worked — those
+    // three take `Object` in the source, so their erasure is the one already
+    // registered and only `put` diverges.
+    //
+    // BOTH are kept: a caller reaching this through a raw/`Map`-typed reference
+    // emits the `Object` form, and the bridge method the compiler generates for
+    // `Map.put` has exactly that descriptor.
+    r.register(
+        c,
+        "put",
+        "(Ljava/lang/Enum;Ljava/lang/Object;)Ljava/lang/Object;",
         native_em_put,
     );
     r.register(
@@ -15247,17 +15316,75 @@ fn keygen_algorithm_of(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
 /// default goes wrong in only some of them. Here they had already agreed on the
 /// wrong answer (128 for everything); the next edit is the one that would have
 /// split them.
+/// The real `KeyGeneratorSpi` behind this receiver, or `None` when this crate
+/// built it.
+///
+/// `getInstance` is a native for all three overloads, and until 2026-09-02
+/// every one of them returned the two-field synthetic (algorithm at slot 0,
+/// key size at slot 1), so the eight natives below could read those slots
+/// unconditionally. They cannot any more: the five `SunTls*` KDFs are served by
+/// handing back a REAL `javax.crypto.KeyGenerator` over the platform's SPI, and
+/// a real one's slots hold `provider`/`spi`/`algorithm`/`lock` instead.
+///
+/// TYPE-CHECKED, not trusted. `get_field_by_name` can fall back to a
+/// name->slot mapping, and on a two-field synthetic "spi" resolves to slot 0 —
+/// a `String`. Returning that would hand a `String` to `invoke_virtual` as a
+/// `KeyGeneratorSpi`. The same unchecked read put a `String` where a `Provider`
+/// belonged in `pbkdf2_get_provider` and killed the caller on
+/// `String.getName()`; this is that lesson applied before it could happen
+/// again. A `String` is not a `KeyGeneratorSpi`, so the check is also exactly
+/// the discriminator needed.
+///
+/// This is `skf_receiver_is_ours` in the positive direction: that one asks
+/// "did we build it" through a side table, this one asks "can I delegate" and
+/// answers with the thing to delegate TO. No table, so nothing to keep in step
+/// with GC relocation or to evict.
+fn keygen_real_spi(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    let Value::Object(Some(spi)) = ctx.get_field_by_name(this, "spi") else {
+        return None;
+    };
+    let spi_class = ctx.class_id_by_name("javax/crypto/KeyGeneratorSpi")?;
+    if ctx.is_subclass(ctx.class_id_of_object(spi), spi_class) {
+        Some(spi)
+    } else {
+        None
+    }
+}
+
+/// A `SecureRandom` for the `init` overloads that do not carry one.
+///
+/// The JDK's own `KeyGenerator.init(spec)` calls
+/// `engineInit(params, JCAUtil.getSecureRandom())` rather than passing null,
+/// and `TlsRsaPremasterSecretGenerator` reads its argument — a null there is an
+/// NPE inside the provider, not a defaulted value.
+fn keygen_default_random(ctx: &mut dyn NativeContext) -> Result<Value, MethodCallFailed> {
+    match ctx.new_object_initialized("java/security/SecureRandom", "()V", &[])? {
+        Some(v @ Value::Object(Some(_))) => Ok(v),
+        _ => Ok(Value::Object(None)),
+    }
+}
+
 fn keygen_get_instance_named(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let algo = obj_arg(args, 0)?;
     let algo_str = ctx.read_string(algo).unwrap_or_default();
     let bits = match keygen_default_bits(&algo_str) {
         Some(bits) => bits,
         None => {
+            // AFTER this engine's own verdict, never before it — the ordering
+            // `try_delegate_cipher_to_chain` writes down and the whole safety
+            // argument for `jdk_service_class`. A name this crate generates
+            // keys for is generated HERE; only a name it refuses reaches the
+            // platform's own implementation class.
+            if let Some(real) =
+                crate::jca::provider_chain::build_real_key_generator(ctx, "SunJCE", &algo_str)?
+            {
+                return Ok(Some(Value::Object(Some(real))));
+            }
             return Err(throw_jca_exc(
                 ctx,
                 "java/security/NoSuchAlgorithmException",
                 &format!("{algo_str} KeyGenerator not available"),
-            ))
+            ));
         }
     };
     let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2)?;
@@ -15277,6 +15404,21 @@ fn keygen_get_instance_named(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// does — `HmacSHA256` really will hand back a 64-bit key for `init(64)`.
 fn keygen_init_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // A generator this crate did not build belongs to the provider that did.
+    // See `keygen_real_spi`.
+    if let Some(spi) = keygen_real_spi(ctx, this) {
+        let size = args.get(1).copied().unwrap_or(Value::Int(0));
+        let random = match args.get(2) {
+            Some(v @ Value::Object(Some(_))) => *v,
+            _ => keygen_default_random(ctx)?,
+        };
+        return ctx.invoke_virtual(
+            spi,
+            "engineInit",
+            "(ILjava/security/SecureRandom;)V",
+            &[size, random],
+        );
+    }
     let algo = keygen_algorithm_of(ctx, this);
     let key_size = args
         .get(1)
@@ -15703,6 +15845,18 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         "(Ljava/security/SecureRandom;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if let Some(spi) = keygen_real_spi(ctx, this) {
+                let random = match args.get(1) {
+                    Some(v @ Value::Object(Some(_))) => *v,
+                    _ => keygen_default_random(ctx)?,
+                };
+                return ctx.invoke_virtual(
+                    spi,
+                    "engineInit",
+                    "(Ljava/security/SecureRandom;)V",
+                    &[random],
+                );
+            }
             // "the provider default", not the literal 128 — which for AES is
             // 256 and for DESede is 168. Resetting to 128 here re-introduced
             // the very defect `keygen_default_bits` exists to fix, one method
@@ -15722,17 +15876,52 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
     // `InvalidAlgorithmParameterException` instead would break the BouncyCastle
     // clients that call this purely to pass a curve/nonce spec (see the
     // Round-15 BcProbe note on `getInstance` above).
+    // These two stay a NO-OP for a synthetic receiver, deliberately and for the
+    // reason above — but they are the ONLY route into the five `SunTls*` KDFs,
+    // whose whole input is an `AlgorithmParameterSpec`. Swallowing the spec on
+    // a real receiver would leave its generator uninitialised and
+    // `generateKey()` would then throw from inside the provider, which is a
+    // worse answer than the `NoSuchAlgorithmException` this used to give.
     r.register(
         kg,
         "init",
         "(Ljava/security/spec/AlgorithmParameterSpec;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Some(spi) = keygen_real_spi(ctx, this) {
+                let spec = args.get(1).copied().unwrap_or(Value::Object(None));
+                let random = keygen_default_random(ctx)?;
+                return ctx.invoke_virtual(
+                    spi,
+                    "engineInit",
+                    "(Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",
+                    &[spec, random],
+                );
+            }
+            Ok(None)
+        },
     );
     r.register(
         kg,
         "init",
         "(Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Some(spi) = keygen_real_spi(ctx, this) {
+                let spec = args.get(1).copied().unwrap_or(Value::Object(None));
+                let random = match args.get(2) {
+                    Some(v @ Value::Object(Some(_))) => *v,
+                    _ => keygen_default_random(ctx)?,
+                };
+                return ctx.invoke_virtual(
+                    spi,
+                    "engineInit",
+                    "(Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",
+                    &[spec, random],
+                );
+            }
+            Ok(None)
+        },
     );
     r.register(
         kg,
@@ -15740,6 +15929,14 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         "()Ljavax/crypto/SecretKey;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if let Some(spi) = keygen_real_spi(ctx, this) {
+                return ctx.invoke_virtual(
+                    spi,
+                    "engineGenerateKey",
+                    "()Ljavax/crypto/SecretKey;",
+                    &[],
+                );
+            }
             let key_size = ctx.get_field(this, 1).as_int().unwrap_or(128);
             // The algorithm was recorded at `getInstance` and, until this
             // change, never read again — which is how one code path served

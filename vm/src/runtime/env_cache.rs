@@ -1823,6 +1823,26 @@ cached_is_set!(dbg_hotpath_counts, "CRATONVM_DBG_HOTPATH_COUNTS");
 /// back edge against HotSpot's 4.9 ns, so the two arms have to be comparable
 /// inside one binary.
 cached_is_set!(no_backedge_poll_gate, "CRATONVM_JIT_NO_BACKEDGE_POLL_GATE");
+
+/// `CRATONVM_JIT_NO_FIELD_FAST_PATH` -- disable the quickened `getfield` /
+/// `putfield` arms in the interpreter (per-site receiver-class + offset
+/// memo, raw compact-layout load/store). Off restores the full
+/// `op_getfield` / `op_putfield` handler on every instance field access.
+/// Token: `CRATONVM_JIT=-field-fast-path`.
+cached_is_set!(no_field_fast_path, "CRATONVM_JIT_NO_FIELD_FAST_PATH");
+
+/// `CRATONVM_JIT_NO_OSR_INLINE_GATE` -- call `try_osr_with_backoff` on every
+/// backward branch instead of only once `Frame::backward_count` has reached
+/// the smallest threshold the call could accept. Token:
+/// `CRATONVM_JIT=-osr-inline-gate`.
+cached_is_set!(no_osr_inline_gate, "CRATONVM_JIT_NO_OSR_INLINE_GATE");
+
+/// `CRATONVM_JIT_NO_INVOKE_FAST_DOOR` -- disable the monomorphic
+/// `invokevirtual` / `invokeinterface` fast door (borrowed cache entry,
+/// compact argument transfer, per-method invocation counter). Off routes
+/// every cache hit through `execute_invokevirtual_cached`. Token:
+/// `CRATONVM_JIT=-invoke-fast-door`.
+cached_is_set!(no_invoke_fast_door, "CRATONVM_JIT_NO_INVOKE_FAST_DOOR");
 /// `CRATONVM_DBG_BYTECODE_DUMP` -- temporary raw-bytecode + mnemonic
 /// disassembly dump (2026-07-15, JRubyScriptTemplateTests round 3): see
 /// `push_frame_and_fire_entry`'s own doc comment for the full story --

@@ -3943,6 +3943,7 @@ pub(super) fn populate_virtual_invoke_cache(
         force_native_cache: std::sync::OnceLock::new(),
         descriptor_facts_cache: std::sync::OnceLock::new(),
         intercept_shape_cache: std::sync::OnceLock::new(),
+        interp_invocations: std::sync::atomic::AtomicU32::new(0),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -4079,4 +4080,359 @@ mod intrinsic_census_virtual_tests {
             .is_none());
         assert_eq!(registry.slots_with_incomplete_invocations(), 0);
     }
+}
+
+// ── Monomorphic virtual fast door (2026-09-02) ───────────────────────────
+//
+// `execute_invokevirtual_cached` is the spec-complete cached dispatcher: it
+// clones the cache entry (two `Arc` increments and two decrements per call),
+// consults every debug trace, runs the interception chain on a `[Value; 16]`
+// it fills by decoding every argument, takes a class-manager read lock to ask
+// whether the receiver is a `java.util` class, and pays a sharded read lock
+// plus a hash lookup for the invocation counter — on every warm hit.
+//
+// This door handles the one shape that is nearly every hit — a warm
+// monomorphic site, a bytecode callee, nothing to intercept — with: a
+// borrowed cache entry (one `Arc` increment for the callee), a header
+// compare on the receiver, memoized answers to every per-callee question, a
+// relaxed counter for tier-up, and a verbatim `CompactValue` transfer of the
+// arguments into the callee's locals. Anything it cannot prove verbatim
+// returns `None` with the operand stack untouched, and the general dispatcher
+// runs exactly as before.
+//
+// What it declines, so the general path keeps owning it: a null or
+// non-object receiver (the helpful NPE), a polymorphic receiver (the poly
+// cache), lambda and annotation proxies, an interface site whose receiver
+// selection is not yet memoized, a synchronized callee, a callee with a
+// registered native or a non-zero intercept shape, a `java.util` receiver's
+// tier-up, a callee with an exception table or more than eight parameters,
+// any argument whose slot is not already in the exact representation the
+// callee's locals want (unmarked category-2, `Int(0)`-as-null, ...), a full
+// frame stack, a virtual thread, PGO profiling, and every invoke diagnostic.
+//
+// Kill switch: `CRATONVM_JIT_NO_INVOKE_FAST_DOOR=1`. Engagement:
+// `CRATONVM_DBG=invokestats` counts these hits with the cache hits.
+
+/// See the module note above `execute_invokevirtual_fast_door`.
+#[inline]
+pub(super) fn execute_invokevirtual_fast_door(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    cp_index: u16,
+    is_interface: bool,
+    fast_field: Option<&cratonvm_gc::zgc::ZgcRealHeap>,
+) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    use std::sync::atomic::Ordering;
+    if crate::classloading::any_class_redefined() {
+        return None;
+    }
+    if crate::runtime::env_cache::loader_aware_resolution() && adapt_isin_seen() {
+        return None;
+    }
+    let caller_class_id = thread.frames[frame_idx].class_id;
+    let (receiver_class_id, cached, gate_generation) =
+        match thread.invoke_cache.get(caller_class_id, cp_index, false) {
+            Some(CachedInvokeTarget::VirtualBytecode {
+                receiver_class_id,
+                cached,
+                gate,
+            }) => (*receiver_class_id, Arc::clone(cached), gate.generation),
+            _ => return None,
+        };
+    if cached.is_synchronized || cached.is_static {
+        return None;
+    }
+    let num_params = cached.num_params as usize;
+    let total_args = num_params + 1;
+    let stack = &thread.frames[frame_idx].stack;
+    if stack.len() < total_args {
+        return None;
+    }
+    let Some(recv_ptr) = stack.peek_compact_at(num_params).as_object_ptr() else {
+        return None;
+    };
+    if shared
+        .mem
+        .heap
+        .is_object_address(recv_ptr as usize)
+        .is_none()
+    {
+        return None;
+    }
+    // SAFETY: `recv_ptr` is a registered object start on this heap.
+    let header = unsafe { &*(recv_ptr as *const cratonvm_gc::ObjectHeader) };
+    if header.kind() == cratonvm_types::ObjectKind::Array {
+        return None;
+    }
+    let actual_class_id = header.class_id;
+    if actual_class_id != receiver_class_id {
+        return None;
+    }
+    if shared.classes.is_lambda_proxy_class(actual_class_id)
+        || shared.classes.is_annotation_proxy_class(actual_class_id)
+    {
+        return None;
+    }
+    if is_interface && actual_class_id != cached.declaring_class_id {
+        let memo_hit = !iface_select_memo_disabled()
+            && thread
+                .iface_select_sites
+                .get(caller_class_id, cp_index)
+                .is_some_and(|&(recv, decl)| {
+                    recv == actual_class_id && decl == cached.declaring_class_id
+                });
+        if !memo_hit {
+            return None;
+        }
+        site_stats::bump(site_stats::IFACE_SELECT_HIT);
+    } else if is_interface {
+        site_stats::bump(site_stats::IFACE_SELECT_TRIVIAL);
+    }
+    // Every question the interception chain asks is a constant of the callee.
+    let shape = *cached.intercept_shape_cache.get_or_init(|| {
+        intercept_shape_of(
+            cached.class_name.as_ref(),
+            cached.method_name.as_ref(),
+            cached.method_descriptor.as_ref(),
+        )
+    });
+    if shape != 0 {
+        return None;
+    }
+    // `force_native_cache` is filled by the general path; until it has
+    // answered `false` once, or if it answered `true`, this is not our call.
+    if cached.force_native_cache.get() != Some(&false) {
+        return None;
+    }
+    if thread.frames.len() >= shared.config.max_stack_depth {
+        return None;
+    }
+    if cratonvm_jit_api::descriptor_facts_disabled() {
+        return None;
+    }
+    let facts = cached.descriptor_facts();
+    if facts.param_tags_overflow
+        || num_params > cratonvm_jit_api::DescriptorFacts::INLINE_PARAMS
+        || facts.param_tag_len as usize != num_params
+    {
+        return None;
+    }
+    dbg_invoke_stats_record(0);
+
+    // Trivial instance getter (`aload_0; getfield; xreturn`): answer from the
+    // quickened field site of the getter's own class without a frame, the
+    // way `try_execute_cached_trivial_instance_getter` does without locks.
+    if num_params == 0 {
+        if let Some(zgc) = fast_field {
+            let code = &cached.code;
+            if code.len() == 7
+                && code[0] == 0x2a
+                && code[1] == 0xb4
+                && crate::runtime::env_cache::trivial_getter_fast_path()
+                && !crate::runtime::jvmti::any_method_entry_listener_active()
+                && !crate::runtime::jvmti::any_method_exit_listener_active()
+            {
+                let field_cp = u16::from_be_bytes([code[2], code[3]]);
+                let ret_opcode = code[4];
+                let declaring = cached.declaring_class_id;
+                let frame = &mut thread.frames[frame_idx];
+                if field_fast::getfield_fast_keyed(
+                    shared,
+                    zgc,
+                    &mut thread.fast_field_sites,
+                    &mut frame.stack,
+                    declaring,
+                    field_cp,
+                    ret_opcode,
+                ) {
+                    return Some(Ok(CachedCallResult::Handled));
+                }
+            }
+        }
+    }
+
+    // Tier-up: the same gate as the general path, with the two per-call
+    // questions it used to answer with a registry probe and a class-manager
+    // read lock replaced by the `NativeCallSite` memo and the `java/util/`
+    // bitmap, and the counter kept on the callee.
+    let mut compiled_call: Option<cratonvm_jit::RetainedCode> = None;
+    if gate_generation == 0
+        && !crate::runtime::env_cache::disable_jit()
+        && cached.exception_table.is_empty()
+        && crate::runtime::env_cache::jit_virtual_tierup()
+    {
+        let has_native = cached
+            .native_call_site()
+            .resolve(
+                &shared.natives.native_methods,
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            )
+            .is_some();
+        let java_util = match crate::classloading::class_is_java_util(receiver_class_id) {
+            Some(b) => b,
+            None => return None,
+        };
+        if !has_native && !java_util {
+            let jit_generation = cratonvm_jit::jit_cache_generation();
+            let found = if cached.jit_probe_is_current(jit_generation) {
+                None
+            } else {
+                let found = shared.jit.jit_cache.read().get(
+                    &cached.class_name,
+                    &cached.method_name,
+                    &cached.method_descriptor,
+                    cached.declaring_class_id,
+                );
+                if found.is_none() {
+                    cached.record_jit_probe_miss(jit_generation);
+                }
+                found.map(cratonvm_jit::RetainedCode::new)
+            };
+            compiled_call = match found {
+                Some(c) => Some(c),
+                None => {
+                    const JIT_RETRY_STRIDE: u32 = 64;
+                    // The profile store is credited in batches of this size,
+                    // so the census still sees every call.
+                    const SYNC_EVERY: u32 = 16;
+                    let threshold = crate::runtime::env_cache::jit_invocation_threshold();
+                    let cnt = cached.interp_invocations.fetch_add(1, Ordering::Relaxed) + 1;
+                    if cnt % SYNC_EVERY == 0 {
+                        shared
+                            .jit
+                            .profile_store
+                            .add_invocations(cached.invoc_key(), SYNC_EVERY);
+                    }
+                    let should_attempt = cnt >= threshold
+                        && (cnt == threshold || (cnt - threshold) % JIT_RETRY_STRIDE == 0);
+                    let mut upgraded = None;
+                    if should_attempt {
+                        if crate::runtime::env_cache::bg_compile() {
+                            ensure_bg_compiler_started(shared);
+                            let tiered_key = crate::jit::tiered::MethodKey::new(
+                                cached.class_name.as_ref(),
+                                cached.method_name.as_ref(),
+                                cached.method_descriptor.as_ref(),
+                            );
+                            let _ = shared
+                                .jit
+                                .tiered_manager
+                                .on_method_invocation_observed(&tiered_key, cnt as u64);
+                        } else {
+                            let gate = match thread.invoke_cache.get(caller_class_id, cp_index, false)
+                            {
+                                Some(CachedInvokeTarget::VirtualBytecode { gate, .. }) => {
+                                    gate.clone()
+                                }
+                                _ => return None,
+                            };
+                            if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
+                                try_jit_upgrade_with_gate(shared, &cached, gate)
+                            {
+                                upgraded = Some(compiled);
+                            }
+                        }
+                    }
+                    upgraded
+                }
+            };
+        }
+    }
+
+    if let Some(compiled) = compiled_call {
+        // Compiled callee: the direct call wants `Value` arguments, so this
+        // is the one shape that still decodes them.
+        const MAX_INLINE_ARGS: usize = 16;
+        if total_args > MAX_INLINE_ARGS {
+            return None;
+        }
+        let param_tags = ParamTags::for_method(&cached);
+        let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
+        {
+            let frame = &mut thread.frames[frame_idx];
+            for i in (0..total_args).rev() {
+                let tag = param_tags.get_with_receiver(&cached.method_descriptor, i);
+                args_buf[i] = match frame.stack.pop_arg_for_descriptor_checked(tag) {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(MethodCallFailed::from(e))),
+                };
+            }
+        }
+        let args_slice = &mut args_buf[..total_args];
+        refresh_stale_object_args(shared, args_slice);
+        let ret = cached.return_tag();
+        let heap = compiled.needs_heap();
+        match execute_jit_call_decoded(
+            shared,
+            thread,
+            frame_idx,
+            &compiled,
+            total_args as u16, // Cast: small param count
+            ret,
+            heap,
+            &cached,
+            args_slice,
+        ) {
+            Ok(Some(ccr)) => return Some(Ok(ccr)),
+            Ok(None) => {}
+            Err(e) => return Some(Err(e)),
+        }
+        thread.refill_pools_from_shared(
+            &shared.mem.operand_stack_pool,
+            &shared.mem.tag_pool,
+            cached.max_locals as usize,
+            (cached.max_stack as usize).max(16) + 8,
+        );
+        let frame = Frame::new_pooled_cached(
+            cached,
+            args_slice,
+            &mut thread.locals_pool,
+            &mut thread.stacks_pool,
+        );
+        push_frame_and_fire_entry(shared.vm_identity, thread, frame);
+        return Some(Ok(CachedCallResult::FramePushed));
+    }
+
+    // Verbatim argument transfer: validate every slot against the descriptor
+    // first, commit the pop only once all of them are in the representation
+    // the callee's locals want.
+    let mut slots = [(CompactValue::null(), b'L'); cratonvm_jit_api::DescriptorFacts::INLINE_PARAMS + 1];
+    {
+        let stack = &thread.frames[frame_idx].stack;
+        for i in 0..total_args {
+            let depth = total_args - 1 - i;
+            let (cv, kind) = stack.peek_with_kind_at(depth);
+            let tag = if i == 0 { b'L' } else { facts.param_tags[i - 1] };
+            let ok = match tag {
+                b'L' | b'[' => cv.is_object() || cv.is_null(),
+                b'J' => kind == crate::runtime::ValueStack::KIND_MARK_LONG,
+                b'D' => kind == crate::runtime::ValueStack::KIND_MARK_DOUBLE,
+                b'F' => cv.as_float().is_some(),
+                b'I' | b'Z' | b'B' | b'C' | b'S' => cv.as_int().is_some(),
+                _ => false,
+            };
+            if !ok {
+                return None;
+            }
+            slots[i] = (cv, tag);
+        }
+    }
+    thread.frames[frame_idx].stack.discard_top(total_args);
+    thread.refill_pools_from_shared(
+        &shared.mem.operand_stack_pool,
+        &shared.mem.tag_pool,
+        cached.max_locals as usize,
+        (cached.max_stack as usize).max(16) + 8,
+    );
+    let frame = Frame::new_pooled_cached_compact(
+        cached,
+        &slots[..total_args],
+        &mut thread.locals_pool,
+        &mut thread.stacks_pool,
+    );
+    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
+    Some(Ok(CachedCallResult::FramePushed))
 }

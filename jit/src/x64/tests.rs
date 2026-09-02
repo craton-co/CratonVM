@@ -694,6 +694,7 @@ fn test_helpers() -> JitRuntimeHelpers {
         // tests below build their own table and wire their own helper.
         g1_barrier_addr: 0,
         g1_post_write_barrier: 0,
+        ref_store_post_skip_mask: 0,
     }
 }
 
@@ -16918,4 +16919,77 @@ fn the_containment_compare_narrows_its_displacement_and_knows_the_two_base_cases
         bytes(&|c| c.emit_cmp_r64_mem_disp(RAX, R13, 0)),
         vec![0x49, 0x3B, 0x45, 0x00],
     );
+}
+
+/// The two post-barrier gate shapes are mutually exclusive, and a plan that
+/// supplies neither (or both) is declined.
+///
+/// The mask shape exists because the age FLOOR cannot express the generational
+/// collector's question. Its `write_barrier` cards a store only when the
+/// receiver is in the old generation, which is `GC_FLAG_OLD_GEN` — a bit in the
+/// flags nibble of the same byte the floor compares. The two do not order: an
+/// object allocated straight into old gen has `gc_age == 0`, so its flags byte
+/// is `0x01`, BELOW the age-zero floor `0x10`, while a young object that has
+/// survived three collections is `0x30`, above it. A single unsigned threshold
+/// would therefore have told compiled code to skip the card on exactly the
+/// receivers that need one — so publishing both shapes at once is refused
+/// rather than silently preferring one.
+#[test]
+fn a_ref_store_plan_publishes_exactly_one_post_barrier_shape() {
+    let mut helpers = test_helpers();
+    helpers.ref_store_pre_gate = 0x1000;
+    helpers.ref_store_post_gate = 0x1008;
+
+    let gates = |h: &JitRuntimeHelpers| {
+        (
+            super::objects::ref_store_gates_of(h).is_some(),
+            super::objects::ref_store_post_skip_mask_of(h),
+        )
+    };
+
+    // Neither shape: nothing can rule the post barrier out.
+    helpers.ref_store_post_young_floor = 0;
+    helpers.ref_store_post_skip_mask = 0;
+    assert_eq!(gates(&helpers), (false, None), "neither shape");
+
+    // Floor only — ZGC's shape.
+    helpers.ref_store_post_young_floor = 0x1010;
+    helpers.ref_store_post_skip_mask = 0;
+    assert_eq!(gates(&helpers), (true, None), "floor only");
+
+    // Mask only — the generational collector's shape.
+    helpers.ref_store_post_young_floor = 0;
+    helpers.ref_store_post_skip_mask = usize::from(cratonvm_types::GC_FLAG_OLD_GEN);
+    assert_eq!(
+        gates(&helpers),
+        (true, Some(cratonvm_types::GC_FLAG_OLD_GEN)),
+        "mask only",
+    );
+
+    // Both: refused. Two independent skips for one question, and for a mask
+    // publisher the floor is not merely redundant but wrong.
+    helpers.ref_store_post_young_floor = 0x1010;
+    helpers.ref_store_post_skip_mask = usize::from(cratonvm_types::GC_FLAG_OLD_GEN);
+    assert_eq!(gates(&helpers).0, false, "both shapes");
+}
+
+/// The exact numbers behind that refusal, as a statement about the flags byte
+/// rather than about the emitter: an old-gen receiver can sit BELOW the
+/// age-zero floor, so no unsigned threshold separates old from young.
+#[test]
+fn no_age_floor_can_separate_an_old_gen_receiver_from_a_young_one() {
+    let flags_byte = |age: u8, flags: u8| (age << 4) | flags;
+    // Allocated straight into old gen: age 0, and it NEEDS a card.
+    let old_new = flags_byte(0, cratonvm_types::GC_FLAG_OLD_GEN);
+    // Survived three collections, still young: it needs none.
+    let young_old = flags_byte(3, 0);
+    assert!(
+        old_new < young_old,
+        "the receiver that needs a card ({old_new:#04x}) sorts BELOW one that \
+         does not ({young_old:#04x}) — which is why the floor shape cannot be \
+         used here, and the mask can",
+    );
+    // The mask answers both correctly.
+    assert_ne!(old_new & cratonvm_types::GC_FLAG_OLD_GEN, 0);
+    assert_eq!(young_old & cratonvm_types::GC_FLAG_OLD_GEN, 0);
 }

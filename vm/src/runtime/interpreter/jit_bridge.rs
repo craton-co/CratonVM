@@ -1887,6 +1887,60 @@ pub(super) fn compile_osr_artifact(
                     }
                     // ===== INTRINSIC REGION END: ATOMIC_LONG =====
 
+                    // ===== INTRINSIC REGION BEGIN: BOX_UNBOX =====
+                    // `Long.longValue()` / `Integer.intValue()` emitted INLINE.
+                    //
+                    // Deliberately placed BEFORE the two thin direct binds
+                    // below, which recognise the same two triples: whichever
+                    // arm runs first `continue`s, so this ordering is what
+                    // decides that the site gets an inline `MOV` rather than a
+                    // CALL. The binds stay as the fallback for a site whose
+                    // receiver class id does not resolve.
+                    //
+                    // THIS is the load-bearing door for the workload that
+                    // motivates the intrinsic, and the reason it is not enough
+                    // to add it to `try_compile` alone. An autoboxed counter
+                    // lives in a LOOP BODY — `probes/BlobStreamCostCpu.java`'s
+                    // `boxed Long counter` arm is `if (count > 0) { count--; }`
+                    // — and a loop body is what OSR compiles: that probe
+                    // reports `osr_entered=51` against `method-entry:
+                    // admitted=2`. A single-pass-only intrinsic would report
+                    // sites and move nothing, which is the exact failure the
+                    // `VarHandle` bind below records for itself.
+                    if invoke_kind == 0
+                        && (target_class == "java/lang/Long" || target_class == "java/lang/Integer")
+                    {
+                        let box_cid = shared
+                            .classes
+                            .class_manager
+                            .read()
+                            .find_bootstrap_class_by_name(&target_class)
+                            .map(|id| id.as_u32());
+                        if let Some((entry, num_params, ret, guard_class_id)) =
+                            box_cid.and_then(|cid| {
+                                cratonvm_jit::try_resolve_box_unbox_intrinsic(
+                                    &target_class,
+                                    &mn,
+                                    &desc,
+                                    cid,
+                                )
+                            })
+                        {
+                            direct_calls2.push((
+                                pc,
+                                crate::jit::JitDirectCall {
+                                    entry,
+                                    needs_context: false,
+                                    num_params,
+                                    return_type: ret,
+                                    guard_class_id,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+                    // ===== INTRINSIC REGION END: BOX_UNBOX =====
+
                     // `Integer.intValue()` thin direct call — `Integer` is
                     // `final`, so a site declared against it is statically
                     // monomorphic (guard-free); the helper handles the
@@ -5649,6 +5703,7 @@ pub(super) fn try_jit_upgrade_with_gate(
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -7122,6 +7177,7 @@ pub(super) fn try_jit_compile_callee_slow(
         force_native_cache: std::sync::OnceLock::new(),
         descriptor_facts_cache: std::sync::OnceLock::new(),
         intercept_shape_cache: std::sync::OnceLock::new(),
+        interp_invocations: std::sync::atomic::AtomicU32::new(0),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),

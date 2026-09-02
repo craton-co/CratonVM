@@ -3232,15 +3232,19 @@ pub mod dispatch_timing {
     }
 
     pub fn report() {
+        // The bridge's own engagement census, BEFORE the `calls == 0` gate:
+        // both lines are self-gating (silent for a run with no GPU work) and
+        // both count the `--gpu` auto-offload path, which never goes through
+        // `submitMethod` and so never moves `CALLS`. Until 2026-09-02 they sat
+        // behind the gate, so a transfer-floor or dot-product soak under
+        // `--gpu` printed no census at all -- a run whose pool served nothing
+        // read as a clean run.
+        cratonvm_types::gpu_event_census::exit_summary();
+        cratonvm_types::gpu_dispatch_memo_census::exit_summary();
         let calls = CALLS.load(Ordering::Relaxed);
         if calls == 0 {
             return;
         }
-        // The bridge's own engagement census, printed first because it is
-        // what says whether the two per-launch driver-call savings below
-        // are being served at all.
-        cratonvm_types::gpu_event_census::exit_summary();
-        cratonvm_types::gpu_dispatch_memo_census::exit_summary();
         let total: u64 = NANOS.iter().map(|n| n.load(Ordering::Relaxed)).sum();
         eprintln!(
             "[cratonvm] gpu dispatch: calls={calls} accounted={:.1} us/call",
