@@ -1121,14 +1121,31 @@ impl Compiler {
             // invalidated by relocation: an array's length is immutable and
             // no bytecode can write it.
             {
-                let len_hoists: Vec<(usize, i32)> = self
+                // The third element is the bci this hoisted check reports when
+                // it traps. The check no longer stands where the programmer
+                // wrote it, so it has to name a site explicitly: the FIRST
+                // `arraylength` of the hoist (`seq_end - 1`, one before the
+                // one-past-the-end recorded by `ArrayLenHoist::sites`), which
+                // is the site that would have trapped first had nothing moved.
+                // A hoist with no sites cannot happen -- LICM builds the record
+                // from them -- but falling back to the loop header keeps a bci
+                // in this method rather than none at all.
+                let len_hoists: Vec<(usize, i32, usize)> = self
                     .array_len_hoist_info
                     .iter()
                     .enumerate()
                     .filter(|(_, h)| h.loop_header == pc)
-                    .map(|(idx, h)| (h.array_local, self.array_len_hoist_offsets[idx]))
+                    .map(|(idx, h)| {
+                        (
+                            h.array_local,
+                            self.array_len_hoist_offsets[idx],
+                            h.sites
+                                .first()
+                                .map_or(h.loop_header, |&(_, seq_end)| seq_end - 1),
+                        )
+                    })
                     .collect();
-                for (array_local, hoist_offset) in len_hoists {
+                for (array_local, hoist_offset, trap_bci) in len_hoists {
                     // Array reference into RAX.
                     if let Some(reg) = self.reg_for_local(array_local) {
                         self.emit_mov_reg_reg(RAX, reg);
@@ -1140,7 +1157,8 @@ impl Compiler {
                     // action. It is elided outright when the dataflow already
                     // proves the receiver non-null at the header.
                     if !self.is_local_nonnull(pc, array_local) {
-                        self.emit_null_check_array_load(npe_action::ARRAY_LENGTH);
+                        let key = crate::x64::inlining::record_npe_trap_site(trap_bci);
+                        self.emit_null_check_array_load(npe_action::ARRAY_LENGTH, key);
                     }
                     // MOV EAX, [RAX + array length offset] -- zero-extends into
                     // RAX, and a length is non-negative, so the 64-bit slot

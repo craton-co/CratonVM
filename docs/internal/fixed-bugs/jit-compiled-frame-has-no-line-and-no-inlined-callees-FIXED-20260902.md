@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | **CLOSED 2026-09-02.** Five defects fixed; all seven residuals the 2026-09-01 page left open are closed — five by code, one by a proof that it is unreachable, one because it was stale when it was written. Two further defects were found by measuring the closure and are fixed here. Opened 2026-09-01 on `dev` @ `56d6c3722`, re-scoped the same day; residuals closed on `fix/stacktrace-residuals-20260902`, measured 2026-09-02 on that branch merged with `origin/dev` @ `9874c587e`. |
+| **Status** | **CLOSED 2026-09-02.** Five defects fixed; all seven residuals the 2026-09-01 page left open are closed — five by code, one by a proof that it is unreachable, one because it was stale when it was written. Two further defects were found by measuring the closure and are fixed here. Opened 2026-09-01 on `dev` @ `56d6c3722`, re-scoped the same day; residuals closed on `fix/stacktrace-residuals-20260902`, measured 2026-09-02 on that branch merged with `origin/dev` @ `001acd84f`. |
 | **Symptom** | A stack trace captured after warm-up lost frames, printed `-1` for the line of a compiled frame, and reported the OSR back-edge instead of the real call site. Cold traces were correct. Nothing threw and nothing logged. |
 | **Cause** | Five independent defects with one habit under them: *a program point that was already recorded somewhere was not carried to the one consumer that wanted it.* The bci was in the frame's safepoint-id slot; the inlined callees were known to the splicer; the OSR continuation was known to the entry site; the trapping bci was in the emitter's hand; the callee's `ClassId` was in the resolver's hand. Each was dropped one function short of the walk. |
 | **Fix** | Carry each of them — plus the one thing that was genuinely absent: a translation from the optimizing tier's safepoint COUNTER to a bytecode index. |
@@ -75,9 +75,12 @@ class-file, `LineNumberTable` or resolution problem.
 ## The residual round, measured
 
 2026-09-02, x86-64 **Linux**, release (`opt-level=3`, fat LTO), JDK 25, real-JDK
-mode, on the branch AFTER merging `origin/dev` — 38 commits had landed under it
-while this was being written, and a measurement on the pre-merge tree would have
-been a measurement of a tree nobody is going to run.
+mode, on the branch AFTER merging `origin/dev` — and re-taken after merging it a
+second time, because 111 more commits landed while this was being written. A
+measurement on the pre-merge tree would have been a measurement of a tree nobody
+is going to run, and the second merge is what makes that concrete: it broke the
+build (below), so the first round's binary and the shipped one are not the same
+program.
 
 ### Both witnesses, 30 runs each
 
@@ -163,6 +166,26 @@ Three things it says that nothing else could:
 other: the exact return-address key is being spent where there is a splice to
 spend it on, and nowhere else.
 
+### The second merge broke the build, in the one place this page touches
+
+`emit_null_check_array_load` grew a `trap_key` parameter here. Between the first
+merge and the second, dev's LICM gained a **hoisted** `arraylength` null check —
+a fourth call site of that method, in `bytecode_walk.rs`, written against the old
+signature. Git merged both hunks without a conflict and the tree did not compile:
+a textual merge cannot see a signature it never read.
+
+The fix is not `0`. A hoisted check no longer stands where the programmer wrote
+it, so it has to name a site explicitly, and the honest one is the **first**
+`arraylength` of the hoist (`sites[0].1 - 1`) — the site that would have trapped
+first had nothing moved. Passing `0` would have compiled, passed every test on
+this page, and printed `Method:-1` for exactly the loops LICM optimises, which is
+the failure mode this whole page is about.
+
+That is the fourth time the same shape has appeared here: a behaviour reached
+through more doors than the first patch found. The others are the three compile
+doors, the three inline-frame consumers, and the four throwable constructors of
+defect (5).
+
 ### Suite
 
 `regression-suite`, full core list, output-compared against HotSpot 25.
@@ -172,7 +195,8 @@ spend it on, and nowhere else.
   weakened to `p > 0 || p == -1`, restored here to unconditional — passes.
 * On the branch **after** the merge: **82 of 85 passed, 3 failed** —
   `RMapGcStress`, `RJdkIntrinsics3`, `RBufferPoolCount`. `RJitStackTraceLines`
-  still passes.
+  still passes. The same 82/85, with the same three names, on the binary built
+  after the second merge.
 
 The three are not this branch's. Two independent arms say so:
 
