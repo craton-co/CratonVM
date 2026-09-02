@@ -721,6 +721,41 @@ pub struct GcFlags {
     /// `CRATONVM_CARD_TABLE_ONLY` — restrict old→young discovery to the card
     /// table.
     pub card_table_only: bool,
+    /// `CRATONVM_GC_FULL_RSET_SCAN` -- restore the whole-old-generation
+    /// old->young walk on every young collection.
+    ///
+    /// **Default OFF since 2026-09-02** (gc-genpause F2); it was the DEFAULT
+    /// behaviour before that, reached by the absence of
+    /// [`Self::card_table_only`].
+    ///
+    /// What it turns back on is `scan_all_old_to_young` -- a full
+    /// `OldGen::walk_objects()` (which materialises a `Vec` of every tenured
+    /// object) scanning every reference slot of every one of them, AFTER the
+    /// dirty-card scan has already answered the same question. It made young
+    /// pause time grow permanently with old-generation size: measured at
+    /// 41-61 ms of a ~229 ms steady-state pause on a heap whose old generation
+    /// held no old->young edges at all.
+    ///
+    /// It was a standing insurance premium against a missed write barrier, and
+    /// what replaces it is [`Self::verify_rset`] -- the same insurance as a
+    /// verifier you can run, rather than a tax every collection pays. This
+    /// flag is the revert lever: set it if a premature-reclamation defect is
+    /// suspected and you want the old belt-and-braces seeding back.
+    pub full_rset_scan: bool,
+    /// `CRATONVM_GC_VERIFY_RSET` -- after each young collection's old->young
+    /// seeding, walk the whole old generation and report every edge the card
+    /// table did NOT deliver, as `[rset-verify] edges=N missing=M`.
+    ///
+    /// The generational twin of G1's `CRATONVM_G1_DBG_RSET`, and for the same
+    /// reason: a remembered set that is trusted needs a way to be checked, and
+    /// a checker whose output cannot distinguish "nothing missing" from "never
+    /// looked" is worthless -- so it prints the edge count it verified beside
+    /// the misses, and a run that seeded no edges says so.
+    ///
+    /// Costs a full old-gen walk per young collection, which is exactly the
+    /// cost [`Self::full_rset_scan`] used to pay unconditionally. That is the
+    /// trade: pay it while you are auditing, not forever.
+    pub verify_rset: bool,
     /// `CRATONVM_OLD_SWEEP_JIT` — default **ON** opt-out for the old-gen
     /// non-moving sweep. [`parse::on_unless_zero`].
     pub old_sweep_jit: bool,
@@ -1363,6 +1398,8 @@ impl GcFlags {
             sp_no_coalesce: present(src, "CRATONVM_SP_NO_COALESCE"),
             no_defrag_promote: present(src, "CRATONVM_NO_DEFRAG_PROMOTE"),
             card_table_only: present(src, "CRATONVM_CARD_TABLE_ONLY"),
+            full_rset_scan: present(src, "CRATONVM_GC_FULL_RSET_SCAN"),
+            verify_rset: present(src, "CRATONVM_GC_VERIFY_RSET"),
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
             g1_parallel_evac_in_jit: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC_IN_JIT"),

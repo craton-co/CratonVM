@@ -44,6 +44,10 @@ pub mod native_ring;
 /// Receiver classes no supported JDK image declares — the measured table that
 /// decides which `Bridge` registrations are `SyntheticStub` by §1.5.
 pub mod no_image_receiver;
+/// What the HOST says its text encoding is: `native.encoding`,
+/// `sun.jnu.encoding` and the three stream encodings, which JEP 400 did NOT
+/// pin to UTF-8 (only `file.encoding`).
+pub mod os_encoding;
 pub mod poly_call_site;
 /// Where an absorbed failure is **recorded** — `PrintStream`/`PrintWriter`'s
 /// `trouble` flag (read back by `checkError()`) and a `Handler`'s

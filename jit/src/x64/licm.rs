@@ -7465,3 +7465,94 @@ mod loop_xform_tests {
         );
     }
 }
+
+/// Gated inline reference stores — **default ON**, opt out with
+/// `CRATONVM_JIT_GATED_REF_STORE=0`.
+///
+/// The switch exists so the change can be A/B'd in ONE binary, which the
+/// feature it replaces could not be: `CRATONVM_NO_JIT_INLINE_PUTFIELD` measured
+/// exactly zero on the default collector, because the path it disabled was
+/// already unreachable there (`region_bounds_are_live` is false under G1 and
+/// ZGC, so every receiver fell through six containment compares into the
+/// helper). A kill switch that cannot change a number is not a lever.
+///
+/// Turning this off restores that behaviour exactly — the store takes
+/// `jit_putfield_object`, with its full SATB pre-barrier and the collector's
+/// own post barrier — so the off arm is a supported configuration, not a
+/// broken one.
+pub fn gated_ref_store_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_GATED_REF_STORE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// The deferred operand-stack register cache for **every** method rather than
+/// only for call-free pure kernels — `CRATONVM_JIT_OPERAND_CACHE=1`, default
+/// **OFF**, and this comment is mostly about why.
+///
+/// # What the veto costs today
+///
+/// `push_from_rax` parks a pushed value in a scratch register instead of
+/// storing it to the frame, so a value consumed by the next bytecode never
+/// makes the memory round trip. It is gated on `pure_kernel`: no invokes, no
+/// MIC/PIC or indy sites, no field or static-field ops, no allocation, no array
+/// allocation, no typechecks, no inline sites, no speculative BCE guards. One
+/// `getfield` anywhere in a method turns it off for the whole method, so it
+/// never engages on application code — every operand-stack push is a frame
+/// store and every pop a frame load.
+///
+/// # Why the obvious widening is WRONG, stated exactly
+///
+/// The comment at that gate blamed "the broad R8/R9 experiment regressed
+/// call-heavy methods because each call flushed live scratch values". That
+/// reads as a cost argument and is not one: a flush emits the store the frame
+/// push would have emitted anyway, only later.
+///
+/// The real blocker is a register collision. `SCRATCH_REGS` is `[R8, R9]` and
+/// `ARG_REGS` is `[RCX, RDX, R8, R9]` on Win64, `[RDI, RSI, RDX, RCX, R8, R9]`
+/// on System V — **R8 and R9 are argument registers on both**. Every helper
+/// call marshalling three arguments writes R8; four writes R9. Only sites that
+/// call `flush_scratch_registers` first are safe, and the emitter has far more
+/// `emit_call_absolute` sites than flush sites: the checked getfield helper,
+/// `jit_putfield_object`, the TLAB post-init, the write barrier and the
+/// inline-cache slow path all marshal into ARG_REGS without one. Under
+/// `pure_kernel` none of them is reachable, which is why the collision has
+/// never mattered.
+///
+/// Turning this on without that audit produces wrong code, measurably: with it
+/// default-on, `test_compile_fib` returned 20 for `fib(10)` and
+/// `test_getfield_putfield_roundtrip` returned garbage.
+///
+/// # What it would take
+///
+/// Either an audit that puts a flush in front of every ARG_REGS write, or a
+/// scratch pair that is not an argument register. There is no free caller-saved
+/// GPR pair on either ABI — RAX is the accumulator, R10 belongs to bounds
+/// checks and SIMD, R11 stages call targets — so the second route means
+/// callee-saved registers, which are already `LOCAL_REGS` and would need
+/// prologue save/restore and a GC-map story of their own. Neither is a flag
+/// flip, and this flag exists so that whoever does the work can measure the
+/// two arms in one binary.
+///
+/// **The frame-growth defect this was blamed for is fixed independently** and
+/// is not gated here: `StackSlot::Scratch` now carries the home word its push
+/// reserved, and `flush_scratch_registers` stores into that instead of
+/// reserving another. Before, a straight-line stretch with several calls
+/// reserved a fresh word at every flush and grew the spill region until it hit
+/// `spill-range-exhausted`. Pure kernels get that fix today, and it is the
+/// prerequisite that would make any future widening bounded.
+pub fn operand_cache_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_OPERAND_CACHE").as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        )
+    })
+}

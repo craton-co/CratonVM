@@ -75,10 +75,28 @@ pub mod a2dbg;
 pub mod arena;
 // The ONE implementation of "a non-reference value was stored into a slot the
 // class declares as a reference" (W7-84-primitive-in-reference-store.md).
-// Crate-private on purpose: it exists so `gen_heap`, `zgc`, `g1` and `heap`
-// cannot drift apart again, and a public re-export would invite a fifth
-// caller with a fifth opinion.
-mod autobox;
+//
+// The STORE and READ primitives -- `box_for_reference_slot`,
+// `unbox_reference_slot`, `needs_reference_box` -- are still `pub(crate)`, and
+// for exactly the original reason: the module exists so `gen_heap`, `zgc`,
+// `g1` and `heap` cannot drift apart again, and exporting the boxing primitive
+// would invite a fifth caller with a fifth opinion. Nothing outside this crate
+// can reach them, and `gc/tests/primitive_in_reference_slot.rs`'s ratchet still
+// pins that exactly four files call them.
+//
+// The MODULE became `pub` on 2026-09-01 for three items that are not stores at
+// all -- `expect_primitive_into_reference`, `ExpectedPrimitiveIntoReference`
+// and `expected_primitive_into_reference_count`. They exist so ONE known
+// producer, `vm/src/vm/vm_object.rs`'s class-mirror populator, can declare its
+// two deliberate `ClassId`-over-`java.lang.Class.cachedConstructor` writes
+// EXPECTED, instead of the W7-84 guard spending its entire default-run
+// rate-limit budget reporting the VM to itself (~33 stores, ~12 stderr WARN
+// lines, on a hello-world -- so a genuine third-party store arrived after the
+// limiter was already spent). A `pub use` re-export here would have worked
+// equally well; `pub mod` was chosen because the module doc is where a reader
+// has to end up anyway to learn what the scope means, and a re-export hides
+// that path.
+pub mod autobox;
 pub mod blocked_access_debug;
 pub mod card_table;
 pub mod class_unloading;
@@ -166,9 +184,12 @@ pub use gc_metrics::{
     collector_decision_report, gc_metrics_report, CollectorDecision, GcMetricsRaw, GcMetricsReport,
 };
 pub use gen_heap::{
-    clear_jit_read_bounds, jit_g1_barrier_addr, jit_read_bounds_addr, jit_region_bounds_addr,
-    publish_jit_read_bounds, GenerationalHeap, HeapStats, HeapStatsSnapshot, JitG1BarrierTable,
-    JitReadBoundsTable, JitRegionBoundsTable, JIT_G1_BARRIER, JIT_READ_BOUNDS, JIT_REGION_BOUNDS,
+    clear_jit_read_bounds, clear_jit_ref_store_plan, jit_g1_barrier_addr, jit_read_bounds_addr,
+    jit_ref_store_gate_addrs, jit_region_bounds_addr, publish_jit_read_bounds,
+    publish_jit_ref_store_plan, set_jit_ref_store_post_active, set_jit_ref_store_pre_active,
+    GenerationalHeap, HeapStats, HeapStatsSnapshot, JitG1BarrierTable, JitReadBoundsTable,
+    JitRefStoreGates, JitRegionBoundsTable, JIT_G1_BARRIER, JIT_READ_BOUNDS, JIT_REF_STORE_GATES,
+    JIT_REGION_BOUNDS, JIT_YOUNG_FLOOR_AGE_ZERO,
 };
 pub use heap::{ArrayElementType, Heap, ObjectHeader, ObjectKind};
 pub use mark_bitmap::MarkBitmap;

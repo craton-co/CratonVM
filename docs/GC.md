@@ -173,6 +173,18 @@ RefCheckOld (weak/soft/finalizer protocol, young and old referents),
 SpinPoll / SpinPollMark (never-polling compiled spins vs STW + concurrent
 mark), BinaryTrees (deep recursion). Always diff against a real JDK run.
 
+Two generational remembered-set probes live in `bench/` and are ordinary
+tracked sources rather than part of the kit above:
+
+* `OldGenRsetProbe [retainedDepth] [rounds] [churnDepth]` -- a large tenured
+  set with **no** old-to-young edges, so every old-to-young scan it provokes is
+  measurable waste. This is the pause-breakdown probe.
+* `OldToYoungEdgeProbe [nodes] [rounds] [churnDepth]` -- its companion, which
+  stores freshly allocated young objects into tenured fields and then verifies
+  every one of them. This is the probe on which a card-table-only collector can
+  actually be wrong, so it is the one to run under `CRATONVM_GC_VERIFY_RSET=1`;
+  a verifier run whose `edges` is zero has tested nothing.
+
 **Diagnostics** (env-gated, in the release binary):
 
 | Switch | What it does |
@@ -196,7 +208,10 @@ mark), BinaryTrees (deep recursion). Always diff against a real JDK run.
 | `CRATONVM_DBG_GC_STRESS=<bytes>` | Force young GCs every N allocated bytes (Generational) |
 | `CRATONVM_GC_PAR_THREADS=<n>` | Generational young-GC worker count. `0`/`1` forces the sequential collector; `>= 2` forces that many workers regardless of heap size. Unset = `min(available_parallelism, 8)` once the young gen passes the size floor. `available_parallelism` follows CPU affinity, so a `taskset -c N` run is automatically sequential |
 | `CRATONVM_GC_PAR_MIN_BYTES=<bytes>` | Young-gen size floor below which the young GC stays sequential (default 16 MiB) |
-| `CRATONVM_GC_SWEEP_ANCHOR_STRIDE=<bytes>` | Byte spacing of the parallel-sweep anchors (default 8 MiB). Lower it to drive the parallel sweep on a small young gen under `CRATONVM_DBG_GC_STRESS` |
+| `CRATONVM_GC_SWEEP_ANCHOR_STRIDE=<bytes>` | Byte spacing of the parallel-sweep anchors (default 8 MiB). Also sizes the MOVING path's parallel object-start-walk chunks. Lower it to drive either on a small young gen under `CRATONVM_DBG_GC_STRESS` |
+| `CRATONVM_GC_VERIFY_RSET=1` | After each young collection's old->young seeding, walk the whole old generation and report `[rset-verify] site=.. edges=N missing=M seeded=S`. `missing > 0` names an edge the card table did not deliver, and the first one's referrer/class/slot. **Read `edges` too**: `missing=0` on a run that found no edges at all is vacuous, not clean. Costs a full old-gen walk per young GC |
+| `CRATONVM_GC_FULL_RSET_SCAN=1` | Restore the pre-2026-09-02 whole-old-generation old->young walk on every young collection. The revert lever for the default flip below; the first thing to try if a premature-reclamation defect is suspected under Generational |
+| `CRATONVM_GC_YOUNG_TRIGGER_PERCENT=<n>` | Moving young collection trigger, as a percent of from-space capacity (default 50, clamped 1..=95). Raising it collects less often and copies more survivors per cycle; see "Young sizing" below |
 
 Note: `tracing::debug!` is compiled out of release builds
 (`release_max_level_info`); for cycle-phase confirmation attach gdb to
@@ -282,6 +297,75 @@ Old gen is a free-list
 allocator collected by a VM-driven concurrent cycle (initial mark STW →
 concurrent trace → remark STW → concurrent sweep, with a remark-time
 TAMS snapshot gating the sweep).
+
+*Where a moving young pause actually goes, and the 2026-09-02 changes.*
+`CRATONVM_DBG=gcpause` reports a per-phase breakdown for the MOVING cycle.
+Before 2026-09-02, on `bench/OldGenRsetProbe 19 700 16` at `-Xmx1g`
+(medians of the 12 collections after the retained set tenures, total median
+pause 229 ms):
+
+| phase | before | after | scales with |
+|---|---:|---:|---|
+| the from-space object-start walk | 120 ms | **22-39 ms** | young *allocated* |
+| `full_old_rset_scan` -- the whole old-gen walk | 50 ms | **0 ms** | old live set |
+| `cheney_drain` -- copying the survivors | 29 ms | 32-63 ms | young *live* |
+| `cardclear+young_reset` | 23 ms | 28-52 ms | card count |
+| `scan_dirty_cards` | 8 ms | **0 ms** | old-gen size |
+| **total pause** | **229 ms** | **100-133 ms** | |
+
+Only ~12 % of a minor collection copied live objects. The two largest phases
+were O(young allocated) and O(old live set), which is the shape a generational
+collector exists to avoid. Afterwards the copy is the largest phase, and only
+6 of 14 collections still cross the 100 ms threshold `gcpause` reports at.
+Five things changed:
+
+* **The object-start walk is parallel.** It is split at the allocator's own
+  anchor grid and chunked across `young_gc_threads()` workers, each chunk
+  proved by requiring its chain to land exactly on the next anchor -- the same
+  contract the non-moving sweep's parallel walk has always had, and which the
+  MOVING (default) path did not use. Any refusal abandons the attempt
+  wholesale and the untouched sequential walk runs from scratch against a
+  FRESH bitmap, because a partially-filled one is worse than none. The walk is
+  now its own `objstart_walk` phase mark with `objstart_chunks` /
+  `objstart_parallel` counters beside it: `pre_evacuate` also covered the
+  safepoint spin and the arena locks, and a 52 % attribution to a mark that
+  wide was a hypothesis, not a measurement.
+* **The whole-old-generation scan is off by default.** It ran AFTER the
+  dirty-card scan had already answered the same question, and made young pause
+  time grow permanently with old-gen size. `CRATONVM_GC_FULL_RSET_SCAN=1`
+  restores it; `CRATONVM_GC_VERIFY_RSET=1` replaces it, running the same walk
+  as a checker that prints `edges=N missing=M` -- the shape G1 already uses for
+  its own remembered set.
+* **The card map is no longer scanned with atomic RMWs.** `take_dirty_cards`
+  used `swap(AcqRel)` on every card byte and `clear_all` stored over every byte
+  again: two O(cards) locked passes per cycle, ~8.3 ns/card, measured linear
+  from 98 K to 1 M cards while finding nothing. Both now read first (`Acquire`,
+  a plain `mov`) and write only the bytes that are genuinely dirty.
+* **The write barrier marks the card directly.** The interpreter/native
+  barrier went through a TLS lookup, an `Arc`, a `parking_lot::Mutex` and a
+  growable `Vec` per reference store, with no deduplication; it now performs
+  the same conditional byte store the JIT's inline barrier emits, so there is
+  one card-marking rule in the VM instead of two.
+* **The compiled reference store is NOT part of this batch.** An inline SATB
+  gate was written for it here and then withdrawn: `ref_store_pre_gate` (helper
+  ABI v10) had landed on dev first and is a strict superset -- it gates the
+  post barrier and a young-age floor as well, and does not require the field's
+  old value to be null. Shipping a second mechanism into the same emitter is
+  how `region_bounds_addr` came to mean two things at once. Note that those
+  gates are published by ZGC only: `ref_store_gates()` requires all three
+  slots and Generational cannot express its post-barrier as an age floor (it
+  keys on `GC_FLAG_OLD_GEN`, a mask test), so under `-XX:+UseGenerationalGC`
+  every compiled reference store still pays the helper call. Closing that is
+  its own piece of work.
+
+*Young sizing.* `CRATONVM_GC_YOUNG_TRIGGER_PERCENT` (default 50) is the
+percentage of from-space occupancy that triggers a moving collection. The 50 %
+is documented as leaving room for survivors, but to-space has the SAME capacity
+as from-space and promotion drains to old gen on top of that, so the copying
+collector's real constraint permits considerably more. Raising it collects less
+often and copies more survivors per cycle; which effect wins is a property of
+the workload's survival rate, which is why this ships as a measurable knob at
+its historical default rather than as a new default nobody has swept.
 
 **G1.** A contiguous arena split into fixed regions with an O(log R)
 address→region table. Young pauses evacuate all Eden+Survivor regions

@@ -225,6 +225,291 @@ receiver/type guard that deopts to the normal call path on mismatch:
   primitive arrays (insertion sort, inline)
 - `CRC32`/`CRC32C.update`
 
+### Register residency in the optimizing tier — built, verified, still opt-in
+
+`ir_lower` keeps **every** value in a frame word. Its GP tier is fixed
+(RAX/RCX/RDX for values, R10/R11 for safepoint and shadow-stack work, R8/R9 for
+call arguments), `frame_word_off` returns `Err` for `ValueLoc::Reg`, and the
+linear-scan allocator that exists and self-verifies
+(`regalloc::allocate_linear_scan` plus `verify_allocation`) was wired only as a
+**write-through read cache over XMM2–XMM7**, behind
+`CRATONVM_JIT_IR_LINEAR_SCAN`, default off. Its own doc comment stated the
+consequence: *"this wiring is still FP-only. An `int` loop counter gets nothing
+out of it."*
+
+The single-pass backend, meanwhile, colours Java locals into callee-saved GPRs
+(`LOCAL_REGS` = RBX/R12–R15, plus RSI/RDI on Windows) by default. So the
+baseline tier keeps loop counters and accumulators in registers and the
+optimizing tier that supersedes it does not.
+
+**That inversion is measured, in one binary.** `CRATONVM_JIT_IR_LONG=0` declines
+any method using `long`, which routes a `long`-accumulating kernel to the
+single-pass backend and changes nothing else. Five one-line kernels, 20.5M
+iterations each, identical checksums on every arm:
+
+| kernel (inner loop body) | C2 / IR | C1 / single-pass | C1 advantage |
+|---|---:|---:|---:|
+| `s += a[i]` over `int[]` | 84–90 ms | 25–28 ms | **3.2x** |
+| `N n = a[i]; if (n != null)` | 91–103 ms | 31–34 ms | **3.0x** |
+| `s += a[i].v` | 93–102 ms | 34–37 ms | **2.7x** |
+| `a[i].v = i` | 165–178 ms | 119–129 ms | 1.4x |
+| `a[i].next = a[i]` | 347–361 ms | 284–304 ms | ~1.2x |
+
+(Linux/EPYC, load 5–12, three rounds. An earlier Windows run at load ~0.6 put
+the first row at 1.6x; the direction is the same and the size is host-dependent.)
+The last two rows are the control that makes the rest readable: they are
+dominated by out-of-line barrier work, so register residency cannot move them,
+and it does not. `jit/src/x64/single_pass_only.rs` treats this inversion as a
+finite, enumerable list of single-pass specialisations to veto on. It is not
+finite.
+
+**What landed.** `regalloc::xmm_roles::IR_GP_LINEAR_SCAN` = RBX, R12–R15 — a
+general-purpose file beside the XMM one, on the same write-through contract.
+
+Every part of the register choice is forced. They are callee-saved on **both**
+ABIs, which this wiring needs because it has no reload machinery: a value's
+register must survive a call by the calling convention rather than by analysis,
+and that rules out even the otherwise-obvious System V candidates RSI/RDI. They
+are untouched by this emitter's own tiers. The prologue saves them and every
+exit restores them (`IR_GP_PROLOGUE_SAVED`), on the same footing as the XMM save
+area and just as dynamically — a method that promotes nothing emits no save.
+
+**The safepoint obligation is discharged by type, not by structure.** A GC root
+walk reads a frame it did not stop, through RBP, and `OopMapEntry` names frame
+slots only, so no reference may be register-resident at a safepoint. The XMM
+file discharged that by having no register a `Ref` could occupy; the GP file has
+to refuse the type, which `plan_register_residency`'s bank match does. Everything
+else is unchanged by construction: the home word is written at every definition,
+so `emit_safepoint_map`, `build_deopt_points` and `emit_phi_copies` read exactly
+what they always did.
+
+**The default did not move, and the census is why.** With
+`CRATONVM_DBG_IR_LINEAR_SCAN=1`:
+
+* on `BinTrees.itemCheck` the file works — `resident=7 (fp=0 gp=7) demoted=0`,
+  `phi=0`, 13 candidates lost to splits and 2 to type;
+* on all five probe kernels above it never runs at all: *"refused: liveness and
+  colourer disagree about which values want a home"*, 5 of 5.
+
+That refusal is a **pre-existing** gate, not something the GP file introduced.
+`regalloc::ir_op_defines_value` (through `wants_loc`) and `ir_lower`'s
+`op_defines_result_slot` (through `node_color`) are two enumerations of one
+question — the second and third of the three `the_three_ir_op_enumerations`
+names — and any disagreement declines the whole method. It was declining the XMM
+cache the same way and nobody could see it, because the flag printed only on
+success. Both halves of that are fixed here: every refusal now carries a reason,
+the enumeration disagreement names the offending node and op, and a successful
+plan reports its per-cause skip census (`split_or_spilled`,
+`wrong_bank_or_type`, `no_home`, `phi`).
+
+So the capability is built, tested and safe, and the flip is a separate decision
+that wants two things this change does not have: the two enumerations
+reconciled, so the kernels that show the inversion can actually reach the
+allocator, and a wall-clock measurement on a quiet host — which the host this
+landed on could not supply (load 30–63 for the second half of the session).
+**Do not flip it on the strength of the table above; that table is the problem
+statement, not a result.**
+
+Off is exactly the pre-change emission: no register handed out, no save area
+reserved, every read from its home word.
+
+Two couplings are worth knowing. Residency and the **level-2 selector** are
+mutually exclusive — `isel`'s encoder is anchored byte-for-byte against the
+per-opcode arms under the assumption that the frame-homed allocation *is* this
+backend's allocation, which residency makes false — so a MIR mode turns
+residency off. And the IR tier still publishes no OSR entry table; the assertion
+that would catch an OSR trampoline entering past a prologue that saves registers
+now covers the GP band too.
+
+**Known limit, named rather than guessed at:** a loop counter and a loop
+accumulator are `Op::Phi` at the loop header, and phis are excluded — the
+allocator refuses them, and their homes are written by `emit_phi_copies` at each
+incoming edge rather than by a definition arm, so there is no site that could
+publish one into a register. Reaching loop-carried values therefore needs the
+allocator to admit phis and `emit_phi_copies` to publish; the `phi=` field of
+the skip census is there to say how much that is worth on a given workload
+before anyone builds it.
+
+### Reference stores: barrier gates instead of a region table
+
+Under the default collector, **every reference `putfield` in compiled code was
+an out-of-line call**, and the inline fast path guarding it was dead code that
+still cost about twenty-five instructions.
+
+The fast path was gated on `region_bounds_are_live(region_bounds_addr)` — the
+*contents* of the process-global `JIT_REGION_BOUNDS` table. ZGC (the default
+since 2026-08-10) and G1 both deliberately never publish into it; `zgc.rs` says
+so outright: filling it "would re-enable an inline reference STORE fast path
+this collector must not have". Worse, the emitter's admission test was
+`helpers.region_bounds_addr != 0` — the *address* of a static, hence a constant
+`true` — so the whole sequence was emitted (null test, alignment test, six
+containment compares that could never pass, a compactness test, an old-gen test)
+and then fell through to `jit_putfield_object` anyway.
+
+The prediction that follows is falsifiable and was checked:
+`CRATONVM_NO_JIT_INLINE_PUTFIELD=1` must measure exactly zero. On BinTrees d=16
+it did — 3546/3541 ms on against 3525/3786 ms off, checksum `14985902` on all
+four runs. **A kill switch that cannot change a number is not a lever.**
+
+**What landed is not a re-run at the same question.** The old guard asked "is
+the receiver in a published young region", which is a *generational* question G1
+and ZGC do not answer. The collector now publishes three bytes
+(`gc::gen_heap::JIT_REF_STORE_GATES`, reached through
+`JitRuntimeHelpers::ref_store_pre_gate` / `_post_gate` / `_post_young_floor`),
+and each names a **prefix of a barrier helper's own control flow**:
+
+| inline test | the helper's own first act |
+|---|---|
+| `pre_active == 0` | `satb_pre_barrier` loads `mark_active` and returns |
+| `flags_byte < young_floor` | `note_ref_store_slow` compares `gc_age` to the promotion age and returns |
+| `post_active == 0` | `note_ref_store` loads `has_old_objects` and returns |
+
+So a skipped call is one that would have returned having done nothing. On any
+other answer the sequence calls the collector's **own** `write_barrier` — no
+remembered-set contract moves into the emitter, which is the mistake the
+previous inline store path made and the reason `inline_card_mark_available` is
+hard-`false`.
+
+Two properties make reading these inline safe. Each gate may be conservative but
+never permissive: publishers raise a mirror *before* the state it mirrors and
+lower it *after*, so it can only ever say "there may be work" when there is
+none. And the SATB flag is armed only inside the mark-start pause
+(`start_concurrent_mark` takes a `StopTheWorldToken`), so no mutator can sit
+between its inline test and its store while the flag flips. The young floor is
+pinned at `gc_age == 0` — the bound that needs no ordering argument at all,
+since the promotion age is clamped to at least 1 — and that is the case that
+matters, because in allocation-heavy code the receiver of a reference store is
+overwhelmingly an object allocated moments earlier.
+
+The gated path also drops the condition that the field's **old value be null**,
+which is what used to send every re-assignment of an already-set reference to
+the helper. With `pre_active` read directly, the old value stops mattering.
+
+`CRATONVM_JIT_GATED_REF_STORE=0` restores the helper path. A collector that
+publishes no plan (all three addresses zero) gets the previous emission byte for
+byte, which is what G1 and Generational get today.
+`CRATONVM_DBG=jit-method-stats` prints `compiled reference stores: gated=N
+declined=M` — both numbers always, because a zero on the left alone cannot
+distinguish "no plan published" from "this workload compiles no reference
+stores". On BinTrees d=16 under the default collector it reads `gated=2
+declined=0`, which is the engagement evidence the switch it replaces could not
+produce.
+
+**The throughput result is NEUTRAL, and it is stated here rather than left to
+be inferred from the mechanism.** Wall clock was unusable — the host ran at load
+20–63 with four other sessions' VMs on it, and a BinTrees arm swung 1600–5000
+ms — so the arms were priced in **CPU time**, which is what this host's own
+methodology calls for. Eight pairs, alternated with the order flipped on
+alternate pairs, `-Xmx4g`, BinTrees d=16:
+
+| arm | user CPU (s), 8 runs | median |
+|---|---|---:|
+| gated ON | 2.16 2.17 2.16 2.20 2.16 2.20 2.13 2.17 | 2.165 |
+| gated OFF | 2.14 2.19 2.13 2.12 2.21 2.21 2.14 2.17 | 2.165 |
+
+Identical. (System CPU ranged 0.83–2.11 on both arms — GC and page-fault noise,
+not attributable to either.)
+
+Two things explain that without contradicting the change. The census reads
+`gated=2 declined=0`: only two compiled sites in this workload take the
+sequence at all, so the sample is small. And BinTrees builds a tree that
+survives, so `has_old_objects` arms early and the surviving path still calls
+`write_barrier` — the young-receiver floor is what would elide it, and it
+covers only `gc_age == 0`.
+
+So what is established is engagement, correctness and the emitted sequence — a
+call plus six compares that could never pass, replaced by three byte tests —
+and what is **not** established is a throughput win on any workload measured so
+far. It is kept on because the removed compares are provably dead code and the
+off arm is a supported configuration, not because a number says so. A
+call-denser workload on a quiet host is the measurement that would settle it.
+
+### Call sites: argument staging moved to the cold path
+
+Both `emit_direct_cross_call` and `emit_inline_cache_call` opened by copying
+every outgoing argument into a contiguous staging region, then loaded the same
+frame slots again to marshal them into ABI registers — 3N memory operations per
+call where N does. The only reader of that region is the callee-deopt service,
+reached when a callee returns the deopt sentinel and otherwise never.
+
+The staging now happens on each reader's own cold side: inside
+`emit_inline_callee_deopt_service` past its `JNE .done`, and immediately before
+the shared hashed/vtable stub in the megamorphic region rather than ahead of the
+monomorphic guard. The resolving slow path already re-staged for itself, which
+is what made the copy at the top redundant even before this. The values are read
+out of the same frame slots in all three places, and nothing between the marshal
+and any of them writes those slots.
+
+**Known residual, not fixed here.** Because `needs_context` is checked as a
+runtime property of the cached entry, the argument marshalling is emitted twice
+per cache entry — ten copies at a site with one MIC and a four-entry PIC. That
+is a code-*size* cost rather than a per-execution one (each execution runs
+exactly one copy), and the clean fix is a uniform entry ABI, which changes how
+every compiled method receives its arguments. `needs_context` is an output of
+optimization and it moves the ABI; that is not a change to stack on top of a
+register-file change in the same pass.
+
+### Displacement widths
+
+Both backends hard-coded the disp32 ModRM form at sites where a disp8 is legal,
+each with a smallest-form encoder sitting next to the site that did not call it.
+`ir_lower`'s frame accessors (`load_reg_from_frame`, `lea_reg_from_frame`,
+`fp_load`, `fp_store`, `emit_xmm_frame_move`) now share one
+`emit_rbp_modrm_disp`, which is where the RBP-has-no-`mod=00` rule lives — three
+bytes on the instruction class that dominates every IR body. The guarded
+receiver check reads six table words at displacements 0..40 through RDX, every
+one of them a disp8, and paid disp32 on each: 18 bytes per unproven-receiver
+field access.
+
+### The operand-stack register cache, and why it is still pure-kernel-only
+
+`push_from_rax` parks a pushed value in a scratch register instead of storing it
+to the frame. It is gated on `pure_kernel` — no invokes, no MIC/PIC or indy
+sites, no field or static-field ops, no allocation, no typechecks, no inline
+sites, no speculative BCE guards — so one `getfield` anywhere in a method turns
+it off for the whole method and it never engages on application code.
+
+The comment at that gate blamed "the broad R8/R9 experiment regressed call-heavy
+methods because each call flushed live scratch values", which reads as a cost
+argument and is not one: a flush emits the store the frame push would have
+emitted anyway, only later.
+
+**The real blocker is a register collision.** `SCRATCH_REGS` is `[R8, R9]` and
+`ARG_REGS` is `[RCX, RDX, R8, R9]` on Win64, `[RDI, RSI, RDX, RCX, R8, R9]` on
+System V — R8 and R9 are argument registers on both. Every helper call
+marshalling three arguments writes R8; four writes R9. Only sites that call
+`flush_scratch_registers` first are safe, and the emitter has far more
+`emit_call_absolute` sites than flush sites. Under `pure_kernel` none of them is
+reachable, which is why the collision has never mattered. Turning the cache on
+broadly without that audit produces wrong code, measurably: with it default-on,
+`test_compile_fib` returned 20 for `fib(10)` and
+`test_getfield_putfield_roundtrip` returned garbage.
+
+Two things did change. `CRATONVM_JIT_OPERAND_CACHE=1` exists so the two arms can
+be measured in one binary, which the previous shape could not be. And a real
+defect underneath was fixed unconditionally: `StackSlot::Scratch` now carries
+the home word its push reserved and `flush_scratch_registers` stores into that
+instead of reserving another, so a straight-line stretch with several calls no
+longer grows the spill region once per call until `spill-range-exhausted` fails
+the compile.
+
+### Allocation in the optimizing tier — still a stub, and that is why its gate is shut
+
+`emit_new_object_stub` is three register loads and a `CALL`; the single-pass
+`emit_inline_tlab_new` is a cursor load, a bump, a limit compare and inline
+header writes. So an escaping allocation would compile *worse* after escape
+analysis has run on it.
+
+It costs nothing today, and the reason is worth stating rather than
+rediscovering: `c2_alloc_upgrade_enabled()` is opt-in
+(`CRATONVM_JIT_C2_ALLOC_UPGRADE`), so a method containing any `new` is never
+promoted to the optimizing tier at all. The stub is why that gate is shut, and
+`IR_MAX_ALLOCATIONS` is pinned at 16 while every neighbouring cap is 64 for the
+same reason. Opening the gate means first lifting the inline TLAB sequence into
+`runtime_lowering.rs` beside the stub — that module exists to be the one place
+both front ends share allocation, dispatch and monitor contracts, and this is
+the contract it is missing.
+
 ### Summary table
 
 | Feature | Default | Opt-out / opt-in var |
@@ -246,6 +531,10 @@ receiver/type guard that deopts to the normal call path on mismatch:
 | BC `crypto/{engines,io,modes,paddings}` + `math/` JIT | **allowed** | — |
 | BC blanket ban (`asn1/`, `util/`, ...) | still banned | `CRATONVM_JIT_ALLOW_PACKAGES` |
 | Precise JIT stack maps | **ON** | `CRATONVM_NO_PRECISE_JIT_MAPS` |
+| IR-tier register residency (GP + FP files) | off — built and verified, flip wants a measurement | `CRATONVM_JIT_IR_LINEAR_SCAN=1` |
+| Gated inline reference stores | **ON** where a collector publishes a plan | `CRATONVM_JIT_GATED_REF_STORE=0` |
+| Operand-stack register cache beyond pure kernels | off (see the section above for the ARG_REGS collision) | `CRATONVM_JIT_OPERAND_CACHE=1` |
+| Optimizing tier for allocation-bearing methods | off (the tier has no inline TLAB bump) | `CRATONVM_JIT_C2_ALLOC_UPGRADE` |
 
 ### Performance — current status
 

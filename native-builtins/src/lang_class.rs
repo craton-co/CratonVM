@@ -2627,9 +2627,17 @@ pub(crate) fn native_class_get_resource(
     // resolves to a real on-disk location. Fall back to `classpath:<name>`
     // only when the structured walk finds nothing but raw bytes still exist
     // (covers synthetic loaders that override `find_resource` directly).
-    let urls = ctx.find_all_resource_urls(&resource_name);
-    let url_str = if let Some(first) = urls.first() {
-        first.clone()
+    // Stop at the first hit, exactly as `ClassLoader.getResource` does — this
+    // is that method's sibling door and had the same whole-list-then-discard
+    // shape. The incremental walk yields the same elements in the same order,
+    // so element 0 is unchanged; what changes is that the remaining classpath
+    // entries are no longer probed after the answer is known (44 of the 309
+    // entries on the quarkus harness classpath are DIRECTORIES, i.e. an
+    // `exists()` plus a canonicalize each). Shares
+    // `CRATONVM_GETRESOURCE_FIRST_HIT` with the ClassLoader door: one lever
+    // for one behaviour, or a bisect lands on whichever door it reached.
+    let url_str = if let Some(first) = crate::classloader::first_resource_url(ctx, &resource_name) {
+        first
     } else if ctx.find_resource(&resource_name).is_some() {
         format!("classpath:{resource_name}")
     } else {
@@ -19636,7 +19644,20 @@ pub(crate) fn i2_classloader_get_defined_package(
         && !defined_lazily
         && !loader.is_some_and(|l| crate::classloader::loader_is_builtin(ctx, l))
     {
-        return Ok(Some(Value::Object(None)));
+        // ... UNLESS this loader has itself defined a class in the default
+        // package, which is the one way a custom loader DOES define it.
+        // MEASURED on HotSpot: `new ClassLoader(null){}.getDefinedPackage("")`
+        // is `null`, and becomes the unnamed `Package` the moment the loader
+        // defines a class with no package. The unconditional `null` here was
+        // right about row N02 (a loader that defined nothing must not inherit
+        // the class path's answer) and wrong about this one.
+        let defined_here = loader
+            .map(|l| crate::classloader::loader_namespace_id(ctx, l))
+            .filter(|ns| *ns >= cratonvm_types::ClassLoaderId::NATIVE_FIRST_USER_DEFINED)
+            .is_some_and(|ns| ctx.any_loaded_class_in_package_for_loader("", ns));
+        if !defined_here {
+            return Ok(Some(Value::Object(None)));
+        }
     }
     let ns = loader.map_or(0, |l| crate::classloader::loader_namespace_id(ctx, l));
 
@@ -20972,7 +20993,14 @@ pub(crate) fn native_class_get_class_loader(
         || (class_name.starts_with("sun/") && class_name != "sun/reflect/misc/Trampoline")
         || class_name.starts_with("com/sun/");
     if loader_type == 0 && is_jdk_pkg {
-        // Bootstrap loader в†’ null per JVM spec.
+        // NOT every image class is boot-loaded -- see
+        // `classloader::platform_loader_for_image_class`.
+        if let Some(platform) =
+            crate::classloader::platform_loader_for_image_class(ctx, &class_name)
+        {
+            return Ok(Some(Value::Object(Some(platform))));
+        }
+        // Bootstrap loader -> null per JVM spec.
         return Ok(Some(Value::Object(None)));
     }
     if loader_type == 0 && !is_jdk_pkg {

@@ -114,7 +114,7 @@ use crate::JitRuntimeHelpers;
 /// (Revision `2` shipped the 60-field table; the `monitor_enter`/`monitor_exit`
 /// append that made it 62 did not bump this constant, because at the time
 /// nothing checked it. `ABI_REVISIONS` is that check.)
-pub const JIT_HELPERS_ABI_VERSION: u32 = 10;
+pub const JIT_HELPERS_ABI_VERSION: u32 = 11;
 
 /// Size in bytes of the helper table under [`JIT_HELPERS_ABI_VERSION`].
 ///
@@ -545,14 +545,31 @@ helper_fn_slots! {
     HelperFnNewObject, new_object, new_object_fn, (i64, i64, i64) -> i64;
     HelperFnAnewarrayObject, anewarray_object, anewarray_object_fn, (i64, i64, i64) -> i64;
 
-    // Array access. Loads: (array_ptr, index). Primitive stores:
-    // (array_ptr, index, val). `aastore` additionally takes `vm_ptr` first
-    // because a reference store runs the write barrier.
+    // Array access. Primitive loads: (array_ptr, index). Primitive stores:
+    // (array_ptr, index, val). `aaload` and `aastore` additionally take
+    // `vm_ptr` FIRST, for the symmetric reason: a reference LOAD runs the ZGC
+    // read barrier and a reference STORE runs the write barrier, and both need
+    // a `&VmHeap` to reach one.
+    //
+    // `aaload` gained its `vm_ptr` on 2026-09-01 (`.agent-requests/B8-abi.txt`).
+    // A JIT-helper ABI change is normally expensive; this one was affordable
+    // because NO emitter calls `helpers.aaload`. `aaload` is lowered inline by
+    // `jit/src/x64/arrays.rs::emit_ref_aload_regs`, `grep -rn "helpers\.aaload"
+    // jit/src` is empty, and the aarch64 backend does not call it either -- so
+    // there was no emitted `call` whose argument registers had to move and no
+    // `stack_arg_block_size` / shadow-space accounting to revisit. Nothing
+    // consumes the declared arity except this file's own assertions (3 <= 4, so
+    // `HELPERS_NEEDING_WIN64_STACK_ARGS` is unchanged).
+    //
+    // The row still has to be honest BEFORE anything routes `aaload` back to
+    // the helper under an armed barrier, which is what
+    // `let _: HelperFnAaload = jit_aaload;` in `vm/src/jit/helpers.rs`
+    // enforces: the two halves cannot disagree and still compile.
     HelperFnBaload, baload, baload_fn, (i64, i64) -> i64;
     HelperFnBastore, bastore, bastore_fn, (i64, i64, i64) -> ();
     HelperFnIaload, iaload, iaload_fn, (i64, i64) -> i64;
     HelperFnIastore, iastore, iastore_fn, (i64, i64, i64) -> ();
-    HelperFnAaload, aaload, aaload_fn, (i64, i64) -> i64;
+    HelperFnAaload, aaload, aaload_fn, (i64, i64, i64) -> i64;
     HelperFnAastore, aastore, aastore_fn, (i64, i64, i64, i64) -> ();
     HelperFnMultianewarray2d, multianewarray_2d, multianewarray_2d_fn,
         (i64, i64, i64, i64) -> i64;
@@ -841,6 +858,14 @@ helper_field_table! {
     (ldc_string_cp,                  Function, false),
     (ffm_segment_get,                Function, false),
     (ffm_segment_set,                Function, false),
+    // Reference-store barrier gates. NOT functions: each is the address of a
+    // collector-owned gate BYTE that compiled code reads to decide whether a
+    // barrier CALL can be skipped. Optional in the strongest sense -- 0 means
+    // "this collector published no plan" and every emitter arm keeps its
+    // full-helper path.
+    (ref_store_pre_gate,             Constant, false),
+    (ref_store_post_gate,            Constant, false),
+    (ref_store_post_young_floor,     Constant, false),
     // Address of the GC's JIT_G1_BARRIER table, not a call target.
     (g1_barrier_addr,                Constant, false),
     (g1_post_write_barrier,          Function, false),
@@ -864,7 +889,7 @@ const _: () = assert!(
 
 // Pin the literal count so a *removal* also has to touch this line.
 const _: () = assert!(
-    NUM_HELPER_FIELDS == 71,
+    NUM_HELPER_FIELDS == 74,
     "JitRuntimeHelpers field count changed — bump JIT_HELPERS_ABI_VERSION, the \
      literal here, and the size literal below",
 );
@@ -872,8 +897,8 @@ const _: () = assert!(
 // Pin the literal size and alignment. The JIT bakes `disp32` offsets derived
 // from this layout into RWX memory; a silent change here is a wild call.
 const _: () = assert!(
-    JIT_HELPERS_ABI_SIZE == 568,
-    "JitRuntimeHelpers size changed (expected 71 * 8 = 568) — the JIT's baked \
+    JIT_HELPERS_ABI_SIZE == 592,
+    "JitRuntimeHelpers size changed (expected 74 * 8 = 592) — the JIT's baked \
      helper offsets are now wrong; bump JIT_HELPERS_ABI_VERSION deliberately",
 );
 const _: () = assert!(
@@ -1038,8 +1063,11 @@ pub const GOLDEN_HELPER_OFFSETS: [(&str, usize); NUM_HELPER_FIELDS] = [
     ("ldc_string_cp", 528),
     ("ffm_segment_get", 536),
     ("ffm_segment_set", 544),
-    ("g1_barrier_addr", 552),
-    ("g1_post_write_barrier", 560),
+    ("ref_store_pre_gate", 552),
+    ("ref_store_post_gate", 560),
+    ("ref_store_post_young_floor", 568),
+    ("g1_barrier_addr", 576),
+    ("g1_post_write_barrier", 584),
 ];
 
 // Every golden row must name the descriptor row at the same index AND agree
@@ -1176,7 +1204,21 @@ pub const ABI_REVISIONS: &[HelperAbiRevision] = &[
         num_fields: 69,
         size: 552,
     },
-    // v10 -- appended `g1_barrier_addr` / `g1_post_write_barrier` (F-08), the
+    // v10 -- appended the three REFERENCE-STORE BARRIER GATES. Each is the
+    // address of a collector-owned byte that names a PREFIX of a barrier
+    // helper's own control flow, so compiled code can skip the CALL exactly
+    // when the helper would have returned on its first test. They replace an
+    // inference the emitter was making from `region_bounds_addr`, whose
+    // emptiness under G1 and ZGC left every reference store paying six
+    // containment compares that could never pass and then calling the helper
+    // anyway. Optional: all-zero is "no plan published" and restores that
+    // helper path exactly.
+    HelperAbiRevision {
+        version: 10,
+        num_fields: 72,
+        size: 576,
+    },
+    // v11 -- appended `g1_barrier_addr` / `g1_post_write_barrier` (F-08), the
     // table and the call target G1's INLINE post-write barrier needs. Closing
     // defect G1-2 had made every JIT-compiled reference store an out-of-line
     // `putfield_object` call under G1, because the inline arms are gated on a
@@ -1184,10 +1226,15 @@ pub const ABI_REVISIONS: &[HelperAbiRevision] = &[
     // put a real G1 barrier inline instead of borrowing the generational one's
     // premises. Both optional: zeros emit no inline barrier and every store
     // keeps the helper call it takes today.
+    //
+    // Appended AFTER v10's three gates rather than beside them: both landed on
+    // 2026-09-02 in parallel branches, and v10 reached `dev` first, so its
+    // offsets are the established ones and these two go on the end. That is the
+    // whole reason this is v11 and not a second v10.
     HelperAbiRevision {
-        version: 10,
-        num_fields: 71,
-        size: 568,
+        version: 11,
+        num_fields: 74,
+        size: 592,
     },
 ];
 
@@ -1404,7 +1451,7 @@ const _: () = {
          really is a displacement and is range-checked by validate_with",
     );
     assert!(
-        constants == 7,
+        constants == 10,
         "the number of baked-address slots changed — a Constant slot is loaded \
          as data and is NOT range-checked by validate_with, so misclassifying \
          a displacement as one silently removes its only sanity check",
@@ -1780,6 +1827,12 @@ mod tests {
             ("ldc_string_cp", offset_of!(H, ldc_string_cp)),
             ("ffm_segment_get", offset_of!(H, ffm_segment_get)),
             ("ffm_segment_set", offset_of!(H, ffm_segment_set)),
+            ("ref_store_pre_gate", offset_of!(H, ref_store_pre_gate)),
+            ("ref_store_post_gate", offset_of!(H, ref_store_post_gate)),
+            (
+                "ref_store_post_young_floor",
+                offset_of!(H, ref_store_post_young_floor),
+            ),
             ("g1_barrier_addr", offset_of!(H, g1_barrier_addr)),
             ("g1_post_write_barrier", offset_of!(H, g1_post_write_barrier)),
         ];
@@ -1812,15 +1865,20 @@ mod tests {
     /// loudly rather than be absorbed by a computed expression.
     #[test]
     fn helper_table_size_and_align_are_the_literal_abi_numbers() {
-        assert_eq!(core::mem::size_of::<H>(), 568);
+        assert_eq!(core::mem::size_of::<H>(), 592);
         assert_eq!(core::mem::align_of::<H>(), 8);
-        assert_eq!(JIT_HELPERS_ABI_SIZE, 568);
+        assert_eq!(JIT_HELPERS_ABI_SIZE, 592);
         assert_eq!(JIT_HELPERS_ABI_ALIGN, 8);
         assert_eq!(HELPER_FIELD_STRIDE, 8);
-        assert_eq!(NUM_HELPER_FIELDS, 71);
-        assert_eq!(H::NUM_FIELDS, 71);
+        assert_eq!(NUM_HELPER_FIELDS, 74);
+        assert_eq!(H::NUM_FIELDS, 74);
+        // v10's three appended slots are gate ADDRESSES, not call targets, so
+        // the callable-slot count stood still while the table grew. v11 (F-08)
+        // appended one of each: `g1_barrier_addr` is a table address and
+        // `g1_post_write_barrier` IS a call target, so the callable count moves
+        // by exactly one. That divergence is the point of counting them apart.
         assert_eq!(H::NUM_HELPER_FN_FIELDS, 60);
-        assert_eq!(JIT_HELPERS_ABI_VERSION, 10);
+        assert_eq!(JIT_HELPERS_ABI_VERSION, 11);
     }
 
     /// The golden table is the only name→offset binding in the crate written
@@ -1858,9 +1916,9 @@ mod tests {
         assert_eq!(
             last,
             HelperAbiRevision {
-                version: 10,
-                num_fields: 71,
-                size: 568,
+                version: 11,
+                num_fields: 74,
+                size: 592,
             },
         );
         // Append-only history: each revision strictly grows the table.
@@ -2056,7 +2114,13 @@ mod tests {
         let required = HELPER_FIELDS.iter().filter(|d| d.required).count();
         assert_eq!(functions, 60, "callable slots");
         assert_eq!(offsets, 4, "displacement slots");
-        assert_eq!(constants, 7, "baked-address slots");
+        // v10 appended three Constants (gate ADDRESSES, not call targets) and
+        // v11 (F-08) appended one more Constant — `g1_barrier_addr`, the
+        // geometry table's address — plus one optional Function,
+        // `g1_post_write_barrier`. So the callable count moved by exactly one
+        // across the two revisions and the baked-address count by four, which
+        // is the divergence counting them apart exists to show.
+        assert_eq!(constants, 10, "baked-address slots");
         assert_eq!(required, 43, "required slots");
         assert_eq!(functions - required, 17, "optional callable slots");
         assert_eq!(functions + offsets + constants, H::NUM_FIELDS);
@@ -2216,12 +2280,13 @@ mod tests {
         let mut h = H::default();
         h.newarray = 1;
         // The LAST field, whatever it currently is — `g1_post_write_barrier`
-        // since F-08 appended G1's inline barrier pair.
+        // since F-08 appended G1's inline barrier pair after v10's three
+        // reference-store gates.
         h.g1_post_write_barrier = 2;
         let w = h.as_words();
         assert_eq!(w[0], 1, "first slot");
         assert_eq!(w[H::NUM_FIELDS - 1], 2, "last slot");
-        assert_eq!(w.len(), 71);
+        assert_eq!(w.len(), 74);
     }
 
     /// Build a table with every *required* slot non-zero and every optional

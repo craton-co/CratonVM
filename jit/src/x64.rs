@@ -220,10 +220,34 @@ mod inlining;
 /// Engagement count for the splice cursor clamp, for `jit-method-stats`.
 /// A number beside a result is what says whether the guard ran at all.
 pub(crate) use inlining::inline_live_slot_clamps;
+/// The PC -> inline-chain map, and the per-compile session that records it.
+///
+/// NAMED rather than glob re-exported, unlike the ~15 `pub use foo::*;`
+/// siblings above. A glob would be capped at each item's own declared
+/// visibility and so would be sound, but `inlining` is not a lowering module
+/// with one entry point: it is the splice emitter, and most of what is `pub`
+/// in it is a hook the walk calls. These five items ARE its interface to the
+/// rest of the tree -- `jit/src/lib.rs` names `InlineFrameMap` for the
+/// `CompiledMethod` field, `x64/driver.rs` opens and closes the session
+/// around codegen, and `vm/src/jit/conservative_roots.rs` reads
+/// `InlineFrameLevel` out of the finished map to expand a compiled frame into
+/// the inlined callees it is standing inside.
+///
+/// Without this line none of them can name the types at all: the module was
+/// private and unexported, which is why the whole producer shipped inert and
+/// every item in it still carries `#[allow(dead_code)]`. `InlineFrameRow` is
+/// deliberately NOT exported -- it is the emission-order form, consumed by
+/// `finish_inline_frame_recording` and meaningless outside it.
+pub use inlining::{
+    begin_inline_frame_recording, finish_inline_frame_recording, inline_frame_map_enabled,
+    InlineFrameLevel, InlineFrameMap,
+};
 mod arith;
 mod arrays;
 mod deopt_stubs;
 mod objects;
+pub(crate) use objects::note_ungated_ref_store;
+pub use objects::ref_store_site_counts;
 mod osr;
 mod simd;
 
@@ -260,12 +284,20 @@ enum StackSlot {
     /// round-trip when a register-mapped local is loaded and then immediately
     /// used by an arithmetic or branch operation.
     CalleeSaved(u8),
-    /// Value is in a caller-saved scratch register (R8/R9). Used as a
-    /// deferred-spill cache: `push_from_rax` moves the result into a scratch
-    /// register instead of storing to the frame, avoiding the store+load
-    /// round-trip when the value is consumed by the very next operation.
-    /// Scratch slots MUST be flushed before any call, backward branch, or return.
-    Scratch(u8),
+    /// Value is in a caller-saved scratch register (R8/R9), paired with the
+    /// frame word its push already reserved for it. Used as a deferred-spill
+    /// cache: `push_from_rax` moves the result into a scratch register instead
+    /// of storing to the frame, avoiding the store+load round-trip when the
+    /// value is consumed by the very next operation.
+    ///
+    /// Scratch slots MUST be flushed before any call, backward branch or
+    /// return, and the flush stores into **this** home rather than reserving
+    /// another. Carrying the home in the slot is what bounds the spill region:
+    /// without it a straight-line stretch with several calls reserved a fresh
+    /// word at every flush and grew the frame until the range was exhausted,
+    /// which is the "call-heavy regression" that had confined this whole
+    /// mechanism to methods containing no calls at all.
+    Scratch(u8, i32),
     /// Value is in an XMM register (XMM0-XMM15). Used for FP locals loaded via
     /// dload/fload from XMM-allocated locals. Avoids the XMM→RAX→frame round-trip
     /// when the value is immediately consumed by a double/float arithmetic op.
