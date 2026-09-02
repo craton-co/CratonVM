@@ -76965,6 +76965,7 @@ fn s31_inline_site_metadata_roundtrip() {
         ldc2w_info: vec![(2, 12345678)],
         needs_heap: true,
         class_name: "com/example/Foo".to_string(),
+        class_id: 0,
         method_name: "bar".to_string(),
         descriptor: "(I)I".to_string(),
         elided_invoke_pcs: vec![5],

@@ -1045,7 +1045,7 @@ struct JitSignals {
     /// throw site and the first interpreter frame — the whole point of the
     /// trace. Snapshot them while they are still on the stack; the drain hands
     /// them to the throwable. See
-    /// `internal/fixed-bugs/jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901.md`.
+    /// `jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902.md`.
     ///
     /// `RefCell` rather than `Cell` because the payload is not `Copy`; it is
     /// only ever borrowed for the length of a `take`/`replace`, never across a
@@ -1073,10 +1073,8 @@ pub(crate) struct DrainedJitSignals {
     /// about to lose.
     pub npe_compiled_frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
     /// Drained alongside `npe` for hygiene (a stale action code must not
-    /// outlive its NPE), but not yet consumed by the JIT-return drains —
-    /// they throw the bare NPE exactly as before this consolidation
-    /// (attaching the JEP-358 action message here is a follow-up).
-    #[allow(dead_code)]
+    /// outlive its NPE). Read by the two restash paths, which put it back with
+    /// the flag and the frame snapshot — see [`restash_jit_pending_npe`].
     pub npe_action: u8,
     pub deopt: bool,
 }
@@ -1125,11 +1123,16 @@ fn npe_frame_snapshot_enabled() -> bool {
 /// interpreter still on the stack. Cheap by construction: this records the
 /// same small structs the GC root walk already builds, and does no class-store
 /// lookup, no string formatting and takes no lock.
-fn snapshot_npe_compiled_frames() {
+fn snapshot_npe_compiled_frames(trap_key: u32) {
     if !npe_frame_snapshot_enabled() {
         return;
     }
-    let frames = crate::jit::conservative_roots::active_compiled_frames();
+    let mut frames = crate::jit::conservative_roots::active_compiled_frames();
+    // The one frame the walk cannot put a line on is the one that raised: an
+    // inline null check publishes no safepoint id. `trap_key` is the site id its
+    // cold trampoline passed in, and this is the only place both the key and
+    // the frames exist at once.
+    crate::jit::conservative_roots::apply_npe_trap_site(&mut frames, trap_key);
     JIT_SIGNALS.with(|s| {
         *s.npe_compiled_frames.borrow_mut() = (!frames.is_empty()).then_some(frames);
     });
@@ -1216,6 +1219,38 @@ pub(crate) fn peek_jit_athrow_bci() -> i64 {
 /// drain-without-route rationale.
 pub(crate) fn stash_jit_pending_npe() {
     set_jit_pending_npe();
+}
+
+/// Raise the pending-NPE flag WITHOUT taking a compiled-frame snapshot.
+///
+/// For the one shape [`stash_jit_pending_npe`] is wrong for: a door that
+/// drained the flag with [`take_jit_pending_npe`] and is putting it back. That
+/// take leaves `npe_compiled_frames` untouched, so the snapshot from the trap
+/// is still there and is still the right one; taking another would overwrite it
+/// with a stack the raising frame has already left.
+pub(crate) fn set_jit_pending_npe_flag_only() {
+    JIT_SIGNALS.with(|s| {
+        s.npe.set(true);
+        s.npe_action.set(0);
+    });
+}
+
+/// Put back an NPE that [`take_all_jit_signals`] drained WHOLE -- flag, JEP-358
+/// action code and the compiled-frame snapshot -- exactly as it was found.
+///
+/// The action code was previously dropped by every restash (the setter resets
+/// it to `0`), so an implicit NPE that took a round trip through a door which
+/// declined to service it lost its "Cannot load from int array" message. Both
+/// halves travel together because both describe the same trap.
+pub(crate) fn restash_jit_pending_npe(
+    action: u8,
+    frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
+) {
+    JIT_SIGNALS.with(|s| {
+        s.npe.set(true);
+        s.npe_action.set(action);
+        *s.npe_compiled_frames.borrow_mut() = frames;
+    });
 }
 
 /// Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): re-stash a previously
@@ -1317,7 +1352,7 @@ fn set_jit_pending_npe() {
         s.npe.set(true);
         s.npe_action.set(0);
     });
-    snapshot_npe_compiled_frames();
+    snapshot_npe_compiled_frames(0);
 }
 
 /// Internal: set the pending-NPE flag *with* a JEP-358 action code
@@ -1326,11 +1361,23 @@ fn set_jit_pending_npe() {
 /// JEP-358 message to the JIT-originated NPE.
 #[inline]
 fn set_jit_pending_npe_action(code: u8) {
+    set_jit_pending_npe_action_at(code, 0);
+}
+
+/// As [`set_jit_pending_npe_action`], with the id of the inline null-check
+/// site that trapped (`0` when the caller has none).
+///
+/// Only the inline null-check stubs can name a site: they are the shape whose
+/// bci is otherwise unrecoverable, because the check is not a GC-capable call
+/// and so publishes no safepoint id. Every other NPE-signalling helper is a
+/// call, and its frame's slot already holds an id `activation_bci` can use.
+#[inline]
+fn set_jit_pending_npe_action_at(code: u8, trap_key: u32) {
     JIT_SIGNALS.with(|s| {
         s.npe.set(true);
         s.npe_action.set(code);
     });
-    snapshot_npe_compiled_frames();
+    snapshot_npe_compiled_frames(trap_key);
 }
 
 /// Re-stash a previously-taken JIT NPE action code (OSR drain-without-route
@@ -1470,7 +1517,22 @@ pub extern "C" fn jit_npe_with_action(code: i64) {
     // matching every other array/field helper's entry (the next GC must
     // re-scan after we deopt back out to the interpreter).
     crate::jit::conservative_roots::note_jit_boundary();
-    set_jit_pending_npe_action(code as u8);
+    // The argument is PACKED: the low byte is the JEP-358 action code, and the
+    // upper 24 bits are the inline null-check site id, or zero. A stub that
+    // sets only the action (the historical shape, and the reason-10 precise
+    // putfield path) therefore reads back as `trap_key == 0` with no special
+    // case. See `x64::inlining::NpeTrapSite` and
+    // `x64::Compiler::emit_null_check_store_stubs`.
+    //
+    // `as u64` before the shift, not `as u32`: the sign of an `i64` argument is
+    // nobody's business here and an arithmetic shift on a hypothetical negative
+    // would fabricate a key.
+    let packed = code as u64;
+    // Truncation: the low byte IS the action code by construction.
+    let action = (packed & 0xff) as u8;
+    // Truncation: `record_npe_trap_site` caps ids at 24 bits.
+    let trap_key = ((packed >> 8) & 0x00ff_ffff) as u32;
+    set_jit_pending_npe_action_at(action, trap_key);
     // Out-of-band deopt signal: the stub loads `i64::MIN` as the return value
     // (same invariant as `jit_bastore`'s null arm did before).
     set_jit_deopt_pending();
@@ -3032,7 +3094,15 @@ pub(crate) fn implicit_signal_of(
 fn restash_implicit_signal(signal: ImplicitSignal) {
     match signal {
         ImplicitSignal::Aioobe { index, length } => stash_jit_pending_aioobe(index, length),
-        ImplicitSignal::Npe => stash_jit_pending_npe(),
+        // `set_jit_pending_npe_flag_only`, NOT `stash_jit_pending_npe`. This
+        // door drains the NPE with `take_jit_pending_npe()`, which takes the
+        // FLAG and leaves the compiled-frame snapshot where the helper put it.
+        // Re-stashing through the ordinary setter would take a SECOND snapshot
+        // here -- one frame shallower, because the callee whose code raised the
+        // NPE has already returned -- and silently overwrite the real one. The
+        // trace would still be plausible and would be missing exactly the frame
+        // it was taken to keep.
+        ImplicitSignal::Npe => set_jit_pending_npe_flag_only(),
         ImplicitSignal::Arithmetic => stash_jit_pending_arithmetic(),
         ImplicitSignal::None => {}
     }
@@ -3051,6 +3121,7 @@ fn materialize_implicit_signal(
     vm: &SharedVm,
     thread: &mut JvmThread,
     signal: ImplicitSignal,
+    npe_frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
 ) -> Option<ObjectRef> {
     match signal {
         ImplicitSignal::Aioobe { index, length } => {
@@ -3063,13 +3134,29 @@ fn materialize_implicit_signal(
             )
             .ok()
         }
-        ImplicitSignal::Npe => crate::runtime::exceptions::create_exception_object(
-            vm,
-            thread,
-            "java/lang/NullPointerException",
-            None,
-        )
-        .ok(),
+        ImplicitSignal::Npe => {
+            let exc = crate::runtime::exceptions::create_exception_object(
+                vm,
+                thread,
+                "java/lang/NullPointerException",
+                None,
+            )
+            .ok()?;
+            // The frames the helper snapshotted at the trap. Without this the
+            // NPE materialised HERE -- i.e. every implicit NPE routed into a
+            // compiled callee's own handler -- keeps the frameless trace
+            // `fillInStackTrace` just built, which is the whole defect the
+            // snapshot exists to close. Attaching it in the constructor arm
+            // rather than at each door is what stops a fourth door from
+            // silently reopening it.
+            crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                vm,
+                &thread.frames,
+                exc,
+                npe_frames,
+            );
+            Some(exc)
+        }
         ImplicitSignal::Arithmetic => crate::runtime::exceptions::create_exception_object(
             vm,
             thread,
@@ -3524,7 +3611,15 @@ unsafe fn route_implicit_exc_through_callee(
         // own `idiv`, because there is one body — a `getMessage()` that changed
         // with the dispatch route would be its own wrong answer, and this used
         // to be kept true by hand.
-        let exc = materialize_implicit_signal(vm, thread, implicit);
+        // This door drained the FLAG only (`take_jit_pending_npe`), so the
+        // snapshot is still in the signal record; take it here so it is
+        // consumed by exactly the throwable it belongs to.
+        let npe_frames = if implicit == ImplicitSignal::Npe {
+            take_jit_pending_npe_compiled_frames()
+        } else {
+            None
+        };
+        let exc = materialize_implicit_signal(vm, thread, implicit, npe_frames);
         if let Some(exc) = exc {
             if let Ok(v) = try_run_callee_handler(
                 vm,
@@ -3762,7 +3857,7 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
     // outgoing arguments still identify that callee, and run its handler at
     // the recorded throw bci.  Re-entering the callee from bytecode 0 used to
     // duplicate all side effects before a caught bounds/null/divide exception.
-    let signals = take_all_jit_signals(thread);
+    let mut signals = take_all_jit_signals(thread);
     let throw_pc = if signals.athrow_bci >= 0 {
         signals.athrow_bci as usize
     } else {
@@ -3799,6 +3894,7 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
                 vm,
                 thread,
                 implicit_signal_of(signals.aioobe, signals.npe, signals.arithmetic),
+                signals.npe_compiled_frames.take(),
             );
             if let Some(exc) = implicit {
                 if let Ok(v) = try_run_callee_handler(
@@ -3826,7 +3922,11 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
         stash_jit_pending_aioobe(index, length);
     }
     if signals.npe {
-        stash_jit_pending_npe();
+        // Restore the snapshot the drain took WITH the flag, rather than
+        // letting the setter take a fresh one here: `take_all_jit_signals`
+        // moved it out, and a second `active_compiled_frames()` at this point
+        // describes a shallower stack than the trap did.
+        restash_jit_pending_npe(signals.npe_action, signals.npe_compiled_frames.take());
     }
     if signals.arithmetic {
         stash_jit_pending_arithmetic();
@@ -9114,6 +9214,66 @@ pub unsafe extern "C" fn jit_putfield_object(
     if val != 0 {
         let heap = heap_from_vm(vm_ptr);
         heap.write_barrier(obj_ref, value);
+    }
+}
+
+/// F-08 — G1's post-write barrier, called from the slow arm of the JIT's
+/// INLINE G1 barrier.
+///
+/// # What the caller has already proved, and what it has not
+///
+/// The inline sequence reaches this call only when both of its filters have
+/// failed to prove there is nothing to remember: `val_ptr` is non-null, and
+/// `obj_ptr` and `val_ptr` do not lie in the same G1 region. Those are exactly
+/// the two conditions `G1Collector::post_write_barrier_rset` itself tests
+/// first, so the inline arm is eliding calls the callee would have returned
+/// from — not calls it would have acted on. Everything else, including an
+/// address outside G1's arena and a destination region that is Free, is left
+/// to the callee, which already handles all of it.
+///
+/// # Why this is not [`jit_write_barrier`]
+///
+/// That helper routes through `VmHeap::write_barrier`, which carries a
+/// `debug_assert!` requiring an SATB pre-barrier on the same thread whenever a
+/// mark cycle is active. The assertion is correct for a general store and
+/// wrong for this caller: the inline arm stores only into a field whose OLD
+/// value is NULL (that is the arm's own precondition, tested inline and
+/// bailing to `jit_putfield_object` otherwise), and a null old value is exactly
+/// the case `satb_pre_barrier` returns from immediately. No pre-barrier fires,
+/// none is owed, and the debug assertion would fire on a correct program.
+/// Weakening it would remove the check from every other caller; a separate
+/// entry point says the thing once, here.
+///
+/// It also skips the generational card-marking dispatch entirely, going
+/// straight to G1's remembered-set barrier, which is the only collector this
+/// helper is ever wired for by the emitter (`g1_inline_barrier_available`
+/// requires a published `JIT_G1_BARRIER` table, and only `G1Collector`
+/// publishes one). A non-G1 heap reaching here is a no-op rather than a
+/// misfiled card: the match below has one arm.
+///
+/// # Safety
+///
+/// Called from JIT-compiled code. `vm_ptr` must be a valid `SharedVm` pointer;
+/// `obj_ptr` and `val_ptr` are raw heap words and are screened here exactly as
+/// [`jit_write_barrier`] screens them, because a stale or garbage receiver must
+/// take the null path rather than be dereferenced.
+pub unsafe extern "C" fn jit_g1_post_write_barrier(vm_ptr: i64, obj_ptr: i64, val_ptr: i64) {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache,
+    // exactly as `jit_write_barrier` does. Omitting it would leave a stale
+    // frame census behind a call that can reach the collector.
+    crate::jit::conservative_roots::note_jit_boundary();
+    if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
+        return;
+    }
+    if val_ptr == 0 {
+        return;
+    }
+    let heap = heap_from_vm(vm_ptr);
+    if let cratonvm_gc::vm_heap::VmHeap::G1(g1) = heap {
+        g1.post_write_barrier_rset(
+            ObjectRef::from_raw(obj_ptr as usize as *mut u8),
+            ObjectRef::from_raw(val_ptr as usize as *mut u8),
+        );
     }
 }
 
@@ -19869,7 +20029,10 @@ fn restash_jit_signals(thread: &mut JvmThread, sig: DrainedJitSignals) {
         stash_jit_pending_aioobe(index, length);
     }
     if sig.npe {
-        stash_jit_pending_npe();
+        // Same rule as `handle_compiled_callee_deopt_sentinel`'s restore: the
+        // frames belong to the trap, not to this drain, so put back the ones
+        // that were taken instead of sampling a fresh (shallower) stack.
+        restash_jit_pending_npe(sig.npe_action, sig.npe_compiled_frames);
     }
     if sig.arithmetic {
         stash_jit_pending_arithmetic();
@@ -25048,6 +25211,21 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         ref_store_pre_gate: ref_store_gates.0,
         ref_store_post_gate: ref_store_gates.1,
         ref_store_post_young_floor: ref_store_gates.2,
+        // F-08 -- G1's inline post-write barrier: the geometry table, and the
+        // call target its slow arm uses.
+        //
+        // A THIRD table address in this struct, and the third is not a
+        // duplicate of either of the first two. `region_bounds_addr` above is
+        // the table whose EMPTINESS under G1 closes defect G1-2 -- nothing may
+        // ever publish into it for G1. `read_bounds_addr` answers the read-side
+        // "is this address mapped". This one carries the numbers an inline G1
+        // barrier needs in order to BE a barrier: arena base, arena length,
+        // region mask, plus the F-05 card table's base and shift. Wired
+        // unconditionally; the table itself is all-zero unless a G1 collector
+        // has published, and the emitter treats a zero length as "no inline
+        // barrier".
+        g1_barrier_addr: cratonvm_gc::jit_g1_barrier_addr(),
+        g1_post_write_barrier: jit_g1_post_write_barrier as *const () as usize,
         // Cooperative JIT safepoint polling (CRATONVM_JIT_SAFEPOINT_POLLS,
         // off by default) — address of the process-global VM's
         // stw_requested flag byte. `process_vm()` is published by
@@ -25172,6 +25350,7 @@ const _: () = {
     let _: HelperFnPutfieldFloat = jit_putfield_float;
     let _: HelperFnPutfieldDouble = jit_putfield_double;
     let _: HelperFnPutfieldObject = jit_putfield_object;
+    let _: HelperFnG1PostWriteBarrier = jit_g1_post_write_barrier;
 
     // Statics.
     let _: HelperFnGetstatic = jit_getstatic;

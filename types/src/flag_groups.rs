@@ -1016,6 +1016,14 @@ pub const INVENTORY: &[E] = &[
     // disables the sink and `off_word` must stay `None`.
     E { group: Group::JIT, token: "alloc-spill-sink", on_key: None, off_key: Some("CRATONVM_JIT_NO_ALLOC_SPILL_SINK"), off_word: None, since: "2026-08-06" },
     E { group: Group::JIT, token: "arith-licm", on_key: None, off_key: Some("CRATONVM_DISABLE_ARITH_LICM"), off_word: None, since: "2026-06-16" },
+    // Declared 2026-09-02 with the three codegen changes of
+    // `array-element-load-baseline-codegen-20260901`. All three are default-ON
+    // and all three change the EMITTED BYTES of code that runs on every
+    // iteration of every array loop, so each gets its own lever at the level
+    // the change is at.
+    E { group: Group::JIT, token: "arraylen-licm", on_key: None, off_key: Some("CRATONVM_DISABLE_ARRAYLEN_LICM"), off_word: None, since: "2026-09-02" },
+    E { group: Group::JIT, token: "rip-safepoint-poll", on_key: Some("CRATONVM_JIT_RIP_SAFEPOINT_POLL"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::JIT, token: "fused-bounds-load", on_key: Some("CRATONVM_JIT_FUSED_BOUNDS_LOAD"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "bce", on_key: None, off_key: Some("CRATONVM_JIT_NO_BCE"), off_word: None, since: "2026-06-03" },
     E { group: Group::JIT, token: "bg-compile", on_key: Some("CRATONVM_BG_COMPILE"), off_key: None, off_word: None, since: "2026-06-18" },
     // The bytecode loop rewriter (`x64::plan_bytecode_loop_xform`: peel,
@@ -1187,6 +1195,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "operand-cache", on_key: Some("CRATONVM_JIT_OPERAND_CACHE"), off_key: None, off_word: None, since: "2026-09-02" },
     // Default-ON A/B lever: `ir_lower::reloc_emit_enabled` reads `0`/`false`.
     E { group: Group::JIT, token: "ir-reloc-emit", on_key: Some("CRATONVM_JIT_IR_RELOC_EMIT"), off_key: None, off_word: Some("0"), since: "2026-07-31" },
+    E { group: Group::JIT, token: "ir-cold-arg-stage", on_key: Some("CRATONVM_JIT_IR_COLD_ARG_STAGE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     // Declared 2026-08-30 with the relocation-gate coupling. Default-ON, so a
     // KILL SWITCH: `=0` restores the pre-fix behaviour in which a safepoint map
     // `record_oop_map` had ALREADY judged short was still published as
@@ -1227,6 +1236,38 @@ pub const INVENTORY: &[E] = &[
     // emitted. Sits beside `compiled-frame-lines`, the structurally identical
     // sibling added on the same branch for defect 1 of the same page.
     E { group: Group::JIT, token: "inline-frame-map", on_key: None, off_key: Some("CRATONVM_JIT_NO_INLINE_FRAME_MAP"), off_word: None, since: "2026-09-01" },
+    // Default-ON. The OPTIMIZING tier's safepoint-id slot holds a monotonic
+    // counter, not a bci, so `activation_bci` refused the whole backend and
+    // every C2 frame printed `(Unknown Source)` -- the largest population of
+    // line-less compiled frames left after 2026-09-01. `ir_lower` now records
+    // the id->bci translation (`CompiledMethod::safepoint_bci_table`) and the
+    // walk reads through it. Separate from `compiled-frame-lines`, which
+    // reverts the recovery on BOTH backends and so cannot attribute a suspect
+    // line to the translation rather than to the slot read.
+    E { group: Group::JIT, token: "ir-frame-lines", on_key: None, off_key: Some("CRATONVM_JIT_NO_IR_FRAME_LINES"), off_word: None, since: "2026-09-02" },
+    // Default-ON. An inline null check is not a GC-capable call, so it
+    // publishes no safepoint id and the frame it raises from was the ONE frame
+    // in an NPE snapshot with no line (`big:-1`). The emitter records the
+    // trapping bci and the splice chain per site and gives a described site a
+    // ten-byte COLD trampoline that passes its id to `jit_npe_with_action`; the
+    // `TEST`/`JZ` fast path is unchanged. This name reverts the recording and
+    // the trampoline together, so the retained metadata, the cold bytes and the
+    // line disappear as one. Depends on `inline-frame-map`: the enclosing bci
+    // of a trap inside a splice is only knowable from that session's scope
+    // stack.
+    E { group: Group::JIT, token: "npe-trap-lines", on_key: None, off_key: Some("CRATONVM_JIT_NO_NPE_TRAP_LINES"), off_word: None, since: "2026-09-02" },
+    // Default-ON. `stackwalker::frame_class_ids_with_compiled` -- the walk the
+    // JEP 403 deep-reflection gate and `Class.forName`'s caller loader read --
+    // reported ONE class per compiled artifact and so could not see a method
+    // the JIT had inlined. It answers in `ClassId` and resolving a JIT label by
+    // name would have been a guess in a security path; an inlined level now
+    // carries the id the RESOLVER used, and only a chain keyed on the exact
+    // return address is expanded (the coarse safepoint-id key is shared with
+    // the inline cache's miss edge, where the spliced body did not run).
+    // Separate from `inline-frame-map`, which kills the producer and takes the
+    // DISPLAY frames with it; this is the half a caller-attribution change has
+    // to be attributable to on its own.
+    E { group: Group::JIT, token: "inline-caller-frames", on_key: None, off_key: Some("CRATONVM_JIT_NO_INLINE_CALLER_FRAMES"), off_word: None, since: "2026-09-02" },
     // D2: a guarded-virtual site emits guard, splice AND miss edge under ONE
     // safepoint bci, and the miss edge records no inline-frame row -- so that
     // bci held exactly one chain, was never poisoned, and the innermost frame
@@ -1664,6 +1705,22 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "g1-young-pause-target", on_key: Some("CRATONVM_G1_YOUNG_PAUSE_TARGET"), off_key: None, off_word: None, since: "2026-08-18" },
     E { group: Group::GC, token: "g1-scrub-free", on_key: Some("CRATONVM_G1_SCRUB_FREE"), off_key: None, off_word: None, since: "2026-08-18" },
     E { group: Group::GC, token: "g1-narrow-fixup", on_key: Some("CRATONVM_G1_NARROW_FIXUP"), off_key: None, off_word: Some("0"), since: "2026-08-18" },
+    E { group: Group::GC, token: "g1-parallel-evac-in-jit", on_key: Some("CRATONVM_G1_PARALLEL_EVAC_IN_JIT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::GC, token: "g1-cleanup-walk", on_key: Some("CRATONVM_G1_CLEANUP_WALK"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::GC, token: "g1-adaptive-ihop", on_key: Some("CRATONVM_G1_ADAPTIVE_IHOP"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::GC, token: "g1-adaptive-tenuring", on_key: Some("CRATONVM_G1_ADAPTIVE_TENURING"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::GC, token: "gc-reserve", on_key: Some("CRATONVM_GC_RESERVE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::GC, token: "zgc-markbits", on_key: Some("CRATONVM_ZGC_MARKBITS"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::GC, token: "zgc-page-pinned-relocate", on_key: Some("CRATONVM_ZGC_PAGE_PINNED_RELOCATE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::GC, token: "zgc-parsweep", on_key: Some("CRATONVM_ZGC_PARSWEEP"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::GC, token: "g1-reserve-heap", on_key: Some("CRATONVM_G1_RESERVE_HEAP"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::GC, token: "g1-uncommit", on_key: Some("CRATONVM_G1_UNCOMMIT"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::GC, token: "g1-card-rset", on_key: Some("CRATONVM_G1_CARD_RSET"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::GC, token: "g1-inline-barrier", on_key: Some("CRATONVM_G1_INLINE_BARRIER"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::GC, token: "g1-mark-lock-yield", on_key: Some("CRATONVM_G1_MARK_LOCK_YIELD"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::GC, token: "g1-shared-alloc", on_key: Some("CRATONVM_G1_SHARED_ALLOC"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::GC, token: "g1-eden-stripes", on_key: Some("CRATONVM_G1_EDEN_STRIPES"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::GC, token: "g1-parallel-mark", on_key: Some("CRATONVM_G1_PARALLEL_MARK"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::DBG, token: "g1-dbg-rset", on_key: Some("CRATONVM_G1_DBG_RSET"), off_key: None, off_word: None, since: "2026-08-18" },
     E { group: Group::GC, token: "g1-workers", on_key: Some("CRATONVM_G1_WORKERS"), off_key: None, off_word: None, since: "2026-06-22" },
     E { group: Group::GC, token: "g1-rset-source-cap", on_key: Some("CRATONVM_G1_RSET_SOURCE_CAP"), off_key: None, off_word: None, since: "2026-08-13" },

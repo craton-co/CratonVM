@@ -8,11 +8,14 @@ java-launcher-compatible:
 | Flag | Backend | One-liner |
 |---|---|---|
 | `-XX:+UseGenerationalGC` / `-XX:-UseZGC` | `GenerationalHeap` (`gc/src/gen_heap.rs`) | Semi-space young gen + free-list old gen with a concurrent old-gen mark-sweep cycle. Young collections are **moving by default**; each cycle diverts to the non-moving sweep only when its own root-coverage proof fails (see "Backend details" below). |
-| `-XX:+UseG1GC` | `G1Collector` (`gc/src/g1.rs`) | Region-based (1 MB regions, 2 MB above 4 GB heaps): young/mixed evacuation with remembered sets, SATB concurrent marking, humongous spans, region pinning. |
+| `-XX:+UseG1GC` | `G1Collector` (`gc/src/g1.rs`) | Region-based (region size targets ~2048 regions, clamped to 1-32 MB): young/mixed evacuation with remembered sets, SATB concurrent marking, humongous spans, region pinning. The heap is **reserved** at `-Xmx` and committed on demand. |
 | *(default)* / `-XX:+UseZGC` / `-XX:+UseZ` | `ZgcRealHeap` (`gc/src/zgc.rs`) | **Not a real ZGC**: a memory-backed, non-moving, whole-heap stop-the-world mark-sweep over one arena, with a hash-set allocation registry. No colored pointers, no load barriers, no concurrency, no compaction. The colored-pointer/`ZPage` code above it in `zgc.rs` (and `zgc_concurrent.rs`) is a metadata-only simulation with no production consumer. |
 
 Unrecognized `-XX:+Use*GC` selectors warn and fall back to Generational.
-Heap size comes from `-Xmx`/`-Xms` as usual.
+Heap size comes from `-Xmx`/`-Xms` as usual — and under G1, since F-16, those
+two mean what they do on HotSpot: `-Xmx` is the size of the address-space
+*reservation* and `-Xms` is the memory committed at startup. The other backends
+still allocate their whole `-Xmx` up front.
 
 **ZGC is the default**, and the `zgc` Cargo feature is default-ON (it gates
 the `GcAlgorithm::Zgc` variant, so the default cannot be `Zgc` without it). It
@@ -193,9 +196,15 @@ tracked sources rather than part of the kit above:
 | `CRATONVM_DBG_WEAKREF=1` | Weak/Phantom null/restore pass tracing |
 | `CRATONVM_G1_NO_EVAC_RETRY=1` | Disable the evacuation-failure drain (bisection) |
 | `CRATONVM_G1_PARALLEL_EVAC=0` | Force the single-threaded evacuator. Parallel evacuation is the **default**; the worker threads are not respawned per pause. Still owed: a gauntlet-scale soak and a throughput number, so this remains the bisection lever for any suspected parallel-evacuation regression. |
+| `CRATONVM_G1_PARALLEL_EVAC_IN_JIT=0` | Restore the serial fallback for pauses taken while a thread is in compiled code. That fallback used to be unconditional, on the stated ground that only the serial path pinned conservative JIT roots — which was stale (the parallel driver applies the same collection-set exclusion). It mattered because on a JIT-warm application it is true for nearly every pause, so G1 copied single-threaded in production. **First thing to try for any G1 crash seen only with the JIT warm** — defect G1-11 lives in this path. |
+| `CRATONVM_G1_CLEANUP_WALK=1` | Make the concurrent-cycle cleanup pause recompute per-region liveness by walking every object, instead of reading the byte counter the marker maintains. The walk was cleanup's only implementation until F-06 — an O(heap) STW pass at the end of every cycle. `=1` restores it as the authority; a debug build runs both and asserts they agree. First thing to try if a cycle is suspected of freeing a live Old region. |
+| `CRATONVM_G1_ADAPTIVE_IHOP=0` | Restore the pause-time-driven marking threshold. By default the threshold is planned from the measured mark duration and old-generation growth rate and tightened on to-space exhaustion; pause time drives only the young size, which is what it actually describes. |
+| `CRATONVM_G1_ADAPTIVE_TENURING=0` | Restore the fixed `promotion_age` (15). By default the tenuring threshold is re-derived after each pause from an age histogram of surviving bytes, and may tenure earlier than configured — never later — when survivor space would overflow. |
+| `CRATONVM_G1_RESERVE_HEAP=0` | Commit the whole heap at startup instead of reserving `-Xmx` and committing on demand. Also the state a platform without a reservation implementation is in anyway. First thing to try for a G1 fault at a heap address that looks mapped. |
+| `CRATONVM_G1_UNCOMMIT=1` | **Opt-in.** Return the pages of a trailing run of Free regions to the OS at the end of a concurrent-mark cleanup, so a process that has finished a burst does not hold its high-water mark for life. Never shrinks below `-Xms`, and only above the highest region still in use — the committed set has to stay a prefix. Opt-in because the two halves of the reserved heap have different failure modes: getting growth wrong is a missed optimisation, getting the shrink wrong is a fault in compiled code. |
 | `CRATONVM_G1_EAGER_HUMONGOUS=0` | Restore cleanup-only humongous reclaim. By default an evacuation pause also frees humongous spans it can prove nothing references. This is the only path that frees memory outside the collection set, so it is the first thing to rule out if a live humongous object goes missing. |
 | `CRATONVM_G1_YOUNG_PAUSE_TARGET=1` | **Opt-in.** Let `max_gc_pause_ms` bound the YOUNG generation too, not just the old half of a mixed collection set: G1 also collects once the Eden+Survivor region count reaches an adaptive target, tightened by 20% after any PRODUCTIVE pause that overruns the goal and relaxed while pauses stay under half of it. Does nothing until such an overrun is measured (the target starts at its 60%-of-regions ceiling and a target at the ceiling is not a trigger). Measured trade on `G1ChurnPauseProbe` at `-Xmx2048m`: p50 -21%, p99 +3%, wall +4.2%, one extra pause — see the young-sizing paragraph under Backend details for the full table and why it is not a default. |
-| `CRATONVM_G1_WORKERS=<n>` | Force the evacuation worker count; `=1` drains the parallel path serially, which separates a concurrency race from a logic divergence |
+| `CRATONVM_G1_WORKERS=<n>` | Force the evacuation worker count; `=1` drains the parallel path serially, which separates a concurrency race from a logic divergence. Overrides `-XX:ParallelGCThreads`, which in turn overrides the machine-derived default |
 | `CRATONVM_DBG_GC_STRESS=<bytes>` | Force young GCs every N allocated bytes (Generational) |
 | `CRATONVM_GC_PAR_THREADS=<n>` | Generational young-GC worker count. `0`/`1` forces the sequential collector; `>= 2` forces that many workers regardless of heap size. Unset = `min(available_parallelism, 8)` once the young gen passes the size floor. `available_parallelism` follows CPU affinity, so a `taskset -c N` run is automatically sequential |
 | `CRATONVM_GC_PAR_MIN_BYTES=<bytes>` | Young-gen size floor below which the young GC stays sequential (default 16 MiB) |
@@ -208,12 +217,30 @@ Note: `tracing::debug!` is compiled out of release builds
 (`release_max_level_info`); for cycle-phase confirmation attach gdb to
 un-inlined gc-crate symbols (LTO is off for `cratonvm-cli` dev builds).
 
-**Tuning knobs** (java-compatible): `-Xmx`/`-Xms`,
-`-XX:G1HeapRegionSize=<bytes>`, `-XX:InitiatingHeapOccupancyPercent=<n>`
-(adaptive around the static value, floored at max(1 % of heap, one
-region)), `-XX:MaxGCPauseMillis=<n>` (drives adaptive IHOP and the mixed
-collection's copy-time budget), `-XX:MaxHeapSize`,
-`-XX:+HeapDumpOnOutOfMemoryError`.
+**Tuning knobs** (java-compatible): `-Xmx` (reserved heap under G1),
+`-Xms` (committed at startup under G1; accepted and ignored by the other
+backends), `-XX:G1HeapRegionSize=<bytes>` (rounded to a power of two and
+clamped to 1-32 MB), `-XX:InitiatingHeapOccupancyPercent=<n>` — a **ceiling**
+on the adaptive threshold, never a floor, floored at max(1 % of heap, one
+region) — `-XX:MaxGCPauseMillis=<n>` (the young-generation size target and the
+mixed collection's copy-time budget), `-XX:ParallelGCThreads=<n>`,
+`-XX:MaxHeapSize`, `-XX:+HeapDumpOnOutOfMemoryError`.
+
+**Reading a G1 pause.** `--verbose:gc` prints one `[GC-STAT]` line per pause
+whose phase fields are a *partition* of the pause, not a sample of it:
+
+```
+roots_us + rset_us + closure_us + fixup_us + free_us + verify_us + other_us == pause_us
+```
+
+`fixup_regions` / `fixup_bytes` are the denominator for `fixup_us` — a long
+fix-up on a big old generation and a long fix-up on a small one are different
+problems. `verify_us` is the budgeted post-pause dangling-reference sweep, which
+runs in release builds (`CRATONVM_G1_VERIFY_BUDGET=0` opts out); it used to be
+charged to no phase at all, so the rows did not sum and the difference was
+invisible. On the parallel evacuator phases 1-3 are fused into one work-stealing
+closure and are reported wholly as `closure_us`, with `roots_us`/`rset_us` zero
+— that is the honest reading, not a missing measurement.
 
 ## Backend details worth knowing
 
@@ -374,7 +401,7 @@ target at the ceiling is not a trigger — and an unproductive pause (nothing
 copied, nothing freed) resets it to the ceiling so it can never storm.
 
 It is **not** a default, and the reason is measured. On
-`apps/probes/G1ChurnPauseProbe 96 900` at `-Xmx2048m` (96 MiB retained, 3.6 GiB
+`probes/G1ChurnPauseProbe 96 900` at `-Xmx2048m` (96 MiB retained, 3.6 GiB
 of garbage, 200 ms goal), medians of 3 interleaved reps:
 
 | arm | wall | pauses | total pause | p50 | p99 |
@@ -393,11 +420,86 @@ is always paid in full and it is the one p99 reports. A latency-sensitive
 workload may still want the median improvement — turn it on and measure your
 own pause distribution.
 
+**That table predates five findings, and it was re-run.** The +4.2 % wall-clock
+is the cost of taking MORE pauses at the per-pause price of the day, and that
+price changed: the parallel evacuator now runs on JIT-warm pauses instead of
+falling back to serial (F-01), forwarding moved out of a side hash map (F-02),
+collection-set membership stopped being a SipHash lookup on the innermost loop
+(F-03), the parallel driver stopped taking the whole-heap fix-up (F-04), and
+cleanup stopped walking the heap (F-06).
+
+Re-run 2026-09-02 on the same probe and heap, RELEASE build, eight interleaved
+reps per arm, medians:
+
+| | flag OFF | flag ON | delta |
+|---|---|---|---|
+| p50 pause | 644 ms | 580 ms | **&minus;10 %** |
+| max pause | 826 ms | 749 ms | **&minus;9 %** |
+| total pause | 2074 ms | 2007 ms | &minus;3 % |
+| wall | 8102 ms | 8258 ms | **+1.9 %** |
+| pauses | 3 | 5 | +2 |
+
+The trade improved in the predicted direction and by roughly the predicted
+amount: the wall-clock cost more than halved (+4.2 % &rarr; +1.9 %), total pause
+went from a cost to a small saving, and the reduction now reaches the MAXIMUM
+pause as well as the median — which is what a pause goal is actually about, and
+what the original measurement could not show.
+
+**It still ships opt-in, and the reason is the host, not the numbers.**
+`/proc/loadavg` read 28&ndash;44 throughout, from other work on the machine, and
+this document's own rule — the one every number in the older table was taken
+under — is that a contended host inverts an A/B of this size. A +1.9 % wall cost
+measured at load 40 is not evidence that the default should change. What would
+settle it is the same eight reps on an idle machine; the harness and the probe
+are both in the tree now, so that is a twenty-minute job rather than a
+reconstruction.
+
+One obstacle had to be cleared first: **the probe was not in the tree**. It was
+committed with the measurement, then deleted along with the rest of `probes/` by
+a "major doc consistency update" while every citation of it survived — including
+this document's, which also named the wrong directory. It is restored, and its
+`checksum` line is there so a run can be diffed against a real JDK's — all
+sixteen runs above produced `checksum=2063754854400`, identical to JDK 25's.
+
 *Where a young pause actually goes.* Every `--verbose:gc`
 `[GC-STAT]` line now carries a per-phase breakdown — `roots_us`, `rset_us`,
-`closure_us`, `fixup_us`, `free_us` — with `fixup_us` printed beside the
-`fixup_regions` / `fixup_bytes` it covered, because a slow walk and a large
-old generation are different problems. On `apps/probes/G1ChurnPauseProbe 96 900`
+`closure_us`, `fixup_us`, `free_us`, `verify_us`, `other_us` — with `fixup_us`
+printed beside the `fixup_regions` / `fixup_bytes` it covered, because a slow
+walk and a large old generation are different problems. The seven fields SUM to
+`pause_us`: `verify_us` is the budgeted post-pause dangling-reference sweep,
+which runs in release builds and used to be charged to no phase at all, and
+`other_us` is the derived remainder. A table whose rows do not sum to the total
+cannot be used to argue that a cost was removed rather than moved, which is
+exactly what the rest of this section tries to do with it.
+
+The first thing the completed partition showed is a cost nobody had a number
+for. On `probes/G1ChurnPauseProbe 8 40` at `-Xmx256m`, ten runs, **`verify_us`
+is 10.8-14.5 % of every young pause** — the budgeted post-pause
+dangling-reference sweep, which runs in release builds and was previously
+charged to no phase at all. It is defensible while G1-11 is open, but it is a
+choice, and `CRATONVM_G1_VERIFY_BUDGET` is now a decision an operator can
+actually make. (Also from those runs: the seven fields summed to `pause_us`
+EXACTLY, all ten times.)
+
+*Parallel evacuation on JIT-warm pauses (F-01), first reading.* Same probe and
+heap, five interleaved reps per arm, one pause per run:
+
+| arm | median pause | median wall |
+|---|---|---|
+| `CRATONVM_G1_PARALLEL_EVAC_IN_JIT=0` (the old fallback) | 305 ms | 7606 ms |
+| default | 268 ms | 7683 ms |
+
+Pause −12 %, wall unchanged, and the probe's checksum was identical across all
+ten runs and equal to a real JDK 25's. Read it as a direction, not a
+measurement: it is a **debug build** on a host running two other agents'
+compiles, so the absolute numbers mean nothing and the copy loop's share is not
+the release build's. The release-build version of this is owed, together with
+the young-sizing re-run above.
+
+One asymmetry in it is real and expected: the parallel arm's fix-up walked 21-26
+regions against the serial arm's 12. N workers claim N to-space regions, so more
+regions are "written into" and the narrowed Phase-4 set is correspondingly
+wider. The parallel closure pays for it and then some. On `probes/G1ChurnPauseProbe 96 900`
 at `-Xmx2048m` a 330 ms young pause split: roots 0.7 %, remembered-set
 walks 0.03 %, Cheney closure 38 %, whole-heap fix-up 10-18 %, freeing the
 collection set **42 %**. That last figure is why the phase breakdown exists
@@ -415,6 +517,53 @@ inter-object padding can exist because every object size is a multiple of
 itself 152 -> 18 ms. `CRATONVM_G1_SCRUB_FREE=1` restores it, and that is
 the first thing to try if a G1 heap-corruption investigation wants the old
 "a freed region reads as zeros" world back.
+
+*The inline G1 write barrier reaches only one of the two JIT tiers.*
+`CRATONVM_G1_INLINE_BARRIER=1` emits a real G1 post-write barrier inline
+(null test, same-region test, out-of-line helper for anything those two cannot
+dismiss) from all four reference-store emitters in the single-pass /
+bytecode-walk tier. It cannot reach the IR tier at all: `ir_lower` has **no
+reference-store site**, as its own `read_bounds_addr` doc states — it asks only
+the read-side "is this address mapped" question — so a method the IR tier
+compiles keeps the out-of-line `putfield_object` helper whatever the flag says.
+
+Measured, not inferred. With `RUST_LOG=cratonvm_jit=info` the emitter logs
+`jit: G1 inline post-write barrier ACTIVE` once per process: it appears on
+`apps/g1_probe/G1CardChurn` with the flag on and never with it off, and never on
+`probes/G1ChurnPauseProbe` in either arm. So the workload that exhibits the
+barrier and the workload that exhibits pause behaviour are different ones, which
+is why the flag ships opt-in with no pause-level number — a `jit/` gap, not a
+`gc/` one.
+
+Watch the log filter when checking this: a bare `RUST_LOG=info` shows nothing,
+because the launcher builds its filter as
+`from_default_env().add_directive(WARN)` and a global WARN ties with a global
+`info` on specificity, resolving last-added-wins. Use the target-scoped form.
+
+*Free-region search: measured, and still linear.* Both searches
+(`find_free_region_from`, `find_contiguous_free`) are O(regions), and the
+region count used to grow with `-Xmx`. `[GC] g1 free-scan:` reports calls,
+regions probed and the worst single scan for each. Two readings:
+
+| workload | single | contiguous |
+|---|---|---|
+| young churn, 2048 regions | 1543 calls, 1543 probed, **worst 1** | never called |
+| 400 humongous allocations, 256 regions | 15 calls, 1027 probed, worst 195 | 400 calls, 35943 probed, **worst 227** |
+
+The ordinary path is free — the rotating hint answers in one probe, always. The
+humongous path scans most of the heap per call, and that is still 36,000
+comparisons of an enum against a constant across a whole run, on a path that
+then memsets megabytes. A hint for it was tried and measured at 0.9% (35,943 →
+35,617 probes) and dropped: the free-scan cursor tracks single-region Eden
+claims and has no relationship to where a humongous span was freed.
+
+What bounds it is the region-size ergonomic above: ~2048 regions at any heap
+size means the scan is bounded by a constant rather than by `-Xmx`, which is the
+property the concern was actually about. A free-region bitmap would buy those
+comparisons at the price of a second source of truth for "is this region Free" —
+read in ~200 places, written in 8 — and one that says Free about a live region
+hands the allocator memory that is in use. Refused on the number; the instrument
+stays so it can be revisited against a workload.
 
 *The Phase-4 walk, narrowed.* A young pause's reference fix-up walks only the
 collection set's remembered-set sources plus every region the pause WROTE

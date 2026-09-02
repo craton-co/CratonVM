@@ -239,8 +239,10 @@ pub(crate) use inlining::inline_live_slot_clamps;
 /// deliberately NOT exported -- it is the emission-order form, consumed by
 /// `finish_inline_frame_recording` and meaningless outside it.
 pub use inlining::{
-    begin_inline_frame_recording, finish_inline_frame_recording, inline_frame_map_enabled,
-    InlineFrameLevel, InlineFrameMap,
+    begin_inline_frame_recording, begin_npe_trap_recording, finish_inline_frame_recording,
+    finish_npe_trap_recording, inline_call_map_at_return_counts, inline_frame_map_enabled,
+    inline_miss_edge_poison_counts, npe_trap_lines_enabled, InlineFrameLevel, InlineFrameMap,
+    NpeTrapMap, NpeTrapSite,
 };
 mod arith;
 mod arrays;
@@ -284,20 +286,25 @@ enum StackSlot {
     /// round-trip when a register-mapped local is loaded and then immediately
     /// used by an arithmetic or branch operation.
     CalleeSaved(u8),
-    /// Value is in a caller-saved scratch register (R8/R9), paired with the
-    /// frame word its push already reserved for it. Used as a deferred-spill
-    /// cache: `push_from_rax` moves the result into a scratch register instead
-    /// of storing to the frame, avoiding the store+load round-trip when the
-    /// value is consumed by the very next operation.
+    /// Value is in a caller-saved scratch register (R8/R9). Used as a
+    /// deferred-spill cache: `push_from_rax` moves the result into a scratch
+    /// register instead of storing to the frame, avoiding the store+load
+    /// round-trip when the value is consumed by the very next operation.
+    /// Scratch slots MUST be flushed before any call, backward branch, or return.
     ///
-    /// Scratch slots MUST be flushed before any call, backward branch or
-    /// return, and the flush stores into **this** home rather than reserving
-    /// another. Carrying the home in the slot is what bounds the spill region:
-    /// without it a straight-line stretch with several calls reserved a fresh
-    /// word at every flush and grew the frame until the range was exhausted,
-    /// which is the "call-heavy regression" that had confined this whole
-    /// mechanism to methods containing no calls at all.
-    Scratch(u8, i32),
+    /// **A home offset was carried here for one day and reverted.** The idea
+    /// was to bound the spill region -- `flush_scratch_registers` reserves a
+    /// fresh word per flushed value, so a stretch with several calls grows it
+    /// once per call. Reserving the home at PUSH time instead made
+    /// `push_from_rax` advance the spill cursor where it previously did not,
+    /// and that shipped a nondeterministic heap corruption:
+    /// `RMapGcStress` went from PASS to "duplicate insert" / an
+    /// `ArrayIndexOutOfBoundsException` inside `String.equals`, and
+    /// `CRATONVM_JIT_KERNEL_REG_LOCALS=0` -- which makes this whole path inert
+    /// -- was what made it pass again. The frame-growth defect is real and
+    /// still open; whatever fixes it must not move this cursor, because the
+    /// OSR entry's local homes are derived from the same layout.
+    Scratch(u8),
     /// Value is in an XMM register (XMM0-XMM15). Used for FP locals loaded via
     /// dload/fload from XMM-allocated locals. Avoids the XMM→RAX→frame round-trip
     /// when the value is immediately consumed by a double/float arithmetic op.
@@ -617,6 +624,11 @@ struct Compiler {
     arith_hoist_offsets: Vec<i32>,
     /// LICM: frame offset of the first shared arith-LICM scratch slot.
     arith_scratch_base: i32,
+    /// LICM: loop-invariant `arraylength` hoisting info.
+    array_len_hoist_info: Vec<ArrayLenHoist>,
+    /// LICM: frame offsets for hoisted array lengths (one per
+    /// `array_len_hoist_info` entry, shared by all of that entry's sites).
+    array_len_hoist_offsets: Vec<i32>,
     /// Frame offset of the first callee-saved register slot (from RBP).
     callee_saved_base: i32,
     /// SIMD: vectorizable loops detected during analysis.
@@ -637,7 +649,7 @@ struct Compiler {
     /// `[NULL + ARRAY_LENGTH_OFFSET]`, hitting the signal-handler hs_err path
     /// that just re-raises and kills the VM.
     ///
-    /// Each entry is `(action, patch_offset)`: `action` is the JEP-358
+    /// Each entry is `(action, patch_offset, trap_key)`: `action` is the JEP-358
     /// [`cratonvm_jit_api::npe_action`] code for the trapping opcode (so the
     /// interpreter can attach "Cannot load from int array" etc. when
     /// `-XX:+ShowCodeDetailsInExceptionMessages` is on), and `patch_offset` is
@@ -649,7 +661,14 @@ struct Compiler {
     /// path drains the NPE flag and surfaces the (action-only) exception.
     /// (Previously a single shared stub called `jit_bastore(0)`, which set the
     /// byte-store action for *every* opcode regardless of element type.)
-    null_check_store_stubs: Vec<(u8, usize)>,
+    ///
+    /// `trap_key` is the id `x64::inlining::record_npe_trap_site` issued for
+    /// this site, or `0` for "not described". A non-zero key buys the site its
+    /// own ten-byte cold trampoline, which packs `action | key << 8` into the
+    /// helper's single argument so the NPE snapshot can put a LINE on the frame
+    /// that raised. `0` keeps the historical shape exactly: the `JZ` goes
+    /// straight to the shared per-action stub.
+    null_check_store_stubs: Vec<(u8, usize, u32)>,
     /// Post-invoke exception checks. After every JIT-dispatched invoke
     /// (`invoke_dispatch` / `invoke_virtual_mic`) whose callee can throw,
     /// the codegen emits a `CMP RAX, i64::MIN; JE rel32` guard. The
@@ -763,6 +782,22 @@ struct Compiler {
     /// already contains an absolute imm64 and is shift-safe by
     /// construction.
     helper_call_patches: Vec<usize>,
+    /// Native offsets of RIP-relative `disp32` fields that address a FIXED
+    /// ABSOLUTE address (today: the safepoint flag, see
+    /// [`emit_test_mem8_abs_imm8`]), paired with the number of instruction
+    /// bytes that follow the displacement.
+    ///
+    /// A RIP-relative displacement is measured from the address of the NEXT
+    /// instruction, so the trailing count matters: `TEST BYTE [rip+d32], imm8`
+    /// carries its `imm8` after the displacement and its reference point is
+    /// `disp32_offset + 4 + 1`, not `+ 4`.
+    ///
+    /// Serves the same purpose as [`Self::helper_call_patches`] and for the
+    /// same reason: the unroll duplicator copies body bytes verbatim, and a
+    /// displacement that was right at the original site addresses
+    /// `target + shift` from the copy. Each copy is re-resolved against the
+    /// reconstructed absolute target.
+    rip_abs_disp32_patches: Vec<(usize, usize)>,
     /// Task #60 — IC (inline cache) patch sites for per-clone slot allocation.
     ///
     /// Each entry is `(native_offset_of_imm64, kind, original_slot_ptr)` where
@@ -2146,6 +2181,7 @@ impl Compiler {
         static_field_info: Vec<(usize, u32, usize, u8, bool)>,
         hoist_info: Vec<LoopHoist>,
         arith_hoist_info: Vec<ArithLoopHoist>,
+        array_len_hoist_info: Vec<ArrayLenHoist>,
         alloc_result: super::regalloc::RegAllocResult,
         reserve_matrix_dot_scratch: bool,
         helpers: JitRuntimeHelpers,
@@ -2169,6 +2205,7 @@ impl Compiler {
         // If scalar replacement is active, reserve extra slots for replaced object fields.
         let num_hoists = hoist_info.len();
         let num_arith_hoists = arith_hoist_info.len();
+        let num_len_hoists = array_len_hoist_info.len();
         // LICM arithmetic: besides one result slot per hoist, reserve a small
         // shared scratch pool sized to the deepest hoisted expression. The
         // pool is shared because hoists execute serially (one per loop entry),
@@ -2269,6 +2306,7 @@ impl Compiler {
             + num_hoists
             + num_arith_hoists
             + arith_scratch_depth
+            + num_len_hoists
             + num_scalar_slots
             + (if precise_maps { 1 } else { 0 })
             + jit_thread_slots
@@ -2528,6 +2566,15 @@ impl Compiler {
         let arith_scratch_local = arith_hoist_base + num_arith_hoists;
         let arith_scratch_base: i32 = ((arith_scratch_local as i32) + 1) * 8; // Cast: x86-64 immediate encoding
 
+        // LICM: array-length hoist slots follow the arith scratch pool, so
+        // none of the four regions alias. Each slot holds a zero-extended
+        // 32-bit length; nothing in it is ever a reference, so these slots are
+        // deliberately absent from every oop map.
+        let len_hoist_base = arith_scratch_local + arith_scratch_depth;
+        let array_len_hoist_offsets: Vec<i32> = (0..num_len_hoists)
+            .map(|k| ((len_hoist_base + k) as i32 + 1) * 8) // Cast: x86-64 immediate encoding
+            .collect();
+
         Self {
             method_label,
             buf,
@@ -2588,6 +2635,8 @@ impl Compiler {
             hoist_offsets,
             arith_hoist_info,
             arith_hoist_offsets,
+            array_len_hoist_info,
+            array_len_hoist_offsets,
             arith_scratch_base,
             callee_saved_base,
             simd_loops: Vec::new(),
@@ -2608,6 +2657,7 @@ impl Compiler {
             mic_slots: Vec::new(),
             pic_slots: Vec::new(),
             helper_call_patches: Vec::new(),
+            rip_abs_disp32_patches: Vec::new(),
             ic_patches: Vec::new(),
             cloned_mic_slots: Vec::new(),
             cloned_pic_slots: Vec::new(),

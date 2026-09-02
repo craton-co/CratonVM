@@ -246,9 +246,15 @@ verbatim. HotSpot has a small table that rewrites a few platform spellings on
 AIX/Solaris; the two rows this host can produce (`UTF-8`, `ANSI_X3.4-1968`) are
 passed through by HotSpot too, and only `C`, `C.utf8`, `POSIX` and `en_US.utf8`
 are generated here, so a row that cannot be measured is not guessed at. The
-Windows console/ACP split is measured on one host at one code page; the band
-rule around it comes from the JDK's `getConsoleEncoding` and is covered by unit
-tests rather than by a second machine.
+Windows console/ACP split WAS measured against HotSpot on one 1251 host, on
+2026-09-02 — one command run five ways plus a second console code page, real
+`os_encoding` against real HotSpot, 5/5. That verification came a day after this
+record was retired and it corrected TWO defects in the code retired here: the
+terminal test was `GetConsoleMode` where HotSpot's is `isatty`, and `chcp 65001`
+was spelled `cp65001` where HotSpot spells it `UTF-8`. See
+`stdout-encoding-differs-from-hotspot-on-windows-20260901.md` §11. The
+`MS932`/`GBK`/`MS949`/`MS950` ANSI rows are still the JDK's table and not a
+host's, and no CratonVM binary has been BUILT on Windows.
 
 And a real degradation, stated because it is a behaviour change and not a
 theoretical one: if the host names an encoding this image has no charset for

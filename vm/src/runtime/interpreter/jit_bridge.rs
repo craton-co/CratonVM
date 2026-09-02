@@ -188,7 +188,7 @@ fn osr_stage_get() -> &'static str {
 // Which interpreter frames are, right now, being run by compiled code
 // ---------------------------------------------------------------------------
 //
-// jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901, defect (3):
+// jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902, defect (3):
 // a trace captured after `main` has OSR'd says `main:62` -- the back-edge it
 // tiered up at -- where HotSpot says `main:66`, the call that was executing.
 //
@@ -3654,6 +3654,7 @@ pub(super) fn try_osr(
             MethodCallFailed::ExceptionThrown(exc) => {
                 crate::runtime::exceptions::attach_snapshotted_npe_frames(
                     shared,
+                    &thread.frames,
                     exc,
                     npe_snapshot,
                 );
@@ -3684,7 +3685,12 @@ pub(super) fn try_osr(
                 // re-stashed: it was taken for this raise, and by the time a
                 // later drain surfaced the flag it would describe frames that
                 // are long gone. A short trace beats a confidently wrong one.
-                crate::jit::helpers::stash_jit_pending_npe();
+                //
+                // `set_jit_pending_npe_flag_only` is what makes that sentence
+                // true of the CODE: `stash_jit_pending_npe` takes a fresh
+                // snapshot of its own, so the frames were not dropped here at
+                // all — they were silently replaced by a shallower set.
+                crate::jit::helpers::set_jit_pending_npe_flag_only();
             }
         }
         return None;
@@ -8827,6 +8833,18 @@ fn resolve_inline_site_from(
     } else {
         callee_class.to_string()
     };
+    // ...and its id, chosen by the SAME branch so the two can never name
+    // different classes. A stack walk that has to answer in `ClassId` -- the
+    // JEP 403 deep-reflection gate, `Class.forName`'s caller loader -- can then
+    // see a spliced frame without resolving a JIT label by name, which would be
+    // a guess in a security-relevant path. `cp_class_id` is the id
+    // `callee_class` was looked up under; `declaring_id` is the class that
+    // declares the body a receiver resolution selected.
+    let inlined_body_class_id = if receiver_class_id.is_some() {
+        declaring_id.as_u32()
+    } else {
+        cp_class_id.as_u32()
+    };
 
     if method.is_synchronized() {
         no!("synchronized");
@@ -9790,6 +9808,7 @@ fn resolve_inline_site_from(
         ldc2w_info,
         needs_heap,
         class_name: inlined_body_class_name,
+        class_id: inlined_body_class_id,
         method_name: callee_method.to_string(),
         descriptor: callee_desc.to_string(),
         elided_invoke_pcs,
@@ -10422,6 +10441,7 @@ pub(super) fn execute_jit_call(
             MethodCallFailed::ExceptionThrown(exc) => {
                 crate::runtime::exceptions::attach_snapshotted_npe_frames(
                     shared,
+                    &thread.frames,
                     exc,
                     npe_snapshot,
                 );
@@ -10910,6 +10930,7 @@ pub(super) fn execute_jit_call_decoded(
             MethodCallFailed::ExceptionThrown(exc) => {
                 crate::runtime::exceptions::attach_snapshotted_npe_frames(
                     shared,
+                    &thread.frames,
                     exc,
                     npe_snapshot,
                 );
@@ -11303,6 +11324,7 @@ pub(super) fn execute_jit_call_oneshot(
             MethodCallFailed::ExceptionThrown(exc) => {
                 crate::runtime::exceptions::attach_snapshotted_npe_frames(
                     shared,
+                    &thread.frames,
                     exc,
                     npe_snapshot,
                 );

@@ -72,6 +72,49 @@ pub enum GcBackend {
     Zgc,
 }
 
+/// F-14 — the largest region size the ergonomic or an explicit
+/// `-XX:G1HeapRegionSize` will produce. HotSpot's cap, and for the same reason:
+/// past this, a single region is a large enough unit of collection that
+/// `max_gc_pause_ms` stops being controllable and humongous allocation
+/// (anything over half a region) stops being reachable for ordinary arrays.
+pub const G1_MAX_REGION_SIZE: usize = 32 * 1024 * 1024;
+
+/// F-14 — how many regions the ergonomic aims for, independent of heap size.
+///
+/// The region COUNT, not the region size, is what several per-pause passes are
+/// linear in: the pre-evacuation `(type, cursor)` snapshot, the free-region
+/// census, the collection-set filter, `phase4_regions_to_walk`, and both
+/// free-region searches. The remembered set's worst case is quadratic in it.
+/// Holding the count roughly constant as the heap grows is the whole point;
+/// HotSpot targets the same number.
+const G1_TARGET_REGION_COUNT: usize = 2048;
+
+/// Round `requested` to a power of two inside
+/// `[MIN_REGION_SIZE, G1_MAX_REGION_SIZE]`.
+///
+/// Power-of-two because the collector's address→region lookup is a shift (see
+/// `g1::normalize_region_size`); clamped because both ends of the range are
+/// operator-facing policy rather than arithmetic.
+pub fn clamp_region_size(requested: usize) -> usize {
+    let clamped = requested.clamp(crate::region::MIN_REGION_SIZE, G1_MAX_REGION_SIZE);
+    let rounded = crate::g1::normalize_region_size(clamped);
+    // Rounding UP can leave the ceiling; rounding down to the ceiling keeps it
+    // a power of two because `G1_MAX_REGION_SIZE` is one.
+    rounded.min(G1_MAX_REGION_SIZE)
+}
+
+/// F-14 — region size for a heap of `total_bytes`, targeting
+/// [`G1_TARGET_REGION_COUNT`] regions.
+///
+/// Replaces a two-step ladder (1 MiB below 4 GiB, 2 MiB above) whose region
+/// COUNT grew without bound with heap size: 4096 regions at 4 GiB, 8192 at
+/// 16 GiB, 16384 at 32 GiB. This keeps it near 2048 across the range —
+/// 1 MiB regions up to a 2 GiB heap, then 2/4/8/16/32 MiB — and tops out at
+/// [`G1_MAX_REGION_SIZE`], after which the count grows again by necessity.
+pub fn g1_ergonomic_region_size(total_bytes: usize) -> usize {
+    clamp_region_size((total_bytes / G1_TARGET_REGION_COUNT).max(crate::region::DEFAULT_REGION_SIZE))
+}
+
 /// Explicit G1 tuning overrides wired from the `-XX:` knobs, applied by
 /// [`VmHeap::new_with_overrides`]. `None` keeps the collector default.
 #[derive(Debug, Default, Clone, Copy)]
@@ -84,6 +127,12 @@ pub struct G1ConfigOverrides {
     pub max_gc_pause_ms: Option<u64>,
     /// `-XX:±UseStringDeduplication`.
     pub string_dedup: Option<bool>,
+    /// `-XX:ParallelGCThreads=<n>` — evacuation worker count (F-13). `None`
+    /// leaves `gc_worker_threads` at its `0` = machine-derived default.
+    pub parallel_gc_threads: Option<usize>,
+    /// `-Xms` — bytes to commit up front (F-16). `None` leaves
+    /// `initial_heap_size` at its `0` = ergonomic default.
+    pub initial_heap_size: Option<usize>,
 }
 
 // ─── GPU-offload coordination (Phase 6 item 1) ───────────────────────────
@@ -285,14 +334,17 @@ impl VmHeap {
             GcBackend::G1 => {
                 let mut config = G1CollectorConfig::default();
                 config.heap_size = total_bytes;
-                // Scale region size: 1 MB for heaps < 4 GB, 2 MB for larger
-                if total_bytes > 4 * 1024 * 1024 * 1024 {
-                    config.region_size = 2 * 1024 * 1024;
-                }
-                // Explicit -XX: overrides take precedence over the ergonomic.
+                config.region_size = g1_ergonomic_region_size(total_bytes);
+                // Explicit -XX: overrides take precedence over the ergonomic,
+                // but are held to the same shape — a region size is a power of
+                // two in `[MIN_REGION_SIZE, G1_MAX_REGION_SIZE]` no matter who
+                // chose it. `G1Collector::new` would round a non-power-of-two
+                // up anyway (see `normalize_region_size`); doing it here as
+                // well is what keeps the value an operator reads back out of
+                // the config equal to the one the collector is using.
                 if let Some(rs) = overrides.region_size {
                     if rs > 0 {
-                        config.region_size = rs;
+                        config.region_size = clamp_region_size(rs);
                     }
                 }
                 if let Some(ihop) = overrides.ihop_percent {
@@ -303,6 +355,22 @@ impl VmHeap {
                 }
                 if let Some(dedup) = overrides.string_dedup {
                     config.string_dedup_enabled = dedup;
+                }
+                // F-13: an explicit count is still clamped to the hardware by
+                // `parallel_worker_count`; 0 would mean "auto" there, so a
+                // `-XX:ParallelGCThreads=0` is rejected by the CLI rather than
+                // being silently reinterpreted.
+                if let Some(n) = overrides.parallel_gc_threads {
+                    if n > 0 {
+                        config.gc_worker_threads = n;
+                    }
+                }
+                // F-16: `-Xms`. Clamped to the reservation by
+                // `G1Collector::new`, so an `-Xms` above `-Xmx` yields a heap
+                // rather than a refusal — the two are specified separately and
+                // a user who oversizes one should still get a VM.
+                if let Some(n) = overrides.initial_heap_size {
+                    config.initial_heap_size = n;
                 }
                 VmHeap::G1(G1State::new(config))
             }

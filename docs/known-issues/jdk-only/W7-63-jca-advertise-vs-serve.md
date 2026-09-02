@@ -20,6 +20,15 @@
 >
 > What is left is five `SunTls*` `KeyGenerator` services, and the reason is
 > structural rather than clerical (§8c).
+>
+> **2026-09-02, later the same day: §8c's second bullet closed too**, and its
+> own diagnosis was the thing that was wrong. `unmodifiableList(x) instanceof
+> RandomAccess` did not fail because a fabricated class failed to declare a
+> marker — it failed because the opcodes and `getClass()` each computed the
+> receiver's display class through a different subtype walk, and the opcodes'
+> walk was the exception-`catch_type` fallback, which cannot match an interface
+> at all. §8d. The bullet had sent the next reader to `native-collections`,
+> which was correct throughout.
 
 > **The verification this page asked for, run at last.** The original status
 > said: "This lane could not build or run Rust. Every Rust change below is
@@ -740,6 +749,12 @@ makes the encoding right as well as the signature.
 
 ## 8c. What is still open
 
+> One of the three below closed on 2026-09-02 and is kept, struck through, with
+> what it turned out to be. It is worth keeping because the bullet's own
+> diagnosis was wrong in a way that would have sent the next reader to the wrong
+> crate: it said the defect "belongs to whoever owns `native-collections`'
+> wrapper minting", and the wrapper minting was correct.
+
 * **Five `SunTls*` `KeyGenerator` services.** `SunTlsPrf`, `SunTls12Prf`,
   `SunTlsMasterSecret`, `SunTlsKeyMaterial`, `SunTlsRsaPremasterSecret` — the
   TLS-internal KDFs, which take `TlsKeyMaterialParameterSpec`-family specs this
@@ -749,16 +764,156 @@ makes the encoding right as well as the signature.
   they did not build (the `skf_receiver_is_ours` shape). An engine change, not
   a row, and `every_keygenerator_the_engine_implements_is_advertised` asserts
   they stay absent until it is made.
-* **`Collections.unmodifiableList(x) instanceof RandomAccess`** is `true` in
-  `--jdk-only`, where real bytecode builds the view, and `false` in the two
-  modes where `alloc_unmod_wrapper` fabricates it — the fabricated class does
-  not re-declare the marker its own NAME promises.
-  `apps/probes/RandomAccessProbe` is the three-line reproducer. Belongs to
-  whoever owns `native-collections`' wrapper minting.
+
+* ~~**`Collections.unmodifiableList(x) instanceof RandomAccess`** is `true` in
+  `--jdk-only` and `false` in the two modes where `alloc_unmod_wrapper`
+  fabricates the view — the fabricated class does not re-declare the marker its
+  own NAME promises. Belongs to whoever owns `native-collections`' wrapper
+  minting.~~
+
+  > **CLOSED 2026-09-02, and it was not the wrapper minting.** See
+  > "8d. One name that reads like the other" below. `apps/probes/RandomAccessProbe`
+  > is now byte-identical to HotSpot on twelve rows in `--jdk-only` and in
+  > real-JDK mode, across all three doors (`instanceof`, `checkcast`,
+  > `Class.isInstance`) and `getClass()`. `--synthetic-jdk` had a SECOND,
+  > unrelated cause for the same symptom, and the sweep run to check that one
+  > pair was not a coincidence found five more defects — §8e.
+
 * **`LinkedList` is not a `Deque`** here and is on HotSpot. Deliberately not
   declared: this VM carries most of the deque surface and not all of it, so the
   interface would turn a clean `ClassCastException` into a missing method at
   the point of use.
+
+## 8d. One name that reads like the other
+
+The wrapper minting was right, and so was every table this bullet pointed at.
+`cratonvm/internal/UnmodifiableList` is a stamp for BOTH of HotSpot's two
+unmodifiable-list classes, and the VM picks between them per instance by asking
+whether the wrapped list implements `RandomAccess` — `getClass()` through
+`native-builtins`' `getclass_backing_is_random_access`, and the
+`instanceof`/`checkcast` opcodes through `typecheck::unmod_backing_reaches`.
+Two implementations of one decision, which is the shape that fails.
+
+The opcode side asked through `ClassManager::is_subclass_of_by_name`. That
+function walks ONLY the superclass chain: it is the exception-`catch_type`
+fallback, and a `catch_type` is never an interface. `RandomAccess` is an
+interface, so it answered `false` for every list ever built — `ArrayList`
+reaches `AbstractList`, `AbstractCollection`, `Object` and stops. The
+`getClass()` side resolved the interface to a `ClassId` and used the
+DAG-walking `is_subclass`, so it answered `true`. One object, at one instant:
+
+```text
+v.getClass()                      java.util.Collections$UnmodifiableRandomAccessList
+RandomAccess.class.isInstance(v)  true
+v instanceof RandomAccess         false
+(RandomAccess) v                  ClassCastException
+```
+
+`display_class_satisfies_target` — the arm that exists precisely to keep the
+opcodes agreeing with `getClass()` — was reached, ran, and computed the wrong
+display class, so the fix is one function call and not a new mechanism. Two
+things made it hard to see and both are worth naming:
+
+* **The disagreement was invisible from either side alone.** `getInterfaces()`
+  returned `[RandomAccess]`, `getClass()` named the RandomAccess class, and the
+  declared interface `Class` object was `==` `RandomAccess.class` — every
+  reflective question answered correctly, because they all run on the display
+  class. Only a probe that asks all three doors about ONE object shows it, which
+  is why `apps/probes/RandomAccessProbe` prints an `agree=` column.
+* **The trap was already written down, on a different call site.** The
+  `Path.toString()` branch in `runtime/invokedynamic.rs` carries a paragraph
+  explaining that `is_subclass_of_by_name` "can never match an interface like
+  `Path` and this branch would silently never fire", added after a concurrent
+  commit made exactly this mistake. This is its second occurrence, and the name
+  is the whole reason: the function that sounds like the general one is the
+  special one. `classloading`'s
+  `the_supers_only_name_walk_cannot_see_an_interface_the_dag_walk_finds` now
+  asserts the divergence in both directions, so the next reader meets it as a
+  test rather than as a comment on an unrelated branch.
+
+The fix moved BOTH halves, which the second measurement forced. Correcting only
+the opcode side made `Collections.unmodifiableList(List.of("a", "b"))` — a
+wrapper whose backing is itself a stamp — read `instanceof=true isInstance=false`:
+a *new* disagreement, where before the pair had been wrong together. Each side
+now runs the same structural rule (`typecheck::object_reaches` and
+`getclass_object_reaches`), descending slot 0, because an unmodifiable view
+carries the marker exactly when the thing it wraps does. Both carry a comment
+saying they are a pair; neither may move alone.
+
+## 8e. The sweep that closed §8c's bullet found five more
+
+Fixing one pair is not evidence about the others, so `apps/probes/CollectionViewTypes`
+asks 24 collection views and 11 concrete classes about 14 interfaces each — 490
+cells, on HotSpot 25.0.3 and on this VM in all three modes, diffed on stdout.
+
+**Real-JDK: 35 of 35 rows now identical.** Three of them were not, and they are
+the OPPOSITE defect from §8d's — over-admissions, where this VM says `true` and
+HotSpot says `false`:
+
+```text
+aConcurrentSkipListSet instanceof List                     CratonVM true   HotSpot false
+aConcurrentSkipListMap instanceof Collection/List/Iterable  true    false
+aPriorityQueue         instanceof Deque                     true    false
+```
+
+`synthetic_implements` has a name-word fallback for classes with no real
+interface data, and it reads the word `List` out of `ConcurrentSkipList`**Set**
+and `ConcurrentSkipList`**Map** — a skip list is how they are BUILT, not what
+they are. This is the family the fallback's own comment already records ("`x
+instanceof List` returned true for a HashSet ... which broke JUnit's
+`Parameterized$RunnersFactory`"), fixed then for Set-versus-List and not for
+these. `PriorityQueue` is a third shape: `Queue` and `Deque` shared one match
+arm, and `Deque extends Queue` rather than the reverse.
+
+An over-admission here is worse than a refusal, because it converts a clean
+`ClassCastException` at the cast into a `NoSuchMethodError` at the first call —
+which is the exact trade §8c's `LinkedList`/`Deque` bullet declines to make. The
+arms now exclude a name whose FINAL word contradicts the target. Not a
+last-word-wins rule, which is tidier and wrong: `Collections$SetFromMap` ends in
+`Map` and is a `Set`.
+
+**`--synthetic-jdk`: every type row that can be measured is identical.** In that
+mode the supertype set comes from `class_manager.rs`'s interface table, and
+NONE of `Collections$Unmodifiable*`, `ImmutableCollections$*` or
+`Arrays$ArrayList` had an arm there — all of them fell to `_ => &[]` and
+declared nothing at all. The coarse questions still answered correctly, because
+the name-word fallback above reads `List` out of `UnmodifiableList`, so only the
+interfaces a name does NOT spell were lost:
+
+```text
+unmodifiableList(ArrayList)  Iterable      HotSpot true  CratonVM false
+                             RandomAccess          true           false
+Arrays.asList                RandomAccess          true           false
+                             Serializable          true           false
+List.of(..) / Set.of(..)     Iterable              true           false
+TreeSet                      SortedSet             true           false
+TreeMap                      SortedMap             true           false
+```
+
+A `Collection` that is not an `Iterable` is the worst of those: every for-each
+through an erased type is a `checkcast java/lang/Iterable`. `TreeSet` and
+`TreeMap` are the `ArrayList`/`LinkedList` split of §8's last bullet happening
+twice more — a group in that table costs its members exactly the markers that
+distinguish them.
+
+### Still open in `--synthetic-jdk`, and not this species
+
+* `Collections.emptyList()`/`emptySet()`/`emptyMap()` hand back a plain
+  `ArrayList`/`HashSet`/`HashMap`. Every type answer is right; the CLASS is
+  wrong (and so `Cloneable` is `true` where HotSpot says `false`). A
+  factory-return question, not a hierarchy one.
+* No `(Collection)` copy constructor for `Vector`, `CopyOnWriteArrayList`,
+  `ConcurrentSkipListSet`, `ConcurrentSkipListMap`, `ArrayDeque` or
+  `PriorityQueue`; no `Collections.unmodifiableSortedMap`; no
+  `DayOfWeek.MONDAY`. Method-surface completeness.
+* `LinkedList` is not a `Deque` — §8c's third bullet, unchanged and deliberate.
+
+The probe prints an `ERROR` row for each of those rather than dying: its first
+version called the factories inline, `unmodifiableSortedMap` raised
+`NoSuchMethodError` at row 22 in that mode, and the fourteen control rows below
+it — every sorted class, the whole reason they are in the probe — silently
+measured nothing. **A probe that stops early does not report less; it reports a
+shorter file that still diffs clean.**
 
 ## 9. How to verify
 

@@ -1379,6 +1379,98 @@ mod tests {
         );
     }
 
+    /// Every float→integer conversion carries the NaN→0 guard JLS
+    /// §5.1.3 requires.
+    ///
+    /// AUDIT 2026-09-02. `cvt.rzi` alone returned the destination type's
+    /// MIN_VALUE for a NaN source on an RTX 2060 — `(int) NaN` was
+    /// `-2147483648`, `(long) NaN` was `Long.MIN_VALUE` — against the
+    /// zero Java specifies. Found by differential test, not by reading:
+    /// the PTX ISA is silent on the NaN case for these conversions,
+    /// which is precisely why three of the four diverged and the fourth
+    /// did not.
+    ///
+    /// Asserted per opcode rather than as "some `setp.nan` exists",
+    /// because the failure that matters is one conversion losing the
+    /// guard while its neighbours keep it — which is the shape the bug
+    /// arrived in.
+    #[test]
+    fn every_float_to_int_conversion_guards_nan() {
+        // (fixture method, descriptor, the cvt this must sit on)
+        let cases = [
+            ("f2iKernel", "([F[I)V", "cvt.rzi.s32.f32", "f32", "s32"),
+            ("f2lKernel", "([F[J)V", "cvt.rzi.s64.f32", "f32", "s64"),
+            ("d2iKernel", "([D[I)V", "cvt.rzi.s32.f64", "f64", "s32"),
+            ("d2lKernel", "([D[J)V", "cvt.rzi.s64.f64", "f64", "s64"),
+        ];
+        for (m, d, cvt, src, dst) in cases {
+            let (method, cp) = crate::analyzer::load_method_with_pool("GpuArithProbe", m, d);
+            let sig = match crate::analyzer::analyze_with_pool(&method, &cp) {
+                OffloadVerdict::Eligible(s) => s,
+                v => panic!("{m} not eligible: {v:?}"),
+            };
+            let text = lower_method_with_pool("GpuArithProbe", &method, &cp, &sig, 7, 5)
+                .unwrap_or_else(|e| panic!("{m} failed to lower: {e}"))
+                .render();
+            assert!(
+                text.contains(cvt),
+                "{m} should lower through `{cvt}`\n{text}"
+            );
+            assert!(
+                text.contains(&format!("setp.nan.{src}")),
+                "{m} must test its SOURCE for NaN — the converted result is an \
+                 ordinary integer and carries no evidence of where it came \
+                 from\n{text}"
+            );
+            assert!(
+                text.contains(&format!("selp.{dst}")),
+                "{m} must select 0 on the NaN path (JLS 5.1.3)\n{text}"
+            );
+            // The select's true-arm is the literal zero, not some
+            // register that happens to hold zero at this point.
+            let selp_line = text
+                .lines()
+                .map(str::trim)
+                .find(|l| l.starts_with(&format!("selp.{dst}")))
+                .unwrap_or_else(|| panic!("{m}: no selp line\n{text}"));
+            assert!(
+                selp_line.contains(", 0, "),
+                "{m}: the NaN arm must be a literal 0, got `{selp_line}`"
+            );
+        }
+    }
+
+    /// The conversions that do NOT get the guard, and why.
+    ///
+    /// `i2f`/`l2f`/`i2d`/`l2d` widen an integer, which has no NaN to
+    /// find; `f2d`/`d2f` are float→float, where a NaN source must stay a
+    /// NaN rather than become zero. Emitting the guard on any of these
+    /// would turn a NaN into 0 and be a new bug of the same family.
+    #[test]
+    fn conversions_without_a_nan_source_do_not_get_the_guard() {
+        for (m, d) in [
+            ("i2fKernel", "([I[F)V"),
+            ("l2fKernel", "([J[F)V"),
+            ("f2dKernel", "([F[D)V"),
+            ("d2fKernel", "([D[F)V"),
+        ] {
+            let (method, cp) =
+                crate::analyzer::load_method_with_pool("GpuArithDifferential", m, d);
+            let sig = match crate::analyzer::analyze_with_pool(&method, &cp) {
+                OffloadVerdict::Eligible(s) => s,
+                v => panic!("{m} not eligible: {v:?}"),
+            };
+            let text = lower_method_with_pool("GpuArithDifferential", &method, &cp, &sig, 7, 5)
+                .unwrap_or_else(|e| panic!("{m} failed to lower: {e}"))
+                .render();
+            assert!(
+                !text.contains("setp.nan"),
+                "{m} has no NaN source to guard, or must preserve one — a \
+                 guard here would convert a NaN result to zero\n{text}"
+            );
+        }
+    }
+
     #[test]
     fn vector_add_lowers_to_real_ptx() {
         let m = lower_fixture("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");

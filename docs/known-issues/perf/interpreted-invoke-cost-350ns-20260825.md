@@ -283,6 +283,74 @@ per-argument slope, whose control arm is the zero-argument call.
 256-byte memset per invoke, which is ~1-2% of a 289 ns call - below this
 host's resolution, and not worth the `MaybeUninit` it would take to remove.
 
+### The aggregate does NOT resolvably move an end-to-end workload
+
+Read this before quoting any per-operation number above as a speed-up.
+
+Every figure in this pass is a **per-operation** delta taken with an internal
+control. None of them is an end-to-end claim, and the end-to-end measurement
+was taken separately and came back **unresolved**.
+
+`bench/CratonBench.java` is the wrong instrument for it: at ~104 s per run it
+is seven compute kernels that all tier up, so after warmup the interpreter is
+barely on the path. The interpreted phase of a *shipped* configuration is
+class loading and the reflective introspection a framework does before
+anything tiers up — code that runs once or a handful of times and therefore
+never reaches the JIT at all. That is the population these changes serve, and
+`probes/ClassLoadShape.java` is the probe for it: 40 rounds over 40 JDK
+classes, walking each one's declared methods, fields, constructors,
+interfaces and superclass.
+
+Its standing ratio, default configuration (JIT on), is itself worth recording:
+
+| | CratonVM | HotSpot | ratio |
+|---|---:|---:|---:|
+| class load + reflect, 40x40 | 1,284 ms | 100 ms | **12.8x** |
+
+The A/B, all five kill switches on versus off, arms interleaved in both
+directions, two batches because the host's condition drifted between them:
+
+| batch | passes | NEW median | OLD median | delta |
+|---|---:|---:|---:|---:|
+| 1 | 6 | 1,103 ms | 1,134 ms | 2.7% |
+| 2 | 8 | 1,065 ms | 1,073 ms | 0.7% |
+
+Sorted, batch 2 (the quieter one):
+
+```
+NEW  1002 1033 1060 1064 1067 1072 1084 1086
+OLD  1014 1034 1046 1072 1074 1111 1112 1155
+```
+
+**What that supports, and what it does not.** The direction is consistently
+favourable — NEW's median is lower in both batches, its minimum is lower, and
+OLD carries the longer tail — but the magnitude is 0.7-2.7% against
+distributions that overlap across most of their range. That is at or below
+what this harness resolves on this host. It is **not** a 3% speed-up claim.
+The first pass of batch 1 also read 1,858 ms for NEW against 1,262 for OLD,
+which is a cold page cache and not a regression; it is excluded above and
+named here so nobody rediscovers it as one.
+
+**Why the per-operation wins do not add up to a visible end-to-end one.**
+This workload's time is dominated by class *parsing*, verification and native
+reflection, not by the specific operations that were made cheaper. A change
+worth 30 ns on an inherited field access is worth 30 ns times however many
+inherited field accesses the workload performs, and here that is a small
+share of a second spent mostly elsewhere. The right reading is that the
+interpreter's per-operation floor came down and the end-to-end ceiling is set
+by something else — which is a statement about where to look next, not a
+reason to revert anything.
+
+**The changes are kept on that basis.** Each one deletes work that was being
+repeated per operation and is fixed per method, per call site or per process;
+each is pinned by an equivalence test; none adds a cache that needs
+invalidating beyond a `OnceLock` on an immutable field or a one-way latch.
+That is the same standard this page already applies to piece 4 of the
+2026-08-11 work. A future end-to-end claim needs a quiet host and a workload
+whose time actually sits in these operations — the Tomcat annotation scan the
+retired predecessor page was built around is the obvious candidate, and it was
+not run here.
+
 ### What this pass did NOT find, so nobody re-derives it
 
 * **Fast-path arms for `tableswitch` / `lookupswitch` are not a lever.** Both do
@@ -313,7 +381,8 @@ host's resolution, and not worth the `MaybeUninit` it would take to remove.
 ### The probes
 
 `probes/FieldShape.java`, `probes/BackEdge.java`, `probes/Arity.java`,
-`probes/Dispatch.java`, `probes/RetTag.java`, `probes/DecodedShare.java`. All
+`probes/Dispatch.java`, `probes/RetTag.java`, `probes/DecodedShare.java`,
+`probes/ClassLoadShape.java`. All
 self-time, interleave their arms in both directions on alternating rounds, and
 report min-of-N. Every one of them carries a control arm in the same process,
 which is what makes them usable on a host at 90% CPU - the arms move together,
