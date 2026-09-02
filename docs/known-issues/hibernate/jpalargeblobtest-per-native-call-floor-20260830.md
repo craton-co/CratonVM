@@ -2,14 +2,14 @@
 
 ## Status
 
-**OPEN, and this is not a hibernate bug. ROOT CAUSE FOUND 2026-09-02, in
-section 11: a callee invoked from COMPILED code never has its tiered-manager
-invocation counter incremented, so a method that cannot be inlined never
-compiles and runs interpreted for the life of the process. The fixture's
-`read()` autoboxes, autoboxing is a call, a call makes it non-inlinable — so all
-100 000 000 invocations run in the interpreter. Everything above section 11 is
-the trail that led there and several of its conclusions are superseded; read
-section 11 first.** This is the residual of
+**OPEN, and this is not a hibernate bug. MECHANISM FOUND 2026-09-02, in section
+12: the JIT's class-guarded intrinsics do not take effect INSIDE A CALLEE. In
+the method being compiled, `AtomicLong.get` is 2.6 ns and `compareAndSet` 15.4;
+one call deeper the same two operations are dispatched generically and REFUSED
+on every single call — measured, `out_special_bc_refused` equal to the exact
+call count — at roughly 1150 ns each. The fixture's `read()` autoboxes, so its
+`Long.valueOf`/`longValue` sit one call deeper and pay that. Sections 9 and 11
+are the trail; section 12 is the finding and the only one to act on.** This is the residual of
 `fixed-suite-bugs/hibernate/jpalargeblob-random-state-side-table-FIXED-20260830.md`, which is retired: both of
 that page's own findings are fixed, the test got 1.35x faster, and it still
 fails. What is left is not a defect in `Random`, in blobs, or in H2 — it is this
@@ -468,3 +468,86 @@ because each was refuted by a control that is worth reusing.
 * Also refuted, so it is not re-tried: the `&& !statically_bound` gate on
   `jit_invoke_dispatch`'s compiled-callee-entry cache is not the mechanism — a
   VIRTUAL callee is equally slow (2474.0 against the static twin's 2546.9).
+
+---
+
+# 12. MECHANISM: the intrinsics do not fire inside a callee, and the fallback is refused per call
+
+Section 11 established that a non-inlinable callee runs 30x slower than the same
+body inlined, and blamed the tiered invocation counter. The counter observation
+is TRUE and is not the operative mechanism. The dispatch census says what is.
+
+## 12.1 The census
+
+`CRATONVM_DBG_MIC_PROF=1`, `probes/TierOneArm.java -Darm=lcgnoloop -Dn=300000`
+— a callee whose body is one `AtomicLong.get` plus one `compareAndSet`:
+
+```
+[DISP_CENSUS] kind_special=598364 out_special_bc_refused=598364 out_tail=598364
+```
+
+**598 364 ≈ 2 x 300 000** — the two atomic operations INSIDE the callee, every
+one of them dispatched generically and every one REFUSED. The same census for
+the `prim` arm, whose `read()` is inlined, is empty: nothing is dispatched at
+all.
+
+`OUT_SPECIAL_BC_REFUSED` is documented in `vm/src/jit/helpers.rs` as "an
+`invokespecial` to an **uncompiled callee** served from the call site's cached
+interpreter frame template … that path DECLINED, per call". `AtomicLong.get` is
+a registered NATIVE, so there is no bytecode to compile and the template can
+only decline — every call then takes the slow generic route, ~1150 ns, twice per
+iteration, which is the ~2500 ns measured.
+
+## 12.2 What that means
+
+In the method the JIT is compiling, those two operations are intrinsified to a
+`MOV` and a `LOCK CMPXCHG` — 2.6 ns and 15.4 ns (section 8). One call deeper
+they are not intrinsified at all. **The class-guarded intrinsic families
+(`Atomic*`, `String`, and section 4's `BOX_UNBOX`) do not reach a callee's own
+sites.**
+
+That is the whole page:
+
+* `read()` autoboxes; `Long.valueOf` / `longValue` are calls; they sit inside
+  `read()`, which is one call deeper than the compiled loop; so the `BOX_UNBOX`
+  intrinsic never applies to them and each pays generic dispatch.
+* It is exactly why section 4's intrinsic bought 1.6x in a tight counter loop —
+  where the sites ARE in the compiled method — and nothing at all on the stream
+  arm.
+* `Random.next` is the same shape one level further down.
+
+## 12.3 A fix that was built, measured and REVERTED
+
+Section 11's counter reading suggested incrementing the tiered manager's
+invocation count from the compiled-code dispatch helper. That was implemented
+behind `CRATONVM_JIT_TIER_COUNT_DISPATCH` (default off) and **measured on one
+binary, both ways**:
+
+| arm | flag OFF | flag ON |
+|---|---:|---:|
+| `prim` | 72.9 | 83.3 |
+| `primcall` | 2349.0 | 2541.7 |
+| `boxed` | 2739.6 | 2604.2 |
+| `lcgnoloop` | 2265.6 | 2234.4 |
+
+Nothing moved, and the engagement check says why: the method-stats line is
+IDENTICAL with the flag on and off (`1 ever invoked`, `still-interpreted=2`), so
+the counter never ran for the method in question. `lcgNoLoop` does not reach
+`jit_invoke_dispatch` at all — what reaches it are the two ATOMIC calls inside
+it, whose callees are natives that counting cannot promote.
+
+The change was reverted. It is recorded because the negative result is worth
+more than the flag: **the compiled-dispatch counter gap is real, and it is not
+what makes this test slow.**
+
+## 12.4 What to do
+
+Make the class-guarded intrinsics reach a callee's sites — or, equivalently,
+inline the callee. The specific question for whoever takes it: when the JIT
+compiles a method that is itself a callee, does its invoke classification
+receive a `cp_invoke_class_id_resolver`? Every one of these intrinsic families
+declines on a `guard_class_id` of 0 by construction
+(`AtomicLongFieldLayout::new` returns `None` for it), so a compile door that
+does not supply one disables all of them silently, with no counter moving and
+no diagnostic printed. That is a one-run experiment with a per-site engagement
+counter read from inside a callee compile.
