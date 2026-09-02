@@ -15543,12 +15543,19 @@ impl GarbageCollector for ZgcRealHeap {
             if self.gc_log_enabled.load(Ordering::Relaxed) {
                 eprintln!(
                     "[GC] zgc-reclaim: bytes_freed={} free_list_bytes={} \
-                     largest_free_block={} cursor={} capacity={} registered={}",
+                     largest_free_block={} cursor={} capacity={} committed={} \
+                     registered={}",
                     bytes_freed,
                     arena.free_list_bytes(),
                     arena.largest_free_block(),
                     arena.used(),
                     arena.capacity(),
+                    // WHAT THE PROCESS IS ACTUALLY HOLDING, beside what the
+                    // heap is allowed to hold. Equal to `capacity` on the
+                    // wholly-committed fallback store and well below it on a
+                    // reserving one, which is the difference between "-Xmx is a
+                    // ceiling" and "-Xmx is a charge".
+                    arena.committed_bytes(),
                     registered_count,
                 );
             }
