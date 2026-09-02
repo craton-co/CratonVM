@@ -13685,8 +13685,25 @@ impl G1Collector {
                 reclaimable += r.cursor().saturating_sub(r.live_bytes);
             }
         }
-        candidates > 0
-            && reclaimable * 100 >= self.config.heap_size * self.config.heap_waste_percent as usize
+        if candidates == 0 {
+            return false;
+        }
+        // The waste floor is a HEADROOM policy: with plenty of Free regions,
+        // a mixed pause that copies a lot to reclaim a little is not worth
+        // taking. It must not refuse the work when the heap is tight — measured
+        // on `G1CardChurn 11 60` at `-Xmx24m`: with the floor applied
+        // unconditionally, a pause storm of ~886 young pauses (against ~40)
+        // ran while the free pool sat under the trigger and the only regions
+        // that could relieve it were refused as "not worth it". HotSpot has
+        // the same floor and a full GC behind it; this collector's full GC IS
+        // the mixed sequence, so the floor is waived once the Free pool is
+        // within twice the free-percent trigger.
+        let total = regions.len().max(1);
+        let free = self.free_region_count.load(Ordering::Relaxed);
+        let trigger_pct = self.needs_gc_free_percent.load(Ordering::Relaxed).max(1);
+        let tight = free * 100 < total * (trigger_pct * 2).min(100);
+        tight
+            || reclaimable * 100 >= self.config.heap_size * self.config.heap_waste_percent as usize
     }
 
     /// Item 2 — close the mixed phase before its pause budget is spent.
@@ -20346,6 +20363,14 @@ mod tests {
         assert!(
             !gc.mixed_phase_has_work(),
             "224 KiB of garbage is 2.7% of the heap, below the 5% floor"
+        );
+
+        // …until the Free pool is tight: then the floor is waived, because the
+        // mixed sequence is the only thing that can relieve the pressure.
+        consume_regions(&gc, 5); // 8 regions, 2 Old, 5 consumed -> 1 Free, under 2x the 25% trigger
+        assert!(
+            gc.mixed_phase_has_work(),
+            "with the Free pool under twice the trigger the waste floor must not refuse work"
         );
     }
 
