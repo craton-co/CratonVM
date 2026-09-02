@@ -699,7 +699,16 @@ impl ZgcRealHeap {
         // arena free list shared with every other allocator in this crate, the
         // write is one header, and "walkable" is the state the rest of the tree
         // assumes of arena bytes below the cursor.
-        tlab.inner.retire();
+        //
+        // `retire_taking_tail`, not `retire`: the plain retire consults the
+        // process-wide tail sinks (`crate::tlab::TlabTailSink`), and THIS heap
+        // is one of them. Letting it run would free the tail into the arena
+        // twice -- once through the sink and once on the line below.
+        // SAFETY: the chunk is live arena memory this thread owns alone.
+        unsafe {
+            tlab.inner.install_tail_filler(crate::tlab::TLAB_FILLER_CLASS_ID);
+        }
+        let _ = tlab.inner.retire_taking_tail();
         tlab.stats.retires += 1;
         debug_assert!(tlab.inner.reserved_tail().is_none());
         let Some((tail_start, tail_end)) = tail else {
@@ -755,6 +764,28 @@ impl ZgcRealHeap {
             return None;
         }
         self.tlab_retire_locked(tlab);
+        let (ptr, want) = self.carve_tlab_chunk(want, need)?;
+        // SAFETY: `[ptr, ptr + want)` was just reserved from the arena and is
+        // owned exclusively by this thread until retire; it is zeroed by the
+        // carve; `want` is a multiple of `ZGC_TLAB_ALIGN`, which is what
+        // `Tlab::new`'s tail-filler contract requires of `ptr + want`.
+        tlab.inner = unsafe { Tlab::new(ptr, want) };
+        tlab.chunk = Some((ptr as usize, ptr as usize + want));
+        tlab.stats.refills += 1;
+        tlab.stats.refill_bytes += want as u64;
+        Some(())
+    }
+
+    /// Carve one zeroed, black-if-marking, young-if-generational chunk of
+    /// `want` bytes (or a recycled block of at least `need`) from the low
+    /// arena. The one chunk source for both TLAB owners on this backend: the
+    /// heap's own [`ZArenaTlab`] cells above, and the VM thread's `Tlab` that
+    /// `refill_tlab` (`zgc::vm_tlab`) hands to the interpreter and the JIT's
+    /// inline allocator.
+    ///
+    /// Returns the chunk and its actual length; `None` means the arena could
+    /// not serve one and the caller takes its per-object path.
+    pub(crate) fn carve_tlab_chunk(&self, want: usize, need: usize) -> Option<(*mut u8, usize)> {
         // Take the arena lock for the bump ONLY. The zeroing below is the
         // expensive half and must not be inside it — that is the very
         // serialisation this whole section exists to remove.
@@ -844,14 +875,6 @@ impl ZgcRealHeap {
         // SAFETY: `arena.alloc` guarantees `want` valid bytes at `ptr`, and the
         // span is exclusively ours until retire.
         unsafe { std::ptr::write_bytes(ptr, 0, want) };
-        // SAFETY: `[ptr, ptr + want)` was just reserved from the arena and is
-        // owned exclusively by this thread until retire; it is zeroed above;
-        // `want` is a multiple of `ZGC_TLAB_ALIGN`, which is what `Tlab::new`'s
-        // tail-filler contract requires of `ptr + want`.
-        tlab.inner = unsafe { Tlab::new(ptr, want) };
-        tlab.chunk = Some((ptr as usize, ptr as usize + want));
-        tlab.stats.refills += 1;
-        tlab.stats.refill_bytes += want as u64;
         // ---- ALLOCATE-BLACK, ONCE PER CHUNK ------------------------------
         //
         // Under snapshot-at-the-beginning every object allocated during a cycle
@@ -878,7 +901,7 @@ impl ZgcRealHeap {
         if self.generational_enabled.load(Ordering::Relaxed) {
             self.mark_young_pages(ptr as usize, ptr as usize + want);
         }
-        Some(())
+        Some((ptr, want))
     }
 
     /// Bump-allocate `size` zeroed bytes from this thread's TLAB.

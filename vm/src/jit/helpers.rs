@@ -4850,6 +4850,18 @@ pub unsafe extern "C" fn jit_post_tlab_init(
         );
     }
 
+    // The header is complete from here on. ZGC needs every TLAB object in its
+    // start registry before anything else can observe the address (the
+    // registry is a mutator-path oracle there, not only the sweep's), and
+    // this helper is the one call the inline allocator always makes -- so
+    // this is where an inline-allocated object is registered. A no-op on the
+    // backends whose sweeps parse the chunk linearly. `zgc/vm_tlab.rs`.
+    {
+        let footprint = HEADER_SIZE
+            + compact_body.map_or(num_fields as usize * SLOT_SIZE, |body| body as usize);
+        vm.mem.heap.note_tlab_object(raw_ptr, footprint);
+    }
+
     // Reconstruct the typed handle and finish init.
     let obj_ref = cratonvm_types::ObjectRef::from_raw(raw_ptr);
 

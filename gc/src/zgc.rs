@@ -113,6 +113,12 @@ mod arena_tlab;
 pub use arena_tlab::ZArenaTlabRetireSummary;
 pub(crate) use arena_tlab::{zgc_tlab_enabled_by_default, zgc_tlab_footprint, ZArenaTlabRegistry};
 
+/// The VM thread's own `Tlab` on this backend: the `Zgc` arm of
+/// `VmHeap::refill_tlab`, per-object registration, tail reclamation, and the
+/// skip-region contract with the compactor. Added 2026-09-02.
+mod vm_tlab;
+pub(crate) use vm_tlab::zgc_vm_tlab_enabled_by_default;
+
 pub(crate) use starts::{
     zgc_mark_bits_enabled, zgc_start_bits_enabled_by_default, ZObjectStartBits,
     ZObjectStarts, ZObjectStartsSnapshot,
@@ -1002,6 +1008,19 @@ struct ZgcCounters {
     /// Cycles that relocated the unpinned pages despite an incomplete coverage
     /// proof. See [`Self::coverage_incompleteness_is_page_pinnable`].
     relocation_on_page_pins: AtomicUsize,
+    /// `CRATONVM_ZGC_JIT_TLAB`: whether `refill_tlab` hands the VM thread's
+    /// buffer a chunk. See `zgc/vm_tlab.rs`.
+    vm_tlab_enabled: AtomicBool,
+    /// Reserved tails of VM TLABs whose owners could not retire before this
+    /// collection, published by the STW protocol and consumed by the slide.
+    jit_tlab_skip: Mutex<Vec<(usize, usize)>>,
+    /// Chunks handed to VM TLABs, and their bytes. The engagement counter for
+    /// the JIT's inline allocator on this backend.
+    vm_tlab_refills: AtomicUsize,
+    vm_tlab_refill_bytes: AtomicUsize,
+    /// Tails taken back from retiring VM TLABs through the sink, and their bytes.
+    vm_tlab_tails_returned: AtomicUsize,
+    vm_tlab_tail_bytes_returned: AtomicUsize,
 }
 
 pub struct ZgcRealHeap {
@@ -1882,6 +1901,12 @@ impl ZgcRealHeap {
                 bytes_uncommitted: AtomicUsize::new(0),
                 conc_black_claims: AtomicUsize::new(0),
                 relocation_on_page_pins: AtomicUsize::new(0),
+                vm_tlab_enabled: AtomicBool::new(zgc_vm_tlab_enabled_by_default()),
+                jit_tlab_skip: Mutex::new(Vec::new()),
+                vm_tlab_refills: AtomicUsize::new(0),
+                vm_tlab_refill_bytes: AtomicUsize::new(0),
+                vm_tlab_tails_returned: AtomicUsize::new(0),
+                vm_tlab_tail_bytes_returned: AtomicUsize::new(0),
             }),
         };
         // G2c: seed the arena's allocation policy to match the mode the flag just
@@ -1966,6 +1991,12 @@ impl ZgcRealHeap {
         // Ignore the `Err`: `OnceLock::set` can only fail if this ran twice on
         // one heap, which this constructor makes impossible.
         let _ = heap.self_weak.set(std::sync::Arc::downgrade(&heap));
+        // The VM thread's `Tlab::retire` hands its unused tail to whichever
+        // sink owns the address; this heap is that sink for its own arena.
+        // See `zgc/vm_tlab.rs`. A `Weak`, so a dropped heap stops answering.
+        let weak: std::sync::Weak<Self> = std::sync::Arc::downgrade(&heap);
+        let sink: std::sync::Weak<dyn crate::tlab::TlabTailSink> = weak;
+        crate::tlab::register_tlab_tail_sink(sink);
         heap
     }
 
@@ -5285,6 +5316,17 @@ impl ZgcRealHeap {
             // num_slots=0` signature.
             let mut pins = self.critical_pin_addrs();
             pins.extend(crate::gc_quiescence::pinned_jit_roots_snapshot());
+            // A VM TLAB whose owner could not retire (blocked in native, or
+            // frozen in compiled code) still bumps into its reserved tail
+            // when it resumes. The tail holds no registered base, so the sweep
+            // is blind to it by construction; the SLIDE is not, and a page it
+            // vacates is zeroed and re-issued. Pin both ends of every published
+            // tail so its pages leave the relocation set, and see
+            // `jit_tlab_skip_floor` below for the cursor. `zgc/vm_tlab.rs`.
+            for (tail_start, tail_end) in self.jit_tlab_skip_regions() {
+                pins.push(tail_start);
+                pins.push(tail_end - 1);
+            }
             if !pins.is_empty() {
                 let page_span = Self::Z_LOGICAL_PAGE_BYTES;
                 let mut dropped = 0usize;
@@ -5582,7 +5624,12 @@ impl ZgcRealHeap {
                         live_ceiling = end;
                     }
                 }
-                let proposed = dest.max(highest_pinned_end);
+                // ...and never below the end of a published VM TLAB tail: the
+                // span between `new_cursor` and `low_end` is zeroed and handed
+                // back to the arena, which is exactly the memory its owner will
+                // bump into when it resumes. `zgc/vm_tlab.rs`.
+                let tail_floor = self.jit_tlab_skip_floor(base, low_end);
+                let proposed = dest.max(highest_pinned_end).max(tail_floor);
                 if live_ceiling > proposed {
                     stranded = live
                         .iter()
@@ -19996,6 +20043,69 @@ pub(crate) mod tests {
             roots[1].as_ptr() as usize, pinned_addr,
             "a conservatively-rooted object moved; the root that named it cannot be              rewritten (it may be a long), so it now points at the zeroed vacated span"
         );
+    }
+
+    /// A blocked or frozen peer's un-retired VM TLAB is published as a skip
+    /// region. The slide must neither drop the bump cursor below its end nor
+    /// write into the buffer: `compact_low_to` would otherwise zero the span
+    /// and hand it out while the peer still bumps into it.
+    #[test]
+    fn a_published_vm_tlab_tail_is_neither_slid_over_nor_reclaimed() {
+        const FIELDS: usize = 500;
+        let heap = ZgcRealHeap::new_shared(64 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+        let per_page = ZgcRealHeap::Z_LOGICAL_PAGE_BYTES / (HEADER_SIZE + FIELDS * SLOT_SIZE);
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        for _page in 0..4 {
+            for i in 0..per_page {
+                let o = heap.alloc_object(ClassId::new(1), FIELDS);
+                if i % 12 == 0 {
+                    roots.push(o);
+                }
+            }
+        }
+        // The peer's buffer sits at the top of the bump region: carve it the
+        // way `refill_tlab` would, pretend the peer bumped 4 KiB into it, and
+        // publish the rest as its reserved tail.
+        heap.set_tlab_enabled(true);
+        let (ptr, size) = heap.refill_tlab(64 * 1024).expect("a fresh chunk");
+        let used = 4096usize;
+        let tail = (ptr as usize + used, ptr as usize + size);
+        unsafe { std::ptr::write_bytes(ptr, 0xAB, used) };
+        heap.set_jit_tlab_skip_regions(&[tail]);
+        let pre: Vec<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+
+        let _serial = quiescence_test_guard();
+        crate::gc_quiescence::clear_pinned_jit_roots();
+        let stw = unsafe { StopTheWorldToken::new() };
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            },
+        );
+        heap.clear_jit_tlab_skip_regions();
+
+        assert!(
+            moved_of(&roots, &pre) > 0,
+            "the fixture must relocate SOMETHING, or a floor that holds proves nothing"
+        );
+        let cursor = {
+            let arena = heap.arena.lock();
+            arena.base_ptr() as usize + arena.used()
+        };
+        assert!(
+            cursor >= tail.1,
+            "cursor {cursor:#x} dropped below the published tail end {:#x}",
+            tail.1
+        );
+        let below = unsafe { std::slice::from_raw_parts(ptr, used) };
+        assert!(
+            below.iter().all(|b| *b == 0xAB),
+            "the slide wrote into the peer's buffer below its published tail"
+        );
+        let stale = unsafe { std::slice::from_raw_parts(tail.0 as *const u8, tail.1 - tail.0) };
+        assert!(stale.iter().all(|b| *b == 0), "the slide wrote into the published tail");
     }
 
     /// Nested critical sections on one array: the inner release must not
