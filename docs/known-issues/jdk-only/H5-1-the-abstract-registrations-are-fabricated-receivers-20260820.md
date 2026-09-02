@@ -386,6 +386,53 @@
 > That is corroboration of §3.2's thesis from outside this record, not a
 > verification of §3.4's map.
 
+
+> **VERIFIED AGAINST A BINARY 2026-09-02.** §5.1 and §5.2 — this record's own two
+> falsifiable predictions — both hold. Binary
+> `/data/l7dod-target/debug/cratonvm`, built 2026-09-02 from this tree on
+> `azure-host-2`. The record had said "Nothing below has been run" for **13 days**.
+>
+> **§5.1, the one registry row that must change.** Predicted `kind:
+> synthetic-stub`, `kind_chosen: true`, `overwrote` absent. Measured, compatible
+> mode:
+>
+> ```text
+> read      ([BII)I  kind=synthetic-stub  chosen=true  overwrote=null  native-io/src/lib.rs:7396
+> readBytes ([BII)I  kind=bridge          chosen=true  overwrote=null  native-io/src/lib.rs:7459
+> ```
+>
+> All three predicates hold, and `readBytes` is unchanged as predicted. The site
+> is `lib.rs:7396`, not the predicted `6499` — **line drift, not a falsifier**:
+> the file is right, and this record's own preamble says to grep the literal
+> rather than trust either number. Under `--jdk-only` the three `read` rows are
+> ABSENT, which §5.1 names in advance as the expected refusal.
+>
+> **§5.2, the strict-mode report.** Predicted: the triple disappears from
+> `violations[]` filtered to `native-shadows-bytecode`. Measured on a
+> `--jdk-only-report`: **61 shadow violations, of which FileInputStream
+> contributes ZERO**, and `read([BII)I` is absent from the list entirely. The 9
+> `FileInputStream` rows that remain are all `synthetic-native-registered` — a
+> different `kind`, and the expected strict refusal of a synthetic stub.
+>
+> **What was NOT run, so nobody reads more into this than it says.** §5.3's
+> 102-vector arm was not run for this note; the falsifier there is a delta
+> ("the count falls by MORE than 1"), and a delta needs a before-binary this note
+> does not have. What it can say is that the corpus HAS been run against this
+> code since — 218 vectors, compatible against strict, in
+> [`P4A-a-corpus-under-jdk-only-for-the-first-time-20260829.md`](P4A-a-corpus-under-jdk-only-for-the-first-time-20260829.md),
+> with zero strict-only failures. §5.4's warning stands untouched: the maps in §2
+> and §3.4 come from a static parser and are NOT verified by this note.
+>
+> **§3.2's subject was measured independently the same day, and it is real.** The
+> mechanism this record names — "this crate fabricates instances of abstract
+> classes" — was found live in `com.sun.net.httpserver`, where `HttpServer
+> .create()` returned an instance of the ABSTRACT public class and
+> `createContext()` returned a context whose every accessor threw
+> `AbstractMethodError` on both shipping arms. Four defects, fixed and verified in
+> [`the-httpserver-family-four-defects-20260902.md`](the-httpserver-family-four-defects-20260902.md).
+> That is corroboration of §3.2's thesis from outside this record, not a
+> verification of §3.4's map.
+
 Commits: `45d6649ae` (H5-A), `be4c2fbd5` (comment corrections), `d2c3c2258`
 (this record, pre-merge draft), `fb67a921b` (merge of the branch tip
 `59e5fd8d0`), plus the update commit that carries this text.
