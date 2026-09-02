@@ -1,8 +1,8 @@
 # The FFM carrier is the VM's own allocation shape — the contract question, decided
 
-**Answers §3 of
-[`fixed-suite-bugs/jdk-only/arena-and-memorysegment-hand-out-an-interface-FIXED-20260901.md`](fixed-suite-bugs/jdk-only/arena-and-memorysegment-hand-out-an-interface-FIXED-20260901.md),
-which stated it so it could be decided once and deliberately did not decide it.**
+**Answers §3 of the retired page
+`arena-and-memorysegment-hand-out-an-interface-FIXED-20260901.md`, which stated
+it so it could be decided once and deliberately did not decide it.**
 2026-08-29.
 
 > Is `cratonvm/internal/foreign/MemorySegmentImpl` a **compatibility stand-in**,
