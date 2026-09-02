@@ -450,9 +450,13 @@ fn derive_host_locale() -> HostLocale {
 /// only `LC_ALL`: the two shapes this precedence exists to get right.
 ///
 /// Returns the RAW locale name, `.codeset` suffix and `@modifier` included.
-/// `parse_locale_name` discards both because a language tag has neither;
-/// [`native_encoding_from_locale_name`] needs the first of them, which is why
-/// the split happens in the callers and not here.
+/// `parse_locale_name` discards both because a language tag has neither.
+///
+/// It had a second caller for one day: a `native_encoding_from_locale_name`
+/// that read the codeset out of this string. That was replaced on 2026-09-01 by
+/// `cratonvm_native_api::os_encoding`, which asks libc instead — a locale NAME
+/// cannot tell an installed locale from a merely requested one, and HotSpot
+/// reports what `setlocale` actually gave it.
 fn posix_locale_category(category: &str) -> String {
     let env = |name: &str| cratonvm_types::flags::runtime_var(name).unwrap_or_default();
     let lc_all = env("LC_ALL");
@@ -465,30 +469,6 @@ fn posix_locale_category(category: &str) -> String {
     }
     env("LANG")
 }
-
-/// What `native.encoding` answered unconditionally before 2026-09-01, what the
-/// Windows leg still answers, and what `CRATONVM_NATIVE_ENCODING=UTF-8`
-/// restores on every platform.
-const DEFAULT_NATIVE_ENCODING: &str = "UTF-8";
-
-/// glibc's `nl_langinfo(CODESET)` for the `C`/`POSIX` locale.
-///
-/// MEASURED on the Linux audit host (Temurin 25.0.4+7), not recalled: with
-/// `LC_ALL=C`, with `LC_ALL=POSIX`, and with `LANG`/`LC_ALL`/`LC_CTYPE` all
-/// unset, HotSpot 25 reports `native.encoding=ANSI_X3.4-1968` — the raw
-/// `nl_langinfo` string, not the canonical `java.nio.charset` name `US-ASCII`.
-/// The raw string is therefore the one to match, and matching it is the whole
-/// point: a cross-VM property diff compares the STRINGS.
-///
-/// Known imprecision, stated rather than papered over: macOS answers
-/// `US-ASCII` from `nl_langinfo` for the same locale, so this leg gives a
-/// different SPELLING of the same charset there. `Charset.forName` accepts
-/// either (each is an alias of the other) and nothing in this tree consumes
-/// `native.encoding`, so the cost is a cosmetic diff on a platform this repo
-/// does not gate on. Fixing it needs a real `nl_langinfo` call, which is the
-/// thing this file deliberately does not make — see
-/// [`derive_native_encoding`].
-const POSIX_C_LOCALE_ENCODING: &str = "ANSI_X3.4-1968";
 
 /// The charset the host announces, for the `native.encoding` property.
 ///
@@ -521,21 +501,21 @@ const POSIX_C_LOCALE_ENCODING: &str = "ANSI_X3.4-1968";
 ///   declines to make; `sun.jnu.encoding` is riskier still, because it decides
 ///   how FILE NAMES are encoded and moving it would change class loading
 ///   rather than printing.
-/// * **It does not read a Windows code page.** `GetACP`, `GetOEMCP` and
-///   `GetConsoleOutputCP` occur zero times in this tree, so the Windows leg
-///   keeps today's `UTF-8` and remains, honestly, still wrong there — HotSpot
-///   answers the ANSI code page. Adding that call is the next stage, not this
-///   one, and `CRATONVM_NATIVE_ENCODING=<name>` is the only way to get a
-///   correct answer on Windows until it exists.
-/// * **It does not call `setlocale`/`nl_langinfo`.** That is process-global
-///   state `derive_host_locale` documents a decision not to touch, so the
-///   codeset is read out of the locale NAME instead. The difference is visible
-///   exactly when a locale is *named but not installed*: measured on the audit
-///   host, `LANG=en_US.ISO-8859-1` makes HotSpot answer `ANSI_X3.4-1968`
-///   (`setlocale` failed, so the process stayed in `C`) where this answers
-///   `ISO-8859-1`. Erring toward the name the operator wrote is the safer of
-///   the two — it cannot invent a NARROWER charset than the environment asked
-///   for — but it is an approximation and not a match.
+/// * **It does not move `sun.jnu.encoding`.** That key decides how FILE NAMES
+///   are encoded, so moving it changes class loading rather than printing —
+///   a different blast radius, and still deferred.
+///
+/// Two bullets that stood here for one day are gone, both closed by
+/// `cratonvm_native_api::os_encoding` on 2026-09-01: this DOES read a Windows
+/// code page now (`GetACP`, and the attached console's code page for a stream
+/// that has one), and it DOES call `setlocale`/`nl_langinfo` rather than
+/// parsing the locale NAME — for `LC_CTYPE` only, on one thread, restoring the
+/// previous locale, which leaves the process-global state `derive_host_locale`
+/// declines to touch exactly as it was found. The name-parse it replaced could
+/// not tell an installed locale from a requested one: measured on the audit
+/// host, `LANG=en_US.ISO-8859-1` makes HotSpot answer `ANSI_X3.4-1968`
+/// (`setlocale` failed, so the process stayed in `C`) where the parse answered
+/// `ISO-8859-1`.
 fn derive_native_encoding() -> String {
     // The A/B for this change, in one binary, on every platform:
     // `CRATONVM_NATIVE_ENCODING=UTF-8` restores the pre-2026-09-01 constant
@@ -559,88 +539,23 @@ fn derive_native_encoding() -> String {
 /// platforms, so a Unix-side edit cannot silently break the Windows build that
 /// nobody working on this can run.
 fn platform_native_encoding() -> String {
-    if cfg!(windows) {
-        return DEFAULT_NATIVE_ENCODING.to_string();
-    }
-    native_encoding_from_locale_name(&posix_locale_category("LC_CTYPE"))
-        .unwrap_or_else(|| POSIX_C_LOCALE_ENCODING.to_string())
-}
-
-/// The charset a POSIX locale name announces, or `None` when it names none.
-///
-/// This is the half of the string `parse_locale_name` throws away
-/// (`head.split('.').next()`), which is why the two live next to each other.
-///
-/// `C`, `POSIX`, `en_US` and the empty string all return `None` — they name no
-/// charset — and the caller then answers [`POSIX_C_LOCALE_ENCODING`], which is
-/// what HotSpot answered for every one of those on the audit host. `C.UTF-8`
-/// and `C.utf8` return `Some("UTF-8")`: the language part being `C` does not
-/// stop the name carrying a codeset, and `C.utf8` is the installed spelling on
-/// this host, so getting that case wrong would move the DEFAULT arm.
-fn native_encoding_from_locale_name(raw: &str) -> Option<String> {
-    // POSIX spells a locale `language[_territory][.codeset][@modifier]`. Drop
-    // the modifier first, or `sr_RS.UTF-8@latin` folds `@latin` into the
-    // codeset.
-    let head = raw.trim().split('@').next().unwrap_or("").trim();
-    let codeset = head.split_once('.').map(|(_, c)| c.trim()).unwrap_or("");
-    if codeset.is_empty() {
-        return None;
-    }
-    Some(canonical_codeset_name(codeset))
-}
-
-/// Spell a locale name's codeset the way `nl_langinfo(CODESET)` does.
-///
-/// HotSpot reports that string VERBATIM — MEASURED: `LANG=C.UTF-8` gives
-/// `UTF-8` and `LC_ALL=C` gives `ANSI_X3.4-1968`, and neither is a canonical
-/// `java.nio.charset` name — so the job here is glibc's spelling, not Java's.
-/// The table is needed because locale NAMES and `nl_langinfo` ANSWERS differ:
-/// this host's two installed UTF-8 locales are spelled `C.utf8` and
-/// `en_US.utf8`, and glibc answers `UTF-8` for both.
-///
-/// An unrecognised codeset is returned AS WRITTEN rather than guessed at or
-/// replaced by a default. Nothing in this tree consumes `native.encoding`
-/// (grep: the only occurrences are the property tables that write it), so an
-/// unusual spelling costs at most a cosmetic cross-VM diff, whereas
-/// substituting a default would silently answer a charset the operator did not
-/// ask for — and the failure mode of THAT is mojibake, not a diff line.
-///
-/// Every name this table can produce was checked against the JDK 25 on the
-/// audit host: `Charset.forName` resolves all 21 of them, `ANSI_X3.4-1968`
-/// included (it is an alias of `US-ASCII`). So user code that does
-/// `Charset.forName(System.getProperty("native.encoding"))` — the one
-/// plausible consumer — cannot be handed a name the JDK rejects.
-fn canonical_codeset_name(codeset: &str) -> String {
-    let key: String = codeset
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
-    let canonical = match key.as_str() {
-        "utf8" => "UTF-8",
-        "ansix341968" | "usascii" | "ascii" | "iso646us" | "646" => POSIX_C_LOCALE_ENCODING,
-        "iso88591" | "88591" | "latin1" => "ISO-8859-1",
-        "iso88592" | "88592" | "latin2" => "ISO-8859-2",
-        "iso88595" | "88595" => "ISO-8859-5",
-        "iso88597" | "88597" => "ISO-8859-7",
-        "iso88599" | "88599" | "latin5" => "ISO-8859-9",
-        "iso885915" | "885915" | "latin9" => "ISO-8859-15",
-        "koi8r" => "KOI8-R",
-        "koi8u" => "KOI8-U",
-        "cp1251" | "windows1251" | "microsoftcp1251" => "CP1251",
-        "cp1252" | "windows1252" | "microsoftcp1252" => "CP1252",
-        "eucjp" | "ujis" => "EUC-JP",
-        "euckr" => "EUC-KR",
-        "gb2312" | "euccn" => "GB2312",
-        "gbk" => "GBK",
-        "gb18030" => "GB18030",
-        "big5" => "BIG5",
-        "big5hkscs" => "BIG5-HKSCS",
-        "sjis" | "shiftjis" => "SHIFT_JIS",
-        "tis620" => "TIS-620",
-        _ => return codeset.to_string(),
-    };
-    canonical.to_string()
+    // Delegated to `cratonvm_native_api::os_encoding`, which asks libc
+    // (`setlocale(LC_CTYPE, "")` then `nl_langinfo(CODESET)`) on Unix and
+    // `GetACP` on Windows, since 2026-09-01.
+    //
+    // It replaces a locale-NAME parse that lived here for one day and whose own
+    // doc named both of its gaps: a name cannot tell a locale that is INSTALLED
+    // from one that is merely requested (measured: `LANG=en_US.ISO-8859-1`
+    // makes HotSpot answer `ANSI_X3.4-1968`, because `setlocale` failed and the
+    // process stayed in `C`, where the parse answers `ISO-8859-1`), and the
+    // Windows leg answered a constant `UTF-8` because no code page was read
+    // anywhere in this tree. Both are closed there.
+    //
+    // The `setlocale` this was written to avoid is called once, on one thread,
+    // for `LC_CTYPE` only, and the previous locale is restored — so the
+    // process-global state `derive_host_locale` declines to touch is left
+    // exactly as it was found.
+    cratonvm_native_api::os_encoding::native_encoding().to_string()
 }
 
 /// The host's locales from a platform API, or `None` where there is no such
@@ -3744,7 +3659,7 @@ impl SharedVm {
         // class-file major version for JDK 25 = 69 (45 + feature 24? → JDK 25 = 69).
         sys_props.insert("java.class.version".to_string(), "69.0".to_string());
 
-        // Encodings. **Read the next two paragraphs before adding a key here.**
+        // Encodings. **Read the next three paragraphs before adding a key here.**
         //
         // The comment this replaces read "Encodings — JDK 18+ pinned to UTF-8
         // for stdout/stderr/file/native", and it was FALSE for three of the
@@ -3768,15 +3683,23 @@ impl SharedVm {
         //     So for those two the PLATFORM table wins outright, and for the
         //     remaining four the `vmProperties()` copy wins by being present
         //     before the `putIfAbsent`s that would otherwise derive them.
-        // Both of `system_bootstrap.rs`'s copies of `native.encoding` now read
-        // this map back through `NativeContext::get_system_property`, so the
-        // derivation below is the single source of truth in every mode and the
-        // three tables cannot disagree about that key. The other five are
-        // still literal `"UTF-8"` wherever they appear, deliberately: routing
-        // them through this map would let a `-Dstdout.encoding=…` that
-        // `vmProperties()`'s `already` filter drops today start reaching the
-        // JDK, and that is a change to `stdout.encoding` SEMANTICS — the
-        // reviewed change the page above defers, not this one.
+        // Both of `system_bootstrap.rs`'s copies read this map back through
+        // `NativeContext::get_system_property`, so the derivation below is the
+        // single source of truth in every mode and the three tables cannot
+        // disagree.
+        //
+        // THE STREAM KEYS ARE DERIVED HERE TOO, since 2026-09-01. That is the
+        // half the page above staged separately and recommended (§9, option A
+        // with C as its kill switch): `stdout.encoding` decides the `Charset`
+        // `install_charset` stamps on `System.out`, and therefore the BYTES —
+        // under `LANG=C` HotSpot writes `?` for a character US-ASCII cannot
+        // map and this VM wrote the UTF-8 sequence, ten rows of a 273-assertion
+        // differential. `CRATONVM_STDOUT_ENCODING=UTF-8` restores the old
+        // behaviour in one binary.
+        //
+        // `sun.jnu.encoding` is NOT derived, deliberately: it decides how FILE
+        // NAMES are encoded, so moving it changes class loading rather than
+        // printing. Different blast radius, different change.
         //
         // `file.encoding` is the one key the old comment got right: JEP 400
         // does pin it, unconditionally, and `COMPAT` is the only escape.
@@ -3784,8 +3707,20 @@ impl SharedVm {
         sys_props.insert("file.encoding".to_string(), "UTF-8".to_string());
         sys_props.insert("native.encoding".to_string(), native_encoding.clone());
         sys_props.insert("sun.jnu.encoding".to_string(), "UTF-8".to_string());
-        sys_props.insert("stdout.encoding".to_string(), "UTF-8".to_string());
-        sys_props.insert("stderr.encoding".to_string(), "UTF-8".to_string());
+        sys_props.insert(
+            "stdout.encoding".to_string(),
+            cratonvm_native_api::os_encoding::stream_encoding(
+                cratonvm_native_api::os_encoding::StdStream::Out,
+            )
+            .to_string(),
+        );
+        sys_props.insert(
+            "stderr.encoding".to_string(),
+            cratonvm_native_api::os_encoding::stream_encoding(
+                cratonvm_native_api::os_encoding::StdStream::Err,
+            )
+            .to_string(),
+        );
         // Session 108 (Cluster D v2 — Console.<clinit> companion fix):
         // `java/io/Console.<clinit>` calls
         // `Charset.forName(System.getProperty("stdin.encoding"), UTF_8)`. The
@@ -3794,9 +3729,17 @@ impl SharedVm {
         // `Charset.lookup(null)` throws — so a null property here trips the
         // Console.<clinit> swallow we observed in Session 108. The
         // `stdin.encoding` key was missing from the bootstrap seed (only
-        // `stdout.encoding` / `stderr.encoding` were pinned). Mirror what
-        // HotSpot's launcher native code does: pin to UTF-8 unconditionally.
-        sys_props.insert("stdin.encoding".to_string(), "UTF-8".to_string());
+        // `stdout.encoding` / `stderr.encoding` were pinned). It must stay
+        // non-null; it need not be UTF-8, and on HotSpot it is the console's
+        // own code page — `cp866` on the 1251 Windows host measured above,
+        // where `stdout.encoding` was the redirected `Cp1251`.
+        sys_props.insert(
+            "stdin.encoding".to_string(),
+            cratonvm_native_api::os_encoding::stream_encoding(
+                cratonvm_native_api::os_encoding::StdStream::In,
+            )
+            .to_string(),
+        );
 
         // Force BufferedInputStream/etc. to use synchronized blocks instead
         // of InternalLock/ReentrantLock. This avoids potential issues with
@@ -7824,6 +7767,10 @@ impl SharedVm {
 
     /// Drain the cleaner queue and return the addresses of cleaner actions
     /// to execute.  The caller is responsible for actually running them.
+    // Test-only: the sole caller is `m19_cleaner_actions_drained`. The
+    // scanner could not see that until the region splitter stopped counting
+    // braces inside string literals (2026-09-02).
+    #[cfg(test)]
     pub fn drain_cleaners(&self) -> Vec<usize> {
         self.mem.cleaner_thread.drain_actions()
     }

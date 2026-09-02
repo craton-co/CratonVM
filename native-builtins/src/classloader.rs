@@ -5079,6 +5079,53 @@ pub(crate) fn is_classloader_instance(ctx: &dyn NativeContext, obj: ObjectRef) -
     false
 }
 
+/// Kill switch for the first-hit `ClassLoader.getResource` walk below.
+/// `CRATONVM_GETRESOURCE_FIRST_HIT=0` restores the whole-list walk that builds
+/// every matching URL and returns element 0. Default ON.
+///
+/// A same-binary lever, not a safety valve: the two walks are required to
+/// answer identically (`class_path.rs`'s
+/// `the_incremental_walk_returns_what_the_whole_list_walk_returns_first`), so
+/// the only thing this flag can change is how much of the classpath was
+/// touched to get there. That makes it the A/B for the cost, which is the one
+/// claim a page about a throughput gap has to be able to check.
+fn get_resource_first_hit_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var_os("CRATONVM_GETRESOURCE_FIRST_HIT")
+                .as_deref()
+                .and_then(|s| s.to_str()),
+            Some("0")
+        )
+    })
+}
+
+/// The first classpath URL for `resource_name`, stopping at the entry that
+/// answers.
+///
+/// The one implementation behind BOTH singular resource doors —
+/// `ClassLoader.getResource` here and `Class.getResource` in `lang_class` —
+/// because they had the same whole-list-then-take-element-0 shape and a fix to
+/// one of them is a fix a bisect can miss on the other.
+///
+/// Falls back to the whole-list walk for a GLOB name, which can match several
+/// names inside a single classpath entry: "the first URL this entry serves"
+/// would silently drop the rest, and `resource_name_supports_incremental_scan`
+/// is the predicate that knows the difference.
+pub(crate) fn first_resource_url(
+    ctx: &mut dyn NativeContext,
+    resource_name: &str,
+) -> Option<String> {
+    if get_resource_first_hit_enabled() && ctx.resource_name_supports_incremental_scan(resource_name)
+    {
+        return ctx
+            .next_resource_url(resource_name, 0, 0)
+            .map(|(url, _, _)| url);
+    }
+    ctx.find_all_resource_urls(resource_name).into_iter().next()
+}
+
 fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // ClassLoader.getResource(String) → URL
     //
@@ -5309,9 +5356,28 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // same name. Fall back to "classpath:<name>" when only `find_resource`
     // (raw bytes) succeeds — covers synthetic test loaders that override
     // find_resource without participating in the structured walk.
-    let urls = ctx.find_all_resource_urls(resource_name);
-    let url_str = if let Some(first) = urls.first() {
-        first.clone()
+    //
+    // STOP AT THE FIRST HIT. `next_resource_url` walks the same segments in
+    // the same order and yields the same elements as `find_all_resource_urls`
+    // (its own doc states the enumeration-to-exhaustion equivalence), so
+    // element 0 is identical either way — but the whole-list call kept
+    // scanning after it had the answer. For an archive entry that costs a hash
+    // probe; for a DIRECTORY entry it costs an `exists()` and a canonicalize,
+    // i.e. filesystem syscalls, on every remaining entry of the classpath.
+    //
+    // `getResource` is one call per class discovered by a ShrinkWrap package
+    // scan (`ClassLoaderAsset.<init>` is `classLoader.getResource(name)`),
+    // which is what made a quarkus `TestResourceManager.start()` several times
+    // slower than HotSpot — HotSpot's `getResource` returns at the first hit.
+    // The incremental walk already existed for the lazy `getResources`
+    // enumeration; the singular door had simply never been wired to it.
+    //
+    // The gate is required: a GLOB name can match several entries WITHIN one
+    // classpath entry, and "the first URL this entry serves" would drop the
+    // rest — `resource_name_supports_incremental_scan` is what excludes those,
+    // and they fall through to the whole-list walk below.
+    let url_str = if let Some(first) = first_resource_url(ctx, resource_name) {
+        first
     } else if ctx.find_resource(resource_name).is_some() {
         format!("classpath:{name}")
     } else {

@@ -5700,6 +5700,64 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The short-circuiting walk must answer EXACTLY what the whole-list walk
+    /// answers first — that equivalence is the licence for
+    /// `ClassLoader.getResource` to stop at the first hit rather than build
+    /// every URL and discard all but element 0.
+    ///
+    /// Asserted on a classpath where the name hits in MORE than one entry, and
+    /// where the first hit is not the last entry: a fixture with a single hit
+    /// cannot tell "returns the first" from "returns the only one", and one
+    /// where the hit is last cannot tell "stopped early" from "walked
+    /// everything".
+    #[test]
+    fn the_incremental_walk_returns_what_the_whole_list_walk_returns_first() {
+        let dir = std::env::temp_dir().join(format!(
+            "cratonvm_test_first_url_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let first = dir.join("first");
+        let second = dir.join("second");
+        let empty = dir.join("empty");
+        for d in [&first, &second, &empty] {
+            fs::create_dir_all(d.join("pkg")).unwrap();
+        }
+        fs::write(first.join("pkg/R.txt"), b"from-first").unwrap();
+        fs::write(second.join("pkg/R.txt"), b"from-second").unwrap();
+
+        // `empty` last so a walk that does not stop early still has an entry
+        // left to visit after the answer is known.
+        let cp = ClassPath::new(&[
+            first.to_string_lossy().into_owned(),
+            second.to_string_lossy().into_owned(),
+            empty.to_string_lossy().into_owned(),
+        ]);
+
+        let all = cp.find_all_resource_urls("pkg/R.txt");
+        assert_eq!(all.len(), 2, "fixture must hit twice, got {all:?}");
+        let (incremental, resume) = cp
+            .next_resource_url_from("pkg/R.txt", 0)
+            .expect("the incremental walk must find it too");
+        assert_eq!(
+            Some(&incremental),
+            all.first(),
+            "the two walks disagree on the FIRST url"
+        );
+        assert_eq!(resume, 1, "it must stop at the entry that answered");
+
+        // A miss agrees too, and costs nothing to state.
+        assert!(cp.find_all_resource_urls("pkg/Absent.txt").is_empty());
+        assert!(cp.next_resource_url_from("pkg/Absent.txt", 0).is_none());
+
+        // And the gate: a glob name can match several names inside ONE entry,
+        // so it must NOT take the incremental path.
+        assert!(!ClassPath::name_supports_incremental_scan("pkg/*.txt"));
+        assert!(ClassPath::name_supports_incremental_scan("pkg/R.txt"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn find_resource_path_traversal_rejected() {
         let cp = ClassPath::new(&[]);

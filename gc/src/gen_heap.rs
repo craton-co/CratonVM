@@ -26,7 +26,7 @@
 
 use std::backtrace::Backtrace;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -23714,4 +23714,131 @@ mod published_bounds_ownership {
     //!
     //! Anything added here that reads one of these tables belongs in that file
     //! instead.
+}
+
+// ---------------------------------------------------------------------------
+// Reference-store barrier gates (JIT)
+// ---------------------------------------------------------------------------
+
+/// Process-global mirror of the three facts compiled code needs in order to
+/// **skip a reference-store barrier CALL that would have returned immediately**.
+///
+/// # What this is, and what it deliberately is not
+///
+/// It is not a barrier. Every byte here names a PREFIX of a barrier helper's
+/// own control flow, read from the same state the helper reads. Compiled code
+/// may take a gate's "no work" answer and skip the call; on any other answer it
+/// calls the same helper it calls today, so no collector's remembered-set or
+/// snapshot contract moves into the emitter.
+///
+/// This is the question [`JIT_REGION_BOUNDS`] is not asking. That table asks
+/// "is the receiver inside a published young region" — a *generational*
+/// question that G1 and ZGC answer by publishing nothing, which left the
+/// emitter laying down six containment compares that could never pass and then
+/// calling the helper anyway.
+///
+/// # The safe direction of every byte
+///
+/// Each gate is allowed to be **conservative but never permissive**:
+///
+/// * `pre_active` / `post_active`: may read 1 while the truth is 0 (compiled
+///   code pays a call it did not need). Must never read 0 while the truth is 1.
+///   Publishers therefore SET the mirror before the truth and CLEAR it after.
+/// * `young_floor`: may be too LOW (fewer stores skip). Must never be too high.
+///
+/// All-zero means "no collector published a plan", and every emitter arm keeps
+/// the full-helper path — exactly today's behaviour.
+#[repr(C)]
+pub struct JitRefStoreGates {
+    /// Non-zero when the SATB pre-write barrier may have work to do.
+    pub pre_active: AtomicU8,
+    /// Non-zero when the post-write barrier may have work to do.
+    pub post_active: AtomicU8,
+    /// A receiver whose `GC_FLAGS_BYTE_OFFSET` byte is unsigned-less-than this
+    /// provably needs no post barrier. `0` disables the test.
+    ///
+    /// That byte holds `gc_age` in bits 4..7 and the GC flags in bits 0..3, so
+    /// a value of `age << 4` is an exact unsigned test of `gc_age < age`: the
+    /// flags nibble is at most 15 and cannot carry `a << 4` up to `(a+1) << 4`.
+    pub young_floor: AtomicU8,
+    /// Whether a plan is published at all. Separate from the three gates so
+    /// "published, and all three currently say no work" is distinguishable
+    /// from "nobody published", which is the difference between an emitted
+    /// fast path and no fast path.
+    pub published: AtomicU8,
+}
+
+pub static JIT_REF_STORE_GATES: JitRefStoreGates = JitRefStoreGates {
+    pre_active: AtomicU8::new(0),
+    post_active: AtomicU8::new(0),
+    young_floor: AtomicU8::new(0),
+    published: AtomicU8::new(0),
+};
+
+/// `gc_age == 0` expressed in the `GC_FLAGS_BYTE_OFFSET` byte's units.
+///
+/// The floor a collector may publish **without any ordering obligation**: an
+/// object that has survived zero collections is younger than every promotion
+/// age (which is clamped to at least 1), so this bound stays true no matter how
+/// the collector retunes. A larger, dynamic floor is possible and would catch
+/// more stores, but it must be LOWERED before the promotion age it mirrors is
+/// lowered, or a store into a newly-old object skips its card — so it is a
+/// separate change with its own ordering argument, not a constant.
+///
+/// It is also the case that matters: in allocation-heavy code the receiver of a
+/// reference store is overwhelmingly an object allocated moments earlier.
+pub const JIT_YOUNG_FLOOR_AGE_ZERO: u8 = 1 << 4;
+
+/// Addresses of the three gate bytes, for `JitRuntimeHelpers`.
+/// Returns `(pre, post, young_floor)`, or all-zero when nothing is published.
+pub fn jit_ref_store_gate_addrs() -> (usize, usize, usize) {
+    if JIT_REF_STORE_GATES.published.load(Ordering::Acquire) == 0 {
+        return (0, 0, 0);
+    }
+    let base = &JIT_REF_STORE_GATES;
+    (
+        &base.pre_active as *const _ as usize,
+        &base.post_active as *const _ as usize,
+        &base.young_floor as *const _ as usize,
+    )
+}
+
+/// Announce that this process's collector maintains the gates.
+///
+/// Both gates are armed here and only ever relaxed by a later publisher call:
+/// a plan that starts armed can never be observed permissive before its owner
+/// has run once.
+pub fn publish_jit_ref_store_plan(young_floor: u8) {
+    JIT_REF_STORE_GATES.pre_active.store(1, Ordering::Release);
+    JIT_REF_STORE_GATES.post_active.store(1, Ordering::Release);
+    JIT_REF_STORE_GATES
+        .young_floor
+        .store(young_floor, Ordering::Release);
+    JIT_REF_STORE_GATES.published.store(1, Ordering::Release);
+}
+
+/// Withdraw the plan — the teardown counterpart. Leaves both gates ARMED so
+/// that any already-compiled body still takes its helper path.
+pub fn clear_jit_ref_store_plan() {
+    JIT_REF_STORE_GATES.pre_active.store(1, Ordering::Release);
+    JIT_REF_STORE_GATES.post_active.store(1, Ordering::Release);
+    JIT_REF_STORE_GATES.young_floor.store(0, Ordering::Release);
+    JIT_REF_STORE_GATES.published.store(0, Ordering::Release);
+}
+
+/// Mirror the SATB barrier's arming state. See [`JitRefStoreGates`] for why the
+/// caller must set this BEFORE arming the real flag and clear it AFTER
+/// disarming.
+pub fn set_jit_ref_store_pre_active(active: bool) {
+    JIT_REF_STORE_GATES
+        .pre_active
+        .store(u8::from(active), Ordering::Release);
+}
+
+/// Mirror "this heap contains at least one old object". Same ordering rule as
+/// [`set_jit_ref_store_pre_active`].
+pub fn set_jit_ref_store_post_active(active: bool) {
+    JIT_REF_STORE_GATES
+        .post_active
+        .store(u8::from(active), Ordering::Release);
 }
