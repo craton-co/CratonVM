@@ -1461,6 +1461,13 @@ pub fn dump_method_stats_to_stderr() {
     // and no timing can tell that apart from "it fired and did not help".
     // `fired=0` can, in one line, at the end of any run.
     //
+    // Those two numbers are pre-emitter and pre-2026-09-02 and must not be
+    // quoted as current: `java/lang/String` is final, so the method-entry
+    // door's devirtualisation was taking every String access site away from
+    // the intrinsic before the gate saw it, and BOTH arms of that A/B measured
+    // a program with no String intrinsic in it. The same rows read ~3.2
+    // ns/char once the rewrite yields. That is the line printed below this one.
+    //
     // The other three counts are printed beside it because they are the
     // candidate REASONS for a `fired=0`: no resolved `java/lang/String` field
     // layout, no constant-pool invoke resolver at the door that asked, or the
