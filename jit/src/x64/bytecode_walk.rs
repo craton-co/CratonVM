@@ -5952,6 +5952,23 @@ impl Compiler {
                                 // (cell base, not +8) differ.
                                 let cell_off = (HEADER_SIZE + c_off as usize) as i32; // Cast: disp32
                                 let mut bail: Vec<usize> = Vec::new();
+                                // F-08 — the G1 arm. Under G1 the guard
+                                // below rejects every receiver (empty
+                                // store-side table), so this whole inline path
+                                // was dead there and every reference store was
+                                // an out-of-line `jit_putfield_object` call.
+                                // When a G1 collector has published its
+                                // geometry and `CRATONVM_G1_INLINE_BARRIER` is
+                                // set, take the containment guard against the
+                                // READ table (which G1 does publish, and which
+                                // answers the only question the guard is doing
+                                // here: can these header reads and this store
+                                // fault) and emit a REAL G1 post-write barrier
+                                // after the store. `region_bounds_are_live`
+                                // stays false under G1 and the barrier-free
+                                // premise stays unavailable — see
+                                // `g1_inline_barrier_available`.
+                                let g1 = self.g1_inline_barrier_available();
                                 self.load_slot_to_reg(RAX, obj_slot);
                                 // INT-6: null + alignment + published-region
                                 // containment (subsumes the old bare null check).
@@ -5976,17 +5993,17 @@ impl Compiler {
                                 // the table's CONTENT, not `region_bounds_addr
                                 // != 0` (the address of a process-global static,
                                 // always non-zero). See `region_bounds_are_live`.
-                                bail.extend(
-                                    if receiver_is_trusted_oop
-                                        && region_bounds_are_live(self.helpers.region_bounds_addr)
-                                    {
-                                        self.emit_trusted_oop_receiver_check()
-                                    } else {
-                                        self.emit_guarded_getfield_receiver_check(
-                                            self.helpers.region_bounds_addr,
-                                        )
-                                    },
-                                );
+                                bail.extend(if g1 {
+                                    self.emit_g1_store_receiver_check()
+                                } else if receiver_is_trusted_oop
+                                    && region_bounds_are_live(self.helpers.region_bounds_addr)
+                                {
+                                    self.emit_trusted_oop_receiver_check()
+                                } else {
+                                    self.emit_guarded_getfield_receiver_check(
+                                        self.helpers.region_bounds_addr,
+                                    )
+                                });
                                 // LEGACY receiver (no GC_FLAG_COMPACT) → helper: the
                                 // compact 8-byte cell offset is only valid for a
                                 // genuinely-compact object. A class with a registered
@@ -6008,7 +6025,10 @@ impl Compiler {
                                 self.emit_and_r64_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT as i8);
                                 bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ not-compact → helper
                                                                             // old-gen receiver → helper (card). gc_flags @21 bit0.
-                                if !self.inline_card_mark_available() {
+                                                                            // F-08: skipped on the G1 arm — `GC_FLAG_OLD_GEN` is a
+                                                                            // generational bit and a G1 rset edge is cross-REGION,
+                                                                            // not old-to-young.
+                                if !g1 && !self.inline_card_mark_available() {
                                     self.emit_mov_r32_mem_disp32(
                                         RCX,
                                         RAX,
@@ -6034,7 +6054,14 @@ impl Compiler {
                                                                            // FAST STORE: bare 8-byte pointer at the cell base.
                                 self.load_slot_to_reg(RDX, val_slot);
                                 self.emit_mov_mem_disp32_r64(RAX, RDX, cell_off);
-                                if self.inline_card_mark_available() {
+                                if g1 {
+                                    // F-08 — RCX last held the num_slots bound
+                                    // and is dead; RAX/RDX are clobbered by the
+                                    // filter and reloaded on the slow arm.
+                                    self.emit_g1_post_write_barrier_regs(
+                                        RAX, RDX, RCX, obj_slot, val_slot,
+                                    );
+                                } else if self.inline_card_mark_available() {
                                     self.emit_inline_card_mark_regs(RAX, RDX);
                                 }
                                 let done = self.emit_jmp_rel32_patch();
@@ -6055,6 +6082,23 @@ impl Compiler {
                             {
                                 let cell_off = (HEADER_SIZE + field_index * SLOT_SIZE) as i32; // Cast: x86-64 disp32
                                 let mut bail: Vec<usize> = Vec::new();
+                                // F-08 — the G1 arm. Under G1 the guard
+                                // below rejects every receiver (empty
+                                // store-side table), so this whole inline path
+                                // was dead there and every reference store was
+                                // an out-of-line `jit_putfield_object` call.
+                                // When a G1 collector has published its
+                                // geometry and `CRATONVM_G1_INLINE_BARRIER` is
+                                // set, take the containment guard against the
+                                // READ table (which G1 does publish, and which
+                                // answers the only question the guard is doing
+                                // here: can these header reads and this store
+                                // fault) and emit a REAL G1 post-write barrier
+                                // after the store. `region_bounds_are_live`
+                                // stays false under G1 and the barrier-free
+                                // premise stays unavailable — see
+                                // `g1_inline_barrier_available`.
+                                let g1 = self.g1_inline_barrier_available();
                                 // obj → RAX
                                 self.load_slot_to_reg(RAX, obj_slot);
                                 // INT-6: null + alignment + published-region
@@ -6074,20 +6118,21 @@ impl Compiler {
                                 // the trusted-oop substitution removes the
                                 // containment compares, so it is conditional on
                                 // the bounds table actually holding live bounds.
-                                bail.extend(
-                                    if receiver_is_trusted_oop
-                                        && region_bounds_are_live(self.helpers.region_bounds_addr)
-                                    {
-                                        self.emit_trusted_oop_receiver_check()
-                                    } else {
-                                        self.emit_guarded_getfield_receiver_check(
-                                            self.helpers.region_bounds_addr,
-                                        )
-                                    },
-                                );
+                                bail.extend(if g1 {
+                                    self.emit_g1_store_receiver_check()
+                                } else if receiver_is_trusted_oop
+                                    && region_bounds_are_live(self.helpers.region_bounds_addr)
+                                {
+                                    self.emit_trusted_oop_receiver_check()
+                                } else {
+                                    self.emit_guarded_getfield_receiver_check(
+                                        self.helpers.region_bounds_addr,
+                                    )
+                                });
                                 // old-gen receiver → helper (card barrier). gc_flags is
                                 // the exported gc_flags byte; GC_FLAG_OLD_GEN == bit 0.
-                                if !self.inline_card_mark_available() {
+                                // F-08: not on the G1 arm; see the compact twin.
+                                if !g1 && !self.inline_card_mark_available() {
                                     self.emit_mov_r32_mem_disp32(
                                         RCX,
                                         RAX,
@@ -6130,7 +6175,14 @@ impl Compiler {
                                     RDX,
                                     cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32, // Cast: layout offset → disp32
                                 );
-                                if self.inline_card_mark_available() {
+                                if g1 {
+                                    // F-08 — RCX last held the num_slots bound
+                                    // (and, above, the tag immediate) and is
+                                    // dead here.
+                                    self.emit_g1_post_write_barrier_regs(
+                                        RAX, RDX, RCX, obj_slot, val_slot,
+                                    );
+                                } else if self.inline_card_mark_available() {
                                     self.emit_inline_card_mark_regs(RAX, RDX);
                                 }
                                 let done = self.emit_jmp_rel32_patch();

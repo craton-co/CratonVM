@@ -858,7 +858,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-91 tokens.
+107 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -888,6 +888,22 @@ export inherited from a parent shell.
 | `g1-young-pause-target` | `CRATONVM_G1_YOUNG_PAUSE_TARGET` |
 | `g1-scrub-free` | `CRATONVM_G1_SCRUB_FREE` |
 | `g1-narrow-fixup` | `CRATONVM_G1_NARROW_FIXUP` |
+| `g1-parallel-evac-in-jit` | `CRATONVM_G1_PARALLEL_EVAC_IN_JIT` |
+| `g1-cleanup-walk` | `CRATONVM_G1_CLEANUP_WALK` |
+| `g1-adaptive-ihop` | `CRATONVM_G1_ADAPTIVE_IHOP` |
+| `g1-adaptive-tenuring` | `CRATONVM_G1_ADAPTIVE_TENURING` |
+| `gc-reserve` | `CRATONVM_GC_RESERVE` |
+| `zgc-markbits` | `CRATONVM_ZGC_MARKBITS` |
+| `zgc-page-pinned-relocate` | `CRATONVM_ZGC_PAGE_PINNED_RELOCATE` |
+| `zgc-parsweep` | `CRATONVM_ZGC_PARSWEEP` |
+| `g1-reserve-heap` | `CRATONVM_G1_RESERVE_HEAP` |
+| `g1-uncommit` | `CRATONVM_G1_UNCOMMIT` |
+| `g1-card-rset` | `CRATONVM_G1_CARD_RSET` |
+| `g1-inline-barrier` | `CRATONVM_G1_INLINE_BARRIER` |
+| `g1-mark-lock-yield` | `CRATONVM_G1_MARK_LOCK_YIELD` |
+| `g1-shared-alloc` | `CRATONVM_G1_SHARED_ALLOC` |
+| `g1-eden-stripes` | `CRATONVM_G1_EDEN_STRIPES` |
+| `g1-parallel-mark` | `CRATONVM_G1_PARALLEL_MARK` |
 | `g1-workers` | `CRATONVM_G1_WORKERS` |
 | `g1-rset-source-cap` | `CRATONVM_G1_RSET_SOURCE_CAP` |
 | `g1-verify-budget` | `CRATONVM_G1_VERIFY_BUDGET` |

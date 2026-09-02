@@ -9117,6 +9117,66 @@ pub unsafe extern "C" fn jit_putfield_object(
     }
 }
 
+/// F-08 — G1's post-write barrier, called from the slow arm of the JIT's
+/// INLINE G1 barrier.
+///
+/// # What the caller has already proved, and what it has not
+///
+/// The inline sequence reaches this call only when both of its filters have
+/// failed to prove there is nothing to remember: `val_ptr` is non-null, and
+/// `obj_ptr` and `val_ptr` do not lie in the same G1 region. Those are exactly
+/// the two conditions `G1Collector::post_write_barrier_rset` itself tests
+/// first, so the inline arm is eliding calls the callee would have returned
+/// from — not calls it would have acted on. Everything else, including an
+/// address outside G1's arena and a destination region that is Free, is left
+/// to the callee, which already handles all of it.
+///
+/// # Why this is not [`jit_write_barrier`]
+///
+/// That helper routes through `VmHeap::write_barrier`, which carries a
+/// `debug_assert!` requiring an SATB pre-barrier on the same thread whenever a
+/// mark cycle is active. The assertion is correct for a general store and
+/// wrong for this caller: the inline arm stores only into a field whose OLD
+/// value is NULL (that is the arm's own precondition, tested inline and
+/// bailing to `jit_putfield_object` otherwise), and a null old value is exactly
+/// the case `satb_pre_barrier` returns from immediately. No pre-barrier fires,
+/// none is owed, and the debug assertion would fire on a correct program.
+/// Weakening it would remove the check from every other caller; a separate
+/// entry point says the thing once, here.
+///
+/// It also skips the generational card-marking dispatch entirely, going
+/// straight to G1's remembered-set barrier, which is the only collector this
+/// helper is ever wired for by the emitter (`g1_inline_barrier_available`
+/// requires a published `JIT_G1_BARRIER` table, and only `G1Collector`
+/// publishes one). A non-G1 heap reaching here is a no-op rather than a
+/// misfiled card: the match below has one arm.
+///
+/// # Safety
+///
+/// Called from JIT-compiled code. `vm_ptr` must be a valid `SharedVm` pointer;
+/// `obj_ptr` and `val_ptr` are raw heap words and are screened here exactly as
+/// [`jit_write_barrier`] screens them, because a stale or garbage receiver must
+/// take the null path rather than be dereferenced.
+pub unsafe extern "C" fn jit_g1_post_write_barrier(vm_ptr: i64, obj_ptr: i64, val_ptr: i64) {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache,
+    // exactly as `jit_write_barrier` does. Omitting it would leave a stale
+    // frame census behind a call that can reach the collector.
+    crate::jit::conservative_roots::note_jit_boundary();
+    if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
+        return;
+    }
+    if val_ptr == 0 {
+        return;
+    }
+    let heap = heap_from_vm(vm_ptr);
+    if let cratonvm_gc::vm_heap::VmHeap::G1(g1) = heap {
+        g1.post_write_barrier_rset(
+            ObjectRef::from_raw(obj_ptr as usize as *mut u8),
+            ObjectRef::from_raw(val_ptr as usize as *mut u8),
+        );
+    }
+}
+
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
 // obj_ptr and val_ptr must be 0 (null) or valid heap pointers to live objects.
 // Records a generational write barrier so the GC tracks old-to-young references.
@@ -25048,6 +25108,21 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         ref_store_pre_gate: ref_store_gates.0,
         ref_store_post_gate: ref_store_gates.1,
         ref_store_post_young_floor: ref_store_gates.2,
+        // F-08 -- G1's inline post-write barrier: the geometry table, and the
+        // call target its slow arm uses.
+        //
+        // A THIRD table address in this struct, and the third is not a
+        // duplicate of either of the first two. `region_bounds_addr` above is
+        // the table whose EMPTINESS under G1 closes defect G1-2 -- nothing may
+        // ever publish into it for G1. `read_bounds_addr` answers the read-side
+        // "is this address mapped". This one carries the numbers an inline G1
+        // barrier needs in order to BE a barrier: arena base, arena length,
+        // region mask, plus the F-05 card table's base and shift. Wired
+        // unconditionally; the table itself is all-zero unless a G1 collector
+        // has published, and the emitter treats a zero length as "no inline
+        // barrier".
+        g1_barrier_addr: cratonvm_gc::jit_g1_barrier_addr(),
+        g1_post_write_barrier: jit_g1_post_write_barrier as *const () as usize,
         // Cooperative JIT safepoint polling (CRATONVM_JIT_SAFEPOINT_POLLS,
         // off by default) — address of the process-global VM's
         // stw_requested flag byte. `process_vm()` is published by
@@ -25172,6 +25247,7 @@ const _: () = {
     let _: HelperFnPutfieldFloat = jit_putfield_float;
     let _: HelperFnPutfieldDouble = jit_putfield_double;
     let _: HelperFnPutfieldObject = jit_putfield_object;
+    let _: HelperFnG1PostWriteBarrier = jit_g1_post_write_barrier;
 
     // Statics.
     let _: HelperFnGetstatic = jit_getstatic;
