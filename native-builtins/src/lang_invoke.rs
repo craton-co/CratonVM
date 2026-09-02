@@ -5573,7 +5573,21 @@ fn vh_check_access_mode_supported(
         Some(m) => m.field_desc.as_bytes().first().copied(),
         None => match real_array_var_handle_descriptors(ctx, this) {
             Some((value_desc, _)) => value_desc.as_bytes().first().copied(),
-            None => vh_field_desc(ctx, this).as_bytes().first().copied(),
+            // `vh_read_string`, NOT `vh_field_desc`. The latter substitutes
+            // `DESC_OBJECT` when the handle carries no descriptor at all, so an
+            // UNDETERMINABLE descriptor arrives here spelled `L...` and the
+            // `let Some(first) = first else { return Ok(()) }` escape two lines
+            // below can never fire. The comment on that escape says the
+            // intended behaviour is to keep today's rather than "inheriting a
+            // refusal nothing measured", and a default is not a measurement.
+            //
+            // MEASURED: `get_and_add_on_long_array_boxes_long` builds a handle
+            // with no metadata and a real `long[]` coordinate, and got
+            // `UnsupportedOperationException: getAndAdd is not supported for a
+            // VarHandle over a variable of type a reference` -- the fallback
+            // describing itself.
+            None => vh_read_string(ctx, this, VH_FIELD_DESC)
+                .and_then(|s| s.as_bytes().first().copied()),
         },
     };
     // An undeterminable descriptor keeps today's behaviour rather than

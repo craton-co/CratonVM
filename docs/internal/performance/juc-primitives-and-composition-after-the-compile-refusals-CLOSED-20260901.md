@@ -16,7 +16,9 @@ amortisation, and one measurement it did not trust. All four are discharged:
 What this page was ABOUT — that these primitives are 12-37x — is not fixed and
 was never going to be by one bind. What remains is narrower than this page and
 has a different shape, so it is a new page rather than an open section here:
-[`../../known-issues/perf/completablefuture-composition-is-20x-and-5-percent-compiled-20260901.md`](../../known-issues/perf/completablefuture-composition-is-20x-and-5-percent-compiled-20260901.md).
+[`completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`](completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md)
+— which closed on 2026-09-02, discharging all three of its own residuals and
+measuring composition **1.19x** faster.
 
 ## What was fixed
 
@@ -308,6 +310,8 @@ prescribes `TIMEOUT=600` for.
   profile rather than by arithmetic.
 - [`varhandle-compareandset-thin-direct-bind-FIXED-20260828.md`](varhandle-compareandset-thin-direct-bind-FIXED-20260828.md)
 - [`completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`](completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md)
-- [`../../known-issues/perf/completablefuture-composition-is-20x-and-5-percent-compiled-20260901.md`](../../known-issues/perf/completablefuture-composition-is-20x-and-5-percent-compiled-20260901.md)
-  — the successor, carrying what is genuinely still open.
+- [`completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`](completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md)
+  — the successor. CLOSED 2026-09-02: all three of its residuals discharged,
+  composition 1.19x. What is still open from this line is
+  [`../../known-issues/perf/composition-native-callback-and-the-promotion-question-20260902.md`](../../known-issues/perf/composition-native-callback-and-the-promotion-question-20260902.md).
 - [`../../known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`](../../known-issues/perf/interpreted-invoke-cost-350ns-20260825.md)

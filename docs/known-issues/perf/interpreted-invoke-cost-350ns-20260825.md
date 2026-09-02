@@ -798,6 +798,11 @@ call**. `iface1` is 3/4 clean with one 420 outlier that still sits below the
 
 **`invokestatic` and `invokespecial` are not wired to the door and are the
 internal controls**: `static0` and `special1` overlap across all three arms.
+(Correction, third pass: `special1` is not an `invokespecial` — `javac` 25
+emits `invokevirtual` for a private instance method, and the door declined it
+because its target caches as `Bytecode` rather than `VirtualBytecode`. It was
+a genuine control for *this* pass, but for the wrong reason. See the third
+pass below.)
 `probes/Arity.java` reproduces it independently — `virtual1` base 465/485/474,
 off 443/491/467, new 246/249/269 — while its `static0..static6` ladder shows no
 door effect at all.
@@ -880,7 +885,8 @@ items do not touch these arms.
   `special1` at ~430 ns are now the two worst interpreted call shapes by a wide
   margin, and they are the obvious next target: `0xb8` has a cached dispatcher
   of its own (`execute_invokestatic_cached`) that pays the same per-call
-  constants the virtual door now memoizes.
+  constants the virtual door now memoizes. **Taken by the third pass below**,
+  which also found that `special1` was never an `invokespecial`.
 
 ### Still open
 
@@ -889,7 +895,9 @@ items do not touch these arms.
   A single per-thread value arena in which the callee's locals overlap the
   caller's outgoing arguments is the structural change that removes the rest of
   the frame-lifecycle share, and it touches every reader of `Frame::locals` and
-  `ValueStack` — the GC scans, freeze/thaw, deopt.
+  `ValueStack` — the GC scans, freeze/thaw, deopt. **Re-scoped with
+  measurements by the fourth pass below: the cost is the per-frame object
+  churn, not the filling of the buffers.**
 * **Polymorphic sites** thrash the fast field site and the invoke door alike;
   both fall back on every receiver change, which is the pre-existing shape of
   the monomorphic inline cache.
@@ -922,6 +930,267 @@ done
 
 `CRATONVM_DBG_FIELD_SITE=1` adds the `fast-field:` census and names the first
 few reasons a site could not be quickened.
+
+## The third pass: `invokestatic`, and the call shape the probe was mislabelling
+
+The second pass left `invokestatic` (~250 ns) and what it called
+`invokespecial` (~430 ns) as its two untouched controls, and named them the
+obvious next target. This pass takes both. Same instrument: one Azure host at
+load 13-19, three arms interleaved in both directions over four passes, with
+control arms the change cannot reach.
+
+| arm | binary | switches |
+|---|---|---|
+| `base` | `origin/dev` at `46ddd2bd4` | — |
+| `new` | this branch | none |
+| `off` | this branch | `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR=1` |
+
+`vm/src/runtime/interpreter/invoke_fast.rs` holds the shared machinery — the
+verbatim argument read, the frame push, the per-callee constants and the
+batched invocation credit — plus the two doors. Kill switch:
+`CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` (`CRATONVM_JIT=-nonvirtual-fast-door`);
+the virtual door keeps its own.
+
+### A correction to this page: `Dispatch.special1` is not an `invokespecial`
+
+The second pass reported "`invokespecial` at ~430 ns" and used `special1` as a
+control on the grounds that the virtual door could not reach it. Both halves
+were wrong about the same fact:
+
+**`javac` 25 emits `invokevirtual` for a private instance method.** JEP 181
+(nestmates) removed the need for `invokespecial` there, and
+`javap -c -p Dispatch` shows `invokevirtual #24 // Method p1:(I)I` in `cP1`.
+So `special1` measures an `invokevirtual` whose target is *not* virtually
+dispatched — the resolver caches it as `CachedInvokeTarget::Bytecode`, with no
+receiver class and no vtable slot, and `execute_invokevirtual_fast_door`
+accepts only `VirtualBytecode`. That is the whole explanation for the 430 ns
+against a virtual call's 245 ns, and it means the second pass's `special1`
+column was measuring a gap its own door had left open rather than a call shape
+out of reach.
+
+The number stands; the label did not. A door that covers "the target is a
+fixed method" now serves both `invokespecial` and that case, and `0xb6` tries
+it after the virtual door declines.
+
+### What the doors remove
+
+Both dispatchers pay the three costs the virtual door removed: the cache entry
+is cloned (two `Arc` increments and two decrements, `RedefineGate` carrying its
+own `Arc<AtomicU32>`), every argument goes `CompactValue -> Value ->
+CompactValue` through a stack array, and `invokestatic` takes a sharded
+`RwLock` read plus a hash lookup for the invocation counter **on every call**.
+A door borrows the entry, transfers arguments verbatim into the callee's
+locals, and counts on the `CachedBytecodeMethod` itself, folding sixteen calls
+at a time into the profile store so the census still sees every call.
+
+`invokespecial`'s door deliberately does **not** count: neither arm a cached
+`invokespecial` can land in has a tier-up block (the `VirtualBytecode` arm's is
+guarded by `!is_special`, the `Bytecode` arm has none), and adding one would
+widen which methods reach the optimizing tier. A door must not change tier-up
+policy on its way past.
+
+### Engagement first
+
+`CRATONVM_DBG_FIELD_SITE=1` now prints a door census beside the site caches.
+`probes/Dispatch.java` at 150k x 2 on the measured binary:
+
+```
+door: static hit=900168 miss=378 special hit=300710 miss=802
+```
+
+99.96% and 99.7%. **Two of this pass's three findings came from that counter,
+not from the clock**, and neither would have been visible in a timing run:
+
+* the first `invokespecial` door measured `special hit=0 miss=997`, declining
+  on `loader_aware_resolution`, which is **default-on** — not the rare mode it
+  was taken for. It now performs the same owner re-check the general path does
+  (early-returning on a one-way latch for an ordinary application).
+* the census then still showed `hit=463` against 450 000 calls on the arm that
+  should have been all hits, which is what sent me to `javap` and the
+  nestmates finding above.
+
+### The numbers
+
+`probes/Dispatch.java`, 200k x 5, ns/iteration, four interleaved passes:
+
+| arm | base | new | off |
+|---|---|---|---|
+| `nocall` (control) | 51 49 65 62 | 52 52 51 49 | 51 60 61 52 |
+| `virtual1` (control) | 250 286 278 266 | 246 273 233 282 | 248 251 236 239 |
+| `ifaceInherited` (control) | 259 263 316 267 | 264 301 234 356 | 257 266 245 257 |
+| **`special1`** (private target) | 430 454 460 506 | **245 239 250 269** | 460 480 427 455 |
+| **`static0`** | 234 262 279 278 | **212 231 200 211** | 243 305 272 247 |
+| **`static1`** | 275 293 286 296 | **223 239 219 230** | 272 326 265 267 |
+| **`static4`** | 331 382 363 363 | **260 254 258 278** | 348 359 335 346 |
+
+4/4 with no overlap on every test arm — `new`'s worst is better than `off`'s
+best in each case. **A call to a fixed target falls from ~455 ns to ~250 ns**,
+level with a virtual call; a four-argument static call loses ~85 ns.
+
+`probes/Arity.java`, 800k x 5, is the independent confirmation and shows where
+the static gain comes from:
+
+| arm | base | new | off |
+|---|---|---|---|
+| `nocall` (control) | 54 55 60 52 | 52 55 59 49 | 56 52 55 53 |
+| `virtual1` (control) | 234 252 235 272 | 277 264 276 246 | 277 271 293 309 |
+| `static0` | 248 255 274 268 | **211 209 226 199** | 249 256 265 280 |
+| `static1` | 269 271 328 287 | **234 235 219 254** | 313 277 311 277 |
+| `static2` | 327 323 302 297 | **254 249 257 258** | 346 313 325 302 |
+| `static4` | 373 358 383 347 | **263 283 260 281** | 372 382 363 377 |
+| `static6` | 401 406 437 389 | **295 296 294 312** | 422 417 431 461 |
+
+4/4, no overlap, on all five. The gap widens from ~50 ns at zero arguments to
+~125 ns at six — **about 12-15 ns per argument**, which is the round trip the
+verbatim transfer deletes and is the same slope the first pass measured and
+could not then remove.
+
+### Where the interpreted call now stands
+
+Every interpreted call shape that reaches a cached bytecode target is now
+served by a door, and they land within ~50 ns of each other:
+
+| shape | before this pass | after |
+|---|---:|---:|
+| `invokestatic`, 0 args | ~250 | ~210 |
+| `invokestatic`, 4 args | ~360 | ~265 |
+| `invokevirtual` | ~245 | ~245 |
+| `invokeinterface`, inherited | ~260 | ~260 |
+| fixed target (private / `invokespecial`) | ~455 | ~250 |
+
+What remains between that and HotSpot's ~4 ns is the frame itself, which is
+the open structural item both earlier passes name: four pooled buffers per
+frame and a by-value push, where a per-thread value arena would let the
+callee's locals overlap the caller's outgoing arguments.
+
+### The probes
+
+Unchanged: `probes/Dispatch.java` and `probes/Arity.java`, interleaved in both
+directions with `nocall` and the arms the change cannot reach as controls.
+`CRATONVM_DBG_FIELD_SITE=1` prints `door: static hit/miss special hit/miss`
+and names the first dozen reasons a door declined — **read it before reading a
+clock**, on the evidence of this pass.
+
+## The frame arena, re-scoped: it is not the fill
+
+Every pass on this page has closed by naming the same open item — "the frame
+still owns four heap buffers and is moved by value on push; a per-thread value
+arena is the structural change that removes the rest of the frame-lifecycle
+share" — and every pass has described that share as the *buffers and their
+filling*. This pass went to take it, measured first, and found the description
+wrong in a way that matters for whoever takes it next.
+
+### The instrument
+
+`probes/FrameShape.java` (generated by `tools/gen_frameshape.py`, so its deep
+expressions stay balanced) holds the executed body constant and varies only
+`max_locals` / `max_stack`. Each big arm declares its locals, or builds its
+deep expression, inside a branch the caller never takes, so javac raises the
+frame size for the whole method while the executed path stays the same few
+bytecodes as the small arm:
+
+| arm | `max_stack` | `max_locals` |
+|---|---:|---:|
+| `small` | 1 | 1 |
+| `locals48` | 2 | 49 |
+| `stack32` | 32 | 1 |
+| `both` | 48 | 49 |
+
+The delta between arms is the per-frame sizing and fill cost and nothing else.
+A third argument runs **one arm only**, which is what makes the process-wide
+rdtsc phase counters (`CRATONVM_DBG=invoke-phases`) readable per arm — without
+it every run mixes all five arms and the phases are identical by construction.
+
+### What a bigger frame actually costs
+
+Per-arm, one arm per process, `--nojit`, the general dispatcher (doors off) so
+the phase counters are charged:
+
+| phase (cycles/call) | `small` | `locals48` | `stack32` |
+|---|---:|---:|---:|
+| ic_lookup | 71.5 | 66.2 | 61.4 |
+| guards | 37.4 | 37.3 | 34.6 |
+| args | 57.1 | 57.0 | 54.6 |
+| **frame_build** | **114.3** | **128.3** | 109.8 |
+| frame_push | 38.5 | 36.7 | 35.7 |
+| ret_recycle | 70.9 | 68.7 | 65.8 |
+| measured total | 461.5 | 466.6 | 429.3 |
+
+Two things fall out, and both were surprises:
+
+1. **`frame_build` is the only phase that moves with frame size at all** — and
+   it moves by **14 cycles for 48 extra local slots**, about 0.3 cycles per
+   slot. That is already a vectorised fill. The other 100 cycles of
+   `frame_build` do not care how big the frame is.
+2. **The operand stack costs nothing extra.** `stack32` is not slower than
+   `small` anywhere. That is the second pass's `from_pooled` change working:
+   a pooled slot buffer that is already long enough is handed over as it is,
+   so only the one-byte `kinds` array is still sized per call.
+
+So the frame-lifecycle share is real and large — `frame_build` 25% plus
+`ret_recycle` 15% is **40% of an interpreted `invokestatic`** — but it is
+**size-independent**. It is not the filling of the buffers. It is the churn of
+the frame *objects*: two pooled `(Vec, Vec)` tuples popped and pushed back,
+four `Vec` headers taken and reinstalled, a `ValueStack` built, a ~220-byte
+`Frame` constructed and then moved into the frame stack, and the mirror image
+of all of it on return. Roughly 700 bytes of struct shuffling per call, none of
+which depends on `max_locals`.
+
+### The change that did not separate, recorded so it is not retried
+
+On that first (wrong) reading I rebuilt the locals construction as a single
+pass — size both buffers once with the filler already in place, write the
+arguments by index — replacing `clear()` + a `push()` per argument +
+`resize()`. Same end state, one walk of the buffer instead of three, behind
+`CRATONVM_JIT_NO_FRAME_FILL_FAST`.
+
+Six interleaved passes of `FrameShape` at 400k x 5 on the Azure host, two arms
+of one binary, cost in ns of 48 extra local slots:
+
+```
+fill fast ON   43.3  43.9  35.6  32.8  56.4  30.6     median 39.5
+fill fast OFF  33.8 110.7  40.0  37.1  34.0  54.5     median 38.6
+```
+
+No separation. And the honest tell is in the control: the `stack32` arm, which
+that change **cannot touch**, swung just as widely (ON 28.5-73.9, OFF
+29.1-115.6). The effect, if any, is below what this probe resolves on this
+host, which is unsurprising once the phase table above says the whole
+size-dependent cost is 14 cycles.
+
+**It was reverted.** It bought nothing measurable and paid for it in `unsafe`
+(`set_len` plus a manual fill) and in a second copy of the build kept behind a
+switch — the opposite of the trade that justified keeping the unmeasured
+deletions of earlier passes, which removed code and locks rather than adding
+them. The probe and its generator are kept; they are the reusable part.
+
+### What this means for the arena
+
+The arena is still the right change, but for a different reason than this page
+has been giving:
+
+* **Not** because the buffers are filled per call. That is 14 cycles.
+* **Because a frame is four heap buffers and a 220-byte struct that is
+  constructed, moved into the frame stack, and taken apart again on every
+  call.** An arena replaces all of it with a bump of a per-thread offset and a
+  `(base, len)` pair in the frame — and, at the same time, lets the callee's
+  locals *overlap* the caller's outgoing arguments, which deletes the argument
+  copy the fast doors still perform.
+
+The two measurements a future attempt should take before writing any code:
+
+1. `frame_push` is 38 cycles and `ret_recycle` 71. Emplacing the `Frame`
+   directly into the frame stack's slot (rather than constructing it and
+   moving it in) targets the first; the pooled-buffer hand-off targets the
+   second. Both are size-independent, both are worth more than the fill.
+2. The GC scan is what forces the locals buffer to be initialised at all
+   (`scan_local_objects` walks the whole buffer and would otherwise root a
+   previous frame's dead references). An arena has the same obligation, and
+   the way out is the one HotSpot takes — consult the method's stack map for
+   which locals hold references at the current bci — not more zeroing. The
+   verifier's type maps are already in this VM and are described elsewhere in
+   these notes as "the independent oracle"; that is the piece to build first,
+   because it is what makes an arena legal, not merely fast.
 
 ## Exit criteria
 

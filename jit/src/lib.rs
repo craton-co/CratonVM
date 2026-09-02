@@ -10739,6 +10739,53 @@ pub fn collection_direct_helper_sites() -> (u64, u64, u64) {
     )
 }
 
+/// `CRATONVM_JIT_INT_VALUE_DIRECT` — default-ON, `=0` opts out. The kill switch
+/// for the `Integer.intValue` / `Long.longValue` binds at BOTH doors; see
+/// [`INTEGER_INT_VALUE_DIRECT_SITES`].
+pub fn int_value_direct_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_INT_VALUE_DIRECT") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
+/// Compile-time engagement counter for the `Integer.intValue` bind — how many
+/// call sites any of the three doors actually bound. Read by
+/// `CRATONVM_DBG_DIRECT_BINDS=1`; see `vm::runtime::interp_census`.
+pub static INTEGER_INT_VALUE_DIRECT_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `Long.longValue()` sibling of [`INTEGER_INT_VALUE_DIRECT_SITES`].
+///
+/// Separate because the two binds answer separate questions and one counter
+/// covering both cannot be read: the composition workload binds two `intValue`
+/// sites and one `longValue` site, and a single `sites_bound=3` says which of
+/// the two recognitions fired only if you already know.
+pub static LONG_LONG_VALUE_DIRECT_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read [`INTEGER_INT_VALUE_DIRECT_SITES`].
+pub fn integer_int_value_direct_sites() -> u64 {
+    INTEGER_INT_VALUE_DIRECT_SITES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Read [`LONG_LONG_VALUE_DIRECT_SITES`].
+pub fn long_long_value_direct_sites() -> u64 {
+    LONG_LONG_VALUE_DIRECT_SITES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Count one bound `Integer.intValue` site. Called by the two doors in the
+/// `vm` crate, which cannot name the static across the dependency edge in a
+/// `static` initialiser but can call this.
+pub fn note_integer_int_value_direct_site() {
+    INTEGER_INT_VALUE_DIRECT_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one bound `Long.longValue` site.
+pub fn note_long_long_value_direct_site() {
+    LONG_LONG_VALUE_DIRECT_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Register the `Integer.intValue` thin direct-call helper (called once from
 /// the VM's `build_helpers`).
 pub fn set_integer_int_value_direct_fn(addr: usize) {
@@ -18617,10 +18664,17 @@ pub fn compiled_frame_line_counts() -> [u64; 8] {
 /// | 3 | `exhausted` | compiles refused `spill-range-exhausted` |
 /// | 4 | `past-limit` | compiles refused `spill-cursor-past-limit` |
 /// | 5 | `peak-words` | high-water mark of live spill words in any one compile (a MAX, not a sum) |
-/// | 6 | `res-push` | words reserved by `push_stack` — the ordinary operand push |
-/// | 7 | `res-invalidate` | words reserved by `invalidate_callee_saved` |
-/// | 8 | `res-total` | every word reserved, so the two attributed columns read as a fraction of a whole |
+/// | 6 | `res-push` | the ordinary operand push |
+/// | 7 | `res-invalidate` | `invalidate_callee_saved` re-homing register-aliased entries |
+/// | 8 | `res-total` | every word reserved. NOT a counter: it is DERIVED at read time as the sum of the seven reason columns, so the partition is structural. Counting it separately and asserting the sum could not work — the columns are process-global atomics and seven loads plus an eighth are never a consistent snapshot while other threads compile |
 /// | 9 | `min-headroom` | the FEWEST words left between a reservation's end and `spill_limit_offset`, over every compile (a MIN; `u64::MAX` means nothing reserved) |
+/// | 10 | `inline-reserve-sum` | largest per-compile inline reserve as `spill_size` computes it today: a SUM over every site (a MAX over compiles) |
+/// | 11 | `inline-reserve-path` | what the same compile would need if the reserve were a MAX over top-level sites and over each site's deepest nested PATH (a MAX over compiles) |
+/// | 13 | `res-inline-locals` | an inlined callee's local frame |
+/// | 14 | `res-inline-merge` | an inlined body's branch-merge area |
+/// | 15 | `res-call-service` | the direct-call argument-service copy |
+/// | 16 | `res-helper-args` | a helper's argument buffer or out-parameter (intrinsic dispatch, FFM, the monitor receiver) |
+/// | 12 | `inline-reserve-spent` | what `spill_size` ACTUALLY added (a MAX over compiles). The engagement counter: it equals column 10 with the switch off and column 11 with it on, and inferring which without measuring it is how an inert change ships |
 ///
 /// Column 2 is retired and reads zero. It was the engagement counter for a
 /// canonical-home flush — store to `base + i*8`, reclaim a dead word below the
@@ -18634,7 +18688,7 @@ pub fn compiled_frame_line_counts() -> [u64; 8] {
 /// method, so 19 words is nearly the whole budget for one method and a rounding
 /// error for another. A refusal count of zero plus a large minimum headroom is
 /// a much stronger statement than the refusal count on its own.
-static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 10] = [
+static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 17] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -18645,6 +18699,13 @@ static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 10] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(u64::MAX),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
 ];
 
 /// `flush_scratch_registers` invocations.
@@ -18663,13 +18724,40 @@ pub const SPILL_PEAK_WORDS: usize = 5;
 pub const SPILL_RES_PUSH: usize = 6;
 /// Words reserved by `invalidate_callee_saved`.
 pub const SPILL_RES_INVALIDATE: usize = 7;
-/// Every word reserved, by any caller.
+/// Every word reserved, by any caller. Derived, never stored — see the table.
 pub const SPILL_RES_TOTAL: usize = 8;
+
+/// The seven columns that partition [`SPILL_RES_TOTAL`], in `SpillReason` order.
+pub const SPILL_RES_REASON_COLUMNS: [usize; 7] = [
+    SPILL_RES_PUSH,
+    SPILL_FLUSH_RESERVED,
+    SPILL_RES_INVALIDATE,
+    SPILL_RES_INLINE_LOCALS,
+    SPILL_RES_INLINE_MERGE,
+    SPILL_RES_CALL_SERVICE,
+    SPILL_RES_HELPER_ARGS,
+];
 /// Fewest words ever left between a reservation and the spill limit.
 pub const SPILL_MIN_HEADROOM: usize = 9;
+/// Largest per-compile inline reserve, summed over sites as today.
+pub const SPILL_INLINE_RESERVE_SUM: usize = 10;
+/// The same compile's requirement if the reserve were a max over sites/paths.
+pub const SPILL_INLINE_RESERVE_PATH: usize = 11;
+/// What `spill_size` actually added for inlining.
+pub const SPILL_INLINE_RESERVE_SPENT: usize = 12;
+/// An inlined callee's local frame.
+pub const SPILL_RES_INLINE_LOCALS: usize = 13;
+/// An inlined body's branch-merge area.
+pub const SPILL_RES_INLINE_MERGE: usize = 14;
+/// The direct-call argument-service copy.
+pub const SPILL_RES_CALL_SERVICE: usize = 15;
+/// A helper's argument buffer or out-parameter.
+pub const SPILL_RES_HELPER_ARGS: usize = 16;
+/// Alias: the flush's own reservation column, named for `SpillReason::Flush`.
+pub const SPILL_RES_FLUSH: usize = SPILL_FLUSH_RESERVED;
 
 /// Human names, parallel to the slot indices.
-pub const SPILL_CURSOR_SLOT_NAMES: [&str; 10] = [
+pub const SPILL_CURSOR_SLOT_NAMES: [&str; 17] = [
     "flush-calls",
     "flush-reserved",
     "flush-canonical",
@@ -18680,6 +18768,13 @@ pub const SPILL_CURSOR_SLOT_NAMES: [&str; 10] = [
     "res-invalidate",
     "res-total",
     "min-headroom",
+    "inline-reserve-sum",
+    "inline-reserve-path",
+    "inline-reserve-spent",
+    "res-inline-locals",
+    "res-inline-merge",
+    "res-call-service",
+    "res-helper-args",
 ];
 
 /// Add `n` to one column. `peak-words` must not go through here — it is a
@@ -18698,6 +18793,19 @@ pub fn note_spill_cursor(slot: usize, n: u64) {
 /// Raise the peak-words high-water mark to `words` if it is higher, and lower
 /// the headroom low-water mark to `headroom` if it is smaller. One call, so a
 /// reservation cannot record one and forget the other.
+/// Record one compile's inline reserve, as computed today and as a
+/// max-over-paths alternative would compute it. Both are maxima over compiles:
+/// the question is how big the worst frame gets, not how many frames there are.
+#[inline]
+pub fn note_inline_reserve(sum_words: u64, path_words: u64, spent_words: u64) {
+    SPILL_CURSOR_COUNTS[SPILL_INLINE_RESERVE_SUM]
+        .fetch_max(sum_words, std::sync::atomic::Ordering::Relaxed);
+    SPILL_CURSOR_COUNTS[SPILL_INLINE_RESERVE_PATH]
+        .fetch_max(path_words, std::sync::atomic::Ordering::Relaxed);
+    SPILL_CURSOR_COUNTS[SPILL_INLINE_RESERVE_SPENT]
+        .fetch_max(spent_words, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[inline]
 pub fn note_spill_peak(words: u64, headroom: u64) {
     SPILL_CURSOR_COUNTS[SPILL_PEAK_WORDS].fetch_max(words, std::sync::atomic::Ordering::Relaxed);
@@ -18705,11 +18813,15 @@ pub fn note_spill_peak(words: u64, headroom: u64) {
 }
 
 /// Read the census. See [`SPILL_CURSOR_COUNTS`] for the columns.
-pub fn spill_cursor_counts() -> [u64; 10] {
-    let mut out = [0u64; 10];
+pub fn spill_cursor_counts() -> [u64; 17] {
+    let mut out = [0u64; 17];
     for (i, slot) in SPILL_CURSOR_COUNTS.iter().enumerate() {
         out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
     }
+    // `res-total` is derived, not counted. Every reservation bumps exactly one
+    // reason column, so the sum IS the total by construction and no reservation
+    // can reach the cursor without landing in it.
+    out[SPILL_RES_TOTAL] = SPILL_RES_REASON_COLUMNS.iter().map(|&c| out[c]).sum();
     out
 }
 
@@ -23684,6 +23796,63 @@ fn try_compile_inner(
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                             }
+                            // `Integer.intValue()` / `Long.longValue()` at the
+                            // OPTIMIZING door.
+                            //
+                            // The scope note above says these are
+                            // "single-pass-only" because they are
+                            // `invokevirtual` and this door is gated
+                            // `is_static || is_special`. That was true when it
+                            // was written and is not true now:
+                            // `invokevirtual_site_final_owner` pins an
+                            // unoverridable `invokevirtual` as statically
+                            // bound, and BOTH wrapper classes are `final`, so
+                            // `private_virtual_owner` is `Some` and the site
+                            // arrives here as `is_special` with `direct_class`
+                            // already the declaring class. The door the note
+                            // says these sites cannot reach is the door they
+                            // now come through.
+                            //
+                            // `needs_ctx = true` puts `vm_ptr` in ARG_REGS[0]
+                            // ahead of the receiver, which is the helpers' own
+                            // `(vm_ptr, receiver)` signature — the same
+                            // convention `Thread.currentThread` uses above.
+                            //
+                            // `Long.longValue` is NOT bound here, and the
+                            // reason is a measurement rather than an argument.
+                            // The argument applies unchanged -- `java/lang/Long`
+                            // is `final` too, so its sites arrive here pinned
+                            // exactly as `Integer`'s do -- but the arm was
+                            // written, built and measured, and
+                            // `CRATONVM_DBG_DIRECT_BINDS=1` reported
+                            // `Long.longValue: sites_bound=0` against
+                            // `Integer.intValue: sites_bound=4 served=159 199`
+                            // on the same run. Nothing on the workload this
+                            // change is measured against reaches it, so it
+                            // ships as a follow-up rather than as unexercised
+                            // code: re-add the `Long` half and watch
+                            // `sites_bound` move before believing it.
+                            if direct_target.is_none()
+                                && int_value_direct_enabled()
+                                && !is_static
+                                && direct_class == "java/lang/Integer"
+                                && mn == "intValue"
+                                && desc == "()I"
+                            {
+                                let entry = direct_native_helper(
+                                    &INTEGER_INT_VALUE_DIRECT_FN,
+                                    jdk_only,
+                                    intrinsic_resolver,
+                                    direct_class,
+                                    &mn,
+                                    &desc,
+                                );
+                                if entry != 0 {
+                                    direct_target = Some((entry, true));
+                                    direct_target_is_thin_helper = true;
+                                    note_integer_int_value_direct_site();
+                                }
+                            }
                             if direct_target.is_none()
                                 && !closes_cycle
                                 && !jit_direct_call_requires_dispatch(direct_class, &mn, &desc)
@@ -25480,6 +25649,50 @@ fn try_compile_inner(
             // is an acceptable trade for not running unaudited machinery on
             // every unrelated JIT compile.
             let virtual_interface_inline_admitted = class_id_name_resolver.is_some();
+            // `Integer.intValue()` at a site `invokevirtual_site_final_owner`
+            // pinned as statically bound (`invoke_kind == 1`). The arm further
+            // down still owns `invoke_kind == 0`; this one exists because that
+            // arm can no longer see these sites at all, and widening ITS
+            // condition would hand every other recogniser inside the
+            // `(0 | 2)` block a shape none of them was written for.
+            //
+            // `class_name` is already the pin's substituted DECLARING class,
+            // which for `intValue` is `java/lang/Integer` itself. The opcode is
+            // still `0xb6`, so the x64 ladder adds the receiver back exactly as
+            // it does for the unpinned shape. See
+            // [`INTEGER_INT_VALUE_DIRECT_SITES`].
+            if !is_recursive_call
+                && invoke_kind == 1
+                && direct_jit_callee_calls_enabled
+                && int_value_direct_enabled()
+                && class_name == "java/lang/Integer"
+                && method_name == "intValue"
+                && descriptor == "()I"
+            {
+                let entry = direct_native_helper(
+                    &INTEGER_INT_VALUE_DIRECT_FN,
+                    jdk_only,
+                    intrinsic_resolver,
+                    &class_name,
+                    &method_name,
+                    &descriptor,
+                );
+                if entry != 0 {
+                    needs_heap = true;
+                    note_integer_int_value_direct_site();
+                    direct_calls.push((
+                        pc,
+                        JitDirectCall {
+                            entry,
+                            needs_context: true,
+                            num_params: 0,
+                            return_type: b'I',
+                            guard_class_id: 0,
+                        },
+                    ));
+                    continue;
+                }
+            }
             if !is_recursive_call
                 && (invoke_kind == 3
                     || invoke_kind == 1
@@ -26367,6 +26580,7 @@ fn try_compile_inner(
                 // plain guard-free virtual direct-call path is sound, and
                 // the helper handles the null-receiver NPE itself.
                 if direct_jit_callee_calls_enabled
+                    && int_value_direct_enabled()
                     && invoke_kind == 0
                     && class_name == "java/lang/Integer"
                     && method_name == "intValue"
@@ -26384,6 +26598,7 @@ fn try_compile_inner(
                     );
                     if entry != 0 {
                         needs_heap = true;
+                        note_integer_int_value_direct_site();
                         direct_calls.push((
                             pc,
                             JitDirectCall {
@@ -38185,7 +38400,39 @@ mod layout_constant_inventory {
         // the legacy cell address is `field_index * SLOT_SIZE`, a use of its
         // own and not a reuse of the compact arm's — which this comment claimed
         // until the inventory test refused the count and said so.
-        ("ir_lower.rs", [11, 4, 6, 0, 0, 0, 6, 4]),
+        //
+        // 2026-09-02 added the twelfth `HEADER_SIZE` and two more in tests
+        // (12 -> 14): the optimizing tier's GATED compact reference
+        // `putfield` (`emit_gated_ir_ref_putfield`) and the two test
+        // expectations that reconstruct the same address to assert the store
+        // is emitted at it. The emitter site is the mirror image of the
+        // inline `getfield` compact read directly above it — same
+        // `HEADER_SIZE + packed_body_offset`, same cell — and it is a disp32
+        // site (`48 89 90 disp32`), so it does not share the disp8
+        // backwards-addressing hazard the array sites have. Nothing else
+        // moves: the store reaches the compact cell base directly, with no
+        // `SLOT_SIZE` index and no payload bias, because a compact reference
+        // field IS the bare 8-byte pointer.
+        //
+        // Later the same day, the gated store grew its LEGACY shape and the
+        // counts moved again: `HEADER_SIZE` 14 -> 15, `SLOT_SIZE` 6 -> 7 and
+        // `FIELD_CELL_PAYLOAD64_OFFSET` 4 -> 5, all three from the one
+        // expression `HEADER_SIZE + field_index * SLOT_SIZE` plus the payload
+        // bias inside the 16-byte `Value` cell. It exists because the compact
+        // shape alone fired zero times out of 16,384,000 -- the TLAB fast path
+        // writes legacy headers unconditionally -- and it is the exact mirror
+        // of the inline `getfield`'s own legacy branch two entries above, which
+        // is where the offsets are transcribed from rather than re-derived.
+        // Both stores are disp32 (`48 89 90 disp32`, `4C 89 90 disp32`), so
+        // neither shares the disp8 backwards-addressing hazard; and since the
+        // arm now picks between the two shapes per OBJECT on the
+        // `GC_FLAG_COMPACT` bit, a header shrink must move BOTH or the legacy
+        // shape writes the wrong cell.
+        // Plus the two-shape test's own expectations (`HEADER_SIZE` 15 -> 17):
+        // it reconstructs both cell addresses to assert both stores are
+        // emitted, which is the assertion that would have caught the
+        // compact-only arm before a run-time census had to.
+        ("ir_lower.rs", [17, 4, 7, 0, 0, 0, 6, 6]),
     ];
 
     fn source(file: &str) -> &'static str {

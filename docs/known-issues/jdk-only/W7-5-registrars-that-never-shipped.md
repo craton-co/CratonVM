@@ -570,6 +570,34 @@ landing it here would produce a test that cannot compile until the sibling branc
 merges, and this lane cannot build to check that. It belongs in the same commit
 as §6.2.
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** The banner says "Nothing was built or
+> run on 2026-08-12". §6.3.1's ratchet has now been built and run — which was the
+> open question, because §6.3.1 records it going from a test that "cannot
+> compile" to "a real test" only when a sibling branch merged. It compiles, and
+> all three of §6.3.1's tests pass:
+>
+> ```text
+> cargo test -p cratonvm-native-builtins --test essential_wiring_ratchet
+>   essentials_cover_the_abstract_primitive_stream_terminals ... ok
+>   none_of_the_terminals_is_a_synthetic_stub ................ ok
+>   the_terminals_survive_the_whole_real_jdk_boot ............ ok
+>   boot_path::the_replayed_sequence_matches_vm_init ......... ok
+>   boot_path::the_inline_registrations_in_vm_init_are_enumerated ... ok
+>   5 passed, 0 failed
+> ```
+>
+> **Five tests, and §6.3.1 says three — but this is NOT the count drift every
+> other record in this campaign showed.** The two extra are not growth and not
+> this record's: `boot_path::the_replayed_sequence_matches_vm_init` and
+> `boot_path::the_inline_registrations_in_vm_init_are_enumerated` belong to
+> [`W7-30`](W7-30-stub-ratchet-boot-path-scope.md), which names both. Two records
+> share one file. Reported as drift it would have been noise; read, it is two
+> lanes' work sitting side by side, and both are green.
+>
+> Unchanged: §6.3.1's note that this is **not wired into CI** — that file was not
+> that lane's to edit, and running it by hand here does not wire it.
+> `forEachOrdered` is still deliberately unasserted for the reason §6.3.1 gives.
+
 ### 6.3.1 WRITTEN, 2026-08-12 — `native-builtins/tests/essential_wiring_ratchet.rs`
 
 The sibling branch merged: `register_phase56_primitive_stream_terminals` is in

@@ -1043,3 +1043,178 @@ card's first object start as it goes and stamp the region with the cursor the
 table is valid up to. A later walk uses it below that mark and walks forward
 above it. Old regions stop growing once they fill, so the table would be valid
 for essentially all of one.
+
+## 13. The card screen was switched off for the regions that matter (2026-09-02)
+
+*`perf/g1-card-screen-jit-pinned-20260902`, branched from `dev` at `86889860a`.
+§12.4 measured the card screen skipping 0.79% of source-walk bytes with the JIT
+warm against 20-50% without it, and named the cause: a JIT-pinned source region
+is walked WHOLESALE. This is that carve-out removed.*
+
+### 13.1 What the carve-out was, and the premise under it
+
+`young_collection`/`mixed_collection` add every JIT-pinned region to the source
+list on top of the remembered set's own, and pass `card_screen = false` for
+them. The reason, from the call site: "JIT-compiled code may have installed
+those references through stores the collector cannot assume went through
+`post_write_barrier_rset`". A card screen is derived from that same assumption,
+so applying it there would trust the belt the wholesale walk exists to double.
+
+The premise is about what compiled code can do behind the collector's back. It
+is worth re-deriving rather than inheriting, because it has changed.
+
+### 13.2 The enumeration
+
+Every path by which compiled code can write a reference into a G1 heap now
+reaches `post_write_barrier_rset`, which records the remembered-set entry AND
+dirties the holder's card:
+
+| path | what forces the barrier |
+|---|---|
+| `putfield` (ref), every inline arm, both tiers | G1-2 gates each arm on `region_bounds_are_live(...)`; G1 publishes nothing into `JIT_REGION_BOUNDS`, and `publishing_the_g1_barrier_table_does_not_make_region_bounds_live` pins that. Every arm takes `jit_putfield_object`. |
+| `putfield` under `CRATONVM_G1_INLINE_BARRIER` (F-08) | The inline filter elides only a null value and a same-region store — the two cases whose callee returns without recording. Everything else calls `jit_g1_post_write_barrier`. |
+| `aastore`, single-pass tier | Stores inline, then calls `helpers.write_barrier` → `jit_write_barrier` → `VmHeap::write_barrier`. The inline card-mark shortcut beside it is generational-only (`inline_card_mark_available()` is a constant `false`). |
+| `aastore`, IR tier | Refused outright: `ir_lower` latches a bailout rather than emit a barrier-less reference store. |
+| statics, natives, reflection, `Unsafe`, `VarHandle`, `arraycopy` | All funnel through the barriered accessors; none is compiled inline. |
+
+There is a second, weaker argument that holds independently and covers the
+default configuration: with `CRATONVM_G1_CARD_CLEAN` off (§12), a card is
+cleared only by `G1Region::reset`. A clean card therefore means "no store into
+this region's contents has EVER been recorded since it was recycled", and
+skipping such an object cannot skip one a store has touched.
+
+### 13.3 Measured
+
+`CRATONVM_G1_CARD_SCREEN_JIT_PINNED`, default-on with a `=0` opt-out.
+Release, `HumongousChurn 48 20000 512` at `-Xmx160m`, JIT warm:
+
+| | screen off (old behaviour) | screen on |
+|---|---:|---:|
+| source-walk bytes scanned | 90.1 MB | 1.70 MB |
+| bytes skipped | 0.21 MB | 88.6 MB |
+| **skip-rate** | **0.23%** | **98.11%** |
+
+Four ABBA-interleaved reps for time, medians: wall 7670 → 6960 ms (**-9.3%**),
+total pause 5639 → 4901 ms (**-13.1%**). The tail moves more than the median:
+the off arm ranges 6190-10469 ms and the on arm 6103-7226 ms, because the walk
+no longer scales with how much of the old generation a warm JIT happens to pin.
+
+### 13.4 Correctness evidence
+
+This is a use-after-free class of change — a lost edge frees a live object — so
+it is worth listing what was actually run rather than what was reasoned:
+
+* `dangling=0` from `verify_no_dangling_into_cset` over 21.4M objects across 16
+  pauses, on both arms, parallel evacuator;
+* `missing=0` from `dbg_verify_rset_completeness` across 6 checks on the serial
+  arm (`CRATONVM_G1_PARALLEL_EVAC=0 CRATONVM_G1_DBG_RSET=1`), both arms;
+* HotSpot-identical checksums on every probe and every kill-switch arm:
+  `G1CardChurn 11 60` (7616601600) with the flag on and off,
+  `G1ChurnPauseProbe 24 200` (111889612800), `HumongousHold 300` (266925450),
+  and `HumongousChurn` (249707433568) under `CRATONVM_G1_CARD_RSET=0`,
+  `CRATONVM_G1_CARD_CLEAN=1` and `--nojit`;
+* `a_jit_pinned_source_is_screened_or_walked_wholesale_by_the_flag` pins both
+  directions — 4096 bytes skipped with the flag on, 0 with it off, and the
+  referent reachable only through the pinned holder survives either way.
+
+The wholesale walk is still the `=0` behaviour, and it is the first thing to
+try for a lost-edge defect dated after this.
+
+### 13.5 What this does NOT change
+
+The JIT-pinned regions are still added to the source set unconditionally, and
+they are still excluded from every collection set. This changes only how much
+of such a region Phase 2 reads. Region pinning itself goes away when precise
+shadow-stack coverage lands (§11.1), which is a different and larger piece of
+work.
+
+## 14. Precise root coverage: G1's proof was vacuous, and G1 was the only relocating collector not answering (2026-09-02)
+
+*`perf/g1-precise-root-coverage-20260902`, branched from `dev` at `038e4e1e3`.
+§11.1 and §13.5 both end at the same place — "region pinning goes away when
+precise shadow-stack coverage lands" — and every G1 pause reporting
+`root coverage: incomplete` made that look far away. It was one unpublished
+table.*
+
+### 14.1 The finding
+
+`conservative_roots`'s frame-band verifier decides "does this compiled frame's
+spill band hold a heap address the shadow stack never published?" by
+classifying each band word with `gen_heap::addr_is_movable` — the union of
+`JIT_REGION_BOUNDS` and `MOVABLE_BOUNDS`. Two tables, because filling the first
+to fix the verifier would silently re-enable the inline reference-store fast
+path defect G1-2 closed; the second exists precisely so a collector can answer
+the movability question without that.
+
+**ZGC has published its envelope there since 2026-08-21. G1 published neither.**
+So `movable_bounds_are_live()` was false under G1, the verifier failed closed on
+`YOUNG_BOUNDS_UNPUBLISHED` before inspecting a single frame, and the verdict was
+`incomplete` on **100.00%** of pauses — a constant, carrying no information.
+
+That constant is also what made `CRATONVM_G1_COVERAGE_PIN` useless: a lever that
+refuses to evacuate whenever coverage is incomplete refuses every evacuation
+when coverage is always incomplete.
+
+### 14.2 The fix
+
+`G1Collector::new` publishes its whole arena reservation into `MOVABLE_BOUNDS`,
+and `Drop` clears it owner-checked, mirroring ZGC exactly. The whole
+reservation rather than the committed prefix or the young set: a superset is the
+safe direction — an address wrongly called movable costs a declined
+suppression, an address wrongly called immovable is a frame reported clean that
+was never inspected — and the envelope is the one thing about the arena that
+never changes.
+
+`g1_publishes_its_movable_envelope_without_making_region_bounds_live` pins both
+halves, and the second half is the one that must never regress: the STORE-side
+table stays empty, so this cannot re-open G1-2.
+
+Measured: `root coverage: incomplete` **100.00% → 0.00%** on every probe.
+
+### 14.3 What the earned proof unlocks, measured
+
+With the proof real, the precise-only branch does what §2.4 always said it
+would. Three arms, `HumongousChurn 48 6000 512` at `-Xmx160m`:
+
+| arm | coverage | pauses pinning | `pin_addrs` | dangling |
+|---|---|---:|---:|---:|
+| default (both switches off) | 0% incomplete | 2 | 21 | 0 |
+| `CRATONVM_GC_PRECISE_ONLY_ROOTS=1` only | 0% incomplete | 2 | 21 | 0 |
+| **both switches on** | 0% incomplete | **0** | **0** | 0 |
+
+`checksum=249707433568` in all three. With both on, `G1CardChurn 11 60`,
+`G1ChurnPauseProbe 24 200` and `HumongousHold 300` also run with `pin_addrs=0`,
+`dangling=0` and HotSpot-identical checksums.
+
+**G1 pins nothing.** That is the whole of what region pinning costs — the
+hottest, most garbage-dense Eden region kept out of every collection set (§2.3)
+— removed.
+
+**A vacuous arm on the way, recorded because the next reader will hit it.** The
+first A/B set only `CRATONVM_G1_PRECISE_ONLY_ROOTS=1` and reported both arms
+identical. The master switch `CRATONVM_GC_PRECISE_ONLY_ROOTS` gates it, so
+`moving_young_precise_only` was false in both arms and the experiment measured
+nothing. The G1 switch alone does nothing at all.
+
+### 14.4 Why the defaults do NOT move here
+
+The publish lands on. Both suppression switches stay opt-in, and the reason is
+no longer G1's:
+
+* `dbg_precise_only_roots`'s own doc records that the suppression rests on
+  `CompiledMethod::fully_oop_covered`, a **presence** test — every GC-capable
+  safepoint recorded *an* oop map — not a completeness one, and that the
+  runtime oracle which would settle it (`CRATONVM_DBG_VERIFY_OOP_MAPS`) runs
+  inside the very scan the branch skips
+  (`bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`). That is
+  a JIT-wide question, not a collector one.
+* One workload over a handful of pauses is not a soak for a use-after-free
+  class of change, and the G1 instance of exactly this failure
+  (`bug-g1-evacuates-live-jit-reference-20260819.md`) is a year-fresh record of
+  what it looks like when the proof is wrong.
+
+The stale half of the record is corrected in passing: the doc on
+`CRATONVM_G1_PRECISE_ONLY_ROOTS` said the branch "is unsound under G1" because
+the pin set comes from the scan. That describes the mechanism correctly but
+names the wrong cause — the defect was the vacuous proof, which is what this
+change fixes. The doc now says so, and says what a soak must answer instead.
