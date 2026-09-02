@@ -47,65 +47,79 @@ So **`Next` items 2 and 3 are closed**: the follow-up that removes the cost
 landed, and there is no longer a cost that would justify defaulting
 `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT` to OFF.
 
-### 2. The gate does NOT close the hole — it narrows it
+### 2. RETRACTED — `stale_live` is an upper bound, not a liveness proof
 
-This is the correction that matters. The page reads as though the defect is
-contained fail-closed. It is not. With the gate at its **shipped default**,
-relocation runs and frames still keep pre-move references:
+**The first version of this addendum claimed the gate leaves live stale words at
+its shipped default. That claim is withdrawn: the measurement it rests on does
+not support it, and the witness it named is a demonstrated false positive.**
 
-| arm | result | frames | frames with a LIVE stale word | LIVE words |
-|---|---|---:|---:|---:|
-| gate ON (default) | clean to 900 s cap | 13 | **8** | **15** |
-| `..._MAP_INCOMPLETE=0` | **`rc=1` NPE at 497 s** | 128 | 88 | 322 |
+`report_remap_residue` classifies a from-space word as LIVE by ONE test:
 
-**Every one of those 8 frames reports `cov_complete=true`.** The gate declines
-relocation for maps the compiler has already JUDGED short; these maps are not
-judged short — `causes(...)` reports zero for the methods involved — so the gate
-never sees them. It removes most of the population and none of the mechanism.
+```rust
+let class = if live_hi <= 0 { "unknown" }
+            else if off < live_hi { "LIVE" }     // <- the whole test
+            else { "dead" };
+```
 
-The two clean arms were run at load 8–18. This page's own rule is that a
-contended host suppresses this failure, so "clean to the cap" is weak evidence
-of safety and the residue count is the reading to trust.
+`live_frame_hi` is the **spill high-water mark**, not a liveness bound. Every
+word below it is called LIVE, including a local slot the method has not written
+yet, an `int` local whose 8-byte home still holds a previous frame's pointer,
+and any spill slot below the watermark that is currently dead. The page already
+learned the weaker form of this once — the raw `stale_words` count was an upper
+bound until the `live_hi` split was added — and the split narrowed the bound
+without turning it into a proof.
 
-### 3. A smaller, steadier witness, and it is not H2
+So the honest reading of the numbers below is "at most this many", not "this
+many":
 
-`Next` item 1 asked for a one-method reproducer and named
-`String.substring(II)` at safepoint 41. That witness still reproduces — under
-the default, `mapped=[8, 112] rewritten=2 inlined=[] stale_live=1`, i.e. the
-page's offset 112 is now named and **offset 88 is still not**. But there is a
-smaller one: `probes/SafepointMapResidue.java`, 25 lines, no H2, about two
-minutes, and stable across runs:
+| arm | result | frames | words classified LIVE |
+|---|---|---:|---:|
+| gate ON (default) | clean to 900 s cap | 13 | ≤ 15 |
+| `..._MAP_INCOMPLETE=0` | `rc=1` NPE at 497 s | 128 | ≤ 322 |
+
+The gate-OFF arm still FAILS and the gate-ON arm still passes, which is real and
+is the bisect this page already had. What is **not** established is that any
+particular word in the gate-ON arm is a missed root.
+
+### 3. The witness was dead storage, and the bytecode proves it
+
+`probes/SafepointMapResidue.java` (25 lines, no H2, ~2 minutes) reliably reaches
+the instrument and reports one stable frame:
 
 ```text
 [remap-frame] method=java/lang/StringConcatHelper.doConcat:(...)
-  sp_id=51 frame_size=1056 cov_complete=true live_hi=96
-  mapped=[ 8=0x..ec40 16=0x..ed70 40=0x..0838 ] rewritten=1
+  sp_id=51 cov_complete=true live_hi=96
+  mapped=[ 8=.. 16=.. 40=.. ] rewritten=1
   stale_words=18 stale_live=1 stale_dead=17
   [LIVE off=32 stale=0x20019013eb8->0x200102599b8]
 ```
 
-Slot 40 was named and rewritten; word 32 holds the SAME object's OLD address,
-sits inside the live band, and the map never named it.
+Dumping the map inputs gave `local_mask=Some(19)`, and `local_offset(k)` is
+`8*(k+1)`, so the named slots 8/16/40 are locals 0, 1 and 4. Offset 32 is
+local 3. That looked like "the mask omits a live reference local".
 
-**It is not inlining, and that was measured rather than assumed.** The frame
-carries an inlined `String.<init>([BB)V`, and `fully_oop_covered` has an
-`inline_sites.is_empty()` term — so "the inlined callee's locals are unnamed" is
-the obvious reading. Ablated:
+**It is not. `javap -c` on the real method settles it:**
 
-| arm | frames | frames with a LIVE stale word |
-|---|---:|---:|
-| default | 29 | 1 |
-| `CRATONVM_JIT_INLINE_CALLS=0` | 24 | **3** |
-| `CRATONVM_JIT_INLINE=0` | 25 | **3** |
+```text
+25: istore_3          // local 3 = newLength — an INT
+30: astore 4          // local 4 = buf (byte[]) — the reference
+```
 
-Turning inlining off does not remove them. What is left is the general case
-this page's own `What is actually wrong` section names, and it is worth
-restating in the single-pass backend's own terms: `record_oop_map` walks the
-operand stack and `continue`s past any entry whose `stack_oop_marks[i]` is
-false, **without clearing `map_incomplete`**. The only protection against a mark
-that is simply WRONG is the `stack_oop_marks_exact` seed — and on this witness
-`marks_inexact=0`. A mark vector believed exact and not exact is invisible to
-every counter on that line.
+Bit 4 of the mask can only be set after `astore 4` at pc 30, which is after
+`istore_3` at pc 25. So at every safepoint where the mask reads `Some(19)`,
+local 3 holds an `int` — and the mask naming locals 0, 1 and 4 is **exactly
+right**. The pointer sitting at offset 32 is stale bytes in a slot that does not
+hold a reference at that program point: dead storage below the watermark, which
+is the one thing the LIVE test cannot tell apart from a missed root.
+
+**The lesson this page has now taught a third time.** Its own history is a WARN
+read as a discriminator (wrong twice), then a raw residue count that was an
+upper bound. `stale_live` is the same shape one refinement later. A residue
+count cannot be evidence of a missed root without an independent statement of
+what the slot HOLDS at that pc — and there is one available:
+`docs/.../reference` on the verifier type maps makes exactly that point, and
+`javap -c -l` scopes settle it by hand in a minute.
+
 
 ### 4. The cause census printed six of its seven causes — and the seventh is ZERO
 
@@ -127,74 +141,57 @@ the witness method, with all seven columns printing:
          staged_deep=0 staged_unmappable=0 inline_local_unmappable=0)
 ```
 
-Correlated in one run with the residue instrument: the SAME method contributes
-**3 frames carrying a LIVE stale word**, and **every one of its seven causes
-reads zero**. Every safepoint is mapped, `unmapped_pcs` is empty, and nothing
-in the compiler's own self-assessment registers a shortfall.
+That is worth having on its own: every safepoint of that method is mapped,
+`unmapped_pcs` is empty, and no cause fires. An eighth counter
+(`LOCAL_MASK_UNREACHED`, for the silent `None` branch where the locals are
+skipped without setting `map_incomplete`) was added at the same time and also
+reads zero.
 
-That is the sharpest available statement of what is left, and it is stronger
-than "a cause was hidden": the missing word is invisible to the compiler's
-ENTIRE vocabulary of incompleteness, not merely to the subset that was being
-printed. A fail-closed gate keyed on `map_incomplete` cannot reach it by
-construction — which is why §2 above finds live stale words with the gate at
-its shipped default.
+**What that does NOT establish** — and the first version of this addendum said
+it did — is that a live reference is going unnamed. All eight zeros are
+consistent with the simpler reading, which §3 shows is the true one: the map is
+right and the residue line is a slot that does not hold a reference at that pc.
+A complete census reading zero on a correct map is what a correct map looks
+like.
 
-(Measured on both profiles: the witness and its offsets are identical on the
-release binary and on a debug build, so it is not an optimisation artefact.)
+### 5. What is actually left, and what the next instrument has to be
 
-### 5. The wrong classification, named: the local-oop mask omits a live reference local
+The remaining question is unchanged from `Next` item 2, and it is now honestly
+open rather than falsely answered:
 
-With all eight causes reading zero, the question stopped being *which cause* and
-became *which classification is wrong*. Dumping the inputs `record_oop_map`
-builds from, for the witness method only, answers it in one run.
+* the gate-OFF arm reproduces the corruption; the gate-ON arm does not, over
+  900 s at load 8–18. That is the bisect, and it stands.
+* **no missed root has been exhibited under the shipped default.** Everything
+  offered as one so far has been either dead storage (§3) or unverified.
+* so the fail-closed gate may well be sufficient today, and the cost of keeping
+  it is now nil (§1). That is a materially better position than this page
+  describes, and it should not be undone on the strength of a residue count.
 
-The frame layout is `local_offset(k) = 8 * (k + 1)`, so locals 0..4 sit at
-offsets 8, 16, 24, 32, 40. For the safepoint that becomes `sp_id=51`:
+**Before any repair, the instrument needs to be able to say "live".** A word
+below `live_frame_hi` that the map does not name is a missed root only if the
+slot holds a reference at that bci. Two oracles exist in-tree for that and
+neither is wired to this report:
 
-```text
-[spmap] pc=..  stack_len=0  marks=[]  exact=true  kinds=[]
-        local_mask=Some(19)  param_mask=0x3  slots=[8, 16, 40]
-```
+* the **local-oop mask itself** — if the slot is a local, the mask already says
+  whether it is a reference, and a LIVE classification that contradicts the mask
+  is either a real miss or (as here) a slot that is not a live local at all;
+* the **verifier type maps**, which this repo already records as the independent
+  oracle for a never-mapped word.
 
-`Some(19)` is `0b10011` — locals **0, 1 and 4**, i.e. offsets 8, 16, 40, which
-is exactly the `mapped=[8, 16, 40]` the residue instrument reports for that
-frame. Every named slot came from the local mask; the operand stack contributed
-nothing (`stack_len=0`).
+Cross-checking the residue against either would have retired this witness in one
+run instead of one commit. That, not another cause counter, is the next thing to
+build.
 
-And the live stale word is at **offset 32 — local 3**, which the mask says is
-not a reference. It is: the residue instrument resolves it through the
-collection's own forwarding table (`stale=0x20019013eb8->0x200102599b8`), and
-the object it names is the same one slot 40 holds after rewriting. Two locals
-hold one reference; the mask names one of them.
-
-**So the defect is a believed-exact classification that is wrong**, and the
-reason nothing catches it is structural: the operand-stack marks carry a
-`stack_oop_marks_exact` flag which seeds `map_incomplete`, and **the local masks
-carry no equivalent**. `local_oop_mask_at_current_pc()` returns a mask and the
-builder trusts it unconditionally. A mask that omits a live reference local is
-therefore invisible to all eight causes, to `unmapped_pcs`, and to the
-fail-closed gate — which is why §2 finds live stale words at the shipped
-default.
-
-That is `Next` item 2, now with the failing classification named rather than
-inferred. The two repair directions the page already states are unchanged, and
-the second one is now specific: give the local masks an exactness flag the way
-the stack marks have one, and seed `map_incomplete` from it.
-
-**Reproducing the dump.** Print `cur_bc_pc`, `stack_oop_marks`,
-`stack_oop_marks_exact`, `local_oop_mask_at_current_pc()`, `local_offset(0..15)`
-and `slots` at the end of `record_oop_map`, gated on the method key, then run
-`probes/SafepointMapResidue.java`. A debug build is enough and takes about two
-minutes; the witness and its offsets are identical to the release binary.
 
 ### Where that leaves the page
 
-* **OPEN**, and the remaining work is `Next` item 2 — unchanged in substance and
-  now with a two-minute reproducer instead of a 900-second one, plus a cause
-  census that has been made complete and reads zero on the witness. The next
-  step is therefore NOT another cause: it is either teaching the lowerer to
-  name every live-band word holding a reference, or clearing `coverable`
-  whenever it cannot prove it did.
+* **OPEN**, but less alarmingly than it reads. The corruption reproduces with
+  the gate OFF and not with it ON; the gate now costs nothing; and no missed
+  root has been exhibited under the shipped default. `Next` item 2 stays open
+  because nothing has PROVED the map complete — not because anything has shown
+  it short.
+* The next thing to build is an instrument that can say "live", not another
+  cause counter. See §5.
 * The three faces, the `ZGC_RELOCATE=0` bisect, the residue instrument and the
   fail-closed gate all stand as written.
 * What must not be carried forward is the cost table and the
