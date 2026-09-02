@@ -352,6 +352,9 @@ fn rh7_oopmap_scaffolding_retains_references() {
         frame_slot_offsets: vec![-16, -24],
         moving_young_coverage_complete: false,
         live_frame_hi: 0,
+        local_oop_mask: None,
+        num_locals: 0,
+        inline_local_scopes: Vec::new(),
     });
     cm.push_oop_map(OopMapEntry {
         bytecode_pc: 0,
@@ -359,6 +362,9 @@ fn rh7_oopmap_scaffolding_retains_references() {
         frame_slot_offsets: vec![-16],
         moving_young_coverage_complete: false,
         live_frame_hi: 0,
+        local_oop_mask: None,
+        num_locals: 0,
+        inline_local_scopes: Vec::new(),
     });
     assert!(cm.has_precise_oop_maps());
 

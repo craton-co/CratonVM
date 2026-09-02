@@ -22,7 +22,7 @@ the honest statement is that a gap of roughly 450x became roughly 65-125x, and
 the residual page below is where that number is maintained.
 
 What remains is a different problem and has its own page:
-[`../../known-issues/perf/juc-primitives-and-composition-after-the-compile-refusals-20260828.md`](../../known-issues/perf/juc-primitives-and-composition-after-the-compile-refusals-20260828.md).
+[`juc-primitives-and-composition-after-the-compile-refusals-CLOSED-20260901.md`](juc-primitives-and-composition-after-the-compile-refusals-CLOSED-20260901.md).
 
 ## What the two defects were
 
@@ -230,7 +230,7 @@ cratonvm --java-home <jdk> -cp <out> FjpStress     # @@FJPSTRESS PASS ... max_de
 - `performance/varhandle-writes-and-cas-have-no-fast-path-FIXED-20260827.md`
   — the primitive work this page's first revision predicted would close the
   gap. It did not, and that page says so; this is where the gap actually was.
-- [`../../known-issues/perf/juc-primitives-and-composition-after-the-compile-refusals-20260828.md`](../../known-issues/perf/juc-primitives-and-composition-after-the-compile-refusals-20260828.md)
+- [`juc-primitives-and-composition-after-the-compile-refusals-CLOSED-20260901.md`](juc-primitives-and-composition-after-the-compile-refusals-CLOSED-20260901.md)
   — the residual: the 113x that is left, and the per-op costs under it.
 - [`../../known-issues/hibernate/hib-reactive-multithreaded-insertion-lazy-connection-20260822.md`](../../known-issues/hibernate/hib-reactive-multithreaded-insertion-lazy-connection-20260822.md)
   sections 5.9-5.10 — where this was found.

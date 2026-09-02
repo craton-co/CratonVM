@@ -5579,11 +5579,195 @@ fn remap_one_jit_frame(
 /// while its `this` is live is the shape of
 /// `known-issues/netty/longlonghashmaptest-nullpointerexception...`, and it is
 /// how that page was root-caused.
+///
+/// # The `oracle=[...]` field is the part that can say "live"
+///
+/// `stale_live` (below `live_frame_hi`) is an UPPER BOUND and was twice read as
+/// a verdict. The watermark is where the operand-spill cursor stood, not a
+/// liveness bound, so a slot holding bytes some earlier expression left there
+/// counts as LIVE. Each such word is therefore put to the compiler's own
+/// forward "must be oop" dataflow, carried on the map as
+/// `OopMapEntry::local_oop_mask`:
+///
+/// * `local_oop` -- the dataflow PROVES this local holds a reference and the
+///   map did not name it. This is the only count that is a missed root, and it
+///   should be structurally impossible (every mask bit is pushed into the slot
+///   list); a non-zero here is the finding, and is always printed.
+/// * `local_not_oop` -- the dataflow proves the slot is not a reference at this
+///   bci. Dead storage. This is what the `String.substring` witness was.
+/// * `local_unreached` -- the dataflow never reached this bci, so the map named
+///   NO locals and nothing can be attributed. Suspicious but unproven; paired
+///   with `map_incomplete_cause::LOCAL_MASK_UNREACHED`.
+/// * `inline_local_oop` / `inline_local_not_oop` -- the same two answers for a
+///   local of an inlined callee, from that splice's own mask
+///   (`OopMapEntry::inline_local_scopes`). Spliced locals live in the SPILL
+///   band, so without the scopes every one of them read as `outside_locals`,
+///   and "a spliced callee's locals are named by no oop map" is a defect this
+///   repo has already paid for once.
+/// * `outside_locals` -- spill or staging band with no scope claiming it, where
+///   this oracle is silent. The per-frame detail prints
+///   `FrameLayout::region_name` beside each, which is what makes an
+///   `outside_locals` word actionable.
+///
+/// Only the single-pass x86-64 tier homes local `k` at `[rbp - 8*(k+1)]`, so IR
+/// frames record no mask and no scopes, and report every LIVE word as
+/// `outside_locals`.
 fn remap_residue_dbg() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_REMAP_RESIDUE").is_some()
     })
+}
+
+/// Process-wide totals for the stale-word oracle, so a soak does not have to be
+/// read one `[remap-frame]` line at a time.
+///
+/// The per-frame lines are the evidence and stay; this is the number that can
+/// be quoted. The population it summarizes was previously counted only as
+/// `stale_live`, an upper bound that twice read as a verdict — see
+/// `report_remap_residue`.
+mod residue_census {
+    use std::sync::atomic::AtomicUsize;
+    pub static FRAMES: AtomicUsize = AtomicUsize::new(0);
+    pub static FRAMES_WITH_LIVE: AtomicUsize = AtomicUsize::new(0);
+    pub static LOCAL_OOP: AtomicUsize = AtomicUsize::new(0);
+    pub static LOCAL_NOT_OOP: AtomicUsize = AtomicUsize::new(0);
+    pub static LOCAL_UNREACHED: AtomicUsize = AtomicUsize::new(0);
+    pub static INLINE_LOCAL_OOP: AtomicUsize = AtomicUsize::new(0);
+    pub static INLINE_LOCAL_NOT_OOP: AtomicUsize = AtomicUsize::new(0);
+    pub static OUTSIDE_LOCALS: AtomicUsize = AtomicUsize::new(0);
+}
+
+/// The stale-word oracle's run totals, on `CRATONVM_DBG=remap-residue`.
+///
+/// `local_oop` is the only count that names a missed root: a frame word the
+/// compiler's own "must be oop" dataflow proves holds a reference, below the
+/// live watermark, that the safepoint's map did not name. The other three are
+/// the reasons the raw `stale_live` count overstates — dead storage, an
+/// unreached bci, and the spill band this oracle cannot speak for.
+///
+/// `frames` is the ENGAGEMENT counter: a zero `local_oop` beside a zero
+/// `frames` says the instrument never ran, which is not the same reading as a
+/// zero beside thousands of frames.
+pub fn report_remap_residue_census_at_exit() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let frames = residue_census::FRAMES.load(Relaxed);
+    if frames == 0 {
+        return;
+    }
+    eprintln!(
+        "[remap-residue-summary] frames={} frames_with_live_stale={} local_oop={} local_not_oop={} local_unreached={} inline_local_oop={} inline_local_not_oop={} outside_locals={}",
+        frames,
+        residue_census::FRAMES_WITH_LIVE.load(Relaxed),
+        residue_census::LOCAL_OOP.load(Relaxed),
+        residue_census::LOCAL_NOT_OOP.load(Relaxed),
+        residue_census::LOCAL_UNREACHED.load(Relaxed),
+        residue_census::INLINE_LOCAL_OOP.load(Relaxed),
+        residue_census::INLINE_LOCAL_NOT_OOP.load(Relaxed),
+        residue_census::OUTSIDE_LOCALS.load(Relaxed),
+    );
+}
+
+/// What the local-oop dataflow says about a stale frame word that
+/// `live_frame_hi` classified as LIVE. See `report_remap_residue`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleVerdict {
+    /// Above the live watermark, or the watermark is unknown — not asked.
+    NotLive,
+    /// The dataflow PROVES this local holds a reference and the map did not
+    /// name it. The only verdict that is a missed root.
+    LocalOopUnmapped,
+    /// The dataflow proves the slot is not a reference at this bci: dead
+    /// storage the spill cursor abandoned without clearing.
+    LocalNotOop,
+    /// The dataflow never reached this bci, so the map named no locals and
+    /// nothing can be attributed. Unproven either way.
+    LocalUnreached,
+    /// As `LocalOopUnmapped`, for a local of an inlined callee.
+    InlineLocalOopUnmapped,
+    /// As `LocalNotOop`, for a local of an inlined callee.
+    InlineLocalNotOop,
+    /// Spill or staging band — not a local home, so this oracle is silent.
+    OutsideLocals,
+}
+
+impl StaleVerdict {
+    fn as_str(self) -> &'static str {
+        match self {
+            StaleVerdict::NotLive => "",
+            StaleVerdict::LocalOopUnmapped => "LOCAL-OOP-UNMAPPED",
+            StaleVerdict::LocalNotOop => "local-not-oop",
+            StaleVerdict::LocalUnreached => "local-unreached",
+            StaleVerdict::InlineLocalOopUnmapped => "INLINE-LOCAL-OOP-UNMAPPED",
+            StaleVerdict::InlineLocalNotOop => "inline-local-not-oop",
+            StaleVerdict::OutsideLocals => "outside-locals",
+        }
+    }
+}
+
+/// Put one stale frame word to the compiler's forward "must be oop" dataflow.
+///
+/// `off` is the positive distance below RBP of the word; the single-pass x86-64
+/// emitter homes JVM local `k` at `[rbp - 8*(k+1)]` (`Compiler::local_offset`),
+/// so the offset names a local exactly. `local_mask` is the safepoint's
+/// `OopMapEntry::local_oop_mask` — `None` meaning the dataflow never reached
+/// this bci, which is NOT the same as `Some(0)`.
+fn classify_stale_local(
+    off: usize,
+    local_mask: Option<u64>,
+    num_locals: usize,
+    inline_scopes: &[(i32, u16, u64)],
+) -> StaleVerdict {
+    if off < 8 || off % 8 != 0 || (off / 8 - 1) >= num_locals {
+        // Not a java local of this method. A SPLICED callee's locals are
+        // allocated out of the operand-spill band and are addressed from their
+        // scope's own base, so ask each live scope before giving up.
+        return classify_stale_inline_local(off, inline_scopes);
+    }
+    let k = off / 8 - 1;
+    match local_mask {
+        None => StaleVerdict::LocalUnreached,
+        // A mask is 64 bits wide and cannot speak past that. Unreachable today
+        // (`compute_local_oop_masks` returns nothing at all above 64 locals, so
+        // the entry records `None`), and it must stay UNPROVEN rather than
+        // falling into the "proved not a reference" arm below if that changes.
+        Some(_) if k >= 64 => StaleVerdict::LocalUnreached,
+        Some(m) if m & (1u64 << k) != 0 => StaleVerdict::LocalOopUnmapped,
+        Some(_) => StaleVerdict::LocalNotOop,
+    }
+}
+
+/// The same question for the locals of an inlined callee. Spliced callee local
+/// `k` of a scope based at `base` is homed at `[rbp - (base + 8*k)]`
+/// (`x64::inlining`), so a word inside a scope's band names one of its locals
+/// exactly and the scope's own mask answers for it.
+fn classify_stale_inline_local(off: usize, inline_scopes: &[(i32, u16, u64)]) -> StaleVerdict {
+    let Ok(off_i) = i32::try_from(off) else {
+        return StaleVerdict::OutsideLocals;
+    };
+    for &(base, n, mask) in inline_scopes {
+        if base <= 0 || n == 0 || off_i < base {
+            continue;
+        }
+        let delta = off_i - base;
+        if delta % 8 != 0 {
+            continue;
+        }
+        let k = (delta / 8) as usize;
+        if k >= n as usize {
+            continue;
+        }
+        // Same 64-bit limit as the outer mask: past it the scope says nothing.
+        if k >= 64 {
+            return StaleVerdict::LocalUnreached;
+        }
+        return if mask & (1u64 << k) != 0 {
+            StaleVerdict::InlineLocalOopUnmapped
+        } else {
+            StaleVerdict::InlineLocalNotOop
+        };
+    }
+    StaleVerdict::OutsideLocals
 }
 
 fn report_remap_residue(
@@ -5615,9 +5799,41 @@ fn report_remap_residue(
         .map(|m| m.live_frame_hi)
         .max()
         .unwrap_or(0);
+    // THE ORACLE. `live_hi` is a spill watermark, so "below it and unmapped" is
+    // an upper bound on missed roots and cannot be acted on — it counts dead
+    // spill residue as LIVE, which is how a correct map was read as short (see
+    // the page cited on `OopMapEntry::local_oop_mask`). The forward "must be
+    // oop" dataflow answers the question the watermark cannot: for a word in
+    // the LOCALS band, is that slot a reference at this bci?
+    //
+    // A `None` from ANY map at this sp-id poisons the answer for the safepoint:
+    // that map named no locals at all, so nothing here can be attributed to a
+    // slot the dataflow classified. Otherwise take the union — two maps at one
+    // bci both describe this frame, and a slot either names a reference or does
+    // not.
+    let mut local_mask: Option<u64> = Some(0);
+    let mut num_locals: usize = 0;
+    let mut inline_scopes: Vec<(i32, u16, u64)> = Vec::new();
+    for m in cm.oop_maps.iter().filter(|m| m.bytecode_pc == sp_id) {
+        num_locals = num_locals.max(m.num_locals as usize);
+        inline_scopes.extend_from_slice(&m.inline_local_scopes);
+        local_mask = match (local_mask, m.local_oop_mask) {
+            (Some(a), Some(b)) => Some(a | b),
+            _ => None,
+        };
+    }
     let mut stale_live = 0usize;
     let mut stale_dead = 0usize;
     let mut stale_unknown = 0usize;
+    // The four verdicts the oracle can return about a word BELOW the watermark.
+    // Only the first is a missed root; the other three are the reasons a raw
+    // `stale_live` count overstates.
+    let mut oracle_local_oop = 0usize;
+    let mut oracle_local_not_oop = 0usize;
+    let mut oracle_local_unreached = 0usize;
+    let mut oracle_inline_local_oop = 0usize;
+    let mut oracle_inline_local_not_oop = 0usize;
+    let mut oracle_outside_locals = 0usize;
     let mut detail = String::new();
     if frame_size > 0 && (frame_size as usize) <= 1024 * 1024 && (frame_size as usize) <= rbp {
         let frame_size = frame_size as usize;
@@ -5639,17 +5855,69 @@ fn report_remap_residue(
                     stale_dead += 1;
                     "dead"
                 };
-                // The LIVE ones are the finding; spend the detail budget on
-                // them rather than on whichever happen to come first.
-                if stale_live <= 12 && class == "LIVE" {
+                // Ask the oracle about the words the watermark called LIVE.
+                // Local `k` is homed at `[rbp - 8*(k+1)]` (the emitter's
+                // `local_offset`), so an offset maps back to a local index
+                // exactly; anything outside that band is spill or staging,
+                // about which this oracle says nothing.
+                let verdict = if class != "LIVE" {
+                    StaleVerdict::NotLive
+                } else {
+                    classify_stale_local(off, local_mask, num_locals, &inline_scopes)
+                };
+                match verdict {
+                    StaleVerdict::NotLive => {}
+                    StaleVerdict::LocalOopUnmapped => oracle_local_oop += 1,
+                    StaleVerdict::LocalNotOop => oracle_local_not_oop += 1,
+                    StaleVerdict::LocalUnreached => oracle_local_unreached += 1,
+                    StaleVerdict::InlineLocalOopUnmapped => oracle_inline_local_oop += 1,
+                    StaleVerdict::InlineLocalNotOop => oracle_inline_local_not_oop += 1,
+                    StaleVerdict::OutsideLocals => oracle_outside_locals += 1,
+                }
+                // A word the oracle proves is a reference is the finding, and
+                // it is rare enough to always print. The rest share a budget.
+                if matches!(
+                    verdict,
+                    StaleVerdict::LocalOopUnmapped | StaleVerdict::InlineLocalOopUnmapped
+                ) || (stale_live <= 12 && class == "LIVE")
+                {
                     detail.push_str(&format!(
-                        " [LIVE off={} stale=0x{:x}->0x{:x}]",
-                        off, w, new
+                        " [LIVE off={} k={} {} region={} stale=0x{:x}->0x{:x}]",
+                        off,
+                        if off >= 8 && off % 8 == 0 {
+                            (off / 8 - 1) as i64
+                        } else {
+                            -1
+                        },
+                        verdict.as_str(),
+                        // Which band of the frame the word sits in. Free, from
+                        // the layout the method already carries, and it is what
+                        // makes an `outside-locals` verdict actionable: an
+                        // operand spill slot, a callee-saved register image and
+                        // an outgoing-argument word are three different
+                        // questions, and the oracle above cannot tell them
+                        // apart.
+                        cm.frame_layout.region_name(i32::try_from(off).unwrap_or(i32::MAX)),
+                        w,
+                        new
                     ));
                 }
             }
             addr += 8;
         }
+    }
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        residue_census::FRAMES.fetch_add(1, Relaxed);
+        if stale_live > 0 {
+            residue_census::FRAMES_WITH_LIVE.fetch_add(1, Relaxed);
+        }
+        residue_census::LOCAL_OOP.fetch_add(oracle_local_oop, Relaxed);
+        residue_census::LOCAL_NOT_OOP.fetch_add(oracle_local_not_oop, Relaxed);
+        residue_census::LOCAL_UNREACHED.fetch_add(oracle_local_unreached, Relaxed);
+        residue_census::INLINE_LOCAL_OOP.fetch_add(oracle_inline_local_oop, Relaxed);
+        residue_census::INLINE_LOCAL_NOT_OOP.fetch_add(oracle_inline_local_not_oop, Relaxed);
+        residue_census::OUTSIDE_LOCALS.fetch_add(oracle_outside_locals, Relaxed);
     }
     let mut mapped_desc = String::new();
     for &off in mapped {
@@ -5663,12 +5931,14 @@ fn report_remap_residue(
         mapped_desc.push_str(&format!(" {}=0x{:x}", off, v));
     }
     eprintln!(
-        "[remap-frame] method={} sp_id={} frame_size={} cov_complete={} live_hi={} mapped=[{}] rewritten={} inlined={:?} stale_words={} stale_live={} stale_dead={} stale_unknown={}{}",
+        "[remap-frame] method={} sp_id={} frame_size={} cov_complete={} live_hi={} local_mask={:?} num_locals={} mapped=[{}] rewritten={} inlined={:?} stale_words={} stale_live={} stale_dead={} stale_unknown={} oracle=[local_oop={} local_not_oop={} local_unreached={} inline_local_oop={} inline_local_not_oop={} outside_locals={}]{}",
         cm.method_label,
         sp_id,
         frame_size,
         coverage_complete,
         live_hi,
+        local_mask,
+        num_locals,
         mapped_desc,
         rewritten,
         cm.inlined_methods
@@ -5679,6 +5949,12 @@ fn report_remap_residue(
         stale_live,
         stale_dead,
         stale_unknown,
+        oracle_local_oop,
+        oracle_local_not_oop,
+        oracle_local_unreached,
+        oracle_inline_local_oop,
+        oracle_inline_local_not_oop,
+        oracle_outside_locals,
         detail,
     );
 }
@@ -9039,6 +9315,9 @@ mod tests {
             frame_slot_offsets: vec![-16],
             moving_young_coverage_complete: true,
             live_frame_hi: 0,
+            local_oop_mask: None,
+            num_locals: 0,
+            inline_local_scopes: Vec::new(),
         });
         cm.fully_oop_covered = true;
         cm.fully_shadow_covered = true;
@@ -9071,6 +9350,9 @@ mod tests {
             frame_slot_offsets: vec![-16],
             moving_young_coverage_complete: true,
             live_frame_hi: 0,
+            local_oop_mask: None,
+            num_locals: 0,
+            inline_local_scopes: Vec::new(),
         });
         // The direct-call shape: shadow complete, frame-slot subset incomplete.
         cm.fully_shadow_covered = true;
@@ -9106,6 +9388,9 @@ mod tests {
             frame_slot_offsets: vec![-16],
             moving_young_coverage_complete: false,
             live_frame_hi: 0,
+            local_oop_mask: None,
+            num_locals: 0,
+            inline_local_scopes: Vec::new(),
         });
         cm.fully_shadow_covered = false;
         // `fully_oop_covered` true and shadow false is the inverse of the pair
@@ -9217,6 +9502,9 @@ mod tests {
             frame_slot_offsets: vec![-8],
             moving_young_coverage_complete: false,
             live_frame_hi: 0,
+            local_oop_mask: None,
+            num_locals: 0,
+            inline_local_scopes: Vec::new(),
         });
         cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x10,
@@ -9224,6 +9512,9 @@ mod tests {
             frame_slot_offsets: vec![-16, -24],
             moving_young_coverage_complete: false,
             live_frame_hi: 0,
+            local_oop_mask: None,
+            num_locals: 0,
+            inline_local_scopes: Vec::new(),
         });
         cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x20,
@@ -9231,6 +9522,9 @@ mod tests {
             frame_slot_offsets: vec![],
             moving_young_coverage_complete: false,
             live_frame_hi: 0,
+            local_oop_mask: None,
+            num_locals: 0,
+            inline_local_scopes: Vec::new(),
         });
 
         // Exact-match lookups succeed regardless of insertion order.
@@ -9285,6 +9579,9 @@ mod tests {
             frame_slot_offsets: vec![-16],
             moving_young_coverage_complete: false,
             live_frame_hi: 0,
+            local_oop_mask: None,
+            num_locals: 0,
+            inline_local_scopes: Vec::new(),
         });
         assert!(cm.has_precise_oop_maps());
 
@@ -9474,6 +9771,137 @@ mod tests {
             return_pc_validation_enabled(),
             "the A5 scan must validate return addresses unless \
              CRATONVM_JIT_NO_RETPC_VALIDATE is set",
+        );
+    }
+}
+
+#[cfg(test)]
+mod stale_word_oracle_tests {
+    use super::{classify_stale_local, StaleVerdict};
+
+    /// `local_offset(k) == 8*(k+1)`, so offset 40 is local 4 and offset 32 is
+    /// local 3. This is the `StringConcatHelper.doConcat` witness that
+    /// `bug-h2-testrandommapops-small-heap-corruption-20260829.md` reported as
+    /// a missed root: mask `Some(19)` = locals 0, 1 and 4, and the stale word
+    /// sat at offset 32 — local 3, which `javap` shows is an `int`
+    /// (`25: istore_3`). The oracle has to call that dead storage, not a root.
+    #[test]
+    fn the_doconcat_witness_is_dead_storage() {
+        assert_eq!(
+            classify_stale_local(32, Some(0b10011), 6, &[]),
+            StaleVerdict::LocalNotOop
+        );
+        // ... while the slots the mask DOES name would be roots if they were
+        // ever found stale.
+        for off in [8usize, 16, 40] {
+            assert_eq!(
+                classify_stale_local(off, Some(0b10011), 6, &[]),
+                StaleVerdict::LocalOopUnmapped,
+                "offset {off}"
+            );
+        }
+    }
+
+    /// `None` and `Some(0)` are different claims and must not be folded: the
+    /// first says the dataflow never reached the bci (so the map named no
+    /// locals and nothing is attributable), the second says it reached and
+    /// proved no local holds a reference.
+    #[test]
+    fn unreached_is_not_the_empty_mask() {
+        assert_eq!(
+            classify_stale_local(32, None, 6, &[]),
+            StaleVerdict::LocalUnreached
+        );
+        assert_eq!(
+            classify_stale_local(32, Some(0), 6, &[]),
+            StaleVerdict::LocalNotOop
+        );
+    }
+
+    /// Past the locals band the offsets are spill and staging slots, which are
+    /// not local homes; the oracle must decline rather than answer about the
+    /// wrong slot. Offsets 0 and unaligned words are not local homes either.
+    #[test]
+    fn outside_the_locals_band_the_oracle_is_silent() {
+        assert_eq!(
+            classify_stale_local(56, Some(0), 6, &[]),
+            StaleVerdict::OutsideLocals
+        );
+        assert_eq!(
+            classify_stale_local(0, Some(0), 6, &[]),
+            StaleVerdict::OutsideLocals
+        );
+        assert_eq!(
+            classify_stale_local(36, Some(0), 6, &[]),
+            StaleVerdict::OutsideLocals
+        );
+        // A frame with no mask at all (the IR tier) has `num_locals == 0`, so
+        // every word is outside the band and nothing is misattributed.
+        assert_eq!(
+            classify_stale_local(8, None, 0, &[]),
+            StaleVerdict::OutsideLocals
+        );
+    }
+
+    /// A spliced callee's locals live in the operand-spill band, addressed
+    /// from the scope's own base — outside the java-locals band entirely. The
+    /// outer mask cannot speak for them, and before the scopes were recorded
+    /// every such word read as unclassifiable spill.
+    #[test]
+    fn a_spliced_callees_locals_are_classified_by_their_own_scope() {
+        // Outer method has 2 locals (band 8..=16); a splice based at 96 with
+        // 3 locals whose local 1 is a reference.
+        let scopes = [(96i32, 3u16, 0b010u64)];
+        assert_eq!(
+            classify_stale_local(96, Some(0), 2, &scopes),
+            StaleVerdict::InlineLocalNotOop
+        );
+        assert_eq!(
+            classify_stale_local(104, Some(0), 2, &scopes),
+            StaleVerdict::InlineLocalOopUnmapped
+        );
+        assert_eq!(
+            classify_stale_local(112, Some(0), 2, &scopes),
+            StaleVerdict::InlineLocalNotOop
+        );
+        // One past the scope's last local is spill again, not local 3.
+        assert_eq!(
+            classify_stale_local(120, Some(0), 2, &scopes),
+            StaleVerdict::OutsideLocals
+        );
+        // Below the scope's base, likewise.
+        assert_eq!(
+            classify_stale_local(88, Some(0), 2, &scopes),
+            StaleVerdict::OutsideLocals
+        );
+        // A scope that could not classify its locals is not recorded at all,
+        // so its band stays honestly unattributed rather than reading "dead".
+        assert_eq!(
+            classify_stale_local(104, Some(0), 2, &[]),
+            StaleVerdict::OutsideLocals
+        );
+    }
+
+    /// The java-locals band wins when the two could overlap: a splice base is
+    /// allocated out of the spill band, so an overlap means the scope record is
+    /// wrong, and answering from the method's own dataflow is the safer half.
+    #[test]
+    fn the_outer_locals_band_is_consulted_first() {
+        let scopes = [(8i32, 4u16, u64::MAX)];
+        assert_eq!(
+            classify_stale_local(8, Some(0), 4, &scopes),
+            StaleVerdict::LocalNotOop
+        );
+    }
+
+    /// `compute_local_oop_masks` gives up past 64 locals, so a mask can only
+    /// speak for bits 0..63; a local above that must not read as "not an oop",
+    /// which would be claiming a proof the mask does not carry.
+    #[test]
+    fn a_local_past_the_mask_width_is_not_proven_dead() {
+        assert_eq!(
+            classify_stale_local(8 * 65, Some(u64::MAX), 80, &[]),
+            StaleVerdict::LocalUnreached
         );
     }
 }
