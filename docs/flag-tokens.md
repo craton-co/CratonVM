@@ -878,7 +878,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-115 tokens.
+119 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -916,6 +916,10 @@ export inherited from a parent shell.
 | `zgc-markbits` | `CRATONVM_ZGC_MARKBITS` |
 | `zgc-page-pinned-relocate` | `CRATONVM_ZGC_PAGE_PINNED_RELOCATE` |
 | `zgc-parsweep` | `CRATONVM_ZGC_PARSWEEP` |
+| `zgc-bitmap-sweep` | `CRATONVM_ZGC_BITMAP_SWEEP` |
+| `zgc-mark-root-filter` | `CRATONVM_ZGC_MARK_ROOT_FILTER` |
+| `zgc-jit-tlab` | `CRATONVM_ZGC_JIT_TLAB` |
+| `zgc-tlab-tail-sink` | `CRATONVM_ZGC_TLAB_TAIL_SINK` |
 | `g1-reserve-heap` | `CRATONVM_G1_RESERVE_HEAP` |
 | `g1-uncommit` | `CRATONVM_G1_UNCOMMIT` |
 | `g1-card-rset` | `CRATONVM_G1_CARD_RSET` |
@@ -1125,7 +1129,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-24 tokens.
+25 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1147,6 +1151,7 @@ export inherited from a parent shell.
 | `mockito-legacy-selectors` | `CRATONVM_MOCKITO_LEGACY_SELECTORS` |
 | `stackwalker-jdk-walk` | `CRATONVM_SW_JDK_WALK` |
 | `jdk-random` | `CRATONVM_JDK_RANDOM` |
+| `jdk-scanner` | `CRATONVM_JDK_SCANNER` |
 | `strict-swallows` | `CRATONVM_STRICT_SWALLOWS` |
 | `tomcat-mapper-natives` | `CRATONVM_TOMCAT_MAPPER_NATIVES` |
 | `vh-strict-reference-return` | `CRATONVM_VH_STRICT_REFERENCE_RETURN` |
