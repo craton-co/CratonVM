@@ -1162,7 +1162,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_GC_PAR_MIN_BYTES` | GC | `CRATONVM_GC=par-min-bytes` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_GC_PAR_THREADS` | GC | `CRATONVM_GC=par-threads` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_GC_PRECISE_ONLY_ROOTS` | GC | `CRATONVM_GC=precise-only-roots` | opt-in | off | behaviour | snapshot | vm |
-| `CRATONVM_GC_STATS` | DBG | `CRATONVM_DBG=gc-stats` | opt-in | off | diag | snapshot | vm-cli |
+| `CRATONVM_GC_STATS` | DBG | `CRATONVM_DBG=gc-stats` | opt-in | off | diag | snapshot | native-builtins, vm-cli |
 | `CRATONVM_GC_STREAM_REFRESH_EACH` | GC | `CRATONVM_GC=stream-refresh-each` | opt-in | off | behaviour | snapshot | native-collections |
 | `CRATONVM_GC_STRESS` | GC | `CRATONVM_GC=stress` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_GC_SWEEP_ANCHOR_STRIDE` | GC | `CRATONVM_GC=sweep-anchor-stride` | opt-in | off | behaviour | snapshot | types |
@@ -1202,6 +1202,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JBOSS_BRUTE_FORCE_JARS` | COMPAT | `CRATONVM_COMPAT=jboss-brute-force-jars` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_JBOSS_LOGGER_BASE_EMIT` | COMPAT | `CRATONVM_COMPAT=jboss-logger-base-emit` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_JBOSS_LOGGER_LEVEL_FILTER` | COMPAT | `CRATONVM_COMPAT=jboss-logger-level-filter` | default-on | on | behaviour | snapshot | native-builtins |
+| `CRATONVM_JBOSS_LOG_CONTEXT_INITIALIZER` | COMPAT | `CRATONVM_COMPAT=jboss-log-context-initializer` | default-on | on | behaviour | snapshot | native-builtins |
 | `CRATONVM_JBOSS_MP_ROOT` | COMPAT | `CRATONVM_COMPAT=jboss-mp-root` | opt-in | off | behaviour | snapshot | native-builtins |
 | `CRATONVM_JCA_LENIENT_GETINSTANCE` | SECURITY | `CRATONVM_SECURITY=jca-lenient-getinstance` | opt-in | off | behaviour | snapshot | native-builtins |
 | `CRATONVM_JDK_RANDOM` | COMPAT | `CRATONVM_COMPAT=jdk-random` | opt-in | off | behaviour | snapshot | native-builtins, native-collections |

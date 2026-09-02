@@ -1064,6 +1064,7 @@ export inherited from a parent shell.
 | `jboss-boot-log-file` | `CRATONVM_JBOSS_BOOT_LOG_FILE` |
 | `jboss-brute-force-jars` | `CRATONVM_JBOSS_BRUTE_FORCE_JARS` |
 | `jboss-logger-base-emit` | `CRATONVM_JBOSS_LOGGER_BASE_EMIT` |
+| `jboss-log-context-initializer` | `CRATONVM_JBOSS_LOG_CONTEXT_INITIALIZER` |
 | `jboss-logger-level-filter` | `CRATONVM_JBOSS_LOGGER_LEVEL_FILTER` |
 | `jboss-mp-root` | `CRATONVM_JBOSS_MP_ROOT` |
 | `lazy-streams` | `CRATONVM_LAZY_STREAMS` |
