@@ -362,6 +362,18 @@ const SIG_MD5_SHA1_RSA: i32 = 23;
 /// that already resolves changes route — their `algo_idx` arms are matched
 /// first, and `algo_name` still answers for them.
 const SIG_DSA_REAL: i32 = 24;
+/// `HSS/LMS` (RFC 8554) — the stateful hash-based signature the SUN provider
+/// added in JDK 21, VERIFY-only there as here.
+///
+/// Same shape as `SIG_DSA_REAL`: this crate implements no Merkle-tree
+/// signature, the platform's `sun.security.provider.HSS` does, and the drive is
+/// the same construct/init/update/verify. It gets its own index rather than
+/// joining the DSA family because its SPI class is not derivable from the name
+/// and because a caller CAN tell the two apart — `initSign` on this one fails
+/// on HotSpot too (`HSS/LMS` signing is not implemented in the JDK), and that
+/// refusal has to come from the platform's own SPI rather than from a guess
+/// here.
+const SIG_HSS_LMS: i32 = 25;
 
 fn algo_idx(name: &str) -> i32 {
     let upper = name.to_ascii_uppercase();
@@ -420,6 +432,7 @@ fn algo_idx(name: &str) -> i32 {
         // The rest of the `sun.security.provider.DSA` family — `NONEwithDSA`,
         // `SHA{224,384,512}withDSA`, `SHA3-{224,256,384,512}withDSA` and the
         // nine `inP1363Format` twins. Last, so every explicit arm above wins.
+        "HSS/LMS" => SIG_HSS_LMS,
         other if dsa_family_spi_class(other).is_some() => SIG_DSA_REAL,
         _ => -1,
     }
@@ -1009,6 +1022,10 @@ fn dsa_real_spi_class(
         SIG_SHA256_DSA => Some("sun/security/provider/DSA$SHA256withDSA"),
         SIG_SHA1_DSA => Some("sun/security/provider/DSA$SHA1withDSA"),
         SIG_DSA_REAL => dsa_family_spi_class(&sig_algorithm_name(ctx, this)),
+        // Not a DSA class, but the same drive and the same reason — routed
+        // here so it shares `drive_real_signature_spi` rather than growing a
+        // parallel copy of it.
+        SIG_HSS_LMS => Some("sun/security/provider/HSS"),
         _ => None,
     }
 }

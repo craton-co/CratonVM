@@ -2180,6 +2180,27 @@ fn seed_direct_native_engine_services() {
             .expect("DSA_FAMILY_SIGNATURE_NAMES is exactly dsa_family_spi_class's domain");
         put_service(SUN, "Signature", algorithm, &cls);
     }
+    // `HSS/LMS` (RFC 8554), which SUN has carried since JDK 21 and this list
+    // never had. Both halves are the platform's own classes: the `KeyFactory`
+    // is reached because `kf_get_instance` falls to `build_real_key_factory`
+    // for a name `kf_algo_idx` refuses, and the `Signature` through
+    // `signature::dsa_real_spi_class`'s `SIG_HSS_LMS` arm.
+    put_service(SUN, "KeyFactory", "HSS/LMS", "sun.security.provider.HSS$KeyFactoryImpl");
+    put_service(SUN, "Signature", "HSS/LMS", "sun.security.provider.HSS");
+    // `Configuration.JavaLoginConfig`, the JAAS login-configuration provider.
+    // `javax.security.auth.login.Configuration.getInstance` is not intercepted
+    // by this crate, so the row IS the implementation; without it
+    // `getInstance("JavaLoginConfig", null)` refused on a VM carrying a working
+    // `ConfigFile$Spi`. `JcaResolveAll` reports this engine as a SKIP — its API
+    // is not the `getInstance(String)` shape that probe models — so the gap
+    // census could say nothing about it; `apps/probes/JcaModernEngines` asks it
+    // directly.
+    put_service(
+        SUN,
+        "Configuration",
+        "JavaLoginConfig",
+        "sun.security.provider.ConfigFile$Spi",
+    );
     // `DSA` and `DSS` are ALIASES of `SHA1withDSA` on HotSpot, not services.
     // Seeding `DSA` as a primary made `Security.getAlgorithms("Signature")`
     // report a name HotSpot does not — measured 2026-09-02, it was the only
@@ -4328,6 +4349,50 @@ fn seed_sunjce_delegated_cipher_services() {
 /// (`jdk_service_class`), so a row here IS the implementation, driven from the
 /// platform's own class. Ordered after this engine's verdict, so no name it
 /// computes changes hands.
+/// The four SunJCE services behind engines `JcaResolveAll` reports as SKIP:
+/// three `KDF` (HKDF, JEP 478, final in JDK 25) and `KEM.DHKEM` (RFC 9180).
+///
+/// A skip is not a pass, and these were the proof: nine services sit behind
+/// `KDF`/`KEM`/`Configuration` and the gap census could say nothing about any
+/// of them because their APIs are not `getInstance(String)`-shaped. Asked
+/// directly (`apps/probes/JcaModernEngines`), five of the nine refused.
+///
+/// `javax.crypto.KDF.getInstance` is not intercepted by this crate, so the row
+/// is the whole implementation and the platform's own
+/// `HKDFKeyDerivation$HKDFSHA*` serves it — verified against HotSpot on the
+/// RFC 5869 extract-then-expand vector, byte for byte. `KEM` IS intercepted,
+/// and `DHKEM` needed an arm in `kem::kem_algo_idx` beside the row.
+fn seed_sunjce_modern_engine_services() {
+    const P: &str = "SunJCE";
+    for hash in ["SHA256", "SHA384", "SHA512"] {
+        put_service(
+            P,
+            "KDF",
+            &format!("HKDF-{hash}"),
+            &format!("com.sun.crypto.provider.HKDFKeyDerivation$HKDF{hash}"),
+        );
+    }
+    put_service(P, "KEM", "DHKEM", "com.sun.crypto.provider.DHKEM");
+    // Two services this VM has been SERVING all along and never advertised —
+    // the `W7-63` half again. `KeyAgreement.DiffieHellman` is the one
+    // `jca-provider-population-gap-20260830.md` §4 runs a complete 2048-bit
+    // agreement through while noting its whole type was unlisted, and
+    // `Signature.NONEwithRSA` has had a `SIG_NONE_RSA` arm since 2026-08-14.
+    put_service(
+        P,
+        "KeyAgreement",
+        "DiffieHellman",
+        "com.sun.crypto.provider.DHKeyAgreement",
+    );
+    put_alias(P, "KeyAgreement", "DH", "DiffieHellman");
+    put_service(
+        P,
+        "Signature",
+        "NONEwithRSA",
+        "com.sun.crypto.provider.RSACipherAdaptor",
+    );
+}
+
 fn seed_sunjce_pbe_mac_services() {
     const P: &str = "SunJCE";
     // (algorithm spelling, class-name spelling) — the `SHA-512/224` pair
@@ -4786,6 +4851,11 @@ fn seed_sunjsse_services() {
 fn jca_service_ctor_parameter_type(engine_type: &str) -> Option<&'static str> {
     match engine_type {
         "CertStore" => Some("Ljava/security/cert/CertStoreParameters;"),
+        // JEP 478's `KDF`, final in JDK 25 and the second engine of this shape.
+        // `KDFSpi`'s only constructor takes `KDFParameters`, and the concrete
+        // SunJCE classes declare nothing else — `HKDFKeyDerivation$HKDFSHA256`
+        // has a `(KDFParameters)` constructor and NO `()V`.
+        "KDF" => Some("Ljavax/crypto/KDFParameters;"),
         _ => None,
     }
 }
@@ -6433,6 +6503,26 @@ pub(crate) fn jdk_service_class(
     Some((name, class_name.to_string()))
 }
 
+/// The REAL implementation class a provider registered for `(type, algo)`, or
+/// `None` when the row is absent, empty, or carries the `.Native` marker.
+///
+/// The marker is not a class. It means "a Rust engine in this crate answers
+/// this", so a caller asking "is there something to instantiate here?" must get
+/// `None` for it — otherwise every natively-served row looks like a delegable
+/// one and `build_jca_impl` is sent after a class that does not exist.
+pub(crate) fn service_implementation_class(
+    type_str: &str,
+    provider: &str,
+    algo: &str,
+) -> Option<String> {
+    let entry = get_service_entry(provider, type_str, algo)?;
+    let class_name = entry.class_name.trim();
+    if class_name.is_empty() || class_name.ends_with(".Native") {
+        return None;
+    }
+    Some(class_name.to_string())
+}
+
 /// Every `SSLContext` protocol name SunJSSE registers on JDK 25, ASCII-
 /// uppercased.
 ///
@@ -7232,17 +7322,38 @@ fn provider_service_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) ->
         .as_deref()
         .and_then(jca_service_ctor_parameter_type)
     {
-        if let Some(param @ Value::Object(Some(_))) = args.get(1).cloned() {
-            let ctor = format!("({param_desc})V");
-            match ctx.new_object_initialized(&internal, &ctor, &[param]) {
-                Ok(Some(v @ Value::Object(Some(_)))) => return Ok(Some(v)),
-                Err(MethodCallFailed::ExceptionThrown(t)) => {
-                    return Err(MethodCallFailed::ExceptionThrown(t))
-                }
-                // Fall through to the no-arg attempt: a provider may have
-                // registered a class under this engine that does declare `()V`.
-                _ => {}
+        // A NULL parameter still takes this arm, which is the JDK's own rule
+        // and was the half this code did not have.
+        //
+        // `Provider.Service.newInstance` branches on whether the ENGINE
+        // declares a constructor-parameter class, not on whether the caller
+        // supplied one: with a class declared it does
+        // `clazz.getConstructor(ctrParamClz).newInstance(constructorParameter)`
+        // and a null argument is ordinary. The previous form required a
+        // non-null parameter and otherwise fell through to `()V`.
+        //
+        // For `CertStore` that was invisible — its `getInstance` always carries
+        // parameters. `KDF.getInstance("HKDF-SHA256")` calls
+        // `newInstance(null)`, and `HKDFKeyDerivation$HKDFSHA256` has no `()V`
+        // at all, so the fall-through produced an object whose constructor
+        // never ran: `hmacLen` read 0 and every derivation, at every length,
+        // failed `length > hmacLen * 255` with "Requested length exceeds
+        // maximum allowed length". Measured 2026-09-02 with
+        // `apps/probes/JcaModernEngines`, whose cause-chain printing is what
+        // made a message naming the PROVIDER point at the constructor.
+        let param = match args.get(1).cloned() {
+            Some(v @ Value::Object(Some(_))) => v,
+            _ => Value::Object(None),
+        };
+        let ctor = format!("({param_desc})V");
+        match ctx.new_object_initialized(&internal, &ctor, &[param]) {
+            Ok(Some(v @ Value::Object(Some(_)))) => return Ok(Some(v)),
+            Err(MethodCallFailed::ExceptionThrown(t)) => {
+                return Err(MethodCallFailed::ExceptionThrown(t))
             }
+            // Fall through to the no-arg attempt: a provider may have
+            // registered a class under this engine that does declare `()V`.
+            _ => {}
         }
     }
     // GC-safe allocate + run the no-arg constructor (real BC SPI bytecode). The
@@ -7574,6 +7685,7 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         seed_algorithm_parameter_generator_services();
         seed_sunjce_pbe_mac_services();
         seed_sunjce_delegated_cipher_services();
+        seed_sunjce_modern_engine_services();
         let gi = "sun/security/jca/GetInstance";
         r.register(
             gi,
