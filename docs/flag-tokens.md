@@ -574,7 +574,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-254 tokens.
+255 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -684,6 +684,7 @@ export inherited from a parent shell.
 | `long-box-direct-helpers` | `CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS` |
 | `varhandle-read-direct-helpers` | `CRATONVM_JIT_VARHANDLE_READ_DIRECT_HELPERS` |
 | `varhandle-cas-direct-helpers` | `CRATONVM_JIT_VARHANDLE_CAS_DIRECT_HELPERS` |
+| `varhandle-ref-read-direct` | `CRATONVM_JIT_VARHANDLE_REF_READ_DIRECT` |
 | `varhandle-write-direct-helpers` | `CRATONVM_JIT_VARHANDLE_WRITE_DIRECT_HELPERS` |
 | `varhandle-cas-funnel-fast` | `CRATONVM_JIT_VARHANDLE_CAS_FUNNEL_FAST` |
 | `longroot-strict` | `CRATONVM_LONGROOT_STRICT` |
