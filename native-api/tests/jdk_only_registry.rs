@@ -158,7 +158,14 @@ fn strict_registration_refuses_synthetic_stub() {
             method,
             descriptor,
             registered_by,
+            survivor,
         } => {
+            assert!(
+                survivor.is_none(),
+                "no earlier registration owned this triple, so the refusal DID \
+                 retire the method; a survivor here would be the fall-through \
+                 species, got {survivor:?}"
+            );
             assert_eq!(class, "com/example/Strict");
             assert_eq!(method, "fake");
             assert_eq!(
@@ -184,6 +191,87 @@ fn strict_registration_refuses_synthetic_stub() {
         refused[0].kind(),
         "synthetic-native-registered",
         "the kind tag is a wire format shared with the JSON report"
+    );
+}
+
+
+// ---------------------------------------------------------------------------
+// 2b. A refusal is NOT automatically a retirement
+// ---------------------------------------------------------------------------
+
+/// `register` is last-write-wins and the `JdkOnly` arm returns WITHOUT
+/// inserting, so refusing a `SyntheticStub` whose triple is already owned does
+/// not hand the method to real JDK bytecode — **the earlier native survives as
+/// the winner**, and the two modes run different code for that triple.
+///
+/// Measured on the shipping registry at nine triples (`--dump-native-registry`
+/// in both modes, compared on the winning registration): four are deliberate
+/// per-mode branching in `lang_system.rs`, and five are this shape —
+/// `java/util/logging/Handler.{getLevel,setLevel}` and
+/// `LogRecord.{getLevel,getMessage,getSequenceNumber}`, where a `phases_early`
+/// `Intrinsic` outlives the later `SyntheticStub` that displaces it in
+/// compatible mode.
+///
+/// Nothing could see that species before this field existed. `registrar_drift`
+/// compares a synthetic-only pass against a shipping one and this is two
+/// SHIPPING passes; `duplicate_registration_gate` records it as blind spot 3
+/// (a dropped registration leaves no census row at all); and the §1.4 shadow
+/// census skips `NativeKind::Intrinsic`, which is exactly the survivor's kind
+/// in all five.
+#[test]
+fn a_refusal_over_an_owned_triple_names_the_survivor() {
+    let mut reg = NativeMethodRegistry::new();
+    reg.set_compatibility_mode(CompatibilityMode::JdkOnly);
+
+    // The earlier registration — admissible under JdkOnly, so it enters.
+    register_as(
+        &mut reg,
+        NativeKind::Intrinsic,
+        "com/example/Survivor",
+        "m",
+        "()I",
+        cb_one,
+    );
+    // The later one is refused. The slot does NOT revert to bytecode.
+    register_as(
+        &mut reg,
+        NativeKind::SyntheticStub,
+        "com/example/Survivor",
+        "m",
+        "()I",
+        cb_two,
+    );
+
+    assert!(
+        reg.find("com/example/Survivor", "m", "()I").is_some(),
+        "the earlier Intrinsic still owns the slot — that is the defect this \
+         test pins, not a bug in the test"
+    );
+
+    let survived = reg.refusals_that_left_a_survivor();
+    assert_eq!(
+        survived.len(),
+        1,
+        "one refusal landed on an owned triple, got {survived:?}"
+    );
+    let (class, method, descriptor, survivor) = survived[0];
+    assert_eq!((class, method, descriptor), ("com/example/Survivor", "m", "()I"));
+    assert!(
+        survivor.starts_with("intrinsic@"),
+        "the survivor's KIND leads, because an Intrinsic survivor is the one \
+         the shadow census can never report: {survivor:?}"
+    );
+    assert!(
+        survivor.contains("jdk_only_registry.rs"),
+        "and its site must name the registrar that produced it, got {survivor:?}"
+    );
+
+    // The JSON the `--jdk-only-report` carries must say so too: a consumer that
+    // reads only `kind()` sees "synthetic-native-registered" for both shapes.
+    let json = reg.refused_registrations()[0].to_json();
+    assert!(
+        json.contains("\"survivor\""),
+        "the report row must carry the field, got {json}"
     );
 }
 

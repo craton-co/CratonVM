@@ -9381,6 +9381,35 @@ impl ClassManager {
         self.class_store.len()
     }
 
+    /// Is any currently-loaded class a member of `package_slash` (e.g.
+    /// `"java/sql"`, `""` for the default package)?
+    ///
+    /// This is the DEFINITION question `ClassLoader.getDefinedPackage` asks,
+    /// and it is not the same as the visibility question
+    /// `find_all_resource_urls` answers: a package whose class files sit in the
+    /// boot image but none of whose classes has been loaded is visible and NOT
+    /// defined, exactly as on HotSpot, where a loader defines a package when it
+    /// defines a class in it.
+    ///
+    /// Immediate members only — `java/sql` does not answer for
+    /// `java/sql/rowset/Foo`, matching the JDK's flat package namespace.
+    ///
+    /// O(loaded classes). Called only from the `getDefinedPackage` /
+    /// `getDefinedPackages` family, which is not a hot path; deliberately NOT
+    /// memoised, because classes keep loading and a memo would freeze the
+    /// answer a package had before its first class arrived.
+    pub fn any_loaded_class_in_package(&self, package_slash: &str) -> bool {
+        self.class_store.iter().any(|c| {
+            // Array classes (`[Ljava/lang/String;`) are members of no package
+            // for this purpose; the leading `[` keeps them from matching a
+            // real name anyway.
+            match c.name.rsplit_once('/') {
+                Some((pkg, _)) => pkg == package_slash,
+                None => package_slash.is_empty(),
+            }
+        })
+    }
+
     /// Register a class name → id mapping for a given loader.
     ///
     /// This is primarily used by test code that manually inserts classes
