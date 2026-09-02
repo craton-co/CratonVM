@@ -4085,23 +4085,46 @@ fn seed_sunjce_pbe_services() {
             "com.sun.crypto.provider.PBEParameters",
         );
     }
-    const HASHES: &[&str] = &[
-        "SHA1",
-        "SHA224",
-        "SHA256",
-        "SHA384",
-        "SHA512",
-        "SHA512_224",
-        "SHA512_256",
+    // TWO spellings, and conflating them cost four services.
+    //
+    // The ALGORITHM name carries a slash — `PBEWithHmacSHA512/224AndAES_128` —
+    // because that is the digest's own name (`SHA-512/224`, FIPS 180-4) with
+    // the JCA's `SHA-` elision. The nested CLASS name cannot: `/` is not a Java
+    // identifier character, so the JDK writes `PBES2Parameters$HmacSHA512_224-
+    // AndAES_128`. This loop derived both from one array spelled the class's
+    // way, so the four `SHA512/{224,256}` rows were registered under names
+    // HotSpot does not have and the names HotSpot DOES have were absent.
+    //
+    // The cost was symmetric and both halves were measured on 2026-09-02:
+    // `Security.getProvider("SunJCE").getServices()` advertised four rows
+    // HotSpot has never advertised, and
+    // `AlgorithmParameters.getInstance("PBEWithHmacSHA512/224AndAES_128")`
+    // raised `NoSuchAlgorithmException` where HotSpot serves it. That engine's
+    // `getInstance` is NOT intercepted by this crate — it is ordinary JDK
+    // bytecode walking `Provider.getService` — so the row is the whole
+    // mechanism, and a misspelt row is the whole defect.
+    //
+    // `jca-provider-population-gap-20260830.md` §5 concluded "0 of 84 are
+    // clerical" from reading two other engines' dispatch. These four were.
+    const HASHES: &[(&str, &str)] = &[
+        // (algorithm spelling, class-name spelling)
+        ("SHA1", "SHA1"),
+        ("SHA224", "SHA224"),
+        ("SHA256", "SHA256"),
+        ("SHA384", "SHA384"),
+        ("SHA512", "SHA512"),
+        ("SHA512/224", "SHA512_224"),
+        ("SHA512/256", "SHA512_256"),
     ];
     const KEYSIZES: &[&str] = &["128", "256"];
-    for hash in HASHES {
+    for (hash, hash_cls) in HASHES {
         for keysize in KEYSIZES {
             let algo = format!("PBEWithHmac{hash}AndAES_{keysize}");
             // The nested class name drops the "PBEWith" prefix, e.g.
             // `PBES2Parameters$HmacSHA256AndAES_256` (verified via `javap`),
             // NOT `PBES2Parameters$PBEWithHmacSHA256AndAES_256`.
-            let cls = format!("com.sun.crypto.provider.PBES2Parameters$Hmac{hash}AndAES_{keysize}");
+            let cls =
+                format!("com.sun.crypto.provider.PBES2Parameters$Hmac{hash_cls}AndAES_{keysize}");
             put_service(P, "AlgorithmParameters", &algo, &cls);
         }
     }
