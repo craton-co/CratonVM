@@ -94,6 +94,15 @@ pub(super) fn read_args_verbatim(
     if stack.len() < total_args || total_args > slots.len() {
         return false;
     }
+    // The tag walk below indexes `facts.param_tags`, which is a fixed
+    // `[u8; INLINE_PARAMS]`. A descriptor with more parameters than that has
+    // no inline tags to read, and one shorter than `total_args` claims would
+    // read past its own length. Both doors already refuse an overflowing
+    // descriptor before calling here; this is the helper standing on its own.
+    let num_params = total_args - usize::from(has_receiver);
+    if facts.param_tags_overflow || num_params > facts.param_tag_len as usize {
+        return false;
+    }
     for i in 0..total_args {
         let depth = total_args - 1 - i;
         let (cv, kind) = stack.peek_with_kind_at(depth);
