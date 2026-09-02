@@ -2,11 +2,13 @@
 
 ## Status
 
-**OPEN, and the page's whole model needs replacing. Re-measured 2026-09-02: the
-decomposition below is right in its PROPORTIONS and wrong in its conclusions,
-and the cause is not a "per-native-call floor" at all — the fixture's `read()`
-is not being COMPILED, so it pays the interpreter for everything in it. Section
-9 is the finding; read it before acting on anything above it.** This is the residual of
+**OPEN, and the page's model needs replacing. Re-measured 2026-09-02: the
+decomposition below is right in its PROPORTIONS and wrong in its conclusions.
+The cause is not a "per-native-call floor" — it is that an operation which is
+fast when the JIT emits it INLINE stays at interpreter cost when it sits inside
+a CALLEE, however that callee is reached. Section 9 is the finding and section
+9.1 corrects an earlier, wrong version of it. Read both before acting on
+anything above.** This is the residual of
 `fixed-suite-bugs/hibernate/jpalargeblob-random-state-side-table-FIXED-20260830.md`, which is retired: both of
 that page's own findings are fixed, the test got 1.35x faster, and it still
 fails. What is left is not a defect in `Random`, in blobs, or in H2 — it is this
@@ -282,60 +284,78 @@ lever, 3/3 pairs:
 its `get` (2.41 ns) and `getAndIncrement` (12.02 ns) siblings was membership of
 the intrinsic region.
 
-# 9. The real finding: the method containing the work is not COMPILED
+# 9. The real finding: an operation is fast INLINE and 35x slower inside a callee
 
-Fixing `compareAndSet` did not move `lcgNext` — the static method whose body is
-one `get` plus one `compareAndSet` — by one nanosecond. That is what exposed
-this, and it is bigger than anything else on this page.
+Fixing `compareAndSet` did not move `lcgNext` — the method whose body is one
+`get` plus one `compareAndSet` — by one nanosecond. That is what exposed this.
 
-| arm | JIT on | `--nojit` | JIT speedup |
-|---|---:|---:|---:|
-| `AL.compareAndSet` (direct, in the timing loop) | 15.4 | 2226.6 | 145x |
-| the same `get`+CAS loop written INLINE | 18.6 | 2109.4 | 113x |
-| **`lcgNext(AL,32)` — the identical body behind a static call** | **2265.6** | 2500.0 | **1.1x** |
+All arms below are one per process (`probes/TierOneArm.java`, `-Darm=`), 3 000 000
+iterations, CPU clock, so the method-stats line describes that arm and nothing
+else.
 
-`lcgNext` costs the same whether the JIT is on or off. **Its body runs
-interpreted in both.** The 122x gap between it and the inline version is not the
-CAS, not the do/while, and not a call floor — an ordinary static call measures
-8.67 ns and a virtual call 20.14 ns (`probes/CallFloor.java`).
+| arm | CratonVM | HotSpot |
+|---|---:|---:|
+| `AL.get()` in the caller's own loop | 52.1 | — |
+| static call, arithmetic body | 83.3 | 0.42 |
+| static call, callee body has a REAL loop | 62.5 | 0.44 |
+| get + CAS **inlined into the caller** | 72.9 | 20.8 |
+| the identical body in a **static** callee | **2546.9** | 20.8 |
+| the identical body in a **virtual** callee | **2474.0** | 20.8 |
+| the same plus a `do/while` (`= Random.next`) | 2572.9 | 15.6 |
 
-And the same shape governs THIS page's workload. Two streams differing only in
-the counter's type, both calling a virtual `read()` once per byte:
+**35x, and the elimination is complete:**
 
-| arm | JIT on | `--nojit` | JIT speedup |
-|---|---:|---:|---:|
-| `stream prim no Random` | 41.5 | 1692.7 | **40.8x** |
-| `stream boxed no Random` | 2531.3 | 3906.3 | **1.5x** |
-| `stream boxed+new Random` (the fixture) | 4453.1 | 6510.4 | 1.5x |
+* not the loop — a callee with a real loop and no atomics is 62.5 ns;
+* not the atomics — `AL.get()` in the caller's loop is 52.1 ns;
+* not the `do/while` — removing it changes nothing (2500.0 vs 2572.9);
+* not static-vs-virtual — a virtual callee is just as slow (2474.0);
+* not tiering thresholds — `CRATONVM_TIER_C1_THRESHOLD=1` and
+  `CRATONVM_TIER_OSR_THRESHOLD=1` change it by under 1%;
+* not compilation — the boxed and primitive arms report **identical** compile
+  counts (`c1=1 c2=3 osr=2 deopts=0`, `admitted=5`).
 
-A `read()` with a primitive counter gets 40x from the JIT. The identical method
-with a boxed counter gets 1.5x — it is barely being compiled at all.
+What is left is: **the work is fast when the JIT emits it into the method being
+compiled, and pays interpreter prices when it sits one call deeper.** HotSpot has
+no such cliff — 20.8 ns whether inline, static or virtual.
 
-**So the boxing term is not "three native calls at ~300 ns each".** It is that
-the method containing the boxing does not reach compiled code, and therefore
-pays the INTERPRETER for everything in it — the two unboxes, the `valueOf`, the
-field access and the dispatch alike. That is also why section 4's
-`Long.longValue` intrinsic bought 1.6x on a tight counter loop and nothing at
-all on the stream arm: an intrinsic is JIT emission, and there is no JIT here to
-emit it.
+This governs this page's own workload. Two streams differing ONLY in the
+counter's type, both dispatching a virtual `read()` per byte, in isolated
+processes: **93.75 ns/op primitive against 2880.21 boxed**, with identical
+compile counts. The boxing inside `read()` is paying the same cliff, which is
+why section 4's `Long.longValue` intrinsic bought 1.6x on a tight counter loop
+and nothing at all on the stream arm.
 
 ## What to ask next
 
-The question is no longer "which native is slow" but **"why does a method whose
-body autoboxes fail to compile, when its primitive twin compiles and runs 40x
-faster?"** Concretely:
+Two candidates survive, and neither is confirmed:
 
-* `lcgNext` is called 400 000+ times from an OSR-compiled lambda and the method
-  stats report `still-interpreted=7 c1=0` with **500 total invocations tracked**
-  across the whole run. A method invoked only from COMPILED code may never
-  accumulate the profile counts that admit it — that is a hypothesis this page
-  has evidence for and has not proved, and it is the first thing to test.
-* If it holds, it is not a hibernate bug or a boxing bug. It is a tiering bug,
-  and this test is one of its symptoms.
+1. **The class-guarded intrinsics do not take effect inside a callee.** Every
+   one of them (`Atomic*`, `String`, and section 4's `BOX_UNBOX`) needs a
+   resolved receiver class id, and declines when it is 0 — `AtomicLongFieldLayout::new`
+   returns `None` for id 0 by construction. A compile door that classifies
+   invokes without supplying `cp_invoke_class_id_resolver` would therefore
+   disable every one of them silently, with no counter moving. The tree already
+   records that `try_compile` is not the only door and that the others
+   "classify invokes themselves".
+2. **The callee is compiled but not ENTERED as compiled**, so its body runs
+   interpreted and its natives cost interpreter prices (~1150 ns each; two of
+   them is 2300, and the measurement is 2500).
 
-Until that is answered, the ns/byte arithmetic in sections above — and the
-`~955` target this page opened with — are predictions about a VM that compiles
-the fixture's `read()`. It does not.
+The cheap discriminator between them is a per-site engagement counter read from
+INSIDE a callee compile, which this pass did not build.
+
+## 9.1 CORRECTION to the first version of this section
+
+The first version of section 9, committed earlier the same day, said "the method
+containing the boxing is not COMPILED". **That is wrong and the evidence is one
+command away:** isolated per-arm runs report identical compile counts for the
+boxed and primitive streams (`c1=1 c2=3 osr=2 deopts=0`). Both are compiled.
+
+It was inferred from a `--nojit` comparison — the boxed stream gains 1.5x from
+the JIT where the primitive twin gains 40.8x — which is a real observation with
+a different cause: the boxed arm's cost is dominated by work the JIT does not
+remove, so the RATIO is small without the method being uncompiled. A ratio is
+not a tier.
 
 # 10. Probes added by sections 8 and 9
 
@@ -344,3 +364,7 @@ the fixture's `read()`. It does not.
 * `probes/CallFloor.java` — what an ordinary Java call costs (static 8.67 ns,
   loop-bodied static 15.67, virtual 20.14, against HotSpot's 0.42 for all
   three), so "it is the call" can be ruled out rather than assumed.
+* `probes/TierOneArm.java` — ONE arm per process (`-Darm=`), so
+  `CRATONVM_DBG=jit-method-stats` describes that arm alone. This is what showed
+  the boxed and primitive streams have identical compile counts, and it is the
+  harness section 9's elimination table is built from.
