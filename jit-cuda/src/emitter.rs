@@ -88,11 +88,22 @@ pub struct PtxModule {
 }
 
 impl PtxModule {
+    /// The PTX ISA version this module's header declares: the lowest
+    /// one that admits its own `.target`.
+    ///
+    /// Derived, never hardcoded. See [`crate::target`] for the account
+    /// of the `.version 7.5` literal this replaces and why it made GPU
+    /// offload a silent no-op on every device newer than Ampere.
+    pub fn isa_version(&self) -> crate::target::IsaVersion {
+        crate::target::isa_for_target(self.sm_major, self.sm_minor)
+    }
+
     /// Render the module as a single PTX text blob suitable for
     /// `DeviceModule::from_ptx`.
     pub fn render(&self) -> String {
         let mut out = String::new();
-        out.push_str(".version 7.5\n");
+        let (isa_major, isa_minor) = self.isa_version();
+        out.push_str(&format!(".version {isa_major}.{isa_minor}\n"));
         out.push_str(&format!(".target sm_{}{}\n", self.sm_major, self.sm_minor));
         out.push_str(".address_size 64\n\n");
         for k in &self.kernels {

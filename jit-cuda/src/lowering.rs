@@ -1078,6 +1078,53 @@ mod tests {
             .unwrap_or_else(|e| panic!("lowering failed for {class}.{method_name}: {e}"))
     }
 
+    /// The regression test for the `.version 7.5` literal — the one
+    /// that would have caught it without a Hopper card.
+    ///
+    /// A real fixture lowered for each modern architecture, asserting
+    /// that the header the module renders is one that architecture's
+    /// own ISA admits. Before 2026-09-02 every row here rendered
+    /// `.version 7.5` beside a target that ISA has never heard of, and
+    /// `cuModuleLoadData` refused the module — invisibly, because the
+    /// only real-hardware gate runs on an RTX 2060 (`sm_75`), the one
+    /// architecture where that literal is correct.
+    #[test]
+    fn every_modern_target_renders_a_loadable_header() {
+        let method = load_method("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
+        let sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("fixture not eligible: {v:?}"),
+        };
+        // (target, the `.version` its ISA floor requires)
+        let cases = [
+            ((7, 5), "7.5"),  // Turing — the measured card, must not move
+            ((8, 0), "7.5"),  // Ampere GA100
+            ((8, 6), "7.5"),  // Ampere GA10x
+            ((8, 9), "7.8"),  // Ada
+            ((9, 0), "7.8"),  // Hopper
+            ((10, 0), "8.7"), // Blackwell datacenter
+            ((12, 0), "8.7"), // Blackwell RTX
+        ];
+        for ((maj, min), want_version) in cases {
+            let m = lower_method("EligibleVectorAdd", &method, &sig, maj, min)
+                .unwrap_or_else(|e| panic!("lowering failed for sm_{maj}{min}: {e}"));
+            let text = m.render();
+            assert!(
+                text.contains(&format!(".version {want_version}
+")),
+                "sm_{maj}{min} must render `.version {want_version}`, got:
+{}",
+                text.lines().take(3).collect::<Vec<_>>().join("
+")
+            );
+            assert!(
+                text.contains(&format!(".target sm_{maj}{min}
+")),
+                "sm_{maj}{min} must render its own target"
+            );
+        }
+    }
+
     #[test]
     fn vector_add_lowers_to_real_ptx() {
         let m = lower_fixture("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
@@ -1337,14 +1384,29 @@ mod tests {
     /// `CUDA_ERROR_INVALID_PTX` at module load (silent CPU fallback via
     /// blacklist) precisely because only vector_add was ever assembled.
     fn ptxas_round_trip(text: &str, stem: &str) {
+        ptxas_round_trip_at(text, stem, "sm_75");
+    }
+
+    /// Assemble `text` for one named architecture, failing with the
+    /// assembler's own diagnostic.
+    ///
+    /// AUDIT 2026-09-02: every caller of `ptxas_round_trip` renders PTX
+    /// for `sm_75` and this harness assembled it for `sm_75`. That is a
+    /// closed loop — the whole suite could pass on a machine with a full
+    /// CUDA toolkit while the header this crate emits for a Hopper card
+    /// was unassemblable, which is exactly what was true while `render`
+    /// wrote a literal `.version 7.5` beside a probed `.target`. Naming
+    /// the architecture is what lets
+    /// `ptxas_round_trip_every_modern_target` close it.
+    fn ptxas_round_trip_at(text: &str, stem: &str, arch: &str) {
         let tmpdir = std::env::temp_dir();
-        let stem = format!("cratonvm_jit_cuda_{stem}_{}", std::process::id());
+        let stem = format!("cratonvm_jit_cuda_{stem}_{arch}_{}", std::process::id());
         let src_path = tmpdir.join(format!("{stem}.ptx"));
         let out_path = tmpdir.join(format!("{stem}.cubin"));
         std::fs::write(&src_path, text).expect("write ptx");
         let ptxas = std::env::var("PTXAS").unwrap_or_else(|_| "ptxas".to_string());
         let out = std::process::Command::new(&ptxas)
-            .arg("-arch=sm_75")
+            .arg(format!("-arch={arch}"))
             .arg("-o")
             .arg(&out_path)
             .arg(&src_path)
@@ -1352,10 +1414,92 @@ mod tests {
             .expect("invoke ptxas");
         assert!(
             out.status.success(),
-            "ptxas rejected the PTX:\nstdout: {}\nstderr: {}\nPTX:\n{}",
+            "ptxas rejected the PTX for {arch}:\nstdout: {}\nstderr: {}\nPTX:\n{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
             text,
+        );
+    }
+
+    /// Whether the installed `ptxas` knows `arch` at all.
+    ///
+    /// A CUDA 12 toolkit cannot assemble for Blackwell and a CUDA 13 one
+    /// has dropped everything below `sm_75`. Asking first is what lets
+    /// the multi-architecture round trip skip what the toolkit does not
+    /// know instead of reporting the toolkit's age as a defect in our
+    /// PTX.
+    fn ptxas_knows_arch(ptxas: &str, arch: &str) -> bool {
+        // An empty module is the cheapest possible probe: it exercises
+        // the `-arch` parse and nothing else, so a failure is
+        // unambiguously "unknown architecture".
+        let tmpdir = std::env::temp_dir();
+        let probe = tmpdir.join(format!(
+            "cratonvm_jit_cuda_archprobe_{arch}_{}.ptx",
+            std::process::id()
+        ));
+        let text = format!(".version 6.3\n.target {arch}\n.address_size 64\n");
+        if std::fs::write(&probe, text).is_err() {
+            return false;
+        }
+        std::process::Command::new(ptxas)
+            .arg(format!("-arch={arch}"))
+            .arg("-o")
+            .arg(tmpdir.join(format!(
+                "cratonvm_jit_cuda_archprobe_{arch}_{}.cubin",
+                std::process::id()
+            )))
+            .arg(&probe)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// The toolkit-side gate for the `.version` regression.
+    ///
+    /// `every_modern_target_renders_a_loadable_header` proves the two
+    /// header directives agree with each other; this proves they agree
+    /// with NVIDIA's assembler, which is the only authority that counts.
+    /// It needs a CUDA toolkit and no GPU at all, so it runs anywhere
+    /// `ptxas` is installed — including the public runners the
+    /// self-hosted hardware gate cannot use, and which are the reason the
+    /// original bug survived: the only real GPU in CI is an RTX 2060.
+    ///
+    /// Architectures the installed toolkit does not know are skipped and
+    /// reported, never failed, so an old toolkit degrades coverage
+    /// visibly instead of turning red for the wrong reason.
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-it"),
+        ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
+    )]
+    fn ptxas_round_trip_every_modern_target() {
+        let method = load_method("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
+        let sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("fixture not eligible: {v:?}"),
+        };
+        let ptxas = std::env::var("PTXAS").unwrap_or_else(|_| "ptxas".to_string());
+        let mut assembled: Vec<String> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
+        for (maj, min) in [(7, 5), (8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (12, 0)] {
+            let arch = format!("sm_{maj}{min}");
+            if !ptxas_knows_arch(&ptxas, &arch) {
+                skipped.push(arch);
+                continue;
+            }
+            let m = lower_method("EligibleVectorAdd", &method, &sig, maj, min)
+                .unwrap_or_else(|e| panic!("lowering failed for {arch}: {e}"));
+            ptxas_round_trip_at(&m.render(), "vector_add_multi_arch", &arch);
+            assembled.push(arch);
+        }
+        assert!(
+            !assembled.is_empty(),
+            "no architecture was assembled, which makes this test vacuous. \
+             `ptxas` knows none of the targets this crate emits for. \
+             Skipped: {skipped:?}"
+        );
+        eprintln!(
+            "ptxas_round_trip_every_modern_target: assembled {assembled:?}, skipped {skipped:?}"
         );
     }
 

@@ -472,21 +472,70 @@ impl OffloadCache {
         };
         // Ask the device it will actually launch on for its compute
         // capability, so kernels are lowered for the real `sm_XX`
-        // instead of the Volta floor. Clamped up only: the lowering
-        // emits sm_70-era PTX, so a device older than that (or a
-        // failed probe) keeps the floor and the driver rejects the
-        // module later if it truly cannot run it.
+        // instead of the Volta floor. Floored at sm_70: the lowering
+        // emits Volta-era PTX, so a device older than that (or a failed
+        // probe) keeps the floor and the driver rejects the module later
+        // if it truly cannot run it.
+        //
+        // AUDIT 2026-09-02: the probe used to be clamped UPWARD ONLY,
+        // and `PtxModule::render` wrote a literal `.version 7.5` beside
+        // whatever it produced. PTX ISA 7.5 tops out at `sm_87`, so on
+        // Ada (`sm_89`), Hopper (`sm_90`) and Blackwell (`sm_100`/
+        // `sm_120`) every lowered module named a target its own declared
+        // ISA version does not know, `cuModuleLoadData` refused it,
+        // `lookup_or_compile` blacklisted the method, and the VM ran
+        // every kernel on the CPU — right answers, one `info` line, and
+        // a `--gpu` flag that bought a CUDA context and nothing else.
+        // `render` now derives `.version` from the target
+        // (`jit_cuda::target::isa_for_target`), and the downward clamp
+        // below closes the other direction: a driver older than its own
+        // GPU cannot parse the ISA that GPU's target requires, and the
+        // honest answer there is to run the device as the newest
+        // architecture the driver does know rather than to emit a header
+        // nothing can load.
         let sm = if ctx.is_some() {
             match cuda_bridge::probe_device(config.gpu_device_ordinal) {
                 Ok(caps) if (caps.compute_major, caps.compute_minor) >= (7, 0) => {
+                    let probed = (caps.compute_major, caps.compute_minor);
+                    // An unreadable driver version means "do not clamp":
+                    // the pre-audit behaviour, which is right whenever we
+                    // cannot prove the driver is behind.
+                    let target = match cuda_bridge::driver_cuda_version() {
+                        Ok(v) => {
+                            let driver_isa = jit_cuda::target::max_isa_for_cuda_version(v);
+                            let clamped =
+                                jit_cuda::target::clamp_target_to_isa(probed, driver_isa);
+                            if clamped != probed {
+                                tracing::warn!(
+                                    "gpu offload: device {} is sm_{}{} but the installed                                      driver (CUDA {}.{}) only parses PTX ISA {}.{}; lowering                                      for sm_{}{} instead",
+                                    caps.ordinal,
+                                    probed.0,
+                                    probed.1,
+                                    v / 1000,
+                                    (v % 1000) / 10,
+                                    driver_isa.0,
+                                    driver_isa.1,
+                                    clamped.0,
+                                    clamped.1,
+                                );
+                            }
+                            clamped
+                        }
+                        Err(_) => probed,
+                    };
+                    let isa = jit_cuda::target::isa_for_target(target.0, target.1);
                     tracing::info!(
-                        "gpu offload: device {} is {} (sm_{}{}), lowering for it",
+                        "gpu offload: device {} is {} (sm_{}{}), lowering for sm_{}{}                          with PTX ISA {}.{}",
                         caps.ordinal,
                         caps.name,
-                        caps.compute_major,
-                        caps.compute_minor
+                        probed.0,
+                        probed.1,
+                        target.0,
+                        target.1,
+                        isa.0,
+                        isa.1,
                     );
-                    (caps.compute_major, caps.compute_minor)
+                    target
                 }
                 _ => (7, 0),
             }
