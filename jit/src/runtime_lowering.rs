@@ -222,6 +222,249 @@ pub(crate) fn emit_new_object_stub(
 /// length)` / `jit_anewarray_object(vm, component_class_id, length)`, and the
 /// same zero-on-failure convention (`0` = pending exception stashed) as
 /// `emit_new_object_stub`'s target.
+/// What [`emit_inline_tlab_new_ir`] needs from its caller, grouped so the call
+/// site reads as a contract rather than as nine positional arguments.
+/// `Op::New` sites that received the inline bump, and those that declined and
+/// kept the stub.
+///
+/// Both, always. A matching checksum on a workload whose allocations all took
+/// the stub proves nothing about the bump, and this path is unreachable under a
+/// default configuration (`c2_alloc_upgrade_enabled` is opt-in) -- so a zero on
+/// the left is the EXPECTED reading, and it has to be distinguishable from
+/// "emitted and refused".
+static INLINE_TLAB_SITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STUB_ONLY_SITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn note_stub_only_alloc() {
+    STUB_ONLY_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(inline bump, stub only)` counts of compiled `Op::New` sites.
+pub fn ir_alloc_site_counts() -> (u64, u64) {
+    (
+        INLINE_TLAB_SITES.load(std::sync::atomic::Ordering::Relaxed),
+        STUB_ONLY_SITES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+pub(crate) struct InlineTlabPlan {
+    /// Frame offset of the cached `*mut JvmThread` that `fetch_current_thread`
+    /// wrote in the prologue. `0` declines: a thread nobody fetched must not be
+    /// dereferenced, which is the same verdict every shadow-stack site reaches
+    /// through its own null guard.
+    pub thread_slot_off: i32,
+    /// `Tlab::cursor` and `Tlab::end` as byte offsets from `&JvmThread`.
+    pub cursor_off: i32,
+    pub end_off: i32,
+    /// `jit_post_tlab_init(vm, obj, class_id, num_fields) -> obj`. `0` declines.
+    pub post_init: usize,
+    /// Frame offset of the VM context pointer, for that call.
+    pub context_off: i32,
+    pub class_id: u32,
+    pub num_fields: usize,
+}
+
+/// Inline TLAB bump allocation for the **optimizing tier**, with
+/// [`emit_new_object_stub`] as its slow path.
+///
+/// Returns `false` without emitting anything when the shape is not admitted, in
+/// which case the caller emits the stub alone — exactly the previous behaviour.
+///
+/// # Why this exists
+///
+/// `emit_new_object_stub` is three register loads and a `CALL` into
+/// `jit_new_object`, which walks the allocator's own path and may collect. The
+/// single-pass backend has `x64::objects::emit_inline_tlab_new` and pays no
+/// call on the common path, so an escaping allocation compiled *worse* after
+/// escape analysis had run on it. That is one of the two independent causes of
+/// the July 2026 Binary Trees 4x regression, and the reason
+/// `IR_MAX_ALLOCATIONS` is 16 while every neighbouring cap is 64.
+///
+/// # The size contract, which is the whole difficulty
+///
+/// `jit_post_tlab_init` derives the object's `shape` and total size from
+/// `class_layout(class_id)` **itself**. A caller that sizes the allocation as
+/// `HEADER_SIZE + num_fields * SLOT_SIZE` while the class carries a registered
+/// compact layout therefore hands the helper a size mismatch and corrupts the
+/// heap. The snapshot is taken here from the same two functions the single-pass
+/// emitter and the helper both use — `class_layout` and `layout_replace_guard`
+/// — so all three agree by construction rather than by inspection.
+///
+/// A layout can also be **replaced** between compile and execution, which is
+/// what the guard emitted first is for: it compares the live field count
+/// against the one this compile baked and diverts to the helper on a mismatch,
+/// before any state exists to unwind.
+///
+/// # Ordering: every header write lands BEFORE the cursor commits
+///
+/// Publishing the cursor first exposes an object whose header is still whatever
+/// the TLAB slot held — `class_id = 0` to the GC walker, which then mis-decodes
+/// it and steps into its neighbour. The mark word is written
+/// **unconditionally**: it stopped being padding when the 24 -> 16 shrink folded
+/// `kind`, `element_type`, `gc_age` and `gc_flags` into bits 48..63, and
+/// skipping it published whatever the slot held as those four fields — the
+/// 2026-08-07 Spring Boot regression (`read_slot: corrupt Value cell` in 178 of
+/// 184 classes).
+///
+/// The cursor is aligned up to 8 before use, because an interleaved array
+/// allocation can leave it unaligned and the walker assumes 8-aligned headers.
+///
+/// # This is a second implementation, and the tests know it
+///
+/// One shared sequence would be better. The obstacle is that the header-write
+/// contract is policed by source scans of `emit_inline_tlab_new`'s own body, so
+/// moving that body means rewriting the oracle in the same change as the code it
+/// polices. Instead this body is held to the *same* oracle: the scans in
+/// `x64::flag_and_header_contracts` cover both functions, so a divergence fails
+/// them rather than going quietly stale in one of the two.
+pub(crate) fn emit_inline_tlab_new_ir(
+    buf: &mut ExecutableBuffer,
+    plan: &InlineTlabPlan,
+    stub_target: usize,
+    frame_record: usize,
+) -> bool {
+    if plan.thread_slot_off <= 0
+        || plan.post_init == 0
+        || stub_target == 0
+        || plan.cursor_off == plan.end_off
+    {
+        return false;
+    }
+
+    // The layout snapshot, from the same source the helper reads. `None` means
+    // this class allocates with uniform 16-byte cells.
+    let compact: Option<(usize, *const u32, u32)> = if cratonvm_types::compact_ref_fields_enabled() {
+        cratonvm_types::class_layout(plan.class_id)
+            .filter(|l| l.field_count() == plan.num_fields)
+            .map(|l| {
+                let (addr, expected) = cratonvm_types::layout_replace_guard(plan.class_id);
+                (l.body_size as usize, addr, expected)
+            })
+    } else {
+        None
+    };
+
+    let body = match compact {
+        Some((body, _, _)) => body,
+        None => match plan.num_fields.checked_mul(cratonvm_types::SLOT_SIZE) {
+            Some(b) => b,
+            None => return false,
+        },
+    };
+    let Some(total) = body.checked_add(cratonvm_types::HEADER_SIZE) else {
+        return false;
+    };
+    // The allocator hands out 8-aligned runs and the walker steps by them.
+    if total % 8 != 0 {
+        return false;
+    }
+    let Ok(total) = i32::try_from(total) else {
+        return false;
+    };
+    // Every header displacement below is encoded as a disp8.
+    if cratonvm_types::GC_FLAGS_BYTE_OFFSET > 127 || cratonvm_types::MARK_WORD_OFFSET > 127 {
+        return false;
+    }
+
+    let mut slow: Vec<usize> = Vec::new();
+
+    // Step 0 — layout-replace guard, before any state exists to unwind.
+    if let Some((_, count_addr, expected)) = compact {
+        emit_mov_imm64(buf, R11, count_addr as u64);
+        buf.emit(&[0x41, 0x8B, 0x03]); // MOV EAX, [R11]
+        buf.emit_byte(0x3D); // CMP EAX, imm32
+        buf.emit(&expected.to_le_bytes());
+        slow.push(emit_jcc(buf, 0x85)); // JNE .slow
+    }
+
+    // Step 1 — the cached thread. Null means "untracked": take the stub rather
+    // than dereference a pointer nobody fetched.
+    emit_load_frame(buf, R10, plan.thread_slot_off);
+    buf.emit(&[0x4D, 0x85, 0xD2]); // TEST R10, R10
+    slow.push(emit_jcc(buf, 0x84)); // JE .slow
+
+    // Step 2 — cursor, aligned up to 8.
+    buf.emit(&[0x4D, 0x8B, 0x9A]); // MOV R11, [R10 + disp32]
+    buf.emit(&plan.cursor_off.to_le_bytes());
+    buf.emit(&[0x49, 0x83, 0xC3, 0x07]); // ADD R11, 7
+    buf.emit(&[0x49, 0x83, 0xE3, 0xF8]); // AND R11, -8
+
+    // Step 3 — bump, and refuse if it passes the TLAB end.
+    buf.emit(&[0x49, 0x8D, 0x83]); // LEA RAX, [R11 + disp32]
+    buf.emit(&total.to_le_bytes());
+    buf.emit(&[0x49, 0x3B, 0x82]); // CMP RAX, [R10 + disp32]
+    buf.emit(&plan.end_off.to_le_bytes());
+    slow.push(emit_jcc(buf, 0x87)); // JA .slow
+
+    // Step 4 — the header, all of it, before the commit below.
+    // class_id at offset 0.
+    buf.emit(&[0x41, 0xC7, 0x43, 0x00]); // MOV DWORD [R11 + 0], imm32
+    buf.emit(&plan.class_id.to_le_bytes());
+    // shape at NUM_SLOTS_OFFSET — `num_fields` in BOTH layouts, matching
+    // `jit_post_tlab_init`, which writes the same value again idempotently.
+    // Cast: a field count is bounded by the class file's own u16 limits.
+    let shape = plan.num_fields as u32;
+    buf.emit(&[
+        0x41,
+        0xC7,
+        0x43,
+        cratonvm_types::NUM_SLOTS_OFFSET as u8,
+    ]);
+    buf.emit(&shape.to_le_bytes());
+    // mark_word at MARK_WORD_OFFSET — UNCONDITIONAL. See the doc comment.
+    buf.emit(&[
+        0x49,
+        0xC7,
+        0x43,
+        cratonvm_types::MARK_WORD_OFFSET as u8,
+    ]);
+    buf.emit(&0i32.to_le_bytes());
+    // GC_FLAG_COMPACT, as a BYTE and AFTER the mark word that would erase it.
+    // `gc_age` shares this byte and is 0 at allocation, so writing the whole
+    // byte is safe; a dword store here would run past a 16-byte header.
+    if compact.is_some() {
+        buf.emit(&[
+            0x41,
+            0xC6,
+            0x43,
+            cratonvm_types::GC_FLAGS_BYTE_OFFSET as u8,
+            cratonvm_types::GC_FLAG_COMPACT,
+        ]);
+    }
+
+    // Step 5 — commit, now that the header is walker-coherent.
+    buf.emit(&[0x49, 0x89, 0x82]); // MOV [R10 + disp32], RAX
+    buf.emit(&plan.cursor_off.to_le_bytes());
+
+    // Step 6 — the cold header work the helper owns: identity hash, primitive
+    // defaults, finalizer registration. It returns the object in RAX, which is
+    // where both arms converge.
+    emit_load_frame(buf, ENTRY_ABI_REGS[0], plan.context_off);
+    emit_mov_reg(buf, ENTRY_ABI_REGS[1], R11);
+    // Casts: a class id is a u32; a field count is bounded by the class file.
+    emit_mov_imm32_sx(buf, ENTRY_ABI_REGS[2], plan.class_id as i32);
+    emit_mov_imm32_sx(buf, ENTRY_ABI_REGS[3], plan.num_fields as i32);
+    emit_call_absolute(buf, plan.post_init);
+    emit_post_call_frame_republish(buf, frame_record);
+    let done = emit_jmp(buf);
+
+    // ── slow path: the shared stub, unchanged ────────────────────────
+    for p in slow {
+        patch_rel32_to_here(buf, p);
+    }
+    emit_new_object_stub(
+        buf,
+        plan.context_off,
+        stub_target,
+        plan.class_id,
+        plan.num_fields,
+        frame_record,
+    );
+    patch_rel32_to_here(buf, done);
+    INLINE_TLAB_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
 pub(crate) fn emit_new_array_stub(
     buf: &mut ExecutableBuffer,
     context_offset: i32,
