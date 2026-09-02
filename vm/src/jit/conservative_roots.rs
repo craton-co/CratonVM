@@ -6324,7 +6324,7 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
     // INTO. The narrowing rests on "their roots are published by their own
     // mechanisms", which does not hold for an object that has been allocated
     // and not yet stored anywhere tracked — see
-    // `docs/known-issues/gc/bug-g1-evacuates-live-jit-reference-20260819.md`.
+    // `bug-g1-evacuates-live-jit-reference-20260819.md`.
     if !frame_bands_enabled() || !scan_compiled_frame_bands(info, scanner_sp, heap, out) {
         scan_one_frame(scanner_sp, info.frame_base, heap, out);
     }

@@ -1042,7 +1042,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // so likewise gets a vacuous coverage proof (see the fail-closed guard in
     // `conservative_roots::moving_young_unpublished_frame_oop_present`).
     //
-    // `docs/known-issues/gc/bug-g1-evacuates-live-jit-reference-20260819.md`
+    // `bug-g1-evacuates-live-jit-reference-20260819.md`
     // states this restriction as though it were already implemented ("requires
     // `is_generational()`, so under G1 it is false"). It was true of the
     // siblings and false here; this is the line that makes the record true.
@@ -1155,7 +1155,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // every candidate failed `is_object_address` (`chain>0 added=0`). Those are
     // three different defects and the collector-side line reads identically for
     // all three. See
-    // `docs/known-issues/gc/bug-g1-evacuates-live-jit-reference-20260819.md`.
+    // `bug-g1-evacuates-live-jit-reference-20260819.md`.
     if dbg_jit_rootscan() {
         let frames = crate::jit::conservative_roots::active_compiled_frames();
         let labels: Vec<&str> = frames.iter().map(|(_, l, _, _)| l.as_str()).collect();

@@ -10910,7 +10910,7 @@ impl G1Collector {
     /// `PolynomialTest` failure was (`pin_addrs=0` was the process-wide total),
     /// but it is real, and it is a reason to prefer candidate fix 2 — repairing
     /// the scan — over widening this predicate. See
-    /// `docs/known-issues/gc/bug-g1-evacuates-live-jit-reference-20260819.md`.
+    /// `bug-g1-evacuates-live-jit-reference-20260819.md`.
     fn empty_jit_publication(&self) -> bool {
         // "A compiled frame is live." `is_active()` counts only JIT entries
         // that pushed a `JitEntryGuard`; a frame reached without one (the

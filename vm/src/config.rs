@@ -24,7 +24,7 @@ pub enum GcAlgorithm {
     /// being true when the `zgc` default landed, and it is load-bearing: a
     /// reader who believes it attributes a default-build measurement to the
     /// wrong collector, which is what happened while root-causing
-    /// `docs/known-issues/gc/bug-g1-evacuates-live-jit-reference-20260819.md`
+    /// `bug-g1-evacuates-live-jit-reference-20260819.md`
     /// (three arms recorded as "generational" were ZGC runs).
     Generational,
     /// G1 (Garbage-First) region-based collector.
