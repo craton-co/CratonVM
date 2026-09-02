@@ -12,7 +12,7 @@
 //! P3-6 (dispatch_async) are designed so that on no-device boxes the
 //! handlers return well-defined synthetic results: a non-null
 //! `GpuExecutor`, a `Failed` `GpuFuture` with "no CUDA device" in the
-//! message, and a working host-side `ResidencyTracker` round trip.
+//! message.
 //!
 //! # File-level gating
 //!
@@ -35,59 +35,27 @@
 //!
 //! # What does run today
 //!
-//! `residency_tracker_compiles` is a true unit smoke test against
-//! `cratonvm_vm::runtime::gpu_residency::ResidencyTracker` (Item
-//! P3-7). It does not need the SharedVm harness and runs on the
-//! no-GPU dev box.
+//! Nothing in this file. It used to hold `residency_tracker_compiles`,
+//! a smoke test against
+//! `cratonvm_vm::runtime::gpu_residency::ResidencyTracker` (Item P3-7).
+//! Both the test and that module were removed on 2026-09-02: the
+//! tracker was dead code. Its `device_bytes` field was only ever
+//! written as `None`, so `is_resident` could not return `true` for any
+//! handle -- and this test asserted exactly that, with the rationale
+//! "no CUDA on this box", which dressed a structural constant up as a
+//! hardware observation. Nothing outside the module's own tests ever
+//! constructed a `ResidencyTracker`.
+//!
+//! The `GpuArray` residency that actually ships lives in
+//! `native-builtins/src/craton_gpu.rs` (the handle/host-bytes store
+//! behind `arrayWrap*`/`arrayToHost`/`arrayIsResident`/`releaseArray`)
+//! and in `offload.rs`'s `device_cache` (the per-handle
+//! `Arc<DeviceBuffer<T>>`). `craton_gpu.rs`'s own unit tests cover the
+//! wrap/release/is-resident conventions against that live store, which
+//! is where such a test belongs: it can reach a `NativeContext`, and
+//! this crate cannot.
 
 #![cfg(feature = "gpu-offload")]
-
-use cratonvm_vm::runtime::gpu_residency::{PrimitiveType, ResidencyTracker};
-
-/// True unit smoke. The `ResidencyTracker` is a pure host-side
-/// structure (Item P3-7); it tracks Java primitive-array handles
-/// and their byte buffers so the dispatch path can do `arrayWrapInt`,
-/// `arrayToHost`, `arrayIsResident`, and `releaseArray` without ever
-/// touching CUDA. On a no-GPU box `is_resident` must be `false` for
-/// every handle — wrapping is purely a host bookkeeping operation
-/// until a real device upload happens.
-#[test]
-fn residency_tracker_compiles() {
-    let tracker = ResidencyTracker::new();
-
-    // [1, 2, 3] as i32 little-endian.
-    let bytes: Vec<u8> = vec![
-        1, 0, 0, 0, //
-        2, 0, 0, 0, //
-        3, 0, 0, 0, //
-    ];
-
-    let handle = tracker.wrap(PrimitiveType::I32, bytes.clone());
-    assert!(handle > 0, "wrap must return a non-zero handle");
-
-    assert_eq!(
-        tracker.to_host(handle).as_deref(),
-        Some(bytes.as_slice()),
-        "to_host must return the exact bytes we wrapped"
-    );
-
-    assert_eq!(
-        tracker.element_type(handle),
-        Some(PrimitiveType::I32),
-        "element_type must remember the primitive kind"
-    );
-
-    assert!(
-        !tracker.is_resident(handle),
-        "no CUDA on this box — is_resident must be false"
-    );
-
-    tracker.release(handle);
-    assert!(
-        tracker.to_host(handle).is_none(),
-        "after release, the handle must no longer resolve"
-    );
-}
 
 /// PHASE3-GUESS: needs the SharedVm-with-classpath harness so we can
 /// load `craton.gpu.Native` from the compiled annotations jar and
