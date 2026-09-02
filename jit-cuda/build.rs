@@ -49,6 +49,17 @@ fn main() {
         "cargo:rustc-env=JIT_CUDA_FIXTURE_DIR={}",
         fixture_out_dir.display()
     );
+    // Where the compiled `craton.gpu.*` annotation classes live, when
+    // this build found them. Exported so `annotations.rs`'s contract
+    // test can read the Java enums this crate parses BY NAME and check
+    // that the two still agree — see
+    // `rust_enum_names_match_the_java_definitions`. Empty string when
+    // the `craton-gpu-java` project was not found, which the test
+    // reports as a skip rather than treating as a pass.
+    println!(
+        "cargo:rustc-env=CRATON_GPU_CLASSES_DIR={}",
+        std::env::var("DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_DIR").unwrap_or_default()
+    );
 
     if let Err(e) = prepare_clean_dir(&fixture_out_dir) {
         println!(

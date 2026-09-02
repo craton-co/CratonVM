@@ -291,24 +291,40 @@ what they always did.
 * on all five probe kernels above it never runs at all: *"refused: liveness and
   colourer disagree about which values want a home"*, 5 of 5.
 
-That refusal is a **pre-existing** gate, not something the GP file introduced.
+That refusal was a **pre-existing** gate, not something the GP file introduced.
 `regalloc::ir_op_defines_value` (through `wants_loc`) and `ir_lower`'s
 `op_defines_result_slot` (through `node_color`) are two enumerations of one
 question — the second and third of the three `the_three_ir_op_enumerations`
 names — and any disagreement declines the whole method. It was declining the XMM
 cache the same way and nobody could see it, because the flag printed only on
-success. Both halves of that are fixed here: every refusal now carries a reason,
-the enumeration disagreement names the offending node and op, and a successful
-plan reports its per-cause skip census (`split_or_spilled`,
-`wrong_bank_or_type`, `no_home`, `phi`).
+success. Both halves of that are fixed: every refusal now carries a reason, the
+enumeration disagreement names the offending node and op, and a successful plan
+reports its per-cause skip census (`split_or_spilled`, `wrong_bank_or_type`,
+`no_home`, `phi`).
 
-So the capability is built, tested and safe, and the flip is a separate decision
-that wants two things this change does not have: the two enumerations
-reconciled, so the kernels that show the inversion can actually reach the
-allocator, and a wall-clock measurement on a quiet host — which the host this
-landed on could not supply (load 30–63 for the second half of the session).
-**Do not flip it on the strength of the table above; that table is the problem
-statement, not a result.**
+**The disagreement itself is fixed too, and it was exactly two ops.**
+`op_defines_result_slot` lists `Op::ArrayLength` and `Op::NewArray`;
+`ir_op_defines_value` did not — while its own doc comment asserted lockstep and
+named those two as *"absent there and absent here"*. The comment written to
+prevent the drift was the drift. Every counted loop spelled
+`for (i = 0; i < a.length; i++)` contains an `arraylength`, which is why the
+five array-touching kernels declined and `BinTrees.itemCheck`, which touches no
+array, was the one that promoted. Nothing was ever miscompiled — the agreement
+check did its job and declined — but the optimization was unavailable wherever
+arrays are, which is most places.
+
+The lockstep claim is now enforced rather than asserted:
+`the_two_value_defining_enumerations_agree` parses both function bodies out of
+the two source files and compares the sets, so adding an arm to one list and
+forgetting the other fails a test instead of surfacing as an unexplained
+refusal months later.
+
+So the capability is built, tested, safe, and no longer structurally blocked.
+The flip is a separate decision that still wants a **measurement on a quiet
+host**, which is what this work could not supply: the box ran at load 30–352
+throughout, with the fat-LTO link of the verifying binary SIGKILLed by the OOM
+killer at load 352. **Do not flip it on the strength of the table above; that
+table is the problem statement, not a result.**
 
 Off is exactly the pre-change emission: no register handed out, no save area
 reserved, every read from its home word.
@@ -493,22 +509,145 @@ instead of reserving another, so a straight-line stretch with several calls no
 longer grows the spill region once per call until `spill-range-exhausted` fails
 the compile.
 
-### Allocation in the optimizing tier — still a stub, and that is why its gate is shut
+### Allocation in the optimizing tier — the bump landed; the gate is now a policy question
 
-`emit_new_object_stub` is three register loads and a `CALL`; the single-pass
-`emit_inline_tlab_new` is a cursor load, a bump, a limit compare and inline
-header writes. So an escaping allocation would compile *worse* after escape
-analysis has run on it.
+This section used to say the optimizing tier lowered every `new` through
+`emit_new_object_stub` — three register loads and a `CALL` — while the
+single-pass backend had `emit_inline_tlab_new`, so an escaping allocation
+compiled *worse* after escape analysis had run on it. That is fixed:
+`runtime_lowering::emit_inline_tlab_new_ir` gives this tier the cursor load,
+the bump, the limit compare and the inline header writes, with the old stub as
+its slow path. It lives beside the stub because that module exists to be the
+one place both front ends share allocation, dispatch and monitor contracts.
 
-It costs nothing today, and the reason is worth stating rather than
-rediscovering: `c2_alloc_upgrade_enabled()` is opt-in
-(`CRATONVM_JIT_C2_ALLOC_UPGRADE`), so a method containing any `new` is never
-promoted to the optimizing tier at all. The stub is why that gate is shut, and
-`IR_MAX_ALLOCATIONS` is pinned at 16 while every neighbouring cap is 64 for the
-same reason. Opening the gate means first lifting the inline TLAB sequence into
-`runtime_lowering.rs` beside the stub — that module exists to be the one place
-both front ends share allocation, dispatch and monitor contracts, and this is
-the contract it is missing.
+Three things in it are load-bearing and none of them is a copy of the
+single-pass sequence:
+
+* **The size comes from `class_layout`, not from arithmetic.**
+  `jit_post_tlab_init` derives the object's shape and total size from
+  `class_layout(class_id)` itself, so a caller that sizes the allocation as
+  `HEADER_SIZE + num_fields * SLOT_SIZE` while the class carries a registered
+  compact layout hands the helper a size mismatch and corrupts the heap. The
+  snapshot is taken from the same two functions the helper and the single-pass
+  emitter read, so all three agree by construction rather than by inspection.
+* **A layout can be replaced between compile and execution**, which is what the
+  guard emitted first is for: it compares the live field count against the one
+  this compile baked and diverts to the helper on a mismatch, before any state
+  exists to unwind.
+* **Every header write lands before the cursor commits**, and the mark word is
+  written unconditionally. Publishing the cursor first exposes an object whose
+  header is still whatever the TLAB slot held — `class_id = 0` to the GC
+  walker, which then mis-decodes it and steps into its neighbour. The mark word
+  stopped being padding when the 24 → 16 byte shrink folded `kind`,
+  `element_type`, `gc_age` and `gc_flags` into it; skipping it is the
+  2026-08-07 Spring Boot regression (`read_slot: corrupt Value cell` in 178 of
+  184 classes).
+
+Measured: the site census reads `inline-bump=2 stub-only=0` with the path on
+and `0 / 2` with `CRATONVM_JIT_IR_INLINE_TLAB=0`, the Binary Trees checksum is
+`674478` on every arm and matches HotSpot, and the regression suite is 85/85
+with `CRATONVM_JIT_C2_ALLOC_UPGRADE=1` forcing the new path.
+
+`CRATONVM_JIT_C2_ALLOC_UPGRADE` is still opt-in, and `IR_MAX_ALLOCATIONS` is
+still 16. That is now a *population* question rather than a codegen one —
+flipping it moves every allocation-bearing method to a different tier, which is
+a change that wants its own measurement — but the reason the gate could not be
+opened at all is gone.
+
+### The receiver null check nobody could prove away
+
+`getfield` on `this` re-tested `this` for null on every execution, including
+every iteration of a loop, for a value the JVM guarantees at the call site.
+Two independent gaps produced that, and both had to be closed:
+
+**The dataflow could not represent the fact.** `null_check_elim::analyze` seeded
+entry IN to `0` — nothing proven on entry — so a local became known non-null
+only by being dereferenced. That is enough for straight-line code and useless
+for a loop: the IN mask at a loop header is the meet of the entry path and the
+backedge, the backedge carries "local 0 non-null" because the body's own
+`getfield` proved it, the entry path carries nothing, and the intersection is
+empty. The fact died at the header on every iteration.
+
+**The getfield emitter never asked.** `emit_trusted_oop_receiver_check` emitted
+`TEST`/`JZ` unconditionally, while the array sites next door had consulted
+`is_local_nonnull` since round 11. The proof existed and had no consumer.
+
+`CRATONVM_JIT_THIS_NONNULL` seeds bit 0 when local 0 holds a receiver;
+`CRATONVM_JIT_RECEIVER_NULL_ELIM` lets the two `getfield` arms consult the
+result. They are separate switches because the blast radii differ — the seed
+widens a fact three consumers already read (inline array null-check elision,
+`ifnull`/`ifnonnull` branch elision, and the new one), while the consumer flag
+only adds the third — and one switch for both would have made them
+indistinguishable in a bisect.
+
+Instance-ness is **derived, and the derivation refuses rather than guesses**.
+`compile_with_param_slots` takes no `is_static`, but `method_key` already
+carries the descriptor and `num_params` is the argument count with `this`
+included, so the answer is which of `declared` / `declared + 1` the count
+equals. "Neither" answers `None`. Note the width convention: `count_param_slots`
+counts `J` and `D` as **one** argument each, unlike `compute_param_jvm_slots`,
+which counts them as two slots — reading the wrong one misclassifies every
+method with a `long` or `double` parameter.
+
+Scoped to `getfield` and deliberately to nothing else. `putfield`'s preceding
+push is the stored **value**, not the receiver — the exact shape of the Tomcat
+`MessageBytes.setString` miscompile that `opcode_dereferences_receiver` already
+documents — and `checkcast` does not throw on a null receiver at all, so its
+`JZ` targets a legal null path; eliding it would let a null fall into the
+`KIND_TAGS` byte compare and fault.
+
+#### Measured: it engages, and it does not show up in the clock
+
+Probe: `for (i = 0; i < 2000; i++) s += this.x;`, called 40,000 times — 80M
+executions of the elided check. Debug binary, Azure `vm1`, a shared host that
+was also running two fat-LTO release builds and an H2 suite.
+
+| Arm | census | checksum |
+|---|---|---|
+| both on | `elided=2 emitted=0` | 240000000 |
+| `CRATONVM_JIT_RECEIVER_NULL_ELIM=0` | `elided=0 emitted=2` | 240000000 |
+| `CRATONVM_JIT_THIS_NONNULL=0` | `elided=0 emitted=2` | 240000000 |
+
+Both halves are load-bearing and independently switchable — turning off either
+one returns the count to zero — and the answer matches HotSpot on every arm.
+
+Throughput, five interleaved reps per arm, CPU time (`%U + %S`; wall clock is
+meaningless on that host): medians **3.30 s on and 3.30 s off**, ranges
+3.01–3.33 and 3.13–3.39. **No detectable difference.** The loop does run
+compiled — the `--nojit` arm was still going after two minutes against 3.3
+seconds — so this is a measurement of compiled code, not of the interpreter.
+
+That is the expected result and it is worth stating rather than filing away:
+`TEST r,r; JZ rel32` is nine bytes and two well-predicted µops, and an
+out-of-order core hides them behind the load they guard. What the elision buys
+is **code size**, paid entirely at compile time, plus the fact that a check
+that is not emitted cannot be got wrong.
+
+**This is not an implicit null check, and that was the choice, not an
+omission.** The audit item asked for the HotSpot mechanism: let the load fault
+on the null page and translate the signal. `vm/src/runtime/crash_handler.rs`
+can already resume — the Windows VEH rewrites `RIP` and returns
+`EXCEPTION_CONTINUE_EXECUTION`, and the Unix handler has the faulting PC, the
+faulting address and `si_code` — and a lock-free append-only PC table would be
+async-signal-safe. What is missing is **lifetime**: a `CompiledMethod`'s buffer
+is unmapped on invalidation and its address is immediately reusable by the next
+`alloc_executable` (`unregister_jit_method_name` exists for exactly this
+reason), so a stale entry would recover at a PC that now belongs to different
+code. Correct registration therefore has to participate in the code-cache
+lifecycle, which is where that work belongs. Against that, the check being
+removed is `TEST r,r; JZ rel32` — 9 bytes and two well-predicted µops — and
+proving it away costs nothing at runtime and cannot mistranslate a signal.
+Eliding by proof is strictly better than faulting where the proof exists; the
+implicit check is only worth its machinery where it does not.
+
+And the measurement above **bounds** what it could be worth here, which is the
+part that settles it: an implicit null check removes *exactly the same two
+instructions* this elision removes, at the sites where the proof fails. The
+arm that removes them measured the same as the arm that keeps them. Building a
+signal-based recovery path with a code-cache-lifetime dependency to buy an
+effect that a direct A/B cannot resolve is not a trade worth making now — and
+if a workload ever does show the check on its profile, this section is the
+record of what was already tried and what it cost.
 
 ### Summary table
 
@@ -534,7 +673,10 @@ the contract it is missing.
 | IR-tier register residency (GP + FP files) | off — built and verified, flip wants a measurement | `CRATONVM_JIT_IR_LINEAR_SCAN=1` |
 | Gated inline reference stores | **ON** where a collector publishes a plan | `CRATONVM_JIT_GATED_REF_STORE=0` |
 | Operand-stack register cache beyond pure kernels | off (see the section above for the ARG_REGS collision) | `CRATONVM_JIT_OPERAND_CACHE=1` |
-| Optimizing tier for allocation-bearing methods | off (the tier has no inline TLAB bump) | `CRATONVM_JIT_C2_ALLOC_UPGRADE` |
+| Optimizing tier for allocation-bearing methods | off (a tier-population change, no longer a codegen gap) | `CRATONVM_JIT_C2_ALLOC_UPGRADE` |
+| Inline TLAB bump in the optimizing tier | **ON** | `CRATONVM_JIT_IR_INLINE_TLAB=0` |
+| `this` seeded non-null at method entry | **ON** | `CRATONVM_JIT_THIS_NONNULL=0` |
+| `getfield` receiver null-check elision | **ON** | `CRATONVM_JIT_RECEIVER_NULL_ELIM=0` |
 
 ### Performance — current status
 

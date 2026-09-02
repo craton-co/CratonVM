@@ -323,8 +323,17 @@ divergence that is not one.** That is a gap in a feature that just shipped, and
 it is the strongest practical argument on this page — it is, after all, exactly
 how the ten rows were found.
 
-Two things would close the gap without touching `System.out` at all, and both
-are separable from the compatibility judgement in §9:
+**Both were done, and then the gap closed underneath them.** Items 1 and 2
+landed in `docs/testing/diff-hotspot.md` §5.1 on 2026-09-01 — an injective
+byte-to-text escape so the reference side is never mangled, plus a report hint
+that names an encoding-shaped divergence and prints the pin. On 2026-09-02 the
+compatibility judgement in §9 was taken as well, so both VMs now derive the
+encoding from the same host and this class of false red cannot arise: with one
+machine and one rule there is nothing left to disagree about. §5.1 keeps the
+escape and the hint, because `CRATONVM_STDOUT_ENCODING` can still pin one side
+by hand and a genuine charset defect has the same shape.
+
+The two items, as originally stated:
 
 1. **Say so in `docs/testing/diff-hotspot.md` §5 or §8**, with the workaround:
    both sides accept `-Dstdout.encoding=UTF-8` and it is forwarded to the
@@ -536,13 +545,29 @@ both are given `-Dstdout.encoding=UTF-8`.
    gate on every non-UTF-8 host — and `probes/EncodingFidelity.java` prints it
    so it stays observable.
 
-2. **The Windows arm is implemented but not RUN.** `GetACP` /
-   `GetConsoleOutputCP` / `GetConsoleMode` are called, and the two spellings
-   they produce (`Cp1251` for the ANSI code page, `cp866` for an attached
-   console) are measured — but measured from **HotSpot** on the 1251 machine,
-   in one `-XshowSettings:properties` run with stdout redirected and stdin
-   still on the console. No CratonVM binary has been built on Windows and run
-   against §1's witness. Everything in §10's table is Linux, which §3 is why
-   that is worth something and not everything. The unit tests in
-   `cratonvm_native_api::os_encoding` pin the two spelling rules; the console
-   detection itself is unexercised.
+2. ~~**The Windows arm is implemented but not RUN.**~~ **Run 2026-09-02, and
+   it was wrong twice.** The `#[cfg(windows)]` arm had never been compiled by
+   anything — Linux only builds the Unix arm — so both defects shipped
+   unexamined:
+
+   * **The terminal test.** It used `GetConsoleMode`, which succeeds only for a
+     real console. HotSpot's is `isatty`, i.e.
+     `GetFileType == FILE_TYPE_CHAR`, which is ALSO true for the `NUL` device.
+     Measured, one command five ways at `chcp 866` on a `GetACP()==1251` host,
+     `GetConsoleMode` agreed with HotSpot in three of five and `GetFileType` in
+     five of five. The two rows that separate them are `1> NUL` and `0< NUL` —
+     not a curiosity, but how a service or a scheduled task ordinarily runs.
+   * **Code page 65001.** The generic console rule spelled it `cp65001`;
+     HotSpot answers `UTF-8`. There is no `sun.nio.cs.CP65001`, so the generic
+     answer is one `Charset.forName` away from throwing at bootstrap.
+
+   With both fixed, the real `os_encoding` matches HotSpot **5/5** across the
+   redirection matrix and at both console code pages. The decision is now split
+   out of the syscalls (`windows_stream_encoding_for`) so the matrix is a unit
+   test rather than only a comment.
+
+   Still unmeasured on Windows: everything ABOVE the property, because no
+   CratonVM binary has been BUILT on Windows and run against §1's witness —
+   only `cratonvm_native_api` was compiled and executed there. The bytes
+   `System.out` puts on a Windows console are still inferred from the Linux
+   arm of §10, which §3 argues is the same mechanism.

@@ -107,13 +107,20 @@ pub mod concurrent_mark;
 pub mod evac_pool;
 pub mod external_roots;
 pub mod g1;
+pub mod g1_cards;
 pub mod g1_concurrent;
+pub mod heap_reservation;
 pub mod gc;
 /// Card / remembered-set cost counters and the per-cycle collector-decision
 /// record (see [`gc_metrics::gc_metrics_report`] and
 /// [`gc_metrics::collector_decision_report`]).
 pub mod gc_metrics;
 pub mod gc_quiescence;
+/// Parallel evacuation for the generational young (Cheney) copy phase — the
+/// copy-then-CAS forwarding protocol, per-worker to-space buffers, and the
+/// work-sharing closure. Driven only by [`gen_heap`]; the census counters are
+/// public so a run can say whether the parallel path engaged.
+pub mod gen_evac;
 pub mod gen_heap;
 pub mod heap;
 pub mod mark_bitmap;
@@ -124,6 +131,10 @@ pub mod old_gen;
 pub mod pinned;
 pub mod reference;
 pub mod region;
+/// Heap backing store: reserve address space, commit it in granules, and give
+/// it back. See the module docs for why the `alloc_zeroed` block it replaces
+/// charged the whole of `-Xmx` at startup on Windows and never returned a byte.
+pub mod reservation;
 #[cfg(feature = "gpu-offload")]
 pub mod safepoint;
 pub mod satb;
@@ -182,12 +193,12 @@ pub use gc_metrics::{
     collector_decision_report, gc_metrics_report, CollectorDecision, GcMetricsRaw, GcMetricsReport,
 };
 pub use gen_heap::{
-    clear_jit_read_bounds, clear_jit_ref_store_plan, jit_read_bounds_addr,
+    clear_jit_read_bounds, clear_jit_ref_store_plan, jit_g1_barrier_addr, jit_read_bounds_addr,
     jit_ref_store_gate_addrs, jit_region_bounds_addr, publish_jit_read_bounds,
     publish_jit_ref_store_plan, set_jit_ref_store_post_active, set_jit_ref_store_pre_active,
-    GenerationalHeap, HeapStats, HeapStatsSnapshot, JitReadBoundsTable, JitRefStoreGates,
-    JitRegionBoundsTable, JIT_READ_BOUNDS, JIT_REF_STORE_GATES, JIT_REGION_BOUNDS,
-    JIT_YOUNG_FLOOR_AGE_ZERO,
+    GenerationalHeap, HeapStats, HeapStatsSnapshot, JitG1BarrierTable, JitReadBoundsTable,
+    JitRefStoreGates, JitRegionBoundsTable, JIT_G1_BARRIER, JIT_READ_BOUNDS, JIT_REF_STORE_GATES,
+    JIT_REGION_BOUNDS, JIT_YOUNG_FLOOR_AGE_ZERO,
 };
 pub use heap::{ArrayElementType, Heap, ObjectHeader, ObjectKind};
 pub use mark_bitmap::MarkBitmap;

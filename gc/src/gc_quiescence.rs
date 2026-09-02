@@ -481,6 +481,8 @@ fn peer_coverage_counters_inner() -> (usize, usize, usize) {
 /// deposit, and a pause that reaches only one of them is still cleared.
 pub fn reset_peer_proven_jit_depth() {
     peer_proven_depth_reset_inner();
+    // The helper-window pins describe peers frozen during THIS cycle only.
+    clear_xt_cycle_pinned_jit_roots();
 }
 
 /// A cooperatively-parking peer deposits `depth` JIT entries it has just PROVEN
@@ -841,12 +843,18 @@ pub fn begin_moving_young_coverage_cycle() {
     coverage_incomplete_set(false);
     incomplete_reason_clear();
     unrewritable_peer_state_set(false);
+    CONSERVATIVE_JIT_SCANS.store(0, Ordering::Relaxed);
     // The cross-thread handshake ledger is per-PAUSE and only ever read as
     // "does this account for every peer JIT entry?", so a value carried over
     // from the previous pause would be an over-count — the one direction that
     // could license a relocation nobody proved. Clear it here and again in the
     // barrier's `request_stw`; see `reset_peer_proven_jit_depth`.
     peer_proven_depth_reset_inner();
+    // Same scope, same reason: this cycle's helper-window pins describe peers
+    // frozen during THIS cycle. Cleared here as well as in
+    // `reset_peer_proven_jit_depth`, because this entry point does not go
+    // through it and a pause that reaches only one of the two is still cleared.
+    clear_xt_cycle_pinned_jit_roots();
 }
 
 /// Whether this cycle's root scan touched state belonging to a peer thread that
@@ -1612,6 +1620,7 @@ pub fn clear_pinned_jit_roots() {
 /// owned by the calling thread.
 pub fn add_pinned_jit_root(addr: usize) {
     arm_pinned_guard();
+    CONSERVATIVE_JIT_SCANS.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut map) = pinned_jit_map().lock() {
         map.entry(std::thread::current().id())
             .or_default()
@@ -1624,6 +1633,10 @@ pub fn add_pinned_jit_root(addr: usize) {
 /// always reflect its CURRENT live JIT frames.
 pub fn publish_pinned_jit_roots(addrs: &[usize]) {
     arm_pinned_guard();
+    // BEFORE the emptiness test below. "This thread looked and found nothing"
+    // and "this thread never looked" are different facts and the map cannot
+    // hold the difference -- see `conservative_jit_scans`.
+    CONSERVATIVE_JIT_SCANS.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut map) = pinned_jit_map().lock() {
         let tid = std::thread::current().id();
         if addrs.is_empty() {
@@ -1634,20 +1647,112 @@ pub fn publish_pinned_jit_roots(addrs: &[usize]) {
     }
 }
 
+/// How many threads have published a conservative JIT-frame scan since
+/// [`begin_moving_young_coverage_cycle`] reset the count.
+///
+/// # Why a count and not just the pin set
+///
+/// [`pinned_jit_roots_snapshot`] is EMPTY in two completely different
+/// situations: nobody found a conservative root (fine -- there is nothing to
+/// pin), and nobody looked (fatal -- a collector that pins by value would then
+/// pin nothing and relocate everything, believing it was protected).
+///
+/// A consumer that treats the empty set as a licence needs to be able to tell
+/// those apart, and the set itself cannot. This is the discriminator: a zero
+/// here beside live compiled frames means the instrument was armed where it
+/// cannot fire, which is a refusal rather than a pass.
+///
+/// Bumped by both publication paths, including a publication of an EMPTY
+/// vector -- "this thread looked and found nothing" is exactly the fact that
+/// has to be distinguishable.
+pub fn conservative_jit_scans() -> usize {
+    CONSERVATIVE_JIT_SCANS.load(Ordering::Relaxed)
+}
+
+/// Conservative JIT-frame scans published this cycle. See
+/// [`conservative_jit_scans`].
+static CONSERVATIVE_JIT_SCANS: AtomicUsize = AtomicUsize::new(0);
+
 /// Snapshot the conservative-pinned-JIT-root addresses published by ALL
 /// threads. `G1Collector` maps these to regions it must exclude from the
 /// collection set.
 pub fn pinned_jit_roots_snapshot() -> Vec<usize> {
-    match pinned_jit_map().lock() {
+    let mut out: Vec<usize> = match pinned_jit_map().lock() {
         Ok(map) => map.values().flat_map(|s| s.iter().copied()).collect(),
         Err(_) => Vec::new(),
+    };
+    // Plus the peers nobody could publish FOR: see `XT_CYCLE_PINNED_JIT_ROOTS`.
+    if let Ok(set) = xt_cycle_pin_set().lock() {
+        out.extend(set.iter().copied());
     }
+    out
 }
 
 /// Count of conservative-pinned JIT roots currently published (diagnostics).
 pub fn pinned_jit_root_count() -> usize {
-    match pinned_jit_map().lock() {
+    let per_thread: usize = match pinned_jit_map().lock() {
         Ok(map) => map.values().map(|s| s.len()).sum(),
+        Err(_) => 0,
+    };
+    per_thread + xt_cycle_pinned_jit_root_count()
+}
+
+// ---------------------------------------------------------------------------
+// Cross-thread HELPER-WINDOW pins (this cycle only)
+// ---------------------------------------------------------------------------
+//
+// `PINNED_JIT_ROOTS_BY_THREAD` above is published BY EACH THREAD, at its own
+// safepoint arrival or blocking-region entry. A helper-window peer is exactly
+// the thread that reached NEITHER: it was interrupted by the collector's signal
+// while inside a Rust helper called from compiled code, so it has no entry, and
+// the scan that recovers its roots runs on the COLLECTOR's thread and cannot
+// publish under the peer's `ThreadId`.
+//
+// Without somewhere to put them, those roots were only ever marked, and the
+// cycle refused to relocate at all (`incomplete_reason::XT_HELPER_WINDOW`). On
+// `org.h2.test.jdbc.TestCachedQueryResults` that is 219 of 227 refusals -- the
+// entire reason ZGC never compacts on the H2 fragmentation family.
+//
+// The set is per-CYCLE rather than per-thread because that is its real scope:
+// `helper_window_pass` recomputes it from scratch on every collection, and the
+// peer it describes has resumed by the next one. `begin_moving_young_coverage_cycle`
+// clears it, which is the same point that clears the coverage verdict it used
+// to be expressed as.
+static XT_CYCLE_PINNED_JIT_ROOTS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<usize>>,
+> = std::sync::OnceLock::new();
+
+fn xt_cycle_pin_set() -> &'static std::sync::Mutex<std::collections::HashSet<usize>> {
+    XT_CYCLE_PINNED_JIT_ROOTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Pin `addrs` for the remainder of this collection.
+///
+/// The caller must have recovered them from a COMPLETE conservative scan of the
+/// peer -- its register file AND its whole readable stack band. A partial scan
+/// must keep refusing the cycle instead: pinning what you found does not help
+/// when what you missed is also unrewritable.
+pub fn add_xt_cycle_pinned_jit_roots(addrs: &[usize]) {
+    if addrs.is_empty() {
+        return;
+    }
+    if let Ok(mut set) = xt_cycle_pin_set().lock() {
+        set.extend(addrs.iter().copied());
+    }
+}
+
+/// Drop this cycle's helper-window pins. Called from
+/// [`begin_moving_young_coverage_cycle`].
+pub fn clear_xt_cycle_pinned_jit_roots() {
+    if let Ok(mut set) = xt_cycle_pin_set().lock() {
+        set.clear();
+    }
+}
+
+/// How many helper-window pins the current cycle published (diagnostics).
+pub fn xt_cycle_pinned_jit_root_count() -> usize {
+    match xt_cycle_pin_set().lock() {
+        Ok(set) => set.len(),
         Err(_) => 0,
     }
 }
@@ -1768,6 +1873,7 @@ pub fn publish_xt_helper_window(windows: u64, roots: u64) {
     XT_HW_WINDOWS_LAST_CYCLE.fetch_add(windows, Ordering::Relaxed);
     XT_HW_ROOTS_LAST_CYCLE.fetch_add(roots, Ordering::Relaxed);
 }
+
 
 /// `(passes, taken_over, unclassified, roots, hw_windows, hw_roots)` for the
 /// cycle currently in progress.

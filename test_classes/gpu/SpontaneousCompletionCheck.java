@@ -2,8 +2,9 @@
 // followups item 3 (2026-07-12): a GpuFuture must complete on its own,
 // with ZERO isDone()/getNow()/get() calls in between dispatch and
 // completion — driven by the vm/src/runtime/offload.rs completion
-// reaper thread waking off the cuLaunchHostFunc host callback, not by
-// the application polling.
+// reaper thread, not by the application polling. (Since 2026-09-02 the
+// reaper polls the completion event; the cuLaunchHostFunc callback it
+// used to wake off is opt-in via CRATONVM_GPU_HOST_CALLBACK=1.)
 //
 // NOT YET RUN: this needs the external craton-gpu-java repo (the
 // `craton.gpu.GpuExecutor`/`GpuFuture` classes below) checked out

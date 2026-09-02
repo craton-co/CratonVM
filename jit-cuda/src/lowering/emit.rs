@@ -274,6 +274,37 @@ fn if_conversion_budget_from_flags() -> u32 {
     })
 }
 
+/// What the kernel's dispatch guard has proved about one register.
+///
+/// The guard every counted-loop kernel opens with — `if (tid >= bound)
+/// return;` — is a range check the body then repeats at every array
+/// access. For the overwhelmingly common shape, `arr[i]` where `i` is
+/// the induction variable, the repeat is provably redundant: the guard
+/// already established `0 <= tid < bound`, and if `bound` IS that
+/// array's length there is nothing left to check.
+///
+/// The `0 <=` half is not free, and getting it wrong would be a heap
+/// overwrite rather than a slow kernel. `tid` is
+/// `ctaid.x * ntid.x + tid.x + tid_base`, computed in `u32` and
+/// reinterpreted as `s32`; a launch covering `i32::MAX` elements creates
+/// up to `block - 1` threads past `2^31`, whose `s32` index is NEGATIVE.
+/// A signed `tid >= bound` test lets those through — today they are
+/// caught by the per-access `index < 0` check and deopt to the CPU. So
+/// the guard has to prove non-negativity itself before the per-access
+/// check can be removed; see [`Emitter::emit_loop_guard`] for the two
+/// forms it emits and which one each bound gets.
+#[derive(Clone, Debug)]
+pub(crate) struct IndexProof {
+    /// The register proved to satisfy `0 <= index < bound`.
+    pub index: String,
+    /// The register holding that exclusive upper bound.
+    pub bound: String,
+    /// Which parameter's `.length` the bound IS, when it is one — the
+    /// case where an access to that same parameter needs no precondition
+    /// at all.
+    pub bound_is_param_len: Option<usize>,
+}
+
 /// All state the emitter needs while walking a method.
 pub(crate) struct Emitter<'a> {
     pub bytes: &'a [u8],
@@ -292,6 +323,56 @@ pub(crate) struct Emitter<'a> {
     /// `param_ptr_reg`) so each array op can index it instead of
     /// re-running `format!("p{param_idx}_len")` on every access.
     pub param_len_name: Vec<String>,
+    /// For each parameter index: the register its `pN_len` was loaded
+    /// into, once, in the prologue.
+    ///
+    /// AUDIT 2026-09-02: `emit_bounds_check` used to emit its own
+    /// `ld.param.s32` for the length on EVERY array access, plus a
+    /// fresh `mov.s32 %r, 0` for the constant it compared against. Both
+    /// are loop-invariant and neither depends on the access, so a kernel
+    /// touching three arrays paid six redundant instructions per
+    /// element. Loaded once here, in `bind_param_locals`, which
+    /// dominates every access by construction.
+    pub param_len_reg: Vec<Option<Reg>>,
+    /// What the dispatch guard has proved about the induction register.
+    ///
+    /// See [`IndexProof`] and `emit_bounds_check` for how a proof
+    /// retires an access's bounds check entirely.
+    pub(crate) index_proofs: Vec<IndexProof>,
+    /// Per-array preconditions discovered while walking the body, to be
+    /// spliced in at [`Emitter::prologue_splice_at`].
+    ///
+    /// A bounds check is retired by proving `bound <= pN_len` once for
+    /// the whole kernel rather than `index < pN_len` at every access.
+    /// Which arrays need such a precondition is only known after the
+    /// walk — and emitting one for every array parameter up front would
+    /// deopt kernels that never index that array at the loop bound, which
+    /// is a behaviour change, not an optimisation. So they accumulate
+    /// here and are spliced back to a dominating position at the end.
+    pub(crate) bounds_prologue: String,
+    /// Byte offset in `body` immediately after the dispatch guard, where
+    /// [`Emitter::bounds_prologue`] is spliced by `into_body`.
+    ///
+    /// `None` for a shape with no guard (straight-line kernels), where
+    /// nothing is proved and nothing is spliced.
+    pub(crate) prologue_splice_at: Option<usize>,
+    /// `(param index, bound register name)` pairs that already have a
+    /// precondition in `bounds_prologue`, so a kernel with twenty
+    /// accesses to one array emits one.
+    pub(crate) param_len_guarded: Vec<(usize, String)>,
+    /// Set while `try_emit_if_converted` is speculatively emitting an
+    /// arm whose text it may discard.
+    ///
+    /// A discarded arm must leave nothing behind — that is why the
+    /// speculation already saves and restores `writes_param_mask`,
+    /// `reads_param_mask` and `used_bounds_label`. Rather than add
+    /// `bounds_prologue` and `param_len_guarded` to that list, this flag
+    /// stops the one thing that writes them from running at all during
+    /// speculation. That is also the right ANSWER and not merely the
+    /// simpler bookkeeping: a speculated arm is code that may or may not
+    /// have executed, and hoisting a precondition out of it would apply
+    /// it to threads that were never going to take the branch.
+    pub(crate) speculating: bool,
     /// Local slot of the loop induction variable (if we are in a loop).
     pub iv_slot: Option<u16>,
     /// 2-D nested-loop follow-up: local slot of the INNER loop's
@@ -329,6 +410,14 @@ pub(crate) struct Emitter<'a> {
     /// Local slot used for the kernel result return (scalar return only).
     /// Populated by the post-loop walker when it sees the matching `*return`.
     pub ret_value_reg: Option<Reg>,
+    /// The per-thread contribution a reduction kernel folds across its
+    /// warp before the one atomic per warp. See [`Emitter::finalize_epilogue`].
+    ///
+    /// Created by the first guard emitted for a reduction kernel
+    /// ([`Emitter::guard_exit_label`]), so that a thread the guard
+    /// retires can still join the warp tree carrying a zero rather than
+    /// leave a hole in it. `None` for every other shape.
+    pub reduction_acc: Option<Reg>,
     /// Phase 10 #2 — bit-set of parameter indices the body writes to
     /// via `*astore`. Each `array_store*` arm in the opcode dispatch
     /// resolves the array reference back to its parameter via
@@ -378,6 +467,12 @@ impl<'a> Emitter<'a> {
             param_len_name: (0..sig.param_kinds.len())
                 .map(|i| format!("p{i}_len"))
                 .collect(),
+            param_len_reg: vec![None; sig.param_kinds.len()],
+            index_proofs: Vec::new(),
+            bounds_prologue: String::new(),
+            prologue_splice_at: None,
+            param_len_guarded: Vec::new(),
+            speculating: false,
             iv_slot: None,
             iv_slot_inner: None,
             bound_reg: None,
@@ -388,6 +483,7 @@ impl<'a> Emitter<'a> {
             if_convert_budget: if_conversion_budget_from_flags(),
             hit_back_branch: false,
             ret_value_reg: None,
+            reduction_acc: None,
             writes_param_mask: 0,
             reads_param_mask: 0,
             cp,
@@ -445,6 +541,16 @@ impl<'a> Emitter<'a> {
                     writeln!(self.body, "    ld.param.u64 {}, [p{i}_ptr];", r.name).unwrap();
                     self.param_ptr_reg[i] = r.name.clone();
                     self.locals.set(slot, r);
+                    // AUDIT 2026-09-02: hoist the length load. Every
+                    // bounds check used to emit its own
+                    // `ld.param.s32 [pN_len]`; it is loop-invariant, so
+                    // one load here — at a point that dominates every
+                    // access by construction — serves the whole kernel.
+                    // ptxas removes it again if the array is never
+                    // indexed, which is the only case it costs anything.
+                    let len = self.regs.fresh_reg(RegKind::S32);
+                    writeln!(self.body, "    ld.param.s32 {}, [p{i}_len];", len.name).unwrap();
+                    self.param_len_reg[i] = Some(len);
                     slot += 1;
                 }
             }
@@ -554,23 +660,63 @@ impl<'a> Emitter<'a> {
         self.tid_reg = Some(r);
     }
 
-    /// Emit `if (tid >= bound) ret;` using a fresh predicate register.
+    /// Emit the dispatch guard — `if (tid outside [0, bound)) return;` —
+    /// and record what it proves.
     ///
-    /// This `tid >= bound` dispatch (one thread runs iff `0 <= tid <
+    /// This `tid < bound` dispatch (one thread runs iff `0 <= tid <
     /// bound`) is the GPU analogue of the canonical Java loop
     /// `for (int i = 0; i < bound; i++)`. It is *only* correct for that
-    /// exact shape: stride +1, strict-`<` exit, and a start value that
-    /// is either `0` or has already been folded into `tid` by
+    /// exact shape: stride +1, strict-`<` exit, and a start value that is
+    /// either `0` or has already been folded into `tid` by
     /// `apply_loop_start_offset` (so `tid` here may really mean
     /// `tid + K`). The loop recognizer
-    /// ([`crate::lowering::loop_recog::detect_loop`]) has already
-    /// rejected every other shape — `<=`/`!=`/`>`/`>=` exits, non-unit
-    /// strides, negative or non-constant starts — before emission
-    /// reaches here. The `debug_assert!`s below pin that contract: if a
-    /// future change to the recognizer ever lets a non-canonical loop
-    /// through, a debug build trips here instead of silently corrupting
-    /// data.
-    pub fn emit_loop_guard(&mut self, bound: &Reg, loop_info: &CountedLoop) {
+    /// ([`crate::lowering::loop_recog::detect_loop`]) has already rejected
+    /// every other shape — `<=`/`!=`/`>`/`>=` exits, non-unit strides,
+    /// negative or non-constant starts — before emission reaches here.
+    /// The `debug_assert!`s below pin that contract: if a future change to
+    /// the recognizer ever lets a non-canonical loop through, a debug
+    /// build trips here instead of silently corrupting data.
+    ///
+    /// # Two forms, and why the guard has to prove `tid >= 0`
+    ///
+    /// AUDIT 2026-09-02: the guard used to be a single `setp.ge.s32`,
+    /// which retires every thread whose index is too large and says
+    /// nothing about one whose index is negative. That was fine while
+    /// every access re-checked `index < 0` for itself. It stops being
+    /// fine the moment [`Emitter::prove_index_within_param`] uses the
+    /// guard to retire those checks — and the negative case is real, not
+    /// theoretical: `tid` is `ctaid.x * ntid.x + tid.x + tid_base`
+    /// computed in `u32` and reinterpreted as `s32`, so a launch covering
+    /// close to `i32::MAX` elements creates up to `block - 1` threads
+    /// past `2^31`, whose `s32` index is negative.
+    ///
+    /// * `bound_nonneg` — the bound is an array length, or a literal that
+    ///   is not negative. One `setp.ge.u32` then decides both halves:
+    ///   reinterpreted as `u32` a negative `tid` is at least `2^31`,
+    ///   which exceeds any bound that fits in a non-negative `s32`. Same
+    ///   instruction count as before, strictly more proved.
+    /// * otherwise — the bound is an `int` PARAMETER, which may legally be
+    ///   negative (`for (i = 0; i < n; i++)` with `n < 0` runs zero
+    ///   times). An unsigned compare would read that as an enormous bound
+    ///   and run the body, so this form keeps the signed comparison and
+    ///   pays one extra compare-and-branch to reject a negative `tid`
+    ///   explicitly.
+    ///
+    /// Retiring an out-of-range thread to `L_done` rather than to the
+    /// bounds-failure block is correct in both forms: such a thread
+    /// corresponds to no loop iteration at all, so there is nothing for
+    /// the CPU to re-run.
+    ///
+    /// `bound_is_param_len` names the parameter whose `.length` the bound
+    /// IS, when it is one — the case where an access to that same
+    /// parameter needs no precondition either.
+    pub fn emit_loop_guard(
+        &mut self,
+        bound: &Reg,
+        loop_info: &CountedLoop,
+        bound_is_param_len: Option<usize>,
+        bound_nonneg: bool,
+    ) {
         debug_assert_eq!(
             loop_info.exit_op, 0xA2,
             "emit_loop_guard: counted loop reached emission with a \
@@ -584,14 +730,38 @@ impl<'a> Emitter<'a> {
             loop_info.iv_stride
         );
         let tid = self.tid_reg.clone().expect("emit_tid was called");
-        let p = self.regs.fresh_reg(RegKind::Pred);
-        writeln!(
-            self.body,
-            "    setp.ge.s32 {}, {}, {};",
-            p.name, tid.name, bound.name
-        )
-        .unwrap();
-        writeln!(self.body, "    @{} bra L_done;", p.name).unwrap();
+        let exit = self.guard_exit_label();
+        if bound_nonneg {
+            let p = self.regs.fresh_reg(RegKind::Pred);
+            writeln!(
+                self.body,
+                "    setp.ge.u32 {}, {}, {};",
+                p.name, tid.name, bound.name
+            )
+            .unwrap();
+            writeln!(self.body, "    @{} bra {exit};", p.name).unwrap();
+        } else {
+            let neg = self.regs.fresh_reg(RegKind::Pred);
+            writeln!(self.body, "    setp.lt.s32 {}, {}, 0;", neg.name, tid.name).unwrap();
+            writeln!(self.body, "    @{} bra {exit};", neg.name).unwrap();
+            let p = self.regs.fresh_reg(RegKind::Pred);
+            writeln!(
+                self.body,
+                "    setp.ge.s32 {}, {}, {};",
+                p.name, tid.name, bound.name
+            )
+            .unwrap();
+            writeln!(self.body, "    @{} bra {exit};", p.name).unwrap();
+        }
+        self.index_proofs.push(IndexProof {
+            index: tid.name.clone(),
+            bound: bound.name.clone(),
+            bound_is_param_len,
+        });
+        // Everything emitted from here on is dominated by the guard, so
+        // this is where a per-array precondition discovered during the
+        // walk gets spliced back to. See `Emitter::bounds_prologue`.
+        self.prologue_splice_at = Some(self.body.len());
     }
 
     /// 2-D nested-loop follow-up: emit the nested-loop guard and index
@@ -661,7 +831,8 @@ impl<'a> Emitter<'a> {
             p.name, tid.name, total.name
         )
         .unwrap();
-        writeln!(self.body, "    @{} bra L_done;", p.name).unwrap();
+        let exit = self.guard_exit_label();
+        writeln!(self.body, "    @{} bra {exit};", p.name).unwrap();
         let i = self.regs.fresh_reg(RegKind::S32);
         let j = self.regs.fresh_reg(RegKind::S32);
         writeln!(
@@ -682,9 +853,77 @@ impl<'a> Emitter<'a> {
         self.tid_reg_inner = Some(j);
     }
 
-    /// Append the bounds-check failure block and the kernel epilogue
-    /// label. The kernel always ends with an unconditional `ret;`.
+    /// Where a dispatch guard sends a thread that has no iteration.
+    ///
+    /// `L_done` for every kernel but a reduction. A reduction folds each
+    /// thread's contribution across its warp with `shfl.sync`, and a
+    /// shuffle reads lanes by NUMBER: a lane that has already returned
+    /// is a hole the tree would read undefined bits from. So a retired
+    /// thread in a reduction kernel does not return — it joins the tree
+    /// at `L_reduce_zero` contributing zero, which is the identity the
+    /// host pre-zeroes the accumulator with. This is also where the
+    /// accumulator register is minted, so both the zero path and the
+    /// real return write the same register.
+    fn guard_exit_label(&mut self) -> &'static str {
+        if !self.sig.is_reduction {
+            return "L_done";
+        }
+        if self.reduction_acc.is_none() {
+            let kind = match self.sig.return_kind {
+                ParamKind::I32 => RegKind::S32,
+                ParamKind::I64 => RegKind::S64,
+                ParamKind::F32 => RegKind::F32,
+                ParamKind::F64 => RegKind::F64,
+                // The analyzer only flags a scalar-returning method as a
+                // reduction; anything else here is a contract violation,
+                // and `scalar_return` will refuse the kind loudly.
+                _ => return "L_done",
+            };
+            self.reduction_acc = Some(self.regs.fresh_reg(kind));
+        }
+        "L_reduce_zero"
+    }
+
+    /// Append the reduction epilogue (when there is one), the bounds-check
+    /// failure block and the kernel epilogue label. The kernel always
+    /// ends with an unconditional `ret;`.
+    ///
+    /// # The reduction epilogue
+    ///
+    /// AUDIT 2026-09-02. Until this date a reduction kernel issued one
+    /// `red.global.add` PER THREAD into the single accumulator: a dot
+    /// product over 2^24 elements was 16.7M atomics to one cache line,
+    /// which is the atomic unit's worst case and the one thing that made
+    /// the emitted kernel unlike anything hand-written. Now each warp
+    /// folds its 32 contributions with five `shfl.sync.down` steps and
+    /// lane 0 issues the one atomic — 32x fewer.
+    ///
+    /// Exact for `int`/`long`: two's-complement addition is associative,
+    /// so reordering the sum changes nothing. Float reductions were
+    /// already excluded from the transparent path for reordering the sum
+    /// (`offload::try_dispatch`); they keep that exclusion.
+    ///
+    /// # Why the mask is all lanes, and what an exited lane means
+    ///
+    /// The dispatch guard sends a thread with no iteration to
+    /// `L_reduce_zero` rather than to `ret` (see
+    /// [`Emitter::guard_exit_label`]), so every lane that could reach the
+    /// tree does, carrying a real value or a zero. The only lanes that
+    /// EXIT before the tree are bounds-failure deopts — and a kernel that
+    /// took one has its whole result discarded by the host, so the
+    /// undefined bits a `shfl.sync` reads from an exited lane cannot reach
+    /// a Java program. On sm_70+ an exited lane named in the mask does
+    /// not stall the shuffle; it simply supplies unspecified data.
+    ///
+    /// The atomic is skipped for a warp whose folded value is zero
+    /// (`setp.ne`): a warp past the end of the iteration space, or a
+    /// float warp that summed to `+0.0`. Adding zero to a pre-zeroed cell
+    /// is a no-op in every case except `-0.0`, and `0.0 + -0.0` is `0.0`
+    /// in Java too, so the skip is invisible.
     pub fn finalize_epilogue(&mut self) {
+        if let Some(acc) = self.reduction_acc.clone() {
+            self.emit_reduction_epilogue(&acc);
+        }
         // Common "done" label — used by the loop guard and the return
         // paths. We just fall through to ret.
         writeln!(self.body, "L_done:").unwrap();
@@ -712,47 +951,215 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Emit a bounds check: if `index >= len` jump to failure label.
-    /// `param_idx` selects the cached `pN_len` kernel-parameter name
-    /// (see `param_len_name`).
+    /// Emit the Java bounds check for `index` against parameter
+    /// `param_idx`'s length: on failure, jump to the shared failure
+    /// block, which raises the flag the host reads to deopt.
+    ///
+    /// # One unsigned compare, not two signed ones
+    ///
+    /// Java's check is `index < 0 || index >= len`, and this used to
+    /// emit it literally: materialise `0`, compare, branch, compare
+    /// again, branch again — six instructions and two branches per
+    /// access. A single unsigned compare decides both halves at once.
+    /// Reinterpreted as `u32` a negative index is at least `2^31`, and
+    /// an array length is at most `i32::MAX`, so `index >=u len` holds
+    /// exactly when `index < 0 || index >= len` does. This is the same
+    /// identity HotSpot's own bounds check has used for decades.
+    ///
+    /// It rests on `pN_len` being non-negative, which the marshaller
+    /// guarantees: it is a JVM array length, read from the object
+    /// header, and the JVM has no negative-length array.
+    ///
+    /// # …and often no compare at all
+    ///
+    /// Before emitting anything, ask whether the dispatch guard already
+    /// settled it. See [`IndexProof`] for what the guard proves and
+    /// [`Emitter::prove_index_within_param`] for the two ways a proof
+    /// discharges an access.
     fn emit_bounds_check(&mut self, index: &Reg, param_idx: usize) {
+        if self.prove_index_within_param(index, param_idx) {
+            return;
+        }
         self.used_bounds_label = true;
-        let len = self.regs.fresh_reg(RegKind::S32);
-        let p_neg = self.regs.fresh_reg(RegKind::Pred);
-        let p_ge = self.regs.fresh_reg(RegKind::Pred);
+        let len = self.param_len_operand(param_idx);
+        let p = self.regs.fresh_reg(RegKind::Pred);
+        // `.u32` on registers declared `.s32`: PTX's relaxed
+        // source-operand typing makes signed and unsigned integers of the
+        // same width compatible, and the reinterpretation is the point.
+        writeln!(
+            self.body,
+            "    setp.ge.u32 {}, {}, {};",
+            p.name, index.name, len
+        )
+        .unwrap();
+        writeln!(self.body, "    @{} bra {};", p.name, self.bounds_fail_label).unwrap();
+    }
+
+    /// The operand naming parameter `param_idx`'s length — the register
+    /// `bind_param_locals` hoisted it into, or a freshly-loaded one for a
+    /// caller that never ran `bind_param_locals` (only the unit tests
+    /// that drive `walk` directly do that).
+    fn param_len_operand(&mut self, param_idx: usize) -> String {
+        if let Some(r) = &self.param_len_reg[param_idx] {
+            return r.name.clone();
+        }
+        let r = self.regs.fresh_reg(RegKind::S32);
         writeln!(
             self.body,
             "    ld.param.s32 {}, [{}];",
-            len.name, self.param_len_name[param_idx]
+            r.name, self.param_len_name[param_idx]
         )
         .unwrap();
-        // index < 0 also fails — Java semantics.
-        let zero = self.regs.fresh_reg(RegKind::S32);
-        writeln!(self.body, "    mov.s32 {}, 0;", zero.name).unwrap();
+        let name = r.name.clone();
+        self.param_len_reg[param_idx] = Some(r);
+        name
+    }
+
+    /// Whether the dispatch guard already proves `index` is in range for
+    /// parameter `param_idx`, so the per-access check can be omitted.
+    ///
+    /// Two ways it can:
+    ///
+    /// 1. **The bound IS this array's length.** `for (i = 0; i < a.length;
+    ///    i++) a[i] = …` — the guard retired every thread whose index
+    ///    falls outside `[0, a.length)` before the body started. Nothing
+    ///    to emit here, and nothing once per kernel either.
+    /// 2. **The bound is no larger than this array's length.** The other
+    ///    arrays in `out[i] = a[i] + b[i]`, whose lengths the guard says
+    ///    nothing about. One precondition per array — `if (a.length <
+    ///    bound) deopt;` — discharges every access to it, however many
+    ///    there are. It is spliced back to a dominating position (see
+    ///    [`Emitter::bounds_prologue`]) rather than left where it was
+    ///    discovered.
+    ///
+    /// Case 2 replaces a per-access check with a weaker precondition, not
+    /// a stronger one: it deopts exactly the launches on which some
+    /// access WOULD have gone out of bounds, and Java's semantics for
+    /// those is an `ArrayIndexOutOfBoundsException` anyway. It fires
+    /// earlier than the failing access, which the deopt contract already
+    /// permits — the host discards the device result and re-runs the
+    /// whole method on the CPU, where the exception is raised at the
+    /// right place with the right message.
+    ///
+    /// Deliberately NOT applied to the nested (2-D) shape. There the
+    /// guard is `tid < R * C` with the product computed in `s32`, so a
+    /// large `R` and `C` overflow it and a "proof" resting on it would
+    /// admit indices past the end. Fixing that means widening the
+    /// multiply, which changes the nested guard's shape and its
+    /// measurements; until then the nested kernels keep the (now
+    /// single-compare) check. `emit_nested_loop_guard_and_decompose`
+    /// registers no proof, so this returns `false` there by construction.
+    fn prove_index_within_param(&mut self, index: &Reg, param_idx: usize) -> bool {
+        let Some(proof) = self
+            .index_proofs
+            .iter()
+            .find(|p| p.index == index.name)
+            .cloned()
+        else {
+            return false;
+        };
+        if proof.bound_is_param_len == Some(param_idx) {
+            return true;
+        }
+        if self
+            .param_len_guarded
+            .iter()
+            .any(|(i, b)| *i == param_idx && *b == proof.bound)
+        {
+            return true;
+        }
+        if !self.unconditional_since_guard() {
+            // The access sits behind a branch, so it may not execute.
+            // A precondition hoisted out of it would deopt launches on
+            // which Java would have thrown nothing at all — a silent
+            // performance cliff rather than a wrong answer, but a
+            // behaviour change either way. Fall back to the per-access
+            // check, which is still one unsigned compare rather than the
+            // six this used to be.
+            //
+            // Case 1 above does NOT need this guard: it emits nothing.
+            // It is a statement about the VALUE of the index, which the
+            // dispatch guard established for every thread that reached
+            // the body, and that stays true wherever inside the body the
+            // access happens to sit.
+            return false;
+        }
+        let Some(len) = self.param_len_reg[param_idx].clone() else {
+            // No hoisted length means `bind_param_locals` never ran — a
+            // unit test driving `walk` directly. Nothing to prove
+            // against; fall back to the per-access check.
+            return false;
+        };
+        // `bound <= pN_len` plus the guard's `0 <= index < bound` gives
+        // `0 <= index < pN_len`, which is the check being retired.
+        // Signed, not unsigned: a `ParamScalar` bound may legitimately be
+        // negative (a loop that runs zero times), and the guard's own
+        // form already accounts for that.
+        self.used_bounds_label = true;
+        let p = self.regs.fresh_reg(RegKind::Pred);
         writeln!(
-            self.body,
+            self.bounds_prologue,
             "    setp.lt.s32 {}, {}, {};",
-            p_neg.name, index.name, zero.name
+            p.name, len.name, proof.bound
         )
         .unwrap();
         writeln!(
-            self.body,
+            self.bounds_prologue,
             "    @{} bra {};",
-            p_neg.name, self.bounds_fail_label
+            p.name, self.bounds_fail_label
         )
         .unwrap();
+        self.param_len_guarded.push((param_idx, proof.bound));
+        true
+    }
+
+    /// Whether everything emitted since the dispatch guard is
+    /// straight-line, so the current emission point is reached by every
+    /// thread that passed the guard.
+    ///
+    /// Answered by looking for a branch in the body text rather than by
+    /// tracking block structure, for the same reason
+    /// `check_every_branch_has_its_label` and `speculation_cost` read the
+    /// text: there is no IR to ask. It is sound in the direction that
+    /// matters — any conditional control flow in this emitter goes
+    /// through a `bra`, so no branch means no condition. A `bra` that is
+    /// unconditional (the end-of-body jump to `L_done`) reads as
+    /// conditional here and merely gives up an optimisation.
+    ///
+    /// `false` during speculation and for shapes with no guard at all.
+    fn unconditional_since_guard(&self) -> bool {
+        if self.speculating {
+            return false;
+        }
+        match self.prologue_splice_at {
+            Some(at) if at <= self.body.len() => !self.body[at..].contains("bra "),
+            _ => false,
+        }
+    }
+
+    /// Emit the address of element `index` of the array based at `base`,
+    /// and return the register holding it.
+    ///
+    /// One instruction. `mad.wide.s32 %rd, %r, <size>, %rd_base`
+    /// sign-extends the 32-bit index, multiplies it by the element size
+    /// and adds the 64-bit base, which is a single `IMAD.WIDE` in SASS.
+    ///
+    /// AUDIT 2026-09-02: this used to be three — `cvt.s64.s32` to widen,
+    /// `mul.lo.s64` to scale, `add.u64` to offset — plus two 64-bit
+    /// temporaries live across them. ptxas contracts that pattern
+    /// sometimes and is not obliged to, and certainly not across the
+    /// bounds-check branches that used to sit in between. The register
+    /// saving matters as much as the instruction count: 64-bit
+    /// temporaries are what push an index-heavy kernel into spilling.
+    fn emit_element_addr(&mut self, index: &Reg, base: &Reg, elem_size: usize) -> Reg {
+        let addr = self.regs.fresh_reg(RegKind::U64);
         writeln!(
             self.body,
-            "    setp.ge.s32 {}, {}, {};",
-            p_ge.name, index.name, len.name
+            "    mad.wide.s32 {}, {}, {}, {};",
+            addr.name, index.name, elem_size, base.name
         )
         .unwrap();
-        writeln!(
-            self.body,
-            "    @{} bra {};",
-            p_ge.name, self.bounds_fail_label
-        )
-        .unwrap();
+        addr
     }
 
     /// Walk a region of bytecode from `start` to `end` (exclusive),
@@ -1184,6 +1591,10 @@ impl<'a> Emitter<'a> {
         let saved_bounds_label = self.used_bounds_label;
 
         let real_body = std::mem::take(&mut self.body);
+        // Nothing emitted from here to the restore below may escape into
+        // the kernel prologue; see the `speculating` field.
+        let was_speculating = self.speculating;
+        self.speculating = true;
         let then_ok = self.walk_straight(plan.then_start, plan.then_goto_pc, loop_info);
         let then_text = std::mem::take(&mut self.body);
         let then_state = BlockState {
@@ -1205,6 +1616,7 @@ impl<'a> Emitter<'a> {
         };
 
         self.body = real_body;
+        self.speculating = was_speculating;
         let budget = self.if_convert_budget;
         let cost = speculation_cost(&then_text)
             .zip(speculation_cost(&else_text))
@@ -2130,8 +2542,8 @@ impl<'a> Emitter<'a> {
             0x88 => self.conv("cvt.s32.s64", RegKind::S64, RegKind::S32)?, // l2i
             0x89 => self.conv("cvt.rn.f32.s64", RegKind::S64, RegKind::F32)?, // l2f
             0x8A => self.conv("cvt.rn.f64.s64", RegKind::S64, RegKind::F64)?, // l2d
-            0x8B => self.conv("cvt.rzi.s32.f32", RegKind::F32, RegKind::S32)?, // f2i
-            0x8C => self.conv("cvt.rzi.s64.f32", RegKind::F32, RegKind::S64)?, // f2l
+            0x8B => self.conv_float_to_int("cvt.rzi.s32.f32", RegKind::F32, RegKind::S32)?, // f2i
+            0x8C => self.conv_float_to_int("cvt.rzi.s64.f32", RegKind::F32, RegKind::S64)?, // f2l
             // f2d — but see `float_sqrt_triple_at`: when this widen exists
             // only to reach `Math.sqrt(D)D` and is narrowed straight back,
             // leave the value as F32 and let `invokestatic` emit a single
@@ -2139,8 +2551,8 @@ impl<'a> Emitter<'a> {
             // later arms the collapse is in progress.
             0x8D if self.float_sqrt_triple_at(pc) => {}
             0x8D => self.conv("cvt.f64.f32", RegKind::F32, RegKind::F64)?, // f2d
-            0x8E => self.conv("cvt.rzi.s32.f64", RegKind::F64, RegKind::S32)?, // d2i
-            0x8F => self.conv("cvt.rzi.s64.f64", RegKind::F64, RegKind::S64)?, // d2l
+            0x8E => self.conv_float_to_int("cvt.rzi.s32.f64", RegKind::F64, RegKind::S32)?, // d2i
+            0x8F => self.conv_float_to_int("cvt.rzi.s64.f64", RegKind::F64, RegKind::S64)?, // d2l
             // d2f — a no-op when the value on the stack is already F32,
             // which happens only for the collapsed float-sqrt triple.
             0x90 if self.stack.0.last().map(|r| r.kind) == Some(RegKind::F32) => {}
@@ -3783,6 +4195,44 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// A unary float operation — in practice `neg.f32` for `fneg`.
+    ///
+    /// # NaN payloads are NOT preserved, and that is allowed
+    ///
+    /// AUDIT 2026-09-02. Measured on an RTX 2060: every NaN that reaches
+    /// `neg.f32`, `add.f32`, `mul.f32` or `div.rn.f32` comes back as
+    /// `0x7fffffff` — CUDA's canonical NaN — regardless of the payload
+    /// that went in. HotSpot propagates the payload, and for negation it
+    /// flips only the sign bit, so `Float.floatToRawIntBits` sees
+    /// different answers on the two.
+    ///
+    /// This is not a defect and is deliberately not fixed:
+    ///
+    /// * JLS §4.2.3 does not specify which NaN bit pattern an arithmetic
+    ///   operation produces, and the PTX ISA says outright that "NaN
+    ///   inputs yield an unspecified NaN". Both sides are conforming.
+    /// * Nothing an ordinary program does can see it. NaN compares false
+    ///   against everything including itself, `Float.isNaN` is unaffected,
+    ///   and a NaN's payload does not influence any later result's value
+    ///   or its NaN-ness. The single observable is
+    ///   `floatToRawIntBits`/`doubleToRawLongBits`.
+    /// * `fneg` alone COULD be made exact — a `mov.b32` / `xor.b32
+    ///   0x80000000` / `mov.b32` triple is a pure sign flip that
+    ///   preserves the payload, which is what IEEE 754 §5.5.1 actually
+    ///   specifies negation to be. It is not done because it would make
+    ///   one of the four consistent with HotSpot and leave the other
+    ///   three canonicalising, which is a worse thing to document than
+    ///   "none of them preserve payloads": a program that survived
+    ///   `-x` would still be surprised by `x + 0.0f`.
+    ///
+    /// What IS specified, and what this crate therefore does guarantee,
+    /// is the NaN behaviour of float→integer conversion — see
+    /// [`Emitter::conv_float_to_int`], where the device was returning
+    /// MIN_VALUE against a JLS that says zero.
+    ///
+    /// `bench-gpu/arith-differential.sh` measures all of this; the
+    /// payload cases are the ones it reports as differing on the float
+    /// arithmetic kernels and passing everywhere else.
     fn unop_f32(&mut self, mnemonic: &str) -> Result<(), LoweringError> {
         let a = self.stack.pop()?;
         let r = self.regs.fresh_reg(RegKind::F32);
@@ -3846,6 +4296,87 @@ impl<'a> Emitter<'a> {
         let a = self.stack.pop()?;
         let r = self.regs.fresh_reg(to);
         writeln!(self.body, "    {} {}, {};", mnemonic, r.name, a.name).unwrap();
+        self.stack.push(r);
+        Ok(())
+    }
+
+    /// A float→integer narrowing conversion (`f2i`/`f2l`/`d2i`/`d2l`),
+    /// with the NaN case Java specifies and PTX does not.
+    ///
+    /// JLS §5.1.3 is unambiguous: if the value is NaN the result of the
+    /// conversion is **zero**. Everything else about the conversion —
+    /// round toward zero, saturate at the type's extremes — PTX's
+    /// `cvt.rzi` already does, and that half was measured correct.
+    ///
+    /// # AUDIT 2026-09-02: it was returning MIN_VALUE
+    ///
+    /// Found by differentially testing the emitter against HotSpot on an
+    /// RTX 2060 (`test_classes/gpu/GpuArithDifferential.java`). Per
+    /// element, over an input set built from raw bit patterns:
+    ///
+    /// ```text
+    ///   (int)  NaN   HotSpot 0    device -2147483648
+    ///   (long) NaN   HotSpot 0    device -9223372036854775808
+    /// ```
+    ///
+    /// 474 of 4096 elements wrong for `d2i`/`d2l`, 584 for `f2l`, with
+    /// CratonVM's own CPU path matching HotSpot exactly on all of them —
+    /// so the divergence is this lowering and nothing else.
+    ///
+    /// `f2i` (`cvt.rzi.s32.f32`) measured CORRECT on this device: 0 of
+    /// 4096. It gets the guard anyway. The PTX ISA does not promise
+    /// NaN→0 for any of these — it is silent, which is what let three of
+    /// the four differ from the fourth — so "correct on sm_75 today" is
+    /// not a property to build on, and two instructions is not a price
+    /// worth arguing about against a wrong answer.
+    ///
+    /// The guard is `setp.nan` on the SOURCE, not a comparison of the
+    /// result: the result of a NaN conversion is an ordinary integer and
+    /// carries no evidence of where it came from.
+    fn conv_float_to_int(
+        &mut self,
+        mnemonic: &str,
+        from: RegKind,
+        to: RegKind,
+    ) -> Result<(), LoweringError> {
+        let a = self.stack.pop()?;
+        let raw = self.regs.fresh_reg(to);
+        writeln!(self.body, "    {} {}, {};", mnemonic, raw.name, a.name).unwrap();
+        let is_nan = self.regs.fresh_reg(RegKind::Pred);
+        let src_suffix = match from {
+            RegKind::F32 => "f32",
+            RegKind::F64 => "f64",
+            other => {
+                return Err(LoweringError::Internal(format!(
+                    "conv_float_to_int: source must be a float kind, got {other:?}"
+                )))
+            }
+        };
+        // `x != x` is true exactly for NaN, and `setp.nan` says so
+        // directly rather than through a comparison whose own NaN
+        // behaviour would then need arguing about.
+        writeln!(
+            self.body,
+            "    setp.nan.{} {}, {}, {};",
+            src_suffix, is_nan.name, a.name, a.name
+        )
+        .unwrap();
+        let dst_suffix = match to {
+            RegKind::S32 => "s32",
+            RegKind::S64 => "s64",
+            other => {
+                return Err(LoweringError::Internal(format!(
+                    "conv_float_to_int: destination must be a signed integer kind, got {other:?}"
+                )))
+            }
+        };
+        let r = self.regs.fresh_reg(to);
+        writeln!(
+            self.body,
+            "    selp.{} {}, 0, {}, {};",
+            dst_suffix, r.name, raw.name, is_nan.name
+        )
+        .unwrap();
         self.stack.push(r);
         Ok(())
     }
@@ -3938,28 +4469,8 @@ impl<'a> Emitter<'a> {
         // Element read: see `reads_param_mask` (chunked-writeback guard).
         self.mark_param_read(param_idx);
         self.emit_bounds_check(&index, param_idx);
-        let offset = self.regs.fresh_reg(RegKind::U64);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
-        let addr = self.regs.fresh_reg(RegKind::U64);
+        let addr = self.emit_element_addr(&index, &array_ref, elem_size);
         let result = self.regs.fresh_reg(elem_kind);
-        writeln!(
-            self.body,
-            "    cvt.s64.s32 {}, {};",
-            byte_idx.name, index.name
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    mul.lo.s64 {}, {}, {};",
-            offset.name, byte_idx.name, elem_size
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    add.u64 {}, {}, {};",
-            addr.name, array_ref.name, offset.name
-        )
-        .unwrap();
         writeln!(
             self.body,
             "    ld.global{} {}, [{}];",
@@ -3977,22 +4488,9 @@ impl<'a> Emitter<'a> {
         // Element read: see `reads_param_mask` (chunked-writeback guard).
         self.mark_param_read(param_idx);
         self.emit_bounds_check(&index, param_idx);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
-        let addr = self.regs.fresh_reg(RegKind::U64);
+        let addr = self.emit_element_addr(&index, &array_ref, 1);
         let raw = self.regs.fresh_reg(RegKind::S32);
         let result = self.regs.fresh_reg(RegKind::S32);
-        writeln!(
-            self.body,
-            "    cvt.s64.s32 {}, {};",
-            byte_idx.name, index.name
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    add.u64 {}, {}, {};",
-            addr.name, array_ref.name, byte_idx.name
-        )
-        .unwrap();
         // Load signed 8-bit, widen to 32-bit (sign-extended) — Java baload semantics.
         writeln!(self.body, "    ld.global.s8 {}, [{}];", raw.name, addr.name).unwrap();
         writeln!(self.body, "    cvt.s32.s8 {}, {};", result.name, raw.name).unwrap();
@@ -4015,29 +4513,9 @@ impl<'a> Emitter<'a> {
         // Element read: see `reads_param_mask` (chunked-writeback guard).
         self.mark_param_read(param_idx);
         self.emit_bounds_check(&index, param_idx);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
-        let offset = self.regs.fresh_reg(RegKind::U64);
-        let addr = self.regs.fresh_reg(RegKind::U64);
+        let addr = self.emit_element_addr(&index, &array_ref, 2);
         let raw = self.regs.fresh_reg(RegKind::S32);
         let result = self.regs.fresh_reg(RegKind::S32);
-        writeln!(
-            self.body,
-            "    cvt.s64.s32 {}, {};",
-            byte_idx.name, index.name
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    mul.lo.s64 {}, {}, 2;",
-            offset.name, byte_idx.name
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    add.u64 {}, {}, {};",
-            addr.name, array_ref.name, offset.name
-        )
-        .unwrap();
         let load_suffix = if is_char { "u16" } else { "s16" };
         let cvt = if is_char {
             "cvt.u32.u16"
@@ -4078,27 +4556,7 @@ impl<'a> Emitter<'a> {
             u64::MAX
         };
         self.emit_bounds_check(&index, param_idx);
-        let offset = self.regs.fresh_reg(RegKind::U64);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
-        let addr = self.regs.fresh_reg(RegKind::U64);
-        writeln!(
-            self.body,
-            "    cvt.s64.s32 {}, {};",
-            byte_idx.name, index.name
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    mul.lo.s64 {}, {}, {};",
-            offset.name, byte_idx.name, elem_size
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    add.u64 {}, {}, {};",
-            addr.name, array_ref.name, offset.name
-        )
-        .unwrap();
+        let addr = self.emit_element_addr(&index, &array_ref, elem_size);
         writeln!(
             self.body,
             "    st.global{} [{}], {};",
@@ -4120,20 +4578,7 @@ impl<'a> Emitter<'a> {
             u64::MAX
         };
         self.emit_bounds_check(&index, param_idx);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
-        let addr = self.regs.fresh_reg(RegKind::U64);
-        writeln!(
-            self.body,
-            "    cvt.s64.s32 {}, {};",
-            byte_idx.name, index.name
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    add.u64 {}, {}, {};",
-            addr.name, array_ref.name, byte_idx.name
-        )
-        .unwrap();
+        let addr = self.emit_element_addr(&index, &array_ref, 1);
         // Truncate value to s8 implicitly via st.global.s8 (PTX OK).
         writeln!(
             self.body,
@@ -4156,27 +4601,7 @@ impl<'a> Emitter<'a> {
             u64::MAX
         };
         self.emit_bounds_check(&index, param_idx);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
-        let offset = self.regs.fresh_reg(RegKind::U64);
-        let addr = self.regs.fresh_reg(RegKind::U64);
-        writeln!(
-            self.body,
-            "    cvt.s64.s32 {}, {};",
-            byte_idx.name, index.name
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    mul.lo.s64 {}, {}, {};",
-            offset.name, byte_idx.name, elem_size
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    add.u64 {}, {}, {};",
-            addr.name, array_ref.name, offset.name
-        )
-        .unwrap();
+        let addr = self.emit_element_addr(&index, &array_ref, elem_size);
         writeln!(
             self.body,
             "    st.global.s16 [{}], {};",
@@ -4186,84 +4611,201 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// `arraylength` — the parameter's `pN_len`, which the prologue
+    /// already holds in a register.
+    ///
+    /// AUDIT 2026-09-02: this issued its own `ld.param.s32`, so a kernel
+    /// whose loop bound is written `a.length` inline loaded the same
+    /// kernel parameter twice. Reusing the hoisted register also makes
+    /// the value the loop bound compares against and the value the
+    /// bounds check compares against the SAME register, which is the
+    /// identity `Emitter::prove_index_within_param` matches on.
     fn arraylength(&mut self) -> Result<(), LoweringError> {
         let array_ref = self.stack.pop()?;
         let (param_idx, _kind) = self.array_param_of(&array_ref)?;
-        let r = self.regs.fresh_reg(RegKind::S32);
-        writeln!(
-            self.body,
-            "    ld.param.s32 {}, [{}];",
-            r.name, self.param_len_name[param_idx]
-        )
-        .unwrap();
+        let name = self.param_len_operand(param_idx);
+        let r = self
+            .param_len_reg[param_idx]
+            .clone()
+            .unwrap_or_else(|| Reg {
+                kind: RegKind::S32,
+                name,
+                wide: false,
+            });
         self.stack.push(r);
         Ok(())
     }
 
     fn scalar_return(&mut self, kind: RegKind, suffix: &str) -> Result<(), LoweringError> {
         let value = self.stack.pop()?;
-        let ret_ptr = self.regs.fresh_reg(RegKind::U64);
-        writeln!(self.body, "    ld.param.u64 {}, [ret_ptr];", ret_ptr.name).unwrap();
         if self.sig.is_reduction {
             // AUDIT 2026-05-24 (C31): dot-product / sum reduction shape.
             // The element-wise lowering substitutes `iload iv → tid` so
             // each CUDA thread carries one iteration's partial term in
             // `value`. A plain `st.global.<suffix>` would have every
             // thread race-overwrite the single `*ret_ptr` slot — silently
-            // wrong sums. Emit `red.global.add.<atomic_suffix>` so each
-            // thread's partial contribution accumulates correctly.
+            // wrong sums.
             //
-            // `red`, not `atom` (found 2026-07-11 on real hardware): PTX's
-            // `atom` REQUIRES a destination operand for the fetched old
-            // value — the two-operand `atom.global.add [p], v;` form is a
-            // ptxas error ("Arguments mismatch for instruction 'atom'"),
-            // which made every reduction kernel fail module load with
-            // CUDA_ERROR_INVALID_PTX and silently blacklist to CPU. The
-            // fire-and-forget form that discards the old value is the
-            // `red` (reduction) instruction, which is exactly what an
-            // accumulate-only epilogue wants.
-            //
-            // PTX atomic-add type suffixes are NOT identical to the
-            // load/store suffixes: integer atomics use unsigned widths
-            // (`red.add.u32` / `red.add.u64`) — they operate on the raw
-            // bit pattern, which matches Java two's-complement semantics
-            // for signed accumulation. Float atomics use `.f32`
-            // (sm_20+) / `.f64` (sm_60+).
-            //
-            // The host marshaller MUST pre-zero `*ret_ptr` before launch;
-            // `KernelSignature::is_reduction` documents this contract.
-            let atomic_suffix = match kind {
-                RegKind::S32 => ".u32",
-                RegKind::S64 => ".u64",
-                RegKind::F32 => ".f32",
-                RegKind::F64 => ".f64",
-                _ => {
-                    return Err(LoweringError::UnsupportedNode(format!(
-                        "reduction atomic-add for register kind {kind:?} (suffix `{suffix}`) is not supported",
-                    )));
-                }
+            // AUDIT 2026-09-02: the accumulate no longer happens here. The
+            // value is handed to the warp tree in `finalize_epilogue`
+            // through the shared accumulator register, and the guard's
+            // retired threads arrive at the same tree carrying zero. See
+            // `emit_reduction_epilogue` for the atomic and its contract.
+            if !matches!(
+                kind,
+                RegKind::S32 | RegKind::S64 | RegKind::F32 | RegKind::F64
+            ) {
+                return Err(LoweringError::UnsupportedNode(format!(
+                    "reduction accumulate for register kind {kind:?} (suffix `{suffix}`) is not supported",
+                )));
+            }
+            let Some(acc) = self.reduction_acc.clone() else {
+                return Err(LoweringError::Internal(
+                    "reduction return reached with no accumulator; the dispatch \
+                     guard mints it and every reduction has one"
+                        .into(),
+                ));
             };
-            writeln!(
-                self.body,
-                "    red.global.add{} [{}], {};",
-                atomic_suffix, ret_ptr.name, value.name
-            )
-            .unwrap();
-        } else {
-            // Non-reduction scalar return. For a single-thread / straight-line
-            // shape, every thread writes the same value to `*ret_ptr` so
-            // racing on the store is benign. Marshalling pre-allocates a
-            // one-element output buffer.
-            writeln!(
-                self.body,
-                "    st.global{} [{}], {};",
-                suffix, ret_ptr.name, value.name
-            )
-            .unwrap();
+            if acc.kind != value.kind {
+                return Err(LoweringError::Internal(format!(
+                    "reduction accumulator is {:?} but the returned value is {:?}",
+                    acc.kind, value.kind
+                )));
+            }
+            writeln!(self.body, "    mov{} {}, {};", suffix, acc.name, value.name).unwrap();
+            self.ret_value_reg = Some(value);
+            writeln!(self.body, "    bra L_reduce;").unwrap();
+            return Ok(());
         }
+        let ret_ptr = self.regs.fresh_reg(RegKind::U64);
+        writeln!(self.body, "    ld.param.u64 {}, [ret_ptr];", ret_ptr.name).unwrap();
+        // Non-reduction scalar return. For a single-thread / straight-line
+        // shape, every thread writes the same value to `*ret_ptr` so
+        // racing on the store is benign. Marshalling pre-allocates a
+        // one-element output buffer.
+        writeln!(
+            self.body,
+            "    st.global{} [{}], {};",
+            suffix, ret_ptr.name, value.name
+        )
+        .unwrap();
         self.ret_value_reg = Some(value);
         writeln!(self.body, "    bra L_done;").unwrap();
         Ok(())
+    }
+
+    /// The warp tree and the one atomic per warp. See
+    /// [`Emitter::finalize_epilogue`] for the argument.
+    ///
+    /// ```text
+    /// L_reduce_zero:
+    ///     mov acc, 0
+    /// L_reduce:
+    ///     for offset in 16, 8, 4, 2, 1:
+    ///         other = shfl.sync.down(acc, offset)   (two b32 halves for 64-bit)
+    ///         acc = acc + other
+    ///     if laneid == 0 && acc != 0:
+    ///         red.global.add [ret_ptr], acc
+    /// ```
+    ///
+    /// `shfl.sync` moves 32 bits; a 64-bit accumulator is split with
+    /// `mov.b64 {lo, hi}` and rejoined. Floats travel as their bit
+    /// patterns and are added as floats with an explicit `.rn`, which is
+    /// the same rounding every other float add in this emitter carries.
+    ///
+    /// `red`, not `atom` (found 2026-07-11 on real hardware): PTX's `atom`
+    /// requires a destination for the fetched old value, and the
+    /// two-operand form is a `ptxas` error that made every reduction
+    /// kernel fail to load. Integer atomics take the unsigned width
+    /// suffix; the bit pattern is identical and wrapping add is what
+    /// Java does. The host marshaller MUST pre-zero `*ret_ptr` before
+    /// launch — `KernelSignature::is_reduction` documents the contract.
+    fn emit_reduction_epilogue(&mut self, acc: &Reg) {
+        let (add, zero, atomic_suffix, wide) = match acc.kind {
+            RegKind::S32 => ("add.s32", "0", ".u32", false),
+            RegKind::S64 => ("add.s64", "0", ".u64", true),
+            RegKind::F32 => ("add.rn.f32", "0f00000000", ".f32", false),
+            RegKind::F64 => ("add.rn.f64", "0d0000000000000000", ".f64", true),
+            // `guard_exit_label` only mints one of the four kinds above.
+            _ => unreachable!("reduction accumulator of kind {:?}", acc.kind),
+        };
+        let mov_suffix = match acc.kind {
+            RegKind::S32 => ".s32",
+            RegKind::S64 => ".s64",
+            RegKind::F32 => ".f32",
+            _ => ".f64",
+        };
+        writeln!(self.body, "L_reduce_zero:").unwrap();
+        writeln!(self.body, "    mov{mov_suffix} {}, {zero};", acc.name).unwrap();
+        writeln!(self.body, "L_reduce:").unwrap();
+        for offset in [16u32, 8, 4, 2, 1] {
+            let other = self.regs.fresh_reg_with_wide(acc.kind, acc.wide);
+            if wide {
+                let lo = self.regs.fresh_reg(RegKind::U32);
+                let hi = self.regs.fresh_reg(RegKind::U32);
+                let lo2 = self.regs.fresh_reg(RegKind::U32);
+                let hi2 = self.regs.fresh_reg(RegKind::U32);
+                writeln!(self.body, "    mov.b64 {{{}, {}}}, {};", lo.name, hi.name, acc.name)
+                    .unwrap();
+                writeln!(
+                    self.body,
+                    "    shfl.sync.down.b32 {}, {}, {offset}, 0x1f, 0xffffffff;",
+                    lo2.name, lo.name
+                )
+                .unwrap();
+                writeln!(
+                    self.body,
+                    "    shfl.sync.down.b32 {}, {}, {offset}, 0x1f, 0xffffffff;",
+                    hi2.name, hi.name
+                )
+                .unwrap();
+                writeln!(self.body, "    mov.b64 {}, {{{}, {}}};", other.name, lo2.name, hi2.name)
+                    .unwrap();
+            } else {
+                let bits = self.regs.fresh_reg(RegKind::U32);
+                let bits2 = self.regs.fresh_reg(RegKind::U32);
+                writeln!(self.body, "    mov.b32 {}, {};", bits.name, acc.name).unwrap();
+                writeln!(
+                    self.body,
+                    "    shfl.sync.down.b32 {}, {}, {offset}, 0x1f, 0xffffffff;",
+                    bits2.name, bits.name
+                )
+                .unwrap();
+                writeln!(self.body, "    mov.b32 {}, {};", other.name, bits2.name).unwrap();
+            }
+            writeln!(
+                self.body,
+                "    {add} {}, {}, {};",
+                acc.name, acc.name, other.name
+            )
+            .unwrap();
+        }
+        let lane = self.regs.fresh_reg(RegKind::U32);
+        let is_lane0 = self.regs.fresh_reg(RegKind::Pred);
+        let nonzero = self.regs.fresh_reg(RegKind::Pred);
+        let do_add = self.regs.fresh_reg(RegKind::Pred);
+        let ret_ptr = self.regs.fresh_reg(RegKind::U64);
+        writeln!(self.body, "    mov.u32 {}, %laneid;", lane.name).unwrap();
+        writeln!(self.body, "    setp.eq.u32 {}, {}, 0;", is_lane0.name, lane.name).unwrap();
+        writeln!(
+            self.body,
+            "    setp.ne{mov_suffix} {}, {}, {zero};",
+            nonzero.name, acc.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    and.pred {}, {}, {};",
+            do_add.name, is_lane0.name, nonzero.name
+        )
+        .unwrap();
+        writeln!(self.body, "    ld.param.u64 {}, [ret_ptr];", ret_ptr.name).unwrap();
+        writeln!(
+            self.body,
+            "    @{} red.global.add{atomic_suffix} [{}], {};",
+            do_add.name, ret_ptr.name, acc.name
+        )
+        .unwrap();
     }
 }
 

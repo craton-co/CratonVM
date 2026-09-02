@@ -22,6 +22,13 @@ cratonvm-types = { path = "../types", version = "0.3.0" }
 # (and has no `[dev-dependencies]` at all). The `cratonvm-jit` edge below is
 # `[dev-dependencies]`-only and is unaffected.
 cratonvm-jfr = { path = "../jfr", version = "0.3.0" }
+# The GPU critical-section registry (`cratonvm_cuda_bridge::critical`): the
+# one place every collector asks "may I relocate, and what must I keep alive"
+# before a cycle. Optional, pulled in only by `gpu-offload`. Acyclic:
+# `cratonvm-cuda-bridge` depends on `cratonvm-types` and nothing else in the
+# workspace; its `cuda` feature is NOT enabled here, so this is the driverless
+# stub crate and adds no toolkit requirement.
+cratonvm-cuda-bridge = { path = "../cuda-bridge", version = "0.3.0", optional = true }
 parking_lot.workspace = true
 tracing.workspace = true
 rustc-hash.workspace = true
@@ -55,7 +62,7 @@ default = ["zgc"]
 # Enables `safepoint::SafepointToken`, `Heap::enter_gpu_critical`, and
 # GC-delay logic that pauses collection while a token is held. With this
 # feature off the crate compiles to identical bytes as before the GPU work.
-gpu-offload = []
+gpu-offload = ["dep:cratonvm-cuda-bridge"]
 # The Z Garbage Collector backend — THE DEFAULT COLLECTOR OF THIS VM. As of
 # 2026-08-10 it is `src/zgc.rs`, `src/zgc_concurrent.rs` and the TWELVE modules
 # of `src/zgc/`: vaddr, page, barrier, forwarding, metrics, remembered, mark,
@@ -115,26 +122,32 @@ gpu-offload = []
 #        `CRATONVM_ZGC_GENERATIONAL=1` opts in.
 #    So "the feature is not concurrent and not generational", which this file
 #    said until 2026-09-01, was wrong about both: they are off, not absent.
-#  * `ZgcCollector` / `ZgcHeap` / `GenerationalZgc` / `ColoredPointer` /
-#    `LoadBarrier` remain a metadata-only SIMULATION of OpenJDK ZGC's model:
-#    synthetic `u64` page addresses with no backing storage, a forwarding
-#    table that copies no bytes, and a `&mut self` load barrier rather than an
-#    atomic self-healing CAS. Selecting one emits a one-time `tracing::warn!`
-#    so it can never masquerade as production ZGC. The module docs enumerate
-#    exactly what is deferred. These are NOT what the default run selects.
+#  * The SIMULATION is GONE (2026-09-02). `ZgcCollector` / `ZgcHeap` /
+#    `GenerationalZgc` / `ColoredPointer` / `LoadBarrier` were a metadata-only
+#    model of OpenJDK ZGC -- synthetic `u64` page addresses with no backing
+#    storage, a forwarding table that copied no bytes, a `&mut self` load
+#    barrier rather than an atomic self-healing CAS -- kept as scaffolding for
+#    the real modules and loud about what it was. The real modules landed, so
+#    the scaffolding became 1,250 lines of a production file that nothing
+#    outside its own tests referenced. Every concept in it now has an honest
+#    implementation: `zgc::vaddr`, `zgc::barrier`, `zgc::page`,
+#    `zgc::generation`.
 #  * The twelve `src/zgc/` modules are real, compiling and unit-tested, and
-#    ELEVEN of the twelve are now used by `src/zgc.rs` outside its `mod tests`.
-#    Recount one module at a time before quoting, from the repo root:
-#      awk '/^mod tests \{/{exit} {print}' gc/src/zgc.rs | grep -c '\bcensus::'
-#    On 2026-09-01 that reads: mark 49, census 35, vaddr 20, tlab 15,
-#    barrier 13, generation 13, page 8, forwarding 7, remembered 3,
-#    adapters 2, relocate 2, metrics 1. The `metrics` 1 is a `TODO(zgc)`
-#    COMMENT (`src/zgc.rs:14325`) and not a call, so `metrics` is the one
-#    module still unadopted — a grep count cannot tell a call from a mention,
-#    which is why the number is quoted with that caveat rather than alone. The
-#    earlier "HALF of them are adopted, six NOT" split (2026-08-10, naming
-#    barrier / forwarding / remembered / generation / relocate / adapters as
-#    the unadopted six) is history and is wrong about all six today.
+#    most of the twelve are used by `src/zgc.rs` outside its `mod tests`.
+#    DO NOT WRITE THE NUMBERS HERE. A census in this comment and its twin in
+#    `src/zgc.rs` have each been wrong twice, and one of the wrong ones was
+#    carried into
+#    `docs/known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md`
+#    and used to discount a suite result. Since 2026-09-02 the count is
+#    derived rather than written: `scripts/zgc-submodule-adoption.sh` produces
+#    it, `types/tests/zgc-submodule-adoption.txt` records it, and
+#    `zgc_submodule_adoption_matches_the_recorded_census` fails the build when
+#    they disagree. Read it there.
+#    ONE CAVEAT THE COUNT CANNOT CARRY, kept from the census it replaces: a
+#    grep cannot tell a call from a mention. `metrics 1` is a `TODO(zgc)`
+#    COMMENT, so `metrics` is the module still genuinely unadopted even though
+#    it counts as 1. Check what a number refers to before quoting it as
+#    adoption.
 #    The TLAB is default-ON and serves `alloc_object`/`alloc_array` via
 #    `alloc_raw_tlab`, so do NOT say "not wired into the real allocator" —
 #    that phrasing was carried out of this file into

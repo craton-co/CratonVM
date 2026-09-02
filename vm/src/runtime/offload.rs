@@ -176,6 +176,29 @@ pub struct OffloadCache {
     /// dispatch needs several streams so consecutive chunks can run
     /// concurrently, and these are private to the offload path (the
     /// `streams` map above holds Java-visible `GpuStream` handles).
+    /// Round-robin pool of streams for dispatches that did not bring
+    /// their own.
+    ///
+    /// AUDIT 2026-09-02: the handle-less path — which is every
+    /// transparent interpreter dispatch, i.e. the common case — used to
+    /// call `Stream::new(ctx)` per submission and drop it when the
+    /// submission was released. `cuStreamCreate` is not free and
+    /// `cuStreamDestroy` can synchronize, so a workload calling an
+    /// offloaded method in a loop paid for both on every call, to get a
+    /// stream it used exactly once. The chunked writeback already pools
+    /// its streams for exactly this reason; this is the same pool
+    /// discipline for the same cost.
+    ///
+    /// Two dispatches that land on the same pooled stream serialise
+    /// against each other. That is not a regression: the transparent
+    /// path marshals, launches, and then finalizes — a blocking wait —
+    /// before returning to the interpreter, so it never had two launches
+    /// in flight to overlap in the first place. Callers that DO want
+    /// overlap register their own stream through `stream_create` and
+    /// pass its handle, which bypasses this pool entirely.
+    dispatch_streams: RwLock<Vec<std::sync::Arc<Stream>>>,
+    /// Cursor into [`OffloadCache::dispatch_streams`].
+    next_dispatch_stream: std::sync::atomic::AtomicUsize,
     chunk_streams: RwLock<Vec<std::sync::Arc<Stream>>>,
     /// Reused page-locked staging slabs for the chunked writeback, one
     /// per element type. See `staging_slot!` for why they are cached.
@@ -472,21 +495,70 @@ impl OffloadCache {
         };
         // Ask the device it will actually launch on for its compute
         // capability, so kernels are lowered for the real `sm_XX`
-        // instead of the Volta floor. Clamped up only: the lowering
-        // emits sm_70-era PTX, so a device older than that (or a
-        // failed probe) keeps the floor and the driver rejects the
-        // module later if it truly cannot run it.
+        // instead of the Volta floor. Floored at sm_70: the lowering
+        // emits Volta-era PTX, so a device older than that (or a failed
+        // probe) keeps the floor and the driver rejects the module later
+        // if it truly cannot run it.
+        //
+        // AUDIT 2026-09-02: the probe used to be clamped UPWARD ONLY,
+        // and `PtxModule::render` wrote a literal `.version 7.5` beside
+        // whatever it produced. PTX ISA 7.5 tops out at `sm_87`, so on
+        // Ada (`sm_89`), Hopper (`sm_90`) and Blackwell (`sm_100`/
+        // `sm_120`) every lowered module named a target its own declared
+        // ISA version does not know, `cuModuleLoadData` refused it,
+        // `lookup_or_compile` blacklisted the method, and the VM ran
+        // every kernel on the CPU — right answers, one `info` line, and
+        // a `--gpu` flag that bought a CUDA context and nothing else.
+        // `render` now derives `.version` from the target
+        // (`jit_cuda::target::isa_for_target`), and the downward clamp
+        // below closes the other direction: a driver older than its own
+        // GPU cannot parse the ISA that GPU's target requires, and the
+        // honest answer there is to run the device as the newest
+        // architecture the driver does know rather than to emit a header
+        // nothing can load.
         let sm = if ctx.is_some() {
             match cuda_bridge::probe_device(config.gpu_device_ordinal) {
                 Ok(caps) if (caps.compute_major, caps.compute_minor) >= (7, 0) => {
+                    let probed = (caps.compute_major, caps.compute_minor);
+                    // An unreadable driver version means "do not clamp":
+                    // the pre-audit behaviour, which is right whenever we
+                    // cannot prove the driver is behind.
+                    let target = match cuda_bridge::driver_cuda_version() {
+                        Ok(v) => {
+                            let driver_isa = jit_cuda::target::max_isa_for_cuda_version(v);
+                            let clamped =
+                                jit_cuda::target::clamp_target_to_isa(probed, driver_isa);
+                            if clamped != probed {
+                                tracing::warn!(
+                                    "gpu offload: device {} is sm_{}{} but the installed                                      driver (CUDA {}.{}) only parses PTX ISA {}.{}; lowering                                      for sm_{}{} instead",
+                                    caps.ordinal,
+                                    probed.0,
+                                    probed.1,
+                                    v / 1000,
+                                    (v % 1000) / 10,
+                                    driver_isa.0,
+                                    driver_isa.1,
+                                    clamped.0,
+                                    clamped.1,
+                                );
+                            }
+                            clamped
+                        }
+                        Err(_) => probed,
+                    };
+                    let isa = jit_cuda::target::isa_for_target(target.0, target.1);
                     tracing::info!(
-                        "gpu offload: device {} is {} (sm_{}{}), lowering for it",
+                        "gpu offload: device {} is {} (sm_{}{}), lowering for sm_{}{}                          with PTX ISA {}.{}",
                         caps.ordinal,
                         caps.name,
-                        caps.compute_major,
-                        caps.compute_minor
+                        probed.0,
+                        probed.1,
+                        target.0,
+                        target.1,
+                        isa.0,
+                        isa.1,
                     );
-                    (caps.compute_major, caps.compute_minor)
+                    target
                 }
                 _ => (7, 0),
             }
@@ -500,6 +572,8 @@ impl OffloadCache {
             print_decisions: config.print_gpu_decisions,
             streams: RwLock::new(FxHashMap::default()),
             next_stream_handle: std::sync::atomic::AtomicU64::new(1),
+            dispatch_streams: RwLock::new(Vec::new()),
+            next_dispatch_stream: std::sync::atomic::AtomicUsize::new(0),
             chunk_streams: RwLock::new(Vec::new()),
             chunk_events: RwLock::new(Vec::new()),
             builtin_module: RwLock::new(None),
@@ -800,7 +874,7 @@ impl OffloadCache {
                 buf,
                 pool_key: None,
             }],
-            _gc_critical: GcCriticalGuard::acquire(),
+            gc_critical: GcCriticalGuard::acquire(),
         });
 
         let handle = NEXT_SUBMISSION_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1528,28 +1602,21 @@ pub fn try_dispatch(
             // Marshal args → device, launch the kernel, synchronize, and
             // write kernel-written arrays back into the Java heap (void)
             // or download the accumulator (reduction). This reuses the
-            // explicit-path machinery (`dispatch_method_from_native`
-            // registers a submission; we finalize it synchronously here).
+            // explicit path's marshal and launch and finalizes here.
             // Any failure leaves the operand stack + locals untouched, so
             // falling through to the CPU body is always safe.
-            let handle = dispatch_method_from_native(
+            // Synchronous: the submission is never registered and never
+            // watched by the reaper; this call finalizes it and reads the
+            // result off it directly. See `Completion::Caller`.
+            let submission = dispatch_method_sync(
                 shared,
                 class_name,
                 method_name,
                 method_descriptor,
                 args,
             );
-            // Keep our own submission handle alive across
-            // `release_submission` below (which only drops the
-            // registry's reference) so a reduction can still read the
-            // completed `SerializedResult` off `submission.status`
-            // after the registry entry is gone.
-            let submission = lookup_submission(handle);
-            let result = match &submission {
-                Some(sub) => finalize_submission(shared, sub),
-                None => Err("offload submission was not registered".to_string()),
-            };
-            release_submission(handle);
+            let result = finalize_submission(shared, &submission);
+            let submission = Some(submission);
             match result {
                 Ok(()) => {
                     tracing::debug!(
@@ -2002,7 +2069,7 @@ mod tests {
             status: parking_lot::Mutex::new(SubmissionStatus::Running),
             finalize: parking_lot::Mutex::new(Some(FinalizeState {
                 writebacks: Vec::new(),
-                _gc_critical: GcCriticalGuard::acquire(),
+                gc_critical: GcCriticalGuard::acquire(),
             })),
             device_done: std::sync::atomic::AtomicBool::new(false),
         });
@@ -2060,13 +2127,13 @@ mod tests {
             status: parking_lot::Mutex::new(SubmissionStatus::Running),
             finalize: parking_lot::Mutex::new(Some(FinalizeState {
                 writebacks: Vec::new(),
-                _gc_critical: GcCriticalGuard::acquire(),
+                gc_critical: GcCriticalGuard::acquire(),
             })),
             device_done: std::sync::atomic::AtomicBool::new(false),
         });
         register_submission(sub.clone());
 
-        finalize_enqueued_handle(&weak_vm, handle);
+        finalize_enqueued_handle(&weak_vm, &sub);
 
         assert!(matches!(
             &*sub.status.lock(),
@@ -2097,13 +2164,13 @@ mod tests {
             status: parking_lot::Mutex::new(SubmissionStatus::Running),
             finalize: parking_lot::Mutex::new(Some(FinalizeState {
                 writebacks: Vec::new(),
-                _gc_critical: GcCriticalGuard::acquire(),
+                gc_critical: GcCriticalGuard::acquire(),
             })),
             device_done: std::sync::atomic::AtomicBool::new(false),
         });
         register_submission(sub.clone());
 
-        finalize_enqueued_handle(&weak_vm, handle);
+        finalize_enqueued_handle(&weak_vm, &sub);
 
         assert!(matches!(&*sub.status.lock(), SubmissionStatus::Running));
         release_submission(handle);
@@ -2442,36 +2509,137 @@ pub struct FinalizeState {
     /// Writebacks to drain after the event fires (download device
     /// buffers into source Java arrays / resident-store entries).
     pub writebacks: Vec<MarshalWriteback>,
-    /// GC-critical-section bookkeeping. We can't store a real
-    /// `SafepointToken` here because that type is intentionally
-    /// `!Send` (one-thread RAII contract), and finalization may
-    /// run on a different thread from dispatch. Instead we manage
-    /// the increment/decrement manually: dispatch increments
-    /// `vm_heap::GPU_CRITICAL_COUNT`, finalization (or `Drop` of
-    /// this state, if finalize never runs) decrements it.
-    _gc_critical: GcCriticalGuard,
+    /// The submission's GPU critical-section token, held from dispatch
+    /// to writeback. See [`GcCriticalGuard`] for what it declares and
+    /// what it no longer does.
+    gc_critical: GcCriticalGuard,
 }
 
-/// Send-able RAII guard for the process-wide GPU_CRITICAL_COUNT.
-/// Manually mirrors `SafepointToken`'s increment/decrement
-/// semantics without the `!Send` marker.
+/// A registered, leased, attributed GPU critical-section token.
+///
+/// AUDIT 2026-09-02. Until this date this was a bare increment of
+/// `cratonvm_gc::vm_heap::GPU_CRITICAL_COUNT`, held from dispatch until
+/// the writeback drained, and every collector spun on that counter
+/// without bound. So: no collection at all for the length of any
+/// kernel, a hang for the life of the process if one submission was
+/// never finalized, and ZGC — the default collector — not consulting the
+/// counter at all, which let its compacting slide run under a
+/// device-to-host copy landing in the arena.
+///
+/// Now it wraps a [`cuda_bridge::critical::CriticalToken`], which the
+/// collectors consult through `cratonvm_gc::vm_heap::gpu_coordination`
+/// before every cycle. What the token declares is the whole contract:
+///
+/// * [`Relocation::Forbidden`](cuda_bridge::critical::Relocation::Forbidden)
+///   for the two SHORT windows in which the device reads or writes the
+///   heap arena in place — the zero-copy upload during marshalling and
+///   the download during writeback. The collector waits for these,
+///   bounded, and runs non-moving if they outlast its budget.
+/// * [`Relocation::KeepAliveOnly`](cuda_bridge::critical::Relocation::KeepAliveOnly)
+///   with the writeback targets as keep-alive roots for the LONG window,
+///   dispatch to finalize. The collector does not wait for this at all:
+///   it keeps the targets alive, moves them if it likes, and the
+///   writeback reads their new addresses back through
+///   [`GcCriticalGuard::keepalive_addrs`] before it writes. Collection
+///   runs during a kernel, which it never could before.
+///
+/// Every token carries the VM, thread, site and (once known) submission
+/// handle, so a collector stall names its holder; and a lease, so an
+/// abandoned submission is reaped and its writeback refused
+/// ([`GcCriticalGuard::is_revoked`]) instead of wedging the collector.
 #[cfg(feature = "gpu-offload")]
-pub struct GcCriticalGuard;
+pub struct GcCriticalGuard {
+    token: cuda_bridge::critical::CriticalToken,
+}
 
 #[cfg(feature = "gpu-offload")]
 impl GcCriticalGuard {
-    /// Increment the GC-critical counter and return the guard.
+    /// A keep-alive-only token with no declared roots and no VM
+    /// attribution. For paths whose device buffers are all resident
+    /// `GpuArray`s (nothing to keep alive in the heap) and for tests.
     pub fn acquire() -> Self {
-        cratonvm_gc::vm_heap::GPU_CRITICAL_COUNT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        Self
+        Self::acquire_for(
+            0,
+            None,
+            "unattributed",
+            cuda_bridge::critical::Relocation::KeepAliveOnly,
+            &[],
+        )
+    }
+
+    /// Acquire with full attribution. `keepalive` are the raw addresses
+    /// of the heap objects the holder will write to after the device
+    /// finishes; the collector keeps them alive and remaps them.
+    pub fn acquire_for(
+        vm: u64,
+        submission: Option<u64>,
+        site: &'static str,
+        relocation: cuda_bridge::critical::Relocation,
+        keepalive: &[usize],
+    ) -> Self {
+        use cuda_bridge::critical::{default_token_lease, global, OwnerId, Registry};
+        let owner = OwnerId::current(vm, submission, site);
+        let token = Registry::acquire_with(global(), owner, default_token_lease(), relocation, keepalive);
+        Self { token }
+    }
+
+    /// Whether the registry revoked this token — lease expired, or the VM
+    /// shut down. A revoked holder must not write to the heap: its
+    /// keep-alive roots were dropped and the objects may be gone.
+    pub fn is_revoked(&self) -> bool {
+        self.token.is_revoked()
+    }
+
+    /// The declared keep-alive addresses as the collector last left them,
+    /// in declaration order. Empty once revoked.
+    pub fn keepalive_addrs(&self) -> Vec<usize> {
+        self.token.keepalive_addrs()
     }
 }
 
+/// Who observes a submission's completion.
+///
+/// AUDIT 2026-09-02. Every dispatch used to register a `cuLaunchHostFunc`
+/// callback to learn when its kernel finished. A host function on a
+/// stream is not free: CUDA runs it after the work ahead of it and
+/// **blocks every launch enqueued behind it on that stream until it
+/// returns** — so a chain of kernels on one stream paid a driver-thread
+/// round trip between every pair. GPULlama3's 453-launch decode step
+/// measured 14 ms of host time against 24 ms of device time, and the
+/// graph-capture path, which skips the callback, measured 2.05x. This is
+/// the other half of that number. The reaper now polls `cuEventQuery`
+/// instead (see [`completion_reaper_loop`]), which asks the device a
+/// question without inserting anything into its queue.
+///
+/// `CRATONVM_GPU_HOST_CALLBACK=1` restores the callback, as the A/B
+/// lever for one binary.
 #[cfg(feature = "gpu-offload")]
-impl Drop for GcCriticalGuard {
-    fn drop(&mut self) {
-        cratonvm_gc::vm_heap::GPU_CRITICAL_COUNT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Completion {
+    /// The completion reaper watches the submission and finalizes it on
+    /// its own thread when the device reports the event fired. The
+    /// explicit async API (`GpuFuture`) wants this: nothing on the Java
+    /// side has to call back for the writeback to happen.
+    Reaper,
+    /// The caller will finalize the submission itself, synchronously,
+    /// as the transparent interpreter hook does. Nothing is queued for
+    /// the reaper, no callback is registered and the submission is not
+    /// entered in the process-wide registry: three lock acquisitions
+    /// and a driver call per call site that bought nothing on a path
+    /// that blocks on the event before returning.
+    Caller,
+}
+
+/// `CRATONVM_GPU_HOST_CALLBACK=1` restores the per-launch
+/// `cuLaunchHostFunc`. See [`Completion`].
+#[cfg(feature = "gpu-offload")]
+fn host_callback_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_GPU_HOST_CALLBACK")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(feature = "gpu-offload")]
@@ -2629,6 +2797,58 @@ impl OffloadCache {
         Stream::new(ctx).map(std::sync::Arc::new)
     }
 
+    /// A stream for a dispatch that did not name one.
+    ///
+    /// Built once per device and handed out round-robin. See
+    /// [`OffloadCache::dispatch_streams`] for why pooling is safe here
+    /// and what it replaces.
+    ///
+    /// Falls back to a fresh `Stream::new` if the pool cannot be built,
+    /// so a driver that refuses to create streams up front still gets
+    /// the driver's own error at the point of use rather than a bare
+    /// "no streams".
+    fn dispatch_stream(
+        &self,
+        ctx: &cuda_bridge::DeviceContext,
+    ) -> Result<std::sync::Arc<Stream>, cuda_bridge::DeviceError> {
+        {
+            let have = self.dispatch_streams.read();
+            if !have.is_empty() {
+                let i = self
+                    .next_dispatch_stream
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(std::sync::Arc::clone(&have[i % have.len()]));
+            }
+        }
+        {
+            let mut slot = self.dispatch_streams.write();
+            if slot.is_empty() {
+                let mut made = Vec::with_capacity(dispatch_stream_pool_size());
+                for _ in 0..dispatch_stream_pool_size() {
+                    match Stream::new(ctx) {
+                        Ok(s) => made.push(std::sync::Arc::new(s)),
+                        Err(e) => {
+                            tracing::debug!(
+                                "gpu offload: dispatch stream pool unavailable ({e}); \
+                                 falling back to a per-dispatch stream"
+                            );
+                            made.clear();
+                            break;
+                        }
+                    }
+                }
+                *slot = made;
+            }
+            if !slot.is_empty() {
+                let i = self
+                    .next_dispatch_stream
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(std::sync::Arc::clone(&slot[i % slot.len()]));
+            }
+        }
+        Stream::new(ctx).map(std::sync::Arc::new)
+    }
+
     fn chunk_stream_pool(&self, ctx: &cuda_bridge::DeviceContext) -> Vec<std::sync::Arc<Stream>> {
         {
             let have = self.chunk_streams.read();
@@ -2775,6 +2995,7 @@ impl OffloadCache {
         runtime_work: u32,
         finalize_state: Option<FinalizeState>,
         weak_vm: std::sync::Weak<crate::vm::SharedVm>,
+        completion: Completion,
     ) -> std::sync::Arc<StreamSubmission> {
         let handle = NEXT_SUBMISSION_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -3103,74 +3324,53 @@ impl OffloadCache {
         //     callback against this attach.
         *submission.finalize.lock() = finalize_state;
 
-        // 7. Known-issues followups #3 — start (idempotent) the
-        //    process-wide completion reaper, then register a host
-        //    callback that both flags `device_done` (the existing
-        //    poll-fast-path optimization for `isDone()`/`getNow()`)
-        //    and enqueues this submission's handle onto the reaper so
-        //    it gets finalized on its own, with no Java call required.
-        //    Registration failing for any reason is non-fatal:
-        //    `poll_submission_status` falls back to `Event::query`,
-        //    which is always correct on its own, and a still-`Running`
-        //    submission just waits for an explicit `get()`/`isDone()`
-        //    exactly like before this followup landed.
+        // 7. Hand the submission to whoever observes its completion.
         //
-        //    The closure clones the submission's `Arc` and otherwise
-        //    only touches `AtomicBool::store` + `enqueue_completion`
-        //    (a plain mutex/condvar push, no CUDA driver call) —
-        //    `cuLaunchHostFunc` callbacks run on a driver-owned thread
-        //    and must never re-enter the CUDA driver (no
-        //    `Stream`/`Event`/`DeviceBuffer` calls) or block for long.
-        //    Keeping the submission alive via the clone until the
-        //    callback fires is a side effect, not a goal, but it is a
-        //    benign one: it means the submission (and any device
-        //    buffers referenced by its pending `FinalizeState`) can't
-        //    be freed out from under a kernel that's still in-flight
-        //    on the device, even if every other reference (registry +
-        //    caller) is dropped first.
+        //    A synchronous caller finalizes it itself, right after this
+        //    returns, and needs nothing else — see `Completion::Caller`.
         //
-        //    AUDIT 2026-08-03: that "benign" reasoning above missed a
-        //    real consequence — being the *last* strong reference means
-        //    THIS closure is the one whose drop runs `StreamSubmission`'s
-        //    (and transitively `cuda_bridge::Stream`'s / cudarc's
-        //    `CudaStream`'s) destructor, and `CudaStream::drop` issues a
-        //    real CUDA driver call (stream teardown/sync against the
-        //    default stream). Doing that from inside a `cuLaunchHostFunc`
-        //    callback is exactly the "must never re-enter the CUDA
-        //    driver" rule stated two paragraphs up — verified on
-        //    hardware (RTX 2060) via a reproducible `cudarc` panic,
-        //    `DriverError(CUDA_ERROR_NOT_PERMITTED, "operation not
-        //    permitted")`, out of `CudaStream`'s `Drop` impl, on every
-        //    dispatch of a synchronous (non-Future-API) kernel like
-        //    `GpuDotBench.dotReduce` — that path never calls
-        //    `register_submission`, so by the time the driver actually
-        //    invokes this callback the synchronous caller has already
-        //    finished and dropped its own reference, leaving this
-        //    closure's clone as the last one, 100% of the time.
-        //    Fix: move `cb_submission` INTO `enqueue_completion` instead
-        //    of letting it drop locally here. The reaper thread — an
-        //    ordinary thread, not a CUDA callback — becomes the one that
-        //    (maybe) runs the final drop, which is exactly where CUDA
-        //    driver calls are allowed.
+        //    For the async API the completion reaper watches it. By
+        //    default the reaper POLLS the completion event: `cuEventQuery`
+        //    asks the device a question without enqueueing anything, so
+        //    the next launch on this stream is not held behind a host
+        //    round trip the way a `cuLaunchHostFunc` holds it (see
+        //    `Completion`). The callback is kept behind
+        //    `CRATONVM_GPU_HOST_CALLBACK=1` as the A/B lever.
+        //
+        //    Either way the submission `Arc` moves onto the reaper queue
+        //    rather than being dropped on a driver thread: the last
+        //    `Arc<StreamSubmission>` to go drops a `cuda_bridge::Stream`,
+        //    whose destructor is a driver call, and a `cuLaunchHostFunc`
+        //    callback is the one place that is forbidden — verified on an
+        //    RTX 2060 (2026-08-03) as `CUDA_ERROR_NOT_PERMITTED` out of
+        //    `CudaStream::drop` on every synchronous dispatch.
+        if completion == Completion::Caller {
+            return submission;
+        }
         ensure_completion_reaper_started();
-        let cb_submission = submission.clone();
-        let cb_weak_vm = weak_vm;
-        if let Err(e) = stream.add_host_callback(Box::new(move || {
-            cb_submission
-                .device_done
-                .store(true, std::sync::atomic::Ordering::Release);
-            let cb_handle = cb_submission.handle;
-            // Transfers ownership of `cb_submission` into the reaper
-            // queue — see the AUDIT note above. Do not reintroduce a
-            // local `Arc<StreamSubmission>`/`Arc<Stream>` drop in this
-            // closure; that is precisely what re-enters the CUDA driver
-            // from a host callback.
-            enqueue_completion(cb_handle, cb_weak_vm, cb_submission);
-        })) {
-            tracing::debug!(
-                "gpu offload: add_host_callback registration failed ({e}); \
-                 poll_submission_status will fall back to Event::query for handle={handle}",
-            );
+        if host_callback_enabled() {
+            let cb_submission = submission.clone();
+            let cb_weak_vm = weak_vm;
+            if let Err(e) = stream.add_host_callback(Box::new(move || {
+                cb_submission
+                    .device_done
+                    .store(true, std::sync::atomic::Ordering::Release);
+                let cb_handle = cb_submission.handle;
+                // Transfers ownership of `cb_submission` into the reaper
+                // queue — see above. Do not reintroduce a local
+                // `Arc<StreamSubmission>`/`Arc<Stream>` drop in this
+                // closure; that is precisely what re-enters the CUDA
+                // driver from a host callback.
+                enqueue_completion(cb_handle, cb_weak_vm, cb_submission);
+            })) {
+                tracing::debug!(
+                    "gpu offload: add_host_callback registration failed ({e}); \
+                     the reaper will poll the event for handle={handle}",
+                );
+                enqueue_completion(handle, std::sync::Weak::default(), submission.clone());
+            }
+        } else {
+            enqueue_completion(handle, weak_vm, submission.clone());
         }
 
         submission
@@ -3420,11 +3620,17 @@ pub fn dispatch_gemm(
         buf: c_buf,
         len: c_elems,
     }];
-    // The same guard every other dispatch site takes: it keeps the
-    // collector off the marshalled arrays until the writeback has drained.
-    // `Heap::enter_gpu_critical` returns a token borrowed from the heap,
-    // which cannot be stored in a submission that outlives this frame.
-    let gc_guard = GcCriticalGuard::acquire();
+    // A keep-alive token for the submission's life. Every buffer here is
+    // a resident `GpuArray`, so there is no heap object to keep alive and
+    // nothing to remap; the token exists so the submission is attributed
+    // and leased like every other.
+    let gc_guard = GcCriticalGuard::acquire_for(
+        shared.vm_identity as u64,
+        None,
+        "dispatch_gemm",
+        cuda_bridge::critical::Relocation::KeepAliveOnly,
+        &[],
+    );
 
     let handle = NEXT_SUBMISSION_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let submission = std::sync::Arc::new(StreamSubmission {
@@ -3434,7 +3640,7 @@ pub fn dispatch_gemm(
         status: parking_lot::Mutex::new(SubmissionStatus::Running),
         finalize: parking_lot::Mutex::new(Some(FinalizeState {
             writebacks,
-            _gc_critical: gc_guard,
+            gc_critical: gc_guard,
         })),
         device_done: std::sync::atomic::AtomicBool::new(false),
     });
@@ -3761,63 +3967,126 @@ fn ensure_completion_reaper_started() {
     });
 }
 
-/// Body of the completion reaper thread. Blocks on `REAPER_WAKE` (no
-/// busy-polling); for each drained `(handle, weak_vm, submission)`
-/// triple, upgrades that entry's own `weak_vm` and runs the same
-/// [`finalize_submission`] work `get()` would have — off the mutator,
-/// with no Java thread involved. `finalize_submission`'s own errors are
-/// already recorded on `StreamSubmission::status`; there is nothing
-/// further to do with its `Result` here.
+/// Body of the completion reaper thread.
 ///
-/// `submission` is kept bound (not `let _ = ...`'d away) for the
-/// duration of `finalize_enqueued_handle` and only drops when the loop
-/// moves on to the next iteration. If this is the last strong
-/// `Arc<StreamSubmission>` in the process, that drop — and the
-/// `cuda_bridge::Stream` / cudarc `CudaStream` teardown it can
-/// transitively trigger — happens right here, on this ordinary thread.
-/// That is the point: see `REAPER_QUEUE`'s doc comment for why it must
-/// NOT happen back in the `cuLaunchHostFunc` callback that produced
-/// this entry.
+/// Parks on `REAPER_WAKE` while it has nothing to watch. Once a
+/// submission is queued it POLLS: each pass asks every watched
+/// submission whether its device work has been observed complete —
+/// `device_done` (set by the optional host callback), or the completion
+/// event's `cuEventQuery` — and finalizes the ones that have, running
+/// the same [`finalize_submission`] work `get()` would have, off the
+/// mutator and with no Java thread involved.
+///
+/// AUDIT 2026-09-02: polling replaced the per-launch `cuLaunchHostFunc`
+/// as the default because a host function blocks the launches queued
+/// behind it on its stream; see [`Completion`]. A `cuEventQuery` costs a
+/// microsecond and touches no queue. Between passes with nothing
+/// finished the thread yields a few times and then sleeps, capped at
+/// 200 us, so a kernel that takes milliseconds is queried a few thousand
+/// times rather than continuously and a kernel that takes microseconds
+/// is noticed within a few of them.
+///
+/// The submission `Arc` stays bound to the entry for as long as it is
+/// watched. If it is the last strong `Arc<StreamSubmission>` in the
+/// process, the drop — and the `cuda_bridge::Stream` teardown it can
+/// transitively trigger — happens here, on an ordinary thread, which is
+/// the point: see `REAPER_QUEUE`'s doc comment.
 #[cfg(feature = "gpu-offload")]
 fn completion_reaper_loop() {
+    type Watched = (
+        u64,
+        std::sync::Weak<crate::vm::SharedVm>,
+        std::sync::Arc<StreamSubmission>,
+    );
+    let mut watched: Vec<Watched> = Vec::new();
+    let mut quiet_passes: u32 = 0;
     loop {
-        let item = {
+        {
             let mut queue = REAPER_QUEUE.lock();
-            loop {
-                if let Some(item) = queue.pop_front() {
-                    break Some(item);
+            if watched.is_empty() {
+                while queue.is_empty() {
+                    if REAPER_SHUTDOWN.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+                    // `Condvar::wait` atomically releases `queue` while
+                    // parked and re-acquires it on wake, so a `notify_one`
+                    // from `enqueue_completion` landing between the
+                    // empty-check above and this wait is never missed.
+                    REAPER_WAKE.wait(&mut queue);
                 }
-                if REAPER_SHUTDOWN.load(std::sync::atomic::Ordering::Acquire) {
-                    break None;
-                }
-                // `Condvar::wait` atomically releases `queue` while
-                // parked and re-acquires it on wake, so a
-                // `notify_one` from `enqueue_completion` landing
-                // between the empty-check above and this wait can
-                // never be missed once we're inside `wait`.
-                REAPER_WAKE.wait(&mut queue);
             }
+            watched.extend(queue.drain(..));
+        }
+        if REAPER_SHUTDOWN.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let mut progressed = false;
+        watched.retain(|(_, weak_vm, sub)| {
+            if !submission_observed_complete(sub) {
+                return true;
+            }
+            finalize_enqueued_handle(weak_vm, sub);
+            progressed = true;
+            false
+        });
+        if watched.is_empty() {
+            quiet_passes = 0;
+            continue;
+        }
+        quiet_passes = if progressed {
+            0
+        } else {
+            quiet_passes.saturating_add(1)
         };
-        let (handle, weak_vm, _submission_keepalive) = match item {
-            Some(item) => item,
-            None => return,
-        };
-        finalize_enqueued_handle(&weak_vm, handle);
-        // `_submission_keepalive` drops here — safe on this thread even
-        // if it is the last `Arc<StreamSubmission>`.
+        if quiet_passes < 8 {
+            std::thread::yield_now();
+        } else {
+            let us = (20 * u64::from(quiet_passes)).min(200);
+            std::thread::sleep(std::time::Duration::from_micros(us));
+        }
     }
 }
 
-/// Attempt to finalize one reaper-queued handle: upgrade `weak_vm`
-/// and, if that succeeds and the handle is still registered, run
-/// [`finalize_submission`]. A failed upgrade (VM torn down, or
-/// `self_arc` was never populated) is a silent no-op — the
-/// submission is simply left for the existing poll-based path
-/// (`poll_submission_status`, `get()`) to finalize later, exactly as
-/// it always has. Keeping the caller (`completion_reaper_loop`)
-/// draining rather than exiting on a failed upgrade avoids leaking
-/// the thread's role as the queue's sole consumer for as long as the
-/// process runs multiple short-lived VMs (tests).
+/// Whether the reaper may finalize `sub` now without blocking.
+///
+/// True for a submission already terminal (finalize is then a no-op
+/// that drops the entry), for one whose host callback flagged
+/// `device_done`, for one whose completion event has fired, and for one
+/// that has no event at all — a pre-launch failure, or a test fixture —
+/// where there is nothing on the device to wait for.
+#[cfg(feature = "gpu-offload")]
+fn submission_observed_complete(sub: &StreamSubmission) -> bool {
+    if !matches!(&*sub.status.lock(), SubmissionStatus::Running) {
+        return true;
+    }
+    if sub.device_done.load(std::sync::atomic::Ordering::Acquire) {
+        return true;
+    }
+    match sub.event.as_ref() {
+        None => true,
+        Some(ev) => match ev.query() {
+            Ok(done) => done,
+            // A query that errors will error again from
+            // `finalize_submission`, which records the failure on the
+            // status; letting it through is how that gets reported.
+            Err(_) => true,
+        },
+    }
+}
+
+/// Finalize one reaper-queued submission: upgrade `weak_vm` and, if that
+/// succeeds, run [`finalize_submission`]. A failed upgrade (VM torn
+/// down, or `self_arc` was never populated) is a silent no-op — the
+/// submission is left for the poll-based path (`poll_submission_status`,
+/// `get()`) to finalize later, exactly as it always has. Keeping the
+/// caller (`completion_reaper_loop`) draining rather than exiting on a
+/// failed upgrade avoids leaking the thread's role as the queue's sole
+/// consumer for as long as the process runs multiple short-lived VMs
+/// (tests).
+///
+/// Takes the submission itself rather than looking its handle up: the
+/// reaper holds the `Arc`, and a `Completion::Caller` submission is
+/// never in the registry at all.
 ///
 /// Factored out of `completion_reaper_loop`'s body so both the
 /// VM-alive and VM-torn-down paths are unit-testable directly,
@@ -3826,20 +4095,22 @@ fn completion_reaper_loop() {
 /// exercised by one test in the whole binary — see
 /// `reaper_finalizes_submission_without_any_poll_call`).
 #[cfg(feature = "gpu-offload")]
-fn finalize_enqueued_handle(weak_vm: &std::sync::Weak<crate::vm::SharedVm>, handle: u64) {
+fn finalize_enqueued_handle(
+    weak_vm: &std::sync::Weak<crate::vm::SharedVm>,
+    sub: &std::sync::Arc<StreamSubmission>,
+) {
     let Some(shared) = weak_vm.upgrade() else {
         return;
     };
-    if let Some(sub) = lookup_submission(handle) {
-        let _ = finalize_submission(&shared, &sub);
-    }
+    let _ = finalize_submission(&shared, sub);
 }
 
 /// Push `(handle, weak_vm, submission)` onto the reaper's work queue
 /// and wake it. `weak_vm` travels with the handle rather than being
 /// fixed once for the reaper thread's whole life — see the doc comment
-/// on `REAPER_QUEUE` for why that distinction matters. Called from the
-/// `cuLaunchHostFunc` callback registered in `dispatch_async`, so this
+/// on `REAPER_QUEUE` for why that distinction matters. Called from
+/// `dispatch_async` directly, or from the `cuLaunchHostFunc` callback
+/// when `CRATONVM_GPU_HOST_CALLBACK=1` restores one, so this
 /// must stay cheap and must never call back into the CUDA driver: a
 /// `parking_lot::Mutex` lock + `VecDeque` push + `Condvar::notify_one`
 /// is the same class of "plain host memory operation" the callback
@@ -3929,12 +4200,16 @@ fn kind_of_device_message(m: &str) -> GpuErrorKind {
     }
 }
 
+/// A submission that failed before anything was launched, not yet in
+/// the registry. [`record_failed_submission`] registers one for the
+/// handle-returning entry points; the synchronous dispatch path hands
+/// it straight to its caller.
 #[cfg(feature = "gpu-offload")]
-fn record_failed_submission(
+fn failed_submission(
     stream: Option<std::sync::Arc<Stream>>,
     kind: GpuErrorKind,
     message: String,
-) -> u64 {
+) -> std::sync::Arc<StreamSubmission> {
     // Every explicit-dispatch failure ends here, and until this line
     // existed none of them said anything: the reason was stored on the
     // submission and only ever surfaced if the Java side successfully
@@ -3942,16 +4217,23 @@ fn record_failed_submission(
     // with the analyzer verdicts.
     tracing::warn!("gpu offload: submission failed — {message}");
     let handle = NEXT_SUBMISSION_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let sub = std::sync::Arc::new(StreamSubmission {
+    std::sync::Arc::new(StreamSubmission {
         handle,
         stream,
         event: None,
         status: parking_lot::Mutex::new(SubmissionStatus::Failed { message, kind }),
         finalize: parking_lot::Mutex::new(None),
         device_done: std::sync::atomic::AtomicBool::new(false),
-    });
-    register_submission(sub);
-    handle
+    })
+}
+
+#[cfg(feature = "gpu-offload")]
+fn record_failed_submission(
+    stream: Option<std::sync::Arc<Stream>>,
+    kind: GpuErrorKind,
+    message: String,
+) -> u64 {
+    register_submission(failed_submission(stream, kind, message))
 }
 
 /// Convenience wrapper around
@@ -4016,6 +4298,58 @@ pub fn dispatch_method_from_native_on_stream(
     java_args: &[cratonvm_types::Value],
     stream_handle: Option<u64>,
 ) -> u64 {
+    let submission = dispatch_method_inner(
+        shared,
+        class_name,
+        method_name,
+        descriptor,
+        java_args,
+        stream_handle,
+        Completion::Reaper,
+    );
+    // Register the submission and return its handle. The Java side wraps
+    // this handle in `GpuFutureImpl`.
+    register_submission(submission)
+}
+
+/// The transparent interpreter hook's dispatch: the same marshal and
+/// launch as [`dispatch_method_from_native`], handed back as the
+/// submission itself for the caller to finalize synchronously.
+///
+/// AUDIT 2026-09-02. `try_dispatch` used to go through the handle API —
+/// register in the process-wide table, register a `cuLaunchHostFunc`
+/// callback, queue for the reaper, look the handle back up, finalize,
+/// release — for a call that blocks on the completion event before it
+/// returns and so never needed any of it. See [`Completion::Caller`].
+#[cfg(feature = "gpu-offload")]
+pub fn dispatch_method_sync(
+    shared: &crate::vm::SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    java_args: &[cratonvm_types::Value],
+) -> std::sync::Arc<StreamSubmission> {
+    dispatch_method_inner(
+        shared,
+        class_name,
+        method_name,
+        descriptor,
+        java_args,
+        None,
+        Completion::Caller,
+    )
+}
+
+#[cfg(feature = "gpu-offload")]
+fn dispatch_method_inner(
+    shared: &crate::vm::SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    java_args: &[cratonvm_types::Value],
+    stream_handle: Option<u64>,
+    completion: Completion,
+) -> std::sync::Arc<StreamSubmission> {
     use cratonvm_types::{ArrayElementType, Value};
     use cuda_bridge::{KernelArgs, Stream as CudaStream};
     use std::sync::Arc;
@@ -4073,7 +4407,7 @@ pub fn dispatch_method_from_native_on_stream(
         // `f.get()` without throwing, leaving output arrays at their
         // pre-launch zero values — masquerading as a writeback bug.
         if let Err(e) = shared.load_class_concurrent(class_name) {
-            return record_failed_submission(
+            return failed_submission(
                 None,
                 GpuErrorKind::Compile,
                 format!("submitMethod: load class failed for {class_name}: {e:?}"),
@@ -4083,7 +4417,7 @@ pub fn dispatch_method_from_native_on_stream(
         let class_id = match cm.get_loaded_class_id(class_name) {
             Some(id) => id,
             None => {
-                return record_failed_submission(
+                return failed_submission(
                     None,
                     GpuErrorKind::Compile,
                     format!(
@@ -4095,7 +4429,7 @@ pub fn dispatch_method_from_native_on_stream(
         let class = match cm.get_class(class_id) {
             Some(c) => c,
             None => {
-                return record_failed_submission(
+                return failed_submission(
                     None,
                     GpuErrorKind::Compile,
                     format!("submitMethod: class id missing in manager: {class_name}"),
@@ -4109,7 +4443,7 @@ pub fn dispatch_method_from_native_on_stream(
         {
             Some(i) => i as u16,
             None => {
-                return record_failed_submission(
+                return failed_submission(
                     None,
                     GpuErrorKind::Compile,
                     format!(
@@ -4146,7 +4480,7 @@ pub fn dispatch_method_from_native_on_stream(
                         ..
                     }) = class.constant_pool.get(cp)
                     else {
-                        return record_failed_submission(
+                        return failed_submission(
                             None,
                             GpuErrorKind::Compile,
                             format!(
@@ -4160,7 +4494,7 @@ pub fn dispatch_method_from_native_on_stream(
                     let Some((nm, _desc)) =
                         class.constant_pool.get_name_and_type(*name_and_type_index)
                     else {
-                        return record_failed_submission(
+                        return failed_submission(
                             None,
                             GpuErrorKind::Compile,
                             format!(
@@ -4188,7 +4522,7 @@ pub fn dispatch_method_from_native_on_stream(
                 resolved.into_tuple()
             }
             LookupOutcome::Skip => {
-                return record_failed_submission(
+                return failed_submission(
                     None,
                 GpuErrorKind::Compile,
                     format!(
@@ -4196,7 +4530,7 @@ pub fn dispatch_method_from_native_on_stream(
                     ),);
             }
             LookupOutcome::Blacklisted => {
-                return record_failed_submission(
+                return failed_submission(
                     None,
                     GpuErrorKind::Compile,
                     format!(
@@ -4220,7 +4554,7 @@ pub fn dispatch_method_from_native_on_stream(
     let ctx = match cache.device() {
         Some(c) => c,
         None => {
-            return record_failed_submission(
+            return failed_submission(
                 None,
                 GpuErrorKind::Launch,
                 format!(
@@ -4257,7 +4591,7 @@ pub fn dispatch_method_from_native_on_stream(
         Some(h) => match cache.resolve_stream(h) {
             Some(s) => s,
             None => {
-                return record_failed_submission(
+                return failed_submission(
                     None,
                     GpuErrorKind::Launch,
                     format!(
@@ -4267,30 +4601,40 @@ pub fn dispatch_method_from_native_on_stream(
                 );
             }
         },
-        None => match CudaStream::new(ctx) {
-            Ok(s) => Arc::new(s),
+        // A handle-less caller takes a pooled stream rather than a
+        // freshly created one — see `OffloadCache::dispatch_streams`.
+        None => match cache.dispatch_stream(ctx) {
+            Ok(s) => s,
             Err(e) => {
-                return record_failed_submission(
+                return failed_submission(
                     None,
                     kind_of_device_error(&e),
-                    format!("submitMethod: Stream::new failed: {e}"),
+                    format!("submitMethod: no dispatch stream available: {e}"),
                 );
             }
         },
     };
 
-    // 6. Enter the GC-critical section. The guard lives in the
-    //    StreamSubmission's FinalizeState (Phase 7 #1), bracketing
-    //    the kernel's read of source arrays from dispatch through
-    //    writeback. We also keep a short-lived SafepointToken bound
-    //    to the calling thread for the marshal-time gpu_marshal::*
-    //    calls — they have a `&SafepointToken<'_>` signature, and
-    //    the GcCriticalGuard alone wouldn't satisfy it. Once
-    //    marshalling is done the token is dropped; the guard in
-    //    the FinalizeState keeps the GC paused for the rest of
-    //    the submission's life.
-    let gc_guard = GcCriticalGuard::acquire();
-    let token = shared.mem.heap.enter_gpu_critical();
+    // 6. Open the MARSHAL window. The zero-copy upload hands the device
+    //    the heap arena's own address and host-blocks until the DMA has
+    //    retired (`gpu_marshal::zerocopy_enabled`), so for the length of
+    //    this window nothing may relocate: a `Relocation::Forbidden`
+    //    token says so to every collector. The long-lived keep-alive
+    //    token that outlives this frame is taken at step 9, once the
+    //    writeback targets are known.
+    //
+    //    The `SafepointToken` the `gpu_marshal::*` signatures require is
+    //    a type-level marker on a local counter; the registry token is
+    //    what the collector reads.
+    let marshal_window = GcCriticalGuard::acquire_for(
+        shared.vm_identity as u64,
+        None,
+        "dispatch_method_inner:marshal",
+        cuda_bridge::critical::Relocation::Forbidden,
+        &[],
+    );
+    let local_counter = std::sync::atomic::AtomicU32::new(0);
+    let token = cratonvm_gc::safepoint::SafepointToken::new(&local_counter);
 
     // 7. Marshal Java args into KernelArgs + remember writebacks.
     //    `max_array_len` tracks the largest array length we marshal —
@@ -4336,7 +4680,7 @@ pub fn dispatch_method_from_native_on_stream(
             Some(Value::Object(Some(r))) => *r,
             Some(Value::Object(None)) => {
                 drop(token);
-                return record_failed_submission(
+                return failed_submission(
                     Some(stream.clone()),
                 GpuErrorKind::Compile,
                     format!(
@@ -4345,7 +4689,7 @@ pub fn dispatch_method_from_native_on_stream(
             }
             Some(other) => {
                 drop(token);
-                return record_failed_submission(
+                return failed_submission(
                     Some(stream.clone()),
                     GpuErrorKind::Compile,
                     format!(
@@ -4355,7 +4699,7 @@ pub fn dispatch_method_from_native_on_stream(
             }
             None => {
                 drop(token);
-                return record_failed_submission(
+                return failed_submission(
                     Some(stream.clone()),
                     GpuErrorKind::Compile,
                     format!(
@@ -4391,7 +4735,7 @@ pub fn dispatch_method_from_native_on_stream(
                     Some(s) => s,
                     None => {
                         drop(token);
-                        return record_failed_submission(
+                        return failed_submission(
                             Some(stream.clone()),
                             GpuErrorKind::Compile,
                             format!(
@@ -4407,7 +4751,7 @@ pub fn dispatch_method_from_native_on_stream(
                 Value::Object(Some(o)) => o,
                 Value::Object(None) => {
                     drop(token);
-                    return record_failed_submission(
+                    return failed_submission(
                         Some(stream.clone()),
                 GpuErrorKind::Compile,
                         format!(
@@ -4416,7 +4760,7 @@ pub fn dispatch_method_from_native_on_stream(
                 }
                 other => {
                     drop(token);
-                    return record_failed_submission(
+                    return failed_submission(
                         Some(stream.clone()),
                         GpuErrorKind::Compile,
                         format!(
@@ -4428,7 +4772,7 @@ pub fn dispatch_method_from_native_on_stream(
             };
             let Some(etype) = shared.mem.heap.array_element_type(field_obj) else {
                 drop(token);
-                return record_failed_submission(
+                return failed_submission(
                     Some(stream.clone()),
                     GpuErrorKind::Compile,
                     format!(
@@ -4458,7 +4802,7 @@ pub fn dispatch_method_from_native_on_stream(
                 }
                 Err(msg) => {
                     drop(token);
-                    return record_failed_submission(
+                    return failed_submission(
                         Some(stream.clone()),
                         kind_of_device_message(&msg),
                         msg,
@@ -4510,7 +4854,7 @@ pub fn dispatch_method_from_native_on_stream(
                         }
                         Err(msg) => {
                             drop(token);
-                            return record_failed_submission(
+                            return failed_submission(
                                 Some(stream.clone()),
                                 kind_of_device_message(&msg),
                                 msg,
@@ -4541,7 +4885,7 @@ pub fn dispatch_method_from_native_on_stream(
                         }
                         Err(msg) => {
                             drop(token);
-                            return record_failed_submission(
+                            return failed_submission(
                                 Some(stream.clone()),
                                 kind_of_device_message(&msg),
                                 msg,
@@ -4567,7 +4911,7 @@ pub fn dispatch_method_from_native_on_stream(
                     Some(Value::Double(v)) => kernel_args = kernel_args.push_f64(v),
                     _ => {
                         drop(token);
-                        return record_failed_submission(
+                        return failed_submission(
                             Some(stream.clone()),
                 GpuErrorKind::Compile,
                             format!(
@@ -4579,7 +4923,7 @@ pub fn dispatch_method_from_native_on_stream(
             }
             Value::Object(None) => {
                 drop(token);
-                return record_failed_submission(
+                return failed_submission(
                     Some(stream.clone()),
                     GpuErrorKind::Compile,
                     format!("submitMethod: arg #{i} is null"),
@@ -4587,7 +4931,7 @@ pub fn dispatch_method_from_native_on_stream(
             }
             _ => {
                 drop(token);
-                return record_failed_submission(
+                return failed_submission(
                     Some(stream.clone()),
                     GpuErrorKind::Compile,
                     format!("submitMethod: arg #{i} type unsupported: {arg:?}"),
@@ -4629,7 +4973,7 @@ pub fn dispatch_method_from_native_on_stream(
                 Ok(b) => std::sync::Arc::new(b),
                 Err(e) => {
                     drop(token);
-                    return record_failed_submission(
+                    return failed_submission(
                         Some(stream.clone()),
                         kind_of_device_error(&e),
                         format!(
@@ -4712,7 +5056,7 @@ pub fn dispatch_method_from_native_on_stream(
             Ok(b) => (b, Some(pool_key)),
             Err(e) => {
                 drop(token);
-                return record_failed_submission(
+                return failed_submission(
                     Some(stream.clone()),
                     GpuErrorKind::Compile,
                     format!("submitMethod: failed to allocate failure_flag buffer: {e}"),
@@ -4803,7 +5147,7 @@ pub fn dispatch_method_from_native_on_stream(
                 Some(v) => max_array_len.max(v.max(0) as usize),
                 None => {
                     drop(token);
-                    return record_failed_submission(
+                    return failed_submission(
                         Some(stream.clone()),
                         GpuErrorKind::Launch,
                         format!(
@@ -4818,10 +5162,26 @@ pub fn dispatch_method_from_native_on_stream(
         _ => max_array_len,
     };
     let runtime_work: u32 = u32::try_from(work_items).unwrap_or(u32::MAX);
-    // The thread-local SafepointToken's role is over (marshal is
-    // done). The cross-thread GcCriticalGuard (moved into
-    // `FinalizeState` below) takes over.
+    // Marshalling is done: every DMA against the arena has retired. Take
+    // the keep-alive token for the submission's life, declaring the Java
+    // arrays the writeback will land in as roots — those are the only
+    // heap objects the submission still names — and THEN release the
+    // relocation veto. The order matters: the roots must be registered
+    // before a collector is free to move them.
+    let keepalive: Vec<usize> = writebacks
+        .iter()
+        .filter_map(MarshalWriteback::heap_target)
+        .map(|obj| obj.as_ptr() as usize)
+        .collect();
+    let gc_guard = GcCriticalGuard::acquire_for(
+        shared.vm_identity as u64,
+        None,
+        "dispatch_method_inner:submission",
+        cuda_bridge::critical::Relocation::KeepAliveOnly,
+        &keepalive,
+    );
     drop(token);
+    drop(marshal_window);
     // 9. Known-issues followups #3 — the writebacks + GC-critical
     //    guard are handed to `dispatch_async` itself now, rather than
     //    attached by this caller after the call returns: attaching
@@ -4851,16 +5211,13 @@ pub fn dispatch_method_from_native_on_stream(
         runtime_work,
         Some(FinalizeState {
             writebacks,
-            _gc_critical: gc_guard,
+            gc_critical: gc_guard,
         }),
         shared.self_arc.read().as_ref().cloned().unwrap_or_default(),
+        completion,
     );
 
-    // 10. Register the submission and return its handle. The Java
-    //     side wraps this handle in `GpuFutureImpl`.
-    let handle = submission.handle;
-    register_submission(submission);
-    handle
+    submission
 }
 
 /// Phase 7 #1 — finalize a submission on the first `future.get()`.
@@ -4900,10 +5257,25 @@ pub fn finalize_submission(
     let pending = finalize_guard.take();
 
     if let Some(FinalizeState {
-        writebacks,
-        _gc_critical,
+        mut writebacks,
+        gc_critical,
     }) = pending
     {
+        // 0. A revoked token means the registry stopped keeping this
+        //    submission's arrays alive — its lease ran out, or its VM is
+        //    gone. Nothing below may touch the heap.
+        if gc_critical.is_revoked() {
+            let message = "GPU critical-section token was revoked (lease expired or VM shut \
+                           down) before the writeback ran; result discarded"
+                .to_string();
+            *submission.status.lock() = SubmissionStatus::Failed {
+                message: message.clone(),
+                kind: GpuErrorKind::Launch,
+            };
+            drop(writebacks);
+            drop(gc_critical);
+            return Err(message);
+        }
         // 1. Wait for the kernel to complete via the recorded event.
         //
         //    Skipped for a chunked submission: its writeback waits each
@@ -4921,21 +5293,56 @@ pub fn finalize_submission(
                     message: format!("event.synchronize: {e}"),
                     kind: kind_of_device_error(&e),
                 };
-                // _gc_critical drops here (releases GC gate).
                 drop(writebacks);
-                drop(_gc_critical);
+                drop(gc_critical);
                 return Err(match &*status {
                     SubmissionStatus::Failed { message, .. } => message.clone(),
                     _ => unreachable!(),
                 });
             }
         }
-        // 2. Synthesize a thread-local SafepointToken to satisfy
-        //    the writeback signature. The token is purely a
-        //    type-system marker (the actual no-GC window is held
-        //    by `_gc_critical` against the shared GPU_CRITICAL_COUNT);
-        //    a local counter satisfies the borrow without affecting
-        //    the real GC gate.
+        // 2. Open the WRITEBACK window: the downloads below land in the
+        //    heap arena in place, so relocation is forbidden until they
+        //    have retired. Taken BEFORE the addresses are read back, so
+        //    nothing can move them between the read and the write; the
+        //    acquisition itself waits out any moving cycle in progress
+        //    (`Registry::begin_moving_cycle`).
+        let writeback_window = GcCriticalGuard::acquire_for(
+            gc_critical_vm(shared),
+            Some(submission.handle),
+            "finalize_submission:writeback",
+            cuda_bridge::critical::Relocation::Forbidden,
+            &[],
+        );
+        // The collector may have moved the target arrays while the kernel
+        // ran; the registry has their current addresses.
+        if gc_critical.is_revoked() {
+            let message = "GPU critical-section token was revoked while waiting for the \
+                           device; result discarded"
+                .to_string();
+            *submission.status.lock() = SubmissionStatus::Failed {
+                message: message.clone(),
+                kind: GpuErrorKind::Launch,
+            };
+            drop(writeback_window);
+            drop(writebacks);
+            drop(gc_critical);
+            return Err(message);
+        }
+        let live = gc_critical.keepalive_addrs();
+        for (target, addr) in writebacks
+            .iter_mut()
+            .filter_map(MarshalWriteback::heap_target_mut)
+            .zip(live)
+        {
+            // SAFETY: `addr` is the collector-maintained current address of
+            // the object this writeback declared at dispatch, kept alive by
+            // the token that is still held.
+            *target = unsafe { cratonvm_types::ObjectRef::from_raw(addr as *mut u8) };
+        }
+        // The `SafepointToken` the `gpu_marshal::*` signatures require is
+        // a type-level marker on a local counter; `writeback_window` is
+        // what the collector reads.
         let local_counter = std::sync::atomic::AtomicU32::new(0);
         let local_token = cratonvm_gc::safepoint::SafepointToken::new(&local_counter);
 
@@ -4992,12 +5399,13 @@ pub fn finalize_submission(
                 }
             }
         }
-        // 4. Drop guard (release real GC gate) BEFORE we touch the
-        //    status mutex so a concurrent reader of status doesn't
-        //    block GC longer than necessary.
+        // 4. Close both windows BEFORE we touch the status mutex so a
+        //    concurrent reader of status doesn't hold the collector off
+        //    longer than necessary.
         drop(local_token);
+        drop(writeback_window);
         drop(writebacks);
-        drop(_gc_critical);
+        drop(gc_critical);
 
         // 4. Transition status.
         let mut status = submission.status.lock();
@@ -5041,6 +5449,12 @@ pub fn finalize_submission(
             SubmissionStatus::Failed { message, .. } => Err(message.clone()),
         }
     }
+}
+
+/// The VM identity a token names, as the registry's `u64`.
+#[cfg(feature = "gpu-offload")]
+fn gc_critical_vm(shared: &crate::vm::SharedVm) -> u64 {
+    shared.vm_identity as u64
 }
 
 /// Known-issues followups item 3 — the non-blocking half of
@@ -5730,7 +6144,7 @@ pub(crate) mod input_cache {
     use cuda_bridge::DeviceBuffer;
     use parking_lot::Mutex;
     use rustc_hash::FxHashMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, OnceLock};
 
     pub(crate) enum CachedBuffer {
@@ -5903,7 +6317,119 @@ pub(crate) mod input_cache {
     /// would skip a live entry and leave the device mirror stale. The
     /// reverse window (bit set, entry not yet inserted) is a harmless
     /// false positive.
+    /// Set once a method containing a primitive array store has been
+    /// admitted to the JIT, after which nothing may be cached.
+    ///
+    /// # The trade this replaces
+    ///
+    /// This cache mirrors a Java array in device memory across submits,
+    /// which is only sound while every host write to that array evicts
+    /// the entry. The interpreter's `*astore` arms and the
+    /// `jit_iastore`/`jit_bastore` helpers all call [`invalidate`]; the
+    /// JIT's IR pipeline lowers `Op::ArrayStore` to an inline
+    /// `MOVSS`/`MOVSD` with no helper to hook, so there was one path
+    /// that could write an array behind the cache's back.
+    ///
+    /// `offload_jit_gate` closed it from the other side, by refusing to
+    /// COMPILE any method containing `iastore`/`lastore`/`fastore`/
+    /// `dastore` while a GPU is attached. That is sound and enormously
+    /// broad: it has nothing to do with whether the method has ever seen
+    /// a kernel, so passing `--gpu` de-optimised the CPU half of every
+    /// mixed workload — a ray tracer's setup loops, an inference
+    /// pipeline's array fills — to keep coherent a cache most of those
+    /// methods will never touch.
+    ///
+    /// AUDIT 2026-09-02 made the choice explicit rather than implicit,
+    /// and measured it. Both directions are sound; the question is which
+    /// side pays. Blocking the JIT costs native code on methods that may
+    /// have no connection to the device. Disabling the cache costs one
+    /// H2D copy per submit on arrays that are re-submitted unchanged.
+    ///
+    /// The second sounded bounded — "it is only PCIe bandwidth" — and on
+    /// the workload the cache exists for it is 5x. `GpuWarm f 2^22 5` on
+    /// an RTX 2060: `warm_ms` 2 with the cache, 10 without, and
+    /// `CRATONVM_GPU_TRACE_BYTES=1` showing 48 MB once against 48 MB
+    /// every submit. So blocking the JIT remains the default and this
+    /// path is reached only under
+    /// `CRATONVM_GPU_JIT_ARRAY_WRITERS=allow`, for the opposite shape:
+    /// a mixed workload whose CPU half does real array work around a
+    /// kernel that runs once.
+    ///
+    /// It is still decided lazily rather than up front. The flag flips
+    /// at JIT ADMISSION of the first array-writing method, which is
+    /// strictly before that method's compiled code can run, so a program
+    /// that never compiles one keeps the cache even under `allow`.
+    ///
+    /// The existing entries are dropped at the same moment
+    /// ([`disable_for_jit_array_writer`]), because an array cached a
+    /// moment ago is one the about-to-run compiled code may write.
+    static DISABLED_BY_JIT: AtomicBool = AtomicBool::new(false);
+
+    /// Whether the residency cache is still accepting entries.
+    pub(crate) fn is_enabled() -> bool {
+        !DISABLED_BY_JIT.load(Ordering::Acquire)
+    }
+
+    /// Give up the residency cache so a method that writes a primitive
+    /// array can be JIT-compiled. See [`DISABLED_BY_JIT`].
+    ///
+    /// Idempotent, and cheap after the first call: one relaxed-ish load
+    /// on a path (`offload_jit_gate::compute`) that is already memoised
+    /// per method.
+    ///
+    /// Ordering is the whole argument. This runs at ADMISSION — before
+    /// the method is compiled, and therefore before its compiled code
+    /// can execute a single store. Entries inserted before this point
+    /// are dropped here; entries after are refused by [`insert`]. There
+    /// is no window in which a compiled store can run against a live
+    /// entry.
+    ///
+    /// A concurrent marshal that already took an `Arc` out of the cache
+    /// keeps its buffer alive and proceeds. That is not a new race: an
+    /// interpreted store racing the same marshal has always been able to
+    /// `invalidate` an entry a submit had already read. The explicit
+    /// async API documents that writing a kernel's input array while the
+    /// kernel runs is the caller's problem; the transparent path is
+    /// synchronous and cannot reach it.
+    pub(crate) fn disable_for_jit_array_writer() {
+        if DISABLED_BY_JIT.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let mut tables = map().lock();
+        let dropped: usize = tables.values().map(|t| t.len()).sum();
+        tables.clear();
+        rebuild_filter(&tables);
+        drop(tables);
+        tracing::info!(
+            "gpu offload: input-residency cache disabled ({dropped} entr(ies) dropped) \
+             so methods writing primitive arrays can be JIT-compiled. Every kernel \
+             argument is re-uploaded per submit from here on."
+        );
+    }
+
+    /// Total entries across every VM's table.
+    ///
+    /// Test-only, and deliberately not per-VM: what
+    /// `disable_for_jit_array_writer` has to guarantee is that NOTHING is
+    /// cached anywhere, not that one heap's table is empty.
+    #[cfg(test)]
+    pub(crate) fn table_len_for_test() -> usize {
+        map().lock().values().map(|t| t.len()).sum()
+    }
+
+    /// The membership filter `invalidate` reads on every array store in
+    /// the VM. Test-only; see [`ADDR_FILTER`].
+    #[cfg(test)]
+    pub(crate) fn addr_filter_for_test() -> u64 {
+        ADDR_FILTER.load(Ordering::Acquire)
+    }
+
     fn insert(vm: usize, obj: ObjectRef, entry: Entry) {
+        // Refused once a JIT-compiled array writer exists: there would be
+        // no way to evict this entry when that code stores into `obj`.
+        if !is_enabled() {
+            return;
+        }
         ADDR_FILTER.fetch_or(addr_bit(obj), Ordering::AcqRel);
         map().lock().entry(vm).or_default().insert(obj, entry);
     }
@@ -6075,6 +6601,37 @@ pub enum ChunkedStage {
 const CHUNK_STREAMS_DEFAULT: usize = 8;
 #[cfg(feature = "gpu-offload")]
 const CHUNK_COUNT_DEFAULT: usize = 8;
+
+/// Streams the handle-less dispatch path rotates over, instead of
+/// creating and destroying one per submission.
+///
+/// Four, not one, and not eight. One would be enough for the
+/// transparent interpreter path on its own — it finalizes before
+/// returning, so it never has two launches in flight — but
+/// `dispatch_method_from_native` is also reachable from several Java
+/// threads at once, and giving those a shared stream would serialise
+/// dispatches the driver could have overlapped. Four covers that without
+/// holding open more driver objects than a program that never offloads
+/// anything would want to pay for.
+///
+/// Override with `CRATONVM_GPU_DISPATCH_STREAMS`, and set it to 1 to get
+/// the strictest ordering if a bug is ever suspected to be one of
+/// stream concurrency.
+#[cfg(feature = "gpu-offload")]
+const DISPATCH_STREAM_POOL_DEFAULT: usize = 4;
+
+/// See [`DISPATCH_STREAM_POOL_DEFAULT`].
+#[cfg(feature = "gpu-offload")]
+fn dispatch_stream_pool_size() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GPU_DISPATCH_STREAMS")
+            .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))
+            .filter(|n: &usize| *n >= 1 && *n <= 32)
+            .unwrap_or(DISPATCH_STREAM_POOL_DEFAULT)
+    })
+}
 
 /// Streams the chunked dispatch rotates launches over.
 /// Override with `CRATONVM_GPU_CHUNK_STREAMS`.
@@ -6720,6 +7277,38 @@ impl MarshalWriteback {
             | Self::ResidentI64 { handle, .. }
             | Self::ResidentF32 { handle, .. }
             | Self::ResidentF64 { handle, .. } => Some(*handle),
+            _ => None,
+        }
+    }
+
+    /// The Java array this writeback lands in, if it lands in one.
+    ///
+    /// These are the addresses a submission declares as keep-alive roots
+    /// at dispatch; the resident and cell variants name device buffers
+    /// or the resident store, never the heap.
+    pub fn heap_target(&self) -> Option<cratonvm_types::ObjectRef> {
+        match self {
+            Self::Chunked { obj, .. }
+            | Self::I32 { obj, .. }
+            | Self::I64 { obj, .. }
+            | Self::F32 { obj, .. }
+            | Self::F64 { obj, .. } => Some(*obj),
+            _ => None,
+        }
+    }
+
+    /// Mutable twin of [`MarshalWriteback::heap_target`], for the
+    /// finalize path to install the collector's current address before
+    /// writing. Same variant order, so `zip` with
+    /// `GcCriticalGuard::keepalive_addrs` pairs each target with its own
+    /// declaration.
+    pub fn heap_target_mut(&mut self) -> Option<&mut cratonvm_types::ObjectRef> {
+        match self {
+            Self::Chunked { obj, .. }
+            | Self::I32 { obj, .. }
+            | Self::I64 { obj, .. }
+            | Self::F32 { obj, .. }
+            | Self::F64 { obj, .. } => Some(obj),
             _ => None,
         }
     }

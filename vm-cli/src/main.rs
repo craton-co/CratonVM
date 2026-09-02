@@ -260,6 +260,21 @@ fn maybe_dump_shutdown_reports() {
             eprintln!(
                 "[cratonvm] compiled reference stores: gated={gated} declined={declined}"
             );
+            // Optimizing-tier allocation. A zero on the left is the EXPECTED
+            // reading under a default configuration -- `c2_alloc_upgrade` is
+            // opt-in, so no method containing a `new` reaches that tier -- and
+            // printing both is what separates that from "emitted and refused".
+            let (bump, stub) = cratonvm_jit::runtime_lowering::ir_alloc_site_counts();
+            eprintln!("[cratonvm] optimizing-tier allocations: inline-bump={bump} stub-only={stub}");
+            // getfield receiver null checks. The PAIR, never the ratio: an
+            // all-zero pair means the trusted-oop arm was never reached at all
+            // (no inline getfield compiled), while zero-elided-with-nonzero-
+            // emitted means it WAS reached and the dataflow proved nothing.
+            // Those look identical as a percentage and want opposite fixes.
+            let (nn_elided, nn_emitted) = cratonvm_jit::x64::receiver_null_check_counts();
+            eprintln!(
+                "[cratonvm] getfield receiver null checks: elided={nn_elided} emitted={nn_emitted}"
+            );
         }
         // Reference loads whose slot did NOT hold a reference, contained by
         // `GETFIELD_EXPECT_REFERENCE` instead of being handed to compiled code
@@ -671,6 +686,15 @@ struct Args {
     #[arg(long = "Xmx", value_name = "SIZE", overrides_with = "max_heap")]
     max_heap: Option<String>,
 
+    /// Initial heap size (e.g., 16m, 512m).
+    ///
+    /// F-16: this used to be accepted and discarded, because the heap was
+    /// allocated at `-Xmx` in the collector's constructor and there was nothing
+    /// for an initial size to mean. Under G1 the heap is now RESERVED at `-Xmx`
+    /// and COMMITTED on demand, so `-Xms` names the prefix committed up front.
+    #[arg(long = "Xms", value_name = "SIZE", overrides_with = "initial_heap")]
+    initial_heap: Option<String>,
+
     /// Print verbose class loading information.
     #[arg(long = "verbose:class")]
     verbose_class: bool,
@@ -1071,6 +1095,34 @@ struct Args {
         overrides_with = "g1_max_pause"
     )]
     g1_max_pause: Option<String>,
+
+    /// `-XX:G1MixedGCLiveThresholdPercent=<n>` → an Old region at or above
+    /// this percent live is never a mixed-collection candidate (honoured
+    /// under G1).
+    #[arg(
+        long = "XX:G1MixedLiveThreshold",
+        value_name = "PCT",
+        overrides_with = "g1_mixed_live_threshold"
+    )]
+    g1_mixed_live_threshold: Option<String>,
+
+    /// `-XX:G1HeapWastePercent=<n>` → the mixed phase ends once its candidates
+    /// hold less garbage than this percent of the heap (honoured under G1).
+    #[arg(
+        long = "XX:G1HeapWaste",
+        value_name = "PCT",
+        overrides_with = "g1_heap_waste"
+    )]
+    g1_heap_waste: Option<String>,
+
+    /// `-XX:ParallelGCThreads=<n>` → GC evacuation worker count (honoured
+    /// under G1). Absent means the count is derived from the machine.
+    #[arg(
+        long = "XX:ParallelGCThreads",
+        value_name = "N",
+        overrides_with = "g1_parallel_gc_threads"
+    )]
+    g1_parallel_gc_threads: Option<String>,
 
     /// `-XX:±UseStringDeduplication` → G1 String dedup (honoured under G1).
     #[arg(
@@ -2101,32 +2153,34 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             // Default is on; nothing to emit.
             i += 1;
         }
-        // `-Xms<size>` (minimum/initial heap): CratonVM sizes the heap from
-        // `-Xmx` only, so the minimum-heap hint is accepted and ignored
-        // rather than rejected. A drop-in `java` must not abort on it —
-        // Maven Surefire forks pass `-Xms512m` unconditionally.
+        // `-Xms<size>` (minimum/initial heap) -> `--Xms <size>`.
+        //
+        // F-16: this arm used to DROP the flag. "CratonVM sizes the heap from
+        // `-Xmx` only" was true while the collector allocated its whole arena
+        // in the constructor — there was no initial size for the value to name.
+        // G1 now reserves `-Xmx` as address space and commits a prefix, so
+        // `-Xms` names that prefix and is honoured.
         //
         // Both the inline (`-Xms512m`) and separate-token (`-Xms 512m`) forms
         // must be handled. The separate-token form is listed in
         // `VALUE_TAKING_OPTS`, so `insert_program_args_separator` keeps the
-        // value adjacent to the flag here; if we only dropped the `-Xms`
-        // token the bare value (`512m`) would survive and clap would mistake
-        // it for the main-class positional, shifting/consuming the real
-        // class name and the following program args. So when the value is a
-        // separate token (`a == "-Xms"`), consume it too — mirroring the
-        // `-Xshare`/`-Xverify`/`-Xbootclasspath`/`-Xlog` separate-token
-        // branches. The flag is accepted-and-ignored, so nothing is emitted
-        // either way.
-        else if a.starts_with("-Xms") {
-            if std::env::var_os("CRATONVM_DBG_ARGS").is_some() {
-                eprintln!("[cratonvm] ignoring unimplemented HotSpot flag: {a}");
-            }
-            if a == "-Xms" && i + 1 < args.len() {
-                // Separate-token form `-Xms 512m`: drop the value token too.
-                i += 2;
+        // value adjacent to the flag here; emitting the value as clap's own
+        // argument is what stops a bare `512m` surviving to be mistaken for the
+        // main-class positional (which would shift and consume the real class
+        // name and the program args after it). Same shape as the `-Xmx` arm
+        // above; a bare trailing `-Xms` with no value is dropped, as before.
+        else if let Some(rest) = a.strip_prefix("-Xms") {
+            if rest.is_empty() {
+                if i + 1 < args.len() {
+                    out.push("--Xms".into());
+                    out.push(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             } else {
-                // Inline form `-Xms512m` (value rides on the same token), or a
-                // bare trailing `-Xms` with no value: drop just this token.
+                out.push("--Xms".into());
+                out.push(rest.to_string());
                 i += 1;
             }
         }
@@ -2173,6 +2227,14 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             i += 1;
         } else if let Some(v) = a.strip_prefix("-XX:MaxGCPauseMillis=") {
             out.push("--XX:MaxGCPause".into());
+            out.push(v.to_string());
+            i += 1;
+        } else if let Some(v) = a.strip_prefix("-XX:G1MixedGCLiveThresholdPercent=") {
+            out.push("--XX:G1MixedLiveThreshold".into());
+            out.push(v.to_string());
+            i += 1;
+        } else if let Some(v) = a.strip_prefix("-XX:G1HeapWastePercent=") {
+            out.push("--XX:G1HeapWaste".into());
             out.push(v.to_string());
             i += 1;
         } else if let Some(v) = a.strip_prefix("-XX:MaxDirectMemorySize=") {
@@ -4263,6 +4325,26 @@ fn run() -> Result<()> {
         config = config.with_max_heap_size(ergo);
     }
 
+    // F-16 — `-Xms`. Applied AFTER `-Xmx` so it can be clamped against the heap
+    // size actually in force, ergonomic default included. Clamping rather than
+    // rejecting: HotSpot treats `-Xms` above `-Xmx` as an error, but a VM that
+    // refuses to start over a memory hint is a worse drop-in than one that
+    // starts with the heap it was told it may have — and a Surefire fork with a
+    // stale `-Xms` is exactly the case this has to survive.
+    if let Some(initial) = &args.initial_heap {
+        let size = parse_size(initial)
+            .with_context(|| format!("Invalid initial heap size: {initial}"))?;
+        let clamped = size.min(config.max_heap_size);
+        if clamped != size && args.verbose_gc {
+            eprintln!(
+                "[cratonvm] -Xms {} MB exceeds -Xmx {} MB; committing the whole heap",
+                size / (1024 * 1024),
+                config.max_heap_size / (1024 * 1024)
+            );
+        }
+        config.initial_heap_size = clamped;
+    }
+
     // CDS configuration
     if let Some(archive_path) = &args.shared_archive_file {
         config.shared_archive_file = Some(archive_path.clone());
@@ -4470,8 +4552,34 @@ fn run() -> Result<()> {
             ),
         }
     }
+    if let Some(s) = &args.g1_mixed_live_threshold {
+        match s.parse::<u8>() {
+            Ok(p) if (1..=100).contains(&p) => config.g1_mixed_gc_live_threshold_percent = Some(p),
+            _ => eprintln!(
+                "Warning: ignoring -XX:G1MixedGCLiveThresholdPercent={s} (expected 1..=100)"
+            ),
+        }
+    }
+    if let Some(s) = &args.g1_heap_waste {
+        match s.parse::<u8>() {
+            Ok(p) if p <= 100 => config.g1_heap_waste_percent = Some(p),
+            _ => eprintln!("Warning: ignoring -XX:G1HeapWastePercent={s} (expected 0..=100)"),
+        }
+    }
     if let Some(s) = &args.g1_string_dedup {
         config.g1_string_dedup = Some(s == "true");
+    }
+    if let Some(s) = &args.g1_parallel_gc_threads {
+        match s.parse::<usize>() {
+            // Rejecting 0 rather than accepting it: inside the collector 0 is
+            // the sentinel for "derive from the machine", so honouring
+            // `-XX:ParallelGCThreads=0` would silently do the opposite of what
+            // an operator writing it means.
+            Ok(n) if n > 0 => config.g1_parallel_gc_threads = Some(n),
+            _ => eprintln!(
+                "Warning: ignoring -XX:ParallelGCThreads={s} (expected a positive integer)"
+            ),
+        }
     }
     if let Some(s) = &args.max_direct_memory {
         match parse_size(s) {
@@ -5722,9 +5830,13 @@ fn run() -> Result<()> {
             let resig = cratonvm_vm::jit::xt_root_scan::XT_PEER_RESIGNALS.load(O::Relaxed);
             let saved =
                 cratonvm_vm::jit::xt_root_scan::XT_PEERS_CLASSIFIED_AFTER_RETRY.load(O::Relaxed);
+            let hw_pin =
+                cratonvm_vm::jit::xt_root_scan::XT_HELPER_WINDOWS_PINNED.load(O::Relaxed);
+            let hw_ref =
+                cratonvm_vm::jit::xt_root_scan::XT_HELPER_WINDOWS_REFUSED.load(O::Relaxed);
             eprintln!(
                 "[GC] xt_peer_scan: unclassified_peers={peers} cycles_with_unclassified={cycles} \
-                 taken_over={taken} xt_roots={roots} helper_windows={hw} \
+                 taken_over={taken} xt_roots={roots} helper_windows={hw} hw_pinned={hw_pin} hw_refused={hw_ref} \
                  resignals={resig} classified_after_retry={saved} enabled={}",
                 cratonvm_vm::jit::xt_root_scan::enabled(),
             );
@@ -10487,27 +10599,39 @@ mod tests {
     }
 
     #[test]
-    fn hotspot_xms_inline_is_dropped_keeping_class_name() {
-        // `-Xms512m` (inline value) is accepted-and-ignored: the whole token
-        // is dropped and the main-class name is untouched.
+    fn hotspot_xms_inline_rewrites_to_clap_long() {
+        // F-16: `-Xms512m` used to be dropped, because the heap was allocated
+        // at `-Xmx` in the collector's constructor and an initial size named
+        // nothing. G1 now reserves `-Xmx` and commits a prefix, so the value is
+        // carried through to clap like `-Xmx`'s.
         let raw = argv(&["java", "-Xms512m", "Main"]);
+        let out = normalize_java_launcher_argv(raw);
+        assert_eq!(out, argv(&["java", "--Xms", "512m", "Main"]));
+    }
+
+    #[test]
+    fn a_bare_trailing_xms_with_no_value_is_still_dropped() {
+        // Nothing to carry, and emitting `--Xms` with no value would make clap
+        // reject a command line HotSpot accepts.
+        let raw = argv(&["java", "Main", "-Xms"]);
         let out = normalize_java_launcher_argv(raw);
         assert_eq!(out, argv(&["java", "Main"]));
     }
 
     #[test]
-    fn hotspot_xms_separate_token_drops_value_not_class_name() {
-        // B1 regression: `-Xms 512m` (separate value token) must drop BOTH
-        // the flag and its value. Previously only `-Xms` was dropped, leaving
-        // `512m` to be mistaken for the main-class positional and shifting
-        // `Main` into a program arg. Maven Surefire / Gradle forks emit this
-        // form. The value sits adjacent here because `-Xms` is in
-        // VALUE_TAKING_OPTS, so we mirror the full pre-clap pipeline.
+    fn hotspot_xms_separate_token_keeps_its_value_and_the_class_name() {
+        // B1 regression, still: `-Xms 512m` (separate value token) must not
+        // leave a bare `512m` to be mistaken for the main-class positional,
+        // shifting `Main` into a program arg. Maven Surefire / Gradle forks
+        // emit this form. The value sits adjacent here because `-Xms` is in
+        // VALUE_TAKING_OPTS, so this mirrors the full pre-clap pipeline.
+        //
+        // F-16 changed the remedy, not the requirement: the value is now
+        // consumed by being handed to clap as `--Xms 512m` rather than by being
+        // thrown away.
         let stage1 = insert_program_args_separator(argv(&["java", "-Xms", "512m", "Main"]));
         let out = normalize_java_launcher_argv(stage1);
-        // `512m` is gone; `Main` survives as the (only) main-class positional,
-        // followed by the launcher-inserted `--` program-args separator.
-        assert_eq!(out, argv(&["java", "Main", "--"]));
+        assert_eq!(out, argv(&["java", "--Xms", "512m", "Main", "--"]));
     }
 
     #[test]
@@ -10532,6 +10656,10 @@ mod tests {
         let parsed =
             Args::try_parse_from(stage4).expect("clap must accept HotSpot separate-token -Xms");
         assert_eq!(parsed.max_heap.as_deref(), Some("256m"));
+        // F-16: and the initial size ARRIVES, rather than being discarded on
+        // the way. (`-Xms` above `-Xmx` is clamped where the config is built,
+        // not here — this stage only has to carry the value.)
+        assert_eq!(parsed.initial_heap.as_deref(), Some("512m"));
         assert_eq!(parsed.classpath.as_deref(), Some("x"));
         assert_eq!(parsed.class_name.as_deref(), Some("Main"));
     }
