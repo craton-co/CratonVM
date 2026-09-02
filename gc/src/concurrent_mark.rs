@@ -87,8 +87,29 @@ impl ConcurrentGcState {
     }
 
     /// Set the GC phase (called by the GC coordinator).
+    ///
+    /// This is the ONE writer of the phase, and therefore the one place that
+    /// can keep the JIT's SATB pre-barrier gate honest. Compiled reference
+    /// stores skip their pre-barrier call when that gate reads clear, so the
+    /// gate must be armed for a superset of the interval in which
+    /// [`Self::is_marking_active`] is true — never a subset. Hence the
+    /// asymmetry below: arm BEFORE the phase becomes observable, disarm AFTER
+    /// it stops being. `arm`/`disarm` count markers rather than setting a
+    /// boolean, because this type is shared by the generational collector and
+    /// G1 and a process can hold several heaps at once.
     pub fn set_phase(&self, phase: ConcurrentGcPhase) {
+        let was = self.is_marking_active();
+        let will = matches!(
+            phase,
+            ConcurrentGcPhase::ConcurrentMark | ConcurrentGcPhase::Remark
+        );
+        if will && !was {
+            crate::gen_heap::arm_jit_ref_store_marker();
+        }
         self.phase.store(phase as u8, Ordering::Release);
+        if was && !will {
+            crate::gen_heap::disarm_jit_ref_store_marker();
+        }
     }
 
     /// Whether concurrent marking is active (SATB barrier should log).
