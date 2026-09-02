@@ -13132,7 +13132,18 @@ impl Compiler {
                         // belonged to the pre-redesign inline path; the
                         // current one completes the header before the cursor
                         // advance, which is what made default-on safe.)
-                        let skip_helper = !has_prim_init && !has_finalizer;
+                        // ...and, under a collector that keeps an object-start
+                        // registry, NEVER: `tlab_post_init` is what registers
+                        // the object, and that registry is ZGC's only record
+                        // that it exists (the sweep visits registered bases,
+                        // `is_object_address` answers from it, the
+                        // conservative root scan screens with it). Skipping it
+                        // there leaves a live object invisible to all three.
+                        // Unreachable before mutators had a TLAB chunk on that
+                        // collector, which is what made this latent.
+                        let skip_helper = !has_prim_init
+                            && !has_finalizer
+                            && self.helpers.tlab_registration_required == 0;
                         let can_inline = cratonvm_types::flags::runtime_var_os(
                             "CRATONVM_JIT_DISABLE_INLINE_NEW",
                         )

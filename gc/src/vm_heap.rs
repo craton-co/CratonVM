@@ -3585,6 +3585,22 @@ impl VmHeap {
             VmHeap::Zgc(h) => h.refill_mutator_tlab(requested_size),
         }
     }
+    /// Whether [`Self::note_thread_tlab_object`] does anything on this
+    /// collector — i.e. whether an object bump-allocated from a thread's own
+    /// TLAB must be registered before it is used.
+    ///
+    /// Read at compile time (through `JitRuntimeHelpers::
+    /// tlab_registration_required`) so the JIT's inline-`new` never takes the
+    /// fast path that skips the helper doing the registering.
+    #[inline]
+    pub fn tlab_objects_need_registration(&self) -> bool {
+        match self {
+            VmHeap::Generational(_) | VmHeap::G1(_) => false,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => true,
+        }
+    }
+
     /// An object was bump-allocated from a thread's own TLAB and its header
     /// is written: a collector that keeps an object-start registry records it
     /// here. A no-op on the collectors whose heaps are parsed by header.

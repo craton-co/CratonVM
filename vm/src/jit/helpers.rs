@@ -25122,6 +25122,18 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         class_id_offset_in_obj: 0,
         get_current_thread: jit_get_current_thread as *const () as usize,
         tlab_post_init: jit_post_tlab_init as *const () as usize,
+        // Does this collector keep an object-start registry that a
+        // bump-allocated object must be entered into before use? If so the
+        // emitter must not take the inline-`new` fast path that skips
+        // `tlab_post_init`, because that helper is what enters it.
+        tlab_registration_required: usize::from(
+            vm_for_helpers
+                .map(|vm| vm.mem.heap.tlab_objects_need_registration())
+                // No VM in hand (the hand-built test tables): answer the
+                // FAIL-CLOSED direction. `1` costs the fast path; `0` would
+                // leave an object unregistered on a collector that needs it.
+                .unwrap_or(true),
+        ),
         // Stage 3 (precise oop maps) — only wire the frame-record helper when
         // the precise gate is on; otherwise leave it 0 so the prologue emits
         // nothing extra. The JIT also gates emission on its own cached flag,
