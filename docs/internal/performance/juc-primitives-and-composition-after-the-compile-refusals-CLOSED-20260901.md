@@ -78,6 +78,15 @@ throughout. **Per-row CPU time**, for the reason in the next section:
 | `AtomicInteger.incrementAndGet` (control) | 5.5-6.2 (**5.8**) | 5.5-6.0 (**5.9**) | 1.01x | 8.8 | **0.7x** |
 | plain field store (control) | 12.9-13.4 (**13.3**) | 11.9-13.5 (**13.2**) | 1.00x | 6.2 | 2.2x |
 
+> **The `HotSpot` and `x HS` columns are SOFT and are here for orientation
+> only.** The A/B columns are one binary with one switch, so the host cancels
+> out of them; the HotSpot column is a different process on the same busy host
+> and nothing cancels. Its own control is the proof: `AtomicInteger.increment`
+> reads 8.1, 8.5, 8.7, 8.7, 9.0, 10.4, 23.6, 24.5 ns cpu across the eight reps
+> — a 3x spread on a row that cannot have moved. Read the medians as an order
+> of magnitude, not as ratios; the numbers this page CONCLUDES from are the
+> OFF/ON column and the engagement counts.
+
 † still a COMPOSITE — a `get` and then the CAS — and it moves for the read
 inside it. Subtracting the matching `get` row leaves **116.6** ns OFF against
 **111.3** ns ON for the CAS alone, i.e. unmoved to within 5 %. That arithmetic
@@ -87,6 +96,24 @@ is the reason to believe the 2.18x is the read and not the box.
 row this page opened on — "77.0 ns against 41.3 for the same read of an `int`,
 and the 1.9x is its measured price" — reads **64.3 against 65.0, i.e. 0.99x**.
 A reference read now costs what a primitive read costs.
+
+### Re-measured after merging dev
+
+`dev` moved 75 commits between the branch point and the merge, so the table
+above was re-taken on the MERGED tree — the rule that a 3/3 pass can become a
+2/2 fail on same-day dev. Five interleaved reps per arm, load 59.1-61.0, and
+the verdict is unchanged:
+
+| operation | bind ON | bind OFF | OFF/ON |
+|---|---:|---:|---:|
+| `VarHandle.get` reference | 64.1-68.2 (**66.1**) | 134.3-141.8 (**140.2**) | **2.12x** |
+| `VarHandle.compareAndSet` reference † | 171.6-178.0 (175.7) | 255.8-268.1 (263.1) | 1.50x |
+| the six controls | — | — | 0.97-1.04x |
+
+(2.18x before the merge, 2.12x after, at twice the load.) The merged tree also
+passes the regression suite **121/121, 0 harness-blindness flags**, and
+`RJitVarHandleRefRead` is byte-identical to HotSpot in both arms of the kill
+switch.
 
 ### Engagement, which needs no quiet box
 
