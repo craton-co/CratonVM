@@ -101,7 +101,7 @@ means the class is not reading the suite's database configuration.
 ## 3. `HqlParserMemoryUsageTest.testParserMemoryUsage` — not a new finding
 
 This is the already-tracked open page
-`docs/known-issues/hibernate/hibernate-orm-hql-parser-memory-overhead-20260817.md`,
+`../../../known-issues/hibernate/hibernate-orm-hql-parser-memory-overhead.md`,
 re-observed. That page records `~627,000 KB` against a 256 MiB budget; the
 "new" finding reports `630,335 KB`. Same measurement, same class, same
 mechanism, twelve days apart.
