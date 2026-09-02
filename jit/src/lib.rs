@@ -38400,7 +38400,39 @@ mod layout_constant_inventory {
         // the legacy cell address is `field_index * SLOT_SIZE`, a use of its
         // own and not a reuse of the compact arm's — which this comment claimed
         // until the inventory test refused the count and said so.
-        ("ir_lower.rs", [11, 4, 6, 0, 0, 0, 6, 4]),
+        //
+        // 2026-09-02 added the twelfth `HEADER_SIZE` and two more in tests
+        // (12 -> 14): the optimizing tier's GATED compact reference
+        // `putfield` (`emit_gated_ir_ref_putfield`) and the two test
+        // expectations that reconstruct the same address to assert the store
+        // is emitted at it. The emitter site is the mirror image of the
+        // inline `getfield` compact read directly above it — same
+        // `HEADER_SIZE + packed_body_offset`, same cell — and it is a disp32
+        // site (`48 89 90 disp32`), so it does not share the disp8
+        // backwards-addressing hazard the array sites have. Nothing else
+        // moves: the store reaches the compact cell base directly, with no
+        // `SLOT_SIZE` index and no payload bias, because a compact reference
+        // field IS the bare 8-byte pointer.
+        //
+        // Later the same day, the gated store grew its LEGACY shape and the
+        // counts moved again: `HEADER_SIZE` 14 -> 15, `SLOT_SIZE` 6 -> 7 and
+        // `FIELD_CELL_PAYLOAD64_OFFSET` 4 -> 5, all three from the one
+        // expression `HEADER_SIZE + field_index * SLOT_SIZE` plus the payload
+        // bias inside the 16-byte `Value` cell. It exists because the compact
+        // shape alone fired zero times out of 16,384,000 -- the TLAB fast path
+        // writes legacy headers unconditionally -- and it is the exact mirror
+        // of the inline `getfield`'s own legacy branch two entries above, which
+        // is where the offsets are transcribed from rather than re-derived.
+        // Both stores are disp32 (`48 89 90 disp32`, `4C 89 90 disp32`), so
+        // neither shares the disp8 backwards-addressing hazard; and since the
+        // arm now picks between the two shapes per OBJECT on the
+        // `GC_FLAG_COMPACT` bit, a header shrink must move BOTH or the legacy
+        // shape writes the wrong cell.
+        // Plus the two-shape test's own expectations (`HEADER_SIZE` 15 -> 17):
+        // it reconstructs both cell addresses to assert both stores are
+        // emitted, which is the assertion that would have caught the
+        // compact-only arm before a run-time census had to.
+        ("ir_lower.rs", [17, 4, 7, 0, 0, 0, 6, 6]),
     ];
 
     fn source(file: &str) -> &'static str {

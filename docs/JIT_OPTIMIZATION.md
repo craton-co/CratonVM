@@ -798,13 +798,45 @@ before this existed. Same binary, one run, no rebuild. That is the property
 that makes a silent failure mode survivable, and it is worth more here than it
 is anywhere else in this file.
 
-**Where the residual risk actually is**, for whoever revisits this: the
-lifetime hazard is driven by `CompiledMethod` drops, and the soak exercised only
-8 of them per run. There is no production eviction path to lean on —
+#### The two things the soak left untested, and what closed them
+
+The soak above ran single-threaded and saw 8 `CompiledMethod` drops per run.
+That left the lock-free table untested under **concurrent** faults, and the
+lifetime path barely exercised. Both were closed before the default moved,
+with `CRATONVM_JIT_THRESHOLD=1` (so every method compiles immediately, which is
+what actually produces drop churn) and 128 reader classes behind an interface:
+
+| Arm | census | answer |
+|---|---|---|
+| 8 threads, no supersede, ON | `registered=23 retired=23` **`recovered=7433`** | `sum=61988608 npes=12504` ✓ |
+| 8 threads, same, OFF (control) | `emitted=23 registered=0` | `sum=61988608 npes=12504` ✓ |
+| 8 threads, supersede ON, 200k iters | `registered=23 retired=23 recovered=1` | `sum=123985408 npes=25000` ✓ |
+
+**7,433 faults recovered across eight threads at once**, with the checksum
+matching HotSpot exactly on every arm and `rc=0` throughout. That is the
+lock-free table doing concurrent reads against concurrent registration and
+retirement, which is the shape nothing else had exercised.
+
+`registered` equalled `retired` in every arm, in every run, at every scale —
+8/8, 15/15, 23/23. The table does not leak entries, which is the accounting
+half of the lifetime argument.
+
+**The correctness half rests on an invariant worth naming**, because it is
+easy to break and nothing else would notice. `CompiledMethod::drop` retires
+`[entry, entry + buffer.pos())`, and registration keys sites off
+`cm.entry + fault_off`. Those two agree only because the method entry *is* the
+buffer base — `driver.rs` says so in as many words (`let entry_offset = 0; //
+prologue starts at offset 0`), and the OSR-trampoline purge in that same `Drop`
+already depends on it. Give the prologue a non-zero offset and every site below
+the new entry silently stops being retired, which is precisely the stale-entry
+hazard the whole design exists to prevent.
+
+**What is still not stressed**, for whoever revisits this: there is no
+production eviction path to drive drops harder than tier-up does.
 `jit_code_cache_cap_reached` *refuses new compiles* rather than evicting, and
-`CachedMethods::evict_least_used` is called from tests only — so drops come from
-tier-up supersede and deopt. A soak that wanted to hammer address reuse would
-need a deopt storm, not a bigger heap or a longer loop.
+`CachedMethods::evict_least_used` is called from tests only. So drops come from
+supersede and deopt, and 23 per process is what a compile-everything workload
+produces. Hammering address reuse beyond that needs a deopt storm.
 
 ### Summary table
 
