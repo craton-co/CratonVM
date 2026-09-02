@@ -272,10 +272,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: call.** Not rebuilt in this lane: no claim is made that the change compiles or",
     ),
     (
-        "docs/known-issues/jdk-only/W7-30-stub-ratchet-boot-path-scope.md",
-        "status block says: the whole time**: §9. Nothing was built or run on 2026-08-12; every claim",
-    ),
-    (
         "docs/known-issues/jdk-only/W7-36-differential-view-families.md",
         "status block says: REBUILT, NOT VERIFIED. 1 recorded and deliberately not attempted.**",
     ),
@@ -290,10 +286,6 @@ const ALLOWED: &[(&str, &str)] = &[
     (
         "docs/known-issues/jdk-only/W7-49-slot-index-recensus.md",
         "status block says: Branch `fix/w44-slot-index-sweep-20260812`. Nothing here is built or run. Every",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-5-registrars-that-never-shipped.md",
-        "status block says: Wave 7, lane W7-5. Nothing was built or run on 2026-08-12.",
     ),
     (
         "docs/known-issues/jdk-only/W7-55-record-reconciliation.md",

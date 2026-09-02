@@ -5841,7 +5841,7 @@ impl G1Collector {
                 &mut objects_copied,
                 &mut bytes_copied,
                 &mut work_list,
-                !jit_pinned_regions.contains(&src_idx),
+                self.card_screen_for_source(&jit_pinned_regions, src_idx),
             );
         }
         self.fill_card_scan_phases(&mut phases, card_screen_snapshot);
@@ -6356,7 +6356,7 @@ impl G1Collector {
                 &mut objects_copied,
                 &mut bytes_copied,
                 &mut work_list,
-                !jit_pinned_regions.contains(&src_idx),
+                self.card_screen_for_source(&jit_pinned_regions, src_idx),
             );
         }
         self.fill_card_scan_phases(&mut phases, card_screen_snapshot);
@@ -6755,8 +6755,10 @@ impl G1Collector {
                 &mut bytes,
                 &mut main_deferred_self_forwarded,
                 // F-05: the JIT-pinned half of `sources` is walked wholesale,
-                // exactly as on the serial arm.
-                !wholesale_sources.contains(&src_idx),
+                // exactly as on the serial arm — unless
+                // `CRATONVM_G1_CARD_SCREEN_JIT_PINNED` says the barrier now
+                // covers it. See `card_screen_for_source`.
+                self.card_screen_for_source(&wholesale_sources, src_idx),
             );
         }
 
@@ -14263,6 +14265,32 @@ impl G1Collector {
     /// reads its own contribution as a difference rather than by resetting
     /// them. Resetting would race with a concurrent-mark step that happens to
     /// be scanning at the same moment.
+    /// May Phase 2 apply the card screen to this source region?
+    ///
+    /// One place, because the answer is a policy about what the write barrier
+    /// covers and it has to be the same on the serial and parallel arms.
+    ///
+    /// A source the remembered set named is screened, always: the entry and the
+    /// card have the same three producers, so a region with no dirty card holds
+    /// no recorded cross-region edge. A JIT-PINNED source is the question this
+    /// answers — it is added to the source list unconditionally, as
+    /// defence-in-depth against compiled stores that might have skipped the
+    /// barrier, and screening it would trust exactly what that walk exists to
+    /// double-check.
+    ///
+    /// Under G1 there are no such stores any more. Every compiled
+    /// reference-store path reaches `post_write_barrier_rset`; the enumeration,
+    /// with the gate that forces each one, is on
+    /// [`cratonvm_types::GcFlags::g1_card_screen_jit_pinned`], and
+    /// `CRATONVM_G1_CARD_SCREEN_JIT_PINNED=0` restores the wholesale walk.
+    ///
+    /// This is the lever the §12 measurement pointed at: the screen was not
+    /// weak, it was switched off for the regions a warm JIT makes most of.
+    #[inline]
+    fn card_screen_for_source(&self, wholesale: &RegionSet, src_idx: usize) -> bool {
+        !wholesale.contains(&src_idx) || gc_flags().g1_card_screen_jit_pinned
+    }
+
     fn card_scan_snapshot(&self) -> [u64; 4] {
         [
             self.card_regions_offered.load(Ordering::Relaxed),
@@ -28273,6 +28301,142 @@ mod tests {
     /// Serial arm; the parallel twin follows. See the note on
     /// `a_source_region_with_no_dirty_card_is_skipped_entirely` for why the
     /// dispatching entry point is not used.
+    /// A JIT-PINNED source region: screened when
+    /// `CRATONVM_G1_CARD_SCREEN_JIT_PINNED` is on, walked wholesale when it is
+    /// off — and correct either way.
+    ///
+    /// This is the carve-out §12.4 measured: a JIT-pinned source used to bypass
+    /// the screen unconditionally, and with a warm JIT that is most sources,
+    /// which is why the screen skipped 0.79% of bytes there against 20-50%
+    /// without the JIT. Both halves are asserted, for the reason the
+    /// per-object screen's own test gives: without the skip assertion this
+    /// passes on a screen that never engages, and without the evacuation
+    /// assertion it passes on one that skips everything.
+    #[test]
+    fn a_jit_pinned_source_is_screened_or_walked_wholesale_by_the_flag() {
+        if !gc_flags().g1_card_rset {
+            eprintln!(
+                "[F-05] skipped: CRATONVM_G1_CARD_RSET=0 disables the card screen this test measures"
+            );
+            return;
+        }
+        // `(flag, expect_skips)` — the flag decides whether the pinned source
+        // is screened; correctness is asserted in both arms.
+        for (on, expect_skips) in [("1", true), ("0", false)] {
+            cratonvm_types::flags::with_thread_overrides(
+                &[("CRATONVM_G1_CARD_SCREEN_JIT_PINNED", Some(on))],
+                || {
+                    let gc = make_collector();
+                    // Q lives in Eden and will be collected.
+                    let q = gc.alloc_object(ClassId::new(2), 1);
+                    let q_region = gc
+                        .lookup_region_for_addr(q.as_ptr() as usize)
+                        .expect("region");
+                    gc.set_field(q, 0, Value::Int(31337));
+
+                    // The source is a hand-built Old region: many fillers that
+                    // reference nothing (clean cards) and ONE holder that does.
+                    // Built by hand rather than by an `alloc_object` loop
+                    // because escaping a region means FILLING it, and this
+                    // fixture needs room past the cursor for the skip span.
+                    let (holder, holder_region) = {
+                        let mut regions = gc.regions.write();
+                        let src = regions
+                            .iter()
+                            .position(|r| r.region_type == RegionType::Free)
+                            .expect("a free region");
+                        regions[src].region_type = RegionType::Old;
+                        let mut place = |slots: u32| -> ObjectRef {
+                            let size = HEADER_SIZE + slots as usize * SLOT_SIZE;
+                            let (p, _) =
+                                regions[src].bump_alloc(size, 8, "test").expect("room");
+                            let h = ObjectHeader::new(
+                                ClassId::new(1),
+                                ObjectKind::Object,
+                                ArrayElementType::Reference,
+                                0,
+                                slots,
+                            );
+                            unsafe {
+                                std::ptr::write(p as *mut ObjectHeader, h);
+                                ObjectRef::from_raw(p)
+                            }
+                        };
+                        for _ in 0..256 {
+                            let _ = place(0);
+                        }
+                        let holder = place(1);
+                        (holder, src)
+                    };
+                    gc.with_regions_mut(|_| {});
+                    assert_ne!(holder_region, q_region);
+                    // The barrier dirties the holder's card and records the
+                    // remembered-set edge; the fillers' cards stay clean.
+                    gc.set_field(holder, 0, Value::Object(Some(q)));
+
+                    // Make the holder's region JIT-PINNED. A published TLAB
+                    // skip span is the entry point `jit_pinned_region_set`
+                    // reads that a test can drive without a live compiled
+                    // frame — and it must sit PAST the cursor, where a real
+                    // un-retired tail sits. A span planted among live objects
+                    // is not a weaker fixture but a corrupt one: every region
+                    // walker treats it as "skip these bytes", so the walk
+                    // resyncs mid-object and reads a header out of payload
+                    // (an access violation, which is how the first version of
+                    // this test announced itself).
+                    let (base, tail, cursor) = {
+                        let regions = gc.regions.read();
+                        let b = regions[holder_region].data.as_ptr() as usize;
+                        (
+                            b,
+                            b + regions[holder_region].data.len(),
+                            regions[holder_region].cursor(),
+                        )
+                    };
+                    assert!(
+                        tail - 16 > base + cursor,
+                        "the skip span must sit past the cursor"
+                    );
+                    gc.set_jit_tlab_skip_regions(&[(tail - 16, tail)]);
+
+                    let skipped_before = gc.card_bytes_skipped.load(Ordering::Relaxed);
+                    let mut roots: Vec<ObjectRef> = vec![];
+                    let result = gc.young_collection_serial(&mut roots, &NoopMonitors);
+                    let skipped = gc.card_bytes_skipped.load(Ordering::Relaxed) - skipped_before;
+                    gc.clear_jit_tlab_skip_regions();
+
+                    // Correctness, both arms: Q was reachable only through the
+                    // holder in the pinned region.
+                    let q_new = result
+                        .pointer_map
+                        .get(&(q.as_ptr() as usize))
+                        .copied()
+                        .expect("Q, referenced only from the pinned source, must be evacuated");
+                    let q_new_ref = unsafe { ObjectRef::from_raw(q_new as *mut u8) };
+                    assert_eq!(
+                        gc.get_field(holder, 0),
+                        Value::Object(Some(q_new_ref)),
+                        "flag={on}: the holder's slot must be rewritten"
+                    );
+                    assert_eq!(gc.get_field(q_new_ref, 0).as_int(), Some(31337));
+
+                    // Engagement.
+                    eprintln!("[screen-jit-pinned] flag={on} skipped={skipped}");
+                    assert_eq!(
+                        skipped > 0,
+                        expect_skips,
+                        "flag={on}: expected the pinned source to be {} (skipped={skipped})",
+                        if expect_skips {
+                            "screened"
+                        } else {
+                            "walked wholesale"
+                        }
+                    );
+                },
+            );
+        }
+    }
+
     #[test]
     fn the_per_object_screen_skips_the_clean_objects_and_finds_the_dirty_one() {
         // The kill switch turns off the very thing this test measures. Say so
