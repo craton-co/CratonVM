@@ -5147,6 +5147,7 @@ fn register_enum_set_natives_with_category(
         "(Ljava/lang/Class;)Ljava/util/EnumSet;",
         native_es_all_of,
     );
+    r.register(c, "toString", "()Ljava/lang/String;", native_es_to_string);
     r.register(
         c,
         "of",
@@ -6077,6 +6078,55 @@ fn native_es_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(None)
 }
 
+/// `EnumSet.toString()`.
+///
+/// In real-JDK mode `AbstractCollection.toString()` bytecode runs and nothing
+/// here is consulted. `--synthetic-jdk` has no bytecode, so with no
+/// registration the call reached `Object.toString` and printed
+/// `java.util.EnumSet@9` where HotSpot prints `[ALPHA, GAMMA]` — measured
+/// 2026-09-02, `apps/probes/SyntheticEnumSurface`.
+///
+/// Built on `native_es_iterator`'s snapshot rather than on the backing array
+/// directly, so the two cannot disagree about which elements the set holds or
+/// in what order — the same reason `native_es_size` reads the size through the
+/// backing instead of counting.
+fn native_es_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let cls = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
+    if cls == "java/util/RegularEnumSet" || cls == "java/util/JumboEnumSet" {
+        return cratonvm_native_collections::native_al_to_string(ctx, args);
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(backing) = es_get_backing(ctx, this) {
+        let size = match ctx.get_field(backing, 1) {
+            Value::Int(n) if n > 0 => n as usize,
+            _ => 0,
+        };
+        if let Value::Object(Some(data)) = ctx.get_field(backing, 0) {
+            for i in 0..size.min(ctx.array_length(data)) {
+                let elem = ctx.get_array_element(data, i);
+                let rendered = match elem {
+                    Value::Object(Some(o)) => {
+                        // An enum's `toString()` is its `name()` unless the enum
+                        // overrides it; slot 0 is `Enum.name`, which is what
+                        // `native_enum_value_of` matches on.
+                        match ctx.get_field(o, 0) {
+                            Value::Object(Some(n)) => ctx.read_string(n).unwrap_or_default(),
+                            _ => String::from("null"),
+                        }
+                    }
+                    _ => String::from("null"),
+                };
+                parts.push(rendered);
+            }
+        }
+    }
+    let out = format!("[{}]", parts.join(", "));
+    Ok(Some(Value::Object(Some(ctx.create_string(&out)))))
+}
+
 fn native_es_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let cls = ctx
@@ -6270,6 +6320,25 @@ pub(crate) fn register_enum_map_natives(r: &mut NativeMethodRegistry) {
         c,
         "put",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_em_put,
+    );
+    // The descriptor javac ACTUALLY emits. `EnumMap<K extends Enum<K>, V>`
+    // erases `K` to `java/lang/Enum`, not to `java/lang/Object`, so a real call
+    // site emits `put(Ljava/lang/Enum;Ljava/lang/Object;)Ljava/lang/Object;`
+    // (`javap -s`) and never matched the row above. Measured 2026-09-02 with
+    // `apps/probes/SyntheticEnumSurface`: `new EnumMap<>(Local.class).put(k, v)`
+    // was `NoSuchMethodError: java.util.EnumMap.put(java.lang.Enum, java.lang.Object)`
+    // in `--synthetic-jdk`, while `get`/`remove`/`containsKey` worked — those
+    // three take `Object` in the source, so their erasure is the one already
+    // registered and only `put` diverges.
+    //
+    // BOTH are kept: a caller reaching this through a raw/`Map`-typed reference
+    // emits the `Object` form, and the bridge method the compiler generates for
+    // `Map.put` has exactly that descriptor.
+    r.register(
+        c,
+        "put",
+        "(Ljava/lang/Enum;Ljava/lang/Object;)Ljava/lang/Object;",
         native_em_put,
     );
     r.register(

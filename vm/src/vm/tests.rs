@@ -28692,6 +28692,7 @@ fn countdown_latch_extra_countdown_noop() {
     assert_eq!(count, Value::Long(0));
 }
 
+#[ignore = "STALE: the test passes a NULL TimeUnit and expects `false`. HotSpot throws NullPointerException: Cannot invoke \"java.util.concurrent.TimeUnit.toNanos(long)\" because \"unit\" is null -- verified on 25.0.3 -- and CratonVM now throws the identical message, so the CURRENT behaviour is correct and the assertion is not. It passed only while a synthetic CountDownLatch.await native ignored its TimeUnit argument. Triaged 2026-09-02 as part of the supposed enum-constant cluster; it is not an enum defect. docs/internal/fixed-suite-bugs/synthetic-jdk-enum-surface-20260902.md"]
 #[test]
 fn countdown_latch_await_timeout_returns_result() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -37213,6 +37214,7 @@ fn enum_set_basic_operations() {
     assert_eq!(size, Value::Int(1));
 }
 
+#[ignore = "STALE: the test passes a NULL Class to EnumMap(Class) and expects it to construct. HotSpot throws NullPointerException: Cannot invoke \"java.lang.Class.getEnumConstantsShared()\" because \"klass\" is null -- verified on 25.0.3 -- and CratonVM throws the identical message. Not an enum defect either; the real EnumMap gap it was thought to expose (put's erased descriptor is (Ljava/lang/Enum;Ljava/lang/Object;), not (Object,Object)) was found by probe and is FIXED. docs/internal/fixed-suite-bugs/synthetic-jdk-enum-surface-20260902.md"]
 #[test]
 fn enum_map_put_get_size() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
