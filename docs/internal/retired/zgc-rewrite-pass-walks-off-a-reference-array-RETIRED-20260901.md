@@ -1141,6 +1141,62 @@ That is three instruments on this page armed where they could not fire —
 `below16=`, `heapcopy_dbg()` behind the tagged early return, and this one twice.
 It is the page's most reusable lesson.
 
+## The aliasing defect has a real caller, and it is netty
+
+`Unsafe.reallocateMemory` is not a theoretical path here.
+`io.netty.util.internal.PlatformDependent0` line 727 —
+`reallocateDirectNoCleaner`, behind `UnpooledUnsafeNoCleanerDirectByteBuf`'s
+`capacity(int)` — is:
+
+```java
+return newDirectBuffer(UNSAFE.reallocateMemory(directBufferAddress(buffer), capacity), capacity);
+```
+
+**It uses the returned address**, which is the contract and which is why the
+relocation in §3 is safe for it. Before the fix, growing such a buffer returned
+the SAME handle and left the block covering every `Unsafe` allocation made after
+it, so any later off-heap allocation in the process was silently aliased into
+netty's grown buffer. Every read and write through the later handle landed in
+the wrong block, with nothing reported on either side.
+
+The JDK's own `DirectByteBuffer(int cap)` cannot trip the §1 bound either:
+it allocates `max(1, cap + (pageAligned ? ps : 0))` and sets `address` to `base`
+(or to `base + padding` when page-aligning), so the bytes remaining from the
+published address are always `>= capacity`. A slice or duplicate carries a
+smaller capacity at a higher offset, which is the same inequality. The guard is
+therefore expected to read `short_translations=0` on healthy workloads, and that
+is the reading to expect rather than a suspicious one.
+
+## What has NOT been re-measured, and why
+
+The repro itself — `io.netty.util.ResourceLeakDetectorTest` under
+`-XX:+UseZGC --nojit`, at the 38 reps this page's own power calculation
+derived — has not been re-run against this branch at the time of writing. Two
+things stood in the way and both are worth recording:
+
+* **the netty test build was gone.** `/data/cratonvm/apps/netty/*/target/` had
+  been cleaned when `/data` filled, while `common.args` still listed those
+  directories and the SNAPSHOT jars (main classes only) stayed put. A first
+  38-rep arm therefore ran to completion with `rc=0`, `found=0`, ~22 s per rep
+  and `collections=0` — a **vacuous arm that reads exactly like a clean one**.
+  Rebuilding one module fixes it in about a minute:
+  `mvn -o -pl common -am -DskipTests -Dcheckstyle.skip=true ... test-compile`,
+  after which the documented `found=3 ok=2 failed=1` shape returns. Screen every
+  rep on that shape, never on `rc`;
+* **the shared host could not link the binary.** Fat LTO at `-j 1` was
+  SIGKILLed twice at `avail` 0-4 GB with load 40-190 from other sessions. A
+  driver is parked there waiting for `avail>=10G` and `load<30`.
+
+What that leaves is stated plainly: the branch is verified by 4190
+`native-builtins` and 2645 `cratonvm-vm` unit tests, 80/80 of the Java
+regression suite against HotSpot, and the 472-row `UnsafeShadowSweep`
+differential in which exactly one line moved. The GC crash this page is about
+was closed by bisect on 2026-08-19 and none of this touches the collector. The
+outstanding rep run would add a **denominator** — netty is the workload that
+actually reaches `unsafe_arena_real_ptr`, so it is the one that can say whether
+`translations` is non-zero in production — and it is not load-bearing for the
+retirement.
+
 ## The elimination table, final
 
 | candidate writer | verdict | the number / the reason |
@@ -1169,9 +1225,15 @@ memory-safety defect — which is why it is fixed rather than argued away.
 in both directions. Every one fails with only its own fix reverted, and the
 negative halves — a grow that fits keeps its handle; a resize that cannot move
 retains nothing; a block that exactly covers its capacity is published — fail if
-the guards are made unconditional. 4178 `native-builtins` unit tests, 2645
-`cratonvm-vm` unit tests, and 79/79 of the Java regression suite against HotSpot.
-The differential table above.
+the guards are made unconditional. On the branch merged with `dev`: 4190
+`native-builtins` unit tests, 2645 `cratonvm-vm` unit tests, and **80/80** of
+the Java regression suite against HotSpot. The differential table above.
+
+A note on that suite, because it bit twice in one session: `regression-suite`
+and `UnsafeShadowSweep` both compile into a SHARED output directory, so two runs
+at once produce `class not found` for whichever vector loses the race. A 78/80
+and an earlier 79-with-`RReflect`-failing were both that, and both went to 80/80
+when re-run alone. **Run it serially, or read its failures as your own.**
 
 **Not proven:** that any of the three ever fired on a real workload. The
 engagement counters exist now precisely so that question has an answer next time,
