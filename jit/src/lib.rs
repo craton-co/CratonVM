@@ -17762,6 +17762,51 @@ pub static PRIVATE_INVOKEVIRTUAL_PINNED: std::sync::atomic::AtomicU64 =
 pub static FINAL_INVOKEVIRTUAL_PINNED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Call sites where the static-bind rewrite YIELDED to a call-site intrinsic.
+///
+/// `java/lang/String` is `final`, so `invokevirtual_site_final_owner` answers
+/// for every `String.charAt`/`length`/`isEmpty`/`hashCode` site in the tree and
+/// the rewrite below turns `invoke_kind` 0 into 1. That is a correct statement
+/// about dispatch and it was catastrophic here: the instance call-site
+/// intrinsic gate a few hundred lines down is `invoke_kind == 0 ||
+/// invoke_kind == 2`, and the inline/direct-bind ladder that kind-1 sites take
+/// FIRST ends in a `continue`. So the site was bound to a real call to
+/// `String.charAt` and never offered the inline decode — not declined, not
+/// counted, not printed by any of the three `string-intrinsic` diagnostics,
+/// because it left the loop before reaching them.
+///
+/// Measured on `probes/CharAtDoorProbe.java`, one class, one run, five
+/// byte-identical bodies: the arm called straight from `main` read **349.64
+/// ns/char** and the four reached through a functional interface (which the
+/// OSR door compiles, and which never runs this rewrite) read 3.2-4.3.
+/// `CRATONVM_JIT_FINAL_DEVIRT=0` on the SAME binary moved the first arm to
+/// **6.85** — 51x from one flag, and the flag is not the fix, it is the proof.
+///
+/// A non-zero reading here is the count of sites this rule handed back.
+pub static DEVIRT_YIELDED_TO_INTRINSIC: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`DEVIRT_YIELDED_TO_INTRINSIC`].
+pub fn devirt_yielded_to_intrinsic_count() -> u64 {
+    DEVIRT_YIELDED_TO_INTRINSIC.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `CRATONVM_JIT_NO_DEVIRT_INTRINSIC_YIELD=1` — restore the pre-2026-09-02
+/// ordering, in which a `final`-class devirtualisation took a call site away
+/// from an intrinsic that would have inlined it.
+///
+/// Default OFF (the yield is ON). The B arm of an in-binary A/B: with this set,
+/// `probes/CharAtDoorProbe.java`'s `direct-from-main` row returns to ~350
+/// ns/char while every other arm is unchanged, which is the whole finding in
+/// one line.
+///
+/// NOT `OnceLock`-cached, matching `string_intrinsic_pin_enabled`: read at
+/// compile time only, never on a runtime hot path.
+fn devirt_intrinsic_yield_enabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_DEVIRT_INTRINSIC_YIELD").is_none()
+}
+
+
 /// `checkcast` sites that got the inline class-id compare, and the two reasons
 /// the rest did not.
 ///
@@ -24557,7 +24602,42 @@ fn try_compile_inner(
             //
             // A private target is not a dispatch site, so it takes the same
             // route `invokespecial` does: bind exactly, at the resolved owner.
-            let class_name = if invoke_kind == 0 {
+            //
+            // ...UNLESS an inline call-site intrinsic would take this site.
+            // Statically binding it is a correct claim about DISPATCH and a
+            // disastrous one about CODEGEN: the instance-intrinsic gate below
+            // is `invoke_kind == 0 || invoke_kind == 2`, and a kind-1 site
+            // reaches the inline/direct-bind ladder first and leaves the loop
+            // through its `continue`. `java/lang/String` is `final`, so this
+            // rule answers for EVERY `String.charAt`/`length`/`isEmpty`/
+            // `hashCode` site in the tree — and every one of them was bound to
+            // a real call instead of the inline decode, silently: not declined,
+            // not counted, and invisible to all three `string-intrinsic`
+            // diagnostics, which sit past the point the site left.
+            //
+            // Measured on `probes/CharAtDoorProbe.java`, one class, one run,
+            // five byte-identical bodies — the arm called straight from `main`
+            // 349.64 ns/char against 3.2-4.3 for the four the OSR door
+            // compiles, and 6.85 on the same binary with
+            // `CRATONVM_JIT_FINAL_DEVIRT=0`.
+            //
+            // So the site is handed back. `try_resolve_intrinsic` is the
+            // layout-independent matcher and `try_resolve_string_intrinsic` the
+            // layout-aware one; between them they are exactly the set the gate
+            // below would accept, asked the same way it asks. A PRIVATE target
+            // is not affected: no intrinsic matches a private method, so the
+            // JVMS 5.4.6 correctness rule above keeps every site it had.
+            let yields_to_intrinsic = invoke_kind == 0
+                && devirt_intrinsic_yield_enabled()
+                && (try_resolve_intrinsic(&class_name, &method_name, &descriptor).is_some()
+                    || try_resolve_string_intrinsic(
+                        &class_name,
+                        &method_name,
+                        &descriptor,
+                        resolved_string_layout,
+                    )
+                    .is_some());
+            let class_name = if invoke_kind == 0 && !yields_to_intrinsic {
                 match cp_invokespecial_owner_resolver.and_then(|r| r(cp_idx, opcode)) {
                     Some(owner) => {
                         invoke_kind = 1;
@@ -24568,6 +24648,14 @@ fn try_compile_inner(
                     None => class_name,
                 }
             } else {
+                if yields_to_intrinsic {
+                    DEVIRT_YIELDED_TO_INTRINSIC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                        eprintln!(
+                            "[cratonvm-jitc] devirt YIELDS to intrinsic {class_name}.{method_name}{descriptor} @pc={pc}"
+                        );
+                    }
+                }
                 class_name
             };
             let invoke_kind = invoke_kind;

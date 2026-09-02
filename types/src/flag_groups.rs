@@ -1401,6 +1401,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ic-frame-republish", on_key: None, off_key: Some("CRATONVM_JIT_NO_IC_FRAME_REPUBLISH"), off_word: None, since: "2026-08-24" },
     E { group: Group::JIT, token: "checkcast-inline", on_key: Some("CRATONVM_JIT_CHECKCAST_INLINE"), off_key: None, off_word: None, since: "2026-08-28" },
     E { group: Group::JIT, token: "final-devirt", on_key: Some("CRATONVM_JIT_FINAL_DEVIRT"), off_key: None, off_word: None, since: "2026-08-28" },
+    // Declared 2026-09-02. `final-devirt` above is `java/lang/String`'s
+    // problem: String is final, so the rewrite it drives took EVERY String
+    // access site away from the inline intrinsic. This is the opt-out for the
+    // yield that gives them back -- default OFF, so the yield is on.
+    E { group: Group::JIT, token: "devirt-intrinsic-yield", on_key: None, off_key: Some("CRATONVM_JIT_NO_DEVIRT_INTRINSIC_YIELD"), off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "inline-calls", on_key: Some("CRATONVM_JIT_INLINE_CALLS"), off_key: None, off_word: None, since: "2026-08-18" },
     E { group: Group::JIT, token: "inline-nest", on_key: Some("CRATONVM_JIT_INLINE_NEST"), off_key: None, off_word: None, since: "2026-08-18" },
     E { group: Group::JIT, token: "inline-call-dispatch", on_key: Some("CRATONVM_JIT_INLINE_CALL_DISPATCH"), off_key: None, off_word: None, since: "2026-08-18" },

@@ -1474,6 +1474,20 @@ pub fn dump_method_stats_to_stderr() {
         "[cratonvm] JIT String-intrinsic pin: fired={sp_fired} blind-no-layout={sp_no_layout} \
          blind-no-resolver={sp_no_resolver} fail-closed={sp_fail_closed}"
     );
+    // Sites the `final`-class devirtualisation handed BACK to a call-site
+    // intrinsic (`crate::devirt_yielded_to_intrinsic_count`).
+    //
+    // Printed beside the pin because it answers the question the pin's four
+    // counters could not: `java/lang/String` is final, so before 2026-09-02
+    // every String access site was statically bound and left the invoke loop
+    // BEFORE the instance-intrinsic gate, which is `invoke_kind == 0 || == 2`.
+    // Not declined, not blind, not counted -- gone. `probes/CharAtDoorProbe`
+    // read 349.64 ns/char on the arm that took this path against 3.2-4.3 on
+    // four byte-identical siblings that did not.
+    eprintln!(
+        "[cratonvm] JIT devirt yielded to intrinsic: {}",
+        crate::devirt_yielded_to_intrinsic_count()
+    );
     // Methods sealed out of compilation BEFORE any attempt, by reason. A
     // different and larger population than `hot_but_stuck` — a Spring Boot
     // context startup seals ~856 here against ~69 refused compiles — and until
