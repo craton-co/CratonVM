@@ -22,6 +22,7 @@ pub mod annotations;
 pub mod emitter;
 pub mod lowering;
 pub mod signature;
+pub mod target;
 
 #[cfg(test)]
 mod test_support;
@@ -33,3 +34,7 @@ pub use annotations::{
 };
 pub use emitter::{LoweringError, PtxKernel, PtxModule, PtxParam};
 pub use signature::KernelSignature;
+pub use target::{
+    clamp_target_to_isa, isa_for_target, max_isa_for_cuda_version, min_isa_for_target, IsaVersion,
+    SmTarget,
+};
