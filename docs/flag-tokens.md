@@ -577,7 +577,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-282 tokens.
+283 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1108,7 +1108,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-21 tokens.
+22 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1133,6 +1133,7 @@ export inherited from a parent shell.
 | `strict-swallows` | `CRATONVM_STRICT_SWALLOWS` |
 | `tomcat-mapper-natives` | `CRATONVM_TOMCAT_MAPPER_NATIVES` |
 | `vh-strict-reference-return` | `CRATONVM_VH_STRICT_REFERENCE_RETURN` |
+| `vh-null-coordinate-npe` | `CRATONVM_VH_NULL_COORDINATE_NPE` |
 
 ## `CRATONVM_TEST`
 
