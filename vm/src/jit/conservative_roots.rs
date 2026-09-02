@@ -419,6 +419,82 @@ unsafe fn write_gs_qword(disp: usize, val: usize) {
 static GLOBAL_JIT_DEPTH: cratonvm_types::striped_counter::StripedCounter =
     cratonvm_types::striped_counter::StripedCounter::new();
 
+/// `CRATONVM_XT_PINNED_PEER_DEPTH=1` -- credit a frozen peer's JIT depth to the
+/// cross-thread coverage account when this cycle PINNED that peer's entire
+/// stack, instead of refusing the cycle because the peer never parked to prove
+/// its own frames rewritable.
+///
+/// Default OFF, so the two behaviours are one binary apart and the comparison
+/// is an A/B rather than a rebuild. See
+/// [`refresh_moving_young_coverage_for_collection`] for the argument, and
+/// `cratonvm_gc::gc_quiescence::add_xt_cycle_pinned_jit_depth` for why the
+/// per-thread depth is published from here rather than from the (much colder)
+/// blocked-region transition.
+pub fn xt_pinned_peer_depth_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_XT_PINNED_PEER_DEPTH").is_some()
+    })
+}
+
+/// This thread's OS tid, in the same namespace `blocked_os_tids` reports and
+/// `helper_window_pass` enumerates -- the key the initiator will look this
+/// thread's depth up by.
+#[cfg(windows)]
+fn self_os_tid() -> u32 {
+    unsafe extern "system" {
+        fn GetCurrentThreadId() -> u32;
+    }
+    unsafe { GetCurrentThreadId() }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn self_os_tid() -> u32 {
+    // SAFETY: `SYS_gettid` takes no arguments and cannot fail.
+    unsafe { libc::syscall(libc::SYS_gettid) as u32 }
+}
+
+#[cfg(not(any(windows, all(unix, target_os = "linux"))))]
+fn self_os_tid() -> u32 {
+    // No helper-window scanner on this platform, so nothing ever reads the
+    // slot; 0 keeps every thread on the never-registered path.
+    0
+}
+
+thread_local! {
+    /// This thread's published JIT-depth cell, resolved once. `None` until the
+    /// first chain mutation with the credit enabled.
+    static SELF_JIT_DEPTH_SLOT: std::cell::RefCell<
+        Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Publish this thread's current `JIT_ENTRY_CHAIN` length so a GC initiator
+/// that freezes this thread can attribute a depth to it.
+///
+/// One TLS read and one relaxed store on a path that already does both; the
+/// registry lock is taken only on this thread's FIRST call. Gated so the
+/// default arm pays a single cached-bool branch.
+#[inline]
+fn publish_self_jit_depth(depth: usize) {
+    if !xt_pinned_peer_depth_enabled() {
+        return;
+    }
+    SELF_JIT_DEPTH_SLOT.with(|c| {
+        // `try_borrow_mut`: this runs on the JIT entry/exit path, which a panic
+        // unwind can re-enter. Skipping a publish is safe (the initiator then
+        // reads a stale-SMALLER depth and under-credits, refusing a cycle it
+        // could have run); a double-borrow panic here would not be.
+        let Ok(mut slot) = c.try_borrow_mut() else {
+            return;
+        };
+        let cell = slot.get_or_insert_with(|| {
+            cratonvm_gc::gc_quiescence::register_self_jit_depth_slot(self_os_tid())
+        });
+        cell.store(depth, std::sync::atomic::Ordering::Release);
+    });
+}
+
 /// Re-export the GC-side quiescence flag so VM call sites have a single
 /// canonical entry point. The flag itself lives in the gc crate (see
 /// `gc::gc_quiescence`) because the GC must consult it from inside its own
@@ -895,6 +971,7 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         n
     });
     GLOBAL_JIT_DEPTH.inc();
+    publish_self_jit_depth(depth);
     // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
     // this is the ONLY point at which a thread becomes
     // `CompiledUninterruptible`. A nested entry re-records the same state,
@@ -972,6 +1049,7 @@ pub fn pop_jit_entry() -> Option<usize> {
     });
     if let Some(entry) = popped {
         GLOBAL_JIT_DEPTH.dec();
+        publish_self_jit_depth(remaining);
         thread_state::record_transition(
             leaving_compiled_state(remaining),
             "jit::conservative_roots::pop_jit_entry",
@@ -1074,6 +1152,9 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
         GLOBAL_JIT_DEPTH.dec();
         cratonvm_gc::gc_quiescence::leave();
         cratonvm_jit::jit_execution_leave();
+    }
+    if pruned > 0 {
+        publish_self_jit_depth(remaining);
     }
     if pruned > 0 {
         tracing::debug!(
@@ -3889,12 +3970,32 @@ pub fn refresh_moving_young_coverage_for_collection() -> bool {
     let peer_depth = peer_jit_depth();
     if peer_depth > 0 {
         let proven = cratonvm_gc::gc_quiescence::peer_proven_jit_depth();
+        // Depth belonging to peers this cycle discharged by PINNING instead of
+        // by proof (see `add_xt_cycle_pinned_jit_depth`). Two conditions, and
+        // both are load-bearing:
+        //
+        //  - the credit is enabled, so the old behaviour is one flag away; and
+        //  - EVERY helper window this cycle was pinned. A single unpinned
+        //    window means some frozen peer's stack is neither proven nor
+        //    immobile, and since the account is one process-wide subtraction it
+        //    cannot exclude just that peer -- so it credits nothing at all.
+        //
+        // `xt_cycle_pinned_jit_depth` applies the third condition itself: it
+        // returns 0 if any pinned peer's depth was unknown.
+        let pinned = if xt_pinned_peer_depth_enabled()
+            && crate::jit::xt_root_scan::helper_windows_all_pinned_this_cycle()
+        {
+            cratonvm_gc::gc_quiescence::xt_cycle_pinned_jit_depth()
+        } else {
+            0
+        };
+        let covered = proven.saturating_add(pinned);
         let accounted = xt_jit_coverage_handshake_enabled()
-            && (peer_coverage_accounted(peer_depth, proven) || xt_jit_coverage_assume());
+            && (peer_coverage_accounted(peer_depth, covered) || xt_jit_coverage_assume());
         cratonvm_gc::gc_quiescence::note_peer_coverage_verdict(accounted);
         if xt_coverage_dbg() {
             eprintln!(
-                "[xt-coverage] peer_depth={peer_depth} proven={proven} accounted={accounted}"
+                "[xt-coverage] peer_depth={peer_depth} proven={proven} pinned={pinned} accounted={accounted}"
             );
         }
         if !accounted {

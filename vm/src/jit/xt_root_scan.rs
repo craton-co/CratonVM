@@ -742,6 +742,25 @@ mod imp {
                                 candidates.iter().map(|o| o.as_ptr() as usize).collect();
                             cratonvm_gc::gc_quiescence::add_xt_cycle_pinned_jit_roots(&addrs);
                             pinned_windows += 1;
+                            // A pinned window covers the peer's WHOLE stack
+                            // (`[rsp, stack_base)`) plus its register file, so
+                            // every JIT frame it holds is immobile -- which is
+                            // what the cross-thread coverage account wants to
+                            // hear, and it wants to hear it as a DEPTH.
+                            //
+                            // Reading the peer's published depth after it has
+                            // resumed is still exact: `mark_blocked_region_leave`
+                            // waits out an active pause, so a blocked peer
+                            // cannot run Java (and so cannot mutate its chain)
+                            // between the block and the end of this STW.
+                            //
+                            // `None` -- a peer that never registered a slot --
+                            // poisons the ledger rather than crediting zero.
+                            if crate::jit::conservative_roots::xt_pinned_peer_depth_enabled() {
+                                cratonvm_gc::gc_quiescence::add_xt_cycle_pinned_jit_depth(
+                                    cratonvm_gc::gc_quiescence::jit_depth_of_tid(tid),
+                                );
+                            }
                         } else {
                             unpinned_windows += 1;
                         }
@@ -1548,6 +1567,25 @@ mod imp {
                                 candidates.iter().map(|o| o.as_ptr() as usize).collect();
                             cratonvm_gc::gc_quiescence::add_xt_cycle_pinned_jit_roots(&addrs);
                             pinned_windows += 1;
+                            // A pinned window covers the peer's WHOLE stack
+                            // (`[rsp, stack_base)`) plus its register file, so
+                            // every JIT frame it holds is immobile -- which is
+                            // what the cross-thread coverage account wants to
+                            // hear, and it wants to hear it as a DEPTH.
+                            //
+                            // Reading the peer's published depth after it has
+                            // resumed is still exact: `mark_blocked_region_leave`
+                            // waits out an active pause, so a blocked peer
+                            // cannot run Java (and so cannot mutate its chain)
+                            // between the block and the end of this STW.
+                            //
+                            // `None` -- a peer that never registered a slot --
+                            // poisons the ledger rather than crediting zero.
+                            if crate::jit::conservative_roots::xt_pinned_peer_depth_enabled() {
+                                cratonvm_gc::gc_quiescence::add_xt_cycle_pinned_jit_depth(
+                                    cratonvm_gc::gc_quiescence::jit_depth_of_tid(tid),
+                                );
+                            }
                         } else {
                             unpinned_windows += 1;
                         }
