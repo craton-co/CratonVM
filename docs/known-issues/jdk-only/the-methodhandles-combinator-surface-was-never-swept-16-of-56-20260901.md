@@ -120,3 +120,69 @@ corrective, then (d), then (c).
 ```bash
 cratonvm --java-home "$JDK" --jdk-only -cp probes/out MhCombinatorSweep
 ```
+
+## 5. The fix attempt FAILED, and the cause is now located (2026-09-02)
+
+Four release builds, each producing a **byte-identical** sweep. The attempt is
+preserved on `claude/l5-mh-combinators-wip-20260902` (74568bbc7) and reverted
+from the lane branch, because a 930-line unverified diff -- new dispatch arms
+and an edit to the `check_override` pin list -- has no business riding along
+with three fixes that are verified.
+
+**The located cause: the new registrar was wired into
+`native-builtins/src/lib.rs` at a line that falls inside
+`register_synthetic_overrides`**, which is `#[cfg(feature = "synthetic-jdk")]`
+gated and runs in NEITHER real-JDK nor compatible mode. So the natives compiled
+-- their message strings are in the shipped binary -- the code was correct, and
+the registry never received a single one of them.
+
+`--dump-native-registry` said so in one comparison, and it is the measurement
+the next attempt should START from rather than reach fourth:
+
+```text
+--jdk-only    MethodHandles.constant      PRESENT   register_method_handles_constant_bridge
+--jdk-only    MethodHandles.zero          ABSENT    register_p65_method_handles_extra
+compatible    all seven new triples       ABSENT
+```
+
+Two registrars in one file, ~600 lines apart, with different reachability.
+`register_method_handles_constant_bridge` is called from the real-JDK essentials
+path; `register_p65_method_handles_extra` is called only from `phases_late.rs`.
+That is the same species as
+`the-fix-that-changed-nothing-a-shadowed-registrar-on-the-lookup-define-doors-20260830.md`
+-- a registration that exists and is never dispatched -- arriving through a
+different door: not shadowed by a later twin, but never installed at all.
+
+### The three hypotheses that were WRONG, so nobody re-tests them
+
+Each was a real defect, each was fixed, and none of them moved a single row:
+
+| hypothesis | what it actually was |
+| --- | --- |
+| the `primitive-into-reference` store in `zero` | GENUINE: `MH_BOUND` is a reference slot, and a raw `Value::Int(0)` written into it is nulled by the G30 guard. The corrupted handle then dragged in the JDK's `BoundMethodHandle`/`ClassSpecializer` machinery, which failed to link and took `zero(String)` and `empty(...)` -- two rows that had been PASSING -- down with it. Fixed. Not the cause |
+| the registrar missing from the real-JDK essentials path in `vm_init.rs` | added next to `register_p63_method_handles_lookup`. Not sufficient alone |
+| the seven names missing from `vm_exec.rs::check_override` | GENUINE: that literal list is what pins a native ahead of the JDK bytecode, and without an entry the bytecode runs even when the native IS registered. Necessary, not sufficient |
+
+The last two are almost certainly still REQUIRED; they are simply not the whole
+chain. A working fix needs all three at once: a registrar reachable from a path
+that actually runs, the names pinned in `check_override`, and no primitive
+stored into `MH_BOUND`.
+
+### One row that was passing by accident
+
+`k.zeroRef` -- `MethodHandles.zero(String.class).invoke()` -- was green before
+any of this, and it was green for the wrong reason: the old implementation
+returned an inert handle with no `MH_KIND` whose invocation produced null, and
+null happens to be the right answer for a reference type. Making the handle real
+is what exposed it. Worth remembering when reading the 40 passing rows in §3: a
+green row on this surface is not automatically evidence that the combinator is
+implemented.
+
+### Start here next time
+
+`arrayLength` is the cheapest row to iterate on: one factory, one dispatch arm,
+no loop semantics, and it fails as `AbstractMethodError`, which is unambiguously
+the JDK bytecode running rather than our native. Get that ONE row green,
+confirm it with `--dump-native-registry` rather than with the sweep, and the
+other five follow the same wiring.
+
