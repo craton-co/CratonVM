@@ -17389,7 +17389,9 @@ pub fn register_essential_natives_with_shims(
         |_ctx, _args| -> MethodCallResult {
             Err(MethodCallFailed::from(
                 RuntimeError::NoSuchElementException {
-                    message: "Collections.emptyEnumeration()".to_string(),
+                    // A bare `new NoSuchElementException()` on the oracle;
+                    // empty is this crate's marker for a null message.
+                    message: String::new(),
                 },
             ))
         },
@@ -45188,6 +45190,59 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/Object;",
         native_class_get_enum_constants,
     );
+    // Three JDK enums whose constants the synthetic model did not carry.
+    // `--synthetic-jdk` only, for the reason `native_enum_value_of` states: in
+    // real-JDK mode the real `<clinit>` and `values()` bytecode run and a
+    // registration here would only shadow them. `<clinit>` is additionally
+    // runtime-gated inside `publish_synthetic_enum_constants` on
+    // `is_class_synthetic_stub`, so a feature-enabled binary in real-JDK mode
+    // leaves the JDK's own interned constants alone.
+    //
+    // The constant lists live beside the publisher in `lang_class`, and must
+    // stay identical to `class_manager.rs`'s `enum_constant_fields` rows — that
+    // side declares the statics, this side fills them, and declared-but-unfilled
+    // is a NULL constant, which is worse than the `NoSuchFieldError` it
+    // replaces.
+    #[cfg(feature = "synthetic-jdk")]
+    {
+        registry.register(
+            "java/time/DayOfWeek",
+            "<clinit>",
+            "()V",
+            crate::lang_class::day_of_week_clinit,
+        );
+        registry.register(
+            "java/time/DayOfWeek",
+            "values",
+            "()[Ljava/time/DayOfWeek;",
+            crate::lang_class::day_of_week_values,
+        );
+        registry.register(
+            "java/net/http/HttpClient$Version",
+            "<clinit>",
+            "()V",
+            crate::lang_class::http_version_clinit,
+        );
+        registry.register(
+            "java/net/http/HttpClient$Version",
+            "values",
+            "()[Ljava/net/http/HttpClient$Version;",
+            crate::lang_class::http_version_values,
+        );
+        registry.register(
+            "java/net/http/HttpClient$Redirect",
+            "<clinit>",
+            "()V",
+            crate::lang_class::http_redirect_clinit,
+        );
+        registry.register(
+            "java/net/http/HttpClient$Redirect",
+            "values",
+            "()[Ljava/net/http/HttpClient$Redirect;",
+            crate::lang_class::http_redirect_values,
+        );
+    }
+
     // `Enum.valueOf(Class, String)` — synthetic-JDK only. See
     // `lang_class::native_enum_value_of`: `java/lang/Enum`'s natives were
     // retired against the real-JDK suite, where the real bytecode serves them,

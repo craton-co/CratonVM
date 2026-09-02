@@ -105,6 +105,30 @@ jobs:
           TG: ${{ github.workspace }}/test_classes/gpu
         run: bash bench-gpu/runtime-stress.sh | tee runtime-stress.log
 
+      # Marshalling: all SIX element types the pipeline admits, across
+      # both transfer paths (zero-copy and, with
+      # CRATONVM_GPU_NO_ZEROCOPY=1, staged), at odd lengths, with inputs
+      # spanning each type's full range -- every one of the 65536 short
+      # values and all 256 byte values, and every float/double edge case
+      # including NaN and both zeros.
+      #
+      # This is the regression test for the 2026-09-02 short[]/byte[]
+      # gap: the analyzer admitted those kernels and the lowering emitted
+      # PTX, but `dispatch_method_from_native`'s `match element_type` had
+      # no arm for them, so each dispatch failed at marshalling and
+      # silently re-ran on the interpreter. The answers stayed correct,
+      # which is why it survived -- so this script also counts H2D
+      # transfers per kernel and FAILS if any of the six never dispatched.
+      # A correctness arm with no engagement census cannot see this class
+      # of defect; it ends up comparing the interpreter with itself.
+      - name: GPU marshalling stress (real driver)
+        shell: bash
+        env:
+          CV: ${{ github.workspace }}/target-gpu/release/cratonvm.exe
+          JDK: ${{ env.JDK }}
+          TG: ${{ github.workspace }}/test_classes/gpu
+        run: bash bench-gpu/marshal-stress.sh | tee marshal-stress.log
+
       # Concurrent dispatch: one context, many threads — the shape
       # `OffloadCacheRegistry` gives every dispatching Java thread. This
       # is the regression test for the 2026-09-02 `DeviceBuffer::zeros`

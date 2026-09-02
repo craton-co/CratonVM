@@ -9781,7 +9781,36 @@ impl ClassManager {
                 | "java/lang/ProcessHandle"
                 | "java/lang/ProcessHandle$Info"
         );
-        let access_flags = if (name.contains("$") && !is_concrete_dollar_class)
+        let access_flags = if jdk_superclass(name) == "java/lang/Enum" {
+            // ACC_ENUM, derived from the superclass row rather than from a
+            // second list of enum names — one fact, one place. It must be
+            // tested BEFORE the `$`/`able` heuristics: `HttpClient$Version`
+            // contains a `$` and would otherwise be fabricated as an INTERFACE.
+            //
+            // `native-builtins`' `class_is_declared_enum` requires BOTH
+            // `ACC_ENUM` and a `java/lang/Enum` parent, and it gates
+            // `Class.getEnumConstants`, which `EnumSet.allOf` reads through.
+            // Without the flag a synthetic enum publishes its constants and
+            // answers `name()`, `ordinal()` and `values()` correctly while
+            // `X.class.isEnum()` is false and `getEnumConstants()` is null.
+            //
+            // That was true of EVERY synthetic JDK enum, including
+            // `PosixFilePermission`, which has been the model for the others
+            // since it landed — measured 2026-09-02 with
+            // `apps/probes/SyntheticEnumSurface` and `TuDiag`:
+            //
+            //     TimeUnit             isEnum=false getEnumConstants=null allOf=0
+            //     DayOfWeek            isEnum=false getEnumConstants=null allOf=0
+            //     PosixFilePermission  isEnum=false getEnumConstants=null allOf=0
+            //     a user-defined enum  isEnum=true  getEnumConstants=2    allOf=2
+            //
+            // A real enum's class file carries `ACC_ENUM` and `ACC_FINAL`, and
+            // `SUPER` is set on every modern class file.
+            ClassAccessFlags::PUBLIC
+                | ClassAccessFlags::SUPER
+                | ClassAccessFlags::FINAL
+                | ClassAccessFlags::ENUM
+        } else if (name.contains("$") && !is_concrete_dollar_class)
             || name.ends_with("able")
             || is_known_jdk_interface
         {
@@ -11228,6 +11257,30 @@ fn jdk_superclass(name: &str) -> &'static str {
         // java.nio.file.attribute — enum PosixFilePermission extends Enum
         "java/nio/file/attribute/PosixFilePermission" => "java/lang/Enum",
 
+        // The three enums added 2026-09-02 with `enum_constant_fields`. This
+        // row is not decoration: `Enum.name()`/`ordinal()`/`compareTo()` are
+        // registered on `java/lang/Enum`, so a stub without it publishes its
+        // constants correctly and then answers `NoSuchMethodError` the moment
+        // anyone calls `name()` on one — measured for both `HttpClient` enums
+        // before this row existed, with `MONDAY` working beside them.
+        //
+        // It is the same row `posix_publish_constants`' doc calls out as the
+        // thing that made an INVERTED name/ordinal pair merely latent rather
+        // than fatal: "one missing superclass row, or one enum copied from this
+        // model without that row, and every constant is NAMELESS".
+        //
+        // `TimeUnit` is here for the same reason though it long predates them:
+        // it had a full field table, a `<clinit>` and working `name()`/
+        // `ordinal()`/`values()`, and no superclass row — so
+        // `class_is_declared_enum` (which requires ACC_ENUM *and* a
+        // `java/lang/Enum` parent) said false, `Class.getEnumConstants`
+        // returned null, and `EnumSet.allOf(TimeUnit.class)` answered 0 against
+        // HotSpot's 7 while every direct use of the enum was correct.
+        "java/time/DayOfWeek"
+        | "java/net/http/HttpClient$Version"
+        | "java/net/http/HttpClient$Redirect"
+        | "java/util/concurrent/TimeUnit" => "java/lang/Enum",
+
         // Number type hierarchy
         "java/lang/Integer" | "java/lang/Long" | "java/lang/Short" | "java/lang/Byte"
         | "java/lang/Float" | "java/lang/Double" => "java/lang/Number",
@@ -12642,6 +12695,28 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
             .collect()
     }
 
+    /// The static fields a synthetic JDK enum needs: one per constant, in
+    /// declaration (= ordinal) order, plus the `$VALUES` array its `<clinit>`
+    /// publishes and `EnumSet.allOf` / `Class.getEnumConstants` read.
+    ///
+    /// One builder rather than a hand-written list per enum, for the reason
+    /// `publish_synthetic_enum_constants` gives on the other half of this pair:
+    /// the enum stubs that predate it are the survivors of copies that drifted.
+    fn enum_constant_fields(descriptor: &str, constants: &[&str]) -> Vec<ClassFileField> {
+        let mk = |n: &str, d: &str| ClassFileField {
+            access_flags: FieldAccessFlags::PUBLIC
+                | FieldAccessFlags::STATIC
+                | FieldAccessFlags::FINAL,
+            name: cratonvm_types::intern_arc(n),
+            descriptor: cratonvm_types::intern_arc(d),
+            attributes: vec![],
+        };
+        let mut fields: Vec<ClassFileField> =
+            constants.iter().map(|c| mk(c, descriptor)).collect();
+        fields.push(mk("$VALUES", &format!("[{descriptor}")));
+        fields
+    }
+
     fn named_field(name: &str, descriptor: &str) -> ClassFileField {
         ClassFileField {
             access_flags: FieldAccessFlags::empty(),
@@ -13883,6 +13958,21 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                     attributes: vec![],
                 });
             }
+            // `$VALUES`, added 2026-09-02. Its absence was the last row of
+            // `apps/probes/SyntheticEnumSurface`: every direct use of TimeUnit
+            // worked — `MILLISECONDS.name()`, `toNanos`, `values()` — while
+            // `EnumSet.allOf(TimeUnit.class)` answered 0 against HotSpot's 7,
+            // because `Class.getEnumConstants` reads `$VALUES` and
+            // `set_static_field_by_name` is a silent no-op on a static this
+            // table never declared. The clinit's publish is the other half.
+            fields.push(ClassFileField {
+                access_flags: FieldAccessFlags::PUBLIC
+                    | FieldAccessFlags::STATIC
+                    | FieldAccessFlags::FINAL,
+                name: cratonvm_types::intern_arc("$VALUES"),
+                descriptor: cratonvm_types::intern_arc("[Ljava/util/concurrent/TimeUnit;"),
+                attributes: vec![],
+            });
             fields
         }
         // java.lang.ref: Reference = 2 fields (referent=0, queue=1)
@@ -14142,6 +14232,54 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
             instance_fields(2)
         }
 
+        // Three JDK enums the synthetic model did not carry, added 2026-09-02.
+        //
+        // A synthetic JDK enum needs its constants DECLARED as statics here (so
+        // `GETSTATIC` resolves) and POPULATED by a native `<clinit>` (so the
+        // resolved value is not null) — `native-builtins`'
+        // `publish_synthetic_enum_constants` is the second half, and one
+        // without the other is worse than neither: a declared-but-unpopulated
+        // constant turns `NoSuchFieldError` into a NULL enum, which is exactly
+        // the shape two stale tests were asserting when they passed a null
+        // TimeUnit and a null Class.
+        //
+        // Measured absent by `apps/probes/SyntheticEnumSurface`:
+        // `DayOfWeek.MONDAY`, `HttpClient$Version.HTTP_1_1` and
+        // `HttpClient$Redirect.NEVER` were each `NoSuchFieldError` in
+        // `--synthetic-jdk` while `TimeUnit.MILLISECONDS` (which HAS a table
+        // here) worked.
+        //
+        // DECLARATION ORDER IS THE ORDINAL, and it is `javap` order on
+        // 25.0.3+9, not alphabetical: `compareTo`, `EnumMap` and `EnumSet` all
+        // key on it.
+        //
+        // `$VALUES` is declared alongside, unlike the `PosixFilePermission`
+        // block below — whose own doc records that omitting it makes the
+        // `<clinit>`'s `$VALUES` publish a silent no-op, because
+        // `set_static_field_by_name` resolves a DECLARED static and does
+        // nothing otherwise. `EnumSet.allOf` and `Class.getEnumConstants` read
+        // `$VALUES`, so without the declaration they answer empty.
+        "java/time/DayOfWeek" => enum_constant_fields(
+            "Ljava/time/DayOfWeek;",
+            &[
+                "MONDAY",
+                "TUESDAY",
+                "WEDNESDAY",
+                "THURSDAY",
+                "FRIDAY",
+                "SATURDAY",
+                "SUNDAY",
+            ],
+        ),
+        "java/net/http/HttpClient$Version" => enum_constant_fields(
+            "Ljava/net/http/HttpClient$Version;",
+            &["HTTP_1_1", "HTTP_2"],
+        ),
+        "java/net/http/HttpClient$Redirect" => enum_constant_fields(
+            "Ljava/net/http/HttpClient$Redirect;",
+            &["NEVER", "ALWAYS", "NORMAL"],
+        ),
+
         // Spring Boot 3 JarFileArchive.<clinit> reads PosixFilePermission.OWNER_* statics.
         // When the JDK image is unavailable we fall back to a synthetic stub; declare
         // the enum constants so GETSTATIC resolves, and wire values from a native <clinit>
@@ -14157,7 +14295,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 ),
                 attributes: vec![],
             };
-            vec![
+            let mut fields = vec![
                 mk("OWNER_READ"),
                 mk("OWNER_WRITE"),
                 mk("OWNER_EXECUTE"),
@@ -14167,7 +14305,32 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 mk("OTHERS_READ"),
                 mk("OTHERS_WRITE"),
                 mk("OTHERS_EXECUTE"),
-            ]
+            ];
+            // `$VALUES`, 2026-09-02 — the declaration `posix_publish_constants`
+            // nominated and wrote its publish against: "this table declares the
+            // nine constants for this stub but NOT `$VALUES` … so the `$VALUES`
+            // publish below currently goes nowhere on the synthetic side … the
+            // declaration is nominated; the publish is written now so it starts
+            // working the moment that lands."
+            //
+            // It lands here. Nothing else changes: that `<clinit>` already
+            // writes both spellings, and `values()` reads the nine statics
+            // directly either way. What it fixes is `Class.getEnumConstants`,
+            // which reads `$VALUES` and answered null — invisible until
+            // `create_synthetic_stub` started setting ACC_ENUM in this same
+            // change, because `class_is_declared_enum` refused before it ever
+            // looked for the array.
+            fields.push(ClassFileField {
+                access_flags: FieldAccessFlags::PUBLIC
+                    | FieldAccessFlags::STATIC
+                    | FieldAccessFlags::FINAL,
+                name: cratonvm_types::intern_arc("$VALUES"),
+                descriptor: cratonvm_types::intern_arc(
+                    "[Ljava/nio/file/attribute/PosixFilePermission;",
+                ),
+                attributes: vec![],
+            });
+            fields
         }
 
         // `Files.getOwner` on Windows returns one of these. Field NAMES (not
