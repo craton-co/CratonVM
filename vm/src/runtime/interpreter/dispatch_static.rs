@@ -1252,6 +1252,7 @@ pub(super) fn populate_invoke_cache(
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
+        descriptor_facts_cache: std::sync::OnceLock::new(),
         intercept_shape_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
@@ -1571,7 +1572,7 @@ pub(super) fn execute_invokestatic_cached(
                     found
                 };
                 if let Some(compiled) = compiled_probe {
-                    let ret = crate::jit::return_type(&cached.method_descriptor);
+                    let ret = cached.return_tag();
                     let heap = compiled.needs_heap();
                     // WP2.4-F1: inherit the gate from the bytecode entry —
                     // both the JIT path and the bytecode path bind to the
@@ -1825,7 +1826,7 @@ pub(super) fn execute_invokestatic_cached(
                 &mut []
             } else if num_params <= MAX_INLINE_ARGS {
                 // ONE forward scan; the per-argument form rescanned from `(` each time.
-                let param_tags = ParamTags::of(&cached.method_descriptor);
+                let param_tags = ParamTags::from_facts(cached.descriptor_facts());
                 args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
                 for i in (0..num_params).rev() {
                     args_buf[i] = thread.frames[frame_idx]
@@ -1836,7 +1837,7 @@ pub(super) fn execute_invokestatic_cached(
                 }
                 &mut args_buf[..num_params]
             } else {
-                let param_tags = ParamTags::of(&cached.method_descriptor);
+                let param_tags = ParamTags::from_facts(cached.descriptor_facts());
                 args_vec.resize(num_params, Value::Uninitialized);
                 for i in (0..num_params).rev() {
                     args_vec[i] = thread.frames[frame_idx]

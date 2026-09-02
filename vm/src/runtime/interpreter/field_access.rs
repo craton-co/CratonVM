@@ -576,6 +576,19 @@ pub(super) fn resolve_field_in_class(
     Ok(resolved)
 }
 
+/// Kill switch for the duplicate-class-name gate below
+/// (`CRATONVM_NO_DUP_NAME_FIELD_GATE=1`), so the change can be A/B'd on one
+/// binary. Set, the gate is skipped and every call walks the authoritative
+/// path exactly as it did before the gate existed — a cross-binary comparison
+/// is not an A/B.
+#[inline]
+fn dup_name_field_gate_disabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_DUP_NAME_FIELD_GATE").is_some()
+    })
+}
+
 pub(super) fn retarget_instance_field_to_receiver(
     shared: &SharedVm,
     current_class_id: ClassId,
@@ -584,6 +597,38 @@ pub(super) fn retarget_instance_field_to_receiver(
     field: &ResolvedField,
 ) -> Option<ResolvedField> {
     hotpath_counts::bump(&hotpath_counts::RETARGET_FIELD_CALLS);
+    // ── Loader-split gate (2026-09-02) ───────────────────────────────────
+    //
+    // Everything below this function's early-return block exists for ONE
+    // situation: the receiver class and the resolved declaring class have the
+    // SAME NAME under DIFFERENT `ClassId`s, so the cached field index belongs
+    // to the wrong copy of the class. The very first thing the slow half does
+    // is `if &*receiver_class.name != &*resolved_decl.name { return None; }`.
+    //
+    // Without this gate, every `getfield`/`putfield` whose receiver class
+    // merely DIFFERS from the declaring class — the ordinary shape of an
+    // inherited field, and most field accesses in real OO bytecode — reached
+    // that test by way of a `class_manager` read lock, three `get_class`
+    // lookups and a constant-pool walk. The `FieldSiteCache` above answers
+    // resolution in an array index and two integer compares; this function
+    // then threw that away on the majority of accesses.
+    //
+    // `any_duplicate_class_name()` is a single relaxed load of a latch raised
+    // by `loaded_classes_insert` the first time any binary name resolves to
+    // two distinct `ClassId`s. False ⇒ no receiver/declaring pair can be a
+    // same-name-different-id pair ⇒ the slow half is provably a no-op.
+    //
+    // Measured (`probes/FieldShape.java`, `--nojit`, min-of-9, arms
+    // interleaved both ways): the inherited-over-own-class delta for one
+    // get+put pair was 54 / 78 / 103 ns across three runs.
+    //
+    // One diagnostic consequence, stated so it is not rediscovered as a bug:
+    // the `[RETARGET-SKIP]` trace in the early-return block below cannot fire
+    // while the gate short-circuits. Set `CRATONVM_NO_DUP_NAME_FIELD_GATE=1`
+    // alongside `CRATONVM_DBG_FIELD_WATCH` to get it back.
+    if !dup_name_field_gate_disabled() && !crate::classloading::any_duplicate_class_name() {
+        return None;
+    }
     if field.is_static
         || receiver_class_id == ClassId::new(0)
         || receiver_class_id == field.declaring_class_id

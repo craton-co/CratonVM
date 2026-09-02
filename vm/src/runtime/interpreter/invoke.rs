@@ -2810,9 +2810,50 @@ impl ParamTags {
     // method; wider ones take the fallback and are unchanged.
     const INLINE: usize = 8;
 
+    /// Adopt a [`cratonvm_jit_api::DescriptorFacts`] that was tokenised once
+    /// per *method* and cached on the `CachedBytecodeMethod`, instead of
+    /// rescanning the descriptor for this one call.
+    ///
+    /// The two tokenisations are the same algorithm — `DescriptorFacts::of`
+    /// is [`Self::of`]'s parameter walk, moved to where it can be memoized —
+    /// so this is a relocation of work, not a change of answer.
+    /// `param_tags_match_descriptor_facts` pins them against each other.
+    ///
+    /// `CRATONVM_JIT_NO_PARAM_TAG_SCAN` still bypasses to the per-index
+    /// rescan, so the kill switch means the same thing on both constructors.
+    #[inline]
+    pub(super) fn from_facts(facts: &cratonvm_jit_api::DescriptorFacts) -> Self {
+        if param_tag_scan_disabled() {
+            return Self {
+                tags: [b'L'; Self::INLINE],
+                len: 0,
+                overflow: false,
+                bypass: true,
+            };
+        }
+        debug_assert_eq!(
+            Self::INLINE,
+            cratonvm_jit_api::DescriptorFacts::INLINE_PARAMS,
+            "ParamTags and DescriptorFacts must agree on the inline width, or \
+             the overflow fallback engages at two different arities"
+        );
+        Self {
+            tags: facts.param_tags,
+            // Widening: bounded by INLINE_PARAMS (8) by the producer's loop.
+            len: facts.param_tag_len as usize,
+            overflow: facts.param_tags_overflow,
+            bypass: false,
+        }
+    }
+
     /// Tokenise `descriptor` once. Tokenisation mirrors [`nth_param_tag_byte`]
     /// exactly, including its `b'['`-for-arrays tag and its `b'L'` answer for
     /// an out-of-range index; `param_tags_match_nth_param_tag_byte` pins that.
+    ///
+    /// Prefer [`Self::from_facts`] wherever a `CachedBytecodeMethod` is in
+    /// hand: this constructor rescans the descriptor on every call, and the
+    /// invoke path called it per invoke. It remains for the resolution paths
+    /// that hold only a descriptor string.
     #[inline]
     pub(super) fn of(descriptor: &str) -> Self {
         if param_tag_scan_disabled() {

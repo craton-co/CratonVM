@@ -3597,6 +3597,7 @@ pub fn execute(
                                         is_synchronized,
                                         is_static,
                                         force_native_cache: std::sync::OnceLock::new(),
+                                        descriptor_facts_cache: std::sync::OnceLock::new(),
                                         intercept_shape_cache: std::sync::OnceLock::new(),
                                         native_callback_cache: std::sync::OnceLock::new(),
                                         invoc_key: std::sync::OnceLock::new(),
@@ -3930,6 +3931,7 @@ pub fn execute(
                                             is_synchronized,
                                             is_static,
                                             force_native_cache: std::sync::OnceLock::new(),
+                                            descriptor_facts_cache: std::sync::OnceLock::new(),
                                             intercept_shape_cache: std::sync::OnceLock::new(),
                                             native_callback_cache: std::sync::OnceLock::new(),
                                             invoc_key: std::sync::OnceLock::new(),
@@ -5246,6 +5248,51 @@ fn execute_frame_from_index(
     // arm's admission test to a register compare. Arming it mid-method is
     // observed on the next call/return, the accepted pgo-style tradeoff.
     let acmp_identity_trace = crate::runtime::env_cache::active_profiles_identity_trace();
+    // ── Back-edge poll word (2026-09-02) ─────────────────────────────────
+    //
+    // Every backward branch used to call `safepoint_check` UNCONDITIONALLY and
+    // then `continue` — straight into the loop-top poll thirty lines below,
+    // which asks `stw_requested` first and only calls `safepoint_check` if it
+    // is set. So the back-edge call was redundant with the very next thing the
+    // loop does, *except* for its tail: the async-exception drain, which is
+    // the only work at a back edge that the loop top does not repeat.
+    //
+    // That tail was not cheap. `take_async_exception` goes through
+    // `self_async_slot`: a thread-local `RefCell` borrow, an `Arc::clone`, a
+    // `swap(0, AcqRel)` and an `Arc` drop — three locked read-modify-writes
+    // per loop iteration, inside a function too large to inline (it carries
+    // the memwatch and blocked-access debug hooks). Measured with
+    // `probes/BackEdge.java` (two loops with identical total body-bytecode
+    // counts and an 8x difference in back-edge count, so the per-back-edge
+    // cost falls out of the difference): one interpreted backward branch cost
+    // 33-37 ns against HotSpot's template interpreter at 4.9 ns.
+    //
+    // Hoisting the slot handle turns the back-edge question into two relaxed
+    // loads and a predicted branch. See
+    // `ThreadRegistry::self_async_slot_handle` for why observing registration
+    // once per `execute_frame` entry is sound (same pgo-style tradeoff as
+    // `pgo_enabled` and `single_step_active` above).
+    let async_exception_slot = shared
+        .threads
+        .thread_registry
+        .self_async_slot_handle(thread.thread_id);
+    // The condition every back edge now tests before paying for
+    // `safepoint_check`. Written as a macro rather than a closure because the
+    // four call sites sit inside `&mut thread` borrows and a closure capturing
+    // `shared`/`async_exception_slot` would still have to be called in a
+    // position where `thread` is reborrowed.
+    macro_rules! backedge_poll_needed {
+        () => {
+            shared
+                .mem
+                .gc_barrier
+                .stw_requested
+                .load(std::sync::atomic::Ordering::Acquire)
+                || async_exception_slot
+                    .as_ref()
+                    .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed) != 0)
+        };
+    }
     // When a fast-path bytecode needs to throw a RuntimeError (AIOOBE, NPE, etc.),
     // it sets this to Some(...) and breaks out of the fast-path match instead of
     // returning directly. The main loop then converts it to a catchable Java exception.
@@ -5380,7 +5427,9 @@ fn execute_frame_from_index(
                         }
                         OsrBackoffOutcome::Skip => {}
                     }
-                    safepoint_check(shared, thread);
+                    if backedge_poll_needed!() {
+                        safepoint_check(shared, thread);
+                    }
                 }
             } else {
                 $frame.pc = $saved_pc + 3;
@@ -5695,7 +5744,9 @@ fn execute_frame_from_index(
                                             }
                                             OsrBackoffOutcome::Skip => {}
                                         }
-                                        safepoint_check(shared, thread);
+                                        if backedge_poll_needed!() {
+                                            safepoint_check(shared, thread);
+                                        }
                                     }
                                 } else {
                                     frame.pc = saved_pc + 5; // skip iload_X + iload_Y + if_icmplt(3)
@@ -6033,7 +6084,9 @@ fn execute_frame_from_index(
                             }
                             OsrBackoffOutcome::Skip => {}
                         }
-                        safepoint_check(shared, thread);
+                        if backedge_poll_needed!() {
+                            safepoint_check(shared, thread);
+                        }
                     }
                     continue;
                 }
@@ -6141,7 +6194,7 @@ fn execute_frame_from_index(
                     // lreturn (0xad): a KIND_LONG slot is read bit-exact so a
                     // collision-shaped long return keeps its high bits.
                     let value = if opcode == 0xb0 {
-                        let ret = crate::jit::return_type(frame.method_descriptor());
+                        let ret = frame.return_tag();
                         coerce_value_for_return_validated(shared, cv.to_value(), ret)
                     } else {
                         decode_arg_kind_aware(cv, kind, desc_byte)
@@ -7337,19 +7390,34 @@ fn execute_frame_from_index(
                     // adapter before it allocates either wrapper in interpreter mode.
                     // The helper verifies both the lambda metadata and its concrete
                     // getter bytecode; a miss preserves the ordinary invoke path.
-                    let tdigest_kernel = frame.class_name() == "org/elasticsearch/tdigest/Dist"
-                        && matches!(frame.method_name(), "quantile" | "cdf")
-                        && frame.method_descriptor() == "(DILjava/util/function/Function;)D";
+                    //
+                    // ORDER MATTERS (2026-09-02). This recognizer is
+                    // workload-specific and this arm is EVERY `invokestatic` in
+                    // the VM. It used to open with
+                    // `frame.class_name() == "org/elasticsearch/tdigest/Dist"`,
+                    // so every static call in every program paid a `FrameInner`
+                    // match, an `Arc<str>` deref and a length compare before
+                    // reaching the dispatch it actually wanted.
+                    //
+                    // The operands are all pure, so `&&` may be reordered
+                    // freely, and the BYTECODE-SHAPE half is both cheaper and
+                    // far more selective: three byte loads from `code_ptr`,
+                    // which the preamble has already pulled into L1, against a
+                    // four-opcode window (`invokestatic; invokeinterface; …
+                    // checkcast; … invokevirtual`) that essentially no other
+                    // call site matches. The name tests now run only for a call
+                    // site that already looks exactly like the kernel.
+                    //
                     // SAFETY: `code_ptr` addresses this frame's bytecode and the
-                    // preceding length check proves every inspected offset is in bounds.
-                    if tdigest_kernel
-                        && saved_pc + 14 <= code_len
+                    // `saved_pc + 14 <= code_len` test proves offsets +3/+8/+11
+                    // are in bounds of the padded buffer.
+                    if saved_pc + 14 <= code_len
                         && unsafe { *code_ptr.add(saved_pc + 3) } == 0xb9
                         && unsafe { *code_ptr.add(saved_pc + 8) } == 0xc0
-                        // SAFETY: `saved_pc + 14 <= code_len` was checked
-                        // above, so offsets +3/+8/+11 are all in bounds of the
-                        // frame's padded bytecode buffer.
                         && unsafe { *code_ptr.add(saved_pc + 11) } == 0xb6
+                        && frame.class_name() == "org/elasticsearch/tdigest/Dist"
+                        && matches!(frame.method_name(), "quantile" | "cdf")
+                        && frame.method_descriptor() == "(DILjava/util/function/Function;)D"
                     {
                         let index = frame.stack.pop_unchecked();
                         let lambda = frame.stack.pop_unchecked();
@@ -8209,7 +8277,9 @@ fn execute_frame_from_index(
                         }
                         OsrBackoffOutcome::Skip => {}
                     }
-                    safepoint_check(shared, thread);
+                    if backedge_poll_needed!() {
+                        safepoint_check(shared, thread);
+                    }
                 }
                 continue;
             }
@@ -8221,7 +8291,7 @@ fn execute_frame_from_index(
             Ok(InstructionResult::Return(value)) => {
                 // Slow-path return — check for stackless frames
                 if frame_idx > initial_frame_idx {
-                    let ret = crate::jit::return_type(thread.frames[frame_idx].method_descriptor());
+                    let ret = thread.frames[frame_idx].return_tag();
                     let value = value.map(|v| {
                         if ret == b'V' {
                             v

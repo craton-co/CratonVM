@@ -1306,6 +1306,31 @@ impl Frame {
         }
     }
 
+    /// This frame's method return-type tag byte — the character after `')'`
+    /// in its descriptor, or `b'V'` for void and for a malformed descriptor.
+    ///
+    /// # Why it is a method rather than a call to `jit::return_type`
+    ///
+    /// `areturn` needs this on **every** reference return, to pick the
+    /// `coerce_value_for_return_validated` shape, and in object-oriented
+    /// bytecode most returns are reference returns. The call it replaces
+    /// (`crate::jit::return_type(frame.method_descriptor())`) is a linear scan
+    /// of the descriptor string for `')'`, so a method returning
+    /// `Ljava/util/Map;` from a two-reference-parameter signature paid forty
+    /// byte comparisons per return.
+    ///
+    /// A `Cached` frame answers from the `OnceLock` on its shared
+    /// `CachedBytecodeMethod`, so the scan happens once per method. An
+    /// `Owned` frame has no such record and keeps the scan — those are the
+    /// uncached, reflective and synthetic pushes, not the hot path.
+    #[inline]
+    pub fn return_tag(&self) -> u8 {
+        match &self.inner {
+            FrameInner::Cached(cm) => cm.return_tag(),
+            FrameInner::Owned(o) => cratonvm_jit::return_type(&o.method_descriptor),
+        }
+    }
+
     /// Access the method name (cold path — error messages, stack traces).
     #[inline]
     pub fn method_name(&self) -> &str {
@@ -2775,6 +2800,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),

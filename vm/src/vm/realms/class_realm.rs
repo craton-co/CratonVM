@@ -658,11 +658,34 @@ impl ClassRealm {
     /// comparison it replaces took the class-manager read lock, resolved the
     /// class, and compared an `Arc<str>` against a literal, once per virtual
     /// invoke.
+    ///
+    /// # The `u32::MAX` state is the common one, and it used to be the slow one
+    ///
+    /// "Steady state" above meant *once the class exists*. `AnnotationProxy` is
+    /// a VM-internal synthetic class that most programs never mint, so the hint
+    /// stayed `u32::MAX` for the whole process and every virtual invoke reached
+    /// [`Self::resolve_annotation_proxy_cid`] — whose negative cache is keyed
+    /// on `class_definition_epoch()`, bumped by *every* class definition.
+    /// During class loading (Tomcat's annotation scan, Spring cold start — the
+    /// phase that runs interpreted) the epoch never holds still, so the
+    /// negative never held and each virtual invoke took the class-manager read
+    /// lock and probed the name across the builtin loader delegation chain.
+    ///
+    /// `any_annotation_proxy_defined()` closes that: a process-global one-way
+    /// latch raised by `loaded_classes_insert` the first time the name is
+    /// defined *anywhere*, so it is immune to the epoch. False ⇒ no realm has
+    /// the class ⇒ no `class_id` can be it. It gates only the *lookup*, never
+    /// the answer — the per-realm `annotation_proxy_cid` still decides
+    /// identity, because two VMs in one process mint the class independently
+    /// and must not share an id.
     #[inline]
     pub fn is_annotation_proxy_class(&self, class_id: ClassId) -> bool {
         let hint = self.annotation_proxy_cid.load(Ordering::Relaxed);
         if hint != u32::MAX {
             return class_id.as_u32() == hint;
+        }
+        if !crate::classloading::any_annotation_proxy_defined() {
+            return false;
         }
         self.resolve_annotation_proxy_cid() == Some(class_id)
     }

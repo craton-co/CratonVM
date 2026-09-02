@@ -920,7 +920,7 @@ pub(super) fn execute_invokevirtual_vtable_fast(
     // ONE forward scan for the whole descriptor. This closure used to call
     // `nth_param_tag_byte` per argument, and that rescans from `(` each time,
     // so popping N args cost O(N^2) tokenising of a string fixed per call site.
-    let param_tags = ParamTags::of(&entry_cached.method_descriptor);
+    let param_tags = ParamTags::from_facts(entry_cached.descriptor_facts());
     let arg_desc_byte =
         |i: usize| -> u8 { param_tags.get_with_receiver(&entry_cached.method_descriptor, i) };
     let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
@@ -1857,7 +1857,7 @@ pub(super) fn execute_invokevirtual_cached(
                     // gaps/bc-ec-mod-mododdinverse-investigation.md.
                     // ONE forward scan; the per-argument form rescanned from `(` each time.
 
-                    let param_tags = ParamTags::of(&cached.method_descriptor);
+                    let param_tags = ParamTags::from_facts(cached.descriptor_facts());
 
                     let arg_desc_byte = |i: usize| -> u8 {
                         param_tags.get_with_receiver(&cached.method_descriptor, i)
@@ -2243,7 +2243,7 @@ pub(super) fn execute_invokevirtual_cached(
                             None
                         });
                         if let Some(compiled) = compiled_opt {
-                            let ret = crate::jit::return_type(&cached.method_descriptor);
+                            let ret = cached.return_tag();
                             let heap = compiled.needs_heap();
                             // total_args = receiver + declared params; the decoded
                             // dispatcher treats arg 0 as the receiver.
@@ -2645,7 +2645,7 @@ pub(super) fn execute_invokevirtual_cached(
             // pattern long args. See gaps/bc-ec-mod-mododdinverse-investigation.md.
             // ONE forward scan; the per-argument form rescanned from `(` each time.
 
-            let param_tags = ParamTags::of(&cached.method_descriptor);
+            let param_tags = ParamTags::from_facts(cached.descriptor_facts());
 
             let arg_desc_byte =
                 |i: usize| -> u8 { param_tags.get_with_receiver(&cached.method_descriptor, i) };
@@ -3783,6 +3783,7 @@ pub(super) fn populate_virtual_invoke_cache(
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
+        descriptor_facts_cache: std::sync::OnceLock::new(),
         intercept_shape_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
