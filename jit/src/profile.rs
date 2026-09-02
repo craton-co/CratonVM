@@ -881,7 +881,13 @@ impl ProfileStore {
         let mut write = shard.counts.write();
         match write.get(&packed_key) {
             Some(cell) => saturating_inc(cell),
-$1
+            None => {
+                write.insert(packed_key, AtomicU32::new(1));
+                1
+            }
+        }
+    }
+
     /// `increment_invocation` by `n` at once. The interpreter's virtual fast
     /// door counts on `CachedBytecodeMethod::interp_invocations` (one relaxed
     /// `fetch_add`) and folds the count in here every few calls, so this

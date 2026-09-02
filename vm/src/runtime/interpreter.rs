@@ -5395,7 +5395,8 @@ fn execute_frame_from_index(
     // primitive `*aload` / `*astore` fast arms; see `field_fast` for the
     // contract and for what turns them off. Hoisted per `execute_frame`
     // entry like every other gate above (same pgo-style tradeoff).
-$1    // ── Invoke fast door admission (2026-09-02) ─────────────────────────
+    let fast_field_zgc = field_fast::fast_field_zgc(shared);
+    // ── Invoke fast door admission (2026-09-02) ─────────────────────────
     // Off while anything the general dispatcher would have to observe per
     // call is armed: PGO (it records call sites and receivers), the invoke
     // traces, the frame trace, or a virtual thread. See
@@ -7433,7 +7434,8 @@ $1    // ── Invoke fast door admission (2026-09-02) ────────
                 0xb6 => {
                     let cp_index = ((b1 as u16) << 8) | (b2 as u16); // Cast: bytecode operand decoding
                     let _ = frame;
-$1                    if invoke_fast_door_on {
+                    thread.frames[frame_idx].pc = saved_pc + 3;
+                    if invoke_fast_door_on {
                         match execute_invokevirtual_fast_door(
                             shared,
                             thread,
@@ -7463,7 +7465,8 @@ $1                    if invoke_fast_door_on {
                             None => {}
                         }
                     }
-$2                    // A warm monomorphic site hits here and dispatches with one
+                    // PERF: consult the cheap thread-local inline cache FIRST.
+                    // A warm monomorphic site hits here and dispatches with one
                     // class-id compare + arg decode + frame push — no locks, no
                     // hierarchy walk. Only on a miss (cold site, or the receiver
                     // class changed) do we fall to the heavier `vtable_fast`
@@ -7693,7 +7696,8 @@ $2                    // A warm monomorphic site hits here and dispatches with o
                     let cp_index = ((b1 as u16) << 8) | (b2 as u16); // Cast: bytecode operand decoding
                     let _ = frame;
                     // invokeinterface is 5 bytes: opcode(1) + index(2) + count(1) + 0(1)
-$1                    if invoke_fast_door_on {
+                    thread.frames[frame_idx].pc = saved_pc + 5;
+                    if invoke_fast_door_on {
                         match execute_invokevirtual_fast_door(
                             shared,
                             thread,
@@ -7723,7 +7727,10 @@ $1                    if invoke_fast_door_on {
                             None => {}
                         }
                     }
-$2                    match cached_result {
+                    let cached_result = execute_invokevirtual_cached(
+                        shared, thread, frame_idx, cp_index, saved_pc, false, true,
+                    );
+                    match cached_result {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
                             continue;

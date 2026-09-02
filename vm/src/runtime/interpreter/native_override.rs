@@ -5976,7 +5976,8 @@ pub(super) const INTERCEPT_SHAPE_CLASSLOADER_RESOURCE: u8 = 1 << 0;
 /// This triple could reach the `java/lang/Class` reflection re-target.
 pub(super) const INTERCEPT_SHAPE_CLASS_REFLECTION: u8 = 1 << 1;
 /// This triple could reach the real-`HttpURLConnection` carrier exemption.
-$1/// One of the three name-matched intercepts in the cached virtual
+pub(super) const INTERCEPT_SHAPE_HTTP_CARRIER: u8 = 1 << 2;
+/// One of the three name-matched intercepts in the cached virtual
 /// dispatcher (`ClassLoader.setDefaultAssertionStatus`, the surefire
 /// `LazyLauncher.discover` native, the reflective `Method.invoke` /
 /// `Constructor.newInstance` override). Consumed only by the invoke fast
@@ -6003,10 +6004,14 @@ pub(super) fn intercept_shape_of(class_name: &str, method_name: &str, descriptor
     if class_reflection_shape(method_name, descriptor) {
         shape |= INTERCEPT_SHAPE_CLASS_REFLECTION;
     }
-$1    if named_intercept_shape(class_name, method_name, descriptor) {
+    if http_carrier_declaring_class(class_name) {
+        shape |= INTERCEPT_SHAPE_HTTP_CARRIER;
+    }
+    if named_intercept_shape(class_name, method_name, descriptor) {
         shape |= INTERCEPT_SHAPE_NAMED;
     }
-$2
+    shape
+}
 
 /// The name triples `intercept_classloader_set_default_assertion_status`,
 /// `surefire_lazy_launcher_discover_native` and

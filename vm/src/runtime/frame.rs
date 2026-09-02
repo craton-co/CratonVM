@@ -1271,7 +1271,8 @@ impl Frame {
         }
     }
 
-$1        &mut self,
+    pub fn reset_for_tail_call(
+        &mut self,
         class_id: ClassId,
         code: Arc<[u8]>,
         max_stack: u16,

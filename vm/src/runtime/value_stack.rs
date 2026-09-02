@@ -1182,7 +1182,11 @@ impl ValueStack {
     /// # Panics
     /// Panics if fewer than `depth + 1` slots are live.
     #[inline(always)]
-$1
+    pub fn peek_compact_at(&self, depth: usize) -> CompactValue {
+        debug_assert!(self.len > depth, "stack underflow in peek_compact_at");
+        self.slots[self.len - 1 - depth]
+    }
+
     /// Peek the slot `depth` below the top together with its kind mark
     /// (`0` is the top). The invoke fast door reads every argument this way
     /// before committing the pop, so a shape it cannot transfer verbatim
