@@ -7469,6 +7469,77 @@ pub fn jit_getfield_primitive_in_ref_slot() -> u64 {
     JIT_GETFIELD_PRIMITIVE_IN_REF_SLOT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Corrupt legacy `Value` cells this crate has decoded at a JIT helper door.
+///
+/// Also increments `cratonvm_types::cell_census`, so the process-wide total
+/// stays right; kept separately because "a JIT helper read one" and "a
+/// collector read one" want different searches.
+pub static JIT_CORRUPT_VALUE_CELLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`JIT_CORRUPT_VALUE_CELLS`].
+pub fn jit_corrupt_value_cells() -> u64 {
+    JIT_CORRUPT_VALUE_CELLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Read one legacy 16-byte `Value` cell with its discriminant SCREENED — the
+/// VM-crate counterpart of `gc::heap::read_value_cell_checked`.
+///
+/// # Why a raw `read_value_atomic` is not acceptable here
+///
+/// `read_value_atomic` loads two words and `transmute`s them into a `Value`
+/// with no validation. If those 16 bytes were not a `Value` — array payload
+/// read through the flat-object path, or a punned/torn write — the result is an
+/// enum holding an out-of-range discriminant, which is UB *the instant it
+/// exists*, before anything looks at it.
+///
+/// What that UB costs is neither hypothetical nor a fault at the read. A
+/// `match` on a Rust enum needs no default arm and therefore gets **no bounds
+/// check**: LLVM indexes its jump table directly — `movsxd rax, [r10 + rax*4]`
+/// — because a valid discriminant is in range by construction. The garbage tag
+/// becomes the index. That is the decoded faulting instruction of the eight
+/// hibernate-orm JSON/XML `hs_err` files, and it sits in
+/// `gc::heap::coerce_field_value_for_slot` — one frame ABOVE the reader that
+/// built the bad `Value`, which is why auditing read sites for jump tables
+/// found nothing at the read sites themselves. See
+/// `internal/fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md` §3.
+///
+/// Screening at the read turns that into `Value::Object(None)` plus a counted,
+/// rate-limited report naming the slot and both raw words.
+///
+/// # Safety
+/// `ptr` must name 16 readable, 8-byte-aligned bytes inside a live allocation.
+#[inline]
+unsafe fn jit_read_value_cell_checked(ptr: *const Value, site: &'static str) -> Value {
+    match cratonvm_types::read_value_checked_atomic(ptr) {
+        Some(v) => v,
+        None => {
+            JIT_CORRUPT_VALUE_CELLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let n = cratonvm_types::cell_census::note_decoded();
+            if n < 32 {
+                cratonvm_types::cell_census::note_reported();
+                // SAFETY: caller contract — 16 readable, 8-byte-aligned bytes.
+                // Per-word atomic so the diagnostic cannot tear against a
+                // concurrent plain writer.
+                let raw0 = (*(ptr as *const std::sync::atomic::AtomicU64))
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let raw1 = (*((ptr as *const u8).add(8) as *const std::sync::atomic::AtomicU64))
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    target: "cratonvm::jit::guard",
+                    slot = ?ptr,
+                    raw0 = format!("{raw0:#018x}"),
+                    raw1 = format!("{raw1:#018x}"),
+                    "{site}: corrupt Value cell (out-of-range discriminant) — \
+                     returning null instead of a UB-on-match Value. Heap \
+                     reference-integrity defect (see HIB-CV-32).",
+                );
+            }
+            Value::Object(None)
+        }
+    }
+}
+
 /// Calls that arrived with `GETFIELD_RECEIVER_PROVEN_OOP` set — the engagement
 /// counter for the trusted-receiver arm, printed beside the total so "adopted"
 /// and "helped" stay separable.
@@ -7649,7 +7720,12 @@ unsafe fn jit_getfield_impl(
     // PLAIN-SLOT TEARING FIX (2026-07-06): see the matching note on the
     // compact-layout branch above -- was `std::ptr::read(ptr as *const
     // Value)`, non-atomic, tearable against a concurrent plain putfield.
-    let val: Value = cratonvm_types::read_value_atomic(ptr as *const Value);
+    // DISCRIMINANT-SCREENED, and the `match` below is why. `read_value_atomic`
+    // would `transmute` these 16 bytes into a `Value` unconditionally; the
+    // multi-arm `match val` a hundred lines down then indexes a jump table by
+    // the tag with no bounds check. See `jit_read_value_cell_checked`, and
+    // `coerce_field_value_for_slot` for the crash that shape produced.
+    let val: Value = jit_read_value_cell_checked(ptr as *const Value, "jit_getfield/legacy-slot");
     // A REFERENCE load whose slot does not hold a reference.
     //
     // The legacy 16-byte slot carries its own discriminant, so unlike the
@@ -7847,10 +7923,11 @@ unsafe fn jit_getfield_impl(
         Value::Float(f) => f.to_bits() as i64,
         Value::Double(d) => d.to_bits() as i64,
         Value::Object(Some(r)) => {
-            // Live filter, unlike the compact-layout twin above:
-            // `read_value_atomic` (types/src/value.rs:1570) is a raw
-            // `transmute` of two relaxed word loads and validates nothing, so
-            // this `ObjectRef` can hold arbitrary bits straight off the slot.
+            // Live filter, unlike the compact-layout twin above. The read is
+            // now discriminant-screened (`jit_read_value_cell_checked`), which
+            // rules out an invalid TAG — it says nothing about the payload, so
+            // this `ObjectRef` can still hold arbitrary bits straight off the
+            // slot and the plausibility gate below is still load-bearing.
             //
             // TODO(zgc): legacy 16-byte reference field. Under `VmHeap::Zgc`
             // the barrier belongs on the slot read, i.e. before the `Value` is
@@ -8021,7 +8098,10 @@ pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i
         let existing = if let Some(storage) = storage {
             cratonvm_types::read_compact_field(ptr, storage, std::sync::atomic::Ordering::Relaxed)
         } else {
-            cratonvm_types::read_value_atomic(ptr as *const Value)
+            // Screened even though this is diagnostic-only: `{:?}` on a `Value`
+            // is itself a `match` over the discriminant, so an unscreened read
+            // here would crash the very run that armed the trace.
+            jit_read_value_cell_checked(ptr as *const Value, "jit_putfield_int/pfi-trace")
         };
         let cid_off = obj_ptr as *const u8;
         let cid: u32 = std::ptr::read(cid_off as *const u32);
@@ -8271,7 +8351,11 @@ pub unsafe extern "C" fn jit_putfield_object(
     // Atomic per-word read/write: the slot is read concurrently by the GC
     // marker and (possibly) written by another mutator thread; pair both ends
     // through the atomic helpers so the access is well-defined and tear-free.
-    let old_value: Value = cratonvm_types::read_value_atomic(ptr as *const Value);
+    // Screened: a corrupt cell decodes to `Object(None)` and is skipped by the
+    // `if let` below, rather than becoming an invalid `Value` and then an
+    // `ObjectRef` pushed onto the mark queue.
+    let old_value: Value =
+        jit_read_value_cell_checked(ptr as *const Value, "jit_putfield_ref/satb-pre");
     if let Value::Object(Some(_)) = old_value {
         let heap = heap_from_vm(vm_ptr);
         heap.satb_barrier(old_value);
@@ -14634,14 +14718,23 @@ unsafe fn varhandle_instance_field_read_bits(
 /// A baked direct call has no `JitInvokeInfo` of its own (see
 /// `bytecode_walk.rs`: `info_ptr` is `None` for a thin helper), so the cold arm
 /// cannot hand the generic dispatcher the site's real descriptor. These stand
-/// in for it, and for a PRIMITIVE return that substitution is not observable:
-/// the descriptor's only readers are the argument decode (one reference
-/// coordinate either way), `unbox_poly_return_checked`'s return-type rules and
-/// `coerce_native_return`, and all three see the identical return char. It is
-/// observable for a REFERENCE return — `varhandle_reference_return_mismatch`
-/// compares against the site's declared class — which is exactly why the bind
-/// refuses those and leaves them on the funnel with their real info.
-const VARHANDLE_READ_DESCRIPTORS: [&str; 8] = [
+/// in for it.
+///
+/// For a PRIMITIVE return the substitution is not observable: the descriptor's
+/// only readers are the argument decode (one reference coordinate either way),
+/// `unbox_poly_return_checked`'s return-type rules and `coerce_native_return`,
+/// and all three see the identical return char.
+///
+/// For a REFERENCE return there is one reader that CAN tell the difference —
+/// `varhandle_reference_return_mismatch`, which compares against the site's
+/// declared class — and the two reference kinds exist to answer it without a
+/// descriptor. `REF_OBJECT` needs no answer (its stand-in IS its real
+/// descriptor, and no box is refused at an `Object` return); `REF_STRICT` names
+/// a site no box can satisfy at all, so `varhandle_read_direct_reference`
+/// raises on any box the cold arm produces. See
+/// `cratonvm_jit::VARHANDLE_BOX_ACCEPTING_RETURNS` for the thirteen types that
+/// fall between the two and are therefore not bound.
+const VARHANDLE_READ_DESCRIPTORS: [&str; cratonvm_jit::VARHANDLE_READ_KINDS] = [
     "(Ljava/lang/Object;)Z",
     "(Ljava/lang/Object;)B",
     "(Ljava/lang/Object;)C",
@@ -14650,6 +14743,15 @@ const VARHANDLE_READ_DESCRIPTORS: [&str; 8] = [
     "(Ljava/lang/Object;)J",
     "(Ljava/lang/Object;)F",
     "(Ljava/lang/Object;)D",
+    // REF_OBJECT. Not a stand-in at all: a site of this kind declares exactly
+    // this descriptor, so the cold arm dispatches with the real one.
+    "(Ljava/lang/Object;)Ljava/lang/Object;",
+    // REF_STRICT. Here it IS erased, and the one reader that can tell the
+    // difference is `unbox_poly_return_checked`'s W6-1 rule. That rule is
+    // reproduced for this kind in `varhandle_read_direct_impl`, which needs no
+    // descriptor: the kind exists precisely because NO boxed primitive is
+    // assignable to what such a site declared.
+    "(Ljava/lang/Object;)Ljava/lang/Object;",
 ];
 
 /// Synthetic call sites for the cold arm of the `VarHandle` read helpers, one
@@ -14666,6 +14768,8 @@ static VARHANDLE_READ_INFOS: [JitInvokeInfo; cratonvm_jit::VARHANDLE_READ_SLOTS]
     vh_read_info(0, 5),
     vh_read_info(0, 6),
     vh_read_info(0, 7),
+    vh_read_info(0, 8),
+    vh_read_info(0, 9),
     vh_read_info(1, 0),
     vh_read_info(1, 1),
     vh_read_info(1, 2),
@@ -14674,6 +14778,8 @@ static VARHANDLE_READ_INFOS: [JitInvokeInfo; cratonvm_jit::VARHANDLE_READ_SLOTS]
     vh_read_info(1, 5),
     vh_read_info(1, 6),
     vh_read_info(1, 7),
+    vh_read_info(1, 8),
+    vh_read_info(1, 9),
     vh_read_info(2, 0),
     vh_read_info(2, 1),
     vh_read_info(2, 2),
@@ -14682,6 +14788,8 @@ static VARHANDLE_READ_INFOS: [JitInvokeInfo; cratonvm_jit::VARHANDLE_READ_SLOTS]
     vh_read_info(2, 5),
     vh_read_info(2, 6),
     vh_read_info(2, 7),
+    vh_read_info(2, 8),
+    vh_read_info(2, 9),
     vh_read_info(3, 0),
     vh_read_info(3, 1),
     vh_read_info(3, 2),
@@ -14690,18 +14798,22 @@ static VARHANDLE_READ_INFOS: [JitInvokeInfo; cratonvm_jit::VARHANDLE_READ_SLOTS]
     vh_read_info(3, 5),
     vh_read_info(3, 6),
     vh_read_info(3, 7),
+    vh_read_info(3, 8),
+    vh_read_info(3, 9),
 ];
 
 /// One entry of [`VARHANDLE_READ_INFOS`]. `num_jit_args: 2` counts the
 /// receiver — the `VarHandle` itself — plus the single coordinate, matching
 /// `INTEGER_INT_VALUE_INFO`'s `1` for a zero-argument `invokevirtual`.
-const fn vh_read_info(mode: usize, ret: usize) -> JitInvokeInfo {
+const fn vh_read_info(mode: usize, kind: usize) -> JitInvokeInfo {
     JitInvokeInfo {
         class_name: "java/lang/invoke/VarHandle",
         method_name: cratonvm_jit::VARHANDLE_READ_MODES[mode],
-        descriptor: VARHANDLE_READ_DESCRIPTORS[ret],
+        descriptor: VARHANDLE_READ_DESCRIPTORS[kind],
         num_jit_args: 2,
-        return_type: cratonvm_jit::VARHANDLE_READ_RETURNS[ret],
+        return_type: cratonvm_jit::varhandle_read_slot_return(
+            mode * cratonvm_jit::VARHANDLE_READ_KINDS + kind,
+        ),
         invoke_kind: 0,
         declaring_class_id: 0,
     }
@@ -14746,8 +14858,10 @@ unsafe fn varhandle_read_direct_impl(vm_ptr: i64, vh: i64, receiver: i64, slot: 
     crate::jit::conservative_roots::note_jit_boundary();
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
     let vm = &*(vm_ptr as *const SharedVm);
-    let site_ret =
-        cratonvm_jit::VARHANDLE_READ_RETURNS[slot % cratonvm_jit::VARHANDLE_READ_RETURNS.len()];
+    let site_ret = cratonvm_jit::varhandle_read_slot_return(slot);
+    if cratonvm_jit::varhandle_read_slot_is_reference(slot) {
+        return varhandle_read_direct_reference(vm, vm_ptr, vh, receiver, slot);
+    }
     // No SATB flush and no reference-argument forwarding, unlike
     // `jit_invoke_dispatch`: this arm cannot allocate, cannot reach a
     // safepoint, and returns a primitive. It also takes no thread borrow —
@@ -14771,6 +14885,141 @@ unsafe fn varhandle_read_direct_impl(vm_ptr: i64, vh: i64, receiver: i64, slot: 
         args.as_ptr() as i64,
         2,
     )
+}
+
+/// The REFERENCE half of [`varhandle_read_direct_impl`], split out because it
+/// differs from the primitive half in the two places a reference result costs
+/// something.
+///
+/// **The handoff root.** A reference the callee hands back is live only in a
+/// register until the caller stores it, so it has to be published where the
+/// collector can see it. That is what the primitive arm's comment means when it
+/// says it takes no thread borrow: it does not need one, and this arm does.
+/// `jit_thread_mut` here is the same borrow `jit_invoke_dispatch` takes one
+/// frame further in, so the funnel round trip this bind removes was paying for
+/// it anyway.
+///
+/// **W6-1 on the cold arm.** `REF_STRICT` names a site whose declared return
+/// type NO boxed primitive is assignable to (the classification is
+/// `cratonvm_jit::varhandle_read_helper_slot`'s, and it declines the thirteen
+/// types where the answer would depend on which wrapper arrived). So when the
+/// cold arm's dispatch produces a box, that is a `WrongMethodTypeException`
+/// with no further information needed — which is exactly what
+/// `unbox_poly_return_checked` would have raised for the site's real
+/// descriptor, and the only observable this bind's erased stand-in would
+/// otherwise have lost.
+///
+/// The FAST arm needs no such check: `varhandle_instance_field_read_bits`
+/// refuses a reference site over a primitive variable, and a reference variable
+/// holding a box is served by the funnel's own copy of this read today with no
+/// check either.
+///
+/// # SAFETY
+///
+/// See [`varhandle_read_direct_impl`].
+unsafe fn varhandle_read_direct_reference(
+    vm: &SharedVm,
+    vm_ptr: i64,
+    vh: i64,
+    receiver: i64,
+    slot: usize,
+) -> i64 {
+    if vh != 0 && receiver != 0 {
+        if let Some((thread, _guard)) = jit_thread_mut() {
+            if let Some(bits) =
+                varhandle_instance_field_read_bits(vm, vh as u64, receiver as u64, b'L', Some(thread))
+            {
+                VARHANDLE_READ_DIRECT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                JIT_FUNNEL_BYPASS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return bits;
+            }
+        }
+        // The borrow and its guard end here, before the cold arm below takes
+        // its own inside `jit_invoke_dispatch`.
+    }
+    VARHANDLE_READ_DIRECT_DECLINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let args = [vh, receiver];
+    let bits = jit_invoke_dispatch(
+        vm_ptr,
+        &VARHANDLE_READ_INFOS[slot] as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        2,
+    );
+    if cratonvm_jit::varhandle_read_slot_kind(slot) != cratonvm_jit::VARHANDLE_READ_KIND_REF_STRICT
+        || bits == i64::MIN
+        || bits == 0
+    {
+        // Not the strict kind, the dispatch already threw (`i64::MIN` is the
+        // deopt sentinel and is not a representable object address), or the
+        // access answered `null` — which W6-1 leaves alone by construction.
+        return bits;
+    }
+    varhandle_strict_reference_return_check(vm, slot, bits)
+}
+
+/// `unbox_poly_return_checked`'s W6-1 rule, reproduced for a `REF_STRICT` slot
+/// whose cold arm has just produced `bits`.
+///
+/// Returns `bits` unchanged for everything outside the fire set — a value that
+/// is not a live object, a class the manager cannot name, and any object that
+/// is not one of the eight primitive wrappers. Those are the same exclusions
+/// `varhandle_reference_return_mismatch` makes, and for the same reason: a
+/// synthetic stand-in, an un-nameable fabricated class or a genuine reference
+/// value keeps today's behaviour.
+///
+/// # SAFETY
+///
+/// `bits` is whatever `jit_invoke_dispatch` returned for a reference-returning
+/// site; it is heap-validated here before any dereference.
+unsafe fn varhandle_strict_reference_return_check(vm: &SharedVm, slot: usize, bits: i64) -> i64 {
+    if !crate::vm::vm_exec::vh_strict_reference_return() {
+        return bits;
+    }
+    let Some(obj) = vm.mem.heap.is_object_address(bits as usize) else {
+        return bits;
+    };
+    let class_id = vm.mem.heap.class_id_of(obj);
+    let actual = {
+        // Scoped: `create_exception_object` below takes the class-manager WRITE
+        // lock to load the throwable and must not find this read guard held —
+        // the same confinement `varhandle_reference_return_mismatch` documents.
+        let cm = vm.classes.class_manager.read();
+        match cm.get_class(class_id).map(|c| c.name.to_string()) {
+            Some(name) => name,
+            None => return bits,
+        }
+    };
+    if !crate::vm::vm_exec::is_primitive_wrapper_class_name(&actual) {
+        return bits;
+    }
+    let Some((thread, _guard)) = jit_thread_mut() else {
+        return bits;
+    };
+    // Not the funnel's wording, because this arm genuinely does not have the
+    // site's descriptor to quote — it has the fact that MADE the descriptor
+    // unnecessary. Saying that is more useful than quoting the erased stand-in,
+    // which would name `java/lang/Object` and be a lie.
+    let message = format!(
+        "VarHandle access site declares a reference return type that no boxed \
+         primitive satisfies, but the access produced {}",
+        actual.replace('/', ".")
+    );
+    match crate::runtime::exceptions::create_exception_object(
+        vm,
+        thread,
+        "java/lang/invoke/WrongMethodTypeException",
+        Some(&message),
+    ) {
+        Ok(exc) => handle_jit_dispatch_error(
+            vm,
+            thread,
+            crate::error::MethodCallFailed::ExceptionThrown(exc),
+            &VARHANDLE_READ_INFOS[slot],
+        ),
+        // Exception construction failed; the legacy silent path is still
+        // better than a fabricated sentinel with nothing behind it.
+        Err(_) => bits,
+    }
 }
 
 /// The thin direct-call target for slot `SLOT` of
@@ -14802,7 +15051,7 @@ fn varhandle_read_direct_fns() -> [usize; cratonvm_jit::VARHANDLE_READ_SLOTS] {
     }
     slots!(
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-        25, 26, 27, 28, 29, 30, 31,
+        25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
     )
 }
 
@@ -25239,7 +25488,7 @@ mod varhandle_read_direct_helper_tables {
     /// site returning `J` would run `get`'s `Z` body, read the right field and
     /// return the wrong width.
     #[test]
-    fn the_thirty_two_slots_are_thirty_two_distinct_functions() {
+    fn every_slot_is_its_own_distinct_function() {
         let addrs = varhandle_read_direct_fns();
         let unique: std::collections::HashSet<usize> = addrs.iter().copied().collect();
         assert_eq!(
@@ -25267,39 +25516,88 @@ mod varhandle_read_direct_helper_tables {
     #[test]
     fn each_synthetic_call_site_matches_its_slot() {
         for (slot, info) in VARHANDLE_READ_INFOS.iter().enumerate() {
-            let mode = slot / cratonvm_jit::VARHANDLE_READ_RETURNS.len();
-            let ret = slot % cratonvm_jit::VARHANDLE_READ_RETURNS.len();
+            let mode = cratonvm_jit::varhandle_read_slot_mode(slot);
             assert_eq!(info.class_name, "java/lang/invoke/VarHandle");
             assert_eq!(info.method_name, cratonvm_jit::VARHANDLE_READ_MODES[mode]);
-            assert_eq!(info.return_type, cratonvm_jit::VARHANDLE_READ_RETURNS[ret]);
+            assert_eq!(
+                info.return_type,
+                cratonvm_jit::varhandle_read_slot_return(slot)
+            );
             assert_eq!(info.invoke_kind, 0, "a read mode is an invokevirtual site");
             // The receiver (the handle) plus one coordinate.
             assert_eq!(info.num_jit_args, 2);
-            // And the round trip: the recognition maps this info's own name and
-            // descriptor back to this slot.
-            assert_eq!(
-                cratonvm_jit::varhandle_read_helper_slot(info.method_name, info.descriptor),
-                Some(slot),
-            );
+            // And the round trip. The two REFERENCE slots share one descriptor
+            // by construction — `REF_STRICT`'s is erased, which is the whole
+            // reason `varhandle_read_direct_impl` reproduces W6-1 for it
+            // instead of leaving it to the descriptor — so the round trip is
+            // asserted to land on the `REF_OBJECT` slot of the SAME mode
+            // rather than on `slot` itself.
+            let round_trip =
+                cratonvm_jit::varhandle_read_helper_slot(info.method_name, info.descriptor);
+            let expected = if cratonvm_jit::varhandle_read_slot_is_reference(slot) {
+                mode * cratonvm_jit::VARHANDLE_READ_KINDS
+                    + cratonvm_jit::VARHANDLE_READ_KIND_REF_OBJECT
+            } else {
+                slot
+            };
+            assert_eq!(round_trip, Some(expected), "slot {slot}");
         }
     }
 
-    /// The erased descriptors carry a primitive return and exactly one
-    /// reference coordinate — the substitution the cold arm is only allowed to
-    /// make because a primitive return makes it unobservable. A reference
-    /// return here would silently disable `unbox_poly_return_checked`'s W6-1
-    /// rule for every declined read.
+    /// What each erased descriptor is allowed to be, per kind.
+    ///
+    /// * a PRIMITIVE slot's substitution is unobservable, because the
+    ///   descriptor's only readers — the argument decode,
+    ///   `unbox_poly_return_checked`'s return-type rules and
+    ///   `coerce_native_return` — all see the identical return char;
+    /// * a `REF_OBJECT` slot's is not a substitution at all: a site of that
+    ///   kind declares exactly `(L…;)Ljava/lang/Object;`, and W6-1 cannot fire
+    ///   at an `Object` return anyway;
+    /// * a `REF_STRICT` slot's IS erased, and that is exactly why
+    ///   `varhandle_strict_reference_return_check` exists. This row is the one
+    ///   that says the erasure is deliberate rather than an oversight — the
+    ///   pairing that must not be broken silently is "erased descriptor here,
+    ///   W6-1 reproduced there".
+    ///
+    /// An `[` or `V` return in this table would be a slot the recogniser can
+    /// never produce, so it is asserted absent rather than handled.
     #[test]
-    fn no_synthetic_call_site_carries_a_reference_return() {
-        for info in VARHANDLE_READ_INFOS.iter() {
-            assert!(
-                !matches!(info.return_type, b'L' | b'[' | b'V'),
-                "{} returns {}",
-                info.descriptor,
-                info.return_type as char,
-            );
+    fn every_synthetic_call_site_carries_its_kinds_erasure() {
+        for (slot, info) in VARHANDLE_READ_INFOS.iter().enumerate() {
             assert!(info.descriptor.starts_with("(Ljava/lang/Object;)"));
+            assert!(!matches!(info.return_type, b'[' | b'V'));
+            let kind = cratonvm_jit::varhandle_read_slot_kind(slot);
+            if kind == cratonvm_jit::VARHANDLE_READ_KIND_REF_OBJECT
+                || kind == cratonvm_jit::VARHANDLE_READ_KIND_REF_STRICT
+            {
+                assert_eq!(info.return_type, b'L', "slot {slot}");
+                assert_eq!(info.descriptor, "(Ljava/lang/Object;)Ljava/lang/Object;");
+            } else {
+                assert!(
+                    !matches!(info.return_type, b'L'),
+                    "{} returns {}",
+                    info.descriptor,
+                    info.return_type as char,
+                );
+            }
         }
+        // The pairing, stated as an assertion rather than only in prose: the
+        // strict kind is the only one whose descriptor lies, and the file that
+        // holds this table also holds the check that makes the lie harmless.
+        // A source witness, for the reason `source-witness-tests-read-the-working-tree`
+        // gives: `CARGO_MANIFEST_DIR` is `<repo>/vm`, so this reads the working
+        // tree and an unbuilt edit still fails here. What it pins is that the
+        // erased descriptor above is CALLED-OUT-TO rather than merely declared:
+        // deleting the call and keeping the function would leave the strict
+        // slot silently unchecked.
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/jit/helpers.rs"),
+        )
+        .expect("read helpers.rs");
+        assert!(
+            text.contains("varhandle_strict_reference_return_check(vm, slot, bits)"),
+            "REF_STRICT carries an erased descriptor with nothing reproducing W6-1",
+        );
     }
 }
 
@@ -25449,7 +25747,7 @@ const FFM_CARRIER_SLOTS: u32 = 6;
 // `HEADER_SIZE + index * SLOT_SIZE` lies inside the allocation.
 unsafe fn ffm_read_long_slot(obj_ptr: i64, index: usize) -> Option<i64> {
     let ptr = (obj_ptr as *const u8).add(HEADER_SIZE + index * SLOT_SIZE);
-    match cratonvm_types::read_value_atomic(ptr as *const Value) {
+    match jit_read_value_cell_checked(ptr as *const Value, "ffm_read_long_slot") {
         Value::Long(v) => Some(v),
         _ => None,
     }
