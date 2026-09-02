@@ -375,6 +375,47 @@ impl DeviceContextInner {
         })
     }
 
+    /// Record `event` on the stream cudarc's allocator issues its
+    /// zeroing memset to, so a buffer from `alloc_zeros` can carry a
+    /// `last_write` marker like an uploaded one does.
+    ///
+    /// # AUDIT 2026-09-02: this is what made a shared context corrupt
+    ///
+    /// `DeviceBufferInner::zeros` calls cudarc's `alloc_zeros`, which
+    /// issues an ASYNC memset on the device's default stream and returns
+    /// immediately. The outer `DeviceBuffer::zeros` then handed back a
+    /// buffer with an EMPTY `last_write` slot, so a following
+    /// `launch_on_stream` on a user stream had nothing to wait on — and
+    /// the memset was free to land after the kernel's stores and wipe
+    /// them.
+    ///
+    /// Measured on an RTX 2060: one `DeviceContext` shared by four
+    /// threads, 4 MiB output buffers, 24 rounds — 4 of 4 runs produced
+    /// `got 0` where the kernel's result should have been. At 1 MiB it
+    /// passed 5 of 5, which is why this had never been seen: the window
+    /// is the length of the memset. That is the exact shape
+    /// `OffloadCacheRegistry` gives every dispatching Java thread.
+    ///
+    /// Recording here rather than synchronizing keeps the allocation
+    /// asynchronous; the existing wait loop in
+    /// `launch.rs::launch_on_stream` does the rest, because it already
+    /// gates the launch behind every argument's `last_write`.
+    pub(crate) fn record_alloc_event(&self, event: &crate::Event) -> Result<()> {
+        self.bind_to_thread()?;
+        let stream = *self.dev.cu_stream();
+        // SAFETY: the context is bound on this thread, `event` outlives
+        // the call (the caller owns it), and `stream` is the device's own
+        // default stream, alive for as long as `self.dev`.
+        unsafe {
+            cudarc::driver::result::event::record(event.cu_event_raw(), stream)
+                .map_err(map_err("cuEventRecord alloc_zeros"))?;
+        }
+        // So the wait-elision in `launch_on_stream` can recognise a
+        // same-stream marker instead of issuing a needless barrier.
+        event.set_recorded_on(stream);
+        Ok(())
+    }
+
     pub(crate) fn synchronize(&self) -> Result<()> {
         // AUDIT 2026-05-29 (SOUND-1 / H10c): bind the primary context to
         // this thread before `cuCtxSynchronize`. `DeviceContext` is

@@ -7218,6 +7218,38 @@ fn execute_frame_from_index(
                             .set_array_element(arr_ref, index as usize, value) // Widening: index conversion
                         {
                             Ok(()) => {
+                                // Phase 10 #2: the host just wrote this
+                                // array, so any device buffer mirroring it
+                                // is stale.
+                                //
+                                // AUDIT 2026-09-02: this arm did not do
+                                // this, and it is the arm that RUNS. The
+                                // `Instruction::Iastore` arm in
+                                // `opcodes.rs` invalidates and so does
+                                // `jit::helpers::jit_iastore`, so the hole
+                                // was invisible to a reading of either —
+                                // but the fast dispatch loop handles every
+                                // x-astore before `opcodes.rs` is ever
+                                // consulted, and it left the GPU
+                                // input-residency cache holding a device
+                                // copy the host had moved on from. The
+                                // next submit computed from stale data:
+                                // silent wrong answers in the default
+                                // configuration, with `--gpu` and no other
+                                // flag.
+                                //
+                                // Found by `GpuRuntimeStress`, where four
+                                // of six scenarios diverged from HotSpot
+                                // and the two that passed were exactly the
+                                // two that never mutate an input between
+                                // submits.
+                                //
+                                // Costs one relaxed load and a not-taken
+                                // branch when nothing is cached, which is
+                                // every run that never submits a kernel —
+                                // see `input_cache::ADDR_FILTER`.
+                                #[cfg(feature = "gpu-offload")]
+                                crate::runtime::offload::input_cache::invalidate(arr_ref);
                                 frame.pc = saved_pc + 1;
                                 continue;
                             }
