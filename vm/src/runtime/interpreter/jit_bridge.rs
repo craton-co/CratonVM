@@ -3684,7 +3684,12 @@ pub(super) fn try_osr(
                 // re-stashed: it was taken for this raise, and by the time a
                 // later drain surfaced the flag it would describe frames that
                 // are long gone. A short trace beats a confidently wrong one.
-                crate::jit::helpers::stash_jit_pending_npe();
+                //
+                // `set_jit_pending_npe_flag_only` is what makes that sentence
+                // true of the CODE: `stash_jit_pending_npe` takes a fresh
+                // snapshot of its own, so the frames were not dropped here at
+                // all — they were silently replaced by a shallower set.
+                crate::jit::helpers::set_jit_pending_npe_flag_only();
             }
         }
         return None;

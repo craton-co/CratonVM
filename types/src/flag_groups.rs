@@ -1204,6 +1204,26 @@ pub const INVENTORY: &[E] = &[
     // emitted. Sits beside `compiled-frame-lines`, the structurally identical
     // sibling added on the same branch for defect 1 of the same page.
     E { group: Group::JIT, token: "inline-frame-map", on_key: None, off_key: Some("CRATONVM_JIT_NO_INLINE_FRAME_MAP"), off_word: None, since: "2026-09-01" },
+    // Default-ON. The OPTIMIZING tier's safepoint-id slot holds a monotonic
+    // counter, not a bci, so `activation_bci` refused the whole backend and
+    // every C2 frame printed `(Unknown Source)` -- the largest population of
+    // line-less compiled frames left after 2026-09-01. `ir_lower` now records
+    // the id->bci translation (`CompiledMethod::safepoint_bci_table`) and the
+    // walk reads through it. Separate from `compiled-frame-lines`, which
+    // reverts the recovery on BOTH backends and so cannot attribute a suspect
+    // line to the translation rather than to the slot read.
+    E { group: Group::JIT, token: "ir-frame-lines", on_key: None, off_key: Some("CRATONVM_JIT_NO_IR_FRAME_LINES"), off_word: None, since: "2026-09-02" },
+    // Default-ON. An inline null check is not a GC-capable call, so it
+    // publishes no safepoint id and the frame it raises from was the ONE frame
+    // in an NPE snapshot with no line (`big:-1`). The emitter records the
+    // trapping bci and the splice chain per site and gives a described site a
+    // ten-byte COLD trampoline that passes its id to `jit_npe_with_action`; the
+    // `TEST`/`JZ` fast path is unchanged. This name reverts the recording and
+    // the trampoline together, so the retained metadata, the cold bytes and the
+    // line disappear as one. Depends on `inline-frame-map`: the enclosing bci
+    // of a trap inside a splice is only knowable from that session's scope
+    // stack.
+    E { group: Group::JIT, token: "npe-trap-lines", on_key: None, off_key: Some("CRATONVM_JIT_NO_NPE_TRAP_LINES"), off_word: None, since: "2026-09-02" },
     // D2: a guarded-virtual site emits guard, splice AND miss edge under ONE
     // safepoint bci, and the miss edge records no inline-frame row -- so that
     // bci held exactly one chain, was never poisoned, and the innermost frame

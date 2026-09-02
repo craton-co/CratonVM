@@ -2776,6 +2776,43 @@ pub struct CompiledMethod {
     /// retain nothing, so the retained metadata and the extra trace frames
     /// are A/B-able together inside one binary.
     pub inline_frame_map: crate::x64::InlineFrameMap,
+    /// Where each of this artifact's INLINE NULL CHECKS would raise: the
+    /// trapping bci in this method's own code, plus the spliced callees around
+    /// it, keyed by the id its cold trampoline passes to
+    /// `jit_npe_with_action`.
+    ///
+    /// The one program point a compiled frame reaches with no safepoint id to
+    /// its name, and therefore the one an `ActiveCompiledFrame` could not put a
+    /// line on. See `x64::NpeTrapSite`. Empty -- and allocation-free -- for
+    /// every method with no inline null check and for
+    /// `CRATONVM_JIT_NO_NPE_TRAP_LINES=1`.
+    ///
+    /// Introspection and diagnosis ONLY: read exactly once, by
+    /// `vm/src/jit/helpers.rs` while it snapshots the frames for an implicit
+    /// NPE. Never by codegen, the GC root walk or deopt.
+    pub npe_trap_map: crate::x64::NpeTrapMap,
+    /// Optimizing-tier safepoint id -> the BYTECODE INDEX that safepoint sits
+    /// at, ascending by id. Empty for every single-pass artifact.
+    ///
+    /// `OopMapEntry::bytecode_pc` is not a bci on this backend: `ir_lower`
+    /// stores a monotonic safepoint counter starting at 1 there, because an IR
+    /// safepoint is a NODE and several nodes can share one bci. Those counters
+    /// are small integers indistinguishable from plausible bcis, and the
+    /// artifact's own table records them -- so a stack walk that trusted the
+    /// slot would print a confidently WRONG line rather than none, which is why
+    /// `conservative_roots::activation_bci` refused an `used_ir_backend`
+    /// artifact outright and every optimizing-tier frame reported
+    /// `(Unknown Source)`. This is the translation that refusal was waiting
+    /// for: one `(id, bci)` pair per emitted safepoint, filled by
+    /// `Lowerer::emit_safepoint_map` from the same `cur_bci` the deopt machinery
+    /// already keys throw sites on, and passed through `resume_bci` so a
+    /// safepoint inside an IR-spliced callee reports the ENCLOSING invoke
+    /// rather than a pc that does not exist in this method's code.
+    ///
+    /// Introspection and diagnosis ONLY -- never read by codegen, the GC root
+    /// walk or deopt. It is a translation of an id the GC already keys on, not
+    /// a second source of truth about it.
+    pub safepoint_bci_table: Vec<(u32, u32)>,
     /// Deoptimization points: native code offsets where deopt can occur.
     /// Used by the deopt framework to reconstruct interpreter state.
     pub deopt_points: Vec<deopt::DeoptimizationPoint>,
@@ -3173,6 +3210,8 @@ impl CompiledMethod {
             // Two empty `Vec`s. No allocation, and none unless this compile
             // actually splices something.
             inline_frame_map: Default::default(),
+            npe_trap_map: Default::default(),
+            safepoint_bci_table: Vec::new(),
             deopt_points: Vec::new(),
             _deopt_point_boxes: Vec::new(),
             oop_maps: Vec::new(),
@@ -3255,6 +3294,8 @@ impl CompiledMethod {
             // Two empty `Vec`s. No allocation, and none unless this compile
             // actually splices something.
             inline_frame_map: Default::default(),
+            npe_trap_map: Default::default(),
+            safepoint_bci_table: Vec::new(),
             deopt_points: Vec::new(),
             _deopt_point_boxes: Vec::new(),
             oop_maps: Vec::new(),
@@ -3381,6 +3422,20 @@ impl CompiledMethod {
         self.oop_maps
             .iter()
             .find(|map| map.bytecode_pc == bytecode_pc)
+    }
+
+    /// The bytecode index an OPTIMIZING-tier safepoint id names, if this
+    /// artifact recorded one. See [`Self::safepoint_bci_table`].
+    ///
+    /// `None` for every single-pass artifact (the table is empty there, and the
+    /// id IS the bci) and for an id the lowerer emitted no translation for. A
+    /// caller must treat `None` as "no line available", never as bci 0.
+    #[inline]
+    pub fn safepoint_bci(&self, safepoint_id: u32) -> Option<u32> {
+        self.safepoint_bci_table
+            .binary_search_by_key(&safepoint_id, |(id, _)| *id)
+            .ok()
+            .map(|i| self.safepoint_bci_table[i].1)
     }
 
     /// real-frame-deopt: locate the deopt point for an exact native PC offset.
@@ -17858,6 +17913,101 @@ pub fn jit_bail_shortcircuits() -> u64 {
 /// Record one bail-list short-circuit. Called from [`compile_gate::admit`].
 pub(crate) fn note_jit_bail_shortcircuit() {
     JIT_BAIL_SHORTCIRCUITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Why each compiled frame in a stack trace got, or did not get, a line.
+///
+/// Lives in this crate rather than beside its only writer
+/// (`vm::jit::conservative_roots::activation_bci`) so that
+/// [`tiered::dump_method_stats_to_stderr`] can print it: the `vm` crate depends
+/// on this one, not the other way round.
+///
+/// **This is a refusal census, not a hit rate**, and the distinction is the
+/// whole point. The audit branch's `bci_lookup_census` was dropped in the
+/// 2026-09-01 merge along with the two-source lookup it described, and the
+/// lesson recorded in its place was that *a silent fallback producing a
+/// plausible answer is indistinguishable, from the outside, from the precise
+/// path working*. A bare `answered/total` pair has the same defect one level
+/// up: it cannot say whether the frames with no line are aarch64 artifacts, an
+/// optimizing tier with no translation table, frames stopped between
+/// safepoints, or a kill switch someone left set in an environment. Each of
+/// those wants a different fix and three of them are invisible in a trace,
+/// which prints `(Unknown Source)` for all of them.
+///
+/// Slots, in the order [`compiled_frame_line_counts`] returns them:
+///
+/// | # | name | meaning |
+/// |---|---|---|
+/// | 0 | `single-pass` | answered from the safepoint-id slot directly |
+/// | 1 | `ir` | answered through `CompiledMethod::safepoint_bci_table` |
+/// | 2 | `npe-trap` | answered from an inline null check's trap site |
+/// | 3 | `no-sp-id` | no usable safepoint id: no slot reserved (`sp_id_slot_off == 0`, which is also every aarch64 artifact), an out-of-band RBP, or the prologue's unset sentinel |
+/// | 4 | `id-unrecorded` | the id named no safepoint of this artifact's own |
+/// | 5 | `ir-untranslated` | an optimizing-tier id with no `(id, bci)` row |
+/// | 6 | `out-of-range` | the recovered value is not a spec-legal bci |
+/// | 7 | `switched-off` | `CRATONVM_JIT_NO_COMPILED_FRAME_LINES` or `CRATONVM_JIT_NO_IR_FRAME_LINES` |
+///
+/// Slots 3-7 are the populations the page
+/// `jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901` had to
+/// reason about with no instrument at all.
+static COMPILED_FRAME_LINE_COUNTS: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Index into [`COMPILED_FRAME_LINE_COUNTS`]: answered from the safepoint-id
+/// slot, single-pass backend.
+pub const FRAME_LINE_ANSWERED_SINGLE_PASS: usize = 0;
+/// Answered through the optimizing tier's `(id, bci)` table.
+pub const FRAME_LINE_ANSWERED_IR: usize = 1;
+/// Answered from an inline null check's recorded trap site.
+pub const FRAME_LINE_ANSWERED_NPE_TRAP: usize = 2;
+/// No usable safepoint id in the frame.
+pub const FRAME_LINE_REFUSED_NO_SP_ID: usize = 3;
+/// The id named no safepoint this artifact recorded.
+pub const FRAME_LINE_REFUSED_ID_UNRECORDED: usize = 4;
+/// An optimizing-tier id with no translation.
+pub const FRAME_LINE_REFUSED_IR_UNTRANSLATED: usize = 5;
+/// The recovered value is not a spec-legal bci.
+pub const FRAME_LINE_REFUSED_OUT_OF_RANGE: usize = 6;
+/// A kill switch is set.
+pub const FRAME_LINE_REFUSED_SWITCHED_OFF: usize = 7;
+
+/// Human names, parallel to the slot indices, so the dump and any future
+/// consumer cannot disagree about which column is which.
+pub const FRAME_LINE_SLOT_NAMES: [&str; 8] = [
+    "single-pass",
+    "ir",
+    "npe-trap",
+    "no-sp-id",
+    "id-unrecorded",
+    "ir-untranslated",
+    "out-of-range",
+    "switched-off",
+];
+
+/// Record one verdict. One bump, taken by every arm of `activation_bci`, so a
+/// new refusal cannot be added without choosing a column for it.
+#[inline]
+pub fn note_compiled_frame_line(slot: usize) {
+    if let Some(c) = COMPILED_FRAME_LINE_COUNTS.get(slot) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Read the census. See [`COMPILED_FRAME_LINE_COUNTS`] for the columns.
+pub fn compiled_frame_line_counts() -> [u64; 8] {
+    let mut out = [0u64; 8];
+    for (i, slot) in COMPILED_FRAME_LINE_COUNTS.iter().enumerate() {
+        out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    out
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

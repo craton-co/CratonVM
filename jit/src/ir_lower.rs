@@ -699,6 +699,17 @@ struct Lowerer<'a> {
     /// "no slot" sentinel on the reader side, and a zero id in the slot means
     /// "this frame has not reached a safepoint yet".
     next_sp_id: u32,
+    /// `(safepoint id, bytecode index)` for every safepoint this compile
+    /// emits, in emission order — which is ascending by id, because ids come
+    /// from `next_sp_id`.
+    ///
+    /// The translation `CompiledMethod::safepoint_bci_table` documents. The id
+    /// is what the frame slot holds and what the GC keys its map on; the bci is
+    /// what a stack trace needs and what nothing on this backend recorded, so
+    /// every optimizing-tier frame printed `(Unknown Source)`. Recorded here
+    /// rather than in `OopMapEntry::bytecode_pc` because that field IS the id —
+    /// overwriting it would repoint every oop-map lookup the collector makes.
+    sp_id_bcis: Vec<(u32, u32)>,
     /// Frame offset of `arg[0]` in the Java-argument staging region a call
     /// marshals its args into; `arg[i]` lives at `args_stage_top_off - i*8`
     /// (increasing address), and `args_ptr = rbp - args_stage_top_off`.
@@ -1153,6 +1164,7 @@ impl<'a> Lowerer<'a> {
             oop_maps: Vec::new(),
             defined_nodes: vec![false; graph.nodes.len()],
             next_sp_id: 1,
+            sp_id_bcis: Vec::new(),
             args_stage_top_off,
             spill_cap_off,
             saved_xmm_bytes,
@@ -1631,6 +1643,16 @@ impl<'a> Lowerer<'a> {
 
         let id = self.next_sp_id;
         self.next_sp_id = self.next_sp_id.wrapping_add(1);
+        // The id->bci translation a stack walk needs. `resume_bci` is the same
+        // normalisation the throw-site and deopt paths apply: inside an
+        // IR-spliced callee `cur_bci` is a pc in the COMBINED buffer, which
+        // names no instruction in this method's own `Code`, so it is mapped
+        // back to the enclosing invoke. `u32::try_from` cannot fail for a
+        // spec-legal bci; a value that somehow exceeds it records nothing,
+        // which reports no line rather than a wrong one.
+        if let Ok(bci) = u32::try_from(self.resume_bci(self.cur_bci)) {
+            self.sp_id_bcis.push((id, bci));
+        }
         // MOV qword [rbp - sp_id_slot_off], imm32 (sign-extended; ids are small)
         self.buf.emit(&[0x48, 0xC7, 0x85]);
         self.buf.emit(&(-self.sp_id_slot_off).to_le_bytes());
@@ -10666,6 +10688,7 @@ pub(crate) fn lower_inner_with_scopes(
     let shadow_thread_slot_off = lowerer.shadow_thread_slot_off;
     let shadow_savebase_slot_off = lowerer.shadow_savebase_slot_off;
     let oop_maps = std::mem::take(&mut lowerer.oop_maps);
+    let sp_id_bcis = std::mem::take(&mut lowerer.sp_id_bcis);
     let locals_size = lowerer.locals_size;
     let first_spill = lowerer.first_spill;
     let spill_cap_off = lowerer.spill_cap_off;
@@ -10848,6 +10871,17 @@ pub(crate) fn lower_inner_with_scopes(
     // "this word is a register image" is the property the reader is testing.
     cm.sp_id_slot_off = sp_id_slot_off;
     cm.oop_maps = oop_maps;
+    // Ascending by construction (ids come from a counter), which is what
+    // `CompiledMethod::safepoint_bci` binary-searches on. Sorted rather than
+    // asserted: a future lowerer that emits a safepoint out of order would
+    // otherwise turn a diagnostic into a wrong line, and the vector is one
+    // entry per GC-capable point.
+    cm.safepoint_bci_table = {
+        let mut t = sp_id_bcis;
+        t.sort_unstable_by_key(|(id, _)| *id);
+        t.dedup_by_key(|(id, _)| *id);
+        t
+    };
     // Stage A.2 (precise oop maps, B-K fix) parity with the x64 fast-tier
     // driver (`x64/driver.rs`'s `cm.fully_oop_covered = compiler.precise_maps
     // && ... && compiler.safepoint_pcs.is_subset(&compiler.mapped_safepoint_pcs)`).

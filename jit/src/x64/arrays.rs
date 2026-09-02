@@ -229,14 +229,21 @@ impl Compiler {
     /// The previous `process::abort()` in `vm/src/jit/helpers.rs`
     /// jit_iastore/bastore/aastore was a comment-level "fail loudly"
     /// theater because the helpers were never reached on the inline path.
-    fn emit_null_check_array_store(&mut self, action: u8) {
+    ///
+    /// `trap_key` is the id `x64::inlining::record_npe_trap_site` issued for
+    /// this site, or `0` when the site is not described. It travels with the
+    /// action code so [`emit_null_check_store_stubs`] can give a described site
+    /// its own cold trampoline; the two bytes of fast path emitted here are the
+    /// same either way.
+    fn emit_null_check_array_store(&mut self, action: u8, trap_key: u32) {
         // TEST RAX, RAX  (48 85 C0)
         self.buf.emit(&[0x48, 0x85, 0xC0]);
-        // JZ rel32 → null-store stub (patched later)
+        // JZ rel32 -> null-store stub (patched later)
         self.buf.emit(&[0x0F, 0x84]);
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-        self.null_check_store_stubs.push((action, patch_offset));
+        self.null_check_store_stubs
+            .push((action, patch_offset, trap_key));
     }
 
     /// Null check for `putfield` inside a protected range whose handler needs
@@ -246,7 +253,8 @@ impl Compiler {
     pub(super) fn emit_precise_null_check_field_store(&mut self) {
         let bci = self.dbg_last_pc;
         if !self.precise_exception_frames || !self.pc_is_protected(bci) {
-            self.emit_null_check_array_store(npe_action::NONE);
+            let key = crate::x64::inlining::record_npe_trap_site(bci);
+            self.emit_null_check_array_store(npe_action::NONE, key);
             return;
         }
         if !self.exc_frame_box_ptr_by_bci.contains_key(&bci) {
@@ -286,7 +294,8 @@ impl Compiler {
         }
         // JEP 358: the trapping opcode IS at `code[bc_pc]` (the array-store
         // arm passes its own pc), so derive the per-element-type action.
-        self.emit_null_check_array_store(array_opcode_npe_action(code, bc_pc));
+        let key = crate::x64::inlining::record_npe_trap_site(bc_pc);
+        self.emit_null_check_array_store(array_opcode_npe_action(code, bc_pc), key);
     }
 
     /// Round-9 HIGH fix (asymmetric coverage): emit an inline null check
@@ -304,14 +313,16 @@ impl Compiler {
     /// run the epilogue. We therefore reuse the SAME shared stub by
     /// pushing the JZ patch offset into the same `null_check_store_stubs`
     /// vector; both loads and stores branch to it.
-    pub(super) fn emit_null_check_array_load(&mut self, action: u8) {
+    /// `trap_key`: see [`Self::emit_null_check_array_store`].
+    pub(super) fn emit_null_check_array_load(&mut self, action: u8, trap_key: u32) {
         // TEST RAX, RAX  (48 85 C0)
         self.buf.emit(&[0x48, 0x85, 0xC0]);
-        // JZ rel32 → shared null-check stub (patched later)
+        // JZ rel32 -> shared null-check stub (patched later)
         self.buf.emit(&[0x0F, 0x84]);
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-        self.null_check_store_stubs.push((action, patch_offset));
+        self.null_check_store_stubs
+            .push((action, patch_offset, trap_key));
     }
 
     /// Round-11 HIGH-2 (mirrors `emit_null_check_array_store_at`):
@@ -326,7 +337,8 @@ impl Compiler {
             }
         }
         // JEP 358: derive the per-element-type action from the trapping opcode.
-        self.emit_null_check_array_load(array_opcode_npe_action(code, bc_pc));
+        let key = crate::x64::inlining::record_npe_trap_site(bc_pc);
+        self.emit_null_check_array_load(array_opcode_npe_action(code, bc_pc), key);
     }
 
     /// Emit an inline null check on the `arraylength` receiver (assumed
@@ -378,7 +390,8 @@ impl Compiler {
         }
         // Reuse the shared null-check stub machinery; the action is the
         // `arraylength` JEP-358 code ("Cannot read the array length").
-        self.emit_null_check_array_load(npe_action::ARRAY_LENGTH);
+        let key = crate::x64::inlining::record_npe_trap_site(bc_pc);
+        self.emit_null_check_array_load(npe_action::ARRAY_LENGTH, key);
     }
 
     /// Emit an array bounds check. RAX=array ptr, RCX=index (as i64).

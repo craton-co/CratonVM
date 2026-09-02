@@ -239,8 +239,10 @@ pub(crate) use inlining::inline_live_slot_clamps;
 /// deliberately NOT exported -- it is the emission-order form, consumed by
 /// `finish_inline_frame_recording` and meaningless outside it.
 pub use inlining::{
-    begin_inline_frame_recording, finish_inline_frame_recording, inline_frame_map_enabled,
-    InlineFrameLevel, InlineFrameMap,
+    begin_inline_frame_recording, begin_npe_trap_recording, finish_inline_frame_recording,
+    finish_npe_trap_recording, inline_call_map_at_return_counts, inline_frame_map_enabled,
+    inline_miss_edge_poison_counts, npe_trap_lines_enabled, InlineFrameLevel, InlineFrameMap,
+    NpeTrapMap, NpeTrapSite,
 };
 mod arith;
 mod arrays;
@@ -627,7 +629,7 @@ struct Compiler {
     /// `[NULL + ARRAY_LENGTH_OFFSET]`, hitting the signal-handler hs_err path
     /// that just re-raises and kills the VM.
     ///
-    /// Each entry is `(action, patch_offset)`: `action` is the JEP-358
+    /// Each entry is `(action, patch_offset, trap_key)`: `action` is the JEP-358
     /// [`cratonvm_jit_api::npe_action`] code for the trapping opcode (so the
     /// interpreter can attach "Cannot load from int array" etc. when
     /// `-XX:+ShowCodeDetailsInExceptionMessages` is on), and `patch_offset` is
@@ -639,7 +641,14 @@ struct Compiler {
     /// path drains the NPE flag and surfaces the (action-only) exception.
     /// (Previously a single shared stub called `jit_bastore(0)`, which set the
     /// byte-store action for *every* opcode regardless of element type.)
-    null_check_store_stubs: Vec<(u8, usize)>,
+    ///
+    /// `trap_key` is the id `x64::inlining::record_npe_trap_site` issued for
+    /// this site, or `0` for "not described". A non-zero key buys the site its
+    /// own ten-byte cold trampoline, which packs `action | key << 8` into the
+    /// helper's single argument so the NPE snapshot can put a LINE on the frame
+    /// that raised. `0` keeps the historical shape exactly: the `JZ` goes
+    /// straight to the shared per-action stub.
+    null_check_store_stubs: Vec<(u8, usize, u32)>,
     /// Post-invoke exception checks. After every JIT-dispatched invoke
     /// (`invoke_dispatch` / `invoke_virtual_mic`) whose callee can throw,
     /// the codegen emits a `CMP RAX, i64::MIN; JE rel32` guard. The

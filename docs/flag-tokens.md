@@ -577,7 +577,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-265 tokens.
+267 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -681,6 +681,8 @@ export inherited from a parent shell.
 | `osr-pc-refresh` | `CRATONVM_JIT_NO_OSR_PC_REFRESH` |
 | `compiled-frame-lines` | `CRATONVM_JIT_NO_COMPILED_FRAME_LINES` |
 | `inline-frame-map` | `CRATONVM_JIT_NO_INLINE_FRAME_MAP` |
+| `ir-frame-lines` | `CRATONVM_JIT_NO_IR_FRAME_LINES` |
+| `npe-trap-lines` | `CRATONVM_JIT_NO_NPE_TRAP_LINES` |
 | `inline-miss-edge-poison` | `CRATONVM_JIT_NO_INLINE_MISS_EDGE_POISON` |
 | `ir-string-access-admit` | `CRATONVM_JIT_NO_IR_STRING_ACCESS_ADMIT` |
 | `inline-call-map-at-return` | `CRATONVM_JIT_NO_INLINE_CALL_MAP_AT_RETURN` |

@@ -4134,6 +4134,27 @@ fn compiled_frame_bci_enabled() -> bool {
 /// ignoring it the artifact pays for metadata nobody reads, and with the walk
 /// reading a map that was never emitted every frame silently loses its
 /// callees. One variable, both halves.
+/// Kill switch for the OPTIMIZING tier's line numbers.
+///
+/// Default ON. `CRATONVM_JIT_NO_IR_FRAME_LINES=1` restores the blanket
+/// `used_ir_backend` refusal, i.e. `(Unknown Source)` for every frame the IR
+/// backend compiled, which is what every such frame reported before
+/// `CompiledMethod::safepoint_bci_table` existed.
+///
+/// It is a separate name from `CRATONVM_JIT_NO_COMPILED_FRAME_LINES` because
+/// the two isolate different things. That one reverts the whole recovery, on
+/// both backends at once, so it cannot say whether a suspect line came from the
+/// id-to-bci translation this tier needs or from the slot read both tiers
+/// share. The translation is the new evidence and is the half worth being able
+/// to switch alone; a wrong line under this switch OFF and a right one under it
+/// ON is a one-binary attribution.
+fn ir_frame_bci_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_IR_FRAME_LINES").is_none()
+    })
+}
+
 fn inline_frame_chains_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
@@ -4214,16 +4235,24 @@ pub struct ActiveCompiledFrame {
 ///
 /// # Two more things it refuses
 ///
-/// * **The optimizing IR backend** (`used_ir_backend`). There
-///   `OopMapEntry::bytecode_pc` is NOT a bci: `ir_lower` stores a monotonic
-///   safepoint counter starting at 1 (its own doc says so, and the
+/// * **An optimizing IR-backend id with no translation** (`used_ir_backend`).
+///   There `OopMapEntry::bytecode_pc` is NOT a bci: `ir_lower` stores a
+///   monotonic safepoint counter starting at 1 (its own doc says so, and the
 ///   single-pass backend's `SP_ID_UNSET_BC_PC` comment explains why THAT
 ///   backend cannot do the same). Those ids are small integers
 ///   indistinguishable from plausible bcis, AND the artifact's own table
-///   records them — so the confirmation above passes and a real,
-///   confidently-wrong line comes out. An IR-tier frame therefore keeps `-1`,
-///   as it did before; giving it a line needs a safepoint-id -> bci side
-///   table the artifact does not carry today.
+///   records them, so the confirmation above passes and a real,
+///   confidently-wrong line would come out if the id were used as one.
+///
+///   Until 2026-09-02 the whole backend was refused on that ground, and that
+///   was the largest remaining population of line-less compiled frames. The
+///   refusal is now exactly as wide as the hazard: `ir_lower` records the
+///   `(id, bci)` pair for every safepoint it emits
+///   (`CompiledMethod::safepoint_bci_table`), this reads the bci THROUGH it,
+///   and an id the table does not name is still refused. What that leaves is
+///   an artifact compiled before the table existed, or a safepoint whose bci
+///   exceeded `u32` -- both `None`, neither a guess.
+///   `CRATONVM_JIT_NO_IR_FRAME_LINES=1` restores the blanket refusal.
 /// * **Anything outside the spec's bci range** — see [`plausible_bci`]. The
 ///   two synthetic pcs the single-pass backend stamps are already rejected by
 ///   the `i32::try_from` below (both are within one of `u32::MAX`), but that
@@ -4235,14 +4264,55 @@ pub struct ActiveCompiledFrame {
 /// `bytecode_pc: 0` and would otherwise resolve every compiled frame to the
 /// first line of its method — is already refused by `active_safepoint_id`.
 fn activation_bci(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<i32> {
-    if cm.used_ir_backend {
+    use cratonvm_jit::{
+        note_compiled_frame_line as note, FRAME_LINE_ANSWERED_IR,
+        FRAME_LINE_ANSWERED_SINGLE_PASS, FRAME_LINE_REFUSED_ID_UNRECORDED,
+        FRAME_LINE_REFUSED_IR_UNTRANSLATED, FRAME_LINE_REFUSED_NO_SP_ID,
+        FRAME_LINE_REFUSED_OUT_OF_RANGE, FRAME_LINE_REFUSED_SWITCHED_OFF,
+    };
+    // Every exit below names a census column. That is not decoration: a trace
+    // prints `(Unknown Source)` for all five refusals and there is no other
+    // way to tell which population a line-less frame came from. See
+    // `cratonvm_jit::COMPILED_FRAME_LINE_COUNTS`.
+    let Some(id) = active_safepoint_id(rbp, cm) else {
+        note(FRAME_LINE_REFUSED_NO_SP_ID);
         return None;
-    }
-    let id = active_safepoint_id(rbp, cm)?;
+    };
     // `find_oop_map_for_safepoint_id` is `&self` and is the artifact's own
     // record of which bytecode PCs it emitted a safepoint at.
-    cm.find_oop_map_for_safepoint_id(id)?;
-    i32::try_from(plausible_bci(id)?).ok()
+    if cm.find_oop_map_for_safepoint_id(id).is_none() {
+        note(FRAME_LINE_REFUSED_ID_UNRECORDED);
+        return None;
+    }
+    // The optimizing tier's slot holds an ID, not a bci. Translate it through
+    // the artifact's own table, and refuse when there is none: an untranslated
+    // id is a small integer that looks exactly like a bci, which is the wrong
+    // answer this refusal was written to avoid.
+    let recorded = if cm.used_ir_backend {
+        if !ir_frame_bci_enabled() {
+            note(FRAME_LINE_REFUSED_SWITCHED_OFF);
+            return None;
+        }
+        match cm.safepoint_bci(id) {
+            Some(bci) => bci,
+            None => {
+                note(FRAME_LINE_REFUSED_IR_UNTRANSLATED);
+                return None;
+            }
+        }
+    } else {
+        id
+    };
+    let Some(bci) = plausible_bci(recorded).and_then(|v| i32::try_from(v).ok()) else {
+        note(FRAME_LINE_REFUSED_OUT_OF_RANGE);
+        return None;
+    };
+    note(if cm.used_ir_backend {
+        FRAME_LINE_ANSWERED_IR
+    } else {
+        FRAME_LINE_ANSWERED_SINGLE_PASS
+    });
+    Some(bci)
 }
 
 /// The callees inlined into `cm` at the program point a live frame is standing
@@ -4291,13 +4361,18 @@ fn activation_bci(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<i32> 
 ///
 /// # The optimizing tier needs no extra refusal here
 ///
-/// [`activation_bci`] refuses an `used_ir_backend` artifact outright, so key 2
-/// can never be reached for one. Key 1 is a CODE LAYOUT fact — the byte offset
-/// of a return address in this artifact's own buffer — and carries no
-/// assumption about which backend emitted it, so it needs no refusal. (In
-/// practice an IR artifact's map is empty anyway: `record_inline_frame_row` is
-/// called only from the single-pass splicer, and one compile produces one
-/// artifact, so a map can never describe a buffer other than its own.)
+/// Key 2 is the safepoint-id slot read back as a bci, and since 2026-09-02
+/// [`activation_bci`] can answer that for an `used_ir_backend` artifact too
+/// (through `CompiledMethod::safepoint_bci_table`). It still reaches no chain:
+/// an IR artifact's `inline_frame_map` is EMPTY, because
+/// `record_inline_frame_row` is called only from the single-pass splicer and
+/// one compile produces one artifact, so `compiled_frame_inline_chain` returns
+/// on the `is_empty()` guard before either key is consulted. Key 1 is a CODE
+/// LAYOUT fact -- the byte offset of a return address in this artifact's own
+/// buffer -- and carries no assumption about which backend emitted it, so it
+/// needs no refusal either. IR-tier inlining therefore still contributes no
+/// frames; it needs its own producer, keyed off `InlineScopeTable`, and that is
+/// a separate change from giving the tier a line.
 ///
 /// # The fail-closed rule
 ///
@@ -4354,6 +4429,72 @@ fn compiled_frame_inline_chain(
         // must not: an ambiguous chain and an absent one both mean no inlined
         // frame may be reported here.
         None => Vec::new(),
+    }
+}
+
+/// Give the INNERMOST frame of an NPE snapshot the line and the inlined
+/// callees of the inline null check that raised.
+///
+/// An inline null check is not a GC-capable call, so it publishes no safepoint
+/// id and [`activation_bci`] correctly refuses the stale one in the slot: the
+/// frame that RAISED was the one frame in the snapshot with no line. The
+/// emitter records what it knows at every such site
+/// (`x64::inlining::record_npe_trap_site`) and the site's cold trampoline hands
+/// its key to `jit_npe_with_action`; this is where the two meet.
+///
+/// `trap_key == 0` means the site was not described -- the feature switched
+/// off, a bci out of spec range, a chain the emitter refused, or a helper that
+/// signals an NPE without going through an inline check at all -- and leaves
+/// the snapshot exactly as the walk built it.
+///
+/// Three things make a mismatched key harmless rather than wrong:
+///
+///   * keys are per-compile MONOTONIC ids, never indices, so one that belongs
+///     to another artifact (or to a rewound splice) MISSES rather than landing
+///     on a neighbouring site;
+///   * the lookup is against the innermost frame's OWN artifact, which is the
+///     one whose trampoline ran;
+///   * both halves respect the switches the rest of this file does, so
+///     `CRATONVM_JIT_NO_COMPILED_FRAME_LINES=1` still produces `-1` here and
+///     `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` still produces no callee frames.
+///
+/// `frames` is OUTERMOST-first (see [`active_compiled_frames`]), so the frame
+/// that trapped is the last one.
+pub fn apply_npe_trap_site(frames: &mut [ActiveCompiledFrame], trap_key: u32) {
+    if trap_key == 0 {
+        return;
+    }
+    let want_bci = compiled_frame_bci_enabled();
+    let want_chains = inline_frame_chains_enabled();
+    if !want_bci && !want_chains {
+        return;
+    }
+    let Some(top) = frames.last_mut() else {
+        return;
+    };
+    if top.cm_ptr == 0 {
+        return;
+    }
+    // SAFETY: the same window and the same contract as `active_compiled_frames`
+    // -- this runs inside the JIT helper that trapped, on the owning thread,
+    // with the artifact still registered in the JIT cache and its chain entry
+    // still pushed, and `cm_ptr` came from that walk moments ago.
+    let cm = unsafe { &*(top.cm_ptr as *const cratonvm_jit::CompiledMethod) };
+    let Some(site) = cm.npe_trap_map.get(trap_key) else {
+        return;
+    };
+    if want_bci {
+        if let Ok(bci) = i32::try_from(site.bci) {
+            top.bci = bci;
+            cratonvm_jit::note_compiled_frame_line(cratonvm_jit::FRAME_LINE_ANSWERED_NPE_TRAP);
+        }
+    }
+    if want_chains {
+        top.inline_chain = site
+            .chain
+            .iter()
+            .map(|l| (l.label.clone(), l.bci))
+            .collect();
     }
 }
 
@@ -4553,7 +4694,18 @@ pub fn active_compiled_frames() -> Vec<ActiveCompiledFrame> {
                 }
                 let bci = match frame_rbp {
                     Some(rbp) if want_bci => activation_bci(*rbp, cm).unwrap_or(-1),
-                    _ => -1,
+                    _ => {
+                        // Counted, so an all-`-1` trace under
+                        // `CRATONVM_JIT_NO_COMPILED_FRAME_LINES=1` is
+                        // distinguishable from one where the recovery ran and
+                        // refused. A kill switch that looks identical to a
+                        // defect is how a switch left set in an environment
+                        // becomes a bug report.
+                        cratonvm_jit::note_compiled_frame_line(
+                            cratonvm_jit::FRAME_LINE_REFUSED_SWITCHED_OFF,
+                        );
+                        -1
+                    }
                 };
                 out.push(ActiveCompiledFrame {
                     interp_depth: e.interp_depth,

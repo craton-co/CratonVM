@@ -1295,6 +1295,35 @@ pub fn dump_method_stats_to_stderr() {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        // Why the compiled frames in this run's stack traces did or did not
+        // carry a line. Unconditional and including zeros, for the reason the
+        // rows above are: `(Unknown Source)` is what a trace prints for FOUR
+        // different refusals plus a kill switch, and nothing else in the system
+        // can tell them apart. An all-zero line means no stack trace this run
+        // crossed a compiled frame, which is itself the answer to "did this
+        // path engage at all". See `crate::compiled_frame_line_counts`.
+        //
+        // The two emitter-side censuses ride along because they answer the
+        // next question this one raises. `inline-map-at-return` separates an
+        // exact `native_pc_offset` hit from a miss -- the distinction whose
+        // absence let an emitter defect file oop maps 9-25 bytes past the
+        // return address while a fallback answered and nothing said which
+        // evidence produced it. `miss-edge-poison` says how many chains were
+        // deliberately given up so a frame could not be handed the callees of
+        // a splice that did not run. Both were `pub fn`s with no caller
+        // anywhere in the tree until now, which is the same defect this row
+        // exists to fix one level up.
+        eprintln!(
+            "[cratonvm] compiled-frame lines: {} | inline-map-at-return={:?}              miss-edge-poison={:?}",
+            crate::compiled_frame_line_counts()
+                .iter()
+                .zip(crate::FRAME_LINE_SLOT_NAMES.iter())
+                .map(|(c, n)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            crate::x64::inline_call_map_at_return_counts(),
+            crate::x64::inline_miss_edge_poison_counts(),
+        );
     }
     // The unresumable-trap refusal's census, printed UNCONDITIONALLY and
     // including zeros — before the `DIAG_CORE` early return, like the rows

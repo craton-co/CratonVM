@@ -4158,13 +4158,16 @@ impl Compiler {
                                     .filter(|&&(po, _)| po >= body_start && po < body_end)
                                     .copied()
                                     .collect();
-                                // JEP 358: each entry is (action, patch_offset);
-                                // filter by the offset, carry the action through.
+                                // JEP 358: each entry is (action, patch_offset,
+                                // trap_key); filter by the offset and carry the
+                                // action through. The trap key is DROPPED for
+                                // the copies below -- see the `extend` that
+                                // re-adds them.
                                 let orig_nullstore_stubs: Vec<(u8, usize)> = self
                                     .null_check_store_stubs
                                     .iter()
-                                    .filter(|&&(_, po)| po >= body_start && po < body_end)
-                                    .copied()
+                                    .filter(|&&(_, po, _)| po >= body_start && po < body_end)
+                                    .map(|&(action, po, _)| (action, po))
                                     .collect();
                                 let orig_self_calls: Vec<usize> = self
                                     .self_call_patches
@@ -4372,10 +4375,22 @@ impl Compiler {
                                             .iter()
                                             .map(|&(po, bci)| (po + shift_us, bci)),
                                     );
+                                    // Trap key `0`: a copied site keeps the
+                                    // action (which depends only on the opcode)
+                                    // and gives up its LINE. The recorded site
+                                    // describes the body this copy was made
+                                    // from, and a duplicated body is not
+                                    // guaranteed to be the same splice -- a
+                                    // guarded site emits one copy per receiver
+                                    // variant, each a different callee. Carrying
+                                    // the key would name one variant's chain on
+                                    // every copy: a frame naming a method that
+                                    // did not run, which is the one outcome this
+                                    // area refuses. A missing line is the other.
                                     self.null_check_store_stubs.extend(
                                         orig_nullstore_stubs
                                             .iter()
-                                            .map(|&(action, po)| (action, po + shift_us)),
+                                            .map(|&(action, po)| (action, po + shift_us, 0u32)),
                                     );
                                     self.self_call_patches
                                         .extend(orig_self_calls.iter().map(|&po| po + shift_us));
@@ -7445,7 +7460,8 @@ impl Compiler {
                             // array opcode, so no precise JEP-358 array action
                             // applies — record NONE (unmessaged NPE), matching
                             // the prior behaviour.
-                            self.emit_null_check_array_load(npe_action::NONE);
+                            let trap_key = crate::x64::inlining::record_npe_trap_site(pc);
+                            self.emit_null_check_array_load(npe_action::NONE, trap_key);
 
                             // Save array base in R8 (RAX is needed as the
                             // STOS source register).
@@ -7729,7 +7745,8 @@ impl Compiler {
                             // TEST RAX,RAX / JZ -> shared null-check stub.
                             // Intrinsic array access — no precise array opcode,
                             // so record NONE (unmessaged NPE).
-                            self.emit_null_check_array_load(npe_action::NONE);
+                            let trap_key = crate::x64::inlining::record_npe_trap_site(pc);
+                            self.emit_null_check_array_load(npe_action::NONE, trap_key);
                             // MOV R8, RAX  (49 89 C0)
                             self.buf.emit(&[0x49, 0x89, 0xC0]);
                             // MOV R9D, [R8 + ARRAY_LENGTH_OFFSET]  (45 8B 48 dd)

@@ -1073,10 +1073,8 @@ pub(crate) struct DrainedJitSignals {
     /// about to lose.
     pub npe_compiled_frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
     /// Drained alongside `npe` for hygiene (a stale action code must not
-    /// outlive its NPE), but not yet consumed by the JIT-return drains —
-    /// they throw the bare NPE exactly as before this consolidation
-    /// (attaching the JEP-358 action message here is a follow-up).
-    #[allow(dead_code)]
+    /// outlive its NPE). Read by the two restash paths, which put it back with
+    /// the flag and the frame snapshot — see [`restash_jit_pending_npe`].
     pub npe_action: u8,
     pub deopt: bool,
 }
@@ -1125,11 +1123,16 @@ fn npe_frame_snapshot_enabled() -> bool {
 /// interpreter still on the stack. Cheap by construction: this records the
 /// same small structs the GC root walk already builds, and does no class-store
 /// lookup, no string formatting and takes no lock.
-fn snapshot_npe_compiled_frames() {
+fn snapshot_npe_compiled_frames(trap_key: u32) {
     if !npe_frame_snapshot_enabled() {
         return;
     }
-    let frames = crate::jit::conservative_roots::active_compiled_frames();
+    let mut frames = crate::jit::conservative_roots::active_compiled_frames();
+    // The one frame the walk cannot put a line on is the one that raised: an
+    // inline null check publishes no safepoint id. `trap_key` is the site id its
+    // cold trampoline passed in, and this is the only place both the key and
+    // the frames exist at once.
+    crate::jit::conservative_roots::apply_npe_trap_site(&mut frames, trap_key);
     JIT_SIGNALS.with(|s| {
         *s.npe_compiled_frames.borrow_mut() = (!frames.is_empty()).then_some(frames);
     });
@@ -1216,6 +1219,38 @@ pub(crate) fn peek_jit_athrow_bci() -> i64 {
 /// drain-without-route rationale.
 pub(crate) fn stash_jit_pending_npe() {
     set_jit_pending_npe();
+}
+
+/// Raise the pending-NPE flag WITHOUT taking a compiled-frame snapshot.
+///
+/// For the one shape [`stash_jit_pending_npe`] is wrong for: a door that
+/// drained the flag with [`take_jit_pending_npe`] and is putting it back. That
+/// take leaves `npe_compiled_frames` untouched, so the snapshot from the trap
+/// is still there and is still the right one; taking another would overwrite it
+/// with a stack the raising frame has already left.
+pub(crate) fn set_jit_pending_npe_flag_only() {
+    JIT_SIGNALS.with(|s| {
+        s.npe.set(true);
+        s.npe_action.set(0);
+    });
+}
+
+/// Put back an NPE that [`take_all_jit_signals`] drained WHOLE -- flag, JEP-358
+/// action code and the compiled-frame snapshot -- exactly as it was found.
+///
+/// The action code was previously dropped by every restash (the setter resets
+/// it to `0`), so an implicit NPE that took a round trip through a door which
+/// declined to service it lost its "Cannot load from int array" message. Both
+/// halves travel together because both describe the same trap.
+pub(crate) fn restash_jit_pending_npe(
+    action: u8,
+    frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
+) {
+    JIT_SIGNALS.with(|s| {
+        s.npe.set(true);
+        s.npe_action.set(action);
+        *s.npe_compiled_frames.borrow_mut() = frames;
+    });
 }
 
 /// Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): re-stash a previously
@@ -1317,7 +1352,7 @@ fn set_jit_pending_npe() {
         s.npe.set(true);
         s.npe_action.set(0);
     });
-    snapshot_npe_compiled_frames();
+    snapshot_npe_compiled_frames(0);
 }
 
 /// Internal: set the pending-NPE flag *with* a JEP-358 action code
@@ -1326,11 +1361,23 @@ fn set_jit_pending_npe() {
 /// JEP-358 message to the JIT-originated NPE.
 #[inline]
 fn set_jit_pending_npe_action(code: u8) {
+    set_jit_pending_npe_action_at(code, 0);
+}
+
+/// As [`set_jit_pending_npe_action`], with the id of the inline null-check
+/// site that trapped (`0` when the caller has none).
+///
+/// Only the inline null-check stubs can name a site: they are the shape whose
+/// bci is otherwise unrecoverable, because the check is not a GC-capable call
+/// and so publishes no safepoint id. Every other NPE-signalling helper is a
+/// call, and its frame's slot already holds an id `activation_bci` can use.
+#[inline]
+fn set_jit_pending_npe_action_at(code: u8, trap_key: u32) {
     JIT_SIGNALS.with(|s| {
         s.npe.set(true);
         s.npe_action.set(code);
     });
-    snapshot_npe_compiled_frames();
+    snapshot_npe_compiled_frames(trap_key);
 }
 
 /// Re-stash a previously-taken JIT NPE action code (OSR drain-without-route
@@ -1470,7 +1517,22 @@ pub extern "C" fn jit_npe_with_action(code: i64) {
     // matching every other array/field helper's entry (the next GC must
     // re-scan after we deopt back out to the interpreter).
     crate::jit::conservative_roots::note_jit_boundary();
-    set_jit_pending_npe_action(code as u8);
+    // The argument is PACKED: the low byte is the JEP-358 action code, and the
+    // upper 24 bits are the inline null-check site id, or zero. A stub that
+    // sets only the action (the historical shape, and the reason-10 precise
+    // putfield path) therefore reads back as `trap_key == 0` with no special
+    // case. See `x64::inlining::NpeTrapSite` and
+    // `x64::Compiler::emit_null_check_store_stubs`.
+    //
+    // `as u64` before the shift, not `as u32`: the sign of an `i64` argument is
+    // nobody's business here and an arithmetic shift on a hypothetical negative
+    // would fabricate a key.
+    let packed = code as u64;
+    // Truncation: the low byte IS the action code by construction.
+    let action = (packed & 0xff) as u8;
+    // Truncation: `record_npe_trap_site` caps ids at 24 bits.
+    let trap_key = ((packed >> 8) & 0x00ff_ffff) as u32;
+    set_jit_pending_npe_action_at(action, trap_key);
     // Out-of-band deopt signal: the stub loads `i64::MIN` as the return value
     // (same invariant as `jit_bastore`'s null arm did before).
     set_jit_deopt_pending();
@@ -3031,7 +3093,15 @@ pub(crate) fn implicit_signal_of(
 fn restash_implicit_signal(signal: ImplicitSignal) {
     match signal {
         ImplicitSignal::Aioobe { index, length } => stash_jit_pending_aioobe(index, length),
-        ImplicitSignal::Npe => stash_jit_pending_npe(),
+        // `set_jit_pending_npe_flag_only`, NOT `stash_jit_pending_npe`. This
+        // door drains the NPE with `take_jit_pending_npe()`, which takes the
+        // FLAG and leaves the compiled-frame snapshot where the helper put it.
+        // Re-stashing through the ordinary setter would take a SECOND snapshot
+        // here -- one frame shallower, because the callee whose code raised the
+        // NPE has already returned -- and silently overwrite the real one. The
+        // trace would still be plausible and would be missing exactly the frame
+        // it was taken to keep.
+        ImplicitSignal::Npe => set_jit_pending_npe_flag_only(),
         ImplicitSignal::Arithmetic => stash_jit_pending_arithmetic(),
         ImplicitSignal::None => {}
     }
@@ -3050,6 +3120,7 @@ fn materialize_implicit_signal(
     vm: &SharedVm,
     thread: &mut JvmThread,
     signal: ImplicitSignal,
+    npe_frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
 ) -> Option<ObjectRef> {
     match signal {
         ImplicitSignal::Aioobe { index, length } => {
@@ -3062,13 +3133,24 @@ fn materialize_implicit_signal(
             )
             .ok()
         }
-        ImplicitSignal::Npe => crate::runtime::exceptions::create_exception_object(
-            vm,
-            thread,
-            "java/lang/NullPointerException",
-            None,
-        )
-        .ok(),
+        ImplicitSignal::Npe => {
+            let exc = crate::runtime::exceptions::create_exception_object(
+                vm,
+                thread,
+                "java/lang/NullPointerException",
+                None,
+            )
+            .ok()?;
+            // The frames the helper snapshotted at the trap. Without this the
+            // NPE materialised HERE -- i.e. every implicit NPE routed into a
+            // compiled callee's own handler -- keeps the frameless trace
+            // `fillInStackTrace` just built, which is the whole defect the
+            // snapshot exists to close. Attaching it in the constructor arm
+            // rather than at each door is what stops a fourth door from
+            // silently reopening it.
+            crate::runtime::exceptions::attach_snapshotted_npe_frames(vm, exc, npe_frames);
+            Some(exc)
+        }
         ImplicitSignal::Arithmetic => crate::runtime::exceptions::create_exception_object(
             vm,
             thread,
@@ -3523,7 +3605,15 @@ unsafe fn route_implicit_exc_through_callee(
         // own `idiv`, because there is one body — a `getMessage()` that changed
         // with the dispatch route would be its own wrong answer, and this used
         // to be kept true by hand.
-        let exc = materialize_implicit_signal(vm, thread, implicit);
+        // This door drained the FLAG only (`take_jit_pending_npe`), so the
+        // snapshot is still in the signal record; take it here so it is
+        // consumed by exactly the throwable it belongs to.
+        let npe_frames = if implicit == ImplicitSignal::Npe {
+            take_jit_pending_npe_compiled_frames()
+        } else {
+            None
+        };
+        let exc = materialize_implicit_signal(vm, thread, implicit, npe_frames);
         if let Some(exc) = exc {
             if let Ok(v) = try_run_callee_handler(
                 vm,
@@ -3761,7 +3851,7 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
     // outgoing arguments still identify that callee, and run its handler at
     // the recorded throw bci.  Re-entering the callee from bytecode 0 used to
     // duplicate all side effects before a caught bounds/null/divide exception.
-    let signals = take_all_jit_signals(thread);
+    let mut signals = take_all_jit_signals(thread);
     let throw_pc = if signals.athrow_bci >= 0 {
         signals.athrow_bci as usize
     } else {
@@ -3798,6 +3888,7 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
                 vm,
                 thread,
                 implicit_signal_of(signals.aioobe, signals.npe, signals.arithmetic),
+                signals.npe_compiled_frames.take(),
             );
             if let Some(exc) = implicit {
                 if let Ok(v) = try_run_callee_handler(
@@ -3825,7 +3916,11 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
         stash_jit_pending_aioobe(index, length);
     }
     if signals.npe {
-        stash_jit_pending_npe();
+        // Restore the snapshot the drain took WITH the flag, rather than
+        // letting the setter take a fresh one here: `take_all_jit_signals`
+        // moved it out, and a second `active_compiled_frames()` at this point
+        // describes a shallower stack than the trap did.
+        restash_jit_pending_npe(signals.npe_action, signals.npe_compiled_frames.take());
     }
     if signals.arithmetic {
         stash_jit_pending_arithmetic();
@@ -19867,7 +19962,10 @@ fn restash_jit_signals(thread: &mut JvmThread, sig: DrainedJitSignals) {
         stash_jit_pending_aioobe(index, length);
     }
     if sig.npe {
-        stash_jit_pending_npe();
+        // Same rule as `handle_compiled_callee_deopt_sentinel`'s restore: the
+        // frames belong to the trap, not to this drain, so put back the ones
+        // that were taken instead of sampling a fresh (shallower) stack.
+        restash_jit_pending_npe(sig.npe_action, sig.npe_compiled_frames);
     }
     if sig.arithmetic {
         stash_jit_pending_arithmetic();

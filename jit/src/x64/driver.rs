@@ -149,6 +149,10 @@ impl InlineFrameSession {
     /// hook in `x64::inlining` bails on its first read.
     fn open() -> Self {
         crate::x64::begin_inline_frame_recording();
+        // The NPE trap table rides the same session: it is described from the
+        // same splice-scope stack, and a table left over from an abandoned
+        // compile names sites in a DIFFERENT code buffer.
+        crate::x64::begin_npe_trap_recording();
         InlineFrameSession
     }
 }
@@ -160,6 +164,7 @@ impl Drop for InlineFrameSession {
         // live machine code. On the success path this is the second call and
         // does nothing.
         let _ = crate::x64::finish_inline_frame_recording(0);
+        let _ = crate::x64::finish_npe_trap_recording();
     }
 }
 
@@ -2833,6 +2838,11 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     // function; that second close is a no-op (see `InlineFrameSession`).
     let inline_frame_code_len = cm.code_len();
     cm.inline_frame_map = crate::x64::finish_inline_frame_recording(inline_frame_code_len);
+    // No `code_len` screen for the trap table, and it needs none: its keys are
+    // monotonic ids rather than code offsets, so a row a rewind orphaned is
+    // simply unreachable -- no surviving trampoline carries its key. See
+    // `x64::inlining::record_npe_trap_site`.
+    cm.npe_trap_map = crate::x64::finish_npe_trap_recording();
 
     Some(cm)
 }
