@@ -1455,7 +1455,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_MOVING_YOUNG_VERIFY` | DBG | `CRATONVM_DBG=moving-young-verify` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_MSC_REAL_START` | REAL | `CRATONVM_REAL=msc-real-start` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_NATIVE_EC_MULTIPLY` | JIT | `CRATONVM_JIT=native-ec-multiply` | opt-in | off | behaviour | snapshot | types |
-| `CRATONVM_NATIVE_ENCODING` | — | `CRATONVM_NATIVE_ENCODING` | scalar | unset | behaviour | snapshot | vm |
+| `CRATONVM_NATIVE_ENCODING` | — | `CRATONVM_NATIVE_ENCODING` | scalar | unset | behaviour | snapshot | native-api, vm |
 | `CRATONVM_NATIVE_MATCHER_FIND` | JIT | `CRATONVM_JIT=native-matcher-find` | default-on | on | behaviour | snapshot | types, vm |
 | `CRATONVM_NATIVE_PBE_KEYFACTORY` | JIT | `CRATONVM_JIT=native-pbe-keyfactory` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_NATIVE_SHADOW_SINK_CAP` | DBG | `CRATONVM_DBG=native-shadow-sink-cap` | opt-in | off | diag | snapshot | jit, types, vm |
@@ -1563,7 +1563,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_SP_STATS` | DBG | `CRATONVM_DBG=sp-stats` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_SP_TRACE` | DBG | `CRATONVM_DBG=sp-trace` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_SP_VERIFY` | DBG | `CRATONVM_DBG=sp-verify` | opt-in | off | diag | snapshot | types |
-| `CRATONVM_STDOUT_ENCODING` | — | `CRATONVM_STDOUT_ENCODING` | scalar | unset | behaviour | snapshot | — |
+| `CRATONVM_STDOUT_ENCODING` | — | `CRATONVM_STDOUT_ENCODING` | scalar | unset | behaviour | snapshot | native-api |
 | `CRATONVM_STRESS_THREAD_STATES` | THREADS | `CRATONVM_THREADS=stress-thread-states` | default-on | on | behaviour | snapshot | types, vm |
 | `CRATONVM_STRICT_JIT_ROOTS` | JIT | `CRATONVM_JIT=strict-jit-roots` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_STRICT_SWALLOWS` | COMPAT | `CRATONVM_COMPAT=strict-swallows` | opt-in | off | behaviour | snapshot | vm |
