@@ -420,7 +420,23 @@ impl ZObjectStartBits {
         match self.locate(addr) {
             // SAFETY: `locate` bounds-checked `addr`, so `w < self.nwords`.
             Some((w, mask)) => {
-                let prev = unsafe { (*self.words.add(w)).fetch_or(mask, Ordering::AcqRel) };
+                let word = unsafe { &*self.words.add(w) };
+                // TEST BEFORE THE READ-MODIFY-WRITE. This is asked of every
+                // EDGE, not every object, and most edges point at something
+                // already marked -- a shared graph is why marking is a
+                // traversal and not a walk. An unconditional `fetch_or` makes
+                // each of those an exclusive-state acquisition of a cache line
+                // every other worker is also writing; a plain load answers the
+                // same question from a shared one.
+                //
+                // The RMW is still the arbiter, and this only skips the races
+                // it would have lost: nothing clears a mark bit during a mark,
+                // so "already set" is a stable answer, while "not set yet"
+                // falls through and contends for the claim exactly as before.
+                if word.load(Ordering::Relaxed) & mask != 0 {
+                    return false;
+                }
+                let prev = word.fetch_or(mask, Ordering::AcqRel);
                 prev & mask == 0
             }
             None => {

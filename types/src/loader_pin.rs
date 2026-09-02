@@ -141,6 +141,18 @@ pub fn loader_pin_addr(class_id: u32) -> Option<usize> {
 ///
 /// Mirrors [`crate::metadata_pin::snapshot`], whose own note makes the same
 /// argument about the per-object variant being a shared-cache-line hot spot.
+/// The class ids that HAVE a pinned loader.
+///
+/// For a marker that wants to answer "does this class have one?" without a
+/// lock and a hash per marked object: the answer is a property of the class,
+/// so a caller can snapshot these once per collection and index a bitmap.
+pub fn pinned_class_ids() -> Vec<u32> {
+    if !NON_EMPTY.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
+    store().read().keys().copied().collect()
+}
+
 pub fn all_pinned_loaders() -> Vec<usize> {
     if !NON_EMPTY.load(Ordering::Relaxed) {
         return Vec::new();
