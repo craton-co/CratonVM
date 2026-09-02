@@ -63,6 +63,28 @@
 //! `ANSI_X3.4-1968`) are passed through by HotSpot too, and a row that cannot
 //! be measured is not worth guessing at.
 //!
+//! The Windows leg WAS verified, on 2026-09-02, against HotSpot 25.0.3+9 on a
+//! host with `GetACP()==1251` — one command run five ways at `chcp 866`, plus
+//! a second console at `chcp 65001`, comparing this module's own answers:
+//!
+//! ```text
+//!                     CratonVM out/err/in     HotSpot out/err/in
+//!   (console)         cp866/cp866/cp866       cp866/cp866/cp866    match
+//!   1> NUL            cp866/cp866/cp866       cp866/cp866/cp866    match
+//!   1> file.txt       Cp1251/cp866/cp866      Cp1251/cp866/cp866   match
+//!   | more            Cp1251/cp866/cp866      Cp1251/cp866/cp866   match
+//!   0< NUL            cp866/cp866/cp866       cp866/cp866/cp866    match
+//!   (chcp 65001)      UTF-8/UTF-8/UTF-8       UTF-8/UTF-8/UTF-8    match
+//! ```
+//!
+//! It took two corrections to get there, both in code that had shipped the day
+//! before without ever having been COMPILED for Windows, let alone run: the
+//! terminal test was `GetConsoleMode` where HotSpot's is `isatty`
+//! (see [`windows_stream_is_char_device`]), and code page 65001 was spelled
+//! `cp65001` where HotSpot spells it `UTF-8`. Only the ANSI code page of this
+//! one machine (1251) is measured; the `MS932`/`GBK`/`MS949`/`MS950` rows of
+//! [`windows_acp_name`] are still from the JDK's table and not from a host.
+//!
 //! `sun.jnu.encoding` is deliberately NOT derived from here. It decides how
 //! FILE NAMES are encoded, so moving it changes class loading rather than
 //! printing — a different blast radius, and the staging in
@@ -193,11 +215,13 @@ mod win {
         pub fn GetConsoleCP() -> u32;
         pub fn GetConsoleOutputCP() -> u32;
         pub fn GetStdHandle(n_std_handle: u32) -> isize;
-        pub fn GetConsoleMode(h: isize, mode: *mut u32) -> i32;
+        pub fn GetFileType(h: isize) -> u32;
     }
     pub const STD_INPUT_HANDLE: u32 = -10i32 as u32;
     pub const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
     pub const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    /// `GetFileType` — a character device: a console, or `NUL`.
+    pub const FILE_TYPE_CHAR: u32 = 0x0002;
 }
 
 /// The charset name HotSpot uses for a Windows ANSI/OEM code page.
@@ -229,10 +253,19 @@ fn windows_acp_name(cp: u32) -> String {
 /// `874..=950` band and `cp<n>` everywhere else — which is why a Cyrillic
 /// console reports the lower-case `cp866` for `stdin.encoding` while the ANSI
 /// code page of the same machine reports `Cp1251`.
+///
+/// `65001` is the exception and it is MEASURED, on a real console with
+/// `chcp 65001`: HotSpot answers `UTF-8`, not `cp65001`. It has to — there is
+/// no `sun.nio.cs.CP65001`, so the generic rule would name a charset the JDK
+/// cannot resolve, and `Charset.forName` on it throws where HotSpot hands back
+/// `sun.nio.cs.UTF_8`. The same row is already in [`windows_acp_name`] for the
+/// same reason.
 #[cfg(windows)]
 #[must_use]
 fn windows_console_name(cp: u32) -> String {
-    if (874..=950).contains(&cp) {
+    if cp == 65001 {
+        "UTF-8".to_string()
+    } else if (874..=950).contains(&cp) {
         format!("ms{cp}")
     } else {
         format!("cp{cp}")
@@ -245,40 +278,76 @@ fn detect_native_encoding() -> String {
     windows_acp_name(unsafe { win::GetACP() })
 }
 
+/// The decision, with the syscalls lifted out so a test can drive every row of
+/// the measured matrix in [`windows_stream_is_char_device`].
+///
+/// `cp == 0` means the process has no console at all, and then there is no
+/// console code page to report — the ANSI one is the answer whatever the
+/// handle is.
+#[cfg(windows)]
+#[must_use]
+fn windows_stream_encoding_for(console_cp: u32, is_char_device: bool, acp: u32) -> String {
+    if console_cp != 0 && is_char_device {
+        windows_console_name(console_cp)
+    } else {
+        // Redirected into a file or a pipe: HotSpot falls back to the ACP name.
+        windows_acp_name(acp)
+    }
+}
+
 #[cfg(windows)]
 fn detect_stream_encoding(stream: StdStream) -> String {
     // SAFETY: all three are argument-less code-page queries.
-    let (handle_id, cp) = unsafe {
+    let (handle_id, cp, acp) = unsafe {
+        let acp = win::GetACP();
         match stream {
-            StdStream::In => (win::STD_INPUT_HANDLE, win::GetConsoleCP()),
-            StdStream::Out => (win::STD_OUTPUT_HANDLE, win::GetConsoleOutputCP()),
-            StdStream::Err => (win::STD_ERROR_HANDLE, win::GetConsoleOutputCP()),
+            StdStream::In => (win::STD_INPUT_HANDLE, win::GetConsoleCP(), acp),
+            StdStream::Out => (win::STD_OUTPUT_HANDLE, win::GetConsoleOutputCP(), acp),
+            StdStream::Err => (win::STD_ERROR_HANDLE, win::GetConsoleOutputCP(), acp),
         }
     };
-    if cp != 0 && windows_stream_is_console(handle_id) {
-        return windows_console_name(cp);
-    }
-    // Redirected into a file or a pipe: HotSpot falls back to the ACP name.
-    // MEASURED — `java -XshowSettings:properties | grep encoding` on a 1251
-    // host reports `stdout.encoding = Cp1251` (ACP) and, in the same run,
-    // `stdin.encoding = cp866` (the console still attached to stdin).
-    native_encoding().to_string()
+    windows_stream_encoding_for(cp, windows_stream_is_char_device(handle_id), acp)
 }
 
-/// Whether a std handle is attached to a console. `GetConsoleMode` succeeding
-/// is the same test the JDK's own console detection uses; it fails for a file,
-/// a pipe and a closed handle alike.
+/// Whether a std handle is a CHARACTER DEVICE — `isatty`, not "is a console".
+///
+/// This shipped as `GetConsoleMode(h) != 0` on 2026-09-01, on the reasoning
+/// that it is "the same test the JDK's own console detection uses". It is not,
+/// and the difference is observable: `GetConsoleMode` succeeds only for a real
+/// console, while `GetFileType == FILE_TYPE_CHAR` is also true for the `NUL`
+/// device — and `FILE_TYPE_PIPE` / `FILE_TYPE_DISK` are false for both.
+///
+/// MEASURED 2026-09-02 on a Windows host with `GetACP()==1251` and the console
+/// at `chcp 866`, five redirections of one command, HotSpot 25.0.3+9 beside a
+/// probe running both candidate rules (`scratchpad/winenc3.rs`):
+///
+/// ```text
+///                       GetFileType   HotSpot          GetConsoleMode   GetFileType
+///                       in/out/err    stdout.encoding  would answer     answers
+///   (nothing)           2/2/2         cp866            cp866            cp866
+///   1> NUL              2/2/2         cp866            Cp1251  WRONG    cp866
+///   0< NUL              2/2/2         cp866            cp866            cp866
+///   1> file.txt         2/1/2         Cp1251           Cp1251           Cp1251
+///   | more              2/3/2         Cp1251           Cp1251           Cp1251
+/// ```
+///
+/// Five of five for `GetFileType`, three of five for `GetConsoleMode`. The
+/// `NUL` rows are the discriminator, and they are not a curiosity: a service
+/// or a scheduled task started with its output to `NUL` is the ordinary way a
+/// Windows process runs with a console still attached to the other handles.
+///
+/// A closed or invalid handle answers `FILE_TYPE_UNKNOWN`, so it falls through
+/// to the ANSI code page exactly as a pipe does.
 #[cfg(windows)]
-fn windows_stream_is_console(handle_id: u32) -> bool {
+fn windows_stream_is_char_device(handle_id: u32) -> bool {
     // SAFETY: `GetStdHandle` returns a borrowed handle that must not be closed,
-    // and `GetConsoleMode` only writes through the out-pointer on success.
+    // and `GetFileType` only reads it.
     unsafe {
         let h = win::GetStdHandle(handle_id);
         if h == 0 || h == -1 {
             return false;
         }
-        let mut mode: u32 = 0;
-        win::GetConsoleMode(h, &mut mode) != 0
+        win::GetFileType(h) == win::FILE_TYPE_CHAR
     }
 }
 
@@ -348,13 +417,53 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn acp_spelling_is_uppercase_cp_and_console_spelling_is_lowercase() {
-        // The one row that is MEASURED, plus the band rule around it.
+        // The two rows that are MEASURED against HotSpot on a 1251 host —
+        // `Cp1251` from the ANSI code page, `cp866` from a `chcp 866` console —
+        // plus the band rule around them.
         assert_eq!(windows_acp_name(1251), "Cp1251");
         assert_eq!(windows_console_name(866), "cp866");
         assert_eq!(windows_console_name(932), "ms932");
         assert_eq!(windows_console_name(950), "ms950");
         assert_eq!(windows_console_name(1251), "cp1251");
-        assert_eq!(windows_acp_name(65001), "UTF-8");
         assert_eq!(windows_acp_name(936), "GBK");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_measured_redirection_matrix() {
+        // Every row MEASURED 2026-09-02 against HotSpot 25.0.3+9 on a host with
+        // `GetACP()==1251`, console at `chcp 866`, one command run five ways.
+        // The `NUL` rows are the whole reason this is a `GetFileType` test and
+        // not a `GetConsoleMode` one: `NUL` is a character device, and the
+        // rule that shipped on 2026-09-01 answered `Cp1251` for them where
+        // HotSpot answers `cp866`.
+        const ACP: u32 = 1251;
+        const CONSOLE: u32 = 866;
+        // (nothing redirected) — a console, FILE_TYPE_CHAR
+        assert_eq!(windows_stream_encoding_for(CONSOLE, true, ACP), "cp866");
+        // `1> NUL` — still FILE_TYPE_CHAR, and HotSpot still says cp866
+        assert_eq!(windows_stream_encoding_for(CONSOLE, true, ACP), "cp866");
+        // `1> file.txt` — FILE_TYPE_DISK
+        assert_eq!(windows_stream_encoding_for(CONSOLE, false, ACP), "Cp1251");
+        // `| more` — FILE_TYPE_PIPE
+        assert_eq!(windows_stream_encoding_for(CONSOLE, false, ACP), "Cp1251");
+        // No console attached at all: `GetConsoleCP` answers 0.
+        assert_eq!(windows_stream_encoding_for(0, true, ACP), "Cp1251");
+        // A UTF-8 console, which must not be spelled `cp65001`.
+        assert_eq!(windows_stream_encoding_for(65001, true, ACP), "UTF-8");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn code_page_65001_is_utf8_by_both_spellings() {
+        // MEASURED on a `chcp 65001` console: HotSpot answers `UTF-8`. The
+        // generic console rule would say `cp65001`, and there is no
+        // `sun.nio.cs.CP65001` for `Charset.forName` to find — so this row is
+        // the difference between a resolvable charset and a throw at bootstrap.
+        assert_eq!(windows_console_name(65001), "UTF-8");
+        assert_eq!(windows_acp_name(65001), "UTF-8");
+        // No console at all: both callers fall back to the ANSI code page, and
+        // `0` is what `GetACP` cannot return but `GetConsoleCP` can.
+        assert_eq!(windows_acp_name(0), "UTF-8");
     }
 }
