@@ -12339,6 +12339,7 @@ impl GarbageCollector for ZgcRealHeap {
             ZSweepCfg {
                 arena_base: arena.base_ptr() as usize,
                 high_floor: arena.high_cursor(),
+                low_cursor: arena.used(),
                 zero_header_only: self.gen_header_zero_only.load(Ordering::Relaxed),
                 merge_dead_runs: self.gen_dead_runs_enabled.load(Ordering::Relaxed),
                 // Can the mark bits be cleared in bulk after the walk, rather
@@ -12351,11 +12352,23 @@ impl GarbageCollector for ZgcRealHeap {
             }
         };
 
+        // THE BITMAP SWEEP, when the cycle's shape allows it: whole-heap (a
+        // young cycle's floor makes the complement wrong -- it would reclaim
+        // the dead below the floor that a minor deliberately leaves for the
+        // next major), side mark bits, and the switch on. It returns the free
+        // list ALREADY BUILT, so the whole rebuild-and-sort tail below is
+        // skipped with it. See `sweep_bitmap`.
         let sweep_workers = self.sweep_workers(gen_on);
-        let mut swept_total = if sweep_workers > 1 {
-            self.sweep_parallel(&registered, sweep_floor, &cfg, sweep_workers)
-        } else {
-            self.sweep_serial(&registered, sweep_floor, &cfg)
+        let bitmap_swept = (sweep_floor == 0 && self.bitmap_sweep_enabled())
+            .then(|| self.sweep_bitmap(&registered, &cfg))
+            .flatten();
+        let (mut swept_total, complement) = match bitmap_swept {
+            Some((sh, spans, new_cursor)) => (sh, Some((spans, new_cursor))),
+            None if sweep_workers > 1 => (
+                self.sweep_parallel(&registered, sweep_floor, &cfg, sweep_workers),
+                None,
+            ),
+            None => (self.sweep_serial(&registered, sweep_floor, &cfg), None),
         };
         // THE SPILL SET, ALWAYS ON THIS THREAD. It belongs to no word range and
         // is not address-ordered, so it can neither be partitioned nor merged
@@ -12369,7 +12382,10 @@ impl GarbageCollector for ZgcRealHeap {
 
         let bytes_copied = swept_total.bytes_copied;
         let objects_copied = swept_total.objects_copied;
-        let bytes_freed = swept_total.bytes_freed;
+        // `mut`: the complement sweep learns what it reclaimed from the ARENA
+        // (how much the rebuilt free list gained, plus what the cursor gave
+        // back), which is only knowable inside the lock below.
+        let mut bytes_freed = swept_total.bytes_freed;
         let dead_count = swept_total.dead_count;
         let unsizable = swept_total.unsizable;
         let gen_promoted = swept_total.gen_promoted;
@@ -12391,8 +12407,30 @@ impl GarbageCollector for ZgcRealHeap {
             // see two spans as adjacent if they arrive in order. The bitmap scan
             // IS that order within a shard, and `ZSweepShard::absorb` preserves
             // it across shards -- joining the seam where two shards' runs touch.
-            for (off, len) in swept_total.spans.drain(..) {
-                arena.add_free_block(off, len);
+            match &complement {
+                // The bitmap sweep computed the whole LOW free list as the
+                // complement of the live set: address-ordered and merged
+                // already, so it is installed rather than accumulated, and
+                // neither the coalescer below nor the tail retraction has
+                // anything left to sort. `spans` still carries the
+                // large-object end's individual holes, which route by offset.
+                Some((spans, new_cursor)) => {
+                    let was_free = arena.rebuild_low_free_list(spans);
+                    let now_free: usize = spans.iter().map(|(_, len)| *len).sum();
+                    // What this cycle FREED, as opposed to what is free: the
+                    // complement includes the holes that were already on the
+                    // list when the sweep started.
+                    bytes_freed += now_free.saturating_sub(was_free);
+                    bytes_freed += arena.retract_cursor_to(*new_cursor);
+                    for (off, len) in swept_total.spans.drain(..) {
+                        arena.add_free_block(off, len);
+                    }
+                }
+                None => {
+                    for (off, len) in swept_total.spans.drain(..) {
+                        arena.add_free_block(off, len);
+                    }
+                }
             }
 
             // Coalesce the free list into maximal spans — same rationale as
@@ -12410,7 +12448,9 @@ impl GarbageCollector for ZgcRealHeap {
             // The merge itself now lives on `Arena` (`coalesce_free_list`), so
             // this sweep and the last-resort merge `Arena::alloc` runs before
             // it returns `None` cannot drift apart.
-            arena.coalesce_free_list();
+            if complement.is_none() {
+                arena.coalesce_free_list();
+            }
             // The same two steps for the LARGE-OBJECT end. They are separate
             // calls, not a wider version of the two above, because a merge
             // that straddled the point where the two cursors meet would be
@@ -14684,6 +14724,95 @@ pub(crate) mod tests {
     /// merge's "is there a previous span to join to?" branch is the one taken
     /// -- and the version that asked it with `it.next()` inside an `if let`
     /// tuple pattern consumed the span on the failing arm and dropped it.
+    /// The two sweeps must reclaim the same objects and leave the same amount
+    /// of low-arena space allocatable.
+    ///
+    /// Not the same free LIST: the complement sweep does not free-list the
+    /// span above the last survivor at all, it lowers the cursor onto it. So
+    /// the invariant is what a later allocation can actually get -- free-list
+    /// bytes plus bump headroom -- and that must not move.
+    ///
+    /// It is allowed to be BETTER, and the assertion says so in the direction
+    /// it can be: the complement reclaims the bytes of an object whose header
+    /// the per-object sweep refuses to size, which that sweep leaks.
+    #[test]
+    fn the_bitmap_sweep_reclaims_what_the_per_object_sweep_reclaims() {
+        fn outcome(bitmap: bool) -> (usize, usize, usize, usize) {
+            cratonvm_types::flags::with_thread_overrides(
+                &[
+                    (
+                        "CRATONVM_ZGC_BITMAP_SWEEP",
+                        Some(if bitmap { "1" } else { "0" }),
+                    ),
+                    // A slide would rearrange the arena underneath the
+                    // comparison; this test is about the sweep.
+                    ("CRATONVM_ZGC_RELOCATE", Some("0")),
+                ],
+                || {
+                    const LIVE_EVERY: usize = 23;
+                    const OBJECTS: usize = 4000;
+                    let heap = ZgcRealHeap::with_capacity(16 * 1024 * 1024);
+                    heap.set_tlab_enabled(false);
+                    let mut roots: Vec<ObjectRef> = Vec::new();
+                    for i in 0..OBJECTS {
+                        // Mixed shapes, so the holes are not uniform.
+                        let o = if i % 7 == 0 {
+                            heap.alloc_array(ClassId::new(1), ArrayElementType::Byte, 200)
+                        } else {
+                            heap.alloc_object(ClassId::new(11), 3)
+                        };
+                        if i % LIVE_EVERY == 0 {
+                            roots.push(o);
+                        }
+                    }
+                    // One dead and one live large object: the high end takes
+                    // the per-object path on both arms and must agree too.
+                    heap.alloc_array(ClassId::new(1), ArrayElementType::Byte, BIG);
+                    roots.push(heap.alloc_array(ClassId::new(1), ArrayElementType::Byte, BIG));
+                    let expect_live = roots.len();
+                    {
+                        let stw = unsafe { StopTheWorldToken::new() };
+                        heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+                    }
+                    let survivors = roots
+                        .iter()
+                        .filter(|r| heap.registry.contains(r.as_ptr() as usize))
+                        .count();
+                    let registered = heap.registry.snapshot().bases().len();
+                    let arena = heap.arena.lock();
+                    (
+                        expect_live,
+                        survivors,
+                        registered,
+                        arena.free_list_bytes() + arena.low_bump_headroom(),
+                    )
+                },
+            )
+        }
+
+        let per_object = outcome(false);
+        let bitmap = outcome(true);
+        assert_eq!(
+            per_object.0, per_object.1,
+            "the fixture is broken: a root did not survive its own collection"
+        );
+        assert_eq!(
+            (bitmap.0, bitmap.1, bitmap.2),
+            (per_object.0, per_object.1, per_object.2),
+            "the two sweeps disagree about which objects are live \
+             (roots, survivors, registered bases)"
+        );
+        assert!(
+            bitmap.3 >= per_object.3,
+            "the bitmap sweep left LESS allocatable than the per-object one: \
+             {} vs {}. The complement is the exact reclaimable set, so it may \
+             reclaim more (the bytes of an unsizable object, which the \
+             per-object sweep leaks) but never less.",
+            bitmap.3,
+            per_object.3,
+        );
+    }
+
     #[test]
     fn an_empty_leading_shard_does_not_swallow_the_next_shards_first_span() {
         let heap = ZgcRealHeap::with_capacity(4 * 1024 * 1024);
@@ -14698,6 +14827,7 @@ pub(crate) mod tests {
             ZSweepCfg {
                 arena_base: arena.base_ptr() as usize,
                 high_floor: arena.high_cursor(),
+                low_cursor: arena.used(),
                 zero_header_only: true,
                 merge_dead_runs: true,
                 bulk_clearable: heap.mark_bits.is_some(),
@@ -15729,11 +15859,27 @@ pub(crate) mod tests {
         );
     }
 
-    /// The sweep must RETAIN an object it cannot size rather than zero it and
-    /// hand its span to the arena. Retaining leaks one object; the alternative
-    /// is a 1 TiB `write_bytes` and a free block outside the arena.
+    /// The PER-OBJECT sweep must RETAIN an object it cannot size rather than
+    /// zero it and hand its span to the arena. Retaining leaks one object; the
+    /// alternative is a 1 TiB `write_bytes` and a free block outside the
+    /// arena.
+    ///
+    /// Pinned to that arm, because the property is a property of *deriving a
+    /// free span from a dead object's own header*. The complement sweep never
+    /// does that — it derives spans from the LIVE extents and treats
+    /// everything they do not cover as reclaimable — so the catastrophe this
+    /// guards against cannot arise there, and it reclaims the corrupt object
+    /// rather than leaking it. That difference is asserted by
+    /// `the_bitmap_sweep_reclaims_the_object_the_per_object_sweep_leaks`.
     #[test]
     fn the_sweep_retains_an_object_it_cannot_size() {
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_BITMAP_SWEEP", Some("0"))],
+            retains_an_object_it_cannot_size_body,
+        );
+    }
+
+    fn retains_an_object_it_cannot_size_body() {
         let heap = ZgcRealHeap::with_capacity(64 * 1024);
         let live = heap.alloc_object(ClassId::new(1), 2);
         let doomed = heap.alloc_object(ClassId::new(999_995), 4);
@@ -15768,6 +15914,65 @@ pub(crate) mod tests {
             heap.get_field(doomed, 0),
             Value::Int(0x5A5A_5A5A),
             "the body must not have been zeroed"
+        );
+    }
+
+    /// The other half of the arm split above: the complement sweep RECLAIMS
+    /// the object the per-object sweep leaks, and does so without ever reading
+    /// the corrupt size that made it unsizable.
+    ///
+    /// Both halves of the old catastrophe are still asserted here — no
+    /// oversized memset (the body sentinel survives, and only the header is
+    /// zeroed) and no free block outside the arena (the free list stays within
+    /// the cursor, which `rebuild_low_free_list` debug-asserts).
+    #[test]
+    fn the_bitmap_sweep_reclaims_the_object_the_per_object_sweep_leaks() {
+        cratonvm_types::flags::with_thread_overrides(
+            &[
+                ("CRATONVM_ZGC_BITMAP_SWEEP", Some("1")),
+                ("CRATONVM_ZGC_RELOCATE", Some("0")),
+            ],
+            || {
+                let heap = ZgcRealHeap::with_capacity(64 * 1024);
+                let live = heap.alloc_object(ClassId::new(1), 2);
+                let doomed = heap.alloc_object(ClassId::new(999_995), 4);
+                let doomed_addr = doomed.as_ptr() as usize;
+                heap.set_field(doomed, 0, Value::Int(0x5A5A_5A5A));
+                let header = unsafe { &*(doomed.as_ptr() as *const ObjectHeader) };
+                header.add_gc_flags(cratonvm_types::GC_FLAG_COMPACT);
+
+                // SAFETY: these unit tests run the heap single-threaded.
+                let stw = unsafe { StopTheWorldToken::new() };
+                let mut roots = [live];
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+                assert!(
+                    !heap.registry.contains(doomed_addr),
+                    "the complement reclaims an unreachable object whatever its \
+                     header says — nothing referenced it, or the mark would have \
+                     kept it"
+                );
+                // Read the body as RAW BYTES, not through `get_field`: the
+                // header has been zeroed, so the accessor sees `num_slots = 0`
+                // and refuses the index. That refusal is the point of zeroing
+                // a dead header, and it is why the sentinel has to be checked
+                // underneath it.
+                let body = unsafe {
+                    std::slice::from_raw_parts((doomed_addr + HEADER_SIZE) as *const u8, SLOT_SIZE)
+                };
+                assert!(
+                    body.iter().any(|b| *b != 0),
+                    "the body was zeroed: sizing a dead object is exactly what \
+                     this sweep declines to do, so it cannot have known how much \
+                     to clear"
+                );
+                let arena = heap.arena.lock();
+                assert!(
+                    arena.largest_free_block() <= arena.capacity(),
+                    "a free block larger than the arena means a corrupt size was \
+                     trusted after all"
+                );
+            },
         );
     }
 
@@ -17813,8 +18018,21 @@ pub(crate) mod tests {
     /// 265 ms — the restriction was applying a −30% to the small one. A default
     /// run performs only whole-heap cycles, so this is the arm that decides
     /// whether either feature is worth anything to anybody.
+    ///
+    /// Pinned to the PER-OBJECT sweep, whose two cost reductions these are:
+    /// both are ways of not paying for a dead object's size after having read
+    /// it. The complement sweep does not read one at all, so it has no
+    /// `zero_bytes_skipped` to report and merges every run by construction --
+    /// it supersedes both rather than sharing them.
     #[test]
     fn a_whole_heap_sweep_gets_the_cost_reductions_with_generational_off() {
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_BITMAP_SWEEP", Some("0"))],
+            whole_heap_sweep_cost_reductions_body,
+        );
+    }
+
+    fn whole_heap_sweep_cost_reductions_body() {
         let heap = ZgcRealHeap::new_shared(64 * 1024 * 1024);
         heap.set_tlab_enabled(false);
         heap.set_relocation_enabled(false);
