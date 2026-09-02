@@ -12551,6 +12551,20 @@ pub fn register_essential_natives_with_shims(
                 let m_obj = ctx.read_native_pin(pin, m_obj);
                 ctx.set_field_by_name(m_obj, "descriptor", Value::Object(Some(desc)));
             }
+            // `Module.getClassLoader()` is real bytecode `getfield loader`, and
+            // the JDK keeps a module's answer in step with the answer every
+            // class in it gives: `java.sql.Connection.getClassLoader()` and
+            // `java.sql`'s own are BOTH the platform loader. A boot module's is
+            // `null`, which an unwritten field already reports, so only the
+            // platform side needs a write here.
+            if let Some(module_name) = module_name.as_deref() {
+                if let Some(platform) =
+                    crate::classloader::platform_loader_for_module(ctx, module_name)
+                {
+                    let m_obj = ctx.read_native_pin(pin, m_obj);
+                    ctx.set_field_by_name(m_obj, "loader", Value::Object(Some(platform)));
+                }
+            }
             let m_obj = ctx.read_native_pin(pin, m_obj);
             ctx.unpin_native_roots(pin);
             // Publish as the canonical mirror for this module name so future
