@@ -9376,6 +9376,45 @@ pub enum JitIntrinsic {
     AtomicLongAddAndGet,       // addAndGet(J)J       -> old + delta
     // ===== INTRINSIC REGION END: ATOMIC_LONG =====
 
+    // ===== INTRINSIC REGION BEGIN: BOX_UNBOX =====
+    // `java.lang.Long.longValue()` / `java.lang.Integer.intValue()` — the
+    // UNBOX half of autoboxing, emitted as the same aligned `MOV` the
+    // `AtomicLongGet` / `AtomicIntGet` arms above already emit. `Long.value`
+    // and `Integer.value` are `private final` at field slot 0, so this is a
+    // plain load behind a null check; no `LOCK`, no fence, nothing to order.
+    //
+    // # Why a thin direct bind was not enough
+    //
+    // Both already HAVE one (`LONG_LONG_VALUE_DIRECT_FN`,
+    // `INTEGER_INT_VALUE_DIRECT_FN`, 2026-07 and 2026-08-19), and both are
+    // engaged — a `CRATONVM_DBG=jit-method-stats` run of
+    // `probes/BlobStreamCostCpu.java` reports `Long.valueOf=4
+    // Long.longValue=2` sites bound. A bind still emits a CALL with
+    // `needs_context: true`, so it pays argument marshalling, the
+    // Rust<->JIT boundary note, and a non-inlinable call; MEASURED on that
+    // probe, boxing cost **2266 ns/byte** WITH the binds live, against a
+    // primitive counter's 3.4. The remaining cost is the call itself, and
+    // only inline emission removes a call.
+    //
+    // # Soundness
+    //
+    // `java.lang.Long` and `java.lang.Integer` are FINAL, so unlike the
+    // `Atomic*` regions above there is no override a guard has to protect
+    // against. The exact class-id guard is emitted anyway and its miss
+    // deopts: it costs one compare, and it is what makes a mis-resolved
+    // constant-pool class (or a future non-final receiver reaching this
+    // matcher) fail closed instead of loading slot 0 of something else.
+    //
+    // The registered natives keep the value in the SAME memory this reads —
+    // `lang_math.rs::register_wrapper_natives` builds a boxed `Long` by
+    // writing field 0 — so an interpreted caller and a compiled caller agree
+    // on one location, which is the same argument the `ATOMIC_INT` region
+    // makes and the reason it says a side table would have made
+    // intrinsification impossible.
+    LongLongValue,    // java/lang/Long.longValue()J       -> field 0, 8 bytes
+    IntegerIntValue,  // java/lang/Integer.intValue()I     -> field 0, 4 bytes
+    // ===== INTRINSIC REGION END: BOX_UNBOX =====
+
     // ===== INTRINSIC REGION BEGIN: ARRAYCOPY =====
     /// `java.lang.System.arraycopy(Object,int,Object,int,int)` (Phase 2).
     ///
@@ -12203,9 +12242,231 @@ pub fn try_resolve_atomic_long_intrinsic(
     Some((intrinsic.as_entry(), num_params, b'J', layout.class_id))
 }
 
+/// Sites the BOX_UNBOX intrinsic has claimed this process, split by class.
+///
+/// The acceptance criterion, and not the ns/op — the same rule the two
+/// `Atomic*` counters beside this one state: "the intrinsic answering the same
+/// values as the native it replaced proves nothing about whether it actually
+/// ran." A boxing perf claim quoting a ns/op without a non-zero site count here
+/// is quoting a number from a run where nothing was intrinsified.
+pub static LONG_LONG_VALUE_INTRINSIC_SITES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// See [`LONG_LONG_VALUE_INTRINSIC_SITES`].
+pub static INTEGER_INT_VALUE_INTRINSIC_SITES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `(Long.longValue, Integer.intValue)` sites emitted inline.
+pub fn box_unbox_intrinsic_sites() -> (usize, usize) {
+    (
+        LONG_LONG_VALUE_INTRINSIC_SITES.load(std::sync::atomic::Ordering::Relaxed),
+        INTEGER_INT_VALUE_INTRINSIC_SITES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` — keep every `Long.longValue` /
+/// `Integer.intValue` call on its thin direct bind (or, failing that, ordinary
+/// native dispatch).
+///
+/// Separate from the two `Atomic*` switches for the reason they are separate
+/// from each other: a bisect that cannot tell two families apart cannot
+/// attribute a regression to either. It is also the A/B lever for this family
+/// on ONE binary, which is the only kind of A/B this tree accepts for a perf
+/// claim — a control built from a different commit has manufactured a
+/// double-digit "regression" on phases containing neither call.
+fn box_unbox_intrinsic_disabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some()
+    })
+}
+
+/// Matcher for the BOX_UNBOX region — `Long.longValue()J` and
+/// `Integer.intValue()I`, the unbox half of autoboxing.
+///
+/// Same contract as [`try_resolve_atomic_long_intrinsic`]: returns the
+/// intrinsic entry, the parameter count excluding the receiver, the return-type
+/// tag, and the receiver class id to guard on.
+///
+/// # Why the guard is emitted for a FINAL class
+///
+/// `java.lang.Long` and `java.lang.Integer` are final, so unlike the `Atomic*`
+/// families there is no override to protect against and the guard can never
+/// legitimately miss. It is emitted anyway because its miss is a DEOPT, not a
+/// wrong answer: if the constant-pool class ever resolves to something else,
+/// the site falls back to dispatch instead of loading slot 0 of an unrelated
+/// object. One compare is a cheap price for failing closed.
+///
+/// The field-slot premise is the same one the `Atomic*` regions rest on and is
+/// checked the same way: `AtomicLongFieldLayout::new(0, ..)` /
+/// `AtomicIntFieldLayout::new(0, ..)` return `None` unless slot 0's compact
+/// storage is exactly 8 / 4 bytes wide, so a layout this load could not address
+/// never reaches codegen.
+pub fn try_resolve_box_unbox_intrinsic(
+    class: &str,
+    name: &str,
+    descriptor: &str,
+    guard_class_id: u32,
+) -> Option<(usize, usize, u8, u32)> {
+    if box_unbox_intrinsic_disabled() {
+        return None;
+    }
+    // ===== INTRINSIC REGION BEGIN: BOX_UNBOX =====
+    match (class, name, descriptor) {
+        ("java/lang/Long", "longValue", "()J") => {
+            let layout = AtomicLongFieldLayout::new(0, guard_class_id)?;
+            if layout.class_id == 0 {
+                return None;
+            }
+            LONG_LONG_VALUE_INTRINSIC_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ATOMIC_INTRINSIC").is_some() {
+                eprintln!(
+                    "[box-unbox-intrinsic] java/lang/Long.longValue()J class_id={} compact_off={} legacy_off={}",
+                    layout.class_id, layout.value_compact_offset, layout.value_legacy_offset,
+                );
+            }
+            Some((JitIntrinsic::LongLongValue.as_entry(), 0, b'J', layout.class_id))
+        }
+        ("java/lang/Integer", "intValue", "()I") => {
+            let layout = AtomicIntFieldLayout::new(0, guard_class_id)?;
+            if layout.class_id == 0 {
+                return None;
+            }
+            INTEGER_INT_VALUE_INTRINSIC_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ATOMIC_INTRINSIC").is_some() {
+                eprintln!(
+                    "[box-unbox-intrinsic] java/lang/Integer.intValue()I class_id={} compact_off={} legacy_off={}",
+                    layout.class_id, layout.value_compact_offset, layout.value_legacy_offset,
+                );
+            }
+            Some((JitIntrinsic::IntegerIntValue.as_entry(), 0, b'I', layout.class_id))
+        }
+        _ => None,
+    }
+    // ===== INTRINSIC REGION END: BOX_UNBOX =====
+}
+
 #[cfg(test)]
 mod atomic_accessor_intrinsic_tests {
     use super::*;
+
+    // ===== INTRINSIC REGION BEGIN: BOX_UNBOX =====
+
+    /// The emitter tells `LongLongValue` from `IntegerIntValue` by
+    /// `callee_entry` alone, and emits a 64-bit `MOV` for one and a 32-bit
+    /// `MOV` + `MOVSXD` for the other. Two variants sharing an entry value
+    /// would silently read four bytes where eight belong.
+    #[test]
+    fn box_unbox_intrinsics_have_distinct_entries() {
+        assert_ne!(
+            JitIntrinsic::LongLongValue.as_entry(),
+            JitIntrinsic::IntegerIntValue.as_entry(),
+            "the two BOX_UNBOX intrinsics share an `as_entry` value; the codegen              tells them apart by that number alone, and picks the operand WIDTH              from it"
+        );
+        // …and neither may collide with the atomic families whose emitter arms
+        // sit directly above them in the same `if !intrinsic_handled` chain.
+        let others = [
+            JitIntrinsic::AtomicLongGet.as_entry(),
+            JitIntrinsic::AtomicIntGet.as_entry(),
+            JitIntrinsic::AtomicLongGetAndAdd.as_entry(),
+            JitIntrinsic::AtomicIntGetAndAdd.as_entry(),
+        ];
+        for e in others {
+            assert_ne!(e, JitIntrinsic::LongLongValue.as_entry());
+            assert_ne!(e, JitIntrinsic::IntegerIntValue.as_entry());
+        }
+    }
+
+    /// The matcher serves EXACTLY two triples. It is reached for every
+    /// `invokevirtual` in the tree, so a widened match here would emit a field
+    /// load for a method that is not a field read.
+    #[test]
+    fn box_unbox_matcher_is_exactly_two_triples() {
+        // A real class id is needed: `AtomicLongFieldLayout::new` refuses 0, so
+        // passing 0 would make every case below "None" for the wrong reason and
+        // the test would pass without testing anything.
+        const CID: u32 = 12345;
+        assert!(
+            try_resolve_box_unbox_intrinsic("java/lang/Long", "longValue", "()J", CID).is_some(),
+            "the positive case must match, or every negative below is vacuous"
+        );
+        assert!(
+            try_resolve_box_unbox_intrinsic("java/lang/Integer", "intValue", "()I", CID).is_some()
+        );
+        for (c, n, d) in [
+            // Right class, wrong method — `Long.hashCode` is also a field read
+            // but returns a folded int, not the raw slot.
+            ("java/lang/Long", "hashCode", "()I"),
+            ("java/lang/Long", "intValue", "()I"),
+            ("java/lang/Integer", "longValue", "()J"),
+            // Right method, wrong class: `Short`/`Byte`/`Character` box a
+            // NARROWER field and this load would read past it.
+            ("java/lang/Short", "intValue", "()I"),
+            ("java/lang/Byte", "intValue", "()I"),
+            ("java/lang/Character", "charValue", "()C"),
+            ("java/lang/Double", "longValue", "()J"),
+            // The `Atomic*` twins keep their OWN region; matching them here
+            // would emit a plain load where a volatile read is owed.
+            ("java/util/concurrent/atomic/AtomicLong", "longValue", "()J"),
+        ] {
+            assert!(
+                try_resolve_box_unbox_intrinsic(c, n, d, CID).is_none(),
+                "BOX_UNBOX matched {c}.{n}{d}, which it must not"
+            );
+        }
+    }
+
+    /// A site with no resolved receiver class id must decline. The emitter
+    /// re-derives the layout from `guard_class_id`, so registering an intrinsic
+    /// for id 0 would produce a sentinel entry the codegen then bails on,
+    /// leaving a `CALL` to a non-address.
+    #[test]
+    fn box_unbox_declines_an_unresolved_class_id() {
+        assert!(try_resolve_box_unbox_intrinsic("java/lang/Long", "longValue", "()J", 0).is_none());
+        assert!(
+            try_resolve_box_unbox_intrinsic("java/lang/Integer", "intValue", "()I", 0).is_none()
+        );
+    }
+
+    /// The two widths must come from the two DIFFERENT layout helpers, because
+    /// a `Long` payload is 8 bytes and an `Integer` payload is 4 and they sit
+    /// at different offsets inside a legacy 16-byte cell. Reading the wrong one
+    /// is the mistake this pins, and it is invisible for small positive values
+    /// — which is why the correctness probe uses `Long.MIN_VALUE` and
+    /// `0x0123456789ABCDEF`.
+    #[test]
+    fn box_unbox_uses_the_matching_payload_width() {
+        const CID: u32 = 12345;
+        let (_, _, long_ret, _) =
+            try_resolve_box_unbox_intrinsic("java/lang/Long", "longValue", "()J", CID).unwrap();
+        let (_, _, int_ret, _) =
+            try_resolve_box_unbox_intrinsic("java/lang/Integer", "intValue", "()I", CID).unwrap();
+        assert_eq!(long_ret, b'J');
+        assert_eq!(int_ret, b'I');
+        let l = AtomicLongFieldLayout::new(0, CID).unwrap();
+        let i = AtomicIntFieldLayout::new(0, CID).unwrap();
+        assert_ne!(
+            l.value_legacy_offset, i.value_legacy_offset,
+            "the 8-byte and 4-byte payloads sit at the SAME legacy offset; one              of the two emitter arms is then reading the wrong bytes"
+        );
+    }
+
+    /// Both take zero parameters besides the receiver. The emitter pops
+    /// exactly one stack slot; a non-zero count here would leave the operand
+    /// stack unbalanced.
+    #[test]
+    fn box_unbox_takes_no_arguments() {
+        const CID: u32 = 12345;
+        for (c, n, d) in [
+            ("java/lang/Long", "longValue", "()J"),
+            ("java/lang/Integer", "intValue", "()I"),
+        ] {
+            let (_, num_params, _, guard) = try_resolve_box_unbox_intrinsic(c, n, d, CID).unwrap();
+            assert_eq!(num_params, 0, "{c}.{n}{d}");
+            assert_eq!(guard, CID, "{c}.{n}{d} must guard on the resolved class id");
+        }
+    }
+
+    // ===== INTRINSIC REGION END: BOX_UNBOX =====
 
     /// The emitter dispatches on `callee_entry == JitIntrinsic::X.as_entry()`,
     /// so two variants sharing an entry value would silently mis-emit one as
@@ -21254,6 +21515,24 @@ fn try_compile_inner(
                             || cn == "java/util/concurrent/atomic/AtomicInteger"
                             || try_resolve_atomic_long_intrinsic(&cn, &mn, &desc, 0).is_some()
                             || cn == "java/util/concurrent/atomic/AtomicLong"
+                            // BOX_UNBOX. Named by TRIPLE, not by class, and
+                            // that is the difference from the two `Atomic*`
+                            // lines above. Those widen to the whole class
+                            // because `AtomicLong` appears in a handful of
+                            // methods and a false positive costs one of them
+                            // the optimizing tier. `java/lang/Integer` is in
+                            // half the tree, so the same shortcut here would
+                            // push a large and unrelated population off the
+                            // optimizing tier to buy nothing — the intrinsic
+                            // serves exactly two triples.
+                            //
+                            // Calling the resolver with `guard_class_id: 0`
+                            // would be a DEAD term: it returns `None` for 0
+                            // (no layout can be derived), so the predicate
+                            // would silently never fire. Asked directly
+                            // instead.
+                            || (cn == "java/lang/Long" && mn == "longValue" && desc == "()J")
+                            || (cn == "java/lang/Integer" && mn == "intValue" && desc == "()I")
                             || try_resolve_string_intrinsic(&cn, &mn, &desc, None).is_some()
                             || cn == "java/lang/String"
                             // FFM element accessors. Registered by their OWN
@@ -24174,6 +24453,46 @@ fn try_compile_inner(
             // `guard_class_id` stays 0 and the CRC32 codegen bails the site
             // to normal dispatch (0 is never a real class id).
             if !is_recursive_call && (invoke_kind == 0 || invoke_kind == 2) {
+                // ===== INTRINSIC REGION BEGIN: BOX_UNBOX =====
+                // `Long.longValue()` / `Integer.intValue()` emitted INLINE,
+                // and it MUST be asked before the two thin direct binds
+                // immediately below, which recognise the same two triples and
+                // `continue`.
+                //
+                // MEASURED, because this ordering is not cosmetic: with the
+                // BOX_UNBOX block left where it naturally belonged — beside the
+                // other intrinsic families, ~600 lines further down — the
+                // engagement print was EMPTY on a probe that boxes a counter
+                // 3.2 million times. The thin binds swallowed every site first,
+                // the intrinsic never fired, and both arms of the correctness
+                // probe still passed, which is precisely the vacuous green the
+                // site counters beside this exist to expose.
+                //
+                // The binds are not removed: they remain the fallback for a
+                // site whose constant-pool class id does not resolve, where
+                // this matcher declines (`AtomicLongFieldLayout::new` refuses
+                // id 0) and a CALL is still better than generic dispatch.
+                if let Some((entry, num_params, ret, guard_class_id)) = cp_invoke_class_id_resolver
+                    .and_then(|r| r(cp_idx))
+                    .and_then(|cid| {
+                        try_resolve_box_unbox_intrinsic(&class_name, &method_name, &descriptor, cid)
+                    })
+                {
+                    needs_heap = true;
+                    direct_calls.push((
+                        pc,
+                        JitDirectCall {
+                            entry,
+                            needs_context: false,
+                            num_params,
+                            return_type: ret,
+                            guard_class_id,
+                        },
+                    ));
+                    continue;
+                }
+                // ===== INTRINSIC REGION END: BOX_UNBOX =====
+
                 // `Integer.intValue()` thin direct call (see
                 // `INTEGER_INT_VALUE_DIRECT_FN`): `Integer` is `final`, so a
                 // site declared against it is statically monomorphic — the
