@@ -202,7 +202,7 @@ fails, in 641 s instead of 1078 s.
    one run. It is unsafe; read `relocation_on_proven_jit` before believing
    anything it produces.
 
-## ADDENDUM 2026-09-01: the dominant refusal is DISCHARGED, and it was never a proof to repair
+## ADDENDUM 2026-09-01: the dominant refusal is NOT discharged -- read the correction below before the claim above
 
 The 2026-08-30 (b) census named `xt-helper-window-conservative-scan` as **219 of
 227** refusals. It is now gone, and the repair is not a proof at all -- it is a
@@ -275,6 +275,62 @@ run on has to be quiet: at load 26 the class does not finish inside 1800 s,
 is how one earlier attempt produced an empty gate census and a different failure
 (`Timeout trying to lock table "COUNTER"`) that says nothing about the heap.
 Read `relocation_on_proven_jit` before believing any arm of it.
+
+### 2026-09-01 (correction): the helper-window pin does NOT discharge the refusal
+
+**The claim in the section above is wrong and is corrected here.** Pinning a
+frozen peer's conservative roots removes the LABEL
+`xt-helper-window-conservative-scan` from the coverage census; it does not make
+the cycle relocatable, and the refusal has been restored.
+
+Two things were missed.
+
+**1. There is a SECOND refusal site, and it is unlabelled.**
+`interpreter::gc_and_alloc`'s root gather ends with
+
+```rust
+if taken.count() > 0 || helper_windows > 0 {
+    mark_moving_young_coverage_incomplete();      // no reason code
+    mark_unrewritable_peer_state();
+}
+```
+
+so a helper window marks the cycle incomplete a second time, with no reason
+attached. That is why the `PIN=1` arm of the `TestMultiThread` A/B still reports
+`coverage-proof-incomplete=8` with `none=2` among the reasons: the labelled
+refusal moved into the unlabelled bucket. `relocation_on_proven_jit` was 1 with
+the pin and 2 without — i.e. **engagement did not improve**, which the label's
+disappearance had made look like progress.
+
+**2. The pin set cannot be complete, because the scan probes with the wrong
+predicate.** `helper_window_pass` is called with
+`|a| shared.mem.heap.is_object_address(a)`, and ZGC's `is_object_address` is
+`registry.contains(addr)` — **exact object bases only**. A frozen peer holding a
+DERIVED pointer (a compiled loop's pointer into an array body is the ordinary
+case) contributes no candidate, so its base is never pinned and relocating it
+strands the peer. The second site's own comment says precisely this: *"a frozen
+peer's registers can hold only a derived/interior pointer whose base would
+otherwise be evacuated from under it, then zeroed and re-served"*.
+
+### What that leaves, and it is a smaller, sharper question than before
+
+The refusal IS dischargeable — the obstacle is one predicate, and it is no
+longer expensive. `is_heap_addr` resolves an interior pointer to its base in one
+backwards bit scan plus one header dereference (`nearest_base_at_or_below`), not
+the O(live) registry iteration it used to be, and `vm_heap.rs` already feeds it
+per-slot conservative scanning. So the remaining work is:
+
+1. probe the helper window with `is_heap_addr` instead of `is_object_address`,
+   so derived pointers resolve to the base that must be pinned;
+2. price the resulting WIDER conservative root set — every `long` that lands
+   inside a live object's extent becomes a root — which is the trade that has
+   not been measured and is the reason this is not simply switched;
+3. then, and only then, discharge BOTH sites together.
+
+The pins are still published (`CRATONVM_XT_HELPER_WINDOW_PIN`, default on)
+because they are strictly additive — a pin can only keep a page out of one CSet
+— and because `hw_pinned`/`hw_refused` on the `[GC] xt_peer_scan` line are what
+size the work above: **62 of 62 windows** on `TestMultiThread`.
 
 ### 2026-09-01 (later): two reproduction attempts that FAILED, and what each eliminates
 

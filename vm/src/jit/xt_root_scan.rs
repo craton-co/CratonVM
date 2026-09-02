@@ -218,21 +218,20 @@ pub fn helper_window_scan_enabled() -> bool {
     on
 }
 
-/// `CRATONVM_XT_HELPER_WINDOW_PIN=0` -- a helper window refuses the whole
-/// collection again instead of pinning the peer's conservative roots.
+/// `CRATONVM_XT_HELPER_WINDOW_PIN=0` -- stop publishing a frozen helper-window
+/// peer's conservative roots as pins.
 ///
-/// Default ON. The refusal it replaces is `incomplete_reason::XT_HELPER_WINDOW`,
-/// which on `org.h2.test.jdbc.TestCachedQueryResults` is **219 of 227**
-/// refusals -- i.e. the entire reason ZGC never compacts on the H2
-/// fragmentation family, and it is discharged by pinning rather than by any
-/// repair to a proof.
+/// Default ON, and it does NOT discharge `incomplete_reason::XT_HELPER_WINDOW`;
+/// see the note at that refusal. The pins are additive protection and a
+/// measurement: on `org.h2.test.jdbc.TestCachedQueryResults` the helper-window
+/// refusal is **219 of 227**, so `hw_pinned` is the size of what a future
+/// discharge has to cover.
 ///
-/// Sound because the Linux classifier's root set is COMPLETE for a frozen peer:
-/// it reads the published register file AND every readable word from `rsp` up,
-/// so no address that peer can reach is missing. Pinning those keeps them
-/// still; their fields are rewritten through the pointer map exactly as any
-/// other live object's are. A window whose scan was PARTIAL is not pinned and
-/// keeps refusing -- see `classify_slot_helper_window`'s `complete`.
+/// The scan itself is complete in what it READS -- the published register file
+/// and every readable word from `rsp` up -- and `classify_slot_helper_window`
+/// reports `complete` so a partial one is never pinned. What it cannot do is
+/// resolve a DERIVED pointer to its base, because it probes with
+/// `is_object_address` (exact bases). That is the gap that keeps the refusal.
 fn helper_window_pin_enabled() -> bool {
     !matches!(
         cratonvm_types::flags::runtime_var("CRATONVM_XT_HELPER_WINDOW_PIN").as_deref(),
@@ -1518,16 +1517,37 @@ mod imp {
         }
         XT_HELPER_WINDOWS_SCANNED.fetch_add(windows as u64, Ordering::Relaxed);
         XT_HELPER_WINDOW_ROOTS.fetch_add(found_total as u64, Ordering::Relaxed);
-        // ONLY the windows we could not pin refuse the cycle now.
+        // EVERY window still refuses, and the pins above do NOT discharge it.
         //
-        // A pinned window is discharged, not merely counted: its objects are in
-        // `pinned_jit_roots_snapshot()`, which the relocating collectors
-        // already consume to withhold pages. An unpinned one (a partial scan,
-        // or the kill switch) keeps the old blanket refusal.
+        // This was wrong in the first cut of this change, which suppressed the
+        // refusal for a pinned window. The pins are real and the scan is
+        // complete in the sense that matters for what it FINDS -- register file
+        // plus the whole readable stack band -- but the predicate it finds with
+        // is `VmHeap::is_object_address`, which is `registry.contains(addr)`:
+        // EXACT OBJECT BASES ONLY. A frozen peer holding a derived or interior
+        // pointer (a compiled loop's pointer into an array body is the ordinary
+        // case) contributes no candidate at all, so its base object is not
+        // pinned, and relocating it strands the peer on resume. The comment at
+        // the second refusal site in `interpreter::gc_and_alloc` says exactly
+        // this -- "a frozen peer's registers can hold only a derived/interior
+        // pointer whose base would otherwise be evacuated from under it" -- and
+        // it is the reason that site marks the cycle incomplete too.
         //
-        // `CRATONVM_XT_HELPER_WINDOW_PIN=0` restores it for every window, which
-        // is the one-binary A/B for this change.
-        if unpinned_windows > 0 {
+        // Discharging this properly needs the interior-resolving predicate,
+        // `is_heap_addr`, which is now affordable (one backwards bit scan plus
+        // one header dereference via `nearest_base_at_or_below`, not the old
+        // O(live) registry iteration) and which `vm_heap.rs` already feeds
+        // per-slot conservative scanning. The cost of adopting it here is a
+        // WIDER conservative root set -- every long that happens to land inside
+        // a live object's extent becomes a root -- and that trade has not been
+        // measured. Until it is, the refusal stands.
+        //
+        // The pins are still published, because they are strictly additive
+        // (they can only keep a page out of one CSet) and because they are what
+        // made the shortfall measurable: `hw_pinned`/`hw_refused` on the
+        // `[GC] xt_peer_scan` line say how many windows a future discharge
+        // would have to cover.
+        if windows > 0 {
             cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
                 cratonvm_gc::gc_quiescence::incomplete_reason::XT_HELPER_WINDOW,
             );
