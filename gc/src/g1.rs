@@ -7036,7 +7036,19 @@ impl G1Collector {
         let heap_has_humongous = regions
             .iter()
             .any(|r| r.region_type == RegionType::HumongousStart);
-        let want_census = gc_flags().g1_eager_humongous && heap_has_humongous;
+        // ...and there is nothing to take a census FOR if eager reclaim is
+        // already going to decline. Every gate but `census.complete` is
+        // decidable here (see `eager_reclaim_early_decline`), and skipping the
+        // census when one of them holds is what lets `phase4_regions_to_walk`
+        // narrow: measured 843 regions walked per pause -> 5.
+        let early_decline = self.eager_reclaim_early_decline(pointer_map);
+        if let Some(why) = early_decline {
+            if gc_flags().g1_dbg_reach {
+                eprintln!("[g1][HUMONGOUS] census SKIPPED, eager reclaim would decline: {why}");
+            }
+        }
+        let want_census =
+            gc_flags().g1_eager_humongous && heap_has_humongous && early_decline.is_none();
         if !rewrite && !want_census {
             return census;
         }
@@ -9921,6 +9933,51 @@ impl G1Collector {
     /// the census, frees a live H.
     ///
     /// Returns bytes reclaimed.
+    ///
+    /// The reasons this will decline that are already decidable BEFORE Phase 4
+    /// walks anything, or `None` if it could still proceed.
+    ///
+    /// # Why this is not just tidiness
+    ///
+    /// The humongous census is the ONLY thing that forces Phase 4 to take its
+    /// whole-heap walk (`phase4_regions_to_walk` returns `None` when
+    /// `want_census`). Measured on `TestKillProcessWhileWriting`, 2026-09-02:
+    /// that walk covers **843 of 1024 regions and 446 MB per young pause**, and
+    /// costs 3 063 us of a 7 588 us mean pause -- against 18 us for the
+    /// evacuation closure that does all the copying.
+    ///
+    /// And on that workload it bought NOTHING. A `CRATONVM_G1_DBG_REACH=1` run
+    /// logged the decline on **every one of 15 639 pauses**, always with the
+    /// same reason: *"an object registered for finalization is awaiting
+    /// finalize()"*. One registered finalizable object disables eager reclaim
+    /// for the whole run, while the census it cannot use is paid for on every
+    /// pause. The H2 page's 2026-08-29 census recorded the same thing from the
+    /// other end: `humongous-eager: spans=0 bytes=0 declined_pauses=16103`.
+    ///
+    /// `census.complete` is deliberately NOT here: it is a property of the walk
+    /// itself, so it cannot be known before the walk and stays at the call site.
+    fn eager_reclaim_early_decline(
+        &self,
+        pointer_map: &cratonvm_types::PointerMap,
+    ) -> Option<&'static str> {
+        if self.gc_state.phase() != ConcurrentGcPhase::Idle || self.satb_queue.is_active() {
+            return Some("a concurrent mark cycle is in flight (SATB snapshot liveness applies)");
+        }
+        if !self.mark_worklist.lock().is_empty() {
+            return Some("the gray set is non-empty");
+        }
+        if self.finalizer_pause.load(Ordering::Relaxed) {
+            // NOT `pending_finalizer_roots.is_empty()`: Phase 3.5 has already
+            // taken that list by the time this runs, so the obvious test passes
+            // unconditionally. See the `finalizer_pause` field.
+            return Some("an object registered for finalization is awaiting finalize()");
+        }
+        if pointer_map.iter().any(|(old, new)| old == new) {
+            return Some("evacuation failure kept cset regions phase 4 never walked");
+        }
+        None
+    }
+
     fn eager_reclaim_humongous_locked(
         &self,
         regions: &mut Vec<G1Region>,
@@ -9962,22 +10019,14 @@ impl G1Collector {
                 "a phase-4 region walk aborted, so the census under-counts live edges",
             );
         }
-        if self.gc_state.phase() != ConcurrentGcPhase::Idle || self.satb_queue.is_active() {
-            return declined(
-                "a concurrent mark cycle is in flight (SATB snapshot liveness applies)",
-            );
-        }
-        if !self.mark_worklist.lock().is_empty() {
-            return declined("the gray set is non-empty");
-        }
-        if self.finalizer_pause.load(Ordering::Relaxed) {
-            // NOT `pending_finalizer_roots.is_empty()`: Phase 3.5 has already
-            // taken that list by the time this runs, so the obvious test passes
-            // unconditionally. See the `finalizer_pause` field.
-            return declined("an object registered for finalization is awaiting finalize()");
-        }
-        if pointer_map.iter().any(|(old, new)| old == new) {
-            return declined("evacuation failure kept cset regions phase 4 never walked");
+        // Every OTHER gate is decidable BEFORE Phase 4 runs, and
+        // `update_references_in_regions` consults the same list to decide
+        // whether the census is worth walking the heap for. Keeping them in one
+        // function is the point: two copies would drift, and the drift would be
+        // invisible -- a census paid for and then declined looks exactly like a
+        // census that was needed.
+        if let Some(why) = self.eager_reclaim_early_decline(pointer_map) {
+            return declined(why);
         }
 
         // Everything the pause can see a reference from.
