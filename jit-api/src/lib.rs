@@ -1598,6 +1598,73 @@ pub struct JitRuntimeHelpers {
     /// `value` carries raw bits: the integral kinds in their low bytes, float
     /// and double as `to_bits()`.
     pub ffm_segment_set: usize,
+
+    // ── Reference-store barrier plan ────────────────────────────────────
+    //
+    // Three addresses that let compiled code inline the collector's OWN
+    // early-outs instead of paying a call to discover them.
+    //
+    // The whole design is one property: each word below names a PREFIX of the
+    // helper's control flow, and compiled code reads the same word the helper
+    // itself reads. The JIT never reimplements a barrier — when a gate says
+    // "there may be work" it calls the same helper it calls today, so no
+    // collector's remembered-set contract moves into the emitter. What the JIT
+    // gains is the right to skip the CALL when a gate proves the helper would
+    // have returned immediately.
+    //
+    // This is deliberately NOT `region_bounds_addr`'s question. That table
+    // asks "is the receiver in a published young region", which is a
+    // GENERATIONAL question G1 and ZGC do not answer — so under the default
+    // collector its emptiness routed every reference store to the helper and
+    // still emitted six containment compares that could never pass. See the
+    // field docs on `region_bounds_addr` and `read_bounds_addr` for that
+    // history.
+    /// Address of a `u8` that is **zero exactly when the SATB pre-write
+    /// barrier is a no-op for every old value**.
+    ///
+    /// For ZGC this is `ZgcRealHeap::mark_active`; `satb_pre_barrier`'s entire
+    /// body on a non-marking run is a relaxed load of it and a return.
+    ///
+    /// **Why an inline test of it is sound and not a race.** The flag is only
+    /// ever ARMED inside a stop-the-world pause (`start_concurrent_mark` takes
+    /// a `StopTheWorldToken` and arms it at step 3), so no mutator can sit
+    /// between this test and its store while the flag turns on: every mutator
+    /// is parked, and observes the armed flag when it resumes. Disarming is the
+    /// safe direction — a mutator that skips the barrier after the mark phase
+    /// ended has nothing to contribute to a completed snapshot.
+    ///
+    /// `0` = the collector does not publish one ⇒ compiled code must keep the
+    /// pre-barrier, i.e. route the store to the full helper. Appended at the
+    /// END of the struct so all prior golden offsets stay stable.
+    pub ref_store_pre_gate: usize,
+    /// Address of a `u8` that is **zero exactly when the post-write barrier is
+    /// a no-op for every `(receiver, value)` pair**.
+    ///
+    /// For ZGC this is `ZgcRealHeap::has_old_objects`: `note_ref_store` returns
+    /// on it before doing anything else, because with no old object in the heap
+    /// there is no old-to-young edge to remember.
+    ///
+    /// `0` = not published ⇒ compiled code must always run the post barrier
+    /// (call `write_barrier`).
+    pub ref_store_post_gate: usize,
+    /// Address of a `u8` `F` such that a receiver whose `GC_FLAGS_BYTE_OFFSET`
+    /// byte is **unsigned-less-than `F`** provably needs no post barrier.
+    ///
+    /// That byte holds `gc_age` in bits 4..7 and the GC flags in bits 0..3, so
+    /// with `F = promotion_age << 4` one unsigned byte compare is an EXACT test
+    /// of `gc_age < promotion_age`: the flags nibble is at most 15, which
+    /// cannot carry `age << 4` up to `(age + 1) << 4`. That is precisely ZGC's
+    /// `note_ref_store_slow` early-out — a store into a young object needs no
+    /// card, because a young cycle traces every young object anyway.
+    ///
+    /// Published as an address rather than baked as an immediate because the
+    /// promotion age is dynamic; compiled code re-reads it at every store.
+    ///
+    /// `0` = the collector cannot express its post-barrier condition this way
+    /// (Generational keys on `GC_FLAG_OLD_GEN`, a mask test rather than a
+    /// floor; G1 keys on region state the emitter cannot see) ⇒ compiled code
+    /// skips this test and falls back to `ref_store_post_gate` alone.
+    pub ref_store_post_young_floor: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -1787,6 +1854,16 @@ helper_fields! {
     (ldc_string_cp,                  FieldKind::OptionalPtr),
     (ffm_segment_get,                FieldKind::OptionalPtr),
     (ffm_segment_set,                FieldKind::OptionalPtr),
+    // NOT pointers-to-code: addresses of collector-owned gate BYTES. `Offset`
+    // (validated as "may be 0") rather than a required pointer, because 0 is
+    // the meaningful value "this collector publishes no plan" — every emitter
+    // arm then keeps the full-helper path it has today. The dangerous
+    // direction is a WRONG non-zero, which would elide a barrier; that is the
+    // publisher's obligation, and it writes the address of a real `'static`
+    // gate byte or nothing at all.
+    (ref_store_pre_gate,             FieldKind::Offset),
+    (ref_store_post_gate,            FieldKind::Offset),
+    (ref_store_post_young_floor,     FieldKind::Offset),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -1812,7 +1889,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 69,
+    JitRuntimeHelpers::NUM_FIELDS == 72,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -2212,6 +2289,9 @@ mod tests {
             ldc_string_cp: 0x11D8,
             ffm_segment_get: 0x11E0,
             ffm_segment_set: 0x11E8,
+            ref_store_pre_gate: 0x11F0,
+            ref_store_post_gate: 0x11F8,
+            ref_store_post_young_floor: 0x1200,
         }
     }
 
@@ -2453,6 +2533,9 @@ mod tests {
             ldc_string_cp: 0,
             ffm_segment_get: 0,
             ffm_segment_set: 0,
+            ref_store_pre_gate: 0,
+            ref_store_post_gate: 0,
+            ref_store_post_young_floor: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -2628,8 +2711,10 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 67.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 69);
+        // And the macro-driven count is the canonical one for this ABI
+        // revision -- 72 as of v10, which appended the three reference-store
+        // barrier gates.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 72);
     }
 
     #[test]
@@ -2972,6 +3057,21 @@ mod tests {
                 "ffm_segment_set",
                 std::mem::offset_of!(JitRuntimeHelpers, ffm_segment_set),
             ),
+            (
+                69,
+                "ref_store_pre_gate",
+                std::mem::offset_of!(JitRuntimeHelpers, ref_store_pre_gate),
+            ),
+            (
+                70,
+                "ref_store_post_gate",
+                std::mem::offset_of!(JitRuntimeHelpers, ref_store_post_gate),
+            ),
+            (
+                71,
+                "ref_store_post_young_floor",
+                std::mem::offset_of!(JitRuntimeHelpers, ref_store_post_young_floor),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -3027,7 +3127,7 @@ mod tests {
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 43, "required-pointer count drifted");
         assert_eq!(opt, 16, "optional-pointer count drifted");
-        assert_eq!(off, 10, "offset-field count drifted");
+        assert_eq!(off, 13, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }
 
