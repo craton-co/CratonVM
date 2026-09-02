@@ -1804,15 +1804,51 @@ pub(super) fn compile_osr_artifact(
                     // (`while (nextIndex.getAndIncrement() < MAX)`) this
                     // intrinsic exists to speed up.
                     //
-                    // The class-manager guard is read and dropped inside the
-                    // `let` so no lock is held across the matcher call.
+                    // The class id comes off `cm_lock`, the guard this loop
+                    // ALREADY holds, and not from a fresh `.read()`.
+                    //
+                    // This comment used to say "the class-manager guard is read
+                    // and dropped inside the `let` so no lock is held across the
+                    // matcher call". That was true and it was the wrong half of
+                    // the question: the matcher never held one, and the LOOP
+                    // did — `cm_lock` at the top of this `if
+                    // !scan.invoke_ops.is_empty()` block is live for every
+                    // iteration, because `class` is borrowed out of it. A second
+                    // `.read()` here is therefore recursive.
+                    //
+                    // `parking_lot`'s `RwLock` read is not reentrant. A writer
+                    // that arrives between the outer acquisition and the inner
+                    // one parks the inner read BEHIND itself (readers do not
+                    // barge past a queued writer), and the guard that writer is
+                    // waiting for is the outer one this thread is holding. A
+                    // background compile racing any class load is the whole
+                    // window, and the `cratonvm-jit-co` thread is where it was
+                    // caught: `vm-cli/tests/jit_compile_gate_doors.rs` failed
+                    // with `lock order violation: attempted to acquire
+                    // ClassManager (level 10) while holding ClassManager (level
+                    // 10)` — the L10 `OrderedPlRwLock` reporting the deadlock
+                    // one step before it could happen.
+                    //
+                    // Three regions in this loop had it (`AtomicInteger`,
+                    // `AtomicLong`, and the box/unbox pair); all three now read
+                    // through `cm_lock`, which is also strictly cheaper.
+                    //
+                    // The rule is not new here. `dispatch_virtual.rs`'s proxy
+                    // walk states it in full — "walk the chain using the
+                    // ALREADY-HELD `cm` guard rather than calling
+                    // `class_chain_reaches_proxy_instance` (which takes its own
+                    // read) -- a nested second read acquisition on the same
+                    // thread self-deadlocks under parking_lot's writer-preferring
+                    // fairness once any writer is queued" — and these three
+                    // arms were written without it. `vm-cli/tests/
+                    // jit_compile_gate_doors.rs::
+                    // the_osr_door_takes_no_recursive_class_manager_lock` is the
+                    // guard that now names the families rather than waiting for
+                    // one to turn up in an unrelated probe.
                     if invoke_kind == 0
                         && target_class == "java/util/concurrent/atomic/AtomicInteger"
                     {
-                        let atomic_cid = shared
-                            .classes
-                            .class_manager
-                            .read()
+                        let atomic_cid = cm_lock
                             .find_bootstrap_class_by_name(
                                 "java/util/concurrent/atomic/AtomicInteger",
                             )
@@ -1856,10 +1892,9 @@ pub(super) fn compile_osr_artifact(
                     // scheduled timeout and decremented once per expiry.
                     if invoke_kind == 0 && target_class == "java/util/concurrent/atomic/AtomicLong"
                     {
-                        let atomic_long_cid = shared
-                            .classes
-                            .class_manager
-                            .read()
+                        // Through `cm_lock` — see the AtomicInteger arm above for
+                        // why a fresh `.read()` here is a recursive acquisition.
+                        let atomic_long_cid = cm_lock
                             .find_bootstrap_class_by_name("java/util/concurrent/atomic/AtomicLong")
                             .map(|id| id.as_u32());
                         if let Some((entry, num_params, ret, guard_class_id)) = atomic_long_cid
@@ -1910,10 +1945,9 @@ pub(super) fn compile_osr_artifact(
                     if invoke_kind == 0
                         && (target_class == "java/lang/Long" || target_class == "java/lang/Integer")
                     {
-                        let box_cid = shared
-                            .classes
-                            .class_manager
-                            .read()
+                        // Through `cm_lock` — see the AtomicInteger arm above for
+                        // why a fresh `.read()` here is a recursive acquisition.
+                        let box_cid = cm_lock
                             .find_bootstrap_class_by_name(&target_class)
                             .map(|id| id.as_u32());
                         if let Some((entry, num_params, ret, guard_class_id)) =
