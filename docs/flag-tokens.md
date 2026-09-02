@@ -577,11 +577,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-<<<<<<< HEAD
-257 tokens.
-=======
-265 tokens.
->>>>>>> origin/dev
+267 tokens.
 
 | Token | Expands to |
 | --- | --- |
