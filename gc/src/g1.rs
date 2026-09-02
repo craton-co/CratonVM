@@ -13557,10 +13557,22 @@ fn evac_refusal_is_torn(verdict: HeaderVerdict) -> bool {
 /// Default OFF. It exists because the fix UNBLOCKS a workload rather than
 /// moving a number, and a fix like that has no A/B unless the old behaviour is
 /// reachable on the same binary.
+/// Value-parsed, NOT `is_some()`. A kill switch whose OFF word turns it ON is
+/// a control arm that silently is not one: an operator bisecting with
+/// `CRATONVM_G1_LATE_HEADER_WRITE=0` would have been running the buggy
+/// ordering while believing they had disabled it. `truthy_word` is the same
+/// reading `CRATONVM_G1_PARALLEL_EVAC` gets -- empty, `0`, `false`, `off` and
+/// `no` are all OFF.
 fn g1_late_header_write() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_G1_LATE_HEADER_WRITE").is_some()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_G1_LATE_HEADER_WRITE")
+            .and_then(|v| v.into_string().ok())
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
+            })
+            .unwrap_or(false)
     })
 }
 
