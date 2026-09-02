@@ -914,6 +914,27 @@ pub struct GcFlags {
     /// same floor, so the difference between them is only which evidence moves
     /// the threshold between the two.
     pub g1_adaptive_ihop: bool,
+    /// `CRATONVM_G1_ADAPTIVE_TENURING` — re-derive the tenuring threshold after
+    /// every evacuation pause from an age histogram of surviving bytes, instead
+    /// of always promoting at the configured `promotion_age`. Default **ON**
+    /// ([`parse::on_unless_zero`]); `=0` restores the fixed threshold.
+    ///
+    /// The fixed threshold defaults to 15, so every surviving object was copied
+    /// fifteen times before promotion regardless of how full survivor space
+    /// was. That is right for a workload whose medium-lived objects are few and
+    /// straightforwardly wasteful for one where they are not — a burst that
+    /// lives a dozen pauses is copied a dozen times, and the copying is the
+    /// expensive half of an evacuation pause.
+    ///
+    /// The adaptive rule is HotSpot's: the smallest age whose cumulative
+    /// surviving bytes exceed the survivor target. It may only tenure EARLIER
+    /// than configured, never later, so `-XX:MaxTenuringThreshold`-style intent
+    /// is preserved as a ceiling.
+    ///
+    /// `=0` is the bisection lever for a suspected premature-promotion
+    /// regression: under it the collector tenures exactly where every G1 result
+    /// before this flag did.
+    pub g1_adaptive_tenuring: bool,
     /// `CRATONVM_G1_DBG_RSET` — after every G1 evacuation pause, verify that
     /// every cross-region reference into a COLLECTABLE region is named in that
     /// region's remembered set. Opt-in diagnostic; whole-heap and O(live
@@ -1188,6 +1209,7 @@ impl GcFlags {
             g1_narrow_fixup: on_unless_zero(src, "CRATONVM_G1_NARROW_FIXUP"),
             g1_cleanup_walk: present(src, "CRATONVM_G1_CLEANUP_WALK"),
             g1_adaptive_ihop: on_unless_zero(src, "CRATONVM_G1_ADAPTIVE_IHOP"),
+            g1_adaptive_tenuring: on_unless_zero(src, "CRATONVM_G1_ADAPTIVE_TENURING"),
             identity_hash_evict: on_unless_zero(src, "CRATONVM_IDENTITY_HASH_EVICT"),
             g1_dbg_rset: present(src, "CRATONVM_G1_DBG_RSET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),

@@ -1101,6 +1101,11 @@ impl<'a> SharedEvac<'a> {
             new_header.add_gc_flags(GC_FLAG_OLD_GEN);
         } else {
             new_header.set_gc_age(new_header.gc_age().saturating_add(1));
+            // F-18: same accounting as the serial evacuator. The histogram is
+            // an array of atomics precisely so the workers can fill it without
+            // a shard-and-merge step.
+            self.collector
+                .note_survivor_age(new_header.gc_age(), obj_size);
         }
         // (No destination forwarding clear: the mark-word store above wrote
         // the known non-forwarded snapshot over whatever the memcpy carried.)
@@ -2201,6 +2206,21 @@ pub(crate) fn normalize_region_size(requested: usize) -> usize {
     requested.checked_next_power_of_two().unwrap_or(requested)
 }
 
+/// F-18 — the number of distinct object ages the tenuring histogram tracks.
+///
+/// `ObjectHeader::gc_age` is 4 bits, and `promotion_age` is capped at 15 by the
+/// same encoding, so 16 buckets covers every age an object can hold.
+const G1_MAX_TENURING_AGE: usize = 16;
+
+/// F-18 — the share of the young generation survivors should occupy, as a
+/// divisor.
+///
+/// 8, matching HotSpot's default `SurvivorRatio`: survivor space is about an
+/// eighth of the young generation. It is a TARGET, not a limit — exceeding it
+/// does not fail an allocation, it just means the adaptive threshold will
+/// tenure earlier next pause so the copies stop being made.
+const G1_SURVIVOR_TARGET_DIVISOR: usize = 8;
+
 /// Floor for the adaptive young-generation size, as a percentage of the region
 /// count (HotSpot's `G1NewSizePercent`). Below this the collector would pay a
 /// full pause's fixed cost — root scan, remembered-set walk, whole-heap
@@ -2592,6 +2612,21 @@ pub struct G1Collector {
     /// the threshold has been told it was too high. A gauge nobody can read is
     /// a gauge nobody can tune.
     ihop_late_events: AtomicU64,
+    /// F-18 — bytes of surviving objects by AGE, accumulated during the pause
+    /// in progress and consumed at its end to re-derive the tenuring threshold.
+    ///
+    /// Indexed by the age the surviving COPY carries, so bucket `n` reads
+    /// "bytes that have now survived `n` collections". Atomic because the
+    /// parallel evacuator's workers fill it concurrently.
+    survivor_age_bytes: [AtomicUsize; G1_MAX_TENURING_AGE],
+    /// F-18 — the age at which an object is promoted rather than copied to
+    /// survivor space, re-derived after every evacuation pause.
+    ///
+    /// Starts at `config.promotion_age`, which is also its ceiling: the
+    /// adaptive rule may only tenure EARLIER than the operator asked, never
+    /// later. Tenuring later than configured would keep objects circulating in
+    /// the young generation past the point the operator sized it for.
+    tenuring_threshold: AtomicU64,
 
     /// String deduplication table: hash -> canonical object address.
     /// T10.9.B: FxHashMap — key is Java String hash from loaded bytecode.
@@ -3114,6 +3149,8 @@ impl G1Collector {
             alloc_rate_kib_per_ms: AtomicU64::new(0),
             ihop_headroom_percent: AtomicU64::new(100),
             ihop_late_events: AtomicU64::new(0),
+            survivor_age_bytes: std::array::from_fn(|_| AtomicUsize::new(0)),
+            tenuring_threshold: AtomicU64::new(config.promotion_age as u64),
             string_dedup_table: Mutex::new(FxHashMap::default()),
             gc_log_enabled: AtomicBool::new(false),
             marking_complete: AtomicBool::new(false),
@@ -5263,7 +5300,12 @@ impl G1Collector {
             pool_next: &pool_next,
             queue: &queue,
             outstanding: &outstanding,
-            promotion_age: self.config.promotion_age,
+            // F-18: snapshot the ADAPTIVE threshold once per pause, not the
+            // configured one. Once per pause rather than per object so every
+            // worker in one pause makes the same decision — a threshold that
+            // moved mid-pause would tenure two objects of the same age
+            // differently for no reason the heap could explain.
+            promotion_age: self.tenuring_threshold(),
         };
 
         let mut objs = 0usize;
@@ -6349,8 +6391,10 @@ impl G1Collector {
             return None;
         }
 
-        // Decide destination based on age
-        let promote = header.gc_age() >= self.config.promotion_age;
+        // Decide destination based on age. F-18: the threshold is re-derived
+        // after every pause from the age histogram, so it may be below the
+        // configured `promotion_age` when survivor space is under pressure.
+        let promote = header.gc_age() >= self.tenuring_threshold();
         let dest_type = if promote {
             RegionType::Old
         } else {
@@ -6454,6 +6498,8 @@ impl G1Collector {
             new_header.add_gc_flags(GC_FLAG_OLD_GEN);
         } else {
             new_header.set_gc_age(new_header.gc_age().saturating_add(1));
+            // F-18: this object is in survivor space at the age it now carries.
+            self.note_survivor_age(new_header.gc_age(), obj_size);
         }
         // F-02: install the forward on the FROM-space header, after the
         // destination is fully written. Ordering matters for the same reason it
@@ -10502,6 +10548,100 @@ impl G1Collector {
         old_bytes >= threshold
     }
 
+    /// F-18 — the age at which this pause promotes rather than copies.
+    ///
+    /// Reads the adaptive value under `CRATONVM_G1_ADAPTIVE_TENURING` (the
+    /// default) and the configured `promotion_age` otherwise.
+    #[inline]
+    pub(crate) fn tenuring_threshold(&self) -> u8 {
+        if gc_flags().g1_adaptive_tenuring {
+            self.tenuring_threshold.load(Ordering::Relaxed) as u8
+        } else {
+            self.config.promotion_age
+        }
+    }
+
+    /// F-18 — record that `bytes` of live data reached age `age` in this pause.
+    ///
+    /// Called from both evacuators for every object copied to survivor space.
+    /// Promotions are deliberately NOT counted: the histogram answers "how much
+    /// would survivor space have to hold if the threshold were N", and an
+    /// object that has already been tenured is not in survivor space at any
+    /// threshold.
+    #[inline]
+    pub(crate) fn note_survivor_age(&self, age: u8, bytes: usize) {
+        let idx = (age as usize).min(G1_MAX_TENURING_AGE - 1);
+        self.survivor_age_bytes[idx].fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// F-18 — how many bytes survivor space is aiming to hold.
+    ///
+    /// A share of the young generation, which is itself adaptive
+    /// (`young_target_regions`, F-17/G1AUD-9), so this tracks a young
+    /// generation that grows and shrinks rather than being a fixed byte count
+    /// that stops meaning anything when it does.
+    fn survivor_target_bytes(&self) -> usize {
+        let young_regions = self
+            .young_target_regions
+            .load(Ordering::Relaxed)
+            .max(1);
+        (young_regions.saturating_mul(self.config.region_size)) / G1_SURVIVOR_TARGET_DIVISOR
+    }
+
+    /// F-18 — re-derive the tenuring threshold from the age histogram this
+    /// pause just filled, then clear it for the next one.
+    ///
+    /// # Why a fixed threshold is the wrong shape
+    ///
+    /// `promotion_age` defaulted to 15 and was read directly, so every object
+    /// was copied FIFTEEN TIMES before promotion regardless of how full
+    /// survivor space was. That is the right answer for a workload whose
+    /// medium-lived objects are few, and a straightforwardly wasteful one for a
+    /// workload where they are not: a burst of objects that live for a dozen
+    /// pauses is copied a dozen times, and the copying is the expensive half of
+    /// an evacuation pause.
+    ///
+    /// # The rule
+    ///
+    /// HotSpot's: walk the histogram from the youngest age accumulating
+    /// surviving bytes, and stop at the first age whose cumulative total
+    /// exceeds the survivor target. Objects at or above that age are promoted;
+    /// everything younger is copied. So a pause whose survivors comfortably fit
+    /// keeps the configured threshold, and one whose survivors do not tenures
+    /// earlier — exactly enough earlier to fit.
+    ///
+    /// Clamped to `[1, config.promotion_age]`. The floor of 1 is what stops a
+    /// pathological histogram from promoting objects on their FIRST collection,
+    /// which would defeat generational filtering entirely; the ceiling is the
+    /// operator's number, which the adaptive rule may undercut but not exceed.
+    fn update_tenuring_threshold(&self) {
+        let configured = self.config.promotion_age.max(1);
+        let target = self.survivor_target_bytes();
+        let mut cumulative = 0usize;
+        let mut chosen = configured;
+        for age in 1..G1_MAX_TENURING_AGE {
+            cumulative =
+                cumulative.saturating_add(self.survivor_age_bytes[age].load(Ordering::Relaxed));
+            if cumulative > target {
+                chosen = (age as u8).clamp(1, configured);
+                break;
+            }
+        }
+        self.tenuring_threshold
+            .store(chosen as u64, Ordering::Relaxed);
+        for bucket in self.survivor_age_bytes.iter() {
+            bucket.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// F-18 diagnostics: the current threshold and the age histogram.
+    pub fn tenuring_state(&self) -> (u8, [usize; G1_MAX_TENURING_AGE]) {
+        (
+            self.tenuring_threshold.load(Ordering::Relaxed) as u8,
+            std::array::from_fn(|i| self.survivor_age_bytes[i].load(Ordering::Relaxed)),
+        )
+    }
+
     /// F-15 — the static ceiling: the configured `-XX:InitiatingHeapOccupancyPercent`
     /// as a byte count.
     ///
@@ -10934,6 +11074,16 @@ impl G1Collector {
         // G1AUD-9 — re-size the young generation from this pause's measured
         // cost against `max_gc_pause_ms`.
         self.update_young_target(collection_type, pause_us, stats);
+
+        // F-18 — re-derive the tenuring threshold from the age histogram this
+        // pause filled. Here rather than in each driver because every
+        // evacuation path already funnels through this function, so a driver
+        // added later cannot forget to do it — and a histogram that is filled
+        // but never consumed grows without bound across pauses and makes every
+        // threshold it does produce wrong.
+        if gc_flags().g1_adaptive_tenuring {
+            self.update_tenuring_threshold();
+        }
 
         self.log_gc_event(collection_type, pause_us, stats, &phases);
     }
@@ -17098,6 +17248,151 @@ mod tests {
         gc.fold_mark_cycle_sample(0, 64 * 1024 * 1024);
         assert_eq!(gc.marking_threshold_bytes(), planned);
         assert_eq!(gc.ihop_model_state(), state);
+    }
+
+    // -- F-18: adaptive tenuring --
+
+    #[test]
+    fn the_tenuring_threshold_starts_at_the_configured_promotion_age() {
+        let gc = G1Collector::new(G1CollectorConfig {
+            promotion_age: 7,
+            ..small_config()
+        });
+        assert_eq!(gc.tenuring_threshold(), 7);
+        let (threshold, hist) = gc.tenuring_state();
+        assert_eq!(threshold, 7);
+        assert!(hist.iter().all(|&b| b == 0), "the histogram starts empty");
+    }
+
+    #[test]
+    fn survivors_that_fit_keep_the_configured_threshold() {
+        let gc = G1Collector::new(small_config());
+        let configured = gc.config.promotion_age;
+        // Well under the survivor target: an eighth of the young generation.
+        let target = gc.survivor_target_bytes();
+        gc.note_survivor_age(1, target / 4);
+        gc.update_tenuring_threshold();
+        assert_eq!(
+            gc.tenuring_threshold(),
+            configured,
+            "a pause whose survivors comfortably fit must not tenure early"
+        );
+    }
+
+    #[test]
+    fn survivors_that_overflow_the_target_tenure_earlier() {
+        let gc = G1Collector::new(small_config());
+        let configured = gc.config.promotion_age;
+        let target = gc.survivor_target_bytes();
+
+        // Ages 1 and 2 each hold two thirds of the target, so the cumulative
+        // total first exceeds it at age 2 — everything at or above 2 tenures.
+        gc.note_survivor_age(1, target * 2 / 3);
+        gc.note_survivor_age(2, target * 2 / 3);
+        gc.update_tenuring_threshold();
+        assert_eq!(gc.tenuring_threshold(), 2);
+        assert!(
+            gc.tenuring_threshold() < configured,
+            "the whole point is to stop copying objects that will not fit"
+        );
+    }
+
+    #[test]
+    fn the_histogram_is_consumed_by_each_pause_and_does_not_accumulate() {
+        let gc = G1Collector::new(small_config());
+        let target = gc.survivor_target_bytes();
+        gc.note_survivor_age(1, target * 2);
+        gc.update_tenuring_threshold();
+        assert_eq!(gc.tenuring_threshold(), 1);
+
+        let (_, hist) = gc.tenuring_state();
+        assert!(
+            hist.iter().all(|&b| b == 0),
+            "a histogram that is filled but never cleared grows across pauses \
+             and makes every later threshold wrong"
+        );
+
+        // A quiet pause therefore recovers the configured threshold rather than
+        // staying pinned by the previous one's burst.
+        gc.update_tenuring_threshold();
+        assert_eq!(gc.tenuring_threshold(), gc.config.promotion_age);
+    }
+
+    #[test]
+    fn the_adaptive_threshold_never_exceeds_the_configured_one_nor_reaches_zero() {
+        let gc = G1Collector::new(G1CollectorConfig {
+            promotion_age: 3,
+            ..small_config()
+        });
+        // Enormous pressure at age 1: the rule wants to tenure as early as it
+        // can, but promoting on the FIRST collection would defeat generational
+        // filtering entirely.
+        gc.note_survivor_age(1, usize::MAX / 4);
+        gc.update_tenuring_threshold();
+        assert_eq!(gc.tenuring_threshold(), 1);
+
+        // And an empty histogram must not float the threshold above what the
+        // operator asked for.
+        gc.update_tenuring_threshold();
+        assert_eq!(gc.tenuring_threshold(), 3);
+    }
+
+    #[test]
+    fn the_flag_off_arm_uses_the_configured_promotion_age() {
+        let gc = G1Collector::new(small_config());
+        let target = gc.survivor_target_bytes();
+        gc.note_survivor_age(1, target * 4);
+        gc.update_tenuring_threshold();
+        // The stored value moved...
+        assert_eq!(gc.tenuring_threshold.load(Ordering::Relaxed), 1);
+        // ...and the accessor reports it only while the flag is on, which it is
+        // by default. With it off the configured age is what the evacuators see.
+        if gc_flags().g1_adaptive_tenuring {
+            assert_eq!(gc.tenuring_threshold(), 1);
+        } else {
+            assert_eq!(gc.tenuring_threshold(), gc.config.promotion_age);
+        }
+    }
+
+    /// A real pause must fill the histogram — the policy above is only worth
+    /// anything if the evacuators actually report what they copied.
+    ///
+    /// The histogram cannot be inspected AFTER a pause: every driver funnels
+    /// through `record_collection_with_phases`, which consumes and clears it.
+    /// So the observable is the THRESHOLD, and the pause is arranged to produce
+    /// enough survivors to move it — which is also the end-to-end claim worth
+    /// making.
+    #[test]
+    fn a_real_pause_reports_the_ages_it_copied() {
+        let gc = make_collector();
+        assert_eq!(
+            gc.tenuring_threshold(),
+            gc.config.promotion_age,
+            "test setup: nothing has moved the threshold yet"
+        );
+
+        // Shrink the young target so the survivor target is small enough for
+        // one array to overflow: target = young_regions * region_size / 8.
+        gc.young_target_regions.store(1, Ordering::Relaxed);
+        let target = gc.survivor_target_bytes();
+
+        // One live array comfortably larger than the survivor target, but under
+        // half a region so it is not humongous (humongous objects are never
+        // evacuated and would report no age at all).
+        let elems = (target * 2 / 8).min(gc.config.region_size / 4 / 8);
+        let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, elems);
+        let mut roots: Vec<ObjectRef> = vec![arr];
+
+        gc.young_collection_serial(&mut roots, &NoopMonitors);
+
+        assert_eq!(
+            gc.tenuring_threshold(),
+            1,
+            "the array survived at age 1 and by itself exceeds the survivor \
+             target ({target} bytes), so the next pause must tenure at 1 — if \
+             the evacuator reported nothing, the threshold would still be {}",
+            gc.config.promotion_age
+        );
     }
 
     // T19.3.G1 — GC allocation-storm follow-ups.
