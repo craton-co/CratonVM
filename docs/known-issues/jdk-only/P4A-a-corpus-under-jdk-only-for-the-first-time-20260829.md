@@ -459,25 +459,56 @@ run **compatible and strict adjacently**, one observation per arm, at a 900 s
 cap. Neighbouring runs see near-identical load even when the hour does not.
 
 ```text
-vector                          compat            strict
-org.h2.test.db.TestCases        TIMEOUT  900s     TIMEOUT  900s
-org.h2.test.jdbc.TestCancel     TIMEOUT  900s     TIMEOUT  901s
-org.h2.test.scripts.TestScript  TIMEOUT  901s     TIMEOUT  900s
+vector                                  compat            strict
+org.h2.test.db.TestCases                TIMEOUT  900s     TIMEOUT  900s
+org.h2.test.jdbc.TestCancel             TIMEOUT  900s     TIMEOUT  901s
+org.h2.test.scripts.TestScript          TIMEOUT  901s     TIMEOUT  900s
+org.h2.test.store.TestMVStoreBenchmark  TIMEOUT  900s     TIMEOUT  901s
+org.h2.test.synth.TestCrashAPI          TIMEOUT  900s     TIMEOUT  901s
+org.h2.test.synth.TestSimpleIndex       TIMEOUT  900s     TIMEOUT  900s
+org.h2.test.unit.TestFileSystem         TIMEOUT  900s     TIMEOUT  900s
+org.h2.test.store.TestBenchmark         TIMEOUT  900s     "FAIL"   497s   <- see below
 ```
 
-**Compatible mode does not finish them either.** Whatever makes these classes
+**All eight pairs, not three.** An earlier revision of this section reported
+three, then six: the driver finished the rest after the run was stopped being
+watched, and the partial reads were written up as totals. The full set is above.
+
+**Compatible mode does not finish any of them.** Whatever makes these classes
 slow on this VM is present with the strict flag off, so `--jdk-only` is not the
 cause and the §7 timeouts are not evidence against it. That is the same verdict
 §3 and §6 reached for every failure this corpus produced, now extended to the
-slow tail: nothing here is strict-specific.
+whole slow tail.
 
-**Three of eight, not eight of eight.** The run was stopped after three pairs
-when host load reached 47 on eight cores — my six processes were part of that,
-and five more pairs of "both arms over the cap" would have repeated the finding
-while making other lanes' measurements worse. The remaining five are
-`TestBenchmark`, `TestMVStoreBenchmark`, `TestCrashAPI`, `TestSimpleIndex` and
-`TestFileSystem`, and they are UNMEASURED on this axis rather than assumed to
-match.
+### The one row that is not a timeout is not a failure either
+
+`TestBenchmark`'s strict arm exited non-zero at 497 s where its compat arm ran
+to the cap. That is the shape this whole section exists to look for — strict
+doing something compat does not — so it was chased rather than averaged away.
+
+It produced **no exception, no `OutOfMemoryError`, and no shutdown line**; its
+stderr simply stops mid-warning, and both arms had emitted an identical 33 lines
+of benchmark progress. The kernel says why:
+
+```text
+Sep 02 00:56:47 vm1 kernel: Out of memory: Killed process 1675320 (cratonvm)
+  total-vm:8709336kB anon-rss:3035192kB ... global_oom
+```
+
+The host's GLOBAL OOM killer took the process — one minute after that last
+warning, in a ten-minute window where the same reaper also killed four `rustc`
+processes belonging to other lanes (00:47, 00:51, 00:52, 00:53). The box was at
+30 of 31 GB with 0 available. Nothing about that row is a property of
+`--jdk-only`, or of CratonVM.
+
+**`journalctl -k | grep "Killed process"` settles an unexplained non-zero exit in
+one command**, and it is worth reaching for before any hypothesis: a killed
+process looks exactly like a crashed one from the outside, except that it leaves
+no error behind. The absence of a message was the tell.
+
+This is the **fourth** time in this record that the host manufactured a
+defect-shaped result — §5's `ENOSPC`, §7's sharded OOM, and now this — which is
+less a coincidence than a description of what measuring on a shared box costs.
 
 **What this does not say.** It does not say how slow CratonVM is on these
 classes — §5's ratio data is the closest this page has, and it is explicitly not
