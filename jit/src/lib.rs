@@ -1574,6 +1574,49 @@ pub struct OopMapEntry {
     /// object pointers in reclaimed spill slots as un-rewritable roots.
     /// `0` means "unknown" and makes the verifier scan the whole region.
     pub live_frame_hi: i32,
+    /// DIAGNOSTIC ORACLE -- the forward "must be oop" local dataflow mask that
+    /// was in force when this map was built, as a bitmask over JVM local slots
+    /// (bit `k` = local `k`, whose canonical home is `[rbp - 8*(k+1)]`).
+    ///
+    /// `None` means the dataflow never reached this safepoint's bci, i.e. the
+    /// map named NO locals at all (`map_incomplete_cause::LOCAL_MASK_UNREACHED`).
+    /// That is a different statement from `Some(0)`, which says the dataflow DID
+    /// reach here and proved no local holds a reference, and the two must not be
+    /// folded together: the first makes a stale word in the locals band
+    /// unexplained, the second explains it as dead storage.
+    ///
+    /// Recorded so a stale-word report can say **live**. `live_frame_hi` is a
+    /// spill watermark, not a liveness bound, so "below the watermark and not in
+    /// the map" is an upper bound on missed roots and cannot be acted on; this
+    /// mask is the in-tree oracle that turns such a word into one of "the
+    /// dataflow proves this local is a reference" (a real miss) or "the dataflow
+    /// proves it is not" (dead storage). See
+    /// `bug-h2-testrandommapops-small-heap-corruption-20260829.md` §5.
+    ///
+    /// x86-64 single-pass only. The IR tier allocates frame slots rather than
+    /// homing locals at `8*(k+1)`, so it records `None` and the oracle stays
+    /// silent there rather than answering about the wrong frame layout.
+    pub local_oop_mask: Option<u64>,
+    /// Number of JVM locals of the frame `local_oop_mask` describes, so a word
+    /// at `[rbp - 8*(k+1)]` with `k >= num_locals` can be told apart from a
+    /// local the mask declined to name. `0` when there is no mask.
+    pub num_locals: u16,
+    /// The same oracle for the locals of each LIVE INLINE SPLICE, as
+    /// `(base_off, num_locals, oop_mask)`: spliced callee local `k` is homed at
+    /// `[rbp - (base_off + 8*k)]`.
+    ///
+    /// A splice's locals are allocated out of the operand-SPILL band
+    /// (`reserve_spill_slots`), not the java-locals band, so `local_oop_mask`
+    /// above cannot speak for them and every such word would otherwise read as
+    /// unclassifiable spill. That matters because the frames this oracle exists
+    /// for carry splices: "a spliced callee's locals are named by no oop map"
+    /// is a defect this repo has already paid for once.
+    ///
+    /// Only scopes whose mask is known are recorded; a scope that cannot
+    /// classify its locals already fails the safepoint closed
+    /// (`map_incomplete_cause::INLINE_LOCAL_UNMAPPABLE`) and contributes
+    /// nothing here, so a word in its band stays honestly unattributed.
+    pub inline_local_scopes: Vec<(i32, u16, u64)>,
 }
 
 impl OopMapEntry {
@@ -1587,6 +1630,9 @@ impl OopMapEntry {
             frame_slot_offsets: Vec::new(),
             moving_young_coverage_complete: false,
             live_frame_hi: 0,
+            local_oop_mask: None,
+            num_locals: 0,
+            inline_local_scopes: Vec::new(),
         }
     }
 
