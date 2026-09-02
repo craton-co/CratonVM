@@ -2666,6 +2666,64 @@ fn coerce_static_to_descriptor(descriptor: &str, value: Value) -> Option<Value> 
     }
 }
 
+/// Report one post-`<clinit>` fixup arm's outcome at the level that outcome
+/// deserves, instead of at a fixed `warn!`.
+///
+/// # 2026-09-01: why these stopped being warnings
+///
+/// Every one of these lines fired at `warn!` on the SUCCESS path, so a stock
+/// `cratonvm Hello` — a one-line hello-world — printed four to six of them on
+/// a boot where nothing had gone wrong (`UnsafeConstants populated (5/5)`,
+/// `Unsafe ARRAY_*… populated (18/18)`, both BigInteger lines). A warning that
+/// fires on every successful run is not a warning: it is the background a real
+/// one has to be noticed against, and any tool reading this VM's stderr — CI,
+/// a build script, a subprocess consumer, a test harness — sees it. That is
+/// the same measurement that moved the descriptor-coercion guard behind
+/// `cratonvm_types::compact_value::coercion_census`.
+///
+/// The distinction the old lines never drew is the one worth keeping. An arm
+/// RUNNING is routine — that is what the arm is for, and the `<clinit>` that
+/// made it necessary was already reported by the swallow path. An arm running
+/// and coming up SHORT is not routine: a static this VM depends on is still
+/// holding the JDK default, so the next reader of it gets a null or a zero
+/// instead of the value the layout requires — silently, which is exactly the
+/// class of damage `set_static_by_name`'s own descriptor refusal exists to
+/// stop. So the complete case is demoted and the shortfall stays `warn!`, with
+/// wording that says it is a shortfall rather than a status line.
+///
+/// # `info!`, not `debug!`
+///
+/// The workspace pins `tracing` with `release_max_level_info` (root
+/// `Cargo.toml`), which compiles every `tracing::debug!` out of a release
+/// build. Demoting to `debug!` would therefore not move these lines off the
+/// default path, it would DELETE them from the binary that ships and that CI
+/// runs — unrecoverable by any `RUST_LOG`. `info!` sits below `vm-cli`'s
+/// WARN-only default filter (so a quiet boot stays quiet) and is still
+/// reachable with `RUST_LOG=cratonvm_vm=info` in a release build, which is the
+/// property that makes this a demotion rather than a deletion.
+///
+/// `already_ok` is the count that needed no repair because the slot already
+/// held a real value — a SUCCESS, and nonzero only for the arms built on
+/// `set_static_if_zero`. Counting it apart from `populated` is what lets the
+/// shortfall test mean "a static could not be repaired" rather than "a static
+/// did not need repairing"; without it the healthy end-state that helper's own
+/// comment predicts (`0/19`, once the underlying ordering is fixed) would read
+/// as a nineteen-field failure.
+fn note_fixup_outcome(what: &str, populated: i64, already_ok: i64, expected: i64) {
+    let missing = expected - populated - already_ok;
+    if missing <= 0 {
+        tracing::info!("Post-clinit fixup: {what} populated ({populated}/{expected})");
+        return;
+    }
+    tracing::warn!(
+        "Post-clinit fixup SHORTFALL: {what} — {missing} of {expected} static(s) could NOT be \
+         repaired (populated={populated}, already-correct={already_ok}). Each unrepaired slot \
+         still holds the JDK default (null/0), so the next read of it gets that instead of the \
+         value this VM's layout requires, with no exception; any slot rejected on a descriptor \
+         mismatch was named by its own refusal warning above."
+    );
+}
+
 /// After swallowing a `<clinit>` failure, populate critical static fields
 /// that downstream code unconditionally dereferences. Without this, swallowed
 /// `<clinit>` failures leave static fields as null/0, causing NPEs in code
@@ -2750,6 +2808,11 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
         false
     };
 
+    // Statics `set_static_if_zero` left alone because they already held a
+    // non-zero value. See `note_fixup_outcome` for why this cannot be folded
+    // into the per-arm repair count.
+    let already_populated = std::cell::Cell::new(0i32);
+
     // Write ONLY a slot that still holds zero.
     //
     // `set_static_by_name` below writes unconditionally, so a count of
@@ -2759,6 +2822,11 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
     // warning a measurement: `19/19` means nineteen really were zero, and a
     // later `0/19` means the arm has become dead weight and can go.
     let set_static_if_zero = |field_name: &str, value: Value| {
+        // Declining because the slot already held a real value is a SUCCESS
+        // and must not be reported as a shortfall; declining because the field
+        // does not exist is a defect. A bare `n/total` cannot tell them apart,
+        // so the first outcome is counted here and handed to
+        // `note_fixup_outcome` separately.
         let idx = {
             let cm = shared.classes.class_manager.read();
             cm.get_class(class_id).and_then(|cls| {
@@ -2783,6 +2851,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             Value::Int(0) | Value::Long(0) | Value::Object(None)
         );
         if !is_zero {
+            already_populated.set(already_populated.get() + 1);
             return false;
         }
         set_static_by_name(field_name, value)
@@ -2808,7 +2877,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             n += set_static_by_name("BIG_ENDIAN", Value::Int(0)) as i32;
             n += set_static_by_name("UNALIGNED_ACCESS", Value::Int(1)) as i32;
             n += set_static_by_name("DATA_CACHE_LINE_FLUSH_SIZE", Value::Int(0)) as i32;
-            tracing::warn!("Post-clinit fixup: UnsafeConstants populated ({n}/5)");
+            note_fixup_outcome("UnsafeConstants", i64::from(n), 0, 5);
         }
         "jdk/internal/misc/Unsafe" => {
             // ES-FAIL-FAMILY-20260710: `Unsafe.<clinit>` computes each
@@ -2866,8 +2935,11 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             ] {
                 n += set_static_by_name(name, Value::Int(scale)) as i32;
             }
-            tracing::warn!(
-                "Post-clinit fixup: Unsafe ARRAY_*_BASE_OFFSET/INDEX_SCALE populated ({n}/18)"
+            note_fixup_outcome(
+                "Unsafe ARRAY_*_BASE_OFFSET/INDEX_SCALE",
+                i64::from(n),
+                0,
+                18,
             );
         }
         "sun/misc/Unsafe" => {
@@ -2920,8 +2992,14 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             // `size_of::<usize>()`, matching `native_unsafe_address_size` and
             // the `ADDRESS_SIZE0` backfill earlier in this file.
             legacy += set_static_if_zero("ADDRESS_SIZE", Value::Int(8)) as i32;
-            tracing::warn!(
-                "Post-clinit fixup: sun.misc.Unsafe ARRAY_*/ADDRESS_SIZE populated ({legacy}/19)"
+            // Snapshot so the latch report below can subtract it: both blocks
+            // in this arm write through the same `set_static_if_zero`.
+            let already_arrays = already_populated.get();
+            note_fixup_outcome(
+                "sun.misc.Unsafe ARRAY_*/ADDRESS_SIZE",
+                i64::from(legacy),
+                i64::from(already_arrays),
+                19,
             );
 
             // The memory-access warning latch (`<clinit>` bci 185/195). Same
@@ -2969,8 +3047,11 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                     "MEMORY_ACCESS_WARNED_BASE",
                     Value::Object(Some(mirror)),
                 ) as i32;
-                tracing::warn!(
-                    "Post-clinit fixup: sun.misc.Unsafe memory-access latch repaired ({latch}/2)"
+                note_fixup_outcome(
+                    "sun.misc.Unsafe memory-access latch",
+                    i64::from(latch),
+                    i64::from(already_populated.get() - already_arrays),
+                    2,
                 );
             } else {
                 tracing::warn!(
@@ -3107,7 +3188,11 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 );
                 false
             };
-            tracing::warn!(
+            // Routine either way: `repaired=false` is the healthy answer when
+            // the slot already held a real `MemoryAccessOption`, and every path
+            // that failed to repair a genuinely-empty slot has already warned
+            // for itself above.
+            tracing::info!(
                 "Post-clinit fixup: sun.misc.Unsafe MEMORY_ACCESS_OPTION policy={policy_field} repaired={repaired}"
             );
         }
@@ -3221,7 +3306,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             n += set_static_by_name("separator", Value::Object(Some(sep_str))) as i32;
             n += set_static_by_name("pathSeparatorChar", Value::Int(path_sep_char as i32)) as i32;
             n += set_static_by_name("pathSeparator", Value::Object(Some(path_sep_str))) as i32;
-            tracing::warn!("Post-clinit fixup: File fs/separator/pathSeparator populated ({n}/5)");
+            note_fixup_outcome("File fs/separator/pathSeparator", i64::from(n), 0, 5);
         }
         // (Removed) "org/jboss/modules/Module" arm.
         //
@@ -3240,7 +3325,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             // LogManager.manager must be non-null for getLogManager()
             if let Some(mgr) = shared.mem.heap.try_alloc_object(class_id, 4) {
                 if set_static_by_name("manager", Value::Object(Some(mgr))) {
-                    tracing::warn!("Post-clinit fixup: LogManager.manager populated");
+                    tracing::info!("Post-clinit fixup: LogManager.manager populated");
                 }
             }
         }
@@ -3286,7 +3371,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                             .heap
                             .set_field(mode_impl, 0, Value::Object(Some(noop_obj)));
                         if set_static_by_name("INSTANCE", Value::Object(Some(mode_impl))) {
-                            tracing::warn!(
+                            tracing::info!(
                                 class = %class_name,
                                 "Post-clinit fixup: {}.INSTANCE populated with NoopNormalizer2 ModeImpl",
                                 class_name
@@ -3335,7 +3420,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 // VarForm has 4 instance fields (see javap of VarForm).
                 if let Some(vf_obj) = shared.mem.heap.try_alloc_object(vfid, 4) {
                     if set_static_by_name("FORM", Value::Object(Some(vf_obj))) {
-                        tracing::warn!(
+                        tracing::info!(
                             class = %class_name,
                             "Post-clinit fixup: {}.FORM populated with stub VarForm",
                             class_name
@@ -3360,7 +3445,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             if let Some(hid) = handler_id {
                 if let Some(handler) = shared.mem.heap.try_alloc_object(hid, 4) {
                     if set_static_by_name("DELAYED_HANDLER", Value::Object(Some(handler))) {
-                        tracing::warn!(
+                        tracing::info!(
                             "Post-clinit fixup: InitialConfigurator.DELAYED_HANDLER populated"
                         );
                     }
@@ -3369,7 +3454,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 // Class not yet loaded вЂ” allocate a generic Handler stub
                 if let Some(handler) = shared.mem.heap.try_alloc_object(class_id, 4) {
                     if set_static_by_name("DELAYED_HANDLER", Value::Object(Some(handler))) {
-                        tracing::warn!("Post-clinit fixup: InitialConfigurator.DELAYED_HANDLER populated (generic)");
+                        tracing::info!("Post-clinit fixup: InitialConfigurator.DELAYED_HANDLER populated (generic)");
                     }
                 }
             }
@@ -3390,7 +3475,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             let target_id = loader_id.unwrap_or(class_id);
             if let Some(loader_obj) = shared.mem.heap.try_alloc_object(target_id, 1) {
                 if set_static_by_name("INSTANCE", Value::Object(Some(loader_obj))) {
-                    tracing::warn!(
+                    tracing::info!(
                         "Post-clinit fixup: DefaultBootModuleLoaderHolder.INSTANCE populated with synthetic LocalModuleLoader"
                     );
                 }
@@ -3516,8 +3601,11 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                         populated += 1;
                     }
                 }
-                tracing::warn!(
-                    "Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated ({populated}/5)"
+                note_fixup_outcome(
+                    "BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN",
+                    populated as i64,
+                    0,
+                    5,
                 );
                 crate::dispatch_trace::record_note(
                     "Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated",
@@ -3636,7 +3724,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                     }
                 }
                 if radix_fixed {
-                    tracing::warn!(
+                    tracing::info!(
                         "Post-clinit fixup: BigInteger digitsPerLong/longRadix radix tables populated"
                     );
                     crate::dispatch_trace::record_note(
@@ -3740,7 +3828,10 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 }
             }
             if filled > 0 {
-                tracing::warn!(
+                // Not `note_fixup_outcome`: the loop above SKIPS a constant that
+                // is already populated, so `filled < NAMES.len()` is the normal
+                // healthy answer here and would read as a shortfall.
+                tracing::info!(
                     "Post-clinit fixup: TimeUnit backfilled {filled}/{} enum statics",
                     NAMES.len()
                 );
@@ -3887,7 +3978,9 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 }
             }
             if filled > 0 {
-                tracing::warn!(
+                // Same reading as the TimeUnit arm: the loop skips constants
+                // that are already populated, so a partial count is healthy.
+                tracing::info!(
                     "Post-clinit fixup: PosixFilePermission backfilled {filled}/{} enum statics",
                     NAMES.len()
                 );
@@ -4028,9 +4121,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                         populated += 1;
                     }
                 }
-                tracing::warn!(
-                    "Post-clinit fixup: BigDecimal ZERO/ONE/TWO/TEN populated ({populated}/4)"
-                );
+                note_fixup_outcome("BigDecimal ZERO/ONE/TWO/TEN", populated as i64, 0, 4);
             } else {
                 tracing::warn!(
                     "Post-clinit fixup: BigDecimal fixup skipped — intVal/scale/precision/intCompact field indices not resolved"
@@ -4098,7 +4189,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                             // and `AtomicStampedReference` are not).
                             shared.mem.heap.set_field(ai_obj, 0, Value::Int(1));
                             if set_static_by_name(fname, Value::Object(Some(ai_obj))) {
-                                tracing::warn!(
+                                tracing::info!(
                                     "Post-clinit fixup: ServiceContainerImpl.{} populated with AtomicInteger(1)",
                                     fname
                                 );
@@ -4168,7 +4259,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             if needs_fix {
                 if let Some(obj) = shared.mem.heap.try_alloc_object(target_id, num_fields) {
                     if set_static_by_name("log", Value::Object(Some(obj))) {
-                        tracing::warn!(
+                        tracing::info!(
                             "Post-clinit fixup: ElytronMessages.log populated with synthetic $logger"
                         );
                     }
@@ -4217,7 +4308,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 if needs_fix {
                     if let Some(obj) = shared.mem.heap.try_alloc_object(target_id, num_fields) {
                         if set_static_by_name(fname, Value::Object(Some(obj))) {
-                            tracing::warn!(
+                            tracing::info!(
                                 "Post-clinit fixup: ServiceLogger.{} populated with synthetic $logger",
                                 fname
                             );

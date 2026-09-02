@@ -10,6 +10,34 @@
 //! # LIVENESS — READ THIS BEFORE WIRING ANYTHING TO IT
 //! ---------------------------------------------------------------------------
 //!
+//! **SUPERSEDED, 2026-09-01 -- read this correction before the claim below.**
+//! The three bullets that follow were true when the observability audit wrote
+//! them on 2026-07-26 and are *no longer* true, and a stale liveness claim is
+//! more dangerous than none: it is exactly the evidence a later reader uses to
+//! decide a command is not worth implementing. What actually changed:
+//!
+//!  * obsaudit D15 gave `AttachListener::start_listening` a **real** Unix
+//!    domain socket at `/tmp/.java_pid<pid>` serving the HotSpot Attach API
+//!    wire protocol (see that method and the `AttachListener` doc comment).
+//!  * `Vm::new` (`vm/src/vm/vm_init.rs`) now builds a
+//!    `JcmdProcessor::new_with_vm_state(shared.clone())` at bootstrap and
+//!    parks it in `SharedVm::debug.jcmd_processor`, which is what keeps that
+//!    socket bound for the life of the VM.
+//!
+//! So on Linux, `jcmd <pid> ...` / `jstack <pid>` / `jmap <pid>` from an
+//! unmodified JDK **does** reach `register_live_commands` today. It does not
+//! reach `register_standard_commands` -- that set belongs to the
+//! argument-less `JcmdProcessor::new()`, which only tests construct -- so the
+//! *fabricated-data* hazard the bullets warn about remains confined to the
+//! variant production never builds. That distinction is the whole reason
+//! `register_live_commands` exists; keep new commands there.
+//!
+//! Still true: this is Unix-only (`#[cfg(unix)]`; Windows would need a named
+//! pipe), and `hsdb_start_listener` / `HsdbListener` remain test-only.
+//!
+//! The original claim, kept because the reasoning under it is still the right
+//! reasoning and only its premises expired:
+//!
 //! **On a default build, none of the attach/jcmd surface in this module is
 //! reachable from outside the process.** Established by the observability
 //! audit of 2026-07-26:
@@ -34,8 +62,13 @@
 //!  2. `register_default_commands` (the no-VM-state variant used by
 //!     `JcmdProcessor::new` / `::default`) returns **fabricated** output for
 //!     several commands. See the audit note on `Compiler.queue`.
-//!  3. `JFR.start` / `JFR.stop` / `JFR.dump` never touch the flight recorder.
-//!     See the audit notes at their registration sites.
+//!  3. `JFR.start` / `JFR.stop` / `JFR.dump` never touch the flight recorder
+//!     **in `register_standard_commands`**, and still do not: that set has no
+//!     VM binding, so its three entries return an honest "not implemented"
+//!     rather than a fabricated success. See the audit notes at their
+//!     registration sites. As of 2026-09-01 `register_live_commands` carries
+//!     real ones, routed through `VmDiagnosticState::jfr_start` / `jfr_dump` /
+//!     `jfr_stop` and implemented on `SharedVm` in `vm/src/vm/vm_init.rs`.
 //!
 //! Do not "wire up jcmd" by simply constructing a `JcmdProcessor` at
 //! bootstrap: `register_default_commands` would then start reporting invented
@@ -69,6 +102,48 @@ pub trait VmDiagnosticState: Send + Sync {
     /// Write an HPROF heap dump to the given path. Returns bytes written.
     fn heap_dump(&self, _path: &str) -> Result<u64, String> {
         Err("heap dump not supported".to_string())
+    }
+
+    // --- JFR (2026-09-01) ---------------------------------------------------
+    //
+    // The three methods below are what let `register_live_commands` register a
+    // `JFR.start` / `JFR.dump` / `JFR.stop` that actually reaches a
+    // `FlightRecorder`. Requirement (1) of the audit block at the
+    // `register_standard_commands` JFR entries names exactly this: "an
+    // `Arc<SharedVm>` (or a `VmDiagnosticState` extension) on the processor so
+    // the handler can reach `debug.flight_recorder`". The trait extension is
+    // the option that keeps this module free of any `vm::` dependency.
+    //
+    // Each is **defaulted to an honest failure** rather than left required.
+    // That is deliberate on two counts:
+    //
+    //  * it adds no method to implement for the mock states in this file's own
+    //    tests, none of which owns a recorder; and
+    //  * the failure text says the state has no recorder, which is the one
+    //    thing an operator needs to know. Returning a plausible success from a
+    //    state that cannot record is the precise defect the audit block
+    //    records, and a default body is where that defect would silently
+    //    reappear if the default were `Ok`.
+    //
+    // `args` is the diagnostic command's argument list exactly as
+    // `JcmdProcessor::process_command` split it: whitespace-separated tokens.
+
+    /// `jcmd <pid> JFR.start [name=<n>] [maxevents=<n>] [+<Event>#enabled=<bool>]`.
+    /// Returns the operator-facing confirmation line.
+    fn jfr_start(&self, _args: &[String]) -> Result<String, String> {
+        Err("JFR.start: this VM state has no flight recorder binding".to_string())
+    }
+
+    /// `jcmd <pid> JFR.dump [name=<n>] filename=<path>` -- write a running
+    /// recording to `path` without stopping it.
+    fn jfr_dump(&self, _args: &[String]) -> Result<String, String> {
+        Err("JFR.dump: this VM state has no flight recorder binding".to_string())
+    }
+
+    /// `jcmd <pid> JFR.stop [name=<n>] [filename=<path>]` -- write the
+    /// recording if a path was given, then stop it.
+    fn jfr_stop(&self, _args: &[String]) -> Result<String, String> {
+        Err("JFR.stop: this VM state has no flight recorder binding".to_string())
     }
 }
 
@@ -934,6 +1009,22 @@ impl JcmdProcessor {
         //      per-thread rings and writes the chunk.
         // Note that even then the produced `.jfr` is not JMC-loadable — see
         // the FORMAT-FIDELITY GAP block in `jfr/src/dump.rs`.
+        //
+        // 2026-09-01 -- DONE, for `register_live_commands` only. All three
+        // prerequisites above are met there: (1) via the defaulted
+        // `VmDiagnosticState::jfr_start` / `jfr_dump` / `jfr_stop` and their
+        // `SharedVm` implementations in `vm/src/vm/vm_init.rs`, (2) and (3)
+        // inside those. The parenthetical above -- "in practice nothing could
+        // even reach these handlers" -- has also expired; see the 2026-09-01
+        // correction at the top of this module.
+        //
+        // These three STAY as they are, and that is not an oversight. This
+        // function is the no-VM-state set built by the argument-less
+        // `JcmdProcessor::new()`, which owns no `FlightRecorder` and can never
+        // be given one without the `Arc<dyn VmDiagnosticState>` that
+        // `new_with_vm_state` is for. An honest error from a processor that
+        // genuinely cannot record is the correct answer, and replacing it with
+        // anything else would recreate the defect this block exists to record.
         for (name, help, arg_name, arg_help, arg_type, arg_default) in [
             (
                 "JFR.start",
@@ -1171,6 +1262,98 @@ impl JcmdProcessor {
             Box::new(move |_args| {
                 let vs = live_vm!(vs);
                 CommandResult::ok(vs.command_line(), 0)
+            }),
+        ));
+
+        // 11-13. JFR.start / JFR.dump / JFR.stop -- the REAL ones.
+        //
+        // 2026-09-01. The audit block at the `register_standard_commands` JFR
+        // entries lists three prerequisites for implementing these; (1) was a
+        // VM binding, and `VmDiagnosticState::jfr_start` / `jfr_dump` /
+        // `jfr_stop` (this file) plus their `SharedVm` implementations
+        // (`vm/src/vm/vm_init.rs`) are it. (2) and (3) -- `new_recording` +
+        // `start_recording`, `stop_recording`, `dump_recording` -- happen
+        // inside those implementations.
+        //
+        // Registered HERE and not in `register_standard_commands`, and that is
+        // the whole point of the split: the standard set is built by the
+        // argument-less `JcmdProcessor::new()`, which has no VM at all, so its
+        // three entries keep returning an honest "not implemented". A command
+        // that cannot reach a recorder must not answer as though it had.
+        //
+        // These are reachable from a real `jcmd <pid> JFR.start ...`: see the
+        // 2026-09-01 correction at the top of this module for why the old
+        // "nothing can reach these handlers" note no longer holds.
+        //
+        // A bad option or an unknown event name is answered with
+        // `CommandResult::err` and the recording is NOT started -- deliberately
+        // unlike the `-XX:StartFlightRecording` boot path, which panics on the
+        // same mistake. A typo in a boot flag must not produce a VM whose
+        // recording can never contain what was asked for; a typo typed at a
+        // *running* VM must not kill it. Same rule, opposite blast radius.
+        let vs = vm_state.clone();
+        listener.register_command(DiagnosticCommand::new(
+            "JFR.start",
+            "Start a flight recording",
+            CommandImpact::Medium,
+            CommandPermission::ManagementAction,
+            vec![CommandArgument {
+                name: "options".to_string(),
+                description: "name=<n> maxevents=<n> +<Event>#enabled=true".to_string(),
+                arg_type: ArgType::String,
+                required: false,
+                default_value: None,
+            }],
+            Box::new(move |args| {
+                let vs = live_vm!(vs);
+                match vs.jfr_start(args) {
+                    Ok(msg) => CommandResult::ok(msg, 0),
+                    Err(e) => CommandResult::err(e, 1),
+                }
+            }),
+        ));
+
+        let vs = vm_state.clone();
+        listener.register_command(DiagnosticCommand::new(
+            "JFR.dump",
+            "Dump a running flight recording to a file",
+            CommandImpact::Medium,
+            CommandPermission::ManagementAction,
+            vec![CommandArgument {
+                name: "options".to_string(),
+                description: "[name=<n>] filename=<path>".to_string(),
+                arg_type: ArgType::String,
+                required: false,
+                default_value: None,
+            }],
+            Box::new(move |args| {
+                let vs = live_vm!(vs);
+                match vs.jfr_dump(args) {
+                    Ok(msg) => CommandResult::ok(msg, 0),
+                    Err(e) => CommandResult::err(e, 1),
+                }
+            }),
+        ));
+
+        let vs = vm_state.clone();
+        listener.register_command(DiagnosticCommand::new(
+            "JFR.stop",
+            "Stop a flight recording, optionally writing it out first",
+            CommandImpact::Medium,
+            CommandPermission::ManagementAction,
+            vec![CommandArgument {
+                name: "options".to_string(),
+                description: "[name=<n>] [filename=<path>]".to_string(),
+                arg_type: ArgType::String,
+                required: false,
+                default_value: None,
+            }],
+            Box::new(move |args| {
+                let vs = live_vm!(vs);
+                match vs.jfr_stop(args) {
+                    Ok(msg) => CommandResult::ok(msg, 0),
+                    Err(e) => CommandResult::err(e, 1),
+                }
             }),
         ));
     }

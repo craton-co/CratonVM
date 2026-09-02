@@ -962,6 +962,47 @@ pub fn register_builtin_events(registry: &mut EventTypeRegistry) {
         period: EventPeriod::EveryChunk,
         threshold: None,
     });
+
+    // 48. cratonvm.JitCompileDecision
+    //
+    // The first `cratonvm.`-namespaced event in this registry, because it has
+    // no `jdk.*` counterpart: HotSpot's `jdk.Compilation` reports what the
+    // compiler DID, and this reports what it DECIDED and why. It is registered
+    // here rather than in a private registry of its own (the way
+    // `phase::PHASE_*_EVENT` is) precisely so `jfr print` and `jfr summary`
+    // find it in the metadata section of an ordinary recording — an event that
+    // exists but is not in the metadata is worse than no event at all.
+    //
+    // Seven fields, one under the `EVENT_FIELD_INLINE` = 8 inline capacity, so
+    // this event still emits without spilling `EventInstance.fields` to the
+    // heap. Class, method and descriptor are joined into one `method` string
+    // rather than being three fields, matching `jdk.Compilation` and leaving
+    // that headroom intact.
+    //
+    // `EventPeriod::BeginEnd` with `threshold: None`: a decision taken before
+    // the compile runs has zero duration, and a threshold would then silently
+    // drop exactly the refusals this event exists to report. The duration is
+    // real once the call site moves to the end of a successful compile, and is
+    // carried in `end_time` the way every other duration event here carries it.
+    registry.register(EventType {
+        id: stub_id,
+        name: crate::jit_decision::JIT_COMPILE_DECISION_EVENT.into(),
+        category: vec!["Java Virtual Machine".into(), "Compiler".into()],
+        description: "JIT compile admission decision, and the reason for it".into(),
+        fields: vec![
+            EventField::new("method", "string", "Java Method"),
+            EventField::new("door", "string", "Compile Door"),
+            EventField::new("outcome", "string", "Compile Outcome"),
+            EventField::new("reason", "string", "Decision Reason"),
+            EventField::new("bailBci", "int", "Bail Bytecode Index (-1 if none)"),
+            EventField::new("bailOpcode", "int", "Bail Opcode (-1 if none)"),
+            EventField::new("bytecodeSize", "int", "Method Bytecode Size"),
+        ],
+        has_thread: true,
+        has_stacktrace: false,
+        period: EventPeriod::BeginEnd,
+        threshold: None,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1265,6 +1306,58 @@ pub fn emit_compilation_event_arc(
             type_id,
             start_time: start_time_ns,
             end_time: start_time_ns.saturating_add(duration_ns),
+            thread_id: current_jfr_thread_id(),
+            fields,
+        };
+        push_builtin_event(recorder, event);
+    }
+}
+
+/// Emit a `cratonvm.JitCompileDecision` — the compiler's admission verdict for
+/// one method, at one door.
+///
+/// This is the delivery end of [`crate::jit_decision`]; see that module for why
+/// the event exists, how it is armed, and why the producer reaches it through
+/// an installed sink rather than calling this directly. **The producer must
+/// have checked [`crate::jit_decision::jit_decision_enabled`] before building
+/// the `decision`** — the `is_enabled()` guard below is the ordinary built-in
+/// fast path and cannot refund a `String` that has already been formatted.
+///
+/// Field order here must match the `cratonvm.JitCompileDecision` declaration in
+/// `register_builtin_events` exactly; `push_builtin_event` debug-asserts that it
+/// does, because the reader decodes off the declared `type_name` and a desync
+/// would corrupt every later event in the chunk.
+pub fn emit_jit_compile_decision_event(
+    recorder: &mut FlightRecorder,
+    decision: &crate::jit_decision::JitCompileDecision<'_>,
+) {
+    if !crate::is_enabled() {
+        return;
+    }
+    static ID: EventTypeIdCache = OnceLock::new();
+    let name = crate::jit_decision::JIT_COMPILE_DECISION_EVENT;
+    if let Some(type_id) = cached_event_id(&ID, recorder, name) {
+        // The same `class.name+descriptor` spelling the `[ir] admission` stderr
+        // line uses, so a JFR dump and a `CRATONVM_DBG_JITC` log name the same
+        // method identically and can be joined without a translation step.
+        let method = format!(
+            "{}.{}{}",
+            decision.class_name, decision.method_name, decision.method_descriptor
+        );
+        let mut fields = crate::event::EventFields::with_capacity(7);
+        fields.push(EventValue::String(Arc::from(method.as_str())));
+        fields.push(EventValue::Str(decision.door.name()));
+        fields.push(EventValue::Str(decision.outcome.name()));
+        fields.push(decision.reason.to_event_value());
+        fields.push(EventValue::Int(decision.bail_bci));
+        fields.push(EventValue::Int(decision.bail_opcode));
+        fields.push(EventValue::Int(decision.bytecode_size));
+        let event = EventInstance {
+            type_id,
+            start_time: decision.start_time_ns,
+            end_time: decision
+                .start_time_ns
+                .saturating_add(decision.duration_ns),
             thread_id: current_jfr_thread_id(),
             fields,
         };
@@ -3910,7 +4003,10 @@ mod tests {
     fn test_builtin_exact_count_23() {
         let mut registry = EventTypeRegistry::new();
         register_builtin_events(&mut registry);
-        assert_eq!(registry.len(), 47); // 28 original + 19 new T6.2 events
+        // 48th: `cratonvm.JitCompileDecision` (2026-09-01). The test NAME is
+        // historical and has been wrong since the count passed 23; the
+        // assertion is what matters.
+        assert_eq!(registry.len(), 48); // 28 original + 19 T6.2 + 1 cratonvm.*
     }
 
     // --- GC events ---
@@ -4522,7 +4618,10 @@ mod tests {
     fn s41_builtin_event_count_47() {
         let mut registry = EventTypeRegistry::new();
         register_builtin_events(&mut registry);
-        assert_eq!(registry.len(), 47);
+        // 47 `jdk.*` + `cratonvm.JitCompileDecision`. The name is kept at 47
+        // because `docs/observability/phase-accounting.md` cites these tests by
+        // name.
+        assert_eq!(registry.len(), 48);
     }
 
     #[test]
@@ -4888,7 +4987,8 @@ mod tests {
     #[test]
     fn t6_total_event_count_47() {
         let fr = crate::create_flight_recorder();
-        assert_eq!(fr.type_registry.len(), 47);
+        // 47 `jdk.*` + `cratonvm.JitCompileDecision`; see `s41_builtin_event_count_47`.
+        assert_eq!(fr.type_registry.len(), 48);
     }
 
     // --- Custom event support ---
