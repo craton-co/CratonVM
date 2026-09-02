@@ -2505,6 +2505,57 @@ impl ZObjectStartsSnapshot {
         }
     }
 
+    /// Every base a YOUNG cycle must visit, ASCENDING.
+    ///
+    /// The union of two things, and the union is the whole point:
+    ///
+    /// * everything at or above `floor` -- the contiguous nursery
+    ///   `gen_young_floor` describes, which is what a bump-dominated workload
+    ///   produces and which the floor is right about; and
+    /// * everything on a page below the floor that `visit_below` accepts --
+    ///   the free-list-served allocation the floor cannot see, and the
+    ///   over-retention its own doc admits to.
+    ///
+    /// Ascending across the join for free: every below-floor page is below the
+    /// floor. That matters because the sweep's run-merging hands adjacent spans
+    /// to `Arena::add_free_block`, which can only see two spans as adjacent if
+    /// they arrive in order.
+    ///
+    /// One predicate call per WORD, not per base: a word covers 512 arena bytes
+    /// and a logical page is 2 MiB, so a word lies wholly inside one page and
+    /// the answer is the same for all 64 of its bits.
+    #[inline]
+    fn for_each_young_base(
+        &self,
+        floor: usize,
+        visit_below: impl Fn(usize) -> bool,
+        mut f: impl FnMut(usize),
+    ) {
+        let floor_word = (floor.saturating_sub(self.base) / 8) / 64;
+        for (w, &word) in self.words.iter().enumerate() {
+            if word == 0 {
+                continue;
+            }
+            if w < floor_word && !visit_below(w * 64 * 8) {
+                continue;
+            }
+            let mut word = word;
+            while word != 0 {
+                let b = word.trailing_zeros() as usize;
+                word &= word - 1;
+                let addr = self.base + ((w * 64 + b) << 3);
+                // The word straddling the floor is visited either way, so the
+                // exact bound is still this test.
+                if addr >= floor || visit_below(addr - self.base) {
+                    f(addr);
+                }
+            }
+        }
+        for addr in self.extra.iter() {
+            f(*addr);
+        }
+    }
+
     /// How many bases the snapshot holds, counted rather than collected.
     fn base_count(&self) -> usize {
         self.words
@@ -3754,6 +3805,16 @@ pub struct ZgcRealHeap {
     /// things.
     stamp_lo: AtomicUsize,
     stamp_hi: AtomicUsize,
+    /// Regions that have received a fresh allocation since the last whole-heap
+    /// collection, as a bitmap over [`Self::Z_YOUNG_GRAIN_BYTES`] grains.
+    ///
+    /// The repair for `gen_young_floor`'s documented hole -- see
+    /// [`Self::note_young_page`]. One bit per 64 KiB of arena, so a 4 GiB heap
+    /// costs 8 KiB.
+    young_pages: Vec<AtomicU64>,
+    /// Did an allocation land off the grain grid, making the young set
+    /// incomplete? Forces every cycle whole-heap while set.
+    young_page_grid_overflow: AtomicBool,
     /// Bytes this heap has returned to the OS, summed over collections.
     ///
     /// The engagement counter for the reserving backing store's second half. A
@@ -4057,6 +4118,13 @@ impl ZgcRealHeap {
             stamp_lo: AtomicUsize::new(usize::MAX),
             stamp_hi: AtomicUsize::new(0),
             bytes_uncommitted: AtomicUsize::new(0),
+            young_pages: {
+                let pages = arena_end
+                    .saturating_sub(arena_base)
+                    .div_ceil(Self::Z_YOUNG_GRAIN_BYTES);
+                (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect()
+            },
+            young_page_grid_overflow: AtomicBool::new(false),
             conc_black_claims: AtomicUsize::new(0),
             relocation_on_page_pins: AtomicUsize::new(0),
             conc_start_adaptive: AtomicBool::new(conc_start_is_adaptive()),
@@ -5695,6 +5763,15 @@ impl ZgcRealHeap {
     /// 64 MiB default heap.
     const Z_LOGICAL_PAGE_BYTES: usize = 2 * 1024 * 1024;
 
+    /// Granularity of the young-region set -- see [`Self::note_young_page`].
+    ///
+    /// Deliberately FINER than [`Self::Z_LOGICAL_PAGE_BYTES`], and deliberately
+    /// coarser than a snapshot word (512 arena bytes) so the sweep can ask
+    /// "young?" once per word rather than once per object. Both halves are
+    /// load-bearing; the doc on `note_young_page` carries the measurement that
+    /// says why the logical page was too coarse.
+    const Z_YOUNG_GRAIN_BYTES: usize = 64 * 1024;
+
     /// The logical grid as real [`page::ZPageReal`] views, with per-page
     /// `used` and `live_bytes` filled in from the live set.
     ///
@@ -5863,6 +5940,137 @@ impl ZgcRealHeap {
     /// Is the object at `addr` young -- has it survived fewer than
     /// `promotion_age` collections?
     #[inline]
+    /// Mark the logical page holding `addr` as one a young cycle must sweep.
+    ///
+    /// # The hole this closes
+    ///
+    /// [`Self::gen_young_floor`] is the arena's low cursor at the last
+    /// whole-heap collection, and a young cycle sweeps `[floor, cursor)`. That
+    /// is the only way to BOUND the sweep when the registry is a bitmap over
+    /// one contiguous arena -- but the free list hands out space BELOW the
+    /// floor, so an object allocated into a hole a previous sweep left is born
+    /// into the old region and no young cycle will ever reclaim it. The field's
+    /// own doc calls it over-retention and it is; the effect is that on a
+    /// steady-state workload -- where most allocation comes from free-list
+    /// holes rather than the bump -- the young generation reclaims almost
+    /// nothing and the `minors_per_major` budget is spent on cycles that saved
+    /// nothing.
+    ///
+    /// Fixing it needs the young set to be a property of the SPACE rather than
+    /// an address comparison.
+    ///
+    /// # Why the grain is 64 KiB and not the 2 MiB logical page
+    ///
+    /// The logical page is the unit `card_object`, `logical_pages` and
+    /// `generation::ZPromotionPolicy` are keyed by, and it was the obvious
+    /// choice. It is too coarse: a page that holds one old object and one fresh
+    /// one is swept whole, and on any heap whose old generation is smaller than
+    /// a page that is EVERY page -- the union degenerates to "sweep
+    /// everything" and the nursery saves nothing.
+    /// `a_young_cycle_sweeps_only_the_nursery_and_still_reports_the_live_set`
+    /// caught exactly that, at `skipped=0`.
+    ///
+    /// [`Self::Z_YOUNG_GRAIN_BYTES`] is 64 KiB: fine enough that an old region
+    /// and the allocations that follow it rarely share one, and still one bit
+    /// per 64 KiB -- 8 KiB of bitmap for a 4 GiB heap. It also stays coarser
+    /// than a snapshot word (512 arena bytes), which is what lets the sweep ask
+    /// the question once per word instead of once per object.
+    ///
+    /// So the young region is the UNION of two things: everything at or above
+    /// the floor (contiguous, free, and what a bump-dominated workload
+    /// produces) and the pages below it that have received a fresh allocation
+    /// since the last major. On a bump-dominated run the second set is empty
+    /// and this costs a branch; on a free-list-dominated one it is the whole of
+    /// what the floor was missing.
+    ///
+    /// # Cost, and where it is paid
+    ///
+    /// One `fetch_or` on a word covering 64 grains -- 4 MiB of arena -- so
+    /// adjacent allocations share it and the line stays hot. It is skipped
+    /// entirely when generational mode is off (one relaxed load), and the
+    /// TLAB path pays it once per CHUNK rather than once per object, because a
+    /// chunk is contiguous and its pages are known at refill.
+    #[inline]
+    fn note_young_page(&self, addr: usize) {
+        if !self.generational_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.mark_young_pages(addr, addr + 1);
+    }
+
+    /// [`Self::note_young_page`] for a whole span. Used at TLAB refill, where
+    /// the chunk's extent is known and every object it will serve is inside it.
+    fn mark_young_pages(&self, lo: usize, hi: usize) {
+        let base = self.arena_base;
+        if base == 0 || hi <= lo || lo < base {
+            return;
+        }
+        let first = (lo - base) / Self::Z_YOUNG_GRAIN_BYTES;
+        let last = (hi - 1 - base) / Self::Z_YOUNG_GRAIN_BYTES;
+        for pg in first..=last {
+            let Some(word) = self.young_pages.get(pg >> 6) else {
+                // Off the grid entirely. The heap cannot serve such an address,
+                // so failing to record it cannot lose an object -- but a young
+                // sweep that never visits it would, which is why
+                // `young_page_grid_overflow` exists and why a non-zero there
+                // forces every cycle whole-heap.
+                self.young_page_grid_overflow.store(true, Ordering::Relaxed);
+                return;
+            };
+            word.fetch_or(1u64 << (pg & 63), Ordering::Release);
+        }
+    }
+
+    /// Is the page holding arena offset `off` in the young set?
+    #[inline]
+    fn young_page_at_offset(&self, off: usize) -> bool {
+        let pg = off / Self::Z_YOUNG_GRAIN_BYTES;
+        self.young_pages
+            .get(pg >> 6)
+            .is_some_and(|w| w.load(Ordering::Acquire) & (1u64 << (pg & 63)) != 0)
+    }
+
+    /// Forget every young page. Called by a whole-heap collection, which has
+    /// just examined all of them.
+    fn clear_young_pages(&self) {
+        for w in self.young_pages.iter() {
+            w.store(0, Ordering::Relaxed);
+        }
+        self.young_page_grid_overflow.store(false, Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
+    }
+
+    /// Pages below the floor that a young cycle must still sweep, and whether
+    /// the set is trustworthy.
+    ///
+    /// `false` means an allocation landed off the page grid, so the set is
+    /// incomplete and the caller must treat the cycle as whole-heap. Fail
+    /// closed: an incomplete young set retains garbage forever rather than
+    /// merely under-collecting one cycle.
+    fn young_pages_are_complete(&self) -> bool {
+        !self.young_page_grid_overflow.load(Ordering::Relaxed)
+    }
+
+    /// How many 64 KiB grains below the floor the young set currently names.
+    ///
+    /// The engagement counter for this fix. Zero on a bump-dominated workload
+    /// (the floor already covers everything, which is the case the floor was
+    /// designed for and is right about); above zero is the free-list-served
+    /// allocation the floor could not see.
+    pub fn young_pages_below_floor(&self) -> usize {
+        let floor = self.gen_young_floor.load(Ordering::Relaxed);
+        if floor <= self.arena_base {
+            return 0;
+        }
+        let limit = (floor - self.arena_base) / Self::Z_YOUNG_GRAIN_BYTES;
+        (0..limit).filter(|pg| {
+            self.young_pages
+                .get(pg >> 6)
+                .is_some_and(|w| w.load(Ordering::Relaxed) & (1u64 << (pg & 63)) != 0)
+        })
+        .count()
+    }
+
     fn addr_is_young(&self, addr: usize, promotion_age: u8) -> bool {
         self.header_ref(addr as *mut u8).gc_age() < promotion_age
     }
@@ -8906,6 +9114,11 @@ impl ZgcRealHeap {
         // section header for the measurement this replaced.
         self.audit_registry_insert(ptr as usize, size, "alloc_raw");
         self.registry.insert(ptr as usize);
+        // A FRESH ALLOCATION MAKES ITS PAGE YOUNG. The free list serves from
+        // below `gen_young_floor`, so without this an object born into a hole
+        // a previous sweep left is unreachable by every young cycle -- see
+        // `note_young_page`.
+        self.note_young_page(ptr as usize);
         // See the same call in `register_allocations`.
         crate::gc_quiescence::note_allocated(&[ptr as usize]);
         let after = self.allocated.fetch_add(size, Ordering::Relaxed) + size;
@@ -12618,6 +12831,12 @@ impl ZgcRealHeap {
         if self.mark_active.load(Ordering::Relaxed) {
             self.blacken_range(ptr as usize, ptr as usize + want);
         }
+        // ...and the same for the young set, once per CHUNK rather than once
+        // per object: a chunk is contiguous and every object it will serve is
+        // inside it. See `note_young_page`.
+        if self.generational_enabled.load(Ordering::Relaxed) {
+            self.mark_young_pages(ptr as usize, ptr as usize + want);
+        }
         Some(())
     }
 
@@ -14150,9 +14369,21 @@ impl ZgcRealHeap {
         cfg: &ZSweepCfg,
     ) -> ZSweepShard {
         let mut sh = ZSweepShard::default();
-        registered.for_each_base_in_words(0, registered.word_count(), floor, |base| {
-            self.sweep_one(base, cfg, &mut sh)
-        });
+        if floor == 0 {
+            registered.for_each_base_in_words(0, registered.word_count(), 0, |base| {
+                self.sweep_one(base, cfg, &mut sh)
+            });
+        } else {
+            // A YOUNG CYCLE SWEEPS THE UNION, not the range. See
+            // `note_young_page`: the free list serves from below the floor, so
+            // an object born into a hole a previous sweep left is invisible to
+            // a floor-bounded cycle and is retained until the next major.
+            registered.for_each_young_base(
+                floor,
+                |off| self.young_page_at_offset(off),
+                |base| self.sweep_one(base, cfg, &mut sh),
+            );
+        }
         sh.flush();
         sh
     }
@@ -14953,7 +15184,15 @@ impl GarbageCollector for ZgcRealHeap {
         // `has_old_objects` rather than just `gen_on`: with nothing promoted yet
         // a young cycle IS a full cycle, and counting it as a minor would burn
         // the `minors_per_major` budget on cycles that saved nothing.
-        let young_cycle = gen_on && !force_major && self.has_old_objects.load(Ordering::Relaxed);
+        // ...and the young PAGE set has to be trustworthy. An allocation that
+        // landed off the page grid leaves it incomplete, and an incomplete
+        // young set does not under-collect for one cycle -- it retains whatever
+        // is on the unrecorded page until a major, forever if majors are rare.
+        // Fail closed: see `young_pages_are_complete`.
+        let young_cycle = gen_on
+            && !force_major
+            && self.has_old_objects.load(Ordering::Relaxed)
+            && self.young_pages_are_complete();
         // THE SWEEP FLOOR. On a young cycle the sweep visits only
         // `[gen_young_floor, cursor)` -- see that field for why bounding the
         // sweep by ADDRESS is the only way to bound it at all. `0` on a
@@ -15659,6 +15898,12 @@ impl GarbageCollector for ZgcRealHeap {
             self.gen_young_floor.store(cursor, Ordering::Relaxed);
             self.gen_old_live_bytes
                 .store(bytes_copied, Ordering::Relaxed);
+            // ...AND THE YOUNG PAGE SET STARTS AGAIN. This cycle examined every
+            // page, so nothing below the new floor is owed a visit; the set
+            // refills from the allocations that follow. Clearing it HERE rather
+            // than at the next young cycle is what keeps it a record of "since
+            // the last major" instead of an ever-growing union.
+            self.clear_young_pages();
         }
 
         if unsizable != 0 {
@@ -17165,6 +17410,182 @@ pub(crate) mod tests {
         heap.collect_garbage(&stw, &mut roots, monitors);
         let still = addrs.iter().filter(|a| heap.registry.contains(**a)).count();
         (addrs, still)
+    }
+
+    // ---- D4: the nursery is a union, not a floor --------------------------
+
+    /// **An object allocated BELOW the floor is reclaimed by a young cycle.**
+    ///
+    /// The finding, stated as a test. `gen_young_floor` is the arena's low
+    /// cursor at the last whole-heap collection and a young cycle swept
+    /// `[floor, cursor)` -- but the free list hands out space below the floor,
+    /// so an object allocated into a hole a previous sweep left was born into
+    /// the old region and NO young cycle would ever reclaim it. The field's own
+    /// doc called it over-retention; on a steady-state workload, where most
+    /// allocation comes from holes rather than the bump, it means the young
+    /// generation reclaims almost nothing and the `minors_per_major` budget is
+    /// spent on cycles that saved nothing.
+    ///
+    /// The fixture makes a real hole rather than simulating one: allocate a
+    /// block of garbage, collect it (which frees it below the eventual floor),
+    /// allocate more so the floor lands above it, and then allocate again --
+    /// the free list serves the hole.
+    ///
+    /// The exact edit that trips it: routing `sweep_serial`'s young arm back
+    /// through `for_each_base_from`, or dropping `note_young_page` from
+    /// `alloc_raw`.
+    #[test]
+    fn an_object_born_below_the_nursery_floor_is_still_collected() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        // INTERLEAVED live and garbage, so the holes the sweep leaves are
+        // WALLED by survivors. A block of garbage at the top would simply be
+        // un-bumped by `retract_cursor_into_free_tail` and the floor would land
+        // below it -- no free-list hole, and the fixture would prove nothing.
+        let (head, _chain, _g) = conc_build_graph(&heap, 200, 0);
+        let mut roots: Vec<ObjectRef> = vec![head];
+        let mut fodder: Vec<usize> = Vec::new();
+        for i in 0..4_000 {
+            let o = heap.alloc_object(ClassId::new(44), 2);
+            if i % 8 == 0 {
+                roots.push(o);
+            } else {
+                fodder.push(o.as_ptr() as usize);
+            }
+        }
+        let _ = gen_collect(&heap, &mut roots); // whole-heap: frees the fodder
+        let head = roots[0];
+        let freed = fodder
+            .iter()
+            .filter(|a| heap.is_object_address(**a).is_none())
+            .count();
+        assert!(
+            freed > 3_000,
+            "the fixture needs holes: only {freed} of {} fodder objects were \
+             freed",
+            fodder.len()
+        );
+        // Now push the floor ABOVE the holes with a second whole-heap cycle.
+        heap.gen_force_major_next.store(true, Ordering::Relaxed);
+        let _ = gen_collect(&heap, &mut roots);
+        let head = roots[0];
+        let (_, floor, _) = heap.nursery_stats();
+        assert!(floor > heap.arena_base, "the fixture needs a real floor");
+
+        // MODEL A MATURE HEAP. Generational mode seeds the arena's `prefer_bump`
+        // policy precisely so fresh objects land above the floor -- which works
+        // for exactly as long as there is a bump tail. Once the cursor has
+        // reached capacity every allocation comes from the free list, and that
+        // is the steady state the finding is about. Turning the preference off
+        // is how a unit test reaches it without allocating 64 MiB.
+        heap.arena.lock().set_prefer_bump(false);
+        // Allocate objects of the fodder's exact shape; the free list serves
+        // them out of the holes, i.e. BELOW the floor.
+        let below: Vec<usize> = (0..1_500)
+            .map(|_| heap.alloc_object(ClassId::new(44), 2).as_ptr() as usize)
+            .filter(|a| *a < floor)
+            .collect();
+        assert!(
+            below.len() > 100,
+            "only {} of 1500 allocations landed below the floor; the fixture is \
+             not exercising the free list",
+            below.len()
+        );
+        assert!(
+            heap.young_pages_below_floor() > 0,
+            "allocations landed below the floor and the young set did not \
+             record their grains"
+        );
+
+        // A YOUNG cycle. None of `below` is rooted, so all of it must go.
+        let _ = head;
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(heap.generational_stats().0, 1, "that must have been a minor");
+        let survivors = below
+            .iter()
+            .filter(|a| heap.is_object_address(**a).is_some())
+            .count();
+        assert_eq!(
+            survivors,
+            0,
+            "{survivors} of {} unrooted objects allocated below the nursery \
+             floor survived a young cycle -- they are retained until a major, \
+             which on a free-list-served workload is every object",
+            below.len()
+        );
+    }
+
+    /// **A whole-heap cycle starts the young set again.**
+    ///
+    /// It has just examined every grain, so nothing is owed a visit and the set
+    /// must reset -- otherwise it is an ever-growing union and every young
+    /// cycle converges on a whole-heap sweep, which is the feature turning
+    /// itself off.
+    #[test]
+    fn a_major_forgets_the_young_grains() {
+        let heap = gen_heap_for_test(64 * 1024 * 1024);
+        let (head, _chain, _g) = conc_build_graph(&heap, 200, 0);
+        let mut roots = [head];
+        let _ = gen_collect(&heap, &mut roots);
+        let head = roots[0];
+        heap.gen_force_major_next.store(true, Ordering::Relaxed);
+        let mut roots = [head];
+        let _ = gen_collect(&heap, &mut roots);
+        let head = roots[0];
+        assert_eq!(
+            heap.young_pages_below_floor(),
+            0,
+            "a whole-heap cycle left grains marked young"
+        );
+        // ...and it refills from what follows.
+        let (_, floor, _) = heap.nursery_stats();
+        let mut any_below = false;
+        for _ in 0..2_000 {
+            if (heap.alloc_object(ClassId::new(44), 2).as_ptr() as usize) < floor {
+                any_below = true;
+            }
+        }
+        if any_below {
+            assert!(
+                heap.young_pages_below_floor() > 0,
+                "the set did not refill after the major"
+            );
+        }
+        let _ = head;
+    }
+
+    /// **An allocation the grain grid cannot record forces a whole-heap
+    /// cycle.**
+    ///
+    /// Fail closed. An incomplete young set does not merely under-collect for
+    /// one cycle: it retains whatever is on the unrecorded grain until a major,
+    /// forever if majors are rare. The overflow latch is the only thing between
+    /// that and a leak, so it is asserted rather than assumed.
+    #[test]
+    fn an_ungriddable_allocation_forces_a_whole_heap_cycle() {
+        let heap = gen_heap_for_test(16 * 1024 * 1024);
+        let (head, _chain, _g) = conc_build_graph(&heap, 200, 0);
+        let mut roots = [head];
+        let _ = gen_collect(&heap, &mut roots);
+        let head = roots[0];
+        assert!(heap.has_old_objects.load(Ordering::Relaxed));
+        assert!(heap.young_pages_are_complete());
+        // An address the grid cannot hold: past the arena's own end.
+        heap.mark_young_pages(heap.arena_end + 8, heap.arena_end + 16);
+        assert!(
+            !heap.young_pages_are_complete(),
+            "an off-grid allocation must invalidate the young set"
+        );
+        let mut roots = [head];
+        let _ = gen_collect(&heap, &mut roots);
+        assert_eq!(
+            heap.generational_stats().0,
+            0,
+            "the cycle must have been whole-heap, not young"
+        );
+        assert!(
+            heap.young_pages_are_complete(),
+            "and the whole-heap cycle must clear the latch"
+        );
     }
 
     // ---- D1: the backing store commits lazily and gives memory back -------
@@ -21750,8 +22171,15 @@ pub(crate) mod tests {
 
         // (1) IT REALLY SKIPPED.
         let (skipped, _, _) = heap.nursery_stats();
+        // `>= 2_500` rather than `>= 3_000`: the young region is the UNION of
+        // the floor and the 64 KiB grains that have received a fresh
+        // allocation, so the grain the floor falls INSIDE is swept whole -- the
+        // junk's first objects land in it and mark it young. That over-sweep is
+        // bounded by one grain, and it is the price of no longer missing every
+        // object the free list serves from below the floor. See
+        // `note_young_page`.
         assert!(
-            skipped >= 3_000,
+            skipped >= 2_500,
             "the sweep must have skipped the old generation: skipped={skipped}, \
              and the chain alone is 3000 objects"
         );
@@ -21932,26 +22360,39 @@ pub(crate) mod tests {
             .map(|_| heap.alloc_object(ClassId::new(43), 2).as_ptr() as usize)
             .collect();
 
-        // The young cycle sweeps nothing and must arm the escalation latch.
+        // THE FLOOR NO LONGER DECIDES ON ITS OWN, so this state is not a stall
+        // any more. The young region is the union of the floor and the grains
+        // that have received a fresh allocation, and the junk marked its own --
+        // so the young cycle reclaims it despite a floor above every live
+        // address. That is strictly stronger than the escalation this test used
+        // to assert, and it is the finding `note_young_page` fixes.
         let mut roots = [head];
         let _ = gen_collect(&heap, &mut roots);
         assert_eq!(heap.generational_stats().0, 1, "still counted as a minor");
         assert!(
-            heap.gen_force_major_next.load(Ordering::Relaxed),
-            "a young cycle that reclaimed nothing must escalate, or a floor above              the cursor stalls collection until an allocation fails"
+            junk.iter().all(|a| heap.is_object_address(*a).is_none()),
+            "a young cycle under an impossible floor reclaimed nothing; the \
+             young set is still derived from the floor alone"
+        );
+        // The escalation latch is still the backstop, and it must be DOWN here
+        // precisely BECAUSE this cycle reclaimed something. A young cycle that
+        // genuinely frees nothing still arms it; that path is unchanged.
+        assert!(
+            !heap.gen_force_major_next.load(Ordering::Relaxed),
+            "a young cycle that reclaimed the whole nursery must not escalate"
         );
 
-        // The forced major recomputes the floor and reclaims the junk.
+        // And a major still republishes a sane floor. FORCED, because the
+        // collector no longer needs to escalate its way there -- which is the
+        // whole change above. The test forces the state it wants to observe,
+        // the same way it forced the impossible floor.
+        heap.gen_force_major_next.store(true, Ordering::Relaxed);
         let mut roots = [head];
         let _ = gen_collect(&heap, &mut roots);
         let (_, floor, _) = heap.nursery_stats();
         assert!(
             floor < usize::MAX / 2 && floor > heap.arena_base,
             "the major must republish a sane floor, got {floor:#x}"
-        );
-        assert!(
-            junk.iter().all(|a| heap.is_object_address(*a).is_none()),
-            "and reclaim what the wedged young cycles could not see"
         );
         assert_eq!(conc_walk_chain(&heap, roots[0]), chain);
     }
