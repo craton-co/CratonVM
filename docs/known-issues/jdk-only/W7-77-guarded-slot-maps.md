@@ -411,6 +411,29 @@ none of `types/src/flag_groups.rs`, `types/tests/flag-surface.txt`,
 `cargo test -p cratonvm-types` is unaffected. `HEADER_SIZE` is not a factor at
 any site touched here and is not mentioned outside a symbolic reference.
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** §6.1 says "This lane cannot run
+> `cargo`", so all ten predicates were re-implemented outside the tree and run
+> there. The real ones have now been run, on a build from this tree:
+>
+> ```text
+> cargo test -p cratonvm-native-api --test guarded_slot_maps   11 passed, 0 failed
+> cargo test -p cratonvm-native-api --test read_alias_coverage 12 passed, 0 failed
+> ```
+>
+> **Eleven, not the ten §6.1 describes** — the file grew a test after this record
+> was written. That is the same count drift every record in this campaign has
+> shown; the assertions are what was verified, and the count is noted rather than
+> treated as a finding.
+>
+> A re-implementation passing is weaker evidence than it looks: it shares the
+> author's reading of the predicate, so it can only fail where the author already
+> suspected a failure. Running the tree's own copy is what closes that gap, and
+> §6.1's own framing — "a mirror is not a compiler" appears in F34-1 for the same
+> reason — says so.
+>
+> Unchanged: §6.1's caveat that **all four rows are unobservable from Java
+> today**. What passes is the guard, not a behaviour a probe could reach.
+
 ## 6. Proving the RED
 
 ### 6.1 The gates
