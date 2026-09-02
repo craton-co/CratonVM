@@ -216,6 +216,24 @@ impl HeapStore {
         }
     }
 
+    /// The COMMITTED parts of `[start, end)` as absolute `(addr, len)` spans,
+    /// adjacent ones coalesced — exactly the bytes [`Self::fill_zero`] would
+    /// touch, handed to a caller that will zero them somewhere else (the
+    /// generational heap's off-pause wipe of its evacuated semi-space).
+    pub fn committed_spans(&self, start: usize, end: usize) -> Vec<(usize, usize)> {
+        match self {
+            HeapStore::Owned(v) => {
+                let end = end.min(v.len());
+                if end > start {
+                    vec![(v.as_ptr() as usize + start, end - start)]
+                } else {
+                    Vec::new()
+                }
+            }
+            HeapStore::Reserved(r) => r.committed_spans(start, end),
+        }
+    }
+
     /// Grow the usable capacity to `new_capacity`, returning the (possibly
     /// new) base pointer.
     ///
@@ -363,6 +381,30 @@ impl Reservation {
             // reservation, so the bytes are mapped read-write.
             unsafe { std::ptr::write_bytes(self.base.add(lo), 0, hi - lo) };
         }
+    }
+
+    /// See [`HeapStore::committed_spans`].
+    fn committed_spans(&self, start: usize, end: usize) -> Vec<(usize, usize)> {
+        let end = end.min(self.len);
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        if end <= start {
+            return out;
+        }
+        let first = start / GRANULE;
+        let last = (end - 1) / GRANULE;
+        for g in first..=last {
+            if !self.is_committed(g) {
+                continue;
+            }
+            let lo = (g * GRANULE).max(start);
+            let hi = ((g + 1) * GRANULE).min(end);
+            let addr = self.base as usize + lo;
+            match out.last_mut() {
+                Some((a, l)) if *a + *l == addr => *l += hi - lo,
+                _ => out.push((addr, hi - lo)),
+            }
+        }
+        out
     }
 
     fn committed_granules(&self) -> usize {

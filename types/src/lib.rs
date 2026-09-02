@@ -47,7 +47,11 @@ mod value;
 /// an `FxHashMap` for exactly that reason and then paid to convert it into a
 /// `HashMap` for this field: 43 ms of a 424 ms stop-the-world pause, to change
 /// a container type. Naming the hasher here is what removes that conversion.
-pub type PointerMap = rustc_hash::FxHashMap<usize, usize>;
+/// Since 2026-09-02 (gen-gc-five) this is a SHARDED map built in parallel
+/// by the evacuation workers rather than the flat `FxHashMap` alias; the
+/// reasoning above still holds for every shard. See [`pointer_map`].
+pub mod pointer_map;
+pub use pointer_map::PointerMap;
 
 pub use class_id::{ClassId, ClassLoaderId};
 pub use compact_value::{CompactTag, CompactValue, CompactValueError};
@@ -680,6 +684,37 @@ pub mod gpu_event_census {
     static RECYCLED: AtomicU64 = AtomicU64::new(0);
     static WAITS_ISSUED: AtomicU64 = AtomicU64::new(0);
     static WAITS_ELIDED: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_HIT: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_MISS: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_PARKED: AtomicU64 = AtomicU64::new(0);
+
+    /// One device allocation served from the bridge's allocation pool.
+    #[inline]
+    pub fn note_alloc_pool_hit() {
+        ALLOC_HIT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One device allocation that had to go to `cuMemAlloc`.
+    #[inline]
+    pub fn note_alloc_pool_miss() {
+        ALLOC_MISS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One freed device allocation parked in the pool instead of freed.
+    #[inline]
+    pub fn note_alloc_pool_parked() {
+        ALLOC_PARKED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(pool hits, cuMemAlloc calls, blocks parked)`.
+    #[must_use]
+    pub fn alloc_totals() -> (u64, u64, u64) {
+        (
+            ALLOC_HIT.load(Ordering::Relaxed),
+            ALLOC_MISS.load(Ordering::Relaxed),
+            ALLOC_PARKED.load(Ordering::Relaxed),
+        )
+    }
 
     /// One `cuEventCreate` the pool could not serve.
     #[inline]
@@ -726,16 +761,19 @@ pub mod gpu_event_census {
     pub fn exit_summary() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         let (created, recycled, issued, elided) = totals();
-        if created + recycled + issued + elided == 0 {
+        let (alloc_hit, alloc_miss, alloc_parked) = alloc_totals();
+        if created + recycled + issued + elided + alloc_hit + alloc_miss == 0 {
             return;
         }
         ONCE.call_once(|| {
             eprintln!(
                 "[cratonvm] gpu events: created={created} recycled={recycled} \
                  (pool served {:.1}%); stream waits issued={issued} \
-                 elided={elided} ({:.1}% elided)",
+                 elided={elided} ({:.1}% elided); device allocs: cuMemAlloc={alloc_miss} \
+                 pooled={alloc_hit} ({:.1}% pooled) parked={alloc_parked}",
                 100.0 * recycled as f64 / (created + recycled).max(1) as f64,
                 100.0 * elided as f64 / (issued + elided).max(1) as f64,
+                100.0 * alloc_hit as f64 / (alloc_hit + alloc_miss).max(1) as f64,
             );
         });
     }
