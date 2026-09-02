@@ -1212,6 +1212,15 @@ pub const INVENTORY: &[E] = &[
     // the default collector, because the path it disabled was already
     // unreachable there.
     E { group: Group::JIT, token: "gated-ref-store", on_key: Some("CRATONVM_JIT_GATED_REF_STORE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // The same gates on the OPTIMIZING tier, which had no arm to ask with until
+    // 2026-09-02 and so reported neither gated nor declined. A separate lever
+    // from the one above on purpose: one switch covering both emitters could not
+    // separate "the plan is wrong" from "this emitter is wrong".
+    E { group: Group::JIT, token: "ir-ref-store", on_key: Some("CRATONVM_JIT_IR_REF_STORE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // Diagnostic-only: the DYNAMIC split between the gated arm's inline path
+    // and its helper fallback. The compile-time census counts emitted
+    // sequences, which is not the same fact.
+    E { group: Group::JIT, token: "dbg-ir-ref-store-trace", on_key: Some("CRATONVM_DBG_IR_REF_STORE_TRACE"), off_key: None, off_word: None, since: "2026-09-02" },
     // Seeds `this` non-null at method entry. Kept separate from
     // `receiver-null-elim` below because the blast radii differ: this one
     // widens a fact THREE consumers already read (array null-check elision,
@@ -1835,6 +1844,11 @@ pub const INVENTORY: &[E] = &[
     // binary both ways.
     E { group: Group::GC, token: "gpu-host-callback", on_key: Some("CRATONVM_GPU_HOST_CALLBACK"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "gpu-device-pool", on_key: Some("CRATONVM_GPU_DEVICE_POOL"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // How many carriers the FFM element fast path remembers per thread. `1`
+    // is the single slot it replaced, which is the control arm: kfusion's
+    // integration alternates the TSDF volume with the images it reads, and
+    // one slot published 38.3M native verdicts for 129M consults.
+    E { group: Group::JIT, token: "ffm-verdict-ways", on_key: Some("CRATONVM_FFM_VERDICT_WAYS"), off_key: None, off_word: None, since: "2026-09-02" },
     // `gpu-wait-latch` is DEFAULT-ON with a "0" off-word, same argument as
     // `gpu-device-pool`: skipping a `cuStreamWaitEvent` on an event that has
     // already fired has no observable semantics, so the only honest way to
