@@ -615,6 +615,56 @@ impl ZgcRealHeap {
     ///
     /// Not gated on [`Self::tlab_enabled`]: a chunk issued before the kill
     /// switch was flipped still has to be closed and returned.
+    /// [`Self::retire_all_tlabs`] for a caller that HOLDS A SAFEPOINT.
+    ///
+    /// # Why the caller has to say which it is
+    ///
+    /// A cell this pass cannot `try_lock` is left holding a chunk, and the two
+    /// callers mean opposite things by that:
+    ///
+    /// * From `alloc_raw`, `walk_objects` or the census driver — none of which
+    ///   stops the world — a locked cell is a peer mid-allocation. Nothing is
+    ///   owed: the chunk is that thread's, it will retire at the next
+    ///   collection, and the pass is opportunistic by construction.
+    /// * From `collect_garbage`, at a safepoint, it is a **soundness hazard**.
+    ///   `tlab_retire_skipped_total`'s own doc states it: nothing keeps the
+    ///   compaction cursor above a chunk the collector cannot see, so
+    ///   `compact_low_to` retracts past it and zeroes it, `clear_low_free_list`
+    ///   drops the only record that it was reserved, and the arena and the
+    ///   chunk's owner then fill one span.
+    ///
+    /// Both fed ONE counter until 2026-09-02, and `relocate_stw`'s soundness
+    /// argument rested on that counter reading zero — *"`tlab_retire_skipped`
+    /// measured zero across every run of the `ResourceLeakDetectorTest` repro,
+    /// so no chunk is ever retained and a refusal built on it could never
+    /// fire."* A conflated counter cannot support that: a run reporting 42
+    /// skips says nothing about whether any of them was the dangerous kind.
+    /// `probes/OopMapPeerCoverage.java` reports exactly that number.
+    ///
+    /// So this entry point exists to separate them, and to FAIL CLOSED: a skip
+    /// here arms [`ZgcRealHeap::tlab_retire_incomplete`], and `relocate_stw`
+    /// declines to move anything for the cycle. Declining costs one cycle's
+    /// defragmentation; the alternative is handing the same span to the arena
+    /// and to a thread's bump cursor.
+    pub fn retire_all_tlabs_at_safepoint(&self) -> ZArenaTlabRetireSummary {
+        let summary = self.retire_all_tlabs();
+        if summary.skipped_locked > 0 {
+            self.counters
+                .tlab_retire_skipped_at_safepoint
+                .fetch_add(summary.skipped_locked, Ordering::Relaxed);
+            self.tlab_retire_incomplete.store(true, Ordering::Release);
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                skipped = summary.skipped_locked,
+                tlabs = summary.tlabs,
+                "zgc: a TLAB cell could not be locked AT A SAFEPOINT, so its chunk \
+                 is invisible to this collection -- relocation declines this cycle \
+                 rather than retract the compaction cursor past a reserved span",
+            );
+        }
+        summary
+    }
+
     pub fn retire_all_tlabs(&self) -> ZArenaTlabRetireSummary {
         let cells = self.tlabs.cells();
         let mut summary = ZArenaTlabRetireSummary {
