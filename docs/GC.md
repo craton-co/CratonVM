@@ -228,6 +228,10 @@ clamped to 1-32 MB), `-XX:InitiatingHeapOccupancyPercent=<n>` — a **ceiling**
 on the adaptive threshold, never a floor, floored at max(1 % of heap, one
 region) — `-XX:MaxGCPauseMillis=<n>` (the young-generation size target and the
 mixed collection's copy-time budget), `-XX:ParallelGCThreads=<n>`,
+`-XX:G1MixedGCLiveThresholdPercent=<n>` (default 85: an Old region at or above
+this percent live is never a mixed-collection candidate),
+`-XX:G1HeapWastePercent=<n>` (default 5: the mixed phase ends early once the
+candidates' garbage is below this percent of the heap),
 `-XX:MaxHeapSize`, `-XX:+HeapDumpOnOutOfMemoryError`.
 
 **Reading a G1 pause.** `--verbose:gc` prints one `[GC-STAT]` line per pause

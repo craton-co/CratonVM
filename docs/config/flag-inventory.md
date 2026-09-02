@@ -1177,7 +1177,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_G1_UNCOMMIT` | GC | `CRATONVM_GC=g1-uncommit` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_G1_VERIFY_BUDGET` | GC | `CRATONVM_GC=g1-verify-budget` | opt-in | off | behaviour | snapshot | gc |
 | `CRATONVM_G1_WORKERS` | GC | `CRATONVM_GC=g1-workers` | opt-in | off | behaviour | snapshot | types |
-| `CRATONVM_G1_YOUNG_PAUSE_TARGET` | GC | `CRATONVM_GC=g1-young-pause-target` | opt-in | off | behaviour | snapshot | gc, types |
+| `CRATONVM_G1_YOUNG_PAUSE_TARGET` | GC | `CRATONVM_GC=g1-young-pause-target` | default-on | on | behaviour | snapshot | gc, types |
 | `CRATONVM_GC` | GC | `CRATONVM_GC=…` | group | unset | — | snapshot | types |
 | `CRATONVM_GC_ARRAY_GUARD_BT` | DBG | `CRATONVM_DBG=gc-array-guard-bt` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_GC_CARD_METRICS` | GC | `CRATONVM_GC=card-metrics` | opt-in | off | behaviour | snapshot | gc, types |
