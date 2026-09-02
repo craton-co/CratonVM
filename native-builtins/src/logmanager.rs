@@ -170,18 +170,36 @@ pub(crate) const LOGGER_FIELD_PARENT: usize = 8;
 pub(crate) const LOGGER_FIELD_LEVEL: usize = LOGGER_REAL_FIELDS;
 
 /// What `org.jboss.logmanager.Logger.getEffectiveLevel()` reports for a logger
-/// with no explicit level anywhere up its chain, and the threshold its
-/// `isLoggable` compares against in that state.
+/// with no explicit level anywhere up its chain.
 ///
-/// NOT the JUL default (800 / INFO). jboss-logmanager seeds a `LoggerNode`'s
-/// `effectiveMinLevel` with `Integer.MIN_VALUE` and only raises it when a
-/// level is configured, so an unconfigured JBoss logger logs EVERYTHING where
-/// an unconfigured JUL one stops at INFO. Measured on Temurin 25 +
-/// jboss-logmanager 3.2.2: a freshly created, never-configured logger answers
-/// `getEffectiveLevel() == -2147483648` and `isLoggable(TRACE) == true`.
-/// `attach_minimal_jboss_logger_node` seeds the synthetic node's field with
-/// the same value.
-const JBOSS_UNCONFIGURED_EFFECTIVE_LEVEL: i32 = i32::MIN;
+/// `LoggerNode.<init>` seeds `effectiveLevel` with `Logger.INFO_INT` whenever
+/// `LogContextInitializer.getInitialLevel(name)` answers null, which is what
+/// the interface's `DEFAULT` does — so an unconfigured jboss-logmanager logger
+/// stops at INFO exactly like an unconfigured JUL one.
+///
+/// **This constant was `i32::MIN` for one session, and that was a misreading.**
+/// The probe that produced `-2147483648` ran with `quarkus-bootstrap-runner`
+/// on the classpath, whose `InitialConfigurator.getInitialLevel("")` returns
+/// `Level.ALL` for the ROOT — every logger then inherits it. Re-running the
+/// same probe against jboss-logmanager 3.2.2 with NO
+/// `LogContextInitializer` provider on the classpath reads
+/// `root.effective=800`, `freshControl.effective=800`,
+/// `freshControl.isLoggableTrace=false`. The MIN was one application's
+/// configuration being read as the library's default. Deleting the provider
+/// from the classpath is the control that separates them; see
+/// `apply_log_context_initializer`.
+const JBOSS_UNCONFIGURED_EFFECTIVE_LEVEL: i32 = 800;
+
+/// `java.util.logging.Level.ALL.intValue()`, and the default
+/// `LoggerNode.effectiveMinLevel` — `LoggerNode.<init>` computes
+/// `requireNonNullElse(initializer.getMinimumLevel(name), Level.ALL)`.
+const JBOSS_LEVEL_ALL_INT: i32 = i32::MIN;
+
+/// `java.util.logging.Level.OFF.intValue()`. `LoggerNode.isLoggableLevel`
+/// rejects it outright — `level != OFF_INT && ...` — so `isLoggable(OFF)` is
+/// false however low the thresholds are, which no comparison against a
+/// threshold can reproduce (OFF is `Integer.MAX_VALUE`, i.e. above every one).
+const JBOSS_LEVEL_OFF_INT: i32 = i32::MAX;
 
 // ---------------------------------------------------------------------------
 // Process-wide singleton state
@@ -1367,6 +1385,15 @@ pub(crate) fn reset_state_for_tests() {
     if let Ok(mut l) = logger_explicit_levels(TEST_VM).lock() {
         l.clear();
     }
+    // Both level tables and the resolved-initializer cache, for the same
+    // reason: they are process-wide and name-keyed, so anything left in them
+    // is the next test's inherited threshold or the next test's provider.
+    if let Ok(mut l) = logger_minimum_levels(TEST_VM).lock() {
+        l.clear();
+    }
+    if let Ok(mut c) = jboss_initializer_cell(TEST_VM).lock() {
+        *c = None;
+    }
     if let Ok(mut l) = config_listeners(TEST_VM).lock() {
         l.clear();
     }
@@ -2450,7 +2477,302 @@ fn get_or_create_jboss_logger(
         }
     }
     reg.insert(name.to_string(), obj.as_ptr() as u64);
+    // Drop the registry lock BEFORE the SPI call below: it runs application
+    // bytecode that is free to demand another logger, and that call comes
+    // straight back here.
+    drop(reg);
+    // The node is in the registry first and initialised second, on purpose —
+    // a re-entrant `getLogger(name)` from inside the initializer then finds
+    // this object instead of building a second one and recursing.
+    let obj = apply_log_context_initializer(ctx, obj, name)?;
     Ok(obj)
+}
+
+// ---------------------------------------------------------------------------
+// org.jboss.logmanager.LogContextInitializer (the per-node SPI)
+// ---------------------------------------------------------------------------
+
+const CLS_JBOSS_LOG_CONTEXT_INITIALIZER: &str = "org/jboss/logmanager/LogContextInitializer";
+
+/// Kill switch for the `LogContextInitializer` consultation below.
+/// `CRATONVM_JBOSS_LOG_CONTEXT_INITIALIZER=0` restores the previous behaviour
+/// (no provider is ever asked, every node is born bare). Default ON.
+///
+/// It exists because this is the one place in the logging natives that runs
+/// APPLICATION bytecode from inside a logger allocator — a provider's
+/// `<clinit>` constructs handlers and is free to log — and every
+/// jboss-logmanager consumer in the corpus (WildFly, Keycloak, Quarkus) reaches
+/// it. A kill switch makes "is this the initializer?" a same-binary question.
+fn jboss_log_context_initializer_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var_os("CRATONVM_JBOSS_LOG_CONTEXT_INITIALIZER")
+                .as_deref()
+                .and_then(|s| s.to_str()),
+            Some("0")
+        )
+    })
+}
+
+/// Per-VM cache of the resolved provider: absent = not yet looked for,
+/// `Some(0)` = looked for and there is none, `Some(addr)` = the provider.
+///
+/// Real `LogContext.discoverDefaultInitializer0` resolves once and stores the
+/// result in a static; the negative answer has to be cached too, or every
+/// logger creation in a process with no provider pays a full `ServiceLoader`
+/// scan of the classpath.
+fn jboss_initializer_cell(vm: usize) -> &'static Mutex<Option<u64>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<usize, &'static Mutex<Option<u64>>>>> = OnceLock::new();
+    per_vm_table(&INSTANCE, vm)
+}
+
+thread_local! {
+    /// Set while this thread is resolving or calling the initializer.
+    ///
+    /// A provider's static initialiser builds handlers (Quarkus's
+    /// `InitialConfigurator.<clinit>` constructs a `QuarkusDelayedHandler`),
+    /// and anything on that path may log — which demands a logger, which
+    /// re-enters `get_or_create_jboss_logger`. The re-entrant node is created
+    /// and registered normally; it just does not itself consult the SPI, which
+    /// is what makes the recursion finite.
+    static JBOSS_INITIALIZER_BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Resolve the single `LogContextInitializer` the way
+/// `LogContext.discoverDefaultInitializer0` does: `ServiceLoader.load` over
+/// the interface's own class loader, first provider wins, and `DEFAULT` (which
+/// answers null / null / `NO_HANDLERS` — i.e. nothing) when there is none.
+///
+/// Returns `None` for "no provider", including every failure: a missing
+/// jboss-logmanager, an unloadable provider class, a `ServiceLoader` that
+/// throws. Real jboss-logmanager also swallows provider failures here
+/// (`discoverDefaultInitializer` catches and falls back to `DEFAULT`), and a
+/// VM that refused to hand out loggers because a logging SPI misbehaved would
+/// be worse than one that logs a little less.
+fn resolve_jboss_log_context_initializer(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    if !jboss_log_context_initializer_enabled() {
+        return None;
+    }
+    let vm = ctx.vm_identity();
+    if let Some(addr) = *jboss_initializer_cell(vm)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
+        return if addr == 0 {
+            None
+        } else {
+            // SAFETY: the provider is held by a global root (added below), so
+            // the address stays valid and current for the life of the VM.
+            Some(unsafe { object_from_u64(addr) })
+        };
+    }
+    let resolved = discover_jboss_log_context_initializer(ctx);
+    let addr = resolved.map(|o| o.as_ptr() as u64).unwrap_or(0);
+    jboss_initializer_cell(vm)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(addr);
+    resolved
+}
+
+fn discover_jboss_log_context_initializer(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    // No jboss-logmanager on the classpath: there is no SPI to consult, and
+    // this is the gate that keeps every non-JBoss program out of the code
+    // below. Note it is deliberately NOT gated on
+    // `java.util.logging.manager` — real `LogContext` consults the
+    // initializer whenever it builds a node, whether or not the JBoss
+    // LogManager was installed as the JUL manager.
+    let cid = ctx
+        .ensure_class_initialized(CLS_JBOSS_LOG_CONTEXT_INITIALIZER)
+        .ok()?;
+    let mirror = ctx.get_class_mirror(cid);
+    let mirror_pin = ctx.pin_native_root(mirror);
+    let found = (|| -> Option<ObjectRef> {
+        let loader = match ctx
+            .invoke_virtual(mirror, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+            .ok()?
+        {
+            Some(v @ Value::Object(_)) => v,
+            _ => Value::Object(None),
+        };
+        let mirror = ctx.read_native_pin(mirror_pin, mirror);
+        let loader_arg = loader;
+        let service_loader = match ctx
+            .invoke(
+                "java/util/ServiceLoader",
+                "load",
+                "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;",
+                &[Value::Object(Some(mirror)), loader_arg],
+            )
+            .ok()?
+        {
+            Some(Value::Object(Some(sl))) => sl,
+            _ => return None,
+        };
+        let sl_pin = ctx.pin_native_root(service_loader);
+        let first = (|| -> Option<ObjectRef> {
+            let iterator = match ctx
+                .invoke_virtual(service_loader, "iterator", "()Ljava/util/Iterator;", &[])
+                .ok()?
+            {
+                Some(Value::Object(Some(it))) => it,
+                _ => return None,
+            };
+            let it_pin = ctx.pin_native_root(iterator);
+            let out = (|| -> Option<ObjectRef> {
+                if !matches!(
+                    ctx.invoke_virtual(iterator, "hasNext", "()Z", &[]).ok()?,
+                    Some(Value::Int(1))
+                ) {
+                    return None;
+                }
+                let iterator = ctx.read_native_pin(it_pin, iterator);
+                match ctx
+                    .invoke_virtual(iterator, "next", "()Ljava/lang/Object;", &[])
+                    .ok()?
+                {
+                    Some(Value::Object(Some(provider))) => Some(provider),
+                    _ => None,
+                }
+            })();
+            ctx.unpin_native_roots(it_pin);
+            out
+        })();
+        ctx.unpin_native_roots(sl_pin);
+        first
+    })();
+    ctx.unpin_native_roots(mirror_pin);
+    let provider = found?;
+    // Hold it: the cache stores a raw address, and this is the object every
+    // later node creation calls back into.
+    ctx.add_global_root(provider);
+    tracing::debug!(
+        provider = %ctx
+            .class_name_arc_of_id(ctx.class_id_of_object(provider))
+            .as_deref()
+            .unwrap_or("<unknown>"),
+        "resolved org.jboss.logmanager.LogContextInitializer provider"
+    );
+    Some(provider)
+}
+
+/// Apply the initializer to a freshly created node, mirroring
+/// `LoggerNode.<init>`:
+///
+/// ```text
+/// effectiveMinLevel = requireNonNullElse(initializer.getMinimumLevel(name), Level.ALL).intValue()
+/// level             = initializer.getInitialLevel(name)      // null => inherit
+/// handlers          = safeCloneHandlers(initializer.getInitialHandlers(name))
+/// ```
+///
+/// This is the ONLY thing that puts a handler on the root logger of a Quarkus
+/// process: `io.quarkus.bootstrap.logging.InitialConfigurator` answers
+/// `[QuarkusDelayedHandler]` and `Level.ALL` for the empty name, and nothing
+/// for every other name. Measured, HotSpot + jboss-logmanager 3.2.2:
+/// `root.handlers.initialCount=1` with the provider on the classpath, `0`
+/// (from this SPI — the default `ConsoleHandler` there comes from the separate
+/// `ConfiguratorFactory` chain) without it.
+///
+/// Returns the (possibly relocated) logger.
+fn apply_log_context_initializer(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+    name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    if JBOSS_INITIALIZER_BUSY.with(|b| b.get()) {
+        return Ok(logger);
+    }
+    let logger_pin = ctx.pin_native_root(logger);
+    JBOSS_INITIALIZER_BUSY.with(|b| b.set(true));
+    let result = apply_log_context_initializer_body(ctx, logger, name);
+    JBOSS_INITIALIZER_BUSY.with(|b| b.set(false));
+    let logger = ctx.read_native_pin(logger_pin, logger);
+    ctx.unpin_native_roots(logger_pin);
+    result?;
+    Ok(logger)
+}
+
+fn apply_log_context_initializer_body(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+    name: &str,
+) -> Result<(), MethodCallFailed> {
+    let Some(initializer) = resolve_jboss_log_context_initializer(ctx) else {
+        return Ok(());
+    };
+    let init_pin = ctx.pin_native_root(initializer);
+    let logger_pin = ctx.pin_native_root(logger);
+    let vm = ctx.vm_identity();
+    let result = (|| -> Result<(), MethodCallFailed> {
+        // 1. `getMinimumLevel(name)`, defaulting to `Level.ALL`. This is the
+        //    floor `LoggerNode.isLoggableLevel` checks ALONGSIDE the effective
+        //    level (`level >= effectiveMinLevel && level >= effectiveLevel`),
+        //    so it is a second, independent threshold and not a synonym.
+        let name_obj = ctx.create_string(name);
+        let initializer = ctx.read_native_pin(init_pin, initializer);
+        if let Ok(Some(Value::Object(level))) = ctx.invoke_virtual(
+            initializer,
+            "getMinimumLevel",
+            "(Ljava/lang/String;)Ljava/util/logging/Level;",
+            &[Value::Object(Some(name_obj))],
+        ) {
+            let value = level
+                .and_then(|l| jul_requested_level_value(ctx, Some(l)))
+                .unwrap_or(JBOSS_LEVEL_ALL_INT);
+            set_name_keyed_level(logger_minimum_levels(vm), name, Some(value));
+        }
+
+        // 2. `getInitialLevel(name)`. Null means "inherit", which in this
+        //    name-keyed model means recording nothing and letting the
+        //    ancestor walk answer.
+        let name_obj = ctx.create_string(name);
+        let initializer = ctx.read_native_pin(init_pin, initializer);
+        if let Ok(Some(Value::Object(Some(level)))) = ctx.invoke_virtual(
+            initializer,
+            "getInitialLevel",
+            "(Ljava/lang/String;)Ljava/util/logging/Level;",
+            &[Value::Object(Some(name_obj))],
+        ) {
+            let value = jul_requested_level_value(ctx, Some(level));
+            set_name_keyed_level(logger_explicit_levels(vm), name, value);
+            // Keep the node's own `getLevel()` consistent with the table,
+            // exactly as `setLevel` does. Re-derive both references: the
+            // invoke above ran application bytecode and could have moved them.
+            let logger = ctx.read_native_pin(logger_pin, logger);
+            if ctx.object_num_fields(logger) > LOGGER_FIELD_LEVEL {
+                ctx.set_field(logger, LOGGER_FIELD_LEVEL, Value::Object(Some(level)));
+            }
+        }
+
+        // 3. `getInitialHandlers(name)`.
+        let name_obj = ctx.create_string(name);
+        let initializer = ctx.read_native_pin(init_pin, initializer);
+        let handlers = match ctx.invoke_virtual(
+            initializer,
+            "getInitialHandlers",
+            "(Ljava/lang/String;)[Ljava/util/logging/Handler;",
+            &[Value::Object(Some(name_obj))],
+        ) {
+            Ok(Some(Value::Object(Some(arr)))) => arr,
+            _ => return Ok(()),
+        };
+        let arr_pin = ctx.pin_native_root(handlers);
+        let len = ctx.array_length(handlers);
+        for index in 0..len {
+            let handlers = ctx.read_native_pin(arr_pin, handlers);
+            let element = ctx.get_array_element(handlers, index);
+            if !matches!(element, Value::Object(Some(_))) {
+                continue;
+            }
+            let logger = ctx.read_native_pin(logger_pin, logger);
+            native_jul_logger_add_handler(ctx, &[Value::Object(Some(logger)), element])?;
+        }
+        ctx.unpin_native_roots(arr_pin);
+        Ok(())
+    })();
+    ctx.unpin_native_roots(init_pin);
+    result
 }
 
 fn native_jboss_log_context_get_logger(
@@ -2930,12 +3252,13 @@ fn native_jboss_logger_get_use_parent_filters(
 /// `setLevel(Level.TRACE)` (Quarkus's `traceCategories(...)` support) could
 /// not be observed through the accessor whose entire job is to report it.
 ///
-/// The unconfigured default was also wrong. Measured on Temurin 25 +
-/// jboss-logmanager 3.2.2, a logger with no level anywhere up its chain
-/// reports [`JBOSS_UNCONFIGURED_EFFECTIVE_LEVEL`] — the `LoggerNode`'s
-/// `effectiveMinLevel` seed, which is why an unconfigured JBoss logger is
-/// loggable at TRACE where an unconfigured JUL one is not. `attach_minimal
-/// _jboss_logger_node` already seeds the field with exactly that value.
+/// The unconfigured default is [`JBOSS_UNCONFIGURED_EFFECTIVE_LEVEL`] — INFO,
+/// the `Logger.INFO_INT` `LoggerNode.<init>` seeds `effectiveLevel` with when
+/// the initializer answers no initial level. A Quarkus process reads
+/// `Integer.MIN_VALUE` instead, and that is not the library's default: it is
+/// `InitialConfigurator.getInitialLevel("")` returning `Level.ALL` for the
+/// ROOT, which every logger then inherits. See that constant's doc for the
+/// control run that separates the two.
 ///
 /// `jul_ancestor_explicit_level` is the same name-keyed table with a
 /// nearest-ancestor walk that [`native_jboss_logger_is_loggable`] consults, so
@@ -2963,16 +3286,13 @@ fn native_jboss_logger_get_effective_level(
 ///
 /// Answered a constant `true` ("filtering is owned by the tracing
 /// subscriber"), which was unfalsifiable: `setLevel(WARNING)` suppressed
-/// nothing a Java caller could see. It cannot simply share
-/// [`native_jul_logger_is_loggable`] either, because the two faces DISAGREE on
-/// the unconfigured default and both answers are right for their own manager:
-/// plain JUL falls back to the root's INFO, while jboss-logmanager leaves an
-/// unconfigured node at `effectiveMinLevel = Integer.MIN_VALUE` and therefore
-/// logs everything. Measured, `probe.fresh.isLoggable(TRACE)`: `true` on
-/// HotSpot under the JBoss manager, `false` under plain JUL.
+/// nothing a Java caller could see.
 ///
-/// So: the shared level-int resolution and the shared nearest-ancestor
-/// explicit-level table, with the JBoss default when the table says nothing.
+/// Implements `LoggerNode.isLoggableLevel` as it is actually written —
+/// `level != OFF_INT && level >= effectiveMinLevel && level >= effectiveLevel`
+/// — over the two name-keyed tables. It cannot share
+/// [`native_jul_logger_is_loggable`], which knows about neither the OFF rule
+/// nor the minimum-level floor.
 fn native_jboss_logger_is_loggable(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2981,24 +3301,36 @@ fn native_jboss_logger_is_loggable(
         return jul_throw_npe(JUL_NPE_NULL_LEVEL);
     }
     let vm = ctx.vm_identity();
-    // Nothing configured anywhere: every level is loggable, which is the
-    // answer this method used to hardcode. Taken BEFORE the receiver's name is
-    // read, because that read allocates and this is a per-log-site call — see
-    // `no_explicit_logger_levels`.
-    if no_explicit_logger_levels(vm) {
-        return Ok(Some(Value::Int(1)));
-    }
     let level_value = match args.get(1) {
         Some(Value::Object(level)) => jul_requested_level_value(ctx, *level).unwrap_or(800),
         _ => 800,
     };
+    // `isLoggable(Level.OFF)` is false whatever the thresholds are, and no
+    // comparison can express that: OFF is `Integer.MAX_VALUE`, i.e. at or
+    // above every threshold there is. Checked before the fast path below,
+    // which would otherwise answer `true` for it.
+    if level_value == JBOSS_LEVEL_OFF_INT {
+        return Ok(Some(Value::Int(0)));
+    }
+    // Nothing configured anywhere. Taken BEFORE the receiver's name is read,
+    // because that read allocates and this is a per-log-site call — see
+    // `no_explicit_logger_levels`.
+    if no_explicit_logger_levels(vm) && logger_minimum_levels(vm).lock().is_ok_and(|m| m.is_empty())
+    {
+        return Ok(Some(Value::Int(i32::from(
+            level_value >= JBOSS_UNCONFIGURED_EFFECTIVE_LEVEL,
+        ))));
+    }
     let name = match args.first() {
         Some(Value::Object(Some(this))) => read_jul_logger_name(ctx, *this),
         _ => String::new(),
     };
-    let threshold =
+    let effective =
         jul_ancestor_explicit_level(vm, &name).unwrap_or(JBOSS_UNCONFIGURED_EFFECTIVE_LEVEL);
-    Ok(Some(Value::Int(i32::from(level_value >= threshold))))
+    let minimum = jboss_ancestor_minimum_level(vm, &name).unwrap_or(JBOSS_LEVEL_ALL_INT);
+    Ok(Some(Value::Int(i32::from(
+        level_value >= minimum && level_value >= effective,
+    ))))
 }
 
 /// Keycloak NPE fix — `org/jboss/logmanager/Logger.logRaw(ExtLogRecord)`
@@ -6258,6 +6590,74 @@ fn jul_standard_level_value(name: &str) -> Option<i32> {
 /// still see an ancestor's level, e.g. Spring Boot's
 /// `JavaLoggingSystem.setLogLevel("org.springframework.boot", DEBUG)`
 /// followed by a child logger's `.fine(...)` call).
+/// Write (or clear, on `None`) one name-keyed level table entry.
+///
+/// Shared by the two tables — the effective level and the minimum level — so
+/// the "a `None` REMOVES the row" rule cannot drift between them. Unlike
+/// [`record_jul_logger_level`] this takes the name directly, so it can record
+/// the ROOT (`""`): that function refuses an empty name because it derives it
+/// from a Logger object, where an empty name also means "could not read one".
+/// Here the caller has the real name in hand.
+pub(crate) fn set_name_keyed_level(
+    table: &'static Mutex<HashMap<String, i32>>,
+    name: &str,
+    value: Option<i32>,
+) {
+    let mut levels = table.lock().unwrap_or_else(|e| e.into_inner());
+    match value {
+        Some(value) => {
+            levels.insert(name.to_string(), value);
+        }
+        None => {
+            levels.remove(name);
+        }
+    }
+}
+
+/// `LoggerNode.effectiveMinLevel`, keyed by logger name — the SECOND threshold
+/// `isLoggableLevel` checks, set only from
+/// `LogContextInitializer.getMinimumLevel(name)`.
+///
+/// Separate from [`logger_explicit_levels`] because the two move
+/// independently: `setLevel` changes the effective level and never the
+/// minimum, and a provider that raises the minimum silences a category that
+/// `setLevel` alone would have enabled.
+fn logger_minimum_levels(vm: usize) -> &'static Mutex<HashMap<String, i32>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<usize, &'static Mutex<HashMap<String, i32>>>>> =
+        OnceLock::new();
+    per_vm_table(&INSTANCE, vm)
+}
+
+/// The nearest-ancestor minimum level for `logger_name`, or `None` when no
+/// provider set one anywhere up the chain.
+///
+/// LIMITATION, stated because the difference is invisible with every provider
+/// that exists today: real `LoggerNode` propagates `effectiveMinLevel` down
+/// the tree as a running MAX (a child's is `max(parent's, its own)`), so a
+/// deep node can be governed by a stricter ancestor even when a nearer one is
+/// laxer. This walk takes the NEAREST entry instead. The two agree whenever a
+/// provider's `getMinimumLevel` ignores the name — which both known providers
+/// (`LogContextInitializer.DEFAULT` and Quarkus's `InitialConfigurator`, which
+/// returns a constant) do.
+fn jboss_ancestor_minimum_level(vm: usize, logger_name: &str) -> Option<i32> {
+    let levels = logger_minimum_levels(vm)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if levels.is_empty() {
+        return None;
+    }
+    let mut candidate = logger_name;
+    loop {
+        if let Some(v) = levels.get(candidate) {
+            return Some(*v);
+        }
+        candidate = match logger_name_parent(candidate) {
+            Some(parent) => parent,
+            None => return None,
+        };
+    }
+}
+
 /// True when NO logger anywhere has an explicit level, so
 /// [`jul_ancestor_explicit_level`] is guaranteed to answer `None` for every
 /// name and its caller need not read the receiver's name at all.
@@ -8163,46 +8563,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The JBoss default is NOT the JUL default, and this is the CONTROL that
-    /// keeps the two apart.
+    /// An unconfigured JBoss logger stops at INFO, exactly like an
+    /// unconfigured JUL one.
     ///
-    /// Measured on Temurin 25 + jboss-logmanager 3.2.2 (`JbossLogManagerProbe`,
-    /// `level.freshControl.*`): a never-configured logger under
-    /// `java.util.logging.manager=org.jboss.logmanager.LogManager` answers
-    /// `getEffectiveLevel() == Integer.MIN_VALUE` and `isLoggable(TRACE) ==
-    /// true`, where the same probe under plain JUL stops at INFO. Sharing
-    /// `native_jul_logger_is_loggable` for the JBoss face — the obvious
-    /// simplification, and the one this test exists to refuse — would silently
-    /// suppress every FINE/FINER/FINEST/TRACE record an unconfigured JBoss
-    /// logger is supposed to emit.
+    /// **This test previously asserted the opposite**, on a measurement taken
+    /// with `quarkus-bootstrap-runner` on the classpath — where
+    /// `InitialConfigurator.getInitialLevel("")` hands the ROOT `Level.ALL`
+    /// and every logger inherits it. Re-run against jboss-logmanager 3.2.2
+    /// with NO `LogContextInitializer` provider on the classpath, the same
+    /// probe reads `root.effective=800`, `freshControl.effective=800`,
+    /// `freshControl.isLoggableTrace=false`. One application's configuration
+    /// had been written down as the library's default, in a constant, a test
+    /// name and a doc.
+    ///
+    /// The control that separates them is DELETING THE PROVIDER from the
+    /// classpath, not reading harder: both arms are "jboss-logmanager under
+    /// its own LogManager", and only the SPI differs.
+    /// `the_initializers_root_level_is_inherited_by_every_logger` is the other
+    /// half — the same assertion with a provider installed.
     #[test]
-    fn an_unconfigured_jboss_logger_logs_everything_where_a_jul_one_stops_at_info() {
+    fn an_unconfigured_jboss_logger_stops_at_info_exactly_like_a_jul_one() {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
         reset_state_for_tests();
         let mut ctx = mock_ctx();
         let jboss = get_or_create_jboss_logger(&mut ctx, "probe.fresh").unwrap();
         let trace = make_level(&mut ctx, "TRACE", 400);
+        let info = make_level(&mut ctx, "INFO", 800);
         assert_eq!(
             native_jboss_logger_is_loggable(
                 &mut ctx,
                 &[Value::Object(Some(jboss)), Value::Object(Some(trace))]
             )
             .unwrap(),
-            Some(Value::Int(1)),
-            "an unconfigured JBoss logger must be loggable at TRACE"
+            Some(Value::Int(0)),
+            "with no LogContextInitializer provider, TRACE is below the INFO seed"
+        );
+        assert_eq!(
+            native_jboss_logger_is_loggable(
+                &mut ctx,
+                &[Value::Object(Some(jboss)), Value::Object(Some(info))]
+            )
+            .unwrap(),
+            Some(Value::Int(1))
         );
         assert_eq!(
             native_jboss_logger_get_effective_level(&mut ctx, &[Value::Object(Some(jboss))])
                 .unwrap(),
-            Some(Value::Int(i32::MIN)),
-            "an unconfigured JBoss logger's effective level is the LoggerNode seed"
+            Some(Value::Int(800)),
+            "LoggerNode.<init> seeds effectiveLevel with Logger.INFO_INT"
         );
-        // The JUL face, same level object, the opposite answer. Built through
-        // the real allocator, not `make_logger`: `allocate_logger` initialises
-        // the level slot to a null REFERENCE, where a bare `alloc_object`
-        // leaves it `Int(0)` and the threshold walk reads that as "level 0",
-        // i.e. everything loggable — the mock would agree with the JBoss face
-        // for the wrong reason and this control would prove nothing.
+        // The JUL face, same level object, the SAME answer. Built through the
+        // real allocator, not `make_logger`: `allocate_logger` initialises the
+        // level slot to a null REFERENCE, where a bare `alloc_object` leaves
+        // it `Int(0)` and the threshold walk reads that as "level 0", i.e.
+        // everything loggable — the mock would agree for the wrong reason.
         let jul = get_or_create_logger(&mut ctx, "probe.fresh.jul").unwrap();
         assert_eq!(
             native_jul_logger_is_loggable(
@@ -8211,8 +8625,173 @@ mod tests {
             )
             .unwrap(),
             Some(Value::Int(0)),
-            "an unconfigured JUL logger must NOT be loggable at TRACE"
+            "an unconfigured JUL logger must NOT be loggable at TRACE either"
         );
+    }
+
+    /// `isLoggable(Level.OFF)` is false however low the thresholds are.
+    ///
+    /// `LoggerNode.isLoggableLevel` opens with `level != OFF_INT`, and no
+    /// comparison against a threshold can express that: `Level.OFF.intValue()`
+    /// is `Integer.MAX_VALUE`, at or above every threshold there is. A
+    /// threshold-only implementation answers `true` — the exact opposite —
+    /// and does so most confidently in the case where a caller has just
+    /// switched a category OFF.
+    #[test]
+    fn is_loggable_off_is_false_even_when_everything_else_is_enabled() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        let logger = get_or_create_jboss_logger(&mut ctx, "probe.off").unwrap();
+        let all = make_level(&mut ctx, "ALL", i32::MIN);
+        let off = make_level(&mut ctx, "OFF", i32::MAX);
+        // Open the logger as wide as it goes first, so the OFF answer cannot
+        // come from a threshold that happened to be high.
+        native_jboss_logger_set_level(
+            &mut ctx,
+            &[Value::Object(Some(logger)), Value::Object(Some(all))],
+        )
+        .unwrap();
+        assert_eq!(
+            native_jboss_logger_is_loggable(
+                &mut ctx,
+                &[Value::Object(Some(logger)), Value::Object(Some(all))]
+            )
+            .unwrap(),
+            Some(Value::Int(1)),
+            "control: with the level at ALL, ALL is loggable"
+        );
+        assert_eq!(
+            native_jboss_logger_is_loggable(
+                &mut ctx,
+                &[Value::Object(Some(logger)), Value::Object(Some(off))]
+            )
+            .unwrap(),
+            Some(Value::Int(0)),
+            "OFF is refused by name, not by threshold"
+        );
+    }
+
+    /// The initializer's ROOT level is what every other logger inherits.
+    ///
+    /// This is the mechanism behind the `Integer.MIN_VALUE` a Quarkus process
+    /// reports for every logger: `InitialConfigurator.getInitialLevel("")`
+    /// answers `Level.ALL` for the ROOT and null for everything else, and the
+    /// nearest-ancestor walk carries it down. Asserted here through the table
+    /// the SPI writes rather than through a mock ServiceLoader, so it holds
+    /// whatever route a provider is discovered by.
+    #[test]
+    fn the_initializers_root_level_is_inherited_by_every_logger() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        let deep = get_or_create_jboss_logger(&mut ctx, "a.b.c").unwrap();
+        let trace = make_level(&mut ctx, "TRACE", 400);
+        assert_eq!(
+            native_jboss_logger_is_loggable(
+                &mut ctx,
+                &[Value::Object(Some(deep)), Value::Object(Some(trace))]
+            )
+            .unwrap(),
+            Some(Value::Int(0)),
+            "control: before the root is configured, TRACE is below INFO"
+        );
+
+        // What `apply_log_context_initializer` does for `getInitialLevel("")`.
+        set_name_keyed_level(
+            logger_explicit_levels(ctx.vm_identity()),
+            "",
+            Some(i32::MIN),
+        );
+        assert_eq!(
+            native_jboss_logger_is_loggable(
+                &mut ctx,
+                &[Value::Object(Some(deep)), Value::Object(Some(trace))]
+            )
+            .unwrap(),
+            Some(Value::Int(1)),
+            "a level on the ROOT reaches a.b.c — this is the whole mechanism"
+        );
+        assert_eq!(
+            native_jboss_logger_get_effective_level(&mut ctx, &[Value::Object(Some(deep))])
+                .unwrap(),
+            Some(Value::Int(i32::MIN))
+        );
+    }
+
+    /// `getMinimumLevel` is a SECOND threshold, not a synonym for the level.
+    ///
+    /// `LoggerNode.isLoggableLevel` is
+    /// `level != OFF && level >= effectiveMinLevel && level >= effectiveLevel`,
+    /// so a provider that raises the minimum silences a category that
+    /// `setLevel` alone would have enabled. Collapsing the two tables into one
+    /// would pass every other test in this file and lose exactly this.
+    #[test]
+    fn the_minimum_level_floor_outranks_an_explicit_set_level() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        let logger = get_or_create_jboss_logger(&mut ctx, "floor.probe").unwrap();
+        let trace = make_level(&mut ctx, "TRACE", 400);
+        let all = make_level(&mut ctx, "ALL", i32::MIN);
+
+        native_jboss_logger_set_level(
+            &mut ctx,
+            &[Value::Object(Some(logger)), Value::Object(Some(all))],
+        )
+        .unwrap();
+        assert_eq!(
+            native_jboss_logger_is_loggable(
+                &mut ctx,
+                &[Value::Object(Some(logger)), Value::Object(Some(trace))]
+            )
+            .unwrap(),
+            Some(Value::Int(1)),
+            "control: setLevel(ALL) alone enables TRACE"
+        );
+
+        // What `apply_log_context_initializer` does for `getMinimumLevel`.
+        set_name_keyed_level(logger_minimum_levels(ctx.vm_identity()), "floor", Some(800));
+        assert_eq!(
+            native_jboss_logger_is_loggable(
+                &mut ctx,
+                &[Value::Object(Some(logger)), Value::Object(Some(trace))]
+            )
+            .unwrap(),
+            Some(Value::Int(0)),
+            "an ancestor's minimum level vetoes the logger's own setLevel(ALL)"
+        );
+        // ...and the effective level still reports what setLevel wrote: the
+        // floor gates delivery, it does not rewrite the level.
+        assert_eq!(
+            native_jboss_logger_get_effective_level(&mut ctx, &[Value::Object(Some(logger))])
+                .unwrap(),
+            Some(Value::Int(i32::MIN))
+        );
+    }
+
+    /// The SPI must be asked ONCE, and its absence cached.
+    ///
+    /// Real `LogContext.discoverDefaultInitializer0` resolves into a static.
+    /// Without a cached NEGATIVE, every logger creation in a process with no
+    /// provider — which is most of them — pays a full `ServiceLoader` scan of
+    /// the classpath. The mock cannot load `org.jboss.logmanager`, so this
+    /// asserts the shape that matters: the answer is remembered, and asking
+    /// again does not re-resolve.
+    #[test]
+    fn the_log_context_initializer_lookup_caches_its_negative() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        assert!(resolve_jboss_log_context_initializer(&mut ctx).is_none());
+        assert_eq!(
+            *jboss_initializer_cell(ctx.vm_identity())
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            Some(0),
+            "the negative must be cached, not re-resolved per logger"
+        );
+        assert!(resolve_jboss_log_context_initializer(&mut ctx).is_none());
     }
 
     /// `setLevel` must be OBSERVABLE — through `getLevel`, through
