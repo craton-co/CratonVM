@@ -2847,6 +2847,11 @@ pub struct G1Collector {
     /// identical reason (see `GenerationalHeap::is_object_address`).
     arena_base: usize,
     arena_end: usize,
+    /// F-16 — the committed prefix at construction (`-Xms`, or the ergonomic).
+    /// The floor `uncommit_trailing_free_regions` will not shrink below: an
+    /// operator who asked for an initial heap asked not to pay for growing back
+    /// into it.
+    initial_commit_bytes: usize,
     /// `log2(config.region_size)` (F-09).
     ///
     /// `G1Collector::new` rounds the requested region size up to a power of
@@ -3228,6 +3233,7 @@ impl G1Collector {
             arena_base,
             arena_end,
             region_shift,
+            initial_commit_bytes: initial_commit,
             finalizer_pause: AtomicBool::new(false),
             evac_pool: std::sync::OnceLock::new(),
         }
@@ -3267,6 +3273,104 @@ impl G1Collector {
     /// Diagnostics and tests.
     pub fn heap_is_reserved(&self) -> bool {
         self.arena.is_reserved()
+    }
+
+    /// F-16 — return the pages of a trailing run of Free regions to the OS.
+    ///
+    /// The other half of the reserved heap: growth on demand is what stops a
+    /// large `-Xmx` costing memory it does not use, and this is what lets a
+    /// process that has finished a burst give the memory back rather than
+    /// holding its high-water mark for its whole life.
+    ///
+    /// # The three conditions, and why each one
+    ///
+    /// * **Only a trailing run, and only Free regions.** The committed set has
+    ///   to stay a prefix (see `commit_through_region`), so the only regions
+    ///   that can be given back are the ones above the highest region still in
+    ///   use — and every one of them must be Free, because a region of any
+    ///   other type has bytes a walker will read.
+    /// * **Never below `-Xms`.** An operator who asked for an initial heap
+    ///   asked not to pay for growing back into it.
+    /// * **Narrow the published JIT read bounds FIRST.** That table asserts "a
+    ///   raw load anywhere in this range cannot fault", and a compiled
+    ///   `getfield` tests against it at runtime. Unmapping pages a live bound
+    ///   still describes is a fault in compiled code. The invariant
+    ///   `commit_through_region` maintains in the growth direction — published
+    ///   may lag committed, never exceed it — is maintained here by doing the
+    ///   two steps in the opposite order.
+    ///
+    /// # Why only from `cleanup`
+    ///
+    /// This is the one reclamation point that runs stop-the-world with the
+    /// regions lock held AND after every free of the cycle has been applied.
+    /// An evacuation pause cannot do it: it frees the collection set, but a
+    /// concurrent mark cycle may still hold gray addresses into regions it has
+    /// not yet proven dead.
+    ///
+    /// Opt-in (`CRATONVM_G1_UNCOMMIT`). Growth on demand carries the finding on
+    /// its own and is safe by construction; giving pages back is the half where
+    /// getting the ordering wrong is a fault rather than a missed optimisation,
+    /// so it ships behind its own switch and its own test.
+    ///
+    /// Returns the bytes released.
+    fn uncommit_trailing_free_regions(&self, regions: &[G1Region]) -> usize {
+        self.uncommit_trailing_free_regions_within(regions, gc_flags().g1_uncommit)
+    }
+
+    /// The shrink itself, with the opt-in as a PARAMETER rather than a read of
+    /// a process-cached flag.
+    ///
+    /// Split out for the same reason `verify_no_dangling_into_cset_within` is:
+    /// the flag is latched once per process, so a test that went through the
+    /// wrapper could only ever exercise whichever arm the ambient environment
+    /// selected — and for an opt-in flag that is always the arm that does
+    /// nothing.
+    fn uncommit_trailing_free_regions_within(
+        &self,
+        regions: &[G1Region],
+        enabled: bool,
+    ) -> usize {
+        if !enabled || !self.arena.is_reserved() {
+            return 0;
+        }
+        let region_size = self.config.region_size;
+        if region_size == 0 {
+            return 0;
+        }
+        // The highest region that is NOT Free, plus one: everything above it is
+        // a candidate.
+        let keep_regions = regions
+            .iter()
+            .rposition(|r| r.region_type != RegionType::Free)
+            .map_or(0, |i| i + 1);
+        let floor = self
+            .initial_commit_bytes
+            .max(region_size)
+            .min(self.arena.reserved_len());
+        let want = keep_regions
+            .saturating_mul(region_size)
+            .max(floor);
+        let committed = self.arena.committed_len();
+        if want >= committed {
+            return 0;
+        }
+
+        // Order is the whole safety argument: publish the narrower bound, THEN
+        // unmap. Doing it the other way leaves a window in which compiled code
+        // is told it may load from pages that are gone.
+        crate::gen_heap::publish_jit_read_bounds(0, self.arena_base, self.arena_base + want);
+        if !self.arena.decommit_to(want) {
+            // The OS refused. The bound is already narrow, which is the
+            // fail-safe direction (more helper calls, no faults); restore it to
+            // what is actually committed rather than leaving it pessimistic.
+            crate::gen_heap::publish_jit_read_bounds(
+                0,
+                self.arena_base,
+                self.arena_base + self.arena.committed_len(),
+            );
+            return 0;
+        }
+        committed - self.arena.committed_len()
     }
 
     /// F-16 — make sure every byte up to the END of region `idx` is committed,
@@ -10292,6 +10396,18 @@ impl G1Collector {
             // `note_mark_cycle_start` measures from the wrong instant should the
             // flag be flipped mid-run by a test.
             *self.mark_cycle_start.lock() = None;
+        }
+
+        // F-16 — and give back the pages of any trailing run of Free regions.
+        // Last, after every free this cycle performs: the humongous reclaim and
+        // the in-place Old frees above are exactly what create such a run.
+        let uncommitted = self.uncommit_trailing_free_regions(&regions);
+        if uncommitted > 0 {
+            tracing::debug!(
+                "g1 cleanup: returned {} bytes to the OS ({} committed remain)",
+                uncommitted,
+                self.arena.committed_len()
+            );
         }
 
         // State what this cleanup decided, including any fail-safe it took.
@@ -17447,6 +17563,147 @@ mod tests {
             let _ = gc.alloc_object(ClassId::new(1), 2);
             check("after growth");
         }
+    }
+
+    #[test]
+    fn a_trailing_run_of_free_regions_is_returned_to_the_os() {
+        let gc = G1Collector::new(G1CollectorConfig {
+            heap_size: 16 * 1024 * 1024,
+            region_size: 1024 * 1024,
+            initial_heap_size: 1024 * 1024,
+            ..small_config()
+        });
+        if !gc.heap_is_reserved() {
+            return; // the fallback cannot give pages back and says so
+        }
+        // Grow the prefix to the whole heap, then use only the first three
+        // regions — the classic "finished a burst" shape.
+        assert!(gc.commit_through_region(15));
+        assert_eq!(gc.committed_bytes(), 16 * 1024 * 1024);
+        gc.with_regions_mut(|regions| {
+            for (i, r) in regions.iter_mut().enumerate() {
+                r.region_type = if i < 3 {
+                    RegionType::Old
+                } else {
+                    RegionType::Free
+                };
+            }
+        });
+
+        let released = {
+            let regions = gc.regions.lock();
+            gc.uncommit_trailing_free_regions_within(&regions, true)
+        };
+        assert_eq!(released, 13 * 1024 * 1024, "regions 3..16 are Free");
+        assert_eq!(gc.committed_bytes(), 3 * 1024 * 1024);
+        assert_eq!(
+            gc.reserved_bytes(),
+            16 * 1024 * 1024,
+            "the RESERVATION is untouched — the address space is still ours"
+        );
+
+        // The published read bound must have followed it down, or compiled code
+        // is told it may load from pages that are gone.
+        let (base, end) = crate::gen_heap::jit_read_bounds_slot(0);
+        if base == gc.arena_base {
+            assert!(
+                end <= gc.arena_base + gc.committed_bytes(),
+                "published bound {end:#x} outruns the committed prefix {:#x}",
+                gc.arena_base + gc.committed_bytes()
+            );
+        }
+
+        // And the heap must still work: claiming a region re-commits it.
+        let obj = gc.alloc_object(ClassId::new(1), 2);
+        gc.set_field(obj, 0, Value::Int(0x1234));
+        assert_eq!(gc.get_field(obj, 0), Value::Int(0x1234));
+    }
+
+    #[test]
+    fn the_shrink_stops_at_the_highest_region_still_in_use() {
+        let gc = G1Collector::new(G1CollectorConfig {
+            heap_size: 16 * 1024 * 1024,
+            region_size: 1024 * 1024,
+            initial_heap_size: 1024 * 1024,
+            ..small_config()
+        });
+        if !gc.heap_is_reserved() {
+            return;
+        }
+        assert!(gc.commit_through_region(15));
+        // A single live region near the TOP. The committed set has to stay a
+        // prefix, so nothing below it can be given back however empty it is —
+        // that is the cost of the prefix rule, and it should be visible.
+        gc.with_regions_mut(|regions| {
+            for r in regions.iter_mut() {
+                r.region_type = RegionType::Free;
+            }
+            regions[12].region_type = RegionType::Old;
+        });
+        let regions = gc.regions.lock();
+        assert_eq!(
+            gc.uncommit_trailing_free_regions_within(&regions, true),
+            3 * 1024 * 1024,
+            "only regions 13..16 are above the highest one in use"
+        );
+        assert_eq!(gc.committed_bytes(), 13 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_shrink_never_goes_below_the_initial_heap_size() {
+        let gc = G1Collector::new(G1CollectorConfig {
+            heap_size: 16 * 1024 * 1024,
+            region_size: 1024 * 1024,
+            initial_heap_size: 8 * 1024 * 1024,
+            ..small_config()
+        });
+        if !gc.heap_is_reserved() {
+            return;
+        }
+        assert!(gc.commit_through_region(15));
+        gc.with_regions_mut(|regions| {
+            for r in regions.iter_mut() {
+                r.region_type = RegionType::Free;
+            }
+        });
+        let regions = gc.regions.lock();
+        assert_eq!(
+            gc.uncommit_trailing_free_regions_within(&regions, true),
+            8 * 1024 * 1024,
+        );
+        assert_eq!(
+            gc.committed_bytes(),
+            8 * 1024 * 1024,
+            "-Xms is a floor: an operator who asked for an initial heap asked \
+             not to pay for growing back into it"
+        );
+    }
+
+    #[test]
+    fn the_shrink_is_opt_in() {
+        let gc = G1Collector::new(G1CollectorConfig {
+            heap_size: 16 * 1024 * 1024,
+            region_size: 1024 * 1024,
+            initial_heap_size: 1024 * 1024,
+            ..small_config()
+        });
+        if !gc.heap_is_reserved() {
+            return;
+        }
+        assert!(gc.commit_through_region(15));
+        gc.with_regions_mut(|regions| {
+            for r in regions.iter_mut() {
+                r.region_type = RegionType::Free;
+            }
+        });
+        let regions = gc.regions.lock();
+        assert_eq!(
+            gc.uncommit_trailing_free_regions_within(&regions, false),
+            0,
+            "growth on demand carries F-16 on its own; the shrink is the half \
+             whose failure mode is a fault, so it is off unless asked for"
+        );
+        assert_eq!(gc.committed_bytes(), 16 * 1024 * 1024);
     }
 
     #[test]

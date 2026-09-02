@@ -955,6 +955,22 @@ pub struct GcFlags {
     /// was produced. Note that a platform without a reservation implementation
     /// takes that path anyway — `G1Collector::heap_is_reserved` says which.
     pub g1_reserve_heap: bool,
+    /// `CRATONVM_G1_UNCOMMIT` — return the pages of a trailing run of Free
+    /// regions to the OS at the end of a concurrent-mark cleanup. **Opt-in**
+    /// ([`parse::present`]); requires `CRATONVM_G1_RESERVE_HEAP` (the default).
+    ///
+    /// The other half of F-16. Growth on demand is what stops a large `-Xmx`
+    /// costing memory it does not use; this is what lets a process that has
+    /// finished a burst give the memory back instead of holding its high-water
+    /// mark for its whole life.
+    ///
+    /// Opt-in because the two halves have different failure modes. Getting
+    /// growth wrong is a missed optimisation. Getting the shrink wrong — in
+    /// particular, unmapping pages the published JIT read bounds still describe
+    /// as loadable — is a fault in compiled code, so it ships behind its own
+    /// switch even though the ordering that makes it safe is written down and
+    /// tested.
+    pub g1_uncommit: bool,
     /// `CRATONVM_G1_DBG_RSET` — after every G1 evacuation pause, verify that
     /// every cross-region reference into a COLLECTABLE region is named in that
     /// region's remembered set. Opt-in diagnostic; whole-heap and O(live
@@ -1231,6 +1247,7 @@ impl GcFlags {
             g1_adaptive_ihop: on_unless_zero(src, "CRATONVM_G1_ADAPTIVE_IHOP"),
             g1_adaptive_tenuring: on_unless_zero(src, "CRATONVM_G1_ADAPTIVE_TENURING"),
             g1_reserve_heap: on_unless_zero(src, "CRATONVM_G1_RESERVE_HEAP"),
+            g1_uncommit: present(src, "CRATONVM_G1_UNCOMMIT"),
             identity_hash_evict: on_unless_zero(src, "CRATONVM_IDENTITY_HASH_EVICT"),
             g1_dbg_rset: present(src, "CRATONVM_G1_DBG_RSET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
