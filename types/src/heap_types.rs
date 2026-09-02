@@ -326,12 +326,35 @@ const _: () = assert!(
     "ARRAY_DATA_OFFSET must fit a signed disp8 for JIT array element access"
 );
 
-/// Byte offset of the array-length/object-shape word.
-// 8, not 12, since `identity_hash_code` left the header on 2026-08-07 and
-// `shape` moved up into its place. Every JIT array-length load is emitted
-// from this constant, so the displacement follows automatically -- which is
-// the whole reason it is a named constant and not a literal.
+/// Byte offset of the array-length/object-shape word: the `shape` field of
+/// [`ObjectHeader`], which sits immediately after the 4-byte `class_id`.
+//
+// **4.** This comment read "8, not 12" directly above a value of `4` -- both
+// numbers wrong, and wrong in a way no test could catch, because every JIT
+// array-length load is emitted FROM the constant and so tracked the value
+// while the prose drifted. (It was 12 while the header still carried
+// `kind`/`element_type`/`gc_age`/`gc_flags` and `identity_hash_code` ahead of
+// `shape`; the 32 -> 24 -> 16 shrink of 2026-08-06/07 moved `shape` up behind
+// `class_id`.) The const assert below is the fix that lasts: the offset is now
+// derived from the struct at build time, so a future field reorder is a
+// compile error rather than another stale sentence.
 pub const ARRAY_LENGTH_OFFSET: usize = 4;
+
+// The value is not a choice — it is `shape`'s actual offset in the
+// `#[repr(C)]` header. Pin it, so a field reorder cannot leave every emitted
+// `MOV r32, [obj + ARRAY_LENGTH_OFFSET]` reading `class_id` instead.
+const _: () = assert!(
+    ARRAY_LENGTH_OFFSET == core::mem::offset_of!(ObjectHeader, shape),
+    "ARRAY_LENGTH_OFFSET must equal the byte offset of ObjectHeader::shape"
+);
+// Emitted as a signed disp8 against the object base at every JIT array-length
+// site (`x64/arrays.rs`, `ir_lower.rs`), so it must fit -128..=127 or those
+// instructions silently address BEFORE the object. `disp::disp8_const` makes
+// that a build failure at the emission sites; this makes it one here too.
+const _: () = assert!(
+    ARRAY_LENGTH_OFFSET <= 127,
+    "ARRAY_LENGTH_OFFSET must fit a signed disp8 for JIT array-length loads"
+);
 pub const NUM_SLOTS_OFFSET: usize = 4;
 // --- The quartet, in mark-word bits 48..63 ---------------------------------
 //
@@ -727,16 +750,22 @@ pub fn array_element_type_from_tag(tag: u8) -> Option<ArrayElementType> {
 
 /// The header stored at the beginning of every heap-allocated object/array.
 ///
-/// Layout (32 bytes total, 8-byte aligned):
-/// - `class_id`: ClassId (4 bytes) -- MUST stay at offset 0 (JIT contract)
-/// - `kind`: ObjectKind (1 byte)
-/// - `element_type`: ArrayElementType (1 byte, only meaningful for arrays)
-/// - `gc_age`: u8
-/// - `gc_flags`: u8
-/// - `identity_hash_code`: i32 (4 bytes)
-/// - `shape`: u32 (array length, or full instance-field count)
-/// - `forwarding_ptr`: *mut u8 (8 bytes, used by GC for object relocation)
-/// - `mark_word`: AtomicU64 (8 bytes, thin-lock / monitor state -- offset 24)
+/// Layout (**16 bytes** total, 8-byte aligned) — the three `#[repr(C)]`
+/// fields below and nothing else:
+/// - `class_id`: `ClassId` (4 bytes, offset 0) -- MUST stay there (JIT contract)
+/// - `shape`: `u32` (4 bytes, offset [`ARRAY_LENGTH_OFFSET`] = 4) -- array
+///   length, or full instance-field count
+/// - `mark_word`: `AtomicU64` (8 bytes, offset [`MARK_WORD_OFFSET`] = 8) --
+///   lock state, identity hash, GC forwarding target, AND the
+///   `kind`/`element_type`/`gc_age`/`gc_flags` quartet in bits 48..63
+///
+/// This list said "32 bytes total" and named five fields that no longer exist
+/// as fields — `kind`, `element_type`, `gc_age`, `gc_flags` (folded into the
+/// mark word's bits 48..63), `identity_hash_code` and `forwarding_ptr` (both
+/// absorbed by the mark word) — with `mark_word` at offset 24. It described
+/// the header as it stood before the 32 -> 24 -> 16 shrink of 2026-08-06/07.
+/// Read the field docs, and the const-asserted offsets beside the constants,
+/// rather than this summary; those cannot go stale silently.
 ///
 /// NOTE: `Clone`/`Copy` were removed when `mark_word: AtomicU64` was added,
 /// since atomics are `!Copy`. Header copies must now go through explicit

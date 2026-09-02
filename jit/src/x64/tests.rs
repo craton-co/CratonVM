@@ -153,6 +153,7 @@ fn pop_does_not_reclaim_a_slot_a_buried_entry_still_owns() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         alloc_result,
         false,
         test_helpers(),
@@ -254,6 +255,7 @@ fn a_splice_does_not_rewind_the_cursor_under_a_buried_operand() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         alloc_result,
         false,
         test_helpers(),
@@ -326,6 +328,7 @@ fn push_stack_refuses_to_cross_spill_limit() {
         0,
         1,
         false,
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -5003,7 +5006,10 @@ fn the_inline_g1_barrier_filter_separates_the_four_cases_when_executed() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
-        alloc_result,
+                // dev added `array_len_hoist_info` as argument 13 while this branch
+        // was open; these tests hoist no array length.
+        Vec::new(),
+alloc_result,
         false,
         helpers,
         0,
@@ -5164,7 +5170,10 @@ fn the_inline_g1_barrier_needs_the_flag_the_table_and_the_helper() {
             Vec::new(),
             Vec::new(),
             Vec::new(),
-            alloc_result,
+                        // dev added `array_len_hoist_info` as argument 13 while this branch
+            // was open; these tests hoist no array length.
+            Vec::new(),
+alloc_result,
             false,
             helpers,
             0,
@@ -5289,7 +5298,10 @@ fn the_generational_inline_card_mark_stays_disabled_under_f08() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
-        alloc_result,
+                // dev added `array_len_hoist_info` as argument 13 while this branch
+        // was open; these tests hoist no array length.
+        Vec::new(),
+alloc_result,
         false,
         helpers,
         0,
@@ -6999,6 +7011,213 @@ fn test_find_modified_locals() {
     assert!(modified & (1 << 2) != 0); // local 2 modified by istore_2
     assert!(modified & (1 << 0) == 0); // local 0 NOT modified
     assert!(modified & (1 << 3) == 0); // local 3 NOT modified
+}
+
+/// `for (i = 0; i < a.length; i++) if (a[i] == 'a') c++;` — the exact inner
+/// loop of `probes/CharAtCostCurve.java::scanArr`, taken from `javap -c -p -l`.
+///
+/// This is the shape the whole hoist exists for. javac re-evaluates `a.length`
+/// at the top of every iteration, and the single-pass emitter took that
+/// literally: a receiver move, a `TEST`/`JZ` null check that the loop's own
+/// previous iteration had already discharged, and a header dereference — four
+/// instructions of a 21-instruction body whose useful work is one `MOVZX`.
+///
+/// Locals: 0=a (char[]), 2=c, 4=i.
+#[test]
+fn find_array_len_hoists_matches_the_canonical_counted_loop() {
+    let code: Vec<u8> = vec![
+        0x03, // 0:  iconst_0
+        0x3d, // 1:  istore_2        (c = 0)
+        0x03, // 2:  iconst_0
+        0x36, 0x04, // 3:  istore 4        (i = 0)
+        0x00, 0x00, 0x00, 0x00, 0x00, // 5..9: nop padding to bci 10
+        0x00, 0x00, // 10..11: nop
+        0x15, 0x04, // 12: iload 4         (header)
+        0x2a, // 14: aload_0
+        0xbe, // 15: arraylength
+        0xa2, 0x00, 0x16, // 16: if_icmpge +22 -> 38
+        0x2a, // 19: aload_0
+        0x15, 0x04, // 20: iload 4
+        0x34, // 22: caload
+        0x10, 0x61, // 23: bipush 97
+        0xa0, 0x00, 0x06, // 25: if_icmpne +6 -> 31
+        0x84, 0x02, 0x01, // 28: iinc 2, 1
+        0x84, 0x04, 0x01, // 31: iinc 4, 1
+        0xa7, 0xff, 0xea, // 34: goto -22 -> 12
+        0x1c, // 37: iload_2
+        0xac, // 38: ireturn
+    ];
+    let code_len = code.len();
+    let loops = detect_loops(&code, code_len);
+    assert_eq!(loops[0], (12, 34), "back edge 34 -> header 12, got {loops:?}");
+
+    let hoists = find_array_len_hoists(&code, code_len, &loops);
+    assert_eq!(hoists.len(), 1, "one invariant arraylength, got {hoists:?}");
+    assert_eq!(hoists[0].loop_header, 12);
+    assert_eq!(hoists[0].array_local, 0);
+    assert_eq!(hoists[0].loop_end, 37, "one past the 3-byte goto at 34");
+    assert_eq!(
+        hoists[0].sites,
+        vec![(14, 16)],
+        "the aload_0 at 14 through the arraylength at 15"
+    );
+}
+
+/// Two reads of the same length in one body share ONE slot and ONE pre-header
+/// computation — the pre-header must not grow a load per site.
+#[test]
+fn find_array_len_hoists_shares_one_slot_across_sites() {
+    // Locals: 0=a, 1=i.
+    //  0: iload_1 ; 1: aload_0 ; 2: arraylength ; 3: if_icmpge -> 16 (header at 0)
+    //  6: aload_0 ; 7: arraylength ; 8: pop
+    //  9: iinc 1,1 ; 12: goto -> 0 ; 15: return
+    let code: Vec<u8> = vec![
+        0x1b, // 0:  iload_1 (header)
+        0x2a, // 1:  aload_0
+        0xbe, // 2:  arraylength
+        0xa2, 0x00, 0x0c, // 3:  if_icmpge +12 -> 15
+        0x2a, // 6:  aload_0
+        0xbe, // 7:  arraylength
+        0x57, // 8:  pop
+        0x84, 0x01, 0x01, // 9:  iinc 1, 1
+        0xa7, 0xff, 0xf4, // 12: goto -12 -> 0
+        0xb1, // 15: return
+    ];
+    let code_len = code.len();
+    let loops = detect_loops(&code, code_len);
+    let hoists = find_array_len_hoists(&code, code_len, &loops);
+    assert_eq!(hoists.len(), 1, "one record, not one per site");
+    assert_eq!(hoists[0].sites, vec![(1, 3), (6, 8)]);
+}
+
+/// An array local reassigned inside the body is not invariant, and its length
+/// may genuinely differ per iteration. Caching it would make the loop read a
+/// stale bound — and, where BCE trusted that bound, an unchecked access.
+#[test]
+fn find_array_len_hoists_refuses_a_reassigned_array_local() {
+    // Locals: 0=a, 1=i, 2=other.
+    //  0: iload_1 ; 1: aload_0 ; 2: arraylength ; 3: if_icmpge -> 16
+    //  6: aload_2 ; 7: astore_0        <- a = other, inside the body
+    //  8: iinc 1,1 ; 11: goto -> 0 ; 14: return
+    let code: Vec<u8> = vec![
+        0x1b, // 0:  iload_1 (header)
+        0x2a, // 1:  aload_0
+        0xbe, // 2:  arraylength
+        0xa2, 0x00, 0x0b, // 3:  if_icmpge +11 -> 14
+        0x2c, // 6:  aload_2
+        0x4b, // 7:  astore_0
+        0x84, 0x01, 0x01, // 8:  iinc 1, 1
+        0xa7, 0xff, 0xf5, // 11: goto -11 -> 0
+        0xb1, // 14: return
+    ];
+    let code_len = code.len();
+    let loops = detect_loops(&code, code_len);
+    let hoists = find_array_len_hoists(&code, code_len, &loops);
+    assert!(
+        hoists.is_empty(),
+        "astore_0 in the body makes local 0 variant, got {hoists:?}"
+    );
+}
+
+/// `find_modified_locals` cannot decode a `wide`-prefixed store: it falls into
+/// the catch-all arm and records nothing, so a `wide astore 0` would leave
+/// local 0 looking invariant. The body scan refuses any body containing the
+/// prefix at all rather than trusting a mask that cannot see it.
+#[test]
+fn find_array_len_hoists_refuses_a_wide_prefixed_body() {
+    // Same as the refusal above, but the store is `wide astore 0`
+    // (c4 3a 00 00) — four bytes, which `find_modified_locals` skips whole.
+    let code: Vec<u8> = vec![
+        0x1b, // 0:  iload_1 (header)
+        0x2a, // 1:  aload_0
+        0xbe, // 2:  arraylength
+        0xa2, 0x00, 0x0e, // 3:  if_icmpge +14 -> 17
+        0x2c, // 6:  aload_2
+        0xc4, 0x3a, 0x00, 0x00, // 7:  wide astore 0
+        0x84, 0x01, 0x01, // 11: iinc 1, 1
+        0xa7, 0xff, 0xf2, // 14: goto -14 -> 0
+        0xb1, // 17: return
+    ];
+    let code_len = code.len();
+    let loops = detect_loops(&code, code_len);
+    let hoists = find_array_len_hoists(&code, code_len, &loops);
+    assert!(
+        hoists.is_empty(),
+        "a wide prefix in the body is not modelled, got {hoists:?}"
+    );
+}
+
+/// The cooperative safepoint poll is one RIP-relative instruction, and the
+/// displacement it bakes must resolve to the flag byte itself.
+///
+/// A displacement measured from the wrong reference point reads a byte NEAR
+/// the flag. That is not a fault and not a crash: the poll simply stops seeing
+/// stop-the-world requests, or sees phantom ones, on the back edge of every
+/// compiled loop in the VM. Nothing else in the suite would notice, so decode
+/// the bytes and check the arithmetic.
+#[test]
+fn rip_relative_safepoint_poll_addresses_the_flag_byte() {
+    static FLAG: u8 = 0;
+
+    let alloc_result = crate::regalloc::RegAllocResult {
+        assignments: Vec::new(),
+        xmm_assignments: Vec::new(),
+        used_callee_saved: Vec::new(),
+        used_xmm_regs: Vec::new(),
+        block_live_in: Vec::new(),
+    };
+    let mut helpers = test_helpers();
+    let flag_addr = &FLAG as *const u8 as usize;
+    helpers.safepoint_flag_addr = flag_addr;
+    let mut c = Compiler::new(
+        "rip-poll-test".to_string(),
+        ExecutableBuffer::new(4096).expect("test executable buffer"),
+        0,
+        0,
+        8,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        alloc_result,
+        false,
+        helpers,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Vec::new(),
+    );
+
+    let start = c.buf.pos();
+    let emitted = c.emit_test_mem8_abs_imm8(flag_addr, 0xFF);
+    if !emitted {
+        // The buffer landed more than 2GB from this test binary's data
+        // segment. The fallback is the pre-2026-09-02 sequence and is checked
+        // by the executing poll tests; nothing to decode here.
+        assert_eq!(c.buf.pos(), start, "a refused encoding emits nothing");
+        return;
+    }
+    let bytes: Vec<u8> = c.buf.as_slice()[start..c.buf.pos()].to_vec();
+    assert_eq!(bytes.len(), 7, "F6 05 <disp32> <imm8>");
+    assert_eq!(&bytes[..2], &[0xF6, 0x05], "TEST r/m8, imm8 via [rip+d32]");
+    assert_eq!(bytes[6], 0xFF, "the imm8 tests every bit of the flag byte");
+
+    let disp = i32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+    // RIP is the address of the NEXT instruction — past the imm8, not past the
+    // displacement. `+ 7`, not `+ 6`: the whole point of the test.
+    let insn_end = c.buf.as_ptr() as usize + start + 7;
+    let resolved = (insn_end as i64).wrapping_add(disp as i64) as usize;
+    assert_eq!(
+        resolved, flag_addr,
+        "the RIP-relative displacement must land exactly on the flag byte"
+    );
 }
 
 #[test]
@@ -16452,6 +16671,7 @@ fn the_method_entry_poll_knows_its_own_live_oop_locals() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         alloc_result,
         false,
         test_helpers(),
@@ -16607,6 +16827,7 @@ fn the_containment_compare_narrows_its_displacement_and_knows_the_two_base_cases
             0,
             8,
             false,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),

@@ -126,6 +126,10 @@ pub mod old_gen;
 pub mod pinned;
 pub mod reference;
 pub mod region;
+/// Heap backing store: reserve address space, commit it in granules, and give
+/// it back. See the module docs for why the `alloc_zeroed` block it replaces
+/// charged the whole of `-Xmx` at startup on Windows and never returned a byte.
+pub mod reservation;
 #[cfg(feature = "gpu-offload")]
 pub mod safepoint;
 pub mod satb;

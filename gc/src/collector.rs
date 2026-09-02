@@ -182,6 +182,49 @@ pub trait MonitorCleanup {
     /// Default no-op so moving collectors (whose remap path already handles
     /// reclamation) need no change.
     fn prune_dead(&self, _dead: &[usize]) {}
+
+    /// Does this cleanup actually need the dead-address slice
+    /// [`Self::prune_dead`] takes?
+    ///
+    /// # Why the collector has to ask
+    ///
+    /// Building that slice is not free on the collector's side: it is one
+    /// `usize` per object the sweep reclaimed, pushed inside the
+    /// stop-the-world pause. On the whole-heap cycle `gc::zgc`'s own pause
+    /// anatomy is written against — 13.0M dead objects — that is a **104 MB
+    /// allocation inside the pause**, plus a second pass over 104 MB of cold
+    /// memory to consume it. It is the same defect that was found and fixed
+    /// for `ZObjectStartsSnapshot::bases()` (87 MB, measured at 13% of the
+    /// pause); the fix never reached the sweep's `dead` vector.
+    ///
+    /// And the VM's `MonitorTable::prune_dead` says in its own comment that
+    /// the slice is usually consumed to remove **nothing**: "the number of
+    /// INFLATED monitors is usually zero and never more than a handful --
+    /// inflation needs real contention", measured at 5.36% of
+    /// `LegendreHighPrecisionTest` and 4.98% of `PSquarePercentileTest`, "two
+    /// workloads with no contended monitor in them at all". Its shard survey
+    /// already turns that into 128 uncontended lock pairs — but only *after*
+    /// the collector has paid to build the slice. This asks the same question
+    /// one step earlier, where the cost actually is.
+    ///
+    /// # Why the default is `true`
+    ///
+    /// Fail-safe. An implementation that overrides `prune_dead` and forgets
+    /// this method still receives the complete slice. The failure mode of a
+    /// `false` default would be a silently empty prune — a new object
+    /// inheriting a dead one's monitor, which is precisely what `prune_dead`
+    /// exists to prevent, and it would present as a deadlock rather than as a
+    /// missing optimisation.
+    ///
+    /// # Contract
+    ///
+    /// Answered once per collection, at a safepoint, before the sweep runs. An
+    /// implementation may answer `false` only if `prune_dead` would do nothing
+    /// for *any* input — which under a stop-the-world token means "my tables
+    /// are empty, and no mutator can fill them before the prune".
+    fn wants_dead_addresses(&self) -> bool {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------

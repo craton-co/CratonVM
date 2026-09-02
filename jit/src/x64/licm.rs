@@ -31,6 +31,320 @@ pub(super) struct LoopHoist {
     pub(super) index_local: usize,
 }
 
+/// A loop-invariant `aload A ; arraylength` that can be computed once in the
+/// loop pre-header and read from a frame slot in the body.
+///
+/// This is the cheapest LICM in the backend and the one with the largest
+/// reach, because it is the only invariant load in an ordinary
+/// `for (i = 0; i < a.length; i++)` — javac re-evaluates `a.length` at the top
+/// of every iteration and the single-pass emitter took that literally:
+/// `MOV RAX, Ra ; TEST RAX,RAX ; JZ npe ; MOV EAX,[RAX+len]`, four
+/// instructions and a dependent load, on the hot path of every counted loop
+/// over an array in the VM. See
+/// `array-element-load-baseline-codegen-20260901`, where it is the largest
+/// single row of a 21-instruction body whose useful work is one `MOVZX`.
+///
+/// **The cached value is a primitive, and that is why this hoist is tractable
+/// where the general `getfield`/`getstatic` one (`loop_analysis::
+/// find_invariant_loads`, still inert) is not.** An `int` in a frame slot is
+/// invisible to the GC, needs no oop map, survives every safepoint unchanged,
+/// and cannot be invalidated by relocation — an array's length does not change
+/// and no bytecode can write it. [`LoopHoist`] caches a *pointer* and owes all
+/// of that; this owes none of it.
+///
+/// The soundness obligations that DO remain are the pre-header's:
+///
+/// * The pre-header runs **unconditionally**, including for a zero-trip loop,
+///   so an `arraylength` moved into it must be one the original program was
+///   always going to perform at that same moment. [`LoopHoist`] buys that with
+///   a guard and a deopt; this buys it with a **dominance restriction** in the
+///   matcher instead — only a site in the header's straight-line prefix,
+///   reachable through nothing but local and constant pushes, is taken (see
+///   [`straight_line_prefix_of_header`]). Such a site is evaluated on the first
+///   pass through the header no matter what, so a null `A` may simply throw
+///   NPE in the pre-header: same exception, same JEP-358 action, same instant.
+///   Routing it to a deopt stub instead would work too, and was the first
+///   shape of this code — but a deopt snapshot bakes a `Box` ADDRESS into the
+///   emitted instruction stream, so two compiles of one method produce
+///   different bytes and `corpus_is_deterministic_within_a_process` fails.
+///   The restriction is worth more than the generality it costs: it is
+///   exactly javac's counted-loop shape.
+/// * An OSR entry landing strictly INSIDE the body would read a cold slot —
+///   here a garbage *length*, which a `bounds_safe_pcs` access would then trust
+///   — so those pcs are published OSR-ineligible. The header itself stays
+///   eligible: `osr_entry_native[header]` points BEFORE the pre-header, so a
+///   cold entry there runs the initialisation.
+/// * A header that can be entered bypassing its pre-header at all (an
+///   exception handler landing inside the loop) is vetoed wholesale by
+///   `find_bypassable_loop_headers`, the same filter the other speculating
+///   transforms take.
+///
+/// Attached to the **innermost** loop containing the site, unlike
+/// [`LoopHoist`], which walks outermost-first. Hoisting further out would save
+/// nothing measurable — the pre-header already runs once per entry to a loop
+/// whose body runs it every iteration — and it would cost the inner header its
+/// OSR eligibility, which for a hot inner loop is the entry the tier-up
+/// trigger actually fires on.
+#[derive(Debug)]
+pub(super) struct ArrayLenHoist {
+    /// Bytecode PC of the loop header (back-edge target).
+    pub(super) loop_header: usize,
+    /// First PC strictly after the back-edge instruction. Mirrors
+    /// [`LoopHoist::loop_end`]; see that doc for the OSR contract it serves.
+    pub(super) loop_end: usize,
+    /// Local variable index of the array reference.
+    pub(super) array_local: usize,
+    /// Every `aload A ; arraylength` site in this loop body, as
+    /// `(seq_start, seq_end)` — `seq_start` is the `aload`, `seq_end` is one
+    /// past the `arraylength`. All sites of one `(header, local)` pair share a
+    /// single frame slot and a single pre-header computation; the alternative
+    /// (one hoist record per site) would recompute the same length once per
+    /// site in the pre-header for no gain.
+    pub(super) sites: Vec<(usize, usize)>,
+}
+
+/// Match `aload A ; arraylength` at `pc`, returning `(A, seq_end)`.
+///
+/// Accepts both `aload_0..aload_3` (single-byte) and `aload <u8>` (two-byte).
+/// The wide form (`wide aload <u16>`) is not accepted: `find_modified_locals`
+/// does not decode `wide`-prefixed stores either, so a body containing one
+/// could hide the very store that makes `A` variant. Callers reject such
+/// bodies outright rather than relying on this.
+fn match_invariant_arraylength(code: &[u8], pc: usize, code_len: usize) -> Option<(usize, usize)> {
+    let (local, after_load) = match *code.get(pc)? {
+        // aload_0..aload_3
+        op @ 0x2a..=0x2d => ((op - 0x2a) as usize, pc + 1), // Widening: u8 -> usize (opcode-relative local index)
+        // aload <u8>
+        0x19 => (*code.get(pc + 1)? as usize, pc + 2), // Widening: u8 -> usize (operand byte)
+        _ => return None,
+    };
+    if after_load >= code_len || *code.get(after_load)? != 0xbe {
+        return None;
+    }
+    Some((local, after_load + 1))
+}
+
+/// Find every hoistable loop-invariant `arraylength`, innermost loop first.
+///
+/// A site qualifies when, for the innermost loop containing it:
+/// * the array local is not stored anywhere in the body (`find_modified_locals`
+///   — the same invariance test [`find_loop_hoists`] uses), and
+/// * the local index is below the bitmask's saturation bit, so "not modified"
+///   is a fact about THIS local and not about "some local at or above 63", and
+/// * the site sits in the header's straight-line prefix
+///   ([`straight_line_prefix_of_header`]), so the pre-header may evaluate it
+///   eagerly, and
+/// * the `arraylength` is not itself a branch target, so the two-instruction
+///   sequence cannot be entered halfway, and
+/// * the body contains no `wide` prefix (0xc4) and no `jsr`/`ret`
+///   (0xa8/0xc9/0xa9) — the first because `find_modified_locals` cannot decode
+///   a `wide` store and would report a modified local as invariant, the second
+///   because `detect_loops` does not model subroutine control flow, so "the
+///   body" would not be the set of PCs that can run.
+pub(super) fn find_array_len_hoists(
+    code: &[u8],
+    code_len: usize,
+    loops: &[(usize, usize)],
+) -> Vec<ArrayLenHoist> {
+    if loops.is_empty() {
+        return Vec::new();
+    }
+
+    // Innermost first: the smallest span that contains a site claims it. See
+    // the `ArrayLenHoist` doc for why that is the right end to start from.
+    let mut sorted_loops = loops.to_vec();
+    sorted_loops.sort_by_key(|&(h, b)| b.saturating_sub(h));
+
+    let mut hoists: Vec<ArrayLenHoist> = Vec::new();
+    let mut claimed_pcs: Vec<usize> = Vec::new();
+
+    for &(header, back_edge) in &sorted_loops {
+        let loop_end = back_edge + bytecode_len_at(code, back_edge);
+        if loop_end > code_len || header >= loop_end {
+            continue;
+        }
+
+        // Control-flow shapes this analysis does not model. Checked over the
+        // whole body before any site is taken, so one `wide` store late in the
+        // body cannot validate a hoist matched early in it.
+        let mut unmodelled = false;
+        let mut scan = header;
+        while scan < loop_end {
+            if matches!(code[scan], 0xc4 | 0xa8 | 0xa9 | 0xc9) {
+                unmodelled = true;
+                break;
+            }
+            let l = bytecode_len_at(code, scan);
+            if l == 0 {
+                unmodelled = true;
+                break;
+            }
+            scan += l;
+        }
+        if unmodelled {
+            continue;
+        }
+
+        let modified = find_modified_locals(code, header, loop_end);
+        let targets = branch_target_pcs(code, header, loop_end);
+
+        let mut pc = header;
+        while pc < loop_end && pc < code_len {
+            if claimed_pcs.contains(&pc) {
+                pc += bytecode_len_at(code, pc);
+                continue;
+            }
+            let Some((array_local, seq_end)) = match_invariant_arraylength(code, pc, code_len)
+            else {
+                pc += bytecode_len_at(code, pc);
+                continue;
+            };
+            // `find_modified_locals` saturates every local index at bit 63, so
+            // bit 63 means "some local at or above 63 was stored" and proves
+            // nothing about local 63 itself.
+            let invariant = array_local < 63 && (modified & (1u64 << array_local)) == 0;
+            let interior_entered = targets.contains(&(seq_end - 1));
+            let existing_idx = hoists
+                .iter()
+                .position(|h| h.loop_header == header && h.array_local == array_local);
+            // Dominance is a condition on OPENING a record, not on joining one.
+            // It licenses the pre-header's eager evaluation; once some site has
+            // licensed it, the slot holds this array's true length for the whole
+            // body, and any other invariant read of the same length -- including
+            // one behind a conditional -- may take it. Such a site's own null
+            // check goes with it, which is sound because the pre-header already
+            // proved the receiver non-null on this path.
+            let admissible = invariant
+                && !interior_entered
+                && seq_end <= loop_end
+                && (existing_idx.is_some()
+                    || straight_line_prefix_of_header(code, header, pc, &targets));
+            if admissible {
+                claimed_pcs.push(pc);
+                match existing_idx {
+                    Some(i) => hoists[i].sites.push((pc, seq_end)),
+                    None => hoists.push(ArrayLenHoist {
+                        loop_header: header,
+                        loop_end,
+                        array_local,
+                        sites: vec![(pc, seq_end)],
+                    }),
+                }
+                pc = seq_end;
+            } else {
+                pc += bytecode_len_at(code, pc);
+            }
+        }
+    }
+
+    hoists
+}
+
+/// Is `site` reached from `header` by a run of instructions that cannot
+/// branch, cannot throw, and cannot be entered from anywhere else?
+///
+/// If so, control that reaches the loop header at all reaches `site`, so the
+/// pre-header may evaluate the `arraylength` there eagerly and let a null
+/// receiver throw exactly the NPE the body would have thrown, at the same
+/// point in the execution. That is what lets this hoist skip the deopt
+/// machinery [`LoopHoist`] needs.
+///
+/// The admitted prefix is deliberately tiny: local loads and constant pushes
+/// only. `ldc` is excluded (a class-literal or condy resolution can throw),
+/// every arithmetic opcode is excluded (`idiv` throws), and any branch ends
+/// the run. In practice this admits one shape and it is the one that matters —
+/// javac's `iload i ; aload a ; arraylength ; if_icmpge` loop header, where the
+/// run from the header to the `aload` is a single `iload`.
+fn straight_line_prefix_of_header(
+    code: &[u8],
+    header: usize,
+    site: usize,
+    targets: &[usize],
+) -> bool {
+    let mut pc = header;
+    while pc < site {
+        // A branch landing INSIDE the prefix reaches `site` without having
+        // come through the header, so "the header was entered" would no longer
+        // imply "this instruction runs".
+        if pc != header && targets.contains(&pc) {
+            return false;
+        }
+        let pure_push = matches!(code[pc],
+            // nop
+            0x00
+            // aconst_null .. dconst_1
+            | 0x01..=0x0f
+            // bipush / sipush
+            | 0x10 | 0x11
+            // iload / lload / fload / dload / aload (operand-byte forms)
+            | 0x15..=0x19
+            // iload_0 .. aload_3
+            | 0x1a..=0x2d);
+        if !pure_push {
+            return false;
+        }
+        let l = bytecode_len_at(code, pc);
+        if l == 0 {
+            return false;
+        }
+        pc += l;
+    }
+    pc == site
+}
+
+/// Every branch target inside `[start, end)`, including the `switch` tables.
+///
+/// Used to reject a two-instruction sequence whose second instruction can be
+/// jumped to directly: replacing the pair with one slot load would delete the
+/// landing pad.
+fn branch_target_pcs(code: &[u8], start: usize, end: usize) -> Vec<usize> {
+    let mut targets = Vec::new();
+    let mut pc = start;
+    while pc < end {
+        let op = code[pc];
+        let len = bytecode_len_at(code, pc);
+        if len == 0 {
+            break;
+        }
+        match op {
+            // goto and every two-byte-offset conditional branch.
+            0xa7 | 0x99..=0xa6 | 0xc6 | 0xc7 => {
+                if pc + 2 < code.len() {
+                    let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
+                    if let Some(t) = pc.checked_add_signed(off as isize) {
+                        // Cast: address arithmetic
+                        targets.push(t);
+                    }
+                }
+            }
+            // goto_w
+            0xc8 => {
+                if pc + 4 < code.len() {
+                    let off =
+                        i32::from_be_bytes([code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4]]);
+                    if let Some(t) = pc.checked_add_signed(off as isize) {
+                        // Cast: address arithmetic
+                        targets.push(t);
+                    }
+                }
+            }
+            // tableswitch / lookupswitch: every target is a branch target, and
+            // decoding their variable-length payloads here would duplicate
+            // `bytecode_len_at`. Treat the whole span as entered rather than
+            // half-decode them -- a switch in the body is rare and losing the
+            // hoist there costs nothing anyone can measure.
+            0xaa | 0xab => {
+                for t in pc..end {
+                    targets.push(t);
+                }
+            }
+            _ => {}
+        }
+        pc += len;
+    }
+    targets
+}
+
 /// Information about a loop-invariant FP load that can be hoisted.
 /// Pattern: dload/fload of a local that is not modified within the loop body.
 #[derive(Debug)]
@@ -1833,6 +2147,52 @@ pub(super) fn shadow_no_savebase() -> bool {
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_NO_SAVEBASE").is_some()
+    })
+}
+
+/// `CRATONVM_JIT_RIP_SAFEPOINT_POLL=0` — emit the safepoint poll as
+/// `MOV R11, imm64 ; TEST BYTE [R11], 0xFF` again instead of the one-instruction
+/// `TEST BYTE [rip+disp32], 0xFF`.
+///
+/// Default ON. The two forms read the same byte and branch the same way, so
+/// this is a bisect lever rather than a safety valve — but the poll is on the
+/// back edge of every compiled loop in the VM, which is the largest blast
+/// radius any single instruction change in this backend has, and the RIP form
+/// is the first RIP-relative operand the single-pass emitter has ever
+/// produced. A wrong displacement here reads a byte NEAR the flag and is a
+/// silent liveness bug, not a fault, so it needs a lever that reaches the
+/// emission and not just the analysis.
+///
+/// Reaching for the out-of-reach fallback is NOT what this switch is for: that
+/// path is chosen per site by `emit_test_mem8_abs_imm8`'s own ±2GB test.
+pub(super) fn jit_rip_safepoint_poll_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_RIP_SAFEPOINT_POLL")
+            .and_then(|v| v.into_string().ok())
+            .is_none_or(|v| v != "0")
+    })
+}
+
+/// `CRATONVM_JIT_FUSED_BOUNDS_LOAD=0` — emit the array bounds check as
+/// `MOV R10D, [RAX+len] ; CMP ECX, R10D ; JAE stub` again instead of the fused
+/// `CMP ECX, [RAX+len] ; JAE stub`.
+///
+/// Default ON. Both forms compare the same two numbers against the same
+/// header word and take the same branch; what differs is whether R10D is live
+/// at the stub, and the stub re-loads the length unconditionally so it is
+/// correct under either. The switch exists because the fused form is one
+/// instruction on EVERY bounds check the VM emits — every array access outside
+/// a proved counted loop — so if an array-heavy workload regresses, this is
+/// the arm that separates "the fold" from everything else in the same build.
+pub(super) fn jit_fused_bounds_load_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_FUSED_BOUNDS_LOAD")
+            .and_then(|v| v.into_string().ok())
+            .is_none_or(|v| v != "0")
     })
 }
 

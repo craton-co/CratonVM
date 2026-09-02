@@ -3052,6 +3052,39 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// `TEST BYTE [rip+disp32], 0xFF` against `safepoint_flag_addr` — the
+    /// whole poll in one 7-byte instruction, reporting whether the flag was
+    /// within ±2GB RIP reach of it.
+    ///
+    /// Mirrors `x64/emit.rs`'s `emit_test_mem8_abs_imm8`; the two backends
+    /// emit the same poll and this keeps them saying the same thing. `F6 /0 ib`
+    /// with ModRM `mod=00, rm=101` is the RIP-relative form, and the
+    /// displacement is measured from the end of the WHOLE instruction — past
+    /// the trailing `imm8`, which is why the reach test adds 7 and not 6.
+    ///
+    /// The alternative it replaces, `MOV R11, imm64` + `TEST BYTE [R11], 0xFF`,
+    /// is 15 bytes and two instructions and burns a register. Nothing here
+    /// records a patch site: unlike the single-pass backend, this lowerer never
+    /// duplicates emitted bytes to a second address, so a displacement that is
+    /// right when emitted stays right.
+    fn emit_test_safepoint_flag_rip(&mut self) -> bool {
+        // F6 05 <disp32> <imm8>
+        const LEN: usize = 7;
+        // Cast: non-negative index/count to usize
+        let here = self.buf.as_ptr() as usize + self.buf.pos();
+        let next_pc = here.wrapping_add(LEN);
+        // Widening: i64/usize -> i128 (no truncation, for range check)
+        let delta: i128 = (self.safepoint_flag_addr as i128) - (next_pc as i128);
+        // Widening: i64/usize -> i128 (no truncation, for range check)
+        if delta < i32::MIN as i128 || delta > i32::MAX as i128 {
+            return false;
+        }
+        self.buf.emit(&[0xF6, 0x05]);
+        self.buf.emit(&(delta as i32).to_le_bytes()); // Cast: rel32 displacement
+        self.buf.emit_byte(0xFF);
+        true
+    }
+
     /// Emit the default-on cooperative poll used at method entries and loop
     /// back-edges. The lowerer keeps all live values in frame slots, so the
     /// no-argument slow path may be called directly.
@@ -3062,8 +3095,12 @@ impl<'a> Lowerer<'a> {
         if !enabled || self.safepoint_flag_addr == 0 || self.safepoint_slow_path == 0 {
             return;
         }
-        self.emit_mov_reg_imm64(R11, self.safepoint_flag_addr as u64);
-        self.buf.emit(&[0x41, 0xF6, 0x03, 0xFF]); // TEST byte ptr [R11], 0xff
+        if !self.emit_test_safepoint_flag_rip() {
+            // Out of ±2GB RIP reach — materialize the address and read
+            // through it, the shape this poll had before 2026-09-02.
+            self.emit_mov_reg_imm64(R11, self.safepoint_flag_addr as u64);
+            self.buf.emit(&[0x41, 0xF6, 0x03, 0xFF]); // TEST byte ptr [R11], 0xff
+        }
         self.buf.emit(&[0x0F, 0x84]); // JZ .clear
         let clear_patch = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
@@ -16919,6 +16956,169 @@ mod tests {
         assert_eq!(
             classified, listed,
             "`UNLOWERABLE` and `declared_lowering` disagree"
+        );
+    }
+
+    /// Every `Op::X` named in `regalloc::ir_op_defines_value`'s body.
+    ///
+    /// Read out of the other file's source for the same reason
+    /// [`ops_that_define_a_result_slot`] is read out of this one: the function
+    /// is private, and a copy of its list maintained here would be a fourth
+    /// enumeration of the same question.
+    fn ops_regalloc_calls_value_defining() -> std::collections::BTreeSet<String> {
+        let src = include_str!("regalloc.rs");
+        let body = src
+            .split("fn ir_op_defines_value(op: &Op) -> bool {")
+            .nth(1)
+            .expect("ir_op_defines_value is in regalloc.rs")
+            .split("\n}")
+            .next()
+            .expect("the function ends");
+        let mut out = std::collections::BTreeSet::new();
+        collect_op_names(body, &mut out);
+        assert!(
+            !out.is_empty(),
+            "the regalloc scan found nothing — `ir_op_defines_value`'s shape \
+             changed and this test would now pass vacuously"
+        );
+        out
+    }
+
+    /// The two enumerations of "does this op define a value" are the SAME set.
+    ///
+    /// `regalloc::ir_op_defines_value` calls itself a "verbatim mirror" of
+    /// `op_defines_result_slot`, and until 2026-09-02 it was not one: it omitted
+    /// `Op::ArrayLength` and `Op::NewArray`, and its own doc comment asserted
+    /// they were absent from both. The comment written to prevent the drift was
+    /// the drift.
+    ///
+    /// **What that cost was invisible, which is why this test exists rather
+    /// than a stricter comment.** `plan_register_residency` compares
+    /// `wants_loc` (built from the regalloc predicate) against `node_color`
+    /// (built from this file's), and ONE disagreement declines register
+    /// residency for the whole method. Every counted loop written
+    /// `for (i = 0; i < a.length; i++)` contains an `arraylength`, so every one
+    /// of them declined — silently, because the flag reported only successes.
+    /// Nothing was miscompiled; the optimization was simply unavailable
+    /// wherever arrays are, which is most places.
+    ///
+    /// Compared as sets of names parsed from both sources, so adding an arm to
+    /// one list and forgetting the other fails here instead of turning up as an
+    /// unexplained refusal months later.
+    #[test]
+    fn the_two_value_defining_enumerations_agree() {
+        let here = ops_that_define_a_result_slot();
+        let there = ops_regalloc_calls_value_defining();
+
+        let missing_in_regalloc: Vec<&String> = here.difference(&there).collect();
+        let missing_here: Vec<&String> = there.difference(&here).collect();
+
+        assert!(
+            missing_in_regalloc.is_empty(),
+            "`op_defines_result_slot` names these and `regalloc::ir_op_defines_value` \
+             does not: {missing_in_regalloc:?} — the colourer gives them a home the \
+             liveness model does not know about, so `plan_register_residency` \
+             declines residency for EVERY method containing one",
+        );
+        assert!(
+            missing_here.is_empty(),
+            "`regalloc::ir_op_defines_value` names these and `op_defines_result_slot` \
+             does not: {missing_here:?} — the liveness model expects a home the \
+             colourer never allocates, which is the direction that has no slot to \
+             spill to",
+        );
+    }
+
+    /// A counted loop over `a.length` reaches the register allocator.
+    ///
+    /// The end-to-end form of [`the_two_value_defining_enumerations_agree`],
+    /// and the one that names the consequence rather than the cause.
+    /// `plan_register_residency`'s agreement check compares `wants_loc`
+    /// (`regalloc::ir_op_defines_value`) against `node_color`
+    /// (`op_defines_result_slot`) and declines register residency for the
+    /// WHOLE method on a single disagreement. `Op::ArrayLength` was in the
+    /// second list and not the first, so this shape — the most ordinary
+    /// counted loop in Java — declined every time, and the flag reported
+    /// nothing because it printed only on success.
+    ///
+    /// The bytecode is `static int f(int[] a) { int s = 0; for (int i = 0; i <
+    /// a.length; i++) s += a[i]; return s; }`, assembled by hand so the
+    /// `arraylength` is unmistakably present rather than incidental to a
+    /// fixture.
+    ///
+    /// Asserted on the AGREEMENT, not on a promotion count: whether this
+    /// particular graph ends up with a register is the allocator's business and
+    /// may legitimately change, but the two models must never disagree about
+    /// which values want a home.
+    #[test]
+    fn a_counted_loop_over_array_length_reaches_the_allocator() {
+        use crate::regalloc::build_live_model;
+
+        // 0: iconst_0            s = 0
+        // 1: istore_1
+        // 2: iconst_0            i = 0
+        // 3: istore_2
+        // 4: iload_2         <-- loop head
+        // 5: aload_0
+        // 6: arraylength         THE OP THAT USED TO DECLINE THE METHOD
+        // 7: if_icmpge +15  --> 22
+        // 10: iload_1
+        // 11: aload_0
+        // 12: iload_2
+        // 13: iaload
+        // 14: iadd
+        // 15: istore_1
+        // 16: iinc 2, 1
+        // 19: goto -15      --> 4
+        // 22: iload_1
+        // 23: ireturn
+        let code: [u8; 24] = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x2a, 0xbe, 0xa2, 0x00, 0x0f, 0x1b, 0x2a, 0x1c, 0x2e,
+            0x60, 0x3b, 0x84, 0x02, 0x01, 0xa7, 0xff, 0xf1, 0x1b, 0xac,
+        ];
+        let graph = IrBuilder::new(1, 3)
+            .build(&code, code.len())
+            .expect("the loop builds");
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::ArrayLength)),
+            "the fixture must contain an ArrayLength, or this test proves nothing"
+        );
+
+        let schedule = ir_schedule::schedule(&graph);
+        let plan = plan_slots(&graph, &schedule, None);
+        let live = build_live_model(&graph, &schedule);
+
+        assert_eq!(
+            live.wants_loc.len(),
+            plan.node_color.len(),
+            "the two models disagree about how many nodes there are"
+        );
+        let disagreeing: Vec<(usize, String)> = live
+            .wants_loc
+            .iter()
+            .zip(plan.node_color.iter())
+            .enumerate()
+            .filter(|(_, (wants, color))| **wants != color.is_some())
+            .map(|(id, _)| {
+                (
+                    id,
+                    graph
+                        .nodes
+                        .get(id)
+                        .map(|n| format!("{:?}", n.op))
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert!(
+            disagreeing.is_empty(),
+            "liveness and colourer disagree on {disagreeing:?} — \
+             `plan_register_residency` declines residency for the whole method \
+             on any one of these, so this ordinary counted loop gets no \
+             registers at all",
         );
     }
 

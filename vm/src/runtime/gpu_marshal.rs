@@ -687,6 +687,27 @@ where
 
 /// `false` only when `CRATONVM_GPU_NO_ZEROCOPY` is set — an opt-out for A/B
 /// measurement / safety. Cached.
+///
+/// # The invariant the zero-copy path rests on
+///
+/// AUDIT 2026-09-02. When this is on, the device DMAs against the JVM heap
+/// arena itself rather than against a detached host copy — the array body
+/// is never staged. That is sound only because every transfer below is
+/// SYNCHRONOUS: `DeviceBuffer::from_host` host-blocks on the upload stream
+/// and `to_host` on the download stream before returning, so the DMA has
+/// retired while the caller's `SafepointToken` is still held and the
+/// collector cannot have moved anything.
+///
+/// `cuda_bridge::critical`'s module doc used to assert the opposite — that
+/// "the device never holds a JVM heap address" — and concluded from it
+/// that a GPU critical token needs only keep-alive semantics and not
+/// [`cuda_bridge::critical::Relocation::Forbidden`]. The conclusion is
+/// still right; the reason it gave was not.
+///
+/// So: moving this path to an async upload is not a local change. It would
+/// need either the staged copy back for this arm, or a token that forbids
+/// relocation until the transfer event has fired. Nothing in the types
+/// connects the token's lifetime to the copy's, so nothing would complain.
 fn zerocopy_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();

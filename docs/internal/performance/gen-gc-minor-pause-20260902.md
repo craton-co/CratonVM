@@ -460,11 +460,22 @@ owed", and it is what running the sweep bought.
   2,652 vm, 594 types, 56 tier1, plus the native-collections GC relocation
   tests.
 
-  Still owed, and cheap once a quiet host exists: re-run
-  `bench/OldToYoungEdgeProbe` under `CRATONVM_GC_VERIFY_RSET=1` on a
-  post-merge binary and confirm `edges_verified`, `missing=0` and non-zero
-  `edges`. That is the correctness half; the timing half is already argued
-  above from identical code.
+  **CLOSED, 2026-09-02.** The host quietened (13 `rustc` down to 3), a non-LTO
+  build completed, and the post-merge confirmation was run. Correctness is
+  clean and the checksums are byte-for-byte the pre-merge ones, which is the
+  strongest form of "it did the same work":
+
+  | run | post-merge result | pre-merge |
+  |---|---|---|
+  | `OldToYoungEdgeProbe 20000 200 16`, `-Xmx128m` | `edges_verified=20000`, `minor=55 major=4`, `old_to_young_edges=1,230,608`, `warm=114578260835246` | same `warm` |
+  | verifier, `-Xmx320m`, 40k nodes | 35 passes (2 moving + 33 non-moving), **0 with `missing>0`**, max `edges=1,464,832`, `site=moving edges=45776 missing=0 seeded=45776`, `warm=293386331178234` | same `warm` |
+  | `OldGenRsetProbe`, engagement census | `objstart_chunks=32 objstart_parallel=1` on every cycle, `cycles=6 coverage_fallbacks=0` | same shape |
+
+  The parallel walk still engages on every cycle and the remembered set is
+  still complete on both seeding paths. **No timing number is quoted from this
+  binary** -- it is `lto=off, codegen-units=16` and not comparable to the
+  fat-LTO figures above; only counters, checksums and engagement are read from
+  it. The suite-scale soak (Tomcat, H2, Spring) remains owed.
 
 * **Absolute pause numbers.** See Method. The shares and the counters are what
   this page establishes.
