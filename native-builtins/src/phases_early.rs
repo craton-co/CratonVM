@@ -15106,7 +15106,7 @@ fn carrier_algorithm(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Value {
 /// under a different algorithm's rules. The set below is exactly the set
 /// HotSpot's SunJCE serves; every one of them is a plain random-byte key except
 /// DES and DESede, whose parity rule `des_set_odd_parity` implements.
-fn keygen_default_bits(algo: &str) -> Option<i32> {
+pub(crate) fn keygen_default_bits(algo: &str) -> Option<i32> {
     match algo.to_ascii_uppercase().as_str() {
         "AES" => Some(256),
         "DESEDE" | "TRIPLEDES" => Some(168),
@@ -15118,6 +15118,23 @@ fn keygen_default_bits(algo: &str) -> Option<i32> {
         "HMACSHA256" => Some(256),
         "HMACSHA384" => Some(384),
         "HMACSHA512" => Some(512),
+        // The six SunJCE HMAC key generators this table did not carry, and the
+        // reason the service rows for them were deliberately withheld (see the
+        // `KeyGenerator` seed in `provider_chain`, which says so).
+        //
+        // Every default is the DIGEST OUTPUT length, which is the rule the four
+        // rows above already follow and which `SHA-512/224` makes visible: its
+        // key is 28 bytes, not the 64 its SHA-512 compression function might
+        // suggest. Measured on HotSpot 25.0.3 rather than derived —
+        // `apps/probes/JcaKeyGeneratorDefaults` prints
+        // `KeyGenerator.getInstance(a).generateKey().getEncoded().length` for
+        // every name, and the two VMs' output is diffed.
+        "HMACSHA512/224" => Some(224),
+        "HMACSHA512/256" => Some(256),
+        "HMACSHA3-224" => Some(224),
+        "HMACSHA3-256" => Some(256),
+        "HMACSHA3-384" => Some(384),
+        "HMACSHA3-512" => Some(512),
         _ => None,
     }
 }

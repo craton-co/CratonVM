@@ -3781,6 +3781,35 @@ fn seed_retired_getalgorithms_literals() {
             "RC2",
             "com.sun.crypto.provider.KeyGeneratorCore$RC2KeyGenerator",
         ),
+        // The six that were withheld until 2026-09-02 because
+        // `keygen_default_bits` had no arm for them. It does now — every one is
+        // the digest's own output length, measured against HotSpot rather than
+        // derived — so the precondition the note below states is discharged and
+        // the rows are truthful.
+        (
+            "HmacSHA512/224",
+            "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA512_224",
+        ),
+        (
+            "HmacSHA512/256",
+            "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA512_256",
+        ),
+        (
+            "HmacSHA3-224",
+            "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA3_224",
+        ),
+        (
+            "HmacSHA3-256",
+            "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA3_256",
+        ),
+        (
+            "HmacSHA3-384",
+            "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA3_384",
+        ),
+        (
+            "HmacSHA3-512",
+            "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA3_512",
+        ),
     ] {
         put_service(JCE, "KeyGenerator", algorithm, class_name);
     }
@@ -3790,13 +3819,18 @@ fn seed_retired_getalgorithms_literals() {
     // `Security.getAlgorithms` (their property key is `Alg.Alias.…`), which is
     // why HotSpot's own list names ARCFOUR and not RC4.
     put_alias(JCE, "KeyGenerator", "RC4", "ARCFOUR");
-    // Deliberately NOT seeded, and each for a checkable reason rather than an
-    // oversight: `HmacSHA3-{224,256,384,512}` and `HmacSHA512/{224,256}`,
-    // because `keygen_default_bits` has no arm for them and the
-    // `--synthetic-jdk` path would refuse a name this list published; and the
-    // five `SunTls*` generators, which are TLS-internal KDFs driven by
+    // Deliberately NOT seeded, for a checkable reason rather than an oversight:
+    // the five `SunTls*` generators, which are TLS-internal KDFs driven by
     // `sun.security.ssl` and take `TlsKeyMaterialParameterSpec`-family specs
-    // this engine's `init` surface does not carry.
+    // this engine's two-field `init` surface does not carry. Serving them means
+    // handing back a REAL `javax.crypto.KeyGenerator` over the platform's SPI,
+    // which every native registered on this class would then have to recognise
+    // (the `skf_receiver_is_ours` shape) — a change to the whole engine, not a
+    // row. Recorded as the residual it is.
+    //
+    // `HmacSHA3-{224,256,384,512}` and `HmacSHA512/{224,256}` used to be on
+    // this list for the same kind of reason — `keygen_default_bits` had no arm
+    // — and they are seeded above now that it does.
     put_service(
         "SunRsaSign",
         "KeyPairGenerator",
@@ -8898,13 +8932,70 @@ mod tests {
         }
         // `RC4` is the alias, `ARCFOUR` the service, exactly as on SunJCE.
         assert!(get_service_entry("SunJCE", "KeyGenerator", "RC4").is_some());
-        // Deliberately absent, and asserted so that adding one without an arm in
-        // `keygen_default_bits` reds here rather than at a caller: the synthetic
-        // path would refuse a name this registry published.
-        for unimplemented in ["HmacSHA3-256", "HmacSHA512/256", "SunTlsPrf"] {
+        // THE BICONDITIONAL, over HotSpot's own list, and derived rather than
+        // restated.
+        //
+        // This was two hand-written lists — implemented-and-advertised above,
+        // and a literal `["HmacSHA3-256", "HmacSHA512/256", "SunTlsPrf"]` of
+        // names that must NOT be advertised. The second went stale the moment
+        // `keygen_default_bits` grew arms for the first two (2026-09-02), and
+        // it failed saying they "must not be advertised" — which by then was
+        // false. A list that states the answer cannot check it.
+        //
+        // So: for every `KeyGenerator` name SunJCE registers on HotSpot 25,
+        // advertised HERE if and only if this engine can generate it. Both
+        // directions are the defect: advertising a name the synthetic path
+        // refuses, and refusing to publish a name it serves.
+        const HOTSPOT_SUNJCE_KEYGENERATORS: &[&str] = &[
+            "AES",
+            "ARCFOUR",
+            "Blowfish",
+            "ChaCha20",
+            "DES",
+            "DESede",
+            "HmacMD5",
+            "HmacSHA1",
+            "HmacSHA224",
+            "HmacSHA256",
+            "HmacSHA384",
+            "HmacSHA512",
+            "HmacSHA512/224",
+            "HmacSHA512/256",
+            "HmacSHA3-224",
+            "HmacSHA3-256",
+            "HmacSHA3-384",
+            "HmacSHA3-512",
+            "RC2",
+            "SunTls12Prf",
+            "SunTlsKeyMaterial",
+            "SunTlsMasterSecret",
+            "SunTlsPrf",
+            "SunTlsRsaPremasterSecret",
+        ];
+        for name in HOTSPOT_SUNJCE_KEYGENERATORS {
+            let generates = crate::phases_early::keygen_default_bits(name).is_some();
+            let advertised = get_service_entry("SunJCE", "KeyGenerator", name).is_some();
+            assert_eq!(
+                generates, advertised,
+                "KeyGenerator.{name}: keygen_default_bits generates={generates} but SunJCE                  advertises={advertised} — the two must agree in BOTH directions"
+            );
+        }
+        // The five `SunTls*` KDFs are the ones that must still be absent, and
+        // for a reason that is not a missing table row: they take
+        // `TlsKeyMaterialParameterSpec`-family specs this engine's two-field
+        // `init` surface cannot carry. Asserted by name so that serving them
+        // (which means handing back a real `javax.crypto.KeyGenerator` over the
+        // platform's SPI) reds here and is done deliberately.
+        for tls in [
+            "SunTlsPrf",
+            "SunTls12Prf",
+            "SunTlsMasterSecret",
+            "SunTlsKeyMaterial",
+            "SunTlsRsaPremasterSecret",
+        ] {
             assert!(
-                get_service_entry("SunJCE", "KeyGenerator", unimplemented).is_none(),
-                "{unimplemented} has no keygen_default_bits arm and must not be advertised"
+                crate::phases_early::keygen_default_bits(tls).is_none(),
+                "{tls} is a parameter-spec-driven KDF, not a key size"
             );
         }
     }
