@@ -581,6 +581,47 @@ fn interleave_compiled_frames(
     out
 }
 
+/// Prepend the compiled frames snapshotted at a JIT-signalled implicit NPE to
+/// a trace that was captured after they had already unwound.
+///
+/// An implicit NPE raised inside compiled code is CONSTRUCTED later, from the
+/// interpreter, once the helper's `i64::MIN` sentinel has propagated out of the
+/// compiled activation (see `jit::helpers::take_jit_pending_npe`). By then the
+/// frames between the throw site and the first interpreter frame are gone, and
+/// the trace names none of the code that actually raised the exception —
+/// `[big:42 probe:56 main:67]` on HotSpot reads `[probe:56 main:67]` here, and
+/// after an OSR of the caller it reads `[main:71]` alone.
+///
+/// The snapshot was taken inside the helper, while those frames were still on
+/// the stack. They are innermost-first and belong in front of everything the
+/// late capture found. Entries are built exactly as [`compiled_frame_entry`]
+/// builds them, so a frame recovered this way carries the same bci and line as
+/// one caught live.
+pub fn append_snapshotted_compiled_frames(
+    class_store: &ClassStore,
+    snapshot: &[ActiveCompiledFrame],
+    mut trace: Vec<StackTraceEntry>,
+) -> Vec<StackTraceEntry> {
+    if snapshot.is_empty() {
+        return trace;
+    }
+    // ORDER. A STORED trace is outermost-first — the Java `StackTraceElement[]`
+    // is built by reversing it, which is why `capture_stack_trace`'s consumers
+    // iterate `.rev()`. The snapshotted frames are the INNERMOST ones (they ran
+    // below everything the late capture could still see), so outermost-first
+    // means they go on the END, in the order `active_compiled_frames` already
+    // returns them. Getting this backwards is not a subtle failure: it prints
+    // the throw site as the outermost frame, which reads as a plausible trace
+    // of a completely different call.
+    trace.reserve(snapshot.len());
+    for f in snapshot {
+        if let Some(e) = compiled_frame_entry(class_store, f) {
+            trace.push(e);
+        }
+    }
+    trace
+}
+
 /// Re-point an already-built entry at `bci`, re-resolving its line.
 ///
 /// Used for the OSR-entered interpreter frame whose own `pc` is stale (see
