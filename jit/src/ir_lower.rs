@@ -699,6 +699,17 @@ struct Lowerer<'a> {
     /// "no slot" sentinel on the reader side, and a zero id in the slot means
     /// "this frame has not reached a safepoint yet".
     next_sp_id: u32,
+    /// `(safepoint id, bytecode index)` for every safepoint this compile
+    /// emits, in emission order — which is ascending by id, because ids come
+    /// from `next_sp_id`.
+    ///
+    /// The translation `CompiledMethod::safepoint_bci_table` documents. The id
+    /// is what the frame slot holds and what the GC keys its map on; the bci is
+    /// what a stack trace needs and what nothing on this backend recorded, so
+    /// every optimizing-tier frame printed `(Unknown Source)`. Recorded here
+    /// rather than in `OopMapEntry::bytecode_pc` because that field IS the id —
+    /// overwriting it would repoint every oop-map lookup the collector makes.
+    sp_id_bcis: Vec<(u32, u32)>,
     /// Frame offset of `arg[0]` in the Java-argument staging region a call
     /// marshals its args into; `arg[i]` lives at `args_stage_top_off - i*8`
     /// (increasing address), and `args_ptr = rbp - args_stage_top_off`.
@@ -1176,6 +1187,7 @@ impl<'a> Lowerer<'a> {
             oop_maps: Vec::new(),
             defined_nodes: vec![false; graph.nodes.len()],
             next_sp_id: 1,
+            sp_id_bcis: Vec::new(),
             args_stage_top_off,
             spill_cap_off,
             saved_xmm_bytes,
@@ -1661,6 +1673,21 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// `CRATONVM_JIT_IR_COLD_ARG_STAGE=0` — stage a call's outgoing arguments
+    /// EAGERLY, before the call, as this backend did until 2026-09-02.
+    ///
+    /// Default on, meaning the staging happens on each reader's own cold side.
+    /// The switch exists because the eager version was removed without one, and
+    /// a change to what a frame holds across a call is exactly the kind that
+    /// has to be A/B-able in ONE binary when a GC-stress test starts failing.
+    /// Not having it cost a rebuild per hypothesis.
+    fn cold_arg_stage_enabled() -> bool {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_COLD_ARG_STAGE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    }
+
     // ── Moving-young relocation contract ─────────────────────────────────
     //
     // What `conservative_roots` demands of a compiled frame before a young
@@ -1747,6 +1774,16 @@ impl<'a> Lowerer<'a> {
 
         let id = self.next_sp_id;
         self.next_sp_id = self.next_sp_id.wrapping_add(1);
+        // The id->bci translation a stack walk needs. `resume_bci` is the same
+        // normalisation the throw-site and deopt paths apply: inside an
+        // IR-spliced callee `cur_bci` is a pc in the COMBINED buffer, which
+        // names no instruction in this method's own `Code`, so it is mapped
+        // back to the enclosing invoke. `u32::try_from` cannot fail for a
+        // spec-legal bci; a value that somehow exceeds it records nothing,
+        // which reports no line rather than a wrong one.
+        if let Ok(bci) = u32::try_from(self.resume_bci(self.cur_bci)) {
+            self.sp_id_bcis.push((id, bci));
+        }
         // MOV qword [rbp - sp_id_slot_off], imm32 (sign-extended; ids are small)
         self.buf.emit(&[0x48, 0xC7, 0x85]);
         self.buf.emit(&(-self.sp_id_slot_off).to_le_bytes());
@@ -3052,6 +3089,39 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// `TEST BYTE [rip+disp32], 0xFF` against `safepoint_flag_addr` — the
+    /// whole poll in one 7-byte instruction, reporting whether the flag was
+    /// within ±2GB RIP reach of it.
+    ///
+    /// Mirrors `x64/emit.rs`'s `emit_test_mem8_abs_imm8`; the two backends
+    /// emit the same poll and this keeps them saying the same thing. `F6 /0 ib`
+    /// with ModRM `mod=00, rm=101` is the RIP-relative form, and the
+    /// displacement is measured from the end of the WHOLE instruction — past
+    /// the trailing `imm8`, which is why the reach test adds 7 and not 6.
+    ///
+    /// The alternative it replaces, `MOV R11, imm64` + `TEST BYTE [R11], 0xFF`,
+    /// is 15 bytes and two instructions and burns a register. Nothing here
+    /// records a patch site: unlike the single-pass backend, this lowerer never
+    /// duplicates emitted bytes to a second address, so a displacement that is
+    /// right when emitted stays right.
+    fn emit_test_safepoint_flag_rip(&mut self) -> bool {
+        // F6 05 <disp32> <imm8>
+        const LEN: usize = 7;
+        // Cast: non-negative index/count to usize
+        let here = self.buf.as_ptr() as usize + self.buf.pos();
+        let next_pc = here.wrapping_add(LEN);
+        // Widening: i64/usize -> i128 (no truncation, for range check)
+        let delta: i128 = (self.safepoint_flag_addr as i128) - (next_pc as i128);
+        // Widening: i64/usize -> i128 (no truncation, for range check)
+        if delta < i32::MIN as i128 || delta > i32::MAX as i128 {
+            return false;
+        }
+        self.buf.emit(&[0xF6, 0x05]);
+        self.buf.emit(&(delta as i32).to_le_bytes()); // Cast: rel32 displacement
+        self.buf.emit_byte(0xFF);
+        true
+    }
+
     /// Emit the default-on cooperative poll used at method entries and loop
     /// back-edges. The lowerer keeps all live values in frame slots, so the
     /// no-argument slow path may be called directly.
@@ -3062,8 +3132,12 @@ impl<'a> Lowerer<'a> {
         if !enabled || self.safepoint_flag_addr == 0 || self.safepoint_slow_path == 0 {
             return;
         }
-        self.emit_mov_reg_imm64(R11, self.safepoint_flag_addr as u64);
-        self.buf.emit(&[0x41, 0xF6, 0x03, 0xFF]); // TEST byte ptr [R11], 0xff
+        if !self.emit_test_safepoint_flag_rip() {
+            // Out of ±2GB RIP reach — materialize the address and read
+            // through it, the shape this poll had before 2026-09-02.
+            self.emit_mov_reg_imm64(R11, self.safepoint_flag_addr as u64);
+            self.buf.emit(&[0x41, 0xF6, 0x03, 0xFF]); // TEST byte ptr [R11], 0xff
+        }
         self.buf.emit(&[0x0F, 0x84]); // JZ .clear
         let clear_patch = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
@@ -3754,7 +3828,21 @@ impl<'a> Lowerer<'a> {
         // The staging now happens inside that cold block, out of those same
         // slots, which still hold the same values there because nothing
         // between the marshal and the sentinel test writes them.
-        if has_receiver && num_args > 0 {
+        if !Self::cold_arg_stage_enabled() {
+            // The pre-2026-09-02 shape, kept behind the switch: stage every
+            // argument eagerly, with the receiver null check folded into the
+            // first iteration exactly as it was.
+            for i in 0..num_args {
+                let arg = inputs[2 + i];
+                self.gp_load_value(RAX, arg);
+                if i == 0 && has_receiver {
+                    self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+                    self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
+                }
+                // Cast: an argument index is bounded by the callee's parameter count.
+                self.store_rax(self.args_stage_top_off - (i as i32) * 8);
+            }
+        } else if has_receiver && num_args > 0 {
             self.gp_load_value(RAX, inputs[2]);
             self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
             self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
@@ -3855,12 +3943,15 @@ impl<'a> Lowerer<'a> {
         self.buf.emit(&[0, 0, 0, 0]);
         // ── cold from here ──────────────────────────────────────────────
         // RAX holds the sentinel, so it is free as the transfer scratch.
-        for i in 0..num_args {
-            let arg = inputs[2 + i];
-            self.gp_load_value(RAX, arg);
-            // Cast: an argument index is bounded by the callee's parameter
-            // count, so `i * 8` cannot overflow an x86-64 displacement.
-            self.store_rax(self.args_stage_top_off - (i as i32) * 8);
+        // Skipped under the eager shape: the call site already staged.
+        if Self::cold_arg_stage_enabled() {
+            for i in 0..num_args {
+                let arg = inputs[2 + i];
+                self.gp_load_value(RAX, arg);
+                // Cast: an argument index is bounded by the callee's parameter
+                // count, so `i * 8` cannot overflow an x86-64 displacement.
+                self.store_rax(self.args_stage_top_off - (i as i32) * 8);
+            }
         }
         self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
         self.emit_mov_reg_imm64(CALL_ARG_REGS[1], info_ptr as u64);
@@ -3938,6 +4029,64 @@ impl<'a> Lowerer<'a> {
             let arg = inputs[2 + i];
             self.gp_load_value(ENTRY_ABI_REGS[base + i], arg);
         }
+    }
+
+    /// Marshal the Java arguments into the **no-context** register layout once,
+    /// ahead of the whole inline-cache cascade.
+    ///
+    /// # Why this may sit before the guards
+    ///
+    /// The cascade's guards touch RAX (the receiver and its class id), R10 (the
+    /// cache-slot base) and R11 (the call target), and **nothing else** — no
+    /// `ENTRY_ABI_REGS` member appears in `emit_cmp_eax_r10_disp`,
+    /// `emit_cmp_byte_r10_disp_zero`, `emit_cmp_qword_r10_disp_zero`, or the
+    /// receiver null and kind checks. A layout established here therefore
+    /// survives every arm of the cascade to its `CALL`.
+    ///
+    /// # What it replaces
+    ///
+    /// `needs_context` is a property of the *cached entry*, not of the site, so
+    /// the marshalling was emitted twice per cache entry — ten copies at a site
+    /// with one MIC and a four-entry PIC, each of them `num_args` frame loads.
+    /// The no-context layout is now built once, and a context-needing arm
+    /// converts it with [`Self::emit_ic_shift_for_context`], which is
+    /// register-to-register.
+    ///
+    /// The alternative — one uniform entry ABI — would delete the question
+    /// entirely, and is deliberately not taken here: `needs_context` is an
+    /// output of optimization, so changing it changes how *every* compiled
+    /// method receives its arguments. That is not a change to fold into this
+    /// one.
+    fn emit_ic_premarshal_no_context(&mut self, inputs: &[NodeId], num_args: usize) {
+        for i in 0..num_args {
+            let arg = inputs[2 + i];
+            self.gp_load_value(ENTRY_ABI_REGS[i], arg);
+        }
+    }
+
+    /// Convert the pre-marshalled no-context layout into the context one: shift
+    /// every argument up one register and load the context into
+    /// `ENTRY_ABI_REGS[0]`.
+    ///
+    /// **Descending order is load-bearing.** Moving `[0] -> [1]` first would
+    /// overwrite argument 1 before it is read; from the top down, every
+    /// destination holds a value that has already been moved.
+    ///
+    /// Always legal: `emit_inline_cache_call`'s admission requires
+    /// `num_args + 1 <= ENTRY_ABI_REGS.len()`
+    /// (`ic_declines_when_args_overflow_the_abi_register_file` pins it), so the
+    /// top destination `ENTRY_ABI_REGS[num_args]` is always inside the file.
+    fn emit_ic_shift_for_context(&mut self, num_args: usize) {
+        debug_assert!(
+            num_args + 1 <= ENTRY_ABI_REGS.len(),
+            "the context shift needs {} registers and the file has {}",
+            num_args + 1,
+            ENTRY_ABI_REGS.len(),
+        );
+        for i in (0..num_args).rev() {
+            self.emit_mov_reg_reg64(ENTRY_ABI_REGS[i + 1], ENTRY_ABI_REGS[i]);
+        }
+        self.load_reg_from_frame(ENTRY_ABI_REGS[0], self.context_slot_off);
     }
 
     /// `CMP EAX, dword [R10 + disp]` — an inline-cache class-id guard.
@@ -4129,7 +4278,27 @@ impl<'a> Lowerer<'a> {
         // All three read the same frame slots, and nothing between this point
         // and any of them writes those slots.
 
+        // Marshal the Java arguments ONCE, in the no-context layout, before the
+        // guards. Each cache arm then either calls straight through or shifts
+        // the layout up one register — see `emit_ic_premarshal_no_context` for
+        // why a layout established here survives the cascade (its guards touch
+        // only RAX, R10 and R11).
+        // Under the eager shape the whole pre-marshal/shift scheme is off and
+        // each arm marshals for itself, exactly as before 2026-09-02.
+        let premarshal = Self::cold_arg_stage_enabled();
+        if premarshal {
+            self.emit_ic_premarshal_no_context(inputs, num_args);
+        } else {
+            for i in 0..num_args {
+                let arg = inputs[2 + i];
+                self.gp_load_value(RAX, arg);
+                self.store_rax(self.args_stage_top_off - (i as i32) * 8);
+            }
+        }
+
         // Receiver = arg0. Load it and its class id ONCE for the whole cascade.
+        // RAX is not an `ENTRY_ABI_REGS` member on either ABI, so this does not
+        // disturb the layout just built.
         self.gp_load_value(RAX, inputs[2]);
         self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
         slow_patches.push(self.emit_jcc_rel32(0x84)); // JZ .slow
@@ -4155,12 +4324,22 @@ impl<'a> Lowerer<'a> {
         self.emit_cmp_qword_r10_disp_zero(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8);
         slow_patches.push(self.emit_jcc_rel32(0x84)); // JE .slow
         self.emit_cmp_byte_r10_disp_zero(JitMICSlot::CACHED_NEEDS_CONTEXT_OFFSET as u8);
-        let mic_noctx = self.emit_jcc_rel32(0x84); // JE .mic_noctx
-        self.emit_ic_abi_marshal(inputs, num_args, true);
-        let mic_call = self.emit_jmp_rel32();
-        self.patch_rel32_to_here(mic_noctx);
-        self.emit_ic_abi_marshal(inputs, num_args, false);
-        self.patch_rel32_to_here(mic_call);
+        // Falls THROUGH on the context case and jumps on the no-context one,
+        // because the no-context layout is already in place: the fall-through
+        // shifts it, the jump does nothing at all. That inverts the old sense of
+        // this branch, which is why the target is named for what it skips.
+        if premarshal {
+            let mic_noctx = self.emit_jcc_rel32(0x84); // JE .mic_ready (no shift)
+            self.emit_ic_shift_for_context(num_args);
+            self.patch_rel32_to_here(mic_noctx);
+        } else {
+            let mic_noctx = self.emit_jcc_rel32(0x84); // JE .mic_noctx
+            self.emit_ic_abi_marshal(inputs, num_args, true);
+            let mic_call = self.emit_jmp_rel32();
+            self.patch_rel32_to_here(mic_noctx);
+            self.emit_ic_abi_marshal(inputs, num_args, false);
+            self.patch_rel32_to_here(mic_call);
+        }
         self.emit_call_cached_entry(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8);
         self.emit_inline_callee_deopt_service(info_ptr, num_args, inputs);
         done_patches.push(self.emit_jmp_rel32());
@@ -4184,12 +4363,19 @@ impl<'a> Lowerer<'a> {
             self.emit_cmp_qword_r10_disp_zero(JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8);
             slow_patches.push(self.emit_jcc_rel32(0x84)); // JE .slow
             self.emit_cmp_byte_r10_disp_zero(JitPICSlot::NEEDS_CONTEXT_OFFSETS[i] as u8);
-            let noctx = self.emit_jcc_rel32(0x84); // JE .entry_noctx
-            self.emit_ic_abi_marshal(inputs, num_args, true);
-            let call = self.emit_jmp_rel32();
-            self.patch_rel32_to_here(noctx);
-            self.emit_ic_abi_marshal(inputs, num_args, false);
-            self.patch_rel32_to_here(call);
+            // Same inversion as the MIC arm above.
+            if premarshal {
+                let noctx = self.emit_jcc_rel32(0x84); // JE .entry_ready (no shift)
+                self.emit_ic_shift_for_context(num_args);
+                self.patch_rel32_to_here(noctx);
+            } else {
+                let noctx = self.emit_jcc_rel32(0x84); // JE .entry_noctx
+                self.emit_ic_abi_marshal(inputs, num_args, true);
+                let call = self.emit_jmp_rel32();
+                self.patch_rel32_to_here(noctx);
+                self.emit_ic_abi_marshal(inputs, num_args, false);
+                self.patch_rel32_to_here(call);
+            }
             self.emit_call_cached_entry(JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8);
             self.emit_inline_callee_deopt_service(info_ptr, num_args, inputs);
             done_patches.push(self.emit_jmp_rel32());
@@ -11167,6 +11353,7 @@ pub(crate) fn lower_inner_with_scopes(
     let shadow_thread_slot_off = lowerer.shadow_thread_slot_off;
     let shadow_savebase_slot_off = lowerer.shadow_savebase_slot_off;
     let oop_maps = std::mem::take(&mut lowerer.oop_maps);
+    let sp_id_bcis = std::mem::take(&mut lowerer.sp_id_bcis);
     let locals_size = lowerer.locals_size;
     let first_spill = lowerer.first_spill;
     let spill_cap_off = lowerer.spill_cap_off;
@@ -11350,6 +11537,17 @@ pub(crate) fn lower_inner_with_scopes(
     // "this word is a register image" is the property the reader is testing.
     cm.sp_id_slot_off = sp_id_slot_off;
     cm.oop_maps = oop_maps;
+    // Ascending by construction (ids come from a counter), which is what
+    // `CompiledMethod::safepoint_bci` binary-searches on. Sorted rather than
+    // asserted: a future lowerer that emits a safepoint out of order would
+    // otherwise turn a diagnostic into a wrong line, and the vector is one
+    // entry per GC-capable point.
+    cm.safepoint_bci_table = {
+        let mut t = sp_id_bcis;
+        t.sort_unstable_by_key(|(id, _)| *id);
+        t.dedup_by_key(|(id, _)| *id);
+        t
+    };
     // Stage A.2 (precise oop maps, B-K fix) parity with the x64 fast-tier
     // driver (`x64/driver.rs`'s `cm.fully_oop_covered = compiler.precise_maps
     // && ... && compiler.safepoint_pcs.is_subset(&compiler.mapped_safepoint_pcs)`).
@@ -13009,6 +13207,147 @@ mod tests {
         assert_eq!(ENTRY_ABI_REGS.len(), 6);
         // The shared planner bound must agree with the lowerer's.
         assert_eq!(crate::ir_entry_abi_reg_count(), ENTRY_ABI_REGS.len());
+    }
+
+    /// The context shift moves arguments in DESCENDING order, so no argument is
+    /// overwritten before it has been read.
+    ///
+    /// `emit_ic_premarshal_no_context` builds the no-context layout once, ahead
+    /// of the whole inline-cache cascade, and a context-needing arm converts it
+    /// by shifting every argument up one register. Ascending order would write
+    /// `ENTRY_ABI_REGS[1]` from `[0]` before reading `[1]`, so argument 1 would
+    /// become a second copy of argument 0 and every argument above it the same
+    /// — silently, and only for callees that need the context pointer.
+    ///
+    /// Asserted on the decoded `(dst, src)` pairs rather than on literal bytes,
+    /// because `ENTRY_ABI_REGS` differs between Win64 and System V and a
+    /// byte-literal test would pin one platform's answer as the property.
+    #[test]
+    fn the_context_shift_moves_arguments_from_the_top_down() {
+        for num_args in 1..=(ENTRY_ABI_REGS.len() - 1) {
+            let mut lo = lowerer_with_resident_xmm(4096, None);
+            let at = lo.buf.pos();
+            lo.emit_ic_shift_for_context(num_args);
+            let code = lo.buf.as_slice()[at..].to_vec();
+
+            // `MOV r64, r64` is `REX.W(+R+B) 89 ModRM(mod=11)`. Decode every one
+            // in order; the trailing context load is `8B` and is skipped.
+            let mut moves: Vec<(u8, u8)> = Vec::new();
+            let mut i = 0usize;
+            while i + 2 < code.len() {
+                if (0x48..=0x4F).contains(&code[i]) && code[i + 1] == 0x89 && code[i + 2] >= 0xC0 {
+                    let rex = code[i];
+                    let modrm = code[i + 2];
+                    let src = ((modrm >> 3) & 7) | (((rex >> 2) & 1) << 3);
+                    let dst = (modrm & 7) | ((rex & 1) << 3);
+                    moves.push((dst, src));
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+
+            let want: Vec<(u8, u8)> = (0..num_args)
+                .rev()
+                .map(|k| (ENTRY_ABI_REGS[k + 1], ENTRY_ABI_REGS[k]))
+                .collect();
+            assert_eq!(
+                moves, want,
+                "num_args={num_args}: the shift must run from the top down, so \
+                 every destination holds a value that has already been moved",
+            );
+
+            // …and the context lands in ABI[0], after the shift has vacated it.
+            // `MOV r64, [rbp - disp]` is `REX.W 8B ModRM`, and ABI[0]'s encoding
+            // appears in the ModRM `reg` field.
+            let ctx = ENTRY_ABI_REGS[0];
+            let ctx_loaded = code.windows(3).any(|w| {
+                (0x48..=0x4F).contains(&w[0])
+                    && w[1] == 0x8B
+                    && ((w[2] >> 3) & 7) == (ctx & 7)
+                    && (w[2] & 0xC0) != 0xC0
+            });
+            assert!(
+                ctx_loaded,
+                "num_args={num_args}: the context pointer must be loaded into \
+                 ABI[0] once the shift has vacated it",
+            );
+        }
+    }
+
+    /// The optimizing tier may not be opened to allocation-bearing methods
+    /// while it still lowers `Op::New` through the out-of-line stub.
+    ///
+    /// # The coupling this enforces
+    ///
+    /// `emit_new_object_stub` is three register loads and a `CALL` into
+    /// `jit_new_object`. The single-pass backend has
+    /// `x64::objects::emit_inline_tlab_new` and pays no call on the common
+    /// path. So an escaping allocation compiles WORSE at the optimizing tier
+    /// than at the baseline tier — which is one of the two independent causes
+    /// of the July 2026 Binary Trees 4x regression, and the reason
+    /// `IR_MAX_ALLOCATIONS` is pinned at 16 while every neighbouring cap is 64.
+    ///
+    /// It costs nothing today only because `c2_alloc_upgrade_enabled()` is
+    /// opt-in, so no method containing a `new` is ever promoted to this tier.
+    /// That was a sentence in a comment. It is a test now, because the edit
+    /// that breaks it — flipping the gate on, in `lib.rs`, to widen the
+    /// optimizing tier's population — does not look like it touches allocation
+    /// at all, and its symptom is a throughput regression on exactly the
+    /// workloads nobody re-measures after a policy change.
+    ///
+    /// # What discharges it
+    ///
+    /// Giving this tier an inline TLAB bump. That is not a copy of the
+    /// single-pass sequence: `jit_post_tlab_init` derives `shape` and the
+    /// object's total size from `class_layout(class_id)` **itself**, so a
+    /// caller that sizes the allocation as `HEADER_SIZE + num_fields *
+    /// SLOT_SIZE` while the class carries a registered compact layout hands the
+    /// helper a size mismatch and corrupts the heap. A correct implementation
+    /// needs the compact snapshot AND the runtime layout-version guard the
+    /// single-pass emitter carries for a layout that is REPLACED between
+    /// compile and execution. One shared sequence is the right answer; the
+    /// obstacle is that the header-write contract is policed by source scans of
+    /// `emit_inline_tlab_new`'s own body, so moving it means rewriting the
+    /// oracle in the same change as the code it polices.
+    ///
+    /// When that lands, delete this test — do not weaken it.
+    #[test]
+    fn the_optimizing_tier_stays_shut_to_allocation_while_it_has_no_inline_tlab() {
+        let ir_src = include_str!("ir_lower.rs");
+        // The `Op::New` arm's lowering, as it stands.
+        let uses_stub = ir_src.contains("runtime_lowering::emit_new_object_stub");
+        let has_inline_bump = ir_src.contains("emit_inline_tlab");
+        assert!(
+            uses_stub || has_inline_bump,
+            "the `Op::New` arm lowers through neither the stub nor an inline \
+             bump — this test can no longer see what it is guarding"
+        );
+        if has_inline_bump {
+            // The gap is closed; the coupling below has nothing to protect.
+            return;
+        }
+
+        // Still stub-only. Then the gate must be OPT-IN: `runtime_var_os(..)
+        // .is_some()` is off unless the variable is set, whereas a
+        // `map_or(true, ..)` or a `!matches!(.., Ok("0"))` would be default-on.
+        let lib_src = include_str!("lib.rs");
+        let body = lib_src
+            .split("fn c2_alloc_upgrade_enabled() -> bool {")
+            .nth(1)
+            .expect("c2_alloc_upgrade_enabled is in lib.rs")
+            .split("\n}")
+            .next()
+            .expect("the function ends");
+        assert!(
+            body.contains("is_some()"),
+            "`c2_alloc_upgrade_enabled` is no longer opt-in, but the optimizing \
+             tier still lowers `Op::New` through `emit_new_object_stub` — every \
+             promoted allocation now pays a CALL where the single-pass backend \
+             pays an inline TLAB bump. Give this tier the bump first (see this \
+             test's doc comment for why it is not a copy-paste), or leave the \
+             gate shut.\n\nbody was:\n{body}"
+        );
     }
 
     // ── wire-tiered-manager Step 4: PGO branch-bias in the IR (C2) path ──
@@ -16919,6 +17258,169 @@ mod tests {
         assert_eq!(
             classified, listed,
             "`UNLOWERABLE` and `declared_lowering` disagree"
+        );
+    }
+
+    /// Every `Op::X` named in `regalloc::ir_op_defines_value`'s body.
+    ///
+    /// Read out of the other file's source for the same reason
+    /// [`ops_that_define_a_result_slot`] is read out of this one: the function
+    /// is private, and a copy of its list maintained here would be a fourth
+    /// enumeration of the same question.
+    fn ops_regalloc_calls_value_defining() -> std::collections::BTreeSet<String> {
+        let src = include_str!("regalloc.rs");
+        let body = src
+            .split("fn ir_op_defines_value(op: &Op) -> bool {")
+            .nth(1)
+            .expect("ir_op_defines_value is in regalloc.rs")
+            .split("\n}")
+            .next()
+            .expect("the function ends");
+        let mut out = std::collections::BTreeSet::new();
+        collect_op_names(body, &mut out);
+        assert!(
+            !out.is_empty(),
+            "the regalloc scan found nothing — `ir_op_defines_value`'s shape \
+             changed and this test would now pass vacuously"
+        );
+        out
+    }
+
+    /// The two enumerations of "does this op define a value" are the SAME set.
+    ///
+    /// `regalloc::ir_op_defines_value` calls itself a "verbatim mirror" of
+    /// `op_defines_result_slot`, and until 2026-09-02 it was not one: it omitted
+    /// `Op::ArrayLength` and `Op::NewArray`, and its own doc comment asserted
+    /// they were absent from both. The comment written to prevent the drift was
+    /// the drift.
+    ///
+    /// **What that cost was invisible, which is why this test exists rather
+    /// than a stricter comment.** `plan_register_residency` compares
+    /// `wants_loc` (built from the regalloc predicate) against `node_color`
+    /// (built from this file's), and ONE disagreement declines register
+    /// residency for the whole method. Every counted loop written
+    /// `for (i = 0; i < a.length; i++)` contains an `arraylength`, so every one
+    /// of them declined — silently, because the flag reported only successes.
+    /// Nothing was miscompiled; the optimization was simply unavailable
+    /// wherever arrays are, which is most places.
+    ///
+    /// Compared as sets of names parsed from both sources, so adding an arm to
+    /// one list and forgetting the other fails here instead of turning up as an
+    /// unexplained refusal months later.
+    #[test]
+    fn the_two_value_defining_enumerations_agree() {
+        let here = ops_that_define_a_result_slot();
+        let there = ops_regalloc_calls_value_defining();
+
+        let missing_in_regalloc: Vec<&String> = here.difference(&there).collect();
+        let missing_here: Vec<&String> = there.difference(&here).collect();
+
+        assert!(
+            missing_in_regalloc.is_empty(),
+            "`op_defines_result_slot` names these and `regalloc::ir_op_defines_value` \
+             does not: {missing_in_regalloc:?} — the colourer gives them a home the \
+             liveness model does not know about, so `plan_register_residency` \
+             declines residency for EVERY method containing one",
+        );
+        assert!(
+            missing_here.is_empty(),
+            "`regalloc::ir_op_defines_value` names these and `op_defines_result_slot` \
+             does not: {missing_here:?} — the liveness model expects a home the \
+             colourer never allocates, which is the direction that has no slot to \
+             spill to",
+        );
+    }
+
+    /// A counted loop over `a.length` reaches the register allocator.
+    ///
+    /// The end-to-end form of [`the_two_value_defining_enumerations_agree`],
+    /// and the one that names the consequence rather than the cause.
+    /// `plan_register_residency`'s agreement check compares `wants_loc`
+    /// (`regalloc::ir_op_defines_value`) against `node_color`
+    /// (`op_defines_result_slot`) and declines register residency for the
+    /// WHOLE method on a single disagreement. `Op::ArrayLength` was in the
+    /// second list and not the first, so this shape — the most ordinary
+    /// counted loop in Java — declined every time, and the flag reported
+    /// nothing because it printed only on success.
+    ///
+    /// The bytecode is `static int f(int[] a) { int s = 0; for (int i = 0; i <
+    /// a.length; i++) s += a[i]; return s; }`, assembled by hand so the
+    /// `arraylength` is unmistakably present rather than incidental to a
+    /// fixture.
+    ///
+    /// Asserted on the AGREEMENT, not on a promotion count: whether this
+    /// particular graph ends up with a register is the allocator's business and
+    /// may legitimately change, but the two models must never disagree about
+    /// which values want a home.
+    #[test]
+    fn a_counted_loop_over_array_length_reaches_the_allocator() {
+        use crate::regalloc::build_live_model;
+
+        // 0: iconst_0            s = 0
+        // 1: istore_1
+        // 2: iconst_0            i = 0
+        // 3: istore_2
+        // 4: iload_2         <-- loop head
+        // 5: aload_0
+        // 6: arraylength         THE OP THAT USED TO DECLINE THE METHOD
+        // 7: if_icmpge +15  --> 22
+        // 10: iload_1
+        // 11: aload_0
+        // 12: iload_2
+        // 13: iaload
+        // 14: iadd
+        // 15: istore_1
+        // 16: iinc 2, 1
+        // 19: goto -15      --> 4
+        // 22: iload_1
+        // 23: ireturn
+        let code: [u8; 24] = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x2a, 0xbe, 0xa2, 0x00, 0x0f, 0x1b, 0x2a, 0x1c, 0x2e,
+            0x60, 0x3b, 0x84, 0x02, 0x01, 0xa7, 0xff, 0xf1, 0x1b, 0xac,
+        ];
+        let graph = IrBuilder::new(1, 3)
+            .build(&code, code.len())
+            .expect("the loop builds");
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::ArrayLength)),
+            "the fixture must contain an ArrayLength, or this test proves nothing"
+        );
+
+        let schedule = ir_schedule::schedule(&graph);
+        let plan = plan_slots(&graph, &schedule, None);
+        let live = build_live_model(&graph, &schedule);
+
+        assert_eq!(
+            live.wants_loc.len(),
+            plan.node_color.len(),
+            "the two models disagree about how many nodes there are"
+        );
+        let disagreeing: Vec<(usize, String)> = live
+            .wants_loc
+            .iter()
+            .zip(plan.node_color.iter())
+            .enumerate()
+            .filter(|(_, (wants, color))| **wants != color.is_some())
+            .map(|(id, _)| {
+                (
+                    id,
+                    graph
+                        .nodes
+                        .get(id)
+                        .map(|n| format!("{:?}", n.op))
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert!(
+            disagreeing.is_empty(),
+            "liveness and colourer disagree on {disagreeing:?} — \
+             `plan_register_residency` declines residency for the whole method \
+             on any one of these, so this ordinary counted loop gets no \
+             registers at all",
         );
     }
 

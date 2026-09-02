@@ -1702,6 +1702,17 @@ cached_is_set!(trace_unimplemented, "CRATONVM_TRACE_UNIMPLEMENTED");
 /// of wall-clock timing (robust to host contention noise). See
 /// `interpreter::hotpath_counts`.
 cached_is_set!(dbg_hotpath_counts, "CRATONVM_DBG_HOTPATH_COUNTS");
+/// `CRATONVM_JIT_NO_BACKEDGE_POLL_GATE` -- restore the unconditional
+/// `safepoint_check` call on every interpreted backward branch.
+///
+/// The gate it disables lives in `execute_frame_from_index`: a back edge now
+/// tests `stw_requested` plus the hoisted async-exception slot (two relaxed
+/// loads) before paying for the call, because the only work in that call not
+/// repeated by the loop-top poll thirty lines later was an async-exception
+/// drain costing three locked read-modify-writes. Measured at 33-37 ns per
+/// back edge against HotSpot's 4.9 ns, so the two arms have to be comparable
+/// inside one binary.
+cached_is_set!(no_backedge_poll_gate, "CRATONVM_JIT_NO_BACKEDGE_POLL_GATE");
 /// `CRATONVM_DBG_BYTECODE_DUMP` -- temporary raw-bytecode + mnemonic
 /// disassembly dump (2026-07-15, JRubyScriptTemplateTests round 3): see
 /// `push_frame_and_fire_entry`'s own doc comment for the full story --

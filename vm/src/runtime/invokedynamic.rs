@@ -442,7 +442,21 @@ pub unsafe fn execute_jit_string_concat_raw(
     if arg_types.len() != arg_count || (arg_count != 0 && args_ptr.is_null()) {
         return None;
     }
-    let raw_args = std::slice::from_raw_parts(args_ptr, arg_count);
+    // NOT `from_raw_parts(args_ptr, 0)` when there are no arguments:
+    // `from_raw_parts` requires a non-null, aligned pointer even for a length
+    // of zero, and the guard directly above deliberately admits a NULL
+    // `args_ptr` in exactly that case (a zero-arg call sequence pushes
+    // nothing, so the compiled code has no argument block to point at). A
+    // debug build's `unsafe precondition` check aborts the process on it. The
+    // twin in `execute_jit_indy_generic_raw` below is where that was observed;
+    // this one is the same shape and is corrected with it rather than left as
+    // the copy that still aborts. (A zero-argument concat is `"" + ""` folded
+    // to a site with no operands — rare, not impossible.)
+    let raw_args = if arg_count == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(args_ptr, arg_count)
+    };
     let mut values = Vec::with_capacity(arg_count);
     for (&raw, ty) in raw_args.iter().zip(arg_types.iter()) {
         let value = match ty {
@@ -555,7 +569,20 @@ pub unsafe fn execute_jit_indy_generic_raw(
         }
         .into());
     }
-    let raw_args = std::slice::from_raw_parts(args_ptr, arg_count);
+    // NOT `from_raw_parts(args_ptr, 0)` when there are no arguments:
+    // `from_raw_parts` requires a non-null, aligned pointer even for a length
+    // of zero, and the guard directly above deliberately admits a NULL
+    // `args_ptr` in exactly that case (a zero-arg call sequence pushes
+    // nothing, so the compiled code has no argument block to point at). A
+    // debug build's `unsafe precondition` check aborts the process on it —
+    // `cratonvm-vm --test class_loader_unload_regression
+    // custom_loader_metadata_is_reclaimed_with_jit`, whose lambda call sites
+    // take exactly this door.
+    let raw_args = if arg_count == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(args_ptr, arg_count)
+    };
     let mut values = Vec::with_capacity(arg_count);
     for (&raw, ty) in raw_args.iter().zip(arg_types.iter()) {
         // Descriptor-typed, never bits-typed: a category-2 value must not be
