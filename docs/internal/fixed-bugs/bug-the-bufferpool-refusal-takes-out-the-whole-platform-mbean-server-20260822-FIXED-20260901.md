@@ -275,3 +275,27 @@ HotSpot in the same environment.
   asserts the counter MOVES rather than asserting the hook fired: a rename
   turns `RBufferPoolCount` red with "routeB count moved = false", which names
   the defect directly.
+
+### The re-run after merging dev
+
+Everything above was measured on the branch before it took `origin/dev`. dev
+moved 52 commits under it, so it was rebuilt and re-run on the merge:
+
+```text
+                        before the merge      after the merge
+regression suite        81/81 · 121/121       82/82 · 122/122   (dev added a vector)
+harness-blindness       0 · 0                 0 · 0
+REncodingFidelity       PASS · PASS           PASS · PASS
+RBufferPoolCount        PASS · PASS           PASS · PASS
+RJdkJmx                 PASS · PASS           PASS · PASS
+```
+
+The post-merge binary is built with `lto = "thin"` and `codegen-units = 16`
+on six crates instead of the release profile's `fat` / `1`. That is not a
+preference: the shared host SIGKILLed the fat-LTO link of `cratonvm-cli` five
+times and `cratonvm-native-builtins` twice more, with `MemAvailable` at 0-1 GiB
+and load between 90 and 270 on 8 cores from other sessions' builds. Same
+sources, same `opt-level`; it is a correctness oracle and not a performance
+one, and every number in this record that is about SPEED — there are none —
+would need the standard profile. The pre-merge rows above are from a standard
+`--release` build.
