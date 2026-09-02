@@ -3706,15 +3706,8 @@ pub(super) fn tlab_refill_wedge_break(thread: &mut JvmThread, shared: &SharedVm)
 /// carrying a second, less-hardened copy of that machinery.
 #[derive(Clone, Copy)]
 pub(super) enum TlabShape {
-    /// `num_fields` object slots. `compact_body` is `Some(body_bytes)` when the
-    /// heap lays this class out compactly (`VmHeap::compact_object_body`): the
-    /// header then carries `GC_FLAG_COMPACT` and the reservation is
-    /// `HEADER + body` rather than `HEADER + num_fields * SLOT_SIZE`. Only ZGC
-    /// answers `Some` today; see `tlab_alloc_object_inner`.
-    Object {
-        num_fields: usize,
-        compact_body: Option<usize>,
-    },
+    /// `num_fields` object slots.
+    Object { num_fields: usize },
     /// `length` elements of `element_type`.
     Array {
         element_type: ArrayElementType,
@@ -3743,10 +3736,7 @@ impl TlabShape {
             // see `gc/src/g1.rs`'s zeroed-region closure. Minting eagerly is
             // not an option to get it back: a non-zero mark word loses the
             // thin-lock CAS, so every `synchronized` block would inflate.
-            TlabShape::Object {
-                num_fields,
-                compact_body,
-            } => init_object_header_shaped(ptr, class_id, num_fields, compact_body),
+            TlabShape::Object { num_fields } => init_object_header(ptr, class_id, num_fields),
             TlabShape::Array {
                 element_type,
                 length_u32,
@@ -3774,27 +3764,21 @@ pub(super) fn tlab_alloc_object_inner(
     total_size: usize,
     refill_needs_young_room: bool,
 ) -> Option<ObjectRef> {
-    // Every caller sizes the object as LEGACY (`HEADER + num_fields * SLOT`).
-    // A backend whose own `alloc_object` lays the class out compactly (ZGC)
-    // says so here, and the object gets that shape and that smaller
-    // reservation -- otherwise a TLAB object and a heap-allocated object of
-    // the same class would differ in layout, and on a registry-driven sweep
-    // the legacy slack after a compact header would never be reclaimed. The
-    // callers' `total_size <= tlab_max_alloc` gate used the larger number, so
-    // it still holds.
-    let compact_body = shared.mem.heap.compact_object_body(class_id, num_fields);
-    let total_size = match compact_body {
-        Some(body) => cratonvm_gc::heap::HEADER_SIZE + body,
-        None => total_size,
-    };
+    // LEGACY layout, on every backend, deliberately -- see
+    // `init_object_header`. A 2026-09-02 attempt to give ZGC's TLAB objects
+    // the compact shape its own `alloc_object` uses (so a TLAB object and a
+    // heap-allocated one of the same class would agree) MISCOMPILED
+    // `probes/FjpProbe.java`: wrong per-task sums, no collection involved.
+    // The interpreter fast path has never consulted the layout registry, and
+    // the tree has compiled and cached field access against that fact for
+    // long enough that changing it here is not a local decision. If the two
+    // shapes are ever unified it has to be done at every allocation site at
+    // once, with that probe in the gate.
     tlab_alloc_shaped_inner(
         thread,
         shared,
         class_id,
-        TlabShape::Object {
-            num_fields,
-            compact_body,
-        },
+        TlabShape::Object { num_fields },
         total_size,
         refill_needs_young_room,
     )
@@ -4141,44 +4125,6 @@ pub(super) fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: us
     );
 }
 
-/// [`init_object_header`] with the backend's layout verdict applied: a
-/// `Some(body)` writes the compact shape (`GC_FLAG_COMPACT`, `num_fields`
-/// slots, `body` bytes) exactly as `ZgcRealHeap::alloc_object` does, so an
-/// object laid out in a TLAB is indistinguishable from one the heap laid out.
-/// `None` is the legacy header, unchanged.
-#[inline(always)]
-pub(super) fn init_object_header_shaped(
-    ptr: *mut u8,
-    class_id: ClassId,
-    num_fields: usize,
-    compact_body: Option<usize>,
-) {
-    let Some(body) = compact_body else {
-        init_object_header(ptr, class_id, num_fields);
-        return;
-    };
-    use cratonvm_gc::heap::{ArrayElementType, ObjectHeader, ObjectKind};
-    let slots = u32::try_from(num_fields).unwrap_or(u32::MAX);
-    let mut header = ObjectHeader::new(
-        class_id,
-        ObjectKind::Object,
-        ArrayElementType::Reference,
-        0,
-        slots,
-    );
-    header.set_compact_shape(slots, body);
-    // SAFETY: ptr points to freshly allocated, properly aligned memory for an ObjectHeader.
-    unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
-    cratonvm_gc::a2dbg::record(
-        ptr as usize,
-        class_id.as_u32(),
-        ObjectKind::Object as u8,
-        ArrayElementType::Reference as u8,
-        0,
-        slots,
-        cratonvm_gc::heap::HEADER_SIZE + body,
-    );
-}
 
 /// Shared-heap allocation path (with lock). Used for TLAB misses and large objects.
 pub(crate) fn alloc_object_shared(

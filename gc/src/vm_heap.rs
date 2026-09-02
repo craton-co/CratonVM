@@ -3592,22 +3592,6 @@ impl VmHeap {
         }
     }
 
-    /// The compact body size this backend's own `alloc_object` would give an
-    /// instance of `class_id` with `num_fields` fields, so the VM's TLAB path
-    /// lays the object out with the same shape. `None` means the legacy
-    /// 16-byte-cell layout, which is what the Generational and G1 TLAB paths
-    /// have always produced and keep producing.
-    #[inline]
-    pub fn compact_object_body(&self, class_id: ClassId, num_fields: usize) -> Option<usize> {
-        match self {
-            VmHeap::Generational(_) | VmHeap::G1(_) => {
-                let _ = (class_id, num_fields);
-                None
-            }
-            #[cfg(feature = "zgc")]
-            VmHeap::Zgc(h) => h.compact_object_body(class_id, num_fields),
-        }
-    }
 
     /// Check if a raw address is within a live (non-Free) region of the heap.
     /// For generational GC, always returns false (not applicable).

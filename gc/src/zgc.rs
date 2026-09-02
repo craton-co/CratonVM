@@ -1997,6 +1997,12 @@ impl ZgcRealHeap {
         let weak: std::sync::Weak<Self> = std::sync::Arc::downgrade(&heap);
         let sink: std::sync::Weak<dyn crate::tlab::TlabTailSink> = weak;
         crate::tlab::register_tlab_tail_sink(sink);
+        // This collector finds objects through its allocation-base registry,
+        // never by walking a TLAB chunk, so the JIT's inline allocator must
+        // keep calling the post-init helper that announces each one. Set
+        // before any method can be compiled: heap construction precedes the
+        // first compile. See `cratonvm_types::jit_tlab_registration_required`.
+        cratonvm_types::set_jit_tlab_registration_required(heap.vm_tlab_enabled());
         heap
     }
 

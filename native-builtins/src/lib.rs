@@ -26534,9 +26534,10 @@ pub(crate) fn obj_arg(
             // we don't want to drown those in backtraces.
             if crate::nbflags().dbg_null_native {
                 eprintln!(
-                    "[obj_arg] null at idx={} args.len={}\n{}",
+                    "[obj_arg] null at idx={} args.len={} arg={:?}\n{}",
                     idx,
                     args.len(),
+                    args.get(idx),
                     std::backtrace::Backtrace::force_capture()
                 );
             }

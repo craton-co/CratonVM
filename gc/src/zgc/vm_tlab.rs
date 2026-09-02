@@ -161,19 +161,6 @@ impl ZgcRealHeap {
         self.allocate_black_if_marking(ptr);
     }
 
-    /// The compact body size this heap's `alloc_object` would give an
-    /// instance of `class_id` with `num_fields` fields, or `None` for the
-    /// legacy 16-byte-cell layout. The VM's TLAB path asks this so an object
-    /// it lays out in a chunk has the same shape as one the heap lays out
-    /// itself; the other backends answer `None` and keep their legacy path.
-    #[inline]
-    pub fn compact_object_body(&self, class_id: ClassId, num_fields: usize) -> Option<usize> {
-        cratonvm_types::compact_object_body_size(
-            self.layout_domain(),
-            class_id.as_u32(),
-            num_fields,
-        )
-    }
 
     /// The reserved tails of TLABs whose owners could not retire before this
     /// collection (blocked in native, or frozen in compiled code). Consumed
@@ -227,9 +214,29 @@ impl ZgcRealHeap {
     }
 }
 
+/// `CRATONVM_ZGC_TLAB_TAIL_SINK`: take retired VM TLAB tails back into the
+/// arena free list. `0`/`off`/`false`/`no` declines every tail, which leaves
+/// the VM's filler object in place -- an A/B lever for the reclamation, at
+/// the cost of the tail bytes until the next slide.
+pub(crate) fn zgc_vm_tlab_tail_sink_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_TLAB_TAIL_SINK") {
+            Some(raw) => {
+                let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+                !matches!(v.as_str(), "0" | "off" | "false" | "no")
+            }
+            None => true,
+        }
+    })
+}
+
 impl crate::tlab::TlabTailSink for ZgcRealHeap {
     fn reclaim_tlab_tail(&self, start: usize, end: usize) -> bool {
         if end <= start || start < self.arena_base || end > self.arena_end {
+            return false;
+        }
+        if !zgc_vm_tlab_tail_sink_enabled() {
             return false;
         }
         if (start | end) & (ZGC_TLAB_ALIGN - 1) != 0 {

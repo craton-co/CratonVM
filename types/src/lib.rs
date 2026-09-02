@@ -436,6 +436,39 @@ pub fn set_zgc_read_barrier_armed(armed: bool) {
 static ZGC_READ_BARRIER_ARMED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Whether the collector must be TOLD about each object a thread
+/// bump-allocates out of its TLAB, rather than discovering it by walking the
+/// chunk.
+///
+/// The two linear-sweep collectors (Generational, G1) parse a TLAB chunk as
+/// memory, so an object that merely appears in one needs no announcement.
+/// ZGC's sweep, its `is_object_address` oracle and its conservative scans are
+/// driven by an allocation-base REGISTRY instead, so an object it was never
+/// told about does not exist as far as the runtime is concerned — a receiver
+/// allocated that way decodes as `null` at the next native boundary.
+///
+/// The JIT's inline allocator normally SKIPS its post-allocation helper when
+/// the class needs no primitive initialisation and has no finalizer
+/// (`skip_post_init_helper` in `x64::objects::emit_inline_tlab_new`), because
+/// on those backends the helper would have nothing left to do. That helper is
+/// also the only place an inline-allocated object can be announced, so this
+/// flag forces the call back on. Published by `ZgcRealHeap` when it hands VM
+/// TLABs out; read at JIT compile time, so it must be set before the first
+/// compile — heap construction is, and that is where it is set.
+#[inline]
+pub fn jit_tlab_registration_required() -> bool {
+    JIT_TLAB_REGISTRATION_REQUIRED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Publish the value [`jit_tlab_registration_required`] reports.
+#[inline]
+pub fn set_jit_tlab_registration_required(required: bool) {
+    JIT_TLAB_REGISTRATION_REQUIRED.store(required, std::sync::atomic::Ordering::Release);
+}
+
+static JIT_TLAB_REGISTRATION_REQUIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Corrupt-`Value`-cell census, shared by the three crates that need it.
 ///
 /// It lives HERE rather than in the collector or the VM because the only exit
