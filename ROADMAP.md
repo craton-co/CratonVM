@@ -15,10 +15,11 @@ production caveats.
 - Tighter HotSpot C2 performance parity, with blocking regression budgets for
   HashMap, Binary Trees, and Regex before optimizing broader benchmark totals.
 - GC throughput improvements on allocation-heavy workloads (Binary Trees).
-  Moving-young collection is now the default (`CRATONVM_NO_MOVING_YOUNG` opts
-  out), so its remaining optimizations — the `pointer_map` `FxHashMap`, the
-  disabled self-call spill elision, and the unpriced `jit_frame_record` helper —
-  are work on the default path.
+  On the generational backend, moving-young collection is requested by default
+  (`CRATONVM_NO_MOVING_YOUNG` opts out), so its remaining optimizations — the
+  `pointer_map` `FxHashMap`, the disabled self-call spill elision, and the
+  unpriced `jit_frame_record` helper — are still live work. The *default*
+  collector is ZGC (below), whose throughput work is tracked separately.
 - Repeatable framework-throughput qualification for Spring Boot, Quarkus, and
   Micronaut, following [`docs/framework-throughput.md`](docs/framework-throughput.md).
 - Complete `java.util.concurrent` parity (ForkJoin, ReentrantReadWriteLock,
@@ -41,13 +42,25 @@ as a wish list.
 - JNI: full function-table coverage and OnLoad/OnUnload protocol.
 - JCK compliance run on Java SE 25 (see [docs/legal.md](docs/legal.md)).
 - Concurrent garbage collector: G1 maturity, and production low-latency ZGC.
-  ZGC has been the **default** collector since 2026-08-10 (default-ON `zgc`
-  feature) and has since grown colored pointers, a load barrier, concurrent
-  marking, compaction and an opt-in generational mode. What remains open is
-  production hardening rather than existence — chiefly the JIT-side load
-  barrier, which is still unwired (`docs/feature-designs/zgc-jit-load-barrier.md`;
-  the JIT read helpers currently panic as a tripwire on a colored word). The
-  plan for the rest is
+  ZGC has been the **default** collector since 2026-08-10 (`default = ["zgc"]`
+  in `gc/Cargo.toml`, `GcAlgorithm::Zgc` in `vm/src/config.rs`) and has since
+  grown colored pointers, a load barrier, concurrent marking, compaction and an
+  opt-in generational mode. What remains open is production hardening rather
+  than existence, and the JIT-side load barrier is the centre of it. It is now
+  **plumbed but not armed**: `gc/src/vm_heap.rs::load_ref_slot_barriered` is the
+  backend-dispatching seam, the reference-slot accessors and ZGC's compaction
+  rewrite are relaxed atomics, the JIT's compact-field read routes through the
+  seam, and the inline `aastore` arm consults the armed gate. None of that has
+  executed: `vm/src/vm/vm_init.rs` pins `RELOCATION_REQUESTED = false` and
+  `set_barrier_color` has no non-test caller, so the barrier is unarmed for the
+  life of every shipping process and the work is **staged, not measured**. The
+  measurement that would settle it is a run with the barrier armed showing
+  `ref_load_census::BARRIERED_LOADS` non-zero and `UNBARRIERED_LOADS` zero; it
+  cannot be taken until `jit_aaload` can reach a heap handle (an ABI change),
+  the `ObjectRef`-holding static and legacy slots become atomic, and arming
+  happens at a safepoint. Design:
+  [docs/feature-designs/zgc-jit-load-barrier.md](docs/feature-designs/zgc-jit-load-barrier.md);
+  the plan for the rest is
   [docs/feature-designs/zgc-production-implementation-plan.md](docs/feature-designs/zgc-production-implementation-plan.md).
 - JFR event coverage matching OpenJDK 25.
 
@@ -204,9 +217,15 @@ These are directional goals to gauge progress, not guarantees or claims of
 current state. CratonVM remains research-grade software; numbers are targets we
 are aiming at, and may shift as priorities change.
 
-- **Performance vs HotSpot C2** - narrow the current QuickBench TOTAL gap
-  (3.7x default, with back-edge OSR default-on) toward <=1.2x of JDK 25 C2 runtime, with no single QuickBench
-  micro above 1.5x. Bring Binary Trees (depth=18), currently 23.7x, under 5x through GC throughput work.
+- **Performance vs HotSpot C2** - bring every row of
+  [BENCHMARK.md](BENCHMARK.md)'s interleaved series to <=1.2x of JDK 25 C2, with
+  no single kernel above 1.5x. Two rows (Matrix, Sieve) are already at parity;
+  the worst is Binary Trees at depth 18, measured **9.66x** in that series,
+  which GC throughput work has to bring under 5x. There is no aggregate "TOTAL"
+  ratio to quote — BENCHMARK.md deliberately publishes seven per-kernel rows
+  from one window rather than one number, and the `3.7x` TOTAL and `23.7x`
+  Binary Trees figures this bullet carried until 2026-09-01 were not
+  reproducible from any table in the tree.
 - **Bytecode verifier** - reach 100% of the structural/type checks needed to
   verify the pre-Java-7 split-verifier class-file corpus without `--noverify`.
 - **JCK / compliance** - target >=90% pass rate on a single chosen JCK area,

@@ -1,6 +1,13 @@
 # ZGC's own rewrite pass faults walking a reference array
 
-**Status: CLOSED 2026-08-19.** Bisected to **`aa4bc7922`** — the reference
+**Status: CLOSED 2026-08-19, RETIRED 2026-09-01.** The bisect below names the
+writer. Retirement waited on the one row the elimination table still had open --
+*a raw pointer TRANSLATED out of the arena* -- which the fifth pass said needed
+**a fix rather than a probe**. That fix, and the three defects reading the path
+turned up, are in "Eighth pass" at the foot of the page. Everything above it is
+the record as written, unedited apart from this banner.
+
+**CLOSED 2026-08-19.** Bisected to **`aa4bc7922`** — the reference
 processor wrote through a **pre-GC address** guarded only by `num_fields >= 2`, so
 a `String` passed the test and a queue-head pointer landed on whatever the slide
 had moved into that address. Parent `2fac8c241` crashes 3/38, `aa4bc7922` is clean
@@ -982,6 +989,269 @@ across the commits since 2026-08-15 that finds the one which stops it, or a long
 once with the instruments armed — at which point `below16=` answers the question
 that has been open since the second pass. The instruments are in the tree and
 cost a branch when off, so the next run is cheap.
+
+# Eighth pass, 2026-09-01: the last elimination-table row, FIXED rather than probed
+
+The bisect closed the crash on 2026-08-19. It left one row of the elimination
+table open — **a raw pointer TRANSLATED out of the arena, `untested`** — and the
+fifth pass had already said what closing it would take:
+
+> Zero does *not* clear the path, because the unbounded-write half leaves no
+> trace here; that half needs the bound to be carried to the callee rather than
+> dropped, **which is a fix rather than a probe**.
+
+That is done. Reading the path to fix it turned up **three** defects, one of them
+worse than the one being looked for, and it also turned up two reasons the
+fifth-pass instrument could never have answered the question it was built for.
+
+**None of them is this page's writer.** The writer is proven: the collector's own
+reference processing, `aa4bc7922`, and nothing here revises that. An arena block
+is a Rust-owned `Vec<u8>`, not the managed heap, so this path could not have put
+a pointer on a Java object's header. These are latent hazards in the same
+neighbourhood, fixed on their own merits.
+
+Branch: `fix/zgc-arena-ptr-bounds-20260901`.
+
+## 1. The bound was dropped at the JNI boundary — carried now
+
+`GetDirectBufferAddress` and `GetDirectBufferCapacity` **are** the bound: the JNI
+contract is that a native may touch `capacity` bytes from the address. This VM
+resolved the two independently and checked nothing, so a tagged handle whose
+arena block was shorter than the advertised capacity was published anyway, and a
+native following the contract wrote past the block. `unsafe_arena_real_ptr` had
+always returned how many bytes were left; the call site discarded it
+(`.map(|(ptr, _len)| ptr)`).
+
+The address getter now goes through a new `unsafe_arena_real_ptr_bounded` and
+answers **NULL** on a short block. NULL rather than a clamp, because the capacity
+getter reads a Java field the address getter cannot correct, so the only
+self-consistent pair on offer is `(NULL, capacity)` — and NULL is what the spec
+already reserves for "not a direct buffer", hence what natives that check
+anything check for. Both getters now resolve the capacity through one
+`dbb_capacity`, so they cannot drift apart again.
+
+`jni_long_arg_bits` — the other translating caller, netty-tcnative's
+`SSL.bioWrite(long bio, long address, int len)` — **cannot** be bounded: a
+`jlong` argument carries no length. It stays counted rather than guarded, and
+that is stated here rather than left to be rediscovered.
+
+## 2. A resize moved a block out from under an outstanding pointer
+
+`Vec::resize` reallocates when it must grow past its capacity, and a
+reallocation moves the bytes. Every real pointer handed out before that point
+then named memory the process allocator had taken back — an unbounded write from
+native code into whatever landed there next, which is exactly the shape this page
+spent seven passes hunting.
+
+The displaced buffer is now **retained**, keyed by whatever handle the block ends
+up at and dropped when that handle is freed. The stale pointer reads
+stale-but-mapped bytes instead of corrupting a stranger. **That is a downgrade,
+not a cure** — the native is still using an address the Java side has moved on
+from — but it bounds the blast radius to the block itself, and
+`stale_on_realloc` still reports every occurrence. Retention is at most one
+buffer per handle, so an allocate/translate/resize/free loop does not leak.
+
+### And the fifth pass's instrument was armed where it could not fire
+
+`try_reallocate`'s capacity probe ran `try_reserve_exact` on the **live** `Vec`.
+That reallocates. So the buffer moved during the *probe*, and the detection
+downstream then compared the new size against a capacity that had just been
+satisfied and concluded nothing had moved. `stale_on_realloc` would have read
+zero on a workload where the hazard fired on every resize.
+
+The probe is gone; `reallocate` reports failure with `0` and `try_reallocate`
+maps that to `None`.
+
+## 3. Found in passing, and the serious one: a grown block swallowed its successors
+
+`try_allocate` bumps `next_addr` by the **rounded request**, so each block owns
+exactly that much handle space, and `locate` resolves an address to the greatest
+base at or below it. `reallocate` grew `bytes.len()` and bumped nothing.
+
+So a 64-byte block grown to 4096 **answered for every handle issued after it**.
+Two live `Unsafe.allocateMemory` allocations, one address range, and every read
+and write through the later handle landed silently in the earlier block. No
+diagnostic anywhere, on either side.
+
+`Arena` now records the span it reserved, and a grow that will not fit is served
+from a **fresh handle**. That is `realloc(3)`'s contract, it is what
+`Unsafe.reallocateMemory` already documents, and
+`native_unsafe_reallocate_memory_consolidated` already passed the arena's answer
+straight back to Java — its own comment said "the arena may have moved/resized
+under this address".
+
+This was found because it made the new unit tests flake: they resize to 1 MiB,
+and the grown block then swallowed sibling tests' blocks in a process-global
+arena. **A flaky new test was the defect reporting itself.**
+
+## Measured against HotSpot, one probe, three binaries
+
+`UnsafeShadowSweep` is the L1 differential probe, so the row belongs in it — two
+live allocations staying independent is behaviour, not an address diff, which is
+that probe's own rule. JDK 25.0.3+9, Windows, same class file on every arm:
+
+| arm | `a grown block is not overwritten by a later allocation` |
+|---|---|
+| HotSpot | `true` |
+| CratonVM, stock `dev` | **`false`** |
+| CratonVM, this branch | `true` |
+
+**And the whole-probe diff says nothing else moved.** 472 rows against the
+HotSpot transcript: stock `dev` differs on 10 rows, this branch on 9, and a
+direct diff of the two CratonVM transcripts shows **exactly one changed line** —
+this row. The other nine are the L1 residuals that page already adjudicates.
+
+### The row that would have hidden it
+
+The companion row, `and the later allocation keeps its own bytes`, reads `true`
+on **all three arms including the broken one** — the write and the read hit the
+same aliased cell. A probe with only that row is a green light over live memory
+aliasing. The damage is visible only from the *earlier* block, and only by
+scanning all of it, because the later block lands somewhere in the middle.
+
+## The instrument had no reader at all, and then had the wrong one
+
+`unsafe_arena_translation_stats` was added in the fifth pass and **never called**
+outside its own tests. So `translations` — the denominator — never reached a run,
+and "the hazard never fired" and "no pointer was ever handed out on this
+workload" were the same run. The `stale_on_*` warnings fired into `tracing`, with
+nothing to read them against.
+
+It now prints as one greppable line:
+
+```
+[VM] arena-ptr: translations=N short_translations=N stale_on_realloc=N \
+     retained_on_realloc=N stale_on_free=N
+```
+
+with the GC summary, **and unconditionally whenever a stale or refused
+translation has happened** — gating a correctness event behind a statistics flag
+turns "nobody asked" into "nothing happened".
+
+**And then the repro proved that was still the wrong place.** `CratonRunner` —
+this page's own harness — calls `System.exit(1)` when a test fails, which leaves
+through `lang_system`'s exit native and never reaches `vm-cli`'s normal-return
+arm. The line printed on the `found=0` run where nothing happened and was
+**absent from the `found=3 ok=2 failed=1` run that actually exercised the VM**.
+`lang_system.rs` already carries the fix pattern with the reason beside it: the
+corrupt-cell census moved to that path after "a 1975-class sweep produced this
+line in zero logs and read as a clean run". The printer moved there too.
+
+That is three instruments on this page armed where they could not fire —
+`below16=`, `heapcopy_dbg()` behind the tagged early return, and this one twice.
+It is the page's most reusable lesson.
+
+## The aliasing defect has a real caller, and it is netty
+
+`Unsafe.reallocateMemory` is not a theoretical path here.
+`io.netty.util.internal.PlatformDependent0` line 727 —
+`reallocateDirectNoCleaner`, behind `UnpooledUnsafeNoCleanerDirectByteBuf`'s
+`capacity(int)` — is:
+
+```java
+return newDirectBuffer(UNSAFE.reallocateMemory(directBufferAddress(buffer), capacity), capacity);
+```
+
+**It uses the returned address**, which is the contract and which is why the
+relocation in §3 is safe for it. Before the fix, growing such a buffer returned
+the SAME handle and left the block covering every `Unsafe` allocation made after
+it, so any later off-heap allocation in the process was silently aliased into
+netty's grown buffer. Every read and write through the later handle landed in
+the wrong block, with nothing reported on either side.
+
+The JDK's own `DirectByteBuffer(int cap)` cannot trip the §1 bound either:
+it allocates `max(1, cap + (pageAligned ? ps : 0))` and sets `address` to `base`
+(or to `base + padding` when page-aligning), so the bytes remaining from the
+published address are always `>= capacity`. A slice or duplicate carries a
+smaller capacity at a higher offset, which is the same inequality. The guard is
+therefore expected to read `short_translations=0` on healthy workloads, and that
+is the reading to expect rather than a suspicious one.
+
+## What has NOT been re-measured, and why
+
+The repro itself — `io.netty.util.ResourceLeakDetectorTest` under
+`-XX:+UseZGC --nojit`, at the 38 reps this page's own power calculation
+derived — has not been re-run against this branch at the time of writing. Two
+things stood in the way and both are worth recording:
+
+* **the netty test build was gone.** `/data/cratonvm/apps/netty/*/target/` had
+  been cleaned when `/data` filled, while `common.args` still listed those
+  directories and the SNAPSHOT jars (main classes only) stayed put. A first
+  38-rep arm therefore ran to completion with `rc=0`, `found=0`, ~22 s per rep
+  and `collections=0` — a **vacuous arm that reads exactly like a clean one**.
+  Rebuilding one module fixes it in about a minute:
+  `mvn -o -pl common -am -DskipTests -Dcheckstyle.skip=true ... test-compile`,
+  after which the documented `found=3 ok=2 failed=1` shape returns. Screen every
+  rep on that shape, never on `rc`;
+* **the shared host could not link the binary.** Fat LTO at `-j 1` was
+  SIGKILLed twice at `avail` 0-4 GB with load 40-190 from other sessions. A
+  driver is parked there waiting for `avail>=10G` and `load<30`.
+
+What that leaves is stated plainly: the branch is verified by 4190
+`native-builtins` and 2645 `cratonvm-vm` unit tests, 80/80 of the Java
+regression suite against HotSpot, and the 472-row `UnsafeShadowSweep`
+differential in which exactly one line moved. The GC crash this page is about
+was closed by bisect on 2026-08-19 and none of this touches the collector. The
+outstanding rep run would add a **denominator** — netty is the workload that
+actually reaches `unsafe_arena_real_ptr`, so it is the one that can say whether
+`translations` is non-zero in production — and it is not load-bearing for the
+retirement.
+
+## The elimination table, final
+
+| candidate writer | verdict | the number / the reason |
+|---|---|---|
+| a bad registry insert (three shapes) | **no** | all 0 |
+| the slide itself | **no** | post-slide survey clean the cycle before |
+| the live set arriving broken | **no** | pre-slide census 0 |
+| a retained TLAB chunk | **no** | `tlab_retire_skipped=0` |
+| an allocation sized wrong | **no** | `zgc alloc audit` never fires |
+| a Java field/array store | **no** | `zgc access audit` never fires |
+| a raw native copy into the heap | **no** | `CRATONVM_DBG_HEAPCOPY` 0 |
+| a write through a TAGGED arena handle | **no** | bounds-checked into its own `Vec`; the prescribed probe could not fire |
+| `System.arraycopy` | **no** | per-element `set_array_element` — inside the audit |
+| `Unsafe.copyMemory` off-heap→heap | **no** | refuses reference arrays; bounds-checked twice |
+| an unregistered object based at `victim - 16` | **no** | `below16=` armed and silent across 52 reps |
+| a raw pointer TRANSLATED out of the arena | **no**, and **FIXED anyway** | §1–§3: it cannot reach the managed heap, and the bound is now carried |
+| **the collector's OWN reference processing** | **YES** | `2fac8c241` 3/38, `aa4bc7922` 0/38 |
+
+The last row is the answer. The row above it is closed on two grounds worth
+keeping apart: it could not have been this writer, and it was nevertheless a real
+memory-safety defect — which is why it is fixed rather than argued away.
+
+## What is proven, and what is not
+
+**Proven by measurement:** the three defects above, each with its guard verified
+in both directions. Every one fails with only its own fix reverted, and the
+negative halves — a grow that fits keeps its handle; a resize that cannot move
+retains nothing; a block that exactly covers its capacity is published — fail if
+the guards are made unconditional. On the branch merged with `dev`: 4190
+`native-builtins` unit tests, 2645 `cratonvm-vm` unit tests, and **80/80** of
+the Java regression suite against HotSpot. The differential table above.
+
+A note on that suite, because it bit twice in one session: `regression-suite`
+and `UnsafeShadowSweep` both compile into a SHARED output directory, so two runs
+at once produce `class not found` for whichever vector loses the race. A 78/80
+and an earlier 79-with-`RReflect`-failing were both that, and both went to 80/80
+when re-run alone. **Run it serially, or read its failures as your own.**
+
+**Not proven:** that any of the three ever fired on a real workload. The
+engagement counters exist now precisely so that question has an answer next time,
+and this page's own history says a counter without a denominator is not an
+answer.
+
+**Still inference, unchanged from 2026-08-19:** that the `reference_slots` /
+`relocate_stw` fault this page opens with is the same defect the bisect closed.
+What reproduced symbolized to `chm_collect_all_entries` / `map_state`. Both are
+readers of a heap whose headers have been overwritten, and the identified writer
+overwrites headers — but the specific frames were never reproduced.
+
+## Retired
+
+The writer is identified and fixed, the last open row of the elimination table is
+closed, every instrument this page built either reads zero for a stated reason or
+has been given a reader, and the crash has not reproduced on `dev` since
+2026-08-19.
 
 ## Related
 

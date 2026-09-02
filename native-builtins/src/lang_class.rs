@@ -19636,7 +19636,20 @@ pub(crate) fn i2_classloader_get_defined_package(
         && !defined_lazily
         && !loader.is_some_and(|l| crate::classloader::loader_is_builtin(ctx, l))
     {
-        return Ok(Some(Value::Object(None)));
+        // ... UNLESS this loader has itself defined a class in the default
+        // package, which is the one way a custom loader DOES define it.
+        // MEASURED on HotSpot: `new ClassLoader(null){}.getDefinedPackage("")`
+        // is `null`, and becomes the unnamed `Package` the moment the loader
+        // defines a class with no package. The unconditional `null` here was
+        // right about row N02 (a loader that defined nothing must not inherit
+        // the class path's answer) and wrong about this one.
+        let defined_here = loader
+            .map(|l| crate::classloader::loader_namespace_id(ctx, l))
+            .filter(|ns| *ns >= cratonvm_types::ClassLoaderId::NATIVE_FIRST_USER_DEFINED)
+            .is_some_and(|ns| ctx.any_loaded_class_in_package_for_loader("", ns));
+        if !defined_here {
+            return Ok(Some(Value::Object(None)));
+        }
     }
     let ns = loader.map_or(0, |l| crate::classloader::loader_namespace_id(ctx, l));
 
@@ -20972,7 +20985,14 @@ pub(crate) fn native_class_get_class_loader(
         || (class_name.starts_with("sun/") && class_name != "sun/reflect/misc/Trampoline")
         || class_name.starts_with("com/sun/");
     if loader_type == 0 && is_jdk_pkg {
-        // Bootstrap loader в†’ null per JVM spec.
+        // NOT every image class is boot-loaded -- see
+        // `classloader::platform_loader_for_image_class`.
+        if let Some(platform) =
+            crate::classloader::platform_loader_for_image_class(ctx, &class_name)
+        {
+            return Ok(Some(Value::Object(Some(platform))));
+        }
+        // Bootstrap loader -> null per JVM spec.
         return Ok(Some(Value::Object(None)));
     }
     if loader_type == 0 && !is_jdk_pkg {
