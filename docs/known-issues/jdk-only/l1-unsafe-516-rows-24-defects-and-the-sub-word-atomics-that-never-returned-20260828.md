@@ -324,7 +324,10 @@ primitives and interfaces as well as ordinary classes.
 **UPDATED 2026-08-30 — the scale half of this was changed, and this section
 did not say so.** `array_index_scale_for_name` now returns `0` for a non-array,
 not `1`: exactly the value the paragraph below argued for, landed during this
-campaign while the text kept describing the old behaviour. All four scale rows
+campaign while the text kept describing the old behaviour. **The reason given
+for it was wrong, though — see §25.1: the javadoc's "reported as zero" is about
+ARRAYS OF NARROW TYPES, not about non-arrays, and it was cited here as if it
+settled the non-array case.** All four scale rows
 (`String.class`, `int.class`, `Iface.class`, and the internal spelling) answer
 `0` today, so a caller following the documented
 `if (scale == 0) throw` guard now gets the refusal it is looking for.
@@ -1268,7 +1271,15 @@ as originally written, and this sentence was a false claim about
 After the fix, the `ClinitProbe` diff against HotSpot loses both rows: bci 157
 and bci 166 now match.
 
-### 17.2 What is deliberately NOT fixed
+### 17.2 What is deliberately NOT fixed — SUPERSEDED by §19
+
+> **This section is now WRONG and is kept for its reasoning, not its
+> conclusion.** The latch pair WAS repaired in §19: the R5 warn is 0 on
+> both H2 vectors and on the 40-line repro. What the text below gets
+> right is the mechanism; what it gets wrong is calling it unreachable,
+> because it assumed the repair had to SYNTHESISE an offset encoding.
+> It does not — `staticFieldOffset` mints AND REGISTERS, and making
+> the same call is what fixed it.
 
 `MEMORY_ACCESS_WARNED_BASE`/`_OFFSET` (bci 185/195) still hold their defaults,
 so the R5 warn still fires. Backfilling them needs the class mirror and this
@@ -1537,7 +1548,14 @@ files.
 their per-vector flags and classpath entries, so 4 of 120 exited non-zero and
 exercised less than the suite gives them.
 
-### 21.2 What this does and does not license
+### 21.2 What this does and does not license — SUPERSEDED by §24
+
+> **The refusal this section declines to make HAS since been made
+> (§24).** Two things changed: the count was widened to 136 Netty
+> buffer/util classes, and—the load-bearing correction—the rescues this
+> section is protecting run through the CLASSIFIED paths, not through
+> the case being refused. Re-reading the classifier instead of its
+> summary is what settled it.
 
 **Discharged for four workload families**: the regression corpus, H2, Spring
 Boot and Tomcat+SSL. Nothing in any of them reaches the fallback, and the
@@ -1830,3 +1848,71 @@ there.
 **Not run: WildFly, Keycloak, Elasticsearch** — not checked out on this host.
 The failure mode if one of them does reach the refused case is now a named
 `IllegalArgumentException` quoting the offset, rather than a CAS that lies.
+
+## 25. Two corrections, and a coverage boundary that explains this lane's harness
+
+### 25.1 A javadoc citation that does not say what it was cited for
+
+§4.3 and the source comment beside it both justified `arrayIndexScale(non-array)
+== 0` as *"what the long-standing `sun.misc` javadoc specifies"*. **It does not.**
+JDK 25's `jdk/internal/misc/Unsafe.java` reads:
+
+> arrays of "narrow" types will generally not work properly with accessors like
+> `getByte(Object, long)`, so the scale factor for such classes is reported as
+> zero
+
+That is about **arrays of narrow types**. The javadoc says nothing whatever
+about a non-array, and documents only the `NullPointerException` for null. The
+citation made a judgement call look like a settled reading of the spec.
+
+**The choice stands; its reason is now the honest one.** HotSpot *intends* a
+refusal here and fails to deliver it — it names `java/lang/InvalidClassException`,
+which does not exist, so the throw fails to link and the caller gets
+`NoClassDefFoundError`. Reproducing a botched throw would make this VM wrong on
+the day the JDK fixes it, and `0` is both the value callers guard on
+(`if (scale == 0) throw`) and the safe direction for anyone doing address
+arithmetic. Corrected in the source comment too, where it would otherwise
+mislead the next reader of that function.
+
+### 25.2 The regression suite cannot test a `jdk.internal.misc`-only API
+
+I tried to give the two refusals that landed in §23 and §24 a standing gate, by
+adding assertions to `RUnsafeArrayBase` — the same move that worked for the
+zeroed constants in §20. It fails, and the failure is worth more than the guard
+would have been:
+
+```text
+java -cp ... RUnsafeArrayBase        (no module flags — what the suite does)
+AssertionError: oFO(Class,String) refuses an absent field:
+    expected [java.lang.InternalError] got [harness-java.lang.IllegalAccessException]
+```
+
+**On HotSpot.** `run.sh` passes no `--add-opens` and no `--add-exports`.
+`sun.misc` is reachable anyway because `jdk.unsupported` opens it; **`jdk.internal.misc`
+is not.** The 2-arg `objectFieldOffset(Class, String)` exists *only* on the
+internal spelling, so no vector in this suite can reach it, on either VM.
+
+Reverted rather than landed — it would have reddened the vector in all three
+arms, and it reddens on the ORACLE, so no amount of VM work would have fixed it.
+
+**This is the coverage boundary that explains why this lane has its own
+harness.** `UnsafeShadowSweep` runs with `--add-exports java.base/jdk.internal.misc=ALL-UNNAMED`
+and diffs both spellings; the regression suite structurally cannot. Anything
+this campaign found on the `jdk.internal.misc` door — the sub-word atomics, the
+mint, the static-name narrowing — was invisible to the suite by construction,
+not by oversight.
+
+### 25.3 What actually guards the two refusals
+
+* **The mint refusal** is the sweep's own row (`internal oFO(Class,String)
+  missing name`). If it regresses, that row reappears and the sweep diff moves
+  from 12 back to 14 changed lines.
+* **The null-base refusal** cannot be guarded by a differential vector at all:
+  HotSpot SIGSEGVs on the call, so asking it would kill the oracle. That is why
+  `UnsafeNullArgProbe` runs one call per process, and why `NullBaseControl`
+  exists as its positive control.
+
+Both are checks a person must run, not gates. Stated plainly because a residual
+that is "covered by a probe nobody runs in CI" is covered in the same sense that
+`RUnsafeArrayBase` covered the array constants for as long as the defect
+existed — which is to say, not at all (§20).

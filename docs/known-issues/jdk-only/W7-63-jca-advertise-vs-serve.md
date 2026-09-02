@@ -33,8 +33,31 @@ same day: **186 services are absent from the enumeration and only 84 of them
 actually refuse** — 93 resolve through a path the service map does not
 advertise, and a full 2048-bit Diffie-Hellman runs 0-diff against HotSpot on a
 `KeyAgreement` type that is not enumerated at all. That is exactly this page's
-thesis, arrived at the expensive way; the current numbers live in
-[`jca-provider-population-gap-20260830.md`](jca-provider-population-gap-20260830.md).
+thesis, arrived at the expensive way; that record is
+`jca-provider-population-gap-20260830.md`, retired to `internal/` on
+2026-09-02.
+
+> **Both halves of this page's title were closed on 2026-09-02**, and the
+> numbers above are superseded. The functional gap went 84 -> 5 and the
+> enumeration gap 117 -> 9 (the "186" is a count of enumeration LINES; 62 of
+> them differed only in the implementation-class string). Twenty-eight of the
+> absent services were the SERVES-AND-DOES-NOT-ADVERTISE half named in this
+> title — 22 `SecretKeyFactory`, the unlisted `KeyAgreement.DiffieHellman` that
+> ran a full 2048-bit agreement, `Signature.NONEwithRSA`, and four
+> `AlgorithmParameters` — and they are advertised now.
+>
+> The ADVERTISES-AND-WILL-NOT-SERVE half is at zero in both directions: this VM
+> advertises nothing HotSpot does not (it advertised five such rows on
+> 2026-08-30), and the three serviceability ratchets this page created are
+> disjunctions now — advertised implies serviceable, either computed by this
+> crate or routed to a REAL implementation class, with the
+> `com.sun.crypto.provider.Native` marker explicitly not counting as one.
+>
+> Two of those ratchets could not have failed: each reads its population out of
+> the service registry, but only what the seeders it CALLS have put there, so
+> rows from a new seeder were invisible to it. A third stated its answer as a
+> hand-written literal of names that "must NOT be advertised" and went stale the
+> moment they became implementable. All three are fixed.
 
 > **Second pass, 2026-08-12 (JCA advertise-vs-serve lane).** Six of the seven
 > dispositions in §3 were re-read against the tree and are present as written.

@@ -594,6 +594,26 @@ pub fn run_shutdown_hooks(ctx: &mut dyn NativeContext, trigger: &str) {
     // would report it in zero logs.
     cratonvm_types::scalar_deopt_census::exit_summary();
     cratonvm_types::cell_census::exit_summary();
+    // Same exit path and the same argument: the netty runner this counter was
+    // built for exits through `System.exit` on its failing test, so a line
+    // printed only from `vm-cli`'s normal-return arm is absent from every run
+    // worth reading. See `arena_translation_exit_summary`.
+    crate::unsafe_natives_ext::arena_translation_exit_summary(
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_STATS").is_some(),
+    );
+    // A3 (2026-09-01): the descriptor-coercion guard and the ref-word
+    // degradation guard used to print per occurrence at WARN — 2048 lines on a
+    // hello-world boot, which is how an instrument stops being read. They now
+    // count silently and report here, for the same reason as the two above: a
+    // JUnit runner leaves through `System.exit`. Both are `Once`-guarded and
+    // print nothing at zero.
+    cratonvm_types::compact_value::coercion_census::exit_summary();
+    cratonvm_types::compact_value::degradation_exit_summary();
+    // The JVMS 6.5 uninstantiable-receiver census, on the same exit path and
+    // for the same reason: a JUnit runner leaves through `System.exit`, so a
+    // summary printed anywhere else appears in zero logs of a suite sweep.
+    // Silent unless a native handed back an abstract/interface receiver.
+    cratonvm_native_api::instantiable::exit_summary();
     // Same argument, same exit path: the post-remap stale-frame-word detector
     // splits its hits into words something RESUMES from and words nothing
     // reads, and `resumed_from=0 dead_region=N` is the REPAIRED state rather

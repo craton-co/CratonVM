@@ -13,6 +13,14 @@
 // makes it locale-independent: it never asserts a particular encoding, only
 // that both VMs name the same one and then emit the same bytes through it.
 //
+// `sun.jnu.encoding` is NOT here, and its absence is deliberate. It is still
+// pinned to UTF-8 while HotSpot derives it, so under a C locale the two VMs
+// disagree ON PURPOSE — that key decides how FILE NAMES are encoded, which is
+// class loading rather than printing, and moving it is a separate change with
+// a separate blast radius. Diffing it here would turn a known, chosen
+// divergence into a red gate on any host that does not run UTF-8.
+// `probes/EncodingFidelity.java` prints it, so it stays observable.
+//
 //   docs/known-issues/jdk-only/
 //     bug-printstream-charset-answers-the-abstract-base-20260825.md §5, §6.1
 import java.io.ByteArrayOutputStream;
@@ -47,7 +55,6 @@ public class REncodingFidelity {
         prop("file.encoding");
         // These four are the platform's, and were the defect.
         prop("native.encoding");
-        prop("sun.jnu.encoding");
         prop("stdout.encoding");
         prop("stderr.encoding");
         prop("stdin.encoding");

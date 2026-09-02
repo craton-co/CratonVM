@@ -2,18 +2,22 @@
 // Copyright 2024-2026 Craton Software Company
 
 //! What the HOST says its text encoding is — the source of HotSpot's
-//! `native.encoding`, `sun.jnu.encoding`, `stdout.encoding`, `stderr.encoding`
-//! and `stdin.encoding`.
+//! `native.encoding`, `stdout.encoding`, `stderr.encoding` and
+//! `stdin.encoding`.
 //!
 //! # Why this module exists
 //!
-//! CratonVM used to pin all five to `"UTF-8"` with the comment *"JDK 18+ pinned
-//! to UTF-8 for stdout/stderr/file/native"*. That is true of **`file.encoding`
-//! only** (JEP 400). The other four still follow the platform, and the gap was
-//! recorded as the open residual of
-//! `bug-printstream-charset-answers-the-abstract-base-20260825.md` §5:
+//! CratonVM used to pin all of those to `"UTF-8"` with the comment *"JDK 18+
+//! pinned to UTF-8 for stdout/stderr/file/native"*. That is true of
+//! **`file.encoding` only** (JEP 400). The others still follow the platform,
+//! and the gap was the open residual of
+//! `bug-printstream-charset-answers-the-abstract-base-20260825.md` §5 —
 //! *"CratonVM answers UTF-8 where HotSpot answers the console encoding
-//! (`Cp1251` on this host, from `stdout.encoding`)."*
+//! (`Cp1251` on this host, from `stdout.encoding`)"* — which
+//! `stdout-encoding-differs-from-hotspot-on-windows-20260901.md` then measured
+//! at ten divergent rows in a 273-assertion differential and whose §9
+//! recommended exactly this: *"A, with C as its kill switch"* — follow the
+//! host, keep an opt-out.
 //!
 //! MEASURED against Temurin 25.0.3+9, `-XshowSettings:properties`:
 //!
@@ -21,42 +25,67 @@
 //!                        Linux LANG=C.UTF-8   Linux LANG=C      Windows (ACP 1251)
 //!   file.encoding        UTF-8                UTF-8             UTF-8
 //!   native.encoding      UTF-8                ANSI_X3.4-1968    Cp1251
-//!   sun.jnu.encoding     UTF-8                ANSI_X3.4-1968    Cp1251
 //!   stdout.encoding      UTF-8                ANSI_X3.4-1968    Cp1251   (redirected)
 //!   stdin.encoding       UTF-8                ANSI_X3.4-1968    cp866    (a console)
 //! ```
 //!
 //! Two facts fall out of that table and drive the whole implementation:
 //!
-//! * **On Unix all four are the locale's codeset.** There is no separate
+//! * **On Unix all of them are the locale's codeset.** There is no separate
 //!   "console" encoding to ask for, and redirecting the stream does not change
 //!   the answer.
-//! * **On Windows they are not one value.** `native.encoding`/`sun.jnu.encoding`
-//!   come from the ANSI code page (`GetACP`); a std stream that is *attached to
-//!   a console* reports that console's code page instead, which is why
-//!   `stdin.encoding` reads `cp866` above while `stdout.encoding`, redirected
-//!   into a pipe, falls back to the ACP name.
+//! * **On Windows they are not one value.** `native.encoding` comes from the
+//!   ANSI code page (`GetACP`); a std stream that is *attached to a console*
+//!   reports that console's code page instead, which is why `stdin.encoding`
+//!   reads `cp866` above while `stdout.encoding`, redirected into a pipe,
+//!   falls back to the ACP name.
 //!
 //! The observable consequence is not the property string, it is the bytes:
 //! under `LANG=C`, `System.out.print("Ж")` writes `?` on HotSpot (US-ASCII
 //! cannot map it) and used to write the two UTF-8 bytes `D0 96` here.
 //!
+//! # The two kill switches
+//!
+//! Both restore the pre-2026-09-01 constant exactly, in one binary, so the
+//! change can be A/B'd on any host:
+//!
+//! * `CRATONVM_NATIVE_ENCODING=<name>` — pins [`native_encoding`].
+//! * `CRATONVM_STDOUT_ENCODING=<name>` — pins all three [`stream_encoding`]
+//!   answers, and with them the `Charset` `install_charset` stamps on
+//!   `System.out` / `System.err`, because that stamp is read from the
+//!   `stdout.encoding` / `stderr.encoding` PROPERTIES rather than from here.
+//!
 //! # What is NOT claimed
 //!
 //! The Unix path reports the codeset **verbatim** as `nl_langinfo(CODESET)`
 //! gives it. HotSpot has a small table that rewrites a few platform spellings
-//! (notably on AIX/Solaris); the two rows this host can actually produce —
-//! `UTF-8` and `ANSI_X3.4-1968` — are passed through by HotSpot too, and a row
-//! that cannot be measured is not worth guessing at.
+//! (notably on AIX/Solaris); the two rows this host can produce (`UTF-8` and
+//! `ANSI_X3.4-1968`) are passed through by HotSpot too, and a row that cannot
+//! be measured is not worth guessing at.
+//!
+//! `sun.jnu.encoding` is deliberately NOT derived from here. It decides how
+//! FILE NAMES are encoded, so moving it changes class loading rather than
+//! printing — a different blast radius, and the staging in
+//! `stdout-encoding-differs-from-hotspot-on-windows-20260901.md` §9 keeps it
+//! out of this step on purpose.
 
 use std::sync::OnceLock;
 
-/// The platform's native encoding: HotSpot's `native.encoding` and
-/// `sun.jnu.encoding`.
+/// A kill-switch value, trimmed, or `None` when the variable is unset/empty.
+fn pinned(var: &str) -> Option<String> {
+    cratonvm_types::flags::runtime_var(var)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// The platform's native encoding: HotSpot's `native.encoding`.
 #[must_use]
 pub fn native_encoding() -> &'static str {
     static CACHE: OnceLock<String> = OnceLock::new();
-    CACHE.get_or_init(detect_native_encoding).as_str()
+    CACHE
+        .get_or_init(|| pinned("CRATONVM_NATIVE_ENCODING").unwrap_or_else(detect_native_encoding))
+        .as_str()
 }
 
 /// Which of the three standard streams an encoding is being asked for. Only
@@ -83,7 +112,10 @@ pub fn stream_encoding(stream: StdStream) -> &'static str {
         StdStream::Out => &OUT,
         StdStream::Err => &ERR,
     };
-    cell.get_or_init(|| detect_stream_encoding(stream)).as_str()
+    cell.get_or_init(|| {
+        pinned("CRATONVM_STDOUT_ENCODING").unwrap_or_else(|| detect_stream_encoding(stream))
+    })
+    .as_str()
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +134,12 @@ fn detect_native_encoding() -> String {
     // C-side `printf("%f")` writes `1.5` or `1,5`, and CratonVM links C code it
     // does not own. Leaving the process locale where we found it costs nothing
     // here and cannot surprise them.
+    //
+    // Asking libc rather than parsing the locale NAME is what makes this exact.
+    // A name-parse cannot tell a locale that is installed from one that is only
+    // requested: on this host `LANG=en_US.ISO-8859-1` makes HotSpot answer
+    // `ANSI_X3.4-1968`, because `setlocale` failed and the process stayed in
+    // `C`, where a name-parse answers `ISO-8859-1`.
     //
     // SAFETY: `setlocale`/`nl_langinfo` are called on one thread during
     // bootstrap, behind the `OnceLock` in `native_encoding()`. The `char*`
@@ -287,8 +325,12 @@ mod tests {
         // is still in the "C" locale, where `nl_langinfo(CODESET)` answers
         // `ANSI_X3.4-1968`. So this asserts the setlocale call is there.
         //
-        // It is skipped when the environment really does ask for a C/POSIX
-        // locale, where `ANSI_X3.4-1968` is the RIGHT answer.
+        // Skipped when the environment really does ask for a C/POSIX locale,
+        // where `ANSI_X3.4-1968` is the RIGHT answer, and when either kill
+        // switch is pinning the answer.
+        if pinned("CRATONVM_NATIVE_ENCODING").is_some() {
+            return;
+        }
         let asks_for_c = ["LC_ALL", "LC_CTYPE", "LANG"]
             .iter()
             .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))

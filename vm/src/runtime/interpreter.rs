@@ -3232,6 +3232,90 @@ pub fn execute(
                     } else {
                         0
                     };
+                    // -- The String-intrinsic pin, ASKED at this door -- D1, 2026-09-01
+                    //
+                    // The third door. The measurement that found the pin
+                    // installed at ONE of three, and why the answer is inert at
+                    // the two that reach the single-pass backend directly, is
+                    // written out at the OSR door (`jit_bridge.rs`, at
+                    // `osr_string_pin_declines`); the topology is in
+                    // `compile_gate`'s "installed at ONE door" section.
+                    //
+                    // This door passes `string_layout: None` below -- "String
+                    // intrinsics land in a later wave" -- so the pin's honest
+                    // verdict here is `BlindNoLayout`: a site declared on a
+                    // String-family receiver, no layout resolved at this door,
+                    // and the rule FAILS OPEN (`false`, do not pin). That is
+                    // not a shortcut. Without a layout the single-pass backend
+                    // emits no intrinsic either, so pinning would cost the
+                    // method a C2 body and buy nothing back. The `None` is
+                    // passed deliberately rather than papered over: the whole
+                    // gain is that `blind-no-layout` becomes a MEASURED number
+                    // for this door instead of an invisible absence.
+                    //
+                    // Consequence, so nobody reads more into the counter than
+                    // it carries: with `layout == None` the pin can only answer
+                    // `false` here. `NoSite` and `BlindNoLayout` are `false` by
+                    // rule, and the `BlindNoResolver` fail-closed arm requires
+                    // `layout.is_some()`. So this ask changes no machine code
+                    // today; it is a census entry, not a decision. It becomes a
+                    // real decision the moment the `string_layout: None`
+                    // argument below becomes a resolved layout -- the `if` is
+                    // the tripwire for exactly that.
+                    //
+                    // A resolver IS supplied even though the layout is not,
+                    // because without one the verdict would be
+                    // `BlindNoResolver` -- the STRONGER blindness, which says
+                    // nothing about whether a layout would have mattered -- and
+                    // the narrower fact is the whole reason to ask here.
+                    //
+                    // COST: once per eager first-call compile, off any loop.
+                    // The resolver takes the `class_manager` read lock per site,
+                    // matching `c_invoke_resolver` in `jit_bridge.rs` and the
+                    // field-op loop above, which already takes it per field op;
+                    // `string_intrinsic_pin_verdict` asks nothing at all for a
+                    // method with no `invokevirtual`/`invokeinterface` site and
+                    // stops at the first String-family receiver otherwise. No
+                    // lock is held here -- the `early_is_static` probe above
+                    // took and released its own.
+                    let eager_pin_invoke_resolver =
+                        |cp_idx: u16| -> Option<(String, String, String)> {
+                            let cm = shared.classes.class_manager.read();
+                            let class = cm.get_class(class_id)?;
+                            let (class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
+                                Some(ConstantPoolEntry::MethodReference {
+                                    class_index,
+                                    name_and_type_index,
+                                    ..
+                                }) => (*class_index, *name_and_type_index),
+                                Some(ConstantPoolEntry::InterfaceMethodReference {
+                                    class_index,
+                                    name_and_type_index,
+                                    ..
+                                }) => (*class_index, *name_and_type_index),
+                                _ => return None,
+                            };
+                            let target_class = class.constant_pool.get_class_name(class_idx)?;
+                            let (mn, desc) = class.constant_pool.get_name_and_type(nat_idx)?;
+                            Some((target_class.to_string(), mn.to_string(), desc.to_string()))
+                        };
+                    let eager_string_pin_declines = admission.string_intrinsic_pin_declines(
+                        &scan.invoke_ops,
+                        Some(&eager_pin_invoke_resolver),
+                        // The SAME value handed to `compile_with_param_slots`
+                        // below as its `string_layout` argument. Asking about a
+                        // layout this compile does not use would make the
+                        // census describe a compile that did not happen.
+                        None,
+                    );
+                    if eager_string_pin_declines && crate::runtime::env_cache::dbg_jitc() {
+                        eprintln!(
+                            "[cratonvm-jitc] eager-first-call String-intrinsic pin declines the \
+                             optimizing tier for {class_name_arc}.{method_name_arc}{descriptor_arc} \
+                             -- unreachable while this door passes `string_layout: None`. If this \
+                             ever fires, the later wave landed and this ask is now a decision.",
+                        );
+                    }
                     let mut cm = crate::jit::x64::compile_with_param_slots(
                         &admission,
                         &padded,
@@ -3665,12 +3749,20 @@ pub fn execute(
                                 // catch block. The `InternalError` fallback handles the
                                 // rt.jar-not-loaded boot path (no NPE class yet).
                                 let npe_routed = if crate::jit::helpers::take_jit_pending_npe() {
+                                    // Taken BEFORE the construction below, which is
+                                    // what re-captures the (now compiled-frame-free)
+                                    // stack. See `attach_snapshotted_npe_frames`.
+                                    let snapshot =
+                                        crate::jit::helpers::take_jit_pending_npe_compiled_frames();
                                     match crate::runtime::exceptions::throw_runtime_error(
                                         shared,
                                         thread,
                                         RuntimeError::NullPointerException { message: None },
                                     ) {
                                         MethodCallFailed::ExceptionThrown(exc) => {
+                                            crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                                                shared, exc, snapshot,
+                                            );
                                             jit_early_exception = Some(exc);
                                             true
                                         }

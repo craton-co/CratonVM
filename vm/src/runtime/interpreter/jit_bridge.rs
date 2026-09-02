@@ -184,6 +184,214 @@ fn osr_stage_get() -> &'static str {
     OSR_STAGE.with(std::cell::Cell::get)
 }
 
+// ---------------------------------------------------------------------------
+// Which interpreter frames are, right now, being run by compiled code
+// ---------------------------------------------------------------------------
+//
+// jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901, defect (3):
+// a trace captured after `main` has OSR'd says `main:62` -- the back-edge it
+// tiered up at -- where HotSpot says `main:66`, the call that was executing.
+//
+// ## The mechanism, read off this file rather than assumed
+//
+// `try_osr` enters through `osr_enter_planned` and the artifact runs the method
+// to its RETURN: the value comes back through that function's `ret_type`
+// conversion and `try_osr_with_backoff` turns it into
+// `OsrBackoffOutcome::ReturnOuter`. Compiled code therefore does NOT stop at
+// the loop exit -- everything after the loop, and every call the method makes
+// from there on, executes inside the artifact while the interpreter `Frame` for
+// that same activation sits untouched on `thread.frames` with `pc == entry_pc`.
+// A capture taken from inside that window (a throw in a callee, or another
+// thread's `Thread.getStackTrace()`) walks `thread.frames` and reports the loop
+// header for a method that is executing far below it. That is the *during*
+// sub-case, and it is the only one `probes/StackTraceAfterOsr.java` exercises.
+//
+// The *after* sub-case -- the interpreter continuing past the loop with a stale
+// pc -- does not exist here, and that was checked rather than assumed. Every
+// exit that leaves this frame alive already writes a pc: the OSR-exit transfer
+// (`deopt_resume::transfer_osr_exit_into_live_frame`) assigns
+// `frame.pc = resume_bci`, the RBC.6b handler entry assigns
+// `frame.pc = handler_pc`, and the safe-reject path deliberately leaves
+// `entry_pc` standing because by admission nothing was committed before it.
+// The only other way out is the normal return, which pops the frame.
+//
+// ## Why the pc itself must not be moved
+//
+// Two independent reasons, either one sufficient:
+//
+//   * `Frame::live_locals_mask_here` and `Frame::scan_local_objects_inner`
+//     compute the per-bci live-locals ROOT FILTER from
+//     `[self.pc, self.last_instr_pc]`. Advancing `pc` to where compiled code
+//     really is would make every slot that dies in between stop being a root --
+//     on a frame whose locals are the pre-OSR copies that the conservative half
+//     of the JIT root scan is leaning on.
+//   * The safe-reject exit above is correct only BECAUSE `frame.pc` is still
+//     `entry_pc`. Moving it would resume the interpreter at a bci this
+//     activation never reached, which is the silent-corruption shape RBC.7 is
+//     named for.
+//
+// So the refresh has to be a SIDE CHANNEL that the trace assembler reads and
+// neither the root scan nor any resume path can see. `Frame` is not this file's
+// to widen, so the channel is this registry.
+//
+// ## What this registry can and cannot answer
+//
+// It answers, authoritatively, WHICH interpreter frame is a live OSR
+// continuation and OF WHICH artifact -- two facts only the entry site knows.
+// `stackwalker::drop_osr_continuations` infers the first from
+// `cm.can_osr_enter(frame.pc)`, which is a property of a pc and not of an
+// activation: an interpreted frame genuinely parked on a back-edge while a
+// RECURSIVE compiled activation of the same method is live satisfies it too,
+// and that frame's compiled entry is then dropped from the trace.
+//
+// It cannot answer the current bci by itself, and no honest version of it can.
+// The bci compiled code is at lives in that activation's own frame at
+// `[rbp - cm.sp_id_slot_off]` -- the safepoint-id slot every GC-capable site
+// stores its `OopMapEntry::bytecode_pc` into, which is the mapping deopt and
+// the precise root scan already share. The OSR activation's RBP is reachable
+// only from the saved-RBP chain walk in `vm/src/jit/conservative_roots.rs`:
+// `top_rbp_mirror_read` names the INNERMOST compiled frame, and by capture time
+// that is some callee's, while the chain entry's `exact_rbp` has been
+// overwritten by every prologue that ran underneath it. Re-deriving the bci any
+// other way would be a SECOND pc->bci mapping beside deopt's, which is how this
+// class of defect gets made in the first place. The bci must therefore come
+// from the compiled entry `conservative_roots::active_compiled_frames` already
+// reports for this same activation, matched to the interpreter frame by the
+// pair below. See `.agent-requests/A7-wiring.txt`.
+
+/// Kill switch for the OSR-continuation registry.
+///
+/// Default ON. `CRATONVM_JIT_NO_OSR_PC_REFRESH=1` stops the registry being
+/// written and makes `live_osr_continuation_artifact` answer `None` everywhere,
+/// so every consumer falls back to the pc-shaped heuristic it used before --
+/// one binary, both answers.
+fn osr_pc_refresh_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_OSR_PC_REFRESH").is_none()
+    })
+}
+
+/// One interpreter frame that compiled code is running right now.
+#[derive(Clone, Copy)]
+struct OsrContinuation {
+    /// `thread.frames.len()` at the moment of entry -- deliberately the SAME
+    /// number `JitEntryGuard::enter_with_compiled_at` records as the chain
+    /// entry's `interp_depth`, so a consumer holding one of
+    /// `active_compiled_frames`' `(depth, label, class_id, cm_ptr)` tuples can
+    /// compare directly instead of inventing a second convention. The frame
+    /// itself is `frames[interp_depth - 1]`.
+    interp_depth: u32,
+    /// The artifact running this activation, as `Arc::as_ptr(..) as usize`.
+    /// Bit-identical to the `cm_ptr` that tuple carries: both are the address
+    /// of the payload of the same `Arc<CompiledMethod>`.
+    cm_ptr: usize,
+}
+
+thread_local! {
+    /// This thread's live OSR continuations, outermost first.
+    ///
+    /// A `Vec` rather than one slot because an OSR'd body can call a method
+    /// that itself OSRs; each is a separate activation at a different depth.
+    /// Written once per OSR ENTRY -- never per back-edge -- and read only by a
+    /// stack capture.
+    static OSR_CONTINUATIONS: std::cell::RefCell<Vec<OsrContinuation>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Publishes one `OsrContinuation` for exactly as long as the artifact is on
+/// the stack, and withdraws it however control leaves -- normal return, OSR
+/// exit, routed exception, or a panic unwinding through `catch_unwind`.
+struct OsrContinuationGuard {
+    /// The registry length before this guard pushed. `Drop` truncates back to
+    /// it rather than popping once, for the same reason `JitEntryGuard::drop`
+    /// restores its depth first: a non-local exit out of a NESTED OSR entry
+    /// could otherwise strand that descendant's record above ours, and a stale
+    /// record names a frame depth that by then belongs to a different
+    /// activation.
+    depth_at_push: usize,
+    /// `false` when the kill switch is set or the registry was already
+    /// borrowed; `Drop` must then truncate nothing.
+    armed: bool,
+}
+
+impl OsrContinuationGuard {
+    fn publish(interp_depth: usize, cm_ptr: usize) -> Self {
+        if !osr_pc_refresh_enabled() {
+            return Self {
+                depth_at_push: 0,
+                armed: false,
+            };
+        }
+        OSR_CONTINUATIONS.with(|c| match c.try_borrow_mut() {
+            Ok(mut v) => {
+                let depth_at_push = v.len();
+                v.push(OsrContinuation {
+                    // Saturate rather than panic: a depth this record cannot
+                    // represent must degrade to "no information", never take
+                    // the process down on a path that only feeds a diagnostic.
+                    interp_depth: u32::try_from(interp_depth).unwrap_or(u32::MAX),
+                    cm_ptr,
+                });
+                Self {
+                    depth_at_push,
+                    armed: true,
+                }
+            }
+            // Not reachable today -- the only reader holds the borrow for the
+            // length of one lookup and cannot re-enter OSR from inside it --
+            // but refusing to publish is the safe direction: the consumer then
+            // sees exactly what it saw before this registry existed.
+            Err(_) => Self {
+                depth_at_push: 0,
+                armed: false,
+            },
+        })
+    }
+}
+
+impl Drop for OsrContinuationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        OSR_CONTINUATIONS.with(|c| {
+            if let Ok(mut v) = c.try_borrow_mut() {
+                v.truncate(self.depth_at_push);
+            }
+        });
+    }
+}
+
+/// The artifact currently running `thread.frames[frame_index]` as an OSR
+/// continuation, as a `*const cratonvm_jit::CompiledMethod` cast to `usize` --
+/// the same encoding `conservative_roots::active_compiled_frames` uses for the
+/// `cm_ptr` in its tuples, so the two compare with `==`.
+///
+/// `None` means "no information", not "this frame is interpreted": it is also
+/// what the kill switch and a contended borrow report. A caller must fall back
+/// to whatever it did before rather than read it as a negative claim.
+///
+/// The consumer is `runtime::stackwalker`; the exact call site is written out
+/// in `.agent-requests/A7-wiring.txt`. It lives here because the OSR entry is
+/// the only place that knows the pairing -- nothing else on the thread can tell
+/// an OSR continuation apart from an interpreted frame that merely happens to
+/// be parked on a back-edge the artifact could have been entered at.
+#[allow(dead_code)] // wired up from `runtime::stackwalker`; see A7-wiring.txt
+pub(crate) fn live_osr_continuation_artifact(frame_index: usize) -> Option<usize> {
+    if !osr_pc_refresh_enabled() {
+        return None;
+    }
+    let depth = u32::try_from(frame_index.checked_add(1)?).ok()?;
+    OSR_CONTINUATIONS.with(|c| -> Option<usize> {
+        let live = c.try_borrow().ok()?;
+        live.iter()
+            .rev()
+            .find(|r| r.interp_depth == depth)
+            .map(|r| r.cm_ptr)
+    })
+}
+
 pub(super) fn compile_osr_artifact(
     shared: &SharedVm,
     class_id: ClassId,
@@ -956,6 +1164,108 @@ pub(super) fn compile_osr_artifact(
             // takes that same lock, and a recursive read on a `parking_lot`
             // RwLock can deadlock against a queued writer.
             let osr_string_layout = super::dispatch_static::resolve_string_field_layout(shared);
+            // -- The String-intrinsic pin, ASKED at this door -- D1, 2026-09-01
+            //
+            // Measured on the built branch, ONE binary, two probes:
+            //
+            //     CharAtCostCurve   JIT String-intrinsic pin: fired=2   (method entry)
+            //     CharAtWarmShape   JIT String-intrinsic pin: fired=0   (OSR)
+            //
+            // `CharAtWarmShape`'s entire body is `charAt`. Its `fired=0` was
+            // never a method that FAILED the pin's test -- it was a method the
+            // pin was never shown. The pin was a term of `try_compile_inner`'s
+            // eligibility conjunction, i.e. of `CompileDoor::MethodEntry` and
+            // of nothing else, and this door reaches
+            // `x64::compile_with_param_slots` directly. A zero from a one-door
+            // counter is indistinguishable from "there was nothing to pin",
+            // and that is what let the five hypotheses in
+            // `string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901`
+            // each be refuted without converging: every one of them varied the
+            // METHOD, and the discriminator was the DOOR.
+            //
+            // # The answer is INERT at this door today -- stated, not implied
+            //
+            // The pin means "keep this method on the backend that HAS the
+            // inline `charAt` decode", i.e. do not promote it to the optimizing
+            // tier. This door has no promotion to refuse. `compile_osr_artifact`
+            // reaches `x64::compile_with_param_slots` -- the single-pass backend
+            // -- unconditionally; the only production call of
+            // `ir_lower::lower_inner` in the tree is inside `try_compile_inner`,
+            // and nothing under `vm/**` names `ir_lower` at all. So "do not tier
+            // this up" is already true here BY TOPOLOGY, and there is no machine
+            // code this ask can change today. The ~3x that LIFTING the pin
+            // bought at the method-entry door is not available here, because
+            // there is nothing here to refuse -- do not read this as closing a
+            // live hole.
+            //
+            // What is not inert is the ASKING. `string_pin_asked(Osr)` and
+            // `string_pin_declined(Osr)` now say how much of the population the
+            // pin governs is compiled through this door, and
+            // `string_pin_not_asked(Osr)` stops being this door's whole row --
+            // the one number that would have named the defect above in a single
+            // run. This is a COUNTER, deliberately, and not a fix.
+            //
+            // It stops being inert if either half of the topology moves: an OSR
+            // route to the optimizing tier (then this answer must GATE it), or
+            // an IR String-intrinsic emitter (which retires the pin instead).
+            // The `if` below is the tripwire for the first, and is silent today.
+            //
+            // What this does NOT claim: a method OSR-compiled here can still be
+            // promoted later through `try_jit_upgrade_with_gate`, which goes
+            // through `try_compile_with_invokespecial_resolver` -- the
+            // method-entry door, which DOES ask the pin. Nothing on that route
+            // changed.
+            //
+            // COST: once per OSR compile, never per back-edge. The back-edge
+            // counter reaches a cached artifact; `compile_osr_artifact` runs
+            // once per (method, entry_pc) compile, and this sits on that path,
+            // not on the loop. The resolver takes the `class_manager` read lock
+            // per site -- the same shape as `c_invoke_resolver` in this file --
+            // and `string_intrinsic_pin_verdict` calls it only for
+            // `invokevirtual`/`invokeinterface` sites, stops at the first
+            // String-family receiver, and asks nothing at all for a method with
+            // no `0xb6`/`0xb9` site. No lock is held at this point:
+            // `resolve_string_field_layout` above took and released its own,
+            // and the invoke loop below takes its own AFTER this -- never
+            // nested, which is the recursive-read deadlock the comment above
+            // warns about.
+            let osr_pin_invoke_resolver = |cp_idx: u16| -> Option<(String, String, String)> {
+                let cm = shared.classes.class_manager.read();
+                let class = cm.get_class(class_id)?;
+                let (class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
+                    Some(ConstantPoolEntry::MethodReference {
+                        class_index,
+                        name_and_type_index,
+                        ..
+                    }) => (*class_index, *name_and_type_index),
+                    Some(ConstantPoolEntry::InterfaceMethodReference {
+                        class_index,
+                        name_and_type_index,
+                        ..
+                    }) => (*class_index, *name_and_type_index),
+                    _ => return None,
+                };
+                let target_class = class.constant_pool.get_class_name(class_idx)?;
+                let (mn, desc) = class.constant_pool.get_name_and_type(nat_idx)?;
+                Some((target_class.to_string(), mn.to_string(), desc.to_string()))
+            };
+            // The SAME `osr_string_layout` the invoke loop below screens with
+            // and that `compile_with_param_slots` is handed. Asking the pin
+            // about a different layout than the one this compile uses would
+            // make the census describe a compile that did not happen.
+            let osr_string_pin_declines = admission.string_intrinsic_pin_declines(
+                &scan.invoke_ops,
+                Some(&osr_pin_invoke_resolver),
+                osr_string_layout,
+            );
+            if osr_string_pin_declines && crate::runtime::env_cache::dbg_jitc() {
+                eprintln!(
+                    "[cratonvm-jitc] osr String-intrinsic pin declines the optimizing tier for \
+                     {}.{}{} -- INERT at this door, which is single-pass only. If this door ever \
+                     gains a route to the optimizing tier, THIS is the answer that must gate it.",
+                    class_name, method_name, method_descriptor,
+                );
+            }
             if !scan.invoke_ops.is_empty() {
                 let cm_lock = shared.classes.class_manager.read();
                 let class = cm_lock.get_class(class_id)?;
@@ -3172,6 +3482,24 @@ pub(super) fn try_osr(
             &*compiled,
             Some(thread.frames.len()),
         );
+        // Publish this activation for exactly the window it is on the stack --
+        // see the "Which interpreter frames are, right now, being run by
+        // compiled code" block near the top of this file for why a trace needs
+        // it and why `frame.pc` itself must not be moved instead. Deliberately
+        // in the same scope as `_jit_root_guard` and taking the same
+        // `thread.frames.len()`, so the two records agree about the depth by
+        // construction rather than by convention. Declared second, so it is
+        // withdrawn FIRST: there is never an instant where the registry claims
+        // an activation whose chain entry has already gone.
+        //
+        // Cost: one push and one truncate per OSR ENTRY. Nothing is added to
+        // the back-edge poll (`should_try_osr` returns long before this
+        // function is reached) and nothing at all to the compiled loop; an
+        // entry already pays a cache lookup, two `Vec`s of locals and tags, and
+        // `validate_osr_entry`'s walk over every deopt point, each of which
+        // dwarfs this.
+        let _osr_continuation =
+            OsrContinuationGuard::publish(thread.frames.len(), Arc::as_ptr(&compiled) as usize);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point
             // was validated; `plan` is the proof, obtained from
@@ -3300,6 +3628,9 @@ pub(super) fn try_osr(
         }
     }
     if crate::jit::helpers::take_jit_pending_npe() {
+        // Taken BEFORE the construction below re-captures a stack the compiled
+        // frames have already left — see `attach_snapshotted_npe_frames`.
+        let npe_snapshot = crate::jit::helpers::take_jit_pending_npe_compiled_frames();
         // Round-9/10 HIGH fix: route the NPE through the OSR'd method's own
         // exception table rather than losing it. The OSR target IS the method
         // whose code raised the NPE, so this frame's table is the one to
@@ -3321,6 +3652,11 @@ pub(super) fn try_osr(
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
+                crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                    shared,
+                    exc,
+                    npe_snapshot,
+                );
                 match route_osr_exception_out_of_artifact(
                     shared,
                     thread,
@@ -3344,7 +3680,10 @@ pub(super) fn try_osr(
             _ => {
                 // Couldn't construct a Java NPE object (e.g. rt.jar not
                 // loaded) — re-stash the raw flag as before so the next
-                // JIT drain still surfaces it.
+                // JIT drain still surfaces it. The frame snapshot is NOT
+                // re-stashed: it was taken for this raise, and by the time a
+                // later drain surfaced the flag it would describe frames that
+                // are long gone. A short trace beats a confidently wrong one.
                 crate::jit::helpers::stash_jit_pending_npe();
             }
         }
@@ -9917,7 +10256,7 @@ pub(super) fn execute_jit_call(
     // snapshot — semantics identical (everything was drained on every path
     // anyway; that unconditional draining IS the Round-8..11 leak-fix
     // discipline), minus the repeated TLS walks per call.
-    let (result, sig) = if !compiled.has_dispatch {
+    let (result, mut sig) = if !compiled.has_dispatch {
         // NEW-1.5 + T1.1.a: even on the fast path, a JIT call may
         // transitively trigger GC via a helper. Push the entry guard
         // so the root scanner can find spill slots in this frame;
@@ -10067,12 +10406,23 @@ pub(super) fn execute_jit_call(
         // and stops a later drain for the same method claiming it, since the
         // match compares method names only.
         let _ = cratonvm_jit::deopt::take_last_deopt();
+        // The compiled frames this NPE was raised in have already left the
+        // stack: the null-check stub called `jit_npe_with_action`, loaded the
+        // i64::MIN deopt sentinel and ran the epilogue, so construction here
+        // sees only what the interpreter still holds. `sig` carries the
+        // snapshot the helper took while they were live.
+        let npe_snapshot = sig.npe_compiled_frames.take();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
+                crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                    shared,
+                    exc,
+                    npe_snapshot,
+                );
                 let exc_locals = synchronized_args.as_deref().map_or_else(
                     || jit_saved_args_to_values(cached, &saved_args, np),
                     |args| args.to_vec(),
@@ -10463,7 +10813,7 @@ pub(super) fn execute_jit_call_decoded(
 
     // Run the compiled body. Mirrors execute_jit_call's run+exception logic
     // (including its one-shot signal drain — see the PERF note there).
-    let (result, sig) = if !compiled.has_dispatch {
+    let (result, mut sig) = if !compiled.has_dispatch {
         // SAFETY: compiled is a finalized JIT CompiledMethod with a validated entry; args match its JVM descriptor (receiver-aware).
         let fast_result: Result<i64, cratonvm_jit::CompileError> = {
             let _jit_root_guard =
@@ -10544,12 +10894,23 @@ pub(super) fn execute_jit_call_decoded(
     // Drain pending NPE / AIOOBE set by void-return store helpers (same as
     // execute_jit_call) — route through the JIT'd method's exception table.
     if sig.npe {
+        // The compiled frames this NPE was raised in have already left the
+        // stack: the null-check stub called `jit_npe_with_action`, loaded the
+        // i64::MIN deopt sentinel and ran the epilogue, so construction here
+        // sees only what the interpreter still holds. `sig` carries the
+        // snapshot the helper took while they were live.
+        let npe_snapshot = sig.npe_compiled_frames.take();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
+                crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                    shared,
+                    exc,
+                    npe_snapshot,
+                );
                 return route_jit_signal_exception(
                     shared,
                     thread,
@@ -10849,7 +11210,7 @@ pub(super) fn execute_jit_call_oneshot(
 
     // Run the compiled body. Mirrors `execute_jit_call_decoded`'s run+exception
     // logic (including its one-shot signal drain).
-    let (result, sig) = if !compiled.has_dispatch {
+    let (result, mut sig) = if !compiled.has_dispatch {
         // SAFETY: compiled is a finalized JIT CompiledMethod with a validated entry; args match its JVM descriptor (receiver-aware).
         let fast_result: Result<i64, cratonvm_jit::CompileError> = {
             let _jit_root_guard =
@@ -10926,12 +11287,23 @@ pub(super) fn execute_jit_call_oneshot(
     // helpers, routing each through the JIT'd method's own exception table
     // (same three sinks, same order, as `execute_jit_call_decoded`).
     if sig.npe {
+        // The compiled frames this NPE was raised in have already left the
+        // stack: the null-check stub called `jit_npe_with_action`, loaded the
+        // i64::MIN deopt sentinel and ran the epilogue, so construction here
+        // sees only what the interpreter still holds. `sig` carries the
+        // snapshot the helper took while they were live.
+        let npe_snapshot = sig.npe_compiled_frames.take();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
+                crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                    shared,
+                    exc,
+                    npe_snapshot,
+                );
                 return oneshot_route_exception(
                     shared,
                     thread,
