@@ -41,6 +41,80 @@ impl Compiler {
         false
     }
 
+    /// Emit the SATB pre-barrier gate for a reference store whose receiver is
+    /// in RAX, pushing a bail patch onto `bail` for the cases that must take
+    /// `jit_putfield_object`.
+    ///
+    /// `cell_off` is the displacement of the field's 8-byte reference payload
+    /// from the receiver base -- the compact cell base for a compact layout,
+    /// `cell_off + FIELD_CELL_PAYLOAD64_OFFSET` for a legacy 16-byte cell.
+    /// Clobbers RCX, and R10 when the gate is armed.
+    ///
+    /// # gc-genpause F5.1: why this is a gate and not an unconditional bail
+    ///
+    /// Every one of these sites used to be three instructions:
+    ///
+    /// ```text
+    ///     MOV  RCX, [RAX + cell_off]     ; the old reference
+    ///     TEST RCX, RCX
+    ///     JNZ  helper                    ; non-null old value -> full barrier
+    /// ```
+    ///
+    /// -- taking the helper on ANY non-null old field value, with no way to
+    /// ask whether a mark cycle was even running. But `satb_barrier`, the
+    /// thing that bail leads to, asks exactly that question FIRST and returns
+    /// in two instructions when marking is idle, which is almost always.
+    /// Overwriting a non-null reference field is one of the most common stores
+    /// in Java (`this.next = x`, every field reassignment, every cache
+    /// update), so this was a helper call on a large fraction of compiled
+    /// reference stores to reach a barrier that immediately did nothing.
+    ///
+    /// The receiver here is already known to be YOUNG -- the old-generation
+    /// test above this bails first -- so no card is owed either. A young
+    /// receiver, with no mark cycle running, genuinely needs no barrier at all,
+    /// and this gate is what lets the fast path say so.
+    ///
+    /// # Why the race this looks like is not one
+    ///
+    /// The counter is read at runtime, not baked, so a cycle that arms after
+    /// this method is compiled is seen. And a mutator cannot observe a stale
+    /// zero and then store into a live mark cycle: the counter is armed by
+    /// `set_phase(ConcurrentMark)` inside `ConcurrentMarker::initial_mark`,
+    /// which runs during the initial-mark STW pause with every mutator parked.
+    /// A thread that read zero before the pause has already completed its
+    /// store; a thread that resumes after it reads the armed value. This is
+    /// the same guarantee the interpreter's `satb_barrier` already relies on
+    /// -- it makes the identical check, one level further in.
+    ///
+    /// # Fail-closed
+    ///
+    /// An unpublished (`0`) address restores the unconditional bail, which is
+    /// what a hand-built test helper table gets.
+    pub(super) fn emit_satb_pre_barrier_gate(&mut self, bail: &mut Vec<usize>, cell_off: i32) {
+        // The old reference value, whatever we decide to do about it.
+        self.emit_mov_r64_mem_disp32(RCX, RAX, cell_off);
+        self.emit_test_r64_r64(RCX);
+
+        let armed_addr = self.helpers.satb_armed_addr;
+        if armed_addr == 0 {
+            bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ non-null old
+            return;
+        }
+
+        // A null old value has nothing to log in any mark state.
+        let old_is_null = self.emit_jcc_rel32_patch(0x84); // JZ -> fast store
+
+        // Non-null old value: is any heap actually marking? `MOV r32, m32`
+        // zero-extends into the full 64-bit register, so the 64-bit TEST reads
+        // exactly the four bytes of the counter and nothing beside them.
+        self.emit_mov_imm64_full(R10, armed_addr as i64); // Cast: address -> imm64
+        self.emit_mov_r32_mem_disp32(RCX, R10, 0);
+        self.emit_test_r64_r64(RCX);
+        bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ armed -> helper
+
+        self.patch_rel32_to_here(old_is_null);
+    }
+
     /// Emit the generational post-write barrier using `source_reg` and
     /// `target_reg`, immediately after the reference-slot store.
     ///
@@ -546,10 +620,9 @@ impl Compiler {
             bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old -> helper
         }
 
-        // A non-null old value needs the SATB pre-barrier.
-        self.emit_mov_r64_mem_disp32(RCX, RAX, cell_off);
-        self.emit_test_r64_r64(RCX);
-        bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ non-null -> helper
+        // A non-null old value needs the SATB pre-barrier -- but only while a
+        // mark cycle is actually running (gc-genpause F5.1).
+        self.emit_satb_pre_barrier_gate(&mut bail, cell_off);
 
         // Match the interpreter/helper's silent out-of-bounds drop.
         self.emit_mov_r32_mem_disp32(RCX, RAX, cratonvm_types::NUM_SLOTS_OFFSET as i32);

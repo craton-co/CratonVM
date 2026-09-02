@@ -5535,10 +5535,10 @@ impl Compiler {
                                 }
                                 // non-null OLD value → helper (SATB). The old ref
                                 // is the 8-byte pointer AT the cell base.
-                                self.emit_mov_r64_mem_disp32(RCX, RAX, cell_off);
-                                self.emit_test_r64_r64(RCX);
-                                bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ non-null old
-                                                                            // bounds: field_index < num_slots (header u32 @12).
+                                // gc-genpause F5.1: gated on a live mark cycle
+                                // rather than on the old value alone.
+                                self.emit_satb_pre_barrier_gate(&mut bail, cell_off);
+                                // bounds: field_index < num_slots (header u32 @12).
                                 self.emit_mov_r32_mem_disp32(
                                     RCX,
                                     RAX,
@@ -5614,13 +5614,12 @@ impl Compiler {
                                 }
                                 // non-null OLD value → helper (SATB). Read the cell's
                                 // 8-byte payload; a null old value never needs SATB.
-                                self.emit_mov_r64_mem_disp32(
-                                    RCX,
-                                    RAX,
+                                // gc-genpause F5.1: gated on a live mark cycle
+                                // rather than on the old value alone.
+                                self.emit_satb_pre_barrier_gate(
+                                    &mut bail,
                                     cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32, // Cast: layout offset → disp32
                                 );
-                                self.emit_test_r64_r64(RCX);
-                                bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ non-null old
                                                                             // bounds: field_index < num_slots (header u32 @12).
                                                                             // 32-bit compare — an 8-byte read would fold in the
                                                                             // adjacent gc_age/gc_flags bytes.

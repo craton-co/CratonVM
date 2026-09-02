@@ -24247,6 +24247,14 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         // keeps the native dispatch it has today.
         ffm_segment_get: jit_ffm_segment_get as *const () as usize,
         ffm_segment_set: jit_ffm_segment_set as *const () as usize,
+        // gc-genpause F5.1 -- address of the process-global SATB arming
+        // counter. A `static` in the gc crate, so unlike the card-table
+        // metadata below there is nothing to wait for: it is valid from
+        // process start, it never moves, and it is meaningful under every
+        // backend (a heap that never marks simply leaves it zero). Always
+        // wired; a hand-built test table that leaves it 0 gets the
+        // unconditional SATB bail the compiled fast path had before.
+        satb_armed_addr: cratonvm_gc::satb_armed_addr(),
         // Cooperative JIT safepoint polling (CRATONVM_JIT_SAFEPOINT_POLLS,
         // off by default) — address of the process-global VM's
         // stw_requested flag byte. `process_vm()` is published by

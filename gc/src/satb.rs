@@ -13,10 +13,103 @@
 //! to process. [`SatbBuffer`] remains as a standalone buffer type for callers
 //! that manage their own flushing.
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
+
+// ---------------------------------------------------------------------------
+// The JIT-visible SATB arming counter (gc-genpause F5.1)
+// ---------------------------------------------------------------------------
+
+/// How many live heaps are currently in a concurrent-mark phase where the SATB
+/// pre-barrier has to log.
+///
+/// # Why this exists
+///
+/// [`crate::gen_heap::GenerationalHeap::satb_barrier`] already asks
+/// `is_marking_active()` FIRST and returns in two instructions when marking is
+/// idle -- which is almost always. The compiled reference-store fast path could
+/// not ask that question at all: it bailed to `jit_putfield_object` on ANY
+/// non-null old field value, unconditionally, because the only thing it could
+/// see was the field. Overwriting a non-null reference field is one of the most
+/// common stores in Java (`this.next = x`, every field reassignment), so on the
+/// generational backend a large fraction of compiled reference stores took a
+/// full helper call to reach a barrier that immediately returned.
+///
+/// This counter is the state that question needs, at an address the backend can
+/// bake as a constant: a `static`, so it is fixed for the process lifetime and
+/// readable before any method is compiled -- unlike the per-heap
+/// `Arc<ConcurrentGcState>`, which does not exist until `enable_concurrent_gc`
+/// runs and would leave every method compiled before that point holding a stale
+/// or null address.
+///
+/// # Why a counter and not a flag
+///
+/// A VM host may own more than one heap (this tree has had parallel-test
+/// crashes caused by process-global GC caches). A bare flag would let heap A
+/// leaving its mark phase disarm the barrier while heap B is still marking --
+/// dropping SATB entries heap B needs, which is exactly the class of hole this
+/// module's header is about. A counter cannot do that: it is the NUMBER of
+/// heaps in an active phase, so it only reaches zero when every one of them has
+/// left.
+///
+/// # Failure direction
+///
+/// Non-zero means "some heap is marking, take the helper". The helper then
+/// makes the exact per-heap check and returns if this heap is idle, so a
+/// conservatively-high count costs a call and nothing else. A heap dropped
+/// mid-mark leaks its count, leaving the barrier permanently armed -- slow,
+/// never unsound. Every way this can be wrong is a way that runs MORE barrier
+/// code, not less.
+static SATB_ARMED_HEAPS: AtomicU32 = AtomicU32::new(0);
+
+/// Absolute address of [`SATB_ARMED_HEAPS`], for the JIT to bake as a constant.
+///
+/// Stable for the process lifetime. The backend loads 4 bytes here and takes
+/// the barrier helper when they are non-zero.
+#[inline]
+pub fn satb_armed_addr() -> usize {
+    &SATB_ARMED_HEAPS as *const AtomicU32 as usize
+}
+
+/// Is any heap in an SATB-active phase? The Rust-side reader of the same byte
+/// the JIT tests inline.
+#[inline]
+pub fn satb_armed() -> bool {
+    SATB_ARMED_HEAPS.load(Ordering::Acquire) != 0
+}
+
+/// Record a concurrent-mark phase transition's effect on the arming counter.
+///
+/// Called from [`crate::concurrent_mark::ConcurrentGcState::set_phase`], which
+/// is the only place a phase changes. `was_active`/`now_active` are that
+/// state's own `is_marking_active` predicate applied to the outgoing and
+/// incoming phase, so a no-op transition (setting the phase it already holds,
+/// or moving between two inactive phases) does not touch the counter.
+pub fn note_satb_phase_transition(was_active: bool, now_active: bool) {
+    match (was_active, now_active) {
+        (false, true) => {
+            SATB_ARMED_HEAPS.fetch_add(1, Ordering::Release);
+        }
+        (true, false) => {
+            // Saturating: an underflow would wrap to `u32::MAX` and arm the
+            // barrier forever. Clamping at zero disarms instead, which is the
+            // direction a mismatched pair should never reach -- so assert it in
+            // debug builds rather than papering over it everywhere.
+            debug_assert!(
+                SATB_ARMED_HEAPS.load(Ordering::Acquire) > 0,
+                "SATB arming counter underflow: a heap left an active mark phase                  it was never counted as entering",
+            );
+            let _ = SATB_ARMED_HEAPS.fetch_update(
+                Ordering::Release,
+                Ordering::Acquire,
+                |n| Some(n.saturating_sub(1)),
+            );
+        }
+        _ => {}
+    }
+}
 
 // ---------------------------------------------------------------------------
 // SATB activation state (round-5 CRIT #4 fix — TOCTOU)

@@ -179,6 +179,9 @@ pub use reference::{
 // `#[deprecated]` note on the type). The production region-based collector
 // is `G1Collector` (`g1.rs`), reached through `VmHeap::G1`.
 pub use region::{RegionType, RememberedSet};
-pub use satb::{flush_thread_satb_buffer, satb_thread_local_log, SatbBuffer, SatbQueue};
+pub use satb::{
+    flush_thread_satb_buffer, satb_armed, satb_armed_addr, satb_thread_local_log, SatbBuffer,
+    SatbQueue,
+};
 pub use tlab::Tlab;
 pub use vm_heap::{GcBackend, VmHeap};

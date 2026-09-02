@@ -114,7 +114,7 @@ use crate::JitRuntimeHelpers;
 /// (Revision `2` shipped the 60-field table; the `monitor_enter`/`monitor_exit`
 /// append that made it 62 did not bump this constant, because at the time
 /// nothing checked it. `ABI_REVISIONS` is that check.)
-pub const JIT_HELPERS_ABI_VERSION: u32 = 9;
+pub const JIT_HELPERS_ABI_VERSION: u32 = 10;
 
 /// Size in bytes of the helper table under [`JIT_HELPERS_ABI_VERSION`].
 ///
@@ -837,6 +837,10 @@ helper_field_table! {
     (ldc_string_cp,                  Function, false),
     (ffm_segment_get,                Function, false),
     (ffm_segment_set,                Function, false),
+    // Baked absolute address of the SATB arming counter, not callable. Zero
+    // under a hand-built table, and the backend then keeps the unconditional
+    // SATB bail it had before gc-genpause F5.1.
+    (satb_armed_addr,                Constant, false),
 }
 
 // ---------------------------------------------------------------------
@@ -857,7 +861,7 @@ const _: () = assert!(
 
 // Pin the literal count so a *removal* also has to touch this line.
 const _: () = assert!(
-    NUM_HELPER_FIELDS == 69,
+    NUM_HELPER_FIELDS == 70,
     "JitRuntimeHelpers field count changed — bump JIT_HELPERS_ABI_VERSION, the \
      literal here, and the size literal below",
 );
@@ -865,8 +869,8 @@ const _: () = assert!(
 // Pin the literal size and alignment. The JIT bakes `disp32` offsets derived
 // from this layout into RWX memory; a silent change here is a wild call.
 const _: () = assert!(
-    JIT_HELPERS_ABI_SIZE == 552,
-    "JitRuntimeHelpers size changed (expected 67 * 8 = 536) — the JIT's baked \
+    JIT_HELPERS_ABI_SIZE == 560,
+    "JitRuntimeHelpers size changed (expected 70 * 8 = 560) — the JIT's baked \
      helper offsets are now wrong; bump JIT_HELPERS_ABI_VERSION deliberately",
 );
 const _: () = assert!(
@@ -1031,6 +1035,7 @@ pub const GOLDEN_HELPER_OFFSETS: [(&str, usize); NUM_HELPER_FIELDS] = [
     ("ldc_string_cp", 528),
     ("ffm_segment_get", 536),
     ("ffm_segment_set", 544),
+    ("satb_armed_addr", 552),
 ];
 
 // Every golden row must name the descriptor row at the same index AND agree
@@ -1166,6 +1171,18 @@ pub const ABI_REVISIONS: &[HelperAbiRevision] = &[
         version: 9,
         num_fields: 69,
         size: 552,
+    },
+    // v10 -- appended `satb_armed_addr`, the process-global SATB arming
+    // counter (gc-genpause F5.1). The compiled reference-store fast path used
+    // to bail to `jit_putfield_object` on ANY non-null old field value, with no
+    // way to ask whether a mark cycle was even running -- while
+    // `GenerationalHeap::satb_barrier`, the thing it bails TO, asks exactly
+    // that question first and returns. Baking this address lets the fast path
+    // ask it inline. Optional: a zero slot restores the unconditional bail.
+    HelperAbiRevision {
+        version: 10,
+        num_fields: 70,
+        size: 560,
     },
 ];
 
@@ -1382,7 +1399,7 @@ const _: () = {
          really is a displacement and is range-checked by validate_with",
     );
     assert!(
-        constants == 6,
+        constants == 7,
         "the number of baked-address slots changed — a Constant slot is loaded \
          as data and is NOT range-checked by validate_with, so misclassifying \
          a displacement as one silently removes its only sanity check",
@@ -1758,6 +1775,7 @@ mod tests {
             ("ldc_string_cp", offset_of!(H, ldc_string_cp)),
             ("ffm_segment_get", offset_of!(H, ffm_segment_get)),
             ("ffm_segment_set", offset_of!(H, ffm_segment_set)),
+            ("satb_armed_addr", offset_of!(H, satb_armed_addr)),
         ];
 
         assert_eq!(HELPER_FIELDS.len(), probes.len());
@@ -1788,15 +1806,15 @@ mod tests {
     /// loudly rather than be absorbed by a computed expression.
     #[test]
     fn helper_table_size_and_align_are_the_literal_abi_numbers() {
-        assert_eq!(core::mem::size_of::<H>(), 552);
+        assert_eq!(core::mem::size_of::<H>(), 560);
         assert_eq!(core::mem::align_of::<H>(), 8);
-        assert_eq!(JIT_HELPERS_ABI_SIZE, 552);
+        assert_eq!(JIT_HELPERS_ABI_SIZE, 560);
         assert_eq!(JIT_HELPERS_ABI_ALIGN, 8);
         assert_eq!(HELPER_FIELD_STRIDE, 8);
-        assert_eq!(NUM_HELPER_FIELDS, 69);
-        assert_eq!(H::NUM_FIELDS, 69);
+        assert_eq!(NUM_HELPER_FIELDS, 70);
+        assert_eq!(H::NUM_FIELDS, 70);
         assert_eq!(H::NUM_HELPER_FN_FIELDS, 59);
-        assert_eq!(JIT_HELPERS_ABI_VERSION, 9);
+        assert_eq!(JIT_HELPERS_ABI_VERSION, 10);
     }
 
     /// The golden table is the only name→offset binding in the crate written
@@ -1821,7 +1839,7 @@ mod tests {
         }
         // The last golden offset plus one stride is the whole table.
         let (last_name, last_offset) = GOLDEN_HELPER_OFFSETS[H::NUM_FIELDS - 1];
-        assert_eq!(last_name, "ffm_segment_set");
+        assert_eq!(last_name, "satb_armed_addr");
         assert_eq!(last_offset + HELPER_FIELD_STRIDE, JIT_HELPERS_ABI_SIZE);
     }
 
@@ -1834,9 +1852,9 @@ mod tests {
         assert_eq!(
             last,
             HelperAbiRevision {
-                version: 9,
-                num_fields: 69,
-                size: 552,
+                version: 10,
+                num_fields: 70,
+                size: 560,
             },
         );
         // Append-only history: each revision strictly grows the table.
@@ -2032,7 +2050,7 @@ mod tests {
         let required = HELPER_FIELDS.iter().filter(|d| d.required).count();
         assert_eq!(functions, 59, "callable slots");
         assert_eq!(offsets, 4, "displacement slots");
-        assert_eq!(constants, 6, "baked-address slots");
+        assert_eq!(constants, 7, "baked-address slots");
         assert_eq!(required, 43, "required slots");
         assert_eq!(functions - required, 16, "optional callable slots");
         assert_eq!(functions + offsets + constants, H::NUM_FIELDS);
@@ -2193,11 +2211,11 @@ mod tests {
         h.newarray = 1;
         // The LAST field, whatever it currently is — `ffm_segment_set`
         // since the FFM element accessors were appended.
-        h.ffm_segment_set = 2;
+        h.satb_armed_addr = 2;
         let w = h.as_words();
         assert_eq!(w[0], 1, "first slot");
         assert_eq!(w[H::NUM_FIELDS - 1], 2, "last slot");
-        assert_eq!(w.len(), 69);
+        assert_eq!(w.len(), 70);
     }
 
     /// Build a table with every *required* slot non-zero and every optional

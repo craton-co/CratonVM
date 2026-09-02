@@ -1411,6 +1411,19 @@ pub struct JitRuntimeHelpers {
     /// `value` carries raw bits: the integral kinds in their low bytes, float
     /// and double as `to_bits()`.
     pub ffm_segment_set: usize,
+    /// Baked absolute address of the process-global SATB arming counter
+    /// (`cratonvm_gc::satb_armed_addr`), not callable.
+    ///
+    /// A `u32` that counts how many live heaps are in a concurrent-mark phase
+    /// where the SATB pre-barrier must log. The compiled reference-store fast
+    /// path loads it and takes the full-barrier helper only when it is
+    /// non-zero, instead of taking that helper on EVERY non-null old field
+    /// value the way it used to (gc-genpause F5.1).
+    ///
+    /// Optional: `0` means "unpublished", and the backend then keeps the old
+    /// unconditional bail. That is the fail-closed direction and it is what a
+    /// hand-built test helper table gets.
+    pub satb_armed_addr: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -1600,6 +1613,9 @@ helper_fields! {
     (ldc_string_cp,                  FieldKind::OptionalPtr),
     (ffm_segment_get,                FieldKind::OptionalPtr),
     (ffm_segment_set,                FieldKind::OptionalPtr),
+    // Constant, not callable: the address of the SATB arming counter. Zero
+    // means unpublished, and the backend keeps its unconditional SATB bail.
+    (satb_armed_addr,                FieldKind::Offset),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -1625,7 +1641,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 69,
+    JitRuntimeHelpers::NUM_FIELDS == 70,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -2024,6 +2040,7 @@ mod tests {
             ldc_string_cp: 0x11D8,
             ffm_segment_get: 0x11E0,
             ffm_segment_set: 0x11E8,
+            satb_armed_addr: 0x11F0,
         }
     }
 
@@ -2265,6 +2282,7 @@ mod tests {
             ldc_string_cp: 0,
             ffm_segment_get: 0,
             ffm_segment_set: 0,
+            satb_armed_addr: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -2440,8 +2458,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 67.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 69);
+        // And the macro-driven count is the canonical 70.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 70);
     }
 
     #[test]
@@ -2784,6 +2802,11 @@ mod tests {
                 "ffm_segment_set",
                 std::mem::offset_of!(JitRuntimeHelpers, ffm_segment_set),
             ),
+            (
+                69,
+                "satb_armed_addr",
+                std::mem::offset_of!(JitRuntimeHelpers, satb_armed_addr),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -2839,7 +2862,7 @@ mod tests {
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 43, "required-pointer count drifted");
         assert_eq!(opt, 16, "optional-pointer count drifted");
-        assert_eq!(off, 10, "offset-field count drifted");
+        assert_eq!(off, 11, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }
 

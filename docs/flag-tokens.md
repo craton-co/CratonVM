@@ -836,7 +836,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-85 tokens.
+88 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -845,6 +845,8 @@ export inherited from a parent shell.
 | `moving-young-bounds-guard` | `CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD` |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
 | `card-table-only` | `CRATONVM_CARD_TABLE_ONLY` |
+| `full-rset-scan` | `CRATONVM_GC_FULL_RSET_SCAN` |
+| `verify-rset` | `CRATONVM_GC_VERIFY_RSET` |
 | `compact-ref-fields` | `CRATONVM_COMPACT_REF_FIELDS` |
 | `pack-fields-by-width` | `CRATONVM_PACK_FIELDS_BY_WIDTH` |
 | `compressed-oops` | `CRATONVM_COMPRESSED_OOPS` |
@@ -896,6 +898,7 @@ export inherited from a parent shell.
 | `selective-promote` | `CRATONVM_NO_SELECTIVE_PROMOTE` |
 | `stress` | `CRATONVM_GC_STRESS` |
 | `sweep-anchor-stride` | `CRATONVM_GC_SWEEP_ANCHOR_STRIDE` |
+| `young-trigger-percent` | `CRATONVM_GC_YOUNG_TRIGGER_PERCENT` |
 | `tlab-gc-trigger` | `CRATONVM_TLAB_GC_TRIGGER` |
 | `weakref-clear` | `CRATONVM_WEAKREF_CLEAR` |
 | `youngscan-stride` | `CRATONVM_YOUNGSCAN_STRIDE` |

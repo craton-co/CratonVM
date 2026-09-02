@@ -677,6 +677,7 @@ fn test_helpers() -> JitRuntimeHelpers {
         // accessor site in these tests keeps its ordinary native dispatch.
         ffm_segment_get: 0,
         ffm_segment_set: 0,
+        satb_armed_addr: 0,
     }
 }
 
@@ -5059,7 +5060,7 @@ fn inline_ref_putfield_fast_path_is_gated_on_published_region_bounds() {
     assert_eq!(
         CALLS.load(Ordering::SeqCst),
         1,
-        "a non-null old value must take the SATB pre-barrier helper"
+        "a non-null old value must take the SATB pre-barrier helper when this          table publishes no SATB arming counter (`test_helpers()` leaves          `satb_armed_addr` at 0, the fail-closed shape). The gated version of          this case is          `inline_ref_putfield_satb_bail_is_gated_on_a_live_mark_cycle`."
     );
 
     // 5. Old-generation receiver ⇒ helper (card / RSet), even with a null
@@ -5081,6 +5082,167 @@ fn inline_ref_putfield_fast_path_is_gated_on_published_region_bounds() {
         CALLS.load(Ordering::SeqCst),
         1,
         "an old-generation receiver must take the full-barrier helper"
+    );
+}
+
+/// gc-genpause F5.1: a non-null old value is no longer sufficient, on its own,
+/// to send a compiled reference store to `jit_putfield_object`.
+///
+/// The receiver has already been proven young by the time the SATB test runs,
+/// so it owes no card either -- with no mark cycle running it owes no barrier
+/// at all, and the old code took a helper call to discover that. This pins all
+/// four states, including the one that proves the counter is READ at runtime
+/// rather than folded in at compile time: re-disarming it restores the fast
+/// path in the SAME compiled body.
+#[test]
+fn inline_ref_putfield_satb_bail_is_gated_on_a_live_mark_cycle() {
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    static BOUNDS: [AtomicUsize; 6] = [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ];
+    /// Stands in for `cratonvm_gc::satb_armed_addr()`: the number of heaps in
+    /// an SATB-active mark phase.
+    static ARMED: AtomicU32 = AtomicU32::new(0);
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    unsafe extern "C" fn marker_putfield_object(_vm: i64, _obj: i64, _idx: i64, _val: i64) {
+        CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    // void setRef(Object this, Object v) { this.f = v; }
+    let code: Vec<u8> = vec![
+        0x2a, // 0: aload_0
+        0x2b, // 1: aload_1
+        0xb5, 0x00, 0x01, // 2: putfield #1 (reference)
+        0xb1, // 5: return
+        0, 0,
+    ];
+    let code_len = 6;
+    let field_info = vec![(2usize, 0usize, b'L')];
+    let mut helpers = test_helpers();
+    helpers.putfield_object = marker_putfield_object as *const () as usize; // Cast: fn -> helpers slot
+    helpers.region_bounds_addr = BOUNDS.as_ptr() as usize; // Cast: static address
+    helpers.satb_armed_addr = &ARMED as *const AtomicU32 as usize; // Cast: static address
+
+    set_pending_compact_field_info(vec![(2, 0, true)]);
+    let compiled = compile(
+        &code,
+        code_len,
+        2,
+        2,
+        true, // needs_heap
+        Vec::new(),
+        field_info,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(), // pic_slots
+        Vec::new(), // ldc_info
+        Vec::new(), // ldc2w_info
+        HashMap::new(),
+        HashMap::new(),
+        &helpers,
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None, // string_layout
+    )
+    .expect("reference putfield must compile");
+
+    let mut obj = fake_compact_young_object();
+    let val = Box::new([0u64; 8]);
+    let obj_addr = obj.as_mut_ptr() as usize; // Cast: receiver address
+    let val_addr = val.as_ptr() as usize; // Cast: stored reference
+
+    // Generational shape: publish a range covering the receiver, or every
+    // case below bails on containment and proves nothing about SATB.
+    let page = obj_addr & !0xFFF;
+    BOUNDS[0].store(page, Ordering::Release);
+    BOUNDS[1].store(page + 0x10000, Ordering::Release);
+    assert!(region_bounds_are_live(helpers.region_bounds_addr));
+
+    // 1. Null old value, disarmed. Unchanged behaviour, and it is what makes
+    //    the cell non-null for every case after it.
+    ARMED.store(0, Ordering::Release);
+    CALLS.store(0, Ordering::SeqCst);
+    // SAFETY: JIT-compiled code from valid bytecode in an executable mmap; the
+    // receiver is a live 64-byte buffer shaped like an object header and the
+    // marker helper performs no store.
+    unsafe {
+        compiled.call_with_heap(0, &[obj_addr as i64, val_addr as i64]); // Cast: JIT ABI
+    }
+    assert_eq!(CALLS.load(Ordering::SeqCst), 0, "null old value, no marking");
+    assert_eq!(fake_object_ref_cell(&obj), val_addr, "the store must land");
+
+    // 2. THE CHANGE. Non-null old value, still no mark cycle: a young receiver
+    //    owes no card and an idle collector owes no SATB entry, so the whole
+    //    store is inline.
+    CALLS.store(0, Ordering::SeqCst);
+    // SAFETY: as above.
+    unsafe {
+        compiled.call_with_heap(0, &[obj_addr as i64, val_addr as i64]); // Cast: JIT ABI
+    }
+    assert_eq!(
+        CALLS.load(Ordering::SeqCst),
+        0,
+        "a non-null old value with NO mark cycle running must keep the          barrier-free fast path -- this is the helper call gc-genpause F5.1          removes"
+    );
+    assert_eq!(fake_object_ref_cell(&obj), val_addr, "the store must land");
+
+    // 3. Armed. The SATB entry is now genuinely owed, so the helper runs --
+    //    and the marker helper does not store, which is how we can tell.
+    unsafe {
+        let p = obj.as_mut_ptr() as *mut u8; // Cast: array base -> byte cursor
+        std::ptr::write_bytes(p.add(HEADER_SIZE), 0, 8);
+    }
+    ARMED.store(1, Ordering::Release);
+    CALLS.store(0, Ordering::SeqCst);
+    // SAFETY: as above.
+    unsafe {
+        compiled.call_with_heap(0, &[obj_addr as i64, val_addr as i64]); // Cast: JIT ABI
+    }
+    // The cell was re-zeroed above, so this call has a NULL old value and the
+    // gate lets it through even while armed -- the null elision is orthogonal
+    // and case 4 is the one that exercises the armed bail.
+    assert_eq!(
+        CALLS.load(Ordering::SeqCst),
+        0,
+        "a null old value needs no SATB entry even during a mark cycle"
+    );
+
+    // 4. Armed AND a non-null old value: the one combination that owes the
+    //    pre-barrier.
+    CALLS.store(0, Ordering::SeqCst);
+    // SAFETY: as above.
+    unsafe {
+        compiled.call_with_heap(0, &[obj_addr as i64, val_addr as i64]); // Cast: JIT ABI
+    }
+    assert_eq!(
+        CALLS.load(Ordering::SeqCst),
+        1,
+        "a non-null old value DURING a mark cycle must still take the SATB          pre-barrier helper"
+    );
+
+    // 5. Disarm again, same compiled body. If the emitter had folded the
+    //    counter's value in at compile time rather than baking its ADDRESS,
+    //    this would still call the helper.
+    ARMED.store(0, Ordering::Release);
+    CALLS.store(0, Ordering::SeqCst);
+    // SAFETY: as above.
+    unsafe {
+        compiled.call_with_heap(0, &[obj_addr as i64, val_addr as i64]); // Cast: JIT ABI
+    }
+    assert_eq!(
+        CALLS.load(Ordering::SeqCst),
+        0,
+        "the arming counter is read at RUNTIME: disarming restores the fast          path in the same compiled body"
     );
 }
 
