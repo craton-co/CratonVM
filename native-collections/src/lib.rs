@@ -6177,12 +6177,66 @@ pub fn native_al_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(Some(old))
 }
 
+/// Is `this` one of the JDK's IMMUTABLE stand-in classes, for which a
+/// structural mutator must raise `UnsupportedOperationException`?
+///
+/// In real-JDK mode these receivers carry real bytecode — `Collections$EmptyList`
+/// inherits `AbstractList.add`, which throws — so nothing here is consulted. In
+/// `--synthetic-jdk` there is no bytecode, the interface-registered natives
+/// serve the call instead, and they mutated happily. Measured 2026-09-02 with
+/// `apps/probes/EmptySingletonImmutable`:
+///
+/// ```text
+///     Collections.emptyList().add("x")        SUCCEEDED   (HotSpot: UOE)
+///     Collections.emptyMap().put("k","v")     SUCCEEDED   (HotSpot: UOE)
+///     Collections.singletonList("a").add("x") SUCCEEDED   (HotSpot: UOE)
+///     Arrays.asList("a","b").add("x")         SUCCEEDED   (HotSpot: UOE)
+/// ```
+///
+/// `List.of` / `Set.of` / `Map.of` / `unmodifiable*` were already correct in
+/// every mode: they carry the `cratonvm/internal/Unmodifiable*` stamp, whose
+/// own natives refuse. These seven are the ones minted under a JDK class name
+/// with no such stamp.
+///
+/// **Structural mutators only.** `Arrays$ArrayList` is fixed-SIZE, not
+/// immutable: `add`/`remove` throw on HotSpot and `set` is legal and writes
+/// through to the backing array. That is why this is consulted from `add` and
+/// `put` rather than from a blanket "any write" check — a guard that also
+/// refused `set` would break `Arrays.asList(a).set(0, x)`, which is the
+/// idiomatic reason to call `asList` at all.
+fn is_immutable_jdk_stand_in(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let Some(name) = ctx.class_name_of_id(ctx.class_id_of_object(this)) else {
+        return false;
+    };
+    matches!(
+        &*name,
+        "java/util/Collections$EmptyList"
+            | "java/util/Collections$EmptySet"
+            | "java/util/Collections$EmptyMap"
+            | "java/util/Collections$SingletonList"
+            | "java/util/Collections$SingletonSet"
+            | "java/util/Collections$SingletonMap"
+            | "java/util/Arrays$ArrayList"
+    )
+}
+
 pub fn native_al_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // An immutable JDK stand-in refuses structurally — see
+    // `is_immutable_jdk_stand_in` for the measurement and for why `set` is not
+    // guarded alongside `add`.
+    if is_immutable_jdk_stand_in(ctx, this) {
+        return Err(
+            cratonvm_types::error::RuntimeError::UnsupportedOperationException {
+                message: String::new(),
+            }
+            .into(),
+        );
+    }
     // A `values()` / TreeMap-`entrySet()` view is an `ArrayList` here, but it is
     // not addable. `Map.values`: "The collection supports element removal ... It
     // does not support the `add` or `addAll` operations"; the JDK's
@@ -12671,6 +12725,19 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     //
     // Deliberately here rather than inside `native_map_put_evict`: the `evict`
     // flag is `LinkedHashMap.removeEldestEntry`'s, and a TreeMap has no eldest.
+    // An immutable JDK stand-in (`Collections$EmptyMap`, `$SingletonMap`)
+    // refuses — see `is_immutable_jdk_stand_in`. Ahead of the TreeMap route
+    // because neither of those is a TreeMap and the refusal is unconditional.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if is_immutable_jdk_stand_in(ctx, *this) {
+            return Err(
+                cratonvm_types::error::RuntimeError::UnsupportedOperationException {
+                    message: String::new(),
+                }
+                .into(),
+            );
+        }
+    }
     if let Some(Value::Object(Some(this))) = args.first() {
         if is_tree_map_receiver(ctx, *this) {
             return native_tm_put(ctx, args);
@@ -23484,7 +23551,14 @@ fn native_collections_empty_list(ctx: &mut dyn NativeContext, _args: &[Value]) -
     if let Some(v) = collections_empty_singleton(ctx, "EMPTY_LIST") {
         return Ok(Some(v));
     }
-    // Fallback (field not yet initialised): fresh synthetic empty list.
+    // See `native_collections_empty_map` for why this precedes the synthetic:
+    // the sibling `native_collections_singleton_list` just below already does
+    // it, which is why `singletonList` reported the right class in
+    // `--synthetic-jdk` while `emptyList` reported `java.util.ArrayList`.
+    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$EmptyList") {
+        return Ok(Some(Value::Object(Some(o))));
+    }
+    // Last resort: fresh synthetic empty list.
     let __al_n_fields = al_slots(ctx).2;
     let list = try_alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields)?;
     let arr = alloc_ref_array(ctx, 0);
@@ -46040,6 +46114,14 @@ fn register_array_deque_natives(r: &mut NativeMethodRegistry) {
 
     r.register(c, "<init>", "()V", native_ad_init);
     r.register(c, "<init>", "(I)V", native_ad_init_capacity);
+    // `(Collection)` — see the note on `java/util/Vector`'s. `addLast` per
+    // element, which is what `ArrayDeque(Collection)` specifies.
+    r.register(
+        c,
+        "<init>",
+        "(Ljava/util/Collection;)V",
+        native_ad_init_from_collection,
+    );
     r.register(c, "size", "()I", native_ad_size);
     r.register(c, "isEmpty", "()Z", native_ad_is_empty);
     r.register(c, "addFirst", "(Ljava/lang/Object;)V", native_ad_add_first);
@@ -46107,15 +46189,34 @@ fn register_array_deque_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(c, "clear", "()V", native_ad_clear);
     r.register(c, "toArray", "()[Ljava/lang/Object;", native_ad_to_array);
-    // NO `iterator` REGISTRATION. Real `ArrayDeque.iterator()` bytecode runs,
-    // and that is the fix for the fail-fast row this family carried, not a
-    // concession. The JDK's `DeqIterator` is fail-fast off a PHYSICAL index
-    // into the ring buffer -- `nonNullElementAt` reports any null it reads as a
-    // `ConcurrentModificationException` -- so it is exactly as fail-fast as the
-    // buffer's layout, and no counter reproduces it. `ad_state` derives the
-    // element count and `ad_grow`/`ad_remove_at_logical` reproduce the JDK's
-    // own layout byte for byte, so there is nothing left for a shadow to
-    // protect. See `native_ad_iterator`'s removal in the same commit.
+    // NO `iterator` REGISTRATION in real-JDK mode. Real `ArrayDeque.iterator()`
+    // bytecode runs, and that is the fix for the fail-fast row this family
+    // carried, not a concession. The JDK's `DeqIterator` is fail-fast off a
+    // PHYSICAL index into the ring buffer -- `nonNullElementAt` reports any
+    // null it reads as a `ConcurrentModificationException` -- so it is exactly
+    // as fail-fast as the buffer's layout, and no counter reproduces it.
+    // `ad_state` derives the element count and `ad_grow`/`ad_remove_at_logical`
+    // reproduce the JDK's own layout byte for byte, so there is nothing left
+    // for a shadow to protect. See `native_ad_iterator`'s removal in the same
+    // commit.
+    //
+    // `--synthetic-jdk` HAS NO SUCH BYTECODE, and the consequence is measured
+    // 2026-09-02 (`apps/probes/AdDispatch`): after `d.add("a")`, `size()`
+    // answers 1 and `peekFirst()` answers "a" while a for-each yields ZERO
+    // elements — a silently empty loop, through every declared type and
+    // through `addLast` as well. OPEN, and deliberately not fixed here.
+    //
+    // A `#[cfg(feature = "synthetic-jdk")]` registration was written and
+    // REVERTED, because the cheap version of it is the trap this crate already
+    // names: minting `java/util/ArrayDeque$Itr` arms the dormant registration
+    // at the bottom of `register_snapshot_iterator_natives`, which that comment
+    // calls "a trap armed for whoever produces one later". Doing it right means
+    // minting the real `ArrayDeque$DeqIterator` with the snapshot fields — i.e.
+    // putting ArrayDeque back into `VALUES_ITR_CARRIERS`, which it LEFT on
+    // 2026-08-30 — and that table's own doc records `DescendingIterator` making
+    // java.base a second producer of the carrier class the last time it was
+    // done. Two measured decisions to reverse and a two-producer hazard to
+    // re-open; it wants the census that owns this area, not a side edit.
     r.register(c, "toString", "()Ljava/lang/String;", native_ad_to_string);
     r.register(
         c,
@@ -46124,6 +46225,38 @@ fn register_array_deque_natives(r: &mut NativeMethodRegistry) {
         native_ad_for_each,
     );
     r.set_category(__prev_cat);
+}
+
+/// `ArrayDeque(Collection)` — `this(); addAll(c);`, per the JDK.
+///
+/// Same shape as `native_ll_init_from_collection`, including its GC discipline:
+/// `collect_collection_elements_or_real` re-enters Java and every `addLast`
+/// can grow the backing array, so `this` is pinned and each element re-read
+/// per iteration rather than held across the call.
+fn native_ad_init_from_collection(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    reject_null_collection(args.get(1))?;
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    native_ad_init(ctx, args)?;
+    let source = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let elems = collect_collection_elements_or_real(ctx, source)?;
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    for (i, val) in elems.iter().enumerate() {
+        let this = ctx.read_native_pin(this_pin, this);
+        let val = read_pinned_elem(ctx, handles[i], *val);
+        native_ad_add_last(ctx, &[Value::Object(Some(this)), val])?;
+    }
+    ctx.unpin_native_roots(this_pin);
+    Ok(None)
 }
 
 fn native_ad_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -47032,6 +47165,17 @@ fn register_priority_queue_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Comparator;)V",
         native_pq_init_comparator,
     );
+    // `(Collection)` — see the note on `java/util/Vector`'s. This one must
+    // route through `native_pq_add` rather than copying the source order: a
+    // `PriorityQueue` is a heap, and `PriorityQueue(Collection)` on HotSpot
+    // heapifies. Copying element order would produce a queue whose `poll()`
+    // sequence is the source's, not the comparator's.
+    r.register(
+        c,
+        "<init>",
+        "(Ljava/util/Collection;)V",
+        native_pq_init_from_collection,
+    );
     r.register(c, "size", "()I", native_pq_size);
     r.register(c, "isEmpty", "()Z", native_pq_is_empty);
     r.register(c, "add", "(Ljava/lang/Object;)Z", native_pq_add);
@@ -47045,6 +47189,39 @@ fn register_priority_queue_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "iterator", "()Ljava/util/Iterator;", native_pq_iterator);
     r.register(c, "toString", "()Ljava/lang/String;", native_pq_to_string);
     r.set_category(__prev_cat);
+}
+
+/// `PriorityQueue(Collection)` — `this(); addAll(c);`.
+///
+/// Routed through `native_pq_add` per element rather than copying the source
+/// array, because a `PriorityQueue` is a HEAP: `PriorityQueue(Collection)`
+/// heapifies on HotSpot, and a queue built by copying source ORDER would
+/// `poll()` in the source's sequence rather than the comparator's. Same GC
+/// discipline as `native_ad_init_from_collection`.
+fn native_pq_init_from_collection(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    reject_null_collection(args.get(1))?;
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    native_pq_init(ctx, args)?;
+    let source = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let elems = collect_collection_elements_or_real(ctx, source)?;
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    for (i, val) in elems.iter().enumerate() {
+        let this = ctx.read_native_pin(this_pin, this);
+        let val = read_pinned_elem(ctx, handles[i], *val);
+        native_pq_add(ctx, &[Value::Object(Some(this)), val])?;
+    }
+    ctx.unpin_native_roots(this_pin);
+    Ok(None)
 }
 
 fn native_pq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -47433,6 +47610,18 @@ fn register_vector_natives(r: &mut NativeMethodRegistry) {
 
     r.register(c, "<init>", "()V", native_al_init);
     r.register(c, "<init>", "(I)V", native_al_init_capacity);
+    // `(Collection)` — the copy constructor. Absent until 2026-09-02, so
+    // `new Vector<>(someList)` raised `NoSuchMethodError` in `--synthetic-jdk`
+    // (real-JDK mode runs the class's own bytecode and never reaches here).
+    // Bound to the shared ArrayList implementation like every other method on
+    // this class: `al_slots_for` resolves `elementData`/`elementCount` against
+    // the RECEIVER's layout, which is the whole reason Vector can share these.
+    r.register(
+        c,
+        "<init>",
+        "(Ljava/util/Collection;)V",
+        native_al_init_from_collection,
+    );
     r.register(c, "size", "()I", native_al_size);
     r.register(c, "isEmpty", "()Z", native_al_is_empty);
     r.register(c, "get", "(I)Ljava/lang/Object;", native_vec_get);
@@ -67225,7 +67414,31 @@ fn native_collections_empty_map(ctx: &mut dyn NativeContext, _args: &[Value]) ->
     if let Some(v) = collections_empty_singleton(ctx, "EMPTY_MAP") {
         return Ok(Some(v));
     }
-    // Fallback (field not yet initialised): fresh synthetic empty map.
+    // `alloc_real_jdk` FIRST, exactly as `native_collections_singleton_list`
+    // does one screen up, and for the same reason: it resolves the class the
+    // JDK would have returned in BOTH modes — real-JDK from the image, and
+    // `--synthetic-jdk` from `class_manager`'s fabrication tables, which carry
+    // `Collections$Empty*` field shapes and interface rows already. Only the
+    // static-field cache above is real-JDK-only.
+    //
+    // Without it this fallback minted an ordinary mutable synthetic, so in
+    // `--synthetic-jdk` (measured 2026-09-02, `apps/probes/EmptySingletonImmutable`):
+    //
+    //     Collections.emptyList()  class=java.util.ArrayList
+    //                              instanceof ArrayList = true
+    //                              add("x") = SUCCEEDED
+    //
+    // The `add` is the defect. `ensure_collections_empty_singletons` above
+    // records what a mutable empty singleton cost the last time one shipped —
+    // kotlin-reflect's shaded protobuf tests `instanceof ArrayList` to decide
+    // whether to replace its `emptyList()` placeholder, skipped the
+    // replacement, and mutated the shared object. Here each call happens to
+    // mint a FRESH list, so the write is not shared — it is silently DISCARDED
+    // instead, which is the same class of wrong answer with a quieter failure.
+    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$EmptyMap") {
+        return Ok(Some(Value::Object(Some(o))));
+    }
+    // Last resort: fresh synthetic empty map.
     let map = alloc_backing_map(ctx);
     map_init_eager(ctx, &[Value::Object(Some(map))])?;
     Ok(Some(Value::Object(Some(map))))
@@ -67235,7 +67448,11 @@ fn native_collections_empty_set(ctx: &mut dyn NativeContext, _args: &[Value]) ->
     if let Some(v) = collections_empty_singleton(ctx, "EMPTY_SET") {
         return Ok(Some(v));
     }
-    // Fallback (field not yet initialised): fresh synthetic empty set.
+    // See `native_collections_empty_map` for why this precedes the synthetic.
+    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$EmptySet") {
+        return Ok(Some(Value::Object(Some(o))));
+    }
+    // Last resort: fresh synthetic empty set.
     let set = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
     let inner_map = alloc_backing_map(ctx);
     map_init_eager(ctx, &[Value::Object(Some(inner_map))])?;

@@ -148,16 +148,97 @@ moves — and its variance collapses too (1.40-1.51 against 1.54-2.54).
 Give the emitter an internal `Vec<PtxInstr>` — an enum per mnemonic with
 typed register operands — and render to text once at the end.
 
-Every text-scanning workaround above becomes a list operation.
-Peepholes become possible at all. The three codegen fixes above would
+Every text-scanning workaround above becomes a list operation, and
+peepholes become possible at all. The three codegen fixes above would
 have been passes rather than edits at six emit sites, and the next one
-would be cheaper still. CSE of repeated addresses (visible today: a
-kernel reading `in[i]` twice emits `mad.wide.s32` twice) becomes a
-dozen lines.
+would be cheaper still.
 
 It does not buy general control flow, and it does not buy SCEV. It is
 maybe a week, and it makes the rest of this file's future cheaper
 whether or not the larger option is ever taken.
+
+**It does not buy CSE, and the earlier version of this note was wrong to
+promise it.** See below.
+
+## Retired: three residuals `ptxas` already handles
+
+Measured 2026-09-02 with `ptxas -O3 -v` and `cuobjdump -sass` from CUDA
+13.3, hand-writing the "after" form of each and comparing the generated
+SASS. All three had been listed here as work worth doing. None of them
+are.
+
+**Redundant address and load computation.** The branching-loop kernel
+emits `mad.wide.s32` three times for the same `in[i]`, and
+`ld.global.s32` three times with it — once in the guard block and once
+in each arm. Hand-CSE'd to one of each:
+
+```text
+                    SASS instructions   IMAD.WIDE   LDG.E   registers
+  as emitted                       24           -       1           8
+  hand-CSE'd                       24           -       1           8
+```
+
+Byte-for-byte identical. `ptxas` performs its own CSE and redundant-load
+elimination over the whole function; three PTX loads of the same address
+become one `LDG.E`. Emitter-level CSE would cost a dominance-aware side
+table, an extension to `is_reserved_reg` so a join cannot clobber a
+cached address, and buy nothing.
+
+**`emit_tid` on a straight-line kernel.** The seven instructions that
+compute `tid` are dead there — nothing reads the result. With and
+without them: 8 SASS instructions, 4 registers, identical. `ptxas`
+DCEs them.
+
+**The `bra L_done;` immediately before `L_done:`.** Same experiment,
+same answer: identical SASS.
+
+The general point is worth keeping even though the specific items are
+closed: `ptxas` is a real optimising compiler, so the emitter's job is to
+avoid emitting things `ptxas` **cannot** fix. It cannot remove a bounds
+check it cannot prove dead — which is why the work that DID move the
+needle was the bounds-check elimination and the `mad.wide.s32` fold, not
+tidying.
+
+## Retired: bounds-check elimination for the nested shape
+
+Also listed here as future work, and also closed by looking at the
+output. The 2-D lowering recovers `i = tid / C` and `j = tid % C`, so a
+proof of `0 <= i < R` and `0 <= j < C` is available. It buys nothing,
+because no accepted nested kernel indexes an array by `i` or `j`
+directly — every one of them uses the linearised `i * C + j`:
+
+```text
+    div.s32 %r8,  %r5, %r2;     // i
+    rem.s32 %r9,  %r5, %r2;     // j
+    mul.lo.s32 %r10, %r8, %r2;  // i * C
+    add.s32 %r11, %r10, %r9;    // i * C + j   <- the index
+    setp.ge.u32 %p1, %r11, %r0;
+```
+
+`prove_index_within_param` matches on the index REGISTER being the
+induction register, and `%r11` is neither. Discharging it instead needs a
+linear-index proof — recognise `i*C + j` and check `pN_len >= R*C` once —
+which is a different and larger piece of work, and it has a prerequisite:
+the nested guard computes `R * C` with `mul.lo.s32`, which silently wraps.
+Nothing depends on that today because the per-access check is the
+backstop; removing the check without widening the multiply first would
+turn a wrap into an out-of-bounds write.
+
+## Not attempted: `.maxntid`
+
+`ptxas` budgets registers against an assumed maximum block size, and a
+kernel that declares its own can be given more. The declaration is only
+sound when the launch honours it, which is true for exactly one case —
+an explicit `@GpuKernel(blockX = ...)`, which seeds the launch memo with
+the same number. Every other kernel picks its block size from
+`cuOccupancyMaxPotentialBlockSize` at launch, long after the module was
+compiled, and a `.maxntid` smaller than the launch's block is a launch
+failure rather than a slow kernel. So it applies only to kernels whose
+author wrote a block size by hand, and it needs `block_x` plumbed through
+`lower_method`'s signature to get there. Narrow benefit, public API
+change, and a failure mode worse than the problem: not done.
+
+
 
 ### Larger: consume `jit::ir::Graph`
 
@@ -225,6 +306,45 @@ start. The kernel set is small and stable, so a cache keyed on (PTX
 hash, driver version, `sm_XX`) via `cuLink*` would make warm starts
 near-instant. It is a contained change to `cuda-bridge` and it needs a
 GPU to validate, which is the only reason it is not here.
+
+## Float semantics: what is guaranteed and what is not
+
+Added 2026-09-02, after differentially testing the emitter against
+HotSpot on an RTX 2060 rather than reading its comments
+(`bench-gpu/arith-differential.sh`, fixtures
+`test_classes/gpu/GpuArithDifferential.java` and `GpuArithProbe.java`).
+
+**Guaranteed, and it was wrong until that run.** `(int) NaN` and
+`(long) NaN` are zero — JLS §5.1.3 says so with no room. The device was
+returning the destination type's MIN_VALUE: 474 of 4096 elements wrong
+for `d2i`/`d2l`, 584 for `f2l`. `f2i` happened to be correct on this
+device, which is exactly why the bug survived — the PTX ISA is silent on
+the NaN case for these conversions, so three of the four diverged and the
+fourth did not. All four now carry a `setp.nan` + `selp` guard.
+
+**Not guaranteed, and deliberately left alone.** NaN payloads are not
+preserved by `add`/`mul`/`div`/`neg` on the device: every NaN comes back
+as `0x7fffffff`, CUDA's canonical NaN, whatever went in. HotSpot
+propagates the payload and flips only the sign bit for negation. Both
+conform — JLS §4.2.3 does not specify the pattern and the PTX ISA says
+"NaN inputs yield an unspecified NaN" — and the only way a program can
+observe it is `floatToRawIntBits`. See `Emitter::unop_f32` for why
+fixing `fneg` alone would be worse than documenting all four.
+
+**Measured correct, so worth recording as tested rather than assumed:**
+the shift masks (JLS §15.19 masks the count; PTX clamps it — the emitter
+masks explicitly), integer division including `MIN_VALUE / -1`, the
+narrowing `i2b`/`i2c`/`i2s`, float→int saturation at every boundary, and
+`ineg`/`lneg` at MIN_VALUE. 27 kernels, 4096 elements each, against a
+CPU control.
+
+**The control is not optional.** The first run of this harness reported
+the emitter as diverging on five kernels. Two of them were the host: a
+`String.equals` miscompile under CratonVM's own JIT made the harness take
+the wrong `printf` arm partway through the loop, so it was comparing
+different quantities. `cratonvm --nojit` as a middle arm is what
+separated them, and the harness now refuses to report a device
+difference at all while the control itself disagrees with HotSpot.
 
 ## What the tests now hold
 

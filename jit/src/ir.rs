@@ -7895,6 +7895,30 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
             0xb9 | 0xba => {
                 pc += 5;
             }
+            // wide (0xc4) — JVMS §6.5. `wide iinc` is SIX bytes (prefix,
+            // opcode, 2-byte index, 2-byte signed constant); every other
+            // widened form is four. Without this arm the prefix fell to the
+            // 1-byte catch-all below and the walk desynced by two bytes,
+            // reading operand bytes as phantom opcodes — the same failure the
+            // `0xb9`/`0xba` arms above are written for.
+            //
+            // The tables in `x64/licm.rs` and `regalloc.rs` that DO carry this
+            // arm described it for months as "currently latent — `jit_scan`
+            // rejects `wide`". That stopped being true when the widened forms
+            // were implemented: `x64/bytecode_compat.rs::jit_scan` accepts
+            // `wide` load/store and `wide iinc` today, so compiled methods DO
+            // contain the prefix and every PC-stepping consumer is
+            // load-bearing. This walker is reached only for a method the
+            // builder then refuses — its own main loop has no `0xc4` arm, so
+            // `wide` still bails to single-pass — which is why this is
+            // insurance rather than a fix for anything measured.
+            0xc4 => {
+                if pc + 1 < code_len && code[pc + 1] == 0x84 {
+                    pc += 6;
+                } else {
+                    pc += 4;
+                }
+            }
             _ => {
                 // Unknown opcode — skip (builder will also bail)
                 pc += 1;
@@ -7990,6 +8014,16 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
             // upstream, so falling into the 1-byte catch-all would desync
             // every subsequent PC in this pre-scan.
             0xb9 | 0xba => pc += 5,
+            // wide (0xc4) — see the twin in `find_branch_targets` above for
+            // why this arm exists and why the "currently latent" wording on
+            // the other length tables was stale.
+            0xc4 => {
+                if pc + 1 < code_len && code[pc + 1] == 0x84 {
+                    pc += 6
+                } else {
+                    pc += 4
+                }
+            }
             _ => pc += 1,
         }
     }

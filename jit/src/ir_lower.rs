@@ -538,6 +538,12 @@ struct Lowerer<'a> {
     /// Compact-layout/TLAB-aware object allocation helper. Live `Op::New`
     /// nodes use the same shared runtime-lowering stub as the baseline tier.
     new_object: usize,
+    /// TLAB geometry and the post-init helper, for the inline bump that
+    /// `Op::New` takes instead of the stub. All three are wired together or
+    /// not at all; `emit_inline_tlab_new_ir` declines on any zero.
+    tlab_cursor_off: i32,
+    tlab_end_off: i32,
+    tlab_post_init: usize,
     /// cov-06 — `jit_newarray(vm, atype, length) -> array | 0`. The lowering
     /// for a PRIMITIVE `Op::NewArray` (`element_type != 0`); zero-fill, GC
     /// retry and the zero-on-failure convention (negative length OR OOM) are
@@ -686,6 +692,11 @@ struct Lowerer<'a> {
     /// locals region (locals + context + the five bookkeeping words: sp-id,
     /// cached thread, shadow save-base, shadow save-top, phi-copy scratch).
     first_spill: i32,
+    /// Frame offsets (`[rbp - off]`) of every slot the colouring proved holds
+    /// no reference, computed once from [`SlotPlan::prim_colors`] and published
+    /// on every safepoint map as `OopMapEntry::non_oop_stack_slots`. The IR
+    /// tier's half of the stale-word oracle; nothing gates on it.
+    prim_slot_offsets: Vec<i16>,
     /// Per-safepoint oop maps published for the moving-young relocation
     /// contract. An empty vector means "no precise coverage", which
     /// `conservative_roots` reads as a refusal — the fail-closed direction.
@@ -1128,6 +1139,25 @@ impl<'a> Lowerer<'a> {
             node_slot: vec![None; graph.nodes.len()],
             unallocated_slot_use: std::cell::Cell::new(false),
             latched_bailout: std::cell::RefCell::new(None),
+            prim_slot_offsets: {
+                // Same arithmetic as `planned_slot_off`: colour `c` lives at
+                // `[rbp - (first_spill + 8c)]`. An offset past `i16` is dropped
+                // rather than truncated -- the map's own slot list has the same
+                // bound, and a silently wrong offset would accuse the wrong
+                // slot.
+                let mut offs: Vec<i16> = slot_plan
+                    .prim_colors()
+                    .into_iter()
+                    .filter_map(|c| {
+                        i32::try_from(u64::from(c).saturating_mul(8))
+                            .ok()
+                            .and_then(|d| first_spill.checked_add(d))
+                            .and_then(|o| i16::try_from(o).ok())
+                    })
+                    .collect();
+                offs.sort_unstable();
+                offs
+            },
             slot_plan,
             spill_high_water: first_spill,
             block_offsets: vec![0; schedule.blocks.len()],
@@ -1152,6 +1182,10 @@ impl<'a> Lowerer<'a> {
             putfield_float: helpers.putfield_float,
             putfield_double: helpers.putfield_double,
             new_object: helpers.new_object,
+            // Casts: both are byte offsets inside `JvmThread`, far below i32::MAX.
+            tlab_cursor_off: helpers.tlab_cursor_offset_in_thread as i32,
+            tlab_end_off: helpers.tlab_end_offset_in_thread as i32,
+            tlab_post_init: helpers.tlab_post_init,
             newarray: helpers.newarray,
             anewarray_object: helpers.anewarray_object,
             monitor_enter: helpers.monitor_enter,
@@ -1831,8 +1865,21 @@ impl<'a> Lowerer<'a> {
             local_oop_mask: None,
             num_locals: 0,
             inline_local_scopes: Vec::new(),
-            non_oop_stack_slots: Vec::new(),
-            stack_marks_exact: false,
+            // The IR tier has no java-locals band to speak for, but its slot
+            // COLOURING is a proof about every spill slot it allocated: a
+            // non-`Ref` colour never holds an object pointer, because
+            // `assign_colors` never moves a colour between its two free lists.
+            // Exact because `verify_slot_colouring` re-derives the no-aliasing
+            // property rather than trusting it.
+            //
+            // The premise is `IrType::Ref`, which is the SAME premise this
+            // function publishes roots on a few lines above. So the oracle
+            // cannot be wrong here unless the map itself already is: a
+            // non-`Ref` node holding a real object pointer would be an
+            // unpublished root today, with or without this field. It is not an
+            // independent check of that, and must not be read as one.
+            non_oop_stack_slots: self.prim_slot_offsets.clone(),
+            stack_marks_exact: true,
         });
     }
 
@@ -5143,14 +5190,41 @@ impl<'a> Lowerer<'a> {
                     self.emit_safepoint_map(sp_live_hi);
                 }
                 let slot = self.alloc_slot(id);
-                crate::runtime_lowering::emit_new_object_stub(
-                    &mut self.buf,
-                    self.context_slot_off,
-                    self.new_object,
-                    *class_id,
-                    *num_fields,
-                    self.frame_record,
-                );
+                // Inline TLAB bump first, with the stub as its slow path.
+                // Declining emits the stub alone, which is the behaviour this
+                // arm had before the bump existed.
+                //
+                // The safepoint map above still stands: the bump itself cannot
+                // collect, but its slow path is the same stub, and a map is a
+                // statement about the FRAME at this program point rather than
+                // about which arm runs.
+                let tlab_plan = crate::runtime_lowering::InlineTlabPlan {
+                    thread_slot_off: self.shadow_thread_slot_off,
+                    cursor_off: self.tlab_cursor_off,
+                    end_off: self.tlab_end_off,
+                    post_init: self.tlab_post_init,
+                    context_off: self.context_slot_off,
+                    class_id: *class_id,
+                    num_fields: *num_fields,
+                };
+                let inlined = ir_inline_tlab_enabled()
+                    && crate::runtime_lowering::emit_inline_tlab_new_ir(
+                        &mut self.buf,
+                        &tlab_plan,
+                        self.new_object,
+                        self.frame_record,
+                    );
+                if !inlined {
+                    crate::runtime_lowering::note_stub_only_alloc();
+                    crate::runtime_lowering::emit_new_object_stub(
+                        &mut self.buf,
+                        self.context_slot_off,
+                        self.new_object,
+                        *class_id,
+                        *num_fields,
+                        self.frame_record,
+                    );
+                }
                 // Retract the push the map above emitted. Unbalanced pushes are
                 // not a leak this backend tolerates: `lower_inner` compares
                 // `shadow_pushes` against `shadow_reloads` and refuses the whole
@@ -8539,6 +8613,45 @@ struct SlotPlan {
     peak_live: usize,
 }
 
+impl SlotPlan {
+    /// The colours that provably never hold a reference.
+    ///
+    /// `assign_colors` keeps two free lists and never moves a colour between
+    /// them: a colour first taken by a non-`Ref` value is returned to
+    /// `free_prim` and can only ever be recycled by another non-`Ref` value. So
+    /// a colour is single-class for the life of the method, and a `Prim` colour
+    /// holds a live primitive or dead bytes left by one -- never an object
+    /// pointer.
+    ///
+    /// This is the IR tier's half of the stale-word oracle. Without it an IR
+    /// frame carries no dataflow at all and every stale word in it reports as
+    /// unexplained, which is exactly where the last two unattributed words of
+    /// the 2026-09-02 `TestRandomMapOps` measurement were. See
+    /// `OopMapEntry::non_oop_stack_slots`.
+    fn prim_colors(&self) -> Vec<u32> {
+        // Marked by colour, not searched per node: this runs on the compile
+        // path of every IR method, and a linear `contains` would make it
+        // quadratic in the colour count on exactly the large graphs that can
+        // least afford it.
+        let mut seen = vec![false; self.slots];
+        for (id, class) in self.class.iter().enumerate() {
+            if !matches!(class, Some(SlotClass::Prim)) {
+                continue;
+            }
+            if let Some(Some(color)) = self.node_color.get(id).copied() {
+                if let Some(flag) = seen.get_mut(color as usize) {
+                    *flag = true;
+                }
+            }
+        }
+        seen.iter()
+            .enumerate()
+            .filter(|(_, &f)| f)
+            .map(|(c, _)| c as u32)
+            .collect()
+    }
+}
+
 /// Work budget for the liveness fixed point, in `nodes × blocks` units.
 ///
 /// Past this the analysis is skipped and every value keeps a dedicated slot —
@@ -11697,6 +11810,28 @@ pub(crate) fn lower_inner_with_scopes(
 
 // ── Tests ────────────────────────────────────────────────────────────
 
+/// Inline TLAB bump for the optimizing tier's `Op::New` — **default ON**, opt
+/// out with `CRATONVM_JIT_IR_INLINE_TLAB=0`.
+///
+/// Off restores `emit_new_object_stub` alone, which is what this arm emitted
+/// before the bump existed, so the two are A/B-able in one binary. That is not
+/// a courtesy: the last frame-shaped change that shipped without a switch cost
+/// a full rebuild per hypothesis to bisect.
+///
+/// Note what turning this on does NOT do. `c2_alloc_upgrade_enabled()` is
+/// opt-in, so no method containing a `new` reaches this tier at all under a
+/// default configuration and the bump is unreachable. Closing that gate's
+/// stated reason is exactly what this change is for — see
+/// `the_optimizing_tier_stays_shut_to_allocation_while_it_has_no_inline_tlab`,
+/// which now passes because the bump exists rather than because the gate is
+/// shut.
+fn ir_inline_tlab_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_INLINE_TLAB") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -13317,7 +13452,7 @@ mod tests {
         let ir_src = include_str!("ir_lower.rs");
         // The `Op::New` arm's lowering, as it stands.
         let uses_stub = ir_src.contains("runtime_lowering::emit_new_object_stub");
-        let has_inline_bump = ir_src.contains("emit_inline_tlab");
+        let has_inline_bump = ir_src.contains("emit_inline_tlab_new_ir");
         assert!(
             uses_stub || has_inline_bump,
             "the `Op::New` arm lowers through neither the stub nor an inline \
@@ -15206,6 +15341,21 @@ mod tests {
                 "n{id} is a primitive on the reference's word",
             );
         }
+
+        // …and the stale-word oracle's view of the same plan agrees: every
+        // primitive's colour is offered as "provably not a reference", and the
+        // reference's colour is not. This is what an IR frame publishes as
+        // `OopMapEntry::non_oop_stack_slots`, and a colour wrongly listed here
+        // would let the residue report call a live root dead storage.
+        let prim = plan.prim_colors();
+        for id in [a, t, u, v] {
+            let c = plan.node_color[id as usize].expect("a coloured primitive");
+            assert!(prim.contains(&c), "n{id}'s word {c} is missing from prim_colors");
+        }
+        assert!(
+            !prim.contains(&r_color),
+            "the reference's word {r_color} must never be offered as a non-reference",
+        );
     }
 
     /// COV-02: an `aaload` result is a GC ROOT, and this is the executed proof.
@@ -18337,3 +18487,4 @@ pub static IC_FRAME_REPUBLISH_SITES: std::sync::atomic::AtomicUsize =
 pub fn ic_frame_republish_sites() -> usize {
     IC_FRAME_REPUBLISH_SITES.load(std::sync::atomic::Ordering::Relaxed)
 }
+

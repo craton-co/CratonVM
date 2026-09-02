@@ -484,6 +484,24 @@ close in the same way the Java probe does: the reader publishes a started flag,
 the closer waits for it plus a further 100 ms (20 poll slices) and asserts
 `!is_finished()` before closing anything.
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** Both handles this section names were
+> run, on a build from this tree:
+>
+> ```text
+> cargo test -p cratonvm-native-io --lib socket_channel::tests    19 passed, 0 failed
+> cargo test -p cratonvm-vm --test socket_input_stream_timeout     1 passed, 0 failed
+> ```
+>
+> The `socket_channel::tests` are the ones this section says "must stay green —
+> they cover the three readers this lane did not touch", and they do. The
+> `SO_TIMEOUT` fixture runs across `real_net_sockets` on and off, which is the
+> pair this record cares about.
+>
+> Both handles were run because this record names two. Running one and inferring
+> the other is the shape that made `H3-1` insist on "run both, paste both" — and
+> here the two live in different crates and different build configurations, so a
+> pass in one says nothing about the other compiling.
+
 `cargo test -p cratonvm-native-io --lib net::tests` and
 `--lib socket_channel::tests` must stay green — they cover the three readers this
 lane did not touch. `vm/tests/socket_input_stream_timeout.rs` runs the
