@@ -1959,8 +1959,33 @@ fn kf_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 /// engines disagreed about one name. De-advertising it for `KeyFactory` only,
 /// and pinning the pair with that test, is what closed it.
 /// W7-63-jca-advertise-vs-serve.md.
+///
+/// # It is a DISJUNCTION, because `kf_get_instance` is
+///
+/// `kf_algo_idx(name) >= 0` was the whole answer until 2026-09-02, and by then
+/// it had stopped describing the engine: `kf_get_instance` falls to
+/// `find_service_provider` + `build_real_key_factory` whenever the index is
+/// negative, so any name with a service row naming a REAL implementation class
+/// is served by the platform's own factory. `HSS/LMS` is that shape — SUN
+/// advertises it, this crate has no Merkle-tree key factory, and
+/// `sun.security.provider.HSS$KeyFactoryImpl` is in the boot image.
+///
+/// A predicate narrower than the engine is not a safe conservatism here. This
+/// one gates a ratchet whose whole job is to keep the advertised set and the
+/// serviceable set equal, so understating the second half reds the test for
+/// names that work — which is what it did the first time a delegated
+/// `KeyFactory` row was seeded.
+///
+/// The `.Native` marker deliberately does not count: it is not a class, it
+/// means "a Rust engine answers this", and a marker row for a name with no
+/// index is exactly an advertisement with nothing behind it.
 pub(crate) fn get_instance_offers(name: &str) -> bool {
-    kf_algo_idx(name) >= 0
+    if kf_algo_idx(name) >= 0 {
+        return true;
+    }
+    crate::jca::provider_chain::find_service_provider("KeyFactory", name)
+        .and_then(|p| crate::jca::provider_chain::service_implementation_class("KeyFactory", &p, name))
+        .is_some()
 }
 
 /// The same question for `KeyPairGenerator`, without a provider argument.

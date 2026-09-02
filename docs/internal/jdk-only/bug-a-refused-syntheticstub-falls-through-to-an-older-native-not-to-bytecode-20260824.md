@@ -116,7 +116,7 @@ were wrong, and measuring took one probe:
   `PrintStream` for its `charset()`.
 
 Root cause and fix are in
-`bug-printstream-charset-answers-the-abstract-base-20260825.md`.
+`docs/internal/fixed-bugs/bug-printstream-charset-answers-the-abstract-base-20260825-FIXED-20260901.md` (retired 2026-09-01, both residuals closed).
 
 **Why the round-trip checks pass and hid this.** `setLevel` wrote slot 0 and
 `getLevel` read slot 0, so they agreed with each other perfectly. Only a reader

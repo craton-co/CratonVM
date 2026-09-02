@@ -1103,6 +1103,9 @@ impl Arm64Backend {
             frame_slot_offsets: slots,
             moving_young_coverage_complete: false,
             live_frame_hi: 0,
+            local_oop_mask: None,
+            num_locals: 0,
+            inline_local_scopes: Vec::new(),
         });
     }
 
