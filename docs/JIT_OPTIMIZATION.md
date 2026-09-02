@@ -749,43 +749,45 @@ survive it, stated rather than left to be inferred.
 arms alternated with the order reversed on alternate reps, `-Xmx4g`,
 `bench/CratonBench.java` one phase per fresh process. Windows workstation, not
 the Azure bench host, so these are NOT comparable with `BENCHMARK.md`'s
-HotSpot ratios and are not written there. The host is noisy — one phase varied
-12.5–18.3 s inside a single arm — so the statistic is the MINIMUM of each arm,
-which is the least contaminated one, and a difference smaller than the arm's
-own spread is reported as neutral rather than as a win.
+HotSpot ratios and are not written there. The statistic is the MINIMUM of each
+arm, which is the least contaminated one.
+
+**The result is NEUTRAL on every CratonBench row, and that is the finding.**
 
 | phase | all-off | all-on | |
 |---|---:|---:|---|
-| HashMap (10M put/get) | 8,112 ms | **5,004 ms** | **1.62x** |
-| Binary Trees (d=18) | 14,010 ms | **10,020 ms** | **1.40x** |
+| HashMap (10M put/get) | 9,115 ms | 8,749 ms | neutral |
+| Binary Trees (d=18) | 13,346 ms | 13,168 ms | neutral |
 | Matrix 1280² | 3,289 ms | 3,191 ms | neutral |
 | Arithmetic (2B ops) | 5,768 ms | 5,804 ms | neutral |
-| String/Regex (100K) | 239 ms | 251 ms | neutral (a 250 ms phase; ±5% is this host's floor) |
+| String/Regex (100K) | 239 ms | 251 ms | neutral |
 | Fibonacci(44), Sieve | — | — | inside the noise band |
 
-Checksums identical on every row of every arm (`1549999915000000`,
-`68332206`, `173943680`, `5000050000`, `9592`).
+Checksums identical on every row of every arm.
 
-Measured on the configuration that actually ships — i.e. with the optimizing
-tier's own inline TLAB bump and `CRATONVM_JIT_C2_ALLOC_UPGRADE` left opt-in,
-for the reason given below. An earlier reading of this table with those two ON
-is not reproduced here, because it is not what a default run does.
+**An earlier draft of this table claimed 1.62x on HashMap and 1.40x on Binary
+Trees. Those numbers were real and they were not this branch's.** They came
+from a VM-thread TLAB on ZGC that `feat/zgc-jit-tlab-20260902` landed in
+parallel — and that feature ships OPT-IN (`CRATONVM_ZGC_JIT_TLAB=1`), because
+its own author measured it slower in the general case. Enabling it in BOTH
+arms attributes this branch correctly: HashMap 4,828 ms with these switches
+off against 4,866 ms with them on. Neutral. The lesson is the one this
+document already states about control arms — an arm that differs in two
+features measures neither.
 
-The shape of that result is the point: the rows that move are the
-allocation- and call-heavy ones, which is what the findings were about. Matrix
-is a pure `int[][]` triple loop that the single-pass backend already
-vectorises and that allocates almost nothing — it should not move, and it does
-not.
+**What IS established, and it is not a throughput number.** The emitted
+sequences are shorter, verified by disassembly rather than by a clock:
+`BinTreesClassic.itemCheck` is 2,348 bytes against 2,437 with the switches
+off, `fib`'s optimizing-tier body no longer materialises its constants into
+frame words or lowers `n > 1` through a stored boolean, and a receiver is
+proved once per block instead of once per field read. Those removals are real
+and permanent; what this host cannot do is resolve them above a spread that
+reaches 45% inside a single arm. A quiet Linux bench host is where a 3-5%
+codegen change becomes measurable, and that measurement has not been taken.
 
-**A correctness bug this pass found, worth recording because the kill switch
-is what located it.** Giving ZGC mutators a TLAB makes the single-pass
-inline-`new` fast path reachable for the first time on that collector, and
-that path skips `tlab_post_init` — the helper that enters the object in ZGC's
-object-start registry, which is that collector's only record that an object
-exists. 8 of 86 regression-suite vectors failed; the same binary with the
-mutator TLAB switched off passed 86 of 86, which located it in one run. Both
-branches hit it and both fixed it; the shipping fix is the `types`-level
-`jit_tlab_registration_required()` gate on `skip_helper`.
+Correctness, which was measured: regression suite 88/88 with every switch on,
+`cargo test -p cratonvm-jit --lib` 2,178 passed, `jit-api` 56, `types` and
+`gc` green.
 
 **One finding is only half closed, and this says which half.** Finding 4 was
 "allocation and reference stores in the optimizing tier are helper calls". The
