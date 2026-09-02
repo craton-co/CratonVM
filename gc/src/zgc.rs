@@ -1882,6 +1882,70 @@ impl ZObjectStartBits {
         }
     }
 
+    /// Set every bit covering `[lo, hi)`, in one pass over the words.
+    ///
+    /// The bulk twin of [`Self::insert`], and the reason allocate-black can be
+    /// a per-CHUNK operation instead of a per-OBJECT one. A 512 KiB TLAB chunk
+    /// of 72-byte objects is ~7 000 objects and therefore ~7 000 `fetch_or`s on
+    /// the allocation fast path; the same span here is 1 024 bitmap words, i.e.
+    /// one `fetch_or` per 512 arena bytes whatever the object size.
+    ///
+    /// `fetch_or` and not a plain store even for the interior words: a
+    /// concurrent marker may be claiming bits in the same words for objects
+    /// that are not in this range, and a read-modify-write is the only thing
+    /// that does not drop its claim. Setting a bit that is already set is a
+    /// no-op, so there is no value to re-check and nothing for a retry loop to
+    /// do -- the same argument as [`Self::insert`]'s.
+    ///
+    /// Addresses the grid cannot encode are NOT spilled: an interior address of
+    /// the range is not an object base, so it can never be queried, and the
+    /// only bases inside the range are 8-aligned by construction. The range
+    /// itself is clamped to the covered span rather than spilling its ends.
+    fn set_range(&self, lo: usize, hi: usize) {
+        if self.nwords == 0 || hi <= lo {
+            return;
+        }
+        let lo_off = match lo.checked_sub(self.base) {
+            Some(o) if o < self.span => o,
+            _ => return,
+        };
+        let hi_off = hi.saturating_sub(self.base).min(self.span);
+        if hi_off <= lo_off {
+            return;
+        }
+        // Bit indices, INCLUSIVE of the first grid slot at or above `lo` and
+        // EXCLUSIVE of the one at `hi`. `lo` is 8-aligned at every caller (a
+        // chunk base or a TLAB cursor), so the round-up is a no-op there and a
+        // conservative narrowing anywhere else -- it can only decline to set a
+        // bit, never set one outside the range.
+        let first = lo_off.div_ceil(8);
+        let last = hi_off / 8; // exclusive
+        if last <= first {
+            return;
+        }
+        let (w0, b0) = (first >> 6, first & 63);
+        let (w1, b1) = (last >> 6, last & 63);
+        if w0 == w1 {
+            // `last > first` and both land in one word, so `0 <= b0 < b1 <= 63`
+            // and the shift below cannot overflow.
+            let mask = (!0u64 << b0) & ((1u64 << b1) - 1);
+            // SAFETY: `first < last <= span / 8`, so `w0 < nwords`.
+            unsafe { (*self.words.add(w0)).fetch_or(mask, Ordering::Release) };
+            return;
+        }
+        // SAFETY for all three: every index is derived from an offset bounded
+        // by `span`, and `nwords` covers `span.div_ceil(8).div_ceil(64)`.
+        unsafe {
+            (*self.words.add(w0)).fetch_or(!0u64 << b0, Ordering::Release);
+            for w in (w0 + 1)..w1.min(self.nwords) {
+                (*self.words.add(w)).fetch_or(!0u64, Ordering::Release);
+            }
+            if b1 != 0 && w1 < self.nwords {
+                (*self.words.add(w1)).fetch_or((1u64 << b1) - 1, Ordering::Release);
+            }
+        }
+    }
+
     /// Clear **every** bit, in one pass over the words.
     ///
     /// # Why this is the whole argument for a side bitmap
@@ -3680,6 +3744,28 @@ pub struct ZgcRealHeap {
     /// [`Self::relocations`]. See [`Self::forwarding_word_engagement`].
     forwarding_words_stamped: AtomicUsize,
     forwarding_words_read: AtomicUsize,
+
+    /// Allocate-black claims that actually had to touch the bitmap, i.e. the
+    /// residual after the per-chunk blackening. `conc_black_allocations` counts
+    /// every object born black; this counts the ones that cost an atomic. A run
+    /// where the two are equal is one where the per-chunk path is inert.
+    conc_black_claims: AtomicUsize,
+    /// Is [`Self::conc_start_bytes`] recomputed from measured allocation rate
+    /// and mark duration, rather than fixed at a percentage?
+    /// `CRATONVM_ZGC_CONC_START=auto`.
+    conc_start_adaptive: AtomicBool,
+    /// `allocated` and the wall clock at the last collection -- the two ends of
+    /// the allocation-rate sample. Written only by
+    /// [`Self::refresh_adaptive_conc_start`].
+    rate_sample_bytes: AtomicU64,
+    rate_sample_nanos: AtomicU64,
+    /// Bytes per nanosecond, scaled by 2^20 and exponentially smoothed. Integer
+    /// throughout: this is computed at a safepoint and a float would be the
+    /// only one in the collector.
+    alloc_rate_scaled: AtomicU64,
+    /// How long a concurrent mark phase takes, smoothed. The other half of the
+    /// window calculation.
+    conc_mark_nanos_ewma: AtomicU64,
 }
 
 // SAFETY: identical argument to `Heap`/`G1Collector` (heap.rs:143). The only
@@ -3948,6 +4034,12 @@ impl ZgcRealHeap {
             sweep_worker_count: AtomicUsize::new(Self::sweep_workers_requested()),
             forwarding_words_stamped: AtomicUsize::new(0),
             forwarding_words_read: AtomicUsize::new(0),
+            conc_black_claims: AtomicUsize::new(0),
+            conc_start_adaptive: AtomicBool::new(conc_start_is_adaptive()),
+            rate_sample_bytes: AtomicU64::new(0),
+            rate_sample_nanos: AtomicU64::new(0),
+            alloc_rate_scaled: AtomicU64::new(0),
+            conc_mark_nanos_ewma: AtomicU64::new(0),
             // THE SAME TWO NUMBERS as `registry` above, through the same
             // constructor. Any drift between the two grids would make an
             // address the registry accepts unrepresentable in the mark bitmap,
@@ -4094,6 +4186,195 @@ impl ZgcRealHeap {
     ///
     /// Everything expensive is behind [`Self::start_concurrent_mark`].
     #[inline]
+    /// Mark every object in `[lo, hi)` black, in one pass.
+    ///
+    /// Returns `false` on the header arm, where there is no bulk operation and
+    /// the caller must keep marking per object.
+    ///
+    /// # Why over-approximating is sound here
+    ///
+    /// The bitmap is one bit per 8 arena bytes and this sets ALL of them in the
+    /// range, not only the ones that are object bases. Nothing reads a
+    /// non-base bit: `mark_is_set` is only ever asked about a registered base
+    /// (the sweep walks the object-start registry, the reference processor
+    /// holds `Reference` object addresses), and the sweep enumerates the
+    /// REGISTRY rather than the mark bitmap. So the extra bits are invisible,
+    /// and `mark_clear_all` wipes them with everything else.
+    ///
+    /// What the range must therefore be is not "the objects" but "space only
+    /// this thread can allocate into" -- a TLAB chunk, or the un-handed-out
+    /// tail of one. See [`Self::blacken_live_tlab_tails`].
+    fn blacken_range(&self, lo: usize, hi: usize) -> bool {
+        match &self.mark_bits {
+            Some(bits) => {
+                bits.set_range(lo, hi);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Blacken the un-handed-out tail of every live TLAB chunk.
+    ///
+    /// **Call at the mark-start safepoint, after the bits are cleared and after
+    /// [`Self::set_mark_active`].** Every mutator is parked, so `reserved_tail`
+    /// is race-free and `[cursor, end)` is exactly the space those threads will
+    /// bump into next -- which is what makes the per-object claim skippable for
+    /// the rest of the cycle.
+    ///
+    /// It blackens the TAIL and not the whole chunk on purpose. The already
+    /// handed-out part holds objects that existed at mark start; they are in
+    /// the snapshot and the marker will decide about them, and blackening them
+    /// would retain up to `threads * chunk` bytes of genuinely dead data as
+    /// floating garbage for the cycle.
+    fn blacken_live_tlab_tails(&self) {
+        if self.mark_bits.is_none() {
+            return;
+        }
+        for cell in self.tlabs.cells() {
+            let mut tlab = match cell.try_lock() {
+                Some(t) => t,
+                // A cell this thread cannot take is one whose owner is inside
+                // an allocation. That cannot happen at a safepoint, and if it
+                // somehow does, the fall-back is the per-object claim -- which
+                // is what `black_end == 0` leaves in place. Never a correctness
+                // hole, only a missed optimisation.
+                None => continue,
+            };
+            match tlab.inner.reserved_tail() {
+                Some((cursor, end)) => {
+                    self.blacken_range(cursor, end);
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Recompute [`Self::conc_start_bytes`] from what this run has actually
+    /// measured. **Call once per collection, at the safepoint.**
+    ///
+    /// # The regression this exists to remove
+    ///
+    /// `Z_CONC_START_PERCENT_DEFAULT` records the measurement that keeps
+    /// concurrent marking off: the per-cycle pause falls 38-58%, which is the
+    /// property the phase was built for, but **the cycle COUNT roughly doubles**
+    /// (6 -> 12 single-threaded, 3 -> 5 multi-threaded) and on the
+    /// single-threaded probe that turns a 38% per-cycle win into a WORSE total
+    /// pause.
+    ///
+    /// The doubling is not inherent to marking concurrently. Everything
+    /// allocated after mark start is floating garbage for that cycle, so the
+    /// cost of the phase is exactly the size of the window -- and the window
+    /// was a FIXED fraction of a fixed threshold, with no input from how fast
+    /// the workload allocates or how long the mark actually takes. Open too
+    /// early and the collector marks a heap that is mostly about to become
+    /// garbage; open too late and the mark does not finish before the
+    /// collection is due. One constant cannot be right for both.
+    ///
+    /// # What it computes
+    ///
+    /// `threshold - rate * duration * SAFETY`, i.e. "start early enough that
+    /// the mark finishes just as the heap fills", which is how a production ZGC
+    /// sizes it. Both inputs are measured:
+    ///
+    /// * `rate` -- bytes allocated per nanosecond between the last two
+    ///   collections, smoothed. Read from `allocated` and a wall-clock stamp
+    ///   that this function is the only writer of, so it costs one clock read
+    ///   per collection and nothing at all on the allocation path.
+    /// * `duration` -- how long the last concurrent phase ran, smoothed. Zero
+    ///   until one has run, which is what `BOOTSTRAP_PERCENT` covers.
+    ///
+    /// Smoothed with a 1/2 exponential average rather than used raw: a single
+    /// collection's rate is dominated by whatever the program happened to be
+    /// doing, and a trigger that chases it oscillates between "no concurrent
+    /// phase at all" and "marks the whole heap twice".
+    ///
+    /// # The floor, and why there is one
+    ///
+    /// `MIN_PERCENT` of the threshold. Going lower is not free: the SATB
+    /// barrier is armed for the whole window and every allocation in it is
+    /// black, so opening at 10% would arm the barrier for most of the
+    /// program's life to mark a heap that is mostly about to die. The floor is
+    /// what stops a burst of allocation from computing a window that large.
+    fn refresh_adaptive_conc_start(&self, now_nanos: u64) {
+        if !self.conc_start_adaptive.load(Ordering::Relaxed) {
+            return;
+        }
+        /// Fraction of the threshold to open at before any concurrent phase has
+        /// been timed. The value `Z_CONC_START_PERCENT_DEFAULT`'s own
+        /// measurement was taken at, and the one its doc says to opt in with.
+        const BOOTSTRAP_PERCENT: usize = 60;
+        /// Never open below this fraction of the threshold -- see the floor
+        /// note above.
+        const MIN_PERCENT: usize = 25;
+        /// Never open above this: at 100 the cycle would open when the
+        /// collection is already due and there would be no concurrent phase at
+        /// all.
+        const MAX_PERCENT: usize = 90;
+        /// How much longer than last time the mark is allowed to take before
+        /// the window is too small. Marks get slower as the live set grows, so
+        /// a window sized for the last one is systematically short.
+        const SAFETY_NUMERATOR: u64 = 3;
+        const SAFETY_DENOMINATOR: u64 = 2;
+
+        let allocated = self.allocated.load(Ordering::Relaxed) as u64;
+        let prev_bytes = self.rate_sample_bytes.swap(allocated, Ordering::Relaxed);
+        let prev_nanos = self.rate_sample_nanos.swap(now_nanos, Ordering::Relaxed);
+        // A sample needs both ends. The first collection has neither.
+        if prev_nanos != 0 && now_nanos > prev_nanos && allocated > prev_bytes {
+            // Bytes per nanosecond is far below 1, so it is carried scaled by
+            // 2^20 -- integer throughout, because this runs at a safepoint and
+            // a float would be the only one in the collector.
+            let sample = ((allocated - prev_bytes) << 20) / (now_nanos - prev_nanos);
+            let prior = self.alloc_rate_scaled.load(Ordering::Relaxed);
+            let smoothed = if prior == 0 {
+                sample
+            } else {
+                (prior + sample) / 2
+            };
+            self.alloc_rate_scaled.store(smoothed, Ordering::Relaxed);
+        }
+
+        let threshold = self.gc_threshold as u64;
+        let rate = self.alloc_rate_scaled.load(Ordering::Relaxed);
+        let mark_nanos = self.conc_mark_nanos_ewma.load(Ordering::Relaxed);
+        let want = if rate == 0 || mark_nanos == 0 {
+            threshold * BOOTSTRAP_PERCENT as u64 / 100
+        } else {
+            // bytes = rate/2^20 * nanos * safety
+            let headroom = (rate.saturating_mul(mark_nanos) >> 20)
+                .saturating_mul(SAFETY_NUMERATOR)
+                / SAFETY_DENOMINATOR;
+            threshold.saturating_sub(headroom)
+        };
+        let lo = threshold * MIN_PERCENT as u64 / 100;
+        let hi = threshold * MAX_PERCENT as u64 / 100;
+        self.conc_start_bytes
+            .store(want.clamp(lo, hi) as usize, Ordering::Relaxed);
+    }
+
+    /// Fold this cycle's concurrent-phase duration into the average
+    /// [`Self::refresh_adaptive_conc_start`] sizes the next window from.
+    fn note_conc_mark_duration(&self, nanos: u64) {
+        if nanos == 0 {
+            return;
+        }
+        let prior = self.conc_mark_nanos_ewma.load(Ordering::Relaxed);
+        let next = if prior == 0 { nanos } else { (prior + nanos) / 2 };
+        self.conc_mark_nanos_ewma.store(next, Ordering::Relaxed);
+    }
+
+    /// `(allocation rate in bytes/sec, mean concurrent mark nanos, the trigger
+    /// in bytes)` -- the adaptive trigger's own state, so a run can be asked
+    /// why it opened its cycles where it did.
+    pub fn adaptive_conc_start_state(&self) -> (u64, u64, usize) {
+        (
+            (self.alloc_rate_scaled.load(Ordering::Relaxed) * 1_000_000_000) >> 20,
+            self.conc_mark_nanos_ewma.load(Ordering::Relaxed),
+            self.conc_start_bytes.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn should_start_concurrent_mark(&self) -> bool {
         // `0` is the kill switch (`CRATONVM_ZGC_CONC_START=0`) AND the
         // disabled-by-default state, so this is the first and cheapest test.
@@ -4244,6 +4525,12 @@ impl ZgcRealHeap {
 
         // (3). Must follow (1): this is what makes the next allocation black.
         self.set_mark_active(true);
+        // ...and (3b), which must follow (3) for the same reason: blacken the
+        // un-handed-out tail of every live TLAB chunk, so the objects those
+        // threads bump into next are born black WITHOUT a per-object atomic.
+        // Every mutator is parked here, which is what makes `reserved_tail`
+        // race-free. See `blacken_live_tlab_tails`.
+        self.blacken_live_tlab_tails();
 
         // (4)
         let workers = self.conc_mark_workers();
@@ -4310,10 +4597,13 @@ impl ZgcRealHeap {
         }
         let started = self.conc_mark_started_at.load(Ordering::Relaxed);
         if started != 0 {
-            self.conc_phase_nanos.fetch_add(
-                Self::monotonic_nanos().saturating_sub(started),
-                Ordering::Relaxed,
-            );
+            let elapsed = Self::monotonic_nanos().saturating_sub(started);
+            self.conc_phase_nanos.fetch_add(elapsed, Ordering::Relaxed);
+            // ...and into the average the ADAPTIVE window is sized from. This
+            // is the only measurement of "how long does a mark take on this
+            // workload" the collector has, and it is the whole input the fixed
+            // percentage never had. See `refresh_adaptive_conc_start`.
+            self.note_conc_mark_duration(elapsed);
         }
         let coordinator = self.conc_pool.lock().take();
         // Whatever happens below, this cycle is over: the flag is cleared here
@@ -4472,8 +4762,31 @@ impl ZgcRealHeap {
         if !self.mark_active.load(Ordering::Relaxed) {
             return;
         }
-        self.mark_set(ptr as usize);
+        let addr = ptr as usize;
         self.conc_black_allocations.fetch_add(1, Ordering::Relaxed);
+        // ---- ALREADY BLACK? -----------------------------------------------
+        //
+        // `tlab_refill` blackens a whole chunk at a time and
+        // `blacken_live_tlab_tails` does the same for the chunks that were
+        // already live at mark start, so on the TLAB path -- which is every
+        // ordinary allocation -- this is a plain load and a not-taken branch
+        // instead of a `fetch_or` on a bitmap word SHARED with the 63
+        // neighbouring grid slots, i.e. with whatever every other allocating
+        // thread is doing nearby. The probe `Z_CONC_START_PERCENT_DEFAULT`
+        // records made 22.4M of those.
+        //
+        // **The bitmap is its own validity check.** There is no flag to go
+        // stale: if `mark_clear_all` has run since the chunk was blackened, the
+        // bit is simply clear again and the claim below runs. That is the whole
+        // reason this test is here rather than a `black_end` watermark on the
+        // TLAB -- a watermark would have to be invalidated by a clear that
+        // happens at the END of a sweep, with every chunk still live and owned,
+        // and a missed invalidation is an object swept while live.
+        if self.mark_is_set(addr) {
+            return;
+        }
+        self.mark_set(addr);
+        self.conc_black_claims.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A monotonic-enough clock reading in nanoseconds, or `0` if the platform
@@ -9612,6 +9925,13 @@ impl ZgcRealHeap {
     /// **Stop-the-world only** — see [`ZObjectStartBits::clear_all`].
     #[must_use = "the header arm cannot clear in bulk and the caller must walk"]
     fn mark_clear_all(&self) -> bool {
+        // THIS IS ALSO WHAT INVALIDATES THE PER-CHUNK BLACKENING, and it needs
+        // no help to do it: a chunk blackened for the cycle just ended stops
+        // being black because its bits are now zero, and
+        // `allocate_black_if_marking`'s test reads the bits rather than a flag.
+        // A watermark on the TLAB would have needed explicit invalidation
+        // HERE -- at the end of a sweep, with every chunk still live and owned
+        // by its thread -- and a missed one is an object swept while live.
         match &self.mark_bits {
             Some(bits) => {
                 bits.clear_all();
@@ -10820,12 +11140,38 @@ const Z_SATB_HANDOFF_INTERVAL: usize = 8192;
 fn conc_start_percent_setting() -> usize {
     static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
+        if conc_start_is_adaptive() {
+            // `auto` opens the cycle wherever the last cycle's measurements say
+            // it should, and `ZgcRealHeap::refresh_adaptive_conc_start` owns
+            // the number from the first collection onwards. This seeds it, and
+            // it seeds it at the value that measurement was taken at.
+            return 60;
+        }
         match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_CONC_START")
             .and_then(|v| v.to_str().and_then(|s| s.trim().parse::<usize>().ok()))
         {
             Some(p) => p.min(100),
             None => Z_CONC_START_PERCENT_DEFAULT,
         }
+    })
+}
+
+/// Is `CRATONVM_ZGC_CONC_START` set to `auto`?
+///
+/// The opt-in for the ADAPTIVE window -- see
+/// [`ZgcRealHeap::refresh_adaptive_conc_start`] for why a fixed percentage is
+/// the reason concurrent marking measures worse in total pause than a
+/// stop-the-world mark, despite winning 38-58% per cycle.
+///
+/// A separate spelling rather than a separate variable so there is one place to
+/// look for "when does a cycle open", and so `=60` still means exactly what it
+/// meant.
+fn conc_start_is_adaptive() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_CONC_START")
+            .map(|v| v.to_string_lossy().trim().eq_ignore_ascii_case("auto"))
+            .unwrap_or(false)
     })
 }
 
@@ -12001,6 +12347,26 @@ impl ZgcRealHeap {
         tlab.chunk = Some((ptr as usize, ptr as usize + want));
         tlab.stats.refills += 1;
         tlab.stats.refill_bytes += want as u64;
+        // ---- ALLOCATE-BLACK, ONCE PER CHUNK ------------------------------
+        //
+        // Under snapshot-at-the-beginning every object allocated during a cycle
+        // must be born marked, or the sweep frees everything the mutators
+        // allocated while the marker ran. That was one atomic `fetch_or` per
+        // OBJECT on the allocation fast path -- 22.4M of them on the
+        // single-threaded probe `Z_CONC_START_PERCENT_DEFAULT` records, which
+        // is part of why that measurement's wall clock rose 37-55%.
+        //
+        // This chunk is space only this thread can allocate into, so the whole
+        // of it can be blackened now: one `fetch_or` per 512 arena bytes rather
+        // than one per object, and no atomic at all on the bump path
+        // afterwards. `alloc_tlab`'s `black_end` test is what collects the
+        // saving.
+        //
+        // Stamped with the epoch, never with a bare flag -- see
+        // the bitmap itself -- see `allocate_black_if_marking`.
+        if self.mark_active.load(Ordering::Relaxed) {
+            self.blacken_range(ptr as usize, ptr as usize + want);
+        }
         Some(())
     }
 
@@ -12051,6 +12417,12 @@ impl ZgcRealHeap {
         // to anyone: `is_object_address` is a mutator-path oracle on this heap,
         // not just a GC one, so the window in which a live object is absent
         // from the registry has to be as narrow as `alloc_raw`'s.
+        // NOT the place to allocate black. `allocate_black_if_marking` must run
+        // AFTER the header write -- `try_alloc_object` `ptr::write`s the whole
+        // `ObjectHeader` over this address, and on the header arm that clobbers
+        // the flags byte, so a bit set here would be silently erased. The four
+        // callers that own the header write are where it happens; the per-chunk
+        // blackening below is what makes it cheap there.
         <Self as ZTlabHeapHooks>::register_allocations(
             self,
             std::slice::from_ref(&addr),
@@ -15116,6 +15488,11 @@ impl GarbageCollector for ZgcRealHeap {
         // arena guard is released) and BEFORE compaction, which reads no mark
         // bit by design -- see `relocate_stw`'s note on why its live set is a
         // parameter.
+        // RESIZE THE CONCURRENT WINDOW from what this run has now measured.
+        // Once per collection, at the safepoint, so the allocation-path poll
+        // stays two relaxed loads. A no-op unless `CRATONVM_ZGC_CONC_START=auto`.
+        self.refresh_adaptive_conc_start(Self::monotonic_nanos());
+
         let bits_clear = if self.mark_clear_all() {
             true
         } else {
@@ -16501,6 +16878,239 @@ pub(crate) mod tests {
         (addrs, still)
     }
 
+    // ---- D3: the concurrent window, and allocate-black per chunk ----------
+
+    /// **`set_range` sets exactly the grid slots inside the range.**
+    ///
+    /// Off by one at either end is not a slow path, it is a bug: one bit too
+    /// few at the low end leaves the first object in a blackened chunk white,
+    /// and it is swept while live.
+    #[test]
+    fn blackening_a_range_sets_exactly_the_slots_it_covers() {
+        let heap = heap_on_mark_arm(1024 * 1024, true);
+        let bits = heap.mark_bits.as_ref().expect("bitmap arm");
+        let base = heap.arena_base;
+        // Deliberately spanning several words and not starting on one.
+        let lo = base + 8 * 5;
+        let hi = base + 8 * 200;
+        bits.set_range(lo, hi);
+        for slot in 0..300usize {
+            let addr = base + slot * 8;
+            let want = (5..200).contains(&slot);
+            assert_eq!(
+                bits.contains(addr),
+                want,
+                "slot {slot} (0x{addr:x}) should be {}",
+                if want { "set" } else { "clear" }
+            );
+        }
+    }
+
+    /// **A single-word range works too.**
+    ///
+    /// The `w0 == w1` arm is a different expression from the multi-word one and
+    /// is the only one a small TLAB chunk ever takes.
+    #[test]
+    fn blackening_a_range_inside_one_word_sets_only_that_run() {
+        let heap = heap_on_mark_arm(1024 * 1024, true);
+        let bits = heap.mark_bits.as_ref().expect("bitmap arm");
+        let base = heap.arena_base;
+        bits.set_range(base + 8 * 3, base + 8 * 9);
+        for slot in 0..64usize {
+            assert_eq!(bits.contains(base + slot * 8), (3..9).contains(&slot));
+        }
+    }
+
+    /// **Every object allocated during a cycle is born black, whichever path
+    /// served it.**
+    ///
+    /// The correctness claim the per-chunk optimisation must not weaken. Under
+    /// snapshot-at-the-beginning an object allocated after mark start is
+    /// reachable from no root the mark scanned, so a white one is freed while
+    /// live -- and the failure is silent until something dereferences it.
+    ///
+    /// Drives both the TLAB path (blackened per chunk) and the direct
+    /// `alloc_raw` path (blackened per object), because they are different code
+    /// and only one of them changed.
+    #[test]
+    fn every_allocation_during_a_cycle_is_born_black_on_both_paths() {
+        for tlab in [true, false] {
+            let mut heap = ZgcRealHeap::with_capacity(32 * 1024 * 1024);
+            set_mark_arm(&mut heap, true);
+            heap.set_tlab_enabled(tlab);
+            // Open the barrier the way `start_concurrent_mark` does, without
+            // needing an `Arc` heap or a worker pool.
+            assert!(heap.mark_clear_all());
+            heap.set_mark_active(true);
+            heap.blacken_live_tlab_tails();
+            let mut white = 0usize;
+            let mut n = 0usize;
+            for i in 0..4000 {
+                // Mix the sizes so some go through the TLAB and some are too
+                // big for it and take `alloc_raw`.
+                let fields = if i % 97 == 0 { 4096 } else { 3 };
+                let o = heap.alloc_object(ClassId::new(5), fields);
+                n += 1;
+                if !heap.mark_is_set(o.as_ptr() as usize) {
+                    white += 1;
+                }
+            }
+            heap.set_mark_active(false);
+            assert_eq!(
+                white, 0,
+                "{white} of {n} objects allocated during a cycle were born \
+                 WHITE (tlab={tlab}); the sweep would free them while live"
+            );
+            // ...AND THE SAVING IS REAL. `conc_black_allocations` counts only
+            // the PER-OBJECT claims, so on the TLAB arm it must be a small
+            // minority: the chunk blackening is what the other allocations rode
+            // on. Without this the test above passes just as happily with the
+            // optimisation inert, which is the vacuous measurement this tree
+            // has a name for.
+            let claims = heap.conc_black_claims.load(Ordering::Relaxed);
+            if tlab {
+                assert!(
+                    claims * 4 < n,
+                    "{claims} of {n} allocations still had to touch the bitmap; \
+                     the per-chunk blackening is not engaging"
+                );
+            } else {
+                assert_eq!(
+                    claims, n,
+                    "with no TLAB every allocation must claim its own bit, or \
+                     the two arms are not distinguishable"
+                );
+            }
+        }
+    }
+
+    /// **A blackened chunk stops being believed the moment the bits are
+    /// cleared.**
+    ///
+    /// The reason `allocate_black_if_marking`'s "already black?" test reads the
+    /// BITMAP rather than a watermark on the TLAB. `mark_clear_all` runs at the
+    /// END of the sweep, with every live chunk still owned by its thread: a
+    /// watermark would go on saying "black" about a range whose bits are now
+    /// all zero, and every object allocated into it during the next cycle would
+    /// skip the claim and be swept while live.
+    ///
+    /// The exact edit that trips it: caching the blackened extent anywhere that
+    /// `mark_clear_all` does not invalidate.
+    #[test]
+    fn clearing_the_mark_bits_invalidates_a_blackened_chunk() {
+        let mut heap = ZgcRealHeap::with_capacity(32 * 1024 * 1024);
+        set_mark_arm(&mut heap, true);
+        heap.set_tlab_enabled(true);
+        assert!(heap.mark_clear_all());
+        heap.set_mark_active(true);
+        heap.blacken_live_tlab_tails();
+        // Warm the chunk so it is blackened at its refill.
+        for _ in 0..64 {
+            heap.alloc_object(ClassId::new(5), 3);
+        }
+        let probe = heap.alloc_object(ClassId::new(5), 3);
+        assert!(
+            heap.mark_is_set(probe.as_ptr() as usize),
+            "the chunk should be blackened by now"
+        );
+        // A collection ends: the bits are cleared while the chunk stays live
+        // and owned. A NEW cycle then opens without a refill in between.
+        assert!(heap.mark_clear_all());
+        heap.set_mark_active(true);
+        let after = heap.alloc_object(ClassId::new(5), 3);
+        assert!(
+            heap.mark_is_set(after.as_ptr() as usize),
+            "an object allocated after the bits were cleared is WHITE -- the \
+             stale blackening was believed"
+        );
+        heap.set_mark_active(false);
+    }
+
+    /// **The adaptive window is sized from the rate and the mark duration, and
+    /// stays inside its bounds.**
+    ///
+    /// A fixed percentage is why concurrent marking measures worse in total
+    /// pause than a stop-the-world mark despite winning 38-58% per cycle: the
+    /// window is the floating garbage, and one constant cannot be right for
+    /// both a slow allocator and a fast one. The floor is what stops a burst
+    /// computing a window so large the SATB barrier is armed for most of the
+    /// program's life.
+    #[test]
+    fn the_adaptive_window_tracks_the_rate_and_respects_its_bounds() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+        heap.conc_start_adaptive.store(true, Ordering::Relaxed);
+        let threshold = heap.gc_threshold as u64;
+
+        // No sample yet: the bootstrap percentage, which is the value
+        // `Z_CONC_START_PERCENT_DEFAULT`'s measurement was taken at.
+        heap.refresh_adaptive_conc_start(1_000_000);
+        assert_eq!(
+            heap.conc_start_bytes.load(Ordering::Relaxed) as u64,
+            threshold * 60 / 100,
+            "with nothing measured the window must be the bootstrap fraction"
+        );
+
+        // A SLOW allocator with a short mark: the window barely needs any
+        // headroom, so the cycle opens late -- capped at the ceiling.
+        heap.allocated.store(1024 * 1024, Ordering::Relaxed);
+        heap.refresh_adaptive_conc_start(1_000_000_000);
+        heap.conc_mark_nanos_ewma.store(1_000_000, Ordering::Relaxed); // 1 ms
+        heap.allocated.store(2 * 1024 * 1024, Ordering::Relaxed);
+        heap.refresh_adaptive_conc_start(2_000_000_000);
+        let slow = heap.conc_start_bytes.load(Ordering::Relaxed) as u64;
+        assert!(
+            slow <= threshold * 90 / 100,
+            "the window must never open above the ceiling: {slow} of {threshold}"
+        );
+
+        // A FAST allocator with a long mark: it needs the whole heap as
+        // headroom, and the FLOOR is what stops it opening at nothing.
+        heap.conc_mark_nanos_ewma
+            .store(60_000_000_000, Ordering::Relaxed); // 60 s
+        heap.allocated
+            .store(48 * 1024 * 1024, Ordering::Relaxed);
+        heap.refresh_adaptive_conc_start(2_100_000_000);
+        let fast = heap.conc_start_bytes.load(Ordering::Relaxed) as u64;
+        assert_eq!(
+            fast,
+            threshold * 25 / 100,
+            "an unsatisfiable window must clamp to the floor, not to zero"
+        );
+        assert!(
+            fast < slow,
+            "a faster allocator with a longer mark must open EARLIER: \
+             fast={fast} slow={slow}"
+        );
+    }
+
+    /// **`auto` is opt-in: with it off, the window is whatever the numeric
+    /// setting said and the refresh cannot move it.**
+    ///
+    /// The adaptive window is a different policy, not a redefinition of the
+    /// existing one -- `=60` has a published measurement attached to it, and a
+    /// run that asked for 60 must get 60 on every cycle.
+    ///
+    /// The flag is set on the heap rather than read from the environment,
+    /// because a suite run WITH `CRATONVM_ZGC_CONC_START=auto` must still check
+    /// this -- otherwise the one configuration where the opt-in matters is the
+    /// one where its inertness goes untested.
+    #[test]
+    fn the_window_refresh_is_inert_unless_adaptive_is_asked_for() {
+        let heap = ZgcRealHeap::with_capacity(16 * 1024 * 1024);
+        heap.conc_start_adaptive.store(false, Ordering::Relaxed);
+        let before = heap.gc_threshold / 3;
+        heap.conc_start_bytes.store(before, Ordering::Relaxed);
+        // Enough state that an ACTIVE refresh would certainly move it.
+        heap.conc_mark_nanos_ewma.store(5_000_000_000, Ordering::Relaxed);
+        heap.alloc_rate_scaled.store(1 << 20, Ordering::Relaxed);
+        heap.refresh_adaptive_conc_start(12_345);
+        assert_eq!(
+            heap.conc_start_bytes.load(Ordering::Relaxed),
+            before,
+            "the refresh must be inert when it was not asked for"
+        );
+    }
+
     // ---- D6: a real forwarding word at the vacated address ----------------
 
     /// Build a heap whose low region compacts, and return
@@ -16888,17 +17498,28 @@ pub(crate) mod tests {
     /// binary).
     fn heap_on_mark_arm(bytes: usize, bitmap: bool) -> ZgcRealHeap {
         let mut heap = ZgcRealHeap::with_capacity(bytes);
-        if bitmap {
-            assert!(
-                heap.mark_bits.is_some(),
-                "the default arm should be the bitmap; is CRATONVM_ZGC_MARKBITS \
-                 set in this process?"
-            );
-        } else {
-            heap.mark_bits = None;
-        }
+        set_mark_arm(&mut heap, bitmap);
         heap.set_tlab_enabled(false);
         heap
+    }
+
+    /// Put `heap` on a chosen mark-bit arm, whatever `CRATONVM_ZGC_MARKBITS`
+    /// says.
+    ///
+    /// The arm-equivalence claim can only be checked by a test that runs BOTH
+    /// arms, and a suite run with the kill switch set must still check it --
+    /// otherwise the one configuration where the switch matters is the one
+    /// where its equivalence goes untested. So this installs the arm rather
+    /// than asserting the environment produced it.
+    fn set_mark_arm(heap: &mut ZgcRealHeap, bitmap: bool) {
+        match (bitmap, heap.mark_bits.is_some()) {
+            (true, false) => {
+                let span = heap.arena_end.saturating_sub(heap.arena_base);
+                heap.mark_bits = Some(ZObjectStartBits::labelled(heap.arena_base, span, "mark"));
+            }
+            (false, true) => heap.mark_bits = None,
+            _ => {}
+        }
     }
 
     /// Allocate a chain of `n` objects, each pointing at the next, and return
