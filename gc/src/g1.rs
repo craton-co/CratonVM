@@ -344,6 +344,23 @@ fn parallel_evac_enabled() -> bool {
     gc_flags().g1_parallel_evac
 }
 
+/// F-01 — should this young pause use the parallel evacuator?
+///
+/// Extracted from `young_collection`'s dispatch so the truth table can be
+/// stated as a test rather than as a comment. The whole content of the change
+/// is the third argument: before it, `in_jit` alone vetoed the parallel path,
+/// and on a JIT-warm application `in_jit` is true for nearly every pause.
+///
+/// The reason it could be dropped is in
+/// [`crate::gc_flags`]`().g1_parallel_evac_in_jit`: the parallel driver applies
+/// the same conservative-JIT-root region exclusion the serial one does, because
+/// pinning is a collection-set filter and not a property of the evacuation
+/// loop.
+#[inline]
+fn use_parallel_evacuator(enabled: bool, in_jit: bool, allowed_in_jit: bool) -> bool {
+    enabled && (allowed_in_jit || !in_jit)
+}
+
 /// How many candidate references the evacuation ref-scan refused to
 /// dereference because they did not look like live object headers.
 ///
@@ -1696,6 +1713,26 @@ pub struct G1Region {
     /// it: the trail of walked objects names the victim, this names the call
     /// that committed the bytes.
     bump_trail: BumpTrail,
+    /// F-06 — this region's `(incarnation, cursor, type)` at the last
+    /// `start_concurrent_mark`, or `None` outside a cycle.
+    ///
+    /// A per-region mirror of one row of `G1Collector::mark_start_snapshot`,
+    /// written in the same loop. The snapshot stays because
+    /// `is_live_after_mark` reads it under a different rule; this exists
+    /// because the MARKER needs to know a region's TAMS at the moment it marks
+    /// an object, and it holds `&[G1Region]` and nothing else.
+    mark_start: Option<(u64, usize, RegionType)>,
+    /// F-06 — bytes of objects marked BELOW this region's TAMS in the current
+    /// cycle.
+    ///
+    /// Maintained by [`Self::try_mark_and_account`], which every mark site goes
+    /// through, so that `cleanup` can read per-region liveness instead of
+    /// walking every object in the heap to recompute it. Atomic because the
+    /// mark sites hold `&[G1Region]`, not `&mut`.
+    ///
+    /// Cleared by [`Self::reset`] (the bitmap is cleared there too, so the two
+    /// stay in step) and at every mark start.
+    marked_bytes_below_tams: AtomicUsize,
     /// The same, restricted to `tlab:*` carves.
     ///
     /// A shared ring cannot answer the question it exists for. TLAB carves are
@@ -1729,6 +1766,8 @@ impl G1Region {
             reuse_epoch: 0,
             recycled_in_generation: 0,
             mark_bitmap,
+            mark_start: None,
+            marked_bytes_below_tams: AtomicUsize::new(0),
             bump_trail: BumpTrail::default(),
             tlab_trail: BumpTrail::default(),
         }
@@ -1744,6 +1783,83 @@ impl G1Region {
         let buf = vec![0u8; region_size].into_boxed_slice();
         let base = Box::leak(buf).as_mut_ptr() as usize;
         Self::from_arena(base, region_size)
+    }
+
+    /// F-06 — this region's top-at-mark-start, in bytes from its base.
+    ///
+    /// Objects BELOW it were in the mark snapshot, so the bitmap is
+    /// authoritative for them. Everything at or above postdates the snapshot,
+    /// carries no mark information, and is implicitly live.
+    ///
+    /// The three arms are the rule `cleanup` has always applied, moved here so
+    /// the marker and the cleanup verdict cannot drift apart:
+    ///
+    /// * no cycle data — `cleanup` driven outside a real mark cycle, as the
+    ///   unit tests do — put TAMS at the top so nothing is implicitly live and
+    ///   the verdict is pure-bitmap;
+    /// * a snapshot that still describes this region — its recorded fill level,
+    ///   clamped to the current cursor;
+    /// * recycled (incarnation bumped) or re-typed since the snapshot — the
+    ///   region's ENTIRE content postdates it.
+    fn tams(&self) -> usize {
+        match self.mark_start {
+            None => self.cursor,
+            Some((epoch, snap_cursor, snap_type))
+                if epoch == self.reuse_epoch && snap_type == self.region_type =>
+            {
+                snap_cursor.min(self.cursor)
+            }
+            Some(_) => 0,
+        }
+    }
+
+    /// F-06 — mark `addr` black and, if it predates TAMS, add its size to
+    /// [`Self::marked_bytes_below_tams`]. Returns what `try_mark` returned.
+    ///
+    /// # Why every mark site goes through this
+    ///
+    /// `cleanup` used to derive per-region liveness by walking every object of
+    /// every non-Free region and consulting the bitmap — an O(heap)
+    /// stop-the-world pass at the end of each concurrent cycle, growing with
+    /// the old generation, which is the one part of the heap the collector
+    /// otherwise never touches synchronously. Real G1 has no such pause because
+    /// it accumulates the same number DURING marking. This is that
+    /// accumulation.
+    ///
+    /// It only works if it is the ONLY way a bit gets set. An unaccounted mark
+    /// makes `live_bytes` too small, and a too-small `live_bytes` is what lets
+    /// `cleanup` free a live Old region in place — so the four production mark
+    /// sites (`concurrent_mark_step`, `push_gray_or_mark`'s overflow arm,
+    /// `remark`'s seed-at-cap arm, and the SATB keep-alive's seed-at-cap arm)
+    /// all call this and none call `mark_bitmap.try_mark` directly.
+    ///
+    /// The size is bounded by the region's own cursor before it is added, which
+    /// is the same bound the walk applied, so a corrupt header inflates nothing.
+    /// An object that straddles TAMS is counted in full — under bump
+    /// allocation TAMS is an object boundary so it cannot legitimately happen,
+    /// and over-counting only retains a region for one more cycle.
+    fn try_mark_and_account(&self, addr: usize) -> bool {
+        if !self.mark_bitmap.try_mark(addr) {
+            return false;
+        }
+        let Some(off) = addr.checked_sub(self.data.addr()) else {
+            return true;
+        };
+        // At or above TAMS: implicitly live, and `cleanup` adds that extent
+        // wholesale. Counting it here as well is the G1MAT-1 double-count.
+        if off >= self.tams() {
+            return true;
+        }
+        // SAFETY: `off < tams <= cursor`, so `addr` is inside this region's
+        // live extent; every caller reached it through a region lookup, and the
+        // regions guard is held for the duration of a mark step.
+        let header = unsafe { &*(addr as *const ObjectHeader) };
+        let size = object_total_size(header);
+        if size >= HEADER_SIZE && off.saturating_add(size) <= self.cursor {
+            self.marked_bytes_below_tams
+                .fetch_add(size, Ordering::Relaxed);
+        }
+        true
     }
 
     /// Remaining free bytes in this region.
@@ -1793,6 +1909,13 @@ impl G1Region {
         // reallocated (only `fill(0)`'d) so the bitmap's base address
         // remains valid.
         self.mark_bitmap.clear();
+        // F-06: the byte accumulator is derived from those bits and must be
+        // cleared with them. `mark_start` is deliberately NOT cleared — the
+        // `reuse_epoch` bump above makes `tams()` answer 0 for this region,
+        // i.e. "its entire content postdates the mark snapshot", which is
+        // exactly the verdict the old cleanup walk reached for a region
+        // recycled mid-cycle.
+        self.marked_bytes_below_tams.store(0, Ordering::Relaxed);
         // G1AUD-10 — DO NOT scrub the freed bytes. The allocator already does
         // it, and this was the single most expensive phase of a young pause.
         //
@@ -1968,6 +2091,76 @@ pub(crate) fn ergonomic_gc_worker_threads(cpus: usize) -> usize {
     } else {
         8 + (cpus - 8) * 5 / 8
     }
+}
+
+/// F-06 — the TAMS rule as `cleanup` used to state it, against the global
+/// mark-start snapshot.
+///
+/// Retained only as the oracle for the `debug_assert_eq!` in `cleanup`: the
+/// authority is now `G1Region::tams`, and this exists so that a divergence
+/// between the per-region mirror and the snapshot it was copied from is a
+/// failing test rather than a silently wrong liveness verdict.
+fn cleanup_tams_from_snapshot(
+    snapshot: &[(u64, usize, RegionType)],
+    region_idx: usize,
+    region: &G1Region,
+) -> usize {
+    if snapshot.is_empty() {
+        return region.cursor;
+    }
+    match snapshot.get(region_idx) {
+        Some(&(epoch, snap_cursor, snap_type))
+            if epoch == region.reuse_epoch && snap_type == region.region_type =>
+        {
+            snap_cursor.min(region.cursor)
+        }
+        _ => 0,
+    }
+}
+
+/// F-06 — the walk `cleanup` used to do: sum the sizes of marked objects below
+/// `tams`.
+///
+/// No longer on the pause path by default. It is the `CRATONVM_G1_CLEANUP_WALK`
+/// arm and the debug-build oracle for the accumulator — see the call site.
+fn walk_marked_bytes_below_tams(
+    region: &G1Region,
+    base: usize,
+    tams: usize,
+    jit_skips: &[(usize, usize)],
+) -> usize {
+    let mut live = 0usize;
+    let mut offset = 0usize;
+    while offset < tams {
+        let obj_addr = base + offset;
+        // INT-3 — frozen-peer TLAB tail: skip before interpreting.
+        if let Some(skip) = jit_tlab_skip_span_len(jit_skips, obj_addr) {
+            offset += skip;
+            continue;
+        }
+        // TLAB-retire gap sentinel: skip its exact span.
+        if let Some(gap) = gap_filler_len(obj_addr as *const u8) {
+            offset += gap;
+            continue;
+        }
+        // SAFETY: `offset < tams <= cursor`, so this is inside the region's
+        // live extent and the regions guard is held by the caller.
+        let header = unsafe { &*(obj_addr as *const ObjectHeader) };
+        // Round-9 gc CRIT-1: humongous continuation filler covers the entire
+        // region with no live objects of its own; skip.
+        if is_humongous_filler(header) {
+            break;
+        }
+        let obj_size = object_total_size(header);
+        if obj_size < HEADER_SIZE || offset + obj_size > region.cursor {
+            break;
+        }
+        if region.mark_bitmap.is_marked(obj_addr) {
+            live += obj_size;
+        }
+        offset += obj_size;
+    }
+    live
 }
 
 /// F-09 — round a requested region size up to a power of two.
@@ -3938,19 +4131,37 @@ impl G1Collector {
         // Behaviour-equivalent to the serial path below (byte-identical program
         // output); see the parallel-evacuation module note above.
         //
-        // Fall back to the serial path whenever a thread is in JIT: only the
-        // serial path implements conservative-JIT-root region pinning (the
-        // parallel evacuator would relocate a JIT-rooted object whose holder
-        // slot cannot be rewritten). When parallel DOES run (no thread in JIT)
-        // there are no conservative JIT roots to pin, so it stays correct.
-        // Finalizer resurrection (Phase 3.5) is implemented only on the
-        // serial paths — force serial while resurrection candidates are
-        // pending (System.gc with registered finalizables; rare and already
-        // a full-STW slow path).
-        if parallel_evac_enabled()
-            && !crate::gc_quiescence::is_active()
-            && self.pending_finalizer_roots.lock().is_empty()
-        {
+        // F-01 — this used to read
+        //
+        //     parallel_evac_enabled()
+        //         && !crate::gc_quiescence::is_active()
+        //         && self.pending_finalizer_roots.lock().is_empty()
+        //
+        // and both extra terms are gone, for different reasons.
+        //
+        // The JIT term said "only the serial path implements
+        // conservative-JIT-root region pinning". It does not:
+        // `young_collection_parallel` computes the same exclusion from the same
+        // `pinned_region_set_including_non_object_roots`, and says in its own
+        // comment that it does so deliberately in case this gate is ever
+        // loosened. Pinning is a CSet filter applied before evacuation starts;
+        // it does not constrain how the evacuation loop is scheduled. The term
+        // cost a great deal: on a JIT-warm application it is true for nearly
+        // every pause (330,263 of 330,264 in the audit's own measurement), so
+        // the parallel evacuator was switched off exactly where it was needed
+        // and the worker pool never ran. `CRATONVM_G1_PARALLEL_EVAC_IN_JIT=0`
+        // restores it as a bisection lever — see the flag doc, and note that
+        // defect G1-11 lives in this path.
+        //
+        // The finalizer term was true when it was written and is not any more:
+        // Phase 3.5 now runs on the parallel drivers too, after
+        // `parallel_evacuate` returns and while the regions guard is held
+        // again, which is the same state the serial path runs it in.
+        if use_parallel_evacuator(
+            parallel_evac_enabled(),
+            crate::gc_quiescence::is_active(),
+            gc_flags().g1_parallel_evac_in_jit,
+        ) {
             return self.young_collection_parallel(roots, monitors);
         }
         let start = std::time::Instant::now();
@@ -5384,6 +5595,29 @@ impl G1Collector {
                 &parallel_sources,
             )
         };
+        // Phase 3.5 — finalizer resurrection (F-01). The serial driver runs
+        // this between the closure and the fix-up, and it was the last real
+        // reason the dispatch in `young_collection` forced serial. It needs
+        // nothing the parallel path cannot give it: the regions guard is held
+        // again here, the shards are merged into `pointer_map`, and every
+        // worker TLAB has been retired (its cursor written back), so the
+        // serial `evacuate_object` it uses finds correct region state. A
+        // candidate that no worker forwarded has an untouched mark word, which
+        // is exactly the from-space object this expects.
+        let mut pointer_map = pointer_map;
+        let mut objects_copied = objects_copied;
+        let mut bytes_copied = bytes_copied;
+        {
+            let mut resurrect_list: Vec<*mut u8> = Vec::new();
+            self.resurrect_dead_finalizers(
+                &mut regions,
+                &cset_set,
+                &mut pointer_map,
+                &mut objects_copied,
+                &mut bytes_copied,
+                &mut resurrect_list,
+            );
+        }
         phases.closure_us = phase_mark.elapsed().as_micros() as u64;
         phase_mark = std::time::Instant::now();
 
@@ -5655,6 +5889,22 @@ impl G1Collector {
                 &parallel_sources,
             )
         };
+        // Phase 3.5 — finalizer resurrection; see the twin in
+        // `young_collection_parallel`.
+        let mut pointer_map = pointer_map;
+        let mut objects_copied = objects_copied;
+        let mut bytes_copied = bytes_copied;
+        {
+            let mut resurrect_list: Vec<*mut u8> = Vec::new();
+            self.resurrect_dead_finalizers(
+                &mut regions,
+                &cset_set,
+                &mut pointer_map,
+                &mut objects_copied,
+                &mut bytes_copied,
+                &mut resurrect_list,
+            );
+        }
         phases.closure_us = phase_mark.elapsed().as_micros() as u64;
         phase_mark = std::time::Instant::now();
 
@@ -5848,11 +6098,18 @@ impl G1Collector {
         (result, dead)
     }
 
-    /// Phase 3.5 (serial young/mixed): evacuate dead-but-finalizable CSet
-    /// objects (and their transitive closure, via the same Phase-3 scan)
-    /// so `finalize()` can run against valid memory. See
-    /// [`Self::collect_garbage_with_finalizers`]. No-op when no candidates
-    /// are pending (every plain collection).
+    /// Phase 3.5: evacuate dead-but-finalizable CSet objects (and their
+    /// transitive closure, via the same Phase-3 scan) so `finalize()` can run
+    /// against valid memory. See [`Self::collect_garbage_with_finalizers`].
+    /// No-op when no candidates are pending (every plain collection).
+    ///
+    /// Runs on ALL FOUR evacuation drivers since F-01. It used to be serial-only,
+    /// which is why the dispatch in `young_collection` forced the serial
+    /// evacuator whenever candidates were pending. The parallel drivers call it
+    /// at the same protocol point — after the closure, before the fix-up —
+    /// with the regions guard reacquired and the worker shards already merged
+    /// into `pointer_map`, so every input it reads is in the state the serial
+    /// path leaves them in.
     fn resurrect_dead_finalizers(
         &self,
         regions: &mut Vec<G1Region>,
@@ -8176,7 +8433,7 @@ impl G1Collector {
                 // marked object need reference a SATB seed. Mark it black
                 // without scanning — the rescan the flag forces will scan
                 // its fields. (Stays in place: non-CSet checked above.)
-                regions[idx].mark_bitmap.try_mark(addr);
+                regions[idx].try_mark_and_account(addr);
                 self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
             }
         }
@@ -8235,7 +8492,7 @@ impl G1Collector {
             self.note_gray(new_addr, "push-gray-or-mark", 0);
             worklist.push(new_addr);
         } else if let Some(idx) = self.lookup_region_for_addr(new_addr) {
-            regions[idx].mark_bitmap.try_mark(new_addr);
+            regions[idx].try_mark_and_account(new_addr);
             self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
         }
     }
@@ -8265,6 +8522,19 @@ impl G1Collector {
     /// state is lost (an orphaned controller slot) so the completion gate
     /// in the VM does not spin forever on a cycle nobody is driving.
     pub fn abort_concurrent_mark(&self) {
+        // F-06: an aborted cycle's bitmap is discarded, so the byte
+        // accumulator derived from it must be discarded too — and `mark_start`
+        // with it, or the next `cleanup` driven outside a cycle would read a
+        // stale TAMS and treat post-snapshot bytes as implicitly live on the
+        // strength of a cycle that never finished.
+        {
+            let mut regions = self.regions.lock();
+            for r in regions.iter_mut() {
+                r.mark_start = None;
+                r.marked_bytes_below_tams.store(0, Ordering::Relaxed);
+            }
+            self.mark_start_snapshot.lock().clear();
+        }
         self.mark_worklist.lock().clear();
         self.mark_worklist_overflowed
             .store(false, Ordering::Relaxed);
@@ -8308,9 +8578,13 @@ impl G1Collector {
         // Round-2 fix (HIGH — GC #5): clear every per-region bitmap so a
         // previous cycle's mark bits don't leak into this one.
         {
-            let regions = self.regions.lock();
-            for r in regions.iter() {
+            let mut regions = self.regions.lock();
+            for r in regions.iter_mut() {
                 r.mark_bitmap.clear();
+                // F-06: the per-region mirror of the row written below, and the
+                // byte accumulator that is only meaningful against it.
+                r.mark_start = Some((r.reuse_epoch, r.cursor, r.region_type));
+                r.marked_bytes_below_tams.store(0, Ordering::Relaxed);
             }
             // TAMS snapshot: record every region's incarnation + fill level
             // at mark start so `cleanup` can treat later allocations as live
@@ -8739,7 +9013,7 @@ impl G1Collector {
             // route the mark through the owning region's bitmap (which is
             // keyed off that region's actual data pointer).
             // Already black? Skip — nothing new to discover from it.
-            if !regions[region_idx].mark_bitmap.try_mark(obj_addr) {
+            if !regions[region_idx].try_mark_and_account(obj_addr) {
                 continue;
             }
 
@@ -9168,7 +9442,7 @@ impl G1Collector {
         let overflow_flag = &self.mark_worklist_overflowed;
         let push_with_cap = |worklist: &mut Vec<usize>, idx: usize, addr: usize| {
             if worklist.len() >= MARK_WORKLIST_CAP {
-                regions[idx].mark_bitmap.try_mark(addr);
+                regions[idx].try_mark_and_account(addr);
                 overflow_flag.store(true, Ordering::Relaxed);
                 return;
             }
@@ -9346,92 +9620,74 @@ impl G1Collector {
                 continue;
             }
 
-            // Compute live bytes by walking objects and checking the bitmap.
-            // Round-2 fix (HIGH — GC #5): consult this region's own
-            // bitmap (keyed off `data.as_ptr()`), not a global one.
-            let base = region.data.as_ptr() as usize;
-            let mut live_bytes = 0usize;
-            let mut offset = 0usize;
-
-            // TAMS (top-at-mark-start) for this region. Objects BELOW it were
-            // in the mark snapshot, so the bitmap is authoritative for them;
-            // everything at or above it postdates the snapshot, carries no
-            // mark information, and is implicitly live (added wholesale after
-            // the walk).
+            // F-06 — per-region liveness, read rather than recomputed.
             //
-            // G1MAT-1 (double-count fix): the bitmap walk used to run over the
-            // ENTIRE region `[0, cursor)` and the post-TAMS extent
-            // `cursor - snap_cursor` was then added on top — so every
-            // post-TAMS object that the marker DID reach (SATB keep-alive,
-            // `push_gray_or_mark`, a fresh promotion that a root still names)
-            // was counted twice. That inflates `live_bytes` (it can exceed
-            // `cursor`, breaking the `live_bytes <= cursor` invariant) and
-            // therefore `gc_efficiency`, which is exactly the key
-            // `mixed_collection` / `select_old_regions_for_mixed_gc` sort on
-            // (ascending = worst-first). Inflated efficiency makes
-            // garbage-rich Old regions look live, so mixed GC picks the wrong
-            // regions — and `estimated_evac_cost_ns` (live_bytes x
-            // evac_ns_per_byte) over-charges the pause budget, so it picks
-            // FEWER of them. Net effect: old-gen reclamation is throttled and
-            // biased, which is precisely the failure mode that keeps G1 from
-            // being a usable escape hatch. Bound the bitmap walk by TAMS so
-            // each byte is attributed exactly once.
-            let tams = if mark_snapshot.is_empty() {
-                // No cycle data (cleanup driven outside a real mark cycle,
-                // e.g. unit tests): keep the pure-bitmap behaviour by putting
-                // TAMS at the top, so nothing is treated as implicitly live.
-                region.cursor
-            } else {
-                match mark_snapshot.get(region_idx) {
-                    Some(&(epoch, snap_cursor, snap_type))
-                        if epoch == region.reuse_epoch && snap_type == region.region_type =>
-                    {
-                        snap_cursor.min(region.cursor)
-                    }
-                    // Recycled (epoch bump), re-typed, or absent snapshot entry:
-                    // the region's ENTIRE content postdates the snapshot.
-                    _ => 0,
-                }
-            };
+            // This used to WALK every object of every non-Free region here,
+            // consulting the bitmap and summing sizes: an O(heap)
+            // stop-the-world pass at the end of every concurrent cycle, growing
+            // with the old generation — the one part of the heap the collector
+            // otherwise never touches synchronously. Real G1 has no such pause
+            // because it accumulates the same number DURING marking, which is
+            // what `G1Region::try_mark_and_account` now does. Cleanup is
+            // arithmetic over `regions`.
+            //
+            // TAMS (top-at-mark-start) for this region. Objects BELOW it were
+            // in the mark snapshot, so the bitmap — and therefore the
+            // accumulator — is authoritative for them; everything at or above
+            // it postdates the snapshot, carries no mark information, and is
+            // implicitly live. The three cases the rule has to cover moved to
+            // `G1Region::tams`, which the marker reads too, so the accumulation
+            // and the verdict cannot drift apart.
+            //
+            // G1MAT-1 (double-count fix) is preserved by construction rather
+            // than by a bound on a walk: `try_mark_and_account` adds nothing
+            // for an object at or above TAMS, so a post-TAMS object the marker
+            // DID reach (SATB keep-alive, `push_gray_or_mark`, a fresh
+            // promotion a root still names) is counted once, by the wholesale
+            // extent below. Getting that wrong inflates `gc_efficiency`, which
+            // is the key `select_old_regions_for_mixed_gc` sorts on
+            // (ascending = worst-first), so mixed GC would pick the wrong
+            // regions and `estimated_evac_cost_ns` would over-charge the pause
+            // budget and pick fewer of them.
+            let base = region.data.as_ptr() as usize;
+            let tams = region.tams();
+            debug_assert_eq!(
+                tams,
+                cleanup_tams_from_snapshot(&mark_snapshot, region_idx, region),
+                "region {region_idx}: the per-region TAMS and the mark-start \
+                 snapshot disagree — `start_concurrent_mark` writes both in one \
+                 loop, so they can only diverge if one of them stopped being \
+                 maintained"
+            );
+            let mut live_bytes = region
+                .marked_bytes_below_tams
+                .load(Ordering::Relaxed)
+                .saturating_add(region.cursor.saturating_sub(tams));
 
-            while offset < tams {
-                let obj_addr = base + offset;
-                // INT-3 — frozen-peer TLAB tail: skip before interpreting.
-                if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_addr) {
-                    offset += skip;
-                    continue;
+            // The walk this replaced, kept as a lever and as an oracle.
+            //
+            // `CRATONVM_G1_CLEANUP_WALK=1` restores it as the authority, which
+            // is the single-binary A/B for the change and the first thing to
+            // try if a G1 cycle is suspected of freeing a live Old region. In
+            // a debug build it runs anyway and must agree: an accumulated
+            // liveness is only as good as the claim that every mark site goes
+            // through the accumulator, and that claim deserves a check rather
+            // than a comment.
+            if gc_flags().g1_cleanup_walk || cfg!(debug_assertions) {
+                let walked = walk_marked_bytes_below_tams(region, base, tams, &jit_skips);
+                let walked_live = walked.saturating_add(region.cursor.saturating_sub(tams));
+                debug_assert_eq!(
+                    walked_live, live_bytes,
+                    "region {region_idx}: the accumulated live bytes ({live_bytes}) \
+                     disagree with a walk of the same region ({walked_live}) — some \
+                     mark site is setting a bit without going through \
+                     `try_mark_and_account`, and an under-count is what lets \
+                     cleanup free a live Old region in place"
+                );
+                if gc_flags().g1_cleanup_walk {
+                    live_bytes = walked_live;
                 }
-                // TLAB-retire gap sentinel: skip its exact span.
-                if let Some(gap) = gap_filler_len(obj_addr as *const u8) {
-                    offset += gap;
-                    continue;
-                }
-                let header = unsafe { &*(obj_addr as *const ObjectHeader) };
-                // Round-9 gc CRIT-1: humongous continuation filler covers
-                // the entire region with no live objects of its own; skip.
-                if is_humongous_filler(header) {
-                    break;
-                }
-                let obj_size = object_total_size(header);
-
-                if obj_size < HEADER_SIZE || offset + obj_size > region.cursor {
-                    break;
-                }
-
-                if region.mark_bitmap.is_marked(obj_addr) {
-                    live_bytes += obj_size;
-                }
-                offset += obj_size;
             }
-
-            // TAMS: everything at or above `tams` postdates the mark-start
-            // snapshot and is conservatively live. `tams` already encodes the
-            // recycled / re-typed / absent-entry cases (0 => the whole region
-            // postdates the snapshot) and the no-cycle case (`tams == cursor`
-            // => nothing implicitly live, pure-bitmap verdict). Because the
-            // walk above stopped at `tams`, this addition cannot double-count
-            // a marked post-TAMS object (G1MAT-1).
-            live_bytes += region.cursor.saturating_sub(tams);
 
             // Invariant restored by G1MAT-1: a region can never be more than
             // 100% live, so `gc_efficiency` stays in [0, 1] and the worst-first
@@ -14957,6 +15213,85 @@ mod tests {
         }
     }
 
+    // -- F-01: the parallel evacuator's dispatch, and Phase 3.5 on it --
+
+    #[test]
+    fn the_parallel_evacuator_is_no_longer_vetoed_by_a_live_compiled_frame() {
+        // enabled, in_jit, allowed_in_jit -> parallel?
+        for (enabled, in_jit, allowed, want) in [
+            (true, false, true, true),
+            (true, true, true, true),
+            (true, true, false, false),
+            (true, false, false, true),
+            (false, false, true, false),
+            (false, true, true, false),
+        ] {
+            assert_eq!(
+                use_parallel_evacuator(enabled, in_jit, allowed),
+                want,
+                "enabled={enabled} in_jit={in_jit} allowed_in_jit={allowed}"
+            );
+        }
+    }
+
+    /// Phase 3.5 used to exist only on the serial drivers, which is why the
+    /// dispatch forced serial whenever finalizer candidates were pending. With
+    /// the default flags this pause now takes the PARALLEL driver, so this test
+    /// fails on the pre-F-01 parallel path by losing the object entirely.
+    #[test]
+    fn the_parallel_driver_resurrects_a_dead_finalizable_object() {
+        let gc = make_collector();
+
+        let obj = gc.alloc_object(ClassId::new(77), 2);
+        let addr = obj.as_ptr() as usize;
+        gc.set_field(obj, 0, Value::Int(0xF1A));
+        // Something else in Eden so the pause has work and a CSet.
+        let _churn = gc.alloc_object(ClassId::new(1), 1);
+
+        // No root names it: it is dead, and only its finalizer registration
+        // keeps it alive for one more pause.
+        let mut roots: Vec<ObjectRef> = vec![];
+        let (result, dead) =
+            gc.collect_garbage_with_finalizers(&stw(), &mut roots, &[addr], &NoopMonitors);
+
+        assert_eq!(
+            dead.len(),
+            1,
+            "a dead-but-finalizable CSet object must be resurrected so finalize()              has valid memory to run against"
+        );
+        let moved = dead[0];
+        assert_eq!(
+            result.pointer_map.get(&addr).copied(),
+            Some(moved),
+            "and the caller must be handed its POST-copy address"
+        );
+        let resurrected = unsafe { ObjectRef::from_raw(moved as *mut u8) };
+        assert_eq!(
+            gc.get_field(resurrected, 0),
+            Value::Int(0xF1A),
+            "the resurrected copy must still hold the object's fields"
+        );
+    }
+
+    /// The same object, still REACHABLE, must not be reported dead — otherwise
+    /// the test above would pass on an implementation that resurrects
+    /// everything.
+    #[test]
+    fn a_live_finalizable_object_is_not_reported_dead_by_the_parallel_driver() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(77), 2);
+        let addr = obj.as_ptr() as usize;
+        let _churn = gc.alloc_object(ClassId::new(1), 1);
+
+        let mut roots: Vec<ObjectRef> = vec![obj];
+        let (_result, dead) =
+            gc.collect_garbage_with_finalizers(&stw(), &mut roots, &[addr], &NoopMonitors);
+        assert!(
+            dead.is_empty(),
+            "a rooted finalizable object survived normally and must not be enqueued"
+        );
+    }
+
     // -- F-07: the phase breakdown is a partition --
 
     #[test]
@@ -16935,7 +17270,8 @@ mod tests {
             let region_idx = gc
                 .region_for_ptr(&regions, obj.as_ptr())
                 .expect("freshly-allocated object must live in some region");
-            let marked = regions[region_idx].mark_bitmap.try_mark(obj_addr);
+            // F-06: through the accumulator, like every production mark site.
+            let marked = regions[region_idx].try_mark_and_account(obj_addr);
             assert!(
                 marked,
                 "per-region bitmap must accept real heap addresses post-fix"
@@ -21232,8 +21568,17 @@ mod tests {
     /// `start_concurrent_mark` publishes; lock order is regions -> snapshot,
     /// same as production.
     fn force_mark_snapshot(gc: &G1Collector, region_idx: usize, tams_offset: usize) {
+        // F-06: arm the PER-REGION mirror as well as the global snapshot.
+        // `start_concurrent_mark` writes both in one loop and `cleanup`
+        // debug-asserts they agree, so a fixture that wrote only one would fail
+        // on the fixture rather than on what the test is about.
         let snapshot: Vec<(u64, usize, RegionType)> = {
-            let regions = gc.regions.lock();
+            let mut regions = gc.regions.lock();
+            for (i, r) in regions.iter_mut().enumerate() {
+                let cursor = if i == region_idx { tams_offset } else { r.cursor };
+                r.mark_start = Some((r.reuse_epoch, cursor, r.region_type));
+                r.marked_bytes_below_tams.store(0, Ordering::Relaxed);
+            }
             regions
                 .iter()
                 .enumerate()
@@ -21250,6 +21595,127 @@ mod tests {
         let mut snap = gc.mark_start_snapshot.lock();
         snap.clear();
         snap.extend(snapshot);
+    }
+
+    /// F-06 — the number `cleanup` reports is the one the MARKER accumulated,
+    /// not one it recomputed by walking the heap.
+    ///
+    /// The walk is still reachable (`CRATONVM_G1_CLEANUP_WALK=1`, and every
+    /// debug build runs it as an oracle beside the accumulator), so a test that
+    /// only checked `live_bytes` would pass on either implementation. This one
+    /// reads the accumulator directly and pins the arithmetic cleanup does with
+    /// it.
+    #[test]
+    fn the_marker_accumulates_the_live_bytes_cleanup_reports() {
+        let gc = make_collector();
+        let live = gc.alloc_object(ClassId::new(1), 0);
+        let dead = gc.alloc_object(ClassId::new(2), 0);
+        let live_addr = live.as_ptr() as usize;
+
+        let idx = {
+            let regions = gc.regions.lock();
+            gc.region_for_ptr(&regions, live.as_ptr()).unwrap()
+        };
+        assert_eq!(
+            gc.lookup_region_for_addr(dead.as_ptr() as usize),
+            Some(idx),
+            "test setup: both objects must share one region"
+        );
+        gc.with_regions_mut(|regions| regions[idx].region_type = RegionType::Old);
+
+        // TAMS at the top: everything in the region predates the snapshot, so
+        // the bitmap alone decides and nothing is implicitly live.
+        let cursor = gc.regions.lock()[idx].cursor;
+        force_mark_snapshot(&gc, idx, cursor);
+
+        let live_size = {
+            let regions = gc.regions.lock();
+            assert_eq!(
+                regions[idx].marked_bytes_below_tams.load(Ordering::Relaxed),
+                0,
+                "the accumulator is cleared when the snapshot is armed"
+            );
+            assert!(regions[idx].try_mark_and_account(live_addr));
+            let accumulated = regions[idx].marked_bytes_below_tams.load(Ordering::Relaxed);
+            assert!(
+                accumulated > 0,
+                "marking one object below TAMS must accumulate its size"
+            );
+            accumulated
+        };
+
+        gc.cleanup(&stw());
+
+        let regions = gc.regions.lock();
+        assert_eq!(
+            regions[idx].live_bytes, live_size,
+            "cleanup reports exactly what the marker accumulated -- the dead \
+             object contributes nothing and nothing is implicitly live at this TAMS"
+        );
+        assert!(
+            regions[idx].live_bytes < cursor,
+            "the unmarked object's bytes must NOT be counted, or the test is \
+             not distinguishing liveness from occupancy"
+        );
+    }
+
+    /// F-06 — a region recycled since the mark snapshot reports its whole
+    /// content live, and its accumulator is cleared with its bitmap.
+    ///
+    /// This is the fail-safe direction and the one that matters: a recycled
+    /// region carries no mark information, so reading its stale accumulator
+    /// would under-report liveness — and an under-report is exactly what lets
+    /// `cleanup` free a live Old region in place.
+    #[test]
+    fn a_region_recycled_since_mark_start_reports_its_whole_content_live() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 0);
+        let idx = {
+            let regions = gc.regions.lock();
+            gc.region_for_ptr(&regions, obj.as_ptr()).unwrap()
+        };
+        let cursor = gc.regions.lock()[idx].cursor;
+        force_mark_snapshot(&gc, idx, cursor);
+        {
+            let regions = gc.regions.lock();
+            assert!(regions[idx].try_mark_and_account(obj.as_ptr() as usize));
+            assert!(regions[idx].marked_bytes_below_tams.load(Ordering::Relaxed) > 0);
+        }
+
+        // Recycle it, then refill it: a new incarnation, whose content the mark
+        // snapshot says nothing about.
+        gc.with_regions_mut(|regions| {
+            regions[idx].reset(1);
+            regions[idx].region_type = RegionType::Old;
+            regions[idx].cursor = 4096;
+        });
+        {
+            let regions = gc.regions.lock();
+            assert_eq!(
+                regions[idx].marked_bytes_below_tams.load(Ordering::Relaxed),
+                0,
+                "reset clears the accumulator with the bitmap it is derived from"
+            );
+            assert_eq!(
+                regions[idx].tams(),
+                0,
+                "an incarnation bump means the region's ENTIRE content postdates \
+                 the snapshot"
+            );
+        }
+
+        gc.cleanup(&stw());
+
+        let regions = gc.regions.lock();
+        assert_eq!(
+            regions[idx].live_bytes, 4096,
+            "every byte of a recycled region is conservatively live"
+        );
+        assert_ne!(
+            regions[idx].region_type,
+            RegionType::Free,
+            "and it must not be freed in place"
+        );
     }
 
     /// G1MAT-1 — `cleanup` must attribute each byte of a region exactly once.
@@ -21293,8 +21759,8 @@ mod tests {
         // The marker reached BOTH — including the post-TAMS object. That is the
         // case the old accounting double-counted.
         gc.with_regions_mut(|regions| {
-            assert!(regions[idx].mark_bitmap.try_mark(below_addr));
-            assert!(regions[idx].mark_bitmap.try_mark(above_addr));
+            assert!(regions[idx].try_mark_and_account(below_addr));
+            assert!(regions[idx].try_mark_and_account(above_addr));
         });
 
         gc.cleanup(&stw());

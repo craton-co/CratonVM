@@ -736,6 +736,32 @@ pub struct GcFlags {
     /// any suspected parallel-evacuation regression, and a cycle record still
     /// names which evacuator ran.
     pub g1_parallel_evac: bool,
+    /// `CRATONVM_G1_PARALLEL_EVAC_IN_JIT` — let the parallel evacuator run for
+    /// pauses taken while a thread is inside compiled code. Default **ON**
+    /// ([`parse::on_unless_zero`]); `=0` restores the serial fallback.
+    ///
+    /// Until F-01 the young driver fell back to the serial evacuator whenever
+    /// `gc_quiescence::is_active()`, on the stated ground that "only the serial
+    /// path implements conservative-JIT-root region pinning". That ground was
+    /// stale: `young_collection_parallel` computes the identical exclusion via
+    /// `pinned_region_set_including_non_object_roots`, and its own comment says
+    /// it does so deliberately "even if that gate is ever loosened". Pinning is
+    /// a collection-set FILTER applied before evacuation begins; nothing in it
+    /// requires the evacuation loop to be single-threaded.
+    ///
+    /// The gate mattered because on a JIT-warm application it is true for
+    /// nearly every pause — the audit's own instrumentation recorded 330,263 of
+    /// 330,264 pauses with a live compiled frame — so in production G1 copied
+    /// on one thread and the persistent worker pool never ran.
+    ///
+    /// `=0` is the bisection lever, and the FIRST thing to try for any G1
+    /// crash or corruption seen only with the JIT warm: under it, JIT-warm
+    /// pauses take exactly the evacuator every G1 result before this flag was
+    /// produced under. Defect G1-11 (an access violation under
+    /// `-XX:+UseG1GC -Xmx32m` with the JIT warm) is open at the time of
+    /// writing and lives in this path; reproduce it in both arms before
+    /// attributing a change in its frequency to anything else.
+    pub g1_parallel_evac_in_jit: bool,
     /// `CRATONVM_G1_EAGER_HUMONGOUS` — reclaim provably-dead humongous spans
     /// during evacuation pauses instead of waiting for a concurrent-mark
     /// cleanup. Default **ON** ([`parse::on_unless_zero`]); set `=0` to restore
@@ -849,6 +875,24 @@ pub struct GcFlags {
     /// collector re-walks the whole heap every pause, which is the behaviour
     /// every G1 result before 2026-08-18 was produced under.
     pub g1_narrow_fixup: bool,
+    /// `CRATONVM_G1_CLEANUP_WALK` — make the concurrent-cycle cleanup pause
+    /// recompute per-region liveness by WALKING every object of every non-Free
+    /// region, instead of reading the per-region byte accumulator the marker
+    /// maintains. Opt-in ([`parse::present`]).
+    ///
+    /// The walk was cleanup's only implementation until F-06: an O(heap)
+    /// stop-the-world pass at the end of every concurrent cycle, growing with
+    /// the old generation. Real G1 does not have it, because it accumulates the
+    /// same number during marking; `G1Region::try_mark_and_account` now does.
+    ///
+    /// `=1` restores the walk as the authority. It is the single-binary A/B for
+    /// the change and the FIRST thing to try if a G1 cycle is suspected of
+    /// freeing a live Old region in place — an accumulated liveness is only as
+    /// good as the claim that every mark site goes through the accumulator, and
+    /// an UNDER-count is exactly what makes a live region look wholly dead. A
+    /// debug build runs both and asserts they agree, so the claim is checked
+    /// rather than asserted in prose.
+    pub g1_cleanup_walk: bool,
     /// `CRATONVM_G1_DBG_RSET` — after every G1 evacuation pause, verify that
     /// every cross-region reference into a COLLECTABLE region is named in that
     /// region's remembered set. Opt-in diagnostic; whole-heap and O(live
@@ -1116,10 +1160,12 @@ impl GcFlags {
             card_table_only: present(src, "CRATONVM_CARD_TABLE_ONLY"),
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
+            g1_parallel_evac_in_jit: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC_IN_JIT"),
             g1_eager_humongous: on_unless_zero(src, "CRATONVM_G1_EAGER_HUMONGOUS"),
             g1_young_pause_target: present(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
             g1_scrub_free: present(src, "CRATONVM_G1_SCRUB_FREE"),
             g1_narrow_fixup: on_unless_zero(src, "CRATONVM_G1_NARROW_FIXUP"),
+            g1_cleanup_walk: present(src, "CRATONVM_G1_CLEANUP_WALK"),
             identity_hash_evict: on_unless_zero(src, "CRATONVM_IDENTITY_HASH_EVICT"),
             g1_dbg_rset: present(src, "CRATONVM_G1_DBG_RSET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
