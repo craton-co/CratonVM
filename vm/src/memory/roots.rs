@@ -1158,7 +1158,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // `bug-g1-evacuates-live-jit-reference-20260819.md`.
     if dbg_jit_rootscan() {
         let frames = crate::jit::conservative_roots::active_compiled_frames();
-        let labels: Vec<&str> = frames.iter().map(|(_, l, _, _)| l.as_str()).collect();
+        let labels: Vec<&str> = frames.iter().map(|f| f.label.as_str()).collect();
         // `osr_reason=` is a CUMULATIVE snapshot (bad_shadow_layout,
         // debug_disabled, bad_map_coverage, missing_exact_rbp), not a
         // per-cycle value — this line already runs at a cost only a debug

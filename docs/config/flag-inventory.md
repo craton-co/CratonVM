@@ -1322,6 +1322,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_NO_NESTED_TRACE_FRAMES` | JIT | `CRATONVM_JIT=nested-trace-frames` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_NEW_CLASS_INIT_MEMO` | JIT | `CRATONVM_JIT=new-class-init-memo` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_NEW_SITE_CACHE` | JIT | `CRATONVM_JIT=new-site-cache` | opt-out | on | behaviour | snapshot | vm |
+| `CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT` | JIT | `CRATONVM_JIT=npe-frame-snapshot` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD` | JIT | `CRATONVM_JIT=osr-ambiguous-dead` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_OSR_FRAME_DEDUPE` | JIT | `CRATONVM_JIT=osr-frame-dedupe` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_OSR_REFINED_REF` | JIT | `CRATONVM_JIT=osr-refined-ref` | opt-out | on | behaviour | snapshot | jit |

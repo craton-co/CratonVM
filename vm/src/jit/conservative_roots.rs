@@ -4108,7 +4108,56 @@ fn dbg_swchain_enabled() -> bool {
     *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SWCHAIN").is_some())
 }
 
-pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
+/// One live compiled activation, as a stack capture needs it.
+///
+/// Replaces the `(depth, label, class_id, cm_ptr)` tuple this function used to
+/// return. The tuple was the reason a compiled frame had no line number: it
+/// carried no bytecode index, and `stackwalker::compiled_frame_entry` — the
+/// only consumer that wants one — could therefore do nothing but hard-code
+/// `LINE_NUMBER_UNKNOWN`. See
+/// `internal/fixed-bugs/jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901.md`.
+#[derive(Debug, Clone)]
+pub struct ActiveCompiledFrame {
+    /// Interpreter depth this activation's chain entry was pushed at; the
+    /// splice point in `stackwalker::interleave_compiled_frames`.
+    pub interp_depth: u32,
+    /// `"class/Name.method:descriptor"`, from the artifact's `method_label`.
+    pub label: String,
+    /// `ObjectHeader` class id of the artifact's owner.
+    pub owner_class_id: u32,
+    /// The `CompiledMethod` this activation is running, as a raw address.
+    /// Valid for exactly as long as the frame is live.
+    pub cm_ptr: usize,
+    /// Bytecode index this activation is stopped at, or `-1` when the frame
+    /// published no usable safepoint id. NEVER a guess: see
+    /// [`activation_bci`].
+    pub bci: i32,
+}
+
+/// The bytecode index a live compiled activation is stopped at.
+///
+/// Reads the safepoint id the emitter publishes into `[rbp - sp_id_slot_off]`
+/// before every GC-capable call — the same slot `moving_young_frame_live_hi`
+/// and the precise root walkers already key off — and then REQUIRES that the
+/// artifact actually recorded a safepoint with that id.
+///
+/// That second half is what makes this safe to put on a stack trace. The slot
+/// is written before a call, so between calls it holds the id of the last
+/// safepoint rather than the current position; and an artifact that reserves no
+/// slot leaves whatever the frame's uninitialised memory held. Requiring the id
+/// to name one of THIS artifact's own recorded safepoints rejects both, at the
+/// cost of answering `None` for a frame stopped somewhere no safepoint covers.
+/// A frame with no line is what this page's own reasoning asked for over a
+/// frame with a wrong one, and it is what the caller falls back to.
+fn activation_bci(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<i32> {
+    let id = active_safepoint_id(rbp, cm)?;
+    // `find_oop_map_for_safepoint_id` is `&self` and is the artifact's own
+    // record of which bytecode PCs it emitted a safepoint at.
+    cm.find_oop_map_for_safepoint_id(id)?;
+    i32::try_from(id).ok()
+}
+
+pub fn active_compiled_frames() -> Vec<ActiveCompiledFrame> {
     let nested_enabled = nested_trace_frames_enabled();
     let dbg_chain = dbg_swchain_enabled();
     let scanner_sp = current_stack_pointer();
@@ -4132,7 +4181,7 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
                 chain.len()
             );
         }
-        let mut out: Vec<(u32, String, u32, usize)> = Vec::with_capacity(chain.len());
+        let mut out: Vec<ActiveCompiledFrame> = Vec::with_capacity(chain.len());
         for (dbg_i, e) in chain.iter().enumerate() {
             let Some(info) = e.precise else {
                 if dbg_chain {
@@ -4161,7 +4210,13 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
             // (`stackwalker_log4j_deep_repeated_walks_finish_under_jit`).
             // Walk the saved-RBP chain the way `remap_active_jit_frames`'
             // Stage 5 already does, and report every activation.
-            let mut nested: Vec<*const cratonvm_jit::CompiledMethod> = Vec::new();
+            //
+            // Each activation is carried with the RBP of ITS OWN frame, not
+            // just its method: that is where the safepoint id lives, and it is
+            // the only thing standing between a compiled frame and a line
+            // number. The walk already computes every one of these addresses
+            // to find the next frame — it used to drop them on the floor.
+            let mut nested: Vec<(*const cratonvm_jit::CompiledMethod, usize)> = Vec::new();
             if nested_enabled {
                 if let Some(innermost) = innermost_frame_method(
                     info.exact_rbp,
@@ -4170,7 +4225,7 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
                     scanner_sp,
                     info.compiled_method,
                 ) {
-                    nested.push(innermost);
+                    nested.push((innermost, info.exact_rbp));
                 }
                 // JIT frames use `push rbp; mov rbp,rsp`, so `[rbp]` is the
                 // caller RBP and `[rbp+8]` the return address INTO that caller.
@@ -4202,9 +4257,10 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
                         break;
                     }
                     match cratonvm_jit::lookup_jit_code_range(ret_addr) {
-                        Some(cm_ptr) => {
-                            nested.push(cm_ptr as *const cratonvm_jit::CompiledMethod)
-                        }
+                        // `ret_addr` lies in the PARENT, so the frame this
+                        // method is running in is the one at `parent_rbp`.
+                        Some(cm_ptr) => nested
+                            .push((cm_ptr as *const cratonvm_jit::CompiledMethod, parent_rbp)),
                         // The parent is the interpreter / Rust boundary: this
                         // entry has no further compiled ancestors.
                         None => break,
@@ -4216,14 +4272,14 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
             // short by a bound, one that never started (`exact_rbp == 0`), and
             // the kill-switch path all still owe the boundary method the chain
             // entry was pushed for.
-            if nested.last() != Some(&info.compiled_method) {
-                nested.push(info.compiled_method);
+            if nested.last().map(|(p, _)| *p) != Some(info.compiled_method) {
+                nested.push((info.compiled_method, info.exact_rbp));
             }
             if dbg_chain {
                 let names: Vec<String> = nested
                     .iter()
                     // SAFETY: as the reporting loop below.
-                    .map(|p| unsafe { &**p }.method_label.clone())
+                    .map(|(p, _)| unsafe { &**p }.method_label.clone())
                     .collect();
                 let mut runs: Vec<String> = Vec::new();
                 for n in &names {
@@ -4246,7 +4302,7 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
             // `runtime::stackwalker::interleave_compiled_frames` wants
             // outermost-first, and entries sharing an `interp_depth` keep their
             // push order.
-            for cm_ptr in nested.iter().rev() {
+            for (cm_ptr, frame_rbp) in nested.iter().rev() {
                 // SAFETY: exactly the contract documented on
                 // `PreciseFrameInfo::compiled_method` — the JIT cache holds an
                 // owning `Arc` for as long as the body is registered, and the
@@ -4260,16 +4316,17 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
                 if cm.method_label.is_empty() {
                     continue;
                 }
-                out.push((
-                    e.interp_depth,
-                    cm.method_label.clone(),
-                    cm.owner_class_id,
+                out.push(ActiveCompiledFrame {
+                    interp_depth: e.interp_depth,
+                    label: cm.method_label.clone(),
+                    owner_class_id: cm.owner_class_id,
                     // The artifact itself, so the trace assembler can ask it
                     // whether an interpreter frame's pc is one of ITS OSR entry
                     // points. Valid for exactly as long as the frame is live,
                     // which is the same window this whole function reads in.
-                    *cm_ptr as usize,
-                ));
+                    cm_ptr: *cm_ptr as usize,
+                    bci: activation_bci(*frame_rbp, cm).unwrap_or(-1),
+                });
             }
         }
         out
