@@ -229,10 +229,32 @@ pub(crate) fn proxy_instance_satisfies_target(
 /// Does the backing collection in slot 0 of an unmodifiable wrapper reach
 /// `iface_name` in its own hierarchy?
 ///
-/// `is_subclass_of_by_name` rather than resolving `iface_name` to a `ClassId`
-/// first: the name form neither loads nor looks up, which keeps this on the
-/// no-safepoint side of [`unmod_stamp_display_name`]'s contract. Slot 0 is
-/// `UNMOD_FIELD_BACKING` in `native-collections`.
+/// A NAME form rather than resolving `iface_name` to a `ClassId` first: it
+/// neither loads nor looks up, which keeps this on the no-safepoint side of
+/// [`unmod_stamp_display_name`]'s contract. Slot 0 is `UNMOD_FIELD_BACKING` in
+/// `native-collections`.
+///
+/// `is_assignable_to_name` and NOT `is_subclass_of_by_name`, whose name reads
+/// like the right one and is not: that function is the exception-`catch_type`
+/// fallback and walks ONLY the superclass chain, because a `catch_type` is
+/// never an interface. Every name this function is called with IS an
+/// interface, so the supers-only walk could not match one — `ArrayList`
+/// reaches `AbstractList`, `AbstractCollection`, `Object` and stops.
+///
+/// The cost was one whole display class. `unmod_backing_reaches(.., "java/util/
+/// RandomAccess")` answered `false` for a `Collections.unmodifiableList(new
+/// ArrayList<>(..))`, so the opcodes' display arm picked
+/// `Collections$UnmodifiableList` while `getClass()` — whose authority
+/// (`native-builtins`' `getclass_backing_is_random_access`) resolves the
+/// interface to a `ClassId` and uses the DAG-walking `is_subclass` — reported
+/// `Collections$UnmodifiableRandomAccessList`. `instanceof RandomAccess` was
+/// `false` and `RandomAccess.class.isInstance(..)` `true` for the same object,
+/// which is the one thing `display_class_satisfies_target` exists to prevent.
+/// The identical trap is written out at length on the `Path.toString()` branch
+/// in `runtime/invokedynamic.rs`; this is its second occurrence.
+/// `apps/probes/RandomAccessProbe` is the reproducer, and
+/// `classloading`'s `the_supers_only_name_walk_cannot_see_an_interface_the_dag_walk_finds`
+/// asserts the divergence between the two walks in both directions.
 fn unmod_backing_reaches(
     shared: &SharedVm,
     obj_ref: cratonvm_types::ObjectRef,
@@ -245,12 +267,68 @@ fn unmod_backing_reaches(
         cratonvm_types::Value::Object(Some(b)) => b,
         _ => return false,
     };
-    let backing_cid = shared.mem.heap.class_id_of(backing);
-    shared
-        .classes
-        .class_manager
-        .read()
-        .is_subclass_of_by_name(backing_cid, iface_name)
+    object_reaches(shared, backing, iface_name, 0)
+}
+
+/// Does `obj` — as the object it STANDS FOR, not as the class it is stamped
+/// with — reach `iface_name`?
+///
+/// For an ordinary receiver this is one name walk. The recursion exists for a
+/// wrapper of a wrapper: `Collections.unmodifiableList(List.of("a", "b"))`
+/// backs one `cratonvm/internal/UnmodifiableList` stamp with another. All
+/// eleven stamps declare only their FAMILY-level interfaces in `vm_init.rs`
+/// (`List`, `Collection`, `Serializable`), because everything finer is a
+/// property of the instance's backing rather than of the stamp — which is why
+/// asking the stamp's own hierarchy about `RandomAccess` answers `false` for
+/// every one of them, `List.of`'s included, whose HotSpot display class
+/// (`ImmutableCollections$ListN`, via `AbstractImmutableList`) implements it.
+///
+/// So descend slot 0 (`UNMOD_FIELD_BACKING`): an unmodifiable view carries the
+/// marker exactly when the thing it wraps does.
+///
+/// This function is one half of a PAIR and must not move alone.
+/// `native-builtins`' `getclass_object_reaches` — the authority behind
+/// `Object.getClass()` — runs the identical rule, and it is a separate
+/// implementation because THIS side may not load a class or run Java: the
+/// receiver at `op_instanceof`/`op_checkcast` has been popped from the operand
+/// stack and is a bare Rust local the collector cannot see. That constraint is
+/// also why the rule is structural rather than "consult the display class if it
+/// happens to be loaded": an answer that depended on whether anything had
+/// called `getClass()` first would be a worse defect than the one this closes.
+/// `apps/probes/RandomAccessProbe` prints all three doors per row and an
+/// `agree=` column that goes false the moment the pair parts.
+fn object_reaches(
+    shared: &SharedVm,
+    obj: cratonvm_types::ObjectRef,
+    iface_name: &str,
+    depth: usize,
+) -> bool {
+    // A wrapper chain is a handful of links; the bound is a cycle guard, not a
+    // policy. (`alloc_unmod_wrapper` stores an object that already existed, so
+    // slot-0 nesting is acyclic by construction — this is insurance.)
+    if depth > 8 {
+        return false;
+    }
+    let cid = shared.mem.heap.class_id_of(obj);
+    let is_stamp = {
+        let cm = shared.classes.class_manager.read();
+        if cm.is_assignable_to_name(cid, iface_name) {
+            return true;
+        }
+        match cm.get_class(cid) {
+            Some(c) => c.name.starts_with("cratonvm/internal/Unmodifiable"),
+            None => false,
+        }
+    };
+    if !is_stamp || shared.mem.heap.num_fields(obj) == 0 {
+        return false;
+    }
+    match shared.mem.heap.get_field(obj, 0) {
+        cratonvm_types::Value::Object(Some(inner)) => {
+            object_reaches(shared, inner, iface_name, depth + 1)
+        }
+        _ => false,
+    }
 }
 
 /// The JDK class that a `cratonvm/internal/Unmodifiable*` stamp stands for,
