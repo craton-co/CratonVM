@@ -13,10 +13,7 @@ is the x86-64 jump-table idiom LLVM emits for a dense `match`: `r10` is the
 table, `rax` the index, and the fault means `rax` was not a valid index --
 i.e. an enum was constructed from memory that did not hold a valid
 discriminant. See
-`fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md`
-# (path relative to the internal tree's own root: that tree is stripped from
-# public history, so citing it by a prefixed path is a link no public reader
-# can follow -- types/tests/doc_citation_paths.rs enforces it).
+`internal/fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md`.
 
 Naming the function normally needs the exact binary: an RVA means nothing
 without it, and symbolizing against a near-miss build produces a

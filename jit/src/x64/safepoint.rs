@@ -93,9 +93,45 @@ pub mod map_incomplete_cause {
     /// classify the callee pc at all. See `Compiler::inline_oop_scopes`.
     pub static INLINE_LOCAL_UNMAPPABLE: AtomicUsize = AtomicUsize::new(0);
 
+    /// The local-oop dataflow never reached this safepoint's pc, so the map
+    /// names NO reference locals for it.
+    ///
+    /// `record_oop_map` reads the locals through `local_oop_mask_at_current_pc()`
+    /// inside an `if let Some(..)` with no `else`: a `None` there contributes no
+    /// slots, sets no `map_incomplete`, and bumps nothing, so the safepoint
+    /// would publish a map claiming complete coverage while every live reference
+    /// local is unnamed. That is a real hole in the shape of the one
+    /// `bug-h2-testrandommapops-small-heap-corruption-20260829.md` is about.
+    ///
+    /// **Measured 2026-09-02, and it reads ZERO** on every method of
+    /// `probes/SafepointMapResidue.java`, including the one whose frames the
+    /// residue instrument flags. The dataflow does reach those safepoints and
+    /// does hand back a mask, and the mask is correct — `javap -c` on the
+    /// flagged method shows the slot the instrument called a missed root is an
+    /// `int` local at that pc. Kept as a ruled-out hypothesis rather than a
+    /// live lead: the `tlab_retire_skipped` pattern, where the point of
+    /// printing a zero is that the hypothesis it eliminates is a good one.
+    ///
+    /// The hole it guards is still real even though it has not been observed:
+    /// a `None` from `local_oop_mask_at_current_pc()` would contribute no
+    /// slots, set no `map_incomplete` and bump nothing, so the safepoint would
+    /// publish a map claiming complete coverage while every live reference
+    /// local went unnamed. This counter is what would show that happening.
+    pub static LOCAL_MASK_UNREACHED: AtomicUsize = AtomicUsize::new(0);
+
+    /// How many causes [`snapshot`] returns.
+    ///
+    /// Named so the census printer can assert against it. `driver.rs` printed
+    /// SIX of these seven for as long as the seventh existed, which made a run
+    /// whose only unnameable references were inline-scope locals read as
+    /// `causes(... all zero)` -- "no cause", from a cause census. The
+    /// 2026-08-30 diagnosis that concluded "One cause, `staged_unmappable`"
+    /// was made from that line.
+    pub const COUNT: usize = 8;
+
     /// `(marks_inexact, oop_in_register, stack_deep, local_deep, staged_deep,
-    /// staged_unmappable, inline_local_unmappable)`.
-    pub fn snapshot() -> [usize; 7] {
+    /// staged_unmappable, inline_local_unmappable, local_mask_unreached)`.
+    pub fn snapshot() -> [usize; COUNT] {
         use std::sync::atomic::Ordering::Relaxed;
         [
             MARKS_INEXACT.load(Relaxed),
@@ -105,6 +141,7 @@ pub mod map_incomplete_cause {
             STAGED_ARG_OFF_TOO_DEEP.load(Relaxed),
             STAGED_ARG_UNMAPPABLE.load(Relaxed),
             INLINE_LOCAL_UNMAPPABLE.load(Relaxed),
+            LOCAL_MASK_UNREACHED.load(Relaxed),
         ]
     }
 }
@@ -1558,6 +1595,15 @@ impl Compiler {
             // reference parameters here too, or `moving_young_coverage_complete`
             // (which now claims coverage for it) would be claiming coverage of
             // a map that names nothing. See `local_oop_mask_at_current_pc`.
+            //
+            // A `None` here is a SILENT omission -- no slots, no cause, and the
+            // map still ships claiming complete coverage. Counted (and only
+            // counted) so the population can be priced before anything fails
+            // closed on it: see `map_incomplete_cause::LOCAL_MASK_UNREACHED`.
+            if self.local_oop_mask_at_current_pc().is_none() {
+                map_incomplete_cause::LOCAL_MASK_UNREACHED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if let Some(mut mask) = self.local_oop_mask_at_current_pc() {
                 while mask != 0 {
                     // Cast: count/index to usize

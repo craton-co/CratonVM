@@ -1668,7 +1668,7 @@ pub fn symbolize_rvas(_rvas: &[usize]) -> Vec<(usize, Option<String>)> {
 ///
 /// A register dump alone leaves this to the reader, and the reader does not do
 /// it: all eight crash logs behind
-/// `fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md`
+/// `internal/fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md`
 /// satisfy `fault == r10 + rax*4` — an unchecked jump-table load with a garbage
 /// index — and because nothing said so, two sessions read the wildly scattered
 /// fault addresses as random corruption and looked for an environmental cause.
@@ -2803,7 +2803,7 @@ not an address\n",
 /// the faulting instruction and not only its base. The eight hibernate-orm
 /// JSON/XML crashes were decoded by testing `fault_address == r10 + rax*4` --
 /// which the Linux report could not have answered, because it never printed
-/// `rax` (fixed-bugs/
+/// `rax` (internal/fixed-bugs/
 /// hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md).
 #[cfg(unix)]
 const GREG_RAX: usize = 0;
