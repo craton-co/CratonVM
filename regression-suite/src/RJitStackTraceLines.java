@@ -93,47 +93,48 @@ public class RJitStackTraceLines {
         check(coldProbe > 0, "cold probe line: " + coldProbe);
         check(coldDriver > 0, "cold hotDriver line: " + coldDriver);
 
-        // Defect 1: the frame is present in every arm, and when it carries a
-        // line that line agrees with the cold one.
+        // Defect 1: the frame is present in every arm, with a real line, and
+        // that line is the cold one.
         //
-        // WEAKENED 2026-09-01, deliberately, and this is the interesting part.
-        // The `p > 0` assertion here used to be unconditional and used to pass
-        // -- on a COINCIDENCE, not on correctness.
+        // RE-STRENGTHENED 2026-09-02, and the history is the point. This
+        // assertion was unconditional, passed -- on a COINCIDENCE -- was
+        // weakened to `p > 0 || p == -1` on 2026-09-01, and is now
+        // unconditional again for a reason.
         //
-        // `probe()` above is compiled by the OPTIMIZING tier (confirmed:
+        // `probe()` here is compiled by the OPTIMIZING tier (confirmed:
         // `CRATONVM_DBG=jitc` prints "[ir] admission
         // RJitStackTraceLines.probe()...: admitted to the optimizing pipeline").
         // On that tier `OopMapEntry::bytecode_pc` is NOT a bytecode index: it is
-        // `Lowerer::next_sp_id`, a monotonic safepoint counter that starts at 1
-        // and increments per GC-capable point (`jit/src/ir_lower.rs`). Reading it
-        // as a bci is unsound.
+        // `Lowerer::next_sp_id`, a monotonic safepoint counter starting at 1
+        // (`jit/src/ir_lower.rs`). Reading it as a bci is unsound, and it
+        // answered correctly here for one reason only -- `probe()`'s
+        // `invokestatic outer` sits at bci 1 (`javap -c`) and the counter's
+        // first value is also 1. Move the call off the first instruction and
+        // the same code reported a confidently WRONG line. So `activation_bci`
+        // refused the whole backend, and this arm read -1.
         //
-        // It answered correctly here for one reason only: `probe()`'s
-        // `invokestatic outer` sits at **bci 1** (`javap -c`), and the counter's
-        // first value is also **1**. Move the call off the first instruction --
-        // add a statement above it -- and the same code silently reports a
-        // confidently WRONG line, which is worse than none. So the
-        // `activation_bci` path now refuses an artifact whose `used_ir_backend`
-        // is set, and this arm gets -1.
+        // The lowerer now records the real `(safepoint id, bci)` pair for every
+        // safepoint it emits (`CompiledMethod::safepoint_bci_table`) and the
+        // walk reads the bci THROUGH it, so the tier has a line that is not a
+        // coincidence. `CRATONVM_JIT_NO_IR_FRAME_LINES=1` restores the blanket
+        // refusal, which is what makes a suspect line here attributable to the
+        // translation rather than to the slot read, inside one binary.
         //
-        // The assertion is therefore split rather than deleted: the frame must
-        // still be present in every arm (that half is defect 1's real content and
-        // is unweakened), and a line, WHEN THERE IS ONE, must still equal the
-        // cold line. The single-pass tier -- which is most methods -- still gets
-        // the full check. What is lost is coverage of the optimizing tier, and
-        // that is a genuine gap, recorded on the known-issues page: closing it
-        // needs the IR lowerer to carry the node's real `bytecode_pc` alongside
-        // the safepoint id, which it already has in hand at map-emission time.
+        // Still no constant: the hot line is required to equal the COLD one, so
+        // editing this file moves both sides together and cannot make the check
+        // vacuous. HotSpot passes it for the same reason CratonVM must.
         for (String arm : new String[]{"warmed", "osr"}) {
             StackTraceElement[] st = arm.equals("warmed") ? warmed : osr;
             int p = lineOf(st, "probe");
             check(p != ABSENT, arm + ": probe frame is missing");
             check(
-                p > 0 || p == -1,
-                arm + ": probe line is neither a real line nor the documented "
-                    + "optimizing-tier -1 (" + p + ")");
+                p > 0,
+                arm + ": probe line is not a source line (" + p + "). -1 here is a"
+                    + " compiled frame with no recovered bytecode index -- on the"
+                    + " optimizing tier that is the safepoint-id-to-bci table"
+                    + " going missing.");
             check(
-                p <= 0 || p == coldProbe,
+                p == coldProbe,
                 arm + ": probe line " + p + " != cold " + coldProbe);
         }
 

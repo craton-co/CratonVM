@@ -1324,6 +1324,21 @@ pub fn dump_method_stats_to_stderr() {
             crate::x64::inline_call_map_at_return_counts(),
             crate::x64::inline_miss_edge_poison_counts(),
         );
+        // And how often a compiled entry was dropped as the same activation as
+        // an interpreter frame. `call-opcode` is the row worth reading: that
+        // rule's revert shape is asserted by no test, because the only arm that
+        // ever claimed to isolate it used an environment variable that does not
+        // exist. A counter cannot say the rule is RIGHT; it can say whether it
+        // fires, and a permanent zero is itself a finding.
+        eprintln!(
+            "[cratonvm] stack-walk dedupe: {}",
+            crate::stack_walk_dedupe_counts()
+                .iter()
+                .zip(crate::DEDUPE_SLOT_NAMES.iter())
+                .map(|(c, n)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
     }
     // The unresumable-trap refusal's census, printed UNCONDITIONALLY and
     // including zeros — before the `DIAG_CORE` early return, like the rows

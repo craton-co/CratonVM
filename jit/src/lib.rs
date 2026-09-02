@@ -18028,6 +18028,59 @@ pub fn compiled_frame_line_counts() -> [u64; 8] {
     out
 }
 
+/// How often each of `stackwalker::drop_osr_continuations`' two rules removed a
+/// compiled entry that was the SAME ACTIVATION as an interpreter frame.
+///
+/// | # | name | rule |
+/// |---|---|---|
+/// | 0 | `osr-authoritative` | rule 1, decided by the live-OSR-continuation registry |
+/// | 1 | `osr-heuristic` | rule 1, decided by `can_osr_enter(frame.pc)` because the registry had nothing to say |
+/// | 2 | `call-opcode` | rule 2, an ordinary compiled activation whose interpreter frame is not suspended at an `invoke*` |
+///
+/// Rule 2 is why this exists. Its revert shape is asserted by no test, and
+/// deliberately so: the only place it was ever "observed" was behind
+/// `CRATONVM_JIT_NO_INLINE=1`, a variable that does not exist and never did, so
+/// that arm ran the default configuration and isolated nothing. The shipped fix
+/// therefore rests on an opcode PROOF rather than on a measurement, and a check
+/// whose expected output nobody has measured is a false red waiting to happen.
+///
+/// A counter is what an unmeasurable claim can honestly have instead: it cannot
+/// say the rule is right, but it can say whether it ever FIRES, which is the
+/// question "does this code do anything at all" that no green test answers. A
+/// permanent zero across real workloads is itself a finding.
+static STACK_WALK_DEDUPE_COUNTS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Rule 1, decided by the live-OSR-continuation registry.
+pub const DEDUPE_OSR_AUTHORITATIVE: usize = 0;
+/// Rule 1, decided by the `can_osr_enter` pc heuristic.
+pub const DEDUPE_OSR_HEURISTIC: usize = 1;
+/// Rule 2, the ordinary compiled activation.
+pub const DEDUPE_CALL_OPCODE: usize = 2;
+
+/// Names parallel to the slot indices. See [`STACK_WALK_DEDUPE_COUNTS`].
+pub const DEDUPE_SLOT_NAMES: [&str; 3] = ["osr-authoritative", "osr-heuristic", "call-opcode"];
+
+/// Record one dedupe. See [`STACK_WALK_DEDUPE_COUNTS`].
+#[inline]
+pub fn note_stack_walk_dedupe(slot: usize) {
+    if let Some(c) = STACK_WALK_DEDUPE_COUNTS.get(slot) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Read the dedupe census. See [`STACK_WALK_DEDUPE_COUNTS`].
+pub fn stack_walk_dedupe_counts() -> [u64; 3] {
+    let mut out = [0u64; 3];
+    for (i, slot) in STACK_WALK_DEDUPE_COUNTS.iter().enumerate() {
+        out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct JitCompileMethodKey {
     class_name: String,

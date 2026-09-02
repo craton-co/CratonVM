@@ -912,8 +912,13 @@ fn drop_osr_continuations(
                     return true;
                 }
                 deduped.push((f.interp_depth, f.label.clone()));
+                cratonvm_jit::note_stack_walk_dedupe(if authoritative {
+                    cratonvm_jit::DEDUPE_OSR_AUTHORITATIVE
+                } else {
+                    cratonvm_jit::DEDUPE_OSR_HEURISTIC
+                });
                 // The half that knows where control is, handed to the frame
-                // that survives — but ONLY on the authoritative arm. See "The
+                // that survives -- but ONLY on the authoritative arm. See "The
                 // overrides" above.
                 if authoritative && f.bci >= 0 {
                     overrides.insert(i, (f.bci, f.inline_chain.clone()));
@@ -937,6 +942,7 @@ fn drop_osr_continuations(
                 return true;
             }
             deduped.push((f.interp_depth, f.label.clone()));
+            cratonvm_jit::note_stack_walk_dedupe(cratonvm_jit::DEDUPE_CALL_OPCODE);
             false
         })
         .collect();

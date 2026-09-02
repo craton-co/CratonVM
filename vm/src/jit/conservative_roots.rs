@@ -4296,10 +4296,36 @@ pub struct InlinedLevel {
 ///   is an accident of their VALUES rather than a rule, and the rule is what
 ///   the next synthetic pc will be measured against.
 ///
-/// An artifact with no safepoint-id slot (`sp_id_slot_off == 0`) — compiled
+/// An artifact with no safepoint-id slot (`sp_id_slot_off == 0`) -- compiled
 /// without the precise gate, or aarch64, whose backend hard-codes
 /// `bytecode_pc: 0` and would otherwise resolve every compiled frame to the
-/// first line of its method — is already refused by `active_safepoint_id`.
+/// first line of its method -- is already refused by `active_safepoint_id`.
+///
+/// # aarch64: the refusal is UNREACHABLE, not merely conservative (2026-09-02)
+///
+/// The 2026-09-01 page listed "aarch64 compiled frames still report no line"
+/// as an open residual. It is not one, and the reason is worth writing down
+/// because it is cheaper than re-deriving it: **an aarch64 compiled activation
+/// cannot be on the stack while a Java-level stack capture runs.**
+///
+/// A trace is captured either at a throw or from a caller-sensitive native,
+/// and both are reached by an `invoke*`. `Arm64Backend::emit_invoke` sets
+/// `self.failed` UNCONDITIONALLY -- there is no call-target resolution in that
+/// backend at all -- so a method containing any call bails and is interpreted
+/// (`jit::aarch64_backend::tests::invokestatic_arm_exists_but_always_bails`).
+/// `athrow` and every object-model opcode bail on the same rule
+/// (`object_model_opcodes_are_all_unsupported`), so such a body cannot raise
+/// either, and `label_for_pc` refuses every backward branch target, so it
+/// cannot loop. What compiles there is leaf, straight-line, exception-free
+/// arithmetic that runs to its `ret`.
+///
+/// `Arm64CompileResult::oop_maps` is unconditionally empty for the same
+/// generation of reasons (`compiled_methods_carry_no_oop_maps`), and its only
+/// writer fails closed, so there is no safepoint of any kind to name a bci at.
+/// A line number is downstream of a safepoint mechanism that backend does not
+/// have; giving it one is a consequence of building that mechanism, not a
+/// separate task. Three tests pin the premises, so a change that makes an
+/// aarch64 frame reachable from a capture trips them first.
 fn activation_bci(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<i32> {
     use cratonvm_jit::{
         note_compiled_frame_line as note, FRAME_LINE_ANSWERED_IR,
