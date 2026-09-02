@@ -18666,7 +18666,7 @@ pub fn compiled_frame_line_counts() -> [u64; 8] {
 /// | 5 | `peak-words` | high-water mark of live spill words in any one compile (a MAX, not a sum) |
 /// | 6 | `res-push` | the ordinary operand push |
 /// | 7 | `res-invalidate` | `invalidate_callee_saved` re-homing register-aliased entries |
-/// | 8 | `res-total` | every word reserved. Columns 6, 7 and 13-16 plus `flush-reserved` PARTITION it — `SpillReason` is a parameter of `reserve_spill_slots`, so a new call site cannot be added without choosing one |
+/// | 8 | `res-total` | every word reserved. NOT a counter: it is DERIVED at read time as the sum of the seven reason columns, so the partition is structural. Counting it separately and asserting the sum could not work — the columns are process-global atomics and seven loads plus an eighth are never a consistent snapshot while other threads compile |
 /// | 9 | `min-headroom` | the FEWEST words left between a reservation's end and `spill_limit_offset`, over every compile (a MIN; `u64::MAX` means nothing reserved) |
 /// | 10 | `inline-reserve-sum` | largest per-compile inline reserve as `spill_size` computes it today: a SUM over every site (a MAX over compiles) |
 /// | 11 | `inline-reserve-path` | what the same compile would need if the reserve were a MAX over top-level sites and over each site's deepest nested PATH (a MAX over compiles) |
@@ -18724,8 +18724,19 @@ pub const SPILL_PEAK_WORDS: usize = 5;
 pub const SPILL_RES_PUSH: usize = 6;
 /// Words reserved by `invalidate_callee_saved`.
 pub const SPILL_RES_INVALIDATE: usize = 7;
-/// Every word reserved, by any caller.
+/// Every word reserved, by any caller. Derived, never stored — see the table.
 pub const SPILL_RES_TOTAL: usize = 8;
+
+/// The seven columns that partition [`SPILL_RES_TOTAL`], in `SpillReason` order.
+pub const SPILL_RES_REASON_COLUMNS: [usize; 7] = [
+    SPILL_RES_PUSH,
+    SPILL_FLUSH_RESERVED,
+    SPILL_RES_INVALIDATE,
+    SPILL_RES_INLINE_LOCALS,
+    SPILL_RES_INLINE_MERGE,
+    SPILL_RES_CALL_SERVICE,
+    SPILL_RES_HELPER_ARGS,
+];
 /// Fewest words ever left between a reservation and the spill limit.
 pub const SPILL_MIN_HEADROOM: usize = 9;
 /// Largest per-compile inline reserve, summed over sites as today.
@@ -18807,6 +18818,10 @@ pub fn spill_cursor_counts() -> [u64; 17] {
     for (i, slot) in SPILL_CURSOR_COUNTS.iter().enumerate() {
         out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
     }
+    // `res-total` is derived, not counted. Every reservation bumps exactly one
+    // reason column, so the sum IS the total by construction and no reservation
+    // can reach the cursor without landing in it.
+    out[SPILL_RES_TOTAL] = SPILL_RES_REASON_COLUMNS.iter().map(|&c| out[c]).sum();
     out
 }
 

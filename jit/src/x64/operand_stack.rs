@@ -109,9 +109,9 @@ impl Compiler {
     }
 
     pub(super) fn reserve_spill_slots(&mut self, slots: usize, why: SpillReason) -> Option<i32> {
-        // Every reservation, and every reservation named. `res-total` and the
-        // per-reason columns are written together here so they cannot disagree.
-        crate::note_spill_cursor(crate::SPILL_RES_TOTAL, slots as u64);
+        // One bump, into the column the caller named. `res-total` is derived
+        // from these at read time rather than counted alongside them, so the
+        // partition cannot drift and there is no second atomic to race with.
         crate::note_spill_cursor(why.column(), slots as u64);
         let start = self.next_spill_offset;
         let end = self.checked_spill_range_end(start, slots)?;
