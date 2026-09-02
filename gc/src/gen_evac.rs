@@ -114,6 +114,15 @@ const PLAB_FLOOR_BYTES: usize = 512;
 /// — but it doubles the arena the next collection has to walk in exchange for
 /// nothing. Sizing the buffer against what there is to copy keeps the worst
 /// case a bounded fraction of the live set at both ends of the range.
+///
+/// MEASURED 2026-09-02 (bt18, -Xmx512m, 8 workers): **inert on a real cycle**.
+/// Values 1, 4 and 64 produce byte-identical plans, because `plab_bytes` is
+/// `min(slack / SLACK_TO_BUFFERS_DIV / workers, from_used / workers / this)`
+/// and the SLACK term always wins — `min(11983, 65536)`. It only binds when
+/// slack is large relative to the live set, which is the generously-sized
+/// to-space a unit test builds, never the ~99.9%-full from-space a real young
+/// GC triggers on. Do not spend time tuning it against a real workload; it has
+/// no effect there.
 const PLAB_LIVE_DIVISOR: usize = 4;
 
 /// Fraction of a buffer above which an object bypasses it and takes its own
@@ -125,6 +134,18 @@ const PLAB_DIRECT_SHIFT_DIV: usize = 8;
 
 /// Share of the to-space slack spent on in-flight buffers; the rest becomes
 /// the retirement allowance. See [`ParEvac::plan`].
+///
+/// MEASURED 2026-09-02 (bt18, n=5 each, interleaved): `cheney_drain` medians
+/// 1817 / **1788** / 1927 / 2015 ms for 1 / 2 / 4 / 8. The default has the best
+/// median and 1 and 2 are indistinguishable; 4 and 8 are directionally worse
+/// and much noisier (div=4 spanned 1588..3183 ms), consistent with tiny buffers
+/// meaning more shared-cursor traffic.
+///
+/// WEAKER EVIDENCE THAN IT LOOKS, and the reason is structural rather than
+/// sampling: `plab_bytes` varies BETWEEN RUNS at a fixed divisor (div=4 was
+/// seen at 0, 2912 and 5984 bytes) because the trigger point moves, so a
+/// value's own samples are not all from the same regime. More repetitions
+/// would not fix that. Treat 1..2 as a plateau, not 2 as an optimum.
 const SLACK_TO_BUFFERS_DIV: usize = 2;
 
 /// A worker's first old-gen promotion buffer (gen-gc-five item 4).
@@ -144,6 +165,16 @@ const OLD_PLAB_MAX: usize = 256 * 1024;
 const OLD_PLAB_DIRECT_MIN: usize = 32 * 1024;
 
 /// Batch size a worker takes from the shared worklist per acquisition.
+///
+/// MEASURED 2026-09-02: this is a cap that essentially never engages, so its
+/// value does not matter on any workload resembling bt18. Instrumented over
+/// two moving cycles: **1 of 379 and 1 of 433 acquisitions were clamped by it**,
+/// with a mean share of 8 and 11. The binding term is `len.div_ceil(threads)` —
+/// a transitive closure keeps a frontier of order `graph width`, and split
+/// eight ways that is single digits. Sweeping 16 / 64 / 256 / 1024 moved the
+/// median `cheney_drain` by 4.7% against a 19% within-value spread, i.e. not
+/// resolvably, which is exactly what a cap that fires 0.25% of the time should
+/// do. Keep it as the runaway guard it is; do not read the value as tuned.
 const ACQUIRE_CHUNK: usize = 256;
 /// Local worklist depth at which a worker publishes its surplus unprompted.
 const SPILL_HIGH: usize = 2048;
@@ -153,6 +184,20 @@ const SPILL_KEEP: usize = 512;
 ///
 /// Below this the hand-off costs more than the work it moves — a lock, a
 /// notify, and a cold cache line at the far end for one or two objects.
+///
+/// MEASURED 2026-09-02, and the ONE constant here that demonstrably matters.
+/// `cheney_drain` median / `helper_scans` median, bt18, 8 workers:
+///
+/// | SHARE_MIN | 4 | **8** | 16 | 32 | 64 | 512 |
+/// |---|---|---|---|---|---|---|
+/// | drain ms | 1736 | **1657** | 1703 | 2109 | 2158 | 2568 |
+/// | helper_scans | 1.36M | 1.35M | 1.36M | 1.26M | 1.06M | 0.52M |
+///
+/// 4..16 is a flat optimum; degradation starts at 32 and 8-vs-64 is a DISJOINT
+/// range separation (max 1791 against min 2049). The second row is the
+/// mechanism rather than a correlation: raising the threshold makes workers
+/// hoard instead of publishing, and helper participation halves. 8 sits
+/// mid-plateau with ~2x headroom either side.
 const SHARE_MIN: usize = 8;
 
 /// Times a worker LOST the forwarding CAS and adopted the winner's target.

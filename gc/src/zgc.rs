@@ -9373,6 +9373,14 @@ fn zgc_corpse_enabled() -> bool {
 /// Written for `SQLChar.rawData` — declared `[C`, found holding `Int(1)`, and
 /// the cell a compiled `arraylength` dereferenced as the pointer 1. Watch it
 /// with `CRATONVM_DBG_WATCH_PUN=SQLChar:1`.
+/// Whether `CRATONVM_DBG_WATCH_PUN` is armed. The interpreter's quickened field
+/// arms bypass `get_field` / `set_field`, where the watch reports, so they stay
+/// off while it is armed (see `vm::runtime::interpreter::field_fast`).
+#[inline]
+pub fn punned_store_watch_armed() -> bool {
+    punned_store_watch().is_some()
+}
+
 fn punned_store_watch() -> Option<&'static (String, usize)> {
     static W: std::sync::OnceLock<Option<(String, usize)>> = std::sync::OnceLock::new();
     W.get_or_init(|| {

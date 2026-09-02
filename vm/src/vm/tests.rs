@@ -19277,6 +19277,26 @@ fn linked_list_add_all() {
     assert_eq!(size, Value::Int(3));
 }
 
+/// # IGNORED: this test outlived both things it tested
+///
+/// It drives `java/util/ArrayDeque.iterator()` and then the
+/// `java/util/ArrayDeque$Itr` natives on the object that comes back. Neither
+/// exists any more: the `iterator()` registration was retired on 2026-08-30
+/// (the JDK's `DeqIterator` is fail-fast off a physical ring-buffer index and
+/// no snapshot reproduces it, so the real bytecode runs instead), and the
+/// `$Itr` natives were retired on 2026-09-02 by the iterator-carrier census,
+/// which found this test was their only caller AND that it already failed at
+/// its first line — `java/util/ArrayDeque.iterator() not registered`.
+///
+/// It had been failing since the first of those changes and nobody saw it,
+/// because this whole `#[cfg(all(test, feature = "synthetic-jdk"))]` module
+/// stopped compiling when `InlineSite` grew a field: 4291 tests that could not
+/// be built. Fixed in the same commit as this ignore.
+///
+/// Kept rather than deleted for the reason the census gives: the assertions are
+/// the right ones if an ArrayDeque iterator is ever minted here again.
+/// `docs/internal/fixed-suite-bugs/iterator-carrier-census-20260902.md`.
+#[ignore = "ArrayDeque.iterator() and ArrayDeque$Itr are both deliberately             unregistered; see the iterator-carrier census"]
 #[test]
 fn array_deque_iterator() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -76972,6 +76992,14 @@ fn s31_inline_site_metadata_roundtrip() {
         invoke_targets: Vec::new(),
         resolved_invoke_infos: Vec::new(),
         nested_sites: Vec::new(),
+        // Added when `InlineSite` grew the field. This initializer names every
+        // field explicitly (no `..Default::default()`), which is what makes it
+        // a round-trip test — and also what makes it the file that stops
+        // compiling when the struct grows. It had, and took the WHOLE
+        // `#[cfg(all(test, feature = "synthetic-jdk"))]` module with it: ~72k
+        // lines of tests that could not be built, found 2026-09-02 while
+        // looking for the one consumer of a dormant registration.
+        ir_new_info: Vec::new(),
     };
 
     assert_eq!(site.callee_code_len, 2);
@@ -78371,6 +78399,7 @@ fn t10_9_a_vtable_manager_populated_for_registered_class() {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),

@@ -451,6 +451,12 @@ pub struct CachedBytecodeMethod {
     /// the original test in full, and a clear bit skips a test whose
     /// name-keyed half could not have matched anyway.
     pub intercept_shape_cache: std::sync::OnceLock<u8>,
+    /// Interpreter-side invocation counter for the tier-up decision on the
+    /// monomorphic virtual fast door. Bumped with one relaxed `fetch_add`
+    /// per call; folded into `ProfileStore::increment_invocation` in
+    /// batches so the census and `hot_but_stuck_in_interpreter` still see
+    /// every call (see `dispatch_virtual::execute_invokevirtual_fast_door`).
+    pub interp_invocations: std::sync::atomic::AtomicU32,
     /// Per-call-site native-dispatch memo. **Read it through
     /// [`Self::native_call_site`], never directly.**
     ///
@@ -607,6 +613,9 @@ impl Clone for CachedBytecodeMethod {
             // with this one, so carrying the memo forward answers for the same
             // question.
             intercept_shape_cache: self.intercept_shape_cache.clone(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(
+                self.interp_invocations.load(std::sync::atomic::Ordering::Relaxed),
+            ),
             // `NativeCallSite: Clone` snapshots the memo word. Carrying it
             // forward is sound for the same reason `jit_probe_generation`'s
             // snapshot is: the memo is generation-keyed, so a clone that
@@ -2036,6 +2045,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),

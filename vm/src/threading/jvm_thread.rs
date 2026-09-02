@@ -795,6 +795,13 @@ pub struct JvmThread {
     /// See [`crate::runtime::interpreter::site_cache`] for the validity
     /// argument — read it before adding a `put` call site.
     pub field_sites: crate::runtime::interpreter::FieldSiteCache,
+    /// Quickened instance-field sites: the receiver class the site last
+    /// resolved against and the compact-layout offset / storage kind of the
+    /// field in that class, so the `getfield` / `putfield` fast arms can
+    /// load or store without resolving anything. Same key and epoch
+    /// validation as `field_sites`; filled by the slow handler on the access
+    /// that resolved the field.
+    pub fast_field_sites: crate::runtime::interpreter::FastFieldSiteCache,
 
     /// Per-thread resolved-method site cache — the same "resolved constant
     /// pool" for the `(descriptor, num_params)` pair that the argument-popping
@@ -1076,6 +1083,7 @@ impl JvmThread {
             string_case_cache: Vec::new(),
             invoke_cache: InvokeCache::new(),
             field_sites: crate::runtime::interpreter::FieldSiteCache::new(),
+            fast_field_sites: crate::runtime::interpreter::FastFieldSiteCache::new(),
             method_sites: crate::runtime::interpreter::MethodSiteCache::new(),
             class_sites: crate::runtime::interpreter::ClassSiteCache::new(),
             cast_sites: crate::runtime::interpreter::CastSiteCache::new(),
