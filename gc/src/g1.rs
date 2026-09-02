@@ -5958,6 +5958,15 @@ impl G1Collector {
     ) -> bool {
         let (verdict, _) = self.classify_candidate_header(regions, raw);
         if verdict == HeaderVerdict::Object {
+            // Same second look as `note_root_object_plausibility`'s, on the
+            // other supply route. A slot holding an INTERIOR address passes
+            // `classify_candidate_header` and is then evacuated as an object,
+            // which is how a 0x2010-byte "object" whose header is a heap
+            // pointer gets carved into a Survivor region.
+            // SAFETY: the verdict above validated the tag bytes and the
+            // address's containment below its region's cursor.
+            let cand = unsafe { &*(raw as *const ObjectHeader) };
+            self.note_implausible_legacy_header(regions, raw as *mut u8, cand, "ref-slot-candidate");
             return true;
         }
         // WHICH refusal, not just THAT one. See [`EVAC_REF_REJECTED_TORN`]:
@@ -6235,6 +6244,22 @@ impl G1Collector {
     /// Measurement only — the caller's behaviour is unchanged.
     fn note_root_object_plausibility(&self, regions: &[G1Region], addr: usize) -> bool {
         if self.candidate_header_is_plausible(regions, addr) {
+            // ACCEPTED -- and that is exactly what needs a second look. This
+            // screen answers "do the tag bytes decode and is the address below
+            // its region's cursor", which an INTERIOR address satisfies
+            // trivially: the first eight bytes of a reference slot are a heap
+            // pointer, whose low half reads as a class id and whose high half
+            // reads as `num_slots`. On a heap based at 0x2_0000_0000 that high
+            // half is 0x200, which is why every such holder in this
+            // investigation reported `num_slots=512`.
+            //
+            // So a measured ZERO from this function is not evidence that roots
+            // are clean; it is evidence that this screen cannot see the defect.
+            // The implausible-header screen can.
+            // SAFETY: `candidate_header_is_plausible` just validated the tag
+            // bytes and placed the address inside a live region's span.
+            let header = unsafe { &*(addr as *const ObjectHeader) };
+            self.note_implausible_legacy_header(regions, addr as *mut u8, header, "cset-root");
             return true;
         }
         let n = NON_OBJECT_ROOT_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
