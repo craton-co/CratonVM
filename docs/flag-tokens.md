@@ -1120,7 +1120,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-23 tokens.
+24 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1147,6 +1147,7 @@ export inherited from a parent shell.
 | `vh-strict-reference-return` | `CRATONVM_VH_STRICT_REFERENCE_RETURN` |
 | `vh-null-coordinate-npe` | `CRATONVM_VH_NULL_COORDINATE_NPE` |
 | `vh-unsupported-mode-uoe` | `CRATONVM_VH_UNSUPPORTED_MODE_UOE` |
+| `vh-read-only-handle-uoe` | `CRATONVM_VH_READ_ONLY_HANDLE_UOE` |
 
 ## `CRATONVM_TEST`
 
