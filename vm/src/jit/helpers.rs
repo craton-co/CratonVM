@@ -6152,6 +6152,13 @@ pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize);
     *elem_ptr = val as u8;
+    // The host just wrote this array, so a GPU input-cache entry
+    // mirroring it is stale. `jit_iastore` has carried this since Phase
+    // 10 #2; this helper did not, because `byte[]` could not be
+    // marshalled and so was never cached. It became cacheable on
+    // 2026-09-02 and this line landed with the same change.
+    #[cfg(feature = "gpu-offload")]
+    crate::runtime::offload::input_cache::invalidate(cratonvm_types::ObjectRef::from_raw(ptr));
 }
 
 // SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap
