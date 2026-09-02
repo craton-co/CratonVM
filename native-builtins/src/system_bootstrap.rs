@@ -93,6 +93,32 @@ const FIXED_LENGTH: usize = 40;
 ///
 /// This replaces the C++ `SystemProps::platformProperties()` in HotSpot.
 fn native_platform_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // Read BEFORE the `set` closure below borrows `ctx` for the rest of the
+    // function. The borrow checker, not style, decides the position of this
+    // line.
+    //
+    // `native.encoding` is DERIVED, not pinned, as of 2026-09-01.
+    // `vm/src/vm/vm_init.rs::derive_native_encoding` owns the derivation — the
+    // host locale on Unix, still the `UTF-8` constant on Windows because no
+    // `GetACP`/`GetConsoleOutputCP` call exists anywhere in this tree — and
+    // stamps the answer into the map read back here, so there is ONE
+    // derivation rather than a copy per crate.
+    //
+    // This index is the copy that WINS in real-JDK mode:
+    // `SystemProps.initProperties` does an unconditional
+    // `put(props, "native.encoding", raw.propDefault(_native_encoding_NDX))`,
+    // which overrides both the `vmProperties()` entry below and any `-D` —
+    // the command-line immunity the property is specified to have.
+    //
+    // The fallback is what makes this the change that cannot fail: if the map
+    // somehow has no such key (it always does — `SharedVm::new` seeds it long
+    // before any bytecode runs) this answers exactly what the line it replaces
+    // answered. See
+    // docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-20260901.md.
+    let native_encoding = ctx
+        .get_system_property("native.encoding")
+        .unwrap_or_else(|| "UTF-8".to_string());
+
     // Allocate a String[] of FIXED_LENGTH (40 elements), all null initially
     let arr = ctx.new_array(ArrayElementType::Reference, FIXED_LENGTH);
 
@@ -144,7 +170,22 @@ fn native_platform_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> M
     set(JAVA_IO_TMPDIR_NDX, &tmp.to_string_lossy());
 
     // --- Encoding ---
-    set(NATIVE_ENCODING_NDX, "UTF-8");
+    // Only `native.encoding` is derived (see the note at the top of this
+    // function). The three STREAM keys stay UTF-8 on purpose, and are inert
+    // here in any case: `SystemProps.initProperties` reaches these three
+    // indexes only through `putIfAbsent`, and `vmProperties()` below already
+    // supplies all three, so whatever is written here is overridden before
+    // anything can read it. Whether `System.out` should follow the console is
+    // a compatibility judgement with a blast radius across every Windows user
+    // and is deferred to its own reviewed change —
+    // docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-20260901.md.
+    //
+    // `sun.jnu.encoding` stays UTF-8 for a stronger reason than deferral: it
+    // decides how FILE NAMES are encoded, so moving it would change class
+    // loading rather than printing. It is also, with `native.encoding`, one of
+    // only two keys `initProperties` `put`s unconditionally from this table —
+    // the other four here are overridden by `vmProperties()` before use.
+    set(NATIVE_ENCODING_NDX, native_encoding.as_str());
     set(STDOUT_ENCODING_NDX, "UTF-8");
     set(STDERR_ENCODING_NDX, "UTF-8");
     set(STDIN_ENCODING_NDX, "UTF-8");
@@ -303,6 +344,18 @@ fn native_vm_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     // agreeing — the tell is `java.vm.name`, "CratonVM" here and "cratonvm"
     // there, and a real-JDK run reports the lower-case one. The six keys below
     // are in both. **Add a key to both or you will add it to neither.**
+    //
+    // Amended 2026-09-01: there are THREE tables, not two.
+    // `native_platform_properties` above is the third, and for
+    // `native.encoding` and `sun.jnu.encoding` it is the one that WINS —
+    // `SystemProps.initProperties` `put`s those two from the platform indexes
+    // unconditionally, after this table has already been read. The encoding
+    // block further down records which copy governs which key. `native.encoding`
+    // is now derived exactly once, in
+    // `vm/src/vm/vm_init.rs::derive_native_encoding`, and read back by both
+    // tables in this file, so that key at least cannot drift between the
+    // three. The other five are still literals wherever they appear, on
+    // purpose — see the vm_init table for why.
     props.push((
         "sun.cpu.endian",
         if cfg!(target_endian = "big") {
@@ -320,8 +373,32 @@ fn native_vm_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     // Misc
     props.push(("java.awt.headless", "true".to_string()));
     props.push(("file.encoding", "UTF-8".to_string()));
-    props.push(("sun.stdout.encoding", "UTF-8".to_string()));
-    props.push(("sun.stderr.encoding", "UTF-8".to_string()));
+    // NOT SET, and their absence is the point: `sun.stdout.encoding` and
+    // `sun.stderr.encoding`. HotSpot 25 leaves both NULL — measured on the
+    // audit host in a UTF-8 arm and an `LC_ALL=C` arm alike — and until
+    // 2026-09-01 this table pinned both to `UTF-8`.
+    //
+    // They are the trap for whoever does the `stdout.encoding` stage.
+    // `SystemProps.initProperties` consults them FIRST:
+    //
+    //     putIfAbsent(props, "stdout.encoding",
+    //         props.getOrDefault("sun.stdout.encoding",
+    //                            raw.propDefault(Raw._stdout_encoding_NDX)));
+    //
+    // so a pinned `sun.stdout.encoding` overrides a correctly derived platform
+    // value and silently undoes that fix, leaving no trace in the key anyone
+    // would think to inspect.
+    //
+    // Removing them was checked rather than assumed to be safe: a grep over
+    // the whole tree (`*.rs`, `*.java`, `*.md`, `*.txt`) finds no reader at
+    // all outside `probes/StdoutEncoding.java`, which prints the key precisely
+    // in order to observe that HotSpot leaves it null. Nothing downstream
+    // moves either, because `stdout.encoding` / `stderr.encoding` are pushed
+    // explicitly on the next two lines, which makes the `putIfAbsent` above a
+    // no-op whatever the `sun.*` keys say. So this is the smaller and more
+    // faithful change: two fewer non-HotSpot keys in `System.getProperties()`,
+    // no behaviour difference today, and the trap disarmed before the next
+    // stage steps in it.
     props.push(("stdout.encoding", "UTF-8".to_string()));
     props.push(("stderr.encoding", "UTF-8".to_string()));
     // Session 108: stdin.encoding is consulted by `java/io/Console.<clinit>`
@@ -333,7 +410,19 @@ fn native_vm_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     // tripping a Console.<clinit> swallow in real-JDK mode. Setting the
     // property explicitly mirrors what HotSpot's launcher native code does.
     props.push(("stdin.encoding", "UTF-8".to_string()));
-    props.push(("native.encoding", "UTF-8".to_string()));
+    // Derived, and read back from the one owner rather than restated: see
+    // `vm/src/vm/vm_init.rs::derive_native_encoding`, and the note at the top
+    // of `native_platform_properties` for why the copy THERE is the one that
+    // wins in real-JDK mode (this entry survives only if that index comes back
+    // null). Two hard-coded copies of the same six keys in two crates is how
+    // the false "JDK 18+ pinned to UTF-8" premise stayed unexamined; the same
+    // fallback rule applies as above — if the map has no such key, answer
+    // exactly what this line answered before 2026-09-01.
+    props.push((
+        "native.encoding",
+        ctx.get_system_property("native.encoding")
+            .unwrap_or_else(|| "UTF-8".to_string()),
+    ));
     props.push(("sun.jnu.encoding", "UTF-8".to_string()));
 
     // --- NIO / ZIP toggles to steer the JDK away from native-memory code
