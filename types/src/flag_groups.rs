@@ -3504,10 +3504,22 @@ mod tests {
     }
 
     #[test]
-    fn the_whole_surface_is_fifteen_variables() {
+    fn the_whole_surface_is_seventeen_variables() {
         // This is the number the refactor exists to hold down. Raising it wants
         // an argument, not a merge.
-        assert_eq!(Group::ALL.len() + SCALARS.len(), 15);
+        //
+        // 15 -> 17 on 2026-09-01, and both arguments were already made — at the
+        // entries themselves, in `SCALARS`, by the changes that added them:
+        // `CRATONVM_JFR_ENABLE_EVENTS` (B10) and the `native.encoding` override
+        // (D3). Each is a scalar rather than an `INVENTORY` token for the same
+        // stated reason: it carries a VALUE, and the `E` model is
+        // presence-only. Only the count here was left behind, which is why this
+        // test was red on `dev` for every lane rather than for the one that
+        // grew the surface.
+        //
+        // Two GROUPS were not added — `Group::ALL` is still ten. Adding one of
+        // those is the move that would want a fresh argument.
+        assert_eq!(Group::ALL.len() + SCALARS.len(), 17);
     }
     /// The repository's first commit. No knob can predate it, so a `since:`
     /// earlier than this is a typo rather than a very old flag.
