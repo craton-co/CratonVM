@@ -89,8 +89,11 @@ const SKIPPED_DIRS: &[&str] = &["target", ".git", "vendor", "node_modules"];
 
 /// Re-derivation recipe for row 1 of "Where the surface stands", quoted back to
 /// the reader on failure so the fix does not require finding this file.
-const ROW1_RECIPE: &str =
-    r#"grep -rhoE 'CRATONVM_[A-Z0-9_]+' --include='*.rs' . | sort -u | wc -l"#;
+const ROW1_RECIPE: &str = concat!(
+    r#"grep -rhoE 'CRATONVM_[A-Z0-9_]+' --include='*.rs' --exclude-dir=target "#,
+    r#"--exclude-dir=vendor --exclude-dir=node_modules --exclude-dir='.*' "#,
+    r#". | sort -u | wc -l"#,
+);
 
 /// Re-derivation recipe for row 2. Note it scans `<member>/src` only, which is
 /// why the two rows are different numbers rather than the same one twice.
@@ -724,14 +727,23 @@ fn architecture_per_crate_loc_table_matches_reality() {
 /// `sort -u | wc -l` over a fixed pattern, so "close" has no meaning and any
 /// difference is a difference.
 ///
-/// # One documented divergence from the shell recipe
+/// # The recipe, and who writes these rows now
 ///
-/// Row 1's recipe greps `.` unrestricted; this test skips `target/`, `vendor/`
-/// and dotted directories. Today that makes no difference (verified: the two
-/// scans agree on all 1,056 names, and the 110 vendored `*.rs` files contain
-/// none). It would begin to matter if a `build.rs` ever emitted a name into
-/// `OUT_DIR` — at which point the test is right and the recipe wants a
-/// `-not -path './target/*'`.
+/// Both rows are written by `tools/flag-census/render-inventory.sh` as of
+/// 2026-09-02, so the way to fix a failure here is to REGENERATE, not to
+/// hand-edit — the hand-edit is what made these two the rows that drift. This
+/// test still scans independently: the generator and the test walk the tree
+/// with separate code, and the point is that they agree.
+///
+/// Row 1's recipe used to grep `.` unrestricted while this test skipped
+/// `target/`, `vendor/` and dotted directories — harmless only for as long as
+/// no `build.rs` emitted a name into `OUT_DIR`, and misleading to anyone who
+/// ran it in a built tree. It now carries the same exclusions. The one this
+/// test applies that the recipe cannot express is the internal docs tree,
+/// which `collect_rust` also skips; no `*.rs` lives there today, so the two
+/// agree. (Spelled in words rather than as a path because
+/// `no_source_file_links_into_docs_internal` forbids that path outside the
+/// tree it names, and it cannot tell a directory reference from a citation.)
 #[test]
 fn flag_inventory_surface_counts_are_current() {
     const SECTION: &str = "## Where the surface stands";

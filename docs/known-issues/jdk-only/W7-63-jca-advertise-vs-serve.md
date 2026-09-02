@@ -18,8 +18,13 @@
 > refuted this page's claim about `Collections.unmodifiableSet` and found
 > `ArrayList` missing `RandomAccess`.
 >
-> What is left is five `SunTls*` `KeyGenerator` services, and the reason is
-> structural rather than clerical (§8c).
+> ~~What is left is five `SunTls*` `KeyGenerator` services, and the reason is
+> structural rather than clerical (§8c).~~ **Closed the same day** — the
+> structural change the bullet named was made, and this VM now advertises
+> **335 of HotSpot's 335** services across the five providers while advertising
+> nothing HotSpot does not. §8f. The advertise-versus-serve ledger this page is
+> named for is at zero; what remains on the open list is one declined trade
+> (`LinkedList` is not a `Deque`).
 >
 > **2026-09-02, later the same day: §8c's second bullet closed too**, and its
 > own diagnosis was the thing that was wrong. `unmodifiableList(x) instanceof
@@ -686,12 +691,13 @@ is identical to HotSpot 25.0.3 unless said otherwise.
 | `KeyGenerator` defaults | `getInstance(a).generateKey().getEncoded().length` | identical, incl. `DESede`=24 |
 | nine `SunRsaSign` names | sign + verify + the signature BYTES | identical, all 13 PKCS#1 v1.5 names |
 | ML-DSA `getProvider()` | `KeyFactory`/`Signature` `.getProvider().getName()` | identical, all four names |
-| `SUN.getServices()` | per-provider service counts | identical for SUN, SunRsaSign, SunEC, SunJSSE; SunJCE 189 vs 194 |
+| `SUN.getServices()` | per-provider service counts | identical for all five (SunJCE 189 vs 194 when this row was written; **194 vs 194** since §8f) |
 | `unmodifiableSet` | identity, mutation, class, in all three modes | identical |
 | `--synthetic-jdk` never built | it is now | builds, runs, one defect found |
 
-The one differing row is the five `SunTls*` services. Nothing else in the
-record's open list survives.
+The one differing row was the five `SunTls*` services, and §8f closed it. **No
+row of this table differs now**, and nothing else in the record's open list
+survives.
 
 ## 8b. The twenty-six signature names
 
@@ -749,21 +755,44 @@ makes the encoding right as well as the signature.
 
 ## 8c. What is still open
 
-> One of the three below closed on 2026-09-02 and is kept, struck through, with
-> what it turned out to be. It is worth keeping because the bullet's own
-> diagnosis was wrong in a way that would have sent the next reader to the wrong
-> crate: it said the defect "belongs to whoever owns `native-collections`'
-> wrapper minting", and the wrapper minting was correct.
+> **TWO of the three below closed on 2026-09-02**, both kept struck through with
+> what they turned out to be. The `RandomAccess` one is worth keeping because
+> its own diagnosis was wrong in a way that would have sent the next reader to
+> the wrong crate. The `SunTls*` one is worth keeping because its diagnosis was
+> RIGHT — it named the engine change required, in one sentence, weeks before
+> anyone made it — and the record of a correct deferral is worth as much as the
+> record of a wrong one.
+>
+> **This page's open list is now the single `LinkedList`/`Deque` bullet**, which
+> is a declined trade rather than an unfinished job.
 
-* **Five `SunTls*` `KeyGenerator` services.** `SunTlsPrf`, `SunTls12Prf`,
+* ~~**Five `SunTls*` `KeyGenerator` services.** `SunTlsPrf`, `SunTls12Prf`,
   `SunTlsMasterSecret`, `SunTlsKeyMaterial`, `SunTlsRsaPremasterSecret` — the
   TLS-internal KDFs, which take `TlsKeyMaterialParameterSpec`-family specs this
   engine's two-field synthetic `KeyGenerator` cannot carry. Serving them means
   handing back a real `javax.crypto.KeyGenerator` over the platform's SPI and
   teaching all nine natives registered on that class to recognise a receiver
   they did not build (the `skf_receiver_is_ours` shape). An engine change, not
-  a row, and `every_keygenerator_the_engine_implements_is_advertised` asserts
-  they stay absent until it is made.
+  a row.~~
+
+  > **CLOSED 2026-09-02, exactly as the bullet described.** The engine change
+  > was made: `build_real_key_generator` (the `KeyGenerator` twin of the
+  > `SecretKeyFactory`/`Mac`/`KeyFactory` builders, through
+  > `javax.crypto.KeyGenerator`'s own `(KeyGeneratorSpi, Provider, String)`
+  > constructor, on the engine's refusal path), five rows naming the real
+  > platform classes, and `keygen_real_spi` guarding all six `init`/`generateKey`
+  > natives.
+  >
+  > **This VM now advertises 335 of HotSpot's 335 services** across `SUN`,
+  > `SunRsaSign`, `SunJCE`, `SunEC` and `SunJSSE` — SunJCE 189 → 194 — and
+  > advertises nothing HotSpot does not. §8a's one differing row is gone.
+  >
+  > Verified on the BYTES, not on a resolve. TLS 1.2's PRF and the
+  > master-secret and key-material derivations are deterministic, so four of the
+  > five diff byte-for-byte against HotSpot 25.0.3
+  > (`apps/probes/JcaSunTlsVectors`); `SunTlsRsaPremasterSecret` draws a nonce,
+  > so its length and version bytes are diffed instead. See "8f. The engine
+  > change the SunTls bullet asked for" below.
 
 * ~~**`Collections.unmodifiableList(x) instanceof RandomAccess`** is `true` in
   `--jdk-only` and `false` in the two modes where `alloc_unmod_wrapper`
@@ -914,6 +943,110 @@ version called the factories inline, `unmodifiableSortedMap` raised
 it — every sorted class, the whole reason they are in the probe — silently
 measured nothing. **A probe that stops early does not report less; it reports a
 shorter file that still diffs clean.**
+
+## 8f. The engine change the SunTls bullet asked for
+
+`getInstance` resolving is not the bar here, and the record says so twice
+already. The five `SunTls*` names are KDFs: routing to a generator and never
+initialising it, or initialising it with a spec whose fields were read in the
+wrong order, both produce an object that resolves and then hands back the wrong
+key. So the acceptance test is the BYTES.
+
+TLS 1.2's PRF is deterministic given (secret, label, seed), and so are the
+master-secret and key-material derivations built on it. Four of the five diff
+byte-for-byte; `SunTlsRsaPremasterSecret` draws a nonce, so its length and its
+two version bytes are what is fixed. `apps/probes/JcaSunTlsVectors`, both VMs,
+identical:
+
+```text
+SunTlsPrf                762791fa4ef968af841ad66563edc761…
+SunTls12Prf              eb621eb7ba5be377fceeb81260c3cc88…
+SunTlsMasterSecret       TlsMasterSecret c0dd6ecbed2c4fb4…
+SunTlsKeyMaterial        cw=e491f7c8… sw=7eae9609… civ=3a82de1c siv=c60442b3
+SunTlsRsaPremasterSecret len=48 version=0003
+```
+
+### Three parts, and the one that is easy to get wrong
+
+**The builder.** `build_real_key_generator` is the fourth sibling of
+`build_real_secret_key_factory`, `build_real_key_factory` and `build_real_mac`,
+through `javax.crypto.KeyGenerator`'s own protected
+`(KeyGeneratorSpi, Provider, String)` constructor. Reached only from
+`keygen_get_instance_named`'s refusal path — after this engine's own verdict,
+never before it, which is the whole safety argument `jdk_service_class` is
+written to.
+
+**The guard, which is the part that is easy to get wrong.** Every native on
+`javax/crypto/KeyGenerator` used to be able to assume the receiver was this
+crate's two-field synthetic (algorithm at slot 0, key size at slot 1). A real
+`KeyGenerator`'s slots hold `provider`/`spi`/`algorithm`/`lock` instead, so each
+native now asks `keygen_real_spi` first.
+
+That read is **type-checked, and the type check is not defensive
+programming — it is the discriminator**. `get_field_by_name` can fall back to a
+name→slot mapping, so asking a two-field synthetic for "spi" can return slot 0,
+which is a `String`. Handing that to `invoke_virtual` as a `KeyGeneratorSpi` is
+the failure; checking that it IS a `KeyGeneratorSpi` both prevents it and
+answers the question. The identical unchecked read put a `String` where a
+`Provider` belonged in `pbkdf2_get_provider` and killed the caller on
+`String.getName()` — this is that lesson applied before it could happen twice.
+
+No side table, which is the one deliberate difference from
+`skf_receiver_is_ours`: that one asks "did we build this" through an
+identity-keyed registry, this one asks "can I delegate" and answers with the
+object to delegate TO. Nothing to keep in step with GC relocation, nothing to
+evict.
+
+**The two `AlgorithmParameterSpec` `init` overloads were deliberate no-ops**,
+and they are the ONLY route into these five, whose entire input is a spec. They
+stay no-ops for a synthetic receiver, for the reason recorded on them (an
+`AlgorithmParameterSpec` is an empty marker interface, and the JCE contract lets
+a provider ignore parameters it does not recognise) — but on a real receiver
+they now forward. Swallowing the spec there would have left the generator
+uninitialised and moved the failure into `generateKey()`, which is a worse
+answer than the `NoSuchAlgorithmException` this used to give.
+
+### What the ratchet had to become
+
+`every_keygenerator_the_engine_implements_is_advertised` was a biconditional
+over HotSpot's own twenty-four names: advertised **iff**
+`keygen_default_bits` generates it. Serving the five by ROUTING rather than by
+generating makes that predicate too narrow, and narrowing is not conservatism
+here — it reds the test for names that work.
+
+It is a disjunction now: advertised iff (this crate generates it **or** the row
+names a real platform class). Deleting the old five-name assertion would have
+lost what it was protecting, so it was kept and inverted: those five must still
+have NO `keygen_default_bits` arm (an arm appearing there would mean someone
+fabricated a key where a KDF belongs) and must resolve to a
+`com.sun.crypto.provider.Tls*` class that is not the `.Native` marker.
+
+Checked for falsifiability rather than assumed: deleting one seed row reds it
+with `SunTlsPrf must be advertised with a real class`.
+
+### The regression surface, measured
+
+The guard runs on every `KeyGenerator` call in the VM, and the all-zero-key
+defect that `SecretKeySpec`'s copy shim exists for lives on this exact path. Run
+on both VMs and diffed:
+
+| probe | rows | result |
+|---|---:|---|
+| `JcaSunTlsVectors` | 5 | identical |
+| `JcaKeyGeneratorDefaults` | 24 | identical — the row that used to read "identical but the five `SunTls*`" |
+| `JcaKeygenScrub` | 5 | identical (the all-zero-key property) |
+| `JcaDerivationVectors` | 24 | identical |
+| per-provider service counts | 5 | identical, **335 of 335** |
+| `cargo test -p cratonvm-native-builtins --lib` | 4197 | passed |
+
+### Scope, stated honestly
+
+`sun.security.internal.spec` is not exported by `java.base`, so the probe needs
+`--add-exports java.base/sun.security.internal.spec=ALL-UNNAMED` on both VMs.
+The real caller of these five is `sun.security.ssl`'s own handshake, not
+application code. What closing this buys is that the JDK's TLS stack can reach
+its own KDFs through this VM's provider chain, and that the advertise-versus-
+serve ledger this page is named for reaches zero.
 
 ## 9. How to verify
 

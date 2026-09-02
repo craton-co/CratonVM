@@ -260,6 +260,12 @@ fn maybe_dump_shutdown_reports() {
             eprintln!(
                 "[cratonvm] compiled reference stores: gated={gated} declined={declined}"
             );
+            // Optimizing-tier allocation. A zero on the left is the EXPECTED
+            // reading under a default configuration -- `c2_alloc_upgrade` is
+            // opt-in, so no method containing a `new` reaches that tier -- and
+            // printing both is what separates that from "emitted and refused".
+            let (bump, stub) = cratonvm_jit::runtime_lowering::ir_alloc_site_counts();
+            eprintln!("[cratonvm] optimizing-tier allocations: inline-bump={bump} stub-only={stub}");
         }
         // Reference loads whose slot did NOT hold a reference, contained by
         // `GETFIELD_EXPECT_REFERENCE` instead of being handed to compiled code

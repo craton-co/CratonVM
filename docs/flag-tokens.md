@@ -577,7 +577,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-280 tokens.
+282 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -674,6 +674,8 @@ export inherited from a parent shell.
 | `precise-getstatic-checkcast` | `CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST` |
 | `precise-alloc-athrow` | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` |
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
+| `ir-inline-tlab` | `CRATONVM_JIT_IR_INLINE_TLAB` |
+| `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
 | `gated-ref-store` | `CRATONVM_JIT_GATED_REF_STORE` |
 | `operand-cache` | `CRATONVM_JIT_OPERAND_CACHE` |
@@ -864,7 +866,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-107 tokens.
+108 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -937,6 +939,7 @@ export inherited from a parent shell.
 | `oldgen-compact` | `CRATONVM_OLDGEN_COMPACT` |
 | `overhead-limit` | `CRATONVM_GC_OVERHEAD_LIMIT` |
 | `owner-class-filter` | `CRATONVM_OWNER_CLASS_FILTER` |
+| `par-evac` | `CRATONVM_GC_PAR_EVAC` |
 | `par-min-bytes` | `CRATONVM_GC_PAR_MIN_BYTES` |
 | `par-threads` | `CRATONVM_GC_PAR_THREADS` |
 | `promotion-guard` | `CRATONVM_NO_GC_PROMOTION_GUARD` |
