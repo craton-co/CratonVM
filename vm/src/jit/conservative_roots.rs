@@ -5356,6 +5356,21 @@ fn remap_one_jit_frame(
 ///   band, so without the scopes every one of them read as `outside_locals`,
 ///   and "a spliced callee's locals are named by no oop map" is a defect this
 ///   repo has already paid for once.
+/// * `stack_not_oop` -- the safepoint's own operand-stack model classified that
+///   spill slot as a non-reference and its marks were exact. Dead storage.
+///   This is the band the H2 residue is actually in: 36 of 37 stale words on
+///   `TestRandomMapOps` were `region=operand-spill`.
+/// * `mapped_alias` -- the slot IS named by the map and was rewritten; the value
+///   the rewrite wrote is itself a pointer-map key, because a slide moves
+///   objects into space other objects vacated. This is why "the word is a key
+///   of the pointer map" is not proof that the word is stale, and it produced
+///   this instrument's first and only `LOCAL-OOP-UNMAPPED` before it was
+///   separated out.
+/// * `duplicate_of_mapped` -- no oracle claims the slot, but the object the word
+///   points at is ALSO named by a mapped slot of the same frame, which
+///   relocation rewrote. The object is not lost. Measured on H2: the map names
+///   a group of spill slots and the stale words are the copies three slots
+///   below them, holding the same objects at their pre-move addresses.
 /// * `outside_locals` -- spill or staging band with no scope claiming it, where
 ///   this oracle is silent. The per-frame detail prints
 ///   `FrameLayout::region_name` beside each, which is what makes an
@@ -5393,6 +5408,12 @@ mod residue_census {
     pub static INLINE_SCOPES_SEEN: AtomicUsize = AtomicUsize::new(0);
     pub static INLINE_LOCAL_OOP: AtomicUsize = AtomicUsize::new(0);
     pub static INLINE_LOCAL_NOT_OOP: AtomicUsize = AtomicUsize::new(0);
+    pub static STACK_NOT_OOP: AtomicUsize = AtomicUsize::new(0);
+    pub static DUPLICATE_OF_MAPPED: AtomicUsize = AtomicUsize::new(0);
+    pub static MAPPED_ALIAS: AtomicUsize = AtomicUsize::new(0);
+    /// ENGAGEMENT for the operand-stack half: how many reported frames carried
+    /// an exact stack model with at least one non-oop slot in it.
+    pub static FRAMES_WITH_STACK_MODEL: AtomicUsize = AtomicUsize::new(0);
     pub static OUTSIDE_LOCALS: AtomicUsize = AtomicUsize::new(0);
 }
 
@@ -5414,7 +5435,7 @@ pub fn report_remap_residue_census_at_exit() {
         return;
     }
     eprintln!(
-        "[remap-residue-summary] frames={} frames_with_live_stale={} local_oop={} local_not_oop={} local_unreached={} frames_with_inline_scopes={} inline_scopes={} inline_local_oop={} inline_local_not_oop={} outside_locals={}",
+        "[remap-residue-summary] frames={} frames_with_live_stale={} local_oop={} local_not_oop={} local_unreached={} frames_with_inline_scopes={} inline_scopes={} inline_local_oop={} inline_local_not_oop={} frames_with_stack_model={} stack_not_oop={} duplicate_of_mapped={} mapped_alias={} outside_locals={}",
         frames,
         residue_census::FRAMES_WITH_LIVE.load(Relaxed),
         residue_census::LOCAL_OOP.load(Relaxed),
@@ -5424,6 +5445,10 @@ pub fn report_remap_residue_census_at_exit() {
         residue_census::INLINE_SCOPES_SEEN.load(Relaxed),
         residue_census::INLINE_LOCAL_OOP.load(Relaxed),
         residue_census::INLINE_LOCAL_NOT_OOP.load(Relaxed),
+        residue_census::FRAMES_WITH_STACK_MODEL.load(Relaxed),
+        residue_census::STACK_NOT_OOP.load(Relaxed),
+        residue_census::DUPLICATE_OF_MAPPED.load(Relaxed),
+        residue_census::MAPPED_ALIAS.load(Relaxed),
         residue_census::OUTSIDE_LOCALS.load(Relaxed),
     );
 }
@@ -5447,6 +5472,23 @@ enum StaleVerdict {
     InlineLocalOopUnmapped,
     /// As `LocalNotOop`, for a local of an inlined callee.
     InlineLocalNotOop,
+    /// The safepoint's own operand-stack model classified this spill slot as
+    /// NOT holding a reference, and the mark vector was exact. Dead storage.
+    StackNotOop,
+    /// No oracle claims the slot, but the object it points at IS named by
+    /// another slot of this same frame, which relocation rewrote. The object is
+    /// therefore not lost; this word is a stale DUPLICATE of a live root.
+    DuplicateOfMapped,
+    /// The slot IS in this safepoint's map and was rewritten, and the value the
+    /// rewrite wrote is ITSELF a key of the pointer map -- a to-space address
+    /// that aliases some other object's from-space address, because a slide
+    /// moves objects into space other objects vacated.
+    ///
+    /// Never a missed root, and the reason "this word is a key of the pointer
+    /// map" is not by itself proof that a word is stale. Observed on
+    /// `FileStore.readChunkFooter` (`mapped=[8=..]`, `rewritten=4` of 4 slots),
+    /// where it produced the instrument's first and only LOCAL-OOP-UNMAPPED.
+    MappedAlias,
     /// Spill or staging band — not a local home, so this oracle is silent.
     OutsideLocals,
 }
@@ -5460,6 +5502,9 @@ impl StaleVerdict {
             StaleVerdict::LocalUnreached => "local-unreached",
             StaleVerdict::InlineLocalOopUnmapped => "INLINE-LOCAL-OOP-UNMAPPED",
             StaleVerdict::InlineLocalNotOop => "inline-local-not-oop",
+            StaleVerdict::StackNotOop => "stack-not-oop",
+            StaleVerdict::DuplicateOfMapped => "duplicate-of-mapped",
+            StaleVerdict::MappedAlias => "mapped-alias",
             StaleVerdict::OutsideLocals => "outside-locals",
         }
     }
@@ -5474,15 +5519,36 @@ impl StaleVerdict {
 /// this bci, which is NOT the same as `Some(0)`.
 fn classify_stale_local(
     off: usize,
+    mapped: &[i16],
     local_mask: Option<u64>,
     num_locals: usize,
     inline_scopes: &[(i32, u16, u64)],
+    non_oop_stack: &[i16],
 ) -> StaleVerdict {
+    // FIRST, because a slot the map NAMED was rewritten and cannot be a missed
+    // root. Its current value being a pointer-map key is address aliasing -- a
+    // slide moves objects into space other objects vacated -- and asking the
+    // locals oracle about it is how this instrument produced its only false
+    // `LOCAL-OOP-UNMAPPED`. See `StaleVerdict::MappedAlias`.
+    if i16::try_from(off).is_ok_and(|o| mapped.contains(&o)) {
+        return StaleVerdict::MappedAlias;
+    }
     if off < 8 || off % 8 != 0 || (off / 8 - 1) >= num_locals {
         // Not a java local of this method. A SPLICED callee's locals are
         // allocated out of the operand-spill band and are addressed from their
         // scope's own base, so ask each live scope before giving up.
-        return classify_stale_inline_local(off, inline_scopes);
+        return match classify_stale_inline_local(off, inline_scopes) {
+            // No splice claims it. The last oracle is the safepoint's own
+            // operand-stack model, which is where the H2 residue actually sits.
+            StaleVerdict::OutsideLocals => {
+                if i16::try_from(off).is_ok_and(|o| non_oop_stack.contains(&o)) {
+                    StaleVerdict::StackNotOop
+                } else {
+                    StaleVerdict::OutsideLocals
+                }
+            }
+            other => other,
+        };
     }
     let k = off / 8 - 1;
     match local_mask {
@@ -5574,9 +5640,16 @@ fn report_remap_residue(
     let mut local_mask: Option<u64> = Some(0);
     let mut num_locals: usize = 0;
     let mut inline_scopes: Vec<(i32, u16, u64)> = Vec::new();
+    let mut non_oop_stack: Vec<i16> = Vec::new();
     for m in cm.oop_maps.iter().filter(|m| m.bytecode_pc == sp_id) {
         num_locals = num_locals.max(m.num_locals as usize);
         inline_scopes.extend_from_slice(&m.inline_local_scopes);
+        // A non-exact mark vector was PADDED with "not an oop" for entries
+        // nobody classified, so its complement is a default and not a proof.
+        // Spend it only when the safepoint said it was exact.
+        if m.stack_marks_exact {
+            non_oop_stack.extend_from_slice(&m.non_oop_stack_slots);
+        }
         local_mask = match (local_mask, m.local_oop_mask) {
             (Some(a), Some(b)) => Some(a | b),
             _ => None,
@@ -5593,8 +5666,29 @@ fn report_remap_residue(
     let mut oracle_local_unreached = 0usize;
     let mut oracle_inline_local_oop = 0usize;
     let mut oracle_inline_local_not_oop = 0usize;
+    let mut oracle_stack_not_oop = 0usize;
+    let mut oracle_duplicate = 0usize;
+    let mut oracle_mapped_alias = 0usize;
     let mut oracle_outside_locals = 0usize;
     let mut detail = String::new();
+    // The values the map's own slots hold NOW, i.e. after relocation rewrote
+    // them. A stale word whose target is among these points at an object the
+    // frame still reaches through a named root: the object is not lost, and the
+    // word is a stale DUPLICATE rather than a missing root. Cheap, and it needs
+    // no metadata the map does not already carry.
+    let mut mapped_vals: Vec<usize> = Vec::new();
+    for &off in mapped {
+        let a = rbp.wrapping_sub(off as usize);
+        // One entry per mapped slot, in order, so the description below can
+        // index it; a misaligned slot (never seen) contributes 0, which is not
+        // a pointer-map key and so cannot produce a false duplicate.
+        mapped_vals.push(if a & 0x7 == 0 {
+            // SAFETY: aligned frame slot of a live JIT frame on this thread.
+            unsafe { (a as *const usize).read() }
+        } else {
+            0
+        });
+    }
     if frame_size > 0 && (frame_size as usize) <= 1024 * 1024 && (frame_size as usize) <= rbp {
         let frame_size = frame_size as usize;
         let lo = (rbp - frame_size + 7) & !7usize;
@@ -5623,7 +5717,23 @@ fn report_remap_residue(
                 let verdict = if class != "LIVE" {
                     StaleVerdict::NotLive
                 } else {
-                    classify_stale_local(off, local_mask, num_locals, &inline_scopes)
+                    classify_stale_local(
+                        off,
+                        mapped,
+                        local_mask,
+                        num_locals,
+                        &inline_scopes,
+                        &non_oop_stack,
+                    )
+                };
+                // Last resort before "unexplained": is this the same object a
+                // named slot of this frame already points at?
+                let verdict = if verdict == StaleVerdict::OutsideLocals
+                    && mapped_vals.contains(&new)
+                {
+                    StaleVerdict::DuplicateOfMapped
+                } else {
+                    verdict
                 };
                 match verdict {
                     StaleVerdict::NotLive => {}
@@ -5632,6 +5742,9 @@ fn report_remap_residue(
                     StaleVerdict::LocalUnreached => oracle_local_unreached += 1,
                     StaleVerdict::InlineLocalOopUnmapped => oracle_inline_local_oop += 1,
                     StaleVerdict::InlineLocalNotOop => oracle_inline_local_not_oop += 1,
+                    StaleVerdict::StackNotOop => oracle_stack_not_oop += 1,
+                    StaleVerdict::DuplicateOfMapped => oracle_duplicate += 1,
+                    StaleVerdict::MappedAlias => oracle_mapped_alias += 1,
                     StaleVerdict::OutsideLocals => oracle_outside_locals += 1,
                 }
                 // A word the oracle proves is a reference is the finding, and
@@ -5681,21 +5794,24 @@ fn report_remap_residue(
         }
         residue_census::INLINE_LOCAL_OOP.fetch_add(oracle_inline_local_oop, Relaxed);
         residue_census::INLINE_LOCAL_NOT_OOP.fetch_add(oracle_inline_local_not_oop, Relaxed);
+        residue_census::STACK_NOT_OOP.fetch_add(oracle_stack_not_oop, Relaxed);
+        residue_census::DUPLICATE_OF_MAPPED.fetch_add(oracle_duplicate, Relaxed);
+        residue_census::MAPPED_ALIAS.fetch_add(oracle_mapped_alias, Relaxed);
+        if !non_oop_stack.is_empty() {
+            residue_census::FRAMES_WITH_STACK_MODEL.fetch_add(1, Relaxed);
+        }
         residue_census::OUTSIDE_LOCALS.fetch_add(oracle_outside_locals, Relaxed);
     }
     let mut mapped_desc = String::new();
-    for &off in mapped {
-        let a = rbp.wrapping_sub(off as usize);
-        let v = if a & 0x7 == 0 {
-            // SAFETY: aligned frame slot of a live JIT frame on this thread.
-            unsafe { (a as *const usize).read() }
-        } else {
-            0
-        };
-        mapped_desc.push_str(&format!(" {}=0x{:x}", off, v));
+    for (i, &off) in mapped.iter().enumerate() {
+        mapped_desc.push_str(&format!(
+            " {}=0x{:x}",
+            off,
+            mapped_vals.get(i).copied().unwrap_or(0)
+        ));
     }
     eprintln!(
-        "[remap-frame] method={} sp_id={} frame_size={} cov_complete={} live_hi={} local_mask={:?} num_locals={} mapped=[{}] rewritten={} inlined={:?} stale_words={} stale_live={} stale_dead={} stale_unknown={} scopes={:?} oracle=[local_oop={} local_not_oop={} local_unreached={} inline_local_oop={} inline_local_not_oop={} outside_locals={}]{}",
+        "[remap-frame] method={} sp_id={} frame_size={} cov_complete={} live_hi={} local_mask={:?} num_locals={} mapped=[{}] rewritten={} inlined={:?} stale_words={} stale_live={} stale_dead={} stale_unknown={} scopes={:?} oracle=[local_oop={} local_not_oop={} local_unreached={} inline_local_oop={} inline_local_not_oop={} stack_not_oop={} duplicate_of_mapped={} mapped_alias={} outside_locals={}]{}",
         cm.method_label,
         sp_id,
         frame_size,
@@ -5719,6 +5835,9 @@ fn report_remap_residue(
         oracle_local_unreached,
         oracle_inline_local_oop,
         oracle_inline_local_not_oop,
+        oracle_stack_not_oop,
+        oracle_duplicate,
+        oracle_mapped_alias,
         oracle_outside_locals,
         detail,
     );
@@ -9083,6 +9202,8 @@ mod tests {
             local_oop_mask: None,
             num_locals: 0,
             inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         });
         cm.fully_oop_covered = true;
         cm.fully_shadow_covered = true;
@@ -9118,6 +9239,8 @@ mod tests {
             local_oop_mask: None,
             num_locals: 0,
             inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         });
         // The direct-call shape: shadow complete, frame-slot subset incomplete.
         cm.fully_shadow_covered = true;
@@ -9156,6 +9279,8 @@ mod tests {
             local_oop_mask: None,
             num_locals: 0,
             inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         });
         cm.fully_shadow_covered = false;
         // `fully_oop_covered` true and shadow false is the inverse of the pair
@@ -9270,6 +9395,8 @@ mod tests {
             local_oop_mask: None,
             num_locals: 0,
             inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         });
         cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x10,
@@ -9280,6 +9407,8 @@ mod tests {
             local_oop_mask: None,
             num_locals: 0,
             inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         });
         cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x20,
@@ -9290,6 +9419,8 @@ mod tests {
             local_oop_mask: None,
             num_locals: 0,
             inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         });
 
         // Exact-match lookups succeed regardless of insertion order.
@@ -9347,6 +9478,8 @@ mod tests {
             local_oop_mask: None,
             num_locals: 0,
             inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         });
         assert!(cm.has_precise_oop_maps());
 
@@ -9553,14 +9686,14 @@ mod stale_word_oracle_tests {
     #[test]
     fn the_doconcat_witness_is_dead_storage() {
         assert_eq!(
-            classify_stale_local(32, Some(0b10011), 6, &[]),
+            classify_stale_local(32, &[], Some(0b10011), 6, &[], &[]),
             StaleVerdict::LocalNotOop
         );
         // ... while the slots the mask DOES name would be roots if they were
         // ever found stale.
         for off in [8usize, 16, 40] {
             assert_eq!(
-                classify_stale_local(off, Some(0b10011), 6, &[]),
+                classify_stale_local(off, &[], Some(0b10011), 6, &[], &[]),
                 StaleVerdict::LocalOopUnmapped,
                 "offset {off}"
             );
@@ -9574,11 +9707,11 @@ mod stale_word_oracle_tests {
     #[test]
     fn unreached_is_not_the_empty_mask() {
         assert_eq!(
-            classify_stale_local(32, None, 6, &[]),
+            classify_stale_local(32, &[], None, 6, &[], &[]),
             StaleVerdict::LocalUnreached
         );
         assert_eq!(
-            classify_stale_local(32, Some(0), 6, &[]),
+            classify_stale_local(32, &[], Some(0), 6, &[], &[]),
             StaleVerdict::LocalNotOop
         );
     }
@@ -9589,21 +9722,21 @@ mod stale_word_oracle_tests {
     #[test]
     fn outside_the_locals_band_the_oracle_is_silent() {
         assert_eq!(
-            classify_stale_local(56, Some(0), 6, &[]),
+            classify_stale_local(56, &[], Some(0), 6, &[], &[]),
             StaleVerdict::OutsideLocals
         );
         assert_eq!(
-            classify_stale_local(0, Some(0), 6, &[]),
+            classify_stale_local(0, &[], Some(0), 6, &[], &[]),
             StaleVerdict::OutsideLocals
         );
         assert_eq!(
-            classify_stale_local(36, Some(0), 6, &[]),
+            classify_stale_local(36, &[], Some(0), 6, &[], &[]),
             StaleVerdict::OutsideLocals
         );
         // A frame with no mask at all (the IR tier) has `num_locals == 0`, so
         // every word is outside the band and nothing is misattributed.
         assert_eq!(
-            classify_stale_local(8, None, 0, &[]),
+            classify_stale_local(8, &[], None, 0, &[], &[]),
             StaleVerdict::OutsideLocals
         );
     }
@@ -9618,31 +9751,31 @@ mod stale_word_oracle_tests {
         // 3 locals whose local 1 is a reference.
         let scopes = [(96i32, 3u16, 0b010u64)];
         assert_eq!(
-            classify_stale_local(96, Some(0), 2, &scopes),
+            classify_stale_local(96, &[], Some(0), 2, &scopes, &[]),
             StaleVerdict::InlineLocalNotOop
         );
         assert_eq!(
-            classify_stale_local(104, Some(0), 2, &scopes),
+            classify_stale_local(104, &[], Some(0), 2, &scopes, &[]),
             StaleVerdict::InlineLocalOopUnmapped
         );
         assert_eq!(
-            classify_stale_local(112, Some(0), 2, &scopes),
+            classify_stale_local(112, &[], Some(0), 2, &scopes, &[]),
             StaleVerdict::InlineLocalNotOop
         );
         // One past the scope's last local is spill again, not local 3.
         assert_eq!(
-            classify_stale_local(120, Some(0), 2, &scopes),
+            classify_stale_local(120, &[], Some(0), 2, &scopes, &[]),
             StaleVerdict::OutsideLocals
         );
         // Below the scope's base, likewise.
         assert_eq!(
-            classify_stale_local(88, Some(0), 2, &scopes),
+            classify_stale_local(88, &[], Some(0), 2, &scopes, &[]),
             StaleVerdict::OutsideLocals
         );
         // A scope that could not classify its locals is not recorded at all,
         // so its band stays honestly unattributed rather than reading "dead".
         assert_eq!(
-            classify_stale_local(104, Some(0), 2, &[]),
+            classify_stale_local(104, &[], Some(0), 2, &[], &[]),
             StaleVerdict::OutsideLocals
         );
     }
@@ -9654,8 +9787,60 @@ mod stale_word_oracle_tests {
     fn the_outer_locals_band_is_consulted_first() {
         let scopes = [(8i32, 4u16, u64::MAX)];
         assert_eq!(
-            classify_stale_local(8, Some(0), 4, &scopes),
+            classify_stale_local(8, &[], Some(0), 4, &scopes, &[]),
             StaleVerdict::LocalNotOop
+        );
+    }
+
+    /// A slot the map NAMED cannot be a missed root: relocation rewrote it, and
+    /// its current value being a pointer-map key means that to-space address
+    /// aliases some other object's from-space address. Asking the locals oracle
+    /// about it produced the instrument's only false `LOCAL-OOP-UNMAPPED`, on
+    /// `FileStore.readChunkFooter` -- `mapped=[8=..]` with `rewritten` equal to
+    /// the slot count, so slot 8 held a value the rewrite had just written.
+    #[test]
+    fn a_mapped_slot_is_never_a_missed_root() {
+        // Local 0, mask says it IS a reference: the exact shape that misfired.
+        assert_eq!(
+            classify_stale_local(8, &[], Some(0b1), 9, &[], &[]),
+            StaleVerdict::LocalOopUnmapped,
+            "an UNMAPPED reference local is still the finding"
+        );
+        assert_eq!(
+            classify_stale_local(8, &[8], Some(0b1), 9, &[], &[]),
+            StaleVerdict::MappedAlias,
+            "the same word, once the map names it, is not a missed root"
+        );
+        // The mapped check outranks every other oracle, including the ones
+        // that would otherwise call the word dead.
+        assert_eq!(
+            classify_stale_local(96, &[96], Some(0), 2, &[], &[96]),
+            StaleVerdict::MappedAlias
+        );
+    }
+
+    /// The operand-spill band is where the residue actually is on the workload
+    /// this oracle was built for: 36 of 37 stale words on
+    /// `org.h2.test.store.TestRandomMapOps` sat in `region=operand-spill`,
+    /// which the locals and splice oracles both decline to answer for. The
+    /// safepoint's own stack model closes that gap for the slots it modelled.
+    #[test]
+    fn an_operand_spill_slot_the_stack_model_calls_a_primitive_is_dead() {
+        // Outer method: 2 locals; spill slots 96 and 104 modelled as non-oops.
+        assert_eq!(
+            classify_stale_local(96, &[], Some(0), 2, &[], &[96, 104]),
+            StaleVerdict::StackNotOop
+        );
+        // A spill slot the model did not mention stays unproven.
+        assert_eq!(
+            classify_stale_local(112, &[], Some(0), 2, &[], &[96, 104]),
+            StaleVerdict::OutsideLocals
+        );
+        // A splice's claim wins over the stack model for the same word: the
+        // scope knows it is a local, the stack model only knows it is a slot.
+        assert_eq!(
+            classify_stale_local(96, &[], Some(0), 2, &[(96, 1, 0b1)], &[96]),
+            StaleVerdict::InlineLocalOopUnmapped
         );
     }
 
@@ -9665,7 +9850,7 @@ mod stale_word_oracle_tests {
     #[test]
     fn a_local_past_the_mask_width_is_not_proven_dead() {
         assert_eq!(
-            classify_stale_local(8 * 65, Some(u64::MAX), 80, &[]),
+            classify_stale_local(8 * 65, &[], Some(u64::MAX), 80, &[], &[]),
             StaleVerdict::LocalUnreached
         );
     }

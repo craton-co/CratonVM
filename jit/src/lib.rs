@@ -1617,6 +1617,24 @@ pub struct OopMapEntry {
     /// (`map_incomplete_cause::INLINE_LOCAL_UNMAPPABLE`) and contributes
     /// nothing here, so a word in its band stays honestly unattributed.
     pub inline_local_scopes: Vec<(i32, u16, u64)>,
+    /// Frame-resident OPERAND-STACK slots this safepoint's own stack model
+    /// classified as NOT holding a reference.
+    ///
+    /// The marked ones are already in `frame_slot_offsets`; these are their
+    /// complement, and they are what lets a stale word in the operand-spill
+    /// band be read as dead storage rather than merely unexplained. Measured
+    /// need: on `org.h2.test.store.TestRandomMapOps`, 36 of the 37 stale words
+    /// below `live_frame_hi` sit in `region=operand-spill`, where the locals
+    /// oracle above is silent.
+    ///
+    /// Only meaningful when `stack_marks_exact`; a mark vector that nobody
+    /// classified was PADDED with "not an oop", which is a default and not a
+    /// proof.
+    pub non_oop_stack_slots: Vec<i16>,
+    /// Whether the mark vector behind `non_oop_stack_slots` was exact
+    /// (`Compiler::stack_oop_marks_exact`). False turns every entry above from
+    /// a proof into a guess, so the report must not spend it.
+    pub stack_marks_exact: bool,
 }
 
 impl OopMapEntry {
@@ -1633,6 +1651,8 @@ impl OopMapEntry {
             local_oop_mask: None,
             num_locals: 0,
             inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         }
     }
 
