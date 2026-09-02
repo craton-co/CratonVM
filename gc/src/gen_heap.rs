@@ -1782,8 +1782,128 @@ pub fn addr_is_movable(addr: usize) -> bool {
 /// exactly as [`published_young_regions_are_live`] documents for its own table,
 /// and a caller that reads a quiet verifier as a clean one is measuring an
 /// unpublished table.
+///
+/// The third term is the LIVE-HEAP registry. A published table is only an
+/// answer about the heap it names, and slot-0 ownership makes each table
+/// single-tenant, so with two heaps alive the one that lost the slot gets
+/// `false` for every address — published, fresh, and about somebody else. See
+/// [`RELOCATABLE_HEAPS_LIVE`] for why that is the same vacuous pass an empty
+/// table produces, arrived at from the other side.
 pub fn movable_bounds_are_live() -> bool {
-    published_young_regions_are_live() || movable_bounds_published()
+    published_bounds_represent_every_live_heap()
+        && (published_young_regions_are_live() || movable_bounds_published())
+}
+
+// ---------------------------------------------------------------------------
+// The live-heap registry
+// ---------------------------------------------------------------------------
+
+/// How many heaps whose objects a relocating cycle could move are alive right
+/// now.
+///
+/// # Why a count is needed at all
+///
+/// [`JIT_REGION_BOUNDS`] and [`MOVABLE_BOUNDS`] are process-global and
+/// **last-writer-wins**, and both are discriminated by slot 0 — a table
+/// "belongs to" whichever heap's base it currently names, which is what makes
+/// the owner-checked clears in the three `Drop`s correct. That discrimination
+/// has a consequence the clears do not: a table can describe **exactly one**
+/// heap. Construct a second heap and the first is silently unrepresented in
+/// it.
+///
+/// That was recorded as a known limitation for as long as the only reader was
+/// the JIT's guarded inline `getfield`, where an unrepresented arena costs a
+/// helper call. It stopped being a limitation and became the same defect one
+/// step over once
+/// `conservative_roots::moving_young_unpublished_frame_oop_present` started
+/// asking [`addr_is_movable`] whether a compiled frame's word could be
+/// relocated: for the unrepresented heap that predicate answers `false` for
+/// **every address in the process**, so the verifier walks every verifiable
+/// slot, classifies none of them as movable, and returns "nothing unpublished"
+/// without having inspected anything — a vacuous pass, which is exactly the
+/// chain `bug-g1-evacuates-live-jit-reference-20260819.md` traces from an
+/// empty table to an evacuated live reference.
+///
+/// The difference is only in how the table came to be useless. An EMPTY table
+/// is caught by [`movable_bounds_are_live`], because nothing is published. A
+/// table naming the OTHER heap is not: it is published, it is fresh, it is
+/// simply about somebody else. `pin_addrs=0` read as "there are no JIT roots";
+/// this reads as "no word in this frame is movable". Same false verdict, same
+/// consumer, and no instrument between them.
+///
+/// # Why a count rather than a wider table
+///
+/// Widening the tables to hold N heaps was considered and is the wrong trade.
+/// The tables' addresses are baked into compiled code as immediates and their
+/// six-word layout is the shape the emitted containment sequence walks
+/// (`emit_guarded_getfield_receiver_check`); a variable-length table would put
+/// a loop bound on the JIT's hottest guard to serve a case a running VM never
+/// has. One heap is the shape of every production process — `vm_init` builds
+/// exactly one — so the honest engineering answer is to keep the fast shape
+/// and REFUSE to answer when it cannot represent the process, which is what
+/// every other "cannot inspect" case in this verifier already does.
+///
+/// Registration is RAII ([`RelocatableHeapRegistration`]) rather than a
+/// matched pair of calls, so a heap cannot forget to deregister and an unwind
+/// out of a partially-built heap cannot leak a count that would disable
+/// moving-young for the life of the process.
+///
+/// # It is process-global under `cfg(test)` too, deliberately
+///
+/// Most counters in this crate are thread-local under `cfg(test)`. This one is
+/// not, because the true count is the whole point: a test that saw only its own
+/// thread's heaps would report `1` in a `libtest` binary that has two hundred
+/// heaps alive across a thread per core, and would therefore assert the gate
+/// OPEN in exactly the state the gate exists to close. The consequence is the
+/// one `gc/tests/published_bounds_isolation.rs` was created for and documents in
+/// its header: **a test that observes this count, or any gate built on it,
+/// belongs in that integration file** — Cargo gives it a process, which is the
+/// only mechanism that removes the peer constructions.
+static RELOCATABLE_HEAPS_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// A live heap's entry in the registry [`RELOCATABLE_HEAPS_LIVE`] counts.
+///
+/// Held as a field by every heap that can own relocatable objects
+/// ([`GenerationalHeap`], `zgc::ZgcRealHeap`, `g1::G1Collector`), so the count
+/// tracks heap lifetimes exactly and without a teardown path to forget.
+#[derive(Debug)]
+pub struct RelocatableHeapRegistration {
+    _private: (),
+}
+
+impl RelocatableHeapRegistration {
+    /// Register a newly-constructed heap. Call once, from the constructor.
+    pub fn new() -> Self {
+        RELOCATABLE_HEAPS_LIVE.fetch_add(1, Ordering::AcqRel);
+        Self { _private: () }
+    }
+}
+
+impl Default for RelocatableHeapRegistration {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for RelocatableHeapRegistration {
+    fn drop(&mut self) {
+        RELOCATABLE_HEAPS_LIVE.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// How many heaps are currently registered. Diagnostics and tests.
+pub fn live_relocatable_heaps() -> usize {
+    RELOCATABLE_HEAPS_LIVE.load(Ordering::Acquire)
+}
+
+/// **Can the published-bounds tables describe every live heap?**
+///
+/// `false` once a second heap exists, because slot-0 ownership makes each
+/// table single-tenant — see [`RELOCATABLE_HEAPS_LIVE`]. Zero heaps answers
+/// `true`: there is nothing to misdescribe, and the emptiness of the tables is
+/// then a faithful report that [`movable_bounds_are_live`] already refuses on.
+pub fn published_bounds_represent_every_live_heap() -> bool {
+    RELOCATABLE_HEAPS_LIVE.load(Ordering::Acquire) <= 1
 }
 
 /// How many identity hash codes a thread claims per global `fetch_add`.
@@ -2087,6 +2207,16 @@ pub struct GenerationalHeap {
     /// the collection intact. Empty on every normal collection (byte-identical
     /// default path).
     jit_tlab_skip_regions: Mutex<Vec<(usize, usize)>>,
+
+    /// This heap's entry in the process-global live-heap registry.
+    ///
+    /// Purely an RAII counter — see [`RELOCATABLE_HEAPS_LIVE`]. It exists
+    /// because this heap publishes into two single-tenant global tables, and a
+    /// SECOND live heap makes the frame-band verifier's residency test answer
+    /// `false` for every address belonging to whichever heap lost the slot.
+    /// Held as a field rather than registered by a matched pair of calls so the
+    /// count cannot drift on an early return or an unwind.
+    _bounds_registration: RelocatableHeapRegistration,
 }
 
 // SAFETY: Same reasoning as Heap — raw pointers are to internally owned
@@ -2282,6 +2412,7 @@ impl GenerationalHeap {
             young_trigger_seen_gc_count: std::sync::atomic::AtomicU64::new(0),
             young_trigger_floor: std::sync::atomic::AtomicUsize::new(0),
             jit_tlab_skip_regions: Mutex::new(Vec::new()),
+            _bounds_registration: RelocatableHeapRegistration::new(),
         };
         // Publish the initial region bounds so the lock-free
         // `is_object_address` containment check is correct from the first

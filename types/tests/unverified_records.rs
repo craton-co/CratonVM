@@ -75,6 +75,18 @@ const DISCHARGE_MARKERS: &[&str] = &[
 /// The debt as it stood when this test was written: records whose own status
 /// block says they have never met a binary.
 ///
+/// **All five have now been RUN** (2026-09-02) and none comes back clean, so
+/// they stay here — a run is not a discharge, and the note each entry carries
+/// is what the run found rather than a verdict on the record. Row-by-row
+/// adjudication against each record's own expectation table belongs to its
+/// owner; see
+/// `docs/known-issues/jdk-only/the-five-owed-records-run-at-last-20260902.md`.
+///
+/// One thing that run established the hard way, worth knowing before repeating
+/// it: **all three probes are arm-specific.** Their sites are registered only
+/// under `--synthetic-jdk`, each record says so, and running the default build
+/// first produced numbers that measured the real path and looked like evidence.
+///
 /// **These are OWED, not EXCUSED.** An entry here is a promise someone still has
 /// to keep, and the right way to remove one is to run the handle the record
 /// names and add its `VERIFIED AGAINST A BINARY` note — not to leave it sitting
@@ -87,23 +99,23 @@ const DISCHARGE_MARKERS: &[&str] = &[
 const ALLOWED: &[(&str, &str)] = &[
     (
         "docs/known-issues/jdk-only/W7-24-httpserverloop-and-strict-fallbacks.md",
-        "source landed 2026-08-12, never run; names RArraysMismatch among its handles",
+        "RUN 2026-09-02 on --synthetic-jdk (its sites are unreachable by default): the wildcard family differs, IPv4 where HotSpot gives IPv6, but HttpServerWildcardAddressProbe also prints ephemeral ports and must be normalised before it can be scored",
     ),
     (
         "docs/known-issues/jdk-only/W7-57-close-flush-swallow-sweep.md",
-        "source landed 2026-08-12, never run; names RLClassPath",
+        "RUN 2026-09-02 on --synthetic-jdk: CloseFlushSwallowProbe 129 rows vs HotSpot 120, 35 differing, incl. an internal NPE where HotSpot propagates the caller's error",
     ),
     (
         "docs/known-issues/jdk-only/W7-58-bytebuffer-direct-arm.md",
-        "source landed 2026-08-12, never run; names RJdkNio and RDirectBufferElem",
+        "RUN 2026-09-02 on --synthetic-jdk: 264 rows vs HotSpot 285 (21 UNTESTED, not passing), 39 differing; the getIntLE/putIntLE reds are this record's own documented residuals",
     ),
     (
         "docs/known-issues/jdk-only/W7-70-printstream-close-noop.md",
-        "source landed 2026-08-12, never run; handle not named in the record",
+        "RUN 2026-09-02 via CloseFlushSwallowProbe on --synthetic-jdk (the probe both records name); shares W7-57's result",
     ),
     (
         "docs/known-issues/jdk-only/W7-81-write-route-three-way.md",
-        "source landed 2026-08-12, never run; handle not named in the record",
+        "RUN 2026-09-02 via CloseFlushSwallowProbe on --synthetic-jdk (the probe both records name); shares W7-57's result",
     ),
 ];
 

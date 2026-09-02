@@ -1042,7 +1042,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // so likewise gets a vacuous coverage proof (see the fail-closed guard in
     // `conservative_roots::moving_young_unpublished_frame_oop_present`).
     //
-    // `docs/known-issues/gc/bug-g1-evacuates-live-jit-reference-20260819.md`
+    // `bug-g1-evacuates-live-jit-reference-20260819.md`
     // states this restriction as though it were already implemented ("requires
     // `is_generational()`, so under G1 it is false"). It was true of the
     // siblings and false here; this is the line that makes the record true.
@@ -1155,10 +1155,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // every candidate failed `is_object_address` (`chain>0 added=0`). Those are
     // three different defects and the collector-side line reads identically for
     // all three. See
-    // `docs/known-issues/gc/bug-g1-evacuates-live-jit-reference-20260819.md`.
+    // `bug-g1-evacuates-live-jit-reference-20260819.md`.
     if dbg_jit_rootscan() {
         let frames = crate::jit::conservative_roots::active_compiled_frames();
-        let labels: Vec<&str> = frames.iter().map(|(_, l, _, _)| l.as_str()).collect();
+        let labels: Vec<&str> = frames.iter().map(|f| f.label.as_str()).collect();
         // `osr_reason=` is a CUMULATIVE snapshot (bad_shadow_layout,
         // debug_disabled, bad_map_coverage, missing_exact_rbp), not a
         // per-cycle value — this line already runs at a cost only a debug
@@ -1195,7 +1195,9 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
              incomplete={incomplete} reason={reason} chain={chain} \
              any_jit={any_jit} \
              scan_added={added} unrewritable={unrewritable} is_g1={is_g1} \
-             ybounds={ybounds} frames={labels:?}",
+             ybounds={ybounds} heaps={heaps} \
+             bounds_representative={bounds_representative} \
+             frames={labels:?}",
             precise_only = moving_young_precise_only,
             proven = coverage_proven,
             osr_fb = moving_young_osr_fallback,
@@ -1228,6 +1230,17 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
             // bands and classified nothing as young — a vacuous pass, not a
             // clean frame. See `published_young_regions_are_live`.
             ybounds = cratonvm_gc::gen_heap::published_young_regions_are_live(),
+            // How many heaps are alive, and whether the published tables can
+            // describe them all. Both tables are single-tenant (slot-0
+            // ownership), so `heaps>1` means one heap's addresses answer
+            // `false` to every residency test in the process — the same vacuous
+            // verifier `ybounds=false` reports, reached from a table that IS
+            // published and is simply about the other heap. Printed beside
+            // `ybounds` because `ybounds=true heaps=2` is the reading neither
+            // number gives on its own.
+            heaps = cratonvm_gc::gen_heap::live_relocatable_heaps(),
+            bounds_representative =
+                cratonvm_gc::gen_heap::published_bounds_represent_every_live_heap(),
         );
     }
 
