@@ -257,6 +257,147 @@ impl G1CardTable {
     pub fn card_count(&self) -> usize {
         self.cards.len()
     }
+
+    /// Card cleaning — take a snapshot of which cards covering
+    /// `[start, start+span)` are dirty right now.
+    ///
+    /// # Why a snapshot rather than reading the table as the walk goes
+    ///
+    /// A region walk that cleans a card as it passes it would answer its own
+    /// next question wrongly. Cards are 512 bytes and objects are usually
+    /// smaller, so several objects share one card: scanning object A, cleaning
+    /// the card it sits in, and then asking "is B's card dirty?" reports CLEAN
+    /// for a B that was never examined, and B's cross-region reference is lost.
+    ///
+    /// The snapshot decouples the two: the walk decides what to scan from the
+    /// state the table had when the walk began, and the table is rewritten once
+    /// at the end ([`Self::clean_and_redirty`]).
+    pub fn snapshot(&self, start: usize, span: usize) -> CardSet {
+        let range = self.card_range(start, span);
+        let mut set = CardSet::empty(self.base, range.clone());
+        for i in range.clone() {
+            if self.cards[i].load(Ordering::Relaxed) != G1_CARD_CLEAN {
+                set.set_index(i);
+            }
+        }
+        set
+    }
+
+    /// An all-clean set over the same cards [`Self::snapshot`] would cover, for
+    /// a walk to accumulate the cards it wants kept dirty.
+    pub fn empty_set(&self, start: usize, span: usize) -> CardSet {
+        CardSet::empty(self.base, self.card_range(start, span))
+    }
+
+    /// Card cleaning — clean every card covering `[start, start+span)` and then
+    /// re-dirty exactly those in `keep`.
+    ///
+    /// The caller's contract, and it is the whole soundness argument: it must
+    /// have examined **every object overlapping that range** and put into
+    /// `keep` the start card of each one that still holds a reference into
+    /// another region. A card left clean then means "no object here references
+    /// another region", which is what lets a later pause step over it.
+    ///
+    /// Callers bound `span` by what they actually walked, never by the region's
+    /// cursor — a walk that broke early on an unsizeable header has not
+    /// examined the bytes past the break, and cleaning those would drop live
+    /// edges.
+    pub fn clean_and_redirty(&self, start: usize, span: usize, keep: &CardSet) {
+        for i in self.card_range(start, span) {
+            let want = if keep.contains_index(i) {
+                G1_CARD_DIRTY
+            } else {
+                G1_CARD_CLEAN
+            };
+            self.cards[i].store(want, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A dense bitset over a contiguous run of card indices, used by the card
+/// cleaning pass as both the "was dirty when the walk began" snapshot and the
+/// "must stay dirty" accumulator.
+#[derive(Debug, Clone)]
+pub struct CardSet {
+    base: usize,
+    first: usize,
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl CardSet {
+    fn empty(base: usize, range: std::ops::Range<usize>) -> Self {
+        let len = range.end.saturating_sub(range.start);
+        Self {
+            base,
+            first: range.start,
+            words: vec![0u64; len.div_ceil(64)],
+            len,
+        }
+    }
+
+    #[inline]
+    fn slot(&self, index: usize) -> Option<(usize, u64)> {
+        let rel = index.checked_sub(self.first)?;
+        if rel >= self.len {
+            return None;
+        }
+        Some((rel / 64, 1u64 << (rel % 64)))
+    }
+
+    #[inline]
+    fn set_index(&mut self, index: usize) {
+        if let Some((w, bit)) = self.slot(index) {
+            self.words[w] |= bit;
+        }
+    }
+
+    #[inline]
+    fn contains_index(&self, index: usize) -> bool {
+        match self.slot(index) {
+            Some((w, bit)) => self.words[w] & bit != 0,
+            None => false,
+        }
+    }
+
+    #[inline]
+    fn index_of_addr(&self, addr: usize) -> usize {
+        addr.saturating_sub(self.base) >> G1_CARD_SHIFT
+    }
+
+    /// Mark the card holding `addr`. Addresses outside the covered run are
+    /// ignored, exactly as [`G1CardTable::dirty_addr`] ignores them.
+    #[inline]
+    pub fn insert_addr(&mut self, addr: usize) {
+        if addr >= self.base {
+            self.set_index(self.index_of_addr(addr));
+        }
+    }
+
+    /// Does any card overlapping `[addr, addr+span)` belong to this set?
+    #[inline]
+    pub fn any_in_span(&self, addr: usize, span: usize) -> bool {
+        if addr < self.base {
+            return false;
+        }
+        let first = self.index_of_addr(addr);
+        let last = self.index_of_addr(addr.saturating_add(span.max(1) - 1));
+        (first..=last).any(|i| self.contains_index(i))
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.words.iter().all(|w| *w == 0)
+    }
+
+    pub fn count(&self) -> usize {
+        self.words.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    #[inline]
+    pub fn covered_cards(&self) -> usize {
+        self.len
+    }
 }
 
 #[cfg(test)]
@@ -335,5 +476,75 @@ mod tests {
         t.dirty_addr(BASE);
         assert!(t.any_dirty_in(BASE - 4096, 4096 + 8));
         assert_eq!(t.cards_in(BASE - 4096, 4096), 0);
+    }
+
+    // ── card cleaning ───────────────────────────────────────────────────
+
+    #[test]
+    fn a_snapshot_reports_what_the_table_held_when_it_was_taken() {
+        let t = G1CardTable::new(BASE, 8 * G1_CARD_BYTES);
+        t.dirty_addr(BASE + G1_CARD_BYTES);
+        t.dirty_addr(BASE + 5 * G1_CARD_BYTES);
+        let snap = t.snapshot(BASE, 8 * G1_CARD_BYTES);
+        assert_eq!(snap.count(), 2);
+        assert_eq!(snap.covered_cards(), 8);
+        assert!(snap.any_in_span(BASE + G1_CARD_BYTES, 8));
+        assert!(!snap.any_in_span(BASE, 8));
+
+        // The table moving on does not move the snapshot: that independence is
+        // the point — the walk decides from the snapshot while it rewrites the
+        // table underneath.
+        t.dirty_addr(BASE);
+        assert!(!snap.any_in_span(BASE, 8));
+        assert!(t.is_dirty_addr(BASE));
+    }
+
+    #[test]
+    fn clean_and_redirty_leaves_exactly_the_kept_cards_dirty() {
+        let t = G1CardTable::new(BASE, 8 * G1_CARD_BYTES);
+        for c in 0..8 {
+            t.dirty_addr(BASE + c * G1_CARD_BYTES);
+        }
+        let mut keep = t.empty_set(BASE, 8 * G1_CARD_BYTES);
+        keep.insert_addr(BASE + 2 * G1_CARD_BYTES + 9);
+        keep.insert_addr(BASE + 6 * G1_CARD_BYTES);
+        t.clean_and_redirty(BASE, 8 * G1_CARD_BYTES, &keep);
+
+        for c in 0..8 {
+            let want = c == 2 || c == 6;
+            assert_eq!(
+                t.is_dirty_addr(BASE + c * G1_CARD_BYTES),
+                want,
+                "card {c}"
+            );
+        }
+    }
+
+    /// The bound matters: a walk that stopped early must not clean past where
+    /// it stopped, or it drops edges it never looked at.
+    #[test]
+    fn clean_and_redirty_touches_no_card_past_the_span_it_was_given() {
+        let t = G1CardTable::new(BASE, 8 * G1_CARD_BYTES);
+        for c in 0..8 {
+            t.dirty_addr(BASE + c * G1_CARD_BYTES);
+        }
+        let keep = t.empty_set(BASE, 4 * G1_CARD_BYTES);
+        t.clean_and_redirty(BASE, 4 * G1_CARD_BYTES, &keep);
+        for c in 0..4 {
+            assert!(!t.is_dirty_addr(BASE + c * G1_CARD_BYTES), "card {c} cleaned");
+        }
+        for c in 4..8 {
+            assert!(t.is_dirty_addr(BASE + c * G1_CARD_BYTES), "card {c} untouched");
+        }
+    }
+
+    #[test]
+    fn a_span_straddling_two_cards_is_kept_by_either_of_them() {
+        let t = G1CardTable::new(BASE, 4 * G1_CARD_BYTES);
+        let mut keep = t.empty_set(BASE, 4 * G1_CARD_BYTES);
+        keep.insert_addr(BASE + 2 * G1_CARD_BYTES);
+        assert!(keep.any_in_span(BASE + 2 * G1_CARD_BYTES - 8, 9));
+        assert!(!keep.any_in_span(BASE + 2 * G1_CARD_BYTES - 8, 8));
+        assert!(!keep.is_empty());
     }
 }
