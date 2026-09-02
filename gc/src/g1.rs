@@ -10065,7 +10065,7 @@ impl G1Collector {
         if !self.mark_worklist.lock().is_empty() {
             return Some("the gray set is non-empty");
         }
-        if self.finalizer_pause.load(Ordering::Relaxed) {
+        if self.finalizer_pause.load(Ordering::Relaxed) && !g1_ignore_finalizer_gate() {
             // NOT `pending_finalizer_roots.is_empty()`: Phase 3.5 has already
             // taken that list by the time this runs, so the obvious test passes
             // unconditionally. See the `finalizer_pause` field.
@@ -13903,6 +13903,34 @@ fn g1_late_header_write() -> bool {
 ///
 /// The one-binary A/B for the split. With it set, `TestKillProcessWhileWriting`
 /// goes back to retaining every region on essentially every cycle.
+/// `CRATONVM_G1_IGNORE_FINALIZER_GATE=1` -- **DELIBERATELY UNSOUND**, a probe
+/// and nothing else. Default OFF, and it must stay that way.
+///
+/// It removes the `finalizer_pause` gate from
+/// [`G1Collector::eager_reclaim_early_decline`] so eager humongous reclaim can
+/// run on a heap that has registered finalizable objects. That is NOT SAFE: a
+/// registered finalizable object that is dead and outside this pause's CSet is
+/// unreachable from the humongous census, so a span it references reads as
+/// unreferenced and would be freed under an object that still has to be
+/// finalized -- a use-after-free.
+///
+/// It exists to answer one question before a sound fix is built for it: is that
+/// gate what leaves the H2 workload with 829 of 1024 regions humongous, Eden at
+/// 1.1 regions and 80 young pauses per second? A hypothesis about a cause is
+/// worth a probe before it is worth an engineering change.
+fn g1_ignore_finalizer_gate() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_G1_IGNORE_FINALIZER_GATE")
+            .and_then(|v| v.into_string().ok())
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
+            })
+            .unwrap_or(false)
+    })
+}
+
 fn mark_oob_failsafe() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
