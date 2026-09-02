@@ -453,6 +453,57 @@ closed; the cap face is not, and nothing here should be read as claiming it.
 well as live ones, so per this page's own section-2 caveat those are the
 weakest evidence it collects.
 
+### 4e. 2026-09-02: the CAP face is a whole-heap walk per young pause, feeding a reclaim that declines
+
+The corruption face and the cap face are different defects. With the root fix
+in, one 2400 s `--verbose:gc` run under `-XX:+UseG1GC` produced **32 MB of
+`[GC-STAT]` lines and 169 205 YoungOnly pauses in 37 minutes** -- against a
+default collector that finishes the whole class in 403-554 s.
+
+Summed over those pauses:
+
+| | mean per pause |
+|---|---:|
+| `pause_us` | **7 588** |
+| `closure_us` (the evacuation itself) | **18** |
+| `roots_us` | 129 |
+| `rset_us` | 1 222 |
+| **`fixup_us`** | **3 063** |
+| `free_us` | 14 |
+| `objects_copied` | 64 |
+| `bytes_copied` | 9 888 |
+| **`fixup_regions`** | **843** |
+| **`fixup_bytes`** | **446 MB** |
+
+Total stop-the-world pause time was **1 284 s of a ~2 220 s run** -- the
+collector owns 58% of the wall clock. And the shape says where it goes: copying
+64 objects takes 18 us, while the fix-up walk takes 3 063 us and covers **843
+regions of a 1024-region heap -- essentially the whole heap, on every young
+pause**, 169 205 times, for 76 TB walked in one run.
+
+`phase4_regions_to_walk` exists precisely to narrow that walk, and one line
+decides whether it may:
+
+```rust
+let want_census = gc_flags().g1_eager_humongous && heap_has_humongous;
+```
+
+`want_census` forces `phase4_regions_to_walk` to return `None` (the wide walk),
+because "nothing in the heap references span H" is a whole-heap claim. Eager
+humongous reclaim is default-ON, and H2's MVStore keeps 1 MiB `ByteBuffer`s
+live -- humongous is anything over half a 1 MiB region -- so `heap_has_humongous`
+is essentially always true on this workload and the narrowing NEVER APPLIES.
+
+The sharp end: this page's own 2026-08-29 census recorded
+`humongous-eager: spans=0 bytes=0 declined_pauses=16103`. **The whole-heap
+census that costs 3 ms per pause is feeding an eager reclaim that declines every
+time and frees nothing.** `CRATONVM_G1_EAGER_HUMONGOUS=0` is the one-flag,
+one-binary A/B for that, and it is the next measurement this page needs.
+
+Nothing here is a corruption claim, and none of it is affected by the root fix
+in 4d -- it is the same shape the OOM face's `degraded=empty-collection-set`
+chain was reported against in 2026-08-29, now priced.
+
 ## Status
 
 **OPEN. The OOM face is FIXED (2026-08-30) and held on 2026-09-02 (section 4c: 0 real `OutOfMemoryError` on both G1 arms, and the default-collector control PASSES in 811 s the same day, so the cap is a failure and not a slow host). The ROOT CAUSE of the corruption family is found and fixed (section 4d): G1 evacuated a CSet root pointing INSIDE a reference array and manufactured an object out of the element -- `num_slots=512` was the top half of a heap address, not a shape. Every downstream implausible-header site went to ZERO and V7b dangling references to 0, but the class STILL CAPS at 900 s, so the cap face is untouched. A separate allocation-publication defect was also fixed (section 4b) and did not close anything on its own. The FAILURE MODE MOVED to SIGSEGV in 2026-08-30's arm -- read section 3 before treating that as an improvement. The 48 617 dangling references are 6 holders, not a rate. Split out 2026-08-29** from
