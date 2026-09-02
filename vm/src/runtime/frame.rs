@@ -564,6 +564,68 @@ fn init_locals_pooled(
     init_locals_from_parts(max_locals, args, pool.pop())
 }
 
+/// Size `buf` to exactly `n`, reusing its allocation, and leave every slot
+/// holding `filler`.
+///
+/// This is `clear()` + `resize(n, filler)` with the walk of the existing
+/// contents removed: the buffer's old length is irrelevant because every slot
+/// is about to be overwritten, so the only work is one capacity check and one
+/// contiguous fill the compiler can vectorise. The caller then writes the
+/// argument slots by index.
+///
+/// `frame_build` is the only phase of an interpreted call whose cost moves
+/// with `max_locals` (measured 2026-09-02 with `CRATONVM_DBG=invoke-phases`
+/// and `probes/FrameShape.java`: +14 cycles for 48 extra local slots, against
+/// a stack arm that costs nothing extra since the pass-2 change), which is why
+/// this path is worth spelling out rather than leaving to `Vec::resize`.
+#[inline]
+fn reset_filled<T: Copy>(buf: &mut Vec<T>, n: usize, filler: T) {
+    buf.clear();
+    buf.reserve(n);
+    // SAFETY: `reserve` guarantees capacity >= n. Every element of `0..n` is
+    // written by the fill below before `set_len` makes them observable, and
+    // `T: Copy` has no drop glue, so the elements the `clear` above logically
+    // removed need no further attention.
+    unsafe {
+        let spare = std::slice::from_raw_parts_mut(buf.as_mut_ptr(), n);
+        spare.fill(filler);
+        buf.set_len(n);
+    }
+}
+
+/// Lay the incoming arguments over the leading slots of an already-filled
+/// locals buffer, in the JVMS layout (a category-2 value takes two slots and
+/// leaves the upper one as filler, which it already is).
+///
+/// Returns the number of slots the arguments occupy. Equivalent to
+/// [`copy_args_to_locals`] on a buffer whose tail is filler, which is what
+/// [`reset_filled`] has just guaranteed — the upper half of a category-2
+/// argument therefore needs no write at all.
+#[inline]
+fn write_args_over_filled(locals: &mut [CompactValue], kinds: &mut [u8], args: &[Value]) -> usize {
+    let mut slot = 0usize;
+    for arg in args {
+        if slot >= locals.len() {
+            break;
+        }
+        locals[slot] = CompactValue::from_value_kinded(*arg);
+        kinds[slot] = lkind_of_value(arg);
+        slot += 1;
+        if arg.is_category2() && slot < locals.len() {
+            // The filler already sits here; only the slot counter moves.
+            slot += 1;
+        }
+    }
+    slot
+}
+
+/// `CRATONVM_JIT_NO_FRAME_FILL_FAST=1` restores the `clear()` + per-argument
+/// `push()` + `resize()` build, so the two can be priced inside one binary.
+#[inline]
+fn frame_fill_fast() -> bool {
+    !crate::runtime::env_cache::no_frame_fill_fast()
+}
+
 /// The body of [`init_locals_pooled`], taking the recycled `(vals, tags)` pair
 /// directly instead of popping it from a pool. Lets the non-pooled
 /// constructors source their buffers from the per-OS-thread pool
@@ -587,18 +649,26 @@ fn init_locals_from_parts(
     // Vec) is reused as the parallel `local_kinds` buffer; clear + resize
     // overwrites any stale recycled content so no kind leaks across reuse.
     let mut locals = u64_vec_to_compact(vals);
-    locals.clear();
-    kinds.clear();
-    // Arguments first, filler second, so every slot is written exactly once.
-    // The previous order (`resize` to `n`, then overwrite the leading argument
-    // slots) wrote each argument slot twice on every frame push — nine bytes
-    // per slot, on the hottest path in the VM. The end state is identical:
-    // `push_args_to_locals` lays down exactly the slots `copy_args_to_locals`
-    // would have, and the `resize` below fills exactly the ones it would have
-    // left as filler.
-    push_args_to_locals(&mut locals, &mut kinds, args, n);
-    locals.resize(n, CompactValue::uninitialized());
-    kinds.resize(n, LKIND_OTHER);
+    if frame_fill_fast() {
+        // One pass: size both buffers to `n` with the filler already in place,
+        // then write the argument slots by index. The end state is identical
+        // to the `clear` + `push` + `resize` build below — same filler, same
+        // argument layout — with the buffer walked once instead of three
+        // times and no capacity check per argument.
+        reset_filled(&mut locals, n, CompactValue::uninitialized());
+        reset_filled(&mut kinds, n, LKIND_OTHER);
+        write_args_over_filled(&mut locals, &mut kinds, args);
+    } else {
+        locals.clear();
+        kinds.clear();
+        // Arguments first, filler second, so every slot is written exactly
+        // once. The end state is identical: `push_args_to_locals` lays down
+        // exactly the slots `copy_args_to_locals` would have, and the `resize`
+        // fills exactly the ones it would have left as filler.
+        push_args_to_locals(&mut locals, &mut kinds, args, n);
+        locals.resize(n, CompactValue::uninitialized());
+        kinds.resize(n, LKIND_OTHER);
+    }
     debug_assert_eq!(locals.len(), n, "locals must be exactly max_locals long");
     debug_assert_eq!(kinds.len(), n, "kinds must parallel locals");
     (locals, kinds, eff)
@@ -1215,28 +1285,57 @@ impl Frame {
         let eff_max_locals = u16::try_from(n).unwrap_or(u16::MAX);
         let (vals, mut kinds) = locals_pool.pop().unwrap_or_default();
         let mut locals = u64_vec_to_compact(vals);
-        locals.clear();
-        kinds.clear();
-        locals.reserve(n);
-        kinds.reserve(n);
-        for (cv, tag) in args {
-            locals.push(*cv);
-            match *tag {
-                b'J' => {
-                    kinds.push(LKIND_LONG);
-                    locals.push(CompactValue::uninitialized());
-                    kinds.push(LKIND_OTHER);
+        if frame_fill_fast() {
+            // Same one-pass build as `init_locals_from_parts`: the filler is
+            // laid down once, and a category-2 argument's upper slot needs no
+            // write because the filler is already what belongs there.
+            reset_filled(&mut locals, n, CompactValue::uninitialized());
+            reset_filled(&mut kinds, n, LKIND_OTHER);
+            let mut slot = 0usize;
+            for (cv, tag) in args {
+                if slot >= n {
+                    break;
                 }
-                b'D' => {
-                    kinds.push(LKIND_DOUBLE);
-                    locals.push(CompactValue::uninitialized());
-                    kinds.push(LKIND_OTHER);
+                locals[slot] = *cv;
+                match *tag {
+                    b'J' => {
+                        kinds[slot] = LKIND_LONG;
+                        slot += 2;
+                    }
+                    b'D' => {
+                        kinds[slot] = LKIND_DOUBLE;
+                        slot += 2;
+                    }
+                    _ => {
+                        kinds[slot] = LKIND_OTHER;
+                        slot += 1;
+                    }
                 }
-                _ => kinds.push(LKIND_OTHER),
             }
+        } else {
+            locals.clear();
+            kinds.clear();
+            locals.reserve(n);
+            kinds.reserve(n);
+            for (cv, tag) in args {
+                locals.push(*cv);
+                match *tag {
+                    b'J' => {
+                        kinds.push(LKIND_LONG);
+                        locals.push(CompactValue::uninitialized());
+                        kinds.push(LKIND_OTHER);
+                    }
+                    b'D' => {
+                        kinds.push(LKIND_DOUBLE);
+                        locals.push(CompactValue::uninitialized());
+                        kinds.push(LKIND_OTHER);
+                    }
+                    _ => kinds.push(LKIND_OTHER),
+                }
+            }
+            locals.resize(n, CompactValue::uninitialized());
+            kinds.resize(n, LKIND_OTHER);
         }
-        locals.resize(n, CompactValue::uninitialized());
-        kinds.resize(n, LKIND_OTHER);
         debug_assert_eq!(locals.len(), n);
         debug_assert_eq!(kinds.len(), n);
         let padded_max = (cached.max_stack as usize).max(16) + 8;

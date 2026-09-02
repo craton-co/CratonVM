@@ -1883,6 +1883,12 @@ cached_is_set!(no_invoke_fast_door, "CRATONVM_JIT_NO_INVOKE_FAST_DOOR");
 /// lock). Off routes every cache hit through the general dispatcher.
 /// Token: `CRATONVM_JIT=-nonvirtual-fast-door`.
 cached_is_set!(no_nonvirtual_fast_door, "CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR");
+
+/// `CRATONVM_JIT_NO_FRAME_FILL_FAST` -- restore the `clear()` + per-argument
+/// `push()` + `resize()` locals build in `Frame`, instead of sizing both
+/// buffers once with the filler already in place and writing the arguments by
+/// index. Token: `CRATONVM_JIT=-frame-fill-fast`.
+cached_is_set!(no_frame_fill_fast, "CRATONVM_JIT_NO_FRAME_FILL_FAST");
 /// `CRATONVM_DBG_BYTECODE_DUMP` -- temporary raw-bytecode + mnemonic
 /// disassembly dump (2026-07-15, JRubyScriptTemplateTests round 3): see
 /// `push_frame_and_fire_entry`'s own doc comment for the full story --
