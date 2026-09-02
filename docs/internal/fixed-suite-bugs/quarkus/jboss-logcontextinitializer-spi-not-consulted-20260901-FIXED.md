@@ -133,7 +133,10 @@ logging SPI misbehaved would be worse than one that logs a little less.
 
 * `cargo test -p cratonvm-native-builtins --lib`: **4188 pass, 0 fail**
   (`logmanager` alone: 54, up from 50).
-* `regression-suite/run.sh`: **79 of 79** scheduled vectors pass.
+* `regression-suite/run.sh`: **81 of 81** scheduled vectors pass. Re-run
+  after merging the day's `dev` (which added two vectors of its own) on a
+  binary rebuilt from the merge, together with the probe — the numbers
+  above are the post-merge ones, not the pre-merge ones they started as.
 * `cargo test -p cratonvm-types`: the flag guards pass with the new switch
   declared in `flag_groups.rs` + `flag-surface.txt` and the two generated docs
   regenerated (`render-inventory.sh`, `render-tokens.sh`).
