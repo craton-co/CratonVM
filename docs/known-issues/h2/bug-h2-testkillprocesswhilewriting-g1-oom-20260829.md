@@ -399,12 +399,23 @@ references went to **0**, from 19-65 on the immediately preceding runs and
 `NON_OBJECT_ROOT_COPIED` is now structurally zero and still printed, so
 reintroducing the copy shows up in the same line that reports the skips.
 
-Reproduced identically at rep 2 (`skipped=11 copied=0 v7b=0`) on a loadavg-4
-host.
+Three G1 reps and a same-day control, one binary, quiet host:
+
+| arm | rc | secs | skipped | copied | rej | implausible | V7b |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `-XX:+UseG1GC` rep 1 | 124 (cap) | 900 | 11 | 0 | 19 | 11 | **0** |
+| `-XX:+UseG1GC` rep 2 | 124 (cap) | 900 | 11 | 0 | 18 | 11 | **0** |
+| `-XX:+UseG1GC` rep 3 | 124 (cap) | 900 | 12 | 0 | 20 | 12 | **0** |
+| default collector | **0 (PASS)** | 403 | 0 | 0 | 0 | 0 | 0 |
+
+The control passing in 403 s on the same host and binary is what makes the cap
+a failure rather than a slow machine, and it is the arm this page asserts.
 
 #### What is NOT fixed
 
-**The class still caps at 900 s** (`rc=124`, 3/3). The corruption face is what
+**The class still caps at 900 s** (`rc=124`, 3/3) while the default collector
+passes the same workload in 403 s on the same host -- so G1 is at least 2.2x
+off the control and may be livelocked. The corruption face is what
 closed; the cap face is not, and nothing here should be read as claiming it.
 `rej` stays around 18-19, of which all but one come from
 `rset-source-scan[object]` -- the LINEAR walk, which visits dead objects as
