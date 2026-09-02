@@ -951,7 +951,10 @@ impl Compiler {
     /// there is no dead word below the cursor to reclaim. Anyone reaching for
     /// this again should read `spill_cursor_counts()` first.
     fn flush_home(&mut self, _idx: usize) -> Option<i32> {
-        crate::note_spill_cursor(crate::SPILL_FLUSH_RESERVED, 1);
+        // No hand-rolled bump here: `SpillReason::Flush` IS the
+        // `flush-reserved` column, and counting it twice is what the first
+        // fully-attributed run caught (CratonBench read 1722 where 861 was
+        // right, and `res-total` inherited the error).
         self.reserve_spill_slots(1, SpillReason::Flush)
     }
 
