@@ -589,6 +589,187 @@ struct RegionsBase(*mut G1Region);
 unsafe impl Send for RegionsBase {}
 unsafe impl Sync for RegionsBase {}
 
+// ---------------------------------------------------------------------------
+// Region-index sets (F-03)
+// ---------------------------------------------------------------------------
+
+/// Upper bound on a region index this set will store, and the tripwire that
+/// keeps it a REGION set.
+///
+/// A region index and a heap ADDRESS are both `usize`, so nothing in the type
+/// system distinguishes the two kinds of `usize` set this file keeps — and this
+/// one is a dense bitset, where handing it an address would try to reserve
+/// terabytes. The bound turns that mistake from an out-of-memory abort with no
+/// attribution into an assertion naming the value. 2^26 is 67 million regions:
+/// a 64 TiB heap at the 1 MiB minimum region size has 67 million regions, so no
+/// configuration that fits in memory can reach the bound, while any real heap
+/// address (at least 2^30 on every platform this runs on) is far above it.
+const MAX_TRACKABLE_REGION_INDEX: usize = 1 << 26;
+
+/// A set of region indices, as a bitset.
+///
+/// # Why not `HashSet<usize>`
+///
+/// This replaces `std::collections::HashSet<usize>` at every site that holds
+/// region indices — the collection set above all. `contains` on those sets runs
+/// once per non-null reference slot in Phase 2, Phase 3, Phase 4 and the
+/// post-pause verifier, i.e. inside the two phases that are, since the
+/// free-scrub deletion, most of a young pause.
+///
+/// `std::collections::HashSet` hashes with SipHash-1-3 under a per-process
+/// random seed. That is the right default for a set keyed by untrusted input
+/// and the wrong one for a dense integer index bounded by
+/// `heap_size / region_size`: the key already IS the slot number. Note that the
+/// replaced sites did not even use the `FxHashSet` this file imports and uses
+/// elsewhere — the std default was inherited, not chosen.
+///
+/// A `contains` is now a shift, a bounds compare, a load and a test. The set
+/// itself is `region_count / 8` bytes — 32 bytes for the 256-region default
+/// heap, 4 KiB for a 32 GiB one — so it also stops being a per-pause heap
+/// allocation of any consequence.
+///
+/// # Shape
+///
+/// Deliberately `HashSet`-shaped (`insert` / `contains(&idx)` / `len` / `iter`
+/// / `extend` / `collect`) so the converted call sites read the same
+/// afterwards. `iter` yields `usize` rather than `&usize` — a bitset has no
+/// `usize` to borrow — which is the one place a call site had to change
+/// (`.iter().copied()` becomes `.iter()`).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct RegionSet {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl RegionSet {
+    /// An empty set with no reserved capacity.
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// An empty set sized for `regions` indices up front, so filling it with
+    /// consecutive indices does not re-grow the backing vector.
+    #[inline]
+    pub(crate) fn with_region_capacity(regions: usize) -> Self {
+        Self {
+            words: vec![0; regions.div_ceil(64)],
+            len: 0,
+        }
+    }
+
+    /// Insert `idx`; returns `true` if it was not already present.
+    #[inline]
+    pub(crate) fn insert(&mut self, idx: usize) -> bool {
+        assert!(
+            idx < MAX_TRACKABLE_REGION_INDEX,
+            "g1: {idx} (0x{idx:x}) is not a region index — a RegionSet is a dense bitset over \
+             region numbers and this looks like a heap address. See MAX_TRACKABLE_REGION_INDEX."
+        );
+        let (w, bit) = (idx / 64, 1u64 << (idx % 64));
+        if w >= self.words.len() {
+            self.words.resize(w + 1, 0);
+        }
+        let already = self.words[w] & bit != 0;
+        if !already {
+            self.words[w] |= bit;
+            self.len += 1;
+        }
+        !already
+    }
+
+    /// Is `idx` present? Takes `&usize` to mirror `HashSet::contains`, so a
+    /// converted `filter(|(i, _)| set.contains(i))` — where `i` is already a
+    /// reference — reads unchanged.
+    #[inline]
+    pub(crate) fn contains(&self, idx: &usize) -> bool {
+        let idx = *idx;
+        let w = idx / 64;
+        w < self.words.len() && self.words[w] & (1u64 << (idx % 64)) != 0
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Drop every index, keeping the allocated words.
+    #[inline]
+    pub(crate) fn clear(&mut self) {
+        self.words.iter_mut().for_each(|w| *w = 0);
+        self.len = 0;
+    }
+
+    /// Indices in ascending order. Yields `usize`, not `&usize`.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.words.iter().enumerate().flat_map(|(w, &word)| {
+            let base = w * 64;
+            BitIter { word }.map(move |b| base + b)
+        })
+    }
+}
+
+/// Set bits of one word, lowest first.
+struct BitIter {
+    word: u64,
+}
+
+impl Iterator for BitIter {
+    type Item = usize;
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        if self.word == 0 {
+            return None;
+        }
+        let b = self.word.trailing_zeros() as usize;
+        self.word &= self.word - 1;
+        Some(b)
+    }
+}
+
+impl<'a> IntoIterator for &'a RegionSet {
+    type Item = usize;
+    type IntoIter = Box<dyn Iterator<Item = usize> + 'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
+}
+
+impl IntoIterator for RegionSet {
+    type Item = usize;
+    type IntoIter = std::vec::IntoIter<usize>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter().collect::<Vec<_>>().into_iter()
+    }
+}
+
+impl Extend<usize> for RegionSet {
+    fn extend<I: IntoIterator<Item = usize>>(&mut self, iter: I) {
+        for idx in iter {
+            self.insert(idx);
+        }
+    }
+}
+
+impl FromIterator<usize> for RegionSet {
+    fn from_iter<I: IntoIterator<Item = usize>>(iter: I) -> Self {
+        let mut set = Self::new();
+        set.extend(iter);
+        set
+    }
+}
+
+impl std::fmt::Debug for RegionSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.iter()).finish()
+    }
+}
+
 /// A per-worker, per-destination-type thread-local allocation buffer.
 struct Tlab {
     dest_type: RegionType,
@@ -672,7 +853,7 @@ struct SharedEvac<'a> {
     collector: &'a G1Collector,
     regions_base: RegionsBase,
     /// CSet membership (region indices being evacuated FROM).
-    cset: &'a std::collections::HashSet<usize>,
+    cset: &'a RegionSet,
     /// Free-region indices available for to-space TLAB claiming.
     pool: &'a [usize],
     /// Lock-free claim cursor into `pool`.
@@ -1349,7 +1530,17 @@ pub struct G1CollectorConfig {
     pub ihop_percent: u8,
     /// Tenuring threshold: survive this many young GCs before promotion (default 15).
     pub promotion_age: u8,
-    /// Number of parallel GC worker threads (default 4).
+    /// Number of parallel GC worker threads, or **0 for the machine-derived
+    /// ergonomic** (the default since F-13; see
+    /// [`ergonomic_gc_worker_threads`]).
+    ///
+    /// This used to default to a literal `4`, and `parallel_worker_count` took
+    /// `min(4, available_parallelism())` — so on a 32-core host G1 evacuated
+    /// with four threads and there was no way, short of the
+    /// `CRATONVM_G1_WORKERS` diagnostic override, to say otherwise. A fixed
+    /// small number is a floor for a laptop and a ceiling for a server; 0 means
+    /// "ask the machine", and a non-zero value is an explicit request
+    /// (`-XX:ParallelGCThreads`) that is still clamped to the hardware.
     pub gc_worker_threads: usize,
     /// Enable string deduplication (default false).
     pub string_dedup_enabled: bool,
@@ -1376,7 +1567,8 @@ impl Default for G1CollectorConfig {
             // downward under real memory pressure.
             ihop_percent: 70,
             promotion_age: 15,
-            gc_worker_threads: 4,
+            // F-13: 0 = derive from the machine. See the field doc.
+            gc_worker_threads: 0,
             string_dedup_enabled: false,
             mixed_gc_count_target: 8,
             old_cset_region_threshold_percent: 10,
@@ -1752,6 +1944,70 @@ const PAUSE_HISTORY_CAP: usize = 1 << 16;
 /// that fires on 25% of the whole heap.
 const NEEDS_GC_RECOUNT_INTERVAL: usize = 1024;
 
+/// F-13 — evacuation worker count for a machine with `cpus` hardware threads.
+///
+/// HotSpot's `ParallelGCThreads` ergonomic: one worker per CPU up to 8, then
+/// five eighths of the rest. The taper is not arbitrary — evacuation workers
+/// contend on the free-region pool and on to-space TLAB claims, so the marginal
+/// worker is worth progressively less, and on a large machine a GC that used
+/// every core would evict the application's caches during a pause it is
+/// supposed to be shortening.
+///
+/// | cpus | workers |
+/// |------|---------|
+/// | 1    | 1       |
+/// | 4    | 4       |
+/// | 8    | 8       |
+/// | 16   | 13      |
+/// | 32   | 23      |
+/// | 64   | 43      |
+pub(crate) fn ergonomic_gc_worker_threads(cpus: usize) -> usize {
+    let cpus = cpus.max(1);
+    if cpus <= 8 {
+        cpus
+    } else {
+        8 + (cpus - 8) * 5 / 8
+    }
+}
+
+/// F-09 — round a requested region size up to a power of two.
+///
+/// # Why this is arithmetic, not policy
+///
+/// Region `i` starts at `arena_base + i * region_size`, so "which region owns
+/// this address" is `(addr - arena_base) / region_size`. With a power-of-two
+/// size that is a shift; without one it is a 64-bit hardware divide on the
+/// hottest read in the collector — one the write barrier performs twice per
+/// compiled reference store. HotSpot's `-XX:G1HeapRegionSize` carries the same
+/// requirement and rounds the same way.
+///
+/// The rounding is applied in [`G1Collector::new`] before `num_regions`, the
+/// arena length, the region bases and `region_shift` are derived from it, so
+/// there is exactly one geometry rather than one for the allocator and another
+/// for the lookup.
+///
+/// # What this deliberately does NOT do
+///
+/// It does not clamp to `[MIN_REGION_SIZE, 32 MiB]`. That range is an OPERATOR
+/// ergonomic and belongs with the rest of the `-XX:` handling, in
+/// `vm_heap::new_with_overrides`, which is where it now lives. Clamping here
+/// would silently rewrite the 4 KiB and 8 KiB region sizes several unit tests
+/// use to build a many-region heap cheaply — turning a 512-region fixture into
+/// a 16-region one and quietly changing what those tests cover.
+///
+/// A zero request is returned unchanged: `G1Collector::new` already asserts
+/// "the heap must fit at least one region", and that assertion is a better
+/// place to report it than an arithmetic surprise here.
+pub(crate) fn normalize_region_size(requested: usize) -> usize {
+    if requested == 0 || requested.is_power_of_two() {
+        return requested;
+    }
+    // Checked rather than the panicking form: a request within a factor of two
+    // of `usize::MAX` is not a heap anyone can allocate, and `new`'s assertion
+    // says so better than an overflow panic in a helper.
+    requested.checked_next_power_of_two().unwrap_or(requested)
+}
+
 /// Floor for the adaptive young-generation size, as a percentage of the region
 /// count (HotSpot's `G1NewSizePercent`). Below this the collector would pay a
 /// full pause's fixed cost — root scan, remembered-set walk, whole-heap
@@ -1841,11 +2097,58 @@ pub struct G1PausePhases {
     pub fixup_us: u64,
     /// Phase 5 + eager humongous reclaim — freeing the collection set.
     pub free_us: u64,
+    /// The post-pause verifiers: [`G1Collector::verify_no_dangling_into_cset`]
+    /// (budgeted, and therefore running in RELEASE builds since audit §9 item
+    /// 2) plus the env-gated `dbg_verify_*` family.
+    ///
+    /// It has its own field because it is not free and it was not attributable.
+    /// The verifier runs AFTER `free_us` is recorded and BEFORE `pause_us` is
+    /// taken, so its cost landed in the pause total and in none of the five
+    /// phases: the breakdown did not sum to the pause, and the difference was
+    /// invisible. A budget nobody can see the cost of is a budget nobody can
+    /// argue about — `CRATONVM_G1_VERIFY_BUDGET` is the A/B, and this is its
+    /// readout.
+    pub verify_us: u64,
+    /// Everything in the pause that is not one of the six phases above: the
+    /// CSet construction and pin census before Phase 1, the monitor /
+    /// skip-set / dedup-table / mark-worklist remaps after Phase 5, and the
+    /// bookkeeping around them.
+    ///
+    /// Derived, not measured (`pause_us` minus the six), and present so that
+    /// the breakdown is a PARTITION of the pause rather than a sample of it.
+    /// A phase table whose rows do not sum to the total cannot be used to
+    /// argue that a cost has been removed rather than moved.
+    pub other_us: u64,
     /// Non-CSet regions the fix-up walked, and bytes it walked over them.
     /// The denominator for `fixup_us`: without it a long fix-up cannot be
     /// told from a large old generation.
     pub fixup_regions: u32,
     pub fixup_bytes: u64,
+}
+
+impl G1PausePhases {
+    /// Sum of the six measured phases.
+    #[inline]
+    pub fn measured_us(&self) -> u64 {
+        self.roots_us
+            .saturating_add(self.rset_us)
+            .saturating_add(self.closure_us)
+            .saturating_add(self.fixup_us)
+            .saturating_add(self.free_us)
+            .saturating_add(self.verify_us)
+    }
+
+    /// Fill [`Self::other_us`] from the pause total, so the six measured
+    /// phases plus `other_us` partition `pause_us` exactly.
+    ///
+    /// Saturating: the phase clocks and the pause clock are separate
+    /// `Instant`s and each phase truncates to whole microseconds, so on a
+    /// short pause the parts can round to slightly more than the whole. That
+    /// reports `other_us = 0` rather than underflowing.
+    #[inline]
+    pub fn close(&mut self, pause_us: u64) {
+        self.other_us = pause_us.saturating_sub(self.measured_us());
+    }
 }
 
 /// Percentile reduction of the recorded pauses, split by collection type
@@ -2187,7 +2490,7 @@ pub struct G1Collector {
     /// processing "restores" a weak referent whose fields dangle into
     /// regions freed the same pause (G1CORE-3). Cleared at the start of
     /// every retry evaluation; normally both sets are empty.
-    kept_unresolved_regions: Mutex<std::collections::HashSet<usize>>,
+    kept_unresolved_regions: Mutex<RegionSet>,
     /// The self-forwarded (live-in-place) addresses within
     /// [`Self::kept_unresolved_regions`].
     kept_unresolved_live: Mutex<std::collections::HashSet<usize>>,
@@ -2270,6 +2573,14 @@ pub struct G1Collector {
     /// identical reason (see `GenerationalHeap::is_object_address`).
     arena_base: usize,
     arena_end: usize,
+    /// `log2(config.region_size)` (F-09).
+    ///
+    /// `G1Collector::new` rounds the requested region size up to a power of
+    /// two so this exists; see [`normalize_region_size`] for why that rounding
+    /// is not a policy decision. It makes `lookup_region_for_addr` — the
+    /// hottest read in the collector, called TWICE per compiled reference store
+    /// — a shift instead of a 64-bit hardware divide.
+    region_shift: u32,
 
     /// This pause was entered through
     /// [`Self::collect_garbage_with_finalizers`], i.e. some object registered
@@ -2466,6 +2777,14 @@ impl G1Collector {
 
     /// Create a new G1 collector with the given configuration.
     pub fn new(config: G1CollectorConfig) -> Self {
+        // F-09 — the region size is rounded to a power of two HERE, before
+        // anything derives from it, so `config.region_size`, `num_regions`, the
+        // arena length, every region base and `region_shift` all describe one
+        // geometry. Rounding it later (or only for the shift) would give the
+        // collector two answers to "which region owns this address".
+        let mut config = config;
+        config.region_size = normalize_region_size(config.region_size);
+        let region_shift = config.region_size.trailing_zeros();
         let num_regions = config.heap_size / config.region_size;
         assert!(
             num_regions > 0,
@@ -2587,7 +2906,7 @@ impl G1Collector {
             reference_skip: Mutex::new(FxHashSet::default()),
             pending_finalizer_roots: Mutex::new(Vec::new()),
             resurrected_finalizers: Mutex::new(Vec::new()),
-            kept_unresolved_regions: Mutex::new(std::collections::HashSet::new()),
+            kept_unresolved_regions: Mutex::new(RegionSet::new()),
             kept_unresolved_live: Mutex::new(std::collections::HashSet::new()),
             kept_unresolved_any: AtomicBool::new(false),
             // SECURITY FIX (V7a): start the RSet TLS-cache epoch at 0.
@@ -2596,6 +2915,7 @@ impl G1Collector {
             region_lookup,
             arena_base,
             arena_end,
+            region_shift,
             finalizer_pause: AtomicBool::new(false),
             evac_pool: std::sync::OnceLock::new(),
         }
@@ -2986,7 +3306,7 @@ impl G1Collector {
         regions: &mut Vec<G1Region>,
         target_type: RegionType,
         size: usize,
-        cset: &std::collections::HashSet<usize>,
+        cset: &RegionSet,
     ) -> Option<*mut u8> {
         // G1AUD-9 — try the region the previous object of this type landed in
         // before scanning. Validated exactly as the scan below validates a
@@ -3021,7 +3341,7 @@ impl G1Collector {
         regions: &mut Vec<G1Region>,
         target_type: RegionType,
         size: usize,
-        cset: &std::collections::HashSet<usize>,
+        cset: &RegionSet,
         this: &Self,
     ) -> Option<(*mut u8, usize)> {
         // CORRECTNESS (evacuation destination must NOT be in the collection set):
@@ -3081,7 +3401,7 @@ impl G1Collector {
         // Regions that hold at least one self-forwarded (in-place) object.
         // `lookup_region_for_addr` consults the immutable region table, so it
         // does not borrow `regions` (no conflict with the mutable loop below).
-        let failed: std::collections::HashSet<usize> = pointer_map
+        let failed: RegionSet = pointer_map
             .iter()
             .filter(|(k, v)| k == v)
             .filter_map(|(k, _)| self.lookup_region_for_addr(*k))
@@ -3447,11 +3767,11 @@ impl G1Collector {
 
         // The drain's collection set: exactly the regions holding seeds (the
         // kept regions). Only seed-reachable objects inside them are copied.
-        let cset_set: std::collections::HashSet<usize> = seeds
+        let cset_set: RegionSet = seeds
             .iter()
             .filter_map(|&s| self.lookup_region_for_addr(s))
             .collect();
-        let cset: Vec<usize> = cset_set.iter().copied().collect();
+        let cset: Vec<usize> = cset_set.iter().collect();
         if cset.is_empty() {
             return GcResult {
                 stats: GcStats {
@@ -3510,13 +3830,28 @@ impl G1Collector {
         // previous pause could not evacuate, so it runs with a heap the
         // collector has already declined to reason about normally — exactly the
         // state in which a death certificate should not be issued.
-        let _census =
-            self.update_references_in_regions(&mut regions, &cset_set, &pointer_map, None);
+        // G1AUD-10 / F-07 — the drain is a real pause and reported no phases.
+        // It is also the pause an evacuation-failure investigation reads first,
+        // so "which part of the drain is long" should not require a debug
+        // build. The seed evacuation and closure above are fused here the same
+        // way the parallel evacuator fuses them; charge them to `closure_us`.
+        let mut phases = G1PausePhases::default();
+        phases.closure_us = start.elapsed().as_micros() as u64;
+        let mut phase_mark = std::time::Instant::now();
+        let census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map, None);
+        phases.fixup_us = phase_mark.elapsed().as_micros() as u64;
+        phases.fixup_regions = census.walked_regions;
+        phases.fixup_bytes = census.walked_bytes;
+        phase_mark = std::time::Instant::now();
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
+        phases.free_us = phase_mark.elapsed().as_micros() as u64;
+        phase_mark = std::time::Instant::now();
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
+        self.dbg_verify_rset_completeness(&regions, "kept-drain");
         self.dbg_verify_no_unrewritten_forward(&regions, &cset_set, &pointer_map, roots);
         self.dbg_scan_for_zeroed_refs(&regions, &cset_set, roots);
         self.dbg_verify_reachable_integrity(&regions, roots, "kept-drain");
+        phases.verify_us = phase_mark.elapsed().as_micros() as u64;
 
         let cur_eden = self.current_eden.load(Ordering::Relaxed);
         if cset_set.contains(&cur_eden) {
@@ -3554,12 +3889,13 @@ impl G1Collector {
         }
 
         let pause_us = start.elapsed().as_micros() as u64;
+        phases.close(pause_us);
         let stats = GcStats {
             objects_copied,
             bytes_copied,
             bytes_freed,
         };
-        self.record_collection(G1CollectionType::YoungOnly, pause_us, &stats);
+        self.record_collection_with_phases(G1CollectionType::YoungOnly, pause_us, &stats, phases);
         GcResult { stats, pointer_map }
     }
 
@@ -3721,7 +4057,7 @@ impl G1Collector {
             regions.iter().map(|r| (r.region_type, r.cursor)).collect();
 
         // Phase 1: Scan roots and evacuate reachable objects from CSet
-        let cset_set: std::collections::HashSet<usize> = cset.iter().copied().collect();
+        let cset_set: RegionSet = cset.iter().copied().collect();
         let mut work_list: Vec<*mut u8> = Vec::new();
         // G1AUD-10 — per-phase breakdown. Five `Instant`s on a path that
         // already takes one; see `G1PausePhases` for why this is not
@@ -3803,7 +4139,7 @@ impl G1Collector {
         // is not Free, so it was re-walked *wholesale* every pause on behalf of
         // an object that no longer exists — resurrecting that object's
         // referents, cycle after cycle.
-        let mut rset_sources: std::collections::HashSet<usize> =
+        let mut rset_sources: RegionSet =
             Self::live_rset_sources(&regions, &cset);
 
         // CRIT fix (UAF): actually process the collected rset sources.
@@ -3846,7 +4182,7 @@ impl G1Collector {
         // in the meantime.
         let dbg_phases = gc_flags().g1_dbg_reach;
         let p1_forwards = pointer_map.len();
-        rset_sources.extend(jit_pinned_regions.iter().copied());
+        rset_sources.extend(jit_pinned_regions.iter());
         let unique_sources = rset_sources;
         let rset_sources_scanned = unique_sources.len();
         // G1AUD-11: the narrow Phase-4 set needs these after the walk below
@@ -3959,6 +4295,7 @@ impl G1Collector {
         // forwarding entry (incomplete remembered set => UAF). No-op on
         // the release/quiet path; aborts in debug.
         phases.free_us = phase_mark.elapsed().as_micros() as u64;
+        phase_mark = std::time::Instant::now();
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
         self.dbg_verify_rset_completeness(&regions, "young-serial");
         // Env-gated diagnostics (no-ops unless CRATONVM_G1_DBG_HEADERS /
@@ -3968,6 +4305,9 @@ impl G1Collector {
         self.dbg_verify_no_unrewritten_forward(&regions, &cset_set, &pointer_map, roots);
         self.dbg_scan_for_zeroed_refs(&regions, &cset_set, roots);
         self.dbg_verify_reachable_integrity(&regions, roots, "young-serial");
+        // F-07: the budgeted V7b sweep runs in RELEASE and used to be charged
+        // to no phase at all. See `G1PausePhases::verify_us`.
+        phases.verify_us = phase_mark.elapsed().as_micros() as u64;
 
         // Young and mixed evacuation leave humongous spans IN PLACE — they are
         // never evacuated — but they are no longer left ALIVE unconditionally:
@@ -4038,6 +4378,7 @@ impl G1Collector {
         }
 
         let pause_us = start.elapsed().as_micros() as u64;
+        phases.close(pause_us);
         let stats = GcStats {
             objects_copied,
             bytes_copied,
@@ -4266,7 +4607,7 @@ impl G1Collector {
             old_selected += 1;
         }
 
-        let cset_set: std::collections::HashSet<usize> = cset.iter().copied().collect();
+        let cset_set: RegionSet = cset.iter().copied().collect();
         // Same invariant as the young path: a pinned region must never enter a
         // collection set, because Phase 5 resets every CSet region that holds
         // no self-forwarded object. A mixed CSet is the harder case — it also
@@ -4278,6 +4619,11 @@ impl G1Collector {
             "G1 mixed CSet contains a pinned region"
         );
         let mut work_list: Vec<*mut u8> = Vec::new();
+        // G1AUD-10 / F-07 — the mixed driver reported no phase breakdown at
+        // all, which is backwards: a mixed pause is the long one, and it is the
+        // only kind whose fix-up and free phases touch the old generation.
+        let mut phases = G1PausePhases::default();
+        let mut phase_mark = std::time::Instant::now();
 
         // Evacuate roots
         for root in roots.iter_mut() {
@@ -4345,7 +4691,10 @@ impl G1Collector {
         // targets. Without this, cross-region refs (e.g. old → young)
         // were silently dropped, leaving stale pointers in non-CSet
         // regions after CSet reset.
-        let mixed_rset_sources: std::collections::HashSet<usize> = {
+        phases.roots_us = phase_mark.elapsed().as_micros() as u64;
+        phase_mark = std::time::Instant::now();
+
+        let mixed_rset_sources: RegionSet = {
             // Round-9 gc CRIT-8: the snapshot accessors return owned data
             // (the underlying map lives behind a per-RSet mutex), so the RSet
             // lock is not held across the body.
@@ -4357,7 +4706,7 @@ impl G1Collector {
             // JIT-pinned regions are scanned as sources too (see
             // young_collection): their objects stay in place but their CSet
             // referents must still be evacuated and fixed up.
-            set.extend(jit_pinned_regions.iter().copied());
+            set.extend(jit_pinned_regions.iter());
             set
         };
         let rset_sources_scanned = mixed_rset_sources.len();
@@ -4373,6 +4722,9 @@ impl G1Collector {
                 &mut work_list,
             );
         }
+
+        phases.rset_us = phase_mark.elapsed().as_micros() as u64;
+        phase_mark = std::time::Instant::now();
 
         // Cheney scan
         let mut scan_idx = 0;
@@ -4403,8 +4755,30 @@ impl G1Collector {
             &mut work_list,
         );
 
-        // Update references and free evacuated regions
+        phases.closure_us = phase_mark.elapsed().as_micros() as u64;
+        phase_mark = std::time::Instant::now();
+
+        // Update references and free evacuated regions.
+        //
+        // F-04 residual, stated deliberately: the mixed fix-up stays WIDE.
+        // `phase4_regions_to_walk`'s narrowing argument is that a slot needing
+        // a rewrite is reachable only through the CSet's remembered set, and
+        // for a mixed CSet that leans on the rset of the OLD members — a set
+        // whose completeness for old->old edges is maintained by this very
+        // walk's rebuild half. Narrowing it would make the rebuild's input
+        // depend on the rebuild's own output, and the failure mode is a
+        // use-after-free in the generation a mixed pause exists to reclaim.
+        // Mixed pauses are infrequent (the serial-evacuator note above says so
+        // and uses it to justify not parallelising them at all), so this costs
+        // little. What would license the change is
+        // `dbg_verify_rset_completeness` reporting `missing=0` across a full
+        // mixed sequence with the narrow set applied — the checker exists and
+        // is wired here now.
         let census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map, None);
+        phases.fixup_us = phase_mark.elapsed().as_micros() as u64;
+        phases.fixup_regions = census.walked_regions;
+        phases.fixup_bytes = census.walked_bytes;
+        phase_mark = std::time::Instant::now();
 
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
@@ -4426,13 +4800,17 @@ impl G1Collector {
         // ones, where a stale/incomplete rset is most likely. Verify no
         // survivor slot dangles into a freed CSet region. No-op on the
         // release/quiet path; aborts in debug.
+        phases.free_us = phase_mark.elapsed().as_micros() as u64;
+        phase_mark = std::time::Instant::now();
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
+        self.dbg_verify_rset_completeness(&regions, "mixed-serial");
         // Env-gated diagnostics (no-ops unless CRATONVM_G1_DBG_HEADERS /
         // CRATONVM_G1_DBG_ZERO are set) — mixed-path coverage matching the
         // parallel young path.
         self.dbg_verify_no_unrewritten_forward(&regions, &cset_set, &pointer_map, roots);
         self.dbg_scan_for_zeroed_refs(&regions, &cset_set, roots);
         self.dbg_verify_reachable_integrity(&regions, roots, "mixed-serial");
+        phases.verify_us = phase_mark.elapsed().as_micros() as u64;
 
         let cur_eden = self.current_eden.load(Ordering::Relaxed);
         if cset_set.contains(&cur_eden) {
@@ -4492,12 +4870,13 @@ impl G1Collector {
         // actual pause / bytes copied, so the next mixed CSet is sized against
         // real wall-clock throughput.
         self.update_evac_cost(elapsed.as_nanos() as u64, bytes_copied);
+        phases.close(pause_us);
         let stats = GcStats {
             objects_copied,
             bytes_copied,
             bytes_freed,
         };
-        self.record_collection(G1CollectionType::Mixed, pause_us, &stats);
+        self.record_collection_with_phases(G1CollectionType::Mixed, pause_us, &stats, phases);
         crate::gc_metrics::record_g1_cycle(
             crate::gc_metrics::g1_cycle_kind::MIXED,
             cset_young as u32,
@@ -4514,22 +4893,27 @@ impl G1Collector {
     // Step 9 — parallel evacuation drivers (gated; see the module note above)
     // -----------------------------------------------------------------------
 
-    /// Number of evacuation workers: `gc_worker_threads` clamped to the
-    /// available hardware parallelism (always ≥ 1). With 1 worker the parallel
+    /// Number of evacuation workers (always >= 1). With 1 worker the parallel
     /// code path drains serially — useful for determinism testing.
+    ///
+    /// Precedence: the `CRATONVM_G1_WORKERS` diagnostic override, then an
+    /// explicit `gc_worker_threads` (clamped to the hardware), then the
+    /// machine-derived ergonomic. See [`ergonomic_gc_worker_threads`].
     fn parallel_worker_count(&self) -> usize {
         // Diagnostic override: `CRATONVM_G1_WORKERS=N` forces the worker count
         // (e.g. =1 to drain the parallel path serially and isolate concurrency
         // races from logic divergences). Falls back to the config otherwise.
         if let Some(n) = gc_flags().g1_workers {
-            return n;
+            return n.max(1);
         }
-        let cfg = self.config.gc_worker_threads.max(1);
         let avail = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
             .max(1);
-        cfg.min(avail)
+        match self.config.gc_worker_threads {
+            0 => ergonomic_gc_worker_threads(avail),
+            cfg => cfg.min(avail),
+        }
     }
 
     /// The persistent evacuation worker pool, created on first use.
@@ -4567,11 +4951,11 @@ impl G1Collector {
     unsafe fn parallel_evacuate(
         &self,
         regions_base: RegionsBase,
-        cset_set: &std::collections::HashSet<usize>,
+        cset_set: &RegionSet,
         pool: Vec<usize>,
         roots: &mut [ObjectRef],
         keepalive: &[usize],
-        sources: &std::collections::HashSet<usize>,
+        sources: &RegionSet,
     ) -> (cratonvm_types::PointerMap, usize, usize) {
         // One-shot confirmation that the parallel evacuator is genuinely active
         // (the gauntlet lesson: never assume a gated path was taken — verify).
@@ -4661,7 +5045,7 @@ impl G1Collector {
 
         // Phase 2 (driver): seed the source regions the caller selected — the
         // CSet remembered-set sources plus the JIT-pinned regions (G1AUD-6).
-        for &src_idx in sources {
+        for src_idx in sources.iter() {
             shared.seed_source_region(
                 src_idx,
                 &mut main_tlab,
@@ -4917,13 +5301,30 @@ impl G1Collector {
                 pointer_map: cratonvm_types::PointerMap::default(),
             };
         }
-        let cset_set: std::collections::HashSet<usize> = cset.iter().copied().collect();
+        let cset_set: RegionSet = cset.iter().copied().collect();
         let pool: Vec<usize> = regions
             .iter()
             .enumerate()
             .filter(|(_, r)| r.region_type == RegionType::Free)
             .map(|(i, _)| i)
             .collect();
+
+        // F-04 — G1AUD-11's pre-evacuation `(region_type, cursor)` snapshot,
+        // which until now only the SERIAL young path took.
+        //
+        // The narrowing argument in `phase4_regions_to_walk` is a property of
+        // the remembered set and of what the pause wrote into; nothing in it is
+        // specific to a single-threaded evacuator. Passing `None` here meant
+        // the DEFAULT path always took the whole-heap fix-up while the fallback
+        // path took the narrow one — so the two dispatch arms differed in the
+        // one phase that scales with the live heap rather than the collection
+        // set, and any comparison between them was measuring that instead of
+        // the evacuator.
+        //
+        // One pass over two words per region, on a path that already makes
+        // several such passes.
+        let pre_evac: Vec<(RegionType, usize)> =
+            regions.iter().map(|r| (r.region_type, r.cursor)).collect();
 
         // Marking keep-alive (see `marking_keepalive_roots`): computed while
         // the guard is still dereferenceable, passed to the evacuator as
@@ -4953,11 +5354,22 @@ impl G1Collector {
         // not it is the whole of that defect, the serial/parallel divergence is
         // real and the fail-safe direction is to walk MORE sources, never
         // fewer.
-        let parallel_sources: std::collections::HashSet<usize> = {
+        let parallel_sources: RegionSet = {
             let mut set = Self::live_rset_sources(&regions, &cset);
-            set.extend(jit_pinned_regions.iter().copied());
+            set.extend(jit_pinned_regions.iter());
             set
         };
+
+        // G1AUD-10 / F-07 — per-phase breakdown on the parallel driver too.
+        // The parallel evacuator FUSES phases 1, 1b, 2 and 3 into one
+        // work-stealing closure (roots and rset sources are seeds of the same
+        // queue), so there is no instant at which "the root scan is done" is a
+        // fact about the pause. Reporting the whole seed+closure as
+        // `closure_us` and leaving `roots_us`/`rset_us` at zero says exactly
+        // that, and keeps the six phases a partition of `pause_us`; splitting
+        // one measured interval into three plausible-looking numbers would not.
+        let mut phases = G1PausePhases::default();
+        let mut phase_mark = std::time::Instant::now();
 
         // Take the raw regions base; do NOT deref `regions` again until after
         // `parallel_evacuate` returns (see the module SAFETY MODEL note).
@@ -4972,9 +5384,28 @@ impl G1Collector {
                 &parallel_sources,
             )
         };
+        phases.closure_us = phase_mark.elapsed().as_micros() as u64;
+        phase_mark = std::time::Instant::now();
 
-        // Phase 4: update interior refs in non-CSet regions.
-        let census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map, None);
+        // Phase 4: update interior refs in non-CSet regions. F-04 — narrowed
+        // by the same rule the serial path uses; `parallel_sources` is
+        // precisely the `narrow_sources` term (`live_rset_sources` plus every
+        // JIT-pinned region) that `phase4_regions_to_walk` wants.
+        let narrow = self.phase4_regions_to_walk(
+            &regions,
+            Some(&pre_evac),
+            &parallel_sources,
+            gc_flags().g1_eager_humongous
+                && regions
+                    .iter()
+                    .any(|r| r.region_type == RegionType::HumongousStart),
+        );
+        let census =
+            self.update_references_in_regions(&mut regions, &cset_set, &pointer_map, narrow.as_ref());
+        phases.fixup_us = phase_mark.elapsed().as_micros() as u64;
+        phases.fixup_regions = census.walked_regions;
+        phases.fixup_bytes = census.walked_bytes;
+        phase_mark = std::time::Instant::now();
 
         // Phase 5: free evacuated regions.
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
@@ -4992,10 +5423,14 @@ impl G1Collector {
                 &census,
                 &jit_pinned_regions,
             );
+        phases.free_us = phase_mark.elapsed().as_micros() as u64;
+        phase_mark = std::time::Instant::now();
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
+        self.dbg_verify_rset_completeness(&regions, "young-parallel");
         self.dbg_verify_no_unrewritten_forward(&regions, &cset_set, &pointer_map, roots);
         self.dbg_scan_for_zeroed_refs(&regions, &cset_set, roots);
         self.dbg_verify_reachable_integrity(&regions, roots, "young-parallel");
+        phases.verify_us = phase_mark.elapsed().as_micros() as u64;
 
         // Re-gray the keep-alive copies (SATB-origin entries never sat in the
         // worklist, so the remap below cannot rewrite them — push their
@@ -5043,12 +5478,18 @@ impl G1Collector {
         }
 
         let pause_us = start.elapsed().as_micros() as u64;
+        phases.close(pause_us);
         let stats = GcStats {
             objects_copied,
             bytes_copied,
             bytes_freed,
         };
-        self.record_collection(G1CollectionType::YoungOnly, pause_us, &stats);
+        self.record_collection_with_phases(
+            G1CollectionType::YoungOnly,
+            pause_us,
+            &stats,
+            phases,
+        );
         let (jni_pinned_out, jit_pinned_out) =
             count_young_regions_pinned_out(regions.as_slice(), &jit_pinned_regions);
         crate::gc_metrics::record_g1_cycle(
@@ -5098,6 +5539,9 @@ impl G1Collector {
             })
             .map(|(i, _)| i)
             .collect();
+        // Young half of the CSet, captured before the old members are pushed —
+        // the `record_g1_cycle` young/old split needs both counts.
+        let cset_young = cset.len();
 
         let max_old =
             (regions.len() * self.config.old_cset_region_threshold_percent as usize) / 100;
@@ -5174,7 +5618,7 @@ impl G1Collector {
                 pointer_map: cratonvm_types::PointerMap::default(),
             };
         }
-        let cset_set: std::collections::HashSet<usize> = cset.iter().copied().collect();
+        let cset_set: RegionSet = cset.iter().copied().collect();
         let pool: Vec<usize> = regions
             .iter()
             .enumerate()
@@ -5188,11 +5632,17 @@ impl G1Collector {
 
         // G1AUD-6 — same source set the serial `mixed_collection` builds; see
         // the long note in `young_collection_parallel`.
-        let parallel_sources: std::collections::HashSet<usize> = {
+        let parallel_sources: RegionSet = {
             let mut set = Self::live_rset_sources(&regions, &cset);
-            set.extend(jit_pinned_regions.iter().copied());
+            set.extend(jit_pinned_regions.iter());
             set
         };
+
+        // G1AUD-10 / F-07 — phase breakdown, on the same terms as
+        // `young_collection_parallel`: the evacuator fuses phases 1-3, so the
+        // whole seed+closure is reported as `closure_us`.
+        let mut phases = G1PausePhases::default();
+        let mut phase_mark = std::time::Instant::now();
 
         let regions_base = RegionsBase(regions.as_mut_ptr());
         let (pointer_map, objects_copied, bytes_copied) = unsafe {
@@ -5205,8 +5655,15 @@ impl G1Collector {
                 &parallel_sources,
             )
         };
+        phases.closure_us = phase_mark.elapsed().as_micros() as u64;
+        phase_mark = std::time::Instant::now();
 
+        // Wide, like the serial mixed path — see the F-04 residual note there.
         let census = self.update_references_in_regions(&mut regions, &cset_set, &pointer_map, None);
+        phases.fixup_us = phase_mark.elapsed().as_micros() as u64;
+        phases.fixup_regions = census.walked_regions;
+        phases.fixup_bytes = census.walked_bytes;
+        phase_mark = std::time::Instant::now();
 
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
@@ -5223,8 +5680,12 @@ impl G1Collector {
                 &census,
                 &jit_pinned_regions,
             );
+        phases.free_us = phase_mark.elapsed().as_micros() as u64;
+        phase_mark = std::time::Instant::now();
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
+        self.dbg_verify_rset_completeness(&regions, "mixed-parallel");
         self.dbg_verify_reachable_integrity(&regions, roots, "mixed-parallel");
+        phases.verify_us = phase_mark.elapsed().as_micros() as u64;
 
         // Re-gray the keep-alive copies (see young_collection_parallel).
         for &addr in &keepalive {
@@ -5281,12 +5742,27 @@ impl G1Collector {
         let elapsed = start.elapsed();
         let pause_us = elapsed.as_micros() as u64;
         self.update_evac_cost(elapsed.as_nanos() as u64, bytes_copied);
+        phases.close(pause_us);
         let stats = GcStats {
             objects_copied,
             bytes_copied,
             bytes_freed,
         };
-        self.record_collection(G1CollectionType::Mixed, pause_us, &stats);
+        self.record_collection_with_phases(G1CollectionType::Mixed, pause_us, &stats, phases);
+        // G1-7 parity: the serial mixed driver records a cycle and this one did
+        // not, so under parallel mixed evacuation the `[GC] g1 cycle` stream
+        // simply skipped every mixed pause — the same blindness the empty-CSet
+        // arm above was fixed for, on the arm that actually reclaims old gen.
+        let (jni_pinned_out, jit_pinned_out) =
+            count_young_regions_pinned_out(regions.as_slice(), &jit_pinned_regions);
+        crate::gc_metrics::record_g1_cycle(
+            crate::gc_metrics::g1_cycle_kind::MIXED,
+            cset_young as u32,
+            old_selected as u32,
+            (jni_pinned_out + jit_pinned_out) as u32,
+            parallel_sources.len() as u32,
+            g1_pause_degraded_flags(&pointer_map, jni_pinned_out, jit_pinned_out, true),
+        );
         GcResult { stats, pointer_map }
     }
 
@@ -5380,7 +5856,7 @@ impl G1Collector {
     fn resurrect_dead_finalizers(
         &self,
         regions: &mut Vec<G1Region>,
-        cset_set: &std::collections::HashSet<usize>,
+        cset_set: &RegionSet,
         pointer_map: &mut cratonvm_types::PointerMap,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
@@ -5447,7 +5923,7 @@ impl G1Collector {
         pointer_map: &mut cratonvm_types::PointerMap,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
-        cset: &std::collections::HashSet<usize>,
+        cset: &RegionSet,
     ) -> Option<(*mut u8, bool)> {
         let old_addr = old_ptr as usize;
 
@@ -5958,7 +6434,7 @@ impl G1Collector {
         regions: &mut Vec<G1Region>,
         obj_ptr: *mut u8,
         header: &ObjectHeader,
-        cset: &std::collections::HashSet<usize>,
+        cset: &RegionSet,
         pointer_map: &mut cratonvm_types::PointerMap,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
@@ -6108,7 +6584,7 @@ impl G1Collector {
         &self,
         regions: &mut Vec<G1Region>,
         source_idx: usize,
-        cset: &std::collections::HashSet<usize>,
+        cset: &RegionSet,
         pointer_map: &mut cratonvm_types::PointerMap,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
@@ -6381,9 +6857,9 @@ impl G1Collector {
         &self,
         regions: &[G1Region],
         pre: Option<&[(RegionType, usize)]>,
-        rset_sources: &std::collections::HashSet<usize>,
+        rset_sources: &RegionSet,
         want_census: bool,
-    ) -> Option<std::collections::HashSet<usize>> {
+    ) -> Option<RegionSet> {
         if !gc_flags().g1_narrow_fixup {
             return None;
         }
@@ -6410,9 +6886,9 @@ impl G1Collector {
     fn update_references_in_regions(
         &self,
         regions: &mut Vec<G1Region>,
-        cset: &std::collections::HashSet<usize>,
+        cset: &RegionSet,
         pointer_map: &cratonvm_types::PointerMap,
-        narrow: Option<&std::collections::HashSet<usize>>,
+        narrow: Option<&RegionSet>,
     ) -> HumongousCensus {
         let mut census = HumongousCensus::default();
         let rewrite = !pointer_map.is_empty();
@@ -6477,7 +6953,7 @@ impl G1Collector {
         // then took that destination's rset mutex and hashed the same source
         // 100k times. Cleared per region, so it costs one small `HashSet` and
         // bounds the pushes by the region COUNT rather than the slot count.
-        let mut seen_targets: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut seen_targets: RegionSet = RegionSet::new();
         let jit_skips = self.jit_tlab_skip_spans();
         let dbg_walk = gc_flags().g1_dbg_reach;
         let mut walk_aborted = false;
@@ -6626,7 +7102,7 @@ impl G1Collector {
         obj_ptr: *mut u8,
         header: &ObjectHeader,
         out: &mut Vec<(usize, usize)>,
-        seen: &mut std::collections::HashSet<usize>,
+        seen: &mut RegionSet,
         mut census: Option<&mut HumongousCensus>,
     ) {
         let holder_span = humongous_span_start(regions, holder).unwrap_or(holder);
@@ -6821,7 +7297,7 @@ impl G1Collector {
     fn verify_no_dangling_into_cset(
         &self,
         regions: &[G1Region],
-        cset: &std::collections::HashSet<usize>,
+        cset: &RegionSet,
         pointer_map: &cratonvm_types::PointerMap,
     ) {
         // I-6 COVERAGE (audit §9 item 2). This is the only direct check that
@@ -6869,7 +7345,7 @@ impl G1Collector {
     fn verify_no_dangling_into_cset_within(
         &self,
         regions: &[G1Region],
-        cset: &std::collections::HashSet<usize>,
+        cset: &RegionSet,
         pointer_map: &cratonvm_types::PointerMap,
         budget: usize,
     ) {
@@ -7091,7 +7567,7 @@ impl G1Collector {
     fn dbg_verify_no_unrewritten_forward(
         &self,
         regions: &[G1Region],
-        cset_set: &std::collections::HashSet<usize>,
+        cset_set: &RegionSet,
         pointer_map: &cratonvm_types::PointerMap,
         roots: &[ObjectRef],
     ) {
@@ -7253,7 +7729,7 @@ impl G1Collector {
     fn dbg_scan_for_zeroed_refs(
         &self,
         regions: &[G1Region],
-        cset_set: &std::collections::HashSet<usize>,
+        cset_set: &RegionSet,
         roots: &[ObjectRef],
     ) {
         if !gc_flags().g1_dbg_zero {
@@ -7664,7 +8140,7 @@ impl G1Collector {
     fn marking_keepalive_roots(
         &self,
         regions: &[G1Region],
-        cset_set: &std::collections::HashSet<usize>,
+        cset_set: &RegionSet,
     ) -> Vec<usize> {
         if !self.satb_queue.is_active() {
             return Vec::new();
@@ -7913,7 +8389,7 @@ impl G1Collector {
     /// remap). No-op when no cycle is active (set empty).
     fn remap_reference_skip_set(
         &self,
-        cset_set: &std::collections::HashSet<usize>,
+        cset_set: &RegionSet,
         pointer_map: &cratonvm_types::PointerMap,
     ) {
         let mut skip = self.reference_skip.lock();
@@ -7967,7 +8443,7 @@ impl G1Collector {
     /// final `pointer_map`.
     fn remap_string_dedup_table(
         &self,
-        cset_set: &std::collections::HashSet<usize>,
+        cset_set: &RegionSet,
         pointer_map: &cratonvm_types::PointerMap,
     ) {
         let mut table = self.string_dedup_table.lock();
@@ -9328,7 +9804,7 @@ impl G1Collector {
         roots: &[ObjectRef],
         pointer_map: &cratonvm_types::PointerMap,
         census: &HumongousCensus,
-        jit_pinned: &std::collections::HashSet<usize>,
+        jit_pinned: &RegionSet,
     ) -> usize {
         if !gc_flags().g1_eager_humongous {
             // Disabled, not declined: the pause did not decline to answer a
@@ -9383,7 +9859,7 @@ impl G1Collector {
 
         // Everything the pause can see a reference from.
         let mut live = census.referenced.clone();
-        let mut note_addr = |live: &mut std::collections::HashSet<usize>, addr: usize| {
+        let mut note_addr = |live: &mut RegionSet, addr: usize| {
             if let Some(idx) = self.lookup_region_for_addr(addr) {
                 if let Some(span) = humongous_span_start(regions, idx) {
                     live.insert(span);
@@ -9401,7 +9877,7 @@ impl G1Collector {
         // A conservatively-discovered JIT root can name a region without naming
         // an object (that is the whole reason this set exists), so treat any
         // humongous span it covers as referenced.
-        for &idx in jit_pinned {
+        for idx in jit_pinned.iter() {
             if let Some(span) = humongous_span_start(regions, idx) {
                 live.insert(span);
             }
@@ -9460,7 +9936,7 @@ impl G1Collector {
         // than becoming a use-after-free in a shipped build.
         #[cfg(debug_assertions)]
         {
-            let condemned: std::collections::HashSet<usize> = doomed
+            let condemned: RegionSet = doomed
                 .iter()
                 .flat_map(|&(start, end, _)| start..end)
                 .collect();
@@ -9499,7 +9975,7 @@ impl G1Collector {
         &self,
         regions: &[G1Region],
         roots: &[ObjectRef],
-        condemned: &std::collections::HashSet<usize>,
+        condemned: &RegionSet,
     ) {
         let mut offend = |addr: usize, from: &str| {
             if let Some(idx) = self.lookup_region_for_addr(addr) {
@@ -9842,12 +10318,14 @@ impl G1Collector {
             String::new()
         } else {
             format!(
-                " roots_us={} rset_us={} closure_us={} fixup_us={} free_us={}                  fixup_regions={} fixup_bytes={}",
+                " roots_us={} rset_us={} closure_us={} fixup_us={} free_us={}                  verify_us={} other_us={} fixup_regions={} fixup_bytes={}",
                 phases.roots_us,
                 phases.rset_us,
                 phases.closure_us,
                 phases.fixup_us,
                 phases.free_us,
+                phases.verify_us,
+                phases.other_us,
                 phases.fixup_regions,
                 phases.fixup_bytes,
             )
@@ -10424,14 +10902,14 @@ impl G1Collector {
     /// no longer exists, resurrecting its referents). `Free` sources are left
     /// to `scan_source_region_for_cset_refs`'s own early return, which already
     /// handles them.
-    fn live_rset_sources(regions: &[G1Region], cset: &[usize]) -> std::collections::HashSet<usize> {
-        let mut set = std::collections::HashSet::new();
+    fn live_rset_sources(regions: &[G1Region], cset: &[usize]) -> RegionSet {
+        let mut set = RegionSet::new();
         // G1AUD-9: the coarsened arm below asks "is region `i` in the CSet?"
         // once per region, and `cset` is a SLICE — so that arm was
         // `O(num_regions x |cset|)`, and a young CSet is every young region in
         // the heap. Hash it once, outside the loop; a coarsened rset is exactly
         // the case where the arm runs.
-        let cset_lookup: std::collections::HashSet<usize> = cset.iter().copied().collect();
+        let cset_lookup: RegionSet = cset.iter().copied().collect();
         for &cset_idx in cset {
             // COARSENED (audit §9 item 5): this rset stopped naming individual
             // sources when it hit `rset_source_cap`, so it now asserts only
@@ -10987,7 +11465,7 @@ impl G1Collector {
         &self,
         regions: &[G1Region],
         roots: &[ObjectRef],
-    ) -> std::collections::HashSet<usize> {
+    ) -> RegionSet {
         let mut set = self.jit_pinned_region_set();
         for root in roots {
             let addr = root.as_ptr() as usize;
@@ -11010,14 +11488,14 @@ impl G1Collector {
         set
     }
 
-    fn jit_pinned_region_set(&self) -> std::collections::HashSet<usize> {
-        let mut set: std::collections::HashSet<usize> = if crate::gc_quiescence::is_active() {
+    fn jit_pinned_region_set(&self) -> RegionSet {
+        let mut set: RegionSet = if crate::gc_quiescence::is_active() {
             crate::gc_quiescence::pinned_jit_roots_snapshot()
                 .into_iter()
                 .filter_map(|addr| self.lookup_region_for_addr(addr))
                 .collect()
         } else {
-            std::collections::HashSet::new()
+            RegionSet::new()
         };
         for &(start, end) in self.jit_tlab_skip_regions.lock().iter() {
             // A mutator TLAB is carved from a single Eden region
@@ -11106,7 +11584,12 @@ impl G1Collector {
         if region_size == 0 {
             return None;
         }
-        let idx = (addr - self.arena_base) / region_size;
+        // F-09 — a SHIFT, not the 64-bit `div` this used to be. The divisor is
+        // a runtime value, so `/` compiled to a real `div`: tens of cycles,
+        // unpipelined, twice per compiled reference store (the write barrier
+        // looks up both ends) and once per reference slot in every collector
+        // walk. `normalize_region_size` in `new` is what licenses the shift.
+        let idx = (addr - self.arena_base) >> self.region_shift;
         debug_assert_eq!(
             Some(idx),
             {
@@ -12735,7 +13218,7 @@ fn g1_pause_degraded_flags(
 /// counted here. See `docs/threading/objectref-concurrency-contract.md`.)
 fn count_young_regions_pinned_out(
     regions: &[G1Region],
-    jit_pinned: &std::collections::HashSet<usize>,
+    jit_pinned: &RegionSet,
 ) -> (usize, usize) {
     let mut jni = 0usize;
     let mut jit = 0usize;
@@ -13427,7 +13910,7 @@ struct HumongousCensus {
     /// `HumongousStart` region indices reached by a reference from some walked
     /// object. Over-approximates liveness: a reference from a dead holder still
     /// counts, which costs one extra cycle of retention and never a UAF.
-    referenced: std::collections::HashSet<usize>,
+    referenced: RegionSet,
     /// Every region the walk was supposed to cover ran to its natural end.
     complete: bool,
     /// G1AUD-10 — how much heap the fix-up walk actually covered: non-CSet
@@ -14301,10 +14784,215 @@ mod tests {
         // T19.3.G1 raised from 45 → 70.
         assert_eq!(cfg.ihop_percent, 70);
         assert_eq!(cfg.promotion_age, 15);
-        assert_eq!(cfg.gc_worker_threads, 4);
+        // F-13: 0 means "derive from the machine" — see the field doc.
+        assert_eq!(cfg.gc_worker_threads, 0);
         assert!(!cfg.string_dedup_enabled);
         assert_eq!(cfg.mixed_gc_count_target, 8);
         assert_eq!(cfg.old_cset_region_threshold_percent, 10);
+    }
+
+    // -- F-03: the region-index bitset --
+
+    #[test]
+    fn a_region_set_answers_membership_len_and_order() {
+        let mut set = RegionSet::new();
+        assert!(set.is_empty());
+        assert!(!set.contains(&0), "an empty set contains nothing");
+        assert!(!set.contains(&(usize::MAX / 2)), "including far out of range");
+
+        assert!(set.insert(63), "63 and 64 straddle the first word boundary");
+        assert!(set.insert(64));
+        assert!(set.insert(0));
+        assert!(!set.insert(64), "re-inserting reports not-new");
+        assert_eq!(set.len(), 3, "and does not double-count");
+
+        for i in [0usize, 63, 64] {
+            assert!(set.contains(&i), "{i} was inserted");
+        }
+        for i in [1usize, 62, 65, 4096] {
+            assert!(!set.contains(&i), "{i} was not");
+        }
+        assert_eq!(
+            set.iter().collect::<Vec<_>>(),
+            vec![0, 63, 64],
+            "iteration is ascending -- several call sites feed it to a walk \
+             that is cheaper in address order"
+        );
+    }
+
+    #[test]
+    fn a_region_set_collects_extends_and_clears() {
+        let mut set: RegionSet = [5usize, 1, 5, 200].into_iter().collect();
+        assert_eq!(set.len(), 3, "collect dedups");
+        set.extend([200usize, 201]);
+        assert_eq!(set.iter().collect::<Vec<_>>(), vec![1, 5, 200, 201]);
+
+        let copy = set.clone();
+        assert_eq!(copy, set, "equality is by membership");
+
+        set.clear();
+        assert!(set.is_empty());
+        assert!(!set.contains(&1));
+        assert_ne!(copy, set);
+    }
+
+    #[test]
+    fn a_region_set_sized_up_front_still_grows() {
+        // `with_region_capacity` reserves; it does not bound.
+        let mut set = RegionSet::with_region_capacity(8);
+        assert!(set.is_empty(), "capacity is not membership");
+        set.insert(4096);
+        assert!(set.contains(&4096));
+        assert_eq!(set.len(), 1);
+    }
+
+    /// The tripwire that keeps a RegionSet a set of REGIONS. Both kinds of
+    /// `usize` set in this file look alike, and a dense bitset handed a heap
+    /// address would try to reserve terabytes -- an out-of-memory abort naming
+    /// nothing.
+    #[test]
+    #[should_panic(expected = "is not a region index")]
+    fn a_region_set_refuses_a_heap_address() {
+        let mut set = RegionSet::new();
+        set.insert(0x7f_1234_5000);
+    }
+
+    // -- F-09 / F-13 / F-14: geometry and worker ergonomics --
+
+    #[test]
+    fn a_region_size_is_rounded_up_to_a_power_of_two() {
+        for already in [0usize, 1, 8, 4096, 1024 * 1024, 32 * 1024 * 1024] {
+            assert_eq!(
+                normalize_region_size(already),
+                already,
+                "{already} is already a power of two (or the zero case) and must \
+                 pass through unchanged"
+            );
+        }
+        assert_eq!(normalize_region_size(3), 4);
+        assert_eq!(normalize_region_size(1024 * 1024 + 1), 2 * 1024 * 1024);
+        // 1 MiB - 4 is the unaligned size `arena.rs` records arriving live from
+        // the heap ergonomics.
+        assert_eq!(normalize_region_size(1024 * 1024 - 4), 1024 * 1024);
+    }
+
+    /// The rounding must reach the collector's whole geometry, not just the
+    /// shift -- otherwise the allocator and the address lookup disagree about
+    /// which region owns an address, which is a use-after-free waiting to be
+    /// written.
+    #[test]
+    fn a_collector_built_with_an_odd_region_size_has_one_geometry() {
+        let gc = G1Collector::new(G1CollectorConfig {
+            heap_size: 8 * 1024 * 1024,
+            region_size: 1024 * 1024 - 4,
+            ..small_config()
+        });
+        assert_eq!(gc.config.region_size, 1024 * 1024);
+        assert_eq!(gc.region_shift, 20);
+        assert_eq!(gc.num_regions(), 8);
+        assert_eq!(
+            gc.committed_bytes(),
+            8 * 1024 * 1024,
+            "the arena is num_regions * the ROUNDED size"
+        );
+        let bases: Vec<usize> = gc.regions.lock().iter().map(|r| r.data.addr()).collect();
+        for (i, base) in bases.into_iter().enumerate() {
+            assert_eq!(gc.lookup_region_for_addr(base), Some(i));
+            assert_eq!(gc.lookup_region_for_addr(base + 1024 * 1024 - 1), Some(i));
+        }
+    }
+
+    #[test]
+    fn the_worker_ergonomic_matches_hotspots_taper() {
+        // One per CPU up to 8, then five eighths of the rest.
+        for (cpus, want) in [
+            (0usize, 1usize),
+            (1, 1),
+            (4, 4),
+            (8, 8),
+            (16, 13),
+            (32, 23),
+            (64, 43),
+        ] {
+            assert_eq!(ergonomic_gc_worker_threads(cpus), want, "cpus={cpus}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_worker_count_wins_over_the_ergonomic() {
+        let gc = G1Collector::new(G1CollectorConfig {
+            gc_worker_threads: 2,
+            ..small_config()
+        });
+        if gc_flags().g1_workers.is_none() {
+            let avail = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .max(1);
+            assert_eq!(
+                gc.parallel_worker_count(),
+                2.min(avail),
+                "an explicit count is honoured, still clamped to the hardware"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_worker_count_is_derived_from_the_machine() {
+        let gc = G1Collector::new(G1CollectorConfig {
+            gc_worker_threads: 0,
+            ..small_config()
+        });
+        let avail = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
+        // Only meaningful when the env override is absent -- which is the
+        // normal test environment; skip rather than fail if a soak sets it.
+        if gc_flags().g1_workers.is_none() {
+            assert_eq!(
+                gc.parallel_worker_count(),
+                ergonomic_gc_worker_threads(avail)
+            );
+        }
+    }
+
+    // -- F-07: the phase breakdown is a partition --
+
+    #[test]
+    fn the_phase_breakdown_accounts_for_the_whole_pause() {
+        let mut phases = G1PausePhases {
+            roots_us: 10,
+            rset_us: 20,
+            closure_us: 300,
+            fixup_us: 40,
+            free_us: 5,
+            verify_us: 25,
+            ..Default::default()
+        };
+        assert_eq!(phases.measured_us(), 400);
+        phases.close(1000);
+        assert_eq!(phases.other_us, 600);
+        assert_eq!(
+            phases.measured_us() + phases.other_us,
+            1000,
+            "the six phases plus `other` must BE the pause -- a table whose rows \
+             do not sum to the total cannot show that a cost was removed rather \
+             than moved"
+        );
+    }
+
+    #[test]
+    fn a_phase_breakdown_that_overruns_its_pause_reports_no_remainder() {
+        // Each phase truncates to whole microseconds against a separately
+        // sampled pause clock, so on a short pause the parts can exceed the
+        // whole. That must saturate, not wrap.
+        let mut phases = G1PausePhases {
+            closure_us: 7,
+            ..Default::default()
+        };
+        phases.close(3);
+        assert_eq!(phases.other_us, 0);
     }
 
     // -- Region basics --
@@ -17159,7 +17847,7 @@ mod tests {
             regions[5].region_type = RegionType::Survivor;
             regions[5].cursor = 64;
         }
-        let sources: std::collections::HashSet<usize> = [3usize].into_iter().collect();
+        let sources: RegionSet = [3usize].into_iter().collect();
         let regions = gc.regions.lock();
         let narrow = gc
             .phase4_regions_to_walk(&regions, Some(&pre), &sources, false)
@@ -17188,7 +17876,7 @@ mod tests {
             let regions = gc.regions.lock();
             regions.iter().map(|r| (r.region_type, r.cursor)).collect()
         };
-        let sources = std::collections::HashSet::new();
+        let sources = RegionSet::new();
         let regions = gc.regions.lock();
 
         assert!(
@@ -17383,7 +18071,7 @@ mod tests {
     #[test]
     fn a_destination_hint_naming_a_cset_region_is_rejected() {
         let gc = make_collector();
-        let cset: std::collections::HashSet<usize> = {
+        let cset: RegionSet = {
             let mut regions = gc.regions.lock();
             // Region 1 is a Survivor that is IN the collection set.
             regions[1].region_type = RegionType::Survivor;
@@ -17419,7 +18107,7 @@ mod tests {
     #[test]
     fn a_valid_destination_hint_places_the_object_without_a_scan() {
         let gc = make_collector();
-        let cset: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let cset: RegionSet = RegionSet::new();
         {
             let mut regions = gc.regions.lock();
             // TWO usable Survivor regions. A scan from index 0 would always
@@ -17487,7 +18175,7 @@ mod tests {
         }
 
         let mut out: Vec<(usize, usize)> = Vec::new();
-        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut seen: RegionSet = RegionSet::new();
         {
             let regions = gc.regions.lock();
             let header = unsafe { &*(arr_ptr as *const ObjectHeader) };
@@ -19768,7 +20456,7 @@ mod tests {
         }
 
         let regions = gc.regions.lock();
-        let empty_cset: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let empty_cset: RegionSet = RegionSet::new();
         let empty_map = cratonvm_types::PointerMap::default();
 
         let before = crate::gc_metrics::gc_metrics_raw();

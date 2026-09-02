@@ -1826,6 +1826,7 @@ impl SharedVm {
             ihop_percent: config.g1_ihop_percent,
             max_gc_pause_ms: config.g1_max_gc_pause_ms,
             string_dedup: config.g1_string_dedup,
+            parallel_gc_threads: config.g1_parallel_gc_threads,
         };
         let mut heap = VmHeap::new_with_overrides(gc_backend, config.max_heap_size, g1_overrides);
         // Bind the heap to THIS VM's compact-layout domain, here rather than

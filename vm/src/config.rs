@@ -407,6 +407,9 @@ pub struct VmConfig {
     pub g1_max_gc_pause_ms: Option<u64>,
     /// `-XX:±UseStringDeduplication` — G1 String backing-array dedup.
     pub g1_string_dedup: Option<bool>,
+    /// `-XX:ParallelGCThreads=<n>` — GC worker threads. `None` derives the
+    /// count from the machine (F-13).
+    pub g1_parallel_gc_threads: Option<usize>,
 
     /// Enable compressed object pointers (`-XX:+UseCompressedOops`).
     /// Reduces memory usage by using 32-bit references for heaps < 32 GB.
@@ -783,6 +786,7 @@ impl Default for VmConfig {
             gc_algorithm: GcAlgorithm::Generational,
             g1_ihop_percent: None,
             g1_region_size: None,
+            g1_parallel_gc_threads: None,
             g1_max_gc_pause_ms: None,
             g1_string_dedup: None,
             use_compressed_oops: false,

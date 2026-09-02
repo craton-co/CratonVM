@@ -1030,6 +1030,15 @@ struct Args {
     )]
     g1_max_pause: Option<String>,
 
+    /// `-XX:ParallelGCThreads=<n>` → GC evacuation worker count (honoured
+    /// under G1). Absent means the count is derived from the machine.
+    #[arg(
+        long = "XX:ParallelGCThreads",
+        value_name = "N",
+        overrides_with = "g1_parallel_gc_threads"
+    )]
+    g1_parallel_gc_threads: Option<String>,
+
     /// `-XX:±UseStringDeduplication` → G1 String dedup (honoured under G1).
     #[arg(
         long = "XX:StringDedup",
@@ -4390,6 +4399,18 @@ fn run() -> Result<()> {
     }
     if let Some(s) = &args.g1_string_dedup {
         config.g1_string_dedup = Some(s == "true");
+    }
+    if let Some(s) = &args.g1_parallel_gc_threads {
+        match s.parse::<usize>() {
+            // Rejecting 0 rather than accepting it: inside the collector 0 is
+            // the sentinel for "derive from the machine", so honouring
+            // `-XX:ParallelGCThreads=0` would silently do the opposite of what
+            // an operator writing it means.
+            Ok(n) if n > 0 => config.g1_parallel_gc_threads = Some(n),
+            _ => eprintln!(
+                "Warning: ignoring -XX:ParallelGCThreads={s} (expected a positive integer)"
+            ),
+        }
     }
     if let Some(s) = &args.max_direct_memory {
         match parse_size(s) {
