@@ -37,13 +37,33 @@ use super::{ZObjectStartsSnapshot, ZgcRealHeap, Z_PARMARK_MAX_WORKERS};
 // both the serial and the parallel driver, so the two cannot drift on the
 // question that matters -- which objects are reclaimed.
 //
-// PARALLEL MARKING WAS MEASURED AS A LOSS in this tree (+31% at one worker,
-// +153% at four; reverted 2026-08-14) and the reason does not carry over. A
-// mark is a dependent pointer chase: it is memory-LATENCY bound, and more
-// workers buy nothing while costing coherence traffic on shared queues. A sweep
-// is a linear scan with an independent, mostly-store body: it is bandwidth
-// bound. That is an argument, not a measurement, which is why this ships
-// default-off behind `CRATONVM_ZGC_PARSWEEP` -- see that function.
+// PARALLEL MARKING IS STILL A LOSS, but not for the reason recorded here
+// until 2026-09-02, and the difference is worth carrying because it says
+// where to look next.
+//
+// The 2026-08-14 measurement was +31% at one worker and +153% at four --
+// RISING with worker count, which is the signature of contention, and the
+// note here read it as "coherence traffic on shared queues". Re-measured on
+// BinTreesClassic 16 at -Xmx192m, release, after the per-edge shared counters
+// and the unconditional claim RMW came out of the drain loop (`mark_roots`,
+// `ZObjectStartBits::claim`), mark_us per cycle:
+//
+//     workers   0 (serial)      1        2        4
+//               4107 5277    8720 13842  8169 9820  6691 7040
+//
+// Serial still wins by 2x, but the cost now FALLS as workers are added
+// instead of rising. That inverts the diagnosis: what is left is not
+// contention, it is a fixed per-cycle charge that more workers amortise --
+// and `ZMarkCoordinator::new` spawns N OS threads on every cycle, with
+// `mark_with_controller_stw` spawning a controller on top. A persistent pool
+// parked between cycles is the next thing to try; chasing locks is not.
+//
+// None of it carries over to the SWEEP either way. A mark is a dependent
+// pointer chase, memory-LATENCY bound; a sweep is a linear scan with an
+// independent, mostly-store body, bandwidth bound. That is an argument rather
+// than a measurement, which is why sharding ships default-off behind
+// `CRATONVM_ZGC_PARSWEEP` -- and see that function for the further reason it
+// is currently unreachable.
 
 /// Everything one sweep worker produces. No shared state, by construction.
 ///
@@ -668,6 +688,24 @@ impl ZgcRealHeap {
     }
 
     /// How many threads the sweep should use. `1` is serial.
+    ///
+    /// # IT IS CURRENTLY UNREACHABLE, and that is a defect
+    ///
+    /// [`Self::sweep_bitmap`] is default-on and wins the arm selection in
+    /// `collect_garbage` before the worker count is ever consulted, so
+    /// `CRATONVM_ZGC_PARSWEEP=<n>` parses, clamps, reports, and does nothing.
+    /// A switch that answers is worse than one that is absent: it makes "I
+    /// measured the sharded sweep" a sentence someone can say about a run that
+    /// never sharded.
+    ///
+    /// The complement sweep is not trivially shardable -- it chains `prev_end`
+    /// across the whole address space to compute the free list as one merged,
+    /// ordered sequence, and a shard boundary falls in the middle of that
+    /// chain. Sharding it means giving each worker its own `[prev_end, first
+    /// live base)` seam and joining the seams, which is a real change rather
+    /// than a loop split. Until that is done the honest options are to make
+    /// this switch also disable the bitmap sweep, or to delete it; it is left
+    /// here, documented, rather than quietly.
     ///
     /// # Why this is default-off, on a phase that should parallelise
     ///
