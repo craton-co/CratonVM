@@ -7900,18 +7900,21 @@ pub fn gated_ref_store_enabled() -> bool {
 /// flip, and this flag exists so that whoever does the work can measure the
 /// two arms in one binary.
 ///
-/// **The frame-growth defect this was blamed for is fixed independently** and
-/// is not gated here — but not the way this comment claimed between
-/// 2026-09-01 and 2026-09-02. Carrying the home word on `StackSlot::Scratch`
-/// and reserving it at PUSH time made `push_from_rax` advance the spill cursor;
-/// the OSR entry's local homes come off the same layout, so an OSR transition
-/// loaded the wrong words. That shipped a nondeterministic heap corruption and
-/// was reverted the same day. The fix that stands is `Compiler::flush_home`:
-/// the flush prefers the position's own canonical `base + i*8` word over a
-/// fresh one, which reclaims the dead words a single high live slot pins out of
-/// `reset_spills`' reach — and moves no cursor a push can observe. Pure kernels
-/// get that fix today, and it is the prerequisite that would make any future
-/// widening bounded.
+/// **The frame-growth defect this was blamed for does not reproduce**, and
+/// this comment claimed the opposite between 2026-09-01 and 2026-09-02.
+/// Carrying the home word on `StackSlot::Scratch` and reserving it at PUSH time
+/// made `push_from_rax` advance the spill cursor; the OSR entry's local homes
+/// come off the same layout, so an OSR transition loaded the wrong words. That
+/// shipped a nondeterministic heap corruption and was reverted the same day,
+/// leaving a note that the growth itself was still open.
+///
+/// It is not. The spill census (`crate::spill_cursor_counts`) shows flush
+/// reservations are a small constant that does not move even when the budget is
+/// cut hard enough to refuse 177 compiles, and that peak usage tracks
+/// `max_stack` rather than the number of calls a method makes;
+/// `Compiler::flush_home` carries the inequality that explains why reserving is
+/// already optimal. Nothing here is a prerequisite for widening this flag any
+/// more — the register collision above is, and it still is.
 pub fn operand_cache_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();

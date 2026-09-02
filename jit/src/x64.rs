@@ -270,7 +270,7 @@ thread_local! {
 mod emit;
 mod frames;
 mod operand_stack;
-pub use operand_stack::{canonical_flush_home_enabled, spill_slots_cap};
+pub use operand_stack::spill_slots_cap;
 pub mod safepoint;
 // ---------------------------------------------------------------------------
 // Compile bytecode to x86-64

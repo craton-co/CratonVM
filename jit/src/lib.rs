@@ -18542,9 +18542,12 @@ pub fn compiled_frame_line_counts() -> [u64; 8] {
 /// | 8 | `res-total` | every word reserved, so the two attributed columns read as a fraction of a whole |
 /// | 9 | `min-headroom` | the FEWEST words left between a reservation's end and `spill_limit_offset`, over every compile (a MIN; `u64::MAX` means nothing reserved) |
 ///
-/// Column 2 is the engagement counter for the canonical-home flush: a zero
-/// there with a non-zero column 1 means that path never ran, which is a
-/// different finding from it running and not helping.
+/// Column 2 is retired and reads zero. It was the engagement counter for a
+/// canonical-home flush — store to `base + i*8`, reclaim a dead word below the
+/// cursor — and it read ZERO in every arm at every budget, which is what
+/// withdrew that change. The column is kept so the number has somewhere to go
+/// if anyone tries the idea again, and so this record does not have to be
+/// re-derived; see `Compiler::flush_home`.
 ///
 /// Column 9 is the one that answers "how close did anything actually get?".
 /// `peak-words` alone cannot: the limit is `max_stack` words and varies per

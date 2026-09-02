@@ -17,43 +17,6 @@
 
 use super::*;
 
-/// DEFAULT ON. Opt out with `CRATONVM_JIT_NO_CANONICAL_FLUSH_HOME=1`, which
-/// puts `flush_scratch_registers` back on a fresh spill word per flushed value.
-///
-/// The arm exists because this changes WHERE a live operand lives across a
-/// call, and the last change to that answer — reserving the home at push time,
-/// 2026-09-02 — shipped a nondeterministic heap corruption that took a bisect
-/// with a rebuild per hypothesis to find, because no flag could separate it in
-/// one binary. This one can.
-/// TEST-ONLY, opt-in: cap `spill_slots` at this many words, whatever
-/// `max_stack` asks for. Unset (the default) means no cap.
-///
-/// `spill-range-exhausted` is a refusal nothing in the tree could count until
-/// the spill census landed, and on every workload measured it fires ZERO times
-/// with 7 to 9 words of headroom to spare. A census column that never fires is
-/// indistinguishable from one armed where it cannot fire, and the way to tell
-/// them apart is to make the thing happen on purpose. Shrinking the budget does
-/// that without inventing a pathological method: it is the same emitter, the
-/// same workload and the same code path, with less room.
-///
-/// It caps rather than replaces, so a small method is unaffected and the arm
-/// only bites where the budget was actually being used.
-pub fn spill_slots_cap() -> Option<usize> {
-    static G: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var("CRATONVM_JIT_SPILL_SLOTS_CAP")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-    })
-}
-
-pub fn canonical_flush_home_enabled() -> bool {
-    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_CANONICAL_FLUSH_HOME").is_none()
-    })
-}
 
 impl Compiler {
     pub(super) fn checked_spill_range_end(&mut self, start: i32, slots: usize) -> Option<i32> {
@@ -815,14 +778,19 @@ impl Compiler {
         // it would actually take; the flag is opt-in so the two arms can be
         // measured in one binary.
         //
-        // The SECOND defect — a stretch of calls growing the spill region once
-        // per flush until `spill-range-exhausted` failed the compile — is fixed
-        // in `flush_home`, and deliberately NOT here. Reserving the home at PUSH
-        // time was tried on 2026-09-02 and reverted the same day: it made this
-        // function advance the spill cursor, the OSR entry's local homes are
-        // derived from the same layout, and the result was a nondeterministic
-        // heap corruption. Nothing in this function may touch the cursor, which
-        // is why the fix lives entirely on the flush side.
+        // The SECOND defect this comment used to carry — a stretch of calls
+        // growing the spill region once per flush until `spill-range-exhausted`
+        // failed the compile — DOES NOT REPRODUCE. The spill census
+        // (`spill_cursor_counts`) shows flush reservations are a small constant
+        // that does not move when the budget is cut to the point of refusing
+        // 177 compiles, and that peak usage tracks `max_stack` rather than the
+        // number of calls; `flush_home` carries the inequality that explains it.
+        //
+        // What remains true is the constraint: reserving the home at PUSH time
+        // was tried on 2026-09-02 and reverted the same day, because it made
+        // this function advance the spill cursor and the OSR entry's local
+        // homes are derived from the same layout — a nondeterministic heap
+        // corruption. Nothing here may touch the cursor.
         if self.kernel_operand_cache || operand_cache_enabled() {
             let free = SCRATCH_REGS.iter().copied().find(|&candidate| {
                 !self
@@ -890,52 +858,33 @@ impl Compiler {
     /// Where the flush should put the value that currently sits at
     /// operand-stack position `idx`.
     ///
-    /// The plain answer — take the next word off the spill cursor — is what
-    /// grows the region. The cursor only moves back at an instruction boundary
-    /// (`reset_spills`) and only down to just past the HIGHEST live frame slot,
-    /// so one live value parked high (`invalidate_callee_saved` reserves at the
-    /// top of the reserve and repoints buried entries at it) pins every dead
-    /// word below it out of reach. A stretch of calls then takes a fresh word
-    /// per flush above that pin until `checked_spill_range_end` refuses and the
-    /// whole method falls back to the interpreter.
+    /// It takes the next word off the spill cursor, and that is not a
+    /// compromise — it is optimal. The value being flushed is register-resident
+    /// and owns no word; the positions below it own at most `idx` words between
+    /// them; so `next_spill_offset <= base_spill_offset + idx*8`, and the
+    /// reserved word is never above the position's own canonical home. There is
+    /// no cheaper answer to hand it.
     ///
-    /// So prefer the position's OWN canonical home, `base + idx*8` — the word
-    /// `canonicalize_stack` would give it at the next merge point anyway, and
-    /// the layout `spill_size` is sized for. Two guards make that sound, and
-    /// both are refusals rather than repairs:
+    /// This function exists as a named site because the 2026-09-02 revert left a
+    /// note saying the opposite: that a fresh word per flushed value is what
+    /// made a call-heavy method grow its spill region until
+    /// `spill-range-exhausted` refused the compile. The spill census says that
+    /// is not what the cursor does. On a purpose-built 40-argument stress, a
+    /// `dup`/`astore` stress, CratonBench and the regression suite,
+    /// `flush-reserved` is a small constant (21 of 1067 reservations on the
+    /// stress; `res-push` dominates) and `peak-words` tracks the method's own
+    /// `max_stack`, not the number of calls it makes. Under
+    /// `CRATONVM_JIT_SPILL_SLOTS_CAP` at 48, 32, 24, 16, 12 and 8 words —
+    /// budgets tight enough to refuse 2 to 177 compiles — `flush-reserved`
+    /// does not move at all.
     ///
-    /// * **It must lie inside the already-reserved region** (`< next_spill_offset`).
-    ///   An instruction that needs private scratch homes takes them from a base
-    ///   that clears every live frame slot — above the cursor, never below it
-    ///   (see `arraycopy_scratch_homes_are_allocated_clear_of_the_operand_homes`).
-    ///   Staying under the cursor is what keeps this flush from landing on one.
-    /// * **No other position may already own that word.** Frame offsets are NOT
-    ///   monotone in stack position: `invalidate_callee_saved` repoints buried
-    ///   entries to a single high word, so position 0 can hold `base + 5*8`.
-    ///   Writing a canonical home blind would overwrite a live buried operand —
-    ///   the same class of clobber `canonicalize_stack` solves with a parallel
-    ///   move, and the reason this asks instead of assuming.
-    ///
-    /// When either guard says no, fall back to reserving. That is today's
-    /// behaviour, so the worst case is unchanged and the best case is bounded
-    /// by `stack.len()`.
-    fn flush_home(&mut self, idx: usize) -> Option<i32> {
-        if canonical_flush_home_enabled() {
-            let canonical = self
-                .base_spill_offset
-                .checked_add(i32::try_from(idx).ok()?.checked_mul(8)?)?;
-            let inside = canonical.checked_add(8).is_some_and(|end| end <= self.next_spill_offset);
-            if inside
-                && !self
-                    .stack
-                    .iter()
-                    .enumerate()
-                    .any(|(j, s)| j != idx && matches!(s, StackSlot::Frame(o) if *o == canonical))
-            {
-                crate::note_spill_cursor(crate::SPILL_FLUSH_CANONICAL, 1);
-                return Some(canonical);
-            }
-        }
+    /// A canonical-home variant of this function (store to `base + idx*8` and
+    /// reuse a dead word below the cursor) was written, shipped behind a kill
+    /// switch, and withdrawn: its engagement counter read ZERO in every arm at
+    /// every budget, for the reason the inequality above gives — at a flush
+    /// there is no dead word below the cursor to reclaim. Anyone reaching for
+    /// this again should read `spill_cursor_counts()` first.
+    fn flush_home(&mut self, _idx: usize) -> Option<i32> {
         crate::note_spill_cursor(crate::SPILL_FLUSH_RESERVED, 1);
         self.reserve_spill_slots(1)
     }
