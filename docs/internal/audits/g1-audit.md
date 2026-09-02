@@ -538,7 +538,22 @@ Ordered. Each item is a precondition for the next being meaningful.
    the coarsening bound above is confirmed as insurance for the O(regions²)
    ceiling rather than as relief from present pressure.
 
-   Getting a reading took a purpose-built probe (`apps/g1_probe/RsetChurn.java`, committed so the number stays
+   **The probe named below was NOT in the tree, and could not have been.** This
+   item says it was "committed so the number stays reproducible"; the commit
+   that wrote that sentence touched no `.java` file at all. The cause is
+   mechanical rather than careless — `apps/` is in `.gitignore` (line 12), so
+   `git add apps/g1_probe/RsetChurn.java` silently added nothing and the commit
+   went out claiming a file it did not carry. From that day until 2026-09-02 the
+   number could not be reproduced by anyone.
+
+   The probe is reconstructed from this paragraph's own description of it and
+   now lives at `probes/RsetChurn.java`, which is tracked. That matters because
+   F-05 revisits the conclusion drawn here: `rset_bytes_per_live_byte` answers
+   the SPACE question, and it was read as also answering the TIME one — what it
+   costs to ACT on an entry, which for a region-granular set is a linear walk of
+   the whole source region.
+
+   Getting a reading took a purpose-built probe (`probes/RsetChurn.java`, committed so the number stays
    reproducible: four retained
    depth-12 trees whose leaves are re-pointed at fresh young arrays every
    round, so the edges are old→young and load-bearing) and three corrections

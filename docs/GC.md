@@ -316,7 +316,7 @@ target at the ceiling is not a trigger — and an unproductive pause (nothing
 copied, nothing freed) resets it to the ceiling so it can never storm.
 
 It is **not** a default, and the reason is measured. On
-`apps/probes/G1ChurnPauseProbe 96 900` at `-Xmx2048m` (96 MiB retained, 3.6 GiB
+`probes/G1ChurnPauseProbe 96 900` at `-Xmx2048m` (96 MiB retained, 3.6 GiB
 of garbage, 200 ms goal), medians of 3 interleaved reps:
 
 | arm | wall | pauses | total pause | p50 | p99 |
@@ -344,10 +344,16 @@ lookup on the innermost loop (F-03), the parallel driver stopped taking the
 whole-heap fix-up (F-04), and cleanup stopped walking the heap (F-06). If the
 per-pause cost fell enough, the trade inverts and this should be a default.
 
-Re-running it is the work, not re-reasoning about it: `apps/probes/G1ChurnPauseProbe 96 900`
+Re-running it is the work, not re-reasoning about it: `probes/G1ChurnPauseProbe 96 900`
 at `-Xmx2048m`, medians of 3 interleaved reps, flag OFF vs ON, on a QUIET host —
 a contended one inverts an A/B of this size, and every number in the table above
 was taken on an idle machine for that reason.
+
+One obstacle had to be cleared first: **the probe was not in the tree**. It was
+committed with the measurement, then deleted along with the rest of `probes/` by
+a "major doc consistency update" while every citation of it survived — including
+this document's, which also named the wrong directory. It is restored, and its
+`checksum` line is there so a run can be diffed against a real JDK's.
 
 *Where a young pause actually goes.* Every `--verbose:gc`
 `[GC-STAT]` line now carries a per-phase breakdown — `roots_us`, `rset_us`,
@@ -358,7 +364,7 @@ walk and a large old generation are different problems. The seven fields SUM to
 which runs in release builds and used to be charged to no phase at all, and
 `other_us` is the derived remainder. A table whose rows do not sum to the total
 cannot be used to argue that a cost was removed rather than moved, which is
-exactly what the rest of this section tries to do with it. On `apps/probes/G1ChurnPauseProbe 96 900`
+exactly what the rest of this section tries to do with it. On `probes/G1ChurnPauseProbe 96 900`
 at `-Xmx2048m` a 330 ms young pause split: roots 0.7 %, remembered-set
 walks 0.03 %, Cheney closure 38 %, whole-heap fix-up 10-18 %, freeing the
 collection set **42 %**. That last figure is why the phase breakdown exists
