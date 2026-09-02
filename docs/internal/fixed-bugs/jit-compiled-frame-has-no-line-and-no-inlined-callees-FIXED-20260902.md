@@ -148,7 +148,16 @@ Three things it says that nothing else could:
   could not recover. A run where those two diverged would mean the side channel
   had fired for a frame that did not need it.
 * **`switched-off` is zero**, so no arm of this measurement was silently
-  running with a kill switch left set in the environment.
+  running with a kill switch left set in the environment. That column earned
+  itself during this round. The arm that sets all ten switches at once was run
+  by `export`ing them into a long-lived shell, and every command issued after
+  it — including a `cargo test` of the new integration test — inherited them.
+  The test failed exactly the way the closed defect used to
+  (`after_warm=len=2 [probe:56 main:67]`), and for a few minutes that looked
+  like a regression rather than a dirty environment. Twenty clean runs put it
+  back to 20 of 20. A measurement that cannot say *which switches were set
+  while I measured* cannot tell those two apart; set arms with `env VAR=1 cmd`,
+  never `export`, and read `switched-off` before believing any row.
 
 `inline-map-at-return=[2,0,0,0,0]` on the spliced witness and `[0,…]` on the
 other: the exact return-address key is being spent where there is a splice to
@@ -519,6 +528,7 @@ of the time at p=0.9.
 | `regression-suite/src/RJitStackTraceLines.java` | (1) and (3) **and now (4)'s tier**, against HotSpot 25. Asserts no line constants: the same site is reached cold and hot and the two traces must agree, so editing the file cannot make it vacuously true. |
 | `vm/tests/stack_trace_across_tiers.rs` | all four rows of the spliced witness, plus `CRATONVM_JIT_NO_COMPILED_FRAME_LINES`, `CRATONVM_JIT_NO_INLINE_FRAME_MAP` and `CRATONVM_JIT_NO_OSR_PC_REFRESH`. Uses `CRATONVM_DISABLE_JIT=1` on the SAME binary and `.class` file as the oracle, so it can never go stale on a probe edit. |
 | `vm/tests/stack_trace_compiled_callee.rs` | **new** — defect (5) end to end: the frame that RAISED is present in all three rows, no frame reports a non-positive line, the interpreter arm agrees byte for byte, and `CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT` / `CRATONVM_JIT_NO_NPE_TRAP_LINES` each still revert their own half. |
+| `jit/src/x64/tests.rs` — the three inline null-check tests | the packed word at the machine-code level. They already asserted the JEP-358 action byte; the trampoline now passes `action \| (trap_key << 8)`, so the test hook splits the word ONCE and `test_inline_arraylength_null_throws_npe` additionally asserts the site id is non-zero. A key of zero is precisely what a trace prints as `Method:-1`, so the unit test now fails where the trace used to merely degrade. |
 
 > The compiled-callee test is a `vm/tests` test rather than a
 > `regression-suite` vector for a measured reason: the oracle would have to be
