@@ -99,11 +99,14 @@ pub(crate) const PLAB_MAX: usize = 256 * 1024;
 /// allocator directly, so one large array cannot strand most of a buffer.
 const DIRECT_MIN: usize = 32 * 1024;
 
-/// Objects a worker takes from the shared stack per acquisition.
+/// Objects a worker takes from the shared stack per acquisition, at most.
+/// It also never takes more than half of what is there, so a stack of one
+/// entry is not emptied by the first of eight idle workers to wake.
 const ACQUIRE_CHUNK: usize = 128;
-/// Local stack depth at which a worker publishes surplus work.
+/// Local stack depth at which a worker publishes surplus work regardless of
+/// whether anyone is waiting.
 const SPILL_HIGH: usize = 1024;
-/// Depth a worker keeps for itself when spilling.
+/// Depth a worker keeps for itself when spilling at [`SPILL_HIGH`].
 const SPILL_KEEP: usize = 256;
 
 /// A bump buffer a worker owns outright: `[start, end)` was carved from a
@@ -147,6 +150,19 @@ struct WorkState {
     done: bool,
 }
 
+/// The measurement this exists for (gen-gc-five, r1 release A/B on
+/// `OldGenRsetProbe`): eight workers drained ~350k survivors in 56–72 ms while
+/// ONE worker took 37–49 ms. A depth-first walk of a binary tree pops one
+/// node and pushes two, so a worker's local stack sits at about the tree's
+/// depth — twenty entries — and never reaches [`SPILL_HIGH`]; worker 0 did
+/// the whole closure while seven waited on the condvar. Work has to be
+/// DONATED, not spilled: whenever another worker is idle and this one holds
+/// more than one object, it hands over half. The idle count is mirrored in
+/// an atomic so the test costs one relaxed load per scanned object, and it
+/// goes to zero as soon as the donations land, so a saturated drain pays the
+/// lock only at [`SPILL_HIGH`] as before.
+struct IdleHint(std::sync::atomic::AtomicUsize);
+
 /// Everything the workers share for one drain. Built by the collector with
 /// the arena guards it already holds; the `&mut` borrows end when this is
 /// dropped, before the sequential phases resume.
@@ -164,6 +180,7 @@ pub(crate) struct EvacShared<'a> {
     threads: usize,
     work: Mutex<WorkState>,
     cv: Condvar,
+    idle_hint: IdleHint,
 }
 
 impl<'a> EvacShared<'a> {
@@ -200,6 +217,7 @@ impl<'a> EvacShared<'a> {
                 done: false,
             }),
             cv: Condvar::new(),
+            idle_hint: IdleHint(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -611,11 +629,12 @@ impl<'s, 'a> Worker<'s, 'a> {
                     }
                     let len = g.stack.len();
                     if len > 0 {
-                        let take = len.min(ACQUIRE_CHUNK);
+                        let take = len.div_ceil(2).min(ACQUIRE_CHUNK);
                         self.local.extend(g.stack.drain(len - take..));
                         break;
                     }
                     g.idle += 1;
+                    self.sh.idle_hint.0.store(g.idle, Ordering::Relaxed);
                     if g.idle == self.sh.threads {
                         // Every worker is out of work and the shared stack is
                         // empty: the closure is complete.
@@ -625,19 +644,32 @@ impl<'s, 'a> Worker<'s, 'a> {
                     }
                     g = self.sh.cv.wait(g).unwrap_or_else(|e| e.into_inner());
                     g.idle -= 1;
+                    self.sh.idle_hint.0.store(g.idle, Ordering::Relaxed);
                 }
             }
             while let Some(addr) = self.local.pop() {
                 self.scan(addr);
-                if self.local.len() >= SPILL_HIGH {
-                    let surplus = self.local.len() - SPILL_KEEP;
-                    let mut g = self.sh.work.lock().unwrap_or_else(|e| e.into_inner());
-                    g.stack.extend(self.local.drain(..surplus));
-                    drop(g);
-                    self.sh.cv.notify_all();
+                let len = self.local.len();
+                if len >= SPILL_HIGH {
+                    self.donate(len - SPILL_KEEP);
+                } else if len >= 2 && self.sh.idle_hint.0.load(Ordering::Relaxed) > 0 {
+                    self.donate(len / 2);
                 }
             }
         }
+    }
+
+    /// Move the OLDEST `n` entries of the local stack to the shared one and
+    /// wake the waiters. Oldest, because in a depth-first walk those are the
+    /// widest subtrees: the donation carries the most work per entry.
+    fn donate(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let mut g = self.sh.work.lock().unwrap_or_else(|e| e.into_inner());
+        g.stack.extend(self.local.drain(..n));
+        drop(g);
+        self.sh.cv.notify_all();
     }
 
     fn finish(mut self) -> EvacOutcome {

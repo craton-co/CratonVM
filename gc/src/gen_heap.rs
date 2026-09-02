@@ -2501,6 +2501,15 @@ fn copy_tally_arm(reencounter: bool) {
     });
 }
 
+/// The largest worker's share of a cycle's copies, in percent.
+fn maps_total(objects_copied: usize, max_worker_objects: usize) -> usize {
+    if objects_copied == 0 {
+        0
+    } else {
+        max_worker_objects * 100 / objects_copied
+    }
+}
+
 /// The pause-goal loop's memory between two collections. See
 /// [`next_young_trigger`].
 #[derive(Debug, Default, Clone, Copy)]
@@ -7805,17 +7814,31 @@ impl GenerationalHeap {
                 drop(shared);
                 mv_phase!("evac_drain");
                 let (mut chunks, mut plabs, mut lost, mut filler) = (0u128, 0u128, 0u128, 0u128);
+                let mut max_worker_objects = 0usize;
+                let mut maps: Vec<Vec<(usize, usize)>> = Vec::with_capacity(outcomes.len());
                 for o in outcomes {
-                    pointer_map.extend(o.map);
+                    maps.push(o.map);
                     deferred_dirty_cards.extend(o.deferred_cards);
                     objects_copied += o.objects_copied;
+                    max_worker_objects = max_worker_objects.max(o.objects_copied);
                     copy_tally_add_bulk(o.tally);
                     chunks += o.to_chunks as u128;
                     plabs += o.plabs as u128;
                     lost += o.lost_races as u128;
                     filler += o.to_filler_bytes as u128;
                 }
+                // The workers' pair lists become the map on `threads` threads
+                // (gen-gc-five item 5): the single-threaded fold was 15-25 ms
+                // of a ~105 ms pause on the r1 A/B.
+                pointer_map.par_extend_pairs(&maps, threads);
+                drop(maps);
                 mv_phase!("map_merge");
+                if mv_phase_on {
+                    // Load balance: the largest worker's share of the copies.
+                    // 100 means one worker did everything (the r1 shape).
+                    let total = maps_total(objects_copied, max_worker_objects);
+                    moving_phase_count_push("evac_max_worker_pct", total as u128);
+                }
                 // Everything in to-space has been scanned; the sequential
                 // phases below resume from the frontier.
                 scan_cursor = young_to.used();
