@@ -1295,7 +1295,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_GETFIELD_HELPER` | JIT | `CRATONVM_JIT=getfield-helper` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_GETSTATIC_HELPER` | JIT | `CRATONVM_JIT=getstatic-helper` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` | JIT | `CRATONVM_JIT=guarded-virtual-inline` | opt-in | off | behaviour | snapshot | vm |
-| `CRATONVM_JIT_IMPLICIT_NULL_CHECK` | JIT | `CRATONVM_JIT=implicit-null-check` | opt-in | off | behaviour | snapshot | jit |
+| `CRATONVM_JIT_IMPLICIT_NULL_CHECK` | JIT | `CRATONVM_JIT=implicit-null-check` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_INCLUSIVE_BCE` | JIT | `CRATONVM_JIT=inclusive-bce` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_INDY_BRIDGE` | JIT | `CRATONVM_JIT=indy-bridge` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_INLINE_CALLS` | JIT | `CRATONVM_JIT=inline-calls` | opt-in | off | behaviour | snapshot | vm |
