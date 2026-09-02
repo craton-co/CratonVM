@@ -9,7 +9,7 @@ annotation on nine autoconfiguration classes.
 Retires the `WebMvcEndpointIntegrationTests` half of
 `known-issues/springboot/jettyreactive-tls-timeout-and-webmvcendpoint-autoconfig-20260829.md`.
 The Jetty mTLS half of that page is a different defect and stays open — see
-`known-issues/springboot/jettyreactive-mtls-close-not-observed-20260829.md`.
+`retired/jettyreactive-mtls-verify-timeout-is-load-not-a-close-path-defect-RETIRED-20260901.md`.
 
 ## What the page said, and what the log said
 
