@@ -133,38 +133,14 @@
 //!
 //! # Integration status
 //!
-//! This module is fully implemented and unit-tested but is **not yet
-//! wired into the JIT admission path**. Every JIT/OSR admission call
-//! site that would need a one-line addition
-//! (`crate::runtime::offload_jit_gate::caller_blocks_jit_by_name(shared,
-//! class_id, class_name, method_name, descriptor)` ORed into the
-//! existing skip/deny check) lives inside `vm/src/runtime/interpreter.rs`,
-//! which — in the multi-agent session that authored this module — is
-//! owned by a different, concurrently-editing agent and was read-only
-//! for this change. The four sites (all funnel through
-//! `crate::jit::skip_list::should_skip_jit_with_init`, confirming that
-//! function's own doc comment: "the single source of truth"):
-//!
-//! 1. First-call eager compile path (`fn execute`, the `static_skip_reason`
-//!    check around the `should_skip_jit_with_init` call near line 4321).
-//! 2. `try_jit_upgrade_with_gate` — caller-invocation-count promotion,
-//!    `should_skip_jit_with_init` call near line 27156.
-//! 3. The recursive callee-compile closure inside the caller-counter
-//!    promotion path, `should_skip_jit_with_init` call near line 27510.
-//! 4. `try_jit_compile_callee_slow` — the callee-dispatcher compile path
-//!    used by JIT helper callbacks, `should_skip_jit_with_init` call near
-//!    line 28268.
-//! 5. `compile_osr_artifact` — **the OSR path this whole module exists
-//!    for** ("OSR of a hot loop that contains the invokestatic"),
-//!    `should_skip_jit_with_init` call near line 25586.
-//!
-//! Every one of those five call sites already has `shared: &SharedVm`,
-//! a resolved `class_id`/`declaring_class_id`, and the method's
-//! `class_name`/`method_name`/`descriptor` in scope, so wiring in
-//! [`caller_blocks_jit_by_name`] at each is mechanically a one-line
-//! addition (`|| crate::runtime::offload_jit_gate::caller_blocks_jit_by_name(...)`
-//! next to that site's existing skip check) — no further design work
-//! needed, just ownership of the file.
+//! Wired. [`caller_blocks_jit_by_name`] is consulted at every JIT/OSR
+//! admission site — one in `interpreter.rs` and four in
+//! `interpreter/jit_bridge.rs` (first-call eager compile, the
+//! invocation-count promotion, the callee-compile closure inside it, the
+//! callee-dispatcher compile path, and `compile_osr_artifact`, the OSR
+//! path this module exists for). Find them with
+//! `grep -rn caller_blocks_jit_by_name vm/src`. This paragraph said "not
+//! yet wired" for several weeks after it was.
 
 #![cfg(feature = "gpu-offload")]
 

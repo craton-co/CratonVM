@@ -22,6 +22,13 @@ cratonvm-types = { path = "../types", version = "0.3.0" }
 # (and has no `[dev-dependencies]` at all). The `cratonvm-jit` edge below is
 # `[dev-dependencies]`-only and is unaffected.
 cratonvm-jfr = { path = "../jfr", version = "0.3.0" }
+# The GPU critical-section registry (`cratonvm_cuda_bridge::critical`): the
+# one place every collector asks "may I relocate, and what must I keep alive"
+# before a cycle. Optional, pulled in only by `gpu-offload`. Acyclic:
+# `cratonvm-cuda-bridge` depends on `cratonvm-types` and nothing else in the
+# workspace; its `cuda` feature is NOT enabled here, so this is the driverless
+# stub crate and adds no toolkit requirement.
+cratonvm-cuda-bridge = { path = "../cuda-bridge", version = "0.3.0", optional = true }
 parking_lot.workspace = true
 tracing.workspace = true
 rustc-hash.workspace = true
@@ -55,7 +62,7 @@ default = ["zgc"]
 # Enables `safepoint::SafepointToken`, `Heap::enter_gpu_critical`, and
 # GC-delay logic that pauses collection while a token is held. With this
 # feature off the crate compiles to identical bytes as before the GPU work.
-gpu-offload = []
+gpu-offload = ["dep:cratonvm-cuda-bridge"]
 # The Z Garbage Collector backend — THE DEFAULT COLLECTOR OF THIS VM. As of
 # 2026-08-10 it is `src/zgc.rs`, `src/zgc_concurrent.rs` and the TWELVE modules
 # of `src/zgc/`: vaddr, page, barrier, forwarding, metrics, remembered, mark,

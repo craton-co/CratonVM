@@ -1934,6 +1934,8 @@ impl SharedVm {
             string_dedup: config.g1_string_dedup,
             parallel_gc_threads: config.g1_parallel_gc_threads,
             initial_heap_size: Some(config.initial_heap_size),
+            mixed_gc_live_threshold_percent: config.g1_mixed_gc_live_threshold_percent,
+            heap_waste_percent: config.g1_heap_waste_percent,
         };
         let mut heap = VmHeap::new_with_overrides(gc_backend, config.max_heap_size, g1_overrides);
         // Bind the heap to THIS VM's compact-layout domain, here rather than
@@ -3708,7 +3710,7 @@ impl SharedVm {
         let native_encoding = derive_native_encoding();
         sys_props.insert("file.encoding".to_string(), "UTF-8".to_string());
         sys_props.insert("native.encoding".to_string(), native_encoding.clone());
-        sys_props.insert("sun.jnu.encoding".to_string(), "UTF-8".to_string());
+        sys_props.insert("sun.jnu.encoding".to_string(), native_encoding.clone());
         sys_props.insert(
             "stdout.encoding".to_string(),
             cratonvm_native_api::os_encoding::stream_encoding(
@@ -10365,6 +10367,17 @@ impl std::fmt::Debug for Vm {
 /// a second call — because it is deliberately invoked from two places (see
 /// below), and either may run first or alone.
 pub fn release_vm_native_state(vm_identity: usize) {
+    // GPU critical-section tokens this VM's submissions still hold. A
+    // submission in flight when its VM goes away can never be finalized —
+    // the completion reaper's `Weak::upgrade` fails — so without this its
+    // token would stay outstanding, its keep-alive roots would name a dead
+    // heap on the next VM's collection, and until its lease expired the
+    // registry would still be describing a holder that cannot act. Reaping
+    // here names each one at `warn` and poisons its writeback.
+    #[cfg(feature = "gpu-offload")]
+    {
+        let _ = cuda_bridge::critical::global().shutdown_vm(vm_identity as u64);
+    }
     cratonvm_native_api::uninstall_capabilities(cratonvm_native_api::VmId::from_raw(vm_identity));
     cratonvm_native_builtins::security_manager::forget_vm_security_state(vm_identity);
     // The built-in app/platform `ClassLoader` singletons. Same reasoning as the

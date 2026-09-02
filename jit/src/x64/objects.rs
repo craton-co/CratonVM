@@ -497,6 +497,54 @@ impl Compiler {
         vec![self.emit_jcc_rel32_patch(0x84)] // JZ -> checked helper
     }
 
+    /// [`Self::emit_trusted_oop_receiver_check`], with the check DROPPED when
+    /// the null-check dataflow already proves the receiver non-null at
+    /// `bc_pc`. Returns an empty patch list in that case, which every caller
+    /// already handles — the slow path is simply unreachable.
+    ///
+    /// # Only `getfield` may call this
+    ///
+    /// The proof is `preceding_aload_nonnull_local`: the local named by the
+    /// `aload` that ends exactly at `bc_pc`. That local is the receiver only
+    /// when the receiver is the value on TOP of the operand stack, which is
+    /// true of `getfield` and of nothing else nearby:
+    ///
+    /// * `putfield`'s stack is `[…, objectref, value]` — the preceding push is
+    ///   the stored VALUE, and attributing the receiver's fact to it is the
+    ///   exact shape of the Tomcat `MessageBytes.setString` miscompile that
+    ///   `opcode_dereferences_receiver` documents at length.
+    /// * `checkcast` does not throw on null at all — a null cast succeeds —
+    ///   so its `JZ` targets a legal null path, not an NPE. Eliding it would
+    ///   let a null receiver fall into the `KIND_TAGS` byte compare and fault.
+    ///
+    /// # Why this cannot see a spliced callee's bytecode
+    ///
+    /// `self.null_check_info` is analysed from the caller's `code` and indexed
+    /// by caller bci. `compile_bytecode` is called exactly once, on that same
+    /// array (`driver.rs`), and the inline splicer emits callee bodies through
+    /// its own emitters rather than re-entering the walk — so `code` and
+    /// `bc_pc` here always denote the method the analysis actually ran on. A
+    /// future splicer that DID re-enter `compile_bytecode` with a callee's
+    /// bytecode would break that pairing silently, which is why it is written
+    /// down rather than left to be rediscovered.
+    pub(super) fn emit_trusted_oop_receiver_check_at(
+        &mut self,
+        code: &[u8],
+        bc_pc: usize,
+    ) -> Vec<usize> {
+        if super::null_check_elim::receiver_null_elim_enabled() {
+            if let Some(local) = super::null_check_elim::preceding_aload_nonnull_local(code, bc_pc)
+            {
+                if self.is_local_nonnull(bc_pc, local) {
+                    super::null_check_elim::note_receiver_null_check_elided();
+                    return Vec::new();
+                }
+            }
+        }
+        super::null_check_elim::note_receiver_null_check_emitted();
+        self.emit_trusted_oop_receiver_check()
+    }
+
     // -----------------------------------------------------------------
     // F-08 — the inline G1 post-write barrier
     // -----------------------------------------------------------------

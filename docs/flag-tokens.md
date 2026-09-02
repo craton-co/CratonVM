@@ -577,7 +577,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-282 tokens.
+286 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -678,6 +678,8 @@ export inherited from a parent shell.
 | `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
 | `gated-ref-store` | `CRATONVM_JIT_GATED_REF_STORE` |
+| `this-nonnull` | `CRATONVM_JIT_THIS_NONNULL` |
+| `receiver-null-elim` | `CRATONVM_JIT_RECEIVER_NULL_ELIM` |
 | `operand-cache` | `CRATONVM_JIT_OPERAND_CACHE` |
 | `ir-reloc-emit` | `CRATONVM_JIT_IR_RELOC_EMIT` |
 | `reloc-gate-map-incomplete` | `CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE` |
@@ -742,6 +744,7 @@ export inherited from a parent shell.
 | `ic-frame-republish` | `CRATONVM_JIT_NO_IC_FRAME_REPUBLISH` |
 | `checkcast-inline` | `CRATONVM_JIT_CHECKCAST_INLINE` |
 | `final-devirt` | `CRATONVM_JIT_FINAL_DEVIRT` |
+| `devirt-intrinsic-yield` | `CRATONVM_JIT_NO_DEVIRT_INTRINSIC_YIELD` |
 | `inline-calls` | `CRATONVM_JIT_INLINE_CALLS` |
 | `inline-nest` | `CRATONVM_JIT_INLINE_NEST` |
 | `inline-call-dispatch` | `CRATONVM_JIT_INLINE_CALL_DISPATCH` |
@@ -829,6 +832,7 @@ export inherited from a parent shell.
 | `elide-trivial-ctor` | `CRATONVM_JIT_ELIDE_TRIVIAL_CTOR` |
 | `site-cache-stubs` | `CRATONVM_JIT_SITE_CACHE_STUBS` |
 | `atomic-long-intrinsic` | `CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC` |
+| `box-unbox-intrinsic` | `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC` |
 | `tier-c1-threshold` | `CRATONVM_TIER_C1_THRESHOLD` |
 | `tier-c2-min-invocations` | `CRATONVM_TIER_C2_MIN_INVOCATIONS` |
 | `tier-c2-threshold` | `CRATONVM_TIER_C2_THRESHOLD` |
@@ -866,7 +870,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-109 tokens.
+112 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -921,6 +925,8 @@ export inherited from a parent shell.
 | `gpu-jit-array-writers` | `CRATONVM_GPU_JIT_ARRAY_WRITERS` |
 | `gpu-critical-lease-ms` | `CRATONVM_GPU_CRITICAL_LEASE_MS` |
 | `gpu-critical-wait-ms` | `CRATONVM_GPU_CRITICAL_WAIT_MS` |
+| `gpu-host-callback` | `CRATONVM_GPU_HOST_CALLBACK` |
+| `gpu-device-pool` | `CRATONVM_GPU_DEVICE_POOL` |
 | `gpu-zerocopy` | `CRATONVM_GPU_NO_ZEROCOPY` |
 | `lhm-root-all` | `CRATONVM_LHM_ROOT_ALL` |
 | `max-inflated-bytes` | `CRATONVM_MAX_INFLATED_BYTES` |
@@ -939,9 +945,10 @@ export inherited from a parent shell.
 | `oldgen-compact` | `CRATONVM_OLDGEN_COMPACT` |
 | `overhead-limit` | `CRATONVM_GC_OVERHEAD_LIMIT` |
 | `owner-class-filter` | `CRATONVM_OWNER_CLASS_FILTER` |
-| `par-evac` | `CRATONVM_GC_PAR_EVAC` |
 | `par-min-bytes` | `CRATONVM_GC_PAR_MIN_BYTES` |
+| `par-evac` | `CRATONVM_GC_PAR_EVAC` |
 | `par-threads` | `CRATONVM_GC_PAR_THREADS` |
+| `sync-young-wipe` | `CRATONVM_GC_SYNC_YOUNG_WIPE` |
 | `promotion-guard` | `CRATONVM_NO_GC_PROMOTION_GUARD` |
 | `promotion-oom-guard-broad` | `CRATONVM_PROMOTION_OOM_GUARD_BROAD` |
 | `selective-promote` | `CRATONVM_NO_SELECTIVE_PROMOTE` |
@@ -1107,7 +1114,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-21 tokens.
+22 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1132,6 +1139,7 @@ export inherited from a parent shell.
 | `strict-swallows` | `CRATONVM_STRICT_SWALLOWS` |
 | `tomcat-mapper-natives` | `CRATONVM_TOMCAT_MAPPER_NATIVES` |
 | `vh-strict-reference-return` | `CRATONVM_VH_STRICT_REFERENCE_RETURN` |
+| `vh-null-coordinate-npe` | `CRATONVM_VH_NULL_COORDINATE_NPE` |
 
 ## `CRATONVM_TEST`
 
