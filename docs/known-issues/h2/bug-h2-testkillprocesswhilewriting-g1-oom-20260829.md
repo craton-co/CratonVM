@@ -322,9 +322,98 @@ source-side screen, corrected, run with `CRATONVM_G1_DBG_REACH=1` so the report
 names the CARVE that handed out the span; and the A-vs-B kill-switch comparison
 on a host quiet enough for it to mean something.
 
+### 4d. 2026-09-02, ROOT CAUSE: G1 evacuated a CSet root that pointed INSIDE an array, and manufactured an object out of the element
+
+Sections 4a-4c chased the holder shape through the collector and kept arriving
+one move too late. The instrument that ended it prints, for an implausible
+header, its position in its own region's OBJECT GRID and the raw bytes:
+
+```text
+IMPLAUSIBLE legacy header at cset-root (#1): obj=0x20045200130
+    class_id=1135069736 kind=Object num_slots=512 mark=0x0 claims=0x2010 bytes
+    source=r46/Survivor/off=0x130/... OWNER=evac:hint-dest extent=[0x108,0x218) size=0x110
+    grid=INTERIOR of=0x108 delta=0x28 size=0x110 cid=185 kind=Array idx=4
+    bytes[ ... >>0x130=0x0000020043a7ca28<< ... ]
+```
+
+**The root is 0x28 bytes inside a live reference ARRAY**, and the region's own
+carve trail confirms the extent independently (`OWNER=evac:hint-dest
+extent=[0x108,0x218) size=0x110`). `evacuate_object` read that ELEMENT as an
+object header. The element holds a heap pointer, so:
+
+| header field | what it actually read | value |
+|---|---|---|
+| `class_id` | the pointer's LOW half | `0x43a7ca28` |
+| `num_slots` | the pointer's HIGH half | `0x200` = **512** |
+| `mark_word` | the next eight bytes | 0 -> `kind=Object` |
+
+`num_slots=512` is not a shape. **It is the top half of every address on a heap
+based at `0x2_0000_0000`** -- which is why every holder in sections 4a-4c
+reported 512, and why the `class_id` looked like random garbage each run: it is
+whatever pointer that slot happened to hold. (The `class_id=0 num_slots=8192`
+variant is the same read landing on a slot whose high half is 0.)
+
+The object was then sized at `0x2010`, **eight kilobytes were copied into a
+Survivor region**, and `*root` was rewritten to name the fabrication. Scanning
+it as 512 legacy `Value` slots is the entire downstream family: the rejected
+candidates, the CLAMPED walks, the dangling references and the segfault.
+
+#### The guard had been reporting this for its whole life and doing nothing
+
+`note_root_object_plausibility` already answered "is this CSet root an object?"
+and `NON_OBJECT_ROOT_COPIED` already existed **to count the times the evacuator
+copied one anyway**. The guard was measurement-only, and what it was measuring
+was the collector manufacturing an object out of an array element.
+
+#### ...but it was the wrong predicate, and the first fix measured ZERO
+
+Refusing on that guard alone changed nothing: `skipped=0` on a run still
+producing implausible headers. `candidate_header_is_plausible` asks whether the
+two header tag bytes decode and the address sits below its region's cursor --
+and **an interior address satisfies both trivially**, which is exactly why this
+root was evacuated and why `NON_OBJECT_ROOT_SEEN` had read 0 all along. The
+refusal has to be on BOTH predicates: the tag screen and the implausible-header
+screen. That is the shipped fix; both root loops now leave such a root
+unchanged and pin its region.
+
+#### MEASURED: the cascade is gone
+
+One binary, `-XX:+UseG1GC`, 900 s cap, quiet host (loadavg 4-14). Counts are
+reported lines, and the report throttle is shared across sites, so read the
+ZEROES rather than the ratios:
+
+| implausible header at | before the fix | after |
+|---|---:|---:|
+| `cset-root` (the arrival) | 6 | 11 |
+| `evacuate-src` | 2 | **0** |
+| `evacuate-dest` | 1 | **0** |
+| `worklist-holder` | 2 | **0** |
+| `rset-source-walk` | 4 | **0** |
+| `ref-slot-candidate` | 3 | **0** |
+
+The bad addresses still ARRIVE as conservative roots -- that is what
+conservative scanning is for, and 11 of them is not a defect -- but nothing
+downstream is fabricated from them any more. `[SECURITY V7b]` dangling
+references went to **0**, from 19-65 on the immediately preceding runs and
+48 617 / 50 747 when this page was opened. `copy_shape_drift=0` throughout, and
+`NON_OBJECT_ROOT_COPIED` is now structurally zero and still printed, so
+reintroducing the copy shows up in the same line that reports the skips.
+
+Reproduced identically at rep 2 (`skipped=11 copied=0 v7b=0`) on a loadavg-4
+host.
+
+#### What is NOT fixed
+
+**The class still caps at 900 s** (`rc=124`, 3/3). The corruption face is what
+closed; the cap face is not, and nothing here should be read as claiming it.
+`rej` stays around 18-19, of which all but one come from
+`rset-source-scan[object]` -- the LINEAR walk, which visits dead objects as
+well as live ones, so per this page's own section-2 caveat those are the
+weakest evidence it collects.
+
 ## Status
 
-**OPEN. The OOM face is FIXED (2026-08-30) and held on 2026-09-02 (section 4c: 0 real `OutOfMemoryError` on both G1 arms, and the default-collector control PASSES in 811 s the same day, so the cap is a failure and not a slow host). A real allocation-publication defect was fixed on 2026-09-02 (section 4b) and did NOT close the class -- section 4a's holder shape survives it. The FAILURE MODE MOVED to SIGSEGV in 2026-08-30's arm -- read section 3 before treating that as an improvement. The 48 617 dangling references are 6 holders, not a rate. Split out 2026-08-29** from
+**OPEN. The OOM face is FIXED (2026-08-30) and held on 2026-09-02 (section 4c: 0 real `OutOfMemoryError` on both G1 arms, and the default-collector control PASSES in 811 s the same day, so the cap is a failure and not a slow host). The ROOT CAUSE of the corruption family is found and fixed (section 4d): G1 evacuated a CSet root pointing INSIDE a reference array and manufactured an object out of the element -- `num_slots=512` was the top half of a heap address, not a shape. Every downstream implausible-header site went to ZERO and V7b dangling references to 0, but the class STILL CAPS at 900 s, so the cap face is untouched. A separate allocation-publication defect was also fixed (section 4b) and did not close anything on its own. The FAILURE MODE MOVED to SIGSEGV in 2026-08-30's arm -- read section 3 before treating that as an improvement. The 48 617 dangling references are 6 holders, not a rate. Split out 2026-08-29** from
 `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`, whose ZGC
 defect is closed and which never owned this row. The class **passes under the
 default collector**; only the explicit `-XX:+UseG1GC` arm fails.
