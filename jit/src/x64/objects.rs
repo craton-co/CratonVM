@@ -15,6 +15,35 @@
 
 use super::*;
 
+/// Reference-store sites that received the GATED inline barrier sequence.
+///
+/// A count needs a denominator to be readable: zero here means either that no
+/// collector published a barrier plan or that the workload compiles no
+/// reference stores, and those are different facts. Reported by
+/// `jit-method-stats` beside the declined count below.
+static GATED_REF_STORE_SITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reference-store sites that asked for the gated sequence and were declined —
+/// compiled with the full-helper path instead.
+static UNGATED_REF_STORE_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn note_gated_ref_store() {
+    GATED_REF_STORE_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn note_ungated_ref_store() {
+    UNGATED_REF_STORE_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(gated, declined)` reference-store site counts.
+pub fn ref_store_site_counts() -> (u64, u64) {
+    (
+        GATED_REF_STORE_SITES.load(std::sync::atomic::Ordering::Relaxed),
+        UNGATED_REF_STORE_SITES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 impl Compiler {
     // -----------------------------------------------------------------------
     // Vectorised and bulk loop bodies
@@ -39,80 +68,6 @@ impl Compiler {
         // verified implementation; merely exposing it must not select the
         // unsafe fast path.
         false
-    }
-
-    /// Emit the SATB pre-barrier gate for a reference store whose receiver is
-    /// in RAX, pushing a bail patch onto `bail` for the cases that must take
-    /// `jit_putfield_object`.
-    ///
-    /// `cell_off` is the displacement of the field's 8-byte reference payload
-    /// from the receiver base -- the compact cell base for a compact layout,
-    /// `cell_off + FIELD_CELL_PAYLOAD64_OFFSET` for a legacy 16-byte cell.
-    /// Clobbers RCX, and R10 when the gate is armed.
-    ///
-    /// # gc-genpause F5.1: why this is a gate and not an unconditional bail
-    ///
-    /// Every one of these sites used to be three instructions:
-    ///
-    /// ```text
-    ///     MOV  RCX, [RAX + cell_off]     ; the old reference
-    ///     TEST RCX, RCX
-    ///     JNZ  helper                    ; non-null old value -> full barrier
-    /// ```
-    ///
-    /// -- taking the helper on ANY non-null old field value, with no way to
-    /// ask whether a mark cycle was even running. But `satb_barrier`, the
-    /// thing that bail leads to, asks exactly that question FIRST and returns
-    /// in two instructions when marking is idle, which is almost always.
-    /// Overwriting a non-null reference field is one of the most common stores
-    /// in Java (`this.next = x`, every field reassignment, every cache
-    /// update), so this was a helper call on a large fraction of compiled
-    /// reference stores to reach a barrier that immediately did nothing.
-    ///
-    /// The receiver here is already known to be YOUNG -- the old-generation
-    /// test above this bails first -- so no card is owed either. A young
-    /// receiver, with no mark cycle running, genuinely needs no barrier at all,
-    /// and this gate is what lets the fast path say so.
-    ///
-    /// # Why the race this looks like is not one
-    ///
-    /// The counter is read at runtime, not baked, so a cycle that arms after
-    /// this method is compiled is seen. And a mutator cannot observe a stale
-    /// zero and then store into a live mark cycle: the counter is armed by
-    /// `set_phase(ConcurrentMark)` inside `ConcurrentMarker::initial_mark`,
-    /// which runs during the initial-mark STW pause with every mutator parked.
-    /// A thread that read zero before the pause has already completed its
-    /// store; a thread that resumes after it reads the armed value. This is
-    /// the same guarantee the interpreter's `satb_barrier` already relies on
-    /// -- it makes the identical check, one level further in.
-    ///
-    /// # Fail-closed
-    ///
-    /// An unpublished (`0`) address restores the unconditional bail, which is
-    /// what a hand-built test helper table gets.
-    pub(super) fn emit_satb_pre_barrier_gate(&mut self, bail: &mut Vec<usize>, cell_off: i32) {
-        // The old reference value, whatever we decide to do about it.
-        self.emit_mov_r64_mem_disp32(RCX, RAX, cell_off);
-        self.emit_test_r64_r64(RCX);
-
-        let armed_addr = self.helpers.satb_armed_addr;
-        if armed_addr == 0 {
-            bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ non-null old
-            return;
-        }
-
-        // A null old value has nothing to log in any mark state.
-        let old_is_null = self.emit_jcc_rel32_patch(0x84); // JZ -> fast store
-
-        // Non-null old value: is any heap actually marking? `MOV r32, m32`
-        // zero-extends into the full 64-bit register, so the 64-bit TEST reads
-        // exactly the four bytes of the counter and nothing beside them.
-        self.emit_mov_imm64_full(R10, armed_addr as i64); // Cast: address -> imm64
-        self.emit_mov_r32_mem_disp32(RCX, R10, 0);
-        self.emit_test_r64_r64(RCX);
-        bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ armed -> helper
-
-        self.patch_rel32_to_here(old_is_null);
     }
 
     /// Emit the generational post-write barrier using `source_reg` and
@@ -509,21 +464,21 @@ impl Compiler {
                                                     //    JIT_READ_BOUNDS, STORE callers JIT_REGION_BOUNDS; see above.
         self.emit_mov_imm64(RDX, bounds_addr as i64);
         // region 0: RAX >= b0 && RAX < e0 → ok
-        self.emit_cmp_r64_mem_disp32(RAX, RDX, 0);
+        self.emit_cmp_r64_mem_disp(RAX, RDX, 0);
         let below_b0 = self.emit_jcc_rel32_patch(0x82); // JB → try region 1
-        self.emit_cmp_r64_mem_disp32(RAX, RDX, 8);
+        self.emit_cmp_r64_mem_disp(RAX, RDX, 8);
         let ok0 = self.emit_jcc_rel32_patch(0x82); // JB → in region 0
         self.patch_rel32_to_here(below_b0);
         // region 1
-        self.emit_cmp_r64_mem_disp32(RAX, RDX, 16);
+        self.emit_cmp_r64_mem_disp(RAX, RDX, 16);
         let below_b1 = self.emit_jcc_rel32_patch(0x82); // JB → try region 2
-        self.emit_cmp_r64_mem_disp32(RAX, RDX, 24);
+        self.emit_cmp_r64_mem_disp(RAX, RDX, 24);
         let ok1 = self.emit_jcc_rel32_patch(0x82); // JB → in region 1
         self.patch_rel32_to_here(below_b1);
         // region 2 — last chance: outside → slow.
-        self.emit_cmp_r64_mem_disp32(RAX, RDX, 32);
+        self.emit_cmp_r64_mem_disp(RAX, RDX, 32);
         slow.push(self.emit_jcc_rel32_patch(0x82)); // JB → slow
-        self.emit_cmp_r64_mem_disp32(RAX, RDX, 40);
+        self.emit_cmp_r64_mem_disp(RAX, RDX, 40);
         slow.push(self.emit_jcc_rel32_patch(0x83)); // JAE → slow
                                                     // fall-through / ok: receiver is inside a published live region.
         self.patch_rel32_to_here(ok0);
@@ -620,9 +575,10 @@ impl Compiler {
             bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old -> helper
         }
 
-        // A non-null old value needs the SATB pre-barrier -- but only while a
-        // mark cycle is actually running (gc-genpause F5.1).
-        self.emit_satb_pre_barrier_gate(&mut bail, cell_off);
+        // A non-null old value needs the SATB pre-barrier.
+        self.emit_mov_r64_mem_disp32(RCX, RAX, cell_off);
+        self.emit_test_r64_r64(RCX);
+        bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ non-null -> helper
 
         // Match the interpreter/helper's silent out-of-bounds drop.
         self.emit_mov_r32_mem_disp32(RCX, RAX, cratonvm_types::NUM_SLOTS_OFFSET as i32);
@@ -1221,6 +1177,163 @@ impl Compiler {
         self.emit_post_alloc_oom_check();
         self.push_from_rax();
         self.mark_top_as_oop();
+        true
+    }
+
+    /// The three published reference-store gate addresses, or `None` when this
+    /// process's collector did not publish a plan.
+    ///
+    /// All three or none: a plan with a live pre-gate and a zero post-gate
+    /// would let compiled code skip the post barrier on the strength of a word
+    /// nobody maintains, so the tuple is destructured as a unit and a single
+    /// zero declines the whole fast path.
+    pub(super) fn ref_store_gates(&self) -> Option<(usize, usize, usize)> {
+        let pre = self.helpers.ref_store_pre_gate;
+        let post = self.helpers.ref_store_post_gate;
+        let floor = self.helpers.ref_store_post_young_floor;
+        (pre != 0 && post != 0 && floor != 0).then_some((pre, post, floor))
+    }
+
+    /// Emit a compact reference `putfield` whose barriers are **gated inline**
+    /// rather than paid as a call.
+    ///
+    /// Returns `false` without emitting anything when the shape is not
+    /// admitted, in which case the caller keeps whichever arm it has today.
+    ///
+    /// # What makes this sound
+    ///
+    /// Every gate below names a PREFIX of the barrier helper's own control
+    /// flow, read from the word the helper itself reads:
+    ///
+    /// | inline test | the helper's own first act |
+    /// |---|---|
+    /// | `pre_active == 0` | `satb_pre_barrier` loads `mark_active` and returns |
+    /// | `flags_byte < young_floor` | `note_ref_store_slow` compares `gc_age` to the promotion age and returns |
+    /// | `post_active == 0` | `note_ref_store` loads `has_old_objects` and returns |
+    ///
+    /// So a skipped call is a call that would have returned having done
+    /// nothing. On any other answer this path calls the collector's OWN
+    /// `write_barrier`, which is the same code that records the edge today —
+    /// no remembered-set contract is reimplemented here, which is the mistake
+    /// the previous inline store path made and what
+    /// `inline_card_mark_available` was hard-`false`d to stop.
+    ///
+    /// The gates are published conservatively: each may read "there may be
+    /// work" while the truth is "no work" (a call that was not needed), and
+    /// never the reverse. See `gc::gen_heap::JitRefStoreGates`.
+    ///
+    /// # What this path does NOT have to prove, and why that is the win
+    ///
+    /// The arm it replaces required the field's **old value to be null**, so
+    /// every re-assignment of an already-set reference took the helper. That
+    /// condition existed to make the SATB pre-barrier unnecessary; with
+    /// `pre_active` read directly, the old value stops mattering and the
+    /// ordinary `node.next = other` store stays inline.
+    ///
+    /// It also drops the published-region containment test, which under the
+    /// default collector could never pass — the emitter laid down six compares
+    /// against an all-zero table and then called the helper anyway. Receiver
+    /// validity is still established, by the READ-side bounds table for an
+    /// unproven receiver and by a null test for a type-tracker-proven oop.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn emit_gated_compact_ref_putfield(
+        &mut self,
+        obj_slot: StackSlot,
+        val_slot: StackSlot,
+        field_index: usize,
+        cell_off: i32,
+        receiver_is_trusted_oop: bool,
+    ) -> bool {
+        let Some((pre, post, floor)) = self.ref_store_gates() else {
+            return false;
+        };
+        // The value has to survive to the store and, on the barriered path, to
+        // the helper call — both of which read it out of its frame slot, so no
+        // register constraint travels across the guards.
+        let mut bail: Vec<usize> = Vec::new();
+        self.load_slot_to_reg(RAX, obj_slot);
+
+        // ── receiver validity ───────────────────────────────────────────
+        //
+        // The READ table (`read_bounds_addr`), not the store table. The
+        // question here is only "is this address one this heap handed out, so
+        // the header reads below cannot fault" — the barrier question is the
+        // gates' job now, and conflating the two is what left this arm dead
+        // under every non-publishing collector.
+        bail.extend(if receiver_is_trusted_oop {
+            self.emit_trusted_oop_receiver_check()
+        } else {
+            self.emit_guarded_getfield_receiver_check(self.helpers.read_bounds_addr)
+        });
+
+        // ── SATB pre-barrier gate ───────────────────────────────────────
+        // Marking armed ⇒ the overwritten reference has to reach the snapshot,
+        // which is the helper's job. Rare: armed only during a concurrent
+        // mark phase.
+        self.emit_mov_imm64_full(R11, pre as i64);
+        self.emit_cmp_mem8_imm8(R11, 0, 0);
+        bail.push(self.emit_jcc_rel32_patch(0x85)); // JNE → helper
+
+        // ── layout guard, out of ONE header byte ────────────────────────
+        // `GC_FLAGS_BYTE_OFFSET` carries the flags in bits 0..3 and `gc_age` in
+        // bits 4..7, so this single byte answers both the compactness question
+        // here and the young-receiver question after the store. Read as a byte
+        // rather than as the dword the older arms use: that dword starts 15
+        // bytes into a 16-byte header and takes three of its four bytes from
+        // the first instance field.
+        self.emit_movzx_r32_mem8(RCX, RAX, cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32);
+        self.emit_test_r8_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT);
+        bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ → helper (legacy cell layout)
+
+        // ── slot bounds ─────────────────────────────────────────────────
+        // `field_index < num_slots`. A failure DROPS the store, matching
+        // `jit_putfield_object`'s own out-of-bounds behaviour, so it targets
+        // its own label rather than the helper.
+        self.emit_mov_r32_mem_disp32(R11, RAX, cratonvm_types::NUM_SLOTS_OFFSET as i32);
+        self.emit_mov_imm64(R10, field_index as i64);
+        self.emit_cmp_r32_r32(R10, R11);
+        let oob = self.emit_jcc_rel32_patch(0x83); // JAE → drop
+
+        // ── the store ───────────────────────────────────────────────────
+        self.load_slot_to_reg(RDX, val_slot);
+        self.emit_mov_mem_disp32_r64(RAX, RDX, cell_off);
+
+        // ── post-barrier gates ──────────────────────────────────────────
+        // CL still holds the receiver's flags byte. `age << 4 | flags` compared
+        // unsigned against `promotion_floor << 4` is an EXACT test of
+        // `gc_age < promotion_floor`, because the flags nibble is at most 15
+        // and cannot carry `a << 4` up to `(a + 1) << 4`.
+        let mut done: Vec<usize> = Vec::new();
+        self.emit_mov_imm64_full(R11, floor as i64);
+        self.emit_cmp_r8_mem8(RCX, R11, 0);
+        done.push(self.emit_jcc_rel32_patch(0x82)); // JB → young receiver, no card
+
+        self.emit_mov_imm64_full(R11, post as i64);
+        self.emit_cmp_mem8_imm8(R11, 0, 0);
+        done.push(self.emit_jcc_rel32_patch(0x84)); // JZ → no old objects, no card
+
+        // Neither gate could rule the barrier out: run the collector's own.
+        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+        self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+        self.load_slot_to_reg(ARG_REGS[2], val_slot);
+        self.emit_call_absolute(self.helpers.write_barrier);
+        done.push(self.emit_jmp_rel32_patch());
+
+        // ── helper fallback: the full SATB + post barrier + store ───────
+        for b in bail {
+            self.patch_rel32_to_here(b);
+        }
+        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+        self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+        self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 imm32
+        self.load_slot_to_reg(ARG_REGS[3], val_slot);
+        self.emit_call_absolute(self.helpers.putfield_object);
+
+        self.patch_rel32_to_here(oob);
+        for d in done {
+            self.patch_rel32_to_here(d);
+        }
+        note_gated_ref_store();
         true
     }
 }

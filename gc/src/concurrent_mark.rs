@@ -87,41 +87,15 @@ impl ConcurrentGcState {
     }
 
     /// Set the GC phase (called by the GC coordinator).
-    ///
-    /// gc-genpause F5.1: also maintains the process-global SATB arming counter
-    /// the JIT bakes an address for (`satb::satb_armed_addr`). This is the ONLY
-    /// place a phase changes, which is why the counter lives here rather than
-    /// at the several call sites that drive a cycle -- a mirror maintained in
-    /// more than one place is a mirror that drifts, and a drifted SATB gate
-    /// drops barrier entries.
-    ///
-    /// The `swap` is what makes the pairing exact: it yields the phase that was
-    /// actually replaced, so re-setting the phase a state already holds, or
-    /// moving between two inactive phases, changes nothing. Ordering is
-    /// `AcqRel` rather than the old `Release` because we now READ the previous
-    /// value and act on it.
     pub fn set_phase(&self, phase: ConcurrentGcPhase) {
-        let prev = self.phase.swap(phase as u8, Ordering::AcqRel);
-        let was = Self::phase_is_marking_active(prev);
-        let now = Self::phase_is_marking_active(phase as u8);
-        crate::satb::note_satb_phase_transition(was, now);
-    }
-
-    /// The activeness predicate itself, over a raw phase byte.
-    ///
-    /// Split out so [`Self::is_marking_active`] and [`Self::set_phase`]'s
-    /// transition accounting cannot disagree about which phases arm the
-    /// barrier -- the failure that would leave the JIT's inline gate reading a
-    /// counter that means something different from what the helper checks.
-    #[inline]
-    fn phase_is_marking_active(p: u8) -> bool {
-        p == ConcurrentGcPhase::ConcurrentMark as u8 || p == ConcurrentGcPhase::Remark as u8
+        self.phase.store(phase as u8, Ordering::Release);
     }
 
     /// Whether concurrent marking is active (SATB barrier should log).
     #[inline]
     pub fn is_marking_active(&self) -> bool {
-        Self::phase_is_marking_active(self.phase.load(Ordering::Acquire))
+        let p = self.phase.load(Ordering::Acquire);
+        p == ConcurrentGcPhase::ConcurrentMark as u8 || p == ConcurrentGcPhase::Remark as u8
     }
 }
 

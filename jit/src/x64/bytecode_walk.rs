@@ -138,6 +138,99 @@ fn unresolved_field_site(pc: usize, opcode: u8) -> bool {
     false
 }
 
+/// How many `aastore` (0x53) sites this backend WALKED, whether it lowered them
+/// inline or routed them to the `jit_aastore` helper.
+///
+/// This is the DENOMINATOR of the ZGC-barrier gate census below, and it exists
+/// for one reason: the gate it counts is expected to fire **zero** times for the
+/// life of every shipping process (nothing arms the barrier -- see
+/// [`no_aastore_barrier_gate`]), and a zero on the gate counter alone cannot be
+/// told apart from a gate wired somewhere it can never be reached. This tree has
+/// already paid for that confusion once, with an instrument armed in a place no
+/// value could arrive at, printing the same silence as a correctly-inert one.
+///
+/// Read the two together:
+///   * `walked > 0, fallbacks == 0` -- the gate was consulted N times and
+///     correctly declined every time. This is the expected steady state.
+///   * `walked == 0` -- this instrument never ran. Either the workload compiled
+///     no method containing an `aastore`, or the wiring is broken; a workload
+///     that stores into an `Object[]` in compiled code and reports zero is the
+///     second, and the counter has to be fixed before its zero means anything.
+pub static AASTORE_SITES_WALKED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many `aastore` sites were routed to the `jit_aastore` helper because the
+/// ZGC load barrier was ARMED at emission time.
+///
+/// Expected to be zero today; see [`AASTORE_SITES_WALKED`] for why that zero is
+/// only readable next to its denominator.
+pub static AASTORE_ZGC_GATE_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many `aastore` sites were emitted INLINE even though the barrier was
+/// armed, because `CRATONVM_JIT_NO_AASTORE_BARRIER_GATE` was set.
+///
+/// This is what makes the kill switch a real A/B rather than a claim: an arm run
+/// with the switch set whose `suppressed` is zero never actually exercised the
+/// pre-fix behaviour, so a pass on that arm attributes nothing.
+pub static AASTORE_ZGC_GATE_SUPPRESSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of the `aastore` ZGC-barrier gate census, for the end-of-run report:
+/// `(sites walked, helper fallbacks, kill-switch suppressions)`.
+///
+/// Not yet called by the report -- wiring it into `jit-method-stats` is a `vm/`
+/// edit and is recorded in `.agent-requests/B6-wiring.txt`. Until then the same
+/// three numbers are readable in-process with
+/// `CRATONVM_DBG_AASTORE_BARRIER_GATE=1`, which prints one line per site.
+pub fn aastore_barrier_gate_census() -> (u64, u64, u64) {
+    let relaxed = std::sync::atomic::Ordering::Relaxed;
+    (
+        AASTORE_SITES_WALKED.load(relaxed),
+        AASTORE_ZGC_GATE_FALLBACKS.load(relaxed),
+        AASTORE_ZGC_GATE_SUPPRESSED.load(relaxed),
+    )
+}
+
+/// `CRATONVM_JIT_NO_AASTORE_BARRIER_GATE=1` -- emit the `aastore` reference
+/// load/store INLINE even while the ZGC read barrier is armed, i.e. restore the
+/// behaviour this file had before the gate at the `0x53` arm was added.
+///
+/// # Why a switch for a behaviour nobody wants
+///
+/// Same argument as [`substitute_unresolved_field_sites`] above. The gate is a
+/// coverage fix on a path nothing can reach today, so there is no workload on
+/// which "it passes with the gate" and "it passes without it" differ, and a
+/// cross-binary comparison would vary everything else that landed beside it.
+/// One binary and one variable is the only honest A/B: arming this restores
+/// exactly the inline emission and nothing else, and
+/// [`AASTORE_ZGC_GATE_SUPPRESSED`] says whether the restoration actually
+/// engaged. It is not a supported configuration once a cycle can arm the
+/// barrier -- at that point setting it reinstates the hole described at the
+/// `0x53` arm.
+fn no_aastore_barrier_gate() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_AASTORE_BARRIER_GATE").is_some()
+    })
+}
+
+/// `CRATONVM_DBG_AASTORE_BARRIER_GATE=1` -- print one `[aastore-gate]` line per
+/// `aastore` site this backend lowers, naming the pc, whether the ZGC read
+/// barrier was armed at that moment, and which of the three verdicts the site
+/// took.
+///
+/// The counters answer "how many"; this answers "which sites, and why", which is
+/// the question a zero cannot be interrogated with. It is deliberately per-SITE
+/// and not per-execution: the gate is an emission-time decision, so an execution
+/// count would be measuring the workload rather than the compiler.
+fn dbg_aastore_barrier_gate() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_AASTORE_BARRIER_GATE").is_some()
+    })
+}
+
 /// The int constant pushed by the instruction IMMEDIATELY before `pc`, if that
 /// instruction is a constant push.
 ///
@@ -2106,6 +2199,28 @@ impl Compiler {
                 // forces that entry; `x64/driver.rs` reads it alongside
                 // `emitted_checkcast_throw`, for the same reason.
                 0x53 => {
+                    // The gate census. `AASTORE_SITES_WALKED` is the
+                    // denominator that makes the expected ZERO on
+                    // `AASTORE_ZGC_GATE_FALLBACKS` readable as "consulted and
+                    // correctly declined" rather than "never reached"; see the
+                    // doc on those statics.
+                    AASTORE_SITES_WALKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let barrier_armed = zgc_read_barrier_blocks_inline_fields();
+                    let gate_taken = barrier_armed && !no_aastore_barrier_gate();
+                    if barrier_armed && !gate_taken {
+                        AASTORE_ZGC_GATE_SUPPRESSED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if dbg_aastore_barrier_gate() {
+                        let verdict = if gate_taken {
+                            "helper-fallback"
+                        } else if barrier_armed {
+                            "inline/suppressed-by-kill-switch"
+                        } else {
+                            "inline/barrier-not-armed"
+                        };
+                        eprintln!("[aastore-gate] pc={pc} armed={barrier_armed} verdict={verdict}");
+                    }
                     self.flush_scratch_registers();
                     let val_slot = self.pop_stack();
                     let index_slot = self.pop_stack();
@@ -2117,6 +2232,168 @@ impl Compiler {
                     self.emit_null_check_array_store_at(code, pc);
                     // AIOOBE. Records a bounds-check stub.
                     self.emit_bounds_check(pc);
+
+                    // ## The ZGC read-barrier coverage gate
+                    //
+                    // Everything below this point touches the element SLOT as
+                    // raw machine code: `emit_ref_aload_regs` reads the old
+                    // reference for the SATB snapshot and `emit_ref_astore_regs`
+                    // writes the new one. Both emitters understand compressed
+                    // oops themselves (`emit_narrow_ref_aload_regs` /
+                    // `emit_narrow_ref_astore_regs` encode and decode the 4-byte
+                    // `(addr - base) >> 3` form), which is exactly why the
+                    // missing gate here stayed invisible: the narrow half of
+                    // `narrow_oops_block_inline_fields()` is genuinely handled,
+                    // so nothing ever went wrong under narrow oops and nobody
+                    // looked at the other half.
+                    //
+                    // The other half is `zgc_read_barrier_blocks_inline_fields()`
+                    // and it is NOT handled. Under an armed ZGC cycle a
+                    // reference slot holds `Z_COLORED_TAG (bit 63) | colour
+                    // (bits 42..=46) | 42-bit offset`, which is not a machine
+                    // pointer at all:
+                    //   * the inline LOAD would read that word with no colour
+                    //     test and hand it to `jit_satb_pre_write_barrier` as if
+                    //     it were a pointer -- a Category-A read-barrier hole,
+                    //     and one that is not even among the nine emission
+                    //     points of `zgc-jit-load-barrier.md` 2.3;
+                    //   * the inline STORE would write a PLAIN pointer into a
+                    //     slot the barrier next classifies with
+                    //     `classify_bad_masked`, which reads an uncoloured word
+                    //     as `Good` and truncates it to 42 bits -- silently, per
+                    //     that function's own doc -- and can clobber a heal that
+                    //     was concurrently in flight.
+                    //
+                    // Be precise about what this is NOT. It is not the
+                    // `write_ref_slot` data race of
+                    // `.agent-requests/A16-vm-stores.txt` section 1: an aligned
+                    // qword `mov` emitted by the JIT is not a Rust memory access
+                    // at all, and on x86-64 it is architecturally atomic against
+                    // a `lock cmpxchg`. Nothing here can tear, and no Rust UB is
+                    // in play. What is wrong is COVERAGE -- the rule
+                    // `classify_bad_masked` states for itself, that a slot is
+                    // either fully barriered on BOTH the read and the write side
+                    // or is never handed to it at all.
+                    //
+                    // # Why the ZGC disjunct only, and not the whole
+                    // # `narrow_oops_block_inline_fields()` predicate
+                    //
+                    // Because the narrow half is already covered here, and
+                    // refusing it would be a pure throughput regression on about
+                    // the hottest reference-store opcode there is: every
+                    // `Object[]` store in every narrow-oops run would take a
+                    // helper call to buy nothing. The two compact-field arms
+                    // (`getfield` above, reference `putfield` below) use the
+                    // combined predicate because THEIR inline emitters bake an
+                    // 8-byte access at a fixed offset and would read the wrong
+                    // width under narrow oops; that hazard does not exist at
+                    // this site. ZGC and compressed oops are mutually refused at
+                    // VM init in any case (A9's P1), so the two disjuncts can
+                    // never both be true and splitting them loses nothing.
+                    //
+                    // # Why this changes nothing on a default run
+                    //
+                    // `cratonvm_types::zgc_read_barrier_armed()` is a
+                    // process-global flag whose only writer is
+                    // `ZgcRealHeap::set_barrier_color`, which has no non-test
+                    // caller; `RELOCATION_REQUESTED` is a pinned `false` in
+                    // `vm/src/vm/vm_init.rs`, and `barrier_good_mask` never
+                    // leaves `Z_REMAPPED`. So `gate_taken` is false in every
+                    // shipping configuration and the bytes this arm emits are
+                    // identical to what it emitted before. The cost is one
+                    // relaxed load of that flag per compiled `aastore` SITE --
+                    // not per execution.
+                    //
+                    // What it does close is a claim that was already being made
+                    // elsewhere: `zgc_codegen_honours_read_barrier()` returns a
+                    // constant `true`, and its mechanism 2 says "every inline
+                    // compact-field site is gated on
+                    // `narrow_oops_block_inline_fields`". This site was not, so
+                    // that justification was false here; `zgc_relocation_permitted`
+                    // reads it, which is how an unclosed hole would have become
+                    // a relocating cycle handing JIT code stale pointers.
+                    //
+                    // # The residual this cannot close
+                    //
+                    // An emission-time gate cannot reach code that is ALREADY
+                    // compiled, so arming must still happen where no Java thread
+                    // is inside compiled code, i.e. at a safepoint. That
+                    // obligation is recorded on `ZgcRealHeap::set_barrier_color`
+                    // and is unchanged by this gate.
+                    if gate_taken {
+                        // The fallback is `jit_aastore`, which performs the
+                        // whole opcode -- NPE, AIOOBE, the SAME
+                        // `aastore_store_is_refused` covariance rule the inline
+                        // path calls, the SATB pre-read, the store and the post
+                        // barrier -- through `read_ref_slot` / `write_ref_slot`,
+                        // the single chokepoint the barrier is being plumbed
+                        // into. The design doc calls the helper-CALL arms "the
+                        // barrier's cheap escape hatch": correct today, with
+                        // inline emission a throughput optimisation on top
+                        // rather than a correctness prerequisite.
+                        //
+                        // The null and bounds checks above are left in place and
+                        // are therefore emitted twice on this path. That is
+                        // deliberate: they are the well-exercised JIT stubs, the
+                        // duplicate is a compare on a path that cannot execute
+                        // today, and removing them would make the two arms
+                        // differ in more than the one variable being changed.
+                        if self.helpers.aastore == 0 {
+                            // An unwired helper table (only the unit-test
+                            // sentinel tables leave this zero). Refuse the
+                            // method rather than emit a call to address 0 --
+                            // and, more to the point, rather than fall through
+                            // to the inline sequence, which with the barrier
+                            // armed is precisely the defect this gate exists to
+                            // avoid. Failing closed is the only correct answer.
+                            crate::note_jit_bail_site_at(
+                                "aastore-zgc-barrier-no-helper",
+                                pc,
+                                0x53,
+                            );
+                            return false;
+                        }
+                        AASTORE_ZGC_GATE_FALLBACKS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // Args: (vm_ptr, array_ptr, index, val). Loaded in
+                        // ARG_REGS order after `flush_scratch_registers`, so
+                        // every source is a frame slot (or a callee-saved
+                        // register, which is never an `ARG_REGS` member) and no
+                        // load can clobber a later one's source on either ABI.
+                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                        self.load_slot_to_reg(ARG_REGS[1], array_slot);
+                        self.load_slot_to_reg(ARG_REGS[2], index_slot);
+                        self.load_slot_to_reg(ARG_REGS[3], val_slot);
+                        // `jit_aastore` builds an ArrayStoreException on its
+                        // refusal path, so it allocates: spill and publish an
+                        // oop map exactly as the inline path does around
+                        // `aastore_type_check`.
+                        self.emit_pre_safepoint_spill();
+                        self.emit_call_absolute(self.helpers.aastore);
+                        self.emit_oop_map_for_safepoint();
+                        // Deliberately NO `emit_post_invoke_exception_check`.
+                        // `jit_aastore` returns `()`, so RAX is UNDEFINED on
+                        // return and the `CMP RAX, i64::MIN; JE bail` that check
+                        // emits would fire on whatever the helper happened to
+                        // leave there. Its exceptions travel by the
+                        // pending-signal channel instead
+                        // (`set_jit_pending_npe_action`, `JIT_SIGNALS.aioobe`,
+                        // `set_jit_pending_exception`), which the interpreter's
+                        // post-JIT path drains on every return -- the documented
+                        // contract of the void helper, and the reason the inline
+                        // arm's `b'V'` note is careful to say that ITS RAX is a
+                        // defined value.
+                        //
+                        // `emitted_aastore_throw` is still set: the helper
+                        // reaches the ArrayStoreException through
+                        // `jit_thread_mut()` exactly as `jit_aastore_type_check`
+                        // does, so it needs the dispatch-aware entry for the
+                        // same reason, and without it the check fails open and
+                        // the illegal store proceeds.
+                        self.emitted_aastore_throw = true;
+                        pc += 1;
+                        continue;
+                    }
                     // JVMS §aastore covariance check, BEFORE anything mutates:
                     // on a refusal no element may be written and no barrier may
                     // run. `jit_aastore_type_check` answers 0 (legal) or the
@@ -2411,20 +2688,25 @@ impl Compiler {
                             self.stack.push(top);
                             self.stack_oop_marks.push(top_is_oop);
                         }
-                        StackSlot::Scratch(reg) => {
+                        StackSlot::Scratch(reg, ..) => {
                             // Scratch register holds the value — try to dup into
                             // another scratch register, else spill original to frame
                             // and push another frame copy.
+                            //
+                            // The duplicate needs its OWN home: the two entries
+                            // are separate stack positions and a shared home
+                            // would have one flush overwrite the other.
                             let avail = SCRATCH_REGS.iter().copied().find(|&sr| {
                                 sr != reg
                                     && !self
                                         .stack
                                         .iter()
-                                        .any(|s| matches!(s, StackSlot::Scratch(r) if *r == sr))
+                                        .any(|s| matches!(s, StackSlot::Scratch(r, ..) if *r == sr))
                             });
-                            if let Some(sr) = avail {
+                            let dup_home = avail.and_then(|_| self.reserve_spill_slots(1));
+                            if let (Some(sr), Some(home)) = (avail, dup_home) {
                                 self.emit_mov_reg_reg(sr, reg);
-                                self.stack.push(StackSlot::Scratch(sr));
+                                self.stack.push(StackSlot::Scratch(sr, home));
                                 self.stack_oop_marks.push(top_is_oop);
                             } else {
                                 // No scratch available — load to RAX and push via frame
@@ -5415,7 +5697,46 @@ impl Compiler {
                         // with no real receiver behind it.
                         self.load_slot_to_reg(RAX, obj_slot);
                         self.emit_precise_null_check_field_store();
-                        if type_tag == b'L' || type_tag == b'[' {
+                        // GATED reference store — tried before every arm below,
+                        // and it supersedes them on the counts that matter: it
+                        // reads the collector's published barrier gates instead
+                        // of inferring them from a region table G1 and ZGC
+                        // leave empty (so the compact arm below is UNREACHABLE
+                        // under the default collector — it emits six
+                        // containment compares that cannot pass and then calls
+                        // the helper), and it does not require the field's old
+                        // value to be null, so an ordinary re-assignment stays
+                        // inline instead of taking the helper.
+                        //
+                        // `false` here means "not admitted", and every arm
+                        // below then runs exactly as it does today. Declining
+                        // is the safe direction and the only one a missing
+                        // barrier plan can produce.
+                        let gated_ref_store = (type_tag == b'L' || type_tag == b'[')
+                            && gated_ref_store_enabled()
+                            && inline_putfield_enabled()
+                            && !narrow_oops_block_inline_fields()
+                            && cratonvm_types::compact_ref_fields_enabled()
+                            && match self.compact_field_off.get(&pc) {
+                                Some(&(c_off, _)) => {
+                                    // Cast: a compact field offset plus the
+                                    // header is bounded by the object size.
+                                    let cell_off = (HEADER_SIZE + c_off as usize) as i32;
+                                    self.emit_gated_compact_ref_putfield(
+                                        obj_slot,
+                                        val_slot,
+                                        field_index,
+                                        cell_off,
+                                        receiver_is_trusted_oop,
+                                    )
+                                }
+                                None => false,
+                            };
+                        if gated_ref_store {
+                            // The sequence above is complete: store, both
+                            // barrier gates, the helper fallback and the
+                            // out-of-bounds drop all converge here.
+                        } else if type_tag == b'L' || type_tag == b'[' {
                             // HIGH-5 / R20: inline the reference-field store on the
                             // barrier-free fast path (CRATONVM_JIT_INLINE_PUTFIELD).
                             // The field cell is the 16-byte `Value` enum: tag dword
@@ -5457,6 +5778,10 @@ impl Compiler {
                                 {
                                     eprintln!("[compact-inline] putfield-ref pc={pc} off={c_off}");
                                 }
+                                // Reached only when the gated sequence declined
+                                // (no published plan), so this arm is the
+                                // pre-existing behaviour, unchanged.
+                                note_ungated_ref_store();
                                 // COMPACT inline reference putfield: store the
                                 // bare 8-byte pointer on the barrier-free fast
                                 // path (non-null YOUNG receiver, NULL old value,
@@ -5535,10 +5860,10 @@ impl Compiler {
                                 }
                                 // non-null OLD value → helper (SATB). The old ref
                                 // is the 8-byte pointer AT the cell base.
-                                // gc-genpause F5.1: gated on a live mark cycle
-                                // rather than on the old value alone.
-                                self.emit_satb_pre_barrier_gate(&mut bail, cell_off);
-                                // bounds: field_index < num_slots (header u32 @12).
+                                self.emit_mov_r64_mem_disp32(RCX, RAX, cell_off);
+                                self.emit_test_r64_r64(RCX);
+                                bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ non-null old
+                                                                            // bounds: field_index < num_slots (header u32 @12).
                                 self.emit_mov_r32_mem_disp32(
                                     RCX,
                                     RAX,
@@ -5614,12 +5939,13 @@ impl Compiler {
                                 }
                                 // non-null OLD value → helper (SATB). Read the cell's
                                 // 8-byte payload; a null old value never needs SATB.
-                                // gc-genpause F5.1: gated on a live mark cycle
-                                // rather than on the old value alone.
-                                self.emit_satb_pre_barrier_gate(
-                                    &mut bail,
+                                self.emit_mov_r64_mem_disp32(
+                                    RCX,
+                                    RAX,
                                     cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32, // Cast: layout offset → disp32
                                 );
+                                self.emit_test_r64_r64(RCX);
+                                bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ non-null old
                                                                             // bounds: field_index < num_slots (header u32 @12).
                                                                             // 32-bit compare — an 8-byte read would fold in the
                                                                             // adjacent gc_age/gc_flags bytes.
@@ -13005,7 +13331,7 @@ impl Compiler {
                     let recv_slot = self.pop_stack();
                     let recv_offset = match recv_slot {
                         StackSlot::Frame(offset) => offset,
-                        StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg) => {
+                        StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg, ..) => {
                             let Some(offset) = self.reserve_spill_slots(1) else {
                                 return false;
                             };

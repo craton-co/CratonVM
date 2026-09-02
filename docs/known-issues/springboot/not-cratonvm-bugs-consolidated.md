@@ -4,7 +4,9 @@
 was directly cross-checked against stock HotSpot 25 on the same classpath,
 same harness (`SbRunner`) — and HotSpot fails, or is subject to the exact
 same host constraint, identically. None of these belong in a "CratonVM
-regression" count. Compiled 2026-08-20.
+regression" count. Compiled 2026-08-20; the Jetty mTLS row added 2026-09-01, and
+it is the one row whose HotSpot arm does not merely match — see the section
+below it.
 
 Spring Boot's non-passing-class history is overwhelmingly a **Windows** suite
 (the primary suite host for this project). This index says explicitly, per
@@ -20,7 +22,41 @@ where the underlying condition doesn't exist on Linux in the first place.
 | `org.springframework.boot.micrometer.metrics.autoconfigure.export.datadog.DatadogPropertiesConfigAdapterTests` (`adapterOverridesAllConfigMethods`) | `DatadogPropertiesConfigAdapter`'s own source never overrides `DatadogConfig.compress()` — the interface has it, the adapter doesn't implement it, on this checkout regardless of VM. A genuine gap in Spring Boot's own source, not a CratonVM reflection issue. | Azure Linux, 2026-08-27: `AssertJ: could not find the following elements: ["compress"]`, byte-identical on stock HotSpot 25 and CratonVM, same classpath. | this row |
 | `org.springframework.boot.micrometer.metrics.autoconfigure.export.otlp.OtlpMetricsExportAutoConfigurationTests` | `IllegalArgumentException: Cannot locate field metricsSender on class io.micrometer.registry.otlp.OtlpMeterRegistry` — AssertJ's field introspection can't find a field the test expects, consistent with a dependency-version mismatch between the test source and the actual `micrometer-registry-otlp` jar this ad-hoc classpath-dump harness resolves (bypasses Gradle's own managed dependency resolution). | Azure Linux, 2026-08-27: identical `IllegalArgumentException`, same field/class name, on both stock HotSpot 25 and CratonVM. | this row |
 | `org.springframework.boot.micrometer.tracing.brave.autoconfigure.OtlpExemplarsAutoConfigurationTests` (`otlpOutputShouldContainExemplars`, `otlpOutputShouldContainExemplarsWhenIncludeIsAllAndSpanIsNotSampled`) | The exported OTLP payload contains a duplicate `name: "test.observation"` entry — a content/protocol-level issue unrelated to the other two rows above despite living in the same module family. | Azure Linux, 2026-08-27: byte-identical `AssertionError` ("to appear only once" / appears twice) on both stock HotSpot 25 and CratonVM. | this row |
+| `org.springframework.boot.jetty.reactive.JettyReactiveWebServerFactoryTests` (`sslNeedsClientAuthenticationFailsWithoutClientCertificate`) | **Host load, and HotSpot fails it MORE.** The test asserts with `verify(Duration.ofSeconds(10))` — a WALL-CLOCK budget — on two JVM-internal event loops handshaking over loopback. On an oversubscribed host nothing meets that budget, and the failure is a clean `AssertionError`, so the harness never sees a timeout and the row reads as a VM defect. A packet capture of a failing connection shows the server's `FIN` carrying `seq 1, ack 1` after 14.3 s: **neither side ever wrote a byte** — no `ClientHello`, no `ServerHello`. The TCP connection was completed by the KERNEL's accept queue and then sat unserviced, so there was no handshake to reject and no close path to blame. A passing connection reads `seq 1932, ack 482` and FINs 766 ms after the SYN. | Azure Linux, 2026-09-01. Synchronised bursts of 12 JVMs, both VMs in every burst, load 36-124, 180 runs each: **CratonVM 175 pass / 5 fail (2.8 %), stock HotSpot 25 171 pass / 9 fail (5.0 %)** — all 14 the same `VerifySubscriber timed out` assertion. Steady load does NOT reproduce it: 1161 CratonVM runs at load 20-35 and 38 runs pinned to two cores (up to 36 s wall each) were all green. | `retired/jettyreactive-mtls-verify-timeout-is-load-not-a-close-path-defect-RETIRED-20260901.md` (internal) |
 | `org.springframework.boot.loader.zip.ZipContentTests` | Not actually a failure: 28/29 tests pass, the sole non-pass is `TestAbortedException: Assumption failed: Insufficient disk space` on `openWhenZip64ThatExceedsZipSizeLimitOpensZip` (needs several GB of scratch space to build a Zip64 archive past the standard size limit) — a host resource constraint, and the harness's status classifier counts any ABORTED-containing run as `FAIL` even with zero actual test failures. | Azure Linux, re-confirmed 2026-08-28 on the suite runner: `tests=29 failed=0 aborted=1`. | `../../internal/fixed-suite-bugs/springboot/uri-getrawpath-percent-encoding-inconsistency-FIXED-20260827.md` |
+
+## One row where HotSpot does not fail *identically* — it fails MORE
+
+Every other entry on this page rests on "stock HotSpot fails the same way on
+the same classpath". The Jetty mTLS row does not, and the difference is worth
+stating rather than smoothing over: HotSpot fails it **1.8x more often** than
+CratonVM under the same load.
+
+That makes the row stronger, not weaker, but it also means the usual
+cross-check is not what settles it. Three things were needed, and a future
+session looking at a load-gated suite failure should reach for the same three:
+
+1. **Pair the arms in the SAME burst, not in separate tables.** The page this
+   row replaces had 219 CratonVM runs and no HotSpot column at all, and said
+   so. A VM-only loop cannot separate "this VM is wrong" from "this budget does
+   not survive this host".
+2. **Reproduce with SIMULTANEITY, not with steady load.** All the quiet arms
+   were green, including 38 runs pinned to two cores where the whole test took
+   36 seconds of wall clock and still passed — the 10-second budget is on the
+   `StepVerifier`, not on the process. What tripped it was a burst of cold JVM
+   starts, which is the shape of the original (found 1991 classes deep in a
+   full suite).
+3. **Read the packet, not the log.** A `FIN` carrying `seq 1, ack 1` says
+   nobody serviced the socket; `seq 1932, ack 482` says the rejection worked.
+   No amount of Reactor Netty stack trace distinguishes those two, and two
+   successive triages spent four days on the wrong subsystem because of it.
+
+**Recommendation for the Spring Boot runner, not yet landed:** record
+`/proc/loadavg` beside every suite row, and re-run any class that produces a
+`VerifySubscriber timed out` at load >> core count before attributing it. The
+suite run that produced the original also printed `hotspot baseline: none --
+every failure will be attributed to CratonVM`, which is exactly the condition
+under which a load-gated failure becomes a VM bug on paper.
 
 ## Checked and found to have already resolved itself (not filed as not-a-bug — nothing left to explain)
 

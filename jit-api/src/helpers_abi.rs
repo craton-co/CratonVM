@@ -545,14 +545,31 @@ helper_fn_slots! {
     HelperFnNewObject, new_object, new_object_fn, (i64, i64, i64) -> i64;
     HelperFnAnewarrayObject, anewarray_object, anewarray_object_fn, (i64, i64, i64) -> i64;
 
-    // Array access. Loads: (array_ptr, index). Primitive stores:
-    // (array_ptr, index, val). `aastore` additionally takes `vm_ptr` first
-    // because a reference store runs the write barrier.
+    // Array access. Primitive loads: (array_ptr, index). Primitive stores:
+    // (array_ptr, index, val). `aaload` and `aastore` additionally take
+    // `vm_ptr` FIRST, for the symmetric reason: a reference LOAD runs the ZGC
+    // read barrier and a reference STORE runs the write barrier, and both need
+    // a `&VmHeap` to reach one.
+    //
+    // `aaload` gained its `vm_ptr` on 2026-09-01 (`.agent-requests/B8-abi.txt`).
+    // A JIT-helper ABI change is normally expensive; this one was affordable
+    // because NO emitter calls `helpers.aaload`. `aaload` is lowered inline by
+    // `jit/src/x64/arrays.rs::emit_ref_aload_regs`, `grep -rn "helpers\.aaload"
+    // jit/src` is empty, and the aarch64 backend does not call it either -- so
+    // there was no emitted `call` whose argument registers had to move and no
+    // `stack_arg_block_size` / shadow-space accounting to revisit. Nothing
+    // consumes the declared arity except this file's own assertions (3 <= 4, so
+    // `HELPERS_NEEDING_WIN64_STACK_ARGS` is unchanged).
+    //
+    // The row still has to be honest BEFORE anything routes `aaload` back to
+    // the helper under an armed barrier, which is what
+    // `let _: HelperFnAaload = jit_aaload;` in `vm/src/jit/helpers.rs`
+    // enforces: the two halves cannot disagree and still compile.
     HelperFnBaload, baload, baload_fn, (i64, i64) -> i64;
     HelperFnBastore, bastore, bastore_fn, (i64, i64, i64) -> ();
     HelperFnIaload, iaload, iaload_fn, (i64, i64) -> i64;
     HelperFnIastore, iastore, iastore_fn, (i64, i64, i64) -> ();
-    HelperFnAaload, aaload, aaload_fn, (i64, i64) -> i64;
+    HelperFnAaload, aaload, aaload_fn, (i64, i64, i64) -> i64;
     HelperFnAastore, aastore, aastore_fn, (i64, i64, i64, i64) -> ();
     HelperFnMultianewarray2d, multianewarray_2d, multianewarray_2d_fn,
         (i64, i64, i64, i64) -> i64;
@@ -837,10 +854,14 @@ helper_field_table! {
     (ldc_string_cp,                  Function, false),
     (ffm_segment_get,                Function, false),
     (ffm_segment_set,                Function, false),
-    // Baked absolute address of the SATB arming counter, not callable. Zero
-    // under a hand-built table, and the backend then keeps the unconditional
-    // SATB bail it had before gc-genpause F5.1.
-    (satb_armed_addr,                Constant, false),
+    // Reference-store barrier gates. NOT functions: each is the address of a
+    // collector-owned gate BYTE that compiled code reads to decide whether a
+    // barrier CALL can be skipped. Optional in the strongest sense -- 0 means
+    // "this collector published no plan" and every emitter arm keeps its
+    // full-helper path.
+    (ref_store_pre_gate,             Constant, false),
+    (ref_store_post_gate,            Constant, false),
+    (ref_store_post_young_floor,     Constant, false),
 }
 
 // ---------------------------------------------------------------------
@@ -861,7 +882,7 @@ const _: () = assert!(
 
 // Pin the literal count so a *removal* also has to touch this line.
 const _: () = assert!(
-    NUM_HELPER_FIELDS == 70,
+    NUM_HELPER_FIELDS == 72,
     "JitRuntimeHelpers field count changed — bump JIT_HELPERS_ABI_VERSION, the \
      literal here, and the size literal below",
 );
@@ -869,8 +890,8 @@ const _: () = assert!(
 // Pin the literal size and alignment. The JIT bakes `disp32` offsets derived
 // from this layout into RWX memory; a silent change here is a wild call.
 const _: () = assert!(
-    JIT_HELPERS_ABI_SIZE == 560,
-    "JitRuntimeHelpers size changed (expected 70 * 8 = 560) — the JIT's baked \
+    JIT_HELPERS_ABI_SIZE == 576,
+    "JitRuntimeHelpers size changed (expected 72 * 8 = 576) — the JIT's baked \
      helper offsets are now wrong; bump JIT_HELPERS_ABI_VERSION deliberately",
 );
 const _: () = assert!(
@@ -1035,7 +1056,9 @@ pub const GOLDEN_HELPER_OFFSETS: [(&str, usize); NUM_HELPER_FIELDS] = [
     ("ldc_string_cp", 528),
     ("ffm_segment_get", 536),
     ("ffm_segment_set", 544),
-    ("satb_armed_addr", 552),
+    ("ref_store_pre_gate", 552),
+    ("ref_store_post_gate", 560),
+    ("ref_store_post_young_floor", 568),
 ];
 
 // Every golden row must name the descriptor row at the same index AND agree
@@ -1172,17 +1195,19 @@ pub const ABI_REVISIONS: &[HelperAbiRevision] = &[
         num_fields: 69,
         size: 552,
     },
-    // v10 -- appended `satb_armed_addr`, the process-global SATB arming
-    // counter (gc-genpause F5.1). The compiled reference-store fast path used
-    // to bail to `jit_putfield_object` on ANY non-null old field value, with no
-    // way to ask whether a mark cycle was even running -- while
-    // `GenerationalHeap::satb_barrier`, the thing it bails TO, asks exactly
-    // that question first and returns. Baking this address lets the fast path
-    // ask it inline. Optional: a zero slot restores the unconditional bail.
+    // v10 -- appended the three REFERENCE-STORE BARRIER GATES. Each is the
+    // address of a collector-owned byte that names a PREFIX of a barrier
+    // helper's own control flow, so compiled code can skip the CALL exactly
+    // when the helper would have returned on its first test. They replace an
+    // inference the emitter was making from `region_bounds_addr`, whose
+    // emptiness under G1 and ZGC left every reference store paying six
+    // containment compares that could never pass and then calling the helper
+    // anyway. Optional: all-zero is "no plan published" and restores that
+    // helper path exactly.
     HelperAbiRevision {
         version: 10,
-        num_fields: 70,
-        size: 560,
+        num_fields: 72,
+        size: 576,
     },
 ];
 
@@ -1399,7 +1424,7 @@ const _: () = {
          really is a displacement and is range-checked by validate_with",
     );
     assert!(
-        constants == 7,
+        constants == 9,
         "the number of baked-address slots changed — a Constant slot is loaded \
          as data and is NOT range-checked by validate_with, so misclassifying \
          a displacement as one silently removes its only sanity check",
@@ -1775,7 +1800,12 @@ mod tests {
             ("ldc_string_cp", offset_of!(H, ldc_string_cp)),
             ("ffm_segment_get", offset_of!(H, ffm_segment_get)),
             ("ffm_segment_set", offset_of!(H, ffm_segment_set)),
-            ("satb_armed_addr", offset_of!(H, satb_armed_addr)),
+            ("ref_store_pre_gate", offset_of!(H, ref_store_pre_gate)),
+            ("ref_store_post_gate", offset_of!(H, ref_store_post_gate)),
+            (
+                "ref_store_post_young_floor",
+                offset_of!(H, ref_store_post_young_floor),
+            ),
         ];
 
         assert_eq!(HELPER_FIELDS.len(), probes.len());
@@ -1806,13 +1836,16 @@ mod tests {
     /// loudly rather than be absorbed by a computed expression.
     #[test]
     fn helper_table_size_and_align_are_the_literal_abi_numbers() {
-        assert_eq!(core::mem::size_of::<H>(), 560);
+        assert_eq!(core::mem::size_of::<H>(), 576);
         assert_eq!(core::mem::align_of::<H>(), 8);
-        assert_eq!(JIT_HELPERS_ABI_SIZE, 560);
+        assert_eq!(JIT_HELPERS_ABI_SIZE, 576);
         assert_eq!(JIT_HELPERS_ABI_ALIGN, 8);
         assert_eq!(HELPER_FIELD_STRIDE, 8);
-        assert_eq!(NUM_HELPER_FIELDS, 70);
-        assert_eq!(H::NUM_FIELDS, 70);
+        assert_eq!(NUM_HELPER_FIELDS, 72);
+        assert_eq!(H::NUM_FIELDS, 72);
+        // Unchanged by v10: the three appended slots are gate ADDRESSES, not
+        // call targets, so the callable-slot count stands still while the
+        // table grows. That divergence is the point of counting them apart.
         assert_eq!(H::NUM_HELPER_FN_FIELDS, 59);
         assert_eq!(JIT_HELPERS_ABI_VERSION, 10);
     }
@@ -1839,7 +1872,7 @@ mod tests {
         }
         // The last golden offset plus one stride is the whole table.
         let (last_name, last_offset) = GOLDEN_HELPER_OFFSETS[H::NUM_FIELDS - 1];
-        assert_eq!(last_name, "satb_armed_addr");
+        assert_eq!(last_name, "ref_store_post_young_floor");
         assert_eq!(last_offset + HELPER_FIELD_STRIDE, JIT_HELPERS_ABI_SIZE);
     }
 
@@ -1853,8 +1886,8 @@ mod tests {
             last,
             HelperAbiRevision {
                 version: 10,
-                num_fields: 70,
-                size: 560,
+                num_fields: 72,
+                size: 576,
             },
         );
         // Append-only history: each revision strictly grows the table.
@@ -2050,7 +2083,7 @@ mod tests {
         let required = HELPER_FIELDS.iter().filter(|d| d.required).count();
         assert_eq!(functions, 59, "callable slots");
         assert_eq!(offsets, 4, "displacement slots");
-        assert_eq!(constants, 7, "baked-address slots");
+        assert_eq!(constants, 9, "baked-address slots");
         assert_eq!(required, 43, "required slots");
         assert_eq!(functions - required, 16, "optional callable slots");
         assert_eq!(functions + offsets + constants, H::NUM_FIELDS);
@@ -2209,13 +2242,13 @@ mod tests {
     fn as_words_matches_the_struct_fields() {
         let mut h = H::default();
         h.newarray = 1;
-        // The LAST field, whatever it currently is — `ffm_segment_set`
-        // since the FFM element accessors were appended.
-        h.satb_armed_addr = 2;
+        // The LAST field, whatever it currently is — `ref_store_post_young_floor`
+        // since the reference-store barrier gates were appended.
+        h.ref_store_post_young_floor = 2;
         let w = h.as_words();
         assert_eq!(w[0], 1, "first slot");
         assert_eq!(w[H::NUM_FIELDS - 1], 2, "last slot");
-        assert_eq!(w.len(), 70);
+        assert_eq!(w.len(), 72);
     }
 
     /// Build a table with every *required* slot non-zero and every optional

@@ -2334,6 +2334,33 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
             if let Value::Object(Some(loader)) = ctx.get_field_by_name(this, "loader") {
                 return Ok(Some(Value::Object(Some(loader))));
             }
+            // The field is unset. THREE builders mint `java.lang.Module`
+            // mirrors -- `build_module` here, `Class.getModule()`'s real-JDK
+            // registration in lib.rs, and its synthetic twin in
+            // `phases_late/reflect_invoke.rs` -- and whichever ran first wins
+            // the `cache_module_mirror` slot. A module's loader is a property
+            // of the JDK's own table, not of that race, so the fallback is
+            // asked HERE, at the single read, rather than trusted to three
+            // writes.
+            //
+            // Boot modules keep the spec-correct null this override was
+            // written for; a PLATFORM module answers the platform loader,
+            // matching `Class.getClassLoader()` for every class in it
+            // (`java.sql.Connection` and `java.sql` must not disagree).
+            let module_name = match ctx.get_field_by_name(this, "name") {
+                Value::Object(Some(n)) => ctx.read_string(n),
+                _ => match ctx.get_field(this, 0) {
+                    Value::Object(Some(n)) => ctx.read_string(n),
+                    _ => None,
+                },
+            };
+            if let Some(name) = module_name {
+                if let Some(platform) =
+                    crate::classloader::platform_loader_for_module(ctx, &name)
+                {
+                    return Ok(Some(Value::Object(Some(platform))));
+                }
+            }
             Ok(Some(Value::Object(None)))
         },
     );
