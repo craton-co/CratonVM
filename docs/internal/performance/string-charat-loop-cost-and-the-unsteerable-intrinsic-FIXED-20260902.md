@@ -32,6 +32,16 @@ true statement about a decision that no longer had anything to decide.
 
 The OSR door runs no such rewrite. That is the whole of the 100x.
 
+**Second pass, same day.** This page retired with three residuals listed
+under *Still open*. Two are now closed and the third is re-measured; the
+work is in [What the second pass
+closed](#what-the-second-pass-closed-2026-09-02). The short version: the IR
+tier's String expander went from **78 to 3.4 ns/char** (it now ties the
+single-pass body rather than being 23x behind it), and the enumeration this
+page asked for turned up **two more final classes** whose call sites the same
+rewrite was taking — `Integer.intValue` at 76 ns/op and `Long.longValue` at
+**424**, both now ~1.6.
+
 ## Measured
 
 `probes/CharAtCostCurve.java`, the page's own witness, `charAt` rows,
@@ -168,7 +178,9 @@ that. **The expansion disqualifies its own LICM.**
 
 That is why arm B is ~100 ns/char and not ~3: per character it does two field
 loads, an `arraylength`, two array loads and four guards, none of which leave
-the loop. It is a measured, explained residual and it is left open — see below.
+the loop.
+
+**Closed in the second pass** — `licm-read-hoist`, below.
 
 ### The four documentation contradictions — all four closed
 
@@ -199,27 +211,145 @@ at the two direct doors because neither has a route to the optimizing tier —
 prints the per-door census quoted above. It did not fix this defect and did not
 claim to.
 
+## What the second pass closed (2026-09-02)
+
+Three residuals were listed here. Two are closed by code and the third is
+re-measured and reattributed. All numbers below are one binary, x86-64 Linux,
+`lto=off`, three ABBA-interleaved rounds, n as marked.
+
+### 1. `licm-read-hoist` — the expander's loads are hoisted. 78 → 3.4 ns/char
+
+Exactly the fix this page named. `ir_optimize` gained `loop_writes_memory`,
+the same question as `loop_has_hard_barrier` asked about WRITES only:
+`Op::ArrayLoad` and `Op::ArrayLength` are reads and cannot clobber a hoisted
+load, and `Op::Guard` carries no memory edge at all. `Op::Store` is NOT exempt
+there — the new arm does no alias analysis, so it wants a body that writes
+nothing rather than one whose writes it would have to reason about.
+
+The hoist itself is an ADDITIVE arm beside the `Op::ArrayLength` one, on the
+same three terms, and the existing general load hoist is untouched:
+
+1. **the value cannot change** — nothing in the body writes, and the base is
+   loop-invariant;
+2. **the throw point does not move** — an `Op::Load` deopts rather than faults
+   on a null base, and a deopt raised from the pre-header would rebuild an
+   interpreter frame at a bci the loop never reached. So the base must already
+   be dereferenced on entry to the header: either the load is anchored there
+   (the `ArrayLength` arm's own condition) or some other header-anchored
+   load/`arraylength` reads the same base. For a counted
+   `for (i = 0; i < s.length(); i++)` that is exactly true — `s.length()`
+   expands at the header off the same receiver `s.charAt(i)` uses;
+3. **the memory token is re-anchored** — without it the hoist is inert
+   whenever the body threads memory through a read.
+
+Placed ABOVE the pre-header guard, like the `ArrayLength` arm and for its
+reason: for a nested inner loop `body` over-approximates and drags the
+enclosing pre-header in with it. Over-approximation is the safe direction for
+every test in the arm — a bigger body makes `is_loop_invariant` stricter and
+the header-deref set smaller, so it can only refuse a hoist.
+
+`CRATONVM_DBG=licm` on the arm this exists for now reads
+
+```
+[DBG_LICM] header 7: body 30 node(s), 4 load(s), hard_barrier=true writes_memory=false
+[DBG_LICM] read-hoist load 46 (inputs [42, 45, 3, 13]): HOIST to preheader 22, mem 45 -> 14
+[DBG_LICM] read-hoist load 34 (inputs [7, 33, 3, 13]): HOIST to preheader 22, mem 33 -> 14
+[DBG_LICM] read-hoist load 45 (inputs [42, 34, 3, 32]): HOIST to preheader 22, mem 34 -> 14
+[DBG_LICM] read-hoist load 33 (inputs [7, 23, 3, 32]): HOIST to preheader 22, mem 23 -> 14
+[DBG_LICM] hoisted 4 invariant load(s) to loop pre-header(s)
+```
+
+### 2. The expander's two loads were `jit_getfield` helper CALLs
+
+Found on the way to (1) and worth its own row, because it is a different
+defect with a different blast radius. `try_string_access_intrinsic` emits its
+`coder` and `value` reads at the **invoke** pc, and `ir_lower`'s inline
+compact-`getfield` fast path is keyed by **getfield** pc — so neither load had
+a row and both fell back to the checked helper. **917,203,334** helper CALLs
+in one `probes/CharAtCostCurve.java` run, against `IR-tier inline-getfield
+refusals: no-compact-slot-for-pc=8`.
+
+The compact-field map is now keyed by `(pc, is_reference)` — one pc can
+legitimately own two rows, which is what this expansion needs — and
+`try_compile_inner` installs the two rows from the layout THIS compile
+resolved, never from `ir::published_string_layout()`, whose `OnceLock` may
+carry offsets from before `java/lang/String` had a `CompactLayout`. Refused
+for a legacy `char[]` String, a narrow compact `value`, or a negative body
+offset.
+
+### The arm-B table, with each fix isolated
+
+`probes/CharAtCostCurve.java`, `charAt` rows, pin OFF (the IR tier) unless
+stated. n=9-18 at reps=200, n=3-6 elsewhere.
+
+| reps | HotSpot | default (pin ON) | neither fix | rows only | hoist only | **both** |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 60.3 | 3.32 | 82.6 | 16.1 | 3.40 | **3.22** |
+| 10 | 3.26 | 3.33 | 77.0 | 15.6 | 3.55 | **3.19** |
+| 50 | 0.52 | 3.69 | 79.7 | 16.3 | 3.48 | **3.24** |
+| 200 | 0.47 | 3.39 | 76.2 | 15.8 | 3.54 | **3.45** |
+| 1000 | 0.47 | 3.40 | 77.6 | 15.3 | 3.63 | **3.52** |
+
+* **The hoist is the fix**: 76 → 3.5, ~22x, close to the ~30x this page
+  estimated.
+* **The rows are worth ~4.9x on their own** and are largely SUBSUMED by the
+  hoist for this shape — once the two loads leave the loop it barely matters
+  whether they were helper calls. They are kept because they are not subsumed
+  anywhere else: a String access outside a hoistable loop, or in a loop with a
+  store in it, still pays the helper without them.
+* **The IR tier now TIES the single-pass body** (3.45 against 3.39). The
+  "what retirement is gated on" question this page answered as *no, keep the
+  pin* is now a tie rather than a 23x loss — still not a reason to retire the
+  pin, and now a much cheaper thing to be wrong about.
+* Both switches are per-binary: `CRATONVM_JIT_NO_LICM_READ_HOIST=1` and
+  `CRATONVM_JIT_NO_STRING_ACCESS_INLINE_ROWS=1`.
+
+### 3. The enumeration — and it is not `{String}`
+
+This page asked for the other final classes with an instance call-site entry
+and guessed the set might be `{String}` alone. Walked row by row over the
+kind-0 ladder, the set of **final** declared classes is
+**`{String, Integer, Long}`** — `VarHandle`, `ByteBuffer`, `MessageDigest`,
+`HashMap`, `CRC32`, `CRC32C`, `AtomicInteger` and `AtomicLong` are none of them
+final, and `CharSequence` / `ConcurrentMap` / `MemorySegment` are interfaces.
+
+The other two were not covered, because the yield asked the two INTRINSIC
+matchers and `Integer.intValue` / `Long.longValue` are served by a **thin
+direct-helper bind** instead — a different row of the same ladder, ending in
+the same `continue`, which neither matcher knows about.
+
+`probes/FinalDevirtInstanceIntrinsics.java` (added), ns per unboxing, n=12 at
+reps=200:
+
+| site | HotSpot | before | after | `CRATONVM_JIT_FINAL_DEVIRT=0` |
+|---|---:|---:|---:|---:|
+| `Integer.intValue()` | 0.46 | **76.10** | **1.77** | 1.72 |
+| `Long.longValue()` | 0.63 | **423.55** | **1.57** | 1.59 |
+
+43x and **270x**. Note the shape is not `String`'s: both alternatives are a
+CALL. They are not the same call — the bind the rewrite installs is a Java
+frame with a shadow-stack push and an invocation-counter increment, and the
+helper the ladder installs is a leaf Rust call that reads the box's field.
+That `Long.longValue` costs 424 and `Integer.intValue` 76 for the same
+structure is itself unexplained and is the one thing this row leaves behind;
+what is closed is that the rewrite no longer decides it.
+
+After the fix `CRATONVM_JIT_FINAL_DEVIRT=0` no longer moves either row (1.77
+vs 1.72, 1.57 vs 1.59), which is what "the yield fired" looks like from
+outside — the same reading this page's own fix is verified by.
+
 ## Still open
 
-* **The IR String expander does not get its loads hoisted** (measured above).
-  Fixing it means teaching `ir_optimize::licm` that a `Guard`, an `ArrayLoad`
-  and an `ArrayLength` are reads, not arbitrary-memory barriers, and
-  re-anchoring a hoisted `Op::Load`'s memory token the way the `Op::ArrayLength`
-  hoist already does (`array-element-load-baseline-codegen-FIXED-20260902`).
-  Worth ~30x on arm B — but arm B is not the default path and, after this fix,
-  should not become one without a workload that says so.
-
-* **The residual ~14x to HotSpot.** At ~3.3 ns/char against 0.23, the inline
-  decode is doing per character: a receiver null check, `coder` and `value`
-  loads, an `arraylength`, a bounds check, two byte loads and a branchless
-  combine. HotSpot vectorises. The single-pass region does not hoist `value`
-  and `coder` out of the loop either — the same transform, in the other
-  emitter, and the obvious next step on this path.
-
-* **Any other final class with an instance call-site intrinsic** had the same
-  defect and now yields. None is measured. `java/util/zip/CRC32` and
-  `AtomicInteger` are not final, so the set may be exactly `{String}`; that has
-  not been enumerated.
+* **HotSpot vectorises this loop and we do not.** At ~3.4 ns/char against
+  0.47, the inline decode still does, per character, a receiver null check,
+  two field reads that are now hoisted, an `arraylength`, a bounds check, two
+  byte loads and a branchless combine. That is a general codegen statement —
+  the `char[]` control in the same run reads ~1.0 against HotSpot's ~0.3, so
+  most of what is left is not about `String` at all. It belongs to the
+  vectorisation backlog rather than to this page, and the `charAt`-specific
+  part of it (the single-pass region does not hoist `value` and `coder`
+  either — the same transform, in the other emitter) is now worth far less
+  than it was, because the tier that DOES hoist them ties it.
 
 ## A note on the build
 

@@ -40,7 +40,9 @@ N="${1:-65536}"
 
 if [ ! -f "$TG/GpuRuntimeStress.class" ]; then
   echo "compiling fixture into $TG"
-  "$JDK/bin/javac" -d "$TG" "$ROOT/test_classes/gpu/GpuRuntimeStress.java" || exit 1
+  # Relative source path from $ROOT: javac is a Windows binary and
+  # cannot open the MSYS-style "/c/..." that $ROOT expands to.
+  (cd "$ROOT" && "$JDK/bin/javac" -d "$TG" "test_classes/gpu/GpuRuntimeStress.java") || exit 1
 fi
 
 TMP="$(mktemp -d)"

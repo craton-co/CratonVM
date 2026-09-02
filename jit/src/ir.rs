@@ -3843,9 +3843,29 @@ struct MergeState {
 // (`loop_store_clobber` / `load_safe_past_clobber`) may hoist both out of a
 // counted loop and leave only the element read in the body — which is the
 // shape HotSpot's 0.5 ns/char comes from, and which is unreachable for any
-// node the tier treats as one opaque unit. Whether it DOES hoist them is a
-// measurement, not a claim; `ir_string_intrinsic_census_line` plus the
-// `charAt` rate on `probes/CharAtCostCurve.java` is what answers it.
+// node the tier treats as one opaque unit.
+//
+// MEASURED 2026-09-02, and for the first ten weeks of this emitter's life
+// the answer was NO. `ir_optimize::loop_has_hard_barrier` refused any loop
+// holding a node that is not pure, not control and not `Load`/`Store`/`Phi`
+// — and this expansion emits four `Op::Guard`s, two `Op::ArrayLoad`s and an
+// `Op::ArrayLength` into the very loop it wants hoisting out of, so **it
+// disqualified its own LICM**. `CRATONVM_DBG=licm` reported
+// `hard_barrier=true` with 0 hoisted on every candidate header, and the arm
+// ran at ~78 ns/char rather than ~3.
+//
+// `ir_optimize::loop_writes_memory` and the restricted read-hoist arm beside
+// the `Op::ArrayLength` one fixed that: all four loads leave the loop and
+// the arm reads **3.2-3.5 ns/char**, a tie with the single-pass body it was
+// 23x behind. `CRATONVM_JIT_NO_LICM_READ_HOIST=1` is the B arm.
+//
+// Separately: both loads sit at an INVOKE pc, and `ir_lower`'s inline
+// compact-`getfield` path is keyed by GETFIELD pc, so until the same day
+// each one was a checked `jit_getfield` helper CALL — 917,203,334 of them in
+// one `probes/CharAtCostCurve.java` run. `try_compile_inner` now installs
+// the two rows they need (`CRATONVM_JIT_NO_STRING_ACCESS_INLINE_ROWS=1`
+// restores the fallback); it is worth ~4.9x on its own and is mostly
+// subsumed by the hoist for a loop shape, which is why both are kept.
 //
 // ## What is emitted
 //
@@ -4022,6 +4042,49 @@ static PUBLISHED_STRING_LAYOUT: std::sync::OnceLock<crate::StringFieldLayout> =
 /// [`ir_string_intrinsic_census`] counts each one — which is what makes "the
 /// emitter is unwired" readable rather than indistinguishable from "the
 /// emitter found nothing".
+/// The `invokevirtual` pcs at which [`IrBuilder::try_string_access_intrinsic`]
+/// expanded a String accessor during the CURRENT build, on this thread.
+///
+/// # Why a thread-local
+///
+/// `IrBuilder::build` takes `self` BY VALUE, so a caller cannot read a field
+/// back off the builder once it has run, and [`Graph`] is built by struct
+/// literal in a dozen tests, so a new field there is a wide mechanical change
+/// for a side table exactly one caller wants. `reset` happens at the top of
+/// `build` and the read happens in `lib.rs` immediately after `build` returns,
+/// on the same thread — the only window in which the list means anything.
+///
+/// # What the reader does with it
+///
+/// The two `Op::Load`s this expansion emits sit at an INVOKE pc, and
+/// `ir_lower`'s inline-`getfield` fast path is keyed by
+/// `(getfield pc, is_reference)`. With no row there both loads fall back to the
+/// checked `jit_getfield` helper — one CALL per character. Measured on
+/// `probes/CharAtCostCurve.java`, arm B, 2026-09-02: **917,203,334** helper
+/// calls in one run, with `IR-tier inline-getfield refusals:
+/// no-compact-slot-for-pc=8` naming the reason. These pcs are what lets
+/// `lib.rs` install the two rows.
+thread_local! {
+    static STRING_ACCESS_SITE_PCS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Clear the per-build String-accessor site list.
+fn reset_string_access_sites() {
+    STRING_ACCESS_SITE_PCS.with(|v| v.borrow_mut().clear());
+}
+
+/// Record one expanded String-accessor site.
+fn note_string_access_site(pc: usize) {
+    STRING_ACCESS_SITE_PCS.with(|v| v.borrow_mut().push(pc));
+}
+
+/// The pcs at which this thread's most recent [`IrBuilder::build`] expanded a
+/// String accessor. Empty when the emitter did not fire.
+pub fn string_access_site_pcs() -> Vec<usize> {
+    STRING_ACCESS_SITE_PCS.with(|v| v.borrow().clone())
+}
+
 pub fn publish_string_layout(layout: crate::StringFieldLayout) {
     let _ = PUBLISHED_STRING_LAYOUT.set(layout);
 }
@@ -4603,6 +4666,11 @@ impl IrBuilder {
         }
 
         // ── Past this point the site is consumed. ──
+        // Recorded BEFORE the loads are built, so the site is on the list
+        // whatever the expansion does after this point — there is no
+        // refusal past here, and a list that could disagree with what was
+        // emitted would be worse than no list.
+        note_string_access_site(pc);
         let index = if kind == SI_EMITTED_CHAR_AT {
             Some(self.pop())
         } else {
@@ -5505,6 +5573,10 @@ impl IrBuilder {
     /// Convert bytecode to IR graph.  Returns `None` if an unsupported
     /// opcode is encountered.
     pub fn build(mut self, code: &[u8], code_len: usize) -> Option<Graph> {
+        // Per-build, per-thread: `lib.rs` reads it back the moment this
+        // returns, to install the compact-field rows the String-access
+        // expansion's two loads need. See `string_access_site_pcs`.
+        reset_string_access_sites();
         // Consume the verifier's canonical decode/CFG contract instead of
         // maintaining a second opcode-length scanner in the compiler.
         let verified = cratonvm_reader::verified_code(code.get(..code_len)?).ok()?;

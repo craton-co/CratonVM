@@ -375,6 +375,57 @@ impl ZObjectStartBits {
     /// RMW costs nothing and removes the assumption. `Release` keeps the clear
     /// no weaker than the `Mutex::unlock` it replaces, so the preceding
     /// zero-fill of the dead object cannot be observed after it.
+    /// One bitmap word: the start (or mark) bits for 512 bytes of arena.
+    ///
+    /// The unit a bitmap-driven sweep walks in. Words outside the bitmap read
+    /// as zero rather than panicking, so a caller iterating a snapshot taken
+    /// at a different moment cannot walk off the end.
+    #[inline]
+    pub(crate) fn word_at(&self, w: usize) -> u64 {
+        if w >= self.nwords {
+            return 0;
+        }
+        // SAFETY: bounds-checked immediately above.
+        unsafe { (*self.words.add(w)).load(Ordering::Acquire) }
+    }
+
+    /// Number of words this bitmap covers.
+    #[inline]
+    pub(crate) fn word_count(&self) -> usize {
+        self.nwords
+    }
+
+    /// The arena address the low bit of word `w` describes.
+    #[inline]
+    pub(crate) fn word_base(&self, w: usize) -> usize {
+        self.base + (w << 9)
+    }
+
+    /// Keep only the bits `marks` also has set, word by word: the bulk twin of
+    /// [`Self::remove`], and what a sweep does to the registry once it
+    /// knows the live set as a bitmap.
+    ///
+    /// One `fetch_and` per 512 arena bytes instead of one per dead object.
+    /// `Release` for the same reason `remove` uses it: whatever the sweep
+    /// wrote into the dead object must not be observable after its base stops
+    /// being a registered allocation.
+    ///
+    /// Bits set in `marks` but not here are ignored -- an object allocated
+    /// black after this snapshot was taken is already registered and must stay
+    /// so. Addresses in the overflow set are NOT touched; they are off-grid by
+    /// definition and their owner sweeps them one at a time.
+    pub(crate) fn retain_marked(&self, marks: &ZObjectStartBits) {
+        for w in 0..self.nwords {
+            let keep = marks.word_at(w);
+            // SAFETY: `w < self.nwords`.
+            let word = unsafe { &*self.words.add(w) };
+            if word.load(Ordering::Relaxed) & !keep == 0 {
+                continue; // nothing to clear in this word
+            }
+            word.fetch_and(keep, Ordering::Release);
+        }
+    }
+
     pub(crate) fn remove(&self, addr: usize) {
         if let Some((w, mask)) = self.locate(addr) {
             // SAFETY: `locate` bounds-checked `addr`, so `w < self.nwords`.
@@ -420,7 +471,23 @@ impl ZObjectStartBits {
         match self.locate(addr) {
             // SAFETY: `locate` bounds-checked `addr`, so `w < self.nwords`.
             Some((w, mask)) => {
-                let prev = unsafe { (*self.words.add(w)).fetch_or(mask, Ordering::AcqRel) };
+                let word = unsafe { &*self.words.add(w) };
+                // TEST BEFORE THE READ-MODIFY-WRITE. This is asked of every
+                // EDGE, not every object, and most edges point at something
+                // already marked -- a shared graph is why marking is a
+                // traversal and not a walk. An unconditional `fetch_or` makes
+                // each of those an exclusive-state acquisition of a cache line
+                // every other worker is also writing; a plain load answers the
+                // same question from a shared one.
+                //
+                // The RMW is still the arbiter, and this only skips the races
+                // it would have lost: nothing clears a mark bit during a mark,
+                // so "already set" is a stable answer, while "not set yet"
+                // falls through and contends for the claim exactly as before.
+                if word.load(Ordering::Relaxed) & mask != 0 {
+                    return false;
+                }
+                let prev = word.fetch_or(mask, Ordering::AcqRel);
                 prev & mask == 0
             }
             None => {
@@ -757,6 +824,22 @@ impl ZObjectStarts {
             ZObjectStartsKind::Hash(set) => {
                 set.lock().remove(&addr);
             }
+        }
+    }
+
+    /// Drop every base `marks` does not have set: the whole prune, in one
+    /// `fetch_and` per 512 arena bytes, for a sweep that already holds the
+    /// live set as a bitmap.
+    ///
+    /// `None` on the hash arm, which has no word structure to `and` against
+    /// and whose caller must keep removing one base at a time.
+    pub(crate) fn retain_marked(&self, marks: &ZObjectStartBits) -> Option<()> {
+        match &self.kind {
+            ZObjectStartsKind::Bits(bits) => {
+                bits.retain_marked(marks);
+                Some(())
+            }
+            ZObjectStartsKind::Hash(_) => None,
         }
     }
 

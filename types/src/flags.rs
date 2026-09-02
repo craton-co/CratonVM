@@ -1053,6 +1053,51 @@ pub struct GcFlags {
     /// store is unconditional), so the flag isolates the READ side — which is
     /// the side that can lose an edge — rather than half-disabling both.
     pub g1_card_rset: bool,
+    /// `CRATONVM_G1_CARD_CLEAN` — clean a card once its objects have been
+    /// scanned, instead of leaving it dirty until its region is recycled.
+    /// **Opt-in** ([`parse::present`]), and the measurement below is why.
+    ///
+    /// # The hypothesis, and what measuring it did to it
+    ///
+    /// F-05 added the card table and cleared a card in exactly one place:
+    /// `G1Region::reset`. So the table only ever GAINS bits, and the obvious
+    /// reading of the 0.2% byte skip-rate measured on
+    /// `probes/HumongousChurn.java` at `-Xmx160m` was saturation: a long-lived
+    /// Old region accumulating dirty cards until the screen answers "scan it"
+    /// for everything.
+    ///
+    /// Cleaning is the fix for that, and it works — the unit tests pin all
+    /// three directions (a card whose edge is gone is cleaned, a card whose
+    /// edge survives is kept, and nothing past the walked extent is touched).
+    /// It does not, however, pay for itself on the workload that motivated it.
+    /// Four ABBA-interleaved release reps, `HumongousChurn 48 6000 512` at
+    /// `-Xmx160m --nojit` (the arm where the screen is actually consulted),
+    /// medians:
+    ///
+    /// | | cleaning off | cleaning on |
+    /// |---|---:|---:|
+    /// | wall | 7740 ms | 8392 ms |
+    /// | total pause | 3054 ms | 3680 ms |
+    /// | byte skip-rate | 28.7% | 23.4% |
+    ///
+    /// Slower, and the skip-rate did not reliably rise. A single earlier run
+    /// showed 82% against 45% and would have made a much better story; it was
+    /// noise, and four reps is what it took to see that. The cost is real (a
+    /// per-region-walk snapshot and a rewrite pass) and the benefit on this
+    /// shape is not, because most objects in a retained linked structure hold a
+    /// cross-region reference and their cards are kept dirty anyway.
+    ///
+    /// So the 0.2% is NOT explained by saturation, and this flag is not the
+    /// answer to it. What the same runs do show is that the JIT-warm arm skips
+    /// 0.79% where the `--nojit` arm skips 20-50% — and the difference is not
+    /// the table's contents but how many source regions reach the per-object
+    /// screen at all, since a JIT-pinned source is walked WHOLESALE by design
+    /// (`card_screen: bool` at `scan_source_region_for_cset_refs`). That is
+    /// where the next measurement should go.
+    ///
+    /// Kept, off, because it is sound, tested, and the mechanism a card table
+    /// needs the moment the screen's engagement problem is fixed.
+    pub g1_card_clean: bool,
     /// `CRATONVM_G1_INLINE_BARRIER` — F-08: let the JIT emit G1's post-write
     /// barrier inline instead of routing every compiled reference store to the
     /// `jit_putfield_object` helper. Opt-in ([`parse::present`]).
@@ -1457,6 +1502,7 @@ impl GcFlags {
             g1_reserve_heap: on_unless_zero(src, "CRATONVM_G1_RESERVE_HEAP"),
             g1_uncommit: present(src, "CRATONVM_G1_UNCOMMIT"),
             g1_card_rset: on_unless_zero(src, "CRATONVM_G1_CARD_RSET"),
+            g1_card_clean: present(src, "CRATONVM_G1_CARD_CLEAN"),
             g1_inline_barrier: present(src, "CRATONVM_G1_INLINE_BARRIER"),
             g1_mark_lock_yield: on_unless_zero(src, "CRATONVM_G1_MARK_LOCK_YIELD"),
             g1_shared_alloc: on_unless_zero(src, "CRATONVM_G1_SHARED_ALLOC"),
