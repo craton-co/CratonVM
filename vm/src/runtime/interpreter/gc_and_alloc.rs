@@ -386,9 +386,15 @@ pub(super) fn stw_take_over_and_wait(
     // Generational degrades to the non-moving sweep that consumes the JIT
     // TLAB skip regions; G1 (INT-3) skips the published tails in every region
     // walker and pins everything a frozen peer can address out of the CSet
-    // (see `pin_frozen_peer_roots_for_g1`); ZGC (INT-3 residual) is trivially
-    // safe — non-moving, registry-walked sweep, and its mutators never hold
-    // TLABs. The `supports_jit_tlab_skip` gate is retained for any future
+    // (see `pin_frozen_peer_roots_for_g1`); ZGC sweeps an allocation-base
+    // REGISTRY rather than memory, so an un-retired tail (which holds no
+    // registered base) is invisible to the sweep by construction, and its
+    // SLIDE consumes the published list — the pages a tail touches leave the
+    // relocation set and the bump cursor never drops below a tail's end
+    // (`zgc/vm_tlab.rs`). The "its mutators never hold TLABs" half of this
+    // argument was retired on 2026-09-02, when `VmHeap::refill_tlab` started
+    // serving that backend too; do not reason from it.
+    // The `supports_jit_tlab_skip` gate is retained for any future
     // backend that can't make one of those arguments.
     if !xt::enabled() || !shared.mem.heap.supports_jit_tlab_skip() {
         shared.mem.gc_barrier.wait_for_all();
