@@ -867,3 +867,54 @@ pause and a repair for the next); it still repairs for later pauses.
 `a_narrow_mixed_pause_still_records_the_edges_a_later_young_pause_needs` drives
 the case that would break first — the copy of an object reachable only through
 an Old holder, collected by a rootless young pause immediately after.
+
+### 11.3 END-TO-END, release, interleaved against the branch point
+
+The shape items 1 and 2 are about needs three things at once, and the first two
+probes written for this did not have them: `HumongousHold` ran on a heap small
+enough that a wide walk and a narrow one covered the same regions, and
+`HumongousWide`'s inner churn was dead on arrival, so the JIT removed it and the
+run took three pauses. `probes/HumongousChurn.java` (tracked, unlike the
+`apps/` probe F-05 lost to `.gitignore`) has all three: a 48 MiB retained old
+generation, ONE humongous span held by it, and a young churn that escapes into a
+rotating window so the collector genuinely runs.
+
+**Release binaries, `-Xmx160m -XX:+UseG1GC`, `HumongousChurn 48 20000 512`, six
+ABBA-interleaved reps, A = a binary built at this branch's point on `dev`
+(`5a6247661`), B = this branch. Medians:**
+
+| | A (branch point) | B (ten findings) | |
+|---|---:|---:|---|
+| fix-up walk, total per run | 581.1 ms | 142.0 ms | **-75.6%** |
+| young pause p50 | 63.1 ms | 23.1 ms | **-63.4%** |
+| total pause time | 5410 ms | 4186 ms | -22.6% |
+| wall | 7562 ms | 6028 ms | -20.3% |
+| widest fix-up walk (regions) | 94-99 | 82-85 | |
+| pauses | 17-18 | 16 | |
+
+`checksum=262316478568` on all twelve runs, identical to HotSpot JDK 25's on
+the same probe. The fix-up column is the one this measures directly: a
+humongous span no longer forces the whole-heap walk, so the walk costs a
+quarter of what it did, and the median pause follows it down.
+
+Two honest limits on that table. The p99 column is not in it because it is one
+pause — the first, which is paid in full before any adaptive term can react,
+and which swings by 3x between reps on this host. And the "widest fix-up walk"
+rows are close together because at this heap size the CSet is a small part of
+the heap either way; the number that moved is the TIME, which is the sum over
+pauses, not the width of the widest one.
+
+**The other arms, same binaries** (`e2e-debug2` in the run log): `G1CardChurn
+11 60` at `-Xmx24m` and `G1ChurnPauseProbe 24 200` at `-Xmx256m` both produce
+HotSpot-identical checksums on the default arm and under
+`CRATONVM_G1_NARROW_FIXUP=0`, `CRATONVM_G1_YOUNG_PAUSE_TARGET=0`,
+`CRATONVM_G1_EAGER_HUMONGOUS=0` and `CRATONVM_G1_CARD_RSET=0` — the kill
+switches change the cost, not the answer. The regression suite is 85/85 on the
+branch's own binary.
+
+**One tight-heap arm still OOMs, on both arms.** `G1CardChurn 11 60` at
+`-Xmx24m` reports evacuation failure on most pauses and then
+`OutOfMemoryError` on 2 of 6 control runs and 1 of 6 branch runs — the same
+shape, at the same rate, on a binary built before any of this. It is recorded
+here because a reader running that arm will see it, not as a residual of this
+work.
