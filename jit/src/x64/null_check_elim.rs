@@ -537,3 +537,49 @@ mod receiver_elision_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod receiver_elision_reach_tests {
+    /// The two `getfield` arms must consult the dataflow, and the other four
+    /// receiver-guard sites must NOT.
+    ///
+    /// This is a source scan because the property is about which CALL each arm
+    /// makes, and the arms are unreachable from a unit test without a full
+    /// compile fixture. It is worth the brittleness: the edit that breaks it —
+    /// "unify these six sites on one helper" — looks like tidying and is a
+    /// miscompile at four of them.
+    ///
+    /// * The two `getfield` arms are identifiable by their return shape,
+    ///   `(…, None)`: they hand back a patch list and a separate null patch.
+    ///   Their receiver is the top-of-stack value the preceding `aload`
+    ///   pushed, which is what `preceding_aload_nonnull_local` decodes.
+    /// * The two `putfield` arms must stay on the bare check. `putfield`'s
+    ///   stack is `[…, objectref, value]`, so the preceding push is the stored
+    ///   VALUE — attributing the receiver's nullness to it is the shape of the
+    ///   Tomcat `MessageBytes.setString` miscompile that
+    ///   `opcode_dereferences_receiver` documents.
+    /// * The two `checkcast` arms must stay on the bare check for a different
+    ///   reason: `checkcast` does not throw on a null receiver at all (a null
+    ///   casts to anything), so its `JZ` targets a legal null path rather than
+    ///   an NPE. Eliding it would let a null fall into the `KIND_TAGS` byte
+    ///   compare and fault.
+    #[test]
+    fn only_the_getfield_arms_consult_the_null_check_dataflow() {
+        let src = include_str!("bytecode_walk.rs");
+        let consulting = src.matches("emit_trusted_oop_receiver_check_at(code, pc)").count();
+        assert_eq!(
+            consulting, 2,
+            "expected exactly the two `getfield` arms to consult the dataflow; \
+             found {consulting}. A THIRD consulting site is only correct if its \
+             receiver is the value the immediately-preceding `aload` pushed — \
+             see this test's doc comment for the two shapes where it is not."
+        );
+        let bare = src.matches("self.emit_trusted_oop_receiver_check()").count();
+        assert_eq!(
+            bare, 4,
+            "expected the two `putfield` and two `checkcast` arms to keep the \
+             unconditional check; found {bare}. Moving one of them onto the \
+             `_at` form is a miscompile, not a simplification."
+        );
+    }
+}
