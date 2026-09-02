@@ -560,7 +560,78 @@ The fix reaches the off-switch's numbers WITHOUT turning eager reclaim off:
 8.7 ms -> 4.4 ms.** It does this only on pauses where the reclaim could not
 have run anyway, so nothing that eager reclaim would have freed is given up.
 
-#### The rate is a separate question, and it is the one left
+### 4f. 2026-09-02, THE CAP FACE: one live finalizable object disabled humongous reclaim for the whole process
+
+The rate had a cause, and it is the same gate section 4e found declining the
+census -- but the cost is far larger than the wasted walk.
+
+**The heap was 81% humongous garbage.** The per-pause region census (which had
+to be repaired first -- it sat behind a `try_lock` on the regions mutex that
+every collection path already holds, so it had never once printed) says:
+
+| | mean per pause |
+|---|---:|
+| `hum_regions` | **829 of 1024** |
+| `free_regions` | 185 |
+| `old_regions` | 7.5 |
+| `eden_regions` | **1.1** |
+| `cset_regions` | **1.5** |
+| `jit_pinned_out` | 1.3 |
+
+Eden is ONE REGION. Every ~1 MB of allocation fills it, triggers a pause that
+may collect 1.5 regions, frees 356 KB, and the next allocation triggers again --
+80 young pauses per second. Pinning is not the cause (1.3 regions), so the
+section-4d root fix is not implicated.
+
+#### Why the humongous population never falls
+
+Eager reclaim is the only thing that reclaims humongous spans, and
+`eager_reclaim_humongous_locked` declined outright whenever `finalizer_pause`
+was set. That flag is set for **ANY registered not-yet-enqueued finalizable
+object**, not just a dead one -- one live `FileInputStream` is enough -- so on
+this workload it never ran, on any pause, for the life of the process.
+
+H2's MVStore allocates 1 MiB `ByteBuffer`s. Humongous is anything over half a
+region, and `16 + 1048576` bytes needs TWO 1 MiB regions, so every buffer costs
+2 MiB and none of them ever came back.
+
+#### MEASURED, one binary, one flag
+
+A deliberately UNSOUND probe (since removed) bypassed just that gate:
+
+| | gate ON (default) | gate bypassed |
+|---|---:|---:|
+| young pauses / 900 s | 76 787 | **88** |
+| `hum_regions` | 830.6 | **26.5** |
+| `free_regions` | 183.6 | **980.3** |
+| `cset_regions` | 1.2 | **128.1** |
+| bytes freed per pause | 485 KB | **449 MB** |
+| outcome | `124` (cap) | **`0` — PASS in 633 s** |
+
+**872x fewer pauses, and the class passes** -- against 552 s for the default
+collector on the same host and binary.
+
+#### The shipped fix names the hazard instead of declining for it
+
+The gate's own field doc states the hazard exactly, and it is narrow: *"a
+humongous object with a finalizer ... never resurrected ... it would just be
+freed out from under a `finalize()` that has not run yet."* A humongous span is
+never in the CSet, so Phase 3.5 never resurrects it and it never reaches
+`resurrected_finalizers`.
+
+So `finalizer_addrs_this_pause` keeps the address list Phase 3.5 consumes, and
+the reclaim marks each of those objects' spans live. Nothing else is needed: a
+dead finalizable object that merely REFERENCES a humongous span is already
+covered, because `HumongousCensus::referenced` counts references from dead
+holders by design ("over-approximates liveness"), and a resurrected one is
+walked at its post-copy address.
+
+Two regression tests, one per direction. The second --
+`an_unrelated_finalizer_candidate_no_longer_suppresses_eager_reclaim` -- FAILS
+on the old code, so it is not a vacuous guard.
+
+#### What is left
+
 
 No arm passes -- halving the pause cost just buys more pauses in the same
 900 s (82 000 - 102 000, up from 51 000 - 61 000). Turning the walk off
