@@ -2925,6 +2925,90 @@ fn alloc_buffer_pool(
     Ok(pool)
 }
 
+/// The JDK's OWN `BufferPoolMXBean` list, in HotSpot's ORDER.
+///
+/// `--jdk-only` refuses the `cratonvm/internal/BufferPool` carrier, which is
+/// the policy working; strict mode is also the mode that HAS a real class
+/// library, so `sun.management.ManagementFactoryHelper` can answer instead of
+/// nothing. Its list is NOT already in the right order:
+/// `VM.getBufferPools()` publishes `[direct, mapped, sync]` while HotSpot's
+/// `ManagementFactory.getPlatformMXBeans(BufferPoolMXBean.class)` — which goes
+/// through `DefaultPlatformMBeanProvider`'s name-keyed map instead — answers
+/// `[mapped, direct, mapped - 'non-volatile memory']`. MEASURED on Temurin
+/// 25.0.3+9. The order is part of the observable answer (the caller gets a
+/// `List` and can index it), so it is reproduced rather than passed through.
+///
+/// Returns `None` when there is no `ManagementFactoryHelper` to ask (a
+/// synthetic-JDK image) or the list could not be read, and the caller then
+/// keeps the behaviour it had.
+pub(crate) fn jdk_buffer_pools_in_hotspot_order(
+    ctx: &mut dyn NativeContext,
+) -> Option<Vec<ObjectRef>> {
+    let list = match ctx.invoke(
+        "sun/management/ManagementFactoryHelper",
+        "getBufferPoolMXBeans",
+        "()Ljava/util/List;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(list)))) => list,
+        _ => return None,
+    };
+    let list_pin = ctx.pin_native_root(list);
+    let size = match ctx.invoke_virtual(list, "size", "()I", &[]) {
+        Ok(Some(Value::Int(n))) if n >= 0 => n,
+        _ => {
+            ctx.unpin_native_roots(list_pin);
+            return None;
+        }
+    };
+    // (name, bean) for every element. Each `invoke_virtual` can move the heap,
+    // so the list and every bean collected so far are pinned across the next
+    // one — the same open-coded discipline `alloc_all_buffer_pools` uses.
+    let mut found: Vec<(String, ObjectRef)> = Vec::with_capacity(size.max(0) as usize);
+    let mut failed = false;
+    for i in 0..size {
+        let list_now = ctx.read_native_pin(list_pin, list);
+        let bean = match ctx.invoke_virtual(
+            list_now,
+            "get",
+            "(I)Ljava/lang/Object;",
+            &[Value::Int(i)],
+        ) {
+            Ok(Some(Value::Object(Some(b)))) => b,
+            _ => {
+                failed = true;
+                break;
+            }
+        };
+        let bean_pin = ctx.pin_native_root(bean);
+        let name = match ctx.invoke_virtual(bean, "getName", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let bean = ctx.read_native_pin(bean_pin, bean);
+        ctx.unpin_native_roots(bean_pin);
+        found.push((name, bean));
+    }
+    ctx.unpin_native_roots(list_pin);
+    if failed || found.is_empty() {
+        return None;
+    }
+    let mut ordered: Vec<ObjectRef> = Vec::with_capacity(found.len());
+    for (want, _) in BUFFER_POOL_NAMES {
+        if let Some((_, bean)) = found.iter().find(|(n, _)| n.as_str() == want) {
+            ordered.push(*bean);
+        }
+    }
+    // Anything the JDK publishes that this table does not know keeps its
+    // relative position at the end rather than being dropped.
+    for (name, bean) in &found {
+        if !BUFFER_POOL_NAMES.iter().any(|(n, _)| *n == name.as_str()) {
+            ordered.push(*bean);
+        }
+    }
+    Some(ordered)
+}
+
 /// The `"direct"` pool — the one every caller in the JDK's own code asks for by
 /// name (`VM.getDirectBufferPool`, `JavaNioAccess.getBufferPool`).
 
@@ -3055,6 +3139,38 @@ pub(crate) fn register_buffer_pool_mxbean(r: &mut NativeMethodRegistry) {
         // still arrive with.
         "java/lang/management/BufferPoolMXBean",
         "jdk/internal/misc/VM$BufferPool",
+        // The JDK's OWN direct-pool implementation.
+        //
+        // `java.nio.Bits`' anonymous `VM$BufferPool` reads three
+        // `AtomicLong`s that `Bits.reserveMemory` maintains — and
+        // `Bits.reserveMemory` is never called here, because
+        // `ByteBuffer.allocateDirect` is force-overridden by this VM's own
+        // allocator in EVERY mode (`native_override.rs`). So those counters
+        // are structurally zero.
+        //
+        // That matters because the platform MBean server does not go through
+        // `ManagementFactory.getPlatformMXBeans` — `DefaultPlatformMBeanProvider`
+        // reaches `ManagementFactoryHelper.getBufferPoolMXBeans()`, which
+        // wraps THESE objects. MEASURED 2026-09-01, `probes/PoolRoutes.java`,
+        // one 1 MiB `allocateDirect`:
+        //
+        //   route                                  compatible   --jdk-only
+        //   getPlatformMXBeans -> getCount()        0 -> 1       no bean
+        //   java.nio:type=BufferPool,name=direct    0 -> 0       0 -> 0
+        //
+        // The second row is the standard JMX route — the one JConsole and
+        // every exporter use — and it is exactly the "reports a perfect cache
+        // no matter what the VM is doing" that
+        // `bug-the-bufferpool-refusal-takes-out-the-whole-platform-mbean-
+        // server-20260822.md` argues a pool bean must never do. Only the
+        // three COUNTERS are forced (`native_override.rs`); `getName()` is two
+        // instructions returning `"direct"` and the JDK's own bytecode keeps
+        // it.
+        //
+        // `buffer_pool_kind` answers DIRECT for a receiver with no kind slot,
+        // which is what a `Bits$1` receiver is, so the existing bodies are
+        // already right for it.
+        "java/nio/Bits$1",
     ] {
         r.register(
             owner,

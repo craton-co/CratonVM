@@ -3883,6 +3883,46 @@ pub mod xmm_roles {
         }
     }
 
+    /// `ir_lower`'s **general-purpose** linear-scan file — the registers a
+    /// long-lived `int`/`long` value may be promoted into for a whole method.
+    ///
+    /// RBX and R12–R15, and every part of that choice is forced:
+    ///
+    ///   * **Callee-saved on both ABIs.** `ir_lower` emits calls constantly —
+    ///     runtime helpers, inline-cache dispatch, JIT-to-JIT direct calls —
+    ///     and this wiring has no reload machinery, so a value's register must
+    ///     survive a call by the calling convention rather than by analysis.
+    ///     That rules out every caller-saved register, including the otherwise
+    ///     obvious System V candidates RSI/RDI.
+    ///   * **Untouched by this emitter.** The value tier is RAX/RCX/RDX, the
+    ///     safepoint and shadow-stack scratch is R10/R11, and call arguments go
+    ///     in `ENTRY_ABI_REGS`. None of those overlaps this set.
+    ///   * RBP and RSP are excluded for the obvious reason. R13 is *included*:
+    ///     it is only awkward as an addressing BASE (no `mod=00` form), and
+    ///     nothing here uses one of these as a base.
+    ///
+    /// The frame stays authoritative — this is a write-through read cache,
+    /// exactly like [`IR_LINEAR_SCAN`] — so no oop map, deopt frame state or
+    /// phi copy changes. What does change is that the prologue must save these
+    /// and every exit restore them: see [`IR_GP_PROLOGUE_SAVED`].
+    ///
+    /// **`IrType::Ref` is never promoted**, and that is not a tuning choice. A
+    /// GC safepoint walks a frame it did not stop, through RBP, and
+    /// `OopMapEntry` can only name frame slots — so no reference may be
+    /// register-resident at one. The XMM file discharged that obligation
+    /// structurally, by having no register a `Ref` could occupy; a GP file has
+    /// to discharge it by refusing the type, which `plan_register_residency`
+    /// does and which its own test pins.
+    pub const IR_GP_LINEAR_SCAN: [u8; 5] = [3, 12, 13, 14, 15];
+
+    /// The GP registers `ir_lower::emit_prologue` saves and every exit
+    /// restores — all of [`IR_GP_LINEAR_SCAN`], because every one of them is
+    /// callee-saved on both ABIs and that is exactly why they were chosen.
+    ///
+    /// Unlike the XMM list this is not platform-conditional: System V and Win64
+    /// agree that RBX and R12–R15 belong to the caller.
+    pub const IR_GP_PROLOGUE_SAVED: &[u8] = &IR_GP_LINEAR_SCAN;
+
     /// The first register claimed by two of the three authorities, if any.
     ///
     /// The invariant this module exists to make checkable, as a value rather

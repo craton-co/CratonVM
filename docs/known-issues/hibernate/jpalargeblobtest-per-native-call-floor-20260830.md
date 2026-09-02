@@ -158,8 +158,12 @@ removes a call.
 
 | | OFF | ON |
 |---|---:|---:|
-| `boxed Long counter` | 305 | **215** (1.42x, 4/4 pairs) |
-| `boxed Integer counter` | 364 | **230** |
+| `boxed Long counter` | 389.2 | **244.0** (1.60x, 3/3 pairs) |
+| `boxed Integer counter` | 394.6 | **240.3** (1.64x) |
+| `stream prim no Random` (zero-boxing control) | 45.6 | 45.0 (flat) |
+
+Re-measured after merging 56 commits of `dev`, on the merged tip, arms in
+OFF-then-ON order; the pre-merge figures were 305 -> 215 on the same lever.
 
 Against HotSpot's 3.46 ns that is still 62x, and the remainder is now almost
 entirely **`Long.valueOf`** - the harder half, needing an allocation fast path

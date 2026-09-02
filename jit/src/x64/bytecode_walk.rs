@@ -2688,20 +2688,25 @@ impl Compiler {
                             self.stack.push(top);
                             self.stack_oop_marks.push(top_is_oop);
                         }
-                        StackSlot::Scratch(reg) => {
+                        StackSlot::Scratch(reg, ..) => {
                             // Scratch register holds the value — try to dup into
                             // another scratch register, else spill original to frame
                             // and push another frame copy.
+                            //
+                            // The duplicate needs its OWN home: the two entries
+                            // are separate stack positions and a shared home
+                            // would have one flush overwrite the other.
                             let avail = SCRATCH_REGS.iter().copied().find(|&sr| {
                                 sr != reg
                                     && !self
                                         .stack
                                         .iter()
-                                        .any(|s| matches!(s, StackSlot::Scratch(r) if *r == sr))
+                                        .any(|s| matches!(s, StackSlot::Scratch(r, ..) if *r == sr))
                             });
-                            if let Some(sr) = avail {
+                            let dup_home = avail.and_then(|_| self.reserve_spill_slots(1));
+                            if let (Some(sr), Some(home)) = (avail, dup_home) {
                                 self.emit_mov_reg_reg(sr, reg);
-                                self.stack.push(StackSlot::Scratch(sr));
+                                self.stack.push(StackSlot::Scratch(sr, home));
                                 self.stack_oop_marks.push(top_is_oop);
                             } else {
                                 // No scratch available — load to RAX and push via frame
@@ -5692,7 +5697,46 @@ impl Compiler {
                         // with no real receiver behind it.
                         self.load_slot_to_reg(RAX, obj_slot);
                         self.emit_precise_null_check_field_store();
-                        if type_tag == b'L' || type_tag == b'[' {
+                        // GATED reference store — tried before every arm below,
+                        // and it supersedes them on the counts that matter: it
+                        // reads the collector's published barrier gates instead
+                        // of inferring them from a region table G1 and ZGC
+                        // leave empty (so the compact arm below is UNREACHABLE
+                        // under the default collector — it emits six
+                        // containment compares that cannot pass and then calls
+                        // the helper), and it does not require the field's old
+                        // value to be null, so an ordinary re-assignment stays
+                        // inline instead of taking the helper.
+                        //
+                        // `false` here means "not admitted", and every arm
+                        // below then runs exactly as it does today. Declining
+                        // is the safe direction and the only one a missing
+                        // barrier plan can produce.
+                        let gated_ref_store = (type_tag == b'L' || type_tag == b'[')
+                            && gated_ref_store_enabled()
+                            && inline_putfield_enabled()
+                            && !narrow_oops_block_inline_fields()
+                            && cratonvm_types::compact_ref_fields_enabled()
+                            && match self.compact_field_off.get(&pc) {
+                                Some(&(c_off, _)) => {
+                                    // Cast: a compact field offset plus the
+                                    // header is bounded by the object size.
+                                    let cell_off = (HEADER_SIZE + c_off as usize) as i32;
+                                    self.emit_gated_compact_ref_putfield(
+                                        obj_slot,
+                                        val_slot,
+                                        field_index,
+                                        cell_off,
+                                        receiver_is_trusted_oop,
+                                    )
+                                }
+                                None => false,
+                            };
+                        if gated_ref_store {
+                            // The sequence above is complete: store, both
+                            // barrier gates, the helper fallback and the
+                            // out-of-bounds drop all converge here.
+                        } else if type_tag == b'L' || type_tag == b'[' {
                             // HIGH-5 / R20: inline the reference-field store on the
                             // barrier-free fast path (CRATONVM_JIT_INLINE_PUTFIELD).
                             // The field cell is the 16-byte `Value` enum: tag dword
@@ -5734,6 +5778,10 @@ impl Compiler {
                                 {
                                     eprintln!("[compact-inline] putfield-ref pc={pc} off={c_off}");
                                 }
+                                // Reached only when the gated sequence declined
+                                // (no published plan), so this arm is the
+                                // pre-existing behaviour, unchanged.
+                                note_ungated_ref_store();
                                 // COMPACT inline reference putfield: store the
                                 // bare 8-byte pointer on the barrier-free fast
                                 // path (non-null YOUNG receiver, NULL old value,
@@ -13393,7 +13441,7 @@ impl Compiler {
                     let recv_slot = self.pop_stack();
                     let recv_offset = match recv_slot {
                         StackSlot::Frame(offset) => offset,
-                        StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg) => {
+                        StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg, ..) => {
                             let Some(offset) = self.reserve_spill_slots(1) else {
                                 return false;
                             };

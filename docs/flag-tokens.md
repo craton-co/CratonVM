@@ -577,7 +577,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-266 tokens.
+268 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -672,6 +672,8 @@ export inherited from a parent shell.
 | `precise-alloc-athrow` | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` |
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
+| `gated-ref-store` | `CRATONVM_JIT_GATED_REF_STORE` |
+| `operand-cache` | `CRATONVM_JIT_OPERAND_CACHE` |
 | `ir-reloc-emit` | `CRATONVM_JIT_IR_RELOC_EMIT` |
 | `reloc-gate-map-incomplete` | `CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE` |
 | `ir-selfrec-direct` | `CRATONVM_JIT_IR_SELFREC_DIRECT` |
@@ -1066,13 +1068,14 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-20 tokens.
+21 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `field-resolution-name-only` | `CRATONVM_FIELD_RESOLUTION_NAME_ONLY` |
 | `map-iterator-failfast` | `CRATONVM_NO_MAP_ITERATOR_FAILFAST` |
 | `map-view-cache` | `CRATONVM_MAP_VIEW_CACHE` |
+| `getresource-first-hit` | `CRATONVM_GETRESOURCE_FIRST_HIT` |
 | `verify-map-view-cache` | `CRATONVM_VERIFY_MAP_VIEW_CACHE` |
 | `eager-streams` | `CRATONVM_EAGER_STREAMS` |
 | `foreign-attach` | `CRATONVM_FOREIGN_ATTACH` |
