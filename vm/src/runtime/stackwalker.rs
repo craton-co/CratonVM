@@ -588,10 +588,95 @@ pub fn capture_full_trace(class_store: &ClassStore, frames: &[Frame]) -> Vec<Sta
 ///   * what the two must agree on is the KEPT set after OSR de-duplication,
 ///     and that still comes out of the same call computed the same way.
 ///
-/// The residual is real and is not a regression: `resolve_caller_class_id`
-/// still cannot see a method the JIT inlined, exactly as before. It belongs on
-/// `docs/known-issues/jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901.md`'s
-/// "what would close it" list rather than being silently inherited.
+/// # And the residual it leaves is NOT REACHABLE (audited 2026-09-01)
+///
+/// The blindness is real: `resolve_caller_class_id` still cannot see a method
+/// the JIT inlined, exactly as before. What the audit found is that no
+/// consumer of this walk can ever be standing on one, so nothing is granted or
+/// denied on the strength of it. Written down here rather than left as a "what
+/// would close it" line, because closing it costs a `ClassStore` on every
+/// caller of a walk that runs on `Class.forName` and on every deep-reflection
+/// check, and re-deriving this argument costs a day.
+///
+/// **What every consumer actually asks.** All of them scan innermost-first,
+/// skip a fixed prefix and take the first survivor:
+/// `lang_class::resolve_caller_class_id` (skips `java/lang/reflect/`,
+/// `java/lang/invoke/`, `jdk/internal/reflect/`, `sun/reflect/` except
+/// `sun/reflect/misc/`, `java/lang/Class`, `java/lang/AccessibleObject`),
+/// `lang_class::class_for_name_one_arg_caller_loader` (skips
+/// `java/lang/Class`), `lang_system::requesting_loader_id` (skips
+/// `java/lang/System` and `java/lang/Runtime`),
+/// `classloader::latest_user_defined_loader_class` (skips every
+/// bootstrap/platform frame) and
+/// `unsafe_natives_ext::unsafe_caller_is_boot_path` (skips the two `Unsafe`
+/// classes). So the frame that decides is the innermost Java frame that CALLED
+/// the caller-sensitive native, modulo that skipped prefix.
+///
+/// **Why that frame is never an inlined one.** Every one of those entry points
+/// is a REGISTERED NATIVE on exactly the class the source names --
+/// `Class.forName(Ljava/lang/String;)`, `setAccessible(Z)V` on `Field` /
+/// `Method` / `Constructor` / `AccessibleObject`, `Method.invoke`,
+/// `Field.get` / `set`, `Constructor.newInstance`, `System.loadLibrary`,
+/// `VM.latestUserDefinedLoader0`, `Unsafe.getUnsafe` -- and a native pushes no
+/// `Frame` (`stack_walker`'s `native_get_caller_class` says so in as many
+/// words). The deciding frame is therefore the one holding the `invoke*` that
+/// enters the native, and for THAT method to have been inlined,
+/// `jit_bridge::resolve_inline_site_from` would have had to admit a spliced
+/// body containing that `invoke*`. It cannot:
+///
+///   * `invokedynamic` is refused outright;
+///   * `invokevirtual` / `invokeinterface` are never offered to the
+///     direct-bind resolver -- it is asked for `invoke_kind` 1 and 3 only --
+///     so such a target must be spliced IN TURN, and a nested splice of a
+///     native is refused by `native-shadow` and by
+///     `native-shadow-on-selected-method`;
+///   * `invokestatic` / `invokespecial` are direct-bound through
+///     `callee_compiler` / `direct_callee_lookup`, and both refuse a
+///     native-shadowed target with `DirectBindRefusal::NativeShadow`;
+///   * a call that is neither spliced nor direct-bound refuses the WHOLE
+///     enclosing site ("neither spliced nor direct-bound").
+///
+/// **The two-hop shape does not open it either.** An inlined `W` could in
+/// principle call a direct-bound COMPILED bridge `M` that the consumer's skip
+/// list skips, leaving the walk to answer `W`'s artifact owner instead of
+/// `W`. `M` would have to be a non-native `invokestatic` / `invokespecial`
+/// method inside a skipped package that reaches one of the natives above. The
+/// one candidate in a real JDK image is
+/// `AccessibleObject.setAccessible(AccessibleObject[],Z)`, which is not
+/// registered here -- and its body reaches `setAccessible0`, which is not
+/// registered either, so that route never touches the gate at all.
+///
+/// **The direction that would GRANT has a second, independent closer.** For an
+/// APPLICATION method to be inlined INTO a `java.base` artifact, the site must
+/// be a guarded virtual/interface one (`resolve_receiver_inline_site`): a
+/// `java.base` classfile cannot name an application class in its own constant
+/// pool, and `resolve_ir_inline_site` resolves from that pool only. The
+/// guarded path is single-pass-tier and carries every refusal above. The
+/// reverse -- a `java.base` method inlined into an APPLICATION artifact --
+/// answers with the application class, the LESS privileged of the two, which
+/// is the deny side.
+///
+/// **What would reopen it**, written down rather than defended against:
+/// `CRATONVM_JIT_INLINE_CALL_DISPATCH=1` (default OFF, and the default is a
+/// measured 3.5x) drops the "neither spliced nor direct-bound" refusal and
+/// lets a spliced call reach the blind dispatch helper, which CAN enter a
+/// native; and registering a caller-sensitive gate on a method the native
+/// registry does NOT shadow would put the deciding frame back inside a splice.
+/// The second is the one to re-check whenever a gate moves.
+///
+/// **A fix would also have no evidence to work from.** The only record of what
+/// was spliced at a program point is `CompiledMethod::inline_frame_map`, and
+/// `x64::inlining::record_inline_frame_row` writes a row ONLY at a call
+/// emitted from inside a spliced body. By the argument above no such call
+/// enters a caller-sensitive native, so at every program point this walk is
+/// asked about, that map misses and the chain is empty. Threading a
+/// `ClassStore` through every caller would recover nothing -- and it would
+/// import the INNERMOST frame's key-2 lookup, which is keyed on a safepoint id
+/// that one `cur_bc_pc` shares with the inline cache's MISS EDGE (see
+/// `conservative_roots::compiled_frame_inline_chain`, which refuses that
+/// fallback for the exact key and cannot for the coarse one). On a miss edge
+/// the spliced body did not run, so that lookup can name a method that never
+/// executed: a wrong frame in a trace, but a fail-OPEN caller in a gate.
 pub fn frame_class_ids_with_compiled(frames: &[Frame]) -> Vec<ClassId> {
     let jit = crate::jit::conservative_roots::active_compiled_frames_with_bci();
     if jit.is_empty() {

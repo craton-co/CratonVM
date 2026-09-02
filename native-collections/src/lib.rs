@@ -9664,6 +9664,102 @@ fn map_buckets_slot(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     receiver_table_slot(ctx, this).unwrap_or(MAP_FIELD_BUCKETS)
 }
 
+/// Write the JVMS §2.3 default — `null`, WRITTEN — into the reference-typed
+/// fields of a map object THIS CRATE allocated itself, so a slot that is
+/// legitimately empty until first use reads back as `null` and not as `Int(0)`.
+///
+/// # This is the whole of the 2026-09-01 descriptor-coercion census row
+///
+/// A stock `cratonvm Hello` reported `total=2740
+/// primitive-into-reference[read=2740]`, all 2740 of them at ONE locator
+/// (`class_id=64 index=2 descriptor=[`) — `java.util.HashMap.table`, read by
+/// [`map_state`] through [`map_buckets_slot`] on the `HashSet.add` boot path.
+/// The access-kind breakdown is the finding, and it is easy to read past:
+/// `read=2740`, **`store=0`**. Not one `set_field` in this crate — or anywhere
+/// else in the VM on that path — ever wrote a primitive at that slot. What put
+/// the `Int(0)` there was the ALLOCATOR.
+///
+/// `Value::Object` carries a `NonNull` niche, so the all-zero cell
+/// `alloc_zeroed` leaves decodes as `Value::Int(0)` and NOT as
+/// `Value::Object(None)`. `gc::heap::alloc_object_with_descriptors` and
+/// `interpreter::gc_and_alloc::init_primitive_fields` both exist to write the
+/// defaults explicitly for exactly that reason, and the test
+/// `zero_memory_does_not_decode_as_null_which_is_why_the_write_exists` pins it.
+/// The interpreter's `new` opcode goes through `init_primitive_fields`; the
+/// `NativeContext::alloc_object` this crate calls goes through neither. So a
+/// map a JAVA constructor allocates has a real `null` at `table` and is silent,
+/// while the backing map [`alloc_hs_backing`] allocates for every `HashSet` has
+/// `Int(0)` there and is counted on every read until the first insert publishes
+/// an array.
+///
+/// # Why this is a repair and not a way to quiet the census
+///
+/// The guard is RIGHT that a primitive is sitting in a reference slot; it is
+/// only wrong about who wrote it. Filling the slot with a fabricated array to
+/// make the number go down would be the anti-pattern this tree has been bitten
+/// by — a loud, counted coercion traded for a silent wrong answer. Leaving the
+/// slot empty is correct; this makes "empty" spell itself the way the JVMS
+/// spells it.
+///
+/// # Java-visible behaviour is unchanged, by construction
+///
+/// `coerce_field_value_for_slot` answers a `b'L' | b'['` descriptor with
+/// `Object(None)` for `Int(0)` and with `Object(None)` for `Object(None)`. So
+/// every descriptor-aware reader — `get_field`, `get_field_volatile`,
+/// `get_field_typed`, `compare_and_swap_field`, and the interpreter's own
+/// `getfield` — sees the byte-identical `Value` before and after this write.
+/// The readers that DO differ are the non-coercing ones (`get_field_raw`,
+/// `Object.clone`'s verbatim field copy, the JIT's direct cell reads), and for
+/// those `Int(0)` at a reference slot was the wrong answer and `null` is the
+/// right one. There is no arm on which the old value is preferable, which is
+/// why this is not behind a kill switch: there would be nothing to A/B.
+///
+/// # Scope, and the fabricated-layout early return
+///
+/// Names resolved on the RECEIVER — the same question [`receiver_table_slot`]
+/// asks, through the same call — and only for a receiver that HAS a real
+/// `table` field. A fabricated layout (`cratonvm/synthetic/AnonymousObject$N`,
+/// the bare `ClassId(0)` CHM segments) returns early, and that is load-bearing:
+/// its `_fN` slots have no declared descriptor, the coercion's `_ => value` arm
+/// passes them through untouched, and this file deliberately keeps
+/// `Int(capacity)` at `MAP_FIELD_CAPACITY` and `Int(size)` at `MAP_FIELD_SIZE`
+/// in two of them. Writing `null` there would delete live state. The early
+/// return is the same discriminator [`publish_map_table_inner`] already uses to
+/// decide whether the legacy capacity `Int` may be stored at all.
+///
+/// The four names are the reference-typed instance fields every map this crate
+/// allocates carries: `AbstractMap.keySet`, `AbstractMap.values`,
+/// `HashMap.table`, `HashMap.entrySet`. `LinkedHashMap.head`/`tail` are
+/// deliberately NOT in the list — they are references too, but a name that a
+/// shadowing subclass could have redeclared as an `int` would turn one census
+/// row (`primitive-into-reference`) into another (`null-into-primitive`)
+/// instead of removing one, and no reader in this file consults them before a
+/// writer has.
+///
+/// Cost: four `resolve_field_index_by_class_id` per map ALLOCATION — not per
+/// operation — on a path that already spends an `ensure_class_initialized`, a
+/// `class_num_total_fields`, and four more name resolutions in the initializer
+/// that runs immediately after. Not a GC point: `set_field` only runs the write
+/// barrier, which never allocates from the Java heap (see [`publish_map_table`]
+/// for the same note), so no caller needs a pin around this call.
+fn init_native_map_reference_defaults(ctx: &mut dyn NativeContext, map: ObjectRef) {
+    if receiver_table_slot(ctx, map).is_none() {
+        // Fabricated layout — see the doc comment above. Nothing here is a
+        // reference field by DECLARATION, so there is no default to write, and
+        // writing one would clobber the model's `Int` slots.
+        return;
+    }
+    let class_id = ctx.class_id_of_object(map);
+    let num_fields = ctx.object_num_fields(map);
+    for name in ["table", "entrySet", "keySet", "values"] {
+        if let Some(slot) = ctx.resolve_field_index_by_class_id(class_id, name) {
+            if slot < num_fields {
+                ctx.set_field(map, slot, Value::Object(None));
+            }
+        }
+    }
+}
+
 /// Publish a freshly built bucket table on `map`, honouring both storage
 /// conventions this crate maintains:
 ///
@@ -18199,6 +18295,11 @@ pub fn make_hashset_with_elements(
         let buckets = alloc_ref_array(ctx, cap);
         let pin_base = ctx.pin_native_root(buckets);
         let backing_map = ctx.alloc_object(hashmap_class_id, map_n_fields);
+        // JVMS §2.3 defaults — see [`init_native_map_reference_defaults`]. This
+        // branch already writes `entrySet` explicitly and overwrites `table`
+        // two lines down; `keySet`/`values` are the slots that were left holding
+        // `Int(0)`. Not a GC point, so the pin re-read below is unaffected.
+        init_native_map_reference_defaults(ctx, backing_map);
         let buckets = ctx.read_native_pin(pin_base, buckets);
         ctx.set_field(backing_map, f_table, Value::Object(Some(buckets)));
         ctx.set_field(backing_map, f_size, Value::Int(0));
@@ -19055,7 +19156,16 @@ fn alloc_backing_map(ctx: &mut dyn NativeContext) -> ObjectRef {
     };
     let total = ctx.class_num_total_fields(cid);
     let n = std::cmp::max(total, MAP_NUM_FIELDS);
-    ctx.alloc_object(cid, n)
+    let m = ctx.alloc_object(cid, n);
+    // JVMS §2.3 defaults for the reference slots. `NativeContext::alloc_object`
+    // zero-fills and stops there, and a zeroed cell decodes as `Int(0)`, not as
+    // `null` — so without this every reference field of this map reads back as a
+    // primitive. `table` is the one a caller then reads on EVERY map operation
+    // until the first insert publishes an array, and it was the whole of the
+    // 2,740-hit descriptor-coercion census row. See
+    // [`init_native_map_reference_defaults`].
+    init_native_map_reference_defaults(ctx, m);
+    m
 }
 
 /// `true` for Set classes whose iteration must preserve *insertion* order
@@ -19088,6 +19198,14 @@ fn alloc_hs_backing(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) ->
         let total = ctx.class_num_total_fields(cid);
         let n = std::cmp::max(total, MAP_NUM_FIELDS);
         let m = ctx.alloc_object(cid, n);
+        // JVMS §2.3 defaults, before anything can read them — see
+        // [`init_native_map_reference_defaults`]. This is the insertion-ordered
+        // twin of the `alloc_backing_map` arm below and has the same defect:
+        // `lhm_init_with_cap_lazy` deliberately leaves `table` unallocated, so
+        // without an explicit `null` the slot reads back `Int(0)` for the whole
+        // life of an empty `LinkedHashSet`. Not a GC point, so it sits outside
+        // the pin below.
+        init_native_map_reference_defaults(ctx, m);
         // The freshly allocated backing map is referenced ONLY by this local
         // until the caller stores it into the set's `map` field. Pin it across
         // the initializer (which allocates the bucket table): a moving cycle
@@ -43956,6 +44074,10 @@ fn alloc_linked_hash_map(ctx: &mut dyn NativeContext) -> ObjectRef {
     let total = ctx.class_num_total_fields(cid);
     let n = std::cmp::max(total, MAP_NUM_FIELDS);
     let m = ctx.alloc_object(cid, n);
+    // JVMS §2.3 defaults — see [`init_native_map_reference_defaults`]. The
+    // initializer below is EAGER, so `table` is overwritten with a real array
+    // one line later; `keySet`/`values`/`entrySet` are the slots this rescues.
+    init_native_map_reference_defaults(ctx, m);
     lhm_init_with_cap(ctx, m, MAP_DEFAULT_CAPACITY);
     m
 }

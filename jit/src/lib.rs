@@ -17988,6 +17988,57 @@ pub fn force_c2_enabled() -> bool {
 /// bailed the whole method before a graph existed, which is why switching the
 /// pin off alone measured nothing.
 ///
+/// # The pin is asked at ONE of the three doors, and this population takes
+/// # another — MEASURED 2026-09-01
+///
+/// `probes/CharAtWarmShape.java`, one binary, three arms:
+///
+/// ```text
+/// arm A  default (pin on)                                314-336 ns/char
+/// arm B  CRATONVM_JIT_NO_STRING_INTRINSIC_PIN=1           66-108 ns/char  ~3x faster
+/// arm C  pin off + CRATONVM_JIT_IR_STRING_INTRINSICS=0       421 ns/char  (control)
+/// ```
+///
+/// and the ENGAGEMENT census on arm A, the same workload:
+///
+/// ```text
+/// [cratonvm] JIT String-intrinsic pin: fired=0 blind-no-layout=0
+///            blind-no-resolver=0 fail-closed=0
+///
+/// [cratonvm-jitc] bg-compile  CharAtWarmShape.scanBig(...)I tier=C2 optimized=true osr_bci=12
+/// [cratonvm-jitc] OSR-compile CharAtWarmShape.scanBig(...)I entry_pc=12
+/// ```
+///
+/// **All four of the pin's counters read zero on the very workload the pin
+/// exists to govern**, in a run where switching the pin off moved that workload
+/// 3x. That is the falsifying evidence for the belief that this pin governs
+/// this population. It does not: the pin is a term of `try_compile_inner`'s
+/// eligibility conjunction, `try_compile_inner` is
+/// `compile_gate::CompileDoor::MethodEntry`, and the third line above says this
+/// method is compiled through the OSR door — which `jit/src/compile_gate.rs`'s
+/// own header records reaching `x64::compile_with_param_slots` DIRECTLY,
+/// never through `try_compile_inner`. A counter installed at one door reports
+/// zero for traffic through another, and a zero reads as *correctly inert*.
+///
+/// Arm C is the control that keeps the DECISION intact: lifting the pin
+/// *without* the IR String emitter is worse than the default (421 against 336),
+/// which independently reproduces the 504-vs-135 ns/call reading recorded at
+/// the conjunction in `try_compile_inner`. The pin is right; its placement was
+/// not. So the asking moved to the one object all three doors already hold —
+/// `compile_gate::CompileAdmission::string_intrinsic_pin_declines`, with a
+/// per-door `asked` / `pinned` / `NOT asked` breakdown
+/// ([`string_intrinsic_pin_door_census_line`]). Nothing this function returns
+/// changed, and nothing [`string_intrinsic_pin_declines`] decides changed.
+///
+/// The lesson is worth stating flatly, because the audit that preceded this
+/// spent five hypotheses on it: every one of the five was about which *method*
+/// takes the fast shape — OSR versus method entry as a property of the method,
+/// callee warm order, caller kind across six shapes, first-compile context,
+/// scale — and each was refuted by its own measurement without ever
+/// converging. The discriminator was not a property of the method. It was
+/// which DOOR compiled it, and no instrument in the tree reported the pin per
+/// door.
+///
 /// NOT `OnceLock`-cached, matching `ir_direct_calls_enabled` and
 /// `x64::guarded_inline_getfield_enabled`: this is read at compile time only,
 /// never on a runtime hot path, and caching would make the flag racy against
@@ -18338,13 +18389,106 @@ static STRING_PIN_FAIL_CLOSED: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// prints it yet", which was true for about a day and is exactly the
 /// instrument-drift the counters exist to catch. The per-method verdict under
 /// `CRATONVM_DBG_JITC` reports the same four states one method at a time.
+///
+/// # These four are PROCESS-GLOBAL, and that is how they read zero — 2026-09-01
+///
+/// All four read `0` on `probes/CharAtWarmShape.java` — the workload the pin
+/// exists to govern — in a run where lifting the pin moved that workload 3x
+/// (314-336 ns/char to 66-108). Nothing was wrong with the counting. The pin
+/// is asked in `try_compile_inner`, i.e. at `CompileDoor::MethodEntry`, and
+/// that method is compiled through the OSR door, which reaches the backend
+/// without passing `try_compile_inner` at all. A counter installed at one door
+/// reports zero for traffic through another.
+///
+/// So read [`string_intrinsic_pin_door_census_line`] FIRST. These four only
+/// mean anything for the doors whose per-door `asked` is non-zero; for every
+/// other door they are silence, not evidence. See
+/// [`string_intrinsic_pin_enabled`] for the three-arm measurement.
 pub fn string_intrinsic_pin_census() -> (u64, u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    // The per-door line is emitted HERE, from the getter, which is a
+    // deliberate compromise and not an oversight. Its only caller is
+    // `jit/src/tiered.rs::dump_method_stats_to_stderr`, which formats the four
+    // globals below into the `JIT String-intrinsic pin:` line — and that file
+    // was outside the lane that added the per-door counters, so the new line
+    // could not be written beside the old one. Emitting it from the one
+    // function the printer calls is what keeps both numbers in the same run's
+    // output; the alternative was a per-door census nothing prints, which is
+    // exactly the instrument-drift the paragraph above records happening once
+    // already ("nothing prints it yet" was true for about a day).
+    //
+    // Guarded twice so it can perturb nothing else: on
+    // `flags().jit.method_stats`, the same flag that gates the only caller, so
+    // a unit test reading the census prints nothing; and on a `Once`, so a
+    // second call cannot double the line. Move it into
+    // `dump_method_stats_to_stderr` beside its sibling the moment that file is
+    // in scope, and delete this paragraph with it.
+    if cratonvm_types::flags().jit.method_stats {
+        static PER_DOOR_LINE: std::sync::Once = std::sync::Once::new();
+        PER_DOOR_LINE.call_once(|| eprintln!("{}", string_intrinsic_pin_door_census_line()));
+    }
     (
         STRING_PIN_FIRED.load(Relaxed),
         STRING_PIN_BLIND_NO_LAYOUT.load(Relaxed),
         STRING_PIN_BLIND_NO_RESOLVER.load(Relaxed),
         STRING_PIN_FAIL_CLOSED.load(Relaxed),
+    )
+}
+
+/// The per-door half of [`string_intrinsic_pin_census`], as one line.
+///
+/// # Why a per-door breakdown exists at all
+///
+/// `fired=0` is the whole lesson. It was read as "the pin is correctly inert"
+/// on a workload where lifting the pin was worth 3x, and it meant "this
+/// traffic went through a door that never asks the pin". The four global
+/// counters cannot express that: *asked and found nothing to pin*, *never
+/// asked*, and *the conjunction short-circuited before the pin term* all
+/// produce the identical zero. These can, because per door
+/// `asked + NOT-asked == admitted` is an exact identity — `admitted` is
+/// `compile_gate::admissions`, `asked` is bumped by the first ask on each
+/// admission token, and `NOT-asked` is charged by that token's `Drop`.
+///
+/// Shape:
+///
+/// ```text
+/// [cratonvm] JIT String-intrinsic pin by door: method-entry: admitted=812 asked=44 pinned=7 NOT-asked=768 | eager-first-call: admitted=3 asked=0 pinned=0 NOT-asked=3 | osr: admitted=61 asked=0 pinned=0 NOT-asked=61
+/// ```
+///
+/// How to read a row:
+///
+///   * `asked == admitted` — this door puts the question on every compilation.
+///   * `NOT-asked == admitted` and `admitted > 0` — this door has never been
+///     taught the question, and every global pin counter is blind to
+///     everything it compiled. That is the state of `osr` and
+///     `eager-first-call` as this lands; both are in `vm/**`.
+///   * `NOT-asked > 0` at `method-entry` — compiles whose eligibility
+///     conjunction short-circuited before the pin term, or that bailed before
+///     reaching it. Worth seeing: a short-circuit is the *other* way a pin
+///     term produces no census, and it is indistinguishable from the first in
+///     the global four.
+///   * `pinned` — the per-door half of the global `fired`, and the only number
+///     here that says the pin changed an outcome.
+pub fn string_intrinsic_pin_door_census_line() -> String {
+    use crate::compile_gate::{
+        admissions, string_pin_asked, string_pin_declined, string_pin_not_asked, CompileDoor,
+    };
+    let rows: Vec<String> = CompileDoor::ALL
+        .iter()
+        .map(|d| {
+            format!(
+                "{}: admitted={} asked={} pinned={} NOT-asked={}",
+                d.label(),
+                admissions(*d),
+                string_pin_asked(*d),
+                string_pin_declined(*d),
+                string_pin_not_asked(*d),
+            )
+        })
+        .collect();
+    format!(
+        "[cratonvm] JIT String-intrinsic pin by door: {}",
+        rows.join(" | ")
     )
 }
 
@@ -21172,7 +21316,17 @@ fn try_compile_inner(
         // when the door supplied no constant-pool invoke resolver. It shares its
         // classification with the printed verdict above, so the reason a run
         // reports and the decision a run takes cannot drift apart again.
-        && !string_intrinsic_pin_declines(
+        //
+        // Asked THROUGH the admission token since 2026-09-01, rather than as a
+        // free call. The decision is the same function and the same answer;
+        // what the token adds is that the question is now a PER-DOOR fact, and
+        // that a door which never asks it is a number instead of an inference.
+        // `fired=0` on `probes/CharAtWarmShape.java` — the workload this pin
+        // exists to govern, and one the OSR door compiles — is what a one-door
+        // counter looks like from three doors away. See
+        // `string_intrinsic_pin_enabled` for the three-arm measurement and
+        // `compile_gate`'s "installed at ONE door" section for the topology.
+        && !admission.string_intrinsic_pin_declines(
             &scan.invoke_ops,
             cp_invoke_resolver,
             resolved_string_layout,
