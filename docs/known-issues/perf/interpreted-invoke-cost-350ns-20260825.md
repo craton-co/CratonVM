@@ -163,6 +163,41 @@ arms of one process is not a wall-clock claim.
    `CRATONVM_JIT_NO_IFACE_SELECT_MEMO=1`; `CRATONVM_DBG_FIELD_SITE=1` adds
    `iface-select: hit / miss / fill / trivial`.
 
+   Engagement first, because the wall clock could not have shown it. One
+   900k-iteration probe arm of each shape:
+
+   ```
+   iface-select: hit=900003 miss=5 fill=5 trivial=900045
+   ```
+
+   `A implements I { f() }` takes the short-circuit; `B extends A` takes the
+   memo, at a 99.9999% hit rate. Neither re-walks after the first call.
+
+   `probes/Dispatch.java`, `ifaceInherited` minus `virtual1` — the arm whose
+   receiver does NOT declare the method, so the short-circuit cannot fire and
+   the memo has to answer. ns:
+
+   | | pass 1 | pass 2 | pass 3 | pass 4 |
+   |---|---:|---:|---:|---:|
+   | memo on | -41.3 | -19.2 | +59.5 | -38.5 |
+   | memo off | +88.5 | +88.8 | +60.5 | +44.6 |
+
+   3/4 with no overlap; pass 3 is a tie under a load spike. Medians -29 vs
+   +74, so roughly **100 ns** off an inherited-receiver interface call. With
+   the memo on the delta goes NEGATIVE, which is the right shape rather than a
+   suspicious one: both opcodes now reach the dispatcher through the same
+   work, so what is left is noise around zero.
+
+   **The first A/B of this change separated nothing, and the switch was why.**
+   It gated the memo but not the short-circuit beside it, so its "off" arm was
+   not the pre-change path — and the arm being measured (`iface1`, whose
+   receiver declares the method) short-circuited in BOTH arms. A kill switch
+   that does not restore the old path is not a control, and a probe arm the
+   switch cannot reach is not a measurement. Widened to disable both steps;
+   the numbers above are from the corrected switch, and `Dispatch.java` now
+   prints the `ifaceInherited` delta so the right arm is the obvious one to
+   read.
+
 4. **Two descriptor scans that are constant per method.** `ParamTags::of`
    rescanned `cached.method_descriptor` on every invoke through the inline
    cache; `areturn` called `jit::return_type(frame.method_descriptor())` - a
