@@ -3090,8 +3090,9 @@ impl VmHeap {
                  compaction_cycles={compactions} objects_relocated={relocated} \
                  relocation_skipped_jit={skipped_jit} \
                  relocation_on_proven_jit={proven_jit} \
-                 tlab_retire_skipped={tlab_skipped}                  targeted_pages={targeted_pages}                  targets_recorded={targets_recorded} targets_consumed={targets_consumed}                  tlab_recycled_refills={recycled_refills} tlab_starved_refills={starved_refills}                  tlab_starved_bytes={starved_bytes}",
+                 tlab_retire_skipped={tlab_skipped} tlab_retire_skipped_at_safepoint={tlab_retire_skipped_at_safepoint}                  targeted_pages={targeted_pages}                  targets_recorded={targets_recorded} targets_consumed={targets_consumed}                  tlab_recycled_refills={recycled_refills} tlab_starved_refills={starved_refills}                  tlab_starved_bytes={starved_bytes}",
                 targeted_pages = crate::zgc::forwarding::targeted_pages_selected(),
+                tlab_retire_skipped_at_safepoint = h.tlab_retire_skipped_at_safepoint(),
                 targets_recorded = targets_recorded,
                 targets_consumed = targets_consumed,
                 recycled_refills = recycled_refills,
