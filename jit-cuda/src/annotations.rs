@@ -85,6 +85,116 @@ pub enum AdmissionHint {
     AllowIntrinsicCalls,
 }
 
+/// The admission loosenings a `@GpuKernel` asked for, as an
+/// independent set rather than a single choice.
+///
+/// # Why this exists beside [`AdmissionHint`]
+///
+/// AUDIT 2026-09-02. `AdmissionHint` is one-of, and the four things it
+/// names are not mutually exclusive: wanting `Math.sqrt` says nothing
+/// about wanting an unguarded division. A user could ask for either and
+/// never both.
+///
+/// The cost of that showed up inside this crate rather than in a bug
+/// report. `frem`/`drem` are admitted under `AllowDivByZero`, and the
+/// reason given in `analyzer::Reason::FloatRemainder` is not a semantic
+/// one — it is that minting a dedicated variant "would require editing
+/// `annotations.rs`". So one flag came to gate two unrelated lowering
+/// decisions (skip the integer zero-divisor guard; accept a
+/// precision-bounded `frem` identity), and keeping them untangled takes
+/// three paragraphs of doc comment on three different types.
+///
+/// Here they are separate bits. `AllowDivByZero` still sets both, so
+/// nothing a user has written changes meaning; an annotation that wants
+/// only one can now say so.
+///
+/// # The array form
+///
+/// Java annotation elements may be arrays, so the composable spelling is
+/// `@GpuKernel(admit = {ALLOW_INTRINSIC_CALLS, ALLOW_DIV_BY_ZERO})`.
+/// [`parse_admission_flags`] accepts it and the single-constant form
+/// alike. Whether `craton.gpu.GpuKernel` declares `admit()` as
+/// `AdmissionHint` or `AdmissionHint[]` is that project's decision —
+/// this side is ready for either, which is the half that can be settled
+/// from here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AdmissionFlags {
+    /// `newarray` of a primitive component whose size comes from a
+    /// method parameter is accepted.
+    pub allocation: bool,
+    /// Lowering skips the explicit divisor-zero deopt guard on
+    /// `idiv`/`ldiv`/`irem`/`lrem`. Other guards, such as
+    /// signed-minimum divided by `-1`, remain in force.
+    pub unguarded_integer_division: bool,
+    /// `frem`/`drem` are admitted at all.
+    ///
+    /// Separate from [`AdmissionFlags::unguarded_integer_division`]
+    /// because it accepts a different thing: the div+truncate+fma
+    /// identity is bit-exact only while the quotient magnitude stays
+    /// within the type's exactly-representable-integer range (`< 2^24`
+    /// for `float`, `< 2^53` for `double`). Outside it the answer is
+    /// wrong by a whole multiple of the divisor — not a rounding error —
+    /// and the GPU deopt machinery catches bounds and div-zero traps,
+    /// never wrong VALUES.
+    pub approximate_float_remainder: bool,
+    /// `invokestatic` to a curated [`crate::analyzer::MathIntrinsic`] is
+    /// accepted. Every other `invokestatic` still rejects.
+    pub intrinsic_calls: bool,
+}
+
+impl AdmissionFlags {
+    /// The strict default: nothing loosened.
+    pub const STRICT: Self = Self {
+        allocation: false,
+        unguarded_integer_division: false,
+        approximate_float_remainder: false,
+        intrinsic_calls: false,
+    };
+
+    /// Fold one Java constant name into the set.
+    ///
+    /// Unknown names are ignored rather than defaulted, which is the
+    /// safe direction here: every bit this can set LOOSENS admission, so
+    /// a name this crate does not know leaves the analyzer stricter than
+    /// the user asked for. It can lose coverage and never admit
+    /// something the emitter cannot lower.
+    ///
+    /// (`parse_grid_shape` cannot do the same — an unknown grid shape
+    /// has to REJECT, because defaulting there would silently lower a
+    /// block reduction element-wise. See [`GridShape::Unknown`].)
+    fn apply_name(&mut self, name: &str) {
+        match name {
+            "STRICT" => {}
+            "ALLOW_ALLOCATION" => self.allocation = true,
+            "ALLOW_DIV_BY_ZERO" => {
+                // Both, deliberately: this is the constant users have
+                // been writing, and it has always meant both since
+                // `frem`/`drem` were admitted under it.
+                self.unguarded_integer_division = true;
+                self.approximate_float_remainder = true;
+            }
+            "ALLOW_INTRINSIC_CALLS" => self.intrinsic_calls = true,
+            _ => {}
+        }
+    }
+}
+
+impl From<AdmissionHint> for AdmissionFlags {
+    fn from(h: AdmissionHint) -> Self {
+        let mut f = Self::STRICT;
+        match h {
+            AdmissionHint::Strict => {}
+            AdmissionHint::AllowAllocation => f.allocation = true,
+            AdmissionHint::AllowDivByZero => {
+                f.unguarded_integer_division = true;
+                f.approximate_float_remainder = true;
+            }
+            AdmissionHint::AllowIntrinsicCalls => f.intrinsic_calls = true,
+        }
+        f
+    }
+}
+
 // ---------------------------------------------------------------------
 // Public attribute structs — per spec §2.3
 // ---------------------------------------------------------------------
@@ -99,7 +209,17 @@ pub struct GpuKernelAttrs {
     pub block_y: u32,
     pub block_z: u32,
     pub shared_bytes: u32,
-    pub admit: AdmissionHint,
+    /// Everything the annotation asked for, as an independent set — see
+    /// [`AdmissionFlags`] for why one-of was the wrong shape.
+    ///
+    /// This replaced an `AdmissionHint` of the same name rather than
+    /// sitting beside one. A struct with both would need every
+    /// constructor to keep them in sync, and the first run after adding
+    /// the second field proved the point: twenty tests built
+    /// `GpuKernelAttrs { admit, ..Default::default() }`, left the set at
+    /// `STRICT`, and silently lost their hint. Changing the type breaks
+    /// those callers loudly instead. `AdmissionHint::into()` converts.
+    pub admit: AdmissionFlags,
 }
 
 impl Default for GpuKernelAttrs {
@@ -111,7 +231,7 @@ impl Default for GpuKernelAttrs {
             block_y: 0,
             block_z: 0,
             shared_bytes: 0,
-            admit: AdmissionHint::Strict,
+            admit: AdmissionFlags::STRICT,
         }
     }
 }
@@ -321,20 +441,33 @@ pub(crate) const ADMISSION_HINT_NAMES: [&str; 4] = [
     "ALLOW_INTRINSIC_CALLS",
 ];
 
-fn parse_admission_hint(value: &ElementValue, cp: &ConstantPool) -> AdmissionHint {
-    match as_enum_const_name(value, cp) {
-        Some("STRICT") => AdmissionHint::Strict,
-        Some("ALLOW_ALLOCATION") => AdmissionHint::AllowAllocation,
-        Some("ALLOW_DIV_BY_ZERO") => AdmissionHint::AllowDivByZero,
-        Some("ALLOW_INTRINSIC_CALLS") => AdmissionHint::AllowIntrinsicCalls,
-        // Unlike `parse_grid_shape`, defaulting is safe here: `Strict` is
-        // the STRICTEST hint, so an unrecognised name loses coverage (a
-        // method that would have been admitted is not) and can never
-        // admit something the emitter cannot lower. The contract test
-        // catches the drift either way.
-        _ => AdmissionHint::default(),
+/// Parse `admit` into an independent set, accepting either the
+/// single-constant spelling (`admit = ALLOW_DIV_BY_ZERO`) or the array
+/// one (`admit = {ALLOW_INTRINSIC_CALLS, ALLOW_DIV_BY_ZERO}`).
+///
+/// A nested array is not recursed into: the JVMS permits arbitrary
+/// nesting in the encoding, javac never produces it for an
+/// enum-array-valued element, and flattening one would be reading intent
+/// into a shape no source form makes.
+pub(crate) fn parse_admission_flags(value: &ElementValue, cp: &ConstantPool) -> AdmissionFlags {
+    let mut out = AdmissionFlags::STRICT;
+    match value {
+        ElementValue::Array(items) => {
+            for item in items {
+                if let Some(name) = as_enum_const_name(item, cp) {
+                    out.apply_name(name);
+                }
+            }
+        }
+        other => {
+            if let Some(name) = as_enum_const_name(other, cp) {
+                out.apply_name(name);
+            }
+        }
     }
+    out
 }
+
 
 fn parse_gpu_kernel(ann: &Annotation, cp: &ConstantPool) -> GpuKernelAttrs {
     let mut out = GpuKernelAttrs::default();
@@ -370,7 +503,7 @@ fn parse_gpu_kernel(ann: &Annotation, cp: &ConstantPool) -> GpuKernelAttrs {
         }
     }
     if let Some(v) = find_pair(ann, "admit", cp) {
-        out.admit = parse_admission_hint(v, cp);
+        out.admit = parse_admission_flags(v, cp);
     }
     out
 }
@@ -551,7 +684,7 @@ mod tests {
         let k = m.gpu_kernel.expect("@GpuKernel must be detected");
         assert_eq!(k, GpuKernelAttrs::default());
         assert_eq!(k.grid, GridShape::Elementwise);
-        assert_eq!(k.admit, AdmissionHint::Strict);
+        assert_eq!(k.admit, AdmissionFlags::STRICT);
         // Spec §2.1: 0 means "JVM picks the block dimension".
         assert_eq!(k.block_x, 0);
         assert_eq!(k.block_y, 0);
@@ -581,7 +714,7 @@ mod tests {
         };
         let m = read_method_annotations(&[ria(vec![ann])], &cp);
         let k = m.gpu_kernel.expect("@GpuKernel must be detected");
-        assert_eq!(k.admit, AdmissionHint::AllowAllocation);
+        assert_eq!(k.admit, AdmissionHint::AllowAllocation.into());
         // Untouched fields still take their defaults (spec §2.1: 0).
         assert_eq!(k.grid, GridShape::Elementwise);
         assert_eq!(k.block_x, 0);
@@ -655,4 +788,115 @@ mod tests {
         assert_eq!(c, ClassAnnotations::default());
         assert!(c.enable_async.is_none());
     }
+    /// The array spelling composes; the single-constant one still means
+    /// what it always meant.
+    ///
+    /// AUDIT 2026-09-02. `admit` was one-of, so a kernel could ask for
+    /// `Math.sqrt` OR an unguarded division and never both — even though
+    /// the two decisions have nothing to do with each other. This is the
+    /// request that was previously unsayable.
+    #[test]
+    fn admit_accepts_a_set_of_constants() {
+        let mut cp = CpBuilder::new();
+        let hint_type = cp.utf8("Lcraton/gpu/AdmissionHint;");
+        let intrinsics = cp.utf8("ALLOW_INTRINSIC_CALLS");
+        let div = cp.utf8("ALLOW_DIV_BY_ZERO");
+        let value = ElementValue::Array(vec![
+            ElementValue::Enum {
+                type_name_index: hint_type,
+                const_name_index: intrinsics,
+            },
+            ElementValue::Enum {
+                type_name_index: hint_type,
+                const_name_index: div,
+            },
+        ]);
+
+        let flags = parse_admission_flags(&value, &cp.build());
+
+        assert!(flags.intrinsic_calls, "the first constant was dropped");
+        assert!(
+            flags.unguarded_integer_division,
+            "the second constant was dropped"
+        );
+        assert!(
+            flags.approximate_float_remainder,
+            "ALLOW_DIV_BY_ZERO has admitted frem/drem since 2026-07-11 and \
+             must keep doing so, in either spelling"
+        );
+        assert!(!flags.allocation, "nothing asked for allocation");
+    }
+
+    /// The two decisions `ALLOW_DIV_BY_ZERO` used to carry together can
+    /// now be told apart.
+    ///
+    /// It still SETS both — that constant is what users have written and
+    /// its meaning does not change. What changed is that the analyzer
+    /// reads two independent bits, so a future constant can loosen one
+    /// without the other, and the reason `Reason::FloatRemainder` gives
+    /// for the coupling ("would require editing `annotations.rs`") is no
+    /// longer a reason for anything.
+    #[test]
+    fn the_two_division_decisions_are_separate_bits() {
+        let both: AdmissionFlags = AdmissionHint::AllowDivByZero.into();
+        assert!(both.unguarded_integer_division);
+        assert!(both.approximate_float_remainder);
+
+        // Independently settable, which the enum could not express.
+        let only_integer = AdmissionFlags {
+            unguarded_integer_division: true,
+            ..AdmissionFlags::STRICT
+        };
+        assert!(!only_integer.approximate_float_remainder);
+        let only_float = AdmissionFlags {
+            approximate_float_remainder: true,
+            ..AdmissionFlags::STRICT
+        };
+        assert!(!only_float.unguarded_integer_division);
+    }
+
+    /// Every legacy hint converts to exactly the set it always meant.
+    #[test]
+    fn every_hint_converts_to_the_set_it_always_meant() {
+        assert_eq!(
+            AdmissionFlags::from(AdmissionHint::Strict),
+            AdmissionFlags::STRICT
+        );
+        assert_eq!(
+            AdmissionFlags::from(AdmissionHint::AllowAllocation),
+            AdmissionFlags {
+                allocation: true,
+                ..AdmissionFlags::STRICT
+            }
+        );
+        assert_eq!(
+            AdmissionFlags::from(AdmissionHint::AllowIntrinsicCalls),
+            AdmissionFlags {
+                intrinsic_calls: true,
+                ..AdmissionFlags::STRICT
+            }
+        );
+    }
+
+    /// An unrecognised constant loosens nothing.
+    ///
+    /// The safe direction, and the opposite of `parse_grid_shape`'s:
+    /// every bit here LOOSENS admission, so a name this crate does not
+    /// know leaves the analyzer stricter than asked and can never admit
+    /// something the emitter cannot lower.
+    #[test]
+    fn an_unknown_constant_loosens_nothing() {
+        let mut cp = CpBuilder::new();
+        let hint_type = cp.utf8("Lcraton/gpu/AdmissionHint;");
+        let bogus = cp.utf8("ALLOW_EVERYTHING_PLEASE");
+        let value = ElementValue::Enum {
+            type_name_index: hint_type,
+            const_name_index: bogus,
+        };
+        assert_eq!(
+            parse_admission_flags(&value, &cp.build()),
+            AdmissionFlags::STRICT
+        );
+    }
+
 }

@@ -1108,7 +1108,7 @@ mod tests {
         let (method, cp) = crate::analyzer::load_method_with_pool(class, method_name, descriptor);
         let annotations = crate::annotations::MethodAnnotations {
             gpu_kernel: Some(crate::annotations::GpuKernelAttrs {
-                admit: hint,
+                admit: hint.into(),
                 ..crate::annotations::GpuKernelAttrs::default()
             }),
             gpu_exclude: None,
@@ -2738,7 +2738,7 @@ mod tests {
                 crate::analyzer::load_method_with_pool("EligibleLlamaKernels", name, descriptor);
             let annotations = crate::annotations::MethodAnnotations {
                 gpu_kernel: Some(crate::annotations::GpuKernelAttrs {
-                    admit: hint,
+                    admit: hint.into(),
                     ..crate::annotations::GpuKernelAttrs::default()
                 }),
                 ..crate::annotations::MethodAnnotations::default()
@@ -3633,7 +3633,7 @@ mod tests {
         );
         let annotations = crate::annotations::MethodAnnotations {
             gpu_kernel: Some(crate::annotations::GpuKernelAttrs {
-                admit: crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+                admit: crate::annotations::AdmissionHint::AllowIntrinsicCalls.into(),
                 ..crate::annotations::GpuKernelAttrs::default()
             }),
             gpu_exclude: None,
