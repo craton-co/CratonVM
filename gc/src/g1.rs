@@ -358,6 +358,32 @@ pub fn evacuation_refs_rejected() -> usize {
     EVAC_REF_REJECTED.load(Ordering::Relaxed)
 }
 
+/// The subset of [`EVAC_REF_REJECTED`] whose refusal is evidence of
+/// CORRUPTION rather than of an ordinary dead referent.
+///
+/// The same split the marker's gate already carries as [`GrayRefusal`], and
+/// for the same reason: a candidate at or above its region's cursor, or in a
+/// `Free` region, was never a live object in that region's CURRENT
+/// incarnation, and a slot naming one is ROUTINE -- freed regions are
+/// deliberately not scrubbed (G1AUD-10) and the evacuation walks name dead
+/// objects' slots as well as live ones. A candidate INSIDE the allocated
+/// prefix whose header does not decode is the other thing entirely: something
+/// was placed there and its header does not describe it.
+///
+/// `EVAC_REF_REJECTED` counted both, which is one bit too few to act on. That
+/// is verbatim the defect the 2026-08-30 `plausible_mark_scan_target` split
+/// fixed on the MARKING side, where 2 226 of 2 249 refusals turned out to be
+/// the routine kind and the remaining 23 were the whole story.
+/// `TestKillProcessWhileWriting` reports this evacuation-side family in the
+/// MILLIONS (`#134217728`), and until this split nothing said which of the two
+/// populations that number was.
+pub static EVAC_REF_REJECTED_TORN: AtomicUsize = AtomicUsize::new(0);
+
+/// The value of [`EVAC_REF_REJECTED_TORN`].
+pub fn evacuation_refs_rejected_torn() -> usize {
+    EVAC_REF_REJECTED_TORN.load(Ordering::Relaxed)
+}
+
 /// How many objects the evacuation ref-scan refused to WALK because their own
 /// header did not look like a live object. Expected to be ZERO.
 pub static EVAC_HOLDER_REJECTED: AtomicUsize = AtomicUsize::new(0);
@@ -5618,14 +5644,28 @@ impl G1Collector {
         slot: usize,
         raw: usize,
     ) -> bool {
-        if self.candidate_header_is_plausible(regions, raw) {
+        let (verdict, _) = self.classify_candidate_header(regions, raw);
+        if verdict == HeaderVerdict::Object {
             return true;
         }
+        // WHICH refusal, not just THAT one. See [`EVAC_REF_REJECTED_TORN`]:
+        // "at/above the cursor" and "inside the allocated prefix but the tags
+        // do not decode" are different defects with different producers, and
+        // one counter over both is what made `#134217728` unactionable.
+        let torn = evac_refusal_is_torn(verdict);
         let n = EVAC_REF_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+        let torn_n = if torn {
+            EVAC_REF_REJECTED_TORN.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            EVAC_REF_REJECTED_TORN.load(Ordering::Relaxed)
+        };
         // Rate-limited like the other GC fail-safes: the first is always
         // visible, then powers of two, so a pathological cycle cannot flood a
-        // suite log while a single occurrence still cannot hide.
-        if n <= 8 || n.is_power_of_two() {
+        // suite log while a single occurrence still cannot hide. A TORN
+        // candidate gets its OWN budget: it is the rare population, and
+        // sharing a throttle with the routine one is how a handful of real
+        // events hide behind millions of ordinary ones.
+        if n <= 8 || n.is_power_of_two() || (torn && (torn_n <= 8 || torn_n.is_power_of_two())) {
             // SAFETY: `holder` is the object currently being scanned; the
             // evacuator owns it under the `regions` lock.
             // The holder's SHAPE, not just its class. A rejection says a word
@@ -5655,8 +5695,36 @@ impl G1Collector {
                     )
                 })
                 .unwrap_or_else(|| "r?".to_string());
+            // WHERE THE HOLDER SITS IN ITS OWN REGION'S OBJECT GRID. The
+            // 2026-08-30 census established that every rejection this site
+            // produces carries the same holder shape (`class_id=0
+            // kind=Object num_slots=8192 array_len=0`) and asked what such a
+            // thing is. That question has exactly two answers and this string
+            // separates them: `grid=OBJECT-START` means the bytes at a real
+            // object start decode to that shape, so the HEADER is lying and
+            // the producer is an allocator or a mark-word writer, while
+            // `grid=INTERIOR` / `grid=DESYNC-BEFORE-TARGET` / `grid=WALK-BROKE`
+            // means the holder address is not an object start at all and the
+            // producer is whatever put it on a worklist.
+            //
+            // The raw mark word is printed beside it because the shape's
+            // `kind` and `element_type` live in its top 16 bits: an all-zero
+            // quartet under a non-zero `shape` is what a PRIMITIVE ARRAY
+            // (which carries `class_id` 0 -- see `try_alloc_array`'s callers)
+            // looks like when its kind tags were never written or were
+            // overwritten, and that reads back as exactly the censused shape.
+            let holder_grid = self
+                .lookup_region_for_addr(holder as usize)
+                .map(|i| self.locate_in_object_grid(&regions[i], holder as usize))
+                .unwrap_or_else(|| "grid=no-region".to_string());
+            // SAFETY: as above -- the evacuator owns the holder under the lock.
+            let holder_mark = unsafe {
+                (*(holder as *const ObjectHeader))
+                    .mark_word
+                    .load(Ordering::Relaxed)
+            };
             tracing::warn!(
-                "[g1] {site}: REJECTED a non-object candidate (#{n}): holder=0x{:x} class_id={holder_class} kind={holder_kind:?} num_slots={holder_slots} array_len={holder_len} holder_region={holder_region} slot={slot} candidate=0x{raw:x} — the word is inside the region span but is not a live object header, so evacuating it would have dereferenced it. The slot is left unchanged and the pause continues.",
+                "[g1] {site}: REJECTED a non-object candidate (#{n}, torn={torn} torn_total={torn_n} verdict={verdict:?}): holder=0x{:x} class_id={holder_class} kind={holder_kind:?} num_slots={holder_slots} array_len={holder_len} holder_mark=0x{holder_mark:016x} holder_region={holder_region} {holder_grid} slot={slot} candidate=0x{raw:x} — the word is inside the region span but is not a live object header, so evacuating it would have dereferenced it. The slot is left unchanged and the pause continues.",
                 holder as usize,
             );
         }
@@ -5715,7 +5783,7 @@ impl G1Collector {
         let n = EVAC_HOLDER_CLAMPED.fetch_add(1, Ordering::Relaxed) + 1;
         if n <= 8 || n.is_power_of_two() {
             tracing::warn!(
-                "[g1] evacuation ref-scan CLAMPED a holder's element walk (#{n}):                  obj=0x{addr:x} declared={declared} room={room} — the header claims more                  reference slots than its region holds, so the walk would have read past                  the region. Walking {room}.",
+                "[g1] evacuation ref-scan CLAMPED a holder's element walk (#{n}):                  obj=0x{addr:x} stride={stride} declared={declared} room={room} — the header claims more                  reference slots than its region holds, so the walk would have read past                  the region. Walking {room}.",
             );
         }
         room
@@ -6022,10 +6090,27 @@ impl G1Collector {
                 }
             }
         } else {
-            for_each_flat_object_reference_trusting_header(
+            // The flat walk gets the SAME region clamp the reference-array branch
+            // beside it already has, with the 16-byte `SLOT_SIZE` stride
+            // `holder_walkable_slots` grew for it. `candidate_header_is_plausible`
+            // validated the holder's tag bytes and its containment; it did not
+            // validate that `HEADER_SIZE + num_slots * SLOT_SIZE` lands inside the
+            // region, and a legacy slot leaves a region twice as fast as an array
+            // element does.
+            //
+            // `record_outgoing_rset_edges` already makes exactly this argument and
+            // applies exactly this clamp; it was the only one of the three flat
+            // walks that got it. The two that did not are the two that also WRITE:
+            // an unclamped walk here does not merely read past the holder, it
+            // rewrites `Value` cells past the holder with forwarded pointers, i.e.
+            // it corrupts whatever objects follow it in the region.
+            let walkable_slots =
+                self.holder_walkable_slots(regions, obj_ptr, header.num_slots() as usize, SLOT_SIZE);
+            for_each_flat_object_reference_capped(
                 obj_ptr,
                 header,
                 0,
+                walkable_slots,
                 |slot_ptr, raw, compact| {
                     if !self.evacuation_candidate_is_an_object(
                         regions,
@@ -6256,10 +6341,27 @@ impl G1Collector {
                     }
                 }
             } else {
-                for_each_flat_object_reference_trusting_header(
+                // The flat walk gets the SAME region clamp the reference-array branch
+                // beside it already has, with the 16-byte `SLOT_SIZE` stride
+                // `holder_walkable_slots` grew for it. `candidate_header_is_plausible`
+                // validated the holder's tag bytes and its containment; it did not
+                // validate that `HEADER_SIZE + num_slots * SLOT_SIZE` lands inside the
+                // region, and a legacy slot leaves a region twice as fast as an array
+                // element does.
+                //
+                // `record_outgoing_rset_edges` already makes exactly this argument and
+                // applies exactly this clamp; it was the only one of the three flat
+                // walks that got it. The two that did not are the two that also WRITE:
+                // an unclamped walk here does not merely read past the holder, it
+                // rewrites `Value` cells past the holder with forwarded pointers, i.e.
+                // it corrupts whatever objects follow it in the region.
+                let walkable_slots =
+                    self.holder_walkable_slots(regions, obj_ptr, header.num_slots() as usize, SLOT_SIZE);
+                for_each_flat_object_reference_capped(
                     obj_ptr,
                     header,
                     0,
+                    walkable_slots,
                     |slot_ptr, raw, compact| {
                         if !self.evacuation_candidate_is_an_object(
                             regions,
@@ -9928,7 +10030,8 @@ impl G1Collector {
         let rejected = evacuation_refs_rejected();
         let (holder_rejected, holder_clamped) = evacuation_holder_counts();
         eprintln!(
-            "[GC] g1 evac_ref_rejected={rejected} evac_holder_rejected={holder_rejected} evac_holder_clamped={holder_clamped} source_walk_desync={}",
+            "[GC] g1 evac_ref_rejected={rejected} (torn={}) evac_holder_rejected={holder_rejected} evac_holder_clamped={holder_clamped} source_walk_desync={}",
+            evacuation_refs_rejected_torn(),
             evacuation_source_walk_desyncs(),
         );
         // The remaining two "expected to be ZERO" guard counters, on the same
@@ -13002,6 +13105,36 @@ enum GrayRefusal {
     /// subtree, so the cycle's `live_bytes == 0` verdicts cannot be trusted.
     /// This is what the fail-safe is for.
     TornHeader,
+}
+
+/// [`GrayRefusal`]'s question, asked of a [`HeaderVerdict`]: is this refusal
+/// evidence of CORRUPTION, or of an address that simply is not a live object?
+///
+/// `true` only for the verdicts that mean "something IS allocated here and its
+/// header does not describe it". Everything else -- unaligned, outside the
+/// arena, no such region, a `Free` region, at or above the cursor -- says the
+/// address was never an object start in this region's current incarnation,
+/// which is routine for the reasons [`GrayRefusal::NotAllocated`] spells out.
+///
+/// `HumongousFiller` counts as TORN here and does NOT on the marking side, and
+/// the difference is deliberate: the marker may legitimately be handed a
+/// continuation slice's base, whereas a *reference slot* pointing at one names
+/// an address no allocation ever returned.
+fn evac_refusal_is_torn(verdict: HeaderVerdict) -> bool {
+    match verdict {
+        HeaderVerdict::BadKindTag
+        | HeaderVerdict::BadElementTag
+        | HeaderVerdict::ImplausibleShape
+        | HeaderVerdict::HumongousFiller => true,
+        HeaderVerdict::Object
+        | HeaderVerdict::NullOrUnaligned
+        | HeaderVerdict::OutsideArena
+        | HeaderVerdict::NoRegionGeometry
+        | HeaderVerdict::NoSuchRegion
+        | HeaderVerdict::RegionFree
+        | HeaderVerdict::BelowRegionBase
+        | HeaderVerdict::AboveCursor => false,
+    }
 }
 
 /// `CRATONVM_G1_MARK_OOB_FAILSAFE=1` -- treat [`GrayRefusal::NotAllocated`]
