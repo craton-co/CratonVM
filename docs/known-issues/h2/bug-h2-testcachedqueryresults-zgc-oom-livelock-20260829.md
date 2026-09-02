@@ -332,6 +332,44 @@ because they are strictly additive — a pin can only keep a page out of one CSe
 — and because `hw_pinned`/`hw_refused` on the `[GC] xt_peer_scan` line are what
 size the work above: **62 of 62 windows** on `TestMultiThread`.
 
+### 2026-09-02: the widening is MEASURED, and it is cheap -- the discharge is now justified
+
+The correction above left one thing unpriced: adopting `is_heap_addr` for the
+helper-window probe widens the conservative root set, and "every `long` that
+lands inside a live object's extent becomes a root" sounds like it could be an
+order of magnitude. It is not.
+
+`CRATONVM_XT_HELPER_WINDOW_INTERIOR=1` swaps the predicate and changes nothing
+else -- both refusal sites still fire -- so the two arms differ only in which
+words the helper-window scan admits. `org.h2.test.db.TestMultiThread`, one
+binary, `CRATONVM_DBG_XT_JIT_ROOT_SCAN=1` summing the pass's own root counts:
+
+| predicate | windows | conservative roots | per window |
+|---|---:|---:|---:|
+| `is_object_address` (exact bases) | 64 | 7 134 | 111 |
+| `is_heap_addr` (resolves derived) | 60 | 8 365 | **139** |
+
+**+25 % per window.** Read per WINDOW, not per run: the two arms ran at load
+5.6 and 17.7 and therefore took different numbers of passes (16 and 17), so the
+totals are not directly comparable and the ratio is.
+
+That is a small price for the property that makes pinning sound at all -- a
+derived pointer resolving to the base that must not move. So the remaining work
+is no longer blocked on an unknown:
+
+1. probe the helper window with `is_heap_addr`;
+2. pin the resolved bases (the machinery is already there and already publishes
+   -- `hw_pinned` is 62 of 62 / 64 of 64 / 60 of 60 across every run measured);
+3. discharge BOTH refusal sites together -- the labelled one in `xt_root_scan`
+   and the unlabelled `mark_moving_young_coverage_incomplete()` +
+   `mark_unrewritable_peer_state()` in `interpreter::gc_and_alloc`, which is the
+   one the first attempt missed;
+4. and only then read `relocation_on_proven_jit` on this class, which is the
+   number the whole page turns on.
+
+Step 3 is the one to be careful with: discharging only the labelled site is what
+made the first attempt look like progress while engagement did not move at all.
+
 ### 2026-09-01 (later): two reproduction attempts that FAILED, and what each eliminates
 
 `probes/ZgcRefArrayFragProbe.java` is checked in because it does NOT reproduce.

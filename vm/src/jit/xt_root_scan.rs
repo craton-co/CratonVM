@@ -94,6 +94,44 @@ pub static XT_HELPER_WINDOW_ROOTS: AtomicU64 = AtomicU64::new(0);
 pub static XT_HELPER_WINDOWS_PINNED: AtomicU64 = AtomicU64::new(0);
 pub static XT_HELPER_WINDOWS_REFUSED: AtomicU64 = AtomicU64::new(0);
 
+/// Helper windows THIS CYCLE that could not be pinned (a partial scan, or the
+/// pin switch off). Reset at the start of every pass.
+///
+/// Per-cycle, unlike the two lifetime totals above, because the discharge
+/// decision is per-cycle: a collection may relocate only if EVERY window it saw
+/// is covered. The Windows arm never pins, so it leaves this nonzero and never
+/// discharges.
+pub static XT_HELPER_WINDOWS_UNPINNED_CYCLE: AtomicU64 = AtomicU64::new(0);
+
+/// May this cycle's helper windows be discharged instead of refusing?
+///
+/// True only when the pass pinned every window it saw. Read by
+/// `interpreter::gc_and_alloc`, which raises the SECOND (unlabelled) refusal.
+pub fn helper_windows_all_pinned_this_cycle() -> bool {
+    XT_HELPER_WINDOWS_UNPINNED_CYCLE.load(Ordering::Acquire) == 0
+}
+
+/// `CRATONVM_XT_HELPER_WINDOW_DISCHARGE=1` -- let a fully-pinned helper window
+/// stop refusing the collection. **Default OFF.**
+///
+/// Off by default because it is a behaviour change on the relocation gate and
+/// the first attempt at it (722de9a33) was wrong in two ways at once: it
+/// discharged only the LABELLED refusal, leaving the unlabelled one in
+/// `interpreter::gc_and_alloc` to refuse anyway, and it pinned a root set that
+/// could not be complete because the probe was `is_object_address` (exact bases
+/// only), so a peer's derived pointer left its base unpinned.
+///
+/// Both are addressed here: this flag implies the interior-resolving probe, and
+/// it gates BOTH sites off the same per-cycle condition. The widening that
+/// implies was measured at **+25 % conservative roots per window** on
+/// `TestMultiThread` (111 -> 139), which is what makes it affordable.
+///
+/// Turn it on with `CRATONVM_GC_STATS=1` and read `relocation_on_proven_jit`:
+/// a zero still voids the run.
+pub fn helper_window_discharge_enabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_XT_HELPER_WINDOW_DISCHARGE").is_some()
+}
+
 /// Peers the STW cross-thread scan could NOT classify: it signalled them and
 /// they did not reach the handler before the deadline (`STATE_CANCELLED`), or
 /// no slot was free to arm. Such a peer is neither parked nor proven
@@ -1409,6 +1447,8 @@ mod imp {
         let mut windows = 0usize;
         let mut pinned_windows = 0usize;
         let mut unpinned_windows = 0usize;
+        // Per-cycle, so reset before the pass rather than accumulated.
+        XT_HELPER_WINDOWS_UNPINNED_CYCLE.store(0, Ordering::Release);
         let mut found_total = 0usize;
         let mut examined = 0usize;
         let mut unclassified = 0usize;
@@ -1547,7 +1587,10 @@ mod imp {
         // made the shortfall measurable: `hw_pinned`/`hw_refused` on the
         // `[GC] xt_peer_scan` line say how many windows a future discharge
         // would have to cover.
-        if windows > 0 {
+        XT_HELPER_WINDOWS_UNPINNED_CYCLE.store(unpinned_windows as u64, Ordering::Release);
+        if windows > 0
+            && !(helper_window_discharge_enabled() && unpinned_windows == 0)
+        {
             cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
                 cratonvm_gc::gc_quiescence::incomplete_reason::XT_HELPER_WINDOW,
             );

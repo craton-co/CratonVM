@@ -653,10 +653,12 @@ pub(super) fn stw_take_over_and_wait(
         // changes NOTHING about the refusal, which both this site and
         // `xt_root_scan` still raise unconditionally. Compare `hw_roots` on the
         // `[GC] xt_peer_scan` line between the arms.
-        let interior = cratonvm_types::flags::runtime_var_os(
-            "CRATONVM_XT_HELPER_WINDOW_INTERIOR",
-        )
-        .is_some();
+        // The discharge IMPLIES the interior probe: pinning is only complete
+        // when a derived pointer resolves to the base that must not move, so
+        // the two cannot be selected independently.
+        let interior = xt::helper_window_discharge_enabled()
+            || cratonvm_types::flags::runtime_var_os("CRATONVM_XT_HELPER_WINDOW_INTERIOR")
+                .is_some();
         let (windows, _roots) = if interior {
             xt::helper_window_pass(
                 &taken,
@@ -700,8 +702,25 @@ pub(super) fn stw_take_over_and_wait(
         // stopped meaning "un-rewritable peer state" — see
         // `gc_quiescence::unrewritable_peer_state`. Both are set here because
         // this cycle genuinely satisfies both.
-        cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete();
-        cratonvm_gc::gc_quiescence::mark_unrewritable_peer_state();
+        // THE SECOND REFUSAL, and the one the first discharge attempt missed.
+        // Suppressing only `xt_root_scan`'s labelled `XT_HELPER_WINDOW` moved
+        // the refusal into this unlabelled bucket and left engagement exactly
+        // where it was -- `relocation_on_proven_jit` 1 with the pin against 2
+        // without. Both sites have to agree, off the same condition.
+        //
+        // A TAKEN-OVER peer is a different population: its roots come from the
+        // takeover pass, which is not pinned here, so `taken.count() > 0` keeps
+        // refusing regardless. Only a cycle whose sole unrewritable state is
+        // helper windows -- every one of them pinned from a COMPLETE,
+        // interior-resolving scan -- may be discharged.
+        let helper_only = taken.count() == 0 && helper_windows > 0;
+        let discharged = xt::helper_window_discharge_enabled()
+            && helper_only
+            && xt::helper_windows_all_pinned_this_cycle();
+        if !discharged {
+            cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete();
+            cratonvm_gc::gc_quiescence::mark_unrewritable_peer_state();
+        }
     }
     taken
 }

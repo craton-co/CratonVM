@@ -574,7 +574,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-257 tokens.
+258 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -826,6 +826,7 @@ export inherited from a parent shell.
 | `verify-schedule` | `CRATONVM_JIT_VERIFY_SCHEDULE` |
 | `verify-types` | `CRATONVM_JIT_VERIFY_TYPES` |
 | `virtual-tierup` | `CRATONVM_JIT_VIRTUAL_TIERUP` |
+| `xt-helper-window-discharge` | `CRATONVM_XT_HELPER_WINDOW_DISCHARGE` |
 | `xt-helper-window-interior` | `CRATONVM_XT_HELPER_WINDOW_INTERIOR` |
 | `xt-helper-window-pin` | `CRATONVM_XT_HELPER_WINDOW_PIN` |
 | `xt-helper-window-scan` | `CRATONVM_XT_HELPER_WINDOW_SCAN` |
