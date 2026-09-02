@@ -1342,6 +1342,17 @@ pub enum RuntimeError {
 
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },
+
+    /// `java.lang.InternalError` -- a JVM-internal invariant the caller cannot
+    /// have violated, raised where HotSpot raises it.
+    ///
+    /// Distinct from [`MethodCallFailed::InternalError`], which is documented
+    /// as the UNCATCHABLE form and is not a Java throwable at all. This one is
+    /// an ordinary catchable `Error`, which is what HotSpot throws from
+    /// `Unsafe.objectFieldOffset(Class, String)` when the class has no such
+    /// field.
+    #[error("internal error: {message}")]
+    InternalError { message: String },
 }
 
 fn format_optional_message(message: &Option<String>) -> String {
@@ -2002,6 +2013,9 @@ impl RuntimeError {
                 ("java/util/regex/PatternSyntaxException", None)
             }
             RuntimeError::NotImplemented { feature: _ } => return None,
+            RuntimeError::InternalError { message } => {
+                ("java/lang/InternalError", Some(message.as_str()))
+            }
         };
         let (class_name, borrowed) = pair;
         // A synthesised message wins over the table's `None`. The two are
