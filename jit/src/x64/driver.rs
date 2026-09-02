@@ -397,6 +397,31 @@ pub(super) fn spliced_stack_reserve(site: &crate::InlineSite) -> usize {
         )
 }
 
+/// What one site would need if concurrently-live splices were counted rather
+/// than all of them: its own frame plus the DEEPEST nested path under it,
+/// instead of the sum over every descendant.
+///
+/// Measurement only for now. A splice's epilogue rewinds `next_spill_offset`
+/// to `caller_post_pop_spill` on both the value-returning and the void return
+/// arm, and the outer walk runs `reset_spills()` at every instruction boundary
+/// on top of that -- so sibling splices demonstrably reuse the same words, and
+/// only a root-to-leaf chain is ever live at once. `spliced_stack_reserve` sums
+/// siblings anyway, which is what this exists to price.
+pub(super) fn spliced_stack_reserve_path(site: &crate::InlineSite) -> usize {
+    let (_, param_span) = crate::compute_param_jvm_slots(&site.descriptor, site.callee_is_static);
+    let own = site
+        .callee_max_locals
+        .max(param_span)
+        .saturating_add(site.callee_code_len);
+    let deepest = site
+        .nested_sites
+        .iter()
+        .map(|n| spliced_stack_reserve_path(&n.site))
+        .max()
+        .unwrap_or(0);
+    own.saturating_add(deepest)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn compile_with_param_slots(
     // ── The admission gate, enforced by the type system ───────────────
@@ -1082,6 +1107,19 @@ pub fn compile_with_param_slots(
         .chain(extra_guard_bodies())
         .map(spliced_stack_reserve)
         .sum();
+    // Priced, not yet spent: what the same compile would reserve if the budget
+    // counted concurrently-live splices instead of every site. See
+    // `spliced_stack_reserve_path`.
+    let inline_stack_reserve_path: usize = inline_sites
+        .values()
+        .chain(extra_guard_bodies())
+        .map(spliced_stack_reserve_path)
+        .max()
+        .unwrap_or(0);
+    crate::note_inline_reserve(
+        inline_stack_reserve as u64,
+        inline_stack_reserve_path as u64,
+    );
     let max_stack = max_stack
         .saturating_add(max_invoke_args)
         .saturating_add(inline_stack_reserve);

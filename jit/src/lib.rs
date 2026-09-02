@@ -18549,6 +18549,8 @@ pub fn compiled_frame_line_counts() -> [u64; 8] {
 /// | 7 | `res-invalidate` | words reserved by `invalidate_callee_saved` |
 /// | 8 | `res-total` | every word reserved, so the two attributed columns read as a fraction of a whole |
 /// | 9 | `min-headroom` | the FEWEST words left between a reservation's end and `spill_limit_offset`, over every compile (a MIN; `u64::MAX` means nothing reserved) |
+/// | 10 | `inline-reserve-sum` | largest per-compile inline reserve as `spill_size` computes it today: a SUM over every site (a MAX over compiles) |
+/// | 11 | `inline-reserve-path` | what the same compile would need if the reserve were a MAX over top-level sites and over each site's deepest nested PATH (a MAX over compiles) |
 ///
 /// Column 2 is retired and reads zero. It was the engagement counter for a
 /// canonical-home flush — store to `base + i*8`, reclaim a dead word below the
@@ -18562,7 +18564,7 @@ pub fn compiled_frame_line_counts() -> [u64; 8] {
 /// method, so 19 words is nearly the whole budget for one method and a rounding
 /// error for another. A refusal count of zero plus a large minimum headroom is
 /// a much stronger statement than the refusal count on its own.
-static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 10] = [
+static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 12] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -18573,6 +18575,8 @@ static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 10] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(u64::MAX),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
 ];
 
 /// `flush_scratch_registers` invocations.
@@ -18595,9 +18599,13 @@ pub const SPILL_RES_INVALIDATE: usize = 7;
 pub const SPILL_RES_TOTAL: usize = 8;
 /// Fewest words ever left between a reservation and the spill limit.
 pub const SPILL_MIN_HEADROOM: usize = 9;
+/// Largest per-compile inline reserve, summed over sites as today.
+pub const SPILL_INLINE_RESERVE_SUM: usize = 10;
+/// The same compile's requirement if the reserve were a max over sites/paths.
+pub const SPILL_INLINE_RESERVE_PATH: usize = 11;
 
 /// Human names, parallel to the slot indices.
-pub const SPILL_CURSOR_SLOT_NAMES: [&str; 10] = [
+pub const SPILL_CURSOR_SLOT_NAMES: [&str; 12] = [
     "flush-calls",
     "flush-reserved",
     "flush-canonical",
@@ -18608,6 +18616,8 @@ pub const SPILL_CURSOR_SLOT_NAMES: [&str; 10] = [
     "res-invalidate",
     "res-total",
     "min-headroom",
+    "inline-reserve-sum",
+    "inline-reserve-path",
 ];
 
 /// Add `n` to one column. `peak-words` must not go through here — it is a
@@ -18626,6 +18636,17 @@ pub fn note_spill_cursor(slot: usize, n: u64) {
 /// Raise the peak-words high-water mark to `words` if it is higher, and lower
 /// the headroom low-water mark to `headroom` if it is smaller. One call, so a
 /// reservation cannot record one and forget the other.
+/// Record one compile's inline reserve, as computed today and as a
+/// max-over-paths alternative would compute it. Both are maxima over compiles:
+/// the question is how big the worst frame gets, not how many frames there are.
+#[inline]
+pub fn note_inline_reserve(sum_words: u64, path_words: u64) {
+    SPILL_CURSOR_COUNTS[SPILL_INLINE_RESERVE_SUM]
+        .fetch_max(sum_words, std::sync::atomic::Ordering::Relaxed);
+    SPILL_CURSOR_COUNTS[SPILL_INLINE_RESERVE_PATH]
+        .fetch_max(path_words, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[inline]
 pub fn note_spill_peak(words: u64, headroom: u64) {
     SPILL_CURSOR_COUNTS[SPILL_PEAK_WORDS].fetch_max(words, std::sync::atomic::Ordering::Relaxed);
@@ -18633,8 +18654,8 @@ pub fn note_spill_peak(words: u64, headroom: u64) {
 }
 
 /// Read the census. See [`SPILL_CURSOR_COUNTS`] for the columns.
-pub fn spill_cursor_counts() -> [u64; 10] {
-    let mut out = [0u64; 10];
+pub fn spill_cursor_counts() -> [u64; 12] {
+    let mut out = [0u64; 12];
     for (i, slot) in SPILL_CURSOR_COUNTS.iter().enumerate() {
         out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
     }
