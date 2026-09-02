@@ -5858,7 +5858,7 @@ pub(crate) mod input_cache {
     use cuda_bridge::DeviceBuffer;
     use parking_lot::Mutex;
     use rustc_hash::FxHashMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, OnceLock};
 
     pub(crate) enum CachedBuffer {
@@ -6031,7 +6031,115 @@ pub(crate) mod input_cache {
     /// would skip a live entry and leave the device mirror stale. The
     /// reverse window (bit set, entry not yet inserted) is a harmless
     /// false positive.
+    /// Set once a method containing a primitive array store has been
+    /// admitted to the JIT, after which nothing may be cached.
+    ///
+    /// # The trade this replaces
+    ///
+    /// This cache mirrors a Java array in device memory across submits,
+    /// which is only sound while every host write to that array evicts
+    /// the entry. The interpreter's `*astore` arms and the
+    /// `jit_iastore`/`jit_bastore` helpers all call [`invalidate`]; the
+    /// JIT's IR pipeline lowers `Op::ArrayStore` to an inline
+    /// `MOVSS`/`MOVSD` with no helper to hook, so there was one path
+    /// that could write an array behind the cache's back.
+    ///
+    /// `offload_jit_gate` closed it from the other side, by refusing to
+    /// COMPILE any method containing `iastore`/`lastore`/`fastore`/
+    /// `dastore` while a GPU is attached. That is sound and enormously
+    /// broad: it has nothing to do with whether the method has ever seen
+    /// a kernel, so passing `--gpu` de-optimised the CPU half of every
+    /// mixed workload — a ray tracer's setup loops, an inference
+    /// pipeline's array fills — to keep coherent a cache most of those
+    /// methods will never touch.
+    ///
+    /// AUDIT 2026-09-02 inverts it. Both directions are sound; the
+    /// question is which side pays. Blocking the JIT costs native code
+    /// on methods that may have no connection to the device. Disabling
+    /// the cache costs one H2D copy per submit on arrays that are
+    /// re-submitted unchanged — real, but bounded by PCIe bandwidth and
+    /// paid only by the GPU path that benefits from it.
+    ///
+    /// And it does not have to be chosen up front. The flag flips at JIT
+    /// ADMISSION of the first array-writing method, which is strictly
+    /// before that method's compiled code can run, so:
+    ///
+    /// * a program that never JIT-compiles an array writer keeps the
+    ///   cache, exactly as today;
+    /// * one that does keeps its native code and loses the cache from
+    ///   that moment;
+    /// * neither ever pays both.
+    ///
+    /// The existing entries are dropped at the same moment
+    /// ([`disable_for_jit_array_writer`]), because an array cached a
+    /// moment ago is one the about-to-run compiled code may write.
+    static DISABLED_BY_JIT: AtomicBool = AtomicBool::new(false);
+
+    /// Whether the residency cache is still accepting entries.
+    pub(crate) fn is_enabled() -> bool {
+        !DISABLED_BY_JIT.load(Ordering::Acquire)
+    }
+
+    /// Give up the residency cache so a method that writes a primitive
+    /// array can be JIT-compiled. See [`DISABLED_BY_JIT`].
+    ///
+    /// Idempotent, and cheap after the first call: one relaxed-ish load
+    /// on a path (`offload_jit_gate::compute`) that is already memoised
+    /// per method.
+    ///
+    /// Ordering is the whole argument. This runs at ADMISSION — before
+    /// the method is compiled, and therefore before its compiled code
+    /// can execute a single store. Entries inserted before this point
+    /// are dropped here; entries after are refused by [`insert`]. There
+    /// is no window in which a compiled store can run against a live
+    /// entry.
+    ///
+    /// A concurrent marshal that already took an `Arc` out of the cache
+    /// keeps its buffer alive and proceeds. That is not a new race: an
+    /// interpreted store racing the same marshal has always been able to
+    /// `invalidate` an entry a submit had already read. The explicit
+    /// async API documents that writing a kernel's input array while the
+    /// kernel runs is the caller's problem; the transparent path is
+    /// synchronous and cannot reach it.
+    pub(crate) fn disable_for_jit_array_writer() {
+        if DISABLED_BY_JIT.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let mut tables = map().lock();
+        let dropped: usize = tables.values().map(|t| t.len()).sum();
+        tables.clear();
+        rebuild_filter(&tables);
+        drop(tables);
+        tracing::info!(
+            "gpu offload: input-residency cache disabled ({dropped} entr(ies) dropped) \
+             so methods writing primitive arrays can be JIT-compiled. Every kernel \
+             argument is re-uploaded per submit from here on."
+        );
+    }
+
+    /// Total entries across every VM's table.
+    ///
+    /// Test-only, and deliberately not per-VM: what
+    /// `disable_for_jit_array_writer` has to guarantee is that NOTHING is
+    /// cached anywhere, not that one heap's table is empty.
+    #[cfg(test)]
+    pub(crate) fn table_len_for_test() -> usize {
+        map().lock().values().map(|t| t.len()).sum()
+    }
+
+    /// The membership filter `invalidate` reads on every array store in
+    /// the VM. Test-only; see [`ADDR_FILTER`].
+    #[cfg(test)]
+    pub(crate) fn addr_filter_for_test() -> u64 {
+        ADDR_FILTER.load(Ordering::Acquire)
+    }
+
     fn insert(vm: usize, obj: ObjectRef, entry: Entry) {
+        // Refused once a JIT-compiled array writer exists: there would be
+        // no way to evict this entry when that code stores into `obj`.
+        if !is_enabled() {
+            return;
+        }
         ADDR_FILTER.fetch_or(addr_bit(obj), Ordering::AcqRel);
         map().lock().entry(vm).or_default().insert(obj, entry);
     }
