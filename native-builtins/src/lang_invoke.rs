@@ -332,6 +332,15 @@ pub(crate) struct VarHandleMeta {
     pub field_desc: String,
     pub field_index: i32,
     pub class_id: u32,
+    /// The variable is `final`, so every WRITE access mode on this handle is
+    /// unsupported.
+    ///
+    /// A property of the HANDLE, not of the variable's type, which is why it
+    /// lives here rather than being derived at access time: deriving it would
+    /// mean a `declared_fields` walk (a `Vec<FieldMetadata>` of owned
+    /// `String`s) on every `set`, and `set` is 698 000 calls on one probe.
+    /// Decided once, where the field is already being resolved.
+    pub read_only: bool,
 }
 
 // `VarHandleMeta` is wrapped in `Arc<>` so the hot `get`/`set`/`CAS`
@@ -2455,7 +2464,8 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
                     field_desc: (elem as char).to_string(),
                     field_index: -1,
                     class_id: 0,
-                },
+                                    read_only: false,
+},
             );
             Ok(Some(Value::Object(Some(vh))))
         },
@@ -2504,7 +2514,8 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
                     field_desc: (elem as char).to_string(),
                     field_index: -1,
                     class_id: 0,
-                },
+                                    read_only: false,
+},
             );
             Ok(Some(Value::Object(Some(vh))))
         },
@@ -2958,7 +2969,8 @@ pub(crate) fn alloc_instance_var_handle(
             field_desc: field_desc.to_string(),
             field_index,
             class_id: class_id.as_u32(),
-        },
+                    read_only: false,
+},
     );
     Ok(vh)
 }
@@ -2998,7 +3010,8 @@ pub(crate) fn alloc_static_var_handle(
             field_desc: field_desc.to_string(),
             field_index: -1,
             class_id: 0,
-        },
+                    read_only: false,
+},
     );
     Ok(vh)
 }
@@ -4898,6 +4911,7 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// Signature-polymorphic: args arrive as individual values from the call-site,
 /// i.e. args = [vh_ref, receiver, value] for instance fields.
 fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    vh_check_read_only(ctx, args)?;
     vh_check_leading_coordinate(ctx, args)?;
     let this = obj_arg(args, 0)?;
     // `SegmentVarHandle` (JEP 454 FFM API): see the matching check in `varhandle_get`.
@@ -5018,6 +5032,7 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// Signature-polymorphic: args arrive as individual values from the call-site,
 /// i.e. args = [vh_ref, receiver, expected, new_value] for instance fields.
 fn varhandle_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    vh_check_read_only(ctx, args)?;
     vh_check_leading_coordinate(ctx, args)?;
     let this = obj_arg(args, 0)?;
     // C38: Array-element CAS — args = [vh, array, idx, expected, new_value].
@@ -5122,6 +5137,7 @@ fn varhandle_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// `Object` call site needs it and why the boxing cannot live at the
 /// poly-return boundary.
 fn varhandle_compare_and_exchange(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    vh_check_read_only(ctx, args)?;
     vh_check_leading_coordinate(ctx, args)?;
     let raw = varhandle_compare_and_exchange_raw(ctx, args);
     vh_box_access_result(ctx, args, raw)
@@ -5236,6 +5252,7 @@ fn varhandle_compare_and_exchange_raw(
 /// `Object` call site needs it and why the boxing cannot live at the
 /// poly-return boundary.
 fn varhandle_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    vh_check_read_only(ctx, args)?;
     vh_check_leading_coordinate(ctx, args)?;
     let raw = varhandle_get_and_set_raw(ctx, args);
     vh_box_access_result(ctx, args, raw)
@@ -5351,7 +5368,262 @@ fn varhandle_get_and_set_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// through [`vh_box_access_result`], which the erased `Object` call site
 /// requires; `unbox_poly_return` then unwraps it for a primitive call site such
 /// as H2's `([III)I`.
+/// `CRATONVM_VH_READ_ONLY_HANDLE_UOE=0` — restore the pre-2026-09-02 behaviour,
+/// in which a `VarHandle` over a FINAL field performed the write.
+///
+/// Default on, and a third switch beside `CRATONVM_VH_NULL_COORDINATE_NPE` and
+/// `CRATONVM_VH_UNSUPPORTED_MODE_UOE` rather than a shared one, for the reason
+/// those two are separate: the rules interact, and a shared switch could not
+/// isolate any of them. This is the one of the three that can change a
+/// PASSING workload, because code that writes a final field succeeds today.
+fn vh_read_only_handle_uoe_enabled() -> bool {
+    !matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_VH_READ_ONLY_HANDLE_UOE").as_deref(),
+        Ok("0")
+    )
+}
+
+/// JVMS §4.5 `ACC_FINAL`.
+const ACC_FINAL: u16 = 0x0010;
+
+/// Is `field_name` declared `final` on `class_id` or an ancestor?
+///
+/// Walks the superclass chain exactly as `lookup_require_field` does, and for
+/// the same reason: the field a handle names may be inherited. Called ONCE per
+/// handle, at `findVarHandle` time, never on an access.
+fn vh_field_is_final(
+    ctx: &dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+    field_name: &str,
+) -> bool {
+    let mut cid = class_id;
+    loop {
+        for f in ctx.declared_fields(cid) {
+            if f.name == field_name {
+                return f.access_flags & ACC_FINAL != 0;
+            }
+        }
+        match ctx.superclass_of(cid) {
+            Some(parent) if parent != cid => cid = parent,
+            _ => return false,
+        }
+    }
+}
+
+/// Mark an already-built handle's metadata read-only.
+///
+/// Separate from `alloc_instance_var_handle` rather than a parameter on it:
+/// that helper has several callers which mint handles for variables that are
+/// never final (array elements, byte views), and a parameter would put the
+/// question to all of them. The two `Lookup.find*VarHandle` natives are the
+/// only places a final field can enter.
+fn vh_mark_read_only(ctx: &mut dyn NativeContext, vh: ObjectRef) {
+    if let Some(meta) = vh_meta_get(ctx, vh) {
+        let mut updated = (*meta).clone();
+        updated.read_only = true;
+        vh_meta_put(ctx, vh, updated);
+    }
+}
+
+/// `UnsupportedOperationException` for a WRITE mode on a read-only handle.
+///
+/// # The rule
+///
+/// `findVarHandle` on a `final` field yields a handle whose write modes are all
+/// unsupported. Measured on JDK 25 with `RJdkVarHandleModeSupport`: every one
+/// of `set` / `setVolatile` / `setOpaque` / `setRelease`, the five CAS modes,
+/// the three compare-and-exchange modes, `getAndSet*`, `getAndAdd*` and the
+/// nine `getAndBitwise*` raise it; the four READ modes still answer, and so
+/// does a read of a final REFERENCE field and of a `static final`.
+///
+/// CratonVM performed the write. `VH.set(h, 5)` stored 5 into a `final int` —
+/// a silent successful write to a field the language guarantees is immutable,
+/// which anything caching that field's value is entitled to assume cannot
+/// happen.
+///
+/// # Where it sits
+///
+/// FIRST, ahead of both other rules. Measured, not chosen:
+/// `VH_FIN.set((H) null, 5)` on a final-field handle raises
+/// `UnsupportedOperationException`, not `NullPointerException`, so read-only
+/// beats the null coordinate. Read-only against an unsupported MODE is not
+/// observable — both raise `UnsupportedOperationException` — so the order
+/// between those two is free and this one is placed first for both.
+fn vh_check_read_only(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<(), MethodCallFailed> {
+    if !vh_read_only_handle_uoe_enabled() {
+        return Ok(());
+    }
+    let Some(this) = args.first().and_then(|v| match v {
+        Value::Object(Some(o)) => Some(*o),
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+    let read_only = vh_meta_get(ctx, this)
+        .as_deref()
+        .map(|m| m.read_only)
+        .unwrap_or(false);
+    if !read_only {
+        return Ok(());
+    }
+    Err(RuntimeError::UnsupportedOperationException {
+        message: "a write access mode is not supported by a VarHandle over a final field"
+            .to_string(),
+    }
+    .into())
+}
+
+/// `CRATONVM_VH_UNSUPPORTED_MODE_UOE=0` — restore the pre-2026-09-02 behaviour,
+/// in which an access mode the variable's type does not admit ANSWERED instead
+/// of raising `UnsupportedOperationException`.
+///
+/// Default on, and separate from `CRATONVM_VH_NULL_COORDINATE_NPE` on purpose:
+/// the two rules interact (this one wins, which is HotSpot's order), so a
+/// single switch for both could not isolate either. Each turns silence into an
+/// exception on a path any workload can reach, and a suite that starts failing
+/// has to be bisectable to the RULE rather than to a rebuild.
+fn vh_unsupported_mode_uoe_enabled() -> bool {
+    !matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_VH_UNSUPPORTED_MODE_UOE").as_deref(),
+        Ok("0")
+    )
+}
+
+/// Which family of access mode is being attempted, for
+/// [`vh_check_access_mode_supported`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VhModeFamily {
+    /// `getAndAdd`, `getAndAddAcquire`, `getAndAddRelease`.
+    Arithmetic,
+    /// `getAndBitwise{Or,And,Xor}` and their ordering variants.
+    Bitwise,
+}
+
+/// `UnsupportedOperationException` for an access mode the VARIABLE'S TYPE does
+/// not admit.
+///
+/// # The rule, measured rather than assumed
+///
+/// It is not uniform, which is why `RJdkVarHandleModeSupport` sweeps every mode
+/// against every variable type instead of picking a few. On JDK 25:
+///
+/// ```text
+///   variable      getAndAdd*   getAndBitwise*
+///   boolean       UNSUPPORTED  ok
+///   byte char short int long   ok           ok
+///   float double  ok           UNSUPPORTED
+///   any reference UNSUPPORTED  UNSUPPORTED
+/// ```
+///
+/// So arithmetic is the NUMERIC primitives and bitwise is the INTEGRAL ones
+/// plus `boolean` — the two sets differ at both ends, and `boolean` versus
+/// `float` is the pair that catches a guess. The `Acquire`/`Release` variants
+/// follow their base mode exactly (checked for all four of `boolean`, `int`,
+/// `float` and a reference).
+///
+/// # Why it runs BEFORE the null-coordinate check
+///
+/// Because HotSpot's does. Swept across all ten types: where the mode is
+/// unsupported, a null receiver still yields `UnsupportedOperationException`;
+/// where it is supported, the null receiver yields `NullPointerException`. The
+/// two rules never disagree about which wins, so the order here is the whole
+/// of the interaction and `vh_check_leading_coordinate` is called after this.
+///
+/// # What CratonVM did before
+///
+/// Answered. 57 of the sweep's 166 rows raise `UnsupportedOperationException`
+/// on HotSpot, and CratonVM returned a value for every one — `null` 28 times,
+/// a `float` 20 times (a bitwise op on a `float` variable), `false`/`true` 5
+/// times, and two silent write successes.
+///
+/// # Cost
+///
+/// One `Arc` deref and one byte compare on the ordinary path: the meta is
+/// already in the per-thread memo every access mode consults, and the
+/// descriptor's FIRST byte is the whole test. No allocation, and no work at
+/// all for the read/write/CAS families, which do not call this.
+fn vh_check_access_mode_supported(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    family: VhModeFamily,
+) -> Result<(), MethodCallFailed> {
+    if !vh_unsupported_mode_uoe_enabled() {
+        return Ok(());
+    }
+    let Some(this) = args.first().and_then(|v| match v {
+        Value::Object(Some(o)) => Some(*o),
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+    // A `SegmentVarHandle` is a real JDK class with its own form; its mode
+    // support was not swept, so it keeps today's behaviour.
+    if is_segment_var_handle(ctx, this) {
+        return Ok(());
+    }
+    // The VARIABLE's descriptor, cheapest source first. An array-element
+    // handle minted by the real JDK has no side-table entry, and there the
+    // ELEMENT type is what the rule is about — `real_array_var_handle_descriptors`
+    // is the same accessor `vh_value_and_coordinate_descriptors` reaches for.
+    let meta = vh_meta_get(ctx, this);
+    let first = match meta.as_deref() {
+        Some(m) => m.field_desc.as_bytes().first().copied(),
+        None => match real_array_var_handle_descriptors(ctx, this) {
+            Some((value_desc, _)) => value_desc.as_bytes().first().copied(),
+            None => vh_field_desc(ctx, this).as_bytes().first().copied(),
+        },
+    };
+    // An undeterminable descriptor keeps today's behaviour rather than
+    // inheriting a refusal nothing measured.
+    let Some(first) = first else {
+        return Ok(());
+    };
+    let supported = match family {
+        VhModeFamily::Arithmetic => {
+            matches!(first, b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D')
+        }
+        VhModeFamily::Bitwise => {
+            matches!(first, b'Z' | b'B' | b'C' | b'S' | b'I' | b'J')
+        }
+    };
+    if supported {
+        return Ok(());
+    }
+    let what = match family {
+        VhModeFamily::Arithmetic => "getAndAdd",
+        VhModeFamily::Bitwise => "getAndBitwise",
+    };
+    Err(RuntimeError::UnsupportedOperationException {
+        message: format!(
+            "{what} is not supported for a VarHandle over a variable of type {}",
+            descriptor_to_java_name(first)
+        ),
+    }
+    .into())
+}
+
+/// The Java type name for a descriptor's leading byte, for the message above.
+fn descriptor_to_java_name(first: u8) -> &'static str {
+    match first {
+        b'Z' => "boolean",
+        b'B' => "byte",
+        b'C' => "char",
+        b'S' => "short",
+        b'I' => "int",
+        b'J' => "long",
+        b'F' => "float",
+        b'D' => "double",
+        b'[' => "an array",
+        _ => "a reference",
+    }
+}
+
 fn varhandle_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    vh_check_read_only(ctx, args)?;
+    vh_check_access_mode_supported(ctx, args, VhModeFamily::Arithmetic)?;
     vh_check_leading_coordinate(ctx, args)?;
     let raw = varhandle_get_and_add_raw(ctx, args);
     vh_box_access_result(ctx, args, raw)
@@ -5533,6 +5805,8 @@ fn varhandle_get_and_bitwise(
     args: &[Value],
     op: VhBitOp,
 ) -> MethodCallResult {
+    vh_check_read_only(ctx, args)?;
+    vh_check_access_mode_supported(ctx, args, VhModeFamily::Bitwise)?;
     vh_check_leading_coordinate(ctx, args)?;
     let raw = varhandle_get_and_bitwise_raw(ctx, args, op);
     vh_box_access_result(ctx, args, raw)
@@ -7727,9 +8001,20 @@ fn lookup_find_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         None => -1,
     };
 
-    let vh =
-        alloc_instance_var_handle(ctx, &class, &field_name, &field_desc, field_index, class_id);
-    Ok(Some(Value::Object(Some(vh?))))
+    let vh = alloc_instance_var_handle(
+        ctx,
+        &class,
+        &field_name,
+        &field_desc,
+        field_index,
+        class_id,
+    )?;
+    // A `final` field yields a READ-ONLY handle. Decided here, once, because
+    // this is where the field is already resolved.
+    if vh_field_is_final(ctx, class_id, &field_name) {
+        vh_mark_read_only(ctx, vh);
+    }
+    Ok(Some(Value::Object(Some(vh))))
 }
 
 fn lookup_find_static_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7756,8 +8041,17 @@ fn lookup_find_static_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let field_name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
 
-    let vh = alloc_static_var_handle(ctx, &class, &field_name, &field_desc);
-    Ok(Some(Value::Object(Some(vh?))))
+    let vh = alloc_static_var_handle(ctx, &class, &field_name, &field_desc)?;
+    // Same rule for a `static final`, and it needs the class id this function
+    // never resolved -- the static path takes the class by NAME. Resolve it
+    // only to answer the finality question, and only when it is already
+    // loaded: a miss leaves the handle writable, which is today's behaviour.
+    if let Some(cid) = ctx.class_id_by_name(&class) {
+        if vh_field_is_final(ctx, cid, &field_name) {
+            vh_mark_read_only(ctx, vh);
+        }
+    }
+    Ok(Some(Value::Object(Some(vh))))
 }
 
 /// `MethodHandles.Lookup.revealDirect(MethodHandle)`
@@ -16966,7 +17260,8 @@ mod tests {
                 field_desc: "I".to_string(),
                 field_index: 0,
                 class_id: cid,
-            },
+                            read_only: false,
+},
         );
         let old = varhandle_get_and_add(
             &mut ctx,
@@ -17098,7 +17393,8 @@ mod tests {
                 field_desc: "I".to_string(),
                 field_index: 0,
                 class_id: cid,
-            },
+                            read_only: false,
+},
         );
         let old = varhandle_get_and_set(
             &mut ctx,
@@ -17227,7 +17523,8 @@ mod tests {
                 field_desc: "I".to_string(),
                 field_index: 0,
                 class_id: cid,
-            },
+                            read_only: false,
+},
         );
         // Matching expected → updates and returns the witness (old value).
         let witness = varhandle_compare_and_exchange(
@@ -17274,7 +17571,8 @@ mod tests {
                 field_desc: "I".to_string(),
                 field_index: 0,
                 class_id: cid,
-            },
+                            read_only: false,
+},
         );
         // expected = 99 (wrong) → no swap; witness is the real current 30.
         let witness = varhandle_compare_and_exchange(
@@ -17319,7 +17617,8 @@ mod tests {
                 field_desc: "I".to_string(),
                 field_index: 0,
                 class_id: cid,
-            },
+                            read_only: false,
+},
         );
         // Wrong expected → no swap, returns 0 (false).
         let miss = varhandle_compare_and_set(
@@ -17957,7 +18256,8 @@ mod vh_plan_memo_tests {
                     field_desc: "I".to_string(),
                     field_index: 7,
                     class_id: 0,
-                }),
+                                    read_only: false,
+}),
             );
         }
         // Deliberately NOT asserting that the memo is stale here. That would be
@@ -17990,7 +18290,8 @@ mod vh_plan_memo_tests {
                 field_desc: "Ljava/lang/String;".to_string(),
                 field_index: 3,
                 class_id: 0,
-            }),
+                            read_only: false,
+}),
         );
         vh_meta_bump_generation();
         for _ in 0..4 {

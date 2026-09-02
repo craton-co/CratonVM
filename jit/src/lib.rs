@@ -119,6 +119,7 @@ pub mod platform;
 pub mod profile;
 pub mod range_analysis;
 pub mod regalloc;
+pub mod implicit_null;
 pub mod runtime_lowering;
 pub mod scev;
 pub mod tiered;
@@ -3120,6 +3121,13 @@ impl Drop for CompiledMethod {
         // this artifact owns is unmapped as soon as this function returns, and
         // the address is then reusable by the next `alloc_executable`.
         unregister_jit_method_name(entry);
+        // Third withdrawal, same sentence as the two above, and the one whose
+        // absence is not a degraded diagnostic but arbitrary control flow: an
+        // implicit null-check entry that outlived its buffer would eventually
+        // match a PC belonging to whatever `alloc_executable` handed out next,
+        // and the signal handler would resume execution at a stale address
+        // inside a live method.
+        crate::implicit_null::unregister_range(entry, self._buffer.pos());
         if let Some(owners) = JIT_ENTRY_OWNERS.get() {
             let mut owners = owners.lock();
             if owners
@@ -6585,7 +6593,7 @@ fn append_ir_inline_site(
     // Rebased compact-layout rows for the spliced bodies' field accesses; goes
     // to `ir_lower`, not to the builder, which is why it is not in
     // `IrInlineTables`.
-    compact_fields_out: &mut HashMap<usize, (u32, bool, u8)>,
+    compact_fields_out: &mut HashMap<(usize, bool), (u32, bool, u8)>,
 ) -> bool {
     let code_len = site.callee_code_len;
     if code_len == 0 || site.callee_code.len() < code_len || code_len > *budget {
@@ -6637,7 +6645,7 @@ fn append_ir_inline_site(
     // guessed.
     for &(cpc, byte_offset, is_ref) in &site.compact_field_info {
         if let Some(&(_, _, type_tag)) = site.field_info.iter().find(|(fpc, _, _)| *fpc == cpc) {
-            compact_fields_out.insert(base + cpc, (byte_offset, is_ref, type_tag));
+            compact_fields_out.insert((base + cpc, is_ref), (byte_offset, is_ref, type_tag));
         }
     }
     for &(cpc, class_id, num_fields) in &site.ir_new_info {
@@ -18221,6 +18229,78 @@ fn site_yields_to_call_site_intrinsic(
     }
     try_resolve_intrinsic(class, name, descriptor).is_some()
         || try_resolve_string_intrinsic(class, name, descriptor, string_layout).is_some()
+        || site_yields_to_thin_instance_helper(class, name, descriptor)
+}
+
+/// The other two members of the set, and the reason the first version of
+/// this yield did not cover them.
+///
+/// The two matchers above are the *intrinsic* matchers. The kind-0 invoke
+/// ladder also carries a row of THIN DIRECT-HELPER binds — `Integer.intValue`,
+/// `Long.longValue`, the three `VarHandle` families, `ByteBuffer.get`/`put`,
+/// `MessageDigest.update`, `ConcurrentMap.get`, `HashMap.get` — which neither
+/// matcher knows about, and each of those arms ends in a `continue` exactly
+/// like an intrinsic's. A site the `final`-class rewrite claims never reaches
+/// them either.
+///
+/// # The enumeration
+///
+/// Devirtualisation only answers for a `final` method or a method of a
+/// `final` class, so the population is the ladder's rows whose declared class
+/// is final. Walked, row by row:
+///
+/// | class | final? | reached by the rewrite |
+/// |---|---|---|
+/// | `java/lang/String` | **yes** | yes — the 100x, closed by the matcher above |
+/// | `java/lang/Integer` | **yes** | **yes** |
+/// | `java/lang/Long` | **yes** | **yes** |
+/// | `java/lang/invoke/VarHandle` | no | no |
+/// | `java/nio/ByteBuffer` | no (abstract) | no |
+/// | `java/security/MessageDigest` | no | no |
+/// | `java/util/HashMap` | no | no |
+/// | `java/util/concurrent/ConcurrentMap` | interface (kind 2) | no |
+/// | `java/lang/CharSequence`, `java/lang/foreign/MemorySegment` | interfaces | no |
+/// | `java/util/zip/CRC32`, `CRC32C`, `AtomicInteger`, `AtomicLong` | no | no |
+///
+/// So the set is `{String, Integer, Long}` and not `{String}`.
+///
+/// # What the other two were costing
+///
+/// Measured 2026-09-02, `probes/FinalDevirtInstanceIntrinsics.java`, one
+/// binary, x86-64 Linux, three interleaved rounds (ns per unboxing):
+///
+/// | site | HotSpot | rewrite claims it | rewrite yields |
+/// |---|---:|---:|---:|
+/// | `Integer.intValue()` | 0.46 | **76.10** | **1.24** |
+/// | `Long.longValue()` | 0.63 | **423.55** | **1.07** |
+///
+/// 61x and **396x**. Both alternatives are a CALL — this is not `String`'s
+/// inline-versus-call shape — but they are not the same call: the bind the
+/// rewrite installs is a Java frame with a shadow-stack push and an
+/// invocation-counter increment, and the helper the ladder installs is a
+/// leaf Rust call that reads the box's field and returns.
+///
+/// # The one case this over-approximates
+///
+/// Asked WITHOUT the `jdk_only` policy check the arms themselves apply, so a
+/// build where `direct_native_helper` declines the bind (a `NativeKind`
+/// refusal under `--jdk-only`) yields a site that then takes ordinary
+/// MIC/PIC dispatch rather than a static bind. On a `final` class that cache
+/// is monomorphic by construction, so the cost is a cache probe — the same
+/// trade the CharSequence receiver-profile refusal above already makes, and
+/// the alternative is threading two more resolver arguments through a
+/// predicate that four call sites share.
+fn site_yields_to_thin_instance_helper(class: &str, name: &str, descriptor: &str) -> bool {
+    // Every arm below is itself gated on this, so without it there is no bind
+    // to yield to and the rewrite is the better answer.
+    if !direct_jit_callee_calls_enabled() {
+        return false;
+    }
+    match (class, name, descriptor) {
+        ("java/lang/Integer", "intValue", "()I") => true,
+        ("java/lang/Long", "longValue", "()J") => long_box_direct_helpers_enabled(),
+        _ => false,
+    }
 }
 
 
@@ -18513,6 +18593,121 @@ pub fn note_compiled_frame_line(slot: usize) {
 pub fn compiled_frame_line_counts() -> [u64; 8] {
     let mut out = [0u64; 8];
     for (i, slot) in COMPILED_FRAME_LINE_COUNTS.iter().enumerate() {
+        out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
+/// What the single-pass backend's operand-spill cursor did, and why a compile
+/// was refused when it ran out of room.
+///
+/// `spill-range-exhausted` is a REFUSAL, and a refused compile is invisible:
+/// the method keeps running interpreted and nothing says so. The one thing the
+/// tree could say about it was the last bail site of the last compile
+/// (`take_jit_bail_site`), a single thread-local slot with no count — so
+/// "does this happen at all, and on what?" had no answer, and the fix that was
+/// tried for it on 2026-09-02 was measured by a GC-stress test rather than by
+/// the cursor it moved.
+///
+/// | # | name | meaning |
+/// |---|---|---|
+/// | 0 | `flush-calls` | `flush_scratch_registers` invocations |
+/// | 1 | `flush-reserved` | words the flush took from the cursor, growing the region |
+/// | 2 | `flush-canonical` | words the flush wrote to the position's own `base + i*8` home instead of taking a new one |
+/// | 3 | `exhausted` | compiles refused `spill-range-exhausted` |
+/// | 4 | `past-limit` | compiles refused `spill-cursor-past-limit` |
+/// | 5 | `peak-words` | high-water mark of live spill words in any one compile (a MAX, not a sum) |
+/// | 6 | `res-push` | words reserved by `push_stack` — the ordinary operand push |
+/// | 7 | `res-invalidate` | words reserved by `invalidate_callee_saved` |
+/// | 8 | `res-total` | every word reserved, so the two attributed columns read as a fraction of a whole |
+/// | 9 | `min-headroom` | the FEWEST words left between a reservation's end and `spill_limit_offset`, over every compile (a MIN; `u64::MAX` means nothing reserved) |
+///
+/// Column 2 is retired and reads zero. It was the engagement counter for a
+/// canonical-home flush — store to `base + i*8`, reclaim a dead word below the
+/// cursor — and it read ZERO in every arm at every budget, which is what
+/// withdrew that change. The column is kept so the number has somewhere to go
+/// if anyone tries the idea again, and so this record does not have to be
+/// re-derived; see `Compiler::flush_home`.
+///
+/// Column 9 is the one that answers "how close did anything actually get?".
+/// `peak-words` alone cannot: the limit is `max_stack` words and varies per
+/// method, so 19 words is nearly the whole budget for one method and a rounding
+/// error for another. A refusal count of zero plus a large minimum headroom is
+/// a much stronger statement than the refusal count on its own.
+static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 10] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(u64::MAX),
+];
+
+/// `flush_scratch_registers` invocations.
+pub const SPILL_FLUSH_CALLS: usize = 0;
+/// Words the flush took from the spill cursor.
+pub const SPILL_FLUSH_RESERVED: usize = 1;
+/// Words the flush wrote to the position's own canonical home.
+pub const SPILL_FLUSH_CANONICAL: usize = 2;
+/// Compiles refused because the spill range ran out.
+pub const SPILL_REFUSED_EXHAUSTED: usize = 3;
+/// Compiles refused because the cursor was already past the limit.
+pub const SPILL_REFUSED_PAST_LIMIT: usize = 4;
+/// High-water mark of live spill words in any one compile.
+pub const SPILL_PEAK_WORDS: usize = 5;
+/// Words reserved by the ordinary operand push.
+pub const SPILL_RES_PUSH: usize = 6;
+/// Words reserved by `invalidate_callee_saved`.
+pub const SPILL_RES_INVALIDATE: usize = 7;
+/// Every word reserved, by any caller.
+pub const SPILL_RES_TOTAL: usize = 8;
+/// Fewest words ever left between a reservation and the spill limit.
+pub const SPILL_MIN_HEADROOM: usize = 9;
+
+/// Human names, parallel to the slot indices.
+pub const SPILL_CURSOR_SLOT_NAMES: [&str; 10] = [
+    "flush-calls",
+    "flush-reserved",
+    "flush-canonical",
+    "exhausted",
+    "past-limit",
+    "peak-words",
+    "res-push",
+    "res-invalidate",
+    "res-total",
+    "min-headroom",
+];
+
+/// Add `n` to one column. `peak-words` must not go through here — it is a
+/// maximum, and summing maxima produces a number that describes no run.
+#[inline]
+pub fn note_spill_cursor(slot: usize, n: u64) {
+    debug_assert!(
+        slot != SPILL_PEAK_WORDS && slot != SPILL_MIN_HEADROOM,
+        "peak-words is a max and min-headroom a min; neither is a sum"
+    );
+    if let Some(c) = SPILL_CURSOR_COUNTS.get(slot) {
+        c.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Raise the peak-words high-water mark to `words` if it is higher, and lower
+/// the headroom low-water mark to `headroom` if it is smaller. One call, so a
+/// reservation cannot record one and forget the other.
+#[inline]
+pub fn note_spill_peak(words: u64, headroom: u64) {
+    SPILL_CURSOR_COUNTS[SPILL_PEAK_WORDS].fetch_max(words, std::sync::atomic::Ordering::Relaxed);
+    SPILL_CURSOR_COUNTS[SPILL_MIN_HEADROOM].fetch_min(headroom, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the census. See [`SPILL_CURSOR_COUNTS`] for the columns.
+pub fn spill_cursor_counts() -> [u64; 10] {
+    let mut out = [0u64; 10];
+    for (i, slot) in SPILL_CURSOR_COUNTS.iter().enumerate() {
         out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
     }
     out
@@ -19286,6 +19481,22 @@ static STRING_PIN_BLIND_NO_RESOLVER: std::sync::atomic::AtomicU64 =
 /// doors and this one is a fact about the POLICY: it is the number a revert
 /// would give back.
 static STRING_PIN_FAIL_CLOSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// IR String-access sites that got their two inline compact-field rows.
+///
+/// The number that says the expansion's `value`/`coder` reads are inline loads
+/// rather than `jit_getfield` helper CALLs. A zero beside a non-zero
+/// `emitted_charAt` means the rows were refused — no `coder`, a narrow compact
+/// `value`, or compact ref fields off — and the emitter is paying two CALLs a
+/// character, which is the shape this counter exists to make visible in one
+/// line rather than by reading `getfield helper calls` and guessing.
+static STRING_ACCESS_COMPACT_ROWS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(rows installed,)` — see [`STRING_ACCESS_COMPACT_ROWS`].
+pub fn string_access_compact_rows() -> u64 {
+    STRING_ACCESS_COMPACT_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// `(pin fired, blind: no layout, blind: no resolver, held back by fail-closed)`.
 ///
@@ -22334,7 +22545,7 @@ fn try_compile_inner(
         // Compact-layout metadata for this method's field reads, for the
         // lowerer's guarded inline `getfield`. Filled alongside the builder's
         // `field_info` below.
-        let mut ir_compact_fields: std::collections::HashMap<usize, (u32, bool, u8)> =
+        let mut ir_compact_fields: std::collections::HashMap<(usize, bool), (u32, bool, u8)> =
             std::collections::HashMap::new();
         let mut builder = ir::IrBuilder::new(num_params, cached.max_locals as usize);
         builder.tdigest_scalar_kernel = cached.class_name.as_ref()
@@ -22572,7 +22783,7 @@ fn try_compile_inner(
                         fm.insert(pc, (field_index, type_tag));
                         if cratonvm_types::compact_ref_fields_enabled() {
                             if let Some((c_off, c_ref)) = compact_slot {
-                                ir_compact_fields.insert(pc, (c_off, c_ref, type_tag));
+                                ir_compact_fields.insert((pc, c_ref), (c_off, c_ref, type_tag));
                             }
                         }
                     }
@@ -23734,7 +23945,7 @@ fn try_compile_inner(
                     let budget_mark = budget;
                     let mut sub = ir::IrInlineTables::default();
                     let mut sub_vcalls: Vec<(usize, usize)> = Vec::new();
-                    let mut sub_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+                    let mut sub_compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
                     let ok = append_ir_inline_site(
                         site,
                         pc,
@@ -23846,6 +24057,81 @@ fn try_compile_inner(
         // 0 and walked only through a splice.
         let built = builder.build(ir_combined.as_deref().unwrap_or(code), code_len);
         drop(metrics_build);
+        // ── the String-access expansion's two loads get their compact rows ──
+        //
+        // `ir::try_string_access_intrinsic` expands `length`/`isEmpty`/`charAt`
+        // into a `coder` (Int) and a `value` (Ref) `Op::Load` — both at the
+        // INVOKE pc. The table built above is keyed by GETFIELD pc, so neither
+        // load has a row, and `ir_lower::emit_inline_compact_getfield` declines
+        // both with `no-compact-slot-for-pc`. That decline is a `jit_getfield`
+        // helper CALL per character: `probes/CharAtCostCurve.java` on the arm
+        // that reaches the emitter measured **917,203,334** of them in one run
+        // (2026-09-02), against `IR-tier inline-getfield refusals:
+        // no-compact-slot-for-pc=8` — i.e. eight sites, every character.
+        //
+        // Offsets come from `resolved_string_layout`, the layout THIS compile
+        // resolved and the one the single-pass backend is handed — never from
+        // `ir::published_string_layout()`, whose `OnceLock` may have latched
+        // offsets from before `java/lang/String` had a `CompactLayout`
+        // registered. That is exactly why the expander itself reads only slot
+        // indices off the published one; the offsets have to come from here.
+        //
+        // Refused, so a wrong row is never installed rather than installed and
+        // guarded downstream:
+        //   * no `coder` field (legacy `char[]` String) — the expansion cannot
+        //     run at all, so a row would describe nothing;
+        //   * a NARROW compact `value` — the inline arm emits an unconditional
+        //     8-byte load. `narrow_oops_block_inline_fields` already refuses
+        //     the whole site under compressed oops, so this is the second of
+        //     two independent refusals, kept because a row installed on the
+        //     strength of the other one is a wrong-width load if that one ever
+        //     moves;
+        //   * a negative body offset, which would mean the layout's address is
+        //     below the object header — impossible by construction, and the
+        //     `as u32` below is why it is checked rather than assumed.
+        if let Some(layout) = resolved_string_layout {
+            let sites = ir::string_access_site_pcs();
+            // `CRATONVM_JIT_NO_STRING_ACCESS_INLINE_ROWS=1` is the B arm:
+            // without the rows both loads fall back to the checked
+            // `jit_getfield` helper, exactly as they did before 2026-09-02,
+            // so the cost of that fallback is measurable inside one binary.
+            if !sites.is_empty()
+                && layout.has_coder
+                && !layout.value_compact_is_narrow
+                && cratonvm_types::compact_ref_fields_enabled()
+                && cratonvm_types::flags::runtime_var_os(
+                    "CRATONVM_JIT_NO_STRING_ACCESS_INLINE_ROWS",
+                )
+                .is_none()
+            {
+                // `emit_inline_compact_getfield` computes its address as
+                // `HEADER_SIZE + row.0`; `StringFieldLayout`'s offsets already
+                // carry the header, so subtract it back off exactly once.
+                let hdr = cratonvm_types::HEADER_SIZE as i32;
+                let value_body = layout.value_compact_offset - hdr;
+                let coder_body = layout.coder_compact_offset - hdr;
+                // `coder` is a `byte` field. A registered `CompactLayout`
+                // stores it at its natural one-byte width; the no-registered-
+                // layout fallback points at the legacy 4-byte cell payload
+                // instead, and the two need different loads — which is the
+                // whole reason `coder_compact_is_byte` exists.
+                let coder_tag = if layout.coder_compact_is_byte {
+                    b'B'
+                } else {
+                    b'I'
+                };
+                if value_body >= 0 && coder_body >= 0 {
+                    for pc in sites {
+                        ir_compact_fields
+                            .insert((pc, true), (value_body as u32, true, b'['));
+                        ir_compact_fields
+                            .insert((pc, false), (coder_body as u32, false, coder_tag));
+                        STRING_ACCESS_COMPACT_ROWS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
         if let Some(g) = built.as_ref() {
             metrics.set_nodes_built(g.nodes.len());
             metrics.phase_nodes(metrics::Phase::Build, 0, g.nodes.len());
@@ -29992,6 +30278,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -30221,6 +30508,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -30301,6 +30589,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -31556,6 +31845,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -31701,6 +31991,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -31813,6 +32104,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -31935,6 +32227,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -32061,6 +32354,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -32129,6 +32423,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -32209,6 +32504,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -35604,6 +35900,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -36245,6 +36542,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -36266,6 +36564,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -36401,6 +36700,7 @@ mod tests {
             force_native_cache: std::sync::OnceLock::new(),
             descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -37820,7 +38120,25 @@ mod layout_constant_inventory {
         // its 32-bit twin, the codegen picks between the two per OBJECT on
         // the `GC_FLAG_COMPACT` header bit, so a shrink must move BOTH or the
         // legacy arm reads the wrong cell.
-        ("lib.rs", [7, 1, 4, 1, 0, 0, 2, 2]),
+        //
+        // 2026-09-02: the String-access compact rows installed after
+        // `IrBuilder::build` in `try_compile_inner` add ONE `HEADER_SIZE`,
+        // 7 -> 8. Nothing else on this list moves: no new `SLOT_SIZE`, no
+        // new payload bias, no new array constant.
+        //
+        // Value-safety at a shrunk header, which is what this inventory
+        // exists to make someone check: **this site emits no displacement
+        // at all.** It subtracts `HEADER_SIZE` from
+        // `StringFieldLayout::value_compact_offset` /
+        // `coder_compact_offset` to recover the CompactLayout body offset,
+        // which `ir_lower::emit_inline_compact_getfield` then re-adds as
+        // `HEADER_SIZE + c_off` before encoding it. The header size cancels
+        // exactly, so the emitted disp32 is the same number at any header
+        // size and the round trip cannot go stale against a shrink. It is
+        // counted here anyway because a use that CANNOT be wrong today is
+        // still a use that a later edit can make wrong, which is the
+        // premise of counting every occurrence rather than every hazard.
+        ("lib.rs", [8, 1, 4, 1, 0, 0, 2, 2]),
         // ir_lower.rs: the `use` list, the three compile-time invariants
         // restated at the top of that file, two disp32 field-address
         // computations, two disp8 float array element accesses, and the disp8

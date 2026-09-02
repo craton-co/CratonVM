@@ -684,6 +684,7 @@ pub mod gpu_event_census {
     static RECYCLED: AtomicU64 = AtomicU64::new(0);
     static WAITS_ISSUED: AtomicU64 = AtomicU64::new(0);
     static WAITS_ELIDED: AtomicU64 = AtomicU64::new(0);
+    static WAITS_ELIDED_LATCHED: AtomicU64 = AtomicU64::new(0);
     static ALLOC_HIT: AtomicU64 = AtomicU64::new(0);
     static ALLOC_MISS: AtomicU64 = AtomicU64::new(0);
     static ALLOC_PARKED: AtomicU64 = AtomicU64::new(0);
@@ -740,6 +741,20 @@ pub mod gpu_event_census {
         WAITS_ELIDED.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One wait skipped because the event had ALREADY FIRED, rather than
+    /// because it was recorded on the waiting stream.
+    ///
+    /// Counted separately from [`note_wait_elided`] because the two
+    /// answer different questions. Same-stream elision says the caller
+    /// kept a chain on one stream; this one says the caller waited on
+    /// stale work — a resident buffer whose `last_write` nothing
+    /// rewrites — and it is the counter that says whether the latch is
+    /// earning its query.
+    pub fn note_wait_elided_latched() {
+        WAITS_ELIDED_LATCHED.fetch_add(1, Ordering::Relaxed);
+        WAITS_ELIDED.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// `(created, recycled, waits issued, waits elided)`.
     #[must_use]
     pub fn totals() -> (u64, u64, u64, u64) {
@@ -761,6 +776,7 @@ pub mod gpu_event_census {
     pub fn exit_summary() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         let (created, recycled, issued, elided) = totals();
+        let latched = WAITS_ELIDED_LATCHED.load(Ordering::Relaxed);
         let (alloc_hit, alloc_miss, alloc_parked) = alloc_totals();
         if created + recycled + issued + elided + alloc_hit + alloc_miss == 0 {
             return;
@@ -769,7 +785,7 @@ pub mod gpu_event_census {
             eprintln!(
                 "[cratonvm] gpu events: created={created} recycled={recycled} \
                  (pool served {:.1}%); stream waits issued={issued} \
-                 elided={elided} ({:.1}% elided); device allocs: cuMemAlloc={alloc_miss} \
+                 elided={elided} ({:.1}% elided, {latched} already-fired);                  device allocs: cuMemAlloc={alloc_miss} \
                  pooled={alloc_hit} ({:.1}% pooled) parked={alloc_parked}",
                 100.0 * recycled as f64 / (created + recycled).max(1) as f64,
                 100.0 * elided as f64 / (issued + elided).max(1) as f64,

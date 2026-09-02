@@ -97,7 +97,7 @@ static WRAPPER_CREATED: AtomicBool = AtomicBool::new(false);
 ///
 /// The read-side fast-path screen. See the module note on cost.
 #[inline(always)]
-pub(crate) fn wrapper_exists() -> bool {
+pub fn wrapper_exists() -> bool {
     WRAPPER_CREATED.load(Ordering::Relaxed)
 }
 
