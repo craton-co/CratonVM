@@ -1119,6 +1119,21 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "inclusive-bce", on_key: Some("CRATONVM_JIT_INCLUSIVE_BCE"), off_key: None, off_word: None, since: "2026-07-25" },
     E { group: Group::JIT, token: "inline-allow-static", on_key: Some("CRATONVM_INLINE_ALLOW_STATIC"), off_key: None, off_word: None, since: "2026-06-13" },
     E { group: Group::JIT, token: "inline-getfield", on_key: Some("CRATONVM_JIT_INLINE_GETFIELD"), off_key: None, off_word: None, since: "2026-07-09" },
+    // Declared 2026-09-02. Two OPT-OUTs from the same measurement, both
+    // default ON.
+    //
+    // `string-access-inline-rows`: the IR String-access expansion's `value`
+    // and `coder` reads sit at an INVOKE pc, and the inline compact-getfield
+    // table is keyed by GETFIELD pc — so both fell back to the checked
+    // `jit_getfield` helper, 917,203,334 CALLs in one
+    // `probes/CharAtCostCurve.java` run. `=1` restores that fallback.
+    //
+    // `licm-read-hoist`: `ir_optimize::licm` treated `Op::Guard`,
+    // `Op::ArrayLoad` and `Op::ArrayLength` as arbitrary-memory barriers, so
+    // the expansion disqualified its own loop from every hoist and re-read
+    // both fields per character. `=1` restores that refusal.
+    E { group: Group::JIT, token: "string-access-inline-rows", on_key: None, off_key: Some("CRATONVM_JIT_NO_STRING_ACCESS_INLINE_ROWS"), off_word: None, since: "2026-09-02" },
+    E { group: Group::JIT, token: "licm-read-hoist", on_key: None, off_key: Some("CRATONVM_JIT_NO_LICM_READ_HOIST"), off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "inline-live-slot-clamp", on_key: None, off_key: Some("CRATONVM_JIT_NO_INLINE_LIVE_SLOT_CLAMP"), off_word: None, since: "2026-08-24" },
     E { group: Group::JIT, token: "inline-new", on_key: None, off_key: Some("CRATONVM_JIT_DISABLE_INLINE_NEW"), off_word: None, since: "2026-05-28" },
     E { group: Group::JIT, token: "inline-putfield", on_key: None, off_key: Some("CRATONVM_NO_JIT_INLINE_PUTFIELD"), off_word: None, since: "2026-07-24" },
@@ -2215,6 +2230,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::COMPAT, token: "vh-strict-reference-return", on_key: Some("CRATONVM_VH_STRICT_REFERENCE_RETURN"), off_key: None, off_word: Some("0"), since: "2026-08-07" },
     E { group: Group::COMPAT, token: "vh-null-coordinate-npe", on_key: Some("CRATONVM_VH_NULL_COORDINATE_NPE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::COMPAT, token: "vh-unsupported-mode-uoe", on_key: Some("CRATONVM_VH_UNSUPPORTED_MODE_UOE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::COMPAT, token: "vh-read-only-handle-uoe", on_key: Some("CRATONVM_VH_READ_ONLY_HANDLE_UOE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::TEST, token: "force-win-build", on_key: Some("CRATONVM_FORCE_WIN_BUILD"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::TEST, token: "jdk", on_key: Some("CRATONVM_TEST_JDK"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::TEST, token: "segv", on_key: Some("CRATONVM_TEST_SEGV"), off_key: None, off_word: None, since: "2026-06-01" },

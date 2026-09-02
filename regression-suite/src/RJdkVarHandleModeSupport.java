@@ -32,7 +32,10 @@ public class RJdkVarHandleModeSupport {
         Object o;
         String t;
         final int fin = 9;
+        final Object finRef = "seed";
     }
+
+    static final int SFIN = 9;
 
     static final H h = new H();
     static final H h2 = new H();
@@ -48,6 +51,8 @@ public class RJdkVarHandleModeSupport {
     static final VarHandle VH_O;
     static final VarHandle VH_T;
     static final VarHandle VH_FIN;
+    static final VarHandle VH_FINREF;
+    static final VarHandle VH_SFIN;
 
     static {
         try {
@@ -63,6 +68,9 @@ public class RJdkVarHandleModeSupport {
             VH_O = l.findVarHandle(H.class, "o", Object.class);
             VH_T = l.findVarHandle(H.class, "t", String.class);
             VH_FIN = l.findVarHandle(H.class, "fin", int.class);
+            VH_FINREF = l.findVarHandle(H.class, "finRef", Object.class);
+            VH_SFIN = l.findStaticVarHandle(
+                RJdkVarHandleModeSupport.class, "SFIN", int.class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -248,6 +256,48 @@ public class RJdkVarHandleModeSupport {
         probe("null-recv.Object.getAndBitwiseOr", () -> { return VH_O.getAndBitwiseOr((H) null, "x"); });
         probe("null-recv.String.getAndAdd", () -> { return (String) VH_T.getAndAdd((H) null, "x"); });
         probe("null-recv.String.getAndBitwiseOr", () -> { return (String) VH_T.getAndBitwiseOr((H) null, "x"); });
+        probe("final-int.set", () -> { VH_FIN.set(h, 5); return VOID; });
+        probe("final-int.setVolatile", () -> { VH_FIN.setVolatile(h, 5); return VOID; });
+        probe("final-int.setOpaque", () -> { VH_FIN.setOpaque(h, 5); return VOID; });
+        probe("final-int.setRelease", () -> { VH_FIN.setRelease(h, 5); return VOID; });
+        probe("final-int.compareAndSet", () -> { return VH_FIN.compareAndSet(h, 9, 5); });
+        probe("final-int.weakCompareAndSet", () -> { return VH_FIN.weakCompareAndSet(h, 9, 5); });
+        probe("final-int.weakCompareAndSetPlain", () -> { return VH_FIN.weakCompareAndSetPlain(h, 9, 5); });
+        probe("final-int.weakCompareAndSetAcquire", () -> { return VH_FIN.weakCompareAndSetAcquire(h, 9, 5); });
+        probe("final-int.weakCompareAndSetRelease", () -> { return VH_FIN.weakCompareAndSetRelease(h, 9, 5); });
+        probe("final-int.compareAndExchange", () -> { return (int) VH_FIN.compareAndExchange(h, 9, 5); });
+        probe("final-int.compareAndExchangeAcquire", () -> { return (int) VH_FIN.compareAndExchangeAcquire(h, 9, 5); });
+        probe("final-int.compareAndExchangeRelease", () -> { return (int) VH_FIN.compareAndExchangeRelease(h, 9, 5); });
+        probe("final-int.getAndSet", () -> { return (int) VH_FIN.getAndSet(h, 5); });
+        probe("final-int.getAndSetAcquire", () -> { return (int) VH_FIN.getAndSetAcquire(h, 5); });
+        probe("final-int.getAndSetRelease", () -> { return (int) VH_FIN.getAndSetRelease(h, 5); });
+        probe("final-int.getAndAdd", () -> { return (int) VH_FIN.getAndAdd(h, 5); });
+        probe("final-int.getAndAddAcquire", () -> { return (int) VH_FIN.getAndAddAcquire(h, 5); });
+        probe("final-int.getAndAddRelease", () -> { return (int) VH_FIN.getAndAddRelease(h, 5); });
+        probe("final-int.getAndBitwiseOr", () -> { return (int) VH_FIN.getAndBitwiseOr(h, 5); });
+        probe("final-int.getAndBitwiseOrAcquire", () -> { return (int) VH_FIN.getAndBitwiseOrAcquire(h, 5); });
+        probe("final-int.getAndBitwiseOrRelease", () -> { return (int) VH_FIN.getAndBitwiseOrRelease(h, 5); });
+        probe("final-int.getAndBitwiseAnd", () -> { return (int) VH_FIN.getAndBitwiseAnd(h, 5); });
+        probe("final-int.getAndBitwiseAndAcquire", () -> { return (int) VH_FIN.getAndBitwiseAndAcquire(h, 5); });
+        probe("final-int.getAndBitwiseAndRelease", () -> { return (int) VH_FIN.getAndBitwiseAndRelease(h, 5); });
+        probe("final-int.getAndBitwiseXor", () -> { return (int) VH_FIN.getAndBitwiseXor(h, 5); });
+        probe("final-int.getAndBitwiseXorAcquire", () -> { return (int) VH_FIN.getAndBitwiseXorAcquire(h, 5); });
+        probe("final-int.getAndBitwiseXorRelease", () -> { return (int) VH_FIN.getAndBitwiseXorRelease(h, 5); });
+        probe("final-int.get", () -> { return (int) VH_FIN.get(h); });
+        probe("final-int.getVolatile", () -> { return (int) VH_FIN.getVolatile(h); });
+        probe("final-int.getOpaque", () -> { return (int) VH_FIN.getOpaque(h); });
+        probe("final-int.getAcquire", () -> { return (int) VH_FIN.getAcquire(h); });
+        probe("final-ref.set", () -> { VH_FINREF.set(h, "y"); return VOID; });
+        probe("final-ref.getAndSet", () -> { return VH_FINREF.getAndSet(h, "y"); });
+        probe("final-ref.compareAndSet", () -> { return VH_FINREF.compareAndSet(h, null, "y"); });
+        probe("final-ref.get", () -> { return VH_FINREF.get(h); });
+        probe("static-final.set", () -> { VH_SFIN.set(5); return VOID; });
+        probe("static-final.getAndSet", () -> { return (int) VH_SFIN.getAndSet(5); });
+        probe("static-final.get", () -> { return (int) VH_SFIN.get(); });
+        probe("null-final.set", () -> { VH_FIN.set((H) null, 5); return VOID; });
+        probe("null-final.getAndSet", () -> { return (int) VH_FIN.getAndSet((H) null, 5); });
+        probe("null-final.compareAndSet", () -> { return VH_FIN.compareAndSet((H) null, 9, 5); });
+        probe("null-final.getAndAdd", () -> { return (int) VH_FIN.getAndAdd((H) null, 5); });
         probe("control.boolean.getAndSet", () -> { return (boolean) VH_Z.getAndSet(h, true); });
         probe("control.boolean.compareAndSet", () -> { return VH_Z.compareAndSet(h, (boolean) h2.z, true); });
         probe("control.byte.getAndSet", () -> { return (byte) VH_B.getAndSet(h, (byte) 1); });
