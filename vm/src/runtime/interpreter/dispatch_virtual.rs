@@ -2222,6 +2222,46 @@ pub(super) fn execute_invokevirtual_cached(
                             })
                             .unwrap_or(true)
                     };
+                    // `CRATONVM_DBG_TIERUP_DECLINE=1` — name the FIRST
+                    // condition below that refuses this site, per method. The
+                    // chain gates the invocation COUNTER as well as the
+                    // promotion, so a method refused here is a method
+                    // `jit-method-stats` cannot see and `CRATONVM_JIT_THRESHOLD`
+                    // cannot reach. Mirrors the `&&` order exactly.
+                    if crate::runtime::interp_census::tierup_decline_enabled() {
+                        let reason = if is_special {
+                            "is_special"
+                        } else if matches!(thread.kind, crate::threading::ThreadKind::Virtual) {
+                            "virtual_thread"
+                        } else if cached.is_synchronized {
+                            "synchronized"
+                        } else if entry_gate.generation != 0 {
+                            "entry_gate_generation"
+                        } else if crate::runtime::env_cache::disable_jit() {
+                            "nojit"
+                        } else if has_registered_native() {
+                            "registered_native"
+                        } else if receiver_is_java_util() {
+                            "receiver_is_java_util"
+                        } else if !cached.exception_table.is_empty() {
+                            "callee_exception_table"
+                        } else if !crate::runtime::env_cache::jit_virtual_tierup() {
+                            "virtual_tierup_off"
+                        } else {
+                            "admitted"
+                        };
+                        crate::runtime::interp_census::record_tierup_decline(
+                            reason,
+                            &cached.class_name,
+                            &cached.method_name,
+                            &cached.method_descriptor,
+                        );
+                    }
+                    // Set by the last `&&` operand below, and read inside the
+                    // block: which of the two PROMOTION hazards, if either,
+                    // applies to this site. See
+                    // `env_cache::jit_virtual_nominate_always`.
+                    let mut promotion_barred = false;
                     if !is_special
                         && !matches!(thread.kind, crate::threading::ThreadKind::Virtual)
                         && !cached.is_synchronized
@@ -2233,15 +2273,6 @@ pub(super) fn execute_invokevirtual_cached(
                         // and this one costs a `NativeMethodRegistry` resolve.
                         // Under `--nojit` it is now never evaluated at all.
                         && !has_registered_native()
-                        // The generic-conversion regression reaches a hot
-                        // java.util graph while Spring creates annotation and
-                        // conversion metadata. Its instance-method tier-ups
-                        // are independently JIT-safe at direct/static sites,
-                        // but this cached virtual route can publish a stale
-                        // receiver-specific entry and then spin. Keep only
-                        // this virtual promotion out of java.util; static
-                        // compilation and ordinary direct dispatch remain on.
-                        && !receiver_is_java_util()
                         // A handler-bearing callee must never be entered by a
                         // DIRECT compiled call. `execute_jit_call_decoded`
                         // below has no interpreter boundary at which the
@@ -2264,8 +2295,35 @@ pub(super) fn execute_invokevirtual_cached(
                         // wholesale. `exception_table` is carried on the
                         // callee's own cache entry, so this costs one field
                         // read, not a class-manager lookup.
-                        && cached.exception_table.is_empty()
                         && crate::runtime::env_cache::jit_virtual_tierup()
+                        // The two promotion hazards, evaluated ONCE, and the
+                        // ONLY place either is evaluated.
+                        //
+                        // `receiver_is_java_util` used to be an operand of this
+                        // chain in its own right (its comment, kept below on
+                        // `promotion_barred`'s first line, is the
+                        // generic-conversion regression it was added for). It
+                        // is a PROMOTION hazard, so it belongs where the
+                        // exception-table test now is; leaving it in the chain
+                        // as well is what made the first cut of this change
+                        // inert.
+                        //
+                        // Written as a block so the `&&` chain above still
+                        // short-circuits past its class-manager `try_read`
+                        // under `--nojit` and for a synchronized or
+                        // native-shadowed callee, exactly as before.
+                        //
+                        // With `jit_virtual_nominate_always` (default-ON) the
+                        // chain no longer STOPS here: it enters the block with
+                        // `promotion_barred` set, which suppresses the
+                        // `jit_cache` probe and the inline upgrade but lets the
+                        // invocation counter and the tiered nomination run.
+                        && {
+                            promotion_barred = !cached.exception_table.is_empty()
+                                || receiver_is_java_util();
+                            crate::runtime::env_cache::jit_virtual_nominate_always()
+                                || !promotion_barred
+                        }
                     {
                         // Fast path: already compiled (by this counter or OSR)?
                         //
@@ -2278,7 +2336,9 @@ pub(super) fn execute_invokevirtual_cached(
                         // racing publication can only cause a redundant re-probe,
                         // never a missed one.
                         let jit_generation = cratonvm_jit::jit_cache_generation();
-                        let compiled_opt = if cached.jit_probe_is_current(jit_generation) {
+                        let compiled_opt = if promotion_barred
+                            || cached.jit_probe_is_current(jit_generation)
+                        {
                             None
                         } else {
                             let found = shared.jit.jit_cache.read().get(
@@ -2326,10 +2386,16 @@ pub(super) fn execute_invokevirtual_cached(
                                         .jit
                                         .tiered_manager
                                         .on_method_invocation_observed(&tiered_key, cnt as u64);
-                                } else if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
-                                    try_jit_upgrade_with_gate(shared, &cached, entry_gate.clone())
-                                {
-                                    return Some(compiled);
+                                } else if !promotion_barred {
+                                    if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
+                                        try_jit_upgrade_with_gate(
+                                            shared,
+                                            &cached,
+                                            entry_gate.clone(),
+                                        )
+                                    {
+                                        return Some(compiled);
+                                    }
                                 }
                             }
                             None

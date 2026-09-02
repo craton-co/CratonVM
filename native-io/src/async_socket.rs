@@ -1010,7 +1010,9 @@ fn deliver_future_completion(ctx: &mut dyn NativeContext, c: FutureCompletion) {
                         "(Ljava/lang/Throwable;)Z",
                         &[Value::Object(Some(throwable))],
                     );
-                    let _ = ctx.invoke_virtual(future, "postComplete", "()V", &[]);
+                    // See `native_cf_complete`: `postComplete` is bytecode,
+                    // so the by-NAME native resolver misses on every call.
+                    let _ = ctx.invoke_virtual_bytecode_only(future, "postComplete", "()V", &[]);
                 }
             }
             ctx.remove_global_root(msg_gref);

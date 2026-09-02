@@ -222,6 +222,10 @@ fn maybe_dump_shutdown_reports() {
     // the switch having been off.
     cratonvm_vm::threading::monitor::report_monitor_notify_census_at_exit();
 
+    // The two composition censuses (`CRATONVM_DBG_INTERP_FRAMES`,
+    // `CRATONVM_DBG_TIERUP_DECLINE`). Each prints nothing when unarmed.
+    cratonvm_vm::runtime::interp_census::report_at_exit();
+
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
         // The `getfield` fast-path ENGAGEMENT number, on the same switch. The

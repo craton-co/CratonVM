@@ -1697,6 +1697,25 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "g1-pin-empty-publication", on_key: Some("CRATONVM_G1_PIN_EMPTY_PUBLICATION"), off_key: None, off_word: None, since: "2026-08-20" },
     E { group: Group::GC, token: "g1-precise-only-roots", on_key: Some("CRATONVM_G1_PRECISE_ONLY_ROOTS"), off_key: None, off_word: None, since: "2026-08-20" },
     E { group: Group::GC, token: "precise-only-roots", on_key: Some("CRATONVM_GC_PRECISE_ONLY_ROOTS"), off_key: None, off_word: None, since: "2026-08-22" },
+    // --- composition residuals, 2026-09-02 ----------------------------------
+    // Three default-off diagnostics and four A/B switches from
+    // `performance/completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`.
+    // Every one of them exists so a claim on that page can be re-priced in ONE
+    // binary; two of them were built specifically to refute a hypothesis, and
+    // one of those did.
+    E { group: Group::DBG, token: "interp-frames", on_key: Some("CRATONVM_DBG_INTERP_FRAMES"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::DBG, token: "tierup-decline", on_key: Some("CRATONVM_DBG_TIERUP_DECLINE"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::DBG, token: "direct-binds", on_key: Some("CRATONVM_DBG_DIRECT_BINDS"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::JIT, token: "int-value-direct", on_key: Some("CRATONVM_JIT_INT_VALUE_DIRECT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::JIT, token: "indy-lambda-fast", on_key: Some("CRATONVM_JIT_INDY_LAMBDA_FAST"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::JIT, token: "hot-lookup-cache", on_key: Some("CRATONVM_JIT_HOT_LOOKUP_CACHE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::JIT, token: "virtual-nominate-always", on_key: Some("CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::JIT, token: "native-cf-postcomplete-skip", on_key: Some("CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::JIT, token: "native-cf-postcomplete-direct", on_key: Some("CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // Not this branch's flag: `ir_lower::cold_arg_stage_enabled`, landed
+    // 2026-09-02 undeclared. Declared here because the guard reports the
+    // POPULATION, so leaving one row red hides the next one.
+    E { group: Group::JIT, token: "ir-cold-arg-stage", on_key: Some("CRATONVM_JIT_IR_COLD_ARG_STAGE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "g1-evac-retry", on_key: None, off_key: Some("CRATONVM_G1_NO_EVAC_RETRY"), off_word: None, since: "2026-07-03" },
     E { group: Group::GC, token: "g1-live-region-memo", on_key: None, off_key: Some("CRATONVM_G1_NO_LIVE_REGION_MEMO"), off_word: None, since: "2026-08-17" },
     E { group: Group::GC, token: "g1-parallel-evac", on_key: Some("CRATONVM_G1_PARALLEL_EVAC"), off_key: None, off_word: Some("0"), since: "2026-06-21" },
