@@ -46,6 +46,15 @@
 //!   and jump into the wrong method. Leaking is the cheap way to make that
 //!   unrepresentable rather than merely unlikely.
 //!
+//! Retirement cannot race a fault in the method being retired, and the reason
+//! is an invariant this file borrows rather than establishes: a
+//! `CompiledMethod` is only dropped when **no frame of it is live** — the same
+//! sentence `release_compile_id` and `unregister_jit_method_name` rely on in
+//! the very same `Drop`. A thread cannot be executing at a PC inside a method
+//! that is being unmapped, so it cannot be faulting at one either. What the
+//! retirement protects against is not that race but the LATER one: a fault in
+//! whatever code `alloc_executable` puts at the same address next.
+//!
 //! Exhaustion is therefore possible in a long run with heavy recompilation.
 //! It is handled by *declining* — [`register`] returns `false`, the compiler
 //! emits the explicit check for that site, and `DECLINED` counts it. The
