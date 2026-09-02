@@ -107,7 +107,7 @@ that is simply WRONG is the `stack_oop_marks_exact` seed — and on this witness
 `marks_inexact=0`. A mark vector believed exact and not exact is invisible to
 every counter on that line.
 
-### 4. The cause census printed six of its seven causes
+### 4. The cause census printed six of its seven causes — and the seventh is ZERO
 
 `map_incomplete_cause::snapshot()` returns seven; `driver.rs` printed
 `causes[0..=5]`. A method whose only unnameable references were inline-scope
@@ -117,10 +117,39 @@ column that was missing is precisely the one its conclusion could not have
 ruled out. Fixed, with a `const` assert so a new variant is a compile error
 rather than another silent column.
 
+**Then the fixed census answered, and it is not the seventh cause either.** On
+the witness method, with all seven columns printing:
+
+```text
+[oopcov] frameslot-detail method=java/lang/StringConcatHelper.doConcat:(...)
+  precise_maps=true inline_sites=1 safepoints=11 mapped=11 unmapped_pcs=[]
+  causes(marks_inexact=0 oop_in_reg=0 stack_deep=0 local_deep=0
+         staged_deep=0 staged_unmappable=0 inline_local_unmappable=0)
+```
+
+Correlated in one run with the residue instrument: the SAME method contributes
+**3 frames carrying a LIVE stale word**, and **every one of its seven causes
+reads zero**. Every safepoint is mapped, `unmapped_pcs` is empty, and nothing
+in the compiler's own self-assessment registers a shortfall.
+
+That is the sharpest available statement of what is left, and it is stronger
+than "a cause was hidden": the missing word is invisible to the compiler's
+ENTIRE vocabulary of incompleteness, not merely to the subset that was being
+printed. A fail-closed gate keyed on `map_incomplete` cannot reach it by
+construction — which is why §2 above finds live stale words with the gate at
+its shipped default.
+
+(Measured on both profiles: the witness and its offsets are identical on the
+release binary and on a debug build, so it is not an optimisation artefact.)
+
 ### Where that leaves the page
 
 * **OPEN**, and the remaining work is `Next` item 2 — unchanged in substance and
-  now with a two-minute reproducer instead of a 900-second one.
+  now with a two-minute reproducer instead of a 900-second one, plus a cause
+  census that has been made complete and reads zero on the witness. The next
+  step is therefore NOT another cause: it is either teaching the lowerer to
+  name every live-band word holding a reference, or clearing `coverable`
+  whenever it cannot prove it did.
 * The three faces, the `ZGC_RELOCATE=0` bisect, the residue instrument and the
   fail-closed gate all stand as written.
 * What must not be carried forward is the cost table and the
