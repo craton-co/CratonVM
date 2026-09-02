@@ -324,7 +324,7 @@ fn restamp_outcome(
 // compiled artifact. HotSpot's equivalent is a `ScopeDesc` CHAIN -- an inlined
 // callee is a nested scope at the same PC -- which is what makes the inlined
 // frames reappear in a warmed-up trace. See
-// `docs/known-issues/jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901.md`,
+// `jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902.md`,
 // defect (2).
 //
 // WHAT WAS RULED OUT, in the order it was checked, because each one looked

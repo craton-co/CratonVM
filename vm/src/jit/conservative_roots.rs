@@ -4185,7 +4185,7 @@ fn plausible_bci(recorded: u32) -> Option<u32> {
 /// carried no bytecode index, and `stackwalker::compiled_frame_entry` — the
 /// only consumer that wants one — could therefore do nothing but hard-code
 /// `LINE_NUMBER_UNKNOWN`. See
-/// `internal/fixed-bugs/jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901.md`.
+/// `jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902.md`.
 #[derive(Debug, Clone)]
 pub struct ActiveCompiledFrame {
     /// Interpreter depth this activation's chain entry was pushed at; the

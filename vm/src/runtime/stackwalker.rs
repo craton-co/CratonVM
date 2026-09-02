@@ -753,7 +753,7 @@ fn osr_frame_dedupe_enabled() -> bool {
 ///
 /// An OSR continuation is not the only way one activation ends up with both
 /// halves. With `CRATONVM_JIT_NO_INLINE=1` the witness in
-/// `known-issues/jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901.md`
+/// `jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902.md`
 /// reports `leaf` twice — once as an interpreter frame with a line, once as a
 /// compiled frame — and `can_osr_enter` says nothing about it, because that
 /// frame is not parked at a back-edge.
@@ -1083,7 +1083,7 @@ fn label_names_frame(label: &str, frame: &Frame) -> bool {
 /// A JIT-compiled artifact is not one Java frame. Every callee it inlined is a
 /// method that is genuinely executing, pushes nothing, and — before this —
 /// contributed nothing at all: the witness in
-/// `known-issues/jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901.md`
+/// `jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902.md`
 /// reads `len=3 [leaf:25 probe:-1 main:62]` where HotSpot reads
 /// `len=5 [leaf:25 mid:26 outer:27 probe:42 main:66]`, and `mid`/`outer` are
 /// missing for exactly this reason. [`push_compiled_frames`] expands one

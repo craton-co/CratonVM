@@ -2754,7 +2754,7 @@ pub struct CompiledMethod {
     /// `x64::driver::compile_with_param_slots`; read by
     /// `vm/src/jit/conservative_roots.rs` to give a warmed-up stack trace the
     /// frames an inlined callee otherwise contributes none of (defect 2 of
-    /// `jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901`).
+    /// `jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902`).
     ///
     /// Introspection and diagnosis ONLY. Never read by codegen, never by the
     /// GC root walk, never by deopt. A level here names a method and a bci and
@@ -17966,7 +17966,7 @@ pub(crate) fn note_jit_bail_shortcircuit() {
 /// | 7 | `switched-off` | `CRATONVM_JIT_NO_COMPILED_FRAME_LINES` or `CRATONVM_JIT_NO_IR_FRAME_LINES` |
 ///
 /// Slots 3-7 are the populations the page
-/// `jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901` had to
+/// `jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902` had to
 /// reason about with no instrument at all.
 static COMPILED_FRAME_LINE_COUNTS: [std::sync::atomic::AtomicU64; 8] = [
     std::sync::atomic::AtomicU64::new(0),

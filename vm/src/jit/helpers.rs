@@ -1045,7 +1045,7 @@ struct JitSignals {
     /// throw site and the first interpreter frame — the whole point of the
     /// trace. Snapshot them while they are still on the stack; the drain hands
     /// them to the throwable. See
-    /// `internal/fixed-bugs/jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901.md`.
+    /// `jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902.md`.
     ///
     /// `RefCell` rather than `Cell` because the payload is not `Copy`; it is
     /// only ever borrowed for the length of a `take`/`replace`, never across a

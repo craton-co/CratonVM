@@ -2,7 +2,7 @@
  * Regression: a stack trace must not degrade when the methods on it tier up.
  *
  * Two defects from
- * `known-issues/jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901.md`,
+ * `jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902.md`,
  * both of which only appear AFTER warm-up — that is, only in the runs anyone
  * cares about, and with nothing thrown or logged to say so:
  *

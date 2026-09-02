@@ -23,7 +23,7 @@
 //! `outer` gone), an OSR frame reporting the back-edge it tiered up at rather
 //! than the call it is suspended in (`main:62` for `main:66`), and a compiled
 //! frame emitted beside its own interpreter frame. See
-//! docs/known-issues/jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901.md.
+//! jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902.md.
 //!
 //! Severity is zero for program results and high for diagnosability, which is
 //! exactly why it survived so long: nothing throws, nothing logs, the trace

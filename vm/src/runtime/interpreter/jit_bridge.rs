@@ -188,7 +188,7 @@ fn osr_stage_get() -> &'static str {
 // Which interpreter frames are, right now, being run by compiled code
 // ---------------------------------------------------------------------------
 //
-// jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901, defect (3):
+// jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902, defect (3):
 // a trace captured after `main` has OSR'd says `main:62` -- the back-edge it
 // tiered up at -- where HotSpot says `main:66`, the call that was executing.
 //

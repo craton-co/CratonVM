@@ -870,7 +870,7 @@ pub mod helpful_npe {
                 // CratonVM printed the action alone where HotSpot 25 prints
                 // `Cannot load from int array because
                 // "StackTraceCompiledCallee.table[...]" is null`. Residual 7 of
-                // `jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901`.
+                // `jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902`.
                 //
                 // The ARRAY operand still bails the whole expression when it
                 // cannot be classified, and must: `...[0]` would name no
