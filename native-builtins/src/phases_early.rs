@@ -16442,6 +16442,14 @@ pub(crate) fn pbkdf2_prf_code(alg: &str) -> Option<i32> {
         "PBKDF2WITHHMACSHA256" => Some(256),
         "PBKDF2WITHHMACSHA384" => Some(384),
         "PBKDF2WITHHMACSHA512" => Some(512),
+        // The two SunJCE registers that this table did not: the PRF is the
+        // FIPS 180-4 truncated-SHA-512 pair, whose names carry a slash. Codes
+        // are `512224`/`512256` rather than `224`/`256` because those already
+        // mean SHA-224/SHA-256 and `pbkdf2_derive_for` selects the digest by
+        // this number — reusing one would have derived a key with the wrong
+        // PRF and said nothing.
+        "PBKDF2WITHHMACSHA512/224" => Some(512224),
+        "PBKDF2WITHHMACSHA512/256" => Some(512256),
         _ => None,
     }
 }
@@ -16489,6 +16497,13 @@ macro_rules! pbkdf2_derive_wide_impl {
 }
 pbkdf2_derive_wide_impl!(pbkdf2_derive_wide_sha384, sha2::Sha384);
 pbkdf2_derive_wide_impl!(pbkdf2_derive_wide_sha512, sha2::Sha512);
+// SHA-512/224 and SHA-512/256 are NOT truncations of SHA-512 — FIPS 180-4 gives
+// each its own initial hash value, so `Sha512::finalize()[..28]` is a different
+// number from `Sha512_224::finalize()`. They are separate types in `sha2` for
+// that reason, and they belong on the WIDE macro because their compression
+// function is SHA-512's: a 128-byte HMAC block, not 64.
+pbkdf2_derive_wide_impl!(pbkdf2_derive_wide_sha512_224, sha2::Sha512_224);
+pbkdf2_derive_wide_impl!(pbkdf2_derive_wide_sha512_256, sha2::Sha512_256);
 
 /// Crate-visible PBKDF2 entry point (dispatches to the right 64-byte-block
 /// PRF by [`pbkdf2_prf_code`] code) for callers outside this module — used by
@@ -16508,7 +16523,17 @@ pub(crate) fn pbkdf2_derive_for(
         224 => pbkdf2_derive::<sha2::Sha224>(pw, salt, iters, dklen),
         384 => pbkdf2_derive_wide_sha384(pw, salt, iters, dklen),
         512 => pbkdf2_derive_wide_sha512(pw, salt, iters, dklen),
-        _ => pbkdf2_derive::<sha2::Sha256>(pw, salt, iters, dklen),
+        512224 => pbkdf2_derive_wide_sha512_224(pw, salt, iters, dklen),
+        512256 => pbkdf2_derive_wide_sha512_256(pw, salt, iters, dklen),
+        // 256 and — the hazard — ANY code this function has no arm for.
+        //
+        // Spelled out because the catch-all is a silent wrong answer, not an
+        // error: a PRF code that reaches here derives with SHA-256 and returns
+        // a key of the right LENGTH, so the caller sees a success and the
+        // failure appears wherever the key is next used, against a peer that
+        // derived it correctly. Every code `pbkdf2_prf_code` can return has an
+        // arm above; a new one must add its arm HERE in the same change.
+        256 | _ => pbkdf2_derive::<sha2::Sha256>(pw, salt, iters, dklen),
     }
 }
 
@@ -16587,6 +16612,16 @@ fn is_known_pbe_keyfactory_alg(alg: &str) -> bool {
             | "PBEWithHmacSHA256AndAES_256"
             | "PBEWithHmacSHA384AndAES_256"
             | "PBEWithHmacSHA512AndAES_256"
+            // The `SHA-512/224` and `SHA-512/256` PRF members of the same
+            // family. SunJCE registers all four and this set carried none of
+            // them, so `SecretKeyFactory.getInstance("PBEWithHmacSHA512/224            // AndAES_128")` refused where HotSpot serves it. No derivation is
+            // involved — a `PBEKeyFactory` hands back the password as 7-bit
+            // ASCII whatever the PRF in its name — so the NAME SET is the whole
+            // implementation for these, exactly as it is for the eighteen above.
+            | "PBEWithHmacSHA512/224AndAES_128"
+            | "PBEWithHmacSHA512/224AndAES_256"
+            | "PBEWithHmacSHA512/256AndAES_128"
+            | "PBEWithHmacSHA512/256AndAES_256"
     )
 }
 
@@ -16767,11 +16802,42 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
         // `IOException`-where-`CertificateException`-belongs batch found in the
         // trust manager. `throw_jca_exc` builds the real Java exception object,
         // so what a caller catches is what HotSpot throws.
-        None => Err(throw_jca_exc(
-            ctx,
-            "java/security/NoSuchAlgorithmException",
-            &format!("{alg} SecretKeyFactory not available"),
-        )),
+        // THE PLATFORM'S OWN FACTORY, before the refusal — and only after it.
+        //
+        // Everything above is this engine's verdict; this is the last thing
+        // tried, so no name it computes changes hands. `DES` and `DESede` are
+        // the two SunJCE `SecretKeyFactory` services this VM has no arm for,
+        // and their implementations (`com.sun.crypto.provider.DESKeyFactory`,
+        // `DESedeKeyFactory`) are sitting in the boot image: pure Java,
+        // public no-arg constructors, verified loadable here before the rows
+        // were seeded. Refusing them was a portability defect and nothing else.
+        //
+        // The wrapper is a GENUINE `javax.crypto.SecretKeyFactory` built
+        // through the JDK's own `(Spi, Provider, String)` constructor, so
+        // `getKeySpec`/`translateKey` — which this crate does not intercept —
+        // run ordinary bytecode over a properly-constructed receiver, and the
+        // three natives that DO shadow the class route a receiver they did not
+        // build back to its `spi` (`skf_receiver_is_ours`).
+        None => {
+            if let Some((jdk_provider, _)) = crate::jca::provider_chain::jdk_service_class(
+                requested_provider.as_deref(),
+                "SecretKeyFactory",
+                &alg,
+            ) {
+                if let Some(obj) = crate::jca::provider_chain::build_real_secret_key_factory(
+                    ctx,
+                    &jdk_provider,
+                    &alg,
+                )? {
+                    return Ok(Some(Value::Object(Some(obj))));
+                }
+            }
+            Err(throw_jca_exc(
+                ctx,
+                "java/security/NoSuchAlgorithmException",
+                &format!("{alg} SecretKeyFactory not available"),
+            ))
+        }
     }
 }
 
@@ -16976,13 +17042,17 @@ pub(crate) fn pbkdf2_generate_secret(
         .into());
     }
     let dklen = (key_bits as usize) / 8;
-    let dk = match prf {
-        1 => pbkdf2_derive::<sha1::Sha1>(&pw_bytes, &salt, iters, dklen),
-        224 => pbkdf2_derive::<sha2::Sha224>(&pw_bytes, &salt, iters, dklen),
-        384 => pbkdf2_derive_wide_sha384(&pw_bytes, &salt, iters, dklen),
-        512 => pbkdf2_derive_wide_sha512(&pw_bytes, &salt, iters, dklen),
-        _ => pbkdf2_derive::<sha2::Sha256>(&pw_bytes, &salt, iters, dklen),
-    };
+    // THROUGH `pbkdf2_derive_for`, not a second copy of its match.
+    //
+    // This site carried its own arm-for-arm duplicate of that dispatch, with
+    // the same silent SHA-256 catch-all, and the duplicate is what a new PRF
+    // falls into: adding `PBKDF2WithHmacSHA512/224` and `/256` to
+    // `pbkdf2_prf_code` and to `pbkdf2_derive_for` left THIS copy unchanged, so
+    // both names resolved, derived a 32-byte key, and derived it with SHA-256 —
+    // the two new rows printed byte-identical output, and byte-identical to the
+    // `PBKDF2WithHmacSHA256` row above them (`apps/probes/JcaDerivationVectors`,
+    // which exists because `getInstance` resolving is not evidence of anything).
+    let dk = pbkdf2_derive_for(prf, &pw_bytes, &salt, iters, dklen);
     // Build a real SecretKeySpec(dk, "PBKDF2With…") so getEncoded() returns dk.
     //
     // The comment said `"PBKDF2With…"` but the literal was the bare `"PBKDF2"`,

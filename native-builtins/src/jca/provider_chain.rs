@@ -1856,7 +1856,12 @@ fn build_real_spi_wrapper(
     engine_class: &str,
     ctor_desc: &str,
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
-    if third_party_service_class(Some(provider), type_str, algo).is_none() {
+    // A JDK provider is admitted here too, and ONLY because every caller of
+    // this function is already on its engine's refusal path — see
+    // `jdk_service_class` for why that ordering is the whole safety argument.
+    if third_party_service_class(Some(provider), type_str, algo).is_none()
+        && jdk_service_class(Some(provider), type_str, algo).is_none()
+    {
         return Ok(None);
     }
     let Some(impl_result) = build_jca_impl(ctx, provider, type_str, algo) else {
@@ -4130,6 +4135,156 @@ fn seed_sunjce_pbe_services() {
     }
 }
 
+/// SunJCE's `SecretKeyFactory` table — thirty services, of which this crate
+/// advertised NONE.
+///
+/// Twenty-two of them were being SERVED all along and simply never appeared in
+/// `Security.getProvider("SunJCE").getServices()`: measured 2026-09-02, every
+/// `PBKDF2With*` and `PBEWith*` name below resolves through
+/// `phases_early::pbkdf2_get_instance` and derives bytes identical to
+/// HotSpot's. That is precisely the half `W7-63-jca-advertise-vs-serve.md`
+/// names in its title — "serves names it never advertised" — and an inventory
+/// that cannot see them is wrong about the platform in the safe-looking
+/// direction.
+///
+/// `DES` and `DESede` are the two this engine does NOT compute. They are
+/// listed anyway, with the JDK's real class names, because the refusal arm of
+/// `pbkdf2_get_instance` now hands those names to the platform's own
+/// `DESKeyFactory`/`DESedeKeyFactory` through `jdk_service_class` — so the row
+/// is truthful in the only sense that matters: ask for it and you get a
+/// working factory.
+///
+/// Class names are the JDK 25 originals, taken from HotSpot's own
+/// `getServices()` enumeration rather than recalled — which matters for the
+/// two that are actually instantiated, and for the enumeration diff in the
+/// twenty-eight that are not.
+fn seed_sunjce_secret_key_factory_services() {
+    const P: &str = "SunJCE";
+    put_service(
+        P,
+        "SecretKeyFactory",
+        "DES",
+        "com.sun.crypto.provider.DESKeyFactory",
+    );
+    put_service(
+        P,
+        "SecretKeyFactory",
+        "DESede",
+        "com.sun.crypto.provider.DESedeKeyFactory",
+    );
+    // `PBKDF2Core$Hmac*` — the class-name spelling of `SHA-512/224` is
+    // `SHA512_224`, the algorithm spelling is `SHA512/224`. Kept as explicit
+    // pairs for the same reason the `PBES2Parameters` loop now is: deriving
+    // one from the other cost four services there.
+    for (algo_hash, class_hash) in [
+        ("SHA1", "SHA1"),
+        ("SHA224", "SHA224"),
+        ("SHA256", "SHA256"),
+        ("SHA384", "SHA384"),
+        ("SHA512", "SHA512"),
+        ("SHA512/224", "SHA512_224"),
+        ("SHA512/256", "SHA512_256"),
+    ] {
+        put_service(
+            P,
+            "SecretKeyFactory",
+            &format!("PBKDF2WithHmac{algo_hash}"),
+            &format!("com.sun.crypto.provider.PBKDF2Core$Hmac{class_hash}"),
+        );
+    }
+    // `PBEKeyFactory$*` — here the nested class name KEEPS the `PBEWith`
+    // prefix (unlike `PBES2Parameters`, which drops it), so the two families
+    // cannot share a formatter.
+    for (algo, class_suffix) in [
+        ("PBEWithMD5AndDES", "PBEWithMD5AndDES"),
+        ("PBEWithMD5AndTripleDES", "PBEWithMD5AndTripleDES"),
+        ("PBEWithSHA1AndDESede", "PBEWithSHA1AndDESede"),
+        ("PBEWithSHA1AndRC2_40", "PBEWithSHA1AndRC2_40"),
+        ("PBEWithSHA1AndRC2_128", "PBEWithSHA1AndRC2_128"),
+        ("PBEWithSHA1AndRC4_40", "PBEWithSHA1AndRC4_40"),
+        ("PBEWithSHA1AndRC4_128", "PBEWithSHA1AndRC4_128"),
+        ("PBEWithHmacSHA1AndAES_128", "PBEWithHmacSHA1AndAES_128"),
+        ("PBEWithHmacSHA1AndAES_256", "PBEWithHmacSHA1AndAES_256"),
+        ("PBEWithHmacSHA224AndAES_128", "PBEWithHmacSHA224AndAES_128"),
+        ("PBEWithHmacSHA224AndAES_256", "PBEWithHmacSHA224AndAES_256"),
+        ("PBEWithHmacSHA256AndAES_128", "PBEWithHmacSHA256AndAES_128"),
+        ("PBEWithHmacSHA256AndAES_256", "PBEWithHmacSHA256AndAES_256"),
+        ("PBEWithHmacSHA384AndAES_128", "PBEWithHmacSHA384AndAES_128"),
+        ("PBEWithHmacSHA384AndAES_256", "PBEWithHmacSHA384AndAES_256"),
+        ("PBEWithHmacSHA512AndAES_128", "PBEWithHmacSHA512AndAES_128"),
+        ("PBEWithHmacSHA512AndAES_256", "PBEWithHmacSHA512AndAES_256"),
+        (
+            "PBEWithHmacSHA512/224AndAES_128",
+            "PBEWithHmacSHA512_224AndAES_128",
+        ),
+        (
+            "PBEWithHmacSHA512/224AndAES_256",
+            "PBEWithHmacSHA512_224AndAES_256",
+        ),
+        (
+            "PBEWithHmacSHA512/256AndAES_128",
+            "PBEWithHmacSHA512_256AndAES_128",
+        ),
+        (
+            "PBEWithHmacSHA512/256AndAES_256",
+            "PBEWithHmacSHA512_256AndAES_256",
+        ),
+    ] {
+        put_service(
+            P,
+            "SecretKeyFactory",
+            algo,
+            &format!("com.sun.crypto.provider.PBEKeyFactory${class_suffix}"),
+        );
+    }
+}
+
+/// The two `AlgorithmParameterGenerator` services the JDK ships, and the whole
+/// of that engine's story here.
+///
+/// `AlgorithmParameterGenerator.getInstance` is not intercepted by this crate
+/// at all — no native is registered on the class — so it runs ordinary JDK
+/// bytecode walking `Provider.getService`, and a service row IS the
+/// implementation. No row was seeded for either name, so
+/// `AlgorithmParameterGenerator.getInstance("DSA")` raised
+/// `NoSuchAlgorithmException` on a VM carrying a working
+/// `sun.security.provider.DSAParameterGenerator` in its boot image.
+///
+/// Both classes are pure Java (`DSAParameterGenerator` is FIPS 186-4 prime
+/// generation, `DHParameterGenerator` is safe-prime search over
+/// `BigInteger`), take the public no-arg constructor JCA requires, and were
+/// confirmed loadable on this VM before the rows were added
+/// (`JcaGapSizer --check`).
+fn seed_algorithm_parameter_generator_services() {
+    put_service(
+        "SUN",
+        "AlgorithmParameterGenerator",
+        "DSA",
+        "sun.security.provider.DSAParameterGenerator",
+    );
+    put_alias("SUN", "AlgorithmParameterGenerator", "1.2.840.10040.4.1", "DSA");
+    put_alias(
+        "SUN",
+        "AlgorithmParameterGenerator",
+        "OID.1.2.840.10040.4.1",
+        "DSA",
+    );
+    put_service(
+        "SunJCE",
+        "AlgorithmParameterGenerator",
+        "DiffieHellman",
+        "com.sun.crypto.provider.DHParameterGenerator",
+    );
+    for alias in ["DH", "1.2.840.113549.1.3.1", "OID.1.2.840.113549.1.3.1"] {
+        put_alias(
+            "SunJCE",
+            "AlgorithmParameterGenerator",
+            alias,
+            "DiffieHellman",
+        );
+    }
+}
+
 /// Mirror the real SunJSSE + SUN provider TLS service tables so that the
 /// no-provider `getInstance` search resolves the genuine JDK SPI classes for
 /// the TLS engines Tomcat's JSSE connector needs (`KeyManagerFactory`,
@@ -5982,6 +6137,72 @@ pub(crate) fn third_party_service_class(
     Some(entry.class_name.replace('.', "/"))
 }
 
+/// The implementation class a JDK provider registered for `(type_str, algo)` —
+/// the twin of [`third_party_service_class`] for the providers this crate
+/// normally services natively.
+///
+/// # This is legitimate ONLY on an engine's refusal path
+///
+/// [`NATIVELY_SERVICED_PROVIDERS`] exists because a chain walk that reached the
+/// JDK's own class FIRST would bypass every native implementation in this
+/// crate — a `Cipher.getInstance("AES")` served by `com.sun.crypto.provider
+/// .AESCipher` instead of the Rust engine is not the VM anybody is testing.
+/// That argument is about ORDER, not about the class being unusable, and
+/// `jca::cipher::try_delegate_cipher_to_chain` already writes the discipline
+/// down: "deliberately ordered AFTER this engine's own verdict, never before
+/// it". Called there, the JDK class is reached only for names the native
+/// engine has just refused, so no existing answer changes and the refusal is
+/// replaced by the platform's own implementation.
+///
+/// # Why this is worth having at all
+///
+/// Measured on 2026-09-02, all 84 of the implementation classes behind
+/// `jca-provider-population-gap-20260830.md`'s functional gap LOAD on this VM
+/// (`apps/probes/JcaGapSizer --check`: `loads=yes` for every one; the
+/// `instantiates=` column reports the probe's own
+/// `InaccessibleObjectException` from `setAccessible` on a non-exported
+/// package, which is not how the JCA constructs them). So for a large part of
+/// that gap the implementation is already present and only the route to it was
+/// missing.
+///
+/// Returns `None` for the placeholder class names this crate seeds for its own
+/// natively-served rows (`sun.security.provider.Native`,
+/// `com.sun.crypto.provider.Native`). Those are not classes; they are markers
+/// saying "a Rust engine answers this", and instantiating them would raise
+/// `ClassNotFoundException` on a path whose whole job is to be a quiet
+/// fallback.
+pub(crate) fn jdk_service_class(
+    provider: Option<&str>,
+    type_str: &str,
+    algo: &str,
+) -> Option<(String, String)> {
+    let is_jdk = |name: &str| {
+        NATIVELY_SERVICED_PROVIDERS
+            .iter()
+            .any(|b| b.eq_ignore_ascii_case(name))
+    };
+    let name = match provider {
+        Some(p) => {
+            if !is_jdk(p) {
+                return None;
+            }
+            p.to_string()
+        }
+        None => snapshot()
+            .into_iter()
+            .find(|(name, _, _)| {
+                is_jdk(name) && get_service_entry(name, type_str, algo).is_some()
+            })
+            .map(|(name, _, _)| name)?,
+    };
+    let entry = get_service_entry(&name, type_str, algo)?;
+    let class_name = entry.class_name.trim();
+    if class_name.is_empty() || class_name.ends_with(".Native") {
+        return None;
+    }
+    Some((name, class_name.to_string()))
+}
+
 /// Every `SSLContext` protocol name SunJSSE registers on JDK 25, ASCII-
 /// uppercased.
 ///
@@ -7116,6 +7337,11 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         // loading a password-protected PKCS12 keystore entry doesn't dead-end
         // (RestClientBuilderIntegTests HTTPS suite-timeout).
         seed_sunjce_pbe_services();
+        // SunJCE's thirty `SecretKeyFactory` services, of which twenty-eight
+        // were already SERVED and none were advertised, and the two `Algorithm-
+        // ParameterGenerator` services, which were neither.
+        seed_sunjce_secret_key_factory_services();
+        seed_algorithm_parameter_generator_services();
         let gi = "sun/security/jca/GetInstance";
         r.register(
             gi,
