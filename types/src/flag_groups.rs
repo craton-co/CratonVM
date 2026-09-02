@@ -1516,6 +1516,15 @@ pub const INVENTORY: &[E] = &[
     // `backedge-poll-gate` — off restores the unconditional
     // `safepoint_check` call on every backward branch.
     E { group: Group::JIT, token: "backedge-poll-gate", on_key: None, off_key: Some("CRATONVM_JIT_NO_BACKEDGE_POLL_GATE"), off_word: None, since: "2026-09-02" },
+    // `field-fast-path` — off restores the full `op_getfield` / `op_putfield`
+    // handler on every instance field access.
+    E { group: Group::JIT, token: "field-fast-path", on_key: None, off_key: Some("CRATONVM_JIT_NO_FIELD_FAST_PATH"), off_word: None, since: "2026-09-02" },
+    // `osr-inline-gate` — off calls `try_osr_with_backoff` on every backward
+    // branch instead of only past the smallest OSR threshold.
+    E { group: Group::JIT, token: "osr-inline-gate", on_key: None, off_key: Some("CRATONVM_JIT_NO_OSR_INLINE_GATE"), off_word: None, since: "2026-09-02" },
+    // `invoke-fast-door` — off routes every monomorphic virtual cache hit
+    // through the general `execute_invokevirtual_cached` dispatcher.
+    E { group: Group::JIT, token: "invoke-fast-door", on_key: None, off_key: Some("CRATONVM_JIT_NO_INVOKE_FAST_DOOR"), off_word: None, since: "2026-09-02" },
     // `iface-select-memo` — off makes every `invokeinterface` cache hit
     // retake the class-manager read lock and rewalk the receiver hierarchy
     // to re-verify maximally-specific selection.

@@ -39,7 +39,6 @@
 //! millions of calls; the cold ones are noise at that count.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
 
 /// Prologue: function entry through the inline-cache probe and its entry
 /// `clone()` — the `FxHashMap<(ClassId, u16, bool)>` hash, the bucket probe,
@@ -103,11 +102,23 @@ static CYCLES: [AtomicU64; N] = [ZERO; N];
 static CALLS: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
+#[inline]
 pub fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INVOKE_PHASES").is_some()
-    })
+    // Read up to five times per value return; one relaxed byte load, init cold.
+    static STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let s = STATE.load(Ordering::Relaxed);
+    if s != 0 {
+        return s == 2;
+    }
+    on_init(&STATE)
+}
+
+#[cold]
+#[inline(never)]
+fn on_init(state: &std::sync::atomic::AtomicU8) -> bool {
+    let on = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INVOKE_PHASES").is_some();
+    state.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    on
 }
 
 /// Current cycle counter, or 0 when the instrument is off.
