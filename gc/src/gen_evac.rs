@@ -127,6 +127,22 @@ const PLAB_DIRECT_SHIFT_DIV: usize = 8;
 /// the retirement allowance. See [`ParEvac::plan`].
 const SLACK_TO_BUFFERS_DIV: usize = 2;
 
+/// A worker's first old-gen promotion buffer (gen-gc-five item 4).
+///
+/// Promotion used to be one `OldGen::alloc` per object under the old-gen
+/// mutex: a walk up the size buckets, a best-fit scan inside one, the split
+/// remainder re-pushed, the sorted free-list cache invalidated, and a
+/// `memset` of the block that the copy then overwrote byte for byte. A
+/// worker now carves a buffer with `OldGen::alloc_unzeroed` — the copy is the
+/// write — and bumps promoted objects out of it; the mutex is taken once per
+/// buffer instead of once per object.
+const OLD_PLAB_MIN: usize = 16 * 1024;
+/// The promotion buffer's ceiling; each refill doubles up to this.
+const OLD_PLAB_MAX: usize = 256 * 1024;
+/// A promoted object at least this large bypasses the buffer and takes its
+/// own block, so one large array cannot strand most of a buffer.
+const OLD_PLAB_DIRECT_MIN: usize = 32 * 1024;
+
 /// Batch size a worker takes from the shared worklist per acquisition.
 const ACQUIRE_CHUNK: usize = 256;
 /// Local worklist depth at which a worker publishes its surplus unprompted.
@@ -391,6 +407,14 @@ pub(crate) struct EvacShard {
     work: Vec<usize>,
     /// This worker's young to-space PLAB.
     plab: Plab,
+    /// This worker's OLD-gen promotion buffer (gen-gc-five item 4), carved
+    /// unzeroed from the old generation and bump-allocated; see
+    /// [`ParEvac::promote_alloc`].
+    old_plab: Plab,
+    /// Size of the next promotion buffer this worker carves: 0 means
+    /// [`OLD_PLAB_MIN`], then doubling to [`OLD_PLAB_MAX`] while the worker
+    /// keeps promoting, so a worker that promotes little wastes little.
+    next_old_plab: usize,
 }
 
 /// The plan a driver commits to before opening the parallel phase.
@@ -398,6 +422,12 @@ pub(crate) struct EvacPlan {
     /// Absolute address of the first byte workers may allocate.
     pub(crate) region_start: usize,
     /// One past the last byte workers may allocate.
+    ///
+    /// Also exactly what the driver must COMMIT before opening the phase —
+    /// see [`crate::arena::Arena::commit_evacuation_region`]. It is a bound on
+    /// what the phase can consume, not the whole to-space tail, so committing
+    /// it does not charge the reservation for a semi-space the cycle will not
+    /// touch.
     pub(crate) region_end: usize,
     /// Bytes each worker claims per to-space buffer, sized against what this
     /// cycle has to copy. See [`PLAB_LIVE_DIVISOR`].
@@ -581,13 +611,25 @@ impl<'a> ParEvac<'a> {
             n if n < PLAB_FLOOR_BYTES => 0,
             n => n,
         };
+        let buffers = plab_bytes * workers;
+        // The abandoned-tail allowance is BOUNDED rather than "whatever the
+        // buffers did not take", because `region_end` is now a promise the
+        // driver has to make good in committed memory (see below): an
+        // allowance of the whole slack would commit the entire to-space on
+        // every cycle and undo the reservation's lazy commit.
+        let waste_allowance = (slack - buffers).min(buffers.max(PLAB_MIN_BYTES));
+        // EVERY byte this phase can consume, and therefore every byte the
+        // driver must commit before a worker writes: one exact span per
+        // survivor (at most `from_used`), one in-flight buffer tail per worker
+        // (`buffers`), and the abandoned tails the allowance permits. Nothing
+        // else takes region. The `min` is a belt — `waste_allowance` is capped
+        // at `slack - buffers`, so the sum cannot exceed `to_headroom`.
+        let region_bytes = (from_used + buffers + waste_allowance).min(to_headroom);
         Some(EvacPlan {
             region_start: to_cursor_addr,
-            region_end: to_cursor_addr + to_headroom,
+            region_end: to_cursor_addr + region_bytes,
             plab_bytes,
-            // Whatever the buffers did not take. Spent by `plab_alloc` on
-            // abandoned tails, and then exhausted — never exceeded.
-            waste_allowance: slack - plab_bytes * workers,
+            waste_allowance,
             workers,
         })
     }
@@ -735,13 +777,96 @@ impl<'a> ParEvac<'a> {
         Some(addr)
     }
 
-    /// Hand this worker's unused PLAB tail to the driver's filler list.
+    /// Hand this worker's unused PLAB tail to the driver's filler list, and
+    /// its unused promotion-buffer tail back to the old generation.
     pub(crate) fn retire_plab(&self, shard: &mut EvacShard) {
         let (cur, end) = (shard.plab.cursor, shard.plab.end);
         shard.plab.cursor = 0;
         shard.plab.end = 0;
         if end > cur && cur != 0 {
             shard.plab_gaps.push((cur, end - cur));
+        }
+        self.retire_old_plab(shard);
+    }
+
+    /// Return the never-written tail of the worker's promotion buffer to the
+    /// old generation's free list. `OldGen::release_unused_tail` does not
+    /// stamp the reclaim epoch: the tail never held an object, so no
+    /// concurrent-mark remark snapshot can name an address in it, and a young
+    /// cycle retiring its buffers does not invalidate an in-flight old-gen
+    /// sweep. The tail is 0 or at least `HEADER_SIZE` by [`Self::old_lab_alloc`]'s
+    /// rule, so it is always a legal free block.
+    fn retire_old_plab(&self, shard: &mut EvacShard) {
+        let (cur, end) = (shard.old_plab.cursor, shard.old_plab.end);
+        shard.old_plab.cursor = 0;
+        shard.old_plab.end = 0;
+        if end > cur && cur != 0 {
+            let tail = end - cur;
+            debug_assert!(
+                tail >= HEADER_SIZE && tail % 8 == 0,
+                "a promotion buffer tail must be a free-list-sized block (tail={tail})"
+            );
+            // SAFETY: `[cur, end)` is the unused remainder of a block this
+            // worker carved with `alloc_unzeroed`; nothing was written there.
+            unsafe { self.old_gen.lock().release_unused_tail(cur as *mut u8, tail) };
+        }
+    }
+
+    /// Bump `size` bytes out of the worker's promotion buffer, refusing an
+    /// allocation that would leave exactly 8 bytes: an 8-byte remainder can
+    /// neither go back to the old-gen free list (its minimum block is
+    /// `HEADER_SIZE`) nor carry an `int[]` filler, so the buffer is retired
+    /// with a tail of at least 24 bytes instead.
+    fn old_lab_alloc(shard: &mut EvacShard, size: usize) -> Option<usize> {
+        let after = shard.old_plab.cursor.checked_add(size)?;
+        if after > shard.old_plab.end || shard.old_plab.cursor == 0 {
+            return None;
+        }
+        if shard.old_plab.end - after == 8 {
+            return None;
+        }
+        let p = shard.old_plab.cursor;
+        shard.old_plab.cursor = after;
+        Some(p)
+    }
+
+    /// Old-gen destination for a promoted object of `size` bytes (8-aligned):
+    /// the worker's promotion buffer, a fresh buffer carved under the old-gen
+    /// lock, or — when the old generation cannot spare a buffer — the object's
+    /// own block. `None` means old gen is full and the caller falls back to
+    /// to-space, exactly as the serial path does.
+    fn promote_alloc(&self, shard: &mut EvacShard, size: usize) -> Option<usize> {
+        if size >= OLD_PLAB_DIRECT_MIN {
+            return self.old_gen.lock().alloc_unzeroed(size, 8).map(|p| p as usize);
+        }
+        if let Some(p) = Self::old_lab_alloc(shard, size) {
+            return Some(p);
+        }
+        self.retire_old_plab(shard);
+        let want = if shard.next_old_plab == 0 {
+            OLD_PLAB_MIN
+        } else {
+            shard.next_old_plab
+        };
+        let mut plab = want.max(size);
+        if plab - size == 8 {
+            // The first allocation must not leave the 8-byte tail
+            // `old_lab_alloc` refuses, or a fresh buffer would be handed back
+            // at once.
+            plab += 8;
+        }
+        let mut og = self.old_gen.lock();
+        match og.alloc_unzeroed(plab, 8) {
+            Some(base) => {
+                drop(og);
+                let base = base as usize;
+                shard.next_old_plab = (want * 2).min(OLD_PLAB_MAX);
+                shard.old_plab.cursor = base;
+                shard.old_plab.end = base + plab;
+                Self::old_lab_alloc(shard, size)
+            }
+            // No buffer-sized block: the object on its own, or nothing.
+            None => og.alloc_unzeroed(size, 8).map(|p| p as usize),
         }
     }
 
@@ -868,8 +993,8 @@ impl<'a> ParEvac<'a> {
         let promote =
             self.force_promote_all || owned.gc_age().saturating_add(1) >= self.promotion_age;
         let mut new_addr = if promote {
-            match self.old_gen.lock().alloc(total_size, 8) {
-                Some(p) => p as usize,
+            match self.promote_alloc(shard, total_size) {
+                Some(p) => p,
                 // Old gen full: fall back to to-space, exactly as the serial
                 // path does. The Cheney invariant guarantees room.
                 None => self.plab_alloc(shard, total_size).unwrap_or(0),
@@ -1361,7 +1486,15 @@ mod tests {
         assert!(ParEvac::plan(head, 0x1004, 4096, 2).is_none());
         let plan = ParEvac::plan(head, 0x1008, 4096, 2).expect("an aligned cursor is accepted");
         assert_eq!(plan.region_start, 0x1008);
-        assert_eq!(plan.region_end, 0x1008 + head);
+        // The region is the phase's CONSUMPTION BOUND, not the whole tail:
+        // since 2026-09-02 the driver must commit it before a worker writes
+        // (`Arena::commit_evacuation_region`), and committing the tail would
+        // charge the reservation for a semi-space this cycle never touches.
+        assert_eq!(
+            plan.region_end - plan.region_start,
+            4096 + 2 * plan.plab_bytes + plan.waste_allowance,
+        );
+        assert!(plan.region_end <= 0x1008 + head, "and never past the tail");
     }
 
     /// The per-worker buffer must track the live set, not sit at a constant.

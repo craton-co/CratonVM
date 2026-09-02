@@ -47,7 +47,11 @@ mod value;
 /// an `FxHashMap` for exactly that reason and then paid to convert it into a
 /// `HashMap` for this field: 43 ms of a 424 ms stop-the-world pause, to change
 /// a container type. Naming the hasher here is what removes that conversion.
-pub type PointerMap = rustc_hash::FxHashMap<usize, usize>;
+/// Since 2026-09-02 (gen-gc-five) this is a SHARDED map built in parallel
+/// by the evacuation workers rather than the flat `FxHashMap` alias; the
+/// reasoning above still holds for every shard. See [`pointer_map`].
+pub mod pointer_map;
+pub use pointer_map::PointerMap;
 
 pub use class_id::{ClassId, ClassLoaderId};
 pub use compact_value::{CompactTag, CompactValue, CompactValueError};

@@ -118,6 +118,22 @@ fn mask_last(mask: &[u64; SMALL_MASK_WORDS]) -> Option<usize> {
     None
 }
 
+/// The extents [`Arena::reset_deferring_zero`] left un-zeroed, as arena
+/// offsets: `[0, low_end)` below the old low cursor and `[high_start, len)`
+/// above the old high one.
+#[derive(Debug, Clone, Copy)]
+pub struct DeferredWipe {
+    low_end: usize,
+    high_start: usize,
+}
+
+impl DeferredWipe {
+    /// Bytes the wipe covers before committed-granule filtering.
+    pub fn extent_bytes(&self, capacity: usize) -> usize {
+        self.low_end.min(capacity) + capacity.saturating_sub(self.high_start)
+    }
+}
+
 pub struct Arena {
     /// Backing storage for `capacity` bytes.
     ///
@@ -2506,6 +2522,45 @@ impl Arena {
         self.clear_alloc_anchors();
     }
 
+    /// [`Self::reset`] with the zeroing handed back to the caller.
+    ///
+    /// The metadata reset is identical (cursors, free list, anchors); what
+    /// this does NOT do is the `memset` of everything below the low cursor
+    /// and above the high one. The returned [`DeferredWipe`] names those
+    /// extents as OFFSETS, and [`Self::deferred_wipe_spans`] turns them into
+    /// absolute spans against the arena's backing at the time it is called —
+    /// so a `grow` between the two, which may move the backing (and carries
+    /// the committed bytes, stale contents included, with it), is handled by
+    /// asking late rather than early.
+    ///
+    /// The caller owns the contract `reset` used to discharge: until every
+    /// returned span is zeroed, nothing may read this arena's bytes as
+    /// objects. `GenerationalHeap` keeps the arena INACTIVE (the evacuated
+    /// semi-space is the next cycle's to-space, allocated into by no mutator)
+    /// and joins the wipe before the next collection touches it.
+    pub fn reset_deferring_zero(&mut self) -> DeferredWipe {
+        crate::zero_forensics::record(2, 0, self.data.as_ptr() as usize, self.cursor);
+        let wipe = DeferredWipe {
+            low_end: self.cursor,
+            high_start: self.high_cursor,
+        };
+        self.cursor = 0;
+        self.high_cursor = self.data.len();
+        self.clear_free_list();
+        self.clear_alloc_anchors();
+        wipe
+    }
+
+    /// The absolute `(addr, len)` spans a [`DeferredWipe`] must zero, over
+    /// the arena's CURRENT backing and only its committed granules (an
+    /// uncommitted granule already reads as zero and must not be written).
+    pub fn deferred_wipe_spans(&self, wipe: &DeferredWipe) -> Vec<(usize, usize)> {
+        let len = self.data.len();
+        let mut spans = self.data.committed_spans(0, wipe.low_end.min(len));
+        spans.extend(self.data.committed_spans(wipe.high_start.min(len), len));
+        spans
+    }
+
     /// Reset the arena without zeroing memory.
     ///
     /// # Safety
@@ -2570,6 +2625,30 @@ impl Arena {
             self.data.as_ptr() as usize + self.cursor,
             self.low_bump_headroom(),
         )
+    }
+
+    /// Commit the first `bytes` of the tail [`Self::parallel_evacuation_region`]
+    /// handed out, so evacuation workers may write there directly.
+    ///
+    /// **The parallel evacuator is the one allocation path in this crate that
+    /// does not reach [`Self::hand_out`]** — it bumps its own atomic cursor
+    /// over the raw region and `memcpy`s into it — and `hand_out` is where
+    /// every other path commits the reserved granules it is about to write.
+    /// Backing store is RESERVED address space committed per granule
+    /// ([`crate::reservation`]), so a write into a granule that has never been
+    /// used does not read as zero: it faults. A young to-space that no cycle
+    /// has filled yet is exactly that, which is why the very first parallel
+    /// cycle of a fresh heap died in `copy_nonoverlapping` with
+    /// STATUS_ACCESS_VIOLATION and every later one would have survived.
+    ///
+    /// Returns `false` if the OS refuses the commit, which the caller must
+    /// treat as "no parallel copy phase this cycle" rather than proceeding —
+    /// the serial evacuator allocates through `alloc` and commits as it goes.
+    #[must_use = "an uncommitted evacuation region must not be written to"]
+    pub fn commit_evacuation_region(&mut self, bytes: usize) -> bool {
+        let start = self.cursor;
+        let len = bytes.min(self.data.len().saturating_sub(start));
+        self.data.commit_range(start, len)
     }
 
     /// Publish the outcome of a parallel evacuation: `bytes` were consumed
