@@ -131,6 +131,29 @@ fn generic_snapshot_iterator_roots_array_and_shell_across_allocation() {
 /// The assertions that matter are the `assert_ne!`s: a pointer equal to the
 /// pre-allocation one is a value that was NOT read back through its forwarding
 /// pin, which is the defect this file exists for.
+/// # IGNORED: this test outlived the thing it tests
+///
+/// `java/util/ArrayDeque.iterator()` has had no native registration since
+/// 2026-08-30. That was deliberate and is argued at the registration site: the
+/// JDK's `DeqIterator` is fail-fast off a PHYSICAL ring-buffer index, no
+/// snapshot reproduces it, so the mint was retired and the real bytecode left
+/// to run. ArrayDeque left `VALUES_ITR_CARRIERS` in the same change.
+///
+/// The removal did not update this test. It has failed on every run of this
+/// file since, with `native not registered:
+/// java/util/ArrayDeque.iterator()Ljava/util/Iterator;` — a RED GATE that says
+/// nothing, because the registration it asks for is one the tree decided not to
+/// have. Found 2026-09-02, red on a clean `dev` checkout.
+///
+/// Ignored rather than deleted: this crate's own note on the dormant
+/// `ArrayDeque$Itr` rows says "deleting registrations is the shadow-retirement
+/// lane's edit and wants its own census", and the same boundary applies to the
+/// test that was paired with them. Its assertions are still the right ones IF
+/// an ArrayDeque iterator is ever minted again — including the one that caught
+/// a first attempt at exactly that on 2026-09-02, by requiring
+/// `ArrayDeque$DeqIterator` (what HotSpot hands out) where a snapshot minting
+/// `ArrayDeque$Itr` would have armed the dormant rows.
+#[ignore = "ArrayDeque.iterator() is deliberately unregistered since 2026-08-30;             this test asks for a registration the tree decided not to have.             Un-ignore if ArrayDeque rejoins VALUES_ITR_CARRIERS."]
 #[test]
 fn array_deque_iterator_roots_snapshot_graph_across_allocations() {
     let reg = build_registry();
