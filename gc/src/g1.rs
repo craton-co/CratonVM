@@ -3975,9 +3975,19 @@ impl G1Collector {
                                 old_ptr as usize,
                             );
                         }
-                        if let Some(idx) = self.lookup_region_for_addr(old_ptr as usize) {
-                            regions[idx].pinned = true;
-                        }
+                        // NO PIN HERE. `G1Region::pinned` is the JNI-critical
+                        // pin, cleared only by a matching `unpin_region` or by
+                        // `reset` -- and a pinned region is never collected, so
+                        // it is never reset. Setting it from this loop leaked
+                        // the region for the life of the process, and bought
+                        // nothing even for this pause: the CSet is already
+                        // chosen by the time a root is processed.
+                        //
+                        // `pinned_region_set_including_non_object_roots` is
+                        // where a non-object root's region is kept out of the
+                        // CSet, which is BEFORE selection and per-pause. This
+                        // arm is the backstop for anything that reaches here
+                        // anyway.
                         continue;
                     }
                     // Step 9: `fresh` is ignored here — the root loop keeps its
@@ -4557,9 +4567,19 @@ impl G1Collector {
                                 old_ptr as usize,
                             );
                         }
-                        if let Some(idx) = self.lookup_region_for_addr(old_ptr as usize) {
-                            regions[idx].pinned = true;
-                        }
+                        // NO PIN HERE. `G1Region::pinned` is the JNI-critical
+                        // pin, cleared only by a matching `unpin_region` or by
+                        // `reset` -- and a pinned region is never collected, so
+                        // it is never reset. Setting it from this loop leaked
+                        // the region for the life of the process, and bought
+                        // nothing even for this pause: the CSet is already
+                        // chosen by the time a root is processed.
+                        //
+                        // `pinned_region_set_including_non_object_roots` is
+                        // where a non-object root's region is kept out of the
+                        // CSet, which is BEFORE selection and per-pause. This
+                        // arm is the backstop for anything that reaches here
+                        // anyway.
                         continue;
                     }
                     // Step 9: `fresh` is ignored here — the root loop keeps its
@@ -6325,6 +6345,39 @@ impl G1Collector {
         }
     }
 
+    /// Does `addr` name a live object the collector may FOLLOW -- evacuate,
+    /// scan, forward?
+    ///
+    /// Both screens, because either alone admits the other's defect:
+    ///
+    /// * [`Self::candidate_header_is_plausible`] validates the two header tag
+    ///   bytes and containment below the owning region's cursor. An INTERIOR
+    ///   address satisfies both trivially: the first eight bytes of a reference
+    ///   slot are a heap pointer whose low half reads as a class id and whose
+    ///   high half reads as `num_slots`.
+    /// * [`Self::note_implausible_legacy_header`] rejects exactly that -- a
+    ///   class id in the band no loader mints, or class 0 carrying thousands of
+    ///   slots.
+    ///
+    /// Measured 2026-09-02: gating on the first alone is what let a conservative
+    /// root pointing 0x28 bytes inside a live reference array reach
+    /// `evacuate_object`, which sized an object from the array ELEMENT and
+    /// copied eight kilobytes of it into a Survivor region.
+    fn addr_is_followable_object(
+        &self,
+        regions: &[G1Region],
+        addr: usize,
+        site: &'static str,
+    ) -> bool {
+        if !self.candidate_header_is_plausible(regions, addr) {
+            return false;
+        }
+        // SAFETY: the screen above validated the tag bytes and placed `addr`
+        // inside a live region's committed span.
+        let header = unsafe { &*(addr as *const ObjectHeader) };
+        !self.note_implausible_legacy_header(regions, addr as *mut u8, header, site)
+    }
+
     /// Is this CSet-resident root the start of a live object? Counts and, for
     /// the first few, describes the ones that are not.
     ///
@@ -6342,32 +6395,8 @@ impl G1Collector {
     /// Wiring the refusal to the tag screen alone measured `skipped=0` on a run
     /// that was still fabricating objects out of array elements.
     fn note_root_object_plausibility(&self, regions: &[G1Region], addr: usize) -> bool {
-        if self.candidate_header_is_plausible(regions, addr) {
-            // ACCEPTED BY THE TAG SCREEN -- and that is exactly what needs a
-            // second look, and now a second VERDICT. This
-            // screen answers "do the tag bytes decode and is the address below
-            // its region's cursor", which an INTERIOR address satisfies
-            // trivially: the first eight bytes of a reference slot are a heap
-            // pointer, whose low half reads as a class id and whose high half
-            // reads as `num_slots`. On a heap based at 0x2_0000_0000 that high
-            // half is 0x200, which is why every such holder in this
-            // investigation reported `num_slots=512`.
-            //
-            // So a measured ZERO from this function is not evidence that roots
-            // are clean; it is evidence that this screen cannot see the defect.
-            // The implausible-header screen can.
-            // SAFETY: `candidate_header_is_plausible` just validated the tag
-            // bytes and placed the address inside a live region's span.
-            let header = unsafe { &*(addr as *const ObjectHeader) };
-            if !self.note_implausible_legacy_header(regions, addr as *mut u8, header, "cset-root") {
-                return true;
-            }
-            // Implausible: fall through to the refusal below, which is what
-            // the caller acts on. The FIRST version of this fix skipped only
-            // roots that failed the tag screen, and measured `skipped=0` while
-            // implausible headers kept appearing -- because the interior root
-            // that started this investigation PASSES the tag screen. Two
-            // predicates, and the guard was wired to the wrong one.
+        if self.addr_is_followable_object(regions, addr, "cset-root") {
+            return true;
         }
         let n = NON_OBJECT_ROOT_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
         if n <= 8 || n.is_power_of_two() {
@@ -11606,7 +11635,17 @@ impl G1Collector {
             let Some(idx) = self.lookup_region_for_addr(addr) else {
                 continue;
             };
-            if set.contains(&idx) || self.candidate_header_is_plausible(regions, addr) {
+            // BOTH screens -- see `addr_is_followable_object`. Gating this on
+            // the tag screen alone is what put the containing region of an
+            // INTERIOR root into the CSet: the root passed, its region was not
+            // pinned out, and the root loop then evacuated the array element it
+            // pointed at as if it were an object. Pinning the region out here
+            // is the correct treatment and the cheap one -- the region simply
+            // does not join the CSet, so nothing in it moves and the interior
+            // root stays valid, which is what a conservatively-discovered root
+            // needs and what this set was built to give it.
+            if set.contains(&idx) || self.addr_is_followable_object(regions, addr, "root-pin-scan")
+            {
                 continue;
             }
             let n = NON_OBJECT_ROOT_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
