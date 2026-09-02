@@ -176,6 +176,29 @@ pub struct OffloadCache {
     /// dispatch needs several streams so consecutive chunks can run
     /// concurrently, and these are private to the offload path (the
     /// `streams` map above holds Java-visible `GpuStream` handles).
+    /// Round-robin pool of streams for dispatches that did not bring
+    /// their own.
+    ///
+    /// AUDIT 2026-09-02: the handle-less path — which is every
+    /// transparent interpreter dispatch, i.e. the common case — used to
+    /// call `Stream::new(ctx)` per submission and drop it when the
+    /// submission was released. `cuStreamCreate` is not free and
+    /// `cuStreamDestroy` can synchronize, so a workload calling an
+    /// offloaded method in a loop paid for both on every call, to get a
+    /// stream it used exactly once. The chunked writeback already pools
+    /// its streams for exactly this reason; this is the same pool
+    /// discipline for the same cost.
+    ///
+    /// Two dispatches that land on the same pooled stream serialise
+    /// against each other. That is not a regression: the transparent
+    /// path marshals, launches, and then finalizes — a blocking wait —
+    /// before returning to the interpreter, so it never had two launches
+    /// in flight to overlap in the first place. Callers that DO want
+    /// overlap register their own stream through `stream_create` and
+    /// pass its handle, which bypasses this pool entirely.
+    dispatch_streams: RwLock<Vec<std::sync::Arc<Stream>>>,
+    /// Cursor into [`OffloadCache::dispatch_streams`].
+    next_dispatch_stream: std::sync::atomic::AtomicUsize,
     chunk_streams: RwLock<Vec<std::sync::Arc<Stream>>>,
     /// Reused page-locked staging slabs for the chunked writeback, one
     /// per element type. See `staging_slot!` for why they are cached.
@@ -472,21 +495,70 @@ impl OffloadCache {
         };
         // Ask the device it will actually launch on for its compute
         // capability, so kernels are lowered for the real `sm_XX`
-        // instead of the Volta floor. Clamped up only: the lowering
-        // emits sm_70-era PTX, so a device older than that (or a
-        // failed probe) keeps the floor and the driver rejects the
-        // module later if it truly cannot run it.
+        // instead of the Volta floor. Floored at sm_70: the lowering
+        // emits Volta-era PTX, so a device older than that (or a failed
+        // probe) keeps the floor and the driver rejects the module later
+        // if it truly cannot run it.
+        //
+        // AUDIT 2026-09-02: the probe used to be clamped UPWARD ONLY,
+        // and `PtxModule::render` wrote a literal `.version 7.5` beside
+        // whatever it produced. PTX ISA 7.5 tops out at `sm_87`, so on
+        // Ada (`sm_89`), Hopper (`sm_90`) and Blackwell (`sm_100`/
+        // `sm_120`) every lowered module named a target its own declared
+        // ISA version does not know, `cuModuleLoadData` refused it,
+        // `lookup_or_compile` blacklisted the method, and the VM ran
+        // every kernel on the CPU — right answers, one `info` line, and
+        // a `--gpu` flag that bought a CUDA context and nothing else.
+        // `render` now derives `.version` from the target
+        // (`jit_cuda::target::isa_for_target`), and the downward clamp
+        // below closes the other direction: a driver older than its own
+        // GPU cannot parse the ISA that GPU's target requires, and the
+        // honest answer there is to run the device as the newest
+        // architecture the driver does know rather than to emit a header
+        // nothing can load.
         let sm = if ctx.is_some() {
             match cuda_bridge::probe_device(config.gpu_device_ordinal) {
                 Ok(caps) if (caps.compute_major, caps.compute_minor) >= (7, 0) => {
+                    let probed = (caps.compute_major, caps.compute_minor);
+                    // An unreadable driver version means "do not clamp":
+                    // the pre-audit behaviour, which is right whenever we
+                    // cannot prove the driver is behind.
+                    let target = match cuda_bridge::driver_cuda_version() {
+                        Ok(v) => {
+                            let driver_isa = jit_cuda::target::max_isa_for_cuda_version(v);
+                            let clamped =
+                                jit_cuda::target::clamp_target_to_isa(probed, driver_isa);
+                            if clamped != probed {
+                                tracing::warn!(
+                                    "gpu offload: device {} is sm_{}{} but the installed                                      driver (CUDA {}.{}) only parses PTX ISA {}.{}; lowering                                      for sm_{}{} instead",
+                                    caps.ordinal,
+                                    probed.0,
+                                    probed.1,
+                                    v / 1000,
+                                    (v % 1000) / 10,
+                                    driver_isa.0,
+                                    driver_isa.1,
+                                    clamped.0,
+                                    clamped.1,
+                                );
+                            }
+                            clamped
+                        }
+                        Err(_) => probed,
+                    };
+                    let isa = jit_cuda::target::isa_for_target(target.0, target.1);
                     tracing::info!(
-                        "gpu offload: device {} is {} (sm_{}{}), lowering for it",
+                        "gpu offload: device {} is {} (sm_{}{}), lowering for sm_{}{}                          with PTX ISA {}.{}",
                         caps.ordinal,
                         caps.name,
-                        caps.compute_major,
-                        caps.compute_minor
+                        probed.0,
+                        probed.1,
+                        target.0,
+                        target.1,
+                        isa.0,
+                        isa.1,
                     );
-                    (caps.compute_major, caps.compute_minor)
+                    target
                 }
                 _ => (7, 0),
             }
@@ -500,6 +572,8 @@ impl OffloadCache {
             print_decisions: config.print_gpu_decisions,
             streams: RwLock::new(FxHashMap::default()),
             next_stream_handle: std::sync::atomic::AtomicU64::new(1),
+            dispatch_streams: RwLock::new(Vec::new()),
+            next_dispatch_stream: std::sync::atomic::AtomicUsize::new(0),
             chunk_streams: RwLock::new(Vec::new()),
             chunk_events: RwLock::new(Vec::new()),
             builtin_module: RwLock::new(None),
@@ -2629,6 +2703,58 @@ impl OffloadCache {
         Stream::new(ctx).map(std::sync::Arc::new)
     }
 
+    /// A stream for a dispatch that did not name one.
+    ///
+    /// Built once per device and handed out round-robin. See
+    /// [`OffloadCache::dispatch_streams`] for why pooling is safe here
+    /// and what it replaces.
+    ///
+    /// Falls back to a fresh `Stream::new` if the pool cannot be built,
+    /// so a driver that refuses to create streams up front still gets
+    /// the driver's own error at the point of use rather than a bare
+    /// "no streams".
+    fn dispatch_stream(
+        &self,
+        ctx: &cuda_bridge::DeviceContext,
+    ) -> Result<std::sync::Arc<Stream>, cuda_bridge::DeviceError> {
+        {
+            let have = self.dispatch_streams.read();
+            if !have.is_empty() {
+                let i = self
+                    .next_dispatch_stream
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(std::sync::Arc::clone(&have[i % have.len()]));
+            }
+        }
+        {
+            let mut slot = self.dispatch_streams.write();
+            if slot.is_empty() {
+                let mut made = Vec::with_capacity(dispatch_stream_pool_size());
+                for _ in 0..dispatch_stream_pool_size() {
+                    match Stream::new(ctx) {
+                        Ok(s) => made.push(std::sync::Arc::new(s)),
+                        Err(e) => {
+                            tracing::debug!(
+                                "gpu offload: dispatch stream pool unavailable ({e}); \
+                                 falling back to a per-dispatch stream"
+                            );
+                            made.clear();
+                            break;
+                        }
+                    }
+                }
+                *slot = made;
+            }
+            if !slot.is_empty() {
+                let i = self
+                    .next_dispatch_stream
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(std::sync::Arc::clone(&slot[i % slot.len()]));
+            }
+        }
+        Stream::new(ctx).map(std::sync::Arc::new)
+    }
+
     fn chunk_stream_pool(&self, ctx: &cuda_bridge::DeviceContext) -> Vec<std::sync::Arc<Stream>> {
         {
             let have = self.chunk_streams.read();
@@ -4267,13 +4393,15 @@ pub fn dispatch_method_from_native_on_stream(
                 );
             }
         },
-        None => match CudaStream::new(ctx) {
-            Ok(s) => Arc::new(s),
+        // A handle-less caller takes a pooled stream rather than a
+        // freshly created one — see `OffloadCache::dispatch_streams`.
+        None => match cache.dispatch_stream(ctx) {
+            Ok(s) => s,
             Err(e) => {
                 return record_failed_submission(
                     None,
                     kind_of_device_error(&e),
-                    format!("submitMethod: Stream::new failed: {e}"),
+                    format!("submitMethod: no dispatch stream available: {e}"),
                 );
             }
         },
@@ -5730,7 +5858,7 @@ pub(crate) mod input_cache {
     use cuda_bridge::DeviceBuffer;
     use parking_lot::Mutex;
     use rustc_hash::FxHashMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, OnceLock};
 
     pub(crate) enum CachedBuffer {
@@ -5903,7 +6031,119 @@ pub(crate) mod input_cache {
     /// would skip a live entry and leave the device mirror stale. The
     /// reverse window (bit set, entry not yet inserted) is a harmless
     /// false positive.
+    /// Set once a method containing a primitive array store has been
+    /// admitted to the JIT, after which nothing may be cached.
+    ///
+    /// # The trade this replaces
+    ///
+    /// This cache mirrors a Java array in device memory across submits,
+    /// which is only sound while every host write to that array evicts
+    /// the entry. The interpreter's `*astore` arms and the
+    /// `jit_iastore`/`jit_bastore` helpers all call [`invalidate`]; the
+    /// JIT's IR pipeline lowers `Op::ArrayStore` to an inline
+    /// `MOVSS`/`MOVSD` with no helper to hook, so there was one path
+    /// that could write an array behind the cache's back.
+    ///
+    /// `offload_jit_gate` closed it from the other side, by refusing to
+    /// COMPILE any method containing `iastore`/`lastore`/`fastore`/
+    /// `dastore` while a GPU is attached. That is sound and enormously
+    /// broad: it has nothing to do with whether the method has ever seen
+    /// a kernel, so passing `--gpu` de-optimised the CPU half of every
+    /// mixed workload — a ray tracer's setup loops, an inference
+    /// pipeline's array fills — to keep coherent a cache most of those
+    /// methods will never touch.
+    ///
+    /// AUDIT 2026-09-02 made the choice explicit rather than implicit,
+    /// and measured it. Both directions are sound; the question is which
+    /// side pays. Blocking the JIT costs native code on methods that may
+    /// have no connection to the device. Disabling the cache costs one
+    /// H2D copy per submit on arrays that are re-submitted unchanged.
+    ///
+    /// The second sounded bounded — "it is only PCIe bandwidth" — and on
+    /// the workload the cache exists for it is 5x. `GpuWarm f 2^22 5` on
+    /// an RTX 2060: `warm_ms` 2 with the cache, 10 without, and
+    /// `CRATONVM_GPU_TRACE_BYTES=1` showing 48 MB once against 48 MB
+    /// every submit. So blocking the JIT remains the default and this
+    /// path is reached only under
+    /// `CRATONVM_GPU_JIT_ARRAY_WRITERS=allow`, for the opposite shape:
+    /// a mixed workload whose CPU half does real array work around a
+    /// kernel that runs once.
+    ///
+    /// It is still decided lazily rather than up front. The flag flips
+    /// at JIT ADMISSION of the first array-writing method, which is
+    /// strictly before that method's compiled code can run, so a program
+    /// that never compiles one keeps the cache even under `allow`.
+    ///
+    /// The existing entries are dropped at the same moment
+    /// ([`disable_for_jit_array_writer`]), because an array cached a
+    /// moment ago is one the about-to-run compiled code may write.
+    static DISABLED_BY_JIT: AtomicBool = AtomicBool::new(false);
+
+    /// Whether the residency cache is still accepting entries.
+    pub(crate) fn is_enabled() -> bool {
+        !DISABLED_BY_JIT.load(Ordering::Acquire)
+    }
+
+    /// Give up the residency cache so a method that writes a primitive
+    /// array can be JIT-compiled. See [`DISABLED_BY_JIT`].
+    ///
+    /// Idempotent, and cheap after the first call: one relaxed-ish load
+    /// on a path (`offload_jit_gate::compute`) that is already memoised
+    /// per method.
+    ///
+    /// Ordering is the whole argument. This runs at ADMISSION — before
+    /// the method is compiled, and therefore before its compiled code
+    /// can execute a single store. Entries inserted before this point
+    /// are dropped here; entries after are refused by [`insert`]. There
+    /// is no window in which a compiled store can run against a live
+    /// entry.
+    ///
+    /// A concurrent marshal that already took an `Arc` out of the cache
+    /// keeps its buffer alive and proceeds. That is not a new race: an
+    /// interpreted store racing the same marshal has always been able to
+    /// `invalidate` an entry a submit had already read. The explicit
+    /// async API documents that writing a kernel's input array while the
+    /// kernel runs is the caller's problem; the transparent path is
+    /// synchronous and cannot reach it.
+    pub(crate) fn disable_for_jit_array_writer() {
+        if DISABLED_BY_JIT.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let mut tables = map().lock();
+        let dropped: usize = tables.values().map(|t| t.len()).sum();
+        tables.clear();
+        rebuild_filter(&tables);
+        drop(tables);
+        tracing::info!(
+            "gpu offload: input-residency cache disabled ({dropped} entr(ies) dropped) \
+             so methods writing primitive arrays can be JIT-compiled. Every kernel \
+             argument is re-uploaded per submit from here on."
+        );
+    }
+
+    /// Total entries across every VM's table.
+    ///
+    /// Test-only, and deliberately not per-VM: what
+    /// `disable_for_jit_array_writer` has to guarantee is that NOTHING is
+    /// cached anywhere, not that one heap's table is empty.
+    #[cfg(test)]
+    pub(crate) fn table_len_for_test() -> usize {
+        map().lock().values().map(|t| t.len()).sum()
+    }
+
+    /// The membership filter `invalidate` reads on every array store in
+    /// the VM. Test-only; see [`ADDR_FILTER`].
+    #[cfg(test)]
+    pub(crate) fn addr_filter_for_test() -> u64 {
+        ADDR_FILTER.load(Ordering::Acquire)
+    }
+
     fn insert(vm: usize, obj: ObjectRef, entry: Entry) {
+        // Refused once a JIT-compiled array writer exists: there would be
+        // no way to evict this entry when that code stores into `obj`.
+        if !is_enabled() {
+            return;
+        }
         ADDR_FILTER.fetch_or(addr_bit(obj), Ordering::AcqRel);
         map().lock().entry(vm).or_default().insert(obj, entry);
     }
@@ -6075,6 +6315,37 @@ pub enum ChunkedStage {
 const CHUNK_STREAMS_DEFAULT: usize = 8;
 #[cfg(feature = "gpu-offload")]
 const CHUNK_COUNT_DEFAULT: usize = 8;
+
+/// Streams the handle-less dispatch path rotates over, instead of
+/// creating and destroying one per submission.
+///
+/// Four, not one, and not eight. One would be enough for the
+/// transparent interpreter path on its own — it finalizes before
+/// returning, so it never has two launches in flight — but
+/// `dispatch_method_from_native` is also reachable from several Java
+/// threads at once, and giving those a shared stream would serialise
+/// dispatches the driver could have overlapped. Four covers that without
+/// holding open more driver objects than a program that never offloads
+/// anything would want to pay for.
+///
+/// Override with `CRATONVM_GPU_DISPATCH_STREAMS`, and set it to 1 to get
+/// the strictest ordering if a bug is ever suspected to be one of
+/// stream concurrency.
+#[cfg(feature = "gpu-offload")]
+const DISPATCH_STREAM_POOL_DEFAULT: usize = 4;
+
+/// See [`DISPATCH_STREAM_POOL_DEFAULT`].
+#[cfg(feature = "gpu-offload")]
+fn dispatch_stream_pool_size() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GPU_DISPATCH_STREAMS")
+            .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))
+            .filter(|n: &usize| *n >= 1 && *n <= 32)
+            .unwrap_or(DISPATCH_STREAM_POOL_DEFAULT)
+    })
+}
 
 /// Streams the chunked dispatch rotates launches over.
 /// Override with `CRATONVM_GPU_CHUNK_STREAMS`.

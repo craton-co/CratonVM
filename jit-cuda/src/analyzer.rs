@@ -19,7 +19,7 @@
 //! the reason to log a one-line trace when `--print-gpu-decisions` is
 //! on.
 
-use crate::annotations::{AdmissionHint, GridShape, MethodAnnotations};
+use crate::annotations::{AdmissionFlags, AdmissionHint, GridShape, MethodAnnotations};
 use crate::signature::KernelSignature;
 use cratonvm_reader::attribute::CodeAttribute;
 use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
@@ -434,13 +434,18 @@ pub enum Reason {
     /// silently-wrong `frem`/`drem` must never be the default.
     ///
     /// `classify`'s `0x72 | 0x73` arm therefore only admits these two
-    /// opcodes under `AdmissionHint::AllowDivByZero` — reusing that
-    /// hint (rather than minting a dedicated one, which would require
-    /// editing `annotations.rs`) because it is already the "accept
-    /// looser numeric edge-case semantics for a division-family
-    /// opcode" opt-in, and `frem`/`drem` are literally the floating
-    /// counterparts of `irem`/`lrem`. See `classify` for the full
-    /// reuse rationale.
+    /// opcodes under
+    /// [`AdmissionFlags::approximate_float_remainder`](crate::annotations::AdmissionFlags::approximate_float_remainder).
+    ///
+    /// AUDIT 2026-09-02: that used to read
+    /// `AdmissionHint::AllowDivByZero`, and the reason given for the
+    /// reuse was not a semantic one — it was that minting a dedicated
+    /// variant "would require editing `annotations.rs`". So one flag
+    /// gated two unrelated lowering decisions and three doc comments
+    /// existed to keep them untangled. They are separate bits now.
+    /// `ALLOW_DIV_BY_ZERO` still sets both, because that is the constant
+    /// users have written and its meaning does not change; what is gone
+    /// is the coupling in the code that reads it.
     FloatRemainder,
     /// `lcmp` (0x94) / `fcmpl`/`fcmpg` (0x95/0x96) / `dcmpl`/`dcmpg`
     /// (0x97/0x98) push `-1`/`0`/`1`.
@@ -519,13 +524,15 @@ pub fn analyze_with_pool(method: &ClassFileMethod, cp: &ConstantPool) -> Offload
 /// - `AdmissionHint::Strict`           — no loosening.
 /// - `AdmissionHint::AllowAllocation`  — `newarray` of a primitive
 ///   component whose size comes from a method parameter is accepted.
-/// - `AdmissionHint::AllowDivByZero`   — recorded in the
-///   [`KernelSignature`] so lowering skips integer zero-divisor guards.
-///   AUDIT 2026-07-11: also reused (see `classify`'s `0x72 | 0x73` arm
-///   and [`Reason::FloatRemainder`]) to admit `frem`/`drem`, whose
-///   div+truncate+fma lowering is only bit-exact for quotients within
-///   the type's exactly-representable-integer range — an explicit
-///   opt-in, same spirit as skipping the integer zero-divisor guard.
+/// - `AdmissionHint::AllowDivByZero`   — sets two independent bits (see
+///   [`AdmissionFlags`](crate::annotations::AdmissionFlags)):
+///   `unguarded_integer_division`, recorded in the [`KernelSignature`]
+///   so lowering skips the integer zero-divisor guards, and
+///   `approximate_float_remainder`, which admits `frem`/`drem` at all —
+///   their div+truncate+fma lowering is bit-exact only for quotients
+///   within the type's exactly-representable-integer range, so it needs
+///   an explicit opt-in. The two travelled on one flag until
+///   2026-09-02 for want of a place to put the second.
 /// - `AdmissionHint::AllowIntrinsicCalls` — `invokestatic` is accepted
 ///   only when the constant-pool callee resolves (via
 ///   [`resolve_math_intrinsic`]) to one of the curated
@@ -614,11 +621,17 @@ fn analyze_with_annotations_and_pool_impl(
         },
     };
 
+    // AUDIT 2026-09-02: read the independent SET, not the one-of. See
+    // `annotations::AdmissionFlags` for why the enum was the wrong shape
+    // and what it cost inside this file — `frem`/`drem` gated on
+    // `AllowDivByZero` for no semantic reason, because minting a variant
+    // meant editing another module. `AdmissionFlags::from` keeps every
+    // existing annotation meaning exactly what it meant.
     let hint = annotations
         .gpu_kernel
         .as_ref()
         .map(|k| k.admit)
-        .unwrap_or(AdmissionHint::Strict);
+        .unwrap_or(AdmissionFlags::STRICT);
 
     // AUDIT 2026-08-28: honour the declared grid shape, or refuse.
     //
@@ -738,7 +751,11 @@ fn analyze_with_annotations_and_pool_impl(
         // instead of a racing plain `st.global.<suffix>` for the scalar
         // return. See `KernelSignature::is_reduction` for the contract.
         is_reduction: is_dot_reduction,
-        allow_div_by_zero: matches!(hint, AdmissionHint::AllowDivByZero),
+        // Exactly what the field means and nothing else: skip the
+        // integer zero-divisor guard. The `frem`/`drem` decision that
+        // used to ride on this same flag is now its own bit and is made
+        // above, at admission, where it belongs.
+        allow_div_by_zero: hint.unguarded_integer_division,
     })
 }
 
@@ -769,7 +786,7 @@ fn analyze_with_annotations_and_pool_impl(
 /// the pre-AUDIT-C31 behaviour: every `ldc`/`ldc_w`/`ldc2_w` rejects.
 fn scan_bytecode(
     code: &CodeAttribute,
-    hint: AdmissionHint,
+    hint: AdmissionFlags,
     is_static: bool,
     cp: Option<&ConstantPool>,
 ) -> Result<(Vec<u16>, usize, bool, bool), Reason> {
@@ -1085,7 +1102,7 @@ enum OpClass {
 /// `newarray` come from a method parameter, which we approximate by
 /// checking that the immediately preceding instruction is an `iload`
 /// family opcode.
-fn classify(op: u8, hint: AdmissionHint, prev_op: Option<u8>) -> OpClass {
+fn classify(op: u8, hint: AdmissionFlags, prev_op: Option<u8>) -> OpClass {
     match op {
         // Specific rejects come first.
         0x32 | 0x53 => OpClass::Reject(Reason::RefArrayOp), // aaload, aastore
@@ -1117,7 +1134,7 @@ fn classify(op: u8, hint: AdmissionHint, prev_op: Option<u8>) -> OpClass {
         // for why); `Strict` (the default, `prev_op`-independent like
         // every other band here) still rejects unconditionally so a
         // silently-wrong remainder is never the default outcome.
-        0x72 | 0x73 if matches!(hint, AdmissionHint::AllowDivByZero) => OpClass::Ok,
+        0x72 | 0x73 if hint.approximate_float_remainder => OpClass::Ok,
         0x72 | 0x73 => OpClass::Reject(Reason::FloatRemainder),
         // AUDIT 2026-07-11: `lcmp`/`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg` used to
         // reject unconditionally with `Reason::Compare` — see that
@@ -1156,7 +1173,7 @@ fn classify(op: u8, hint: AdmissionHint, prev_op: Option<u8>) -> OpClass {
         // does not cover object allocation or reference-component
         // arrays. Only primitive `newarray` (0xBC) is loosened, and
         // only when the size came from `iload <n>` (see prev_op).
-        0xBC if matches!(hint, AdmissionHint::AllowAllocation) && is_iload_family(prev_op) => {
+        0xBC if hint.allocation && is_iload_family(prev_op) => {
             OpClass::Ok
         }
         0xBB | 0xBC | 0xBD | 0xC5 => OpClass::Reject(Reason::Allocation),
@@ -1249,10 +1266,10 @@ fn classify_ldc(bytes: &[u8], pc: usize, op: u8, cp: Option<&ConstantPool>) -> O
 fn classify_invokestatic(
     bytes: &[u8],
     pc: usize,
-    hint: AdmissionHint,
+    hint: AdmissionFlags,
     cp: Option<&ConstantPool>,
 ) -> OpClass {
-    if !matches!(hint, AdmissionHint::AllowIntrinsicCalls) {
+    if !hint.intrinsic_calls {
         return OpClass::Reject(Reason::Invoke);
     }
     let Some(cp) = cp else {
@@ -1473,7 +1490,7 @@ mod tests {
     fn annotate(admit: AdmissionHint) -> MethodAnnotations {
         MethodAnnotations {
             gpu_kernel: Some(GpuKernelAttrs {
-                admit,
+                admit: admit.into(),
                 ..GpuKernelAttrs::default()
             }),
             gpu_exclude: None,
@@ -1681,7 +1698,7 @@ mod tests {
     #[test]
     fn compare_opcodes_are_admitted_by_analyzer() {
         for op in 0x94..=0x98 {
-            match classify(op, AdmissionHint::Strict, None) {
+            match classify(op, AdmissionFlags::STRICT, None) {
                 OpClass::Ok => {}
                 OpClass::Reject(r) => {
                     panic!("opcode 0x{op:02x} unexpectedly rejected with {r:?}")

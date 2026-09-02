@@ -5024,6 +5024,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
                 alloc,
                 false,
                 cratonvm_jit_api::JitRuntimeHelpers::default(),

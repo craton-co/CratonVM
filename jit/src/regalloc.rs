@@ -182,10 +182,11 @@ pub(crate) fn bc_len(code: &[u8], pc: usize) -> usize {
         // is 4 bytes for the load/store/ret family, and `wide iinc <index>
         // <const>` is 6 bytes (extra 2-byte signed constant). The modified
         // opcode is the byte at `pc + 1`: only `iinc` (0x84) takes the 6-byte
-        // form. Currently latent — `jit_scan` rejects `wide`, so no compiled
-        // method contains it — but the length table must stay correct as
-        // defense-in-depth so every PC-stepping consumer stays in lockstep if
-        // `wide` is ever accepted. Keep the x64.rs `bytecode_len_at` twin in
+        // form. NOT latent, whatever this comment used to say: `jit_scan`
+        // accepts the widened load/store and `iinc` forms
+        // (`x64/bytecode_compat.rs`), so compiled methods DO contain `wide` and
+        // every PC-stepping consumer of this table is load-bearing rather than
+        // defensive. Keep the x64.rs `bytecode_len_at` twin in
         // sync.
         0xc4 => {
             if pc + 1 < code.len() && code[pc + 1] == 0x84 {
@@ -4238,12 +4239,33 @@ pub struct LiveModel {
 
 /// Does this op define a value that needs a machine location?
 ///
-/// **Verbatim mirror of `ir_lower::op_defines_result_slot`**, including its
-/// omissions (`I2B`/`I2C`/`I2S`, `ArrayLength`, `NewArray` are absent there and
-/// absent here). The two lists must stay in lockstep: a value this predicate
-/// claims exists but `ir_lower` never allocates for has no home to spill to,
-/// and a value `ir_lower` allocates for but this predicate omits is invisible
-/// to the interference check. If that file's list changes, change this one.
+/// **Verbatim mirror of `ir_lower::op_defines_result_slot`.** The two lists
+/// must stay in lockstep: a value this predicate claims exists but `ir_lower`
+/// never allocates for has no home to spill to, and a value `ir_lower`
+/// allocates for but this predicate omits is invisible to the interference
+/// check.
+///
+/// # The comment that guarded against drift WAS the drift
+///
+/// This paragraph used to read "including its omissions (`I2B`/`I2C`/`I2S`,
+/// `ArrayLength`, `NewArray` are absent there and absent here)". `I2B`/`I2C`/
+/// `I2S` were and are absent from both. **`ArrayLength` and `NewArray` were
+/// present in `ir_lower`'s list the whole time**, so the two disagreed on every
+/// method containing an `arraylength` or a `newarray` — which is every counted
+/// loop written `for (i = 0; i < a.length; i++)`.
+///
+/// The consequence was silent and total: `plan_register_residency`'s agreement
+/// check compares `wants_loc` against `node_color`, and a single disagreement
+/// declines register residency **for the whole method**. With
+/// `CRATONVM_DBG_IR_LINEAR_SCAN=1` that showed as *"refused: liveness and
+/// colourer disagree about which values want a home"* on 5 of 5 array-touching
+/// probe kernels, while `BinTrees.itemCheck` — which touches no array —
+/// promoted 7 values fine. The check did its job; nothing was miscompiled, and
+/// the optimization was simply never available where arrays are.
+///
+/// The lockstep claim is enforced now rather than asserted:
+/// `the_two_value_defining_enumerations_agree` in `ir_lower`'s tests reads both
+/// function bodies out of the source and compares the sets.
 fn ir_op_defines_value(op: &Op) -> bool {
     matches!(
         op,
@@ -4281,7 +4303,12 @@ fn ir_op_defines_value(op: &Op) -> bool {
             | Op::Load(_)
             | Op::ArrayLoad(_)
             | Op::ArrayStore(_)
+            // Both of these are in `op_defines_result_slot` and were missing
+            // here, which is what made every array-touching method decline
+            // register residency. See this function's doc comment.
+            | Op::ArrayLength
             | Op::New { .. }
+            | Op::NewArray { .. }
             | Op::Call { .. }
             // cov-01 — mirrors `ir_lower::op_defines_result_slot`.
             | Op::ConstString { .. }

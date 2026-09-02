@@ -324,7 +324,7 @@ fn restamp_outcome(
 // compiled artifact. HotSpot's equivalent is a `ScopeDesc` CHAIN -- an inlined
 // callee is a nested scope at the same PC -- which is what makes the inlined
 // frames reappear in a warmed-up trace. See
-// `docs/known-issues/jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901.md`,
+// `jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902.md`,
 // defect (2).
 //
 // WHAT WAS RULED OUT, in the order it was checked, because each one looked
@@ -590,6 +590,177 @@ pub fn inline_miss_edge_poison_counts() -> [u64; 5] {
     out
 }
 
+/// Where an inline null check would raise, as a stack trace needs it.
+///
+/// An implicit NPE in compiled code is not thrown where it happens: the inline
+/// `TEST`/`JZ` reaches a stub that flags the NPE, loads the deopt sentinel and
+/// runs the EPILOGUE, and the `java/lang/NullPointerException` is constructed
+/// from the interpreter afterwards. `vm/src/jit/helpers.rs` snapshots the live
+/// compiled frames inside that stub so the trace keeps them -- but the trapping
+/// frame published no safepoint id there (an inline null check is not a
+/// GC-capable call), so `activation_bci` correctly refused the stale id in the
+/// slot and the recovered frame printed `-1`.
+///
+/// This is the side channel that is NOT the GC's. The emitter holds the
+/// trapping bci at every one of these sites already; it records it here, gives
+/// the site an id, and emits a ten-byte COLD trampoline that passes the id to
+/// the helper alongside the JEP-358 action code. The fast path -- `TEST`, `JZ`
+/// -- is byte-for-byte unchanged, and a method with no inline null check
+/// records nothing and emits nothing.
+///
+/// `chain` is the same `ScopeDesc`-shaped list `InlineFrameMap` rows carry, so
+/// a trap INSIDE a spliced body reports the callee frames too, and `bci` is the
+/// ENCLOSING compiled method's own index, never a pc from a callee's code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct NpeTrapSite {
+    /// Bytecode index IN THE ENCLOSING COMPILED METHOD.
+    pub bci: u32,
+    /// Spliced callees at this program point, INNERMOST FIRST. Empty for a
+    /// trap that is not inside a splice.
+    pub chain: Vec<InlineFrameLevel>,
+}
+
+/// The finished trap table for one compiled artifact, keyed by the id baked
+/// into each site's trampoline.
+///
+/// Empty -- and holding no allocation -- for every method with no inline null
+/// check, and for the whole feature switched off.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct NpeTrapMap {
+    /// Ascending by id.
+    sites: Vec<(u32, NpeTrapSite)>,
+}
+
+#[allow(dead_code)]
+impl NpeTrapMap {
+    pub fn is_empty(&self) -> bool {
+        self.sites.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.sites.len()
+    }
+
+    /// The site a trampoline's key names, or `None`.
+    ///
+    /// `None` on a key this artifact never issued is the whole safety argument:
+    /// ids are monotonic within a compile and are never reused, so a key that
+    /// survived a rewind, or one read against the wrong artifact, MISSES. It
+    /// cannot land on a different site and hand a frame a line from somewhere
+    /// else -- the failure mode this area refuses everywhere.
+    pub fn get(&self, key: u32) -> Option<&NpeTrapSite> {
+        self.sites
+            .binary_search_by_key(&key, |(id, _)| *id)
+            .ok()
+            .map(|i| &self.sites[i].1)
+    }
+}
+
+/// Whether compiles record a trapping bci for their inline null checks.
+///
+/// Default ON. `CRATONVM_JIT_NO_NPE_TRAP_LINES=1` records nothing and emits no
+/// trampoline, so every inline null-check site branches straight to the shared
+/// per-action stub exactly as it did before 2026-09-02 and a frame recovered
+/// from the NPE snapshot goes back to reporting `-1`. Both halves -- the ten
+/// cold bytes per site and the line in the trace -- revert together, which is
+/// what makes the cost and the behaviour one A/B inside one binary.
+///
+/// It DEPENDS on `CRATONVM_JIT_NO_INLINE_FRAME_MAP`, and deliberately: the
+/// enclosing-method bci of a trap inside a spliced body is the outermost
+/// splice's `entry_bci`, which only `INLINE_FRAME_SCOPES` knows. With that
+/// session closed there is no way to tell a callee's pc from the compiling
+/// method's, so this records nothing rather than a bci out of another method's
+/// code.
+#[allow(dead_code)]
+pub fn npe_trap_lines_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NPE_TRAP_LINES").is_none()
+    })
+}
+
+/// Record the trap site of one inline null check and return its key, or `0`
+/// for "not described" -- which every caller passes straight through to the
+/// emitter, where it selects the historical shared-stub shape.
+///
+/// `bc_pc` is the trapping bytecode index in whatever code the emitter is
+/// walking: the compiling method's own for a top-level opcode, the CALLEE's
+/// inside a splice. The two are separated here rather than at the call sites,
+/// which do not know which they are in.
+///
+/// Ids are monotonic and never reused, so nothing truncates this table on a
+/// rollback. A rewound splice leaves its rows behind and they are unreachable:
+/// the machine code that carried their keys was overwritten, and no later site
+/// can be issued the same id. The alternative -- an index into a `Vec` that
+/// rollback truncates -- makes a key mean a DIFFERENT site after the rewind,
+/// which is a wrong line rather than a missing one.
+#[allow(dead_code)]
+pub(super) fn record_npe_trap_site(bc_pc: usize) -> u32 {
+    if !npe_trap_lines_enabled() || !inline_frame_recording() {
+        return 0;
+    }
+    let described = INLINE_FRAME_SCOPES.with(|s| {
+        let scopes = s.borrow();
+        if scopes.is_empty() {
+            // Not inside a splice: the walk's pc IS this method's bci, and
+            // there are no callee frames to name.
+            return (bc_pc < INLINE_FRAME_MAX_BCI).then(|| (bc_pc as u32, Vec::new()));
+        }
+        // Inside one: the enclosing method's index is the OUTERMOST splice's
+        // entry bci -- where the invoke this whole nest replaces lives in the
+        // compiling method's own code.
+        let outer = scopes[0].entry_bci;
+        if outer >= INLINE_FRAME_MAX_BCI {
+            return None;
+        }
+        // The same all-or-nothing chain the row recorder uses: a level with an
+        // out-of-spec bci or an empty label refuses the WHOLE site, because a
+        // chain with a hole attaches its remaining entries to the wrong caller.
+        let chain = build_inline_frame_chain(scopes.as_slice())?;
+        Some((outer as u32, chain))
+    });
+    let Some((bci, chain)) = described else {
+        return 0;
+    };
+    let id = NPE_TRAP_NEXT_ID.with(|c| {
+        let next = c.get().wrapping_add(1);
+        c.set(next);
+        next
+    });
+    // The trampoline carries the key in the upper 24 bits of one imm32; a
+    // compile with more sites than that describes no more of them.
+    if id >= (1 << 24) {
+        return 0;
+    }
+    NPE_TRAP_SITES.with(|v| v.borrow_mut().push((id, NpeTrapSite { bci, chain })));
+    id
+}
+
+/// Discard whatever an abandoned compile left behind and open a fresh trap
+/// table. Called from the same session guard as
+/// [`begin_inline_frame_recording`].
+#[allow(dead_code)]
+pub fn begin_npe_trap_recording() {
+    NPE_TRAP_SITES.with(|v| v.borrow_mut().clear());
+    NPE_TRAP_NEXT_ID.with(|c| c.set(0));
+}
+
+/// Close the trap table and hand it back. IDEMPOTENT, like
+/// [`finish_inline_frame_recording`]: a second call takes an empty vector and
+/// returns an empty map, so the success path may call it directly and still let
+/// the session guard's `Drop` run.
+#[allow(dead_code)]
+pub fn finish_npe_trap_recording() -> NpeTrapMap {
+    let mut sites = NPE_TRAP_SITES.with(|v| std::mem::take(&mut *v.borrow_mut()));
+    // Ascending by construction (ids come from a counter). Sorted anyway
+    // because `get` binary-searches, and an out-of-order push would otherwise
+    // turn a lookup into a silent miss or, worse, a hit on a neighbour.
+    sites.sort_unstable_by_key(|(id, _)| *id);
+    NpeTrapMap { sites }
+}
+
 /// One level of an inline chain: a spliced callee, and the bytecode index --
 /// in THAT callee's own code -- of the call leading one level further in.
 ///
@@ -604,6 +775,12 @@ pub struct InlineFrameLevel {
     pub label: String,
     /// Bytecode index inside `label`'s method.
     pub bci: u32,
+    /// `ClassId` of the class `label` names, or `0` when the resolver supplied
+    /// none. Carried so a consumer that must answer in `ClassId` -- the JEP 403
+    /// deep-reflection gate, `Class.forName`'s caller loader -- can expand an
+    /// inlined level WITHOUT resolving a JIT label by name, which in a
+    /// security-relevant path would be a guess. See `InlineSite::class_id`.
+    pub class_id: u32,
 }
 
 /// One PC-keyed row: at `native_offset` (equivalently, under safepoint id
@@ -788,6 +965,9 @@ impl InlineFrameMap {
 struct InlineFrameScope {
     /// `"class/Name.method:descriptor"` of the callee being spliced.
     label: String,
+    /// `ClassId` of that callee's class, or `0`. See
+    /// [`InlineFrameLevel::class_id`].
+    class_id: u32,
     /// Where the invoke this splice replaces lives in the ENCLOSING bytecode --
     /// the compiling method's own code for a top-level splice, the enclosing
     /// callee's code for a nested one. Frozen at the push, which is why it can
@@ -812,6 +992,14 @@ thread_local! {
     /// The live splice stack, OUTERMOST first.
     static INLINE_FRAME_SCOPES: std::cell::RefCell<Vec<InlineFrameScope>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// `(id, site)` for every inline null check this compile described, ascending
+    /// by id. See [`record_npe_trap_site`].
+    static NPE_TRAP_SITES: std::cell::RefCell<Vec<(u32, NpeTrapSite)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Next id. MONOTONIC across one compile and never reused, which is what
+    /// makes a stale key a MISS rather than a wrong answer -- see
+    /// [`record_npe_trap_site`].
+    static NPE_TRAP_NEXT_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether compiles emit a PC -> inline-chain map at all.
@@ -869,13 +1057,14 @@ fn inline_site_label(site: &crate::InlineSite) -> String {
     format!("{}.{}:{}", site.class_name, site.method_name, site.descriptor)
 }
 
-fn push_inline_frame_scope(label: String, entry_bci: usize) {
+fn push_inline_frame_scope(label: String, class_id: u32, entry_bci: usize) {
     if !inline_frame_recording() {
         return;
     }
     INLINE_FRAME_SCOPES.with(|s| {
         s.borrow_mut().push(InlineFrameScope {
             label,
+            class_id,
             entry_bci,
             cur_pc: usize::MAX,
         })
@@ -957,6 +1146,7 @@ fn build_inline_frame_chain(scopes: &[InlineFrameScope]) -> Option<Vec<InlineFra
             label: scopes[i].label.clone(),
             // Cast: guarded above by the JVMS 4.9.1 bound.
             bci: bci as u32,
+            class_id: scopes[i].class_id,
         });
     }
     Some(chain)
@@ -1188,7 +1378,7 @@ impl Compiler {
         // compiling method's key on every level; this one records the
         // CALLEE's identity, which is what a stack trace has to name.
         let inline_frame_rows_checkpoint = inline_frame_rows_len();
-        push_inline_frame_scope(inline_site_label(site), pc);
+        push_inline_frame_scope(inline_site_label(site), site.class_id, pc);
         // The guarded-virtual MISS EDGE's poison row. In one line: a
         // receiver-guarded site emits guard, splice and miss edge under ONE
         // `cur_bc_pc`; the miss edge records no row of its own; without this
@@ -3619,7 +3809,7 @@ impl Compiler {
         // ENCLOSING callee's pc -- `inline_walk_at.0`, read HERE, before
         // `try_emit_inline_body` overwrites it and does not restore it.
         let inline_frame_rows_checkpoint = inline_frame_rows_len();
-        push_inline_frame_scope(inline_site_label(site), self.inline_walk_at.0);
+        push_inline_frame_scope(inline_site_label(site), site.class_id, self.inline_walk_at.0);
         let inline_ok = self.try_emit_inline_body(outer_pc, site);
         pop_inline_frame_scope();
         let published = self.deopt_stubs.len() > deopt_stubs_checkpoint

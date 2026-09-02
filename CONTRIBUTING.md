@@ -265,7 +265,7 @@ declaring a name is what routes it through the latched snapshot that
 **A `DBG` knob now has to justify its continued existence.**
 `types/src/flag_groups.rs`'s own `mod tests` carries a retirement horizon: a
 `DBG` row whose `since:` is on or after **2026-08-01** must be referenced
-somewhere outside `types/`, `docs/internal` and the two generated flag
+somewhere outside `types/`, the internal tree and the two generated flag
 documents, or `a_dbg_knob_declared_since_the_horizon_has_a_live_consumer` fails
 naming it. Either land the consumer or delete the row and its four-file
 footprint. The horizon is measured, not chosen: it is the first month boundary

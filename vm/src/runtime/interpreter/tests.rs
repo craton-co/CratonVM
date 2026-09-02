@@ -4198,6 +4198,7 @@ fn t10_shared_resolution_read_hit_round_trip() {
         is_synchronized: false,
         is_static: false,
         force_native_cache: std::sync::OnceLock::new(),
+        descriptor_facts_cache: std::sync::OnceLock::new(),
         intercept_shape_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),

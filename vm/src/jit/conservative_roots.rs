@@ -4134,6 +4134,27 @@ fn compiled_frame_bci_enabled() -> bool {
 /// ignoring it the artifact pays for metadata nobody reads, and with the walk
 /// reading a map that was never emitted every frame silently loses its
 /// callees. One variable, both halves.
+/// Kill switch for the OPTIMIZING tier's line numbers.
+///
+/// Default ON. `CRATONVM_JIT_NO_IR_FRAME_LINES=1` restores the blanket
+/// `used_ir_backend` refusal, i.e. `(Unknown Source)` for every frame the IR
+/// backend compiled, which is what every such frame reported before
+/// `CompiledMethod::safepoint_bci_table` existed.
+///
+/// It is a separate name from `CRATONVM_JIT_NO_COMPILED_FRAME_LINES` because
+/// the two isolate different things. That one reverts the whole recovery, on
+/// both backends at once, so it cannot say whether a suspect line came from the
+/// id-to-bci translation this tier needs or from the slot read both tiers
+/// share. The translation is the new evidence and is the half worth being able
+/// to switch alone; a wrong line under this switch OFF and a right one under it
+/// ON is a one-binary attribution.
+fn ir_frame_bci_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_IR_FRAME_LINES").is_none()
+    })
+}
+
 fn inline_frame_chains_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
@@ -4164,7 +4185,7 @@ fn plausible_bci(recorded: u32) -> Option<u32> {
 /// carried no bytecode index, and `stackwalker::compiled_frame_entry` — the
 /// only consumer that wants one — could therefore do nothing but hard-code
 /// `LINE_NUMBER_UNKNOWN`. See
-/// `internal/fixed-bugs/jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901.md`.
+/// `jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902.md`.
 #[derive(Debug, Clone)]
 pub struct ActiveCompiledFrame {
     /// Interpreter depth this activation's chain entry was pushed at; the
@@ -4193,7 +4214,44 @@ pub struct ActiveCompiledFrame {
     /// for every refusal on the producer side, and an empty chain reproduces
     /// the historical one-entry-per-artifact answer exactly. See
     /// [`compiled_frame_inline_chain`].
-    pub inline_chain: Vec<(String, u32)>,
+    pub inline_chain: Vec<InlinedLevel>,
+    /// Was [`Self::inline_chain`] obtained from the EXACT key (this
+    /// activation's own return address), rather than the coarse safepoint-id
+    /// one?
+    ///
+    /// Display does not care -- both keys are fail-closed for it. A CALLER
+    /// ATTRIBUTION walk does: one `cur_bc_pc` covers a whole spliced region and
+    /// is shared with the inline cache's MISS EDGE, where the spliced body did
+    /// NOT run. A wrong frame in a trace is a wrong frame; a wrong frame in the
+    /// JEP 403 gate is a fail-OPEN caller. So
+    /// `stackwalker::frame_class_ids_with_compiled` expands only an exact
+    /// chain, and this is the bit that says which it has.
+    ///
+    /// `true` on an EMPTY chain is meaningless and never read: there is nothing
+    /// to expand.
+    pub chain_exact: bool,
+}
+
+/// One level of a compiled frame's inline chain, as a stack walk consumes it.
+///
+/// Replaces the `(label, bci)` pair the chain used to carry. The third field is
+/// the whole reason: `class_id` is recorded by the RESOLVER, at the moment it
+/// looked the spliced body up, so a walk that must answer in `ClassId` --
+/// `frame_class_ids_with_compiled`, feeding the JEP 403 deep-reflection gate
+/// and `Class.forName`'s caller loader -- can see an inlined method without
+/// resolving a JIT label BY NAME. That resolution is what made the blind spot
+/// deliberate: a by-name answer in a security gate is a guess, and this is not
+/// one.
+#[derive(Debug, Clone)]
+pub struct InlinedLevel {
+    /// `"class/Name.method:descriptor"`, the shape
+    /// [`ActiveCompiledFrame::label`] uses.
+    pub label: String,
+    /// Bytecode index in `label`'s own method.
+    pub bci: u32,
+    /// `ClassId` of the class `label` names, or `0` for "the producer supplied
+    /// none". A consumer must REFUSE on `0`, never substitute.
+    pub class_id: u32,
 }
 
 /// The bytecode index a live compiled activation is stopped at.
@@ -4214,35 +4272,110 @@ pub struct ActiveCompiledFrame {
 ///
 /// # Two more things it refuses
 ///
-/// * **The optimizing IR backend** (`used_ir_backend`). There
-///   `OopMapEntry::bytecode_pc` is NOT a bci: `ir_lower` stores a monotonic
-///   safepoint counter starting at 1 (its own doc says so, and the
+/// * **An optimizing IR-backend id with no translation** (`used_ir_backend`).
+///   There `OopMapEntry::bytecode_pc` is NOT a bci: `ir_lower` stores a
+///   monotonic safepoint counter starting at 1 (its own doc says so, and the
 ///   single-pass backend's `SP_ID_UNSET_BC_PC` comment explains why THAT
 ///   backend cannot do the same). Those ids are small integers
 ///   indistinguishable from plausible bcis, AND the artifact's own table
-///   records them — so the confirmation above passes and a real,
-///   confidently-wrong line comes out. An IR-tier frame therefore keeps `-1`,
-///   as it did before; giving it a line needs a safepoint-id -> bci side
-///   table the artifact does not carry today.
+///   records them, so the confirmation above passes and a real,
+///   confidently-wrong line would come out if the id were used as one.
+///
+///   Until 2026-09-02 the whole backend was refused on that ground, and that
+///   was the largest remaining population of line-less compiled frames. The
+///   refusal is now exactly as wide as the hazard: `ir_lower` records the
+///   `(id, bci)` pair for every safepoint it emits
+///   (`CompiledMethod::safepoint_bci_table`), this reads the bci THROUGH it,
+///   and an id the table does not name is still refused. What that leaves is
+///   an artifact compiled before the table existed, or a safepoint whose bci
+///   exceeded `u32` -- both `None`, neither a guess.
+///   `CRATONVM_JIT_NO_IR_FRAME_LINES=1` restores the blanket refusal.
 /// * **Anything outside the spec's bci range** — see [`plausible_bci`]. The
 ///   two synthetic pcs the single-pass backend stamps are already rejected by
 ///   the `i32::try_from` below (both are within one of `u32::MAX`), but that
 ///   is an accident of their VALUES rather than a rule, and the rule is what
 ///   the next synthetic pc will be measured against.
 ///
-/// An artifact with no safepoint-id slot (`sp_id_slot_off == 0`) — compiled
+/// An artifact with no safepoint-id slot (`sp_id_slot_off == 0`) -- compiled
 /// without the precise gate, or aarch64, whose backend hard-codes
 /// `bytecode_pc: 0` and would otherwise resolve every compiled frame to the
-/// first line of its method — is already refused by `active_safepoint_id`.
+/// first line of its method -- is already refused by `active_safepoint_id`.
+///
+/// # aarch64: the refusal is UNREACHABLE, not merely conservative (2026-09-02)
+///
+/// The 2026-09-01 page listed "aarch64 compiled frames still report no line"
+/// as an open residual. It is not one, and the reason is worth writing down
+/// because it is cheaper than re-deriving it: **an aarch64 compiled activation
+/// cannot be on the stack while a Java-level stack capture runs.**
+///
+/// A trace is captured either at a throw or from a caller-sensitive native,
+/// and both are reached by an `invoke*`. `Arm64Backend::emit_invoke` sets
+/// `self.failed` UNCONDITIONALLY -- there is no call-target resolution in that
+/// backend at all -- so a method containing any call bails and is interpreted
+/// (`jit::aarch64_backend::tests::invokestatic_arm_exists_but_always_bails`).
+/// `athrow` and every object-model opcode bail on the same rule
+/// (`object_model_opcodes_are_all_unsupported`), so such a body cannot raise
+/// either, and `label_for_pc` refuses every backward branch target, so it
+/// cannot loop. What compiles there is leaf, straight-line, exception-free
+/// arithmetic that runs to its `ret`.
+///
+/// `Arm64CompileResult::oop_maps` is unconditionally empty for the same
+/// generation of reasons (`compiled_methods_carry_no_oop_maps`), and its only
+/// writer fails closed, so there is no safepoint of any kind to name a bci at.
+/// A line number is downstream of a safepoint mechanism that backend does not
+/// have; giving it one is a consequence of building that mechanism, not a
+/// separate task. Three tests pin the premises, so a change that makes an
+/// aarch64 frame reachable from a capture trips them first.
 fn activation_bci(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<i32> {
-    if cm.used_ir_backend {
+    use cratonvm_jit::{
+        note_compiled_frame_line as note, FRAME_LINE_ANSWERED_IR,
+        FRAME_LINE_ANSWERED_SINGLE_PASS, FRAME_LINE_REFUSED_ID_UNRECORDED,
+        FRAME_LINE_REFUSED_IR_UNTRANSLATED, FRAME_LINE_REFUSED_NO_SP_ID,
+        FRAME_LINE_REFUSED_OUT_OF_RANGE, FRAME_LINE_REFUSED_SWITCHED_OFF,
+    };
+    // Every exit below names a census column. That is not decoration: a trace
+    // prints `(Unknown Source)` for all five refusals and there is no other
+    // way to tell which population a line-less frame came from. See
+    // `cratonvm_jit::COMPILED_FRAME_LINE_COUNTS`.
+    let Some(id) = active_safepoint_id(rbp, cm) else {
+        note(FRAME_LINE_REFUSED_NO_SP_ID);
         return None;
-    }
-    let id = active_safepoint_id(rbp, cm)?;
+    };
     // `find_oop_map_for_safepoint_id` is `&self` and is the artifact's own
     // record of which bytecode PCs it emitted a safepoint at.
-    cm.find_oop_map_for_safepoint_id(id)?;
-    i32::try_from(plausible_bci(id)?).ok()
+    if cm.find_oop_map_for_safepoint_id(id).is_none() {
+        note(FRAME_LINE_REFUSED_ID_UNRECORDED);
+        return None;
+    }
+    // The optimizing tier's slot holds an ID, not a bci. Translate it through
+    // the artifact's own table, and refuse when there is none: an untranslated
+    // id is a small integer that looks exactly like a bci, which is the wrong
+    // answer this refusal was written to avoid.
+    let recorded = if cm.used_ir_backend {
+        if !ir_frame_bci_enabled() {
+            note(FRAME_LINE_REFUSED_SWITCHED_OFF);
+            return None;
+        }
+        match cm.safepoint_bci(id) {
+            Some(bci) => bci,
+            None => {
+                note(FRAME_LINE_REFUSED_IR_UNTRANSLATED);
+                return None;
+            }
+        }
+    } else {
+        id
+    };
+    let Some(bci) = plausible_bci(recorded).and_then(|v| i32::try_from(v).ok()) else {
+        note(FRAME_LINE_REFUSED_OUT_OF_RANGE);
+        return None;
+    };
+    note(if cm.used_ir_backend {
+        FRAME_LINE_ANSWERED_IR
+    } else {
+        FRAME_LINE_ANSWERED_SINGLE_PASS
+    });
+    Some(bci)
 }
 
 /// The callees inlined into `cm` at the program point a live frame is standing
@@ -4291,13 +4424,18 @@ fn activation_bci(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<i32> 
 ///
 /// # The optimizing tier needs no extra refusal here
 ///
-/// [`activation_bci`] refuses an `used_ir_backend` artifact outright, so key 2
-/// can never be reached for one. Key 1 is a CODE LAYOUT fact — the byte offset
-/// of a return address in this artifact's own buffer — and carries no
-/// assumption about which backend emitted it, so it needs no refusal. (In
-/// practice an IR artifact's map is empty anyway: `record_inline_frame_row` is
-/// called only from the single-pass splicer, and one compile produces one
-/// artifact, so a map can never describe a buffer other than its own.)
+/// Key 2 is the safepoint-id slot read back as a bci, and since 2026-09-02
+/// [`activation_bci`] can answer that for an `used_ir_backend` artifact too
+/// (through `CompiledMethod::safepoint_bci_table`). It still reaches no chain:
+/// an IR artifact's `inline_frame_map` is EMPTY, because
+/// `record_inline_frame_row` is called only from the single-pass splicer and
+/// one compile produces one artifact, so `compiled_frame_inline_chain` returns
+/// on the `is_empty()` guard before either key is consulted. Key 1 is a CODE
+/// LAYOUT fact -- the byte offset of a return address in this artifact's own
+/// buffer -- and carries no assumption about which backend emitted it, so it
+/// needs no refusal either. IR-tier inlining therefore still contributes no
+/// frames; it needs its own producer, keyed off `InlineScopeTable`, and that is
+/// a separate change from giving the tier a line.
 ///
 /// # The fail-closed rule
 ///
@@ -4316,12 +4454,22 @@ fn compiled_frame_inline_chain(
     cm: &cratonvm_jit::CompiledMethod,
     bci: i32,
     native_pc: Option<usize>,
-) -> Vec<(String, u32)> {
+) -> (Vec<InlinedLevel>, bool) {
+    fn levels(chain: &[cratonvm_jit::x64::InlineFrameLevel]) -> Vec<InlinedLevel> {
+        chain
+            .iter()
+            .map(|l| InlinedLevel {
+                label: l.label.clone(),
+                bci: l.bci,
+                class_id: l.class_id,
+            })
+            .collect()
+    }
     if cm.inline_frame_map.is_empty() {
         // The overwhelming majority: a method that splices nothing carries an
         // empty map and no allocation, and this is the whole cost it adds to a
         // throw.
-        return Vec::new();
+        return (Vec::new(), false);
     }
     // Key 1 — the exact return address, for every frame below the innermost.
     if let Some(pc) = native_pc {
@@ -4333,27 +4481,104 @@ fn compiled_frame_inline_chain(
             // Cast: bounded by `code_len()`, which is a JIT buffer position.
             let off = (pc - entry) as u32;
             if let Some(chain) = cm.inline_frame_map.chain_for_native_offset(off) {
-                return chain.iter().map(|l| (l.label.clone(), l.bci)).collect();
+                return (levels(chain), true);
             }
         }
-        // No fallback to key 2 here — see the doc above. An exact key that
+        // No fallback to key 2 here -- see the doc above. An exact key that
         // misses is evidence that this program point recorded no chain, not
         // permission to consult a coarser one.
-        return Vec::new();
+        return (Vec::new(), false);
     }
     // Key 2 — the safepoint id, the innermost frame's only evidence. `bci` is
     // what `activation_bci` recovered out of the frame's safepoint-id slot,
     // which is the same `cur_bc_pc` the emitter recorded the row under.
     if bci < 0 {
-        return Vec::new();
+        return (Vec::new(), false);
     }
     match cm.inline_frame_map.chain_for_safepoint_bci(bci as u32) {
-        Some(chain) => chain.iter().map(|l| (l.label.clone(), l.bci)).collect(),
+        // `false`: this is the COARSE key. Good enough to display, never good
+        // enough to attribute a caller -- see `ActiveCompiledFrame::chain_exact`.
+        Some(chain) => (levels(chain), false),
         // `None` is both "no row" and "two rows disagreed and the emitter
         // poisoned this bci". The caller cannot act differently on the two and
         // must not: an ambiguous chain and an absent one both mean no inlined
         // frame may be reported here.
-        None => Vec::new(),
+        None => (Vec::new(), false),
+    }
+}
+
+/// Give the INNERMOST frame of an NPE snapshot the line and the inlined
+/// callees of the inline null check that raised.
+///
+/// An inline null check is not a GC-capable call, so it publishes no safepoint
+/// id and [`activation_bci`] correctly refuses the stale one in the slot: the
+/// frame that RAISED was the one frame in the snapshot with no line. The
+/// emitter records what it knows at every such site
+/// (`x64::inlining::record_npe_trap_site`) and the site's cold trampoline hands
+/// its key to `jit_npe_with_action`; this is where the two meet.
+///
+/// `trap_key == 0` means the site was not described -- the feature switched
+/// off, a bci out of spec range, a chain the emitter refused, or a helper that
+/// signals an NPE without going through an inline check at all -- and leaves
+/// the snapshot exactly as the walk built it.
+///
+/// Three things make a mismatched key harmless rather than wrong:
+///
+///   * keys are per-compile MONOTONIC ids, never indices, so one that belongs
+///     to another artifact (or to a rewound splice) MISSES rather than landing
+///     on a neighbouring site;
+///   * the lookup is against the innermost frame's OWN artifact, which is the
+///     one whose trampoline ran;
+///   * both halves respect the switches the rest of this file does, so
+///     `CRATONVM_JIT_NO_COMPILED_FRAME_LINES=1` still produces `-1` here and
+///     `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` still produces no callee frames.
+///
+/// `frames` is OUTERMOST-first (see [`active_compiled_frames`]), so the frame
+/// that trapped is the last one.
+pub fn apply_npe_trap_site(frames: &mut [ActiveCompiledFrame], trap_key: u32) {
+    if trap_key == 0 {
+        return;
+    }
+    let want_bci = compiled_frame_bci_enabled();
+    let want_chains = inline_frame_chains_enabled();
+    if !want_bci && !want_chains {
+        return;
+    }
+    let Some(top) = frames.last_mut() else {
+        return;
+    };
+    if top.cm_ptr == 0 {
+        return;
+    }
+    // SAFETY: the same window and the same contract as `active_compiled_frames`
+    // -- this runs inside the JIT helper that trapped, on the owning thread,
+    // with the artifact still registered in the JIT cache and its chain entry
+    // still pushed, and `cm_ptr` came from that walk moments ago.
+    let cm = unsafe { &*(top.cm_ptr as *const cratonvm_jit::CompiledMethod) };
+    let Some(site) = cm.npe_trap_map.get(trap_key) else {
+        return;
+    };
+    if want_bci {
+        if let Ok(bci) = i32::try_from(site.bci) {
+            top.bci = bci;
+            cratonvm_jit::note_compiled_frame_line(cratonvm_jit::FRAME_LINE_ANSWERED_NPE_TRAP);
+        }
+    }
+    if want_chains {
+        top.inline_chain = site
+            .chain
+            .iter()
+            .map(|l| InlinedLevel {
+                label: l.label.clone(),
+                bci: l.bci,
+                class_id: l.class_id,
+            })
+            .collect();
+        // The trap site is an EXACT program point -- the emitter recorded it at
+        // the null check it is describing, not under a bci a whole spliced
+        // region shares. So this chain is as authoritative as a return-address
+        // one.
+        top.chain_exact = true;
     }
 }
 
@@ -4553,7 +4778,23 @@ pub fn active_compiled_frames() -> Vec<ActiveCompiledFrame> {
                 }
                 let bci = match frame_rbp {
                     Some(rbp) if want_bci => activation_bci(*rbp, cm).unwrap_or(-1),
-                    _ => -1,
+                    _ => {
+                        // Counted, so an all-`-1` trace under
+                        // `CRATONVM_JIT_NO_COMPILED_FRAME_LINES=1` is
+                        // distinguishable from one where the recovery ran and
+                        // refused. A kill switch that looks identical to a
+                        // defect is how a switch left set in an environment
+                        // becomes a bug report.
+                        cratonvm_jit::note_compiled_frame_line(
+                            cratonvm_jit::FRAME_LINE_REFUSED_SWITCHED_OFF,
+                        );
+                        -1
+                    }
+                };
+                let (inline_chain, chain_exact) = if want_chains {
+                    compiled_frame_inline_chain(cm, bci, *native_pc)
+                } else {
+                    (Vec::new(), false)
                 };
                 out.push(ActiveCompiledFrame {
                     interp_depth: e.interp_depth,
@@ -4567,13 +4808,10 @@ pub fn active_compiled_frames() -> Vec<ActiveCompiledFrame> {
                     bci,
                     // The callees this artifact spliced at that same program
                     // point. `Vec::new()` does not allocate, so a method that
-                    // inlines nothing — and the whole feature switched off —
+                    // inlines nothing -- and the whole feature switched off --
                     // costs one branch.
-                    inline_chain: if want_chains {
-                        compiled_frame_inline_chain(cm, bci, *native_pc)
-                    } else {
-                        Vec::new()
-                    },
+                    inline_chain,
+                    chain_exact,
                 });
             }
         }
@@ -5604,6 +5842,21 @@ fn remap_one_jit_frame(
 ///   band, so without the scopes every one of them read as `outside_locals`,
 ///   and "a spliced callee's locals are named by no oop map" is a defect this
 ///   repo has already paid for once.
+/// * `stack_not_oop` -- the safepoint's own operand-stack model classified that
+///   spill slot as a non-reference and its marks were exact. Dead storage.
+///   This is the band the H2 residue is actually in: 36 of 37 stale words on
+///   `TestRandomMapOps` were `region=operand-spill`.
+/// * `mapped_alias` -- the slot IS named by the map and was rewritten; the value
+///   the rewrite wrote is itself a pointer-map key, because a slide moves
+///   objects into space other objects vacated. This is why "the word is a key
+///   of the pointer map" is not proof that the word is stale, and it produced
+///   this instrument's first and only `LOCAL-OOP-UNMAPPED` before it was
+///   separated out.
+/// * `duplicate_of_mapped` -- no oracle claims the slot, but the object the word
+///   points at is ALSO named by a mapped slot of the same frame, which
+///   relocation rewrote. The object is not lost. Measured on H2: the map names
+///   a group of spill slots and the stale words are the copies three slots
+///   below them, holding the same objects at their pre-move addresses.
 /// * `outside_locals` -- spill or staging band with no scope claiming it, where
 ///   this oracle is silent. The per-frame detail prints
 ///   `FrameLayout::region_name` beside each, which is what makes an
@@ -5633,8 +5886,20 @@ mod residue_census {
     pub static LOCAL_OOP: AtomicUsize = AtomicUsize::new(0);
     pub static LOCAL_NOT_OOP: AtomicUsize = AtomicUsize::new(0);
     pub static LOCAL_UNREACHED: AtomicUsize = AtomicUsize::new(0);
+    /// ENGAGEMENT for the inline half of the oracle: how many reported frames
+    /// carried at least one splice scope, and how many scopes in total. Without
+    /// these, `inline_local_*` reading zero cannot be told from an oracle armed
+    /// where it can never fire.
+    pub static FRAMES_WITH_INLINE_SCOPES: AtomicUsize = AtomicUsize::new(0);
+    pub static INLINE_SCOPES_SEEN: AtomicUsize = AtomicUsize::new(0);
     pub static INLINE_LOCAL_OOP: AtomicUsize = AtomicUsize::new(0);
     pub static INLINE_LOCAL_NOT_OOP: AtomicUsize = AtomicUsize::new(0);
+    pub static STACK_NOT_OOP: AtomicUsize = AtomicUsize::new(0);
+    pub static DUPLICATE_OF_MAPPED: AtomicUsize = AtomicUsize::new(0);
+    pub static MAPPED_ALIAS: AtomicUsize = AtomicUsize::new(0);
+    /// ENGAGEMENT for the operand-stack half: how many reported frames carried
+    /// an exact stack model with at least one non-oop slot in it.
+    pub static FRAMES_WITH_STACK_MODEL: AtomicUsize = AtomicUsize::new(0);
     pub static OUTSIDE_LOCALS: AtomicUsize = AtomicUsize::new(0);
 }
 
@@ -5656,14 +5921,20 @@ pub fn report_remap_residue_census_at_exit() {
         return;
     }
     eprintln!(
-        "[remap-residue-summary] frames={} frames_with_live_stale={} local_oop={} local_not_oop={} local_unreached={} inline_local_oop={} inline_local_not_oop={} outside_locals={}",
+        "[remap-residue-summary] frames={} frames_with_live_stale={} local_oop={} local_not_oop={} local_unreached={} frames_with_inline_scopes={} inline_scopes={} inline_local_oop={} inline_local_not_oop={} frames_with_stack_model={} stack_not_oop={} duplicate_of_mapped={} mapped_alias={} outside_locals={}",
         frames,
         residue_census::FRAMES_WITH_LIVE.load(Relaxed),
         residue_census::LOCAL_OOP.load(Relaxed),
         residue_census::LOCAL_NOT_OOP.load(Relaxed),
         residue_census::LOCAL_UNREACHED.load(Relaxed),
+        residue_census::FRAMES_WITH_INLINE_SCOPES.load(Relaxed),
+        residue_census::INLINE_SCOPES_SEEN.load(Relaxed),
         residue_census::INLINE_LOCAL_OOP.load(Relaxed),
         residue_census::INLINE_LOCAL_NOT_OOP.load(Relaxed),
+        residue_census::FRAMES_WITH_STACK_MODEL.load(Relaxed),
+        residue_census::STACK_NOT_OOP.load(Relaxed),
+        residue_census::DUPLICATE_OF_MAPPED.load(Relaxed),
+        residue_census::MAPPED_ALIAS.load(Relaxed),
         residue_census::OUTSIDE_LOCALS.load(Relaxed),
     );
 }
@@ -5687,6 +5958,23 @@ enum StaleVerdict {
     InlineLocalOopUnmapped,
     /// As `LocalNotOop`, for a local of an inlined callee.
     InlineLocalNotOop,
+    /// The safepoint's own operand-stack model classified this spill slot as
+    /// NOT holding a reference, and the mark vector was exact. Dead storage.
+    StackNotOop,
+    /// No oracle claims the slot, but the object it points at IS named by
+    /// another slot of this same frame, which relocation rewrote. The object is
+    /// therefore not lost; this word is a stale DUPLICATE of a live root.
+    DuplicateOfMapped,
+    /// The slot IS in this safepoint's map and was rewritten, and the value the
+    /// rewrite wrote is ITSELF a key of the pointer map -- a to-space address
+    /// that aliases some other object's from-space address, because a slide
+    /// moves objects into space other objects vacated.
+    ///
+    /// Never a missed root, and the reason "this word is a key of the pointer
+    /// map" is not by itself proof that a word is stale. Observed on
+    /// `FileStore.readChunkFooter` (`mapped=[8=..]`, `rewritten=4` of 4 slots),
+    /// where it produced the instrument's first and only LOCAL-OOP-UNMAPPED.
+    MappedAlias,
     /// Spill or staging band — not a local home, so this oracle is silent.
     OutsideLocals,
 }
@@ -5700,6 +5988,9 @@ impl StaleVerdict {
             StaleVerdict::LocalUnreached => "local-unreached",
             StaleVerdict::InlineLocalOopUnmapped => "INLINE-LOCAL-OOP-UNMAPPED",
             StaleVerdict::InlineLocalNotOop => "inline-local-not-oop",
+            StaleVerdict::StackNotOop => "stack-not-oop",
+            StaleVerdict::DuplicateOfMapped => "duplicate-of-mapped",
+            StaleVerdict::MappedAlias => "mapped-alias",
             StaleVerdict::OutsideLocals => "outside-locals",
         }
     }
@@ -5714,15 +6005,36 @@ impl StaleVerdict {
 /// this bci, which is NOT the same as `Some(0)`.
 fn classify_stale_local(
     off: usize,
+    mapped: &[i16],
     local_mask: Option<u64>,
     num_locals: usize,
     inline_scopes: &[(i32, u16, u64)],
+    non_oop_stack: &[i16],
 ) -> StaleVerdict {
+    // FIRST, because a slot the map NAMED was rewritten and cannot be a missed
+    // root. Its current value being a pointer-map key is address aliasing -- a
+    // slide moves objects into space other objects vacated -- and asking the
+    // locals oracle about it is how this instrument produced its only false
+    // `LOCAL-OOP-UNMAPPED`. See `StaleVerdict::MappedAlias`.
+    if i16::try_from(off).is_ok_and(|o| mapped.contains(&o)) {
+        return StaleVerdict::MappedAlias;
+    }
     if off < 8 || off % 8 != 0 || (off / 8 - 1) >= num_locals {
         // Not a java local of this method. A SPLICED callee's locals are
         // allocated out of the operand-spill band and are addressed from their
         // scope's own base, so ask each live scope before giving up.
-        return classify_stale_inline_local(off, inline_scopes);
+        return match classify_stale_inline_local(off, inline_scopes) {
+            // No splice claims it. The last oracle is the safepoint's own
+            // operand-stack model, which is where the H2 residue actually sits.
+            StaleVerdict::OutsideLocals => {
+                if i16::try_from(off).is_ok_and(|o| non_oop_stack.contains(&o)) {
+                    StaleVerdict::StackNotOop
+                } else {
+                    StaleVerdict::OutsideLocals
+                }
+            }
+            other => other,
+        };
     }
     let k = off / 8 - 1;
     match local_mask {
@@ -5814,9 +6126,16 @@ fn report_remap_residue(
     let mut local_mask: Option<u64> = Some(0);
     let mut num_locals: usize = 0;
     let mut inline_scopes: Vec<(i32, u16, u64)> = Vec::new();
+    let mut non_oop_stack: Vec<i16> = Vec::new();
     for m in cm.oop_maps.iter().filter(|m| m.bytecode_pc == sp_id) {
         num_locals = num_locals.max(m.num_locals as usize);
         inline_scopes.extend_from_slice(&m.inline_local_scopes);
+        // A non-exact mark vector was PADDED with "not an oop" for entries
+        // nobody classified, so its complement is a default and not a proof.
+        // Spend it only when the safepoint said it was exact.
+        if m.stack_marks_exact {
+            non_oop_stack.extend_from_slice(&m.non_oop_stack_slots);
+        }
         local_mask = match (local_mask, m.local_oop_mask) {
             (Some(a), Some(b)) => Some(a | b),
             _ => None,
@@ -5833,8 +6152,29 @@ fn report_remap_residue(
     let mut oracle_local_unreached = 0usize;
     let mut oracle_inline_local_oop = 0usize;
     let mut oracle_inline_local_not_oop = 0usize;
+    let mut oracle_stack_not_oop = 0usize;
+    let mut oracle_duplicate = 0usize;
+    let mut oracle_mapped_alias = 0usize;
     let mut oracle_outside_locals = 0usize;
     let mut detail = String::new();
+    // The values the map's own slots hold NOW, i.e. after relocation rewrote
+    // them. A stale word whose target is among these points at an object the
+    // frame still reaches through a named root: the object is not lost, and the
+    // word is a stale DUPLICATE rather than a missing root. Cheap, and it needs
+    // no metadata the map does not already carry.
+    let mut mapped_vals: Vec<usize> = Vec::new();
+    for &off in mapped {
+        let a = rbp.wrapping_sub(off as usize);
+        // One entry per mapped slot, in order, so the description below can
+        // index it; a misaligned slot (never seen) contributes 0, which is not
+        // a pointer-map key and so cannot produce a false duplicate.
+        mapped_vals.push(if a & 0x7 == 0 {
+            // SAFETY: aligned frame slot of a live JIT frame on this thread.
+            unsafe { (a as *const usize).read() }
+        } else {
+            0
+        });
+    }
     if frame_size > 0 && (frame_size as usize) <= 1024 * 1024 && (frame_size as usize) <= rbp {
         let frame_size = frame_size as usize;
         let lo = (rbp - frame_size + 7) & !7usize;
@@ -5863,7 +6203,23 @@ fn report_remap_residue(
                 let verdict = if class != "LIVE" {
                     StaleVerdict::NotLive
                 } else {
-                    classify_stale_local(off, local_mask, num_locals, &inline_scopes)
+                    classify_stale_local(
+                        off,
+                        mapped,
+                        local_mask,
+                        num_locals,
+                        &inline_scopes,
+                        &non_oop_stack,
+                    )
+                };
+                // Last resort before "unexplained": is this the same object a
+                // named slot of this frame already points at?
+                let verdict = if verdict == StaleVerdict::OutsideLocals
+                    && mapped_vals.contains(&new)
+                {
+                    StaleVerdict::DuplicateOfMapped
+                } else {
+                    verdict
                 };
                 match verdict {
                     StaleVerdict::NotLive => {}
@@ -5872,6 +6228,9 @@ fn report_remap_residue(
                     StaleVerdict::LocalUnreached => oracle_local_unreached += 1,
                     StaleVerdict::InlineLocalOopUnmapped => oracle_inline_local_oop += 1,
                     StaleVerdict::InlineLocalNotOop => oracle_inline_local_not_oop += 1,
+                    StaleVerdict::StackNotOop => oracle_stack_not_oop += 1,
+                    StaleVerdict::DuplicateOfMapped => oracle_duplicate += 1,
+                    StaleVerdict::MappedAlias => oracle_mapped_alias += 1,
                     StaleVerdict::OutsideLocals => oracle_outside_locals += 1,
                 }
                 // A word the oracle proves is a reference is the finding, and
@@ -5915,23 +6274,30 @@ fn report_remap_residue(
         residue_census::LOCAL_OOP.fetch_add(oracle_local_oop, Relaxed);
         residue_census::LOCAL_NOT_OOP.fetch_add(oracle_local_not_oop, Relaxed);
         residue_census::LOCAL_UNREACHED.fetch_add(oracle_local_unreached, Relaxed);
+        if !inline_scopes.is_empty() {
+            residue_census::FRAMES_WITH_INLINE_SCOPES.fetch_add(1, Relaxed);
+            residue_census::INLINE_SCOPES_SEEN.fetch_add(inline_scopes.len(), Relaxed);
+        }
         residue_census::INLINE_LOCAL_OOP.fetch_add(oracle_inline_local_oop, Relaxed);
         residue_census::INLINE_LOCAL_NOT_OOP.fetch_add(oracle_inline_local_not_oop, Relaxed);
+        residue_census::STACK_NOT_OOP.fetch_add(oracle_stack_not_oop, Relaxed);
+        residue_census::DUPLICATE_OF_MAPPED.fetch_add(oracle_duplicate, Relaxed);
+        residue_census::MAPPED_ALIAS.fetch_add(oracle_mapped_alias, Relaxed);
+        if !non_oop_stack.is_empty() {
+            residue_census::FRAMES_WITH_STACK_MODEL.fetch_add(1, Relaxed);
+        }
         residue_census::OUTSIDE_LOCALS.fetch_add(oracle_outside_locals, Relaxed);
     }
     let mut mapped_desc = String::new();
-    for &off in mapped {
-        let a = rbp.wrapping_sub(off as usize);
-        let v = if a & 0x7 == 0 {
-            // SAFETY: aligned frame slot of a live JIT frame on this thread.
-            unsafe { (a as *const usize).read() }
-        } else {
-            0
-        };
-        mapped_desc.push_str(&format!(" {}=0x{:x}", off, v));
+    for (i, &off) in mapped.iter().enumerate() {
+        mapped_desc.push_str(&format!(
+            " {}=0x{:x}",
+            off,
+            mapped_vals.get(i).copied().unwrap_or(0)
+        ));
     }
     eprintln!(
-        "[remap-frame] method={} sp_id={} frame_size={} cov_complete={} live_hi={} local_mask={:?} num_locals={} mapped=[{}] rewritten={} inlined={:?} stale_words={} stale_live={} stale_dead={} stale_unknown={} oracle=[local_oop={} local_not_oop={} local_unreached={} inline_local_oop={} inline_local_not_oop={} outside_locals={}]{}",
+        "[remap-frame] method={} sp_id={} frame_size={} cov_complete={} live_hi={} local_mask={:?} num_locals={} mapped=[{}] rewritten={} inlined={:?} stale_words={} stale_live={} stale_dead={} stale_unknown={} scopes={:?} oracle=[local_oop={} local_not_oop={} local_unreached={} inline_local_oop={} inline_local_not_oop={} stack_not_oop={} duplicate_of_mapped={} mapped_alias={} outside_locals={}]{}",
         cm.method_label,
         sp_id,
         frame_size,
@@ -5949,11 +6315,15 @@ fn report_remap_residue(
         stale_live,
         stale_dead,
         stale_unknown,
+        inline_scopes,
         oracle_local_oop,
         oracle_local_not_oop,
         oracle_local_unreached,
         oracle_inline_local_oop,
         oracle_inline_local_not_oop,
+        oracle_stack_not_oop,
+        oracle_duplicate,
+        oracle_mapped_alias,
         oracle_outside_locals,
         detail,
     );
@@ -9318,6 +9688,8 @@ mod tests {
             local_oop_mask: None,
             num_locals: 0,
             inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         });
         cm.fully_oop_covered = true;
         cm.fully_shadow_covered = true;
@@ -9353,6 +9725,8 @@ mod tests {
             local_oop_mask: None,
             num_locals: 0,
             inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         });
         // The direct-call shape: shadow complete, frame-slot subset incomplete.
         cm.fully_shadow_covered = true;
@@ -9391,6 +9765,8 @@ mod tests {
             local_oop_mask: None,
             num_locals: 0,
             inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         });
         cm.fully_shadow_covered = false;
         // `fully_oop_covered` true and shadow false is the inverse of the pair
@@ -9505,6 +9881,8 @@ mod tests {
             local_oop_mask: None,
             num_locals: 0,
             inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         });
         cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x10,
@@ -9515,6 +9893,8 @@ mod tests {
             local_oop_mask: None,
             num_locals: 0,
             inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         });
         cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x20,
@@ -9525,6 +9905,8 @@ mod tests {
             local_oop_mask: None,
             num_locals: 0,
             inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         });
 
         // Exact-match lookups succeed regardless of insertion order.
@@ -9582,6 +9964,8 @@ mod tests {
             local_oop_mask: None,
             num_locals: 0,
             inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
         });
         assert!(cm.has_precise_oop_maps());
 
@@ -9788,14 +10172,14 @@ mod stale_word_oracle_tests {
     #[test]
     fn the_doconcat_witness_is_dead_storage() {
         assert_eq!(
-            classify_stale_local(32, Some(0b10011), 6, &[]),
+            classify_stale_local(32, &[], Some(0b10011), 6, &[], &[]),
             StaleVerdict::LocalNotOop
         );
         // ... while the slots the mask DOES name would be roots if they were
         // ever found stale.
         for off in [8usize, 16, 40] {
             assert_eq!(
-                classify_stale_local(off, Some(0b10011), 6, &[]),
+                classify_stale_local(off, &[], Some(0b10011), 6, &[], &[]),
                 StaleVerdict::LocalOopUnmapped,
                 "offset {off}"
             );
@@ -9809,11 +10193,11 @@ mod stale_word_oracle_tests {
     #[test]
     fn unreached_is_not_the_empty_mask() {
         assert_eq!(
-            classify_stale_local(32, None, 6, &[]),
+            classify_stale_local(32, &[], None, 6, &[], &[]),
             StaleVerdict::LocalUnreached
         );
         assert_eq!(
-            classify_stale_local(32, Some(0), 6, &[]),
+            classify_stale_local(32, &[], Some(0), 6, &[], &[]),
             StaleVerdict::LocalNotOop
         );
     }
@@ -9824,21 +10208,21 @@ mod stale_word_oracle_tests {
     #[test]
     fn outside_the_locals_band_the_oracle_is_silent() {
         assert_eq!(
-            classify_stale_local(56, Some(0), 6, &[]),
+            classify_stale_local(56, &[], Some(0), 6, &[], &[]),
             StaleVerdict::OutsideLocals
         );
         assert_eq!(
-            classify_stale_local(0, Some(0), 6, &[]),
+            classify_stale_local(0, &[], Some(0), 6, &[], &[]),
             StaleVerdict::OutsideLocals
         );
         assert_eq!(
-            classify_stale_local(36, Some(0), 6, &[]),
+            classify_stale_local(36, &[], Some(0), 6, &[], &[]),
             StaleVerdict::OutsideLocals
         );
         // A frame with no mask at all (the IR tier) has `num_locals == 0`, so
         // every word is outside the band and nothing is misattributed.
         assert_eq!(
-            classify_stale_local(8, None, 0, &[]),
+            classify_stale_local(8, &[], None, 0, &[], &[]),
             StaleVerdict::OutsideLocals
         );
     }
@@ -9853,31 +10237,31 @@ mod stale_word_oracle_tests {
         // 3 locals whose local 1 is a reference.
         let scopes = [(96i32, 3u16, 0b010u64)];
         assert_eq!(
-            classify_stale_local(96, Some(0), 2, &scopes),
+            classify_stale_local(96, &[], Some(0), 2, &scopes, &[]),
             StaleVerdict::InlineLocalNotOop
         );
         assert_eq!(
-            classify_stale_local(104, Some(0), 2, &scopes),
+            classify_stale_local(104, &[], Some(0), 2, &scopes, &[]),
             StaleVerdict::InlineLocalOopUnmapped
         );
         assert_eq!(
-            classify_stale_local(112, Some(0), 2, &scopes),
+            classify_stale_local(112, &[], Some(0), 2, &scopes, &[]),
             StaleVerdict::InlineLocalNotOop
         );
         // One past the scope's last local is spill again, not local 3.
         assert_eq!(
-            classify_stale_local(120, Some(0), 2, &scopes),
+            classify_stale_local(120, &[], Some(0), 2, &scopes, &[]),
             StaleVerdict::OutsideLocals
         );
         // Below the scope's base, likewise.
         assert_eq!(
-            classify_stale_local(88, Some(0), 2, &scopes),
+            classify_stale_local(88, &[], Some(0), 2, &scopes, &[]),
             StaleVerdict::OutsideLocals
         );
         // A scope that could not classify its locals is not recorded at all,
         // so its band stays honestly unattributed rather than reading "dead".
         assert_eq!(
-            classify_stale_local(104, Some(0), 2, &[]),
+            classify_stale_local(104, &[], Some(0), 2, &[], &[]),
             StaleVerdict::OutsideLocals
         );
     }
@@ -9889,8 +10273,60 @@ mod stale_word_oracle_tests {
     fn the_outer_locals_band_is_consulted_first() {
         let scopes = [(8i32, 4u16, u64::MAX)];
         assert_eq!(
-            classify_stale_local(8, Some(0), 4, &scopes),
+            classify_stale_local(8, &[], Some(0), 4, &scopes, &[]),
             StaleVerdict::LocalNotOop
+        );
+    }
+
+    /// A slot the map NAMED cannot be a missed root: relocation rewrote it, and
+    /// its current value being a pointer-map key means that to-space address
+    /// aliases some other object's from-space address. Asking the locals oracle
+    /// about it produced the instrument's only false `LOCAL-OOP-UNMAPPED`, on
+    /// `FileStore.readChunkFooter` -- `mapped=[8=..]` with `rewritten` equal to
+    /// the slot count, so slot 8 held a value the rewrite had just written.
+    #[test]
+    fn a_mapped_slot_is_never_a_missed_root() {
+        // Local 0, mask says it IS a reference: the exact shape that misfired.
+        assert_eq!(
+            classify_stale_local(8, &[], Some(0b1), 9, &[], &[]),
+            StaleVerdict::LocalOopUnmapped,
+            "an UNMAPPED reference local is still the finding"
+        );
+        assert_eq!(
+            classify_stale_local(8, &[8], Some(0b1), 9, &[], &[]),
+            StaleVerdict::MappedAlias,
+            "the same word, once the map names it, is not a missed root"
+        );
+        // The mapped check outranks every other oracle, including the ones
+        // that would otherwise call the word dead.
+        assert_eq!(
+            classify_stale_local(96, &[96], Some(0), 2, &[], &[96]),
+            StaleVerdict::MappedAlias
+        );
+    }
+
+    /// The operand-spill band is where the residue actually is on the workload
+    /// this oracle was built for: 36 of 37 stale words on
+    /// `org.h2.test.store.TestRandomMapOps` sat in `region=operand-spill`,
+    /// which the locals and splice oracles both decline to answer for. The
+    /// safepoint's own stack model closes that gap for the slots it modelled.
+    #[test]
+    fn an_operand_spill_slot_the_stack_model_calls_a_primitive_is_dead() {
+        // Outer method: 2 locals; spill slots 96 and 104 modelled as non-oops.
+        assert_eq!(
+            classify_stale_local(96, &[], Some(0), 2, &[], &[96, 104]),
+            StaleVerdict::StackNotOop
+        );
+        // A spill slot the model did not mention stays unproven.
+        assert_eq!(
+            classify_stale_local(112, &[], Some(0), 2, &[], &[96, 104]),
+            StaleVerdict::OutsideLocals
+        );
+        // A splice's claim wins over the stack model for the same word: the
+        // scope knows it is a local, the stack model only knows it is a slot.
+        assert_eq!(
+            classify_stale_local(96, &[], Some(0), 2, &[(96, 1, 0b1)], &[96]),
+            StaleVerdict::InlineLocalOopUnmapped
         );
     }
 
@@ -9900,7 +10336,7 @@ mod stale_word_oracle_tests {
     #[test]
     fn a_local_past_the_mask_width_is_not_proven_dead() {
         assert_eq!(
-            classify_stale_local(8 * 65, Some(u64::MAX), 80, &[]),
+            classify_stale_local(8 * 65, &[], Some(u64::MAX), 80, &[], &[]),
             StaleVerdict::LocalUnreached
         );
     }
