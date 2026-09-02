@@ -226,6 +226,45 @@ hash, driver version, `sm_XX`) via `cuLink*` would make warm starts
 near-instant. It is a contained change to `cuda-bridge` and it needs a
 GPU to validate, which is the only reason it is not here.
 
+## Float semantics: what is guaranteed and what is not
+
+Added 2026-09-02, after differentially testing the emitter against
+HotSpot on an RTX 2060 rather than reading its comments
+(`bench-gpu/arith-differential.sh`, fixtures
+`test_classes/gpu/GpuArithDifferential.java` and `GpuArithProbe.java`).
+
+**Guaranteed, and it was wrong until that run.** `(int) NaN` and
+`(long) NaN` are zero — JLS §5.1.3 says so with no room. The device was
+returning the destination type's MIN_VALUE: 474 of 4096 elements wrong
+for `d2i`/`d2l`, 584 for `f2l`. `f2i` happened to be correct on this
+device, which is exactly why the bug survived — the PTX ISA is silent on
+the NaN case for these conversions, so three of the four diverged and the
+fourth did not. All four now carry a `setp.nan` + `selp` guard.
+
+**Not guaranteed, and deliberately left alone.** NaN payloads are not
+preserved by `add`/`mul`/`div`/`neg` on the device: every NaN comes back
+as `0x7fffffff`, CUDA's canonical NaN, whatever went in. HotSpot
+propagates the payload and flips only the sign bit for negation. Both
+conform — JLS §4.2.3 does not specify the pattern and the PTX ISA says
+"NaN inputs yield an unspecified NaN" — and the only way a program can
+observe it is `floatToRawIntBits`. See `Emitter::unop_f32` for why
+fixing `fneg` alone would be worse than documenting all four.
+
+**Measured correct, so worth recording as tested rather than assumed:**
+the shift masks (JLS §15.19 masks the count; PTX clamps it — the emitter
+masks explicitly), integer division including `MIN_VALUE / -1`, the
+narrowing `i2b`/`i2c`/`i2s`, float→int saturation at every boundary, and
+`ineg`/`lneg` at MIN_VALUE. 27 kernels, 4096 elements each, against a
+CPU control.
+
+**The control is not optional.** The first run of this harness reported
+the emitter as diverging on five kernels. Two of them were the host: a
+`String.equals` miscompile under CratonVM's own JIT made the harness take
+the wrong `printf` arm partway through the loop, so it was comparing
+different quantities. `cratonvm --nojit` as a middle arm is what
+separated them, and the harness now refuses to report a device
+difference at all while the control itself disagrees with HotSpot.
+
 ## What the tests now hold
 
 So that the next change to this file knows what it may not break:
