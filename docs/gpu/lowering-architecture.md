@@ -302,11 +302,13 @@ result cannot be measured.
 **2026-09-02, later the same day:** the second obstacle is gone —
 `GcCriticalGuard` is a registry token and the marshal window declares
 `Relocation::Forbidden`, so an async upload would now be a matter of
-holding that token until the upload event fires. The pinned half landed
-as SYNCHRONOUS staging behind `CRATONVM_GPU_PINNED_H2D=1`
-(`cuda-bridge::PinnedPool`), which is the measurable step: it changes
-only the memory the DMA reads from, against the same blocking contract.
-The measurement it needs is still the one described above.
+holding that token until the upload event fires. The pinned half was
+prototyped as SYNCHRONOUS staging and measured the same day: 10-23%
+slower than the pageable copy at every size from 1 to 128 MiB
+(`cuda-bridge/tests/transfer_bandwidth_it.rs`), so it was removed. What
+remains open is the ASYNC upload, which is a different question —
+overlap with a kernel, not bandwidth — and still needs the measurement
+described above.
 
 ### A cubin cache
 

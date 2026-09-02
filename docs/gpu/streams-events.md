@@ -378,8 +378,7 @@ every kernel goes through `launch_on_stream` on a caller-created
 `Stream`, ordered by the per-buffer `last_write` events, and the
 synchronous copies record nothing.
 
-The context also owns two allocation pools (`AllocPool` for device
-memory, `PinnedPool` for page-locked upload staging) — see
+The context also owns a device allocation pool (`AllocPool`) — see
 [`docs/gpu/README.md`](README.md) for their kill switches.
 
 ## Stub-mode op log

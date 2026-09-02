@@ -1746,11 +1746,9 @@ pub const INVENTORY: &[E] = &[
     // launches queued behind it on its stream). `gpu-device-pool` is
     // DEFAULT-ON with a "0" off-word: the bridge's device-allocation pool has
     // no observable semantics, so the only honest way to price it is one
-    // binary both ways. `gpu-pinned-h2d` routes synchronous uploads through
-    // page-locked staging; opt-in until measured against the pageable path.
+    // binary both ways.
     E { group: Group::GC, token: "gpu-host-callback", on_key: Some("CRATONVM_GPU_HOST_CALLBACK"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "gpu-device-pool", on_key: Some("CRATONVM_GPU_DEVICE_POOL"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
-    E { group: Group::GC, token: "gpu-pinned-h2d", on_key: Some("CRATONVM_GPU_PINNED_H2D"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "gpu-zerocopy", on_key: None, off_key: Some("CRATONVM_GPU_NO_ZEROCOPY"), off_word: None, since: "2026-06-16" },
     // Measurement lever: root every heap-backed LinkedHashMap overlay entry
     // again, restoring the unbounded young-gen pinning the skip-set removed.

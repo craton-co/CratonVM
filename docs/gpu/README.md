@@ -207,8 +207,8 @@ Thin, JVM-agnostic CUDA Driver API wrapper. **Two backends:**
   the [`cudarc`](https://crates.io/crates/cudarc) crate (pinned to
   `cuda-12060`). Owns two copy streams for the synchronous transfers
   and orders every kernel launch by per-buffer `last_write` events;
-  owns the device-allocation pool and the pinned upload-staging pool
-  (`CRATONVM_GPU_DEVICE_POOL=0` / `CRATONVM_GPU_PINNED_H2D=1`).
+  owns the device-allocation pool (`CRATONVM_GPU_DEVICE_POOL=0`
+  disables it).
 
 Public surface:
 

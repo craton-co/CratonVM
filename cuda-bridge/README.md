@@ -104,8 +104,8 @@ returning.
 **Pools.** Freed device allocations return to a per-context pool keyed
 by exact size and are reused by the next allocation of that size once
 the buffer's last-write event has fired (`CRATONVM_GPU_DEVICE_POOL=0`
-disables it). `CRATONVM_GPU_PINNED_H2D=1` routes synchronous uploads
-through page-locked staging slabs the context keeps.
+disables it). Uploads read the caller's memory directly: page-locked
+staging was measured 10-23% slower at every size (see `PinnedHostBuffer`).
 
 ### `Event`
 

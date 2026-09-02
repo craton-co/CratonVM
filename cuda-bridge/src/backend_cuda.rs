@@ -33,9 +33,11 @@
 //! `cuMemAlloc` measured 117 us on an RTX 2060 — more than the device
 //! time of a small kernel — and the offload path allocates on every
 //! cache miss and for every scalar-return cell. [`AllocPool`] recycles
-//! device allocations by exact byte size, and [`PinnedPool`] recycles
-//! page-locked host staging for the H2D copy. Both are per context and
-//! both are bounded; see their docs for the kill switches.
+//! device allocations by exact byte size; it is per context and bounded,
+//! and `CRATONVM_GPU_DEVICE_POOL=0` is its kill switch. Page-locked
+//! staging for the H2D copy was prototyped the same day and measured
+//! SLOWER than the pageable copy at every size (see `PinnedHostBuffer`
+//! in `lib.rs`), so the upload reads the caller's memory directly.
 
 use crate::{DeviceCaps, DeviceError, KernelArg, KernelArgs, LaunchConfig, Result};
 use cudarc::driver::{
@@ -165,8 +167,13 @@ unsafe impl Send for AllocPool {}
 // free on the bound context.
 unsafe impl Sync for AllocPool {}
 
-/// `CRATONVM_GPU_DEVICE_POOL=0` turns the allocation pools off.
-fn device_pool_enabled() -> bool {
+/// `CRATONVM_GPU_DEVICE_POOL=0` turns the allocation pool off.
+///
+/// `pub(crate)` because `DeviceBuffer::drop` in `lib.rs` reads it too: the
+/// drop-time event query exists only to decide whether a block may be
+/// recycled, so with the pool off it must not run at all. A kill switch
+/// that leaves half the change in place is not a control arm.
+pub(crate) fn device_pool_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         cratonvm_types::flags::runtime_var("CRATONVM_GPU_DEVICE_POOL")
@@ -239,137 +246,6 @@ impl Drop for AllocPool {
     }
 }
 
-/// Recycled page-locked host staging for the synchronous upload.
-///
-/// An H2D copy from ordinary pageable memory is staged by the driver
-/// through its own pinned buffer; measured on this box the driver's
-/// staging tops out around 4 GB/s where a copy from page-locked memory
-/// reaches 13 GB/s. Staging through a pinned slab this crate owns — one
-/// `memcpy` at ~26 GB/s, then one DMA at 13 GB/s — is worth roughly 2x
-/// on the upload leg, and `cuMemAllocHost` is far too expensive to pay
-/// per upload, so the slabs are kept.
-///
-/// Best-fit by size: a request takes the smallest parked slab that
-/// holds it, so a workload with a few array sizes settles onto a few
-/// slabs. Bounded by [`PINNED_POOL_CAP_BYTES`] of parked staging and by
-/// [`PINNED_STAGE_MAX_BYTES`] per upload — pinning gigabytes of host
-/// memory is a cost of its own, and a very large array is where the
-/// driver's own staging is already efficient.
-///
-/// Opt-in via `CRATONVM_GPU_PINNED_H2D=1` until it is measured against
-/// the synchronous path it replaces; see `docs/gpu/README.md`.
-pub(crate) struct PinnedPool {
-    /// `(bytes, host pointer)`, unordered.
-    free: std::sync::Mutex<Vec<(usize, *mut std::ffi::c_void)>>,
-    parked_bytes: std::sync::atomic::AtomicUsize,
-    dev: Arc<CudaDevice>,
-}
-
-/// Most pinned staging one context parks.
-const PINNED_POOL_CAP_BYTES: usize = 256 << 20;
-/// Uploads larger than this go straight from the caller's memory.
-const PINNED_STAGE_MAX_BYTES: usize = 64 << 20;
-
-// SAFETY: raw host allocations from `cuMemAllocHost`, freed on the bound
-// context; the list is behind a `Mutex`.
-unsafe impl Send for PinnedPool {}
-// SAFETY: as above.
-unsafe impl Sync for PinnedPool {}
-
-/// `CRATONVM_GPU_PINNED_H2D=1` routes synchronous uploads through pinned
-/// staging.
-fn pinned_h2d_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var("CRATONVM_GPU_PINNED_H2D")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
-            .unwrap_or(false)
-    })
-}
-
-impl PinnedPool {
-    fn new(dev: Arc<CudaDevice>) -> Self {
-        Self {
-            free: std::sync::Mutex::new(Vec::new()),
-            parked_bytes: std::sync::atomic::AtomicUsize::new(0),
-            dev,
-        }
-    }
-
-    /// A page-locked slab of at least `bytes`: the smallest parked one
-    /// that fits, else a fresh `cuMemAllocHost`. `None` when pinned
-    /// staging is off, the upload is above the per-copy cap, or the
-    /// driver refuses.
-    fn take(&self, bytes: usize) -> Option<(usize, *mut std::ffi::c_void)> {
-        if !pinned_h2d_enabled() || bytes == 0 || bytes > PINNED_STAGE_MAX_BYTES {
-            return None;
-        }
-        {
-            let mut free = self.free.lock().unwrap_or_else(|p| p.into_inner());
-            let best = free
-                .iter()
-                .enumerate()
-                .filter(|(_, (size, _))| *size >= bytes)
-                .min_by_key(|(_, (size, _))| *size)
-                .map(|(i, _)| i);
-            if let Some(i) = best {
-                let slab = free.swap_remove(i);
-                self.parked_bytes
-                    .fetch_sub(slab.0, std::sync::atomic::Ordering::Relaxed);
-                return Some(slab);
-            }
-        }
-        self.dev.bind_to_thread().ok()?;
-        let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
-        // SAFETY: `raw` is a live out-param and the context is bound.
-        let rc = unsafe { cudarc::driver::sys::lib().cuMemAllocHost_v2(&mut raw, bytes) };
-        if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS || raw.is_null() {
-            return None;
-        }
-        Some((bytes, raw))
-    }
-
-    /// Park a slab, or free it past the cap. The caller guarantees the
-    /// DMA that read it has completed.
-    fn put(&self, slab: (usize, *mut std::ffi::c_void)) {
-        let over_cap = self
-            .parked_bytes
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .saturating_add(slab.0)
-            > PINNED_POOL_CAP_BYTES;
-        if !over_cap {
-            self.free
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(slab);
-            self.parked_bytes
-                .fetch_add(slab.0, std::sync::atomic::Ordering::Relaxed);
-            return;
-        }
-        self.free_now(slab.1);
-    }
-
-    fn free_now(&self, ptr: *mut std::ffi::c_void) {
-        if self.dev.bind_to_thread().is_err() {
-            return;
-        }
-        // SAFETY: `ptr` came from `cuMemAllocHost_v2` in `take` and is
-        // freed exactly once.
-        unsafe {
-            let _ = cudarc::driver::sys::lib().cuMemFreeHost(ptr);
-        }
-    }
-}
-
-impl Drop for PinnedPool {
-    fn drop(&mut self) {
-        let free = std::mem::take(&mut *self.free.lock().unwrap_or_else(|p| p.into_inner()));
-        for (_, ptr) in free {
-            self.free_now(ptr);
-        }
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct DeviceContextInner {
     dev: Arc<CudaDevice>,
@@ -382,8 +258,6 @@ pub(crate) struct DeviceContextInner {
     copy_d2h: Arc<CudaStream>,
     /// Recycled device allocations. See [`AllocPool`].
     alloc_pool: Arc<AllocPool>,
-    /// Recycled page-locked upload staging. See [`PinnedPool`].
-    pinned_pool: Arc<PinnedPool>,
     /// Free list of `CUevent` handles, recycled instead of destroyed.
     ///
     /// Every kernel submission mints TWO events on this path -- one
@@ -494,7 +368,6 @@ impl DeviceContextInner {
             copy_h2d: copy_h2d.into(),
             copy_d2h: copy_d2h.into(),
             alloc_pool: Arc::new(AllocPool::new(dev.clone())),
-            pinned_pool: Arc::new(PinnedPool::new(dev.clone())),
             event_pool: Arc::new(EventPool {
                 free: std::sync::Mutex::new(Vec::new()),
                 dev,
@@ -839,9 +712,10 @@ impl DeviceModuleInner {
 /// The synchronous upload's device half:
 ///
 ///   1. Takes device storage from the pool, or allocates it.
-///   2. Issues `cuMemcpyHtoDAsync` against `copy_h2d.stream` — from a
-///      page-locked staging slab when `CRATONVM_GPU_PINNED_H2D=1`
-///      (see `PinnedPool`), else straight from `host`.
+///   2. Issues `cuMemcpyHtoDAsync` against `copy_h2d.stream` straight
+///      from `host`. Staging through page-locked memory was measured
+///      10-23% SLOWER at every size (`PinnedHostBuffer` in `lib.rs`), so
+///      there is deliberately no pinned path here.
 ///
 /// AUDIT 2026-09-02: this used to also record a context-wide barrier
 /// event after every upload. Nothing had waited on it since the
@@ -863,31 +737,6 @@ unsafe fn upload_via_copy_h2d_stream<T: bytemuck::Pod + DeviceRepr + Send + Sync
     // is owned by nothing else; the slice takes ownership.
     let slice: CudaSlice<T> = unsafe { ctx.slice_from_raw::<T>(ptr, host.len()) };
     let dst = *DevicePtr::device_ptr(&slice);
-    // Pinned staging when it is on and the copy is small enough to be worth
-    // it: one host memcpy into page-locked memory, then a DMA that the
-    // driver does not have to stage itself. See `PinnedPool`.
-    if let Some(slab) = ctx.pinned_pool.take(bytes) {
-        // SAFETY: the slab holds at least `bytes`, the source is `bytes`
-        // long, and the two cannot overlap (one is a driver allocation).
-        unsafe {
-            std::ptr::copy_nonoverlapping(host.as_ptr() as *const u8, slab.1 as *mut u8, bytes);
-        }
-        // SAFETY: the slab was just filled with `host.len()` `T`s.
-        let staged: &[T] = unsafe { std::slice::from_raw_parts(slab.1 as *const T, host.len()) };
-        // SAFETY: allocation and handles share `ctx`; the slab stays
-        // parked out of the pool until the stream sync below.
-        let rc = unsafe {
-            cudarc::driver::result::memcpy_htod_async(dst, staged, ctx.copy_h2d.stream)
-                .map_err(map_err("cuMemcpyHtoDAsync copy_h2d (pinned)"))
-                .and_then(|()| {
-                    cudarc::driver::result::stream::synchronize(ctx.copy_h2d.stream)
-                        .map_err(map_err("cuStreamSynchronize copy_h2d (pinned)"))
-                })
-        };
-        ctx.pinned_pool.put(slab);
-        rc?;
-        return Ok(slice);
-    }
     // SAFETY: allocation and handles share `ctx`; the caller keeps `host`
     // alive until the upload stream completes.
     unsafe {

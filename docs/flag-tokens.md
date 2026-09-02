@@ -861,7 +861,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-110 tokens.
+109 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -918,7 +918,6 @@ export inherited from a parent shell.
 | `gpu-critical-wait-ms` | `CRATONVM_GPU_CRITICAL_WAIT_MS` |
 | `gpu-host-callback` | `CRATONVM_GPU_HOST_CALLBACK` |
 | `gpu-device-pool` | `CRATONVM_GPU_DEVICE_POOL` |
-| `gpu-pinned-h2d` | `CRATONVM_GPU_PINNED_H2D` |
 | `gpu-zerocopy` | `CRATONVM_GPU_NO_ZEROCOPY` |
 | `lhm-root-all` | `CRATONVM_LHM_ROOT_ALL` |
 | `max-inflated-bytes` | `CRATONVM_MAX_INFLATED_BYTES` |

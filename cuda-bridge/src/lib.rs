@@ -723,22 +723,40 @@ unsafe impl<T: Send> Send for DeviceBuffer<T> {}
 unsafe impl<T: Sync> Sync for DeviceBuffer<T> {}
 
 /// Hand the allocation back to the context's pool when the device is
-/// provably done with it.
+/// already done with it.
 ///
 /// The buffer's `last_write` event names the last launch or copy that
 /// touched the memory. If it has fired (or was never recorded), nothing
-/// on the device can still be reading or writing the block, and it can
-/// be reused by the next allocation with no stream ordering at all. If
-/// it has NOT fired — a buffer evicted from a residency cache while its
-/// kernel is still running — this waits for it. That wait is the fix
-/// for a latent use-after-free as much as it is the pool's admission
-/// test: the underlying `CudaSlice` frees on its own default stream,
-/// which a kernel on a non-blocking user stream is not ordered against.
+/// on the device can still be reading or writing the block and the next
+/// allocation of that size may have it with no stream ordering at all.
+///
+/// # This must never WAIT
+///
+/// AUDIT 2026-09-02, second pass. The first version called
+/// `ev.synchronize()` when the query said "not yet", to widen the pool's
+/// admission. That is a host block on the dropping thread, and the
+/// thread that drops a per-dispatch buffer is the thread submitting the
+/// next dispatch — so a chain of launches serialised on it, which is the
+/// same defect as the per-launch host callback one file over. Measured
+/// on an RTX 2060 (`GpuAsyncChainBench`, 400 launches): 99 us/launch
+/// with the wait, 52 without.
+///
+/// A block whose event has not fired simply takes the ordinary path:
+/// `CudaSlice::drop` calls `cuMemFree`, which the driver documents as
+/// synchronizing with respect to the device, so it is safe against a
+/// running kernel — it is only RECYCLING the block behind a live kernel
+/// that would corrupt, and that is exactly what the query rules out.
+///
+/// Gated on the pool's own switch so `CRATONVM_GPU_DEVICE_POOL=0`
+/// removes the whole change, query included, rather than half of it.
 ///
 /// See `backend_cuda::AllocPool` for the pool and its kill switch.
 #[cfg(feature = "cuda")]
 impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
+        if !backend::device_pool_enabled() {
+            return;
+        }
         let last = self
             .last_write
             .lock()
@@ -746,11 +764,7 @@ impl<T> Drop for DeviceBuffer<T> {
             .take();
         let idle = match last {
             None => true,
-            Some(ev) => match ev.query() {
-                Ok(true) => true,
-                Ok(false) => ev.synchronize().is_ok(),
-                Err(_) => false,
-            },
+            Some(ev) => matches!(ev.query(), Ok(true)),
         };
         if idle {
             self.inner.set_retire_to_pool();
