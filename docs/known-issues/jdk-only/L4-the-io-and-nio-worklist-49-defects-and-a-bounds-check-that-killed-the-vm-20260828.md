@@ -2122,9 +2122,13 @@ Path.of("a/b"), with java/nio/file/Path armed
 ```
 
 `toString` returning the IDENTITY string is the tell: `Object.toString()` ran.
-Not a wrong answer from `UnixPath.toString()` — that would NPE on an unpopulated
-`path`. **`sun/nio/fs/UnixPath` here is a class NAME with no bytecode behind
-it**, and the four rows that still work are the ones our natives still answer.
+
+> **CORRECTED — see §P6.8.** This section went on to conclude that
+> "`sun/nio/fs/UnixPath` here is a class NAME with no bytecode behind it". That
+> is **false**, and inferring it from `Object.toString()` running was the
+> mistake. The class is real and complete; its INSTANCES are empty, and the two
+> field indices this VM writes land on the wrong slots. §P6.8 has the
+> measurement.
 
 `Files`'s residual is the same shape one class over: real `Files.probeContentType`
 reaches `DefaultFileTypeDetector.create()`, which calls `getFileTypeDetector()`
@@ -2144,3 +2148,116 @@ Papering it with a second fabrication — registering `getFileTypeDetector` to
 return a synthetic detector — would move the number to the floor and make the
 retirement look safe while leaving the reason it is not exactly where it was.
 Deliberately not done.
+
+
+## P6.7 The last residual, re-measured — it was three rows more than the record said
+
+`FileInputStream.skip` past EOF has been this lane's single carried residual
+since part one, on a §4.3 note that called it "contract-legal, and a resolution
+finding no registrar edit can move". Both halves of that were re-measured on
+2026-08-30. The conclusion survives. The evidence did not, and neither did the
+count.
+
+**It is four rows, not one.** The probe asked one, so the record inherited one:
+
+```text
+                              HotSpot        this VM
+skip(4) at EOF                     4              0
+skip(2) on a 1-byte file           2              1
+skip(100), 1 byte remaining      100              0
+skip(-1) at position 0     IOException        no-throw
+```
+
+`FileInputStream` **overrides** `InputStream.skip` — its `skip0` is one `lseek`,
+so it may seek past the end and report bytes that were never there, and it
+refuses a negative count. Read-and-discard can only ever report what is
+actually present. Calling that "contract-legal" leaned on `InputStream.skip`'s
+licence to skip fewer bytes, which is the contract of the class this one
+overrides. `L4StreamTailSweep` now asks all four.
+
+**Both stated reasons were wrong.**
+
+*"`skip0(J)J` has `invocations: 0`, so the body cannot be the problem."* The
+registry now reads `skip 0 / skip0 5` for a five-`skip` program. That number is
+real and it is not entry — an `eprintln!` placed in the body printed **nothing**,
+in `--jdk-only` and in the default mode alike. The counter counts a dispatch
+ATTEMPT. (The mirror of `a-zero-invocation-count-is-evidence-about-a-counter`: a
+non-zero count is evidence about a counter too.)
+
+*"`FileInputStream.skip` resolves to its superclass's method."* It does not:
+
+```text
+FileInputStream.class.getMethod("skip", long.class).getDeclaringClass()
+  HotSpot   java.io.FileInputStream
+  this VM   java.io.FileInputStream
+```
+
+and `getDeclaredMethods` lists `skip` **and** `skip0` on the class, exactly as
+HotSpot does. Resolution is correct; what differs is the body `invokevirtual`
+enters. The four answers above are precisely `InputStream.skip`'s
+read-and-discard default, so that is the bytecode running.
+
+**So it is a DISPATCH finding** — the superclass body is entered for a method the
+subclass declares and overrides — and it is still true that no edit to either
+native in `native-io/src/lib.rs` can move it. A seek-based body was written and
+measured inert a second time before being reverted; code that cannot run is
+worse than the absence of it. The source note now carries this account instead
+of the old one.
+
+```text
+2924 differential rows across nine L4 probes, both modes
+2920 identical to HotSpot 25.0.4+7
+   4 residual — the FileInputStream.skip family, one dispatch cause
+```
+
+The headline moved from "1 residual" to 4 because the probe got more honest, not
+because the VM got worse.
+
+
+## P6.8 `UnixPath` is real — it is the instances that are empty
+
+§P6.6 concluded that `sun/nio/fs/UnixPath` is "a class NAME with no bytecode
+behind it", inferred from `Object.toString()` running under the armed dial. That
+inference was wrong, and the same mistake had already been made once in this
+lane on `FileInputStream.skip` (§P6.7): **a method not behaving like the
+subclass's is not evidence that the subclass is absent.** Asked directly:
+
+```text
+                     HotSpot                 this VM
+class                sun.nio.fs.UnixPath     sun.nio.fs.UnixPath
+declaredMethods      52                      52
+declaredFields       7                       7
+declares toString    true                    true
+```
+
+Byte-identical. The class is fully loaded. What differs is the *instance*:
+
+```text
+field         HotSpot                      this VM
+path          byte[3] = a/b                NULL
+stringValue   NULL                         NULL
+fs            sun.nio.fs.LinuxFileSystem   String = "a/b"
+```
+
+`UnixPath`'s instance slots are `fs`(0) `path`(1) `stringValue`(2) `hash`(3)
+`offsets`(4). This VM's `P57_PATH_FIELD` is 0 and `P57_PATH_FS_FIELD` is 1 — so
+**the path string is written where a `UnixFileSystem` belongs, and the owning
+filesystem where a `byte[]` belongs.** Two type-confused slots, invisible for as
+long as our own natives read them back by the same indices, and exactly the
+`System.out` shape from §P6.1 one class over.
+
+**The cheap half does not exist.** Writing `stringValue` by name — which real
+`UnixPath.toString()` returns directly when set — was tried and measured inert:
+the object is allocated against `java/nio/file/Path`, the INTERFACE, with two
+slots, so a `UnixPath` field name does not resolve and the write silently does
+nothing. `stringValue` read back NULL and the armed scope did not move. Reverted.
+
+So the repair is the whole thing: allocate as `sun/nio/fs/UnixPath` at its true
+width, store into the named slots (`fs` for the owning filesystem — which is
+what that field means — `path` for the bytes, `stringValue` for the string), and
+move the 17 `P57_PATH_FIELD`/`P57_PATH_FS_FIELD` sites onto by-name access.
+That is a change to the hottest allocation in `java.nio.file`, it wants its own
+measurement including throughput, and **every unarmed row is 0-diff today** — it
+buys the retirement of this family, not a correctness fix. Left open, with the
+layout above so the next attempt starts from the measurement rather than from
+`Object.toString()`.
