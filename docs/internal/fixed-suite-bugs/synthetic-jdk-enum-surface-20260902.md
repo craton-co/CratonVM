@@ -80,28 +80,86 @@ kept: the `Object` form is what the compiler-generated `Map.put` bridge emits.
 printed `java.util.EnumSet@9` where HotSpot prints `[ALPHA, GAMMA]`. Real-JDK
 runs `AbstractCollection.toString()`; synthetic mode reached `Object.toString`.
 
-## What remains: 4 rows, one cause, and it is not a mechanism
+## The last 4 rows: closed, and the cause was not what the enum names said
+
+The four were `DayOfWeek.MONDAY`, `HttpClient$Version.HTTP_1_1`,
+`HttpClient$Redirect.NEVER` and `EnumSet.allOf(TimeUnit.class)`. The obvious
+reading — "three JDK enums are not modelled, and that is inherent to a mode with
+no class files" — was right about the first three and **wrong about why the
+fourth failed**, and the fourth is the interesting one.
+
+### Three enums, modelled
+
+`class_manager.rs` now declares their constants (through a shared
+`enum_constant_fields` builder, in `javap` declaration order because THAT IS THE
+ORDINAL), `native-builtins` publishes them through a single generic
+`publish_synthetic_enum_constants`, and each gets a `java/lang/Enum` superclass
+row.
+
+That superclass row is not paperwork. Without it the constants publish fine and
+`HttpClient$Version.HTTP_1_1.name()` is a `NoSuchMethodError`, because
+`Enum.name()`/`ordinal()`/`compareTo()` are registered on `java/lang/Enum` —
+which is exactly what `posix_publish_constants`' doc predicted: *"one missing
+superclass row … and every constant is NAMELESS"*.
+
+One generic publisher rather than three copies, for the reason that same doc
+gives: it is itself the survivor of a copy whose `name`/`ordinal` fallbacks came
+out INVERTED, latent only because a superclass row happened to exist.
+
+### `EnumSet.allOf` was never about those enums
+
+`TimeUnit` was already fully modelled — table, `<clinit>`, working `name()`,
+`ordinal()`, `toNanos()`, `values()` — and `EnumSet.allOf(TimeUnit.class)` still
+answered 0. Two causes stacked, and neither is visible from an enum's own
+behaviour:
+
+1. **No synthetic JDK enum has ever carried `ACC_ENUM`.**
+   `class_is_declared_enum` requires the flag AND a `java/lang/Enum` parent, and
+   it gates `Class.getEnumConstants`, which `EnumSet.allOf` reads through. So:
+
+   ```text
+   TimeUnit             isEnum=false getEnumConstants=null allOf=0
+   DayOfWeek            isEnum=false getEnumConstants=null allOf=0
+   PosixFilePermission  isEnum=false getEnumConstants=null allOf=0   <- the MODEL
+   a user-defined enum  isEnum=true  getEnumConstants=2    allOf=2
+   ```
+
+   `PosixFilePermission` has been the template every other synthetic enum was
+   copied from, and it was in this state the whole time. `create_synthetic_stub`
+   now derives `ACC_ENUM` from the superclass row — one fact, one place, no
+   second list of enum names — and it has to be tested BEFORE the `$`/`able`
+   heuristics, or `HttpClient$Version` is fabricated as an INTERFACE.
+
+2. **`$VALUES` was declared for no synthetic enum at all.**
+   `set_static_field_by_name` resolves a DECLARED static and is a silent no-op
+   otherwise, so `<clinit>`s that published `$VALUES` were writing nowhere.
+   `posix_publish_constants` says so about itself — *"the declaration is
+   nominated; the publish is written now so it starts working the moment that
+   lands"* — and this lands it, for `PosixFilePermission` and `TimeUnit` as well
+   as the three new enums.
+
+Neither was findable from the four failing rows. **`ACC_ENUM` was invisible
+because nothing asked**: an enum answers `name()`, `ordinal()`, `values()`,
+`valueOf` and `switch` correctly without it, and only `isEnum()` /
+`getEnumConstants()` / `EnumSet` ever look. Finding it took a diagnostic that
+printed `isEnum` and `getEnumConstants` beside the answer, rather than the
+answer alone — and the tell was the CONTROL row: a user-defined enum passing
+every column that the JDK enums failed.
+
+## Result
 
 ```text
-HttpClient.Version.HTTP_1_1   NoSuchFieldError
-HttpClient.Redirect.NEVER     NoSuchFieldError
-DayOfWeek.MONDAY              NoSuchFieldError
-EnumSet.allOf(TimeUnit.class) 0 where HotSpot gives 7
+real-JDK           20 / 20 identical to HotSpot 25.0.3   (unchanged)
+--synthetic-jdk    20 / 20 identical                     (was 8 differing)
 ```
 
-A synthetic JDK enum needs an explicit entry in `class_manager`'s field table
-declaring its constants as statics, **plus** a native `<clinit>` to populate
-them — the shape `PosixFilePermission` and `TimeUnit` already have, which is
-why `TimeUnit.MILLISECONDS.name()` and `TimeUnit.values()` are correct while
-`DayOfWeek.MONDAY` is not.
+`PosixFilePermission` goes from `getEnumConstants=null` to 9 as a side effect,
+and `apps/probes/CollectionViewTypes`' `EnumSet` row stops being a
+`NoSuchFieldError`.
 
-There is no general fix available: synthetic mode has no class file to read the
-constants from, so every JDK enum it supports is hand-modelled by construction.
-Adding these three is mechanical and is whack-a-mole by nature — a table entry
-plus a `<clinit>` each — and declaring the fields WITHOUT the `<clinit>` would
-be worse than the current error, because `GETSTATIC` would then resolve to a
-null constant, which is exactly the shape the two stale tests above hit.
-
-`EnumSet.allOf` on a JDK enum is the same cause one level along: it reads
-`$VALUES`, and the hand-written tables declare the constants but no `$VALUES`
-array.
+Two guesses were made and measured wrong on the way here, both corrected by
+instrumenting instead of reasoning: `ACC_ENUM` was first added to
+`synthetic_stub_access_flags`, which is never called for these classes (a
+temporary `eprintln` proved it — the branch never fired), and `TimeUnit`'s
+missing superclass row was assumed absent-but-harmless until `isEnum` was
+printed.
