@@ -6018,7 +6018,21 @@ impl G1Collector {
             // overwritten, and that reads back as exactly the censused shape.
             let holder_grid = self
                 .lookup_region_for_addr(holder as usize)
-                .map(|i| self.locate_in_object_grid(&regions[i], holder as usize))
+                .map(|i| {
+                    let r = &regions[i];
+                    let off = (holder as usize).wrapping_sub(r.data.as_ptr() as usize);
+                    format!(
+                        "{} {}",
+                        self.locate_in_object_grid(r, holder as usize),
+                        // The RAW bytes. A `class_id` of 0x65676170 with
+                        // `num_slots` 115 is the ASCII `page` + `s` -- an H2
+                        // MVStore chunk header, i.e. byte-ARRAY PAYLOAD being
+                        // read as an object header. Decoding that from two
+                        // decimal fields is a trick a reader should not have
+                        // to repeat.
+                        hexdump_around(r.data.as_ptr() as *mut u8, r.cursor, off),
+                    )
+                })
                 .unwrap_or_else(|| "grid=no-region".to_string());
             // SAFETY: as above -- the evacuator owns the holder under the lock.
             let holder_mark = unsafe {
@@ -6242,6 +6256,15 @@ impl G1Collector {
         let jit_skips = self.jit_tlab_skip_spans();
         let mut offset = 0usize;
         let mut objects = 0usize;
+        // The object the walk stepped over to arrive here, and the step it
+        // took. `grid=OBJECT-START` alone cannot distinguish "the grid is
+        // sound and this really is an object" from "the grid is walking at
+        // wrong boundaries and lands here by construction" -- and the second
+        // is what a header full of ASCII (`class_id=0x65676170`, the bytes
+        // `page`, from an H2 MVStore chunk header) means. The PREDECESSOR is
+        // the object whose size decided this boundary, so it is the one to
+        // name.
+        let mut prev = String::from("prev=none");
         while offset < region.cursor {
             let obj_ptr = (base + offset) as *mut u8;
             if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_ptr as usize) {
@@ -6285,7 +6308,7 @@ impl G1Collector {
                 );
             }
             if target == offset {
-                return format!("grid=OBJECT-START idx={objects} size=0x{obj_size:x}");
+                return format!("grid=OBJECT-START idx={objects} size=0x{obj_size:x} {prev}");
             }
             if target < offset + obj_size {
                 return format!(
@@ -6296,10 +6319,19 @@ impl G1Collector {
                     header.kind(),
                 );
             }
+            prev = format!(
+                "prev=(off=0x{offset:x} cid={} kind={:?} elem={:?} alen={} slots={} size=0x{obj_size:x} mark={:#018x})",
+                header.class_id.as_u32(),
+                header.kind(),
+                header.element_type(),
+                header.array_length(),
+                header.num_slots(),
+                header.mark_word.load(Ordering::Relaxed),
+            );
             offset += obj_size;
             objects += 1;
         }
-        format!("grid=PAST-CURSOR walked={objects} objects to 0x{offset:x}")
+        format!("grid=PAST-CURSOR walked={objects} objects to 0x{offset:x} {prev}")
     }
 
     fn scan_and_evacuate_refs(
