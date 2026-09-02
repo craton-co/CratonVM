@@ -26828,8 +26828,59 @@ fn getclass_backing_is_random_access(ctx: &mut dyn NativeContext, this: ObjectRe
         Some(cid) => cid,
         None => return false,
     };
-    let backing_cid = ctx.class_id_of_object(backing);
-    ctx.is_subclass(backing_cid, ra)
+    getclass_object_reaches(ctx, backing, ra, 0)
+}
+
+/// Does `obj` reach `target` as the object it STANDS FOR?
+///
+/// The plain `is_subclass` above is the whole answer for an ordinary receiver.
+/// It is not the answer for a wrapper of a wrapper —
+/// `Collections.unmodifiableList(List.of("a", "b"))` backs one
+/// `cratonvm/internal/UnmodifiableList` stamp with another, and every stamp
+/// declares only its FAMILY-level interfaces (`List`, `Collection`,
+/// `Serializable`), never `RandomAccess`, because that marker is a property of
+/// what the instance wraps. Asking the inner stamp's own hierarchy answers
+/// `false` for `List.of`, whose HotSpot display class
+/// (`ImmutableCollections$ListN`, via `AbstractImmutableList`) implements it.
+///
+/// So descend slot 0 (`UNMOD_FIELD_BACKING`): an unmodifiable view carries the
+/// marker exactly when the thing it wraps does.
+///
+/// This function is one half of a PAIR and must not move alone. The interpreter
+/// runs the identical rule in `interpreter::typecheck::object_reaches`, because
+/// the `instanceof`/`checkcast` opcodes cannot call in here — the receiver is a
+/// bare Rust local at that point and this side may load classes and safepoint.
+/// The two answer the same question about the same object through different
+/// machinery, and when they disagree the VM reports one class from `getClass()`
+/// and admits a different one at a cast. Change either and change both;
+/// `apps/probes/RandomAccessProbe` prints all three doors per row and an
+/// `agree=` column that goes false the moment they part.
+fn getclass_object_reaches(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+    target: cratonvm_types::ClassId,
+    depth: usize,
+) -> bool {
+    // A wrapper chain is a handful of links; the bound is a cycle guard, not a
+    // policy. (`alloc_unmod_wrapper` stores an object that already existed, so
+    // slot-0 nesting is acyclic by construction — this is insurance.)
+    if depth > 8 {
+        return false;
+    }
+    let cid = ctx.class_id_of_object(obj);
+    if ctx.is_subclass(cid, target) {
+        return true;
+    }
+    let is_stamp = ctx
+        .class_name_of_id(cid)
+        .is_some_and(|n| n.starts_with("cratonvm/internal/Unmodifiable"));
+    if !is_stamp {
+        return false;
+    }
+    match ctx.get_field(obj, 0) {
+        Value::Object(Some(inner)) => getclass_object_reaches(ctx, inner, target, depth + 1),
+        _ => false,
+    }
 }
 
 /// Whether the backing set of an unmodifiable-sorted-set wrapper (slot 0,

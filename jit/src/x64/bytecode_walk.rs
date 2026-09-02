@@ -757,6 +757,15 @@ impl Compiler {
                     .arith_hoist_info
                     .iter()
                     .any(|h| h.loop_header < pc && pc < h.loop_end);
+                // The array-length hoist caches an int, not a pointer, so a
+                // cold slot cannot be dereferenced -- but it can be BELIEVED.
+                // The hoisted length is what a `bounds_safe_pcs` access was
+                // proved safe against, so entering with a garbage length is an
+                // unchecked out-of-bounds access, not merely a wrong answer.
+                let inside_len_hoisted = self
+                    .array_len_hoist_info
+                    .iter()
+                    .any(|h| h.loop_header < pc && pc < h.loop_end);
                 // A versioned rewrite's pre-header guard is SYNTHETIC: its
                 // bytes are an image of no original instruction, so there is no
                 // bci for an entry there to be published under, and part-way
@@ -779,6 +788,7 @@ impl Compiler {
                 let handler_only = handler_only_pcs.get(pc).copied().unwrap_or(false);
                 if inside_aaload_hoisted
                     || inside_arith_hoisted
+                    || inside_len_hoisted
                     || inside_synthetic_guard
                     || handler_only
                 {
@@ -1084,6 +1094,59 @@ impl Compiler {
                 for (steps, result_offset) in arith_hoists {
                     self.emit_arith_hoist_into_rax(&steps);
                     self.emit_store_local(result_offset, RAX);
+                }
+            }
+
+            // === LICM: Emit hoisted `arraylength` at loop headers ===
+            // Same placement contract as the two hoists above: emitted BEFORE
+            // `pc_to_native[pc]` is set, so the back edge skips it, while
+            // `osr_entry_native[pc]` (set above) points here, so a cold OSR
+            // entry at the header runs it.
+            //
+            // SOUNDNESS: the pre-header executes UNCONDITIONALLY, including
+            // when the loop is zero-trip. `find_array_len_hoists` therefore
+            // only offers sites in the HEADER'S STRAIGHT-LINE PREFIX -- reached
+            // through nothing but local/constant pushes -- so the original
+            // program was always going to evaluate this `arraylength` at this
+            // exact moment anyway. That is why the null case here THROWS
+            // (`npe_action::ARRAY_LENGTH`, the same JEP-358 action and the same
+            // shared stub the in-loop `arraylength` would have used) rather
+            // than deopting the way the aaload hoist's unconstrained sites must.
+            // It also keeps the emitted bytes address-independent: a deopt
+            // snapshot bakes a `Box` pointer, and two compiles of one method
+            // would stop producing identical code.
+            //
+            // The cached value is an int, so unlike the aaload hoist's row
+            // pointer it is not a GC root, needs no oop map, and is not
+            // invalidated by relocation: an array's length is immutable and
+            // no bytecode can write it.
+            {
+                let len_hoists: Vec<(usize, i32)> = self
+                    .array_len_hoist_info
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, h)| h.loop_header == pc)
+                    .map(|(idx, h)| (h.array_local, self.array_len_hoist_offsets[idx]))
+                    .collect();
+                for (array_local, hoist_offset) in len_hoists {
+                    // Array reference into RAX.
+                    if let Some(reg) = self.reg_for_local(array_local) {
+                        self.emit_mov_reg_reg(RAX, reg);
+                    } else {
+                        self.emit_load_local(RAX, self.local_offset(array_local));
+                    }
+                    // The in-loop null check, moved here whole: same TEST/JZ,
+                    // same shared stub, same "Cannot read the array length"
+                    // action. It is elided outright when the dataflow already
+                    // proves the receiver non-null at the header.
+                    if !self.is_local_nonnull(pc, array_local) {
+                        self.emit_null_check_array_load(npe_action::ARRAY_LENGTH);
+                    }
+                    // MOV EAX, [RAX + array length offset] -- zero-extends into
+                    // RAX, and a length is non-negative, so the 64-bit slot
+                    // below holds the same number either way.
+                    self.emit_arraylength_regs();
+                    self.emit_store_local(hoist_offset, RAX);
                 }
             }
 
@@ -1432,6 +1495,43 @@ impl Compiler {
                     self.emit_load_local(RAX, hoist_offset);
                     self.push_from_rax();
                     // Mark intermediate PCs in the skipped sequence
+                    let native_pos = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                    let mut skip_pc = pc + bytecode_len_at(code, pc);
+                    while skip_pc < seq_end {
+                        self.pc_to_native[skip_pc] = native_pos;
+                        skip_pc += bytecode_len_at(code, skip_pc);
+                    }
+                    pc = seq_end;
+                    continue;
+                }
+            }
+
+            // === LICM: Replace a hoisted `arraylength` with a slot load ===
+            // `aload A ; arraylength` becomes one `MOV RAX, [rbp-slot]`,
+            // deleting the receiver move, the null check's TEST/JZ and the
+            // header dereference from every iteration. The pushed value is an
+            // INT: `push_from_rax` leaves the slot unmarked, which is what the
+            // oop maps must see -- a length is never a reference.
+            {
+                let len_replace = self
+                    .array_len_hoist_info
+                    .iter()
+                    .enumerate()
+                    .find_map(|(idx, h)| {
+                        h.sites
+                            .iter()
+                            .find(|&&(start, _)| start == pc)
+                            .map(|&(_, seq_end)| (seq_end, self.array_len_hoist_offsets[idx]))
+                    });
+
+                if let Some((seq_end, hoist_offset)) = len_replace {
+                    self.emit_load_local(RAX, hoist_offset);
+                    self.push_from_rax();
+                    // Mark the skipped `arraylength`. `find_array_len_hoists`
+                    // rejects a sequence whose interior is a branch target, so
+                    // nothing jumps here -- but `pc_to_native` is also read by
+                    // the deopt and OSR machinery, and a `-1` hole there is a
+                    // different claim than "the same native point".
                     let native_pos = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
                     let mut skip_pc = pc + bytecode_len_at(code, pc);
                     while skip_pc < seq_end {
@@ -4219,6 +4319,17 @@ impl Compiler {
                                     .filter(|&&po| po >= body_start && po < body_end)
                                     .copied()
                                     .collect();
+                                // RIP-relative displacements addressing a fixed
+                                // absolute target (the safepoint flag). Same
+                                // hazard as the helper rel32 above and the same
+                                // fix: verbatim bytes would address
+                                // `target + shift` from the copy.
+                                let orig_rip_abs: Vec<(usize, usize)> = self
+                                    .rip_abs_disp32_patches
+                                    .iter()
+                                    .filter(|&&(po, _)| po >= body_start && po < body_end)
+                                    .copied()
+                                    .collect();
                                 let orig_ic_patches: Vec<(usize, u8, usize)> = self
                                     .ic_patches
                                     .iter()
@@ -4312,6 +4423,47 @@ impl Compiler {
                                             // Widening: i64/usize -> i128 (no truncation, for range check)
                                             delta >= i32::MIN as i128 && delta <= i32::MAX as i128,
                                             "unrolled helper rel32 out of range",
+                                        );
+                                        self.buf
+                                            .try_patch_i32(copy_po, delta as i32) // Cast: rel32 displacement
+                                            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
+                                    }
+
+                                    // RIP-relative absolute-target
+                                    // displacements. Identical reasoning to
+                                    // the helper rel32 above, with one
+                                    // difference that is easy to get wrong:
+                                    // the reference point is the end of the
+                                    // whole instruction, so `trail` (the bytes
+                                    // emitted AFTER the displacement — an
+                                    // `imm8` for the safepoint poll's `TEST`)
+                                    // is part of it.
+                                    for &(po, trail) in &orig_rip_abs {
+                                        let mut d_bytes = [0u8; 4];
+                                        d_bytes.copy_from_slice(&self.buf.as_slice()[po..po + 4]);
+                                        let orig_disp32 = i32::from_le_bytes(d_bytes);
+                                        let orig_next_pc = buf_base
+                                            .wrapping_add(po)
+                                            .wrapping_add(4)
+                                            .wrapping_add(trail);
+                                        let target =
+                                            // Widening: usize address & i32 disp32 -> i64 (no truncation; rel math)
+                                            (orig_next_pc as i64).wrapping_add(orig_disp32 as i64);
+                                        let copy_po = po + shift_us;
+                                        let copy_next_pc = buf_base
+                                            .wrapping_add(copy_po)
+                                            .wrapping_add(4)
+                                            .wrapping_add(trail);
+                                        let delta: i128 =
+                                            // Widening: i64/usize -> i128 (no truncation, for range check)
+                                            (target as i128) - (copy_next_pc as i128);
+                                        // Reachable at the original site stays
+                                        // reachable at the copy: the shift is
+                                        // at most one loop body.
+                                        debug_assert!(
+                                            // Widening: i64/usize -> i128 (no truncation, for range check)
+                                            delta >= i32::MIN as i128 && delta <= i32::MAX as i128,
+                                            "unrolled RIP-relative disp32 out of range",
                                         );
                                         self.buf
                                             .try_patch_i32(copy_po, delta as i32) // Cast: rel32 displacement
@@ -4439,6 +4591,13 @@ impl Compiler {
                                     // (e.g. a nested unroll) sees the copy.
                                     self.helper_call_patches
                                         .extend(orig_helper_calls.iter().map(|&po| po + shift_us));
+                                    // Same, for the RIP-relative sites just
+                                    // re-resolved above.
+                                    self.rip_abs_disp32_patches.extend(
+                                        orig_rip_abs
+                                            .iter()
+                                            .map(|&(po, trail)| (po + shift_us, trail)),
+                                    );
                                     // IC patches: same idea — record the
                                     // shifted imm64 location with its kind
                                     // so any later pass can find it.
@@ -5793,6 +5952,23 @@ impl Compiler {
                                 // (cell base, not +8) differ.
                                 let cell_off = (HEADER_SIZE + c_off as usize) as i32; // Cast: disp32
                                 let mut bail: Vec<usize> = Vec::new();
+                                // F-08 — the G1 arm. Under G1 the guard
+                                // below rejects every receiver (empty
+                                // store-side table), so this whole inline path
+                                // was dead there and every reference store was
+                                // an out-of-line `jit_putfield_object` call.
+                                // When a G1 collector has published its
+                                // geometry and `CRATONVM_G1_INLINE_BARRIER` is
+                                // set, take the containment guard against the
+                                // READ table (which G1 does publish, and which
+                                // answers the only question the guard is doing
+                                // here: can these header reads and this store
+                                // fault) and emit a REAL G1 post-write barrier
+                                // after the store. `region_bounds_are_live`
+                                // stays false under G1 and the barrier-free
+                                // premise stays unavailable — see
+                                // `g1_inline_barrier_available`.
+                                let g1 = self.g1_inline_barrier_available();
                                 self.load_slot_to_reg(RAX, obj_slot);
                                 // INT-6: null + alignment + published-region
                                 // containment (subsumes the old bare null check).
@@ -5817,17 +5993,17 @@ impl Compiler {
                                 // the table's CONTENT, not `region_bounds_addr
                                 // != 0` (the address of a process-global static,
                                 // always non-zero). See `region_bounds_are_live`.
-                                bail.extend(
-                                    if receiver_is_trusted_oop
-                                        && region_bounds_are_live(self.helpers.region_bounds_addr)
-                                    {
-                                        self.emit_trusted_oop_receiver_check()
-                                    } else {
-                                        self.emit_guarded_getfield_receiver_check(
-                                            self.helpers.region_bounds_addr,
-                                        )
-                                    },
-                                );
+                                bail.extend(if g1 {
+                                    self.emit_g1_store_receiver_check()
+                                } else if receiver_is_trusted_oop
+                                    && region_bounds_are_live(self.helpers.region_bounds_addr)
+                                {
+                                    self.emit_trusted_oop_receiver_check()
+                                } else {
+                                    self.emit_guarded_getfield_receiver_check(
+                                        self.helpers.region_bounds_addr,
+                                    )
+                                });
                                 // LEGACY receiver (no GC_FLAG_COMPACT) → helper: the
                                 // compact 8-byte cell offset is only valid for a
                                 // genuinely-compact object. A class with a registered
@@ -5849,7 +6025,10 @@ impl Compiler {
                                 self.emit_and_r64_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT as i8);
                                 bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ not-compact → helper
                                                                             // old-gen receiver → helper (card). gc_flags @21 bit0.
-                                if !self.inline_card_mark_available() {
+                                                                            // F-08: skipped on the G1 arm — `GC_FLAG_OLD_GEN` is a
+                                                                            // generational bit and a G1 rset edge is cross-REGION,
+                                                                            // not old-to-young.
+                                if !g1 && !self.inline_card_mark_available() {
                                     self.emit_mov_r32_mem_disp32(
                                         RCX,
                                         RAX,
@@ -5875,7 +6054,14 @@ impl Compiler {
                                                                            // FAST STORE: bare 8-byte pointer at the cell base.
                                 self.load_slot_to_reg(RDX, val_slot);
                                 self.emit_mov_mem_disp32_r64(RAX, RDX, cell_off);
-                                if self.inline_card_mark_available() {
+                                if g1 {
+                                    // F-08 — RCX last held the num_slots bound
+                                    // and is dead; RAX/RDX are clobbered by the
+                                    // filter and reloaded on the slow arm.
+                                    self.emit_g1_post_write_barrier_regs(
+                                        RAX, RDX, RCX, obj_slot, val_slot,
+                                    );
+                                } else if self.inline_card_mark_available() {
                                     self.emit_inline_card_mark_regs(RAX, RDX);
                                 }
                                 let done = self.emit_jmp_rel32_patch();
@@ -5896,6 +6082,23 @@ impl Compiler {
                             {
                                 let cell_off = (HEADER_SIZE + field_index * SLOT_SIZE) as i32; // Cast: x86-64 disp32
                                 let mut bail: Vec<usize> = Vec::new();
+                                // F-08 — the G1 arm. Under G1 the guard
+                                // below rejects every receiver (empty
+                                // store-side table), so this whole inline path
+                                // was dead there and every reference store was
+                                // an out-of-line `jit_putfield_object` call.
+                                // When a G1 collector has published its
+                                // geometry and `CRATONVM_G1_INLINE_BARRIER` is
+                                // set, take the containment guard against the
+                                // READ table (which G1 does publish, and which
+                                // answers the only question the guard is doing
+                                // here: can these header reads and this store
+                                // fault) and emit a REAL G1 post-write barrier
+                                // after the store. `region_bounds_are_live`
+                                // stays false under G1 and the barrier-free
+                                // premise stays unavailable — see
+                                // `g1_inline_barrier_available`.
+                                let g1 = self.g1_inline_barrier_available();
                                 // obj → RAX
                                 self.load_slot_to_reg(RAX, obj_slot);
                                 // INT-6: null + alignment + published-region
@@ -5915,20 +6118,21 @@ impl Compiler {
                                 // the trusted-oop substitution removes the
                                 // containment compares, so it is conditional on
                                 // the bounds table actually holding live bounds.
-                                bail.extend(
-                                    if receiver_is_trusted_oop
-                                        && region_bounds_are_live(self.helpers.region_bounds_addr)
-                                    {
-                                        self.emit_trusted_oop_receiver_check()
-                                    } else {
-                                        self.emit_guarded_getfield_receiver_check(
-                                            self.helpers.region_bounds_addr,
-                                        )
-                                    },
-                                );
+                                bail.extend(if g1 {
+                                    self.emit_g1_store_receiver_check()
+                                } else if receiver_is_trusted_oop
+                                    && region_bounds_are_live(self.helpers.region_bounds_addr)
+                                {
+                                    self.emit_trusted_oop_receiver_check()
+                                } else {
+                                    self.emit_guarded_getfield_receiver_check(
+                                        self.helpers.region_bounds_addr,
+                                    )
+                                });
                                 // old-gen receiver → helper (card barrier). gc_flags is
                                 // the exported gc_flags byte; GC_FLAG_OLD_GEN == bit 0.
-                                if !self.inline_card_mark_available() {
+                                // F-08: not on the G1 arm; see the compact twin.
+                                if !g1 && !self.inline_card_mark_available() {
                                     self.emit_mov_r32_mem_disp32(
                                         RCX,
                                         RAX,
@@ -5971,7 +6175,14 @@ impl Compiler {
                                     RDX,
                                     cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32, // Cast: layout offset → disp32
                                 );
-                                if self.inline_card_mark_available() {
+                                if g1 {
+                                    // F-08 — RCX last held the num_slots bound
+                                    // (and, above, the tag immediate) and is
+                                    // dead here.
+                                    self.emit_g1_post_write_barrier_regs(
+                                        RAX, RDX, RCX, obj_slot, val_slot,
+                                    );
+                                } else if self.inline_card_mark_available() {
                                     self.emit_inline_card_mark_regs(RAX, RDX);
                                 }
                                 let done = self.emit_jmp_rel32_patch();

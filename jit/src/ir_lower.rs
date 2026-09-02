@@ -3052,6 +3052,39 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// `TEST BYTE [rip+disp32], 0xFF` against `safepoint_flag_addr` — the
+    /// whole poll in one 7-byte instruction, reporting whether the flag was
+    /// within ±2GB RIP reach of it.
+    ///
+    /// Mirrors `x64/emit.rs`'s `emit_test_mem8_abs_imm8`; the two backends
+    /// emit the same poll and this keeps them saying the same thing. `F6 /0 ib`
+    /// with ModRM `mod=00, rm=101` is the RIP-relative form, and the
+    /// displacement is measured from the end of the WHOLE instruction — past
+    /// the trailing `imm8`, which is why the reach test adds 7 and not 6.
+    ///
+    /// The alternative it replaces, `MOV R11, imm64` + `TEST BYTE [R11], 0xFF`,
+    /// is 15 bytes and two instructions and burns a register. Nothing here
+    /// records a patch site: unlike the single-pass backend, this lowerer never
+    /// duplicates emitted bytes to a second address, so a displacement that is
+    /// right when emitted stays right.
+    fn emit_test_safepoint_flag_rip(&mut self) -> bool {
+        // F6 05 <disp32> <imm8>
+        const LEN: usize = 7;
+        // Cast: non-negative index/count to usize
+        let here = self.buf.as_ptr() as usize + self.buf.pos();
+        let next_pc = here.wrapping_add(LEN);
+        // Widening: i64/usize -> i128 (no truncation, for range check)
+        let delta: i128 = (self.safepoint_flag_addr as i128) - (next_pc as i128);
+        // Widening: i64/usize -> i128 (no truncation, for range check)
+        if delta < i32::MIN as i128 || delta > i32::MAX as i128 {
+            return false;
+        }
+        self.buf.emit(&[0xF6, 0x05]);
+        self.buf.emit(&(delta as i32).to_le_bytes()); // Cast: rel32 displacement
+        self.buf.emit_byte(0xFF);
+        true
+    }
+
     /// Emit the default-on cooperative poll used at method entries and loop
     /// back-edges. The lowerer keeps all live values in frame slots, so the
     /// no-argument slow path may be called directly.
@@ -3062,8 +3095,12 @@ impl<'a> Lowerer<'a> {
         if !enabled || self.safepoint_flag_addr == 0 || self.safepoint_slow_path == 0 {
             return;
         }
-        self.emit_mov_reg_imm64(R11, self.safepoint_flag_addr as u64);
-        self.buf.emit(&[0x41, 0xF6, 0x03, 0xFF]); // TEST byte ptr [R11], 0xff
+        if !self.emit_test_safepoint_flag_rip() {
+            // Out of ±2GB RIP reach — materialize the address and read
+            // through it, the shape this poll had before 2026-09-02.
+            self.emit_mov_reg_imm64(R11, self.safepoint_flag_addr as u64);
+            self.buf.emit(&[0x41, 0xF6, 0x03, 0xFF]); // TEST byte ptr [R11], 0xff
+        }
         self.buf.emit(&[0x0F, 0x84]); // JZ .clear
         let clear_patch = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
