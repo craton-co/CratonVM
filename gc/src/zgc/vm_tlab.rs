@@ -105,6 +105,24 @@ use super::{zgc_corpse_enabled, ZgcRealHeap, ZGC_TLAB_ALIGN};
 /// The win needs a register-only helper in the JIT's ABI — one call that does
 /// nothing but set the start bit — at which point this becomes a candidate for
 /// default-on again, against this same measurement.
+///
+/// # It is not suite-clean either, and that is UNTRIAGED
+///
+/// `regression-suite/run.sh` against the same debug binary, one run each:
+///
+/// * unset (this default): **83 passed, 2 failed** — `RMapResizeGc`,
+///   `RMapGcStress`. The default path is `refill_tlab -> None` with nothing in
+///   this module reachable, so those two are pre-existing on this host and say
+///   nothing about this arm.
+/// * `=1`: **78 passed, 7 failed** — the same two plus `RJitMultiArrayClass`,
+///   `RArrayStoreLibrary`, `ROverlaySystemGcStress`, `RSyncMethodJit`,
+///   `RVarHandleAccess`.
+///
+/// Five additional failures, one run each, not yet bisected —
+/// `RArrayStoreLibrary` in particular tripped a harness check-count complaint
+/// rather than an assertion, so five failures are not necessarily five
+/// defects. Whoever picks this up starts there: they are the reason this
+/// cannot be flipped on the strength of a throughput fix alone.
 pub(crate) fn zgc_vm_tlab_enabled_by_default() -> bool {
     match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_JIT_TLAB") {
         Some(raw) => {
