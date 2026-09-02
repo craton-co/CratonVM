@@ -1846,6 +1846,14 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::COMPAT, token: "jboss-boot-log-file", on_key: Some("CRATONVM_JBOSS_BOOT_LOG_FILE"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "jboss-brute-force-jars", on_key: Some("CRATONVM_JBOSS_BRUTE_FORCE_JARS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "jboss-logger-base-emit", on_key: Some("CRATONVM_JBOSS_LOGGER_BASE_EMIT"), off_key: None, off_word: None },
+    // `org.jboss.logmanager.LogContextInitializer` consultation at JBoss
+    // logger-node creation, default-ON. `0` restores the previous behaviour:
+    // no provider is ever asked, so every node is born with no initial
+    // handlers and no initial level. It is the one place in the logging
+    // natives that runs APPLICATION bytecode from inside a logger allocator,
+    // and WildFly, Keycloak and Quarkus all reach it — the switch is what
+    // makes "is this the initializer?" a same-binary question.
+    E { group: Group::COMPAT, token: "jboss-log-context-initializer", on_key: Some("CRATONVM_JBOSS_LOG_CONTEXT_INITIALIZER"), off_key: None, off_word: Some("0") },
     // Default-ON, and off for the *exact* untrimmed string `0` only — the
     // `!matches!(…, Ok("0"))` at `logmanager::jboss_logger_level_filter`.
     E { group: Group::COMPAT, token: "jboss-logger-level-filter", on_key: Some("CRATONVM_JBOSS_LOGGER_LEVEL_FILTER"), off_key: None, off_word: Some("0") },

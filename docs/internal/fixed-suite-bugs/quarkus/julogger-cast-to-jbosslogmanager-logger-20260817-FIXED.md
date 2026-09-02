@@ -144,16 +144,26 @@ list while the handler sat on the JBoss root object.
 nobody has asked for cannot have handlers, so the demand-creation was paying an
 allocation for a guaranteed miss.
 
-**4. The level face was stubs — and the JBoss default is not the JUL default.**
-`setLevel` now funnels through `record_jul_logger_level` (the name-keyed table
-every `setLevel` in the tree is required to use) and stamps the slot;
-`getLevel` reads it back; `getEffectiveLevel` and `isLoggable` consult the
-nearest-ancestor walk. `isLoggable` deliberately does **not** simply share the
-JUL native: an unconfigured jboss-logmanager node sits at
-`effectiveMinLevel = Integer.MIN_VALUE` and logs everything, where an
-unconfigured JUL logger stops at INFO. Both answers are correct for their own
-manager. `an_unconfigured_jboss_logger_logs_everything_where_a_jul_one_stops_at_info`
-is the control that refuses that "obvious" simplification.
+**4. The level face was stubs.** `setLevel` now funnels through
+`record_jul_logger_level` (the name-keyed table every `setLevel` in the tree is
+required to use) and stamps the slot; `getLevel` reads it back;
+`getEffectiveLevel` and `isLoggable` consult the nearest-ancestor walk.
+
+> **CORRECTED 2026-09-01, later the same day.** This section originally went on
+> to say that `isLoggable` must not share the JUL native because "an
+> unconfigured jboss-logmanager node sits at
+> `effectiveMinLevel = Integer.MIN_VALUE` and logs everything, where an
+> unconfigured JUL logger stops at INFO". **That is false.** The
+> `Integer.MIN_VALUE` was measured with `quarkus-bootstrap-runner` on the
+> classpath and is quarkus's own configuration —
+> `InitialConfigurator.getInitialLevel("")` returns `Level.ALL` for the ROOT,
+> which every logger then inherits. With no `LogContextInitializer` provider on
+> the classpath the same probe reads `800` on both faces. The two faces DO need
+> separate `isLoggable` implementations, but for two different reasons found
+> later: `isLoggable(Level.OFF)` is false by NAME rather than by threshold, and
+> `getMinimumLevel` is a second, independent floor. See
+> `jboss-logcontextinitializer-spi-not-consulted-20260901-FIXED.md` for the
+> control run and the corrected constant.
 
 **5. `getParent` was a constant null**, so every logger looked like a root. It
 is the immediate dotted-name predecessor — jboss-logmanager materialises the
@@ -168,9 +178,15 @@ existed.
 
 ## And one cause that was not on this class at all
 
-`root.effective` / `level.freshControl.effective` reading 800 where HotSpot
-reads `Integer.MIN_VALUE` was not a stub: it was `.level=INFO`, imported from
-`$java.home/conf/logging.properties`.
+CratonVM was importing `.level=INFO` from `$java.home/conf/logging.properties`
+under the JBoss manager.
+
+(This section originally attributed `root.effective` reading 800 against
+HotSpot's `Integer.MIN_VALUE` to that import. Only half of that is right: the
+import was real and is fixed below, but `Integer.MIN_VALUE` is not
+jboss-logmanager's default — see the correction in cause 4. The import still
+had to go: an explicit INFO level on the ROOT is a process-wide floor CratonVM
+was inventing.)
 
 That file is the **JDK** `LogManager`'s implicit fallback. When
 `java.util.logging.manager` names the JBoss subclass, the primordial read runs
@@ -199,12 +215,11 @@ still honoured — when the JBoss manager is active.
   different SPI: `io.quarkus.bootstrap.logging.InitialConfigurator implements
   org.jboss.logmanager.LogContextInitializer`, which real `LogContext` consults
   per node through `getInitialHandlers(name)` / `getInitialLevel(name)`.
-  CratonVM synthesises `LogContext` and never runs that chain, so no
-  `LogContextInitializer` provider is ever asked. Filed as
-  `docs/known-issues/quarkus/jboss-logcontextinitializer-spi-not-consulted-20260901.md`.
-  It is an application-SPI gap, not a level/handler-plumbing one, and nothing
-  in this page's chain depends on it: the extension stashes whatever
-  `getHandlers()` reports and restores it, and 0 restores consistently.
+  CratonVM synthesised `LogContext` and never ran that chain, so no
+  `LogContextInitializer` provider was ever asked. **CLOSED the same day** —
+  see `jboss-logcontextinitializer-spi-not-consulted-20260901-FIXED.md`, which
+  also corrects this page's account of the unconfigured JBoss level default.
+  Of the two divergences listed here, only `identity.jul_vs_*` is still open.
 
 ## Two harness defects found on the way
 
@@ -302,8 +317,11 @@ and both had been quietly weakening the existing ones:
   `LoggingSetupRecorder.initializeLogging`'s descriptor, and `70248949c`
   (2026-08-13) is the fix. The "a stale binary, not a live defect" wording
   this page carried until now was true of 08-17, not of the bug.
-* `jboss-logcontextinitializer-spi-not-consulted-20260901.md` — the one
-  measured divergence this session did not close.
+* `jboss-logcontextinitializer-spi-not-consulted-20260901-FIXED.md` — filed
+  from this page's "what remains" and closed the same day. Read it for the
+  correction to this page's claim about the unconfigured JBoss level default:
+  the `Integer.MIN_VALUE` cited here was Quarkus's `InitialConfigurator`
+  configuring the ROOT, not jboss-logmanager's own default, which is INFO.
 * `../wildfly/wildfly-jboss-logmanager-geteffectivelevel-null-loggernode.md` —
   an earlier gap in the same native family, and the reason `getEffectiveLevel`
   was a constant in the first place.
