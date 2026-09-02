@@ -1231,6 +1231,38 @@ pub fn hot_lookup_cache() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL` — default-OFF, `=1` opts in.
+///
+/// Admits a `java/util/` receiver to the cached-virtual PROMOTION, i.e. lets
+/// `execute_invokevirtual_cached` enter a compiled body directly at a site the
+/// `receiver_is_java_util` exclusion has always barred. The exception-table
+/// half of `promotion_barred` is NOT relaxed by this: that one is a
+/// correctness hazard (a handler-bearing callee entered by a direct compiled
+/// call has no interpreter boundary at which its own handler can be resumed),
+/// where the prefix is a performance policy.
+///
+/// It exists because the policy has never been priced on its own.
+/// `retired/aqs-thread-handoff-latency-RETIRED-20260805.md` item 3 measured
+/// `ReentrantLock` against a user subclass `MyLock extends ReentrantLock` and
+/// found the subclass 0.77x — but those are two receiver classes in two loop
+/// methods, so the comparison carries "different class, different call site,
+/// different inlining" along with the tier-up. With this switch the SAME
+/// receiver in ONE binary is the A/B.
+///
+/// Pair it with [`jit_virtual_nominate_always`]: with nomination barred there
+/// is usually no compiled body to promote to, so a promotion arm measured
+/// alone re-measures the conflated thing from the other side.
+#[inline]
+pub fn jit_virtual_promote_java_util() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL") {
+            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            Err(_) => false,
+        }
+    })
+}
+
 /// `CRATONVM_DBG_SHADOW` — one-shot shadow-stack trace in `set_jit_thread`.
 ///
 /// Cached because it is read on EVERY interpreter->JIT boundary crossing.

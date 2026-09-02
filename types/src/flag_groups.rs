@@ -1747,6 +1747,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "indy-lambda-fast", on_key: Some("CRATONVM_JIT_INDY_LAMBDA_FAST"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "hot-lookup-cache", on_key: Some("CRATONVM_JIT_HOT_LOOKUP_CACHE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "virtual-nominate-always", on_key: Some("CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::JIT, token: "virtual-promote-java-util", on_key: Some("CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "native-cf-postcomplete-skip", on_key: Some("CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "native-cf-postcomplete-direct", on_key: Some("CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     // `CRATONVM_JIT_IR_COLD_ARG_STAGE` was declared here too, as a courtesy,

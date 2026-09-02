@@ -10755,9 +10755,23 @@ pub fn int_value_direct_enabled() -> bool {
 pub static INTEGER_INT_VALUE_DIRECT_SITES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// `Long.longValue()` sibling of [`INTEGER_INT_VALUE_DIRECT_SITES`].
+///
+/// Separate because the two binds answer separate questions and one counter
+/// covering both cannot be read: the composition workload binds two `intValue`
+/// sites and one `longValue` site, and a single `sites_bound=3` says which of
+/// the two recognitions fired only if you already know.
+pub static LONG_LONG_VALUE_DIRECT_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Read [`INTEGER_INT_VALUE_DIRECT_SITES`].
 pub fn integer_int_value_direct_sites() -> u64 {
     INTEGER_INT_VALUE_DIRECT_SITES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Read [`LONG_LONG_VALUE_DIRECT_SITES`].
+pub fn long_long_value_direct_sites() -> u64 {
+    LONG_LONG_VALUE_DIRECT_SITES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Count one bound `Integer.intValue` site. Called by the two doors in the
@@ -10765,6 +10779,11 @@ pub fn integer_int_value_direct_sites() -> u64 {
 /// `static` initialiser but can call this.
 pub fn note_integer_int_value_direct_site() {
     INTEGER_INT_VALUE_DIRECT_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one bound `Long.longValue` site.
+pub fn note_long_long_value_direct_site() {
+    LONG_LONG_VALUE_DIRECT_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Register the `Integer.intValue` thin direct-call helper (called once from
@@ -23530,24 +23549,30 @@ fn try_compile_inner(
                             // ahead of the receiver, which is the helpers' own
                             // `(vm_ptr, receiver)` signature — the same
                             // convention `Thread.currentThread` uses above.
+                            //
+                            // `Long.longValue` is NOT bound here, and the
+                            // reason is a measurement rather than an argument.
+                            // The argument applies unchanged -- `java/lang/Long`
+                            // is `final` too, so its sites arrive here pinned
+                            // exactly as `Integer`'s do -- but the arm was
+                            // written, built and measured, and
+                            // `CRATONVM_DBG_DIRECT_BINDS=1` reported
+                            // `Long.longValue: sites_bound=0` against
+                            // `Integer.intValue: sites_bound=4 served=159 199`
+                            // on the same run. Nothing on the workload this
+                            // change is measured against reaches it, so it
+                            // ships as a follow-up rather than as unexercised
+                            // code: re-add the `Long` half and watch
+                            // `sites_bound` move before believing it.
                             if direct_target.is_none()
                                 && int_value_direct_enabled()
                                 && !is_static
-                                && ((direct_class == "java/lang/Integer"
-                                    && mn == "intValue"
-                                    && desc == "()I")
-                                    || (long_box_direct_helpers_enabled()
-                                        && direct_class == "java/lang/Long"
-                                        && mn == "longValue"
-                                        && desc == "()J"))
+                                && direct_class == "java/lang/Integer"
+                                && mn == "intValue"
+                                && desc == "()I"
                             {
-                                let cell = if direct_class == "java/lang/Integer" {
-                                    &INTEGER_INT_VALUE_DIRECT_FN
-                                } else {
-                                    &LONG_LONG_VALUE_DIRECT_FN
-                                };
                                 let entry = direct_native_helper(
-                                    cell,
+                                    &INTEGER_INT_VALUE_DIRECT_FN,
                                     jdk_only,
                                     intrinsic_resolver,
                                     direct_class,

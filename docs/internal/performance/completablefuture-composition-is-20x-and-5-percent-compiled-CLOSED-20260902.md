@@ -1,4 +1,4 @@
-# `CompletableFuture` composition — the three residuals discharged, and 1.21x
+# `CompletableFuture` composition — the three residuals discharged, and 1.20x
 
 ## Status
 **CLOSED, 2026-09-02.** Opened 2026-09-01 as the successor to
@@ -10,10 +10,10 @@ number:
 | item | disposition |
 |---|---|
 | #1 why is there so little compiled code to inline? | **ANSWERED, and the answer is that it does not matter.** `receiver_is_java_util` gated the invocation COUNTER, so no `CompletableFuture` method was ever nominated. Fixing that takes the tracked set from 7 methods to 19 and C2 bodies from 3 to 12 — and costs **0.994x**. See "#1" |
-| #2 `Integer.intValue` at 3.99 crossings per chain, bind not engaging | **FIXED** — the bind was refused at COMPILE time at every door, by a pin added for an unrelated rule. `sites_bound=0 served=0` becomes `4 / 159 178`, worth **1.026x**. See "#2" |
+| #2 `Integer.intValue` at 3.99 crossings per chain, bind not engaging | **ANSWERED and FIXED, and worth nothing.** The bind was refused at COMPILE time at every door, by a pin added for an unrelated rule. It now serves 159 199 calls and takes the registry crossings to **zero** — and moves the workload **1.001x**. See "#2" |
 | #3 name-keyed lookup, 8.2 % | **FIXED in the half that dominated it, and the page's attribution of the other half was wrong.** A native stub called `postComplete` by NAME 2.5 times per chain; that is **1.154x** on its own. See "#3" |
 
-Composition is **1.21x faster** and the four refutations the page opened with
+Composition is **1.20x faster** and the four refutations the page opened with
 still stand. What it was ABOUT — that composition is ~20x — is not fixed, for
 the reason the page itself gave: the cost is flat and structural. The part of
 that which is now newly askable has its own page:
@@ -43,15 +43,15 @@ build, and nothing in it is unaccounted for.
 | lever | switch | ratio | ranges disjoint? |
 |---|---|---:|---|
 | `postComplete` no longer resolved by NAME | `CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT=0` | **1.154x** | yes (17.67-18.88 / 15.56-16.38) |
-| `Integer.intValue` thin bind | `CRATONVM_JIT_INT_VALUE_DIRECT=0` | **1.026x** | no (15.98-16.81 / 15.86-16.45) |
+| `Integer.intValue` thin bind | `CRATONVM_JIT_INT_VALUE_DIRECT=0` | 1.026x pre-merge, **1.001x** after | no, and see below |
 | frame-free compiled lambda capture | `CRATONVM_JIT_INDY_LAMBDA_FAST=0` | **1.021x** | no (15.76-17.03 / 15.56-16.38) — but 1.019x and 1.026x in two other runs |
 | skip `postComplete` when there is no waiter | `CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP=0` | 1.006x | no — and it CANNOT help here, see #3 |
 | nominate java.util callees | `CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS=1` | **0.994x** | no — this is why it ships OFF |
 | cache the two hot-path flag reads | `CRATONVM_JIT_HOT_LOOKUP_CACHE=0` | 0.995x | no — **a refuted hypothesis, see #3** |
 
-1.154 x 1.026 x 1.021 = **1.209**, against 1.200 measured for all-switches-off.
-The three that separate account for the whole change; the other three are noise
-either way and ship on their merits, not on a number.
+1.154 x 1.021 = **1.178**, against 1.199 measured for all-switches-off on the
+merged tree. The two levers that separate account for the change; the rest are
+noise either way and ship on their merits, not on a number.
 
 ### Re-measured after merging dev
 
@@ -64,7 +64,9 @@ on same-day dev. Eight interleaved reps, one binary, the same five switches:
 | shipping default | 16.15-16.87 | **16.42** | **25.66** | 1.000x |
 | every switch off | 19.71-20.66 | 19.89 | 31.08 | **1.211x** |
 
-1.193x before the merge, 1.211x after, ranges disjoint both times.
+1.193x before the merge, 1.211x after, ranges disjoint both times; a third run
+after the last two changes reads **1.199x** (15.79-16.73 against 19.52-19.89).
+Read 1.20x as the figure.
 
 ## #1 — why is there so little compiled code, and why that is the wrong question
 
@@ -176,16 +178,51 @@ disqualified it.** The pin made the optimizing door's premise false and nothing
 re-read it — the same shape as
 `a-workaround-can-outlive-its-defect-and-its-comment-is-the-last-to-know`.
 
-Both doors now carry the arm (`Long.longValue` with it, on the identical
-argument — `java/lang/Long` is `final` too):
+Both doors now carry the arm:
 
 | | sites bound | served | declined |
 |---|---:|---:|---:|
 | `CRATONVM_JIT_INT_VALUE_DIRECT=0` | 0 | 0 | 0 |
-| default | **4** | **159 178** | **0** |
+| default | **4** | **159 199** | **0** |
 
-159 178 over 40 000 chains is 3.98 per chain — exactly the population the
-registry crossings were. 1.026x.
+159 199 over 40 000 chains is 3.98 per chain — exactly the population the
+registry crossings were. `sites_bound` counts BIND EVENTS, not distinct sites:
+`lambda$chain$0` has two `intValue` sites and both C1 and C2 bind them. 1.026x.
+
+**And it is worth 1.001x, which is not what the pre-merge run said.** That run
+reported 1.026x with OVERLAPPING ranges — weak evidence recorded as a number —
+and on the merged tree, with tighter data, it does not reproduce: 15.79-16.73
+against 16.17-16.86. What did NOT change is the engagement, and the crossing
+census is unambiguous about it:
+
+| | `java/lang/Integer` registry crossings, 40 000 chains |
+|---|---:|
+| bind on | **0** |
+| bind off | 159 186 |
+| bind off, and dev's box-unbox intrinsic also off | 159 187 |
+
+So the bind removes 159 186 boundary crossings per 40 000 chains, nothing else
+catches them when it is off (the third row rules out the `JitIntrinsic::IntegerIntValue`
+that landed on dev in the same window), and **the workload cannot tell.** The
+crossing is real and its cost here is below what this probe resolves. The bind
+ships on that engagement, not on a time: the finding residual #2 asked for is
+WHY it was refused, and that stands whatever the stopwatch says.
+
+**`Long.longValue` is deliberately NOT bound, and that is a measurement.** The
+argument carries over unchanged — `java/lang/Long` is `final` on the same terms,
+so its sites arrive at the optimizing door pinned exactly as `Integer`'s do —
+and the arm was written, built and run. The census, split so each bind can be
+read on its own, is what stopped it shipping:
+
+    Integer.intValue: sites_bound=4 served=159 199 declined_to_dispatch=0
+    Long.longValue:   sites_bound=0 served=0       declined_to_dispatch=0
+
+Nothing on this workload reaches it. An arm with no witness reads to the next
+person as covered, so it is a named follow-up instead of unexercised code:
+re-add the `Long` half and watch `sites_bound` move before believing it. The
+counters stay — the helper is bound by other doors, so `served`/`declined`
+remain live — and finding this is the whole reason the two binds got separate
+counters rather than one.
 
 ## #3 — the name-keyed lookup is a native calling BACK into Java by name
 
@@ -256,7 +293,7 @@ path got the id-range guard its sibling `is_lambda_proxy_class` already had.
 **And it is worth 0.995x — nothing.** That was a hypothesis, it had a switch
 built for it precisely so it could be priced rather than asserted, and the
 switch refuted it. It ships anyway because it is strictly less work for an
-identical answer, but **no part of the 1.21x is this**, and a reader taking the
+identical answer, but **no part of the 1.20x is this**, and a reader taking the
 8.2 % bucket as "the native registry" would have spent the day in the wrong
 crate. Recorded because the correction is worth more than the row.
 
@@ -264,7 +301,7 @@ crate. Recorded because the correction is worth more than the row.
 
 * **Composition is still ~25 us/chain against HotSpot's sub-microsecond.** The
   page's own diagnosis stands: the cost is flat, uniform across the dispatch and
-  GC support stack, and structural. 1.21x is a real 1.21x and it is not a
+  GC support stack, and structural. 1.20x is a real 1.20x and it is not a
   dent in the ratio.
 * **`getNow` is still one interpreted frame per chain.** It is nominated and
   compiled under the opt-in and never promoted, by design.

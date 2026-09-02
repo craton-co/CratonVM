@@ -2319,8 +2319,12 @@ pub(super) fn execute_invokevirtual_cached(
                         // `jit_cache` probe and the inline upgrade but lets the
                         // invocation counter and the tiered nomination run.
                         && {
+                            // `receiver_is_java_util` is evaluated only when it
+                            // can still change the answer, so the promotion arm
+                            // does not pay its class-manager `try_read` either.
                             promotion_barred = !cached.exception_table.is_empty()
-                                || receiver_is_java_util();
+                                || (!crate::runtime::env_cache::jit_virtual_promote_java_util()
+                                    && receiver_is_java_util());
                             crate::runtime::env_cache::jit_virtual_nominate_always()
                                 || !promotion_barred
                         }

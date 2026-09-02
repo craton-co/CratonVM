@@ -66,6 +66,10 @@ pub fn direct_binds_enabled() -> bool {
 
 /// `Integer.intValue()` thin-direct-call engagement.
 ///
+/// `sites_bound` counts BIND EVENTS, not distinct call sites: a method compiled
+/// at C1 and again at C2 binds its sites twice. `HibfixComposeProbe2` has two
+/// `intValue` sites in `lambda$chain$0` and reports 4.
+///
 /// `[0]` calls served by the helper's own field-0 read, `[1]` calls the helper
 /// declined back to `jit_invoke_dispatch`. The compile-time site count lives in
 /// the `jit` crate (`cratonvm_jit::integer_int_value_direct_sites`), because
@@ -75,11 +79,23 @@ pub static INT_VALUE_DIRECT: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// `Long.longValue()` sibling of [`INT_VALUE_DIRECT`].
+pub static LONG_VALUE_DIRECT: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
 /// Count one served (`declined = false`) or declined (`true`) direct call.
 /// Caller has already tested [`direct_binds_enabled`].
 #[inline]
 pub fn note_int_value_direct(declined: bool) {
     INT_VALUE_DIRECT[usize::from(declined)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`note_int_value_direct`] for the `Long.longValue()` helper.
+#[inline]
+pub fn note_long_value_direct(declined: bool) {
+    LONG_VALUE_DIRECT[usize::from(declined)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 type Census = Mutex<HashMap<String, u64>>;
@@ -135,11 +151,17 @@ pub fn report_at_exit() {
     dump("interp-frames", interp_census(), 60);
     dump("tierup-decline", decline_census(), 60);
     if direct_binds_enabled() {
-        let served = INT_VALUE_DIRECT[0].load(Ordering::Relaxed);
-        let declined = INT_VALUE_DIRECT[1].load(Ordering::Relaxed);
         eprintln!(
-            "[direct-binds] Integer.intValue: sites_bound={} served={served} declined_to_dispatch={declined}",
+            "[direct-binds] Integer.intValue: sites_bound={} served={} declined_to_dispatch={}",
             cratonvm_jit::integer_int_value_direct_sites(),
+            INT_VALUE_DIRECT[0].load(Ordering::Relaxed),
+            INT_VALUE_DIRECT[1].load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "[direct-binds] Long.longValue: sites_bound={} served={} declined_to_dispatch={}",
+            cratonvm_jit::long_long_value_direct_sites(),
+            LONG_VALUE_DIRECT[0].load(Ordering::Relaxed),
+            LONG_VALUE_DIRECT[1].load(Ordering::Relaxed),
         );
     }
 }

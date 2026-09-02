@@ -580,7 +580,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-296 tokens.
+297 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -878,6 +878,7 @@ export inherited from a parent shell.
 | `indy-lambda-fast` | `CRATONVM_JIT_INDY_LAMBDA_FAST` |
 | `hot-lookup-cache` | `CRATONVM_JIT_HOT_LOOKUP_CACHE` |
 | `virtual-nominate-always` | `CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS` |
+| `virtual-promote-java-util` | `CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL` |
 | `native-cf-postcomplete-skip` | `CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP` |
 | `native-cf-postcomplete-direct` | `CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT` |
 

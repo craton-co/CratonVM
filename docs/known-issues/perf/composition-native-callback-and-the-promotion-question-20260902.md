@@ -4,7 +4,7 @@
 **OPEN, opened 2026-09-02.** The two things left by
 `performance/completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`
 (internal), which discharged all three of its own residuals and measured
-**1.21x** on composition. Neither item below is composition-specific, which is
+**1.20x** on composition. Neither item below is composition-specific, which is
 why they are a page rather than a section there.
 
 This page inherits that one's whole "already excluded" list — the four
@@ -90,18 +90,36 @@ separates them. What is measured so far:
 and **0.994x** — nominating alone buys nothing, because `getNow` is then
 compiled and still entered interpreted 40 000 times in 40 000 chains.
 
-**The open half is promotion**, which nothing has priced in its separated form:
+**The open half is promotion.** `CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL`
+(2026-09-02, default-OFF) is the arm for it: it relaxes ONLY the
+`receiver_is_java_util` half of `promotion_barred`, leaving the exception-table
+half alone, because that one is a correctness hazard (a handler-bearing callee
+entered by a direct compiled call has no interpreter boundary at which its own
+handler can be resumed) where the prefix is a performance policy.
 
-* does admitting `java/util/` receivers to the cached-virtual PROMOTION still
-  cost 30 % on `JavaUtilTierUpExclusionProbe`, now that the counter runs either
-  way?
-* does it pay anything on composition, where `getNow` is 1.00 interpreted frame
-  per chain and is the last steady-state interpreted row on the workload?
+It has been run, and it did not answer the question. What it produced:
 
-Both arms need `CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS=1` as their baseline, or
-they re-measure the conflated thing. **Reproduce the two `JavaUtilTierUpExclusionProbe`
-rows before concluding anything** — that is the same instruction its own page
-gave, and it still holds.
+* **the timing route is a dead end at this variance.**
+  `probes/JavaUtilTierUpExclusionProbe.java` was deleted with `probes/` on
+  2026-08-29 and is rebuilt here at `apps/probes/`. Four interleaved reps of
+  three arms scatter 2 752-3 951 ns/op — ±20 % — and no arm separates from any
+  other. The rebuild also does not show the 0.77x subclass effect (median
+  `sub_over_base` 1.00), but it is a REBUILD and that is an absence in a
+  different probe, not a refutation of the 2026-08-05 number;
+* **the engagement route says promotion is not engaging.** A count is immune to
+  load in a way a timing is not, and `getNow` is the whole question: with
+  `CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS=1 CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL=1`
+  it is **still 40 000 interpreted frames in 40 000 chains**, unchanged from
+  shipping. Either the promotion does not engage, or it engages and this site
+  declines for a reason downstream of the prefix.
+
+**Start there, not at the stopwatch.** `CRATONVM_DBG_TIERUP_DECLINE` reports the
+first condition of the tier-up CHAIN; what is missing is the reason the
+`jit_cache` probe or `execute_jit_call_decoded` then refuses, which is a second
+census and the next thing to build. Reproduce the two
+`JavaUtilTierUpExclusionProbe` rows before concluding anything about the
+timings — that is the instruction its own page gave, and the ±20 % above is why
+it still holds.
 
 ## What is excluded, with the evidence
 
