@@ -3788,6 +3788,11 @@ impl Drop for G1Collector {
         // F-16: the arena is a `ReservedHeap` now, so its base comes from
         // `base()` rather than from a slice pointer.
         crate::gen_heap::clear_jit_read_bounds_owned_by(self.arena.base());
+        // Precise root coverage — and the movable envelope with it,
+        // owner-checked on the same discriminator. A dropped collector that
+        // left its envelope behind would have the frame-band verifier classify
+        // a live heap's addresses against a dead arena's range.
+        crate::gen_heap::clear_movable_bounds_owned_by(self.arena.base());
         // F-08 - and the barrier geometry with it. Owner-checked for the same
         // reason: a dropped collector must not leave numbers behind that
         // compiled code would then read as a live arena's.
@@ -3935,6 +3940,34 @@ impl G1Collector {
         // the committed prefix that is exactly false. `commit_through_region`
         // republishes it as the prefix grows.
         crate::gen_heap::publish_jit_read_bounds(0, arena_base, arena_base + arena.committed_len());
+
+        // Precise root coverage — publish what this collector's relocating
+        // phase MAY MOVE, which is the question the frame-band verifier asks
+        // and which G1 was the only relocating collector not answering.
+        //
+        // `conservative_roots`'s verifier decides "does this compiled frame's
+        // spill band hold a young-heap address the shadow stack never
+        // published?" by classifying each band word with
+        // `gen_heap::addr_is_movable` — the union of `JIT_REGION_BOUNDS` (which
+        // G1 must keep empty, or defect G1-2 re-opens) and `MOVABLE_BOUNDS`
+        // (which exists precisely so a collector can answer this WITHOUT
+        // re-enabling the inline reference-store fast path). ZGC has published
+        // its envelope there since 2026-08-21; G1 published neither, so
+        // `movable_bounds_are_live()` was false, the verifier failed closed on
+        // `YOUNG_BOUNDS_UNPUBLISHED` before inspecting a single frame, and
+        // every G1 pause reported `root coverage: incomplete` — 100.00% of
+        // them, measured. That verdict is what forces the conservative scan,
+        // which fills the pin set, which is what pins regions out of every
+        // collection set.
+        //
+        // The WHOLE reservation, not the committed prefix and not the young
+        // regions: a superset is the safe direction, exactly as ZGC's comment
+        // argues. An address wrongly called movable costs a declined
+        // suppression; an address wrongly called immovable is a frame reported
+        // clean that was never inspected. The envelope also never changes,
+        // where the committed prefix grows under `commit_through_region` and
+        // the young set changes every pause.
+        crate::gen_heap::publish_movable_bounds(0, arena_base, arena_base + arena.reserved_len());
 
         // F-08 - publish G1's geometry for the JIT's inline post-write barrier.
         //

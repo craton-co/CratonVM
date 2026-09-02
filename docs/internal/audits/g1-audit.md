@@ -1127,3 +1127,94 @@ they are still excluded from every collection set. This changes only how much
 of such a region Phase 2 reads. Region pinning itself goes away when precise
 shadow-stack coverage lands (§11.1), which is a different and larger piece of
 work.
+
+## 14. Precise root coverage: G1's proof was vacuous, and G1 was the only relocating collector not answering (2026-09-02)
+
+*`perf/g1-precise-root-coverage-20260902`, branched from `dev` at `038e4e1e3`.
+§11.1 and §13.5 both end at the same place — "region pinning goes away when
+precise shadow-stack coverage lands" — and every G1 pause reporting
+`root coverage: incomplete` made that look far away. It was one unpublished
+table.*
+
+### 14.1 The finding
+
+`conservative_roots`'s frame-band verifier decides "does this compiled frame's
+spill band hold a heap address the shadow stack never published?" by
+classifying each band word with `gen_heap::addr_is_movable` — the union of
+`JIT_REGION_BOUNDS` and `MOVABLE_BOUNDS`. Two tables, because filling the first
+to fix the verifier would silently re-enable the inline reference-store fast
+path defect G1-2 closed; the second exists precisely so a collector can answer
+the movability question without that.
+
+**ZGC has published its envelope there since 2026-08-21. G1 published neither.**
+So `movable_bounds_are_live()` was false under G1, the verifier failed closed on
+`YOUNG_BOUNDS_UNPUBLISHED` before inspecting a single frame, and the verdict was
+`incomplete` on **100.00%** of pauses — a constant, carrying no information.
+
+That constant is also what made `CRATONVM_G1_COVERAGE_PIN` useless: a lever that
+refuses to evacuate whenever coverage is incomplete refuses every evacuation
+when coverage is always incomplete.
+
+### 14.2 The fix
+
+`G1Collector::new` publishes its whole arena reservation into `MOVABLE_BOUNDS`,
+and `Drop` clears it owner-checked, mirroring ZGC exactly. The whole
+reservation rather than the committed prefix or the young set: a superset is the
+safe direction — an address wrongly called movable costs a declined
+suppression, an address wrongly called immovable is a frame reported clean that
+was never inspected — and the envelope is the one thing about the arena that
+never changes.
+
+`g1_publishes_its_movable_envelope_without_making_region_bounds_live` pins both
+halves, and the second half is the one that must never regress: the STORE-side
+table stays empty, so this cannot re-open G1-2.
+
+Measured: `root coverage: incomplete` **100.00% → 0.00%** on every probe.
+
+### 14.3 What the earned proof unlocks, measured
+
+With the proof real, the precise-only branch does what §2.4 always said it
+would. Three arms, `HumongousChurn 48 6000 512` at `-Xmx160m`:
+
+| arm | coverage | pauses pinning | `pin_addrs` | dangling |
+|---|---|---:|---:|---:|
+| default (both switches off) | 0% incomplete | 2 | 21 | 0 |
+| `CRATONVM_GC_PRECISE_ONLY_ROOTS=1` only | 0% incomplete | 2 | 21 | 0 |
+| **both switches on** | 0% incomplete | **0** | **0** | 0 |
+
+`checksum=249707433568` in all three. With both on, `G1CardChurn 11 60`,
+`G1ChurnPauseProbe 24 200` and `HumongousHold 300` also run with `pin_addrs=0`,
+`dangling=0` and HotSpot-identical checksums.
+
+**G1 pins nothing.** That is the whole of what region pinning costs — the
+hottest, most garbage-dense Eden region kept out of every collection set (§2.3)
+— removed.
+
+**A vacuous arm on the way, recorded because the next reader will hit it.** The
+first A/B set only `CRATONVM_G1_PRECISE_ONLY_ROOTS=1` and reported both arms
+identical. The master switch `CRATONVM_GC_PRECISE_ONLY_ROOTS` gates it, so
+`moving_young_precise_only` was false in both arms and the experiment measured
+nothing. The G1 switch alone does nothing at all.
+
+### 14.4 Why the defaults do NOT move here
+
+The publish lands on. Both suppression switches stay opt-in, and the reason is
+no longer G1's:
+
+* `dbg_precise_only_roots`'s own doc records that the suppression rests on
+  `CompiledMethod::fully_oop_covered`, a **presence** test — every GC-capable
+  safepoint recorded *an* oop map — not a completeness one, and that the
+  runtime oracle which would settle it (`CRATONVM_DBG_VERIFY_OOP_MAPS`) runs
+  inside the very scan the branch skips
+  (`bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`). That is
+  a JIT-wide question, not a collector one.
+* One workload over a handful of pauses is not a soak for a use-after-free
+  class of change, and the G1 instance of exactly this failure
+  (`bug-g1-evacuates-live-jit-reference-20260819.md`) is a year-fresh record of
+  what it looks like when the proof is wrong.
+
+The stale half of the record is corrected in passing: the doc on
+`CRATONVM_G1_PRECISE_ONLY_ROOTS` said the branch "is unsound under G1" because
+the pin set comes from the scan. That describes the mechanism correctly but
+names the wrong cause — the defect was the vacuous proof, which is what this
+change fixes. The doc now says so, and says what a soak must answer instead.

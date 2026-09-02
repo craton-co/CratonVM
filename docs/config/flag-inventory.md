@@ -1227,7 +1227,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_GPU_IF_CONVERT_MAX_OPS` | JIT | `CRATONVM_JIT=gpu-if-convert-max-ops` | opt-in | off | behaviour | snapshot | jit-cuda |
 | `CRATONVM_GPU_JIT_ARRAY_WRITERS` | GC | `CRATONVM_GC=gpu-jit-array-writers` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_GPU_NO_ZEROCOPY` | GC | `CRATONVM_GC=gpu-zerocopy` | opt-out | on | behaviour | snapshot | vm |
-| `CRATONVM_GPU_TIME_DISPATCH` | DBG | `CRATONVM_DBG=gpu-time-dispatch` | opt-in | off | diag | snapshot | native-builtins |
+| `CRATONVM_GPU_TIME_DISPATCH` | DBG | `CRATONVM_DBG=gpu-time-dispatch` | opt-in | off | diag | snapshot | native-builtins, types |
 | `CRATONVM_GPU_TRACE_BYTES` | DBG | `CRATONVM_DBG=gpu-trace-bytes` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_GPU_WAIT_LATCH` | GC | `CRATONVM_GC=gpu-wait-latch` | default-on | on | behaviour | snapshot | cuda-bridge |
 | `CRATONVM_HARDEN_MANIFEST_CLASSPATH` | SECURITY | `CRATONVM_SECURITY=harden-manifest-classpath` | opt-in | off | behaviour | snapshot | types |
