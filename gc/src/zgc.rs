@@ -2391,6 +2391,55 @@ impl ZObjectStartsSnapshot {
         }
     }
 
+    /// Number of `u64` words in the gridded part of the snapshot.
+    ///
+    /// The unit the parallel sweep splits on. A word is 64 grid slots = 512
+    /// arena bytes, and an object START is a single bit, so a split on a word
+    /// boundary gives every shard a disjoint set of BASES with no object
+    /// straddling two shards -- which is what lets each shard zero its own dead
+    /// objects and clear its own registry bits with no coordination.
+    fn word_count(&self) -> usize {
+        self.words.len()
+    }
+
+    /// Every base in words `[w0, w1)` at or above `floor`, ASCENDING.
+    ///
+    /// [`Self::for_each_base_from`] restricted to a word range, so N of these
+    /// over a partition of `0..word_count()` visit exactly the bases
+    /// `for_each_base_from` would, once each and in the same global order.
+    ///
+    /// `extra` -- the off-grid spill set -- belongs to NO word range and is
+    /// deliberately not visited here. The caller sweeps it separately, on one
+    /// thread; it is empty on every healthy run (see the "one leg that is NOT
+    /// a proof" note on `ZObjectStartBits`), and a set that is not
+    /// address-ordered cannot be partitioned by address anyway.
+    #[inline]
+    fn for_each_base_in_words(&self, w0: usize, w1: usize, floor: usize, mut f: impl FnMut(usize)) {
+        let w1 = w1.min(self.words.len());
+        for w in w0..w1 {
+            let mut word = self.words[w];
+            while word != 0 {
+                let b = word.trailing_zeros() as usize;
+                word &= word - 1;
+                let addr = self.base + ((w * 64 + b) << 3);
+                if addr >= floor {
+                    f(addr);
+                }
+            }
+        }
+    }
+
+    /// Every off-grid base at or above `floor`. See
+    /// [`Self::for_each_base_in_words`] for why this is separate.
+    #[inline]
+    fn for_each_spilled_base(&self, floor: usize, mut f: impl FnMut(usize)) {
+        for addr in self.extra.iter() {
+            if *addr >= floor {
+                f(*addr);
+            }
+        }
+    }
+
     /// How many bases the snapshot holds, counted rather than collected.
     fn base_count(&self) -> usize {
         self.words
@@ -3616,6 +3665,14 @@ pub struct ZgcRealHeap {
     /// need to learn about epochs, and each one that did not would silently
     /// report last cycle's answer.
     mark_bits: Option<ZObjectStartBits>,
+
+    /// Threads the stop-the-world sweep runs on. `1` is serial, and is the
+    /// default -- see [`Self::sweep_workers`] for why a phase that should
+    /// parallelise ships off until it is measured.
+    ///
+    /// Seeded from `CRATONVM_ZGC_PARSWEEP` at construction and owned by this
+    /// instance thereafter, the same shape as `tlab_enabled`.
+    sweep_worker_count: AtomicUsize,
 }
 
 // SAFETY: identical argument to `Heap`/`G1Collector` (heap.rs:143). The only
@@ -3881,6 +3938,7 @@ impl ZgcRealHeap {
             tlabs: ZArenaTlabRegistry::for_capacity(cap),
             tlab_enabled: AtomicBool::new(zgc_tlab_enabled_by_default()),
             dead_scratch: Mutex::new(Vec::new()),
+            sweep_worker_count: AtomicUsize::new(Self::sweep_workers_requested()),
             // THE SAME TWO NUMBERS as `registry` above, through the same
             // constructor. Any drift between the two grids would make an
             // address the registry accepts unrepresentable in the mark bitmap,
@@ -13004,6 +13062,434 @@ impl ZgcRealHeap {
 /// `None` when logging is off: every `lap` is then a branch on an `Option` and
 /// no clock read at all.
 #[derive(Debug)]
+// ---------------------------------------------------------------------------
+// The sweep, as a shardable unit
+// ---------------------------------------------------------------------------
+//
+// The whole-heap sweep is the largest single term in this collector's pause:
+// 170 ms of a 265 ms mean on the 13.0M-dead-object cycle the 2026-08-17 anatomy
+// measured, against 6.3 ms of 112 ms for a young cycle's bounded one. It is
+// also, unlike the mark, embarrassingly parallel -- a linear scan over a bitmap
+// whose only shared output is the arena free list.
+//
+// The two types below are what make that true rather than merely plausible.
+// `ZSweepShard` is everything one worker produces, and nothing in it is shared;
+// `ZgcRealHeap::sweep_one` is the per-object body, written once and called by
+// both the serial and the parallel driver, so the two cannot drift on the
+// question that matters -- which objects are reclaimed.
+//
+// PARALLEL MARKING WAS MEASURED AS A LOSS in this tree (+31% at one worker,
+// +153% at four; reverted 2026-08-14) and the reason does not carry over. A
+// mark is a dependent pointer chase: it is memory-LATENCY bound, and more
+// workers buy nothing while costing coherence traffic on shared queues. A sweep
+// is a linear scan with an independent, mostly-store body: it is bandwidth
+// bound. That is an argument, not a measurement, which is why this ships
+// default-off behind `CRATONVM_ZGC_PARSWEEP` -- see that function.
+
+/// Everything one sweep worker produces. No shared state, by construction.
+///
+/// The free spans are the only output with an ordering obligation: the arena's
+/// post-sweep coalescer merges spans that are ADJACENT, and it can only see two
+/// spans as adjacent if they arrive in ascending order. A shard collects its own
+/// spans ascending (the bitmap scan is ascending), and the merge concatenates
+/// shards in ascending address order, so the global sequence is ascending too --
+/// including across a shard boundary, where the merge additionally JOINS a
+/// shard's last run to the next shard's first when they touch.
+#[derive(Default)]
+struct ZSweepShard {
+    /// Survivor bytes and count.
+    bytes_copied: usize,
+    objects_copied: usize,
+    /// Reclaimed bytes and count.
+    bytes_freed: usize,
+    dead_count: usize,
+    /// Registered bases whose header could not be sized this cycle.
+    unsizable: usize,
+    /// Survivors this shard promoted out of the young generation.
+    gen_promoted: usize,
+    /// Bases this shard actually visited (the nursery's engagement counter).
+    swept: usize,
+    /// Bytes NOT memset because only the header was zeroed.
+    zero_bytes_skipped: usize,
+    /// Dead objects that joined a merged run.
+    dead_in_runs: usize,
+    /// Dead bases, when `MonitorCleanup::wants_dead_addresses` asked for them.
+    dead: Vec<usize>,
+    /// Identity hashes of the dead, for the native side tables keyed by them.
+    dead_hashes: Vec<i32>,
+    /// Free spans, ARENA-RELATIVE and ascending, already run-merged within this
+    /// shard. Handed to `Arena::add_free_block` by the merge.
+    spans: Vec<(usize, usize)>,
+    /// The run currently being accumulated; `None` between runs.
+    run: Option<(usize, usize)>,
+}
+
+impl ZSweepShard {
+    /// Close the run in flight. Every shard must be flushed before its spans
+    /// are read: the last run has no successor to flush it, and missing it
+    /// leaks the topmost run of garbage in the shard -- invisibly, because the
+    /// cursor retraction cannot reclaim a span that is not on the list.
+    fn flush(&mut self) {
+        if let Some(run) = self.run.take() {
+            self.spans.push(run);
+        }
+    }
+
+    /// Fold `other` in. Address order is the caller's obligation: `other` must
+    /// cover strictly higher addresses than `self`.
+    fn absorb(&mut self, other: &mut ZSweepShard) {
+        other.flush();
+        self.bytes_copied += other.bytes_copied;
+        self.objects_copied += other.objects_copied;
+        self.bytes_freed += other.bytes_freed;
+        self.dead_count += other.dead_count;
+        self.unsizable += other.unsizable;
+        self.gen_promoted += other.gen_promoted;
+        self.swept += other.swept;
+        self.zero_bytes_skipped += other.zero_bytes_skipped;
+        self.dead_in_runs += other.dead_in_runs;
+        self.dead.append(&mut other.dead);
+        self.dead_hashes.append(&mut other.dead_hashes);
+        // CONCATENATED, NOT JOINED, at the seam.
+        //
+        // A first version merged a shard's last span with the next shard's
+        // first when they touched. It was wrong twice over and worth nothing
+        // either time:
+        //
+        //  * `sweep_one` never merges a span that reaches the LARGE-OBJECT end
+        //    (see `ZSweepCfg::high_floor`), and a seam join has no way to know
+        //    that -- so it could hand `Arena::add_free_block` a span straddling
+        //    the line, which routes by offset and would then serve the same
+        //    bytes from the low free list and the high cursor both.
+        //  * it saved at most `workers - 1` calls per cycle, and
+        //    `coalesce_free_list` merges adjacent spans immediately afterwards
+        //    regardless.
+        //
+        // Ascending order -- which is the property the coalescer actually needs
+        // -- is preserved by concatenation alone.
+        self.spans.append(&mut other.spans);
+    }
+}
+
+/// The per-cycle constants `sweep_one` reads. Gathered once, outside the loop,
+/// so no worker re-reads an atomic or an environment-derived flag per object.
+struct ZSweepCfg {
+    arena_base: usize,
+    /// Where the large-object end begins. A merged run must never grow across
+    /// it: `Arena::add_free_block` routes a span by its offset and bounds a LOW
+    /// span by the low cursor, so a run spanning the line would be pushed onto
+    /// the low tier while covering high-region bytes, and the arena would serve
+    /// the same memory from the free list and the high cursor both.
+    high_floor: usize,
+    zero_header_only: bool,
+    merge_dead_runs: bool,
+    /// Are the mark bits cleared in bulk after the sweep? When they are, the
+    /// survivor arm does not touch the header at all on a non-generational run.
+    bulk_clearable: bool,
+    want_dead: bool,
+    collect_dead_hashes: bool,
+    gen_on: bool,
+    promo_age: u8,
+}
+
+impl ZgcRealHeap {
+    /// Sweep one registered base into `sh`.
+    ///
+    /// THE WHOLE PER-OBJECT BODY, written once. The serial and parallel
+    /// drivers both call it and neither adds anything, so the two cannot drift
+    /// on the only question that matters -- which objects are reclaimed. The
+    /// arm-equivalence test asserts that as an outcome rather than trusting it.
+    ///
+    /// Takes `&self` and is called concurrently from
+    /// [`Self::sweep_parallel`]'s workers. That is sound because every shard
+    /// owns a disjoint set of bases (the split is on bitmap WORD boundaries and
+    /// an object start is one bit), so the `header_mut` reborrows below never
+    /// alias, the `write_bytes` spans never overlap, and the only shared writes
+    /// are `registry.remove` (one `fetch_and`) and, on a generational cycle,
+    /// the remembered set -- which is why [`Self::sweep_workers`] refuses to
+    /// shard one.
+    #[inline]
+    fn sweep_one(&self, base: usize, cfg: &ZSweepCfg, sh: &mut ZSweepShard) {
+        sh.swept += 1;
+        let header = self.header_mut(base as *mut u8);
+        // A header this collector cannot size must not be swept. The dead arm
+        // below `write_bytes`es `size` bytes and hands the same span to
+        // `Arena::add_free_block`, whose only bound is a `debug_assert!` — so
+        // passing `object_body_size`'s 1 TiB corrupt-header sentinel through
+        // here memsets a terabyte from `base` and free-lists memory that is not
+        // in the arena.
+        //
+        // Retaining it instead leaks one object until its layout resolves again
+        // (or forever, if its class really is gone), which is the fail-safe
+        // direction: it stays registered, stays rooted conservatively, and is
+        // never handed out twice. The one-shot `tracing::warn!` at the call
+        // site makes the leak visible rather than silent.
+        let Some(size) = Self::alloc_size(header) else {
+            sh.unsizable += 1;
+            if !cfg.bulk_clearable {
+                header.clear_gc_flags(GC_FLAG_MARKED);
+            }
+            return;
+        };
+        if self.mark_is_set(base) {
+            // Survivor: keep it, and clear the mark bit for the next cycle.
+            //
+            // ON THE BITMAP ARM THERE IS NOTHING TO CLEAR HERE. One `clear_all`
+            // after the walk does the whole heap, which is the difference
+            // between a linear store over `capacity / 512` bytes and a
+            // read-modify-write of every survivor's 64-byte header line -- i.e.
+            // between touching 8 MB and dirtying the entire live set, on a
+            // phase that is otherwise read-only on a non-generational run.
+            if !cfg.bulk_clearable {
+                header.clear_gc_flags(GC_FLAG_MARKED);
+            }
+            sh.bytes_copied += size;
+            sh.objects_copied += 1;
+            // PHASE G: one more collection survived. `age_survivor` returns
+            // true on the collection that promotes it, and cards it -- see
+            // there for why the card at promotion is what makes a young cycle
+            // sound. Free on a non-generational run: one relaxed load and a
+            // branch.
+            if cfg.gen_on && self.age_survivor(base, header, cfg.promo_age) {
+                sh.gen_promoted += 1;
+            }
+            return;
+        }
+        // Dead: zero it (so a later scan can't see a stale header) and return
+        // the span to the arena free list.
+        //
+        // THE HEADER IS THE WHOLE REASON -- see `zgc_sweep_header_zero`.
+        // `HEADER_SIZE` is the entire `ObjectHeader`, so this leaves
+        // `class_id=0, num_slots=0`, which is the identical corpse a reader of
+        // a vacated span met before; and the body is only reachable through
+        // that header, which is why the bytes below it need not be touched.
+        // `.min(size)` is belt-and-braces: no allocation is shorter than its
+        // header, and a `write_bytes` past the end of one would be exactly the
+        // bug `alloc_size` refuses above.
+        let zero = if cfg.zero_header_only {
+            let n = HEADER_SIZE.min(size);
+            sh.zero_bytes_skipped += size - n;
+            n
+        } else {
+            size
+        };
+        // BEFORE the zeroing: the identity hash lives in the mark word, so
+        // `write_bytes` below is what destroys it. A `0` means "never hashed"
+        // (or hashed then monitor-inflated, which displaces it) and such an
+        // object cannot be a key in an identity-hash-keyed table, so skipping
+        // it is exact rather than approximate. See `identity_side_tables`.
+        if cfg.collect_dead_hashes {
+            let h = cratonvm_types::ObjectHeader::neutral_hash(
+                header.mark_word.load(Ordering::Relaxed),
+            );
+            if h != 0 {
+                sh.dead_hashes.push(h);
+            }
+        }
+        // SAFETY: `base` is a registered allocation of `size` bytes inside the
+        // arena, and both arms write at most `size` of them.
+        unsafe { std::ptr::write_bytes(base as *mut u8, 0, zero) };
+        if base >= cfg.arena_base {
+            let off = base - cfg.arena_base;
+            // A large object never joins a run -- see `ZSweepCfg::high_floor`.
+            let mergeable =
+                cfg.merge_dead_runs && off < cfg.high_floor && off + size <= cfg.high_floor;
+            if mergeable {
+                // ONE SPAN PER RUN. The walk is ascending, so a dead object
+                // adjacent to the previous one extends it; anything else
+                // flushes and starts a new run. See `zgc_sweep_dead_runs` for
+                // why the post-coalesce result is the same either way.
+                sh.dead_in_runs += 1;
+                match sh.run {
+                    Some((ro, rl)) if ro + rl == off => sh.run = Some((ro, rl + size)),
+                    Some(run) => {
+                        sh.spans.push(run);
+                        sh.run = Some((off, size));
+                    }
+                    None => sh.run = Some((off, size)),
+                }
+            } else {
+                // FLUSH FIRST. The coalescer only sees adjacent spans as
+                // adjacent because they arrive in ascending order; emitting
+                // this one ahead of the run below it would break that ordering
+                // for the rest of the cycle.
+                sh.flush();
+                sh.spans.push((off, size));
+            }
+        }
+        sh.bytes_freed += size;
+        sh.dead_count += 1;
+        // THE REGISTRY PRUNE, IN PLACE.
+        //
+        // It used to run after the loop, over a collected `dead` slice -- which
+        // is what made that slice unconditional. The base is already in hand
+        // here, so the second pass over 104 MB of cold `usize`s bought nothing
+        // but the ordering note below, which still holds:
+        //
+        // the prune is a REMOVAL, never a wholesale replacement of the
+        // structure by the mark snapshot's survivors. An allocation registered
+        // by another path between the mark snapshot and here would be erased by
+        // a replacement -- leaking its memory forever (unsweepable) and, worse,
+        // making `is_object_address` deny it so conservative rooting drops it
+        // while reachable.
+        //
+        // No mutator is running (`retire_all_tlabs` ran before the snapshot and
+        // this is inside the stop-the-world pause), so nothing can allocate into
+        // the span this call is freeing.
+        self.registry.remove(base);
+        if cfg.want_dead {
+            sh.dead.push(base);
+        }
+    }
+
+    /// The sweep, on this thread.
+    fn sweep_serial(
+        &self,
+        registered: &ZObjectStartsSnapshot,
+        floor: usize,
+        cfg: &ZSweepCfg,
+    ) -> ZSweepShard {
+        let mut sh = ZSweepShard::default();
+        registered.for_each_base_in_words(0, registered.word_count(), floor, |base| {
+            self.sweep_one(base, cfg, &mut sh)
+        });
+        sh.flush();
+        sh
+    }
+
+    /// The sweep, split over `workers` threads at bitmap word boundaries.
+    ///
+    /// # Why the split is sound
+    ///
+    /// A bitmap word covers 64 grid slots = 512 arena bytes, and an object
+    /// START is a single bit. Splitting on a word boundary therefore gives each
+    /// worker a disjoint set of BASES -- no object is visited twice and none is
+    /// missed, whatever its size. A large object may span many words, but it is
+    /// swept by whichever worker owns the word its BASE sits in, and no other
+    /// worker touches those bytes because no other base lies inside a live
+    /// allocation.
+    ///
+    /// Each worker writes only into its own [`ZSweepShard`]. The two writes
+    /// that leave a shard are `registry.remove` (one `fetch_and` on a word this
+    /// worker's range owns) and the per-object `write_bytes` (disjoint spans).
+    /// The arena free list is NOT touched: spans are handed over afterwards in
+    /// one ordered batch, which is also why the arena guard is not held for the
+    /// walk.
+    ///
+    /// # Why the shards are merged in address order
+    ///
+    /// `Arena::coalesce_free_list` merges spans that are adjacent, and it can
+    /// only see two spans as adjacent if they arrive ascending.
+    /// [`ZSweepShard::absorb`] concatenates in range order and joins the seam
+    /// where one shard's last run touches the next shard's first, so the merged
+    /// sequence is exactly what a serial walk would have produced.
+    fn sweep_parallel(
+        &self,
+        registered: &ZObjectStartsSnapshot,
+        floor: usize,
+        cfg: &ZSweepCfg,
+        workers: usize,
+    ) -> ZSweepShard {
+        let total_words = registered.word_count();
+        let per = total_words.div_ceil(workers);
+        let mut shards: Vec<ZSweepShard> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for i in 0..workers {
+                let w0 = i * per;
+                if w0 >= total_words {
+                    break;
+                }
+                let w1 = (w0 + per).min(total_words);
+                handles.push(scope.spawn(move || {
+                    let mut sh = ZSweepShard::default();
+                    registered.for_each_base_in_words(w0, w1, floor, |base| {
+                        self.sweep_one(base, cfg, &mut sh)
+                    });
+                    sh.flush();
+                    sh
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("zgc sweep worker panicked"))
+                .collect()
+        });
+        // ASCENDING, because `absorb` requires it and the coalescer requires
+        // `absorb`. `shards` is already in range order; draining forwards keeps
+        // it.
+        let mut out = ZSweepShard::default();
+        for sh in shards.iter_mut() {
+            out.absorb(sh);
+        }
+        out
+    }
+
+    /// How many threads the sweep should use. `1` is serial.
+    ///
+    /// # Why this is default-off, on a phase that should parallelise
+    ///
+    /// The sweep is the largest single term in a whole-heap pause -- 170 ms of
+    /// 265 ms on the 13.0M-dead-object cycle the 2026-08-17 anatomy measured --
+    /// and unlike the mark it is a linear scan with an independent body, so it
+    /// is bandwidth bound rather than latency bound and should scale.
+    ///
+    /// That is an argument, not a measurement, and this tree has shipped a ZGC
+    /// marking feature default-ON on an argument before: parallel STW marking,
+    /// 2026-08-14, which cost +31% at one worker and +153% at four and was
+    /// reverted. `Z_CONC_START_PERCENT_DEFAULT` records the lesson in as many
+    /// words. `CRATONVM_ZGC_PARSWEEP=<n>` is the opt-in, and
+    /// `gen_sweep_cost_stats`' `swept` counter beside `--verbose:gc`'s
+    /// `sweep_us` is how the arm is compared.
+    ///
+    /// # The one configuration it refuses
+    ///
+    /// A GENERATIONAL cycle, whatever the setting says. Its survivor arm calls
+    /// `age_survivor`, which on the promoting collection calls `card_object`
+    /// and writes the remembered set -- shared state whose concurrency this
+    /// change has not audited. A young cycle also has nothing to gain: its
+    /// sweep is 6.3 ms of a 112 ms pause, because the floor already bounds it.
+    fn sweep_workers(&self, gen_on: bool) -> usize {
+        if gen_on {
+            return 1;
+        }
+        self.sweep_worker_count.load(Ordering::Relaxed).max(1)
+    }
+
+    /// Set the sweep's worker count for THIS heap. `0` or `1` is serial.
+    ///
+    /// Per heap rather than a process-wide latch, for the reason
+    /// `generational_enabled` and `tlab_enabled` are: the flag readers cache in
+    /// a `OnceLock`, so the first test to touch `CRATONVM_ZGC_PARSWEEP` would
+    /// decide the arm for every other test in the binary -- and the arm
+    /// equivalence this feature rests on can only be asserted by a test that
+    /// runs both in one process.
+    pub fn set_sweep_workers(&self, n: usize) {
+        self.sweep_worker_count
+            .store(Self::clamp_sweep_workers(n), Ordering::Relaxed);
+    }
+
+    /// Never more workers than cores: this is a stop-the-world phase, so
+    /// oversubscription buys nothing and costs context switches inside the
+    /// pause it is meant to shorten.
+    fn clamp_sweep_workers(n: usize) -> usize {
+        if n <= 1 {
+            return 1;
+        }
+        let cores = std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(1);
+        n.min(cores).min(Z_PARMARK_MAX_WORKERS)
+    }
+
+    /// `CRATONVM_ZGC_PARSWEEP` -- the seed for [`Self::sweep_worker_count`].
+    fn sweep_workers_requested() -> usize {
+        match cratonvm_types::flags::runtime_var("CRATONVM_ZGC_PARSWEEP") {
+            Ok(v) => Self::clamp_sweep_workers(v.trim().parse::<usize>().unwrap_or(1)),
+            Err(_) => 1,
+        }
+    }
+}
+
 struct ZPhaseClock {
     last: Option<std::time::Instant>,
 }
@@ -14064,35 +14550,16 @@ impl GarbageCollector for ZgcRealHeap {
         //
         // The registry prune does NOT depend on this. It used to be driven
         // from the same slice, which is why the slice looked unconditional; it
-        // now happens in the sweep loop, where the base is already in hand.
+        // now happens in `sweep_one`, where the base is already in hand.
         let want_dead = monitors.wants_dead_addresses();
-        let mut dead_guard = self.dead_scratch.lock();
-        let dead: &mut Vec<usize> = &mut dead_guard;
-        dead.clear();
-        // Reclaimed objects, counted whether or not they are collected. The
-        // `--verbose:gc` line reported `dead.len()`, which would now read 0 on
-        // every uncontended run and look like a sweep that freed nothing.
-        let mut dead_count = 0usize;
         // Identity hashes of the dead, for the native side tables keyed by
-        // them (`cratonvm_types::identity_side_tables`). Collected HERE and
-        // not from `dead` afterwards, because by then the header is gone:
-        // the dead arm below zeroes it, and after a compacting cycle a dead
-        // base is very often a SURVIVOR's new base, so a later read would
-        // hand a live object's hash to the evictors and reset its state.
+        // them (`cratonvm_types::identity_side_tables`). Collected DURING the
+        // sweep and not from the dead bases afterwards, because by then the
+        // header is gone: the dead arm zeroes it, and after a compacting cycle
+        // a dead base is very often a SURVIVOR's new base, so a later read
+        // would hand a live object's hash to the evictors and reset its state.
         let collect_dead_hashes = crate::gc_flags().identity_hash_evict
             && cratonvm_types::identity_side_tables::any_registered();
-        let mut dead_hashes: Vec<i32> = Vec::new();
-        let mut bytes_copied = 0usize; // "retained" bytes (non-moving)
-        let mut bytes_freed = 0usize;
-        let mut objects_copied = 0usize;
-        // Registered bases whose header could not be sized this cycle — see
-        // the refusal in the sweep loop below.
-        let mut unsizable = 0usize;
-        // Survivors this sweep promoted out of the young generation.
-        let mut gen_promoted = 0usize;
-        // Bases this sweep actually visited, for the nursery's engagement
-        // counter -- see `gen_sweep_skipped`.
-        let mut swept = 0usize;
         // ---- G2e/G2f: THE TWO PER-DEAD-OBJECT COSTS -----------------------
         //
         // §3b measured `sweep` at 182 ms of a 309 ms mean pause and found the
@@ -14105,10 +14572,10 @@ impl GarbageCollector for ZgcRealHeap {
         //  * a `push_block_routed` per object, and then a sort over all of them
         //    in `coalesce_free_list`.
         //
-        // Both are removed below. `zgc_sweep_header_zero` and `zgc_sweep_dead_runs`
-        // carry the arguments; both are read here once rather than per object,
-        // and both are ANDed with `young_cycle` so a whole-heap sweep is
-        // byte-for-byte what it was.
+        // Both are removed in `sweep_one`. `zgc_sweep_header_zero` and
+        // `zgc_sweep_dead_runs` carry the arguments; both are read here once
+        // rather than per object.
+        //
         // EVERY CYCLE, not just a young one. Both were scoped to `young_cycle`
         // when they landed on 2026-08-17, for one reason that has since expired:
         // they went in mid-gauntlet and a default run had to stay byte-for-byte
@@ -14121,203 +14588,78 @@ impl GarbageCollector for ZgcRealHeap {
         // is 170 ms of 265 ms (64%), because it walks 13.0M dead objects against
         // a young cycle's 137k. The measured -30% was being applied to the small
         // one.
-        let zero_header_only = self.gen_header_zero_only.load(Ordering::Relaxed);
-        let merge_dead_runs = self.gen_dead_runs_enabled.load(Ordering::Relaxed);
-        // The run being accumulated, ARENA-RELATIVE, and the two engagement
-        // counters. `None` between runs and after a flush.
-        // Can the mark bits be cleared in bulk after the loop, rather than one
-        // survivor's header at a time inside it? Read once, outside.
-        let bulk_clearable = self.mark_bits.is_some();
-        let mut dead_run: Option<(usize, usize)> = None;
-        let mut dead_runs = 0usize;
-        let mut dead_in_runs = 0usize;
-        let mut zero_bytes_skipped = 0usize;
+        //
+        // THE ARENA GUARD IS NOT HELD FOR THE WALK ANY MORE. It used to wrap
+        // the whole loop, which is what made the sweep unshardable. Only two
+        // numbers were ever read from it (`base_ptr`, `high_cursor`), and both
+        // are constant for the duration of a stop-the-world pause; the free
+        // spans the walk produces are handed over afterwards, in one batch, in
+        // the same ascending order `Arena::coalesce_free_list` requires. The
+        // per-object `write_bytes` writes arena BYTES, which the guard never
+        // protected -- it protects the free-list metadata.
+        let cfg = {
+            let arena = self.arena.lock();
+            ZSweepCfg {
+                arena_base: arena.base_ptr() as usize,
+                high_floor: arena.high_cursor(),
+                zero_header_only: self.gen_header_zero_only.load(Ordering::Relaxed),
+                merge_dead_runs: self.gen_dead_runs_enabled.load(Ordering::Relaxed),
+                // Can the mark bits be cleared in bulk after the walk, rather
+                // than one survivor's header at a time inside it?
+                bulk_clearable: self.mark_bits.is_some(),
+                want_dead,
+                collect_dead_hashes,
+                gen_on,
+                promo_age,
+            }
+        };
+
+        let sweep_workers = self.sweep_workers(gen_on);
+        let mut swept_total = if sweep_workers > 1 {
+            self.sweep_parallel(&registered, sweep_floor, &cfg, sweep_workers)
+        } else {
+            self.sweep_serial(&registered, sweep_floor, &cfg)
+        };
+        // THE SPILL SET, ALWAYS ON THIS THREAD. It belongs to no word range and
+        // is not address-ordered, so it can neither be partitioned nor merged
+        // into a run -- which is why the flush above it is load-bearing. Empty
+        // on every healthy run.
+        swept_total.flush();
+        registered.for_each_spilled_base(sweep_floor, |base| {
+            self.sweep_one(base, &cfg, &mut swept_total)
+        });
+        swept_total.flush();
+
+        let bytes_copied = swept_total.bytes_copied;
+        let objects_copied = swept_total.objects_copied;
+        let bytes_freed = swept_total.bytes_freed;
+        let dead_count = swept_total.dead_count;
+        let unsizable = swept_total.unsizable;
+        let gen_promoted = swept_total.gen_promoted;
+        let swept = swept_total.swept;
+        let zero_bytes_skipped = swept_total.zero_bytes_skipped;
+        let dead_in_runs = swept_total.dead_in_runs;
+        let dead_runs = swept_total.spans.len();
+        // The reused buffer, filled only when `want_dead` said so -- see
+        // `dead_scratch`.
+        let mut dead_guard = self.dead_scratch.lock();
+        let dead: &mut Vec<usize> = &mut dead_guard;
+        dead.clear();
+        dead.append(&mut swept_total.dead);
+        let dead_hashes = std::mem::take(&mut swept_total.dead_hashes);
         {
             let mut arena = self.arena.lock();
-            let arena_base = arena.base_ptr() as usize;
-            // WHERE THE LARGE-OBJECT END BEGINS. `Arena::add_free_block` routes
-            // a span by its offset and bounds a LOW span by the low cursor, so a
-            // run must never grow across this line: it would be pushed onto the
-            // low tier while covering high-region bytes, and the arena would
-            // serve the same memory from the free list and the high cursor both.
-            // The two ends share one middle, so this is reachable rather than
-            // hypothetical.
-            let high_floor = arena.high_cursor();
             // ASCENDING, which the coalescer below depends on: adjacent dead
-            // objects hand adjacent spans to `add_free_block`. The bitmap scan IS
-            // the ascending order.
-            //
-            // FROM `sweep_floor`: on a young cycle everything below it is old, was
-            // pre-marked above, and is retained without being visited -- which is
-            // what makes a young sweep O(young) rather than O(registry). The
-            // 2026-08-17 measurement put that sweep at 182 ms of a 309 ms mean
-            // pause, unchanged by the generation split, because it walked every
-            // registered object whatever the split said.
-            registered.for_each_base_from(sweep_floor, |base| {
-                swept += 1;
-                let header = self.header_mut(base as *mut u8);
-                // A header this collector cannot size must not be swept. The
-                // dead arm below `write_bytes`es `size` bytes and hands the
-                // same span to `Arena::add_free_block`, whose only bound is a
-                // `debug_assert!` — so passing `object_body_size`'s 1 TiB
-                // corrupt-header sentinel through here memsets a terabyte from
-                // `base` and free-lists memory that is not in the arena.
-                //
-                // Retaining it instead leaks one object until its layout
-                // resolves again (or forever, if its class really is gone),
-                // which is the fail-safe direction: it stays registered, stays
-                // rooted conservatively, and is never handed out twice. The
-                // one-shot `tracing::warn!` makes the leak visible rather than
-                // silent.
-                let Some(size) = Self::alloc_size(header) else {
-                    unsizable += 1;
-                    if !bulk_clearable {
-                        header.clear_gc_flags(GC_FLAG_MARKED);
-                    }
-                    return; // `return` and not `continue`: this is a closure now
-                };
-                if self.mark_is_set(base) {
-                    // Survivor: keep it, and clear the mark bit for the next
-                    // cycle.
-                    //
-                    // ON THE BITMAP ARM THERE IS NOTHING TO CLEAR HERE. One
-                    // `clear_all` after the loop does the whole heap, which is
-                    // the difference between a linear store over
-                    // `capacity / 512` bytes and a read-modify-write of every
-                    // survivor's 64-byte header line -- i.e. between touching
-                    // 8 MB and dirtying the entire live set, on a phase that is
-                    // otherwise read-only on a non-generational run.
-                    if !bulk_clearable {
-                        header.clear_gc_flags(GC_FLAG_MARKED);
-                    }
-                    bytes_copied += size;
-                    objects_copied += 1;
-                    // PHASE G: one more collection survived. `age_survivor`
-                    // returns true on the collection that promotes it, and
-                    // cards it -- see there for why the card at promotion is
-                    // what makes a young cycle sound. Free on a non-
-                    // generational run: one relaxed load and a branch.
-                    if gen_on && self.age_survivor(base, header, promo_age) {
-                        gen_promoted += 1;
-                    }
-                } else {
-                    // Dead: zero it (so a later scan can't see a stale header)
-                    // and return the span to the arena free list.
-                    //
-                    // THE HEADER IS THE WHOLE REASON -- see
-                    // `zgc_sweep_header_zero`. `HEADER_SIZE` is the entire
-                    // `ObjectHeader`, so this leaves `class_id=0, num_slots=0`,
-                    // which is the identical corpse a reader of a vacated span
-                    // met before; and the body is only reachable through that
-                    // header, which is why the bytes below it need not be
-                    // touched. `.min(size)` is belt-and-braces: no allocation is
-                    // shorter than its header, and a `write_bytes` past the end
-                    // of one would be exactly the bug `alloc_size` refuses
-                    // above.
-                    //
-                    // SAFETY: `base` is a registered allocation of `size`
-                    // bytes inside the arena, and both arms write at most
-                    // `size` of them.
-                    let zero = if zero_header_only {
-                        let n = HEADER_SIZE.min(size);
-                        zero_bytes_skipped += size - n;
-                        n
-                    } else {
-                        size
-                    };
-                    // BEFORE the zeroing: the identity hash lives in the mark
-                    // word, so `write_bytes` below is what destroys it. A `0`
-                    // means "never hashed" (or hashed then monitor-inflated,
-                    // which displaces it) and such an object cannot be a key
-                    // in an identity-hash-keyed table, so skipping it is exact
-                    // rather than approximate. See `identity_side_tables`.
-                    if collect_dead_hashes {
-                        let h = cratonvm_types::ObjectHeader::neutral_hash(
-                            header.mark_word.load(Ordering::Relaxed),
-                        );
-                        if h != 0 {
-                            dead_hashes.push(h);
-                        }
-                    }
-                    unsafe { std::ptr::write_bytes(base as *mut u8, 0, zero) };
-                    if base >= arena_base {
-                        let off = base - arena_base;
-                        // A large object never joins a run -- see `high_floor`.
-                        let mergeable =
-                            merge_dead_runs && off < high_floor && off + size <= high_floor;
-                        if mergeable {
-                            // ONE SPAN PER RUN. The walk is ascending, so a dead
-                            // object adjacent to the previous one extends it;
-                            // anything else flushes and starts a new run. See
-                            // `zgc_sweep_dead_runs` for why the post-coalesce
-                            // result is the same either way.
-                            dead_in_runs += 1;
-                            match dead_run {
-                                Some((ro, rl)) if ro + rl == off => {
-                                    dead_run = Some((ro, rl + size));
-                                }
-                                Some((ro, rl)) => {
-                                    arena.add_free_block(ro, rl);
-                                    dead_runs += 1;
-                                    dead_run = Some((off, size));
-                                }
-                                None => dead_run = Some((off, size)),
-                            }
-                        } else {
-                            // FLUSH FIRST. The coalescer only sees adjacent
-                            // spans as adjacent because they arrive in ascending
-                            // order; adding this one ahead of the run below it
-                            // would break that ordering for the rest of the
-                            // cycle.
-                            if let Some((ro, rl)) = dead_run.take() {
-                                arena.add_free_block(ro, rl);
-                                dead_runs += 1;
-                            }
-                            arena.add_free_block(off, size);
-                        }
-                    }
-                    bytes_freed += size;
-                    dead_count += 1;
-                    // THE REGISTRY PRUNE, IN PLACE.
-                    //
-                    // It used to run after the loop, over the collected `dead`
-                    // slice -- which is what made that slice unconditional. The
-                    // base is already in hand here, so the second pass over
-                    // 104 MB of cold `usize`s bought nothing but the ordering
-                    // note below, which still holds:
-                    //
-                    // the prune is a REMOVAL, never a wholesale replacement of
-                    // the structure by the mark snapshot's survivors. An
-                    // allocation registered by another path between the mark
-                    // snapshot and here would be erased by a replacement --
-                    // leaking its memory forever (unsweepable) and, worse,
-                    // making `is_object_address` deny it so conservative
-                    // rooting drops it while reachable.
-                    //
-                    // No mutator is running (`retire_all_tlabs` ran before the
-                    // snapshot and this is inside the stop-the-world pause), so
-                    // nothing can allocate into the span this iteration is
-                    // freeing. Lock order is arena -> registry, and no path in
-                    // this file takes them the other way round: `alloc_raw`
-                    // releases the arena guard before `registry.insert`, and
-                    // `is_object_address` takes the registry alone.
-                    self.registry.remove(base);
-                    if want_dead {
-                        dead.push(base);
-                    }
-                }
-            });
-            // The last run has no successor to flush it. Missing this leaks the
-            // topmost run of garbage in every young cycle -- and it would not
-            // show up as a leak, because the cursor retraction below cannot
-            // reclaim a span that is not on the list.
-            if let Some((ro, rl)) = dead_run.take() {
-                arena.add_free_block(ro, rl);
-                dead_runs += 1;
+            // objects hand adjacent spans to `add_free_block`, and it can only
+            // see two spans as adjacent if they arrive in order. The bitmap scan
+            // IS that order within a shard, and `ZSweepShard::absorb` preserves
+            // it across shards -- joining the seam where two shards' runs touch.
+            for (off, len) in swept_total.spans.drain(..) {
+                arena.add_free_block(off, len);
             }
 
             // Coalesce the free list into maximal spans — same rationale as
-            // gen_heap's post-sweep coalescer. The loop above returns ONE
+            // gen_heap's post-sweep coalescer. The walk above returns ONE
             // object-sized hole per dead object, and `Arena::alloc`'s
             // small-tier scan is BUDGETED (16 entries): a workload whose
             // dead objects mix sizes (e.g. runs of 72-byte boxes burying
@@ -15980,6 +16322,233 @@ pub(crate) mod tests {
         heap.collect_garbage(&stw, &mut roots, monitors);
         let still = addrs.iter().filter(|a| heap.registry.contains(**a)).count();
         (addrs, still)
+    }
+
+    // ---- D2c: the sweep, sharded ------------------------------------------
+
+    /// The allocation footprint of `obj`, as the sweep computes it.
+    fn alloc_footprint_of(heap: &ZgcRealHeap, obj: ObjectRef) -> usize {
+        ZgcRealHeap::alloc_size(heap.header_ref(obj.as_ptr())).expect("a fresh object is sizable")
+    }
+
+    /// Drive one collection with a chosen sweep-worker count and report
+    /// everything an observer downstream of the sweep can see.
+    ///
+    /// Deliberately including the ARENA's own view, because the sweep's whole
+    /// output is the free list: a shard merge that dropped or misordered a span
+    /// shows up in `largest_free_block` (the coalescer's product, and the
+    /// coalescer can only merge spans handed to it in ascending order) and
+    /// nowhere else.
+    fn sweep_outcome(workers: usize) -> (usize, usize, usize, usize, usize, usize) {
+        const LIVE_EVERY: usize = 23;
+        const OBJECTS: usize = 4000;
+        let heap = ZgcRealHeap::with_capacity(16 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+        heap.set_sweep_workers(workers);
+        // INTERLEAVED live and dead, so the dead form many separate runs
+        // scattered across the whole bitmap rather than one block at the top --
+        // which is what puts shard boundaries inside runs.
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        for i in 0..OBJECTS {
+            let o = heap.alloc_object(ClassId::new(11), 3);
+            if i % LIVE_EVERY == 0 {
+                roots.push(o);
+            }
+        }
+        // Two large ones at the high end as well, one live, so the LARGE-OBJECT
+        // tier is exercised too -- it is the tier a seam join could corrupt.
+        heap.alloc_array(ClassId::new(1), ArrayElementType::Byte, BIG);
+        roots.push(heap.alloc_array(ClassId::new(1), ArrayElementType::Byte, BIG));
+        let expect_live = roots.len();
+        {
+            // SAFETY: single-threaded unit test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+        }
+        let survivors = roots
+            .iter()
+            .filter(|r| heap.registry.contains(r.as_ptr() as usize))
+            .count();
+        let (_, dead_runs, dead_objects) = heap.gen_sweep_cost_stats();
+        let arena = heap.arena.lock();
+        (
+            expect_live,
+            survivors,
+            dead_objects,
+            dead_runs,
+            arena.free_list_bytes(),
+            arena.largest_free_block(),
+        )
+    }
+
+    /// **THE SHARD-EQUIVALENCE TEST.** A sharded sweep must leave the arena in
+    /// exactly the state the serial one does.
+    ///
+    /// Not "roughly as much free space": the same reclaimed count, the same
+    /// run count, the same free-list byte total AND the same largest block.
+    ///
+    /// The exact edit that trips it: dropping `ZSweepShard::flush` from
+    /// `absorb`, reversing the shard concatenation, or restoring the seam join
+    /// that consumed a span on its failing branch -- which is the defect this
+    /// test was written after, where a shard whose predecessor produced NO
+    /// spans silently lost its first one and a whole dead large array never
+    /// reached the free list.
+    #[test]
+    fn a_sharded_sweep_leaves_the_arena_exactly_as_the_serial_one_does() {
+        let serial = sweep_outcome(1);
+        assert_eq!(serial.0, serial.1, "every root must have survived");
+        assert!(serial.2 > 3_000, "the sweep must have reclaimed something");
+        for workers in [2usize, 3, 4, 7] {
+            assert_eq!(
+                sweep_outcome(workers),
+                serial,
+                "a {workers}-way sharded sweep disagreed with the serial one; \
+                 the tuple is (roots, survivors, dead_objects, dead_runs, \
+                 free_list_bytes, largest_free_block)"
+            );
+        }
+    }
+
+    /// **A shard whose predecessor produced nothing must not lose its first
+    /// span.**
+    ///
+    /// The regression test for the `absorb` defect directly. Three large
+    /// objects at the top of the heap and nothing else: with two or more
+    /// shards every shard but the last produces an EMPTY span list, so the
+    /// merge's "is there a previous span to join to?" branch is the one taken
+    /// -- and the version that asked it with `it.next()` inside an `if let`
+    /// tuple pattern consumed the span on the failing arm and dropped it.
+    #[test]
+    fn an_empty_leading_shard_does_not_swallow_the_next_shards_first_span() {
+        let heap = ZgcRealHeap::with_capacity(4 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+        let mut expect = 0usize;
+        for _ in 0..3 {
+            let a = heap.alloc_array(ClassId::new(1), ArrayElementType::Byte, BIG);
+            expect += alloc_footprint_of(&heap, a);
+        }
+        let cfg = {
+            let arena = heap.arena.lock();
+            ZSweepCfg {
+                arena_base: arena.base_ptr() as usize,
+                high_floor: arena.high_cursor(),
+                zero_header_only: true,
+                merge_dead_runs: true,
+                bulk_clearable: heap.mark_bits.is_some(),
+                want_dead: true,
+                collect_dead_hashes: false,
+                gen_on: false,
+                promo_age: 3,
+            }
+        };
+        let registered = heap.registry.snapshot();
+        // Nothing is marked, so every object is dead and every byte must come
+        // back. Four shards over a heap whose objects all sit at the top.
+        let mut sharded = heap.sweep_parallel(&registered, 0, &cfg, 4);
+        sharded.flush();
+        let freed: usize = sharded.spans.iter().map(|(_, len)| *len).sum();
+        assert_eq!(sharded.dead_count, 3, "all three objects must be swept");
+        assert_eq!(
+            freed, expect,
+            "the sharded sweep produced {freed} free bytes for {expect} bytes of \
+             dead objects -- a span was dropped at a shard seam"
+        );
+        // ...and the spans are ASCENDING, which is what the coalescer needs.
+        assert!(
+            sharded.spans.windows(2).all(|w| w[0].0 < w[1].0),
+            "the merged spans are not in ascending order: {:?}",
+            sharded.spans
+        );
+    }
+
+    /// **A generational cycle is never sharded.**
+    ///
+    /// Its survivor arm reaches `age_survivor` -> `card_object` -> the
+    /// remembered set, whose concurrency this change has not audited; and a
+    /// young sweep has nothing to gain anyway, being 6.3 ms of a 112 ms pause
+    /// because the floor already bounds it. Stated as a refusal in
+    /// `sweep_workers` rather than as a comment, and asserted here.
+    #[test]
+    fn a_generational_cycle_refuses_to_shard_its_sweep() {
+        let heap = ZgcRealHeap::with_capacity(1024 * 1024);
+        heap.set_sweep_workers(8);
+        assert_eq!(
+            heap.sweep_workers(true),
+            1,
+            "a generational cycle must sweep on one thread"
+        );
+        assert!(
+            heap.sweep_workers(false) > 1,
+            "...and a whole-heap one must honour the setting, or the refusal \
+             above is vacuous"
+        );
+    }
+
+    /// The measurement `sweep_workers` asks for, as a runnable thing rather
+    /// than a promise.
+    ///
+    /// ```text
+    /// cargo test --release -p cratonvm-gc --lib -- --ignored --nocapture \
+    ///     zgc::tests::measure_the_sharded_sweep
+    /// ```
+    ///
+    /// Ignored because it wants a release build, a few hundred MB and a quiet
+    /// box -- and because a timing assertion on a shared machine is a flake
+    /// generator, so it PRINTS rather than asserts. Read it beside
+    /// `--verbose:gc`'s `sweep_us` on a real workload before moving the
+    /// default; this measures the phase in isolation, which is the best case
+    /// for parallelism and therefore an upper bound.
+    #[test]
+    #[ignore = "timing measurement; wants --release and a quiet box"]
+    fn measure_the_sharded_sweep() {
+        // Big enough that the sweep is memory-bound rather than a few cache
+        // lines, small enough to run on a laptop.
+        const CAPACITY: usize = 768 * 1024 * 1024;
+        const LIVE_EVERY: usize = 16;
+        const REPS: usize = 3;
+
+        let cores = std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(1);
+        println!("[sweep-bench] capacity={CAPACITY} cores={cores} reps={REPS}");
+        for workers in [1usize, 2, 4, 8, cores] {
+            let mut best = u128::MAX;
+            let mut reclaimed = 0usize;
+            for _ in 0..REPS {
+                let heap = ZgcRealHeap::with_capacity(CAPACITY);
+                heap.set_tlab_enabled(false);
+                heap.set_sweep_workers(workers);
+                let mut roots: Vec<ObjectRef> = Vec::new();
+                let mut n = 0usize;
+                // Fill to ~70% of capacity with 3-field objects, keeping one in
+                // sixteen alive -- a live set of a few percent, which is the
+                // shape a whole-heap cycle actually meets.
+                while heap.allocated_bytes() < CAPACITY * 7 / 10 {
+                    let o = heap.alloc_object(ClassId::new(11), 3);
+                    if n % LIVE_EVERY == 0 {
+                        roots.push(o);
+                    }
+                    n += 1;
+                }
+                let started = std::time::Instant::now();
+                {
+                    // SAFETY: single-threaded unit test.
+                    let stw = unsafe { StopTheWorldToken::new() };
+                    heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+                }
+                best = best.min(started.elapsed().as_micros());
+                reclaimed = heap.gen_sweep_cost_stats().2;
+            }
+            println!(
+                "[sweep-bench] workers={workers:2}  best_collection_us={best:>9}  \
+                 dead_objects={reclaimed}"
+            );
+        }
+        println!(
+            "[sweep-bench] NOTE: this is the whole collection, not the sweep \
+             alone -- the mark is serial in every arm, so the sweep's own \
+             speedup is larger than the ratio above."
+        );
     }
 
     // ---- D2b: the mark bits, out of the object header ---------------------
