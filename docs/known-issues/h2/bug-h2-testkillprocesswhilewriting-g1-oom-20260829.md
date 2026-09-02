@@ -537,10 +537,34 @@ The A/B that bounds the win, one binary, interleaved, 900 s:
 (The `=0` rep 2 ran through a loadavg-414 excursion, so read its TIMES with
 suspicion; `fixup_regions` is structural and is not affected.)
 
+#### MEASURED: the census skip reaches the off-switch's numbers with the feature ON
+
+`want_census` turned out to exist as TWO expressions -- one inside
+`update_references_in_regions` deciding whether the census is BUILT, one at the
+`phase4_regions_to_walk` call site deciding the fix-up walk's WIDTH. The first
+cut of the fix changed only the former and measured `fixup_regions=831`,
+unmoved from baseline, because the call site still said "wide". A census
+skipped while the whole-heap walk still runs is the worst of both. Both now go
+through one `want_humongous_census`.
+
+One binary, 900 s, interleaved, quiet host (loadavg 6-14):
+
+| arm | `fixup_regions` | `fixup_us` | `pause_us` | pauses | rc |
+|---|---:|---:|---:|---:|---|
+| baseline, eager ON (before this fix) | 845 / 841 | 3 764 / 4 178 | 8 682 / 9 704 | 61 481 / 51 525 | 124 |
+| `CRATONVM_G1_EAGER_HUMONGOUS=0` | 5 / 5 | 737 | 4 660 | 96 194 | 124 |
+| **census skip, eager still ON** | **5 / 5** | **658 / 894** | **4 361 / 5 539** | 101 780 / 82 132 | 124 |
+
+The fix reaches the off-switch's numbers WITHOUT turning eager reclaim off:
+**the fix-up walk drops from 843 regions to 5 and the mean young pause halves,
+8.7 ms -> 4.4 ms.** It does this only on pauses where the reclaim could not
+have run anyway, so nothing that eager reclaim would have freed is given up.
+
 #### The rate is a separate question, and it is the one left
 
-Neither arm passes. Turning the walk off entirely still leaves **61 000 -
-80 000 young pauses per 900 s** -- one every 11-15 ms, each freeing about
+No arm passes -- halving the pause cost just buys more pauses in the same
+900 s (82 000 - 102 000, up from 51 000 - 61 000). Turning the walk off
+entirely still leaves **tens of thousands of young pauses per 900 s** -- one every 11-15 ms, each freeing about
 0.5 MB of a 1 GiB heap, against 88 Mixed pauses in 2400 s. `young_target_regions`
 starts at 60% of the heap, so the young generation is not supposed to be
 collected at that granularity. Why the trigger fires that often, and why Mixed
