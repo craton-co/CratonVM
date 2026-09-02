@@ -586,6 +586,7 @@ thread_local! {
             arithmetic: Cell::new(false),
             npe: Cell::new(false),
             npe_action: Cell::new(0),
+            npe_compiled_frames: std::cell::RefCell::new(None),
             deopt: Cell::new(false),
         }
     };
@@ -994,6 +995,22 @@ struct JitSignals {
     arithmetic: Cell<bool>,
     npe: Cell<bool>,
     npe_action: Cell<u8>,
+    /// The COMPILED frames that were live when a JIT helper signalled the NPE.
+    ///
+    /// An implicit NPE in compiled code is not thrown where it happens: the
+    /// helper sets `npe`, returns `i64::MIN`, compiled code returns to the
+    /// interpreter, and only THEN is the `java/lang/NullPointerException`
+    /// constructed. `fillInStackTrace` therefore runs on a stack the compiled
+    /// frames have already left, and the trace loses every method between the
+    /// throw site and the first interpreter frame — the whole point of the
+    /// trace. Snapshot them while they are still on the stack; the drain hands
+    /// them to the throwable. See
+    /// `internal/fixed-bugs/jit-compiled-frame-has-no-line-and-no-inlined-callees-20260901.md`.
+    ///
+    /// `RefCell` rather than `Cell` because the payload is not `Copy`; it is
+    /// only ever borrowed for the length of a `take`/`replace`, never across a
+    /// call, so it cannot be re-entered.
+    npe_compiled_frames: std::cell::RefCell<Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>>,
     deopt: Cell<bool>,
 }
 
@@ -1010,6 +1027,11 @@ pub(crate) struct DrainedJitSignals {
     pub aioobe: Option<(i64, i64)>,
     pub arithmetic: bool,
     pub npe: bool,
+    /// The compiled frames that were live when the helper signalled `npe`.
+    /// See `JitSignals::npe_compiled_frames`; drained here so that no path
+    /// can construct the NPE without also being handed the frames it is
+    /// about to lose.
+    pub npe_compiled_frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
     /// Drained alongside `npe` for hygiene (a stale action code must not
     /// outlive its NPE), but not yet consumed by the JIT-return drains —
     /// they throw the bare NPE exactly as before this consolidation
@@ -1039,9 +1061,48 @@ pub(crate) fn take_all_jit_signals(thread: &mut JvmThread) -> DrainedJitSignals 
         aioobe: s.aioobe.take(),
         arithmetic: s.arithmetic.take(),
         npe: s.npe.take(),
+        npe_compiled_frames: s.npe_compiled_frames.borrow_mut().take(),
         npe_action: s.npe_action.take(),
         deopt: s.deopt.take(),
     })
+}
+
+/// Kill switch for the compiled-frame snapshot taken when a JIT helper signals
+/// an implicit NPE. Default ON; `CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT=1` restores
+/// the historical (frame-losing) trace, so the difference is an A/B inside one
+/// binary rather than a comparison across two builds.
+fn npe_frame_snapshot_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT").is_none()
+    })
+}
+
+/// Snapshot the live compiled frames for a JIT-signalled NPE.
+///
+/// Called from the two `set_jit_pending_npe*` setters, i.e. from inside the
+/// helper, with every compiled frame between the throw site and the
+/// interpreter still on the stack. Cheap by construction: this records the
+/// same small structs the GC root walk already builds, and does no class-store
+/// lookup, no string formatting and takes no lock.
+fn snapshot_npe_compiled_frames() {
+    if !npe_frame_snapshot_enabled() {
+        return;
+    }
+    let frames = crate::jit::conservative_roots::active_compiled_frames();
+    JIT_SIGNALS.with(|s| {
+        *s.npe_compiled_frames.borrow_mut() = (!frames.is_empty()).then_some(frames);
+    });
+}
+
+/// Take the compiled frames snapshotted for a pending JIT NPE, if any.
+///
+/// The drain calls this beside [`take_jit_pending_npe`]. Always a `take`: a
+/// snapshot that outlived its NPE would be attached to an unrelated throwable,
+/// and a trace that is confidently wrong is worse than one that is short.
+pub fn take_jit_pending_npe_compiled_frames(
+) -> Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>> {
+    JIT_SIGNALS.with(|s| s.npe_compiled_frames.borrow_mut().take())
 }
 
 /// Store a pending Java exception from JIT dispatch. Called when
@@ -1216,6 +1277,7 @@ fn set_jit_pending_npe() {
         s.npe.set(true);
         s.npe_action.set(0);
     });
+    snapshot_npe_compiled_frames();
 }
 
 /// Internal: set the pending-NPE flag *with* a JEP-358 action code
@@ -1228,6 +1290,7 @@ fn set_jit_pending_npe_action(code: u8) {
         s.npe.set(true);
         s.npe_action.set(code);
     });
+    snapshot_npe_compiled_frames();
 }
 
 /// Re-stash a previously-taken JIT NPE action code (OSR drain-without-route

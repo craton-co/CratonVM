@@ -574,7 +574,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-254 tokens.
+255 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -671,6 +671,7 @@ export inherited from a parent shell.
 | `reloc-gate-map-incomplete` | `CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE` |
 | `ir-selfrec-direct` | `CRATONVM_JIT_IR_SELFREC_DIRECT` |
 | `nested-trace-frames` | `CRATONVM_JIT_NO_NESTED_TRACE_FRAMES` |
+| `npe-frame-snapshot` | `CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT` |
 | `osr-frame-dedupe` | `CRATONVM_JIT_NO_OSR_FRAME_DEDUPE` |
 | `strict-install-epoch` | `CRATONVM_JIT_STRICT_INSTALL_EPOCH` |
 | `kernel-reg-locals` | `CRATONVM_JIT_KERNEL_REG_LOCALS` |
@@ -1050,7 +1051,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-19 tokens.
+20 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1063,6 +1064,7 @@ export inherited from a parent shell.
 | `jboss-boot-log-file` | `CRATONVM_JBOSS_BOOT_LOG_FILE` |
 | `jboss-brute-force-jars` | `CRATONVM_JBOSS_BRUTE_FORCE_JARS` |
 | `jboss-logger-base-emit` | `CRATONVM_JBOSS_LOGGER_BASE_EMIT` |
+| `jboss-log-context-initializer` | `CRATONVM_JBOSS_LOG_CONTEXT_INITIALIZER` |
 | `jboss-logger-level-filter` | `CRATONVM_JBOSS_LOGGER_LEVEL_FILTER` |
 | `jboss-mp-root` | `CRATONVM_JBOSS_MP_ROOT` |
 | `lazy-streams` | `CRATONVM_LAZY_STREAMS` |

@@ -55,11 +55,20 @@
 //! of the table's absolute contents. Process isolation makes the absolute form
 //! safe *today*; the identity-scoped form stays correct if this file ever grows
 //! a test that builds two heaps at once.
+//!
+//! It has, as of 2026-09-01:
+//! `a_second_live_heap_makes_the_published_bounds_gate_fail_closed` and
+//! `every_backend_registers_in_the_live_heap_registry`. Anything that reads
+//! `gen_heap::live_relocatable_heaps`, or a gate built on it, belongs here for
+//! the same reason the six original tests do — that count is process-global
+//! under `cfg(test)` (deliberately; see its doc comment), so in the lib binary
+//! it reports the ~220 peer heaps and every gate built on it reads closed.
 
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
 use cratonvm_gc::collector::GarbageCollector;
+use cratonvm_gc::g1::{G1Collector, G1CollectorConfig};
 use cratonvm_gc::gen_heap::{
     self, GenerationalHeap, JIT_READ_BOUNDS, JIT_REGION_BOUNDS, MOVABLE_BOUNDS,
 };
@@ -159,6 +168,131 @@ fn the_publishing_heap_still_clears_its_own_bounds_on_drop() {
         !gen_heap::published_young_regions_are_live(),
         "and with nothing else published, the table must be empty"
     );
+}
+
+/// **Two live heaps make the published tables unusable as an answer, and the
+/// gate says so.**
+///
+/// This is the half `a_non_publishing_heap_does_not_clear_the_publishers_bounds`
+/// explicitly does NOT fix, and it was carried as a known limitation for as
+/// long as the only reader was the JIT's guarded inline `getfield`. It stopped
+/// being a limitation once
+/// `conservative_roots::moving_young_unpublished_frame_oop_present` began
+/// asking `addr_is_movable` whether a compiled frame's word could be
+/// relocated: the tables are discriminated by slot 0, so they describe exactly
+/// one heap, and every address of the heap that lost the slot answers `false` —
+/// which the verifier consumes as "no movable word in this frame" and reports
+/// as a clean frame it never classified.
+///
+/// The distinguishing property is that this state looks like SUCCESS from
+/// every angle the empty-table case is checked from: `movable_bounds_published`
+/// is true, the values are fresh, and the publisher is live. Only the count of
+/// live heaps separates them, which is why there is a registry.
+///
+/// Verified by BREAKING it: drop the `published_bounds_represent_every_live_heap`
+/// term from `movable_bounds_are_live` and the middle assertion here fails
+/// while every other test in this file still passes.
+#[test]
+fn a_second_live_heap_makes_the_published_bounds_gate_fail_closed() {
+    let _serialise = LOCK.lock().unwrap();
+
+    let first = GenerationalHeap::with_capacity(1024 * 1024);
+    let first_base = JIT_REGION_BOUNDS.words[0].load(Ordering::Acquire);
+    assert_ne!(first_base, 0, "constructing a heap must publish something");
+    assert_eq!(
+        gen_heap::live_relocatable_heaps(),
+        1,
+        "one heap alive. Every test in this file drops its heaps before          releasing LOCK (the guard is declared first, so it drops last), which          is what makes an ABSOLUTE count assertable here at all"
+    );
+    assert!(
+        gen_heap::movable_bounds_are_live(),
+        "one published heap is exactly the case the verifier may run in"
+    );
+
+    let second = GenerationalHeap::with_capacity(4 * 1024 * 1024);
+    let second_base = JIT_REGION_BOUNDS.words[0].load(Ordering::Acquire);
+    assert_ne!(
+        second_base, first_base,
+        "last writer wins: the later heap must have taken the slot"
+    );
+    assert_eq!(gen_heap::live_relocatable_heaps(), 2);
+
+    // The state the whole registry exists for. Both halves are asserted,
+    // because the second is what makes the first invisible without it.
+    assert!(
+        gen_heap::movable_bounds_published() || gen_heap::published_young_regions_are_live(),
+        "the table is published — that is the trap, not the bug"
+    );
+    assert!(
+        !gen_heap::published_bounds_represent_every_live_heap(),
+        "two heaps cannot both be described by a single-tenant table"
+    );
+    assert!(
+        !gen_heap::movable_bounds_are_live(),
+        "with a second heap alive the gate must refuse: the first heap's every          address now answers `false` to addr_is_movable, and a verifier reading          that as 'no movable words' passes over frames it never classified"
+    );
+
+    // Concretely: an address in the unrepresented heap is invisible to the
+    // residency test, which is the mechanism the gate is standing in front of.
+    let first_young = first_base;
+    assert!(
+        !gen_heap::addr_is_movable(first_young),
+        "the displaced heap's young-from base must be exactly what the residency          test can no longer see"
+    );
+
+    drop(second);
+    assert_eq!(gen_heap::live_relocatable_heaps(), 1);
+    assert!(
+        gen_heap::published_bounds_represent_every_live_heap(),
+        "dropping back to one heap must restore the gate, or one transient heap          would cost the process moving-young for good"
+    );
+    drop(first);
+    assert_eq!(
+        gen_heap::live_relocatable_heaps(),
+        0,
+        "the registration is RAII; a dropped heap cannot leave a count behind"
+    );
+}
+
+/// The registry counts heaps of EVERY backend, not just the two that publish.
+///
+/// G1 publishes into neither table the verifier tests, so on its own it already
+/// fails that verifier closed and needs no registration to do so. The
+/// registration is for the MIXED process: without it, a live generational
+/// heap's published table would be read as an answer about a G1 heap's
+/// addresses — the same false verdict, sourced from a collector that never
+/// claimed to describe anything.
+#[test]
+fn every_backend_registers_in_the_live_heap_registry() {
+    let _serialise = LOCK.lock().unwrap();
+
+    assert_eq!(
+        gen_heap::live_relocatable_heaps(),
+        0,
+        "a peer test left a heap alive — see this file's rule: heaps must be          dropped before LOCK is released"
+    );
+    let gen = GenerationalHeap::with_capacity(1024 * 1024);
+    assert_eq!(gen_heap::live_relocatable_heaps(), 1);
+    let zgc = ZgcRealHeap::with_capacity(1024 * 1024);
+    assert_eq!(gen_heap::live_relocatable_heaps(), 2);
+    let g1 = G1Collector::new(G1CollectorConfig {
+        heap_size: 8 * 1024 * 1024,
+        ..Default::default()
+    });
+    assert_eq!(
+        gen_heap::live_relocatable_heaps(),
+        3,
+        "G1 must register too, or a gen+G1 process reads the gen table as an          answer about G1's addresses"
+    );
+    assert!(
+        !gen_heap::movable_bounds_are_live(),
+        "three heaps, one single-tenant table"
+    );
+
+    drop(g1);
+    drop(zgc);
+    drop(gen);
+    assert_eq!(gen_heap::live_relocatable_heaps(), 0);
 }
 
 // ---------------------------------------------------------------------------

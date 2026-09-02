@@ -1,8 +1,9 @@
 # Loader identity: the two rows the `getDefinedPackage` fix left, and why they are not that fix
 
 **Status: OPEN, MEASURED 2026-09-01.** Both rows were found while closing
-`getDefinedPackage`'s built-in-loader defect (retired to
-the internal tree's `jdk-only/`); neither is that defect, and both are recorded here
+`getDefinedPackage`'s built-in-loader defect — the record
+`bug-getdefinedpackage-answers-visibility-not-definition-for-builtin-loaders-20260822.md`,
+retired on the same day. Neither row IS that defect, and both are recorded here
 rather than folded into it because they have different owners and different
 blast radii.
 

@@ -62,6 +62,7 @@ use parking_lot::RwLock;
 use crate::classloading::{Class, ClassId, ClassStore};
 use crate::native::registry::StackTraceEntry;
 use crate::runtime::frame::Frame;
+use crate::jit::conservative_roots::ActiveCompiledFrame;
 use crate::runtime::fx_collections::{fx_hashmap, FxHashMap};
 
 /// Sentinel "unknown line number" value — `-1` matches HotSpot's
@@ -364,8 +365,8 @@ pub fn capture_full_trace(class_store: &ClassStore, frames: &[Frame]) -> Vec<Sta
             .map(|f| entry_from_frame(class_store, f))
             .collect();
     }
-    let jit = drop_osr_continuations(frames, jit);
-    interleave_compiled_frames(class_store, frames, &jit)
+    let (jit, osr_bci) = drop_osr_continuations(frames, jit);
+    interleave_compiled_frames(class_store, frames, &jit, &osr_bci)
 }
 
 /// The declaring class of every frame on this thread's Java stack, INNERMOST
@@ -397,18 +398,18 @@ pub fn frame_class_ids_with_compiled(frames: &[Frame]) -> Vec<ClassId> {
     if jit.is_empty() {
         return frames.iter().rev().map(|f| f.class_id).collect();
     }
-    let jit = drop_osr_continuations(frames, jit);
+    let (jit, _osr_bci) = drop_osr_continuations(frames, jit);
     let mut out: Vec<ClassId> = Vec::with_capacity(frames.len() + jit.len());
     let mut next = 0usize;
     for (i, f) in frames.iter().enumerate() {
-        while next < jit.len() && (jit[next].0 as usize) <= i {
-            out.push(ClassId::new(jit[next].2));
+        while next < jit.len() && (jit[next].interp_depth as usize) <= i {
+            out.push(ClassId::new(jit[next].owner_class_id));
             next += 1;
         }
         out.push(f.class_id);
     }
     for slot in &jit[next..] {
-        out.push(ClassId::new(slot.2));
+        out.push(ClassId::new(slot.owner_class_id));
     }
     // `frames` is outermost-first; every consumer wants innermost-first.
     out.reverse();
@@ -458,38 +459,63 @@ fn osr_frame_dedupe_enabled() -> bool {
 /// `foo` calling a compiled `foo` satisfies the first two, and dropping that
 /// frame would undo the nested-activation walk this file's sibling fix
 /// restored.
+/// Bytecode index to report for an interpreter frame INSTEAD of its own
+/// `last_instr_pc`, keyed by index into `frames`. Produced by
+/// [`drop_osr_continuations`]; see the `can_osr_enter` arm there for why.
+type OsrBciOverrides = std::collections::HashMap<usize, i32>;
+
 fn drop_osr_continuations(
     frames: &[Frame],
-    jit: Vec<(u32, String, u32, usize)>,
-) -> Vec<(u32, String, u32, usize)> {
+    jit: Vec<ActiveCompiledFrame>,
+) -> (Vec<ActiveCompiledFrame>, OsrBciOverrides) {
     if !osr_frame_dedupe_enabled() {
-        return jit;
+        return (jit, OsrBciOverrides::new());
     }
-    jit.into_iter()
-        .filter(|(depth, label, _, cm_ptr)| {
+    let mut overrides = OsrBciOverrides::new();
+    let kept = jit
+        .into_iter()
+        .filter(|f| {
             // The frame this entry was pushed FROM. An OSR continuation was
             // pushed from the very frame it continues, so that frame is still
             // there and names the same method.
-            let Some(frame) = (*depth as usize).checked_sub(1).and_then(|i| frames.get(i)) else {
+            let Some(i) = (f.interp_depth as usize).checked_sub(1) else {
                 return true;
             };
-            if !label_names_frame(label, frame) {
+            let Some(frame) = frames.get(i) else {
+                return true;
+            };
+            if !label_names_frame(&f.label, frame) {
                 return true;
             }
-            if *cm_ptr == 0 {
+            if f.cm_ptr == 0 {
                 return true;
             }
             // SAFETY: the pointer came from a chain entry whose frame is live
             // on this thread's stack, so the JIT cache still owns the `Arc`;
             // this read happens on the owning thread during that same capture.
-            let cm = unsafe { &*(*cm_ptr as *const cratonvm_jit::CompiledMethod) };
+            let cm = unsafe { &*(f.cm_ptr as *const cratonvm_jit::CompiledMethod) };
             // The decider. An OSR transfer leaves the interpreter frame parked
             // at the BACK-EDGE it jumped from, which is by construction one of
             // this artifact's OSR entry points. An interpreted caller of the
             // same method is parked at an INVOKE, which is not.
-            !cm.can_osr_enter(frame.pc)
+            if !cm.can_osr_enter(frame.pc) {
+                return true;
+            }
+            // Dropping the duplicate is only half the job. That back-edge is
+            // also the STALE position the surviving interpreter frame will be
+            // reported at: once control transfers to compiled code its
+            // `Frame.pc` stops advancing, so every later trace names the loop
+            // the method tiered up in rather than where it actually is —
+            // `main:62`, the back-edge, where HotSpot says `main:66`, the live
+            // call site. The continuation being dropped is the half that
+            // knows, so hand its safepoint bci to the frame that survives.
+            if f.bci >= 0 {
+                overrides.insert(i, f.bci);
+            }
+            false
         })
-        .collect()
+        .collect();
+    (kept, overrides)
 }
 
 /// Does `label` (`class/Name.method:descriptor`) name the same method as
@@ -529,18 +555,23 @@ fn label_names_frame(label: &str, frame: &Frame) -> bool {
 fn interleave_compiled_frames(
     class_store: &ClassStore,
     frames: &[Frame],
-    jit: &[(u32, String, u32, usize)],
+    jit: &[ActiveCompiledFrame],
+    osr_bci: &OsrBciOverrides,
 ) -> Vec<StackTraceEntry> {
     let mut out = Vec::with_capacity(frames.len() + jit.len());
     let mut next = 0usize;
     for (i, f) in frames.iter().enumerate() {
-        while next < jit.len() && (jit[next].0 as usize) <= i {
+        while next < jit.len() && (jit[next].interp_depth as usize) <= i {
             if let Some(e) = compiled_frame_entry(class_store, &jit[next]) {
                 out.push(e);
             }
             next += 1;
         }
-        out.push(entry_from_frame(class_store, f));
+        let mut entry = entry_from_frame(class_store, f);
+        if let Some(bci) = osr_bci.get(&i) {
+            reline_entry(class_store, &mut entry, *bci);
+        }
+        out.push(entry);
     }
     for slot in &jit[next..] {
         if let Some(e) = compiled_frame_entry(class_store, slot) {
@@ -548,6 +579,64 @@ fn interleave_compiled_frames(
         }
     }
     out
+}
+
+/// Prepend the compiled frames snapshotted at a JIT-signalled implicit NPE to
+/// a trace that was captured after they had already unwound.
+///
+/// An implicit NPE raised inside compiled code is CONSTRUCTED later, from the
+/// interpreter, once the helper's `i64::MIN` sentinel has propagated out of the
+/// compiled activation (see `jit::helpers::take_jit_pending_npe`). By then the
+/// frames between the throw site and the first interpreter frame are gone, and
+/// the trace names none of the code that actually raised the exception —
+/// `[big:42 probe:56 main:67]` on HotSpot reads `[probe:56 main:67]` here, and
+/// after an OSR of the caller it reads `[main:71]` alone.
+///
+/// The snapshot was taken inside the helper, while those frames were still on
+/// the stack. They are innermost-first and belong in front of everything the
+/// late capture found. Entries are built exactly as [`compiled_frame_entry`]
+/// builds them, so a frame recovered this way carries the same bci and line as
+/// one caught live.
+pub fn append_snapshotted_compiled_frames(
+    class_store: &ClassStore,
+    snapshot: &[ActiveCompiledFrame],
+    mut trace: Vec<StackTraceEntry>,
+) -> Vec<StackTraceEntry> {
+    if snapshot.is_empty() {
+        return trace;
+    }
+    // ORDER. A STORED trace is outermost-first — the Java `StackTraceElement[]`
+    // is built by reversing it, which is why `capture_stack_trace`'s consumers
+    // iterate `.rev()`. The snapshotted frames are the INNERMOST ones (they ran
+    // below everything the late capture could still see), so outermost-first
+    // means they go on the END, in the order `active_compiled_frames` already
+    // returns them. Getting this backwards is not a subtle failure: it prints
+    // the throw site as the outermost frame, which reads as a plausible trace
+    // of a completely different call.
+    trace.reserve(snapshot.len());
+    for f in snapshot {
+        if let Some(e) = compiled_frame_entry(class_store, f) {
+            trace.push(e);
+        }
+    }
+    trace
+}
+
+/// Re-point an already-built entry at `bci`, re-resolving its line.
+///
+/// Used for the OSR-entered interpreter frame whose own `pc` is stale (see
+/// [`drop_osr_continuations`]). Leaves the line `LINE_NUMBER_UNKNOWN` when the
+/// method has no `LineNumberTable` row covering `bci`, exactly as
+/// [`entry_from_frame`] would.
+fn reline_entry(class_store: &ClassStore, entry: &mut StackTraceEntry, bci: i32) {
+    entry.byte_code_index = bci;
+    entry.line_number = entry
+        .class_id
+        .and_then(|cid| class_store.get(cid))
+        .zip(entry.method_index)
+        .and_then(|(class, idx)| class.methods.get(idx as usize))
+        .and_then(|m| line_number_for_bci_in_method(m, bci.max(0) as usize))
+        .unwrap_or(LINE_NUMBER_UNKNOWN);
 }
 
 /// One compiled frame as a [`StackTraceEntry`], from the artifact's
@@ -559,8 +648,14 @@ fn interleave_compiled_frames(
 /// optimizing tier), which are always of that shape.
 fn compiled_frame_entry(
     class_store: &ClassStore,
-    (_, label, owner_class_id, _): &(u32, String, u32, usize),
+    frame: &ActiveCompiledFrame,
 ) -> Option<StackTraceEntry> {
+    let ActiveCompiledFrame {
+        label,
+        owner_class_id,
+        bci,
+        ..
+    } = frame;
     let (owner_and_method, method_descriptor) = label.rsplit_once(':')?;
     let (class_name, method_name) = owner_and_method.rsplit_once('.')?;
     if class_name.is_empty() || method_name.is_empty() {
@@ -584,14 +679,28 @@ fn compiled_frame_entry(
         ),
         None => (std::sync::Arc::from(class_name), None, None),
     };
+    // The bci comes from the safepoint id the live frame published, and
+    // `activation_bci` has already required the artifact to name it as one of
+    // its own recorded safepoints — so this is a bytecode index the method
+    // really stopped at, not a guess. `-1` (no usable id) keeps the old
+    // answer: `LINE_NUMBER_UNKNOWN`, rendered `(Unknown Source)`. A wrong line
+    // would still be worse than none; what changed is that a right one is now
+    // available for the overwhelming majority of frames.
+    let line_number = if *bci >= 0 {
+        class
+            .zip(method_index)
+            .and_then(|(c, idx)| c.methods.get(idx as usize))
+            .and_then(|m| line_number_for_bci_in_method(m, *bci as usize))
+            .unwrap_or(LINE_NUMBER_UNKNOWN)
+    } else {
+        LINE_NUMBER_UNKNOWN
+    };
     Some(StackTraceEntry {
         class_name,
         method_name: std::sync::Arc::from(method_name),
         source_file,
-        // No bytecode index is recorded for a compiled frame, so there is no
-        // line to resolve. Never guess one: a wrong line is worse than none.
-        line_number: LINE_NUMBER_UNKNOWN,
-        byte_code_index: -1,
+        line_number,
+        byte_code_index: *bci,
         class_id: Some(class_id),
         method_index,
     })
