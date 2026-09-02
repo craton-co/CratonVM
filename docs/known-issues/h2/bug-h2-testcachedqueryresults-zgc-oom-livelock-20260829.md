@@ -414,6 +414,88 @@ only acceptance test -- and `CRATONVM_ZGC_ASSUME_REWRITABLE=1` as the upper
 bound that says what winning looks like.
 
 
+
+### 2026-09-02 (32-core box, legitimate discharge): `relocation_on_proven_jit` moves OFF ZERO with NO corruption
+
+The Windows helper-window arm had none of the pin/discharge work -- it was
+written for Linux -- and on this box that is where the refusals are:
+
+```text
+zgc-relocation-coverage-reason: xt-helper-window-conservative-scan=1468   (95% of 1539)
+                                compiled-frame-oop-not-published=59
+                                active-safepoint-map-incomplete=8
+                                unregistered-jit-frame-on-stack=3
+                                parent-frame-map-incomplete=1
+helper_windows=9087  hw_pinned=0  hw_refused=0      <- none of the code ran
+```
+
+With the Windows arm implemented (a counted window there is complete by
+construction: `snapshot_peer` returning `Some` means the whole GPR range and the
+whole `[rsp, committed_region_end)` band were captured), one binary,
+`org.h2.test.db.TestMultiThread`, both arms `rc=0`:
+
+| arm | `hw_pinned` | `skipped_jit` | `on_proven_jit` | coverage reasons | **NPE** |
+|---|---:|---:|---:|---|---:|
+| base | 71 | 18 | **0** | `helper-window=12`, `oop-not-published=6` | 0 |
+| `HELPER_WINDOW_DISCHARGE=1` | 69 | **7** | **2** | *(helper-window absent)*, `xt-peer=3`, `oop-not-published=3`, `unregistered=1` | **0** |
+
+**This is the first change in this investigation that moves
+`relocation_on_proven_jit` off zero without bypassing the proof, and it does so
+with zero NPEs** -- against the 48 that `ASSUME_REWRITABLE` produces on the same
+box. So pinning a frozen peer's conservative roots, with the interior-resolving
+probe so a derived pointer resolves to the base that must stay still, is SOUND
+where bypassing the proof is not.
+
+**It is not sufficient on its own.** `TestCachedQueryResults` with the discharge
+alone still capped at 2400 s with 6 354 reference-array OOMs. That is the
+conjunction again: removing 1 468 of 1 539 refusals still leaves
+`oop-not-published=59`, `active-safepoint-map-incomplete=8` and
+`unregistered=3`, and ONE of those per cycle refuses that cycle -- while this
+class needs MOST cycles to relocate to keep the arena from shattering.
+
+So the next term is `compiled-frame-oop-not-published`, and the acceptance test
+is unchanged: `relocation_on_proven_jit > 0` with 0 OOM and 0 NPE together.
+
+
+#### And on the class itself: 98 304 -> 99 100, OOMs halved, no corruption
+
+Same binary, `TestCachedQueryResults`, discharge on:
+
+| arm | secs | `actual` | ref-array OOM | COUNTER | **NPE** | `on_proven_jit` |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline | 1519 | 98 304 | 1 497 | 199 | 0 | 1 |
+| `HELPER_WINDOW_DISCHARGE=1` | **997** | **99 100** | **834** | 66 | **0** | 2 |
+
+**+796 entries recovered, reference-array OOMs almost halved, 34 % faster, and
+zero NPEs** -- all 5 111 helper windows pinned, none refused. This is the first
+arm to move the class's own assertion without corrupting anything.
+
+And it re-sorts what is left. The reason census is FIRST-WINS, so removing the
+helper window exposes the terms behind it -- `unregistered-jit-frame-on-stack`
+goes from 3 to 360 not because anything got worse but because 1 468 cycles that
+used to stop earlier now reach it:
+
+```text
+cross-thread-jit-peer             448   (51 % of 877)
+unregistered-jit-frame-on-stack   360   (41 %)
+compiled-frame-oop-not-published   68   ( 8 %)
+active-safepoint-map-incomplete     1
+```
+
+So the next term is `cross-thread-jit-peer`, and there is a specific reason to
+think it is now WRONG rather than merely unsatisfied: the peers it refuses for
+are blocked threads that never reach `publish_peer_jit_coverage_for_stw`, and
+those are exactly the threads whose helper windows this change now PINS. A
+pinned peer's frames cannot move, so it does not need to prove them rewritable
+-- but `peer_coverage_accounted` still counts its JIT entries in `peer_depth`
+and finds no deposit against them.
+
+Fixing that means excluding the pinned-blocked population from `peer_depth`
+(e.g. a process-wide blocked-JIT-depth counter maintained at blocked-region
+enter/leave), and it is the same accounting that produced a false positive
+earlier on this page -- so it must be measured on `relocation_on_proven_jit`,
+not on whether the label disappears.
+
 ### 2026-09-02 (32-core local box): the baseline reproduces EXACTLY, and forcing relocation CORRUPTS
 
 Moved off the shared Azure host, which spent the day between load 1 and 477 and
