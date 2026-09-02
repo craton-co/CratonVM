@@ -481,8 +481,22 @@ match.
 
 **What this does not say.** It does not say how slow CratonVM is on these
 classes — §5's ratio data is the closest this page has, and it is explicitly not
-a benchmark. It says only that the two CratonVM modes are indistinguishable
-here, which is the question that was open.
+a benchmark. It says only that neither mode finishes them, which is the question
+that was open.
+
+**And it is deliberately not a RATIO, which is why three pairs can carry it.**
+`docs/known-issues/` records the counter-case: an interleaved A-B-B-A-A-B run on
+this host once read a clean `1.19x` where every `after` beat every `before`, and
+twelve pairs later the true figure was `1.01x` — the arms had been ranked by
+monotonic load drift, not by the change. Three pairs cannot separate a small
+delta from a trend here, and nothing above claims one.
+
+What the rows above are is a SATURATING observation: each arm either finished
+inside 900 s or did not, and both did not. Load drift can move a duration; it
+cannot turn a run that would have finished in 400 s into one that exceeds 900 s
+and thereby fake agreement between the arms. Read as "neither mode finishes",
+three pairs is enough. Read as "the modes are equally fast", it would not be, and
+that reading is not supported here.
 
 ## Reproduce
 

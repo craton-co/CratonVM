@@ -293,6 +293,7 @@ fn sample_violations() -> Vec<JdkOnlyViolation> {
             method: "put".to_string(),
             descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;".to_string(),
             registered_by: Some("native-builtins/src/lib.rs:1234".to_string()),
+            survivor: None,
         },
         JdkOnlyViolation::SyntheticNativeInvocation {
             class: "java/util/HashMap".to_string(),
@@ -543,6 +544,7 @@ fn relative_provenance_is_never_redacted() {
         method: "put".to_string(),
         descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;".to_string(),
         registered_by: Some("native-builtins/src/lib.rs:1234".to_string()),
+        survivor: None,
     };
     assert!(v
         .render(Some(25), false)
