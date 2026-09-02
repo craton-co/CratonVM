@@ -124,6 +124,10 @@ pub mod old_gen;
 pub mod pinned;
 pub mod reference;
 pub mod region;
+/// Heap backing store: reserve address space, commit it in granules, and give
+/// it back. See the module docs for why the `alloc_zeroed` block it replaces
+/// charged the whole of `-Xmx` at startup on Windows and never returned a byte.
+pub mod reservation;
 #[cfg(feature = "gpu-offload")]
 pub mod safepoint;
 pub mod satb;
@@ -182,9 +186,12 @@ pub use gc_metrics::{
     collector_decision_report, gc_metrics_report, CollectorDecision, GcMetricsRaw, GcMetricsReport,
 };
 pub use gen_heap::{
-    clear_jit_read_bounds, jit_read_bounds_addr, jit_region_bounds_addr, publish_jit_read_bounds,
-    GenerationalHeap, HeapStats, HeapStatsSnapshot, JitReadBoundsTable, JitRegionBoundsTable,
-    JIT_READ_BOUNDS, JIT_REGION_BOUNDS,
+    clear_jit_read_bounds, clear_jit_ref_store_plan, jit_read_bounds_addr,
+    jit_ref_store_gate_addrs, jit_region_bounds_addr, publish_jit_read_bounds,
+    publish_jit_ref_store_plan, set_jit_ref_store_post_active, set_jit_ref_store_pre_active,
+    GenerationalHeap, HeapStats, HeapStatsSnapshot, JitReadBoundsTable, JitRefStoreGates,
+    JitRegionBoundsTable, JIT_READ_BOUNDS, JIT_REF_STORE_GATES, JIT_REGION_BOUNDS,
+    JIT_YOUNG_FLOOR_AGE_ZERO,
 };
 pub use heap::{ArrayElementType, Heap, ObjectHeader, ObjectKind};
 pub use mark_bitmap::MarkBitmap;

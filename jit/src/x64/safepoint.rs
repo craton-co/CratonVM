@@ -472,7 +472,7 @@ impl Compiler {
         }
         for slot in self.stack.iter() {
             match *slot {
-                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) => keep |= bit(r),
+                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r, ..) => keep |= bit(r),
                 StackSlot::Frame(_) | StackSlot::Xmm(_) => {}
             }
         }
@@ -825,7 +825,7 @@ impl Compiler {
             !self
                 .stack
                 .iter()
-                .any(|slot| matches!(slot, StackSlot::Scratch(_) | StackSlot::Xmm(_)))
+                .any(|slot| matches!(slot, StackSlot::Scratch(..) | StackSlot::Xmm(_)))
         };
         if !survivors_ok {
             if !strict_survivors {
@@ -918,7 +918,7 @@ impl Compiler {
             return false;
         }
         for (slot, &is_oop) in self.stack.iter().zip(self.stack_oop_marks.iter()) {
-            if is_oop && matches!(slot, StackSlot::Scratch(_) | StackSlot::Xmm(_)) {
+            if is_oop && matches!(slot, StackSlot::Scratch(..) | StackSlot::Xmm(_)) {
                 shadow_incomplete_cause::OOP_IN_SCRATCH_OR_XMM.fetch_add(1, Relaxed);
                 return false;
             }
@@ -982,7 +982,7 @@ impl Compiler {
                 continue;
             }
             match self.stack[i] {
-                StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg) => {
+                StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg, ..) => {
                     homes.push(ShadowHome::Reg(reg))
                 }
                 // Operand entry spilled to a frame slot: covered by the
@@ -1556,9 +1556,19 @@ impl Compiler {
         if map_incomplete {
             map_incomplete_cause::MARKS_INEXACT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        // The complement of the marked set: frame-resident operand slots the
+        // stack model says are NOT references. Diagnostic only, and only
+        // meaningful while the marks are exact -- see
+        // `OopMapEntry::non_oop_stack_slots`.
+        let mut non_oop_stack_slots: Vec<i16> = Vec::new();
         let n = self.stack.len();
         for i in 0..n {
             if !self.stack_oop_marks[i] {
+                if let StackSlot::Frame(off) = self.stack[i] {
+                    if let Ok(i16_off) = i16::try_from(off) {
+                        non_oop_stack_slots.push(i16_off);
+                    }
+                }
                 continue;
             }
             match self.stack[i] {
@@ -1791,6 +1801,10 @@ impl Compiler {
                 },
                 num_locals: u16::try_from(self.num_locals).unwrap_or(u16::MAX),
                 inline_local_scopes,
+                non_oop_stack_slots,
+                // `map_incomplete` was SEEDED from this above; read the source
+                // rather than the seed, which later causes also set.
+                stack_marks_exact: self.stack.is_empty() || self.stack_oop_marks_exact,
             });
             self.pending_shadow_coverage_complete = false;
         }

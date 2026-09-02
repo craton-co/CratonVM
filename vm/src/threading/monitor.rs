@@ -2991,6 +2991,27 @@ impl cratonvm_gc::MonitorCleanup for MonitorTable {
             }
         }
     }
+
+    /// The shard survey above, asked BEFORE the collector builds the slice.
+    ///
+    /// Same question, the same 128 uncontended lock/unlock pairs, and the same
+    /// soundness argument (under a stop-the-world token a shard observed empty
+    /// stays empty until the prune) — only now the collector can skip filling
+    /// a `Vec<usize>` with millions of addresses that would have removed
+    /// nothing. See [`cratonvm_gc::MonitorCleanup::wants_dead_addresses`] for
+    /// the size of what that saves.
+    ///
+    /// Deliberately not memoised: it is 128 lock pairs once per collection,
+    /// and a cached answer would be one more thing that can go stale across a
+    /// safepoint.
+    fn wants_dead_addresses(&self) -> bool {
+        for i in 0..MONITOR_SHARDS {
+            if !self.monitors[i].lock().is_empty() || !self.cas_locks[i].lock().is_empty() {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl MonitorTable {

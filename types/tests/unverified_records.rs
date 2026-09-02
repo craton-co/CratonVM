@@ -256,16 +256,8 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status: FIXED IN SOURCE, NOT VERIFIED BY AN ARM.** Lane H24, 2026-08-21.",
     ),
     (
-        "docs/known-issues/jdk-only/H3-1-the-ratchet-that-did-not-compile-20260820.md",
-        "status block says: **Status:** **FIXED-UNVERIFIED** — no binary carrying these changes has been",
-    ),
-    (
         "docs/known-issues/jdk-only/H4-1-the-cluster-that-is-not-a-tag-20260820.md",
         "status block says: **Status: FIXED-UNVERIFIED — no binary carrying these changes has been built or",
-    ),
-    (
-        "docs/known-issues/jdk-only/H5-1-the-abstract-registrations-are-fabricated-receivers-20260820.md",
-        "status block says: **Status** **FIXED-UNVERIFIED — no binary carrying these changes has been built or run.**",
     ),
     (
         "docs/known-issues/jdk-only/H6-1-the-canonical-name-slot-holds-a-different-string-20260820.md",
@@ -358,10 +350,6 @@ const ALLOWED: &[(&str, &str)] = &[
     (
         "docs/known-issues/jdk-only/W7-81-write-route-three-way.md",
         "RUN 2026-09-02 via CloseFlushSwallowProbe on --synthetic-jdk (the probe both records name); shares W7-57's result",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-84-primitive-in-reference-store.md",
-        "status block says: **Nothing in §§1-7 was built or run.** This lane may not invoke `cargo`; the",
     ),
     (
         "docs/known-issues/jdk-only/W7-9-minted-interface-abstract-methods.md",

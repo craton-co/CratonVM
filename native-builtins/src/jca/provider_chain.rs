@@ -2219,6 +2219,18 @@ fn seed_direct_native_engine_services() {
             "sun.security.rsa.RSAKeyFactory",
         );
     }
+    // `AlgorithmParameters.RSASSA-PSS` — the PSS parameter block
+    // (`sun.security.rsa.PSSParameters`). `AlgorithmParameters.getInstance` is
+    // not intercepted by this crate, so the row is the implementation; without
+    // it, a caller decoding a PSS `AlgorithmIdentifier` — which is how every
+    // X.509 PSS certificate carries its salt length and MGF — got
+    // `NoSuchAlgorithmException` from `AlgorithmId.decodeParams()`.
+    put_service(
+        RSA,
+        "AlgorithmParameters",
+        "RSASSA-PSS",
+        "sun.security.rsa.PSSParameters",
+    );
     for algorithm in [
         "MD2withRSA",
         "MD5withRSA",
@@ -3996,57 +4008,35 @@ fn seed_sunec_services() {
         "EC",
         "sun.security.ec.ECKeyPairGenerator",
     );
-    // ECDSA Signature family (DER output) + IEEE-P1363 (raw R||S) variants.
-    let sigs: &[(&str, &str)] = &[
-        ("NONEwithECDSA", "sun.security.ec.ECDSASignature$Raw"),
-        ("SHA1withECDSA", "sun.security.ec.ECDSASignature$SHA1"),
-        ("SHA224withECDSA", "sun.security.ec.ECDSASignature$SHA224"),
-        ("SHA256withECDSA", "sun.security.ec.ECDSASignature$SHA256"),
-        ("SHA384withECDSA", "sun.security.ec.ECDSASignature$SHA384"),
-        ("SHA512withECDSA", "sun.security.ec.ECDSASignature$SHA512"),
-        (
-            "SHA3-224withECDSA",
-            "sun.security.ec.ECDSASignature$SHA3_224",
-        ),
-        (
-            "SHA3-256withECDSA",
-            "sun.security.ec.ECDSASignature$SHA3_256",
-        ),
-        (
-            "SHA3-384withECDSA",
-            "sun.security.ec.ECDSASignature$SHA3_384",
-        ),
-        (
-            "SHA3-512withECDSA",
-            "sun.security.ec.ECDSASignature$SHA3_512",
-        ),
-        (
-            "NONEwithECDSAinP1363Format",
-            "sun.security.ec.ECDSASignature$RawinP1363Format",
-        ),
-        (
-            "SHA1withECDSAinP1363Format",
-            "sun.security.ec.ECDSASignature$SHA1inP1363Format",
-        ),
-        (
-            "SHA224withECDSAinP1363Format",
-            "sun.security.ec.ECDSASignature$SHA224inP1363Format",
-        ),
-        (
-            "SHA256withECDSAinP1363Format",
-            "sun.security.ec.ECDSASignature$SHA256inP1363Format",
-        ),
-        (
-            "SHA384withECDSAinP1363Format",
-            "sun.security.ec.ECDSASignature$SHA384inP1363Format",
-        ),
-        (
-            "SHA512withECDSAinP1363Format",
-            "sun.security.ec.ECDSASignature$SHA512inP1363Format",
-        ),
-    ];
-    for (algo, cls) in sigs {
-        put_service(P, "Signature", algo, cls);
+    // The ECDSA `Signature` family, DERIVED rather than listed.
+    //
+    // This was sixteen hand-written `(name, class)` pairs and HotSpot has
+    // twenty: the four `SHA3-*withECDSAinP1363Format` rows were missing, which
+    // is a transcription gap and exactly what a hand-written list produces.
+    // Both halves now come from `signature::ECDSA_FAMILY_SIGNATURE_NAMES` and
+    // `ecdsa_family_service_class`, which is the same pair the ENGINE resolves
+    // its SPI through — so the advertised set and the served set are one list
+    // by construction, and `every_ecdsa_family_signature_name_maps_to_an_spi_class`
+    // pins it.
+    for algorithm in crate::jca::signature::ECDSA_FAMILY_SIGNATURE_NAMES {
+        let cls = crate::jca::signature::ecdsa_family_service_class(algorithm).expect(
+            "ECDSA_FAMILY_SIGNATURE_NAMES is exactly ecdsa_family_spi_class's domain",
+        );
+        put_service(P, "Signature", algorithm, &cls);
+    }
+    // `KeyAgreement` — four services this VM has been SERVING all along and
+    // never advertised. Measured 2026-09-02: `KeyAgreement.getInstance` returns
+    // a working agreement for every one of them, and none appeared in
+    // `Security.getProvider("SunEC").getServices()`. That is the
+    // serves-but-never-advertises half of this file's own title, and the same
+    // shape as `SunJCE`'s unlisted `DiffieHellman`.
+    for (algo, cls) in [
+        ("ECDH", "sun.security.ec.ECDHKeyAgreement"),
+        ("XDH", "sun.security.ec.XDHKeyAgreement"),
+        ("X25519", "sun.security.ec.XDHKeyAgreement.X25519"),
+        ("X448", "sun.security.ec.XDHKeyAgreement.X448"),
+    ] {
+        put_service(P, "KeyAgreement", algo, cls);
     }
     // EC name aliases consumed by getInstance("EC")/key-spec resolution.
     for ty in ["KeyFactory", "KeyPairGenerator", "AlgorithmParameters"] {
@@ -4373,6 +4363,20 @@ fn seed_sunjce_modern_engine_services() {
         );
     }
     put_service(P, "KEM", "DHKEM", "com.sun.crypto.provider.DHKEM");
+    // The four ML-KEM services, which this VM SERVES — `jca::kem` drives the
+    // real `ML_KEM_Impls$K*` SPI and `apps/probes/JcaModernEngines` measures a
+    // full encapsulate/decapsulate agreeing with HotSpot at all three parameter
+    // sets — and never advertised. `Security.getProviders(filter)` reads only
+    // the registry, so a caller selecting a provider by capability could not
+    // see them.
+    for (algo, cls) in [
+        ("ML-KEM", "com.sun.crypto.provider.ML_KEM_Impls$K"),
+        ("ML-KEM-512", "com.sun.crypto.provider.ML_KEM_Impls$K2"),
+        ("ML-KEM-768", "com.sun.crypto.provider.ML_KEM_Impls$K3"),
+        ("ML-KEM-1024", "com.sun.crypto.provider.ML_KEM_Impls$K5"),
+    ] {
+        put_service(P, "KEM", algo, cls);
+    }
     // Two services this VM has been SERVING all along and never advertised —
     // the `W7-63` half again. `KeyAgreement.DiffieHellman` is the one
     // `jca-provider-population-gap-20260830.md` §4 runs a complete 2048-bit
