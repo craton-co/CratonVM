@@ -5113,7 +5113,7 @@ pub(super) fn try_jit_upgrade_with_gate(
             &cached.method_descriptor,
             cached.declaring_class_id,
         ) {
-            let ret = crate::jit::return_type(&cached.method_descriptor);
+            let ret = cached.return_tag();
             let heap = compiled.needs_heap();
             return Some(CachedInvokeTarget::Jit {
                 compiled: compiled.into(),
@@ -5646,6 +5646,7 @@ pub(super) fn try_jit_upgrade_with_gate(
             is_synchronized: method.is_synchronized(),
             is_static: method.is_static(),
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
@@ -6281,7 +6282,7 @@ pub(super) fn try_jit_upgrade_with_gate(
         // whether a thin direct-call helper may shadow real bytecode.
         Some(&intrinsic_resolver),
     )?;
-    let ret = crate::jit::return_type(&cached.method_descriptor);
+    let ret = cached.return_tag();
     let heap = compiled.needs_heap();
 
     // Store in shared JIT cache
@@ -7118,6 +7119,7 @@ pub(super) fn try_jit_compile_callee_slow(
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
+        descriptor_facts_cache: std::sync::OnceLock::new(),
         intercept_shape_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
@@ -10013,7 +10015,7 @@ pub(super) fn jit_saved_args_to_values(
     let is_static = cached.is_static;
     let mut out = Vec::with_capacity(np);
     // ONE forward scan, hoisted out of this per-argument loop.
-    let param_tags = ParamTags::of(&cached.method_descriptor);
+    let param_tags = ParamTags::for_method(&cached);
     for i in 0..np {
         let (cv, kind) = saved_args[i];
         let desc_byte = if is_static {
@@ -10197,7 +10199,7 @@ pub(super) fn execute_jit_call(
     let mut saved_args: [(CompactValue, u8); JIT_ABI_MAX_JAVA_ARGS] =
         [(CompactValue::zero(), 0u8); JIT_ABI_MAX_JAVA_ARGS];
     // ONE forward scan, hoisted out of this per-argument loop.
-    let param_tags = ParamTags::of(&cached.method_descriptor);
+    let param_tags = ParamTags::for_method(&cached);
     for i in (0..np).rev() {
         let (cv, kind) = thread.frames[frame_idx].stack.pop_with_kind_unchecked();
         saved_args[i] = (cv, kind);
@@ -11224,7 +11226,7 @@ pub(super) fn execute_jit_call_oneshot(
     }
     let args_jit = &jit_args[..np];
     let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
-    let return_type = crate::jit::return_type(&cached.method_descriptor);
+    let return_type = cached.return_tag();
     // `run_pushed_frame_to_completion` needs the depth the thread had BEFORE
     // any sink below materialised a frame.
     let frames_depth_on_entry = thread.frames.len();

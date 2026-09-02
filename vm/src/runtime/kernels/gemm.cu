@@ -20,13 +20,35 @@
 // cratonvm build needs no CUDA toolkit. Regenerate after any edit here:
 //
 //   nvcc -arch=compute_75 -ptx gemm.cu -o gemm.ptx
+//   sed -i 's/^\.version .*/.version 6.3/' gemm.ptx      # see below
 //
 // A virtual arch (compute_) rather than a real one (sm_): the driver JITs
 // the PTX for whatever device is present, so one artifact covers Turing
 // through Blackwell instead of one per generation. 75 is the floor
 // because it is the oldest CUDA 13 supports.
 //
-// mod.rs fails the build if the two drift apart.
+// THE SECOND COMMAND IS NOT OPTIONAL
+//
+// nvcc stamps the .version directive with whichever TOOLKIT ran, not with
+// what the code needs. Regenerating on CUDA 13.3 wrote `.version 9.3`,
+// and a driver older than the CUDA 13 line cannot parse that -- so on an
+// r550-era host the module failed to load and every matmul fell back to
+// the CPU, on hardware that would have run the sm_75 code perfectly.
+// The .target was carefully chosen for breadth and the .version silently
+// undid it.
+//
+// 6.3 is the floor for sm_75 (CUDA 10.0, driver r410), and it is honest:
+// every mnemonic below -- ld.global.nc, ld.shared.v4.f32, bar.sync,
+// fma.rn.f32, mul.wide.s32, cvta.to.global, .pragma "nounroll" -- predates
+// CUDA 10. Verified by assembling the rewritten file with ptxas at 6.3,
+// 7.0, 7.5 and 8.0; all four succeed. It matches what
+// jit_cuda::target::min_isa_for_target(7, 5) independently reports for the
+// bytecode-lowered kernels, which is not a coincidence: it is the same
+// question.
+//
+// mod.rs fails the build if the two drift apart, and it asserts the
+// .version literally so a raw nvcc regeneration cannot quietly raise the
+// driver floor again.
 //
 // TRANSPOSE IS EXPRESSED AS STRIDES, NOT AS FOUR KERNELS
 //

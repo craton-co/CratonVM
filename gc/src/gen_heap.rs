@@ -1653,6 +1653,119 @@ pub fn jit_read_bounds_addr() -> usize {
     &JIT_READ_BOUNDS as *const _ as usize
 }
 
+// ---------------------------------------------------------------------------
+// F-08 - G1's own JIT barrier table
+// ---------------------------------------------------------------------------
+
+/// Process-global description of G1's heap geometry, for the JIT's inline G1
+/// post-write barrier (F-08).
+///
+/// # Why a THIRD table, and not either of the two above
+///
+/// [`JIT_REGION_BOUNDS`]'s emptiness under G1 is load-bearing: it is what
+/// closes defect G1-2 (`audits/g1-audit.md` 8.1), by making every
+/// generational-style barrier-free inline reference store unreachable there.
+/// Nothing may be written into it for G1, ever, and the sibling
+/// [`JIT_READ_BOUNDS`] exists precisely because the previous attempt to reuse
+/// one table for two questions would have unblocked those stores. This is the
+/// same lesson a third time: the question here is neither "is this address
+/// mapped" nor "may an inline store skip the barrier" (the answer to which
+/// stays NO) but "what are the numbers an inline barrier needs to DO its job".
+///
+/// # Layout
+///
+/// * `[0]` `arena_base` - G1's single contiguous arena base.
+/// * `[1]` `arena_len` - its length in bytes. Doubles as the liveness flag:
+///   zero means no G1 collector has published, and the emitter then emits no
+///   inline barrier at all.
+/// * `[2]` `region_mask` - `!(region_size - 1)`. The same-region test is
+///   `((obj - arena_base) ^ (val - arena_base)) & region_mask == 0`, which is
+///   `(obj - base) >> region_shift == (val - base) >> region_shift` written
+///   without a shift. A MASK rather than a shift because the emitted sequence
+///   then needs no `CL` and no variable-shift encoding.
+///
+///   The base subtraction is not decoration. G1's arena comes from a `Vec<u8>`
+///   and is only malloc-aligned, so an aligned `region_size` block of the
+///   address space is NOT a region: exactly one region boundary falls inside
+///   each such block. Testing `(obj ^ val) & region_mask` without subtracting
+///   the base would call two addresses straddling that boundary "same region",
+///   skip the barrier, and lose the edge - the use-after-free this barrier
+///   exists to prevent.
+/// * `[3]` `card_table_base`, `[4]` `card_shift` - the F-05 card table
+///   (`crate::g1_cards`). **Published but not read by any emitter today**, and
+///   deliberately so rather than by oversight: dirtying a card inline saves
+///   nothing while the REMEMBERED-SET ENTRY still has to be recorded, because
+///   that entry is a hash-map insert keyed on a (source, target) region pair
+///   and there is no inline form of it. The inline barrier therefore filters
+///   (same region, null store) and calls out for everything else, and the
+///   callee dirties the card on the way through. These two words are what a
+///   future all-inline barrier would need, and it would additionally need
+///   Phase 2 to take its source set from the card table rather than from the
+///   region-index remembered set - which is a policy change, not an emitter
+///   change. See `feature`-level discussion in the F-08 commit.
+///
+/// All-zero means "no G1 collector is live", which is the state under every
+/// other backend and before construction, and the emitter degrades to the
+/// helper call it makes today.
+#[repr(C)]
+pub struct JitG1BarrierTable {
+    pub words: [AtomicUsize; 5],
+}
+
+pub static JIT_G1_BARRIER: JitG1BarrierTable = JitG1BarrierTable {
+    words: [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ],
+};
+
+/// Address of [`JIT_G1_BARRIER`] for the JIT helpers table
+/// (`JitRuntimeHelpers::g1_barrier_addr`).
+pub fn jit_g1_barrier_addr() -> usize {
+    &JIT_G1_BARRIER as *const _ as usize
+}
+
+/// Publish G1's geometry. Called once from `G1Collector::new`.
+///
+/// `arena_len` is stored LAST and with `Release`, so a reader that sees a
+/// non-zero length has necessarily seen the other four words: the length is
+/// the liveness flag and it must not become visible ahead of the numbers it
+/// vouches for.
+pub fn publish_jit_g1_barrier(
+    arena_base: usize,
+    arena_len: usize,
+    region_mask: usize,
+    card_table_base: usize,
+    card_shift: u32,
+) {
+    JIT_G1_BARRIER.words[0].store(arena_base, Ordering::Relaxed);
+    JIT_G1_BARRIER.words[2].store(region_mask, Ordering::Relaxed);
+    JIT_G1_BARRIER.words[3].store(card_table_base, Ordering::Relaxed);
+    JIT_G1_BARRIER.words[4].store(card_shift as usize, Ordering::Relaxed);
+    JIT_G1_BARRIER.words[1].store(arena_len, Ordering::Release);
+}
+
+/// Zero the table if slot 0 still names `owned_base` - the owner-checked
+/// teardown, for exactly the reason [`clear_jit_read_bounds_owned_by`] is
+/// owner-checked: a dropped collector must not leave geometry behind that a
+/// later one would be described by, and must not clobber a LIVE collector's
+/// geometry when two exist (embedding, unit tests).
+///
+/// `arena_len` is cleared FIRST, so no reader can see a live length beside a
+/// zeroed base.
+pub fn clear_jit_g1_barrier_owned_by(owned_base: usize) {
+    if JIT_G1_BARRIER.words[0].load(Ordering::Acquire) != owned_base {
+        return;
+    }
+    JIT_G1_BARRIER.words[1].store(0, Ordering::Release);
+    for w in JIT_G1_BARRIER.words.iter() {
+        w.store(0, Ordering::Release);
+    }
+}
+
 /// Publish one `[base, end)` pair into [`JIT_READ_BOUNDS`] slot `slot` (0..3).
 ///
 /// Separate from the generational publisher because G1 has no `store_region_
@@ -1663,6 +1776,22 @@ pub fn publish_jit_read_bounds(slot: usize, base: usize, end: usize) {
     }
     JIT_READ_BOUNDS.words[slot * 2].store(base, Ordering::Release);
     JIT_READ_BOUNDS.words[slot * 2 + 1].store(end, Ordering::Release);
+}
+
+/// Read back one `[base, end)` pair from [`JIT_READ_BOUNDS`]. `(0, 0)` for an
+/// out-of-range slot or one that was never published.
+///
+/// F-16 needs this: under a reserved-and-committed-on-demand heap the published
+/// bound must never outrun the committed prefix, and that is only checkable by
+/// reading what was published.
+pub fn jit_read_bounds_slot(slot: usize) -> (usize, usize) {
+    if slot >= 3 {
+        return (0, 0);
+    }
+    (
+        JIT_READ_BOUNDS.words[slot * 2].load(Ordering::Acquire),
+        JIT_READ_BOUNDS.words[slot * 2 + 1].load(Ordering::Acquire),
+    )
 }
 
 /// Zero the whole read table — the teardown counterpart, so a dropped heap can

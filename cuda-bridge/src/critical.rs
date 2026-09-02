@@ -66,12 +66,39 @@
 //! token declares here are **keep-alive**, in the `gc/src/pinned.rs` sense
 //! — they must not be *freed*, and they are *remapped* after a moving
 //! cycle via [`Registry::remap_keepalive`]. They are deliberately **not**
-//! a no-relocation request, because the device never holds a JVM heap
-//! address: `gpu_marshal::host_view_*` copies the array body into a fresh
-//! host `Vec` before upload, exactly as JNI hands native code a detached
-//! copy. A token that genuinely does hand the device a heap address must
-//! declare [`Relocation::Forbidden`], and the collector must then refuse
-//! to relocate rather than merely keep the object alive.
+//! a no-relocation request. A token that genuinely does hand the device a
+//! heap address for longer than one safepoint must declare
+//! [`Relocation::Forbidden`], and the collector must then refuse to
+//! relocate rather than merely keep the object alive.
+//!
+//! ## Why keep-alive is enough today, and what it rests on
+//!
+//! AUDIT 2026-09-02. This paragraph used to say the device never holds a
+//! JVM heap address at all, because `gpu_marshal::host_view_*` copies the
+//! array body into a fresh host `Vec` before upload, exactly as JNI hands
+//! native code a detached copy. That is true of the STAGED path and false
+//! of the one that actually runs: `gpu_marshal`'s `direct_xfer!` arm
+//! takes `heap.array_data_ptr(obj)`, builds a slice over the arena in
+//! place, and hands it to `cuMemcpyHtoDAsync`. The device reads the JVM
+//! heap directly, which is the entire point of the zero-copy path — it is
+//! what removes an array-sized host memcpy per direction.
+//!
+//! Keep-alive is still sufficient, for a reason neither module stated:
+//! `DeviceBufferInner::from_host` host-blocks on
+//! `cuStreamSynchronize(copy_h2d)` before returning, so the DMA has
+//! retired while the caller's `SafepointToken` is still held. The
+//! collector cannot run, so the arena cannot move, so there is no window.
+//!
+//! **That is a load-bearing invariant, not an incidental property.** Any
+//! change that lets the upload outlive the marshalling call — moving the
+//! marshaller to `from_host_async`, say, which is otherwise a good idea —
+//! breaks the argument silently: nothing in the type system connects the
+//! token's lifetime to the copy's. Such a change must either keep the
+//! staged copy for the zero-copy arm, or hold a token declaring
+//! [`Relocation::Forbidden`] until the upload event has fired.
+//!
+//! `to_host`'s D→H direction has the same shape and the same guarantee,
+//! for the same reason.
 //!
 //! # Registry instances vs. the process-global one
 //!

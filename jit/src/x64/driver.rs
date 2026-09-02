@@ -1128,6 +1128,49 @@ pub fn compile_with_param_slots(
         .filter(|h| !bypassable_headers.contains(&h.loop_header))
         .collect();
 
+    // LICM: hoist the loop-invariant `arraylength` out of a counted loop's
+    // header. `CRATONVM_DISABLE_ARRAYLEN_LICM=1` is the kill switch — the
+    // hoist changes the emitted body of essentially every loop over an array
+    // in the VM, so it needs one, and the bisect it serves must reach the
+    // level the change is at (the emission, not the analysis).
+    let array_len_hoist_info = if cratonvm_types::flags::runtime_var_os(
+        "CRATONVM_DISABLE_ARRAYLEN_LICM",
+    )
+    .is_some()
+    {
+        Vec::new()
+    } else {
+        find_array_len_hoists(code, code_len, &loops)
+    };
+    // One filter, not the aaload hoist's two. There is no per-bci de-spec to
+    // apply because this pre-header speculates on nothing: it throws the NPE
+    // the body would have thrown rather than deopting, so there is no failed
+    // guard for a de-spec threshold to count.
+    //
+    // The bypassable-header veto DOES apply, and is the load-bearing one. A
+    // header reachable without running its own pre-header — a `goto` from
+    // outside into the loop, or an exception handler landing in the body —
+    // leaves the slot cold, and a cold slot here is a garbage LENGTH that a
+    // `bounds_safe_pcs` access then trusts, i.e. an unchecked out-of-bounds
+    // read rather than a wrong answer. Must run BEFORE `Compiler::new` pairs
+    // the offsets with the info by index.
+    let array_len_hoist_info: Vec<ArrayLenHoist> = array_len_hoist_info
+        .into_iter()
+        .filter(|h| !bypassable_headers.contains(&h.loop_header))
+        .collect();
+    if !array_len_hoist_info.is_empty()
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+    {
+        eprintln!(
+            "[JIT_GEN] arraylength-LICM hoists={} sites={:?}",
+            array_len_hoist_info.len(),
+            array_len_hoist_info
+                .iter()
+                .map(|h| (h.loop_header, h.array_local, h.sites.len()))
+                .collect::<Vec<_>>(),
+        );
+    }
+
     // LICM: find loop-invariant integer-arithmetic runs to hoist into the
     // loop pre-header. These are pure, non-faulting ALU expressions on
     // loop-invariant locals/constants — see `find_arith_loop_hoists`.
@@ -1653,6 +1696,7 @@ pub fn compile_with_param_slots(
         static_field_info,
         hoist_info,
         arith_hoist_info,
+        array_len_hoist_info,
         alloc_result,
         !matrix_dot_loops.is_empty(),
         *helpers,

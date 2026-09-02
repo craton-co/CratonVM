@@ -442,6 +442,41 @@ owed", and it is what running the sweep bought.
   where the prose DESCRIBING the rule trips the checker. That one is left
   alone: the fix is a self-exemption whose shape belongs to its author.
 
+* **The Java-level numbers were measured BEFORE the dev merge, and not
+  re-measured after it.** Two fat-LTO links and one non-LTO link were each
+  starved out on a host running at 100% with ten-plus other sessions' `rustc`
+  (plus Windows Defender as the single largest CPU consumer), so the
+  post-merge binary was never produced.
+
+  What makes that a small gap rather than an unmeasured claim: `card_table.rs`,
+  `young_mark.rs`, `arena.rs` and `types/src/flags.rs` are **byte-identical**
+  between the validated commit and the merge result, and dev's 128 added lines
+  in `gen_heap.rs` are purely additive -- one struct, one static, one const and
+  five `pub fn`s for the ZGC ref-store gates -- with **zero** lines touching
+  `collect_garbage_inner` or any function this page describes (verified by
+  diff and by grep). Those gates are inert under `-XX:+UseGenerationalGC`,
+  which is the configuration every number here was taken in. And every suite is
+  green ON the merged tree: 16 gc suites (1,713 unit + integration), 2,134 jit,
+  2,652 vm, 594 types, 56 tier1, plus the native-collections GC relocation
+  tests.
+
+  **CLOSED, 2026-09-02.** The host quietened (13 `rustc` down to 3), a non-LTO
+  build completed, and the post-merge confirmation was run. Correctness is
+  clean and the checksums are byte-for-byte the pre-merge ones, which is the
+  strongest form of "it did the same work":
+
+  | run | post-merge result | pre-merge |
+  |---|---|---|
+  | `OldToYoungEdgeProbe 20000 200 16`, `-Xmx128m` | `edges_verified=20000`, `minor=55 major=4`, `old_to_young_edges=1,230,608`, `warm=114578260835246` | same `warm` |
+  | verifier, `-Xmx320m`, 40k nodes | 35 passes (2 moving + 33 non-moving), **0 with `missing>0`**, max `edges=1,464,832`, `site=moving edges=45776 missing=0 seeded=45776`, `warm=293386331178234` | same `warm` |
+  | `OldGenRsetProbe`, engagement census | `objstart_chunks=32 objstart_parallel=1` on every cycle, `cycles=6 coverage_fallbacks=0` | same shape |
+
+  The parallel walk still engages on every cycle and the remembered set is
+  still complete on both seeding paths. **No timing number is quoted from this
+  binary** -- it is `lto=off, codegen-units=16` and not comparable to the
+  fat-LTO figures above; only counters, checksums and engagement are read from
+  it. The suite-scale soak (Tomcat, H2, Spring) remains owed.
+
 * **Absolute pause numbers.** See Method. The shares and the counters are what
   this page establishes.
 

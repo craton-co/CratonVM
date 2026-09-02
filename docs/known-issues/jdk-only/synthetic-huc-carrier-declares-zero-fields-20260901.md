@@ -44,32 +44,64 @@ CRATONVM_ZGC_RELOCATE=0   ->  identical warnings, identical DIFF
 
 The object really does declare zero slots.
 
-## 2. Where it comes from
+## 2. Where it comes from — and one fact that does not reconcile
 
 `--dump-native-registry --synthetic-jdk` says `java/net/URL.openConnection`
-`owns=True` at `native-builtins/src/net_phase_e.rs:10626`. That body allocates
-the carrier with
+`owns=True` at `native-builtins/src/net_phase_e.rs`, and that body allocates the
+carrier with
 
 ```rust
 let conn = try_alloc_concurrent_synthetic(ctx, carrier, 16)?;
 ```
 
-`try_alloc_concurrent_synthetic` resolves the class first; when the class loads
-but declares **zero** instance fields, `n = num_fields.max(real)` still asks for
-16 slots, but the object's class says zero and the GC's bounds guard rejects
-every access against that.
+`layout_alias`'s census — which is OFF by default, and is the reason none of this
+appears in an ordinary run — names the site exactly. `CRATONVM_DBG=layout-alias`,
+same probe, same binary:
 
-The funnel already knows about this species. Its own comment:
+```text
+WARN cratonvm_native_api::layout_alias:
+  native allocated slots against a class declaring NONE ...
+  class="java/net/HttpURLConnection" requested_fields=16 real_fields=0
+  direction="undeclared"
+  site=native-builtins/src/net_phase_e.rs:10794:24
+  site=HucAccessors.main([Ljava/lang/String;)V
+```
+
+Three rows, two sites — the Rust funnel and the Java frame that entered it. The
+census's own text lists what `real_fields=0` can mean and puts this case third:
+*"a fabricated stub / the `ClassId::new(0)` fallback arm standing in for a class
+whose real layout is WIDER, in which case this object is SHORT."*
+
+**The two instruments do not agree, and this record does not pretend they do.**
+The census says the object is *"exactly `requested_fields` wide"* — 16. The GC
+guard reads `header.num_slots()` and reports **0**:
+
+```text
+WARN zgc: zgc real: field index OOB index=0 num_slots=0 op="set"
+```
+
+Both are measured, on the same run, about the same class. They cannot both
+describe the same object, so one of these is true and none of them has been
+shown:
+
+* the funnel asked for 16 and something downstream still produced a 0-slot
+  header (in which case the clamp the census believes in did not happen);
+* the guard is reading a *different* `HttpURLConnection` — one allocated by
+  another path that never reached the funnel, so the census never saw it;
+* the header is 16 wide and `num_slots()` is answering from somewhere other
+  than the allocation.
+
+Deciding between them is a `CRATONVM_DBG_ZGC_CORPSE` / header-dump question and
+is exactly the work this page is holding open. What is NOT in doubt is the
+symptom: every accessor on the carrier is refused, `getURL()` reads null, and
+`getDoInput()` is absent from the registry entirely.
+
+The funnel already knows about this species in the abstract. Its own comment:
 
 > ALLOCATION IS UNCHANGED by the widening above: still `max` ... Reporting and
 > refusing are separate changes and this lane makes only the first — the
 > over-allocating population has never been counted, and a funnel with ~2,000
 > call sites is not where you discover that number by failing.
-
-and `layout_alias::classify` returns `Undeclared` for exactly `real == 0`. So
-the case is **observed** — via `layout_alias::observe_from_rust`, which feeds a
-census rather than a log, which is why the run's stderr shows the GC guard's
-complaint and never the fabrication's.
 
 ## 3. Why it matters, and why it is not urgent
 
