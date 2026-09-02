@@ -5839,11 +5839,7 @@ impl G1Collector {
         // Two shapes, both of which `classify_candidate_header` accepts because
         // it only validates the TAG bytes and an upper bound on `shape`:
         //
-        //  * a class id no loader could have minted. The screen is the one this
-        //    file already applies to `num_slots` -- `1 << 24` -- and it is if
-        //    anything more generous for a class id, since a process with 16
-        //    million loaded classes has other problems. The first run of this
-        //    report found `class_id=1130142320` and `class_id=1160062808`.
+        //  * a class id in the BAND no loader mints, and
         //  * class 0 with a field count no class has. `ClassId(0)` is what
         //    every primitive array carries (`newarray` passes it verbatim) and
         //    the MIC/PIC empty-slot sentinel; its objects have zero to a
@@ -5852,10 +5848,33 @@ impl G1Collector {
         //
         // Both authorise a SIXTEEN-byte-stride walk over something that is not
         // a legacy object.
-        const MAX_PLAUSIBLE_CLASS_ID: u32 = 1 << 24;
+        //
+        // # The band, and why "large class id" alone was WRONG
+        //
+        // The first version of this screen refused every `class_id >= 1 << 24`,
+        // on the reasoning that a process with 16 million loaded classes has
+        // other problems. That reasoning is right about LOADED classes and
+        // wrong about this VM's class-id space, which has two synthetic
+        // regions above it:
+        //
+        //  * [`cratonvm_types::AUTOBOX_CLASS_ID`] is `u32::MAX`, and
+        //  * lambda proxies are numbered by `SharedVm::alloc_lambda_proxy_id`,
+        //    a bare counter from `0x8000_0000` (see `resolution.rs`, which
+        //    allocates `ClassId::new(0x8000_0000)`).
+        //
+        // Both are ordinary live objects. Measured: a 500 s
+        // `TestKillProcessWhileWriting` run reported 18 "implausible" headers
+        // and ALL EIGHTEEN were autobox wrappers (`class_id=4294967295`,
+        // `num_slots=1`) or lambda proxies (`class_id=2147483648..64`) -- a
+        // screen that fires on unchanged, correct behaviour, which is worse
+        // than no screen because it invites a conclusion.
+        //
+        // The band between them is what no id occupies.
+        const MAX_LOADED_CLASS_ID: u32 = 1 << 24;
+        const LAMBDA_PROXY_CLASS_ID_BASE: u32 = 0x8000_0000;
         const IMPLAUSIBLE_CLASS0_SLOTS: u32 = 1024;
         let cid = header.class_id.as_u32();
-        let implausible = cid >= MAX_PLAUSIBLE_CLASS_ID
+        let implausible = (cid >= MAX_LOADED_CLASS_ID && cid < LAMBDA_PROXY_CLASS_ID_BASE)
             || (cid == 0 && header.num_slots() >= IMPLAUSIBLE_CLASS0_SLOTS);
         if header.kind() != ObjectKind::Object || !implausible {
             return;
