@@ -496,13 +496,23 @@ asked" are still the same measurement.
 
 ## Still open, and separate
 
-**The `char[]` row.** **5.2 ns/char** for a bounds-checked element read in a
-compiled counted loop is 44x HotSpot, has nothing to do with `String`, and is
-untouched by everything above — including arm B. It is its own question about
-baseline codegen quality, and a `charAt` that reached parity with the `char[]`
-loop would still be 44x HotSpot. Note that arm B's 59-108 is still **11-20x**
-the same VM's own `char[]` loop, so `charAt` has not yet reached even that
-ceiling.
+**The `char[]` row — closed 2026-09-02, and it was not what this page assumed.**
+**5.2 ns/char** for a bounds-checked element read in a compiled counted loop
+had nothing to do with `String` and was untouched by everything above,
+including arm B. It was parked here as "its own question about baseline codegen
+quality", and that question turned out to have one answer: the loop-invariant
+`a.length` that javac re-evaluates at the top of every iteration. Hoisting it
+in both emitters takes the row to **0.64 ns/char** — onto the hand-hoisted
+control, and to ~4.6x HotSpot rather than the 44x quoted above. The 44x itself
+was a cross-host ratio; measured on one host, three interleaved rounds, it was
+24.7x. See array-element-load-baseline-codegen-FIXED-20260902.
+
+That changes the ceiling this page measures `charAt` against, and it does not
+change anything else here: arm B's 59-108 ns/char was **11-20x** the old
+`char[]` number and is ~90-170x the new one, so `charAt` has moved further from
+parity, not closer, and every conclusion above about the pin and the
+unsteerable intrinsic stands. Re-measure the ratio before quoting it — the
+`char[]` number it is taken against has moved.
 
 **Contradictions found in the tree** (documentation, not behaviour; none in this
 page's scope to fix):
