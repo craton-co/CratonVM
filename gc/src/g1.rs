@@ -5891,7 +5891,7 @@ impl G1Collector {
                 let base = r.data.as_ptr() as usize;
                 let off = addr.wrapping_sub(base);
                 format!(
-                    "r{i}/{:?}/off={off:#x}/cursor={:#x}/reuse_epoch={}/recycled_in_generation={} {}",
+                    "r{i}/{:?}/off={off:#x}/cursor={:#x}/reuse_epoch={}/recycled_in_generation={} {} {} {}",
                     r.region_type,
                     r.cursor,
                     r.reuse_epoch,
@@ -5900,6 +5900,15 @@ impl G1Collector {
                     // recording. This is the whole point of the report.
                     r.tlab_trail
                         .describe_owner_or(&r.bump_trail, r.reuse_epoch, off),
+                    // Is this a REAL object boundary in the region's own grid,
+                    // or one a desynced walk invented? `grid=OBJECT-START` with
+                    // a sane `prev=` says an allocator put an object here and
+                    // its header is wrong; `grid=INTERIOR` says the address
+                    // came from somewhere that had no business naming it.
+                    self.locate_in_object_grid(r, addr),
+                    // ...and the bytes, so "shape written, mark word never
+                    // written" is readable rather than inferred.
+                    hexdump_around(r.data.as_ptr() as *mut u8, r.cursor, off),
                 )
             })
             .unwrap_or_else(|| "r?".to_string());
