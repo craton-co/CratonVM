@@ -69,8 +69,27 @@ pub(crate) const Z_ROOT_CLASS_WORDS: usize = 1024;
 /// `CRATONVM_ZGC_MARK_ROOT_FILTER`: consult the filter before the four global
 /// tables. Default on; `0`/`off`/`false`/`no` asks them per object as before.
 ///
-/// Read per COLLECTION, not latched, so both arms can run in one process --
-/// which is what `the_filter_and_the_tables_agree_about_every_object` needs.
+/// # The measurement
+///
+/// `BinTreesClassic 16` at `-Xmx192m`, release, interleaved on a quiet host,
+/// identical checksums:
+///
+/// ```text
+///   mark_us (mean per cycle)     wall clock
+///   on     4774   4154   4079     2455  2277  2332 ms
+///   off    6903   7747   9319     2445  2302  2597 ms
+/// ```
+///
+/// The mark pause halves, 3/3. **The wall clock does not move**, and that is
+/// not a contradiction to explain away: on this workload the mark is 4-9 ms of
+/// a ~2,400 ms run, so halving it is worth about a percent and the run-to-run
+/// spread is wider than that. This is a PAUSE change. It pays where the live
+/// set is large and the tables are populated -- a Spring or H2 workload with
+/// user class loaders and native-backed collections -- and the number to read
+/// there is `mark_us` on the `[GC] zgc-pause:` line, not the benchmark's
+/// total.
+///
+/// Read per COLLECTION, not latched, so both arms can run in one process.
 pub(crate) fn filter_enabled() -> bool {
     match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_MARK_ROOT_FILTER") {
         Some(raw) => {
