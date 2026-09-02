@@ -15106,7 +15106,7 @@ fn carrier_algorithm(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Value {
 /// under a different algorithm's rules. The set below is exactly the set
 /// HotSpot's SunJCE serves; every one of them is a plain random-byte key except
 /// DES and DESede, whose parity rule `des_set_odd_parity` implements.
-fn keygen_default_bits(algo: &str) -> Option<i32> {
+pub(crate) fn keygen_default_bits(algo: &str) -> Option<i32> {
     match algo.to_ascii_uppercase().as_str() {
         "AES" => Some(256),
         "DESEDE" | "TRIPLEDES" => Some(168),
@@ -15118,6 +15118,23 @@ fn keygen_default_bits(algo: &str) -> Option<i32> {
         "HMACSHA256" => Some(256),
         "HMACSHA384" => Some(384),
         "HMACSHA512" => Some(512),
+        // The six SunJCE HMAC key generators this table did not carry, and the
+        // reason the service rows for them were deliberately withheld (see the
+        // `KeyGenerator` seed in `provider_chain`, which says so).
+        //
+        // Every default is the DIGEST OUTPUT length, which is the rule the four
+        // rows above already follow and which `SHA-512/224` makes visible: its
+        // key is 28 bytes, not the 64 its SHA-512 compression function might
+        // suggest. Measured on HotSpot 25.0.3 rather than derived —
+        // `apps/probes/JcaKeyGeneratorDefaults` prints
+        // `KeyGenerator.getInstance(a).generateKey().getEncoded().length` for
+        // every name, and the two VMs' output is diffed.
+        "HMACSHA512/224" => Some(224),
+        "HMACSHA512/256" => Some(256),
+        "HMACSHA3-224" => Some(224),
+        "HMACSHA3-256" => Some(256),
+        "HMACSHA3-384" => Some(384),
+        "HMACSHA3-512" => Some(512),
         _ => None,
     }
 }
@@ -15230,17 +15247,75 @@ fn keygen_algorithm_of(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
 /// default goes wrong in only some of them. Here they had already agreed on the
 /// wrong answer (128 for everything); the next edit is the one that would have
 /// split them.
+/// The real `KeyGeneratorSpi` behind this receiver, or `None` when this crate
+/// built it.
+///
+/// `getInstance` is a native for all three overloads, and until 2026-09-02
+/// every one of them returned the two-field synthetic (algorithm at slot 0,
+/// key size at slot 1), so the eight natives below could read those slots
+/// unconditionally. They cannot any more: the five `SunTls*` KDFs are served by
+/// handing back a REAL `javax.crypto.KeyGenerator` over the platform's SPI, and
+/// a real one's slots hold `provider`/`spi`/`algorithm`/`lock` instead.
+///
+/// TYPE-CHECKED, not trusted. `get_field_by_name` can fall back to a
+/// name->slot mapping, and on a two-field synthetic "spi" resolves to slot 0 —
+/// a `String`. Returning that would hand a `String` to `invoke_virtual` as a
+/// `KeyGeneratorSpi`. The same unchecked read put a `String` where a `Provider`
+/// belonged in `pbkdf2_get_provider` and killed the caller on
+/// `String.getName()`; this is that lesson applied before it could happen
+/// again. A `String` is not a `KeyGeneratorSpi`, so the check is also exactly
+/// the discriminator needed.
+///
+/// This is `skf_receiver_is_ours` in the positive direction: that one asks
+/// "did we build it" through a side table, this one asks "can I delegate" and
+/// answers with the thing to delegate TO. No table, so nothing to keep in step
+/// with GC relocation or to evict.
+fn keygen_real_spi(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    let Value::Object(Some(spi)) = ctx.get_field_by_name(this, "spi") else {
+        return None;
+    };
+    let spi_class = ctx.class_id_by_name("javax/crypto/KeyGeneratorSpi")?;
+    if ctx.is_subclass(ctx.class_id_of_object(spi), spi_class) {
+        Some(spi)
+    } else {
+        None
+    }
+}
+
+/// A `SecureRandom` for the `init` overloads that do not carry one.
+///
+/// The JDK's own `KeyGenerator.init(spec)` calls
+/// `engineInit(params, JCAUtil.getSecureRandom())` rather than passing null,
+/// and `TlsRsaPremasterSecretGenerator` reads its argument — a null there is an
+/// NPE inside the provider, not a defaulted value.
+fn keygen_default_random(ctx: &mut dyn NativeContext) -> Result<Value, MethodCallFailed> {
+    match ctx.new_object_initialized("java/security/SecureRandom", "()V", &[])? {
+        Some(v @ Value::Object(Some(_))) => Ok(v),
+        _ => Ok(Value::Object(None)),
+    }
+}
+
 fn keygen_get_instance_named(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let algo = obj_arg(args, 0)?;
     let algo_str = ctx.read_string(algo).unwrap_or_default();
     let bits = match keygen_default_bits(&algo_str) {
         Some(bits) => bits,
         None => {
+            // AFTER this engine's own verdict, never before it — the ordering
+            // `try_delegate_cipher_to_chain` writes down and the whole safety
+            // argument for `jdk_service_class`. A name this crate generates
+            // keys for is generated HERE; only a name it refuses reaches the
+            // platform's own implementation class.
+            if let Some(real) =
+                crate::jca::provider_chain::build_real_key_generator(ctx, "SunJCE", &algo_str)?
+            {
+                return Ok(Some(Value::Object(Some(real))));
+            }
             return Err(throw_jca_exc(
                 ctx,
                 "java/security/NoSuchAlgorithmException",
                 &format!("{algo_str} KeyGenerator not available"),
-            ))
+            ));
         }
     };
     let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2)?;
@@ -15260,6 +15335,21 @@ fn keygen_get_instance_named(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// does — `HmacSHA256` really will hand back a 64-bit key for `init(64)`.
 fn keygen_init_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // A generator this crate did not build belongs to the provider that did.
+    // See `keygen_real_spi`.
+    if let Some(spi) = keygen_real_spi(ctx, this) {
+        let size = args.get(1).copied().unwrap_or(Value::Int(0));
+        let random = match args.get(2) {
+            Some(v @ Value::Object(Some(_))) => *v,
+            _ => keygen_default_random(ctx)?,
+        };
+        return ctx.invoke_virtual(
+            spi,
+            "engineInit",
+            "(ILjava/security/SecureRandom;)V",
+            &[size, random],
+        );
+    }
     let algo = keygen_algorithm_of(ctx, this);
     let key_size = args
         .get(1)
@@ -15686,6 +15776,18 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         "(Ljava/security/SecureRandom;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if let Some(spi) = keygen_real_spi(ctx, this) {
+                let random = match args.get(1) {
+                    Some(v @ Value::Object(Some(_))) => *v,
+                    _ => keygen_default_random(ctx)?,
+                };
+                return ctx.invoke_virtual(
+                    spi,
+                    "engineInit",
+                    "(Ljava/security/SecureRandom;)V",
+                    &[random],
+                );
+            }
             // "the provider default", not the literal 128 — which for AES is
             // 256 and for DESede is 168. Resetting to 128 here re-introduced
             // the very defect `keygen_default_bits` exists to fix, one method
@@ -15705,17 +15807,52 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
     // `InvalidAlgorithmParameterException` instead would break the BouncyCastle
     // clients that call this purely to pass a curve/nonce spec (see the
     // Round-15 BcProbe note on `getInstance` above).
+    // These two stay a NO-OP for a synthetic receiver, deliberately and for the
+    // reason above — but they are the ONLY route into the five `SunTls*` KDFs,
+    // whose whole input is an `AlgorithmParameterSpec`. Swallowing the spec on
+    // a real receiver would leave its generator uninitialised and
+    // `generateKey()` would then throw from inside the provider, which is a
+    // worse answer than the `NoSuchAlgorithmException` this used to give.
     r.register(
         kg,
         "init",
         "(Ljava/security/spec/AlgorithmParameterSpec;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Some(spi) = keygen_real_spi(ctx, this) {
+                let spec = args.get(1).copied().unwrap_or(Value::Object(None));
+                let random = keygen_default_random(ctx)?;
+                return ctx.invoke_virtual(
+                    spi,
+                    "engineInit",
+                    "(Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",
+                    &[spec, random],
+                );
+            }
+            Ok(None)
+        },
     );
     r.register(
         kg,
         "init",
         "(Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Some(spi) = keygen_real_spi(ctx, this) {
+                let spec = args.get(1).copied().unwrap_or(Value::Object(None));
+                let random = match args.get(2) {
+                    Some(v @ Value::Object(Some(_))) => *v,
+                    _ => keygen_default_random(ctx)?,
+                };
+                return ctx.invoke_virtual(
+                    spi,
+                    "engineInit",
+                    "(Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",
+                    &[spec, random],
+                );
+            }
+            Ok(None)
+        },
     );
     r.register(
         kg,
@@ -15723,6 +15860,14 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         "()Ljavax/crypto/SecretKey;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if let Some(spi) = keygen_real_spi(ctx, this) {
+                return ctx.invoke_virtual(
+                    spi,
+                    "engineGenerateKey",
+                    "()Ljavax/crypto/SecretKey;",
+                    &[],
+                );
+            }
             let key_size = ctx.get_field(this, 1).as_int().unwrap_or(128);
             // The algorithm was recorded at `getInstance` and, until this
             // change, never read again — which is how one code path served
@@ -16442,6 +16587,14 @@ pub(crate) fn pbkdf2_prf_code(alg: &str) -> Option<i32> {
         "PBKDF2WITHHMACSHA256" => Some(256),
         "PBKDF2WITHHMACSHA384" => Some(384),
         "PBKDF2WITHHMACSHA512" => Some(512),
+        // The two SunJCE registers that this table did not: the PRF is the
+        // FIPS 180-4 truncated-SHA-512 pair, whose names carry a slash. Codes
+        // are `512224`/`512256` rather than `224`/`256` because those already
+        // mean SHA-224/SHA-256 and `pbkdf2_derive_for` selects the digest by
+        // this number — reusing one would have derived a key with the wrong
+        // PRF and said nothing.
+        "PBKDF2WITHHMACSHA512/224" => Some(512224),
+        "PBKDF2WITHHMACSHA512/256" => Some(512256),
         _ => None,
     }
 }
@@ -16489,6 +16642,13 @@ macro_rules! pbkdf2_derive_wide_impl {
 }
 pbkdf2_derive_wide_impl!(pbkdf2_derive_wide_sha384, sha2::Sha384);
 pbkdf2_derive_wide_impl!(pbkdf2_derive_wide_sha512, sha2::Sha512);
+// SHA-512/224 and SHA-512/256 are NOT truncations of SHA-512 — FIPS 180-4 gives
+// each its own initial hash value, so `Sha512::finalize()[..28]` is a different
+// number from `Sha512_224::finalize()`. They are separate types in `sha2` for
+// that reason, and they belong on the WIDE macro because their compression
+// function is SHA-512's: a 128-byte HMAC block, not 64.
+pbkdf2_derive_wide_impl!(pbkdf2_derive_wide_sha512_224, sha2::Sha512_224);
+pbkdf2_derive_wide_impl!(pbkdf2_derive_wide_sha512_256, sha2::Sha512_256);
 
 /// Crate-visible PBKDF2 entry point (dispatches to the right 64-byte-block
 /// PRF by [`pbkdf2_prf_code`] code) for callers outside this module — used by
@@ -16508,7 +16668,17 @@ pub(crate) fn pbkdf2_derive_for(
         224 => pbkdf2_derive::<sha2::Sha224>(pw, salt, iters, dklen),
         384 => pbkdf2_derive_wide_sha384(pw, salt, iters, dklen),
         512 => pbkdf2_derive_wide_sha512(pw, salt, iters, dklen),
-        _ => pbkdf2_derive::<sha2::Sha256>(pw, salt, iters, dklen),
+        512224 => pbkdf2_derive_wide_sha512_224(pw, salt, iters, dklen),
+        512256 => pbkdf2_derive_wide_sha512_256(pw, salt, iters, dklen),
+        // 256 and — the hazard — ANY code this function has no arm for.
+        //
+        // Spelled out because the catch-all is a silent wrong answer, not an
+        // error: a PRF code that reaches here derives with SHA-256 and returns
+        // a key of the right LENGTH, so the caller sees a success and the
+        // failure appears wherever the key is next used, against a peer that
+        // derived it correctly. Every code `pbkdf2_prf_code` can return has an
+        // arm above; a new one must add its arm HERE in the same change.
+        256 | _ => pbkdf2_derive::<sha2::Sha256>(pw, salt, iters, dklen),
     }
 }
 
@@ -16587,6 +16757,16 @@ fn is_known_pbe_keyfactory_alg(alg: &str) -> bool {
             | "PBEWithHmacSHA256AndAES_256"
             | "PBEWithHmacSHA384AndAES_256"
             | "PBEWithHmacSHA512AndAES_256"
+            // The `SHA-512/224` and `SHA-512/256` PRF members of the same
+            // family. SunJCE registers all four and this set carried none of
+            // them, so `SecretKeyFactory.getInstance("PBEWithHmacSHA512/224            // AndAES_128")` refused where HotSpot serves it. No derivation is
+            // involved — a `PBEKeyFactory` hands back the password as 7-bit
+            // ASCII whatever the PRF in its name — so the NAME SET is the whole
+            // implementation for these, exactly as it is for the eighteen above.
+            | "PBEWithHmacSHA512/224AndAES_128"
+            | "PBEWithHmacSHA512/224AndAES_256"
+            | "PBEWithHmacSHA512/256AndAES_128"
+            | "PBEWithHmacSHA512/256AndAES_256"
     )
 }
 
@@ -16767,11 +16947,42 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
         // `IOException`-where-`CertificateException`-belongs batch found in the
         // trust manager. `throw_jca_exc` builds the real Java exception object,
         // so what a caller catches is what HotSpot throws.
-        None => Err(throw_jca_exc(
-            ctx,
-            "java/security/NoSuchAlgorithmException",
-            &format!("{alg} SecretKeyFactory not available"),
-        )),
+        // THE PLATFORM'S OWN FACTORY, before the refusal — and only after it.
+        //
+        // Everything above is this engine's verdict; this is the last thing
+        // tried, so no name it computes changes hands. `DES` and `DESede` are
+        // the two SunJCE `SecretKeyFactory` services this VM has no arm for,
+        // and their implementations (`com.sun.crypto.provider.DESKeyFactory`,
+        // `DESedeKeyFactory`) are sitting in the boot image: pure Java,
+        // public no-arg constructors, verified loadable here before the rows
+        // were seeded. Refusing them was a portability defect and nothing else.
+        //
+        // The wrapper is a GENUINE `javax.crypto.SecretKeyFactory` built
+        // through the JDK's own `(Spi, Provider, String)` constructor, so
+        // `getKeySpec`/`translateKey` — which this crate does not intercept —
+        // run ordinary bytecode over a properly-constructed receiver, and the
+        // three natives that DO shadow the class route a receiver they did not
+        // build back to its `spi` (`skf_receiver_is_ours`).
+        None => {
+            if let Some((jdk_provider, _)) = crate::jca::provider_chain::jdk_service_class(
+                requested_provider.as_deref(),
+                "SecretKeyFactory",
+                &alg,
+            ) {
+                if let Some(obj) = crate::jca::provider_chain::build_real_secret_key_factory(
+                    ctx,
+                    &jdk_provider,
+                    &alg,
+                )? {
+                    return Ok(Some(Value::Object(Some(obj))));
+                }
+            }
+            Err(throw_jca_exc(
+                ctx,
+                "java/security/NoSuchAlgorithmException",
+                &format!("{alg} SecretKeyFactory not available"),
+            ))
+        }
     }
 }
 
@@ -16976,13 +17187,17 @@ pub(crate) fn pbkdf2_generate_secret(
         .into());
     }
     let dklen = (key_bits as usize) / 8;
-    let dk = match prf {
-        1 => pbkdf2_derive::<sha1::Sha1>(&pw_bytes, &salt, iters, dklen),
-        224 => pbkdf2_derive::<sha2::Sha224>(&pw_bytes, &salt, iters, dklen),
-        384 => pbkdf2_derive_wide_sha384(&pw_bytes, &salt, iters, dklen),
-        512 => pbkdf2_derive_wide_sha512(&pw_bytes, &salt, iters, dklen),
-        _ => pbkdf2_derive::<sha2::Sha256>(&pw_bytes, &salt, iters, dklen),
-    };
+    // THROUGH `pbkdf2_derive_for`, not a second copy of its match.
+    //
+    // This site carried its own arm-for-arm duplicate of that dispatch, with
+    // the same silent SHA-256 catch-all, and the duplicate is what a new PRF
+    // falls into: adding `PBKDF2WithHmacSHA512/224` and `/256` to
+    // `pbkdf2_prf_code` and to `pbkdf2_derive_for` left THIS copy unchanged, so
+    // both names resolved, derived a 32-byte key, and derived it with SHA-256 —
+    // the two new rows printed byte-identical output, and byte-identical to the
+    // `PBKDF2WithHmacSHA256` row above them (`apps/probes/JcaDerivationVectors`,
+    // which exists because `getInstance` resolving is not evidence of anything).
+    let dk = pbkdf2_derive_for(prf, &pw_bytes, &salt, iters, dklen);
     // Build a real SecretKeySpec(dk, "PBKDF2With…") so getEncoded() returns dk.
     //
     // The comment said `"PBKDF2With…"` but the literal was the bare `"PBKDF2"`,

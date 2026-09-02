@@ -390,6 +390,22 @@ fn metadata_hash(cm: &cratonvm_jit::CompiledMethod) -> u64 {
         i(&mut v, m.bytecode_pc as i64);
         i(&mut v, m.live_frame_hi as i64);
         i(&mut v, m.moving_young_coverage_complete as i64);
+        // `None` and `Some(0)` are different claims (see `OopMapEntry`), so they
+        // must hash differently.
+        i(&mut v, m.local_oop_mask.is_some() as i64);
+        i(&mut v, m.local_oop_mask.unwrap_or(0) as i64);
+        i(&mut v, m.num_locals as i64);
+        i(&mut v, m.inline_local_scopes.len() as i64);
+        for (b, n, mk) in &m.inline_local_scopes {
+            i(&mut v, *b as i64);
+            i(&mut v, *n as i64);
+            i(&mut v, *mk as i64);
+        }
+        i(&mut v, m.stack_marks_exact as i64);
+        i(&mut v, m.non_oop_stack_slots.len() as i64);
+        for o in &m.non_oop_stack_slots {
+            i(&mut v, *o as i64);
+        }
         i(&mut v, m.frame_slot_offsets.len() as i64);
         for o in &m.frame_slot_offsets {
             i(&mut v, *o as i64);

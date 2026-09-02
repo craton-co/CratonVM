@@ -176,10 +176,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status:** FIXED-UNVERIFIED-BY-CARGO. This lane did **not** run `cargo`",
     ),
     (
-        "docs/known-issues/jdk-only/F34-1-the-synthetic-only-registrar-population-and-its-gate-20260813.md",
-        "status block says: **Nothing was built or run.** The lane's constraints forbade `cargo`",
-    ),
-    (
         "docs/known-issues/jdk-only/F6-1-the-arm-that-had-to-move-and-the-two-minters-it-keeps-wrong.md",
         "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`, `native-builtins/src/tls.rs` — this lane's files); NOMINATED (the rest).**",
     ),
@@ -256,16 +252,8 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status: FIXED IN SOURCE, NOT VERIFIED BY AN ARM.** Lane H24, 2026-08-21.",
     ),
     (
-        "docs/known-issues/jdk-only/H3-1-the-ratchet-that-did-not-compile-20260820.md",
-        "status block says: **Status:** **FIXED-UNVERIFIED** — no binary carrying these changes has been",
-    ),
-    (
         "docs/known-issues/jdk-only/H4-1-the-cluster-that-is-not-a-tag-20260820.md",
         "status block says: **Status: FIXED-UNVERIFIED — no binary carrying these changes has been built or",
-    ),
-    (
-        "docs/known-issues/jdk-only/H5-1-the-abstract-registrations-are-fabricated-receivers-20260820.md",
-        "status block says: **Status** **FIXED-UNVERIFIED — no binary carrying these changes has been built or run.**",
     ),
     (
         "docs/known-issues/jdk-only/H6-1-the-canonical-name-slot-holds-a-different-string-20260820.md",
@@ -320,10 +308,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: Wave 7, lane W7-5. Nothing was built or run on 2026-08-12.",
     ),
     (
-        "docs/known-issues/jdk-only/W7-53-blocking-close-family.md",
-        "status block says: **Nothing in the Rust half of this record was built or run.** This session had",
-    ),
-    (
         "docs/known-issues/jdk-only/W7-55-record-reconciliation.md",
         "status block says: Nothing was built or run for this pass. Every verdict below is git and source",
     ),
@@ -352,16 +336,8 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: Branch `fix/short-thread-objects-20260812`. **Nothing here was built or run",
     ),
     (
-        "docs/known-issues/jdk-only/W7-77-guarded-slot-maps.md",
-        "status block says: Nothing here was built or run: this lane writes code, docs and probes. Every",
-    ),
-    (
         "docs/known-issues/jdk-only/W7-81-write-route-three-way.md",
         "RUN 2026-09-02 via CloseFlushSwallowProbe on --synthetic-jdk (the probe both records name); shares W7-57's result",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-84-primitive-in-reference-store.md",
-        "status block says: **Nothing in §§1-7 was built or run.** This lane may not invoke `cargo`; the",
     ),
     (
         "docs/known-issues/jdk-only/W7-9-minted-interface-abstract-methods.md",

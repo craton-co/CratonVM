@@ -26,7 +26,7 @@
 
 use std::backtrace::Backtrace;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -74,6 +74,37 @@ const PROMOTION_AGE: u8 = 3;
 
 /// GC threshold: trigger minor GC when young from-space usage exceeds this %.
 const YOUNG_GC_THRESHOLD_PERCENT: usize = 50;
+
+/// The moving young collection's trigger, as a percentage of from-space
+/// capacity. `CRATONVM_GC_YOUNG_TRIGGER_PERCENT=<n>` overrides
+/// [`YOUNG_GC_THRESHOLD_PERCENT`]; clamped to 1..=95.
+///
+/// # Why this is a knob and not just a constant (gc-genpause F6)
+///
+/// The 50 % is documented as "so the to-space can hold all survivors" -- but
+/// to-space has the SAME capacity as from-space (`with_capacity` splits the
+/// budget into two equal semis, and `Phase 6`'s expansion grows both), and
+/// promotion drains survivors to old gen on top of that. The copying
+/// collector's actual constraint is `survivors <= to-space capacity`, which
+/// permits a trigger far above 50 %. At `-Xmx1g` the 50 % rule collects after
+/// 128 MB of allocation out of a 1 GB heap.
+///
+/// Halving the collection count halves every per-collection cost -- which,
+/// after gc-genpause F1/F2/F3, is most of what a minor pause still is. But
+/// raising it also raises the peak survivor volume a single to-space must
+/// absorb, and a cycle that cannot fit them diverts to the non-moving sweep
+/// and spills to old gen. Which effect wins is a property of the workload's
+/// survival rate, so this ships as a measurable knob at its historical default
+/// rather than as a new default nobody has swept.
+fn young_trigger_percent() -> usize {
+    static PCT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PCT.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_YOUNG_TRIGGER_PERCENT")
+            .and_then(|v| v.to_str().and_then(|s| s.trim().parse::<usize>().ok()))
+            .map(|n| n.clamp(1, 95))
+            .unwrap_or(YOUNG_GC_THRESHOLD_PERCENT)
+    })
+}
 
 /// The opt-out non-moving young collector does not need Cheney-copy headroom:
 /// it reclaims dead spans in place and falls back to allocation-failure GC for
@@ -1622,6 +1653,119 @@ pub fn jit_read_bounds_addr() -> usize {
     &JIT_READ_BOUNDS as *const _ as usize
 }
 
+// ---------------------------------------------------------------------------
+// F-08 - G1's own JIT barrier table
+// ---------------------------------------------------------------------------
+
+/// Process-global description of G1's heap geometry, for the JIT's inline G1
+/// post-write barrier (F-08).
+///
+/// # Why a THIRD table, and not either of the two above
+///
+/// [`JIT_REGION_BOUNDS`]'s emptiness under G1 is load-bearing: it is what
+/// closes defect G1-2 (`audits/g1-audit.md` 8.1), by making every
+/// generational-style barrier-free inline reference store unreachable there.
+/// Nothing may be written into it for G1, ever, and the sibling
+/// [`JIT_READ_BOUNDS`] exists precisely because the previous attempt to reuse
+/// one table for two questions would have unblocked those stores. This is the
+/// same lesson a third time: the question here is neither "is this address
+/// mapped" nor "may an inline store skip the barrier" (the answer to which
+/// stays NO) but "what are the numbers an inline barrier needs to DO its job".
+///
+/// # Layout
+///
+/// * `[0]` `arena_base` - G1's single contiguous arena base.
+/// * `[1]` `arena_len` - its length in bytes. Doubles as the liveness flag:
+///   zero means no G1 collector has published, and the emitter then emits no
+///   inline barrier at all.
+/// * `[2]` `region_mask` - `!(region_size - 1)`. The same-region test is
+///   `((obj - arena_base) ^ (val - arena_base)) & region_mask == 0`, which is
+///   `(obj - base) >> region_shift == (val - base) >> region_shift` written
+///   without a shift. A MASK rather than a shift because the emitted sequence
+///   then needs no `CL` and no variable-shift encoding.
+///
+///   The base subtraction is not decoration. G1's arena comes from a `Vec<u8>`
+///   and is only malloc-aligned, so an aligned `region_size` block of the
+///   address space is NOT a region: exactly one region boundary falls inside
+///   each such block. Testing `(obj ^ val) & region_mask` without subtracting
+///   the base would call two addresses straddling that boundary "same region",
+///   skip the barrier, and lose the edge - the use-after-free this barrier
+///   exists to prevent.
+/// * `[3]` `card_table_base`, `[4]` `card_shift` - the F-05 card table
+///   (`crate::g1_cards`). **Published but not read by any emitter today**, and
+///   deliberately so rather than by oversight: dirtying a card inline saves
+///   nothing while the REMEMBERED-SET ENTRY still has to be recorded, because
+///   that entry is a hash-map insert keyed on a (source, target) region pair
+///   and there is no inline form of it. The inline barrier therefore filters
+///   (same region, null store) and calls out for everything else, and the
+///   callee dirties the card on the way through. These two words are what a
+///   future all-inline barrier would need, and it would additionally need
+///   Phase 2 to take its source set from the card table rather than from the
+///   region-index remembered set - which is a policy change, not an emitter
+///   change. See `feature`-level discussion in the F-08 commit.
+///
+/// All-zero means "no G1 collector is live", which is the state under every
+/// other backend and before construction, and the emitter degrades to the
+/// helper call it makes today.
+#[repr(C)]
+pub struct JitG1BarrierTable {
+    pub words: [AtomicUsize; 5],
+}
+
+pub static JIT_G1_BARRIER: JitG1BarrierTable = JitG1BarrierTable {
+    words: [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ],
+};
+
+/// Address of [`JIT_G1_BARRIER`] for the JIT helpers table
+/// (`JitRuntimeHelpers::g1_barrier_addr`).
+pub fn jit_g1_barrier_addr() -> usize {
+    &JIT_G1_BARRIER as *const _ as usize
+}
+
+/// Publish G1's geometry. Called once from `G1Collector::new`.
+///
+/// `arena_len` is stored LAST and with `Release`, so a reader that sees a
+/// non-zero length has necessarily seen the other four words: the length is
+/// the liveness flag and it must not become visible ahead of the numbers it
+/// vouches for.
+pub fn publish_jit_g1_barrier(
+    arena_base: usize,
+    arena_len: usize,
+    region_mask: usize,
+    card_table_base: usize,
+    card_shift: u32,
+) {
+    JIT_G1_BARRIER.words[0].store(arena_base, Ordering::Relaxed);
+    JIT_G1_BARRIER.words[2].store(region_mask, Ordering::Relaxed);
+    JIT_G1_BARRIER.words[3].store(card_table_base, Ordering::Relaxed);
+    JIT_G1_BARRIER.words[4].store(card_shift as usize, Ordering::Relaxed);
+    JIT_G1_BARRIER.words[1].store(arena_len, Ordering::Release);
+}
+
+/// Zero the table if slot 0 still names `owned_base` - the owner-checked
+/// teardown, for exactly the reason [`clear_jit_read_bounds_owned_by`] is
+/// owner-checked: a dropped collector must not leave geometry behind that a
+/// later one would be described by, and must not clobber a LIVE collector's
+/// geometry when two exist (embedding, unit tests).
+///
+/// `arena_len` is cleared FIRST, so no reader can see a live length beside a
+/// zeroed base.
+pub fn clear_jit_g1_barrier_owned_by(owned_base: usize) {
+    if JIT_G1_BARRIER.words[0].load(Ordering::Acquire) != owned_base {
+        return;
+    }
+    JIT_G1_BARRIER.words[1].store(0, Ordering::Release);
+    for w in JIT_G1_BARRIER.words.iter() {
+        w.store(0, Ordering::Release);
+    }
+}
+
 /// Publish one `[base, end)` pair into [`JIT_READ_BOUNDS`] slot `slot` (0..3).
 ///
 /// Separate from the generational publisher because G1 has no `store_region_
@@ -1632,6 +1776,22 @@ pub fn publish_jit_read_bounds(slot: usize, base: usize, end: usize) {
     }
     JIT_READ_BOUNDS.words[slot * 2].store(base, Ordering::Release);
     JIT_READ_BOUNDS.words[slot * 2 + 1].store(end, Ordering::Release);
+}
+
+/// Read back one `[base, end)` pair from [`JIT_READ_BOUNDS`]. `(0, 0)` for an
+/// out-of-range slot or one that was never published.
+///
+/// F-16 needs this: under a reserved-and-committed-on-demand heap the published
+/// bound must never outrun the committed prefix, and that is only checkable by
+/// reading what was published.
+pub fn jit_read_bounds_slot(slot: usize) -> (usize, usize) {
+    if slot >= 3 {
+        return (0, 0);
+    }
+    (
+        JIT_READ_BOUNDS.words[slot * 2].load(Ordering::Acquire),
+        JIT_READ_BOUNDS.words[slot * 2 + 1].load(Ordering::Acquire),
+    )
 }
 
 /// Zero the whole read table — the teardown counterpart, so a dropped heap can
@@ -2048,6 +2208,21 @@ pub struct GenerationalHeap {
     /// fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md
     /// and fixed-suite-bugs/wildfly/wildfly-stale-objectref-debug-assertion-scoping.md.
     quarantine: Mutex<VecDeque<Arena>>,
+    /// Persistent worker threads for the parallel young copy phase (see
+    /// [`crate::evac_pool`]), created on first use.
+    ///
+    /// Lazy, not built in the constructor, for two reasons. Most heaps in this
+    /// process never run a parallel copy phase at all — the moving cycle is
+    /// only one of the young collector's two paths and the worker policy has
+    /// its own floor — and a `GenerationalHeap` is constructed in a great many
+    /// unit tests, each of which would otherwise pay for OS threads it never
+    /// dispatches to.
+    ///
+    /// Sized once, from the first cycle that asks. A later cycle wanting more
+    /// workers than the pool has gets the pool's count instead
+    /// (`EvacPool::scope` clamps, and `ParEvac::drain` counts heads off the
+    /// clamped number so the termination handshake stays correct).
+    evac_pool: std::sync::OnceLock<crate::evac_pool::EvacPool>,
     /// Lock-free cached address bounds `[base, end)` of the three storage
     /// regions (young from-space, young to-space, old gen), published whenever
     /// the regions are (re)allocated so [`is_object_address`] can do its
@@ -2161,6 +2336,33 @@ pub struct GenerationalHeap {
     /// `AtomicBool` so the flag can be read/written without going
     /// through the per-arena mutex.
     force_promote_all: std::sync::atomic::AtomicBool,
+    /// Survivors the previous moving cycle copied, as the capacity hint for
+    /// the next cycle's `pointer_map` (gc-genpause F4).
+    ///
+    /// # Why a hint and not a better data structure
+    ///
+    /// `pointer_map` takes exactly one insert per surviving object -- measured
+    /// at `pointer_map_len = fwd_copies = 1,446,210` in a single 450 ms drain
+    /// -- and it started every cycle EMPTY. Growing a hash table from zero to
+    /// 1.4 M entries reallocates and rehashes about twenty times, moving
+    /// roughly 2.8 M entries in total on top of the 1.4 M real inserts. That
+    /// growth, not hashing, is the cost: `moving-young-throughput-20260726`'s
+    /// profile named `RawTable::reserve_rehash` at 8.3 % of the whole process
+    /// beside `HashMap::insert` at 40.7 %.
+    ///
+    /// The obvious-looking alternative -- a sorted `Vec<(from, to)>`, push on
+    /// the collector side and binary-search on the consumer side -- is worse
+    /// here, and the call sites say so: `pointer_map.get(..)` appears 127
+    /// times against 18 `insert`s. It is a read-mostly structure with point
+    /// lookups, so trading O(1) hashing for ~21 cache-missing probes per `get`
+    /// would pay for a cheaper build with a more expensive everything-else.
+    /// Pre-sizing takes the growth cost out without touching the shape any
+    /// consumer depends on.
+    ///
+    /// A hint, never a bound: a cycle with more survivors than the last one
+    /// simply grows as before. Starts at zero, which reproduces exactly the
+    /// old behaviour on the first collection.
+    prev_survivor_count: std::sync::atomic::AtomicUsize,
     /// Young-exhaustion signal from the *native* allocation wrappers
     /// (`ctx.alloc_object` / `alloc_array` / the `*_full` fallible twins),
     /// which must stay GC-free mid-callback (their callers hold unrooted
@@ -2244,11 +2446,18 @@ unsafe impl Sync for GenerationalHeap {}
 // 29 ms of a 424 ms median stop-the-world pause — to recompute a size
 // `forward_object_impl` already had in hand.
 //
-// A thread-local is sound here and not merely convenient: `forward_object_impl`
-// takes `&mut Arena` for both destinations, so the copy phase is
-// single-threaded by construction and the borrow checker enforces it. (The
-// PARALLEL part of a young cycle is the mark closure, which is read-only and
-// never forwards.)
+// A thread-local is sound for the SERIAL copy phase and not merely convenient:
+// `forward_object_impl` takes `&mut Arena` for both destinations, so that path
+// is single-threaded by construction and the borrow checker enforces it.
+//
+// It is NOT sound for the parallel copy phase, and the fix is not to make this
+// an atomic. `gen_evac`'s workers each tally into their own `EvacShard` — the
+// same reason `forwards` is per-worker, i.e. this is a per-object write on the
+// hottest path of the pause — and the driver folds every shard in with
+// [`copy_tally_merge`] after the completion barrier. A worker thread's own
+// thread-local is never read, which is exactly why it must never be written:
+// a stale claim that "the copy phase is single-threaded" would have made these
+// four counters silently under-report by however much the helpers copied.
 //
 // Layout: [bytes_promoted, objects_promoted, bytes_copied_young,
 // objects_copied_young].
@@ -2291,6 +2500,23 @@ fn copy_tally_arm(reencounter: bool) {
     COPY_TALLY.with(|t| {
         let mut a = t.get();
         a[if reencounter { 4 } else { 5 }] += 1;
+        t.set(a);
+    });
+}
+
+/// Fold one parallel-evacuation shard's tally into the driver's.
+///
+/// `shard` is `COPY_TALLY`'s own layout — `copy_tally_add`'s four counters
+/// followed by `copy_tally_arm`'s re-encounter/copy pair — accumulated on the
+/// worker that did the copying. Called on the DRIVER thread only, after the
+/// completion barrier, so the tally stays a thread-local of the one thread
+/// that reads it.
+fn copy_tally_merge(shard: &[u64; 6]) {
+    COPY_TALLY.with(|t| {
+        let mut a = t.get();
+        for i in 0..6 {
+            a[i] += shard[i];
+        }
         t.set(a);
     });
 }
@@ -2358,7 +2584,7 @@ impl GenerationalHeap {
     ) -> Self {
         let young_semi_size = young_semi_size.max(1024);
         let old_gen_size = old_gen_size.max(1024);
-        let threshold = young_semi_size * YOUNG_GC_THRESHOLD_PERCENT / 100;
+        let threshold = young_semi_size * young_trigger_percent() / 100;
         let max_young = max_young_semi_size.max(young_semi_size);
 
         let old_gen = OldGen::new(old_gen_size);
@@ -2392,6 +2618,7 @@ impl GenerationalHeap {
             young_to: Mutex::new(Arena::new(young_semi_size)),
             old_gen: Mutex::new(old_gen),
             quarantine: Mutex::new(VecDeque::new()),
+            evac_pool: std::sync::OnceLock::new(),
             region_bounds: [
                 (AtomicUsize::new(0), AtomicUsize::new(0)),
                 (AtomicUsize::new(0), AtomicUsize::new(0)),
@@ -2408,6 +2635,7 @@ impl GenerationalHeap {
             numa_num_nodes,
             stats: HeapStats::default(),
             force_promote_all: std::sync::atomic::AtomicBool::new(false),
+            prev_survivor_count: std::sync::atomic::AtomicUsize::new(0),
             young_spill_pressure: std::sync::atomic::AtomicBool::new(false),
             young_trigger_seen_gc_count: std::sync::atomic::AtomicU64::new(0),
             young_trigger_floor: std::sync::atomic::AtomicUsize::new(0),
@@ -2502,6 +2730,16 @@ impl GenerationalHeap {
 
     /// Return a handle to the GC statistics counters.  Counters are
     /// updated during GC cycles and allocation fast-paths.
+    /// The persistent parallel-evacuation worker pool, created on first use.
+    ///
+    /// See the `evac_pool` field for why this is lazy. `workers` is the total
+    /// the policy asked for, so the pool holds one fewer — the driver is a
+    /// worker too.
+    fn evac_pool(&self, workers: usize) -> &crate::evac_pool::EvacPool {
+        self.evac_pool
+            .get_or_init(|| crate::evac_pool::EvacPool::new(workers.saturating_sub(1)))
+    }
+
     pub fn stats(&self) -> &HeapStats {
         &self.stats
     }
@@ -5156,16 +5394,26 @@ impl GenerationalHeap {
             return;
         }
 
-        // T5.5.2 — route through the thread-local batched dirty path
-        // instead of taking the global card_table mutex on every
-        // reference store. The offset is queued in this mutator's
-        // per-thread buffer (no shared lock) and flushed into the shared
-        // `pending_offsets` either when the buffer hits
-        // THREAD_BUFFER_FLUSH_THRESHOLD entries or when the collector
-        // drains at GC start. The shared `cards` bitmap is updated by
-        // `drain_pending` while the GC holds the card_table mutex
-        // exclusively.
-        self.card_table.thread_local_dirty_addr(src_addr);
+        // gc-genpause F5.2: one relaxed load and, at most, one release byte
+        // store straight into the card map -- the same instruction sequence
+        // the JIT's inline post barrier emits.
+        //
+        // This used to route through a per-thread buffer
+        // (`thread_local_dirty_addr`): a TLS lookup, an `Arc` deref, a
+        // `parking_lot::Mutex`, a linear table-id lookup and a `Vec::push`
+        // that may reallocate, PER REFERENCE STORE, whose entries a safepoint
+        // then folded into this very byte map. The indirection existed only
+        // because the map was unreachable without the collector's mutex;
+        // `CardTable::cards_addr` now caches its base, so the barrier can do
+        // what the JIT has always done. It also never deduplicated -- a field
+        // written in a loop buffered one entry per store, every one of them
+        // naming the same card, which is exactly what `duplicate_card_marks`
+        // counts.
+        //
+        // The buffered API is still present and still correct; nothing on the
+        // mutator path calls it any more, so `flush_all` + `drain_pending` at
+        // GC start are now walks over empty buffers.
+        self.card_table.mark_dirty_lockfree(src_addr);
         // Same gate as `record_barrier_ref_store` above. NOTE: this counts
         // interpreter/native card marks ONLY — the JIT's inline post-write
         // barrier (`jit_card_table_info`) stores `CARD_DIRTY` directly into the
@@ -5859,7 +6107,7 @@ impl GenerationalHeap {
         // genuinely large live set would collect continuously and make things
         // worse than the pause it was trying to avoid.
         let floor = (capacity / 16).max(1);
-        let ceiling = capacity * YOUNG_GC_THRESHOLD_PERCENT / 100;
+        let ceiling = capacity * young_trigger_percent() / 100;
         let mut threshold = self.young_gc_threshold.lock();
         let current = (*threshold).clamp(floor, ceiling.max(floor));
         *threshold = if pause_ms > goal_ms {
@@ -6701,6 +6949,18 @@ impl GenerationalHeap {
         // (genuinely corrupt header), the moving collector is unsound this
         // cycle — divert to the non-moving sweep, which tolerates a partial
         // view (conservative over-marking, never relocates).
+        // gc-genpause F0: split the object-start walk out of `pre_evacuate`.
+        //
+        // `pre_evacuate` was the whole interval from the top of this function
+        // to the card scan -- the safepoint-token spin, the arena locks, the
+        // bounds publish, the card-buffer drain AND the exact from-space
+        // object-start walk, under one name. It measured 110-152 ms of a
+        // ~229 ms steady-state pause, and there was no way to tell which part
+        // of that list it was. Attributing half a pause to a phase mark that
+        // wide is a hypothesis, not a measurement (`READ where a diagnostic's
+        // value is PRODUCED`), and the walk is the thing anyone would try to
+        // optimise. So it gets its own mark and its own size counter.
+        mv_phase!("pre_walk");
         let young_base = young_from.base_ptr() as usize;
         let young_used = young_from.used();
         // One bit per 8 bytes of from-space rather than one hash-table entry
@@ -6791,8 +7051,124 @@ impl GenerationalHeap {
             v.sort_by_key(|&(off, _)| off);
             v
         };
+        // ----- gc-genpause F1: the parallel attempt ---------------------
+        //
+        // The walk below is a sequential header chase over ALLOCATED bytes.
+        // It measured ~120 ms of a ~229 ms steady-state minor pause, against
+        // ~29 ms for the Cheney copy it precedes -- the largest phase of the
+        // collection, and the one phase whose cost tracks how much garbage was
+        // produced rather than how much survived.
+        //
+        // The non-moving sweep -- the FALLBACK path -- already solved exactly
+        // this: split the chain at anchors the ALLOCATOR supplied rather than
+        // ones a walk has to rediscover, walk the chunks in parallel, and
+        // prove each chunk by requiring its chain to land exactly on the next
+        // anchor. The moving path, default since 2026-07-30, had none of it.
+        // This is that machinery, applied to the walk that now runs by
+        // default; `objstart_chunk` is the per-chunk walker and
+        // `parallel_objstart_walk` is the driver, both modelled on
+        // `sweep_chunk` / `parallel_sweep_walk`.
+        //
+        // Anchor sources, same three as the sweep's grid: offset 0, the
+        // allocator's own verified object starts (TLAB refills, young
+        // slow-path allocations, Cheney copies), and the END of every
+        // free/TLAB skip block -- because a span that survived an earlier
+        // collection is never re-handed-out and so contributes no allocator
+        // anchor of its own. `used` terminates the list.
+        //
+        // Anchors landing INSIDE a skip block are dropped: such an anchor is
+        // not an object start, and one minted by two adjacent uncoalesced
+        // blocks would abort the whole attempt for no reason.
+        let mut walked_in_parallel = false;
+        let mut objstart_chunk_count = 0usize;
+        {
+            let threads = crate::young_mark::young_gc_threads(young_used);
+            if threads > 1 && young_used > 0 {
+                let mut anchors: Vec<usize> = Vec::with_capacity(start_skips.len() + 64);
+                anchors.push(0);
+                anchors.extend(young_from.alloc_anchors_snapshot());
+                anchors.extend(
+                    start_skips
+                        .iter()
+                        .filter_map(|&(off, sz)| off.checked_add(sz)),
+                );
+                anchors.retain(|&o| o < young_used);
+                anchors.sort_unstable();
+                anchors.dedup();
+                // Drop anchors inside a skip block. `start_skips` is sorted by
+                // offset, so this is a binary search per anchor rather than
+                // the O(anchors * skips) scan the shape invites.
+                anchors.retain(|&o| {
+                    let i = start_skips.partition_point(|&(off, _)| off <= o);
+                    if i == 0 {
+                        return true;
+                    }
+                    let (off, sz) = start_skips[i - 1];
+                    !(o > off && o < off + sz)
+                });
+                // Subsample to the same stride the sweep's chunks use, so one
+                // knob (`CRATONVM_GC_SWEEP_ANCHOR_STRIDE`) sizes both and a
+                // TLAB-granular grid does not become one chunk per TLAB.
+                let anchor_stride = sweep_anchor_stride();
+                let mut chunk_anchors: Vec<usize> = Vec::new();
+                let mut next_anchor = 0usize;
+                for &a in &anchors {
+                    if a >= next_anchor {
+                        chunk_anchors.push(a);
+                        next_anchor = a - a % anchor_stride + anchor_stride;
+                    }
+                }
+                if chunk_anchors.last() != Some(&young_used) {
+                    chunk_anchors.push(young_used);
+                }
+                // Preconditions the proof depends on, checked rather than
+                // assumed: a full cover starting at 0, strictly increasing,
+                // and with at least one interior boundary to be worth it.
+                let usable = chunk_anchors.len() > 2
+                    && chunk_anchors[0] == 0
+                    && chunk_anchors[chunk_anchors.len() - 1] == young_used
+                    && chunk_anchors.windows(2).all(|w| w[0] < w[1]);
+                if usable {
+                    walked_in_parallel = parallel_objstart_walk(
+                        young_base,
+                        &chunk_anchors,
+                        &start_skips,
+                        &young_object_starts,
+                        threads,
+                    );
+                    if !walked_in_parallel {
+                        // Abandoned wholesale. A partially-filled bitmap is
+                        // WORSE than none -- a bit set by a chunk that walked
+                        // from a bogus anchor names a non-object, and
+                        // `forward_object` relocates through exactly those --
+                        // so the sequential walk gets a clean one. `vec![0u64]`
+                        // is a zero-page mapping, not a memset.
+                        young_object_starts =
+                            crate::young_mark::ObjectStartBits::new(young_base, young_used);
+                    }
+                }
+                objstart_chunk_count = chunk_anchors.len().saturating_sub(1);
+            }
+        }
+        // The ENGAGEMENT census, pushed unconditionally rather than from inside
+        // the attempt. A counter that is absent when the attempt was never made
+        // cannot be told apart from one that is absent because the phase did
+        // not run, and "the instrument was armed where it cannot fire" is how a
+        // zero gets read as a result. `objstart_chunks=0` means no attempt (one
+        // worker, or an unusable anchor grid); a non-zero chunk count with
+        // `objstart_parallel=0` means the attempt was made and REFUSED, which
+        // is a different thing and worth chasing.
+        if mv_phase_on {
+            moving_phase_count_push("objstart_chunks", objstart_chunk_count as u128);
+            moving_phase_count_push("objstart_parallel", u128::from(walked_in_parallel));
+        }
+
         let mut start_free_iter = start_skips.iter().peekable();
-        let mut young_cursor = 0usize;
+        let mut young_cursor = if walked_in_parallel { young_used } else { 0 };
+        // Same word-batching cursor the chunk walker uses. Dropped at the end
+        // of this block, which flushes the last partial word -- including on
+        // every `break` out of the loop below.
+        let mut start_run = young_object_starts.run();
         while young_cursor < young_used {
             if skip_free_blocks(&mut young_cursor, &mut start_free_iter).0 {
                 continue;
@@ -6856,7 +7232,7 @@ impl GenerationalHeap {
                     break;
                 }
             }
-            if !young_object_starts.insert(obj_ptr as usize) {
+            if !start_run.insert(obj_ptr as usize) {
                 // Only reachable if an object start is not 8-byte aligned, which
                 // `gen_object_total_size`'s rounding makes impossible — but a
                 // bitmap cannot represent it, and silently aliasing a
@@ -6873,6 +7249,23 @@ impl GenerationalHeap {
                 break;
             }
             young_cursor += size;
+        }
+        // FLUSH THE LAST PARTIAL WORD before anything reads the bitmap.
+        // `StartRun` also flushes on drop, but its drop is at the end of this
+        // function -- long after `forward_object` starts consulting these bits
+        // -- so relying on it would leave up to 63 object starts unrecorded
+        // for the whole collection, and an unrecorded start is one
+        // `forward_object` refuses to relocate. Explicit, immediately after
+        // the walk, is the only correct placement.
+        drop(start_run);
+        // gc-genpause F0: the walk proper ends here. `objstart_walk_bytes` is
+        // the from-space extent it chased -- ALLOCATED bytes, not live ones --
+        // so a slow walk beside a small `objects_copied` is the O(garbage)
+        // shape this phase is expected to have, and a slow walk beside a small
+        // `objstart_walk_bytes` is something else entirely.
+        mv_phase!("objstart_walk");
+        if mv_phase_on {
+            moving_phase_count_push("objstart_walk_bytes", young_used as u128);
         }
         if moving_with_reserved_tails {
             // T-3 refusal. The walk above completed fine — the tails were
@@ -6926,7 +7319,24 @@ impl GenerationalHeap {
         // forwarded pointer (N hash ops per GC for N live objects).
         // Converted back to std HashMap at the end for public-API
         // compatibility (`GcResult.pointer_map` and `MonitorCleanup`).
-        let mut pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
+        //
+        // gc-genpause F4: pre-sized from the previous cycle's survivor count
+        // (see `prev_survivor_count`). One insert per survivor into a table
+        // that starts empty is ~20 reallocate-and-rehash rounds on a 1.4 M
+        // survivor cycle; a live set is stable enough between consecutive
+        // collections for the last count to be a good guess, and a wrong guess
+        // only costs the growth it would have paid anyway. The 1/8 headroom
+        // keeps the table off its own load-factor boundary when the survivor
+        // count is flat, which is the common case and the one where a resize
+        // would be most annoying.
+        let map_hint = {
+            let prev = self
+                .prev_survivor_count
+                .load(std::sync::atomic::Ordering::Relaxed);
+            prev.saturating_add(prev / 8)
+        };
+        let mut pointer_map: cratonvm_types::PointerMap =
+            cratonvm_types::PointerMap::with_capacity_and_hasher(map_hint, Default::default());
         // CRIT-P2 fix: explicit worklist of promoted (old-gen) objects awaiting
         // a scan. Replaces the O(promoted^2) filter loop that previously
         // rebuilt `Vec<unscanned>` from `pointer_map.values()` per iteration.
@@ -6959,381 +7369,408 @@ impl GenerationalHeap {
         if Self::full_old_rset_scan_enabled() {
             Self::scan_all_old_to_young(&old_gen, &young_from, &mut extra_roots);
         }
+        // gc-genpause F2: the audit that replaces the unconditional scan. Runs
+        // BEFORE Phase 1b, which rewrites the very slots it inspects.
+        if gc_flags().verify_rset {
+            let _ = Self::verify_old_to_young_rset(&old_gen, &young_from, &extra_roots, "moving");
+        }
         mv_phase!("full_old_rset_scan");
 
-        // Phase 1: Forward all root objects
-        for root in roots.iter_mut() {
-            let old_ptr = root.as_ptr();
-            if !young_from.contains(old_ptr) {
-                continue; // Skip roots not in young gen (e.g., old gen objects)
-            }
-            let new_ptr = Self::forward_object(
-                &young_from,
-                &young_object_starts,
-                &mut young_to,
-                &mut old_gen,
-                old_ptr,
-                &mut objects_copied,
-                &mut pointer_map,
-                &mut promoted_worklist,
-                force_promote_all,
-            );
-            // SAFETY: `new_ptr` was returned by `forward_object`, which allocated
-            // space in young_to or old_gen and copied a valid object there.
-            *root = unsafe { ObjectRef::from_raw(new_ptr) };
-        }
-
-        mv_phase!("root_forward");
-
-        // Phase 1a: forward the overlay-backed collections' Rust-side edges.
-        //
-        // LinkedList / LinkedHashMap / TreeMap / TreeSet keep their backing
-        // arrays in process-global side-tables, not in Java heap slots, so
-        // neither a root slot nor a dirty card can describe the edge. `roots`
-        // carries them ONLY when the VM's unconditional overlay scan ran
-        // (`native_roots::scan_collection_overlays`) — and the Generational
-        // collector deliberately SKIPS that scan while JIT quiescence is
-        // engaged, an unregistered JIT frame is on the stack, or a major GC is
-        // pending, relying instead on the marker walking each owner and
-        // pulling in `external_roots_for_owner`.
-        //
-        // `sweep_young_non_moving` (and `old_gen_gc`) implement that owner
-        // walk. This moving Cheney path never did: when the two conditions met
-        // — overlay scan skipped, moving young chosen — every overlay-held
-        // young array was silently reclaimed. The collection then read its own
-        // state through the relocation-invariant identity-hash key and got a
-        // dangling pointer whose zeroed header reads back as `ClassId(0)` with
-        // `array_length == 0`, surfacing far away as an `Int(0)` where an
-        // element belongs (`TreeSet.contains` → `ts_binary_search` →
-        // `Comparator.compare` → `checkcast: not an object reference`, or a
-        // SIGSEGV).
-        //
-        // Seed every current owner's refs, exactly as the non-moving young
-        // path does — a minor collection leaves old gen intact and cannot
-        // decide which owners will later prove dead. Only forwarding is needed
-        // here: the side tables themselves are repointed afterwards by
-        // `remap_external_roots` from `pointer_map`.
-        for overlay_ref in crate::external_roots::external_roots_for_matching_owners(&|_| true) {
-            let old_ptr = overlay_ref.as_ptr();
-            if !young_from.contains(old_ptr) {
-                continue;
-            }
-            let _ = Self::forward_object(
-                &young_from,
-                &young_object_starts,
-                &mut young_to,
-                &mut old_gen,
-                old_ptr,
-                &mut objects_copied,
-                &mut pointer_map,
-                &mut promoted_worklist,
-                force_promote_all,
-            );
-        }
-
         // Old-gen addresses needing card re-mark after Phase 3's `clear_all()`
-        // (applied via `mark_dirty_bulk`). Declared before Phase 1b so a
+        // (applied via `mark_dirty_bulk`). Declared before the seed phases so a
         // PERSISTENT old→young edge processed via a dirty card whose referent
         // STAYS young is re-remembered — otherwise the edge is remembered for
         // exactly one cycle (the promoting one) and the cycle after the dirty-
         // card fixup forgets it.
         let mut deferred_dirty_cards: Vec<usize> = Vec::new();
-
-        mv_phase!("overlay_forward");
-
-        // Phase 1b: Forward old→young references from dirty cards
-        // Ref arrays use compact 8-byte pointers; object fields use 16-byte Value.
-        for &(old_obj, slot_idx, _) in &extra_roots {
-            // SAFETY: `old_obj` is a live old-gen ObjectRef collected from dirty card
-            // scanning, so its pointer targets a valid ObjectHeader.
-            let header = unsafe { &*(old_obj.as_ptr() as *const ObjectHeader) };
-            let is_ref_array = header.kind() == ObjectKind::Array
-                && header.element_type() == ArrayElementType::Reference;
-
-            if is_ref_array {
-                // SAFETY: `old_obj` is a valid old-gen object and `slot_idx` was collected
-                // from dirty card scanning (within array bounds). Pointer arithmetic stays
-                // within the object's allocation.
-                let slot_ptr = unsafe {
-                    old_obj
-                        .as_ptr()
-                        .add(ARRAY_DATA_OFFSET + slot_idx * ref_element_size())
-                };
-                // SAFETY: `slot_ptr` points to a valid 8-byte ref element within the array.
-                let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
-                if raw != 0 {
-                    let ref_ptr = raw as usize as *mut u8;
-                    if young_from.contains(ref_ptr) {
-                        let new_ptr = Self::forward_object(
-                            &young_from,
-                            &young_object_starts,
-                            &mut young_to,
-                            &mut old_gen,
-                            ref_ptr,
-                            &mut objects_copied,
-                            &mut pointer_map,
-                            &mut promoted_worklist,
-                            force_promote_all,
-                        );
-                        // SAFETY: Writing the forwarded pointer back to the same valid slot.
-                        unsafe { write_ref_slot(slot_ptr, new_ptr as u64) };
-                        // Persistent old→young edge: re-remember if the referent
-                        // stayed young (not promoted), so it survives clear_all().
-                        if !old_gen.contains(new_ptr) {
-                            deferred_dirty_cards.push(old_obj.as_ptr() as usize);
-                        }
-                    }
-                }
-            } else if is_compact_object(header) {
-                // Compact object: `slot_idx` is the BYTE OFFSET of an 8-byte
-                // reference slot (recorded that way by the card scan). Mirror
-                // the ref-array branch.
-                // SAFETY: `slot_idx` (byte offset) was recorded by dirty-card
-                // scanning within this object's body; the 8-byte read is in-bounds.
-                let slot_ptr = unsafe { old_obj.as_ptr().add(HEADER_SIZE + slot_idx) };
-                let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
-                if raw != 0 {
-                    let ref_ptr = raw as usize as *mut u8;
-                    if young_from.contains(ref_ptr) {
-                        let new_ptr = Self::forward_object(
-                            &young_from,
-                            &young_object_starts,
-                            &mut young_to,
-                            &mut old_gen,
-                            ref_ptr,
-                            &mut objects_copied,
-                            &mut pointer_map,
-                            &mut promoted_worklist,
-                            force_promote_all,
-                        );
-                        // SAFETY: writing the forwarded pointer back to the slot.
-                        unsafe { write_ref_slot(slot_ptr, new_ptr as u64) };
-                        if !old_gen.contains(new_ptr) {
-                            deferred_dirty_cards.push(old_obj.as_ptr() as usize);
-                        }
-                    }
-                }
-            } else {
-                // SAFETY: `old_obj` is a valid old-gen object, `slot_idx` is within
-                // `num_slots` (from dirty card scanning). Arithmetic stays in bounds.
-                let slot_ptr = unsafe { old_obj.as_ptr().add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                // SAFETY: `slot_ptr` points to a valid `Value`-sized slot in the object.
-                let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
-                if let Value::Object(Some(ref_obj)) = value {
-                    let ref_ptr = ref_obj.as_ptr();
-                    if young_from.contains(ref_ptr) {
-                        let new_ptr = Self::forward_object(
-                            &young_from,
-                            &young_object_starts,
-                            &mut young_to,
-                            &mut old_gen,
-                            ref_ptr,
-                            &mut objects_copied,
-                            &mut pointer_map,
-                            &mut promoted_worklist,
-                            force_promote_all,
-                        );
-                        // SAFETY: `new_ptr` is a valid forwarded allocation.
-                        let new_value =
-                            Value::Object(Some(unsafe { ObjectRef::from_raw(new_ptr) }));
-                        // SAFETY: Writing updated Value back to the same valid slot.
-                        unsafe { std::ptr::write(slot_ptr as *mut Value, new_value) };
-                        // Persistent old→young edge: re-remember if the referent
-                        // stayed young (see Phase 1b array branch).
-                        if !old_gen.contains(new_ptr) {
-                            deferred_dirty_cards.push(old_obj.as_ptr() as usize);
-                        }
-                    }
-                }
-            }
-        }
-
-        mv_phase!("card_root_forward");
-
-        // Phase 2 + 2b: Combined Cheney scan and promoted object scan.
-        //
-        // We alternate between scanning young_to (standard Cheney) and
-        // scanning newly promoted old-gen objects until both are fully
-        // processed. This is necessary because:
-        //   - Scanning a young_to object may forward a reference that gets
-        //     promoted to old gen (needs promoted scan).
-        //   - Scanning a promoted old-gen object may forward a reference
-        //     that lands in young_to (needs Cheney scan) or gets promoted
-        //     itself (needs another promoted scan iteration).
-        let mut scan_cursor: usize = 0;
-        // CRIT-P2 fix: FxHashSet (replaces std HashSet/SipHash) for cheap
-        // dedup of promoted-object scans.
-        let mut scanned_promoted: FxHashSet<usize> = FxHashSet::default();
-        // `deferred_dirty_cards` declared above (before Phase 1b); both the
-        // dirty-card fixup and the promoted-object scan accumulate into it.
-
+        // The same range test `OldGen::contains` performs, as two plain words.
+        // The parallel evacuator holds the old-gen allocator behind a lock and
+        // must not have to take it just to ask "did this land in old gen?".
+        let old_extent = old_gen.extent();
         // HIB-CV-24: a live object keeps its class's defining ClassLoader alive
         // (the instance→loader edge HotSpot gets via `Class.getClassLoader`).
         // Cached once; `false` (and the registry's empty short-circuit) makes the
         // per-object lookup below a no-op for the common no-custom-loader case.
         let loader_pin_on = cratonvm_types::loader_pin::loader_pinning_enabled();
+        // Cheney bump cursor over young to-space, and the promoted-scan dedup
+        // set. Both outlive the evacuator branch below because the finalizer
+        // resurrection pass (Phase 2.5b) continues the same scan.
+        let mut scan_cursor: usize = 0;
+        // CRIT-P2 fix: FxHashSet (replaces std HashSet/SipHash) for cheap
+        // dedup of promoted-object scans.
+        let mut scanned_promoted: FxHashSet<usize> = FxHashSet::default();
 
-        loop {
-            let mut made_progress = false;
+        // ---- Which evacuator copies this cycle's survivors ----
+        //
+        // The parallel copy phase reuses the young collector's existing worker
+        // policy, so it engages on exactly the cycles whose MARK phase already
+        // goes parallel: a young generation past `CRATONVM_GC_PAR_MIN_BYTES`,
+        // or an explicit `CRATONVM_GC_PAR_THREADS`. `ParEvac::plan` then has
+        // the last word — it declines (countably, via
+        // `PAR_EVAC_DECLINED_SLACK`) when to-space cannot cover the survivors
+        // plus the per-worker buffers.
+        //
+        // Falling back to the serial copy is always correct: the two evacuators
+        // seed from the same three sources (`seed_roots` and friends) and
+        // produce the same forwarding map, so `CRATONVM_GC_PAR_EVAC=0` is a
+        // one-run bisection lever between them rather than a behaviour switch.
+        let par_workers = if gc_flags().gc_par_evac {
+            crate::young_mark::young_gc_threads(bytes_before)
+        } else {
+            1
+        };
+        let par_plan = if par_workers >= 2 {
+            let (to_cursor_addr, to_headroom) = young_to.parallel_evacuation_region();
+            crate::gen_evac::ParEvac::plan(
+                to_headroom,
+                to_cursor_addr,
+                young_from.used(),
+                par_workers,
+            )
+        } else {
+            None
+        };
 
-            // Cheney scan: process any unscanned objects in young_to
-            while scan_cursor < young_to.used() {
-                made_progress = true;
-                // SAFETY: `scan_cursor` is within `young_to.used()` and advances by
-                // `total_size` per object, so this points to a valid object header
-                // in the young to-space arena.
-                let obj_ptr = unsafe { young_to.base_ptr_mut().add(scan_cursor) };
-                // SAFETY: `obj_ptr` points to a copied/promoted object with a valid header.
-                let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
-                let total_size = gen_object_total_size(header);
-                // HIB-CV-24: capture the class id before any forwarding may grow
-                // young_to (which would invalidate `header`).
-                let cid = header.class_id.as_u32();
+        if let Some(plan) = par_plan {
+            // ------------------- PARALLEL COPY PHASE -------------------
+            crate::gen_evac::note_par_evac_cycle();
+            // `plan` may have scaled the count DOWN to what to-space slack can
+            // buy buffers for, so it is the plan's number that sizes the
+            // shards, the pool dispatch and the termination handshake — never
+            // the policy's original ask.
+            let par_workers = plan.workers;
+            let mut shards: Vec<crate::gen_evac::EvacShard> =
+                (0..par_workers).map(|_| Default::default()).collect();
+            let to_cursor_end;
+            {
+                let evac = crate::gen_evac::ParEvac::new(
+                    young_from.base_ptr() as usize,
+                    young_from.used(),
+                    young_from.capacity(),
+                    &young_object_starts,
+                    young_to.base_ptr() as usize,
+                    young_to.capacity(),
+                    &plan,
+                    &mut old_gen,
+                    force_promote_all,
+                    PROMOTION_AGE,
+                    loader_pin_on,
+                    fwd_resolve_strict(),
+                );
+                {
+                    // Phases 1 / 1a / 1b run on the DRIVER, into shard 0 —
+                    // the same three seeds the serial arm below uses. Only
+                    // `forward` differs.
+                    let driver = &mut shards[0];
+                    let mut forward = |p: *mut u8| -> *mut u8 {
+                        // SAFETY: `p` is an aligned candidate address inside
+                        // young from-space; every guard needed to decide
+                        // whether it is a real object start is inside
+                        // `evacuate`, which refuses (returning `p`) otherwise.
+                        unsafe { evac.evacuate(driver, p) }
+                    };
+                    seed_roots(roots, &young_from, &mut forward);
+                    mv_phase!("root_forward");
+                    seed_overlay_roots(&young_from, &mut forward);
+                    mv_phase!("overlay_forward");
+                    // SAFETY: `extra_roots` names in-bounds reference slots of
+                    // live old-gen objects (the dirty-card scan's own output).
+                    unsafe {
+                        seed_dirty_card_roots(
+                            &extra_roots,
+                            &young_from,
+                            old_extent,
+                            &mut deferred_dirty_cards,
+                            &mut forward,
+                        );
+                    }
+                    mv_phase!("card_root_forward");
+                }
+                // SAFETY: every queued address is a destination the seeds above
+                // produced — a live copy in young to-space or in old gen.
+                unsafe { evac.drain(self.evac_pool(par_workers), &mut shards) };
+                for shard in shards.iter_mut() {
+                    evac.retire_plab(shard);
+                }
+                to_cursor_end = evac.to_cursor_end();
+            }
+            // `evac` is dropped here: `old_gen` is borrowable again, and no
+            // worker is still running — `EvacPool::scope`'s completion barrier
+            // is what `drain` returns through, and it is also the
+            // happens-before edge for reading the shards below.
 
-                // Scan/forward ref slots. Ref arrays + compact objects store
-                // 8-byte pointers; legacy objects store 16-byte Value cells.
-                // SAFETY: `obj_ptr`/`header` are a valid copied object in young_to.
+            // Make every byte below the new cursor walkable BEFORE publishing
+            // it. This arena becomes the NEXT cycle's from-space, and that
+            // cycle's object-start walk strides it object by object.
+            for shard in &shards {
+                for &(addr, size) in &shard.plab_gaps {
+                    // SAFETY: a retired per-worker buffer's tail — dead,
+                    // 8-aligned, and inside the region `plan` reserved.
+                    unsafe { crate::gen_evac::install_gap_filler(addr, size) };
+                }
+            }
+            let to_base = young_to.base_ptr() as usize;
+            young_to.commit_parallel_evacuation(to_cursor_end);
+
+            // Merge the per-worker shards. EVERY forward is recorded, including
+            // the ones a worker only OBSERVED (a lost forwarding CAS, an
+            // already-forwarded hit): `update_all_roots` can only remap a root
+            // whose old address is a key here, and the equivalent omission in
+            // G1's parallel evacuator was a live root-dangling defect.
+            let to_cap_end = to_base + young_to.capacity();
+            // Shard 0 is the driver's. Everything above it was copied by a
+            // helper thread, and that split is the only evidence that the
+            // parallel evacuator actually spread the work rather than merely
+            // starting threads — see `PAR_EVAC_HELPER_SCANS`.
+            crate::gen_evac::note_par_evac_helper_scans(
+                shards.iter().skip(1).map(|s| s.objects_scanned as u64).sum(),
+            );
+            // The two arms whose absence would not fail now: promotion takes
+            // the old generation's lock (the copy phase's only shared-lock
+            // contention point), and the deferred card is the old→young edge
+            // whose loss surfaces a cycle later, somewhere else.
+            crate::gen_evac::note_par_evac_arms(
+                shards.iter().map(|s| s.tally[1]).sum(),
+                shards.iter().map(|s| s.deferred_dirty_cards.len() as u64).sum(),
+            );
+            for shard in &shards {
+                objects_copied += shard.objects_copied;
+                copy_tally_merge(&shard.tally);
+                deferred_dirty_cards.extend(shard.deferred_dirty_cards.iter().copied());
+                for &(old, new) in &shard.forwards {
+                    pointer_map.insert(old, new);
+                    if new >= to_base && new < to_cap_end {
+                        // perf/gc-oracle-anchors: a to-space destination is an
+                        // object base, and after the swap this arena is the
+                        // next cycle's from-space. Anchoring keeps the parallel
+                        // sweep available there instead of starting the epoch
+                        // with an empty anchor table.
+                        young_to.note_object_start(new - to_base);
+                    }
+                }
+            }
+            // The parallel drain reached a fixpoint over BOTH destinations, so
+            // everything below the cursor is scanned. Phase 2.5b's resurrection
+            // scan appends above it.
+            scan_cursor = young_to.used();
+        } else {
+            // -------------------- SERIAL COPY PHASE --------------------
+            // Scoped so the closure's `&mut` borrows of young_to / old_gen /
+            // pointer_map end before the drain below takes them.
+            {
+                let mut forward = |p: *mut u8| -> *mut u8 {
+                    Self::forward_object(
+                        &young_from,
+                        &young_object_starts,
+                        &mut young_to,
+                        &mut old_gen,
+                        p,
+                        &mut objects_copied,
+                        &mut pointer_map,
+                        &mut promoted_worklist,
+                        force_promote_all,
+                    )
+                };
+                seed_roots(roots, &young_from, &mut forward);
+                mv_phase!("root_forward");
+                seed_overlay_roots(&young_from, &mut forward);
+                mv_phase!("overlay_forward");
+                // SAFETY: as in the parallel arm — `extra_roots` names in-bounds
+                // reference slots of live old-gen objects.
                 unsafe {
-                    forward_ref_slots(obj_ptr, header, |ref_ptr| {
-                        if young_from.contains(ref_ptr) {
-                            Some(Self::forward_object(
-                                &young_from,
-                                &young_object_starts,
-                                &mut young_to,
-                                &mut old_gen,
-                                ref_ptr,
-                                &mut objects_copied,
-                                &mut pointer_map,
-                                &mut promoted_worklist,
-                                force_promote_all,
-                            ))
-                        } else {
-                            None
+                    seed_dirty_card_roots(
+                        &extra_roots,
+                        &young_from,
+                        old_extent,
+                        &mut deferred_dirty_cards,
+                        &mut forward,
+                    );
+                }
+            }
+            mv_phase!("card_root_forward");
+
+            // Phase 2 + 2b: Combined Cheney scan and promoted object scan.
+            //
+            // We alternate between scanning young_to (standard Cheney) and
+            // scanning newly promoted old-gen objects until both are fully
+            // processed. This is necessary because:
+            //   - Scanning a young_to object may forward a reference that gets
+            //     promoted to old gen (needs promoted scan).
+            //   - Scanning a promoted old-gen object may forward a reference
+            //     that lands in young_to (needs Cheney scan) or gets promoted
+            //     itself (needs another promoted scan iteration).
+            loop {
+                let mut made_progress = false;
+
+                // Cheney scan: process any unscanned objects in young_to
+                while scan_cursor < young_to.used() {
+                    made_progress = true;
+                    // SAFETY: `scan_cursor` is within `young_to.used()` and advances by
+                    // `total_size` per object, so this points to a valid object header
+                    // in the young to-space arena.
+                    let obj_ptr = unsafe { young_to.base_ptr_mut().add(scan_cursor) };
+                    // SAFETY: `obj_ptr` points to a copied/promoted object with a valid header.
+                    let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                    let total_size = gen_object_total_size(header);
+                    // HIB-CV-24: capture the class id before any forwarding may grow
+                    // young_to (which would invalidate `header`).
+                    let cid = header.class_id.as_u32();
+
+                    // Scan/forward ref slots. Ref arrays + compact objects store
+                    // 8-byte pointers; legacy objects store 16-byte Value cells.
+                    // SAFETY: `obj_ptr`/`header` are a valid copied object in young_to.
+                    unsafe {
+                        forward_ref_slots(obj_ptr, header, |ref_ptr| {
+                            if young_from.contains(ref_ptr) {
+                                Some(Self::forward_object(
+                                    &young_from,
+                                    &young_object_starts,
+                                    &mut young_to,
+                                    &mut old_gen,
+                                    ref_ptr,
+                                    &mut objects_copied,
+                                    &mut pointer_map,
+                                    &mut promoted_worklist,
+                                    force_promote_all,
+                                ))
+                            } else {
+                                None
+                            }
+                        });
+                    }
+
+                    // HIB-CV-24: keep this object's defining ClassLoader alive. If the
+                    // loader is a young object, evacuate it like any other survivor so
+                    // a live instance pins its loader (else a leaked instance's loader
+                    // would be wrongly reclaimed once the side-table stops rooting it).
+                    if loader_pin_on {
+                        if let Some(loader_old) = cratonvm_types::loader_pin::loader_pin_addr(cid) {
+                            let lp = loader_old as *mut u8;
+                            if young_from.contains(lp) {
+                                Self::forward_object(
+                                    &young_from,
+                                    &young_object_starts,
+                                    &mut young_to,
+                                    &mut old_gen,
+                                    lp,
+                                    &mut objects_copied,
+                                    &mut pointer_map,
+                                    &mut promoted_worklist,
+                                    force_promote_all,
+                                );
+                            }
                         }
-                    });
+                    }
+
+                    scan_cursor += total_size;
                 }
 
-                // HIB-CV-24: keep this object's defining ClassLoader alive. If the
-                // loader is a young object, evacuate it like any other survivor so
-                // a live instance pins its loader (else a leaked instance's loader
-                // would be wrongly reclaimed once the side-table stops rooting it).
-                if loader_pin_on {
-                    if let Some(loader_old) = cratonvm_types::loader_pin::loader_pin_addr(cid) {
-                        let lp = loader_old as *mut u8;
-                        if young_from.contains(lp) {
-                            Self::forward_object(
-                                &young_from,
-                                &young_object_starts,
-                                &mut young_to,
-                                &mut old_gen,
-                                lp,
-                                &mut objects_copied,
-                                &mut pointer_map,
-                                &mut promoted_worklist,
-                                force_promote_all,
-                            );
+                // Promoted object scan: process any unscanned promoted objects.
+                //
+                // CRIT-P2 fix: drain the explicit `promoted_worklist` instead of
+                // rebuilding a Vec from `pointer_map.values()` on every outer
+                // iteration (which was O(promoted^2) until fixpoint). Every
+                // `forward_object` call that promotes an object to old gen
+                // pushes its new address onto `promoted_worklist`, so popping
+                // here is true Cheney-style O(promoted) scanning.
+                //
+                // `forward_object` only pushes on a fresh promotion (not on the
+                // already-forwarded re-encounter path), so the worklist holds
+                // each promoted address at most once. The `scanned_promoted`
+                // check below is kept as a defensive idempotency guard.
+                while let Some(obj_ptr) = promoted_worklist.pop() {
+                    if !scanned_promoted.insert(obj_ptr as usize) {
+                        // already scanned this cycle
+                        continue;
+                    }
+                    made_progress = true;
+                    // SAFETY: `obj_ptr` is a promoted object in old gen (it was
+                    // pushed only when `forward_object` confirmed the allocation
+                    // landed in `old_gen`), with a valid copied header.
+                    let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                    // HIB-CV-24: capture class id before forwarding may grow young_to.
+                    let promoted_cid = header.class_id.as_u32();
+
+                    // Scan/forward ref slots (ref arrays + compact objects use
+                    // 8-byte pointers; legacy objects use 16-byte Value cells). A
+                    // forwarded ref that stays in young to-space is an old→young
+                    // edge: defer-mark its card so the NEXT minor GC's dirty-card
+                    // scan sees it (deferred_dirty_cards is re-marked after Phase
+                    // 3's clear_all; a direct mark would be wiped). The object-field
+                    // case once missed this (BouncyCastle X9ECParametersHolder.params
+                    // -> young X9ECParameters lost its remembered-set entry); the
+                    // unified helper applies it to every layout.
+                    // SAFETY: `obj_ptr`/`header` are a valid promoted old-gen object.
+                    unsafe {
+                        forward_ref_slots(obj_ptr, header, |ref_ptr| {
+                            if young_from.contains(ref_ptr) {
+                                let new_ref_ptr = Self::forward_object(
+                                    &young_from,
+                                    &young_object_starts,
+                                    &mut young_to,
+                                    &mut old_gen,
+                                    ref_ptr,
+                                    &mut objects_copied,
+                                    &mut pointer_map,
+                                    &mut promoted_worklist,
+                                    force_promote_all,
+                                );
+                                if !old_gen.contains(new_ref_ptr) {
+                                    deferred_dirty_cards.push(obj_ptr as usize);
+                                }
+                                Some(new_ref_ptr)
+                            } else {
+                                None
+                            }
+                        });
+                    }
+
+                    // HIB-CV-24: keep this promoted object's defining ClassLoader
+                    // alive (instance→loader). A young loader is evacuated; if it
+                    // stays in young to-space it is an old→young edge, so defer-mark
+                    // this object's card like the ref-slot case above.
+                    if loader_pin_on {
+                        if let Some(loader_old) =
+                            cratonvm_types::loader_pin::loader_pin_addr(promoted_cid)
+                        {
+                            let lp = loader_old as *mut u8;
+                            if young_from.contains(lp) {
+                                let new_lp = Self::forward_object(
+                                    &young_from,
+                                    &young_object_starts,
+                                    &mut young_to,
+                                    &mut old_gen,
+                                    lp,
+                                    &mut objects_copied,
+                                    &mut pointer_map,
+                                    &mut promoted_worklist,
+                                    force_promote_all,
+                                );
+                                if !old_gen.contains(new_lp) {
+                                    deferred_dirty_cards.push(obj_ptr as usize);
+                                }
+                            }
                         }
                     }
                 }
 
-                scan_cursor += total_size;
-            }
-
-            // Promoted object scan: process any unscanned promoted objects.
-            //
-            // CRIT-P2 fix: drain the explicit `promoted_worklist` instead of
-            // rebuilding a Vec from `pointer_map.values()` on every outer
-            // iteration (which was O(promoted^2) until fixpoint). Every
-            // `forward_object` call that promotes an object to old gen
-            // pushes its new address onto `promoted_worklist`, so popping
-            // here is true Cheney-style O(promoted) scanning.
-            //
-            // `forward_object` only pushes on a fresh promotion (not on the
-            // already-forwarded re-encounter path), so the worklist holds
-            // each promoted address at most once. The `scanned_promoted`
-            // check below is kept as a defensive idempotency guard.
-            while let Some(obj_ptr) = promoted_worklist.pop() {
-                if !scanned_promoted.insert(obj_ptr as usize) {
-                    // already scanned this cycle
-                    continue;
+                if !made_progress {
+                    break;
                 }
-                made_progress = true;
-                // SAFETY: `obj_ptr` is a promoted object in old gen (it was
-                // pushed only when `forward_object` confirmed the allocation
-                // landed in `old_gen`), with a valid copied header.
-                let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
-                // HIB-CV-24: capture class id before forwarding may grow young_to.
-                let promoted_cid = header.class_id.as_u32();
-
-                // Scan/forward ref slots (ref arrays + compact objects use
-                // 8-byte pointers; legacy objects use 16-byte Value cells). A
-                // forwarded ref that stays in young to-space is an old→young
-                // edge: defer-mark its card so the NEXT minor GC's dirty-card
-                // scan sees it (deferred_dirty_cards is re-marked after Phase
-                // 3's clear_all; a direct mark would be wiped). The object-field
-                // case once missed this (BouncyCastle X9ECParametersHolder.params
-                // -> young X9ECParameters lost its remembered-set entry); the
-                // unified helper applies it to every layout.
-                // SAFETY: `obj_ptr`/`header` are a valid promoted old-gen object.
-                unsafe {
-                    forward_ref_slots(obj_ptr, header, |ref_ptr| {
-                        if young_from.contains(ref_ptr) {
-                            let new_ref_ptr = Self::forward_object(
-                                &young_from,
-                                &young_object_starts,
-                                &mut young_to,
-                                &mut old_gen,
-                                ref_ptr,
-                                &mut objects_copied,
-                                &mut pointer_map,
-                                &mut promoted_worklist,
-                                force_promote_all,
-                            );
-                            if !old_gen.contains(new_ref_ptr) {
-                                deferred_dirty_cards.push(obj_ptr as usize);
-                            }
-                            Some(new_ref_ptr)
-                        } else {
-                            None
-                        }
-                    });
-                }
-
-                // HIB-CV-24: keep this promoted object's defining ClassLoader
-                // alive (instance→loader). A young loader is evacuated; if it
-                // stays in young to-space it is an old→young edge, so defer-mark
-                // this object's card like the ref-slot case above.
-                if loader_pin_on {
-                    if let Some(loader_old) =
-                        cratonvm_types::loader_pin::loader_pin_addr(promoted_cid)
-                    {
-                        let lp = loader_old as *mut u8;
-                        if young_from.contains(lp) {
-                            let new_lp = Self::forward_object(
-                                &young_from,
-                                &young_object_starts,
-                                &mut young_to,
-                                &mut old_gen,
-                                lp,
-                                &mut objects_copied,
-                                &mut pointer_map,
-                                &mut promoted_worklist,
-                                force_promote_all,
-                            );
-                            if !old_gen.contains(new_lp) {
-                                deferred_dirty_cards.push(obj_ptr as usize);
-                            }
-                        }
-                    }
-                }
-            }
-
-            if !made_progress {
-                break;
             }
         }
 
         mv_phase!("cheney_drain");
+        // gc-genpause F4: the capacity hint for the NEXT cycle's map. Taken
+        // here rather than at the end of the collection because this is the
+        // point where the transitive closure is complete and the number means
+        // "survivors of a young collection" -- the later phases add a handful
+        // of resurrected finalizables and, after a major GC, compose in a
+        // compaction map, neither of which is the quantity being predicted.
+        self.prev_survivor_count.store(
+            pointer_map.len(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if mv_phase_on {
             // The numbers that decide what a slow drain MEANS. `bytes_before`
             // is the young occupancy the cycle started from, so
@@ -7450,6 +7887,11 @@ impl GenerationalHeap {
             }
         }
 
+        // To-space occupancy, which is what "bytes copied" has always meant
+        // here. After a PARALLEL copy phase it also includes the fillers over
+        // retired per-worker buffer tails — real bytes of this arena, and the
+        // reason `gen_evac::par_evac_census()` publishes `filler_bytes`
+        // separately rather than leaving the difference to be inferred.
         let bytes_copied = young_to.used();
 
         if moving_young_dangling_verify_enabled() {
@@ -7744,7 +8186,10 @@ impl GenerationalHeap {
         // 43 ms median / 98 ms max of a 424 ms pause on the OAuth2 6-lane
         // repro.
         mv_phase!("cardclear+young_reset");
-        let mut pointer_map = pointer_map;
+        // (The `let mut pointer_map = pointer_map;` rebind that used to sit
+        // here was the residue of that removed conversion — `pointer_map` was
+        // already `mut` — and clippy's `redundant_locals` fires on it under
+        // `-D warnings`, which is a gate this file has to keep green.)
 
         mv_phase!("pointer_map_rebuild");
         // Phase 4: Swap young spaces (monitor remap deferred until after a
@@ -8005,7 +8450,7 @@ impl GenerationalHeap {
                 // percentage here would undo that on every expansion, so take
                 // the smaller of the two: the goal keeps its say, and the new
                 // capacity still supplies the ceiling.
-                let default_for_new_cap = new_cap * YOUNG_GC_THRESHOLD_PERCENT / 100;
+                let default_for_new_cap = new_cap * young_trigger_percent() / 100;
                 let mut threshold = self.young_gc_threshold.lock();
                 *threshold = if young_pause_goal_ms() > 0 {
                     (*threshold).min(default_for_new_cap)
@@ -8811,6 +9256,13 @@ impl GenerationalHeap {
         // we read the referenced young object out of each slot.
         let mut extra_roots: Vec<(ObjectRef, usize, usize)> = Vec::new();
         Self::scan_dirty_cards(&self.card_table, &old_gen, &young_from, &mut extra_roots);
+        // gc-genpause F2: same audit on the non-moving path. This sweep does
+        // not relocate, so a missed edge here is a premature RECLAIM rather
+        // than a dangling rewrite -- the same defect, one step later.
+        if gc_flags().verify_rset {
+            let _ =
+                Self::verify_old_to_young_rset(&old_gen, &young_from, &extra_roots, "non-moving");
+        }
         // `scan_dirty_cards` *consumes* the dirty-card tracking list. Since
         // this collection does not move young objects, every old→young
         // reference it found is still valid and the card covering it must
@@ -14662,8 +15114,126 @@ impl GenerationalHeap {
     /// emptied Stream/ArrayList results under small-heap concurrency; retaining
     /// an object for one extra minor GC is safe, reclaiming it is not.
     #[inline]
+    /// Should a young collection ALSO walk the whole old generation for
+    /// old->young edges, after the dirty-card scan has already answered?
+    ///
+    /// # Default OFF since 2026-09-02 (gc-genpause F2)
+    ///
+    /// This used to be `!card_table_only`, i.e. ON unless someone opted out,
+    /// and what it turned on was `scan_all_old_to_young`: a full
+    /// `OldGen::walk_objects()` -- which materialises a `Vec` of every tenured
+    /// object -- scanning every reference slot of every one of them, on every
+    /// young collection, duplicating work `scan_dirty_cards` had just done.
+    /// Young pause time therefore grew permanently with OLD-generation size,
+    /// inside a pause that is supposed to grow with the YOUNG live set.
+    ///
+    /// Measured (`OldGenRsetProbe 19 700 16`, `-Xmx1g`, `CRATONVM_DBG=gcpause`):
+    /// `full_old_rset_scan` was 41-61 ms of a ~229 ms steady-state pause, on a
+    /// heap that genuinely held ZERO old->young edges -- the card scan
+    /// returned `dirty_scanned=0 old_to_young_edges=0` and the full walk found
+    /// nothing either. Removing it, one binary, one env var, A,B,A,B,A,B
+    /// interleaved, identical program checksums and identical `minor=14` in
+    /// both arms: 15714 -> 13940 ms minimum, 16138 -> 15080 ms median, and all
+    /// three paired rounds favoured the card-table-only arm.
+    ///
+    /// # What replaces the insurance
+    ///
+    /// It was never a bug -- it was a standing premium against a missed write
+    /// barrier, and a missed barrier really would free a reachable young
+    /// object. What replaces it is `CRATONVM_GC_VERIFY_RSET`
+    /// ([`Self::verify_old_to_young_rset`]): the same whole-old-gen walk, run
+    /// as a CHECK that prints `edges=N missing=M`, so the premium is paid
+    /// while auditing rather than by every collection forever. That is exactly
+    /// the shape G1 already uses for its own remembered set
+    /// (`CRATONVM_G1_DBG_RSET`).
+    ///
+    /// `CRATONVM_GC_FULL_RSET_SCAN=1` is the revert lever.
+    /// `CRATONVM_CARD_TABLE_ONLY=1` keeps its documented meaning and still
+    /// forces the scan off, so a script that sets it is unaffected -- it now
+    /// asks for what it already gets.
     fn full_old_rset_scan_enabled() -> bool {
-        !gc_flags().card_table_only
+        gc_flags().full_rset_scan && !gc_flags().card_table_only
+    }
+
+    /// `CRATONVM_GC_VERIFY_RSET=1` -- did the card table deliver every
+    /// old->young edge this collection needed?
+    ///
+    /// Walks the whole old generation and compares the `(referrer, slot)`
+    /// pairs it finds pointing into from-space against the ones the seeding
+    /// actually produced. Prints
+    /// `[rset-verify] site=.. edges=N missing=M seeded=S`, and names the first
+    /// missing edge's referrer, class and slot.
+    ///
+    /// # Why it prints `edges` and not just `missing`
+    ///
+    /// A checker whose output cannot distinguish "nothing was missing" from
+    /// "there was nothing to miss" is worthless -- a green `missing=0` on a
+    /// run whose old generation held no old->young edges at all proves
+    /// nothing, and that is the most common shape. `edges` is how many the
+    /// walk found; a soak that only ever reports `edges=0` has not tested the
+    /// card table, whatever `missing` says.
+    ///
+    /// # It is vacuous with `CRATONVM_GC_FULL_RSET_SCAN=1`
+    ///
+    /// It runs AFTER the seeding, and the full scan seeds every old->young
+    /// edge in the heap by definition -- so with both flags on, `missing` is
+    /// structurally zero and proves nothing about the card table. Run this
+    /// flag on the DEFAULT configuration, which is the one being checked.
+    ///
+    /// Costs a full old-gen walk per young collection -- precisely the cost
+    /// [`Self::full_old_rset_scan_enabled`] used to pay unconditionally.
+    ///
+    /// Returns `(edges, missing)` so a test can prove the checker is capable
+    /// of reporting a miss -- a verifier nobody has ever seen fail is a
+    /// verifier nobody knows works.
+    fn verify_old_to_young_rset(
+        old_gen: &OldGen,
+        young_from: &Arena,
+        seeded: &[(ObjectRef, usize, usize)],
+        site: &str,
+    ) -> (usize, usize) {
+        let mut have: FxHashSet<(usize, usize)> = FxHashSet::default();
+        for &(obj, slot, _) in seeded {
+            have.insert((obj.as_ptr() as usize, slot));
+        }
+        let mut edges = 0usize;
+        let mut missing = 0usize;
+        let mut first: Option<(usize, u32, usize, usize)> = None;
+        for (obj_ptr, _size) in old_gen.walk_objects() {
+            // SAFETY: `walk_objects` yields valid old-gen object starts.
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            // SAFETY: the object/header pair is valid for this STW walk.
+            unsafe {
+                for_each_ref_slot(obj_ptr, header, |raw, slot_idx| {
+                    if raw.is_null() || !young_from.contains(raw) {
+                        return;
+                    }
+                    edges += 1;
+                    // `for_each_ref_slot` and `scan_dirty_cards` use the SAME
+                    // slot encoding per layout (element index for reference
+                    // arrays, body byte offset for compact objects, slot index
+                    // for legacy cells), so this comparison is exact rather
+                    // than approximate.
+                    if !have.contains(&(obj_ptr as usize, slot_idx)) {
+                        missing += 1;
+                        if first.is_none() {
+                            first =
+                                Some((obj_ptr as usize, header.class_id.as_u32(), slot_idx, raw as usize));
+                        }
+                    }
+                });
+            }
+        }
+        eprintln!(
+            "[rset-verify] site={site} edges={edges} missing={missing} seeded={}",
+            seeded.len(),
+        );
+        if let Some((referrer, class_id, slot, referent)) = first {
+            eprintln!(
+                "[rset-verify]   first MISSING old->young edge: referrer=0x{referrer:x}                  class_id={class_id} slot={slot} -> young 0x{referent:x}. The card table did                  not deliver it, so this cycle would reclaim a reachable young object. Re-run                  with CRATONVM_GC_FULL_RSET_SCAN=1 to confirm the workload is clean under the                  old belt-and-braces seeding.",
+            );
+        }
+        (edges, missing)
     }
 
     /// Append all old-to-young slots using the same slot encoding as the card
@@ -16792,6 +17362,152 @@ fn push_dead(
 /// Sweep `[anchors[0], anchors[last])` with `threads` workers, one chunk per
 /// anchor interval. Returns `None` if ANY chunk saw a grid anomaly.
 #[allow(clippy::too_many_arguments)]
+/// gc-genpause F1 -- walk `[lo, hi)` of from-space recording every object
+/// start, and PROVE the chunk by requiring the chain to land exactly on `hi`.
+///
+/// The parallel half of the young object-start walk. `None` means "this chunk
+/// is not provable", and the driver then abandons the whole parallel attempt
+/// and lets the untouched sequential walk run from scratch -- so every
+/// judgement call here is made in the refusing direction.
+///
+/// # Deliberately stricter than the sequential walk
+///
+/// The sequential walk RESYNCS when its cursor lands inside a free block
+/// (`skip_free_blocks` moves to the block end and warns). This refuses
+/// instead. It is walking from an ANCHOR rather than from offset 0, so a
+/// cursor inside a free block means the anchor grid and the free list
+/// disagree about this chunk, and the exact-landing proof is worth nothing if
+/// the walk is allowed to guess its way back onto the grid. Refusing costs one
+/// sequential walk; guessing costs a bitmap with a bit set on a non-object,
+/// and `forward_object` relocates through those.
+///
+/// This duplicates the sequential walk's per-object stepping, which is a drift
+/// risk and is the same trade `sweep_chunk` already makes against its own
+/// sequential walk. The duplication is safe in one direction only: because
+/// every disagreement here returns `None`, drift can cause an unnecessary
+/// fallback but never a wrong bitmap.
+fn objstart_chunk(
+    young_base: usize,
+    lo: usize,
+    hi: usize,
+    skips: &[(usize, usize)],
+    bits: &crate::young_mark::ObjectStartBits,
+) -> Option<()> {
+    // Position in the skip list. A block that STRADDLES `lo` means the anchor
+    // sits inside free/TLAB space and is not an object start at all.
+    // One atomic OR per 512-byte word instead of one per object: a chunk
+    // visits object starts in ascending order, so consecutive starts land in
+    // the same word about a dozen times running.
+    let mut bits = bits.run();
+    let mut idx = skips.partition_point(|&(off, _)| off < lo);
+    if idx > 0 {
+        let (off, sz) = skips[idx - 1];
+        if off.checked_add(sz)? > lo {
+            return None;
+        }
+    }
+
+    let mut cursor = lo;
+    while cursor < hi {
+        // Free / un-retired-TLAB spans are skipped, not parsed -- but only
+        // when the cursor is exactly at one's start (see the doc comment).
+        while idx < skips.len() && skips[idx].0 == cursor {
+            cursor = cursor.checked_add(skips[idx].1)?;
+            idx += 1;
+        }
+        if cursor >= hi {
+            break;
+        }
+        if idx < skips.len() && skips[idx].0 < cursor {
+            return None; // cursor is past a block start: inside it
+        }
+
+        let obj_ptr = (young_base + cursor) as *mut u8;
+        // SAFETY: `cursor` is an allocator-written object boundary inside the
+        // young arena -- either the chunk's proven anchor or the end of the
+        // previous object's proven extent -- and free/TLAB spans were skipped.
+        let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+
+        // Bug-D parity: a sub-HEADER_SIZE TLAB tail sentinel is strided over,
+        // not parsed as an object.
+        if header.class_id.as_u32() == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
+            // SAFETY: offset 4 lies within the >=8-byte gap.
+            let gap =
+                unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
+            if !(8..HEADER_SIZE).contains(&gap) || gap & 7 != 0 || cursor + gap > hi {
+                return None;
+            }
+            cursor += gap;
+            continue;
+        }
+
+        let size = gen_object_total_size(header);
+        if size < HEADER_SIZE || cursor.checked_add(size).is_none_or(|end| end > hi) {
+            return None;
+        }
+        // An object may not span a free/TLAB range.
+        if idx < skips.len() && skips[idx].0 > cursor && skips[idx].0 < cursor + size {
+            return None;
+        }
+        // A misaligned start cannot be represented in the bitmap; aliasing a
+        // neighbour's bit would make `forward_object` relocate through an
+        // interior word.
+        if !bits.insert(obj_ptr as usize) {
+            return None;
+        }
+        cursor += size;
+    }
+
+    // THE PROOF. Landing anywhere but exactly on the next anchor means this
+    // chunk's chain and the grid disagree, and nothing it recorded is trusted.
+    (cursor == hi).then_some(())
+}
+
+/// gc-genpause F1 -- drive [`objstart_chunk`] across `threads` workers, or
+/// return `None` and leave the caller to walk sequentially.
+///
+/// Mirrors [`parallel_sweep_walk`] deliberately, including the wholesale
+/// abandon on the first refusal: a partially-filled bitmap is worse than no
+/// bitmap, so the caller rebuilds a fresh one for the fallback rather than
+/// reusing whatever this left behind.
+fn parallel_objstart_walk(
+    young_base: usize,
+    anchors: &[usize],
+    skips: &[(usize, usize)],
+    bits: &crate::young_mark::ObjectStartBits,
+    threads: usize,
+) -> bool {
+    let nchunks = anchors.len() - 1;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failed = std::sync::atomic::AtomicBool::new(false);
+
+    let worker = || loop {
+        if failed.load(Ordering::Relaxed) {
+            return;
+        }
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        if i >= nchunks {
+            return;
+        }
+        if objstart_chunk(young_base, anchors[i], anchors[i + 1], skips, bits).is_none() {
+            failed.store(true, Ordering::Relaxed);
+            return;
+        }
+    };
+
+    if threads <= 1 {
+        worker();
+    } else {
+        std::thread::scope(|s| {
+            for _ in 1..threads {
+                s.spawn(&worker);
+            }
+            worker();
+        });
+    }
+    !failed.load(Ordering::Relaxed)
+}
+
 fn parallel_sweep_walk(
     ctx: &SweepCtx<'_>,
     anchors: &[usize],
@@ -16925,7 +17641,7 @@ fn active_narrow_geometry() -> Option<(u64, usize)> {
 }
 
 #[inline]
-fn gen_object_total_size(header: &ObjectHeader) -> usize {
+pub(crate) fn gen_object_total_size(header: &ObjectHeader) -> usize {
     // GCAUD-3 (2026-08-01) — the "not a real object" backstop, hoisted.
     //
     // The `kind as u8 != Object` screen in the legacy arm below is documented
@@ -17232,6 +17948,172 @@ pub(crate) unsafe fn for_each_ref_slot(
             let s = obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE);
             if let Value::Object(Some(r)) = std::ptr::read(s as *const Value) {
                 f(r.as_ptr(), slot_idx);
+            }
+        }
+    }
+}
+
+/// Seed the copy phase from the precise root set, rewriting every root in
+/// place.
+///
+/// `forward` returns the address every reference to its argument must now use:
+/// [`GenerationalHeap::forward_object`] for the serial copy phase,
+/// [`crate::gen_evac::ParEvac::evacuate`] for the parallel one. The seeding is
+/// factored out rather than written twice because WHAT gets seeded is the half
+/// no evacuator's own tests would catch — an overlay edge or a card slot the
+/// parallel path forgot would show up as a live object silently reclaimed, a
+/// week later, on the other collector.
+fn seed_roots(
+    roots: &mut [ObjectRef],
+    young_from: &Arena,
+    forward: &mut dyn FnMut(*mut u8) -> *mut u8,
+) {
+    for root in roots.iter_mut() {
+        let old_ptr = root.as_ptr();
+        if !young_from.contains(old_ptr) {
+            continue; // Skip roots not in young gen (e.g., old gen objects)
+        }
+        let new_ptr = forward(old_ptr);
+        // SAFETY: `new_ptr` came from the evacuator, which either allocated
+        // space in young_to / old_gen and copied a valid object there, or
+        // refused the address and handed back the original.
+        *root = unsafe { ObjectRef::from_raw(new_ptr) };
+    }
+}
+
+/// Seed the overlay-backed collections' Rust-side edges.
+///
+/// LinkedList / LinkedHashMap / TreeMap / TreeSet keep their backing arrays in
+/// process-global side-tables, not in Java heap slots, so neither a root slot
+/// nor a dirty card can describe the edge. `roots` carries them ONLY when the
+/// VM's unconditional overlay scan ran (`native_roots::scan_collection_overlays`)
+/// — and the Generational collector deliberately SKIPS that scan while JIT
+/// quiescence is engaged, an unregistered JIT frame is on the stack, or a major
+/// GC is pending, relying instead on the marker walking each owner and pulling
+/// in `external_roots_for_owner`.
+///
+/// `sweep_young_non_moving` (and `old_gen_gc`) implement that owner walk. The
+/// moving Cheney path never did: when the two conditions met — overlay scan
+/// skipped, moving young chosen — every overlay-held young array was silently
+/// reclaimed. The collection then read its own state through the
+/// relocation-invariant identity-hash key and got a dangling pointer whose
+/// zeroed header reads back as `ClassId(0)` with `array_length == 0`, surfacing
+/// far away as an `Int(0)` where an element belongs (`TreeSet.contains` →
+/// `ts_binary_search` → `Comparator.compare` → `checkcast: not an object
+/// reference`, or a SIGSEGV).
+///
+/// Seed every current owner's refs, exactly as the non-moving young path does —
+/// a minor collection leaves old gen intact and cannot decide which owners will
+/// later prove dead. Only forwarding is needed here: the side tables themselves
+/// are repointed afterwards by `remap_external_roots` from `pointer_map`.
+fn seed_overlay_roots(young_from: &Arena, forward: &mut dyn FnMut(*mut u8) -> *mut u8) {
+    for overlay_ref in crate::external_roots::external_roots_for_matching_owners(&|_| true) {
+        let old_ptr = overlay_ref.as_ptr();
+        if !young_from.contains(old_ptr) {
+            continue;
+        }
+        let _ = forward(old_ptr);
+    }
+}
+
+/// Seed old→young references named by this cycle's dirty cards, rewriting each
+/// slot through its own encoding (ref arrays and compact objects store bare
+/// 8-byte pointers; legacy objects store 16-byte `Value` cells).
+///
+/// A referent that STAYS young after forwarding leaves a persistent old→young
+/// edge, so the holder's card is pushed onto `deferred_dirty_cards` to be
+/// re-marked after Phase 3's `clear_all()` — a direct mark would be wiped, and
+/// the edge would then be remembered for exactly one cycle (the promoting one).
+/// The object-field case once missed this (BouncyCastle
+/// `X9ECParametersHolder.params` -> young `X9ECParameters` lost its
+/// remembered-set entry), which is why all three branches carry it.
+///
+/// `old_extent` is [`OldGen::extent`] — the same range test `OldGen::contains`
+/// performs, as two plain words so the parallel evacuator does not have to hold
+/// the old-generation lock to ask.
+///
+/// # Safety
+/// Every `(old_obj, slot_idx)` must name an in-bounds reference slot of a live
+/// old-generation object, which is what the dirty-card scan produces.
+unsafe fn seed_dirty_card_roots(
+    extra_roots: &[(ObjectRef, usize, usize)],
+    young_from: &Arena,
+    old_extent: (usize, usize),
+    deferred_dirty_cards: &mut Vec<usize>,
+    forward: &mut dyn FnMut(*mut u8) -> *mut u8,
+) {
+    let (old_lo, old_hi) = old_extent;
+    let in_old = |p: *mut u8| {
+        let a = p as usize;
+        a >= old_lo && a < old_hi
+    };
+    for &(old_obj, slot_idx, _) in extra_roots {
+        // SAFETY: `old_obj` is a live old-gen ObjectRef collected from dirty card
+        // scanning, so its pointer targets a valid ObjectHeader.
+        let header = unsafe { &*(old_obj.as_ptr() as *const ObjectHeader) };
+        let is_ref_array = header.kind() == ObjectKind::Array
+            && header.element_type() == ArrayElementType::Reference;
+
+        if is_ref_array {
+            // SAFETY: `old_obj` is a valid old-gen object and `slot_idx` was collected
+            // from dirty card scanning (within array bounds). Pointer arithmetic stays
+            // within the object's allocation.
+            let slot_ptr = unsafe {
+                old_obj
+                    .as_ptr()
+                    .add(ARRAY_DATA_OFFSET + slot_idx * ref_element_size())
+            };
+            // SAFETY: `slot_ptr` points to a valid 8-byte ref element within the array.
+            let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
+            if raw != 0 {
+                let ref_ptr = raw as usize as *mut u8;
+                if young_from.contains(ref_ptr) {
+                    let new_ptr = forward(ref_ptr);
+                    // SAFETY: Writing the forwarded pointer back to the same valid slot.
+                    unsafe { write_ref_slot(slot_ptr, new_ptr as u64) };
+                    if !in_old(new_ptr) {
+                        deferred_dirty_cards.push(old_obj.as_ptr() as usize);
+                    }
+                }
+            }
+        } else if is_compact_object(header) {
+            // Compact object: `slot_idx` is the BYTE OFFSET of an 8-byte
+            // reference slot (recorded that way by the card scan). Mirror
+            // the ref-array branch.
+            // SAFETY: `slot_idx` (byte offset) was recorded by dirty-card
+            // scanning within this object's body; the 8-byte read is in-bounds.
+            let slot_ptr = unsafe { old_obj.as_ptr().add(HEADER_SIZE + slot_idx) };
+            // SAFETY: as above — an in-bounds 8-byte reference slot.
+            let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
+            if raw != 0 {
+                let ref_ptr = raw as usize as *mut u8;
+                if young_from.contains(ref_ptr) {
+                    let new_ptr = forward(ref_ptr);
+                    // SAFETY: writing the forwarded pointer back to the slot.
+                    unsafe { write_ref_slot(slot_ptr, new_ptr as u64) };
+                    if !in_old(new_ptr) {
+                        deferred_dirty_cards.push(old_obj.as_ptr() as usize);
+                    }
+                }
+            }
+        } else {
+            // SAFETY: `old_obj` is a valid old-gen object, `slot_idx` is within
+            // `num_slots` (from dirty card scanning). Arithmetic stays in bounds.
+            let slot_ptr = unsafe { old_obj.as_ptr().add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+            // SAFETY: `slot_ptr` points to a valid `Value`-sized slot in the object.
+            let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
+            if let Value::Object(Some(ref_obj)) = value {
+                let ref_ptr = ref_obj.as_ptr();
+                if young_from.contains(ref_ptr) {
+                    let new_ptr = forward(ref_ptr);
+                    // SAFETY: `new_ptr` is a valid forwarded allocation.
+                    let new_value = Value::Object(Some(unsafe { ObjectRef::from_raw(new_ptr) }));
+                    // SAFETY: Writing updated Value back to the same valid slot.
+                    unsafe { std::ptr::write(slot_ptr as *mut Value, new_value) };
+                    if !in_old(new_ptr) {
+                        deferred_dirty_cards.push(old_obj.as_ptr() as usize);
+                    }
+                }
             }
         }
     }
@@ -18616,9 +19498,621 @@ mod tests {
     }
 
     /// Create a small generational heap for testing.
+    /// gc-genpause F1: the anchor-chunked parallel object-start walk must
+    /// produce EXACTLY the bitmap the sequential walk produces.
+    ///
+    /// Bit-for-bit over the whole span, not just a count -- two walks can
+    /// record the same NUMBER of starts and disagree about where they are,
+    /// and a bit on a non-object is what makes `forward_object` relocate
+    /// through an interior word.
+    #[test]
+    fn the_parallel_object_start_walk_agrees_with_the_sequential_one() {
+        // 1 MiB young semi: the anchor grid buckets at 4 KiB, so this gives a
+        // few hundred buckets and therefore real chunk boundaries. The 4 KiB
+        // `small_gen_heap` would produce one bucket and test nothing.
+        let heap = GenerationalHeap::with_sizes(1024 * 1024, 256 * 1024);
+        // Varied sizes, so the chain a chunk has to follow is not a fixed
+        // stride that would land on any boundary by accident.
+        for i in 0..3000u32 {
+            heap.alloc_object(ClassId::new(0), (i as usize % 7) + 1);
+        }
+
+        let young_from = heap.young_from.lock();
+        let base = young_from.base_ptr() as usize;
+        let used = young_from.used();
+        let skips = young_from.free_blocks_sorted();
+        assert!(used > 32 * 1024, "the fixture must fill enough anchor buckets");
+
+        // Reference: ONE chunk over the whole span, which is the sequential
+        // walk's shape.
+        let seq = crate::young_mark::ObjectStartBits::new(base, used);
+        assert!(
+            objstart_chunk(base, 0, used, &skips, &seq).is_some(),
+            "the whole-span walk must prove"
+        );
+        assert!(seq.len() >= 3000, "every allocation is an object start");
+
+        // Chunked at every allocator anchor.
+        let mut anchors: Vec<usize> = vec![0];
+        anchors.extend(young_from.alloc_anchors_snapshot());
+        anchors.retain(|&o| o < used);
+        anchors.sort_unstable();
+        anchors.dedup();
+        anchors.push(used);
+        assert!(
+            anchors.len() > 3,
+            "the fixture must produce real chunk boundaries, got {:?}",
+            anchors.len()
+        );
+
+        let par = crate::young_mark::ObjectStartBits::new(base, used);
+        assert!(
+            parallel_objstart_walk(base, &anchors, &skips, &par, 4),
+            "every chunk must prove against the allocator's own anchors"
+        );
+
+        assert_eq!(par.len(), seq.len(), "start COUNTS must agree");
+        for off in (0..used).step_by(8) {
+            assert_eq!(
+                par.contains(base + off),
+                seq.contains(base + off),
+                "membership disagrees at offset {off}"
+            );
+        }
+    }
+
+    /// ...and it must REFUSE rather than record, when an anchor is not an
+    /// object start. A parallel walker that guesses its way back onto the grid
+    /// would set bits on interior words, which is strictly worse than not
+    /// running at all -- so this is the property that makes the fallback safe.
+    #[test]
+    fn the_parallel_object_start_walk_refuses_an_anchor_that_is_not_a_start() {
+        let heap = GenerationalHeap::with_sizes(1024 * 1024, 256 * 1024);
+        for i in 0..3000u32 {
+            heap.alloc_object(ClassId::new(0), (i as usize % 7) + 1);
+        }
+        let young_from = heap.young_from.lock();
+        let base = young_from.base_ptr() as usize;
+        let used = young_from.used();
+        let skips = young_from.free_blocks_sorted();
+
+        // An offset 8 bytes into the first object: aligned, in span, and NOT
+        // an object start. The chunk `[0, 8)` cannot land on it and the chunk
+        // starting at it cannot land on `used`.
+        let anchors = vec![0usize, 8, used];
+        let bits = crate::young_mark::ObjectStartBits::new(base, used);
+        assert!(
+            !parallel_objstart_walk(base, &anchors, &skips, &bits, 2),
+            "an anchor inside an object must abandon the parallel attempt"
+        );
+    }
+
     fn small_gen_heap() -> GenerationalHeap {
         // 4KB young semi-space, 8KB old gen
         GenerationalHeap::with_sizes(4 * 1024, 8 * 1024)
+    }
+
+    // -----------------------------------------------------------------------
+    // Parallel evacuation (`gen_evac`)
+    // -----------------------------------------------------------------------
+
+    /// A heap big enough for the parallel copy phase's reservation to be
+    /// affordable: `ParEvac::plan` wants the survivors plus one whole
+    /// `PLAB_BYTES` buffer per worker.
+    fn par_evac_heap() -> GenerationalHeap {
+        GenerationalHeap::with_sizes(4 * 1024 * 1024, 4 * 1024 * 1024)
+    }
+
+    /// Force the young collector's worker policy to `n` and run `f`.
+    ///
+    /// `CRATONVM_GC_PAR_THREADS` is honoured verbatim by `young_gc_threads`,
+    /// including on a heap far below `CRATONVM_GC_PAR_MIN_BYTES` — which is
+    /// exactly what makes the parallel path testable at all. A plain
+    /// `set_var` would be invisible here: the flag snapshot latches.
+    fn with_par_workers<R>(n: usize, f: impl FnOnce() -> R) -> R {
+        let n = n.to_string();
+        let before = crate::gen_evac::par_evac_cycles_on_this_thread();
+        let out = cratonvm_types::flags::with_thread_overrides(
+            &[
+                ("CRATONVM_GC_PAR_THREADS", Some(n.as_str())),
+                ("CRATONVM_GC_PAR_EVAC", Some("1")),
+            ],
+            f,
+        );
+        // Every test below would pass just as happily against the SERIAL
+        // evacuator: the parallel path is gated four ways over (the flag, the
+        // worker policy, the moving collector being chosen at all, and
+        // `plan`'s slack budget), and a silently-declined cycle looks exactly
+        // like a green one. Assert here, once, that the thing under test ran —
+        // on the PER-THREAD counter, because the process-global one is being
+        // bumped by every other test in the binary at the same time.
+        assert!(
+            crate::gen_evac::par_evac_cycles_on_this_thread() > before,
+            "the parallel copy phase never engaged — this test asserted nothing about it",
+        );
+        out
+    }
+
+    /// Build a chain of `n` two-slot objects, each pointing at the next, and
+    /// return the head plus every address in allocation order.
+    fn alloc_chain(heap: &GenerationalHeap, n: usize) -> (ObjectRef, Vec<ObjectRef>) {
+        let objs: Vec<ObjectRef> = (0..n)
+            .map(|i| {
+                let o = heap.alloc_object(ClassId::new(1), 2);
+                heap.set_field(o, 1, Value::Int(i as i32));
+                o
+            })
+            .collect();
+        for w in objs.windows(2) {
+            heap.set_field(w[0], 0, Value::Object(Some(w[1])));
+        }
+        (objs[0], objs)
+    }
+
+    /// Walk the chain from its (remapped) head and collect the payloads.
+    fn read_chain(heap: &GenerationalHeap, head: ObjectRef, n: usize) -> Vec<i32> {
+        let mut out = Vec::with_capacity(n);
+        let mut cur = Some(head);
+        while let Some(o) = cur {
+            out.push(
+                heap.get_field(o, 1)
+                    .as_int()
+                    .expect("payload slot is an int"),
+            );
+            cur = match heap.get_field(o, 0) {
+                Value::Object(next) => next,
+                _ => None,
+            };
+        }
+        out
+    }
+
+    /// The whole point: a young cycle whose COPY phase ran on four workers
+    /// must produce the same reachable graph as one that ran on the calling
+    /// thread.
+    ///
+    /// `with_par_workers` asserts, for this and every test below it, that the
+    /// parallel path really engaged — see the note there.
+    #[test]
+    fn a_parallel_copy_phase_preserves_the_whole_reachable_graph() {
+        let heap = par_evac_heap();
+        let monitors = NoOpMonitors;
+        const N: usize = 400;
+        let (head, _) = alloc_chain(&heap, N);
+        let mut roots = vec![head];
+        let result =
+            with_par_workers(4, || heap.collect_garbage(&stw(), &mut roots, &monitors));
+
+        assert_eq!(result.stats.objects_copied, N, "every chain node survives");
+        assert_ne!(roots[0].as_ptr(), head.as_ptr(), "the head was relocated");
+        assert_eq!(
+            read_chain(&heap, roots[0], N),
+            (0..N as i32).collect::<Vec<_>>()
+        );
+    }
+
+    /// The two evacuators must agree, object for object and field for field.
+    ///
+    /// Run the same construction twice on two heaps — once with the parallel
+    /// copy phase, once with `CRATONVM_GC_PAR_EVAC=0` — and compare what
+    /// survived. This is the assertion that makes the flag a bisection lever
+    /// rather than a behaviour switch.
+    #[test]
+    fn the_parallel_and_serial_evacuators_agree() {
+        const N: usize = 300;
+        let run = |workers: usize, par: &str| {
+            let heap = par_evac_heap();
+            let monitors = NoOpMonitors;
+            let (head, _) = alloc_chain(&heap, N);
+            let mut roots = vec![head];
+            let n = workers.to_string();
+            let before = crate::gen_evac::par_evac_cycles_on_this_thread();
+            let result = cratonvm_types::flags::with_thread_overrides(
+                &[
+                    ("CRATONVM_GC_PAR_THREADS", Some(n.as_str())),
+                    ("CRATONVM_GC_PAR_EVAC", Some(par)),
+                ],
+                || heap.collect_garbage(&stw(), &mut roots, &monitors),
+            );
+            // Both halves are asserted: that the parallel arm really went
+            // parallel, and that `CRATONVM_GC_PAR_EVAC=0` really did not.
+            // Without the second, "the two agree" could mean "both were
+            // serial".
+            assert_eq!(
+                crate::gen_evac::par_evac_cycles_on_this_thread() > before,
+                par == "1",
+                "arm par={par} workers={workers} took the wrong evacuator",
+            );
+            let payloads = read_chain(&heap, roots[0], N);
+            (
+                result.stats.objects_copied,
+                result.pointer_map.len(),
+                payloads,
+            )
+        };
+        let (par_objs, par_map, par_payloads) = run(4, "1");
+        let (ser_objs, ser_map, ser_payloads) = run(1, "0");
+        assert_eq!(par_objs, ser_objs, "objects copied");
+        assert_eq!(par_map, ser_map, "forwarding map size");
+        assert_eq!(par_payloads, ser_payloads, "reachable payloads");
+        assert_eq!(par_payloads.len(), N);
+    }
+
+    /// A child reachable from many parents must end up as ONE copy.
+    ///
+    /// A wide fan-in is the shape that reaches the two arms a chain never
+    /// does. The first is deterministic: whichever worker gets the child
+    /// second takes `evacuate`'s already-forwarded fast path, which must
+    /// RECORD the forward even though it copied nothing (an unrecorded
+    /// forward is a root that never gets remapped). The second is the
+    /// forwarding-CAS loser — two workers copying the same child
+    /// speculatively, one abandoning its copy and adopting the winner's
+    /// address — and that one is opportunistic: it needs a real race, so
+    /// this test cannot guarantee it fires. `EVAC_CAS_LOSSES` is how a given
+    /// run says whether it did; a zero there means this test covered the
+    /// fast path only.
+    #[test]
+    fn a_shared_child_converges_on_one_copy() {
+        let heap = par_evac_heap();
+        let monitors = NoOpMonitors;
+        const PARENTS: usize = 500;
+        let child = heap.alloc_object(ClassId::new(7), 1);
+        heap.set_field(child, 0, Value::Int(0x5eed));
+        let parents: Vec<ObjectRef> = (0..PARENTS)
+            .map(|_| {
+                let p = heap.alloc_object(ClassId::new(8), 1);
+                heap.set_field(p, 0, Value::Object(Some(child)));
+                p
+            })
+            .collect();
+
+        let mut roots = parents.clone();
+        with_par_workers(4, || heap.collect_garbage(&stw(), &mut roots, &monitors));
+
+        let targets: std::collections::HashSet<usize> = roots
+            .iter()
+            .map(|p| match heap.get_field(*p, 0) {
+                Value::Object(Some(c)) => c.as_ptr() as usize,
+                other => panic!("parent slot lost its child: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            targets.len(),
+            1,
+            "{PARENTS} parents converged on {} distinct child copies",
+            targets.len(),
+        );
+        let only = *targets.iter().next().expect("one target");
+        // SAFETY: the address came out of a live parent's reference slot.
+        let child_ref = unsafe { ObjectRef::from_raw(only as *mut u8) };
+        assert_eq!(heap.get_field(child_ref, 0).as_int(), Some(0x5eed));
+    }
+
+    /// The to-space grid a parallel cycle leaves behind must still be
+    /// walkable, because the NEXT cycle reads that arena as from-space and
+    /// strides it object by object.
+    ///
+    /// Every worker retires a partly-used buffer at the end of the pause, so
+    /// even this small live set leaves a filler hole. If the hole were merely
+    /// skipped — or zeroed, which reads as a live `new Object()` — the second
+    /// collection's object-start walk would abort, and the collector's
+    /// documented response to that is to SKIP the cycle: `objects_copied == 0`
+    /// with the survivors left unmoved. So the second cycle copying the chain
+    /// again is the assertion.
+    #[test]
+    fn a_second_cycle_can_walk_what_a_parallel_cycle_left_behind() {
+        let heap = par_evac_heap();
+        let monitors = NoOpMonitors;
+        const N: usize = 200;
+        let (head, _) = alloc_chain(&heap, N);
+        let mut roots = vec![head];
+
+        let first = with_par_workers(4, || heap.collect_garbage(&stw(), &mut roots, &monitors));
+        assert_eq!(first.stats.objects_copied, N);
+        let after_first = roots[0];
+
+        let second = with_par_workers(4, || heap.collect_garbage(&stw(), &mut roots, &monitors));
+        assert_eq!(
+            second.stats.objects_copied, N,
+            "the second cycle copied nothing — its object-start walk did not \
+             complete over the fillers the first cycle left",
+        );
+        assert_ne!(roots[0].as_ptr(), after_first.as_ptr(), "relocated again");
+        assert_eq!(
+            read_chain(&heap, roots[0], N),
+            (0..N as i32).collect::<Vec<_>>()
+        );
+    }
+
+    /// An unreachable object must still be reclaimed when the copy phase is
+    /// parallel: a collector that evacuates everything it can reach AND
+    /// everything it cannot passes every liveness assertion above.
+    #[test]
+    fn a_parallel_copy_phase_still_reclaims_garbage() {
+        let heap = par_evac_heap();
+        let monitors = NoOpMonitors;
+        let live = heap.alloc_object(ClassId::new(1), 1);
+        for _ in 0..250 {
+            let _dead = heap.alloc_object(ClassId::new(2), 1);
+        }
+        let mut roots = vec![live];
+        let result =
+            with_par_workers(4, || heap.collect_garbage(&stw(), &mut roots, &monitors));
+        assert_eq!(
+            result.stats.objects_copied, 1,
+            "only the rooted object may be copied",
+        );
+    }
+
+    /// A wide DAG under eight workers, collected repeatedly.
+    ///
+    /// The tests above are small enough that the driver can finish before a
+    /// helper ever gets going, so they exercise the evacuator's arms but not
+    /// its work-sharing: the shared worklist, the spill threshold, and the
+    /// idle-count termination handshake only do anything once there is more
+    /// work than one worker can hold. This one builds a graph an order of
+    /// magnitude larger, with each node reachable from several parents, and
+    /// runs three consecutive cycles over it.
+    #[test]
+    fn a_wide_dag_survives_repeated_parallel_cycles_intact() {
+        let heap = GenerationalHeap::with_sizes(64 * 1024 * 1024, 16 * 1024 * 1024);
+        let monitors = NoOpMonitors;
+        const WIDTH: usize = 64;
+        const DEPTH: usize = 96;
+
+        // Layer 0 is the root layer; every node in layer k points at two nodes
+        // of layer k+1, so most nodes have two parents and a walk that
+        // forgets to dedup would blow up exponentially.
+        let mut layers: Vec<Vec<ObjectRef>> = Vec::with_capacity(DEPTH);
+        for d in 0..DEPTH {
+            let layer: Vec<ObjectRef> = (0..WIDTH)
+                .map(|w| {
+                    let o = heap.alloc_object(ClassId::new(11), 3);
+                    heap.set_field(o, 2, Value::Int((d * WIDTH + w) as i32));
+                    o
+                })
+                .collect();
+            layers.push(layer);
+        }
+        for d in 0..DEPTH - 1 {
+            for w in 0..WIDTH {
+                let a = layers[d + 1][w];
+                let b = layers[d + 1][(w + 1) % WIDTH];
+                heap.set_field(layers[d][w], 0, Value::Object(Some(a)));
+                heap.set_field(layers[d][w], 1, Value::Object(Some(b)));
+            }
+        }
+
+        let mut roots = layers[0].clone();
+        for cycle in 0..3 {
+            let result =
+                with_par_workers(8, || heap.collect_garbage(&stw(), &mut roots, &monitors));
+            assert_eq!(
+                result.stats.objects_copied,
+                WIDTH * DEPTH,
+                "cycle {cycle} copied the wrong number of survivors",
+            );
+            // Re-walk the whole DAG breadth-first and check every payload is
+            // present exactly once — a lost edge shows up as a missing id, a
+            // duplicated copy as a repeated one.
+            let mut seen: FxHashSet<usize> = FxHashSet::default();
+            let mut ids: Vec<i32> = Vec::new();
+            let mut queue: Vec<ObjectRef> = roots.clone();
+            while let Some(o) = queue.pop() {
+                if !seen.insert(o.as_ptr() as usize) {
+                    continue;
+                }
+                ids.push(heap.get_field(o, 2).as_int().expect("payload"));
+                for slot in 0..2 {
+                    if let Value::Object(Some(child)) = heap.get_field(o, slot) {
+                        queue.push(child);
+                    }
+                }
+            }
+            ids.sort_unstable();
+            assert_eq!(
+                ids,
+                (0..(WIDTH * DEPTH) as i32).collect::<Vec<_>>(),
+                "cycle {cycle} did not preserve the DAG exactly once over",
+            );
+        }
+    }
+
+    /// The drain must actually SPREAD the copying, not merely start threads.
+    ///
+    /// This is the assertion the rest of the suite cannot make. Every liveness
+    /// test above was green while the driver copied all 6144 nodes of the DAG
+    /// and each of the seven helpers copied zero — the closure's frontier
+    /// never came near the 2048-entry local stack the spill rule waited for,
+    /// so the first worker to reach the seeds ran the whole thing alone. A
+    /// parallel evacuator that is only ever one worker is not a correctness
+    /// bug, which is exactly why nothing else here would ever have caught it.
+    ///
+    /// Retried rather than asserted once, because the property is a schedule:
+    /// on a small graph the driver can genuinely finish before a helper is
+    /// scheduled at all, and demanding otherwise on every attempt would be
+    /// asserting on the OS. Over a dozen collections it is the sharing RULE
+    /// that is under test, and a rule that never fires shows up as twelve
+    /// zeroes.
+    #[test]
+    fn the_parallel_drain_spreads_copying_across_its_helpers() {
+        let heap = GenerationalHeap::with_sizes(64 * 1024 * 1024, 64 * 1024 * 1024);
+        let monitors = NoOpMonitors;
+        const WIDTH: usize = 64;
+        const DEPTH: usize = 96;
+        let before = crate::gen_evac::par_evac_helper_scans_on_this_thread();
+
+        for _attempt in 0..12 {
+            // A fresh DAG each attempt: survivors of the last one have aged
+            // and would simply be promoted rather than copied.
+            let mut layers: Vec<Vec<ObjectRef>> = Vec::with_capacity(DEPTH);
+            for _ in 0..DEPTH {
+                layers.push(
+                    (0..WIDTH)
+                        .map(|_| heap.alloc_object(ClassId::new(12), 2))
+                        .collect(),
+                );
+            }
+            for d in 0..DEPTH - 1 {
+                for w in 0..WIDTH {
+                    let a = layers[d + 1][w];
+                    let b = layers[d + 1][(w + 1) % WIDTH];
+                    heap.set_field(layers[d][w], 0, Value::Object(Some(a)));
+                    heap.set_field(layers[d][w], 1, Value::Object(Some(b)));
+                }
+            }
+            let mut roots = layers[0].clone();
+            with_par_workers(8, || heap.collect_garbage(&stw(), &mut roots, &monitors));
+            if crate::gen_evac::par_evac_helper_scans_on_this_thread() > before {
+                return;
+            }
+        }
+        panic!(
+            "twelve parallel collections of a {}-node DAG on eight workers and              the helpers scanned nothing — the drain is not sharing work",
+            WIDTH * DEPTH,
+        );
+    }
+
+
+    /// Survivors must tenure through the PARALLEL evacuator, not just the
+    /// serial one.
+    ///
+    /// Promotion is the only allocation in the parallel copy phase that takes
+    /// a shared lock (the old generation's), and it is also where the
+    /// `GC_FLAG_OLD_GEN` stamp is applied — the bit the JIT's inline
+    /// reference-store fast paths read. Nothing else in this file would notice
+    /// if the parallel path simply never promoted: the objects would stay young,
+    /// stay live, and every liveness assertion would pass.
+    #[test]
+    fn a_parallel_copy_phase_tenures_survivors_into_old_gen() {
+        let heap = par_evac_heap();
+        let monitors = NoOpMonitors;
+        const N: usize = 200;
+        let (head, _) = alloc_chain(&heap, N);
+        let mut roots = vec![head];
+
+        // PROMOTION_AGE is 3, so the third cycle is the one that tenures.
+        for _ in 0..PROMOTION_AGE {
+            with_par_workers(4, || heap.collect_garbage(&stw(), &mut roots, &monitors));
+        }
+
+        let mut in_old = 0usize;
+        let mut cur = Some(roots[0]);
+        while let Some(o) = cur {
+            if heap.is_old_gen_addr(o.as_ptr() as usize) {
+                in_old += 1;
+                // The stamp, not just the address range: a promoted object
+                // that is missing this bit is one the JIT will treat as young.
+                assert!(
+                    heap.get_header(o).gc_flags() & GC_FLAG_OLD_GEN != 0,
+                    "a tenured object is missing GC_FLAG_OLD_GEN",
+                );
+            }
+            cur = match heap.get_field(o, 0) {
+                Value::Object(next) => next,
+                _ => None,
+            };
+        }
+        assert_eq!(
+            in_old, N,
+            "after {PROMOTION_AGE} parallel cycles every survivor should be tenured",
+        );
+        assert_eq!(
+            read_chain(&heap, roots[0], N),
+            (0..N as i32).collect::<Vec<_>>(),
+            "tenuring must not disturb the graph",
+        );
+    }
+
+    /// An OLD object's reference to a YOUNG one must survive a parallel cycle.
+    ///
+    /// This is the dirty-card seed (`seed_dirty_card_roots`) reached through
+    /// the parallel evacuator, and it is the arm whose omission does not fail
+    /// now. A missed old→young edge is a young object the collector cannot see
+    /// from any root it scanned; it is reclaimed, and the old holder is left
+    /// pointing into recycled memory — which surfaces later, somewhere else, as
+    /// a zeroed header. Every test above roots its graph directly and so never
+    /// exercises this path at all.
+    #[test]
+    fn a_parallel_copy_phase_follows_an_old_to_young_reference() {
+        let heap = par_evac_heap();
+        let monitors = NoOpMonitors;
+
+        // Tenure a holder: three cycles at PROMOTION_AGE = 3.
+        let holder = heap.alloc_object(ClassId::new(21), 1);
+        let mut roots = vec![holder];
+        for _ in 0..PROMOTION_AGE {
+            with_par_workers(4, || heap.collect_garbage(&stw(), &mut roots, &monitors));
+        }
+        let holder = roots[0];
+        assert!(
+            heap.is_old_gen_addr(holder.as_ptr() as usize),
+            "the fixture needs a genuinely old holder, or it tests nothing",
+        );
+
+        // A fresh YOUNG referent, stored through the barrier so the card is
+        // dirty — this is the edge only the card scan can describe.
+        let young = heap.alloc_object(ClassId::new(22), 1);
+        heap.set_field(young, 0, Value::Int(0xC0FFEE));
+        heap.set_field(holder, 0, Value::Object(Some(young)));
+        assert!(!heap.is_old_gen_addr(young.as_ptr() as usize));
+
+        // Collect with the holder NOT in the root set: the only way to reach
+        // `young` is through the old holder's dirty card.
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        with_par_workers(4, || heap.collect_garbage(&stw(), &mut roots, &monitors));
+
+        let moved = match heap.get_field(holder, 0) {
+            Value::Object(Some(o)) => o,
+            other => panic!("the old holder's reference was lost: {other:?}"),
+        };
+        assert_ne!(
+            moved.as_ptr(),
+            young.as_ptr(),
+            "the referent should have been relocated and the slot rewritten",
+        );
+        assert_eq!(
+            heap.get_field(moved, 0).as_int(),
+            Some(0xC0FFEE),
+            "the referent survived as an address but not as an object",
+        );
+    }
+
+    /// Reference ARRAYS take a different slot-rewriting branch from object
+    /// fields (bare 8-byte pointers against 16-byte `Value` cells), and the
+    /// parallel scan has to get both right.
+    #[test]
+    fn a_parallel_copy_phase_rewrites_reference_array_elements() {
+        let heap = par_evac_heap();
+        let monitors = NoOpMonitors;
+        const N: usize = 300;
+        let arr = heap.alloc_array(ClassId::new(3), ArrayElementType::Reference, N);
+        let mut originals = Vec::with_capacity(N);
+        for i in 0..N {
+            let e = heap.alloc_object(ClassId::new(4), 1);
+            heap.set_field(e, 0, Value::Int(i as i32));
+            heap.set_array_element(arr, i, Value::Object(Some(e)))
+                .expect("in-bounds reference store");
+            originals.push(e);
+        }
+
+        let mut roots = vec![arr];
+        with_par_workers(4, || heap.collect_garbage(&stw(), &mut roots, &monitors));
+
+        let arr = roots[0];
+        assert_eq!(heap.array_length(arr), N);
+        for i in 0..N {
+            let e = match heap.get_array_element(arr, i).expect("in-bounds read") {
+                Value::Object(Some(e)) => e,
+                other => panic!("element {i} lost its referent: {other:?}"),
+            };
+            assert_ne!(
+                e.as_ptr(),
+                originals[i].as_ptr(),
+                "element {i} was not remapped",
+            );
+            assert_eq!(heap.get_field(e, 0).as_int(), Some(i as i32));
+        }
     }
 
     /// The empty-object-run retention ratchet must be silent on every figure
@@ -21104,7 +22598,7 @@ mod tests {
     }
 
     #[test]
-    fn full_old_rset_scan_preserves_unbarriered_old_to_young_ref() {
+    fn the_rset_verifier_reports_the_edge_the_card_table_did_not_deliver() {
         let heap = small_gen_heap();
         let monitors = NoOpMonitors;
 
@@ -21118,7 +22612,9 @@ mod tests {
 
         let young = heap.alloc_object(ClassId::new(0), 1);
         heap.set_field(young, 0, Value::Int(31337));
-        // Model a raw store which bypasses the remembered-set barrier.
+        // A RAW store, deliberately bypassing the remembered-set barrier --
+        // the exact defect shape the whole-old-generation scan used to insure
+        // against, modelled here so the replacement can be tested against it.
         unsafe {
             std::ptr::write(
                 promoted.as_ptr().add(HEADER_SIZE) as *mut Value,
@@ -21126,14 +22622,91 @@ mod tests {
             );
         }
 
+        let old_gen = heap.old_gen.lock();
+        let young_from = heap.young_from.lock();
+
+        // 1. THE CHECKER CAN FAIL. With nothing seeded, the walk finds the
+        //    edge and reports it missing. A verifier that has never been seen
+        //    to fail is a verifier nobody knows works -- this is the
+        //    generational twin of G1's "clear every remembered set and all
+        //    2114 are reported missing".
+        let (edges, missing) =
+            GenerationalHeap::verify_old_to_young_rset(&old_gen, &young_from, &[], "test-unseeded");
+        assert!(
+            edges >= 1,
+            "the walk must SEE the old->young edge, or `missing=0` would be              vacuous rather than clean (edges={edges})"
+        );
+        assert!(
+            missing >= 1,
+            "an edge no seeding delivered must be reported missing              (edges={edges} missing={missing})"
+        );
+
+        // 2. AND IT DOES NOT CRY WOLF. Hand it the same edge as seeded -- the
+        //    `(referrer, slot)` encoding `scan_dirty_cards` produces for a
+        //    legacy 16-byte cell is the field index -- and the miss goes away.
+        let seeded = [(promoted, 0usize, 0usize)];
+        let (edges2, missing2) = GenerationalHeap::verify_old_to_young_rset(
+            &old_gen,
+            &young_from,
+            &seeded,
+            "test-seeded",
+        );
+        assert_eq!(edges2, edges, "the same walk must find the same edges");
+        assert_eq!(
+            missing2, 0,
+            "a seeded edge must not be reported missing (edges={edges2})"
+        );
+    }
+
+    /// The other half of the gc-genpause F2 trade, stated as a test rather
+    /// than left implicit: with the whole-old-generation scan off by default,
+    /// an old->young edge installed by a RAW store that bypasses the write
+    /// barrier is NOT preserved. The card table is now the only source of
+    /// old->young truth on the default path.
+    ///
+    /// This is not a regression in coverage of any real store: every mutator
+    /// reference store reaches `VmHeap::set_field` / `set_array_element` and
+    /// therefore the barrier, by construction. It is the statement of what the
+    /// removed insurance was insuring, so that a future change which really
+    /// does introduce a barrier-bypassing store has a test that says so --
+    /// and `CRATONVM_GC_FULL_RSET_SCAN=1` is the lever that restores the old
+    /// behaviour while the barrier hole is found.
+    #[test]
+    fn an_unbarriered_old_to_young_store_is_not_preserved_by_the_card_table_alone() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        let old_obj = heap.alloc_object(ClassId::new(0), 1);
+        let mut roots = vec![old_obj];
+        for _ in 0..PROMOTION_AGE {
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
+        }
+        let promoted = roots[0];
+        assert!(heap.is_in_old(promoted.as_ptr()));
+
+        let young = heap.alloc_object(ClassId::new(0), 1);
+        heap.set_field(young, 0, Value::Int(31337));
+        unsafe {
+            std::ptr::write(
+                promoted.as_ptr().add(HEADER_SIZE) as *mut Value,
+                Value::Object(Some(young)),
+            );
+        }
+
+        // The behaviour is conditional on the default: a build (or a run) that
+        // restored the full scan must still preserve the reference, so assert
+        // against the predicate rather than against one hard-coded outcome.
+        let full_scan = GenerationalHeap::full_old_rset_scan_enabled();
         let mut gc_roots = vec![promoted];
         heap.collect_garbage(&stw(), &mut gc_roots, &monitors);
-        match heap.get_field(gc_roots[0], 0) {
-            Value::Object(Some(survivor)) => {
-                assert_eq!(heap.get_field(survivor, 0).as_int(), Some(31337));
-            }
-            other => panic!("full old scan lost unbarriered young ref: {other:?}"),
-        }
+        let survived = matches!(
+            heap.get_field(gc_roots[0], 0),
+            Value::Object(Some(s)) if heap.get_field(s, 0).as_int() == Some(31337)
+        );
+        assert_eq!(
+            survived, full_scan,
+            "an unbarriered old->young edge survives a young collection if and              only if the whole-old-generation scan is enabled              (full_old_rset_scan_enabled()={full_scan}, survived={survived})"
+        );
     }
 
     #[test]
@@ -23714,4 +25287,131 @@ mod published_bounds_ownership {
     //!
     //! Anything added here that reads one of these tables belongs in that file
     //! instead.
+}
+
+// ---------------------------------------------------------------------------
+// Reference-store barrier gates (JIT)
+// ---------------------------------------------------------------------------
+
+/// Process-global mirror of the three facts compiled code needs in order to
+/// **skip a reference-store barrier CALL that would have returned immediately**.
+///
+/// # What this is, and what it deliberately is not
+///
+/// It is not a barrier. Every byte here names a PREFIX of a barrier helper's
+/// own control flow, read from the same state the helper reads. Compiled code
+/// may take a gate's "no work" answer and skip the call; on any other answer it
+/// calls the same helper it calls today, so no collector's remembered-set or
+/// snapshot contract moves into the emitter.
+///
+/// This is the question [`JIT_REGION_BOUNDS`] is not asking. That table asks
+/// "is the receiver inside a published young region" — a *generational*
+/// question that G1 and ZGC answer by publishing nothing, which left the
+/// emitter laying down six containment compares that could never pass and then
+/// calling the helper anyway.
+///
+/// # The safe direction of every byte
+///
+/// Each gate is allowed to be **conservative but never permissive**:
+///
+/// * `pre_active` / `post_active`: may read 1 while the truth is 0 (compiled
+///   code pays a call it did not need). Must never read 0 while the truth is 1.
+///   Publishers therefore SET the mirror before the truth and CLEAR it after.
+/// * `young_floor`: may be too LOW (fewer stores skip). Must never be too high.
+///
+/// All-zero means "no collector published a plan", and every emitter arm keeps
+/// the full-helper path — exactly today's behaviour.
+#[repr(C)]
+pub struct JitRefStoreGates {
+    /// Non-zero when the SATB pre-write barrier may have work to do.
+    pub pre_active: AtomicU8,
+    /// Non-zero when the post-write barrier may have work to do.
+    pub post_active: AtomicU8,
+    /// A receiver whose `GC_FLAGS_BYTE_OFFSET` byte is unsigned-less-than this
+    /// provably needs no post barrier. `0` disables the test.
+    ///
+    /// That byte holds `gc_age` in bits 4..7 and the GC flags in bits 0..3, so
+    /// a value of `age << 4` is an exact unsigned test of `gc_age < age`: the
+    /// flags nibble is at most 15 and cannot carry `a << 4` up to `(a+1) << 4`.
+    pub young_floor: AtomicU8,
+    /// Whether a plan is published at all. Separate from the three gates so
+    /// "published, and all three currently say no work" is distinguishable
+    /// from "nobody published", which is the difference between an emitted
+    /// fast path and no fast path.
+    pub published: AtomicU8,
+}
+
+pub static JIT_REF_STORE_GATES: JitRefStoreGates = JitRefStoreGates {
+    pre_active: AtomicU8::new(0),
+    post_active: AtomicU8::new(0),
+    young_floor: AtomicU8::new(0),
+    published: AtomicU8::new(0),
+};
+
+/// `gc_age == 0` expressed in the `GC_FLAGS_BYTE_OFFSET` byte's units.
+///
+/// The floor a collector may publish **without any ordering obligation**: an
+/// object that has survived zero collections is younger than every promotion
+/// age (which is clamped to at least 1), so this bound stays true no matter how
+/// the collector retunes. A larger, dynamic floor is possible and would catch
+/// more stores, but it must be LOWERED before the promotion age it mirrors is
+/// lowered, or a store into a newly-old object skips its card — so it is a
+/// separate change with its own ordering argument, not a constant.
+///
+/// It is also the case that matters: in allocation-heavy code the receiver of a
+/// reference store is overwhelmingly an object allocated moments earlier.
+pub const JIT_YOUNG_FLOOR_AGE_ZERO: u8 = 1 << 4;
+
+/// Addresses of the three gate bytes, for `JitRuntimeHelpers`.
+/// Returns `(pre, post, young_floor)`, or all-zero when nothing is published.
+pub fn jit_ref_store_gate_addrs() -> (usize, usize, usize) {
+    if JIT_REF_STORE_GATES.published.load(Ordering::Acquire) == 0 {
+        return (0, 0, 0);
+    }
+    let base = &JIT_REF_STORE_GATES;
+    (
+        &base.pre_active as *const _ as usize,
+        &base.post_active as *const _ as usize,
+        &base.young_floor as *const _ as usize,
+    )
+}
+
+/// Announce that this process's collector maintains the gates.
+///
+/// Both gates are armed here and only ever relaxed by a later publisher call:
+/// a plan that starts armed can never be observed permissive before its owner
+/// has run once.
+pub fn publish_jit_ref_store_plan(young_floor: u8) {
+    JIT_REF_STORE_GATES.pre_active.store(1, Ordering::Release);
+    JIT_REF_STORE_GATES.post_active.store(1, Ordering::Release);
+    JIT_REF_STORE_GATES
+        .young_floor
+        .store(young_floor, Ordering::Release);
+    JIT_REF_STORE_GATES.published.store(1, Ordering::Release);
+}
+
+/// Withdraw the plan — the teardown counterpart. Leaves both gates ARMED so
+/// that any already-compiled body still takes its helper path.
+pub fn clear_jit_ref_store_plan() {
+    JIT_REF_STORE_GATES.pre_active.store(1, Ordering::Release);
+    JIT_REF_STORE_GATES.post_active.store(1, Ordering::Release);
+    JIT_REF_STORE_GATES.young_floor.store(0, Ordering::Release);
+    JIT_REF_STORE_GATES.published.store(0, Ordering::Release);
+}
+
+/// Mirror the SATB barrier's arming state. See [`JitRefStoreGates`] for why the
+/// caller must set this BEFORE arming the real flag and clear it AFTER
+/// disarming.
+pub fn set_jit_ref_store_pre_active(active: bool) {
+    JIT_REF_STORE_GATES
+        .pre_active
+        .store(u8::from(active), Ordering::Release);
+}
+
+/// Mirror "this heap contains at least one old object". Same ordering rule as
+/// [`set_jit_ref_store_pre_active`].
+pub fn set_jit_ref_store_post_active(active: bool) {
+    JIT_REF_STORE_GATES
+        .post_active
+        .store(u8::from(active), Ordering::Release);
 }

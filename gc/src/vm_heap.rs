@@ -72,6 +72,49 @@ pub enum GcBackend {
     Zgc,
 }
 
+/// F-14 — the largest region size the ergonomic or an explicit
+/// `-XX:G1HeapRegionSize` will produce. HotSpot's cap, and for the same reason:
+/// past this, a single region is a large enough unit of collection that
+/// `max_gc_pause_ms` stops being controllable and humongous allocation
+/// (anything over half a region) stops being reachable for ordinary arrays.
+pub const G1_MAX_REGION_SIZE: usize = 32 * 1024 * 1024;
+
+/// F-14 — how many regions the ergonomic aims for, independent of heap size.
+///
+/// The region COUNT, not the region size, is what several per-pause passes are
+/// linear in: the pre-evacuation `(type, cursor)` snapshot, the free-region
+/// census, the collection-set filter, `phase4_regions_to_walk`, and both
+/// free-region searches. The remembered set's worst case is quadratic in it.
+/// Holding the count roughly constant as the heap grows is the whole point;
+/// HotSpot targets the same number.
+const G1_TARGET_REGION_COUNT: usize = 2048;
+
+/// Round `requested` to a power of two inside
+/// `[MIN_REGION_SIZE, G1_MAX_REGION_SIZE]`.
+///
+/// Power-of-two because the collector's address→region lookup is a shift (see
+/// `g1::normalize_region_size`); clamped because both ends of the range are
+/// operator-facing policy rather than arithmetic.
+pub fn clamp_region_size(requested: usize) -> usize {
+    let clamped = requested.clamp(crate::region::MIN_REGION_SIZE, G1_MAX_REGION_SIZE);
+    let rounded = crate::g1::normalize_region_size(clamped);
+    // Rounding UP can leave the ceiling; rounding down to the ceiling keeps it
+    // a power of two because `G1_MAX_REGION_SIZE` is one.
+    rounded.min(G1_MAX_REGION_SIZE)
+}
+
+/// F-14 — region size for a heap of `total_bytes`, targeting
+/// [`G1_TARGET_REGION_COUNT`] regions.
+///
+/// Replaces a two-step ladder (1 MiB below 4 GiB, 2 MiB above) whose region
+/// COUNT grew without bound with heap size: 4096 regions at 4 GiB, 8192 at
+/// 16 GiB, 16384 at 32 GiB. This keeps it near 2048 across the range —
+/// 1 MiB regions up to a 2 GiB heap, then 2/4/8/16/32 MiB — and tops out at
+/// [`G1_MAX_REGION_SIZE`], after which the count grows again by necessity.
+pub fn g1_ergonomic_region_size(total_bytes: usize) -> usize {
+    clamp_region_size((total_bytes / G1_TARGET_REGION_COUNT).max(crate::region::DEFAULT_REGION_SIZE))
+}
+
 /// Explicit G1 tuning overrides wired from the `-XX:` knobs, applied by
 /// [`VmHeap::new_with_overrides`]. `None` keeps the collector default.
 #[derive(Debug, Default, Clone, Copy)]
@@ -84,6 +127,12 @@ pub struct G1ConfigOverrides {
     pub max_gc_pause_ms: Option<u64>,
     /// `-XX:±UseStringDeduplication`.
     pub string_dedup: Option<bool>,
+    /// `-XX:ParallelGCThreads=<n>` — evacuation worker count (F-13). `None`
+    /// leaves `gc_worker_threads` at its `0` = machine-derived default.
+    pub parallel_gc_threads: Option<usize>,
+    /// `-Xms` — bytes to commit up front (F-16). `None` leaves
+    /// `initial_heap_size` at its `0` = ergonomic default.
+    pub initial_heap_size: Option<usize>,
 }
 
 // ─── GPU-offload coordination (Phase 6 item 1) ───────────────────────────
@@ -285,14 +334,17 @@ impl VmHeap {
             GcBackend::G1 => {
                 let mut config = G1CollectorConfig::default();
                 config.heap_size = total_bytes;
-                // Scale region size: 1 MB for heaps < 4 GB, 2 MB for larger
-                if total_bytes > 4 * 1024 * 1024 * 1024 {
-                    config.region_size = 2 * 1024 * 1024;
-                }
-                // Explicit -XX: overrides take precedence over the ergonomic.
+                config.region_size = g1_ergonomic_region_size(total_bytes);
+                // Explicit -XX: overrides take precedence over the ergonomic,
+                // but are held to the same shape — a region size is a power of
+                // two in `[MIN_REGION_SIZE, G1_MAX_REGION_SIZE]` no matter who
+                // chose it. `G1Collector::new` would round a non-power-of-two
+                // up anyway (see `normalize_region_size`); doing it here as
+                // well is what keeps the value an operator reads back out of
+                // the config equal to the one the collector is using.
                 if let Some(rs) = overrides.region_size {
                     if rs > 0 {
-                        config.region_size = rs;
+                        config.region_size = clamp_region_size(rs);
                     }
                 }
                 if let Some(ihop) = overrides.ihop_percent {
@@ -303,6 +355,22 @@ impl VmHeap {
                 }
                 if let Some(dedup) = overrides.string_dedup {
                     config.string_dedup_enabled = dedup;
+                }
+                // F-13: an explicit count is still clamped to the hardware by
+                // `parallel_worker_count`; 0 would mean "auto" there, so a
+                // `-XX:ParallelGCThreads=0` is rejected by the CLI rather than
+                // being silently reinterpreted.
+                if let Some(n) = overrides.parallel_gc_threads {
+                    if n > 0 {
+                        config.gc_worker_threads = n;
+                    }
+                }
+                // F-16: `-Xms`. Clamped to the reservation by
+                // `G1Collector::new`, so an `-Xms` above `-Xmx` yields a heap
+                // rather than a refusal — the two are specified separately and
+                // a user who oversizes one should still get a VM.
+                if let Some(n) = overrides.initial_heap_size {
+                    config.initial_heap_size = n;
                 }
                 VmHeap::G1(G1State::new(config))
             }
@@ -624,12 +692,19 @@ impl VmHeap {
     ///   peer root — the VM pins those via
     ///   [`crate::gc_quiescence::add_pinned_jit_root`]) are excluded from the
     ///   CSet, so nothing a frozen peer can address moves.
-    /// - ZGC (INT-3 residual): trivially safe — `ZgcRealHeap` is a
-    ///   non-moving STW mark-sweep whose sweep walks the allocation-base
-    ///   REGISTRY (never linear memory), and [`Self::refill_tlab`] never
-    ///   hands ZGC mutators a TLAB, so un-retired tails cannot exist. A
-    ///   frozen peer's conservative roots are ordinary (pinned-by-design)
-    ///   mark roots.
+    /// - ZGC (INT-3 residual): safe for the reason this protocol is actually
+    ///   about — [`Self::refill_tlab`] returns `None` on the `Zgc` arm, so ZGC
+    ///   mutators are never handed a TLAB and un-retired tails cannot exist —
+    ///   and the sweep walks the allocation-base REGISTRY, never linear
+    ///   memory. A frozen peer's conservative roots are ordinary
+    ///   (pinned-by-design) mark roots.
+    ///   Do NOT reuse the "non-moving STW mark-sweep" justification that stood
+    ///   here until 2026-09-01: `ZgcRealHeap` COMPACTS by default
+    ///   (`CRATONVM_ZGC_RELOCATE`, default-on since 2026-08-13). Whether a
+    ///   frozen in-JIT peer is safe against a MOVING cycle is a separate
+    ///   question, decided by `zgc_relocation_permitted` and
+    ///   `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT` in `gc/src/zgc.rs` and not
+    ///   by this predicate.
     ///
     /// The collector only engages the forcible in-JIT-peer take-over when
     /// this is `true` — now on every backend.
@@ -933,6 +1008,16 @@ impl VmHeap {
     }
 
     /// The software read barrier: repair `obj` if the collector moved it.
+    ///
+    /// This is **not** the ZGC colored-word load barrier, and it cannot be
+    /// taught to be one: its parameter is an [`ObjectRef`] -- a machine
+    /// pointer the caller has already fabricated -- not a reference SLOT, so
+    /// a colored word never reaches it in a form it could repair. Handed one
+    /// it would build an `ObjectRef` out of bit-63 bits, fail
+    /// [`Self::is_object_address`], fall through the `forwarded_after_slide`
+    /// lookup and return the same word unchanged: a silent no-op that also
+    /// violates `zgc::vaddr::debug_assert_plain_word`. The colored-word
+    /// barrier is [`Self::load_ref_slot_barriered`], which takes the slot.
     #[inline]
     pub fn load_and_forward(&self, obj: ObjectRef) -> ObjectRef {
         self.load_and_forward_inner(obj, false).0
@@ -966,6 +1051,296 @@ impl VmHeap {
     #[inline]
     pub fn load_and_forward_validated(&self, obj: ObjectRef) -> ObjectRef {
         self.load_and_forward_inner(obj, validate_once_enabled()).0
+    }
+
+    /// Read a heap reference **SLOT** through this backend's load barrier.
+    ///
+    /// The value returned is a plain machine address (`0` = null) -- exactly
+    /// what [`cratonvm_types::narrow_oop::read_ref_slot`] returns on a
+    /// non-colored backend. A caller may therefore still run
+    /// `plausible_heap_pointer` afterwards, and MUST run it on the *result*
+    /// rather than on the slot word: a colored word is deliberately
+    /// implausible, so filtering the word first is what silently nulls a live
+    /// reference (risk J1 of `docs/feature-designs/zgc-jit-load-barrier.md`).
+    ///
+    /// # Why this exists at all, and why it is here and not in `vm/`
+    ///
+    /// The seven raw reference reads in `vm/src/jit/helpers.rs` panic as a
+    /// tripwire on a colored word instead of barriering it. The two of them
+    /// that still hold a SLOT when the plausibility filter runs -- the
+    /// reference-array element load and the compact-reference field load --
+    /// now funnel through `helpers::jit_load_ref_slot`, and this is the
+    /// function that seam calls. It could not be written in `vm/`:
+    /// `zgc::barrier::z_load` needs a `C: ZBarrierContext`, whose only
+    /// production implementor is `ZgcRealHeap`, and `VmHeap` publishes no
+    /// accessor that hands the context out. Dispatching here keeps every ZGC
+    /// detail inside `gc/` instead of growing a per-site ZGC special case,
+    /// which is the shape that already missed `emit_load_string_value_ptr`
+    /// once.
+    ///
+    /// # What each arm does
+    ///
+    /// * `Generational` / `G1`: today's `read_ref_slot`, byte for byte.
+    ///   Neither collector has a load barrier and neither may gain one here.
+    /// * `Zgc`, barrier NOT armed: the same plain read. This is the only path
+    ///   any shipping configuration takes -- see "Today it cannot fire".
+    /// * `Zgc`, barrier armed: [`crate::zgc::ZgcRealHeap::load_barrier_slot`],
+    ///   which is the one in-tree implementation of the colored-word barrier
+    ///   and already gets right the two conversions a fresh one gets wrong. It
+    ///   views the slot as an `AtomicU64`, runs
+    ///   `barrier::load_barrier_fast_bad`, and on a bad color calls
+    ///   `load_barrier_slow` (forward the offset, publish to the marker,
+    ///   CAS-heal the slot). Crucially it then converts **offset to address**:
+    ///   `z_load` hands back a bare 42-bit heap OFFSET, not a pointer, and
+    ///   returning it uncorrected is a silent truncation that
+    ///   `gc/src/zgc/relocate.rs` and `gc/src/zgc/mark.rs` both already carry
+    ///   doc comments warning about. Re-deriving that conversion here rather
+    ///   than delegating would be a second copy of exactly the knowledge those
+    ///   comments say must live in one place.
+    ///
+    /// # TODAY IT CANNOT FIRE -- the armed arm is dead code
+    ///
+    /// No colored word is stored in a heap slot in any shipping
+    /// configuration, so landing this changes nothing measurable:
+    ///
+    /// * `vm/src/vm/vm_init.rs` pins `const RELOCATION_REQUESTED: bool =
+    ///   false`.
+    /// * `ZgcRealHeap::set_barrier_color` -- the sole writer of the colored
+    ///   state -- has no non-test caller. Its own comment records the
+    ///   obligation on the first one.
+    /// * `barrier_good_mask` is initialised to `vaddr::Z_REMAPPED` and nothing
+    ///   moves it, so `load_barrier_armed()` is false for the process
+    ///   lifetime and `zgc::vaddr::color` has no production caller.
+    ///
+    /// The unarmed cost is therefore one relaxed `AtomicBool` load and a
+    /// not-taken branch on top of the read that already happened.
+    ///
+    /// # P1 -- SLOT WIDTH: compressed oops REFUSE the barrier, they do not get one
+    ///
+    /// `z_load` takes `&AtomicU64`, which is a promise about the SLOT: 8-byte
+    /// aligned, exactly 8 bytes, and valid for WRITES, because the slow path
+    /// self-heals with `slot.compare_exchange(observed, healed, AcqRel,
+    /// Acquire)`. With `narrow_oops_enabled()` the slot is FOUR bytes
+    /// (`read_ref_slot` branches on exactly that), so the `AtomicU64` view
+    /// would read and CAS four bytes of the neighbouring field -- the same
+    /// class of bug `emit_load_string_value_ptr` had to be fixed for once.
+    ///
+    /// A 4-byte path was considered and REJECTED, not deferred: a colored word
+    /// is `Z_COLORED_TAG | color | 42-bit offset`, i.e. bit 63 plus bits 42-46
+    /// plus a 42-bit payload. It does not fit in 32 bits under any encoding,
+    /// so there is no narrow colored word for a narrow barrier to operate on.
+    /// ZGC plus compressed oops is unsupported until the slot representation
+    /// itself changes, which is `zgc-reference-slot-representation.md`'s
+    /// problem and not this function's.
+    ///
+    /// So the narrow arm REFUSES. Unarmed it takes the same plain
+    /// `read_ref_slot` as everything else (identical behaviour, and the only
+    /// reachable case). Armed it panics, deliberately: the alternative is to
+    /// hand compiled code a truncated colored word, and this subsystem's house
+    /// rule -- the same one that makes `ZBarrierContext::on_forward_failure`
+    /// return `!` -- is that an unrepresentable reference fails loudly rather
+    /// than degrading to a wrong pointer. That panic is unreachable twice
+    /// over: `vm/src/vm/vm_init.rs` already refuses the ZGC + compressed-oops
+    /// combination at startup, and nothing arms the barrier. It is asserted
+    /// here anyway because `narrow_oops_enabled()` reads a process-global
+    /// `AtomicBool` that any code can set, so the init-time gate is a fact
+    /// about a default run and not an invariant of this call -- the hardening
+    /// `zgc-reference-slot-representation.md` asks for.
+    ///
+    /// # P3 -- offset 0 / null ambiguity: answered, with one residual
+    ///
+    /// `ZFastPath::Good(0)` is ambiguous between null and an object at heap
+    /// offset 0 (`vaddr::color_offset_roundtrip_many_offsets` asserts offset 0
+    /// is a legal non-null location). `load_barrier_slot` disambiguates it the
+    /// way `barrier.rs` says a Rust caller can and machine code cannot: it
+    /// re-reads the raw word and answers `None` only for `vaddr::Z_NULL`. So
+    /// the decision is made once, here, and not per caller.
+    ///
+    /// RESIDUAL for whoever arms this: that null test is a SECOND load, so a
+    /// mutator store landing between the barrier's load and it can be observed
+    /// as "offset 0" rather than null, yielding the arena base instead of `0`.
+    /// It is harmless while nothing is armed and it is not fixable without
+    /// `ZFastPath::Good` carrying the raw word alongside the offset. The
+    /// durable fix is open question 8 of `zgc-jit-load-barrier.md`: reserve
+    /// offset 0 in the page allocator so the ambiguity has no legal instance.
+    /// Risk J6 of that document is the same fact seen from the JIT side.
+    ///
+    /// # P4 -- `on_forward_failure` returns `!`: NOT handled here, and cannot be
+    ///
+    /// A `ZBarrierContext::forward` that answers `None` panics rather than
+    /// returning. That is a property of `ZgcRealHeap::forward`, not of this
+    /// call: it returns `Some(addr)` unconditionally while `relocate_active`
+    /// is false, which is always, so the panic is unreachable today. It stops
+    /// being unreachable the moment relocation is real and the forwarding
+    /// table can miss, and no wrapper here can turn it into a recoverable
+    /// answer -- the `!` return type is the whole point. Whoever makes
+    /// relocation real owns that decision at `ZgcRealHeap::forward`.
+    ///
+    /// # Ordered work list -- THIS FILE IS THE AUTHORITY
+    ///
+    /// Folded in from `.agent-requests/A9-gc-barrier.txt`. These are the steps
+    /// that must complete, in order, before `vm/src/vm/vm_init.rs`'s
+    /// `RELOCATION_REQUESTED` may be flipped.
+    ///
+    /// **Status changes go HERE and nowhere else.**
+    /// `gc/src/zgc/census.rs`'s `ZSlotShape::word_is_atomically_accessed_today`
+    /// carried a second copy of this sequence until 2026-09-01. The two drifted
+    /// apart inside three weeks and ended up each describing the other as the
+    /// stale one, which is what two copies of an ordered sequence buy. That
+    /// copy is now a pointer to this list plus the per-shape facts only it
+    /// knows; do not start a third. If another file needs the status, cite this
+    /// item.
+    ///
+    /// Status as of 2026-09-01. Every label below is a one-command check and
+    /// the command is named; re-run it rather than trusting the label.
+    ///
+    /// 1. **DONE for the Rust writers (2026-09-01).** Every other writer of a
+    ///    slot this barrier may CAS must be atomic: a plain write racing
+    ///    `load_barrier_slow`'s `compare_exchange` on one location is a data
+    ///    race, and the defect is the NON-ATOMICITY, not the ordering.
+    ///    `cratonvm_types::narrow_oop::read_ref_slot` / `write_ref_slot` are
+    ///    now `Relaxed` atomics in the wide (`AtomicU64`) and narrow
+    ///    (`AtomicU32`) arms alike, with the four-part argument for `Relaxed`
+    ///    rather than something stronger written out above them in
+    ///    `types/src/narrow_oop.rs`. This item quoted a plain
+    ///    `(ptr as *mut u64).write(addr)` until 2026-09-01; that write no
+    ///    longer exists, and `grep -n 'mut u64).write' types/src/narrow_oop.rs`
+    ///    is the check.
+    ///    Still open under this heading, and tracked on the `LegacyField` row
+    ///    of `zgc::census::ZSlotShape::atomicity_debt_note`: the collector-side
+    ///    16-byte `Value` writers in `gc/src/gc.rs`, `gc/src/gen_heap.rs` and
+    ///    `gc/src/g1.rs` are still plain `ptr::write` / `ptr::write_unaligned`.
+    ///    Tracked, not blocking -- those are the Generational and G1 evacuation
+    ///    loops, which never run over a `ZgcRealHeap`, so they are not slots
+    ///    this barrier can reach and CAS.
+    ///    The JIT-emitted inline reference stores under `jit/src/x64/` are NOT
+    ///    this item's problem and never were: machine code is not a Rust memory
+    ///    access, an aligned qword `mov` cannot tear against a `lock cmpxchg`,
+    ///    and no Rust UB is in play. What they have is a COVERAGE obligation,
+    ///    which is step 6.
+    /// 2. **DONE.** The armed test:
+    ///    [`crate::zgc::ZgcRealHeap::load_barrier_armed`] already existed, so
+    ///    no new accessor was needed. Only its slot helper had to widen from
+    ///    private to `pub(crate)`.
+    /// 3. **DONE.** This function, with P1/P3/P4 decided above.
+    ///    **Extended, DONE (2026-09-01), inside `gc/`:** the three
+    ///    ZGC-internal accesses to a word the barrier would CAS --
+    ///    `ZgcRealHeap::relocate_stw`'s compaction slot-rewrite STORE, and the
+    ///    legacy payload READS in `ZgcRealHeap::visit_strong_refs_at` and in
+    ///    `zgc::census::reference_slots` (all `gc/src/zgc.rs`). The compaction
+    ///    store is the one that mattered: its SAFETY note rested on "the world
+    ///    is stopped", which is precisely the property step 7 removes.
+    /// 4. **HALF DONE.** `vm/`: route `helpers::jit_load_ref_slot`'s
+    ///    `read_ref_slot(slot)` through this call. That seam is the single
+    ///    chokepoint and both slot-holding sites funnel through it; it now
+    ///    calls `VmHeap::load_ref_slot_barriered` on its `Some(&VmHeap)` arm
+    ///    and falls back to a raw `read_ref_slot` on its `None` arm.
+    ///    Site B, the compact-reference field load, is DONE (2026-09-01):
+    ///    `jit_getfield` takes `vm_ptr` and has `vm` bound already, so it
+    ///    passes `Some(&vm.mem.heap)` and dispatches here.
+    ///    Site A, `jit_aaload`, is NOT, and cannot be without an ABI change --
+    ///    it receives no `vm_ptr` and so has no route to a `&VmHeap`, and takes
+    ///    the seam's raw arm. The exact change is written out in
+    ///    `.agent-requests/B8-abi.txt` and is IN FLIGHT, not landed; check the
+    ///    signature (`grep -n 'fn jit_aaload' vm/src/jit/helpers.rs`) before
+    ///    believing either state. The census
+    ///    `ref_load_census::COLORED_WORDS_SEEN` is what proves afterwards that
+    ///    no Category-A site was missed.
+    /// 5. **NOT DONE.** Sites D/E/F of `zgc-jit-load-barrier.md` 2.5.1, which
+    ///    hold an `ObjectRef` rather than a slot: their barriers belong
+    ///    upstream at `types/src/value.rs`'s `read_value_atomic` reference arm
+    ///    and at `vm::get_static_shared`, where they are shared with the
+    ///    interpreter rather than duplicated. A static slot is not atomic
+    ///    today and so may not be CAS-healable -- it may need a non-healing
+    ///    barrier kind. Blocked on the `StaticField` row of
+    ///    `zgc::census::ZSlotShape::word_is_atomically_accessed_today`.
+    /// 6. **DONE for the emitters (2026-09-01); the residual it names is not
+    ///    closable here.** The nine Category-A inline emission points of 2.3
+    ///    are kept routed to the helpers by
+    ///    `x64::narrow_oops_block_inline_fields()`, which is
+    ///    `narrow_oops_enabled() || zgc_read_barrier_blocks_inline_fields()`
+    ///    (`jit/src/x64/licm.rs`). `aastore` was the one site that emitted the
+    ///    slot load and the element store inline without consulting it -- not
+    ///    the UB of step 1 but a coverage hole, since an armed cycle would read
+    ///    a coloured word with no colour test and write a plain pointer into a
+    ///    slot the barrier next classifies as `Good` and truncates to 42 bits.
+    ///    That gate landed at the `0x53` arm of
+    ///    `jit/src/x64/bytecode_walk.rs`, with `AASTORE_SITES_WALKED` as the
+    ///    denominator that makes its expected ZERO fallback count readable as
+    ///    "consulted and correctly declined" rather than "never reached".
+    ///    The residual: an emission-time gate cannot reach ALREADY COMPILED
+    ///    sequences, so arming must happen at a safepoint. That is step 7's
+    ///    obligation, and it is recorded on `ZgcRealHeap::set_barrier_color`.
+    /// 7. **NOT DONE.** Only then flip `RELOCATION_REQUESTED`.
+    ///
+    /// # Safety
+    ///
+    /// `slot` must point at a live reference slot of the current width
+    /// ([`cratonvm_types::narrow_oop::ref_field_size`]) inside a live object --
+    /// the same contract as `read_ref_slot`. On the armed ZGC path the slot
+    /// must additionally be valid for WRITES, because the barrier self-heals
+    /// it; every reference slot inside a live heap object is.
+    #[inline]
+    pub unsafe fn load_ref_slot_barriered(&self, slot: *const u8) -> u64 {
+        // Written as an early return on the one arm that differs rather than
+        // as a `match`, so the Generational/G1/unarmed-Zgc answer is LITERALLY
+        // the expression `jit_load_ref_slot` evaluates today. A `match` with
+        // three arms spelling the same call is three places for them to drift
+        // apart, and "landing this changes nothing measurable" has to be
+        // checkable by reading rather than by benchmarking.
+        #[cfg(feature = "zgc")]
+        if let VmHeap::Zgc(h) = self {
+            return Self::zgc_load_ref_slot_barriered(h, slot);
+        }
+        cratonvm_types::narrow_oop::read_ref_slot(slot)
+    }
+
+    /// The `Zgc` arm of [`Self::load_ref_slot_barriered`]. Split out so the
+    /// common path above stays one branch and one call, and so the ZGC
+    /// preconditions sit next to the code that depends on them.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::load_ref_slot_barriered`].
+    #[cfg(feature = "zgc")]
+    #[inline]
+    unsafe fn zgc_load_ref_slot_barriered(h: &ZgcRealHeap, slot: *const u8) -> u64 {
+        // P1. Order matters: test the WIDTH before the armed flag, so the
+        // unsupported combination is refused rather than silently reading and
+        // CAS-ing 8 bytes out of a 4-byte slot. The unarmed narrow read below
+        // is the ordinary one, which is what keeps a compressed-oops run
+        // byte-identical.
+        if cratonvm_types::narrow_oop::narrow_oops_enabled() {
+            assert!(
+                !h.load_barrier_armed(),
+                "ZGC colored-pointer load barrier armed while compressed oops are enabled: \
+                 the reference slot is 4 bytes and a colored word does not fit in 32 bits \
+                 (Z_COLORED_TAG is bit 63). vm_init refuses this combination at startup and \
+                 set_barrier_color has no non-test caller, so reaching here means one of \
+                 those two facts changed without this function being revisited. Refusing \
+                 rather than truncating -- see load_ref_slot_barriered, section P1."
+            );
+            return cratonvm_types::narrow_oop::read_ref_slot(slot);
+        }
+        if !h.load_barrier_armed() {
+            // The only path any shipping configuration takes.
+            return cratonvm_types::narrow_oop::read_ref_slot(slot);
+        }
+        // `AtomicU64` requires 8-byte alignment, and `compare_exchange` on a
+        // misaligned address is UB rather than a slow path. Every reference
+        // slot is 8-aligned by construction (`HEADER_SIZE` and `SLOT_SIZE` are
+        // both multiples of 8, and `ARRAY_DATA_OFFSET` likewise); this is a
+        // debug assert because it is an invariant of the layout, not an input
+        // to be validated on every load.
+        debug_assert_eq!(
+            slot as usize % 8,
+            0,
+            "reference slot must be 8-byte aligned for the AtomicU64 view the load barrier takes"
+        );
+        // Delegates the color test, the slow-path heal, the null
+        // disambiguation (P3) and the OFFSET -> ADDRESS conversion. `None` is
+        // null, which this signature spells `0`, matching `read_ref_slot`.
+        h.load_barrier_slot(slot as usize).map_or(0, |a| a as u64)
     }
 
     /// Decode the first 8 bytes of an object's header as a compact
@@ -2715,8 +3090,9 @@ impl VmHeap {
                  compaction_cycles={compactions} objects_relocated={relocated} \
                  relocation_skipped_jit={skipped_jit} \
                  relocation_on_proven_jit={proven_jit} \
-                 tlab_retire_skipped={tlab_skipped}                  targeted_pages={targeted_pages}                  targets_recorded={targets_recorded} targets_consumed={targets_consumed}                  tlab_recycled_refills={recycled_refills} tlab_starved_refills={starved_refills}                  tlab_starved_bytes={starved_bytes}",
+                 tlab_retire_skipped={tlab_skipped} tlab_retire_skipped_at_safepoint={tlab_retire_skipped_at_safepoint}                  targeted_pages={targeted_pages}                  targets_recorded={targets_recorded} targets_consumed={targets_consumed}                  tlab_recycled_refills={recycled_refills} tlab_starved_refills={starved_refills}                  tlab_starved_bytes={starved_bytes}",
                 targeted_pages = crate::zgc::forwarding::targeted_pages_selected(),
+                tlab_retire_skipped_at_safepoint = h.tlab_retire_skipped_at_safepoint(),
                 targets_recorded = targets_recorded,
                 targets_consumed = targets_consumed,
                 recycled_refills = recycled_refills,
@@ -3141,6 +3517,32 @@ impl VmHeap {
         // Card / remembered-set costs, raw and normalized per allocated object
         // and per live byte.
         eprintln!("{}", crate::gc_metrics::gc_metrics_report());
+        // Parallel young evacuation. Printed UNCONDITIONALLY, including the
+        // all-zero line: the path is gated four ways over (moving cycle,
+        // `CRATONVM_GC_PAR_EVAC`, the worker policy, and `ParEvac::plan`'s
+        // to-space slack), so "never engaged" is the common outcome and a
+        // counter that only appears when non-zero would make it
+        // indistinguishable from "the report is missing".
+        //
+        // `helper_scans` is the one to read second. `cycles > 0` only says the
+        // copy phase dispatched; `helper_scans == 0` beside it says the driver
+        // did all of it, which is a load-balancing regression every
+        // correctness test in the suite passes (see `gen_evac`).
+        {
+            let c = crate::gen_evac::par_evac_census();
+            eprintln!(
+                "[GC] par_evac: cycles={} helper_scans={} cas_losses={} \
+                 declined_for_slack={} filler_bytes={} promotions={} \
+                 deferred_cards={}",
+                c.cycles,
+                c.helper_scans,
+                c.cas_losses,
+                c.declined_for_slack,
+                c.filler_bytes,
+                c.promotions,
+                c.deferred_cards,
+            );
+        }
         let fallbacks = crate::gc_quiescence::moving_young_coverage_fallback_count();
         if crate::gc_quiescence::moving_young_enabled() || fallbacks > 0 {
             // Both numbers, always. A correct answer while `cycles == 0` means
@@ -3228,8 +3630,10 @@ impl VmHeap {
             // several dead objects — so a *dead* object's pre-GC base becomes
             // an interior address of an innocent LIVE object, and the extent
             // walk answered `true` for it. Reference processing then read that
-            // as "the referent survived", and because ZGC's `pointer_map` is
-            // always empty (`zgc.rs:2489`, non-moving) the consumer at
+            // as "the referent survived", and because ZGC's `pointer_map`
+            // was always empty when this arm was written — the collector was
+            // non-moving until 2026-08-13, and `relocate_stw` now returns a
+            // NON-EMPTY map on a default run — the consumer at
             // `interpreter/gc_and_alloc.rs:2287` falls back to the stale
             // address and does `set_field(obj, 0, Value::Object(None))` on it
             // — a null written into the middle of a live object, and at the
@@ -3497,8 +3901,14 @@ impl VmHeap {
     ///   exact. This closes the G1/ZGC hole where the old young-only guard
     ///   was hardwired inert and stale finalize/cleaner addresses flowed to
     ///   `run_finalizers` (UAF on recycled CSet memory).
-    /// - ZGC: non-moving — dead means gone from the registry
-    ///   (`is_addr_live` false).
+    /// - ZGC: dead means gone from the registry (`is_addr_live` false). The
+    ///   moved case never reaches that arm: the `pointer_map` test at the top
+    ///   of this function answers first. That is what keeps the arm correct
+    ///   now that ZGC compacts by default (`CRATONVM_ZGC_RELOCATE`, on since
+    ///   2026-08-13); the bullet gave "non-moving" as its reason until
+    ///   2026-09-01, and the reason had expired even though the answer had
+    ///   not. The R6 audit note further down this file reaches the same
+    ///   finding by reading the two arms rather than the collector.
     pub fn pre_gc_addr_did_not_survive(
         &self,
         addr: usize,

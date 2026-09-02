@@ -3801,6 +3801,351 @@ struct MergeState {
     visited: bool,
 }
 
+// ── String access intrinsics in the optimizing tier ───────────────────
+//
+// `String.length()`, `String.isEmpty()` and `String.charAt(int)` lowered BY
+// this tier, instead of dispatched out of it.
+//
+// ## The defect this closes
+//
+// `docs/known-issues/perf/string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901.md`
+// measured `s.charAt(i)` in a counted loop at a FLAT 186-196 ns/char from
+// 200 000 to 100 000 000 characters, against 5.2 ns/char for the identical
+// loop over a `char[]` in the same run and 0.5 on HotSpot. The cause is
+// structural rather than a tuning problem, and the page's own grep is the
+// statement of it: neither `ir.rs` nor `ir_lower.rs` mentioned a String
+// intrinsic or a string layout even once.
+//
+// Every String access intrinsic lives in the single-pass backend
+// (`x64/bytecode_walk.rs`, region `STRING_ACCESS`), so a method ADMITTED to
+// the optimizing pipeline cannot keep them and falls back to the whole
+// `charAt -> isLatin1 -> StringLatin1.charAt -> String.checkIndex ->
+// Preconditions.checkIndex` chain, whose tail is a registered NATIVE. The
+// in-tree price of that loss is 504 ns/call against 135 (3.7x), recorded on
+// `string_intrinsic_pin_enabled` in `lib.rs`.
+//
+// ## Why this expands into ordinary nodes rather than adding an `Op`
+//
+// Two shapes were possible. A new `Op::StringCharAt` that `ir_lower` expands
+// during lowering is the tidier IR, but it is BLOCKED: `ir_verify`'s
+// `expected_arity` is an exhaustive `match` over `Op` that ends at
+// `Op::Dead => (0, 0)` with no wildcard arm, so a new variant is a compile
+// error in a file this change may not touch. (`ir_optimize`, `ir_schedule`,
+// `range_analysis`, `escape_analysis`, `regalloc` and `ir_lower` all carry
+// `_ =>` arms and would have been fine.) It is the same rule that already
+// forced [`InlineScopeTable`] to be a side table rather than a field on
+// [`Graph`] or [`SafepointSnapshot`].
+//
+// Expanding here is also the better answer on its own merits, for a reason
+// the exhaustiveness accident does not supply: the `value` and `coder` reads
+// become ordinary `Op::Load`s that the existing optimizer can SEE. Neither
+// field is ever written after construction, so `ir_optimize`'s LICM
+// (`loop_store_clobber` / `load_safe_past_clobber`) may hoist both out of a
+// counted loop and leave only the element read in the body — which is the
+// shape HotSpot's 0.5 ns/char comes from, and which is unreachable for any
+// node the tier treats as one opaque unit. Whether it DOES hoist them is a
+// measurement, not a claim; `ir_string_intrinsic_census_line` plus the
+// `charAt` rate on `probes/CharAtCostCurve.java` is what answers it.
+//
+// ## What is emitted
+//
+// Compact-String representation, exactly as the single-pass region assumes:
+// `value` is a `byte[]`, `coder` is 0 (LATIN1, 1 byte/char) or 1 (UTF16, 2
+// little-endian bytes/char), and `length() == value.length >> coder`.
+//
+//     coder  = Op::Load(Int)   [ctrl, mem, recv, Const(coder_field_index)]
+//     value  = Op::Load(Ref)   [ctrl, mem, recv, Const(value_field_index)]
+//     len    = Op::ArrayLength [ctrl, mem, value]
+//     count  = Op::UShr(len, coder)
+//     charAt: off = Op::Shl(index, coder)
+//             lo  = Op::ArrayLoad(Byte)(value, off)         & 0xFF
+//             hi  = Op::ArrayLoad(Byte)(value, off + coder) & 0xFF
+//             ch  = lo | ((hi << 8) & (0 - coder))
+//
+// The decode is BRANCHLESS where the single-pass region uses a
+// `TEST coder; JNZ utf16` diamond, because a diamond built here would have to
+// open a control-flow region in the middle of one bytecode's expansion — new
+// `Op::If`/`Op::Merge` nodes at a pc that is not a branch target — which the
+// merge bookkeeping (`merges`, `loop_headers`, and the one safepoint snapshot
+// per bci) is not built to see. The second byte's address is `off + coder`:
+// the SAME byte as `lo` when `coder == 0`, and the high half of the UTF-16
+// unit when it is 1. Both are in bounds whenever `index` is — a valid UTF16
+// `value.length` is even, so `2*index + 1 <= value.length - 1` — and the
+// `0 - coder` mask discards the second byte on the LATIN1 path. `baload`
+// sign-extends, so each half is masked to `0xFF` before it is combined.
+//
+// ## The narrow-oop `value` load
+//
+// This expansion NEVER emits a hand-rolled displacement for `String.value`,
+// and that is the point rather than an omission. `Op::Load`'s only two
+// lowerings are `ir_lower::emit_inline_compact_getfield`, which refuses the
+// site outright under narrow oops (`x64::narrow_oops_block_inline_fields`),
+// and the compact- and narrow-aware `jit_getfield` helper. Under compressed
+// oops a compact `String.value` is a 4-byte narrow oop, and an unconditional
+// 8-byte load reads half a pointer plus the adjacent coder/hash field and
+// dereferences the result — the defect `emit_load_string_value_ptr` already
+// had to be fixed for once in the single-pass backend
+// (`StringFieldLayout::value_compact_is_narrow`). Of the layout, this file
+// reads only `value_field_index`, `coder_field_index`, `has_coder` and
+// `string_class_id`: the four facts that are slot indices and identities
+// rather than byte offsets, and which therefore cannot encode a width at all.
+//
+// `coder` is loaded BEFORE `value` deliberately. The `Op::Load` helper arm is
+// a `CALL`, and loading the `Ref` last is the shortest window in which a live
+// oop sits across one.
+//
+// ## Every uncertain case deopts; none of them throws
+//
+// A null receiver, a null `value` array and an out-of-range index all reach
+// `Op::Guard { bci }` (plus the null + bounds guards `Op::ArrayLength` and
+// `Op::ArrayLoad` already emit), all at the `invoke`'s own bci. The
+// interpreter then RE-EXECUTES the `invokevirtual`, and the native
+// implementation reproduces the exact `NullPointerException` /
+// `StringIndexOutOfBoundsException`, in-method handlers included. No `CALL`
+// and no fabricated exception is emitted on the inline path — the same
+// discipline the single-pass region keeps with its shared reason-6 trap.
+//
+// The resume bci is the `invoke`'s, and it is right WITHOUT new bookkeeping:
+// `IrBuilder::build` pushes a `SafepointSnapshot { bci: pc, .. }` at the top
+// of every bytecode, BEFORE the opcode runs, so the snapshot at the `invoke`
+// pc still holds the receiver (and the index) on the operand stack — the
+// same state `snapshot_pre_intrinsic_call` records in the single-pass region.
+// Getting a resume bci wrong is a known and expensive failure here: a spliced
+// body recorded a bci the method does not have and turned an
+// `IndexOutOfBoundsException` into an `InternalError`
+// (`ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828`,
+// cited on `ir_inline_enabled`). That is also why this expansion REFUSES
+// inside an open splice: a spliced region records no snapshot at all, so a
+// guard there would deopt into an empty frame.
+//
+// ## The receiver guard
+//
+// The policy is `try_resolve_string_intrinsic`'s, CALLED rather than
+// re-derived: a `java/lang/String` site is final and monomorphic and needs no
+// guard (`guard_class_id == 0`); a `java/lang/CharSequence` site may see any
+// CharSequence and needs a `[recv+0] == string_class_id` compare; a
+// CharSequence site with no resolved String class id is refused outright.
+//
+// This tier then refuses the GUARDED case too, and counts it
+// (`guarded_site_refused`). There is no IR node that reads an `ObjectHeader`
+// class id — `Op::Load` addresses a field, not the header — and the only
+// existing substitute, `Op::InstanceOf`, is an opaque helper `CALL` that
+// would sit in the loop body and defeat the exercise. Emitting the decode
+// without the compare would admit a `StringBuilder` receiver to a
+// String-layout decode, which is a wrong VALUE, not a slow one. A refused
+// site simply dispatches exactly as it does today, so the refusal costs
+// nothing that is not already being paid.
+//
+// ## Both switches, the THIRD door, and why the default is ON
+//
+// `CRATONVM_JIT_IR_STRING_INTRINSICS=0` disables this emitter; it defaults
+// ON. That default is not a claim that the emitter is proven — it is forced
+// by the OTHER switch. `string_intrinsic_pin_enabled` (default ON) pins a
+// method containing a String-intrinsic site to the single-pass backend, so
+// with the pin in place nothing here is ever reached and a default-OFF
+// emitter would be dead twice over. The A/B that means anything is therefore
+//
+//     CRATONVM_JIT_NO_STRING_INTRINSIC_PIN=1                        (emitter on)
+//   vs
+//     CRATONVM_JIT_NO_STRING_INTRINSIC_PIN=1 CRATONVM_JIT_IR_STRING_INTRINSICS=0
+//
+// with the default (pinned) arm as the third reading.
+//
+// That is only true as of 2026-09-01, and it was NOT true when this emitter
+// landed. The pin is one of THREE independent refusals of the same method,
+// and lifting one of three is indistinguishable from lifting none — the
+// failure `jit/src/compile_gate.rs` exists for. The second refusal is
+// `is_intrinsic_site` in `try_compile_inner`'s invoke-planning loop
+// (`jit/src/lib.rs`), which carried a bare unconditional
+// `|| cn == "java/lang/String"`: any method with any `java/lang/String`
+// invoke set `all_emittable = false`, the `else` arm left `invoke_info`
+// unset for the WHOLE method, and `IrBuilder::build`'s `0xb6` arm returns
+// `bail_invoke` on the missing entry BEFORE the line that offers the site to
+// `try_string_access_intrinsic`. With that gate in place the first arm above
+// could not enter this file by any input; reaching it additionally required
+// `CRATONVM_JIT_IR_OVER_INTRINSIC=1`, which disables the gate for every
+// intrinsic family at once and so prices a different program.
+//
+// `lib.rs::ir_string_access_expander_handles` now carves exactly the three
+// ACCESSORS on an UNGUARDED (`java/lang/String`) receiver out of that gate —
+// asking `try_resolve_string_intrinsic`, the same function this file calls,
+// rather than matching a class name — so the two-arm A/B above is reachable
+// as written. Everything else declared on `java/lang/String` still bails,
+// which is correct: `hashCode`, `equals`, `compareTo` and both `indexOf`
+// forms are emitted by the single-pass region and refused here
+// (`SI_NOT_ACCESSOR`), so a method containing one must keep the tier that
+// can emit it. `CRATONVM_JIT_NO_IR_STRING_ACCESS_ADMIT=1` restores the
+// blanket refusal, i.e. reproduces the unreachable state deliberately, and
+// is the fourth reading.
+//
+// Read `ir_string_intrinsic_census_line()` on every arm: a zero `emitted_*`
+// is what tells "the emitter did not help" apart from "the emitter never
+// ran", and this tier has been burned by an instrument armed where it cannot
+// fire often enough that the distinction is worth a counter of its own
+// (`no_layout`). `sites_seen` is the one to read FIRST — a zero there on a
+// pin-off arm means the method never reached this builder at all, which is
+// exactly the third-door signature above and is not a fact about this
+// emitter. Once this is measured, the pin, `CRATONVM_JIT_IR_OVER_INTRINSIC`
+// and `ir_string_access_expander_handles` are all retirable together — the
+// flags' own doc comments stage exactly that.
+
+/// The `java/lang/String` field layout this tier expands String accessors
+/// against, published once per process.
+///
+/// The layout is produced per compile by `lib.rs`'s `string_layout_resolver`
+/// and handed to the single-pass backend as `Compiler::string_layout`; the IR
+/// builder is constructed in the same function and has never been given it.
+/// Rather than thread a new argument through every construction site (the
+/// method-entry door, the OSR door, the eager first-call door and ~30 test
+/// builders), the resolved layout is published ONCE and every later
+/// [`IrBuilder::new`] seeds itself from it. [`IrBuilder::set_string_layout`]
+/// overrides it for a caller that has one in hand.
+///
+/// Publishing once is sound for the four fields this tier reads and for no
+/// others. `value_field_index`, `coder_field_index`, `has_coder` and
+/// `string_class_id` are properties of the LOADED `java/lang/String` class,
+/// fixed for the life of the process once String is loaded. The byte offsets
+/// beside them are not: `StringFieldLayout::new`'s compact arm falls back to
+/// the LEGACY address when no `CompactLayout` has been registered for
+/// `string_class_id` yet, so a layout published early can carry offsets a
+/// later one would not. Nothing here reads an offset — see the section header
+/// for why that is also the narrow-oop answer.
+static PUBLISHED_STRING_LAYOUT: std::sync::OnceLock<crate::StringFieldLayout> =
+    std::sync::OnceLock::new();
+
+/// Publish the resolved `java/lang/String` layout for the optimizing tier.
+///
+/// The first call wins and later calls are ignored; see
+/// [`PUBLISHED_STRING_LAYOUT`] for why that is sound for the fields this tier
+/// actually reads. Until something calls this, every String call site in the
+/// optimizing tier keeps its dispatch and `no_layout` in
+/// [`ir_string_intrinsic_census`] counts each one — which is what makes "the
+/// emitter is unwired" readable rather than indistinguishable from "the
+/// emitter found nothing".
+pub fn publish_string_layout(layout: crate::StringFieldLayout) {
+    let _ = PUBLISHED_STRING_LAYOUT.set(layout);
+}
+
+/// The layout published by [`publish_string_layout`], if any.
+pub fn published_string_layout() -> Option<crate::StringFieldLayout> {
+    PUBLISHED_STRING_LAYOUT.get().copied()
+}
+
+/// Outcome names for the String-intrinsic census, in variant order — the
+/// `SI_*` indices below index both this table and
+/// [`STRING_INTRINSIC_COUNTS`], so the two cannot drift apart.
+const STRING_INTRINSIC_OUTCOMES: [&str; 10] = [
+    // A `java/lang/String` or `java/lang/CharSequence` invoke reached the
+    // expander at all. Every other row is a partition of this one.
+    "sites_seen",
+    "flag_off",
+    // Nobody called `publish_string_layout` — the emitter is armed where it
+    // cannot fire. This row exists so that reading is not a silent zero.
+    "no_layout",
+    "not_an_accessor",
+    // A CharSequence-declared site: correct only behind a header class-id
+    // compare this tier has no node for. See the section header.
+    "guarded_site_refused",
+    "in_splice_refused",
+    "shape_refused",
+    "emitted_length",
+    "emitted_isEmpty",
+    "emitted_charAt",
+];
+
+const SI_SITES_SEEN: usize = 0;
+const SI_FLAG_OFF: usize = 1;
+const SI_NO_LAYOUT: usize = 2;
+const SI_NOT_ACCESSOR: usize = 3;
+const SI_GUARDED_REFUSED: usize = 4;
+const SI_IN_SPLICE: usize = 5;
+const SI_SHAPE_REFUSED: usize = 6;
+const SI_EMITTED_LENGTH: usize = 7;
+const SI_EMITTED_IS_EMPTY: usize = 8;
+const SI_EMITTED_CHAR_AT: usize = 9;
+
+/// One relaxed counter per [`STRING_INTRINSIC_OUTCOMES`] entry.
+static STRING_INTRINSIC_COUNTS: [AtomicU64; STRING_INTRINSIC_OUTCOMES.len()] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Count one expander outcome, and — under `CRATONVM_DBG_IR_STRING` — print
+/// the running census.
+///
+/// Printed per DECISION rather than once at exit because nothing in this crate
+/// is called on the way out: the exit censuses this VM has
+/// (`report_lambda_census_at_exit` and its siblings) are all invoked from
+/// `vm-cli/src/main.rs`. The line is cumulative, so `tail -1` of the run's
+/// `[ir-string]` lines IS the exit census, and the flag is cached so a
+/// default run pays one relaxed increment and nothing else. Wiring
+/// [`ir_string_intrinsic_census_line`] into that exit block is a one-line
+/// follow-up in a file this change may not touch.
+fn note_string_intrinsic(idx: usize) {
+    STRING_INTRINSIC_COUNTS[idx].fetch_add(1, Ordering::Relaxed);
+    if string_intrinsic_reporting() {
+        eprintln!("[ir-string] {}", ir_string_intrinsic_census_line());
+    }
+}
+
+/// `(outcome name, count)` for every row of the String-intrinsic census.
+///
+/// "The emitter exists" and "the emitter ran" are different facts and this is
+/// what separates them. `emitted_charAt` is the ENGAGEMENT number for the
+/// whole lane; `no_layout`, `guarded_site_refused` and `flag_off` each name a
+/// distinct way for it to be zero while the code is present and correct.
+pub fn ir_string_intrinsic_census() -> Vec<(&'static str, u64)> {
+    STRING_INTRINSIC_OUTCOMES
+        .iter()
+        .zip(STRING_INTRINSIC_COUNTS.iter())
+        .map(|(name, count)| (*name, count.load(Ordering::Relaxed)))
+        .collect()
+}
+
+/// [`ir_string_intrinsic_census`] as one line, for a log or an exit report.
+pub fn ir_string_intrinsic_census_line() -> String {
+    let mut out = String::from("ir string intrinsics:");
+    for (name, count) in ir_string_intrinsic_census() {
+        out.push_str(&format!(" {name}={count}"));
+    }
+    out
+}
+
+/// Kill switch for the String access expander. Default ON — see the section
+/// header for why a default-OFF switch would be dead by construction while
+/// `string_intrinsic_pin_enabled` is also on, and for the A/B that needs
+/// both.
+fn ir_string_intrinsics_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_STRING_INTRINSICS") {
+            Some(value) => !matches!(
+                value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no" | ""
+            ),
+            None => true,
+        }
+    })
+}
+
+/// `CRATONVM_DBG_IR_STRING` — print the running census on every expander
+/// decision. Cached: an uncached flag read on a per-call-site path is how
+/// `CRATONVM_DBG_COMPACT_INLINE` came to be 99.1% of all flag reads on a
+/// `BigDecimal` run.
+fn string_intrinsic_reporting() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE
+        .get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_STRING").is_some())
+}
+
 /// Builds an IR `Graph` from JVM bytecode by abstract-interpreting
 /// the operand stack and local variable state.
 pub struct IrBuilder {
@@ -3996,6 +4341,13 @@ pub struct IrBuilder {
     /// not present bails that `checkcast` to single-pass. See
     /// [`Op::CheckCast`].
     checkcast_info: HashMap<usize, (usize, usize)>,
+    /// The resolved `java/lang/String` field layout the String access
+    /// expander decodes against, or `None` — in which case every String
+    /// call site keeps the dispatch it has today. Seeded from
+    /// [`published_string_layout`] at construction and overridable with
+    /// [`Self::set_string_layout`]; see the section above this struct for
+    /// which of its fields are read and why publishing once is sound.
+    string_layout: Option<crate::StringFieldLayout>,
 }
 
 impl IrBuilder {
@@ -4062,6 +4414,7 @@ impl IrBuilder {
             static_field_info: HashMap::new(),
             instanceof_info: HashMap::new(),
             checkcast_info: HashMap::new(),
+            string_layout: published_string_layout(),
         }
     }
 
@@ -4144,6 +4497,244 @@ impl IrBuilder {
     /// insert here (see [`Op::CheckCast`]).
     pub fn set_checkcast_info(&mut self, info: HashMap<usize, (usize, usize)>) {
         self.checkcast_info = info;
+    }
+
+    /// Supply the resolved `java/lang/String` field layout for the String
+    /// access expander. Must be called before [`Self::build`]. `None` — the
+    /// state of a builder constructed before anything published a layout —
+    /// leaves every String call site dispatching exactly as it does today,
+    /// and counts each one under `no_layout` in
+    /// [`ir_string_intrinsic_census`] so the absence is readable.
+    pub fn set_string_layout(&mut self, layout: Option<crate::StringFieldLayout>) {
+        self.string_layout = layout;
+    }
+
+    /// Expand a `String.length()` / `isEmpty()` / `charAt(int)` call site into
+    /// ordinary IR nodes, or leave the site alone.
+    ///
+    /// `true` means the site was CONSUMED — operands popped, result pushed —
+    /// and the caller must not build an `Op::Call` for it. `false` leaves the
+    /// abstract stack exactly as it found it, so the caller's dispatch path is
+    /// unaffected; every refusal below returns before the first `pop`.
+    ///
+    /// The representation, the deopt discipline, the receiver-guard rule and
+    /// both switches are all documented in the section above [`IrBuilder`].
+    fn try_string_access_intrinsic(&mut self, pc: usize, info_ptr: usize, num_args: usize) -> bool {
+        // SAFETY: `info_ptr` addresses a `JitInvokeInfo` the caller (`lib.rs`'s
+        // invoke-planning loop) boxed and keeps alive on the artifact's
+        // `_jit_invoke_infos` for the life of the compiled method. It is the
+        // same pointer this builder is about to bake into an `Op::Call`, and
+        // the same read that loop already performs on its own boxes to
+        // recognise `java/lang/Object.<init>()V`.
+        let info: &JitInvokeInfo = unsafe { &*(info_ptr as *const JitInvokeInfo) };
+        // Screen on the declared class before touching any counter: every
+        // other invoke in the program would otherwise show up as a "site".
+        if info.class_name != "java/lang/String" && info.class_name != "java/lang/CharSequence" {
+            return false;
+        }
+        note_string_intrinsic(SI_SITES_SEEN);
+        if !ir_string_intrinsics_enabled() {
+            note_string_intrinsic(SI_FLAG_OFF);
+            return false;
+        }
+        let Some(layout) = self.string_layout else {
+            note_string_intrinsic(SI_NO_LAYOUT);
+            return false;
+        };
+        // Which sites are accessors, which need a receiver guard, and which
+        // are refused for want of a `coder` field (a legacy `char[]` String)
+        // or of a String class id, is `try_resolve_string_intrinsic`'s
+        // decision — called, not re-derived, so this tier cannot drift from
+        // the one the single-pass backend registers against.
+        let Some((entry, num_params, _ret, guard_class_id)) = crate::try_resolve_string_intrinsic(
+            info.class_name,
+            info.method_name,
+            info.descriptor,
+            Some(layout),
+        ) else {
+            note_string_intrinsic(SI_NOT_ACCESSOR);
+            return false;
+        };
+        // Compare against the sentinels rather than `JitIntrinsic::from_entry`:
+        // that recovery function only classifies the CRC32 family, and the
+        // single-pass region identifies these three the same way.
+        let kind = if entry == crate::JitIntrinsic::StringLength.as_entry() {
+            SI_EMITTED_LENGTH
+        } else if entry == crate::JitIntrinsic::StringIsEmpty.as_entry() {
+            SI_EMITTED_IS_EMPTY
+        } else if entry == crate::JitIntrinsic::StringCharAt.as_entry() {
+            SI_EMITTED_CHAR_AT
+        } else {
+            // `hashCode`, `equals`, `compareTo` and the two `indexOf` forms
+            // resolve through the same function and are deliberately NOT
+            // expanded here: each is a loop or a lazy-cache protocol rather
+            // than a field decode, so each needs control flow this expansion
+            // cannot open (see the section header). They keep their dispatch.
+            note_string_intrinsic(SI_NOT_ACCESSOR);
+            return false;
+        };
+        // A guarded (CharSequence-declared) site needs a header class-id
+        // compare, and there is no IR node that reads an `ObjectHeader`. See
+        // the section header for why `Op::InstanceOf` is not a substitute and
+        // why emitting the decode unguarded is a wrong-value bug.
+        if guard_class_id != 0 {
+            note_string_intrinsic(SI_GUARDED_REFUSED);
+            return false;
+        }
+        // A spliced region records no safepoint snapshot, so a guard built
+        // inside one would resolve an EMPTY deopt frame at a combined-buffer
+        // pc. Refuse; the site keeps its dispatch inside the splice.
+        if !self.splice.is_empty() {
+            note_string_intrinsic(SI_IN_SPLICE);
+            return false;
+        }
+        let Some(ctrl) = self.ctrl_opt() else {
+            note_string_intrinsic(SI_SHAPE_REFUSED);
+            return false;
+        };
+        // The receiver is one slot and every argument of these three
+        // signatures is one slot, so the caller's `num_args` must be exactly
+        // `num_params + 1`. A disagreement means the resolved descriptor and
+        // the planned site are not describing the same call; refuse rather
+        // than pop a depth nothing agreed on.
+        if num_args != num_params + 1 || self.stack.len() < num_args {
+            note_string_intrinsic(SI_SHAPE_REFUSED);
+            return false;
+        }
+
+        // ── Past this point the site is consumed. ──
+        let index = if kind == SI_EMITTED_CHAR_AT {
+            Some(self.pop())
+        } else {
+            None
+        };
+        let recv = self.pop();
+
+        // 1. Null receiver -> deopt at this bci. The interpreter re-executes
+        //    the `invoke` and the native implementation raises the NPE, with
+        //    this method's own handler semantics. `Op::Cmp` widens to a 64-bit
+        //    compare because one operand is `Ref`-typed, so a pointer whose
+        //    low word happens to be zero is not mistaken for null.
+        let null = self.aconst_null();
+        let recv_nonnull = self.add_data(Op::Cmp(CmpOp::Ne), IrType::Int, vec![recv, null], pc);
+        self.graph.add(
+            Op::Guard { bci: pc },
+            IrType::Void,
+            vec![ctrl, recv_nonnull],
+            Some(pc),
+        );
+
+        // 2. `coder` first, then `value` — the `Op::Load` helper arm is a
+        //    `CALL`, and loading the reference last is the shortest window in
+        //    which a live oop sits across one.
+        let coder_index = self.iconst(layout.coder_field_index as i64);
+        let coder = self.graph.add(
+            Op::Load(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, self.mem, recv, coder_index],
+            Some(pc),
+        );
+        self.mem = coder;
+        let value_index = self.iconst(layout.value_field_index as i64);
+        let value = self.graph.add(
+            Op::Load(MemKind::Ref),
+            IrType::Ref,
+            vec![ctrl, self.mem, recv, value_index],
+            Some(pc),
+        );
+        self.mem = value;
+
+        // 3. A real String's `value` is never null, but this expansion may not
+        //    ASSUME it — the whole point of the deopt discipline is that an
+        //    uncertain case leaves for the interpreter rather than reading a
+        //    fabricated address. `Op::ArrayLength` and `Op::ArrayLoad` each
+        //    emit their own null check as well; the explicit guard states the
+        //    intent and keeps the `length` and `charAt` paths identical.
+        let value_nonnull = self.add_data(Op::Cmp(CmpOp::Ne), IrType::Int, vec![value, null], pc);
+        self.graph.add(
+            Op::Guard { bci: pc },
+            IrType::Void,
+            vec![ctrl, value_nonnull],
+            Some(pc),
+        );
+
+        // 4. char_count = value.length >> coder. `Op::ArrayLength` does not
+        //    advance the memory token (nothing writes an array's length), so
+        //    it takes the current one as an input only.
+        let byte_len = self.graph.add(
+            Op::ArrayLength,
+            IrType::Int,
+            vec![ctrl, self.mem, value],
+            Some(pc),
+        );
+        let char_count = self.add_data(Op::UShr, IrType::Int, vec![byte_len, coder], pc);
+
+        let result = if let Some(index) = index {
+            // charAt(I)C.
+            //
+            // Bounds: `0 <= index < char_count`, as two SIGNED compares rather
+            // than one unsigned one because `Op::Cmp` has no unsigned form.
+            // `char_count` is an `arraylength` shifted right and so is never
+            // negative, which makes the pair exactly the unsigned test the
+            // single-pass region spells `CMP; JAE`.
+            let zero = self.iconst(0);
+            let non_negative = self.add_data(Op::Cmp(CmpOp::Ge), IrType::Int, vec![index, zero], pc);
+            self.graph.add(
+                Op::Guard { bci: pc },
+                IrType::Void,
+                vec![ctrl, non_negative],
+                Some(pc),
+            );
+            let in_bounds =
+                self.add_data(Op::Cmp(CmpOp::Lt), IrType::Int, vec![index, char_count], pc);
+            self.graph.add(
+                Op::Guard { bci: pc },
+                IrType::Void,
+                vec![ctrl, in_bounds],
+                Some(pc),
+            );
+
+            // Branchless LATIN1/UTF16 decode. See the section header for why
+            // the second byte's address is `off + coder` and why both reads
+            // are in bounds for every index this guard admits.
+            let off = self.add_data(Op::Shl, IrType::Int, vec![index, coder], pc);
+            let lo_raw = self.graph.add(
+                Op::ArrayLoad(MemKind::Byte),
+                IrType::Int,
+                vec![ctrl, self.mem, value, off],
+                Some(pc),
+            );
+            self.mem = lo_raw;
+            let hi_off = self.add_data(Op::Add, IrType::Int, vec![off, coder], pc);
+            let hi_raw = self.graph.add(
+                Op::ArrayLoad(MemKind::Byte),
+                IrType::Int,
+                vec![ctrl, self.mem, value, hi_off],
+                Some(pc),
+            );
+            self.mem = hi_raw;
+            // `baload` SIGN-extends (JVMS), and a compact String byte is an
+            // unsigned half of a code unit — mask both halves before combining
+            // or every byte >= 0x80 decodes as a negative char.
+            let byte_mask = self.iconst(0xFF);
+            let lo = self.add_data(Op::And, IrType::Int, vec![lo_raw, byte_mask], pc);
+            let hi = self.add_data(Op::And, IrType::Int, vec![hi_raw, byte_mask], pc);
+            let eight = self.iconst(8);
+            let hi_shifted = self.add_data(Op::Shl, IrType::Int, vec![hi, eight], pc);
+            // `0 - coder` is all-ones for UTF16 and zero for LATIN1, which is
+            // what selects between the two decodes without a branch.
+            let coder_mask = self.add_data(Op::Sub, IrType::Int, vec![zero, coder], pc);
+            let hi_selected = self.add_data(Op::And, IrType::Int, vec![hi_shifted, coder_mask], pc);
+            self.add_data(Op::Or, IrType::Int, vec![lo, hi_selected], pc)
+        } else if kind == SI_EMITTED_IS_EMPTY {
+            let zero = self.iconst(0);
+            self.add_data(Op::Cmp(CmpOp::Eq), IrType::Int, vec![char_count, zero], pc)
+        } else {
+            char_count
+        };
+        self.push(result);
+        note_string_intrinsic(kind);
+        true
     }
 
     /// The data type for a merge / loop-carried `Op::Phi`, derived from its
@@ -6468,6 +7059,16 @@ impl IrBuilder {
                         Some(&t) => t,
                         None => return self.bail_invoke(line!(), pc),
                     };
+                    // String access intrinsics in this tier — see the section
+                    // above `IrBuilder`. Offered only to `invokevirtual`:
+                    // `invokestatic` has no receiver, so no String accessor
+                    // can reach this arm through it. A refusal leaves the
+                    // abstract stack untouched and falls through to the
+                    // `Op::Call` below, which is what the site does today.
+                    if op == 0xb6 && self.try_string_access_intrinsic(pc, info_ptr, num_args) {
+                        pc += 3;
+                        continue;
+                    }
                     // Pop args (deepest-first on the abstract stack) and restore
                     // source order so inputs are [ctrl, mem, arg0, arg1, …].
                     let mut args = Vec::with_capacity(num_args);
@@ -6528,6 +7129,17 @@ impl IrBuilder {
                         Some(&t) => t,
                         None => return self.bail_invoke(line!(), pc),
                     };
+                    // A `java/lang/CharSequence.charAt`/`length`/`isEmpty`
+                    // site arrives here rather than at 0xb6. The expander
+                    // refuses every guarded site today, so this call exists
+                    // to COUNT that population (`guarded_site_refused`)
+                    // rather than to emit anything — a number this lane will
+                    // need before anyone decides whether the header class-id
+                    // compare is worth building. Five bytes, not three.
+                    if self.try_string_access_intrinsic(pc, info_ptr, num_args) {
+                        pc += 5;
+                        continue;
+                    }
                     let mut args = Vec::with_capacity(num_args);
                     for _ in 0..num_args {
                         args.push(self.pop());
@@ -7283,6 +7895,30 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
             0xb9 | 0xba => {
                 pc += 5;
             }
+            // wide (0xc4) — JVMS §6.5. `wide iinc` is SIX bytes (prefix,
+            // opcode, 2-byte index, 2-byte signed constant); every other
+            // widened form is four. Without this arm the prefix fell to the
+            // 1-byte catch-all below and the walk desynced by two bytes,
+            // reading operand bytes as phantom opcodes — the same failure the
+            // `0xb9`/`0xba` arms above are written for.
+            //
+            // The tables in `x64/licm.rs` and `regalloc.rs` that DO carry this
+            // arm described it for months as "currently latent — `jit_scan`
+            // rejects `wide`". That stopped being true when the widened forms
+            // were implemented: `x64/bytecode_compat.rs::jit_scan` accepts
+            // `wide` load/store and `wide iinc` today, so compiled methods DO
+            // contain the prefix and every PC-stepping consumer is
+            // load-bearing. This walker is reached only for a method the
+            // builder then refuses — its own main loop has no `0xc4` arm, so
+            // `wide` still bails to single-pass — which is why this is
+            // insurance rather than a fix for anything measured.
+            0xc4 => {
+                if pc + 1 < code_len && code[pc + 1] == 0x84 {
+                    pc += 6;
+                } else {
+                    pc += 4;
+                }
+            }
             _ => {
                 // Unknown opcode — skip (builder will also bail)
                 pc += 1;
@@ -7378,6 +8014,16 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
             // upstream, so falling into the 1-byte catch-all would desync
             // every subsequent PC in this pre-scan.
             0xb9 | 0xba => pc += 5,
+            // wide (0xc4) — see the twin in `find_branch_targets` above for
+            // why this arm exists and why the "currently latent" wording on
+            // the other length tables was stale.
+            0xc4 => {
+                if pc + 1 < code_len && code[pc + 1] == 0x84 {
+                    pc += 6
+                } else {
+                    pc += 4
+                }
+            }
             _ => pc += 1,
         }
     }

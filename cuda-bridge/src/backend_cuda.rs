@@ -82,6 +82,35 @@ pub(crate) fn probe_device(device_ordinal: u32) -> Result<DeviceCaps> {
     })
 }
 
+/// `cuDriverGetVersion`, as `1000 * major + 10 * minor` (e.g. `12080`
+/// for a CUDA 12.8 driver).
+///
+/// The installed driver's version is the ceiling on the PTX ISA version
+/// it can parse, and a module declaring a newer `.version` is rejected
+/// exactly as hard as one naming an unknown `.target`. The VM reads this
+/// once at `OffloadCache` construction and hands it to
+/// `jit_cuda::target::clamp_target_to_isa`; see that module for why both
+/// directions need handling.
+pub(crate) fn driver_cuda_version() -> Result<u32> {
+    // `cuDriverGetVersion` is one of the few driver entry points that is
+    // legal before `cuInit`, but cudarc loads the library lazily, so go
+    // through `lib()` to make sure the symbol table exists. Any failure
+    // is reported rather than papered over: the caller treats an unknown
+    // driver version as "do not clamp", which is the pre-existing
+    // behaviour.
+    let mut version: core::ffi::c_int = 0;
+    // SAFETY: `lib()` returns the loaded driver library; `version` is a
+    // live, aligned `c_int` the call writes exactly once.
+    let res = unsafe { cudarc::driver::sys::lib().cuDriverGetVersion(&mut version) };
+    if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+        return Err(DeviceError::NoDriver);
+    }
+    if version <= 0 {
+        return Err(DeviceError::NoDriver);
+    }
+    Ok(version as u32)
+}
+
 /// AUDIT 2026-05-24 (C32 stream-port fix): inter-stream barrier events
 /// owned by the context. Each is a `CU_EVENT_DISABLE_TIMING` event
 /// created once at context construction and reused for every transfer:
@@ -287,6 +316,47 @@ impl DeviceContextInner {
             }),
             barriers: Arc::new(StreamBarriers { e_h2d, e_k, dev }),
         })
+    }
+
+    /// Record `event` on the stream cudarc's allocator issues its
+    /// zeroing memset to, so a buffer from `alloc_zeros` can carry a
+    /// `last_write` marker like an uploaded one does.
+    ///
+    /// # AUDIT 2026-09-02: this is what made a shared context corrupt
+    ///
+    /// `DeviceBufferInner::zeros` calls cudarc's `alloc_zeros`, which
+    /// issues an ASYNC memset on the device's default stream and returns
+    /// immediately. The outer `DeviceBuffer::zeros` then handed back a
+    /// buffer with an EMPTY `last_write` slot, so a following
+    /// `launch_on_stream` on a user stream had nothing to wait on — and
+    /// the memset was free to land after the kernel's stores and wipe
+    /// them.
+    ///
+    /// Measured on an RTX 2060: one `DeviceContext` shared by four
+    /// threads, 4 MiB output buffers, 24 rounds — 4 of 4 runs produced
+    /// `got 0` where the kernel's result should have been. At 1 MiB it
+    /// passed 5 of 5, which is why this had never been seen: the window
+    /// is the length of the memset. That is the exact shape
+    /// `OffloadCacheRegistry` gives every dispatching Java thread.
+    ///
+    /// Recording here rather than synchronizing keeps the allocation
+    /// asynchronous; the existing wait loop in
+    /// `launch.rs::launch_on_stream` does the rest, because it already
+    /// gates the launch behind every argument's `last_write`.
+    pub(crate) fn record_alloc_event(&self, event: &crate::Event) -> Result<()> {
+        self.bind_to_thread()?;
+        let stream = *self.dev.cu_stream();
+        // SAFETY: the context is bound on this thread, `event` outlives
+        // the call (the caller owns it), and `stream` is the device's own
+        // default stream, alive for as long as `self.dev`.
+        unsafe {
+            cudarc::driver::result::event::record(event.cu_event_raw(), stream)
+                .map_err(map_err("cuEventRecord alloc_zeros"))?;
+        }
+        // So the wait-elision in `launch_on_stream` can recognise a
+        // same-stream marker instead of issuing a needless barrier.
+        event.set_recorded_on(stream);
+        Ok(())
     }
 
     pub(crate) fn synchronize(&self) -> Result<()> {

@@ -532,7 +532,7 @@ impl Compiler {
         // Pop value1 (already on stack before the constant was pushed)
         let val1 = self.pop_stack();
         match val1 {
-            StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg) => {
+            StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg, ..) => {
                 // CMP reg32, imm — direct compare without loading to RAX
                 if reg >= 8 {
                     self.buf.emit_byte(0x41); // REX.B

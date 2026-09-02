@@ -37,7 +37,7 @@
 //! * `std::thread::scope` joins every worker before the caller reads the
 //!   bitmap, giving the happens-before edge for the final `collect_marked`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
 /// One bit per 8 bytes of a young from-space region.
@@ -166,6 +166,52 @@ impl YoungMarkBits {
     }
 }
 
+/// A word-batching cursor over [`ObjectStartBits`] -- see [`ObjectStartBits::run`].
+///
+/// Flushes on drop, so a walk that exits early (every refusal path in
+/// `objstart_chunk` does) still publishes the bits it legitimately recorded.
+/// That matters only for the sequential walk, whose caller keeps the bitmap; a
+/// refused parallel chunk has its whole bitmap thrown away regardless.
+pub(crate) struct StartRun<'a> {
+    bits: &'a ObjectStartBits,
+    word: usize,
+    mask: u64,
+}
+
+impl StartRun<'_> {
+    /// Record an object start. Same contract as [`ObjectStartBits::insert`]:
+    /// `false` means the address is outside the span or not 8-byte aligned,
+    /// and the caller must not run a moving cycle against this bitmap.
+    #[inline]
+    pub(crate) fn insert(&mut self, addr: usize) -> bool {
+        match self.bits.locate(addr) {
+            None => false,
+            Some((w, mask)) => {
+                if w != self.word {
+                    self.flush();
+                    self.word = w;
+                }
+                self.mask |= mask;
+                true
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn flush(&mut self) {
+        if self.mask != 0 {
+            self.bits.words[self.word].fetch_or(self.mask, Ordering::Relaxed);
+            self.mask = 0;
+        }
+    }
+}
+
+impl Drop for StartRun<'_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 /// Exact "is this address an object start in young from-space?" membership,
 /// as one bit per 8 bytes of `[base, base + span)`.
 ///
@@ -185,14 +231,15 @@ impl YoungMarkBits {
 /// unaligned start rather than aliasing a neighbour's bit, and the caller
 /// treats that as a walk that did not complete.
 ///
-/// Single-threaded by construction — the walk and the forwarding that reads it
-/// both run inside the collection's stop-the-world region — so unlike
-/// [`YoungMarkBits`] the accessors are plain loads and stores.
+/// Shared across the object-start walk's workers (gc-genpause F1): the words
+/// are atomic and `insert` is a `fetch_or`, so a chunked parallel walk and the
+/// sequential fallback fill the same bitmap by the same rule. Every access is
+/// `Relaxed` -- the workers are joined before any reader runs, and that join is
+/// the happens-before edge; the bits carry no other data to order.
 pub(crate) struct ObjectStartBits {
-    words: Vec<u64>,
+    words: Vec<AtomicU64>,
     base: usize,
     span: usize,
-    len: usize,
 }
 
 impl ObjectStartBits {
@@ -201,10 +248,9 @@ impl ObjectStartBits {
     pub(crate) fn new(base: usize, span: usize) -> Self {
         let nwords = span.div_ceil(8).div_ceil(64);
         Self {
-            words: vec![0u64; nwords],
+            words: (0..nwords).map(|_| AtomicU64::new(0)).collect(),
             base,
             span,
-            len: 0,
         }
     }
 
@@ -223,15 +269,11 @@ impl ObjectStartBits {
     /// represent this walk exactly, and the caller must not run a moving cycle
     /// against it.
     #[inline]
-    pub(crate) fn insert(&mut self, addr: usize) -> bool {
+    pub(crate) fn insert(&self, addr: usize) -> bool {
         match self.locate(addr) {
             None => false,
             Some((w, mask)) => {
-                let word = &mut self.words[w];
-                if *word & mask == 0 {
-                    *word |= mask;
-                    self.len += 1;
-                }
+                self.words[w].fetch_or(mask, Ordering::Relaxed);
                 true
             }
         }
@@ -243,14 +285,50 @@ impl ObjectStartBits {
     pub(crate) fn contains(&self, addr: usize) -> bool {
         match self.locate(addr) {
             None => false,
-            Some((w, mask)) => self.words[w] & mask != 0,
+            Some((w, mask)) => self.words[w].load(Ordering::Relaxed) & mask != 0,
         }
     }
 
-    /// Number of recorded starts. Diagnostics only.
+    /// Number of recorded starts. Diagnostics and tests only -- deliberately
+    /// NOT maintained incrementally.
+    ///
+    /// # gc-genpause F1: this counter was the whole parallel regression
+    ///
+    /// It used to be an `AtomicUsize` bumped inside `insert`. That is one
+    /// process-global cache line taking a `lock add` from every worker for
+    /// every object in from-space -- ~6.7 M of them on a 268 MB space -- so the
+    /// "parallel" walk was 443-522 ms against the sequential walk's 227-274 ms.
+    /// A shared counter incremented per unit of work is the canonical way to
+    /// make a parallel loop slower than the serial one, and it was maintained
+    /// for a value nothing outside the unit tests reads.
+    ///
+    /// Popcounting on demand is O(words), runs only when someone asks, and
+    /// gives the identical answer.
     #[inline]
     pub(crate) fn len(&self) -> usize {
-        self.len
+        self.words
+            .iter()
+            .map(|w| w.load(Ordering::Relaxed).count_ones() as usize)
+            .sum()
+    }
+
+    /// Batches bit sets into ONE atomic OR per 512-byte word.
+    ///
+    /// A walk visits object starts in increasing address order, and one word
+    /// of this bitmap covers 512 bytes of arena -- about a dozen objects at
+    /// typical sizes. Setting each bit with its own `fetch_or` therefore pays
+    /// a `lock or` roughly twelve times per word for writes that could be one.
+    /// Accumulating the word and flushing it on the way past cuts the atomic
+    /// count by that factor, and costs a compare and an OR per object.
+    ///
+    /// Correct for any order, not just ascending: a revisit of an earlier word
+    /// simply flushes and re-acquires it.
+    pub(crate) fn run(&self) -> StartRun<'_> {
+        StartRun {
+            bits: self,
+            word: usize::MAX,
+            mask: 0,
+        }
     }
 }
 
@@ -498,6 +576,65 @@ mod tests {
         assert!(!bits.contains(BASE + 12));
         assert!(!bits.contains(BASE + 8));
         assert_eq!(bits.len(), 0);
+    }
+
+    /// gc-genpause F1: the word-batching cursor must record exactly the bits
+    /// per-address `insert` would, and must have published them by the time it
+    /// is dropped.
+    ///
+    /// The batching is the whole point of the cursor and also its only risk:
+    /// bits live in a register-held mask until the walk moves past the word,
+    /// so a missed flush loses up to 63 object starts silently -- and a start
+    /// this bitmap does not have is one `forward_object` refuses to relocate.
+    #[test]
+    fn the_batching_cursor_records_exactly_what_insert_would() {
+        const BASE: usize = 0x40_0000;
+        const SPAN: usize = 4096;
+        // Addresses crossing several word boundaries (one word = 512 bytes),
+        // several within one word, and revisits in DESCENDING order to prove
+        // the cursor does not assume ascending input.
+        let addrs: Vec<usize> = vec![
+            BASE, BASE + 8, BASE + 16, BASE + 504, BASE + 512, BASE + 520,
+            BASE + 1024, BASE + 1032, BASE + 2040, BASE + 2048, BASE + 4088,
+            BASE + 512, BASE + 8, BASE + 3000,
+        ];
+
+        let direct = ObjectStartBits::new(BASE, SPAN);
+        for &a in &addrs {
+            assert!(direct.insert(a), "{a:#x} is in-span and aligned");
+        }
+
+        let batched = ObjectStartBits::new(BASE, SPAN);
+        {
+            let mut run = batched.run();
+            for &a in &addrs {
+                assert!(run.insert(a), "{a:#x} is in-span and aligned");
+            }
+            // Deliberately NOT flushed by hand: the drop below must do it.
+        }
+
+        assert_eq!(batched.len(), direct.len(), "start counts must agree");
+        for off in (0..SPAN).step_by(8) {
+            assert_eq!(
+                batched.contains(BASE + off),
+                direct.contains(BASE + off),
+                "membership disagrees at +{off}"
+            );
+        }
+    }
+
+    /// The cursor must reject the same addresses `insert` rejects -- an
+    /// unaligned or out-of-span start cannot be represented, and the caller
+    /// treats that as a walk that did not complete.
+    #[test]
+    fn the_batching_cursor_rejects_what_insert_rejects() {
+        const BASE: usize = 0x40_0000;
+        let bits = ObjectStartBits::new(BASE, 4096);
+        let mut run = bits.run();
+        assert!(!run.insert(BASE + 4), "unaligned");
+        assert!(!run.insert(BASE + 4096), "past the span");
+        assert!(!run.insert(BASE - 8), "before the span");
+        assert!(run.insert(BASE + 4088), "the last aligned slot is in-span");
     }
 
     #[test]

@@ -229,10 +229,32 @@ pub(crate) fn proxy_instance_satisfies_target(
 /// Does the backing collection in slot 0 of an unmodifiable wrapper reach
 /// `iface_name` in its own hierarchy?
 ///
-/// `is_subclass_of_by_name` rather than resolving `iface_name` to a `ClassId`
-/// first: the name form neither loads nor looks up, which keeps this on the
-/// no-safepoint side of [`unmod_stamp_display_name`]'s contract. Slot 0 is
-/// `UNMOD_FIELD_BACKING` in `native-collections`.
+/// A NAME form rather than resolving `iface_name` to a `ClassId` first: it
+/// neither loads nor looks up, which keeps this on the no-safepoint side of
+/// [`unmod_stamp_display_name`]'s contract. Slot 0 is `UNMOD_FIELD_BACKING` in
+/// `native-collections`.
+///
+/// `is_assignable_to_name` and NOT `is_subclass_of_by_name`, whose name reads
+/// like the right one and is not: that function is the exception-`catch_type`
+/// fallback and walks ONLY the superclass chain, because a `catch_type` is
+/// never an interface. Every name this function is called with IS an
+/// interface, so the supers-only walk could not match one — `ArrayList`
+/// reaches `AbstractList`, `AbstractCollection`, `Object` and stops.
+///
+/// The cost was one whole display class. `unmod_backing_reaches(.., "java/util/
+/// RandomAccess")` answered `false` for a `Collections.unmodifiableList(new
+/// ArrayList<>(..))`, so the opcodes' display arm picked
+/// `Collections$UnmodifiableList` while `getClass()` — whose authority
+/// (`native-builtins`' `getclass_backing_is_random_access`) resolves the
+/// interface to a `ClassId` and uses the DAG-walking `is_subclass` — reported
+/// `Collections$UnmodifiableRandomAccessList`. `instanceof RandomAccess` was
+/// `false` and `RandomAccess.class.isInstance(..)` `true` for the same object,
+/// which is the one thing `display_class_satisfies_target` exists to prevent.
+/// The identical trap is written out at length on the `Path.toString()` branch
+/// in `runtime/invokedynamic.rs`; this is its second occurrence.
+/// `apps/probes/RandomAccessProbe` is the reproducer, and
+/// `classloading`'s `the_supers_only_name_walk_cannot_see_an_interface_the_dag_walk_finds`
+/// asserts the divergence between the two walks in both directions.
 fn unmod_backing_reaches(
     shared: &SharedVm,
     obj_ref: cratonvm_types::ObjectRef,
@@ -245,12 +267,68 @@ fn unmod_backing_reaches(
         cratonvm_types::Value::Object(Some(b)) => b,
         _ => return false,
     };
-    let backing_cid = shared.mem.heap.class_id_of(backing);
-    shared
-        .classes
-        .class_manager
-        .read()
-        .is_subclass_of_by_name(backing_cid, iface_name)
+    object_reaches(shared, backing, iface_name, 0)
+}
+
+/// Does `obj` — as the object it STANDS FOR, not as the class it is stamped
+/// with — reach `iface_name`?
+///
+/// For an ordinary receiver this is one name walk. The recursion exists for a
+/// wrapper of a wrapper: `Collections.unmodifiableList(List.of("a", "b"))`
+/// backs one `cratonvm/internal/UnmodifiableList` stamp with another. All
+/// eleven stamps declare only their FAMILY-level interfaces in `vm_init.rs`
+/// (`List`, `Collection`, `Serializable`), because everything finer is a
+/// property of the instance's backing rather than of the stamp — which is why
+/// asking the stamp's own hierarchy about `RandomAccess` answers `false` for
+/// every one of them, `List.of`'s included, whose HotSpot display class
+/// (`ImmutableCollections$ListN`, via `AbstractImmutableList`) implements it.
+///
+/// So descend slot 0 (`UNMOD_FIELD_BACKING`): an unmodifiable view carries the
+/// marker exactly when the thing it wraps does.
+///
+/// This function is one half of a PAIR and must not move alone.
+/// `native-builtins`' `getclass_object_reaches` — the authority behind
+/// `Object.getClass()` — runs the identical rule, and it is a separate
+/// implementation because THIS side may not load a class or run Java: the
+/// receiver at `op_instanceof`/`op_checkcast` has been popped from the operand
+/// stack and is a bare Rust local the collector cannot see. That constraint is
+/// also why the rule is structural rather than "consult the display class if it
+/// happens to be loaded": an answer that depended on whether anything had
+/// called `getClass()` first would be a worse defect than the one this closes.
+/// `apps/probes/RandomAccessProbe` prints all three doors per row and an
+/// `agree=` column that goes false the moment the pair parts.
+fn object_reaches(
+    shared: &SharedVm,
+    obj: cratonvm_types::ObjectRef,
+    iface_name: &str,
+    depth: usize,
+) -> bool {
+    // A wrapper chain is a handful of links; the bound is a cycle guard, not a
+    // policy. (`alloc_unmod_wrapper` stores an object that already existed, so
+    // slot-0 nesting is acyclic by construction — this is insurance.)
+    if depth > 8 {
+        return false;
+    }
+    let cid = shared.mem.heap.class_id_of(obj);
+    let is_stamp = {
+        let cm = shared.classes.class_manager.read();
+        if cm.is_assignable_to_name(cid, iface_name) {
+            return true;
+        }
+        match cm.get_class(cid) {
+            Some(c) => c.name.starts_with("cratonvm/internal/Unmodifiable"),
+            None => false,
+        }
+    };
+    if !is_stamp || shared.mem.heap.num_fields(obj) == 0 {
+        return false;
+    }
+    match shared.mem.heap.get_field(obj, 0) {
+        cratonvm_types::Value::Object(Some(inner)) => {
+            object_reaches(shared, inner, iface_name, depth + 1)
+        }
+        _ => false,
+    }
 }
 
 /// The JDK class that a `cratonvm/internal/Unmodifiable*` stamp stands for,
@@ -1508,6 +1586,26 @@ fn recorded_proxy_interface_set(origin: &cratonvm_classloading::ClassOrigin) -> 
 // Helper: name-based type compatibility for synthetic classes
 // ---------------------------------------------------------------------------
 
+/// Does the innermost simple name END with `term` as its final word?
+///
+/// The FAMILY of a JDK collection class is its last word, not any word:
+/// `ConcurrentSkipListSet` is a `Set` and `ConcurrentSkipListMap` is a `Map`,
+/// and both carry `List` in the middle because a skip list is how they are
+/// built. [`simple_name_has_word`] cannot tell those apart — it is deliberately
+/// an any-word test, and its over-admission score is measured as such — so the
+/// call sites that need the family use this to exclude, never to admit.
+///
+/// Kept separate from `simple_name_has_word` rather than folded into it because
+/// that function's 50/266 score is asserted by `scratchpad/c16/verify.rs`
+/// against a verbatim extract; narrowing it would move numbers a probe pins.
+fn simple_name_ends_with_word(obj_name: &str, term: &str) -> bool {
+    let simple = match obj_name.rfind(['$', '/']) {
+        Some(i) => &obj_name[i + 1..],
+        None => obj_name,
+    };
+    simple.ends_with(term)
+}
+
 /// Does the INNERMOST SIMPLE name of `obj_name` contain `term` as a camel-case
 /// word?
 ///
@@ -1560,6 +1658,12 @@ fn recorded_proxy_interface_set(origin: &cratonvm_classloading::ClassOrigin) -> 
 /// `ConcurrentSkipListMap$Values`, …). None of them is a name the synthetic-JDK
 /// fabrication tables in `classloading/src/class_manager.rs` mention, so none is
 /// reachable through this fallback in practice — checked, not assumed.
+///
+/// The 50/266 score is this FUNCTION's, and since 2026-09-02 it is no longer
+/// the caller's: the `java/util/` arms in [`synthetic_implements`] additionally
+/// exclude a name whose FINAL word contradicts the target
+/// ([`simple_name_ends_with_word`]), which is strictly narrower. Re-score the
+/// call site, not this helper, if the question is what the VM admits.
 ///
 /// docs/known-issues/jdk-only/W8-C16-2-synthetic-implements-simple-name.md
 fn simple_name_has_word(obj_name: &str, term: &str) -> bool {
@@ -1930,7 +2034,14 @@ pub(super) fn synthetic_implements(
         return false;
     }
     if target_class_name == "java/lang/Iterable" {
+        // `!…ends_with_word("Map")` is the whole difference between this and
+        // the version before 2026-09-02, which answered `true` for a
+        // `ConcurrentSkipListMap` — a Map is not an Iterable, and the `List` in
+        // its name is the data structure it is built from. Measured with
+        // `apps/probes/CollectionViewTypes`; see the same guard on the
+        // Collection/List arms below.
         return obj_name.starts_with("java/util/")
+            && !simple_name_ends_with_word(&obj_name, "Map")
             && (simple_name_has_word(&obj_name, "List")
                 || simple_name_has_word(&obj_name, "Set")
                 || simple_name_has_word(&obj_name, "Queue")
@@ -1949,16 +2060,34 @@ pub(super) fn synthetic_implements(
     // against the class-name family that actually implements it.
     if obj_name.starts_with("java/util/") {
         let has = |term: &str| simple_name_has_word(&obj_name, term);
+        // The FAMILY is the LAST word. `has` is an any-word test by design, so
+        // these two exclusions are what keep it from reading a class's
+        // implementation out of its name — `ConcurrentSkipListSet` and
+        // `ConcurrentSkipListMap` are a skip LIST in construction and a `Set`
+        // and a `Map` in type. Both were measured wrong here on 2026-09-02
+        // (`apps/probes/CollectionViewTypes`, real-JDK mode, against HotSpot
+        // 25.0.3): `aConcurrentSkipListSet instanceof List` and
+        // `aConcurrentSkipListMap instanceof Collection/List/Iterable` all
+        // answered `true`.
+        //
+        // Excluding rather than switching to a last-word test, which would be
+        // the tidier rule and is wrong: `Collections$SetFromMap` ends in `Map`
+        // and is a `Set`, so a last-word rule loses it. Excluding only from the
+        // arms whose target the suffix contradicts keeps that cell.
+        let ends = |term: &str| simple_name_ends_with_word(&obj_name, term);
         match target_class_name {
             "java/util/Collection" | "java/lang/Iterable" => {
-                if has("List") || has("Set") || has("Queue") || has("Deque") || has("Collection") {
+                if !ends("Map")
+                    && (has("List") || has("Set") || has("Queue") || has("Deque")
+                        || has("Collection"))
+                {
                     return true;
                 }
             }
             "java/util/List" => {
                 // Lists only (ArrayList, LinkedList, CopyOnWriteArrayList,
                 // Arrays$ArrayList, …). A Set/Queue is NOT a List.
-                if has("List") {
+                if has("List") && !ends("Set") && !ends("Map") {
                     return true;
                 }
             }
@@ -1967,8 +2096,17 @@ pub(super) fn synthetic_implements(
                     return true;
                 }
             }
-            "java/util/Queue" | "java/util/Deque" => {
+            // Split, because `Deque extends Queue` and not the reverse: every
+            // `Deque` is a `Queue`, and a `PriorityQueue` is not a `Deque`.
+            // Sharing one arm made `aPriorityQueue instanceof Deque` answer
+            // `true` — same probe, same run as the two above.
+            "java/util/Queue" => {
                 if has("Queue") || has("Deque") {
+                    return true;
+                }
+            }
+            "java/util/Deque" => {
+                if has("Deque") {
                     return true;
                 }
             }

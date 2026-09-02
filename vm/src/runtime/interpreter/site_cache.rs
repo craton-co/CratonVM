@@ -350,6 +350,49 @@ pub type MethodSiteCache = SiteCache<MethodSiteInfo>;
 /// accelerates the assignable case and leaves every refusal exactly as it was.
 pub type CastSiteCache = SiteCache<ClassId>;
 
+/// Per-thread memo for the **interface receiver-selection re-check**.
+///
+/// # What it removes
+///
+/// `execute_invokevirtual_cached`'s `VirtualBytecode` arm re-verifies, on every
+/// `invokeinterface` that hits the inline cache, that receiver-rooted
+/// maximally-specific resolution from the *actual* receiver class still selects
+/// the cached method's declaring class. The check exists for a real bug — a
+/// parent-interface default that stayed cached after it masked a covariant
+/// bridge on a receiver subinterface — but it was being answered with a
+/// `class_manager` read lock plus a full `find_method_recursive` hierarchy walk,
+/// **per call**.
+///
+/// `invokeinterface` and `invokevirtual` reach the same dispatcher and differ in
+/// exactly this block, which makes the cost directly attributable. Measured
+/// (`probes/Dispatch.java`, `--nojit`, min-of-7, arms interleaved):
+/// interface-over-virtual was **114 ns** on CratonVM against **3.4 ns** on
+/// HotSpot's template interpreter.
+///
+/// # What is stored, and why the value is a pair
+///
+/// Key: the call site, `(caller class, cp index)`. Value: the
+/// `(receiver class, selected declaring class)` pair the walk *verified*.
+///
+/// The key alone is not enough. One interface call site can see several
+/// concrete receiver classes, and the answer is a property of the receiver, not
+/// of the site. Storing the verified pair and comparing both halves on a hit
+/// means a site that rotates receivers simply misses and re-walks — today's
+/// behaviour, no worse — while a monomorphic site (the overwhelming majority)
+/// answers from an array index and two integer compares.
+///
+/// # Validity
+///
+/// Exactly [`SiteCache`]'s: `class_definition_epoch`, `resolution_epoch`, and
+/// the `any_class_redefined` latch. That set is not merely sufficient here, it
+/// is the precise one — a receiver class's superclass and superinterface chain
+/// is fixed at load time, so the walk's answer can only move when a class is
+/// redefined in place (the latch) or when `upgrade_synthetic_class` /
+/// `recompute_subclass_layouts` rewrites a class under an unchanged `ClassId`
+/// (the resolution epoch, which the invalidate hook bumps and which nothing
+/// else in the invoke-cache path observes).
+pub type IfaceSelectSiteCache = SiteCache<(ClassId, ClassId)>;
+
 /// `CRATONVM_DBG=field-site` — prove the site caches are actually firing before
 /// anyone times them.
 ///
@@ -423,8 +466,25 @@ pub mod site_stats {
     pub const JIT_LDC_HIT: usize = 19;
     pub const JIT_LDC_MISS: usize = 20;
     pub const JIT_LDC_FILL: usize = 21;
+    /// The interface receiver-selection re-check, answered from the memo
+    /// instead of a `class_manager` read lock plus a `find_method_recursive`
+    /// hierarchy walk. See [`super::IfaceSelectSiteCache`].
+    ///
+    /// A `hit` here is one avoided lock acquisition. `hit` at zero with
+    /// `miss` climbing on an interface-heavy workload means the call sites are
+    /// polymorphic enough that the memo's monomorphic slot thrashes, which is
+    /// a different finding from "the memo is not wired up".
+    pub const IFACE_SELECT_HIT: usize = 22;
+    pub const IFACE_SELECT_MISS: usize = 23;
+    pub const IFACE_SELECT_FILL: usize = 24;
+    /// The re-check was skipped outright because the receiver's own class is
+    /// the cached method's declaring class, which makes receiver-rooted
+    /// selection trivially agree. Counted apart from `IFACE_SELECT_HIT` so
+    /// "the memo is carrying the workload" stays distinguishable from "the
+    /// workload never needed the memo in the first place".
+    pub const IFACE_SELECT_TRIVIAL: usize = 25;
 
-    const N: usize = 22;
+    const N: usize = 26;
 
     #[allow(clippy::declare_interior_mutable_const)]
     const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -450,7 +510,7 @@ pub mod site_stats {
 
     fn report(when: &str) {
         eprintln!(
-            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={} | cast: hit={} miss={} fill={} reject_loader={} unusable={} | ldc: hit={} miss={} fill={} | jit-ldc: hit={} miss={} fill={}",
+            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={} | cast: hit={} miss={} fill={} reject_loader={} unusable={} | ldc: hit={} miss={} fill={} | jit-ldc: hit={} miss={} fill={} | iface-select: hit={} miss={} fill={} trivial={}",
             super::field_site_slots(),
             COUNTS[FIELD_HIT].load(Ordering::Relaxed),
             COUNTS[FIELD_MISS].load(Ordering::Relaxed),
@@ -474,6 +534,10 @@ pub mod site_stats {
             COUNTS[JIT_LDC_HIT].load(Ordering::Relaxed),
             COUNTS[JIT_LDC_MISS].load(Ordering::Relaxed),
             COUNTS[JIT_LDC_FILL].load(Ordering::Relaxed),
+            COUNTS[IFACE_SELECT_HIT].load(Ordering::Relaxed),
+            COUNTS[IFACE_SELECT_MISS].load(Ordering::Relaxed),
+            COUNTS[IFACE_SELECT_FILL].load(Ordering::Relaxed),
+            COUNTS[IFACE_SELECT_TRIVIAL].load(Ordering::Relaxed),
         );
     }
 

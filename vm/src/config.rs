@@ -316,6 +316,111 @@ pub struct JfrStartRecordingConfig {
     pub dump_on_exit: bool,
 }
 
+/// Apply one HotSpot-shaped JFR **event setting** token from
+/// `-XX:StartFlightRecording:...` to a `VmConfig::jfr_enabled_events` list.
+///
+/// ## The spelling, and why this one
+///
+/// HotSpot's `-XX:StartFlightRecording:` option string mixes two kinds of
+/// token: recording options (`filename=`, `duration=`, `settings=`, ...) and
+/// per-event settings, which are spelled
+///
+/// ```text
+/// +<EventName>#<setting>=<value>
+/// ```
+///
+/// for example `+cratonvm.JitCompileDecision#enabled=true`. The leading `+`
+/// is what tells the option parser "this token is an event setting, not a
+/// recording option": without it, `cratonvm.JitCompileDecision#enabled` is
+/// indistinguishable from a misspelt recording option, and the parser would
+/// have to guess.
+///
+/// Adopting HotSpot's spelling verbatim was chosen over the two obvious
+/// alternatives, both of which were rejected:
+///
+///  * A CratonVM-specific comma-separated list (`events=a,b,c`) cannot even
+///    be written here: the option string is itself comma-separated, so such a
+///    list needs a second separator, and the result would *look* like
+///    HotSpot's syntax while not being it. A spelling that is nearly
+///    HotSpot's is worse than one that is obviously not.
+///  * `settings=<name|path>` is HotSpot's other event-selection option, but
+///    it names a `.jfc` XML profile. Accepting the name and doing something
+///    else, or accepting it and ignoring it, is exactly the silent no-op this
+///    whole event exists to remove, so `settings=` is rejected with a message
+///    pointing at this syntax rather than half-honoured. A real `.jfc` parser
+///    is separate work and is not attempted here.
+///
+/// ## What is accepted
+///
+/// Only the `enabled` setting. It is the only per-event setting CratonVM's
+/// `RecordingSettings` can express by name and act on; HotSpot also spells
+/// `#threshold=20ms` and `#stackTrace=true`, and accepting either without
+/// implementing it would reintroduce the silent no-op above.
+///
+///  * `enabled=true` adds the event name to the list.
+///  * `enabled=false` removes it, and still leaves the list *present*, so
+///    that `+A#enabled=true,+A#enabled=false` ends as an empty whitelist
+///    (record nothing) rather than reverting to `None` (record everything).
+///    An operator who wrote both meant to end up with neither, and a filter
+///    that quietly turns itself off is the failure mode being designed out.
+///
+/// `key` is the token's left-hand side *including* the leading `+` (that is,
+/// `+cratonvm.JitCompileDecision#enabled`) and `value` is its right-hand
+/// side; the caller has already split the token on its first `=`.
+///
+/// The event NAME is deliberately **not** validated here: this function has
+/// no event registry to validate against. `Vm::new` checks every name against
+/// the `FlightRecorder`'s own type registry and fails the boot loudly on an
+/// unknown one. See the `-XX:StartFlightRecording` block in
+/// `vm/src/vm/vm_init.rs`.
+pub fn apply_jfr_event_setting(
+    enabled_events: &mut Option<Vec<String>>,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    let body = key.strip_prefix('+').ok_or_else(|| {
+        format!("-XX:StartFlightRecording: event setting `{key}` must start with `+`")
+    })?;
+    let (event, setting) = body.split_once('#').ok_or_else(|| {
+        format!(
+            "-XX:StartFlightRecording: event setting `{key}` is missing `#<setting>` \
+             (expected `+<EventName>#enabled=true`)"
+        )
+    })?;
+    if event.is_empty() {
+        return Err(format!(
+            "-XX:StartFlightRecording: event setting `{key}` names no event \
+             (expected `+<EventName>#enabled=true`)"
+        ));
+    }
+    if setting != "enabled" {
+        return Err(format!(
+            "-XX:StartFlightRecording: event setting `{key}` asks for `#{setting}`, which \
+             CratonVM does not implement; only `#enabled` is accepted \
+             (expected `+{event}#enabled=true`)"
+        ));
+    }
+    let on = match value {
+        "true" => true,
+        "false" => false,
+        other => {
+            return Err(format!(
+                "-XX:StartFlightRecording: `+{event}#enabled=` must be true or false, \
+                 not `{other}`"
+            ))
+        }
+    };
+    let list = enabled_events.get_or_insert_with(Vec::new);
+    if on {
+        if !list.iter().any(|n| n == event) {
+            list.push(event.to_string());
+        }
+    } else {
+        list.retain(|n| n != event);
+    }
+    Ok(())
+}
+
 /// Configuration for the JVM instance.
 ///
 /// Mirrors common JVM `-X` flags and provides defaults suitable for development.
@@ -407,6 +512,9 @@ pub struct VmConfig {
     pub g1_max_gc_pause_ms: Option<u64>,
     /// `-XX:±UseStringDeduplication` — G1 String backing-array dedup.
     pub g1_string_dedup: Option<bool>,
+    /// `-XX:ParallelGCThreads=<n>` — GC worker threads. `None` derives the
+    /// count from the machine (F-13).
+    pub g1_parallel_gc_threads: Option<usize>,
 
     /// Enable compressed object pointers (`-XX:+UseCompressedOops`).
     /// Reduces memory usage by using 32-bit references for heaps < 32 GB.
@@ -559,6 +667,54 @@ pub struct VmConfig {
     /// before this flag existed. See `JfrStartRecordingConfig` and
     /// `vm-cli/src/main.rs`'s parser for the accepted `opts`.
     pub jfr_start_recording: Option<JfrStartRecordingConfig>,
+
+    /// Event names any JFR recording this VM starts must ask for **by name**:
+    /// the command-line equivalent of `jdk.jfr.Recording.enable(...)`.
+    ///
+    /// `None` (the default) means no name filter, so a recording keeps every
+    /// event it sees. That is what every CratonVM recording did before this
+    /// field existed, and it is still what a plain `-XX:StartFlightRecording`
+    /// does. `Some(names)` installs
+    /// `cratonvm_jfr::RecordingSettings::enabled_event_names`, which is a
+    /// **whitelist**: the recording then keeps *only* those names.
+    ///
+    /// ## Why this is not a field on `JfrStartRecordingConfig`
+    ///
+    /// Two reasons, and the second is the load-bearing one:
+    ///
+    ///  1. It is not a knob on one recording's ring or its dump, which is all
+    ///     `JfrStartRecordingConfig` holds. It states which producers this VM
+    ///     is to arm, and it has to be readable by every path that starts a
+    ///     recording: the boot path today, `jcmd JFR.start` if that is ever
+    ///     wired (see the audit block in `runtime/serviceability.rs`), and an
+    ///     embedder that builds a `VmConfig` directly and never sees argv.
+    ///  2. `JfrStartRecordingConfig` is built with **exhaustive** struct
+    ///     literals by out-of-crate targets (`vm/tests/tier1_tests.rs` builds
+    ///     three of them, naming all five fields), so growing it is a
+    ///     source-breaking change for each one. `VmConfig` is only ever built
+    ///     through `Default` plus `..VmConfig::default()`, so growing it is
+    ///     not. Checked across the workspace before choosing.
+    ///
+    /// ## Why naming events NARROWS the recording
+    ///
+    /// Not a preference: a consequence, and worth knowing before adding a
+    /// name to a command line that already works. The producer gate for a
+    /// default-off diagnostic event (`cratonvm.JitCompileDecision`; see
+    /// `jfr/src/jit_decision.rs`) arms only when a *running* recording names
+    /// that event in `enabled_event_names`, and that same set is the drain
+    /// filter. Today's `RecordingSettings` has no way to say "arm this
+    /// producer *and* keep everything else": arming requires the whitelist,
+    /// and the whitelist excludes whatever is not in it. So naming events on
+    /// the command line narrows the recording to exactly those events, in
+    /// exactly the way `Recording.enable(...)` narrows one from Java. The two
+    /// routes agreeing is the property worth having; `Vm::new` prints the
+    /// resulting set at startup so it is never inferred from a thin dump.
+    ///
+    /// Populated from `-XX:StartFlightRecording:+<Event>#enabled=true` (see
+    /// `apply_jfr_event_setting`) and/or the `CRATONVM_JFR_ENABLE_EVENTS`
+    /// environment variable. Unknown names are a hard, loud failure at boot:
+    /// see the `-XX:StartFlightRecording` block in `vm/src/vm/vm_init.rs`.
+    pub jfr_enabled_events: Option<Vec<String>>,
 
     /// Enable container/cgroup support (`-XX:+UseContainerSupport`).
     /// When `true` (default), the JVM reads cgroup v1/v2 limits to
@@ -783,6 +939,7 @@ impl Default for VmConfig {
             gc_algorithm: GcAlgorithm::Generational,
             g1_ihop_percent: None,
             g1_region_size: None,
+            g1_parallel_gc_threads: None,
             g1_max_gc_pause_ms: None,
             g1_string_dedup: None,
             use_compressed_oops: false,
@@ -814,6 +971,7 @@ impl Default for VmConfig {
             heap_dump_on_oom: false,
             heap_dump_path: None,
             jfr_start_recording: None,
+            jfr_enabled_events: None,
             use_container_support: true,
             container_effective_processors: None,
             // JEP 358: default ON to match HotSpot (messages verified

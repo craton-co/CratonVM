@@ -124,6 +124,62 @@
 //!
 //! The VM half is `vm/src/jit/helpers.rs::admit_direct_native_entry`, which is
 //! where the registry's `NativeKind` can actually be read.
+//!
+//! # The String-intrinsic pin was installed at ONE door and its population
+//! # takes another — C1, 2026-09-01
+//!
+//! `jit/src/lib.rs::string_intrinsic_pin_declines` — *a method with a
+//! `java/lang/String` access-intrinsic call site stays on the single-pass
+//! backend, because the optimizing tier silently loses the intrinsic* — was a
+//! term of `try_compile_inner`'s eligibility conjunction and nothing else.
+//! `try_compile_inner` is [`CompileDoor::MethodEntry`], one of the three doors
+//! the table above enumerates. MEASURED on `probes/CharAtWarmShape.java`, one
+//! binary, three arms:
+//!
+//! ```text
+//! arm A  default (pin on)                                314-336 ns/char
+//! arm B  CRATONVM_JIT_NO_STRING_INTRINSIC_PIN=1           66-108 ns/char  ~3x
+//! arm C  pin off + CRATONVM_JIT_IR_STRING_INTRINSICS=0       421 ns/char  (control)
+//!
+//! [cratonvm] JIT String-intrinsic pin: fired=0 blind-no-layout=0
+//!            blind-no-resolver=0 fail-closed=0
+//! [cratonvm-jitc] OSR-compile CharAtWarmShape.scanBig(...)I entry_pc=12
+//! ```
+//!
+//! All four of the pin's counters read zero on the very workload the pin
+//! exists to govern, while the switch that lifts the pin moved that workload
+//! 3x. A counter installed at one door reports zero for traffic through
+//! another, and a zero reads as *correctly inert*. That is how the audit
+//! behind `string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901`
+//! refuted five hypotheses without converging: every one of them was about
+//! which *method* takes the fast shape, and the discriminator was a *door*.
+//!
+//! So the asking moved here, onto the token every door already holds:
+//! [`CompileAdmission::string_intrinsic_pin_declines`]. The DECISION did not
+//! move and did not change — it is still stated once, in `lib.rs`, and arm C
+//! is the control that says it is right (lifting the pin *without* the IR
+//! String emitter is worse than the default, 421 against 336). What is new is
+//! that asking is a per-door fact: [`string_pin_asked`],
+//! [`string_pin_declined`], and the one that would have named this in a single
+//! run, [`string_pin_not_asked`], which [`CompileAdmission`]'s `Drop` charges
+//! to any door that held an admission and never put the question. Per door,
+//! `asked + not-asked == admissions`, so *this door never asks* is a NUMBER
+//! rather than an inference from a zero.
+//!
+//! [`CompileDoor::asks_string_intrinsic_pin`] is the same fact with the
+//! compiler as its reader, for the reason [`CompileDoor::builds_direct_calls`]
+//! gives: a fourth door has to answer it before the crate builds.
+//!
+//! One thing a reader of the counters must know about today's answers. All
+//! three doors ask as of 2026-09-01, but at the OSR and eager-first-call doors
+//! the pin's decision is, today, *vacuous*: both reach
+//! `x64::compile_with_param_slots` (the single-pass backend) unconditionally
+//! and have no route to the optimizing tier at all, so "keep this method off
+//! the optimizing tier" is already true there. That is incidental correctness
+//! of exactly the kind [`CompileDoor::builds_direct_calls`] refuses to leave
+//! in a doc sentence — it is a property of today's topology, not of the door —
+//! and it is why the counter is `not-asked` rather than a claim that the
+//! answer would have been the same.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -200,6 +256,51 @@ impl CompileDoor {
             CompileDoor::EagerFirstCall => true,
             // `direct_calls2` — eleven push sites, five of them `bridge` rows.
             // The door H12-1 measured binding in strict mode.
+            CompileDoor::Osr => true,
+        }
+    }
+
+    /// Whether this door asks the String-intrinsic pin
+    /// ([`CompileAdmission::string_intrinsic_pin_declines`]) before it reaches
+    /// the backend.
+    ///
+    /// # Why this is a `match` and not a doc sentence — C1, 2026-09-01
+    ///
+    /// The same reason [`builds_direct_calls`] is one, and the same failure a
+    /// second time. The pin lived in `try_compile_inner`'s conjunction, so
+    /// exactly one door asked it; the population that motivated it is compiled
+    /// through another; and the instrument that should have said so — four
+    /// process-global counters — read `fired=0`, which is indistinguishable
+    /// from *there was nothing to pin*. See the module doc for the three-arm
+    /// measurement.
+    ///
+    /// Today `MethodEntry` is the only `true`. The other two are `false` and
+    /// are COUNTED as such by [`string_pin_not_asked`] rather than assumed
+    /// harmless: a `false` here is a statement about what the door does, not a
+    /// claim that its answer would not have mattered.
+    ///
+    /// [`builds_direct_calls`]: CompileDoor::builds_direct_calls
+    pub const fn asks_string_intrinsic_pin(self) -> bool {
+        match self {
+            // `try_compile_inner`'s eligibility conjunction, through the
+            // admission token.
+            CompileDoor::MethodEntry => true,
+            // `vm/src/runtime/interpreter.rs` — reaches
+            // `x64::compile_with_param_slots` directly, and ASKS as of
+            // 2026-09-01. It passes the same `string_layout: None` the backend
+            // call below it passes, so the answer is always `BlindNoLayout` —
+            // fail OPEN, and counted. Deliberate: without a layout the
+            // single-pass backend emits no intrinsic either, so pinning would
+            // cost a C2 body and buy nothing, and `BlindNoLayout` is the arm
+            // that says so. `BlindNoResolver` would not.
+            CompileDoor::EagerFirstCall => true,
+            // `vm/src/runtime/interpreter/jit_bridge.rs` — reaches
+            // `x64::compile_with_param_slots` directly. It resolves a
+            // `java/lang/String` field layout (`osr_string_layout`) and walks
+            // the constant pool per invoke site, so it supplies BOTH of the
+            // pin's inputs and can reach `Pinned`, not merely a blind arm. It
+            // asks as of 2026-09-01; before that it never had been, which is
+            // exactly why `fired=0` on the probe the pin exists for.
             CompileDoor::Osr => true,
         }
     }
@@ -319,6 +420,16 @@ static UNGATED_BACKEND_ENTRIES: AtomicU64 = AtomicU64::new(0);
 /// never declared a [`DirectCallPolicy`]. See [`undeclared_direct_bind_rows`].
 static UNDECLARED_DIRECT_BIND_ROWS: [AtomicU64; 3] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// Compilations at which this door put the String-intrinsic pin's question.
+/// See [`string_pin_asked`] and the module doc's "installed at ONE door".
+static STRING_PIN_ASKED: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// Compilations at which the pin, asked through this door, said *pin it*.
+static STRING_PIN_DECLINED: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// Compilations this door held an admission for and never asked the pin at
+/// all. Charged by [`CompileAdmission`]'s `Drop`, so no door has to remember.
+static STRING_PIN_NOT_ASKED: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 thread_local! {
     /// Depth of open admissions on this thread. A count rather than a flag
@@ -349,6 +460,17 @@ pub struct CompileAdmission {
     /// check. Relaxed throughout — the value is written and read by the one
     /// thread that owns the compilation.
     direct_call_policy: std::sync::atomic::AtomicU8,
+    /// Whether this compilation ever put the String-intrinsic pin's question —
+    /// see [`CompileAdmission::string_intrinsic_pin_declines`].
+    ///
+    /// An atomic behind `&self` for the same reason `direct_call_policy` above
+    /// is one: a `Cell` would make `CompileAdmission` `!Sync`, and the token is
+    /// held across a whole compilation. Relaxed throughout; written and read by
+    /// the one thread that owns the compilation.
+    ///
+    /// Read exactly once more, in `Drop`, which is what makes "never asked" a
+    /// count nobody has to remember to take.
+    string_pin_asked: std::sync::atomic::AtomicBool,
 }
 
 const DIRECT_POLICY_UNDECLARED: u8 = 0;
@@ -439,6 +561,76 @@ impl CompileAdmission {
         }
     }
 
+    /// Must this compilation keep the method on the backend that HAS the
+    /// `java/lang/String` access intrinsic? `true` = do not promote it to the
+    /// optimizing tier.
+    ///
+    /// # The decision is `lib.rs`'s; only the asking is here — C1, 2026-09-01
+    ///
+    /// This forwards, unchanged, to `crate::string_intrinsic_pin_declines`,
+    /// which is where the rule and its three-way "the input was missing"
+    /// treatment are stated once. Nothing about WHAT the pin decides moved:
+    /// arm C of the module doc's measurement is the control that says the
+    /// decision is right, and a rewrite would have voided it.
+    ///
+    /// What moved is WHERE it is asked. The pin used to be a bare call inside
+    /// `try_compile_inner`, i.e. at [`CompileDoor::MethodEntry`] and nowhere
+    /// else, and its four census counters therefore reported `0` on a workload
+    /// compiled through the OSR door — see the module doc. The admission token
+    /// is the one object all three doors already hold, so a door that wants the
+    /// pin's answer can now get it without a fourth hand-copied subset of
+    /// `try_compile_inner`, which is the failure this whole module exists for.
+    ///
+    /// # A door that cannot supply the inputs
+    ///
+    /// Pass what you have, including `None`. The two missing-input cases are
+    /// decided DIFFERENTLY and deliberately, by the same function as before:
+    ///
+    ///   * no constant-pool invoke resolver, layout present — FAIL CLOSED
+    ///     (`true`, keep the method on the backend with the intrinsic), because
+    ///     that is a missing input at one door and not evidence about the
+    ///     method;
+    ///   * no `java/lang/String` field layout — fail OPEN (`false`), because
+    ///     without one the single-pass backend emits no intrinsic either, so
+    ///     pinning would cost a C2 body and buy nothing.
+    ///
+    /// Both are counted by the global census (`blind-no-resolver`,
+    /// `blind-no-layout`, `fail-closed`) and both count as ASKED here, so a
+    /// blind door is visible as a door that asked rather than as a door that
+    /// did not.
+    ///
+    /// # Counting
+    ///
+    /// The first ask on a token bumps [`string_pin_asked`] for its door, so
+    /// `asked + not-asked == admissions` per door even if a door asks twice.
+    /// A `true` additionally bumps [`string_pin_declined`]. Not asking at all
+    /// is charged in `Drop`.
+    pub fn string_intrinsic_pin_declines(
+        &self,
+        invoke_ops: &[(usize, u16, u8)],
+        cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
+        layout: Option<crate::StringFieldLayout>,
+    ) -> bool {
+        let first_ask = !self
+            .string_pin_asked
+            .swap(true, std::sync::atomic::Ordering::Relaxed);
+        if first_ask {
+            STRING_PIN_ASKED[self.door.index()].fetch_add(1, Ordering::Relaxed);
+        }
+        let declines = crate::string_intrinsic_pin_declines(invoke_ops, cp_invoke_resolver, layout);
+        if declines {
+            STRING_PIN_DECLINED[self.door.index()].fetch_add(1, Ordering::Relaxed);
+        }
+        declines
+    }
+
+    /// Whether this compilation has already asked the pin. Test support and
+    /// diagnostics; the counters above are what a run reports.
+    pub fn string_intrinsic_pin_was_asked(&self) -> bool {
+        self.string_pin_asked
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// A token for a **test** that drives the backend directly.
     ///
     /// `x64::compile_with_param_slots` takes `&CompileAdmission`, which is what
@@ -466,6 +658,7 @@ impl CompileAdmission {
             // would be. Same reasoning as `opened_scope: false`: the escape
             // hatch must not launder anything.
             direct_call_policy: std::sync::atomic::AtomicU8::new(DIRECT_POLICY_UNDECLARED),
+            string_pin_asked: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -473,6 +666,23 @@ impl CompileAdmission {
 impl Drop for CompileAdmission {
     fn drop(&mut self) {
         if self.opened_scope {
+            // C1: charge the door that never put the String-intrinsic pin's
+            // question. Doing it HERE rather than at the doors is the whole
+            // point — a door that has not been taught to ask has, by
+            // definition, no line of code in which to record that it did not.
+            // The one thing every door does do is drop this token.
+            //
+            // Gated on `opened_scope` so `for_backend_test` cannot move it:
+            // that keeps `asked + not-asked == admissions` an exact identity
+            // per door, which is the property that makes the census readable.
+            // (`opened_scope` is false only for that hatch, whose own doc
+            // explains why it must not look like a real admission.)
+            if !self
+                .string_pin_asked
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                STRING_PIN_NOT_ASKED[self.door.index()].fetch_add(1, Ordering::Relaxed);
+            }
             OPEN_ADMISSIONS.with(|c| c.set(c.get().saturating_sub(1)));
         }
     }
@@ -560,6 +770,9 @@ pub fn admit(
         // not own and could not build. H20-1 §6 specifies that change as O1;
         // this field is the half that could land green.
         direct_call_policy: std::sync::atomic::AtomicU8::new(DIRECT_POLICY_UNDECLARED),
+        // Not asked until a door asks. `Drop` turns a token that is still
+        // `false` here into a `string_pin_not_asked` for this door.
+        string_pin_asked: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -608,6 +821,43 @@ pub fn undeclared_direct_bind_rows(door: CompileDoor) -> u64 {
     UNDECLARED_DIRECT_BIND_ROWS[door.index()].load(Ordering::Relaxed)
 }
 
+/// Compilations at which `door` asked the String-intrinsic pin.
+///
+/// Read beside [`string_pin_not_asked`] and [`admissions`] for the same door;
+/// the three partition exactly (`asked + not-asked == admissions`). A door
+/// whose `asked` is `0` has not been taught the question, and every
+/// process-global pin counter is blind to everything that door compiled —
+/// which is the reading `fired=0` on `probes/CharAtWarmShape.java` was, and
+/// which nothing in the tree could produce before.
+pub fn string_pin_asked(door: CompileDoor) -> u64 {
+    STRING_PIN_ASKED[door.index()].load(Ordering::Relaxed)
+}
+
+/// Compilations at which the pin, asked through `door`, kept the method off
+/// the optimizing tier.
+///
+/// The per-door half of the census's global `fired`. A zero here means one of
+/// two things and [`string_pin_asked`] separates them: `asked > 0` says the
+/// pin looked and found nothing to pin, `asked == 0` says it was never
+/// consulted at this door at all.
+pub fn string_pin_declined(door: CompileDoor) -> u64 {
+    STRING_PIN_DECLINED[door.index()].load(Ordering::Relaxed)
+}
+
+/// Compilations `door` was admitted for and never asked the pin about.
+///
+/// **The counter this lane exists for.** `fired=0` was read as "the pin is
+/// correctly inert" when it meant "the traffic went through a door that never
+/// asks"; those two are now different numbers. Expected to be the whole of the
+/// OSR and eager-first-call rows until those doors are taught to ask (they are
+/// in `vm/**`), and expected to fall at [`CompileDoor::MethodEntry`] to just
+/// those compiles whose eligibility conjunction short-circuits before the pin
+/// term — which is itself worth seeing, because a short-circuit is the other
+/// way a pin term produces no census at all.
+pub fn string_pin_not_asked(door: CompileDoor) -> u64 {
+    STRING_PIN_NOT_ASKED[door.index()].load(Ordering::Relaxed)
+}
+
 /// Compiles admitted through `door`.
 pub fn admissions(door: CompileDoor) -> u64 {
     ADMISSIONS[door.index()].load(Ordering::Relaxed)
@@ -647,6 +897,9 @@ pub(crate) fn reset_for_test() {
         ADMISSIONS[d.index()].store(0, Ordering::Relaxed);
         REFUSALS[d.index()].store(0, Ordering::Relaxed);
         UNDECLARED_DIRECT_BIND_ROWS[d.index()].store(0, Ordering::Relaxed);
+        STRING_PIN_ASKED[d.index()].store(0, Ordering::Relaxed);
+        STRING_PIN_DECLINED[d.index()].store(0, Ordering::Relaxed);
+        STRING_PIN_NOT_ASKED[d.index()].store(0, Ordering::Relaxed);
     }
     UNGATED_BACKEND_ENTRIES.store(0, Ordering::Relaxed);
 }
@@ -929,6 +1182,81 @@ mod tests {
             CompileDoor::ALL.len(),
             "three doors, three distinct ladders — H12-2 1a's third reason a \
              grep could not produce the bind matrix"
+        );
+    }
+
+    /// A door that never asks the String-intrinsic pin is COUNTED, by the
+    /// token's `Drop`, against that door.
+    ///
+    /// This is the whole instrument. `fired=0` on the workload the pin governs
+    /// was read as "correctly inert" and meant "compiled through a door that
+    /// never asks"; nothing in the tree could tell those apart. Written as an
+    /// explicit asked/not-asked pair for the reason
+    /// `the_ungated_witness_fires_only_without_a_token` gives: a counter that
+    /// never moves and one that always moves both read as a zero from outside.
+    #[test]
+    fn a_door_that_never_asks_the_string_pin_is_counted() {
+        let _guard = COUNTER_LOCK.lock();
+        let before_asked = string_pin_asked(CompileDoor::Osr);
+        let before_not = string_pin_not_asked(CompileDoor::Osr);
+
+        // A door that holds an admission and never puts the question.
+        drop(admit(&unique("pin-silent"), "m", "()V", CompileDoor::Osr).expect("admits"));
+        assert_eq!(string_pin_asked(CompileDoor::Osr), before_asked);
+        assert_eq!(
+            string_pin_not_asked(CompileDoor::Osr),
+            before_not + 1,
+            "a door that reached the backend without asking the pin must be a number"
+        );
+
+        // A door that asks. `invoke_ops` empty is the pin's `NoSite` — no
+        // `invokevirtual`/`invokeinterface` could ever have been intrinsified —
+        // so this asserts the ASKING, which is the fact the census was missing,
+        // without depending on any env var or on a resolved String layout.
+        let a = admit(&unique("pin-asks"), "m", "()V", CompileDoor::Osr).expect("admits");
+        assert!(!a.string_intrinsic_pin_was_asked());
+        assert!(!a.string_intrinsic_pin_declines(&[], None, None));
+        assert!(a.string_intrinsic_pin_was_asked());
+        assert_eq!(string_pin_asked(CompileDoor::Osr), before_asked + 1);
+        // Asking twice must not double the ask count, or the partition
+        // `asked + not-asked == admissions` stops holding.
+        assert!(!a.string_intrinsic_pin_declines(&[], None, None));
+        assert_eq!(string_pin_asked(CompileDoor::Osr), before_asked + 1);
+        drop(a);
+        assert_eq!(
+            string_pin_not_asked(CompileDoor::Osr),
+            before_not + 1,
+            "a door that DID ask must not also be charged as silent"
+        );
+    }
+
+    /// Every door answers whether it asks the pin, and today exactly one does.
+    ///
+    /// The point is not the answers but that `asks_string_intrinsic_pin` is an
+    /// exhaustive `match`: a fourth door cannot be added without answering it.
+    /// Same shape, and the same reason, as
+    /// `every_door_answers_the_direct_call_question` above — that one was
+    /// written after a door bound a helper nobody knew it bound; this one after
+    /// a door compiled a whole population the pin never saw.
+    #[test]
+    fn every_door_asks_the_string_intrinsic_pin() {
+        let asking: Vec<&str> = CompileDoor::ALL
+            .iter()
+            .filter(|d| d.asks_string_intrinsic_pin())
+            .map(|d| d.label())
+            .collect();
+        assert_eq!(
+            asking.len(),
+            CompileDoor::ALL.len(),
+            "a door stopped asking the String-intrinsic pin. This test was once \
+             `exactly_one_door_asks_the_string_intrinsic_pin_today` and asserted \
+             the OPPOSITE, because for a while exactly one door did: the pin \
+             lived in `try_compile_inner`, which only `MethodEntry` reaches, and \
+             the population that motivated the pin took the OSR door. That cost \
+             five refuted hypotheses and was visible only as `fired=0` on the \
+             very probe the pin exists for. If you are removing a door from this \
+             set, the burden is to say why the counter it stops producing is not \
+             the one somebody needs next. Asking: {asking:?}"
         );
     }
 

@@ -6177,12 +6177,66 @@ pub fn native_al_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(Some(old))
 }
 
+/// Is `this` one of the JDK's IMMUTABLE stand-in classes, for which a
+/// structural mutator must raise `UnsupportedOperationException`?
+///
+/// In real-JDK mode these receivers carry real bytecode — `Collections$EmptyList`
+/// inherits `AbstractList.add`, which throws — so nothing here is consulted. In
+/// `--synthetic-jdk` there is no bytecode, the interface-registered natives
+/// serve the call instead, and they mutated happily. Measured 2026-09-02 with
+/// `apps/probes/EmptySingletonImmutable`:
+///
+/// ```text
+///     Collections.emptyList().add("x")        SUCCEEDED   (HotSpot: UOE)
+///     Collections.emptyMap().put("k","v")     SUCCEEDED   (HotSpot: UOE)
+///     Collections.singletonList("a").add("x") SUCCEEDED   (HotSpot: UOE)
+///     Arrays.asList("a","b").add("x")         SUCCEEDED   (HotSpot: UOE)
+/// ```
+///
+/// `List.of` / `Set.of` / `Map.of` / `unmodifiable*` were already correct in
+/// every mode: they carry the `cratonvm/internal/Unmodifiable*` stamp, whose
+/// own natives refuse. These seven are the ones minted under a JDK class name
+/// with no such stamp.
+///
+/// **Structural mutators only.** `Arrays$ArrayList` is fixed-SIZE, not
+/// immutable: `add`/`remove` throw on HotSpot and `set` is legal and writes
+/// through to the backing array. That is why this is consulted from `add` and
+/// `put` rather than from a blanket "any write" check — a guard that also
+/// refused `set` would break `Arrays.asList(a).set(0, x)`, which is the
+/// idiomatic reason to call `asList` at all.
+fn is_immutable_jdk_stand_in(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let Some(name) = ctx.class_name_of_id(ctx.class_id_of_object(this)) else {
+        return false;
+    };
+    matches!(
+        &*name,
+        "java/util/Collections$EmptyList"
+            | "java/util/Collections$EmptySet"
+            | "java/util/Collections$EmptyMap"
+            | "java/util/Collections$SingletonList"
+            | "java/util/Collections$SingletonSet"
+            | "java/util/Collections$SingletonMap"
+            | "java/util/Arrays$ArrayList"
+    )
+}
+
 pub fn native_al_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // An immutable JDK stand-in refuses structurally — see
+    // `is_immutable_jdk_stand_in` for the measurement and for why `set` is not
+    // guarded alongside `add`.
+    if is_immutable_jdk_stand_in(ctx, this) {
+        return Err(
+            cratonvm_types::error::RuntimeError::UnsupportedOperationException {
+                message: String::new(),
+            }
+            .into(),
+        );
+    }
     // A `values()` / TreeMap-`entrySet()` view is an `ArrayList` here, but it is
     // not addable. `Map.values`: "The collection supports element removal ... It
     // does not support the `add` or `addAll` operations"; the JDK's
@@ -9664,6 +9718,102 @@ fn map_buckets_slot(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     receiver_table_slot(ctx, this).unwrap_or(MAP_FIELD_BUCKETS)
 }
 
+/// Write the JVMS §2.3 default — `null`, WRITTEN — into the reference-typed
+/// fields of a map object THIS CRATE allocated itself, so a slot that is
+/// legitimately empty until first use reads back as `null` and not as `Int(0)`.
+///
+/// # This is the whole of the 2026-09-01 descriptor-coercion census row
+///
+/// A stock `cratonvm Hello` reported `total=2740
+/// primitive-into-reference[read=2740]`, all 2740 of them at ONE locator
+/// (`class_id=64 index=2 descriptor=[`) — `java.util.HashMap.table`, read by
+/// [`map_state`] through [`map_buckets_slot`] on the `HashSet.add` boot path.
+/// The access-kind breakdown is the finding, and it is easy to read past:
+/// `read=2740`, **`store=0`**. Not one `set_field` in this crate — or anywhere
+/// else in the VM on that path — ever wrote a primitive at that slot. What put
+/// the `Int(0)` there was the ALLOCATOR.
+///
+/// `Value::Object` carries a `NonNull` niche, so the all-zero cell
+/// `alloc_zeroed` leaves decodes as `Value::Int(0)` and NOT as
+/// `Value::Object(None)`. `gc::heap::alloc_object_with_descriptors` and
+/// `interpreter::gc_and_alloc::init_primitive_fields` both exist to write the
+/// defaults explicitly for exactly that reason, and the test
+/// `zero_memory_does_not_decode_as_null_which_is_why_the_write_exists` pins it.
+/// The interpreter's `new` opcode goes through `init_primitive_fields`; the
+/// `NativeContext::alloc_object` this crate calls goes through neither. So a
+/// map a JAVA constructor allocates has a real `null` at `table` and is silent,
+/// while the backing map [`alloc_hs_backing`] allocates for every `HashSet` has
+/// `Int(0)` there and is counted on every read until the first insert publishes
+/// an array.
+///
+/// # Why this is a repair and not a way to quiet the census
+///
+/// The guard is RIGHT that a primitive is sitting in a reference slot; it is
+/// only wrong about who wrote it. Filling the slot with a fabricated array to
+/// make the number go down would be the anti-pattern this tree has been bitten
+/// by — a loud, counted coercion traded for a silent wrong answer. Leaving the
+/// slot empty is correct; this makes "empty" spell itself the way the JVMS
+/// spells it.
+///
+/// # Java-visible behaviour is unchanged, by construction
+///
+/// `coerce_field_value_for_slot` answers a `b'L' | b'['` descriptor with
+/// `Object(None)` for `Int(0)` and with `Object(None)` for `Object(None)`. So
+/// every descriptor-aware reader — `get_field`, `get_field_volatile`,
+/// `get_field_typed`, `compare_and_swap_field`, and the interpreter's own
+/// `getfield` — sees the byte-identical `Value` before and after this write.
+/// The readers that DO differ are the non-coercing ones (`get_field_raw`,
+/// `Object.clone`'s verbatim field copy, the JIT's direct cell reads), and for
+/// those `Int(0)` at a reference slot was the wrong answer and `null` is the
+/// right one. There is no arm on which the old value is preferable, which is
+/// why this is not behind a kill switch: there would be nothing to A/B.
+///
+/// # Scope, and the fabricated-layout early return
+///
+/// Names resolved on the RECEIVER — the same question [`receiver_table_slot`]
+/// asks, through the same call — and only for a receiver that HAS a real
+/// `table` field. A fabricated layout (`cratonvm/synthetic/AnonymousObject$N`,
+/// the bare `ClassId(0)` CHM segments) returns early, and that is load-bearing:
+/// its `_fN` slots have no declared descriptor, the coercion's `_ => value` arm
+/// passes them through untouched, and this file deliberately keeps
+/// `Int(capacity)` at `MAP_FIELD_CAPACITY` and `Int(size)` at `MAP_FIELD_SIZE`
+/// in two of them. Writing `null` there would delete live state. The early
+/// return is the same discriminator [`publish_map_table_inner`] already uses to
+/// decide whether the legacy capacity `Int` may be stored at all.
+///
+/// The four names are the reference-typed instance fields every map this crate
+/// allocates carries: `AbstractMap.keySet`, `AbstractMap.values`,
+/// `HashMap.table`, `HashMap.entrySet`. `LinkedHashMap.head`/`tail` are
+/// deliberately NOT in the list — they are references too, but a name that a
+/// shadowing subclass could have redeclared as an `int` would turn one census
+/// row (`primitive-into-reference`) into another (`null-into-primitive`)
+/// instead of removing one, and no reader in this file consults them before a
+/// writer has.
+///
+/// Cost: four `resolve_field_index_by_class_id` per map ALLOCATION — not per
+/// operation — on a path that already spends an `ensure_class_initialized`, a
+/// `class_num_total_fields`, and four more name resolutions in the initializer
+/// that runs immediately after. Not a GC point: `set_field` only runs the write
+/// barrier, which never allocates from the Java heap (see [`publish_map_table`]
+/// for the same note), so no caller needs a pin around this call.
+fn init_native_map_reference_defaults(ctx: &mut dyn NativeContext, map: ObjectRef) {
+    if receiver_table_slot(ctx, map).is_none() {
+        // Fabricated layout — see the doc comment above. Nothing here is a
+        // reference field by DECLARATION, so there is no default to write, and
+        // writing one would clobber the model's `Int` slots.
+        return;
+    }
+    let class_id = ctx.class_id_of_object(map);
+    let num_fields = ctx.object_num_fields(map);
+    for name in ["table", "entrySet", "keySet", "values"] {
+        if let Some(slot) = ctx.resolve_field_index_by_class_id(class_id, name) {
+            if slot < num_fields {
+                ctx.set_field(map, slot, Value::Object(None));
+            }
+        }
+    }
+}
+
 /// Publish a freshly built bucket table on `map`, honouring both storage
 /// conventions this crate maintains:
 ///
@@ -12575,6 +12725,19 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     //
     // Deliberately here rather than inside `native_map_put_evict`: the `evict`
     // flag is `LinkedHashMap.removeEldestEntry`'s, and a TreeMap has no eldest.
+    // An immutable JDK stand-in (`Collections$EmptyMap`, `$SingletonMap`)
+    // refuses — see `is_immutable_jdk_stand_in`. Ahead of the TreeMap route
+    // because neither of those is a TreeMap and the refusal is unconditional.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if is_immutable_jdk_stand_in(ctx, *this) {
+            return Err(
+                cratonvm_types::error::RuntimeError::UnsupportedOperationException {
+                    message: String::new(),
+                }
+                .into(),
+            );
+        }
+    }
     if let Some(Value::Object(Some(this))) = args.first() {
         if is_tree_map_receiver(ctx, *this) {
             return native_tm_put(ctx, args);
@@ -18199,6 +18362,11 @@ pub fn make_hashset_with_elements(
         let buckets = alloc_ref_array(ctx, cap);
         let pin_base = ctx.pin_native_root(buckets);
         let backing_map = ctx.alloc_object(hashmap_class_id, map_n_fields);
+        // JVMS §2.3 defaults — see [`init_native_map_reference_defaults`]. This
+        // branch already writes `entrySet` explicitly and overwrites `table`
+        // two lines down; `keySet`/`values` are the slots that were left holding
+        // `Int(0)`. Not a GC point, so the pin re-read below is unaffected.
+        init_native_map_reference_defaults(ctx, backing_map);
         let buckets = ctx.read_native_pin(pin_base, buckets);
         ctx.set_field(backing_map, f_table, Value::Object(Some(buckets)));
         ctx.set_field(backing_map, f_size, Value::Int(0));
@@ -19055,7 +19223,16 @@ fn alloc_backing_map(ctx: &mut dyn NativeContext) -> ObjectRef {
     };
     let total = ctx.class_num_total_fields(cid);
     let n = std::cmp::max(total, MAP_NUM_FIELDS);
-    ctx.alloc_object(cid, n)
+    let m = ctx.alloc_object(cid, n);
+    // JVMS §2.3 defaults for the reference slots. `NativeContext::alloc_object`
+    // zero-fills and stops there, and a zeroed cell decodes as `Int(0)`, not as
+    // `null` — so without this every reference field of this map reads back as a
+    // primitive. `table` is the one a caller then reads on EVERY map operation
+    // until the first insert publishes an array, and it was the whole of the
+    // 2,740-hit descriptor-coercion census row. See
+    // [`init_native_map_reference_defaults`].
+    init_native_map_reference_defaults(ctx, m);
+    m
 }
 
 /// `true` for Set classes whose iteration must preserve *insertion* order
@@ -19088,6 +19265,14 @@ fn alloc_hs_backing(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) ->
         let total = ctx.class_num_total_fields(cid);
         let n = std::cmp::max(total, MAP_NUM_FIELDS);
         let m = ctx.alloc_object(cid, n);
+        // JVMS §2.3 defaults, before anything can read them — see
+        // [`init_native_map_reference_defaults`]. This is the insertion-ordered
+        // twin of the `alloc_backing_map` arm below and has the same defect:
+        // `lhm_init_with_cap_lazy` deliberately leaves `table` unallocated, so
+        // without an explicit `null` the slot reads back `Int(0)` for the whole
+        // life of an empty `LinkedHashSet`. Not a GC point, so it sits outside
+        // the pin below.
+        init_native_map_reference_defaults(ctx, m);
         // The freshly allocated backing map is referenced ONLY by this local
         // until the caller stores it into the set's `map` field. Pin it across
         // the initializer (which allocates the bucket table): a moving cycle
@@ -23366,7 +23551,14 @@ fn native_collections_empty_list(ctx: &mut dyn NativeContext, _args: &[Value]) -
     if let Some(v) = collections_empty_singleton(ctx, "EMPTY_LIST") {
         return Ok(Some(v));
     }
-    // Fallback (field not yet initialised): fresh synthetic empty list.
+    // See `native_collections_empty_map` for why this precedes the synthetic:
+    // the sibling `native_collections_singleton_list` just below already does
+    // it, which is why `singletonList` reported the right class in
+    // `--synthetic-jdk` while `emptyList` reported `java.util.ArrayList`.
+    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$EmptyList") {
+        return Ok(Some(Value::Object(Some(o))));
+    }
+    // Last resort: fresh synthetic empty list.
     let __al_n_fields = al_slots(ctx).2;
     let list = try_alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields)?;
     let arr = alloc_ref_array(ctx, 0);
@@ -43985,6 +44177,10 @@ fn alloc_linked_hash_map(ctx: &mut dyn NativeContext) -> ObjectRef {
     let total = ctx.class_num_total_fields(cid);
     let n = std::cmp::max(total, MAP_NUM_FIELDS);
     let m = ctx.alloc_object(cid, n);
+    // JVMS §2.3 defaults — see [`init_native_map_reference_defaults`]. The
+    // initializer below is EAGER, so `table` is overwritten with a real array
+    // one line later; `keySet`/`values`/`entrySet` are the slots this rescues.
+    init_native_map_reference_defaults(ctx, m);
     lhm_init_with_cap(ctx, m, MAP_DEFAULT_CAPACITY);
     m
 }
@@ -67103,7 +67299,31 @@ fn native_collections_empty_map(ctx: &mut dyn NativeContext, _args: &[Value]) ->
     if let Some(v) = collections_empty_singleton(ctx, "EMPTY_MAP") {
         return Ok(Some(v));
     }
-    // Fallback (field not yet initialised): fresh synthetic empty map.
+    // `alloc_real_jdk` FIRST, exactly as `native_collections_singleton_list`
+    // does one screen up, and for the same reason: it resolves the class the
+    // JDK would have returned in BOTH modes — real-JDK from the image, and
+    // `--synthetic-jdk` from `class_manager`'s fabrication tables, which carry
+    // `Collections$Empty*` field shapes and interface rows already. Only the
+    // static-field cache above is real-JDK-only.
+    //
+    // Without it this fallback minted an ordinary mutable synthetic, so in
+    // `--synthetic-jdk` (measured 2026-09-02, `apps/probes/EmptySingletonImmutable`):
+    //
+    //     Collections.emptyList()  class=java.util.ArrayList
+    //                              instanceof ArrayList = true
+    //                              add("x") = SUCCEEDED
+    //
+    // The `add` is the defect. `ensure_collections_empty_singletons` above
+    // records what a mutable empty singleton cost the last time one shipped —
+    // kotlin-reflect's shaded protobuf tests `instanceof ArrayList` to decide
+    // whether to replace its `emptyList()` placeholder, skipped the
+    // replacement, and mutated the shared object. Here each call happens to
+    // mint a FRESH list, so the write is not shared — it is silently DISCARDED
+    // instead, which is the same class of wrong answer with a quieter failure.
+    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$EmptyMap") {
+        return Ok(Some(Value::Object(Some(o))));
+    }
+    // Last resort: fresh synthetic empty map.
     let map = alloc_backing_map(ctx);
     map_init_eager(ctx, &[Value::Object(Some(map))])?;
     Ok(Some(Value::Object(Some(map))))
@@ -67113,7 +67333,11 @@ fn native_collections_empty_set(ctx: &mut dyn NativeContext, _args: &[Value]) ->
     if let Some(v) = collections_empty_singleton(ctx, "EMPTY_SET") {
         return Ok(Some(v));
     }
-    // Fallback (field not yet initialised): fresh synthetic empty set.
+    // See `native_collections_empty_map` for why this precedes the synthetic.
+    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$EmptySet") {
+        return Ok(Some(Value::Object(Some(o))));
+    }
+    // Last resort: fresh synthetic empty set.
     let set = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
     let inner_map = alloc_backing_map(ctx);
     map_init_eager(ctx, &[Value::Object(Some(inner_map))])?;
@@ -71690,12 +71914,76 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         native_cf_any_of,
     );
 
-    // complete — needed because the real CompletableFuture.complete(null) relies on
-    // the static `NIL` AltResult sentinel, which is effectively null on CratonVM, so
-    // `complete(null)` leaves `result == null` (isDone() stays false). That breaks
-    // e.g. KafkaFuture.allOf(...) whose result is completed with `complete(null)`,
-    // leaving it pending forever (get() hangs).
-    r.register(cf, "complete", "(Ljava/lang/Object;)Z", native_cf_complete);
+    // complete — registered because the real CompletableFuture.complete(null)
+    // relies on the static `NIL` AltResult sentinel, which WAS effectively null
+    // on CratonVM, so `complete(null)` left `result == null` (isDone() stayed
+    // false). That broke e.g. KafkaFuture.allOf(...) whose result is completed
+    // with `complete(null)`, leaving it pending forever (get() hangs).
+    //
+    // **The premise is stale AND the registration is still right.** Both halves
+    // were measured on 2026-09-02, and the second is the surprising one.
+    //
+    // The premise first. Reading the field directly through
+    // `--add-opens java.base/java.util.concurrent`:
+    //
+    //     HotSpot   NIL = java.util.concurrent.CompletableFuture$AltResult@...  NIL.ex = null
+    //     CratonVM  NIL = java.util.concurrent.CompletableFuture$AltResult@4c3  NIL.ex = null
+    //
+    // `NIL` is a proper `AltResult` here now, and with this registration OFF
+    // the real bytecode answers `complete(null) -> true, isDone=true,
+    // get=null` and `allOf(...)` completes — identical to HotSpot. So the hang
+    // this bridge was written to prevent does not reproduce, and "it shadows
+    // real bytecode for a reason that has expired" is a fair reading of it.
+    //
+    // It is still the wrong conclusion. `CompletableFuture` composition is
+    // ~20x HotSpot and this native is 2.50 crossings per chain, which makes it
+    // look exactly like `AtomicReference.compareAndSet`'s synthetic stub —
+    // de-registered on 2026-08-29 for a 1.6x win, on the argument that a stub
+    // over one line of real JDK bytecode is a pure tax. MEASURED here, one
+    // binary, this switch the only difference, six interleaved reps,
+    // `HibfixComposeProbe2` 2 threads x 320 000 chains, load 14-22:
+    //
+    //     registered (default)   20.64-23.55 s cpu   (median 22.16)   34.6 us/chain
+    //     de-registered          66.56-70.49 s cpu   (median 69.52)  108.6 us/chain
+    //
+    // **3.14x SLOWER with the bridge gone**, ranges disjoint, `wrong=0` in all
+    // twelve runs. The native census says why, and it is not "the bytecode is
+    // slow" — the crossing does not disappear, it MULTIPLIES (80 000 chains):
+    //
+    //     CompletableFuture.complete        200 000 ->       0
+    //     CompletableFuture.completeValue         0 -> 200 000   (itself a registered native)
+    //     Unsafe.compareAndSetInt               619 -> 200 000   (+2.5/chain)
+    //     Object.<init>                       2 882 -> 122 174   (+1.5/chain)
+    //
+    // The real `complete` is `completeValue(value)` — which is ANOTHER
+    // registered native, so the boundary is crossed anyway — plus the CAS and
+    // the `AltResult`/`Completion` allocation that this one collapses. This
+    // bridge is not a shadow in front of cheap bytecode; it is a fast path in
+    // front of three more boundary crossings and an allocation.
+    //
+    // The switch is kept because that is a strong claim and it should stay
+    // one run away from being re-checked, not one BUILD away: the "synthetic
+    // stub over a real JDK method is a pure tax" pattern is real, it has paid
+    // out before, and the next person to notice 2.50 crossings per chain here
+    // will reach for it. **Do not flip this default.** If it is ever flipped,
+    // the number above is what has to move first.
+    //
+    // Note also that a class-scoped retirement is the wrong instrument for
+    // this cluster even if the per-triple answer were the other way: this
+    // native serves a SYNTHETIC CompletableFuture too (an Int `done` marker at
+    // slot 1 instead of the real `stack` reference), and retiring a cluster
+    // wholesale is the shape that once left `ConcurrentHashMap` with a retired
+    // constructor and live mutators, silently losing five of six entries (see
+    // `admit_forced_native`'s header).
+    //
+    // `CRATONVM_NATIVE_CF_COMPLETE=0` — do not register it; the real JDK
+    // bytecode runs instead, correctly, and 3.14x slower.
+    if !matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_CF_COMPLETE").as_deref(),
+        Ok("0")
+    ) {
+        r.register(cf, "complete", "(Ljava/lang/Object;)Z", native_cf_complete);
+    }
 
     // completeExceptionally
     r.register(

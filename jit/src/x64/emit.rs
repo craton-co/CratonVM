@@ -1059,6 +1059,128 @@ impl Compiler {
         self.buf.emit(&disp.to_le_bytes());
     }
 
+    /// Emit `CMP r64, [base + disp]` choosing the **smallest legal**
+    /// displacement form, for a `base` that is not RSP/R12.
+    ///
+    /// Split from [`Self::emit_cmp_r64_mem_disp32`] rather than folded into it
+    /// because that one is named for the width it emits and several callers
+    /// pin its bytes. The receiver-containment guard is the caller this exists
+    /// for: it reads six table words at displacements 0..40, every one of which
+    /// fits a `disp8`, and paid three wasted bytes on each.
+    ///
+    /// `base & 7 == 0b100` (RSP/R12) would need a SIB byte, which neither this
+    /// nor the disp32 form emits; such a base falls back to the disp32 form so
+    /// this function never becomes the place a SIB-less RSP operand is
+    /// introduced. `base & 7 == 0b101` (RBP/R13) has no `mod=00` form, so a
+    /// zero displacement there still takes the explicit `disp8` arm.
+    pub(super) fn emit_cmp_r64_mem_disp(&mut self, lhs: u8, base: u8, disp: i32) {
+        if base & 7 == 0b100 || !(i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&disp) {
+            self.emit_cmp_r64_mem_disp32(lhs, base, disp);
+            return;
+        }
+        let mut rex = 0x48u8;
+        if lhs >= 8 {
+            rex |= 0x04;
+        }
+        if base >= 8 {
+            rex |= 0x01;
+        }
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x3B); // CMP r64, r/m64
+        if disp == 0 && base & 7 != 0b101 {
+            // mod=00 — no displacement byte at all.
+            self.buf.emit_byte(((lhs & 7) << 3) | (base & 7));
+        } else {
+            // mod=01 — disp8.
+            self.buf.emit_byte(0x40 | ((lhs & 7) << 3) | (base & 7));
+            // Cast: guarded by the range check above.
+            self.buf.emit_byte(disp as u8);
+        }
+    }
+
+    /// `MOVZX r32, byte [base + disp8]` — a one-BYTE header read.
+    ///
+    /// The reference-store gates test bits of the `GC_FLAGS_BYTE_OFFSET` byte,
+    /// which sits 15 bytes into a 16-byte header. The pre-existing readers of
+    /// it use `MOV r32, [base + disp]` — a FOUR-byte read starting at byte 15,
+    /// so three of the four bytes come from the first instance field, or from
+    /// whatever follows a field-less object. That works only because every
+    /// consumer masks the low byte back out. This emitter reads the byte the
+    /// callers actually want.
+    pub(super) fn emit_movzx_r32_mem8(&mut self, dst: u8, base: u8, disp: i32) {
+        let mut rex = 0u8;
+        if dst >= 8 {
+            rex |= 0x44;
+        }
+        if base >= 8 {
+            rex |= 0x41;
+        }
+        if rex != 0 {
+            self.buf.emit_byte(rex);
+        }
+        self.buf.emit(&[0x0F, 0xB6]); // MOVZX r32, r/m8
+        self.emit_modrm_disp_for_base(dst, base, disp);
+    }
+
+    /// `CMP BYTE [base + disp], imm8`.
+    pub(super) fn emit_cmp_mem8_imm8(&mut self, base: u8, disp: i32, imm: u8) {
+        if base >= 8 {
+            self.buf.emit_byte(0x41); // REX.B
+        }
+        self.buf.emit_byte(0x80); // CMP r/m8, imm8  (/7)
+        self.emit_modrm_disp_for_base(7, base, disp);
+        self.buf.emit_byte(imm);
+    }
+
+    /// `CMP r8, BYTE [base + disp]` — an unsigned byte compare against a
+    /// memory-resident threshold. `lhs` must be one of the legacy byte
+    /// registers (AL/CL/DL/BL); an extended register would need a REX prefix
+    /// this encoding does not emit, so it is refused rather than mis-encoded.
+    pub(super) fn emit_cmp_r8_mem8(&mut self, lhs: u8, base: u8, disp: i32) {
+        debug_assert!(lhs < 4, "emit_cmp_r8_mem8: r{lhs} is not a legacy byte register");
+        if base >= 8 {
+            self.buf.emit_byte(0x41); // REX.B
+        }
+        self.buf.emit_byte(0x3A); // CMP r8, r/m8
+        self.emit_modrm_disp_for_base(lhs, base, disp);
+    }
+
+    /// `TEST r8, imm8` for a legacy byte register.
+    pub(super) fn emit_test_r8_imm8(&mut self, reg: u8, imm: u8) {
+        debug_assert!(reg < 4, "emit_test_r8_imm8: r{reg} is not a legacy byte register");
+        self.buf.emit(&[0xF6, 0xC0 | (reg & 7), imm]);
+    }
+
+    /// ModRM byte plus displacement for `[base + disp]`, smallest legal form.
+    ///
+    /// The two x86 base special cases both apply and both are silent
+    /// mis-encodings if ignored: `base & 7 == 0b101` (RBP/R13) has no `mod=00`
+    /// form, and `base & 7 == 0b100` (RSP/R12) needs a SIB byte, which this
+    /// emits as the canonical `0x24`.
+    fn emit_modrm_disp_for_base(&mut self, reg: u8, base: u8, disp: i32) {
+        let needs_disp = disp != 0 || base & 7 == 0b101;
+        let short = (i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&disp);
+        let mode: u8 = if !needs_disp {
+            0x00
+        } else if short {
+            0x40
+        } else {
+            0x80
+        };
+        self.buf.emit_byte(mode | ((reg & 7) << 3) | (base & 7));
+        if base & 7 == 0b100 {
+            self.buf.emit_byte(0x24); // SIB: scale=0, index=none, base=rsp/r12
+        }
+        if needs_disp {
+            if short {
+                // Cast: guarded by `short`.
+                self.buf.emit_byte(disp as u8);
+            } else {
+                self.buf.emit(&disp.to_le_bytes());
+            }
+        }
+    }
+
     /// Emit `MOV r64, r64` (register-to-register move).
     pub(super) fn emit_mov_r64_r64(&mut self, dst: u8, src: u8) {
         // Peephole: skip self-moves (no-op). Matches `emit_mov_reg_reg`.
@@ -1080,6 +1202,54 @@ impl Compiler {
     pub(super) fn emit_sub_r64_r64(&mut self, dst: u8, src: u8) {
         self.rex_w_rb(src, dst);
         self.buf.emit_byte(0x29); // SUB r/m64, r64
+        self.modrm_reg(src, dst);
+    }
+
+    /// `SUB r64, [base + disp32]` (REX.W 2B /r).
+    ///
+    /// F-08 — the inline G1 barrier's `addr - arena_base`. A memory operand
+    /// rather than a baked immediate on purpose: the arena base is a property
+    /// of the collector INSTANCE, and compiled code outlives collector
+    /// construction in embedding and in the unit suite, so the value has to be
+    /// read at run time from the published table. That is the same rule
+    /// `emit_guarded_getfield_receiver_check` follows for the bounds it
+    /// compares against.
+    pub(super) fn emit_sub_r64_mem_disp32(&mut self, dst: u8, base: u8, disp: i32) {
+        let mut rex = 0x48u8;
+        if dst >= 8 {
+            rex |= 0x04;
+        }
+        if base >= 8 {
+            rex |= 0x01;
+        }
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x2B); // SUB r64, r/m64
+        self.buf.emit_byte(0x80 | ((dst & 7) << 3) | (base & 7));
+        self.buf.emit(&disp.to_le_bytes());
+    }
+
+    /// `AND r64, [base + disp32]` (REX.W 23 /r). Sets ZF from the result, so
+    /// the caller can branch on it without a separate `TEST`.
+    pub(super) fn emit_and_r64_mem_disp32(&mut self, dst: u8, base: u8, disp: i32) {
+        let mut rex = 0x48u8;
+        if dst >= 8 {
+            rex |= 0x04;
+        }
+        if base >= 8 {
+            rex |= 0x01;
+        }
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x23); // AND r64, r/m64
+        self.buf.emit_byte(0x80 | ((dst & 7) << 3) | (base & 7));
+        self.buf.emit(&disp.to_le_bytes());
+    }
+
+    /// `XOR dst64, src64` (REX.W 31 /r).
+    ///
+    /// Distinct from [`Self::emit_xor_reg_self`], which is the zeroing idiom.
+    pub(super) fn emit_xor_r64_r64(&mut self, dst: u8, src: u8) {
+        self.rex_w_rb(src, dst);
+        self.buf.emit_byte(0x31); // XOR r/m64, r64
         self.modrm_reg(src, dst);
     }
 
@@ -1169,6 +1339,51 @@ impl Compiler {
         self.buf.emit_byte(rex);
         self.buf.emit_byte(0x85); // TEST r/m64, r64
         self.buf.emit_byte(0xC0 | ((reg & 7) << 3) | (reg & 7));
+    }
+
+    /// `TEST BYTE [rip+disp32], imm8` — the RIP-relative sibling of
+    /// [`Self::emit_test_mem8_imm8`], for a **fixed absolute address** that is
+    /// within ±2GB of the instruction being emitted.
+    ///
+    /// x86-64 has no `TEST [m64], imm8` form taking a bare 64-bit absolute
+    /// address, which is why the safepoint poll materialized its flag address
+    /// into R11 first. It does have this one: `F6 /0 ib` with ModRM
+    /// `mod=00, rm=101` addresses `[rip + disp32]`, so the whole poll is
+    /// **7 bytes and one instruction** instead of `MOV R11, imm64`
+    /// (10 bytes) + `TEST BYTE [R11+0], 0xFF` (5 bytes), and it needs no
+    /// scratch register at all.
+    ///
+    /// The RIP the CPU adds `disp32` to is the address of the NEXT
+    /// instruction — i.e. past the trailing `imm8`, not past the
+    /// displacement. Getting that wrong reads the flag one byte early, which
+    /// is a silent wrong answer rather than a fault, so the `+ LEN` below is
+    /// load-bearing.
+    ///
+    /// Returns `false` **without emitting anything** when the target is out of
+    /// rel32 reach (the JIT code cache and the VM's data segment are separate
+    /// mappings and nothing guarantees they land within 2GB of each other), so
+    /// the caller can fall back to the register-materializing form. The reach
+    /// test is the same one [`Self::emit_call_absolute`] makes, and rests on
+    /// the same fact: `ExecutableBuffer` is allocated once at a fixed capacity
+    /// and never relocates, so `as_ptr() + pos()` is already this
+    /// instruction's final runtime address.
+    pub(super) fn emit_test_mem8_abs_imm8(&mut self, addr: usize, imm8: u8) -> bool {
+        // F6 05 <disp32> <imm8>
+        const LEN: usize = 7;
+        // Cast: non-negative index/count to usize
+        let here = self.buf.as_ptr() as usize + self.buf.pos();
+        let next_pc = here.wrapping_add(LEN);
+        // Widening: i64/usize -> i128 (no truncation, for range check)
+        let delta: i128 = (addr as i128) - (next_pc as i128);
+        // Widening: i64/usize -> i128 (no truncation, for range check)
+        if delta < i32::MIN as i128 || delta > i32::MAX as i128 {
+            return false;
+        }
+        self.buf.emit(&[0xF6, 0x05]); // TEST r/m8, imm8 with ModRM(00, /0, RIP)
+        self.rip_abs_disp32_patches.push((self.buf.pos(), 1));
+        self.buf.emit(&(delta as i32).to_le_bytes()); // Cast: rel32 displacement
+        self.buf.emit_byte(imm8);
+        true
     }
 
     /// `TEST BYTE [base+disp], imm8` -- checks a per-object header flag byte
