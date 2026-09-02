@@ -21,6 +21,29 @@ cratonvm [OPTIONS] --jar <FILE.jar> [ARGS...]
 | `--synthetic-jdk` | Use the synthetic Rust standard library (~5,200 native stubs, no JDK needed) instead. Mutually exclusive with `--real-jdk`. Requires a build with the `synthetic-jdk` Cargo feature — otherwise the launch fails rather than starting a VM with no class library at all. | off |
 | `--jdk-only` | Real JDK **and** real class bytes are authoritative: no class is fabricated without real bytes, and no synthetic-stub native is registered or invoked. Implies `--real-jdk`; conflicts with `--synthetic-jdk`. An internal diagnostic — see [JDK-only mode](#jdk-only-mode) below. | off (`LAUNCHER_DEFAULT_COMPATIBILITY_MODE` = `compatible`) |
 
+## Differential mode
+
+Run the same program under CratonVM **and** under a reference JDK, compare
+stdout / stderr / exit status, and report the **first** divergence. Boots no VM
+in the launcher process; both sides are children.
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--diff-hotspot` | Enable differential mode. Exit `0` identical, `1` diverged, `2` no usable reference JDK / invocation refused, `3` the CratonVM side was not self-consistent. Refuses `--synthetic-jdk`; works with `--jar` and `--jdk-only`. See [`testing/diff-hotspot.md`](testing/diff-hotspot.md). | off |
+| `--diff-ignore <PATTERN>` | Mask any output line containing `PATTERN` on both sides before comparison. `*` is a wildcard; everything else is a literal substring — **not** a regex, because the launcher links no regex engine and promising syntax it cannot honour is worse than saying so. Repeatable. Requires `--diff-hotspot`. | none |
+| `--diff-runs <N>` | How many times the CratonVM side runs, so the program's own nondeterminism is detected before a difference can be blamed on HotSpot. `1` disables the check. Requires `--diff-hotspot`. | `2` |
+| `--diff-timeout <SECONDS>` | Per-child wall clock. An overrun renders as `<timeout>` on the exit channel, which never compares equal to a clean exit. Requires `--diff-hotspot`. | `120` |
+| `--diff-java-arg <ARG>` | An extra argument passed to the reference `java` only (e.g. an `--add-opens` the CratonVM side does not need). Repeatable. Requires `--diff-hotspot`. | none |
+| `--diff-strict` | Treat a difference that only the built-in nondeterminism maskers explain as a failure (exit `1` instead of `0`). Requires `--diff-hotspot`. | off |
+
+The verdict is **byte-exact first**: the maskers (`identity-hash`, `hex-address`,
+`thread-id`, `timestamp`, `absolute-path`) run only as a second opinion on a
+failure, so no masker can turn a strict pass into a false pass. A reference
+candidate whose `-version` banner says CratonVM is rejected and resolution
+continues — this tree ships a `java`-named alias binary, and without that guard
+the tool would compare CratonVM against itself and report a serene,
+meaningless "no divergence".
+
 > **The `--real-jdk` figure used to read "~300 native methods".** That was wrong
 > by roughly 9x and is now pinned to a single constant with its derivation
 > attached. Read it carefully: `REAL_JDK_NATIVE_REGISTRATIONS` counts

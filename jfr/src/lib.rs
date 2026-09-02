@@ -129,6 +129,7 @@ pub mod dump;
 pub mod event;
 pub mod jdk_chunk;
 pub mod jdk_only;
+pub mod jit_decision;
 pub mod phase;
 pub mod recording;
 pub mod repository;
@@ -160,6 +161,18 @@ pub use jdk_only::{
 pub use phase::{
     Anomalies, Category, Level, PhaseReport, PhaseSpan, ThreadPhases,
     PHASE_ACCOUNTING_SCHEMA_VERSION,
+};
+// The JIT compile-decision diagnostic event. Named re-exports rather than a
+// glob, for the same reason as `jdk_only`'s and `phase`'s below: the module's
+// vocabulary (`CompileDoor`, `CompileOutcome`, `install_jit_decision_sink`) is
+// generic enough that a reader should be able to see which subsystem's contract
+// a name belongs to at the use site. `jit_decision_enabled` is re-exported flat
+// because it is the one item a producer calls on its hot path and the whole
+// point of it is to be cheap to reach.
+pub use jit_decision::{
+    install_jit_decision_sink, jit_decision_enabled, record_jit_compile_decision,
+    sync_jit_decision_gate, CompileDoor, CompileOutcome, DecisionText, JitCompileDecision,
+    JitDecisionSink, JIT_COMPILE_DECISION_EVENT, NO_BAIL_SITE,
 };
 pub use recording::*;
 pub use repository::*;

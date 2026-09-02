@@ -9398,6 +9398,33 @@ impl ClassManager {
     /// `getDefinedPackages` family, which is not a hot path; deliberately NOT
     /// memoised, because classes keep loading and a memo would freeze the
     /// answer a package had before its first class arrived.
+    /// [`Self::any_loaded_class_in_package`], narrowed to the classes ONE
+    /// loader defined.
+    ///
+    /// `loader_native_id` is `ClassLoaderId::to_native_id()`'s flat value, the
+    /// same numbering `NativeContext::loader_id_of_class` reports and
+    /// `classloader::loader_namespace_id` hands out — so a user-defined
+    /// loader's own id (>= 3) selects exactly the classes IT defined, and
+    /// nothing a parent or the application loader defined.
+    ///
+    /// This is the question `ClassLoader.getDefinedPackage` asks of a CUSTOM
+    /// loader. The unscoped form cannot answer it: `com.example.app` has a
+    /// loaded class in every run, and answering `true` for a loader that
+    /// defined none of them is the "any package I can see" error one arm over.
+    pub fn any_loaded_class_in_package_for_loader(
+        &self,
+        package_slash: &str,
+        loader_native_id: u32,
+    ) -> bool {
+        self.class_store.iter().any(|c| {
+            c.loader_id.to_native_id() == loader_native_id
+                && match c.name.rsplit_once('/') {
+                    Some((pkg, _)) => pkg == package_slash,
+                    None => package_slash.is_empty(),
+                }
+        })
+    }
+
     pub fn any_loaded_class_in_package(&self, package_slash: &str) -> bool {
         self.class_store.iter().any(|c| {
             // Array classes (`[Ljava/lang/String;`) are members of no package
