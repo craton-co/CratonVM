@@ -119,7 +119,7 @@ pub mod platform;
 pub mod profile;
 pub mod range_analysis;
 pub mod regalloc;
-pub(crate) mod runtime_lowering;
+pub mod runtime_lowering;
 pub mod scev;
 pub mod tiered;
 pub mod x64;

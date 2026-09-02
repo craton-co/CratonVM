@@ -2606,6 +2606,76 @@ impl Arena {
         self.data.len()
     }
 
+    /// The LOW bump tail as `(first free address, byte count)` — the span a
+    /// parallel evacuation may carve into per-worker buffers.
+    ///
+    /// # Why an evacuator cannot just call `alloc`
+    ///
+    /// [`Self::alloc`] takes `&mut self`, which is precisely what makes a
+    /// copying collector's copy phase single-threaded. Handing the un-bumped
+    /// tail out as two plain words lets N workers bump a shared atomic cursor
+    /// inside it instead, with the arena itself untouched until
+    /// [`Self::commit_parallel_evacuation`] publishes the result.
+    ///
+    /// The tail is returned rather than the whole arena on purpose: the free
+    /// list holds spans whose neighbours are live objects, and an evacuator
+    /// bumping through those would overwrite them.
+    pub fn parallel_evacuation_region(&self) -> (usize, usize) {
+        (
+            self.data.as_ptr() as usize + self.cursor,
+            self.low_bump_headroom(),
+        )
+    }
+
+    /// Commit the first `bytes` of the tail [`Self::parallel_evacuation_region`]
+    /// handed out, so evacuation workers may write there directly.
+    ///
+    /// **The parallel evacuator is the one allocation path in this crate that
+    /// does not reach [`Self::hand_out`]** — it bumps its own atomic cursor
+    /// over the raw region and `memcpy`s into it — and `hand_out` is where
+    /// every other path commits the reserved granules it is about to write.
+    /// Backing store is RESERVED address space committed per granule
+    /// ([`crate::reservation`]), so a write into a granule that has never been
+    /// used does not read as zero: it faults. A young to-space that no cycle
+    /// has filled yet is exactly that, which is why the very first parallel
+    /// cycle of a fresh heap died in `copy_nonoverlapping` with
+    /// STATUS_ACCESS_VIOLATION and every later one would have survived.
+    ///
+    /// Returns `false` if the OS refuses the commit, which the caller must
+    /// treat as "no parallel copy phase this cycle" rather than proceeding —
+    /// the serial evacuator allocates through `alloc` and commits as it goes.
+    #[must_use = "an uncommitted evacuation region must not be written to"]
+    pub fn commit_evacuation_region(&mut self, bytes: usize) -> bool {
+        let start = self.cursor;
+        let len = bytes.min(self.data.len().saturating_sub(start));
+        self.data.commit_range(start, len)
+    }
+
+    /// Publish the outcome of a parallel evacuation: `bytes` were consumed
+    /// from the tail [`Self::parallel_evacuation_region`] handed out.
+    ///
+    /// The caller must already have made every byte below the new cursor
+    /// walkable — object copies, and a filler over every retired per-worker
+    /// buffer's tail (`gen_evac::install_gap_filler`). This method deliberately
+    /// does NOT take the gaps and push them on the free list instead: a free
+    /// block is invisible to `walk_objects` and friends, and this arena is
+    /// about to become the next cycle's FROM-space, where several walks
+    /// reconstruct the object grid without consulting the free list at all.
+    ///
+    /// # Panics
+    /// If `end_addr` is outside the tail that was handed out — below its start
+    /// would lose live copies, above it would put the cursor past the arena's
+    /// own capacity.
+    pub fn commit_parallel_evacuation(&mut self, end_addr: usize) {
+        let (start, len) = self.parallel_evacuation_region();
+        assert!(
+            end_addr >= start && end_addr <= start + len,
+            "parallel evacuation ended at {end_addr:#x}, outside the tail [{start:#x},{:#x})",
+            start + len,
+        );
+        self.cursor += end_addr - start;
+    }
+
     /// Retract the bump cursor into a free span that ends exactly at it,
     /// returning the bytes handed back to the un-bumped tail.
     ///

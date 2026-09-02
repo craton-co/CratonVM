@@ -176,10 +176,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status:** FIXED-UNVERIFIED-BY-CARGO. This lane did **not** run `cargo`",
     ),
     (
-        "docs/known-issues/jdk-only/F34-1-the-synthetic-only-registrar-population-and-its-gate-20260813.md",
-        "status block says: **Nothing was built or run.** The lane's constraints forbade `cargo`",
-    ),
-    (
         "docs/known-issues/jdk-only/F6-1-the-arm-that-had-to-move-and-the-two-minters-it-keeps-wrong.md",
         "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`, `native-builtins/src/tls.rs` — this lane's files); NOMINATED (the rest).**",
     ),
@@ -312,10 +308,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: Wave 7, lane W7-5. Nothing was built or run on 2026-08-12.",
     ),
     (
-        "docs/known-issues/jdk-only/W7-53-blocking-close-family.md",
-        "status block says: **Nothing in the Rust half of this record was built or run.** This session had",
-    ),
-    (
         "docs/known-issues/jdk-only/W7-55-record-reconciliation.md",
         "status block says: Nothing was built or run for this pass. Every verdict below is git and source",
     ),
@@ -342,10 +334,6 @@ const ALLOWED: &[(&str, &str)] = &[
     (
         "docs/known-issues/jdk-only/W7-74-short-object-repairs.md",
         "status block says: Branch `fix/short-thread-objects-20260812`. **Nothing here was built or run",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-77-guarded-slot-maps.md",
-        "status block says: Nothing here was built or run: this lane writes code, docs and probes. Every",
     ),
     (
         "docs/known-issues/jdk-only/W7-81-write-route-three-way.md",

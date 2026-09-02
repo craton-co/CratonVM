@@ -322,6 +322,31 @@ impl DeviceModule {
     /// monotonic counter ([`next_module_name`]); the backend retains it in
     /// `DeviceModuleInner::module_name` so subsequent `get_func` lookups
     /// stay consistent and multiple modules coexist.
+    /// # A cubin cache here would duplicate the driver's own
+    ///
+    /// AUDIT 2026-09-02. This hands PTX text to the driver's JIT, which
+    /// was recorded as an opportunity: cache the compiled cubin on disk
+    /// and skip the compile on later starts. Measured first, on an RTX
+    /// 2060 with a 64-instruction kernel, median of nine:
+    ///
+    /// ```text
+    ///   distinct PTX, driver cache on      0.63 ms
+    ///   distinct PTX, CUDA_CACHE_DISABLE=1  12.05 ms
+    /// ```
+    ///
+    /// The 19x is the NVIDIA driver's own persistent compute cache, and
+    /// it survives process restarts: text that cost 28 ms to compile in
+    /// one process loads in 0.6 ms in the next. A cache in this crate
+    /// would reimplement that, with its own invalidation problem, to
+    /// save the first run of a never-before-seen kernel on a given
+    /// machine.
+    ///
+    /// Worth knowing rather than acting on: a deployment that sets
+    /// `CUDA_CACHE_DISABLE=1`, or one with a read-only or absent cache
+    /// directory, pays ~12 ms per kernel per start. That is the case a
+    /// cubin cache would be for.
+    ///
+    /// `cuda-bridge/tests/transfer_bandwidth_it.rs` is the measurement.
     pub fn from_ptx(ctx: &DeviceContext, ptx: &str, kernel_names: &[&str]) -> Result<Self> {
         let module_name = next_module_name();
         // cudarc 0.13's `CudaDevice::load_ptx` keeps the kernel-name
@@ -596,6 +621,34 @@ pub(crate) enum KernelArg {
 /// Allocation is one `cuMemAllocHost` and the buffer is reused across
 /// dispatches, so the cost is paid once per size class rather than per
 /// call. In stub mode this is a plain heap `Vec` and nothing is pinned.
+///
+/// # Do NOT extend this to the upload path
+///
+/// AUDIT 2026-09-02. The 12.95-against-3.98 figure above is a D2H
+/// measurement of an ASYNC copy, and it does not transfer to H2D, which
+/// is synchronous — there the driver stages through its own pinned
+/// buffer and is already fast. Measured on the same RTX 2060, median of
+/// nine, release build, staging cost included because it is what a
+/// caller would wait for:
+///
+/// ```text
+///   MiB    pageable-sync    pinned-staged     ratio
+///     1       4.27 GiB/s       3.33 GiB/s     0.78x
+///     8       6.11 GiB/s       5.50 GiB/s     0.90x
+///    32       5.75 GiB/s       5.15 GiB/s     0.90x
+///   128       6.74 GiB/s       5.20 GiB/s     0.77x
+/// ```
+///
+/// Staging is 10-23% SLOWER at every size: the host memcpy into the
+/// pinned buffer costs more than the faster DMA saves. The obvious
+/// optimisation is a pessimisation here, and the number it would have
+/// had to beat had never been taken.
+///
+/// It stays right for the CHUNKED WRITEBACK it was built for, where the
+/// point is not raw bandwidth but that an async D2H can overlap with a
+/// kernel at all — which requires a page-locked destination.
+///
+/// `cuda-bridge/tests/transfer_bandwidth_it.rs` is the measurement.
 pub struct PinnedHostBuffer<T: Copy> {
     inner: backend::PinnedHostInner<T>,
 }
@@ -643,6 +696,28 @@ pub(crate) type LastWriteSlot = std::sync::Arc<std::sync::Mutex<Option<std::sync
 /// Allocate a fresh empty [`LastWriteSlot`].
 pub(crate) fn new_last_write_slot() -> LastWriteSlot {
     std::sync::Arc::new(std::sync::Mutex::new(None))
+}
+
+/// A [`LastWriteSlot`] already holding an event recorded on the stream
+/// the allocator's zeroing memset was issued to.
+///
+/// AUDIT 2026-09-02. `DeviceBuffer::zeros` used to hand back an EMPTY
+/// slot, which reads as "nothing has written this buffer yet" — true of
+/// the allocation and false of the memset still in flight. A consumer on
+/// a user stream then had nothing to wait on, and the zeroing could
+/// overwrite the kernel's output. Four threads sharing one context
+/// produced `got 0` in 4 of 4 runs at 4 MiB, and passed 5 of 5 at 1 MiB,
+/// because the window is the length of the memset.
+///
+/// A failure to create the event fails the allocation rather than
+/// silently returning an unordered buffer: the unordered buffer IS the
+/// bug, and a `zeros` that cannot promise its own contents is not one.
+fn alloc_last_write_slot(ctx: &DeviceContext) -> Result<LastWriteSlot> {
+    let event = Event::new(ctx)?;
+    ctx.0.record_alloc_event(&event)?;
+    Ok(std::sync::Arc::new(std::sync::Mutex::new(Some(
+        std::sync::Arc::new(event),
+    ))))
 }
 
 // ── Device-element bound ─────────────────────────────────────────────
@@ -768,11 +843,18 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     }
 
     /// Allocate `len` elements, zero-initialised.
+    ///
+    /// The zeroing is asynchronous, so the buffer comes back carrying a
+    /// `last_write` marker for it — exactly as an uploaded buffer does.
+    /// Without that marker a following `launch_on_stream` had nothing to
+    /// wait on and the memset could land AFTER the kernel's stores; see
+    /// `record_alloc_event` in the cuda backend for the measurement.
     pub fn zeros(ctx: &DeviceContext, len: usize) -> Result<Self> {
         let _ = Self::ASSERT_DEVICE_REPR;
-        backend::DeviceBufferInner::zeros(&ctx.0, len).map(|inner| Self {
+        let inner = backend::DeviceBufferInner::zeros(&ctx.0, len)?;
+        Ok(Self {
             inner,
-            last_write: new_last_write_slot(),
+            last_write: alloc_last_write_slot(ctx)?,
             _host_uploads: Vec::new(),
         })
     }
@@ -1083,10 +1165,17 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     }
 
     /// Allocate `len` elements, zero-initialised.
+    ///
+    /// The zeroing is asynchronous, so the buffer comes back carrying a
+    /// `last_write` marker for it — exactly as an uploaded buffer does.
+    /// Without that marker a following `launch_on_stream` had nothing to
+    /// wait on and the memset could land AFTER the kernel's stores; see
+    /// `record_alloc_event` in the cuda backend for the measurement.
     pub fn zeros(ctx: &DeviceContext, len: usize) -> Result<Self> {
-        backend::DeviceBufferInner::zeros(&ctx.0, len).map(|inner| Self {
+        let inner = backend::DeviceBufferInner::zeros(&ctx.0, len)?;
+        Ok(Self {
             inner,
-            last_write: new_last_write_slot(),
+            last_write: alloc_last_write_slot(ctx)?,
             _host_uploads: Vec::new(),
         })
     }

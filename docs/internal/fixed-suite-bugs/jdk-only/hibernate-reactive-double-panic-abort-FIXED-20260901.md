@@ -290,23 +290,85 @@ already been printed, so it read as a mystery post-run crash rather than a
 teardown bug". That is this defect's mechanism and this defect's symptom,
 written down for a different door, weeks earlier.
 
-## 9. What is left open
+## 9. Why only `--jdk-only` — it is JNA, and the answer was in the third frame
 
-**Why only `--jdk-only`.** The page's mode-specificity claim survives a fresh
-control it did not have — §4 admitted the zero-match check was against an old
-residual-log corpus, not a same-day run. `BatchFetchTest` alone, base binary,
-compatible mode: `rc=0`, zero panics, `ok=3`. Under `--jdk-only`: `rc=134`.
+The page's mode-specificity claim survives a fresh control it did not have (§4
+admitted the zero-match check was against an old residual-log corpus, not a
+same-day run). `BatchFetchTest` alone, base binary, compatible mode: `rc=0`,
+zero panics, `ok=3`. Under `--jdk-only`: `rc=134`.
 
-What that difference is NOT: the loaded native-library set. `strace -e openat`
-on both arms gives the **same 8 libraries** — `libc`, `libcrypto`, `libextnet`,
-`libgcc_s`, `libjava`, `libjvm`, `libm`, `libssl` — so it is not "strict mode
-dlopens something compatible mode does not". Enabling
-`cratonvm_vm::native::jni=debug` on both arms logged **no** attach or detach on
-either, which is consistent with the panic firing before
-`jni_detach_current_thread` reaches any of its logging.
+Two things it is NOT. The loaded native-library set is **identical** — seven
+objects in both modes (`libc`, `libcrypto`, `libextnet`, `libjava`, `libgcc_s`,
+`libm`, `libssl`), so it is not "strict mode dlopens something compatible mode
+does not". (An earlier pass here read `strace` output that counted the loader's
+*failed* search-path probes as loads and briefly listed `libjvm.so` among them;
+filtering `ENOENT` removes it. `libjvm.so` is never loaded — those were the
+loader walking `/lib`, `/usr/lib`, the `glibc-hwcaps` variants and missing at
+each.) And `tracing` cannot answer it: the detach path's own `debug!`/`trace!`
+lines emit nothing from a TSD destructor in either mode.
 
-So what makes a TSD-registered `DetachCurrentThread` fire only under
-`--jdk-only` is not pinned down. It is a **reachability** question about which
-Java paths run real-JDK native code, not a question about this defect: the code
-that aborted has no mode-dependence at all. It no longer crashes anything, so it
-is recorded here rather than left as an open page.
+Asked from the other end it falls out immediately. Interposing
+`pthread_key_create` and printing, for every key that carries a destructor, the
+destructor's owning object (`tsdspy.c`, `LD_PRELOAD`):
+
+```text
+--jdk-only    3 keys
+  dtor=?@/data/bin/cratonvm-...            caller=?@/data/bin/cratonvm-...   (x2)
+  dtor=?@/home/azureuser/.cache/JNA/temp/jna1788342378766891624.tmp
+                                           caller=?@/lib/x86_64-linux-gnu/libc.so.6
+compatible    2 keys
+  dtor=?@/data/bin/cratonvm-...            caller=?@/data/bin/cratonvm-...   (x2)
+```
+
+**One extra key under `--jdk-only`, and its destructor lives in JNA.**
+`jna-5.13.0.jar`'s `com/sun/jna/linux-x86-64/libjnidispatch.so` imports
+`pthread_key_create` and exports `JNA_detach` beside
+`Java_com_sun_jna_Native_setDetachState` — JNA's documented per-thread detach
+state. The destructor calls `(*vm)->DetachCurrentThread(vm)`, which is invoke
+table slot 5, which is `jni_detach_current_thread`.
+
+So the whole chain, end to end:
+
+1. under `--jdk-only`, JNA's native library is loaded (Testcontainers' Docker
+   client reaches it); in compatible mode it is not;
+2. JNA extracts `libjnidispatch.so` to `~/.cache/JNA/temp/jnaNNNN.tmp`, dlopens
+   it, and **deletes the file**;
+3. it registers a pthread TSD key whose destructor detaches the thread;
+4. glibc runs that destructor in `__nptl_deallocate_tsd`, after
+   `__call_tls_dtors`, so every Rust `thread_local!` is already gone;
+5. `is_foreign_attached()` → `LocalKey::with` → `P1`.
+
+Step 2 is also why the backtrace's frame 9 is `<unknown>` and always will be:
+the mapping has no on-disk backing left to symbolicate. That frame is not
+missing information, it is a deleted file.
+
+**Nothing in that chain is mode-dependent except step 1.** The defect was never
+a `--jdk-only` defect; strict mode only decides whether JNA is on the path. What
+remains unanswered is one level further out — *why* the JNA-loading path runs
+only in strict mode — and that is a question about Testcontainers' class graph,
+not about this defect, which no longer crashes anything either way.
+
+## 10. What is left open
+
+**Nothing about this defect.** §9 names the registrant, the mechanism and the
+mode difference, and the crash is gone in both modes.
+
+One question sits one level further out and is deliberately not chased here:
+*why* the JNA-loading path runs under `--jdk-only` and not in compatible mode.
+That is a question about which classes Testcontainers' Docker client reaches
+when CratonVM stops fabricating stand-ins — a class-graph question, not a
+threading one. It changes nothing about the fix: every step of §9's chain except
+that first one is mode-independent, and the code that aborted had no
+mode-dependence at all.
+
+Two smaller things this lane found and dealt with rather than left:
+
+* `harness_exit_shim::unhandled_filter` was a **fourth** copy of
+  `std::thread::current()` on a fault path, inside an `extern "system"` SEH
+  filter where the unwind would be undefined behaviour. It is
+  `#[cfg(all(test, windows))]`, so it was left alone until it could actually be
+  compile-checked on Windows rather than changed blind.
+* `layout_alias::observe`'s doc listed `declared == 0` among the cases it
+  suppresses, where `classify` tests that case *first* on purpose. The contract
+  described the recorder as blind to exactly the species the detector had been
+  widened to catch.

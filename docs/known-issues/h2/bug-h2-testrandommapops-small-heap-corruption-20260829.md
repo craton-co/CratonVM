@@ -19,13 +19,16 @@ load ~3** — against the inherited base rate of "roughly one in three runs of
 lever is host quietness, not a flag, and it is the difference between a defect
 nobody could bisect and one anybody can.
 
-**READ THE 2026-09-02 ADDENDUM FIRST.** The corruption has a shipped
-fail-closed fix, its cost has been repaid, and the residue this page treats as
-evidence of a missed root has since been MEASURED and explained: `local_oop`,
-the count that names a missed root, is zero on both the probe and
-`TestRandomMapOps`. One arm (`--Xmx 4g`) is still un-re-measured, and that is
-the only thing keeping this page open. Everything below the 2026-09-01 addendum
-is the historical record, including two readings this page later withdrew.
+**READ BOTH 2026-09-02 ADDENDA, THE "(later)" ONE FIRST.** Where things stand:
+the fail-closed fix REDUCED this defect and did not close it — the
+`NullPointerException` face still reproduces at the shipped default at
+`--Xmx 256m` on a quiet host (2 of 3 runs in one batch on a release binary).
+`--Xmx 1g` and `--Xmx 4g` are clean over 1500 s each, so the title's "small
+heap" premise is right again. And the residue this page treats as evidence of a
+missed root has been MEASURED and is not one: `local_oop`, the count that names
+a missed root, is zero over ~370 frames. Everything below the 2026-09-01
+addendum is the historical record, including three readings this page later
+withdrew.
 
 ## ADDENDUM 2026-09-01: the COST is gone; the HOLE is not. Both were measured on one binary
 
@@ -338,8 +341,14 @@ older `stale_live` number should assume it contains this population too.
 
 ### Where that leaves the page, 2026-09-02
 
-* Still **OPEN**, and for one reason only: the 4g arm above has not been
-  re-measured on current dev. Everything else this page asked for has been done.
+**SUPERSEDED the same day — read the "(later)" addendum below.** The 4g arm WAS
+re-measured (clean), and something worse turned up in its place: the NPE still
+reproduces at the shipped default at 256m. The bullets below stand except for
+the first, which claimed the 4g arm was the only thing left.
+
+* Still **OPEN**, and the reason is no longer the 4g arm: it is that the defect
+  itself still reproduces. Everything this page asked for as INSTRUMENTATION has
+  been done.
 * `Next` item 1 (the instrument) is **CLOSED** — built, tested, committed, and
   it answers the witness in one run.
 * `Next` items 2 and 3 were closed by the 2026-09-01 addendum and stay closed.
@@ -350,6 +359,97 @@ older `stale_live` number should assume it contains this population too.
   counts dead spill, abandoned copies of named roots, and to-space addresses
   that alias from-space keys — all three of which this session watched mislead a
   reader, twice including me.
+
+## ADDENDUM 2026-09-02 (later): the defect is NOT fixed — it still reproduces at the shipped default
+
+The addendum above concluded that the only thing keeping this page open was an
+un-re-measured `--Xmx 4g` arm. **That is wrong, and the correction is the more
+important half of the day.** The 4g arm was measured and is clean; what is not
+clean is the heap size this page is named after.
+
+All of the following is one RELEASE binary built from `dev@777688aa5`
+(`cargo build --release`, fat LTO — the host finally had the memory for it),
+`org.h2.test.store.TestRandomMapOps`, `/proc/loadavg` recorded on every run.
+
+| arm | heap | runs | NPE | OOM | clean | times |
+|---|---|---:|---:|---:|---:|---|
+| **shipped default**, batch A | 256m | 3 | **2** | 0 | 1 | 866 s, 388 s |
+| **shipped default**, batch B | 256m | 4 | 0 | 0 | 4 | 900 s cap |
+| **shipped default**, long arm | 256m | 1 | 0 | 0 | 1 | 1500 s cap |
+| shipped default | 1g | 1 | 0 | 0 | 1 | 1500 s cap |
+| shipped default | 4g | 1 | 0 | 0 | 1 | 1500 s cap |
+| `CRATONVM_ZGC_RELOCATE=0` | 256m | 4 | 0 | **4** | 0 | 296–573 s |
+| `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` | 256m | 4 | 0 | **2** | 2 | 688 s, 860 s |
+
+The failure is the `NullPointerException` face this page already documents,
+with the same shape:
+
+```
+seed:-6609831345401105555 op:14 java.lang.NullPointerException
+  at org.h2.mvstore.RandomAccessStore.readStoreHeader(RandomAccessStore.java:260)
+  at org.h2.mvstore.FileStore.start(FileStore.java:944)
+  at org.h2.mvstore.MVStore.<init>(MVStore.java:296)
+```
+
+### What this overturns
+
+* **"The gate-ON arm does not reproduce, over 900 s at load 8–18" is withdrawn.**
+  That was ONE run on a busy host. On a quiet host the same binary fails twice
+  in three runs. This page's own 2026-08-29 section says the lever is host
+  quietness and that a contended box hid the defect — the gate-ON arm was then
+  measured on a contended box anyway.
+* **The fail-closed gate reduced the rate; it did not close the hole.** Two
+  failures in eight shipped-default runs today, against "9 in 9" before the fix.
+  That is a real improvement and it is not a fix.
+* **The 4g claim of the L7 addendum does not reproduce on current dev.** 1500 s
+  clean at 4g and at 1g. The title's "small heap" premise is right again.
+
+### What the batches do NOT support
+
+Batch A failed 2 of 3 and batch B failed 0 of 4 on the SAME binary, same heap,
+same workload. Batch B ran concurrently with the `RELOCATE=0` arm at loads
+4.9–20.5. So the per-batch rate is not stable and **no rate quoted from a single
+batch is worth anything** — including the two clean batches. Run them serially
+on an idle host before believing any number here.
+
+### The relocation lever still points the same way, and still has no clean control
+
+Neither switch produces a clean arm at 256m: both remove the NPE and substitute
+the fragmentation `OutOfMemoryError` this page's cost section describes —
+`RELOCATE=0` in 4 of 4, the narrower `RELOCATE_UNDER_PROVEN_JIT=0` in 2 of 4.
+Consistent with relocation being the lever, and **not a control**: an arm that
+trades one failure for another cannot isolate either. The page has hit this
+shape before, and the fix is a heap size where neither failure mode is forced —
+which 1g and 4g are, and at which the NPE does not appear either.
+
+### And the oracle says it is not a missed root
+
+Across every run above, on ~370 reported frames spanning two heap sizes and both
+binaries, **`local_oop` and `inline_local_oop` are ZERO**: not one frame word
+below the live watermark that the compiler's own "must be oop" dataflow proves
+is a reference and the map failed to name. The stale words are dead spill,
+abandoned copies of roots the map DOES name, and to-space/from-space address
+aliases.
+
+That is a negative result and it is the useful kind. The hypothesis this page
+has pursued since 2026-08-29 — *the map is short, relocation rewrites what it
+names and leaves a live reference behind* — is not what the instrument built to
+detect it finds. Either the defect is elsewhere in the relocation path (the
+object header, the forwarding table, a non-frame root), or it is in a frame the
+oracle cannot speak for. The next step is to widen the instrument to the
+non-frame roots, not to keep looking for an unnamed local.
+
+### Where that actually leaves the page
+
+* **OPEN, and more open than the addendum above claimed.** The defect
+  reproduces at the shipped default. Retiring it would have been wrong.
+* The 4g/1g arms are closed: clean, release binary, 1500 s each.
+* The next measurement is a SERIAL batch on an idle host — at least 10 runs at
+  256m, nothing else on the machine — to get a base rate that a fix can be
+  measured against. Every rate on this page so far was taken with something else
+  running.
+* The next INSTRUMENT is not another frame-word oracle. `local_oop=0` is now
+  well-evidenced; look outside the compiled frame.
 
 ## ADDENDUM 2026-08-30 (L7 corpus lane): it is NOT a small-heap defect — 4g fails too
 
