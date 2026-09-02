@@ -9967,6 +9967,14 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .any_loaded_class_in_package(package_slash)
     }
 
+    fn any_loaded_class_in_package_for_loader(&self, package_slash: &str, loader_id: u32) -> bool {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .any_loaded_class_in_package_for_loader(package_slash, loader_id)
+    }
+
     fn set_class_hidden(&mut self, class_id: ClassId) {
         let mut cm = self.shared.classes.class_manager_write();
         if let Some(class) = cm.get_class_mut(class_id) {
@@ -17688,15 +17696,28 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
             return;
         };
         let mut recorder = self.shared.debug.flight_recorder.lock();
-        let Some(recording) = recorder.get_recording_mut(id) else {
-            return;
-        };
-        recording.settings.enabled_event_names =
-            enabled_names.map(|names| names.iter().cloned().collect());
-        recording.settings.event_thresholds_by_name = thresholds
-            .iter()
-            .map(|(name, nanos)| (name.clone(), *nanos))
-            .collect();
+        {
+            let Some(recording) = recorder.get_recording_mut(id) else {
+                return;
+            };
+            recording.settings.enabled_event_names =
+                enabled_names.map(|names| names.iter().cloned().collect());
+            recording.settings.event_thresholds_by_name = thresholds
+                .iter()
+                .map(|(name, nanos)| (name.clone(), *nanos))
+                .collect();
+        }
+        // A14/A8 (2026-09-01): re-arm the `cratonvm.JitCompileDecision` producer
+        // gate. That event is armed only when a RUNNING recording names it, and
+        // the gate is otherwise refreshed by `refresh_running_ids` — which runs
+        // on start, not on a settings change. Every Java-side settings edit
+        // funnels through this function (`native-builtins/src/jfr.rs`), and
+        // `Recording.enable(...)` changes no recording STATE, so without this
+        // line `r.start()` followed by `r.enable(...)` leaves the producer
+        // permanently dark while the reverse order works — an argument-order
+        // dependence nothing would explain. The `recording` borrow is scoped
+        // above so `recorder` is free to be re-borrowed here.
+        cratonvm_jfr::jit_decision::sync_jit_decision_gate(&recorder);
     }
 
     fn jfr_set_java_output(&mut self, path: &str) {

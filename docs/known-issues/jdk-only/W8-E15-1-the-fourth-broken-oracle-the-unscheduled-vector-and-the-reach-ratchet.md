@@ -9,7 +9,7 @@ Subject: `regression-suite/src/RFsSingleton.java`,
 `regression-suite/run.sh`, `regression-suite/harness-guard.sh`.
 
 Follows on from
-[`W8-E9-1-three-broken-oracles-and-the-suite-denominator.md`](W8-E9-1-three-broken-oracles-and-the-suite-denominator.md)
+`W8-E9-1-three-broken-oracles-and-the-suite-denominator.md` (retired: `W8-E9-1-three-broken-oracles-and-the-suite-denominator`)
 — its §7 NOM-1 and NOM-2 are §§1–2 below, and its §6's declined suggestion is §3
 — and from
 [`D1-R11-SERVICELOADER-DOUBLE-SOURCE-20260813.md`](D1-R11-SERVICELOADER-DOUBLE-SOURCE-20260813.md),
