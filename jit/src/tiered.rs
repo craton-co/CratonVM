@@ -1324,6 +1324,23 @@ pub fn dump_method_stats_to_stderr() {
             crate::x64::inline_call_map_at_return_counts(),
             crate::x64::inline_miss_edge_poison_counts(),
         );
+        // What the operand-spill cursor did. `exhausted` is a REFUSED COMPILE:
+        // the method keeps running interpreted and the only thing that ever
+        // said so was a single-slot "last bail site" with no count, so "does
+        // this happen, and on what?" had no answer at all. A non-zero
+        // `flush-canonical` is the engagement counter for the canonical-home
+        // flush — a zero there beside a non-zero `flush-reserved` means that
+        // path never ran, which is a different finding from it running and not
+        // helping. `peak-words` is a MAX over compiles, never a sum.
+        eprintln!(
+            "[cratonvm] spill cursor: {}",
+            crate::spill_cursor_counts()
+                .iter()
+                .zip(crate::SPILL_CURSOR_SLOT_NAMES.iter())
+                .map(|(c, n)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         // And how often a compiled entry was dropped as the same activation as
         // an interpreter frame. `call-opcode` is the row worth reading: that
         // rule's revert shape is asserted by no test, because the only arm that
@@ -1480,6 +1497,19 @@ pub fn dump_method_stats_to_stderr() {
     eprintln!(
         "[cratonvm] JIT String-intrinsic pin: fired={sp_fired} blind-no-layout={sp_no_layout} \
          blind-no-resolver={sp_no_resolver} fail-closed={sp_fail_closed}"
+    );
+    // Beside the pin, because the two answer the halves of one question. The
+    // pin says whether a String-accessor method was kept OFF the optimizing
+    // tier; this says, for the ones that reached it, whether the expansion's
+    // `value`/`coder` reads are inline loads or `jit_getfield` helper CALLs.
+    // Before the rows existed, every expanded `charAt` paid two CALLs per
+    // character -- 917,203,334 of them on one `probes/CharAtCostCurve.java`
+    // run -- and nothing in this dump said so: `getfield helper calls` counted
+    // them without naming the source, and `emitted_charAt` reported the
+    // expansion as a success.
+    eprintln!(
+        "[cratonvm] JIT String-access inline rows: sites={}",
+        crate::string_access_compact_rows()
     );
     // Sites the `final`-class devirtualisation handed BACK to a call-site
     // intrinsic (`crate::devirt_yielded_to_intrinsic_count`).

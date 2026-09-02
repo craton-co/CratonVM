@@ -526,8 +526,12 @@ pub mod site_stats {
     pub const FAST_PUT_MISS: usize = 30;
     pub const FAST_PUT_FILL: usize = 31;
     pub const FAST_FIELD_UNUSABLE: usize = 32;
+    pub const DOOR_STATIC_HIT: usize = 33;
+    pub const DOOR_STATIC_MISS: usize = 34;
+    pub const DOOR_SPECIAL_HIT: usize = 35;
+    pub const DOOR_SPECIAL_MISS: usize = 36;
 
-    const N: usize = 33;
+    const N: usize = 37;
 
     #[allow(clippy::declare_interior_mutable_const)]
     const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -553,7 +557,7 @@ pub mod site_stats {
 
     fn report(when: &str) {
         eprintln!(
-            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={} | cast: hit={} miss={} fill={} reject_loader={} unusable={} | ldc: hit={} miss={} fill={} | jit-ldc: hit={} miss={} fill={} | iface-select: hit={} miss={} fill={} trivial={} | fast-field: get hit={} miss={} fill={} put hit={} miss={} fill={} unusable={}",
+            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={} | cast: hit={} miss={} fill={} reject_loader={} unusable={} | ldc: hit={} miss={} fill={} | jit-ldc: hit={} miss={} fill={} | iface-select: hit={} miss={} fill={} trivial={} | fast-field: get hit={} miss={} fill={} put hit={} miss={} fill={} unusable={} | door: static hit={} miss={} special hit={} miss={}",
             super::field_site_slots(),
             COUNTS[FIELD_HIT].load(Ordering::Relaxed),
             COUNTS[FIELD_MISS].load(Ordering::Relaxed),
@@ -588,6 +592,10 @@ pub mod site_stats {
             COUNTS[FAST_PUT_MISS].load(Ordering::Relaxed),
             COUNTS[FAST_PUT_FILL].load(Ordering::Relaxed),
             COUNTS[FAST_FIELD_UNUSABLE].load(Ordering::Relaxed),
+            COUNTS[DOOR_STATIC_HIT].load(Ordering::Relaxed),
+            COUNTS[DOOR_STATIC_MISS].load(Ordering::Relaxed),
+            COUNTS[DOOR_SPECIAL_HIT].load(Ordering::Relaxed),
+            COUNTS[DOOR_SPECIAL_MISS].load(Ordering::Relaxed),
         );
     }
 

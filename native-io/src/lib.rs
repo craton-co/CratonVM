@@ -8521,6 +8521,25 @@ fn native_is_transfer_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 // an unregistered triple. The count stays 37 and the reason is a test outside
 // this crate, not a dispatch requirement. Long note at the foot of this
 // function.
+/// Whether the real `java.util.Scanner` should run instead of this crate's
+/// tokenizer, on a real JDK.
+///
+/// The same shape as `jdk_random_enabled` in `native-collections`: a
+/// registration-time gate, so the family is not registered at all rather than
+/// refused at dispatch. `CRATONVM_ENFORCE_NATIVE_SHADOW` cannot serve here --
+/// it is a `--jdk-only` instrument and `NativeKind::allowed_in` is
+/// unconditionally true for `Compatible`, so the dial moves compatible mode by
+/// zero (measured: 50 diff lines with it and without it).
+fn jdk_scanner_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JDK_SCANNER").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+
 fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     // RETAG ATTEMPTED 2026-08-19 AND REVERTED — the classification above is
@@ -8585,6 +8604,59 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
     // an unconditional `true` there, so this moves the default mode by zero and
     // the 25 rows stay open in it, against the day the Rust tokenizer is retired
     // outright.
+    // The compatible-mode half of the same retirement. `SyntheticStub` already
+    // drops this family under `--jdk-only`; on a real JDK with the flag on it is
+    // not registered in EITHER mode and `java.util.Scanner`'s own bytecode runs,
+    // which is what would close the 25 rows listed above in the default mode.
+    //
+    // THE DEFAULT IS OFF, AND IT IS CHOSEN BY MEASUREMENT, exactly as the
+    // sibling gate `jdk_random_enabled` is.
+    //
+    // Correctness says turn it ON. `apps/probes/ScannerShadowSweep`, 94 rows:
+    //
+    // ```text
+    //             flag OFF        flag ON
+    //   compat    50 diff lines   0
+    //   jdk-only  0               0
+    // ```
+    //
+    // -- the flag closes all 25 wrong rows in the DEFAULT mode, which
+    // `SyntheticStub` alone cannot do (`NativeKind::allowed_in` is
+    // unconditionally true for `Compatible`).
+    //
+    // AND IT COSTS NOTHING ELSE. The whole `java.util` corpus was re-run in
+    // compatible mode with the flag ON -- UtilCoverage, UtilCoverage4,
+    // UtilTail2, UtilTail, Collections, MapViews, Properties, ViewIdentity,
+    // Base64 and UtilUnshadowed, 1631 rows -- and every one is byte-identical
+    // to its flag-OFF run. Only `ScannerShadowSweep` moves, 50 diff lines to 0.
+    // A retirement that closes 25 rows is worth little if it opens others
+    // somewhere the probe for THIS class cannot see, so the corpus is the
+    // check, not the class's own probe.
+    //
+    // Throughput says leave it off. `apps/probes/ScannerBench`, A/B/B/A
+    // interleaved so load drift cannot be mistaken for the effect, ns per scan
+    // of a 40-item source:
+    //
+    // ```text
+    //                       shadowed          retired
+    //   next (tokens)       623985, 672046    5118757, 4769729
+    //   nextInt             518312, 435840    5181001, 5303971
+    //   nextLine            380821, 323801    4712739, 6249495
+    // ```
+    //
+    // 8x on tokens, 11x on typed reads, 15x on lines, and the A pair and the B
+    // pair each agree with themselves. The real `Scanner` drives a `Matcher`
+    // over a `CharBuffer` and re-reads its source through `findPatternInBuffer`
+    // where this crate's tokenizer walks an `Arc<str>` with a Rust regex, so the
+    // gap is structural.
+    //
+    // So the two modes get what each is for: `--jdk-only` already has the
+    // correctness, because the family is `SyntheticStub` and is dropped there,
+    // and compatible mode keeps the tokenizer and its 25 recorded rows. Turning
+    // this on is a throughput decision and the numbers above are its price.
+    if registry.real_jdk() && jdk_scanner_enabled() {
+        return;
+    }
     registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let c = "java/util/Scanner";
 

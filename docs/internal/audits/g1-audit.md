@@ -918,3 +918,212 @@ branch's own binary.
 shape, at the same rate, on a binary built before any of this. It is recorded
 here because a reader running that arm will see it, not as a residual of this
 work.
+
+## 12. Card cleaning, and what measuring it said about the card table (2026-09-02)
+
+*`perf/g1-card-clean-bot-20260902`, branched from `dev` at `120bb7c37`. Opened
+to close the residual F-05 states in its own module docs — "a card is cleaned
+only at `G1Region::reset`, so a long-lived Old region's cards saturate" — and
+to add the block-start table the same note names. It landed the first, refused
+the second on the measurement, and found that neither was the reason the card
+screen looked inert.*
+
+### 12.1 The hypothesis and the number that started it
+
+§11's A/B run left a byte skip-rate for the card screen:
+`scanned=92007064 skipped=223968` — **0.2%**. F-05's own fixture reports
+99.95% on a fresh region, so something was eating the difference, and the
+module docs already named a candidate: the table only ever GAINS bits, because
+`G1Region::reset` is the only thing that clears one. A long-lived Old region
+would then accumulate dirty cards until the screen answers "scan it" for
+everything.
+
+### 12.2 What shipped
+
+`CRATONVM_G1_CARD_CLEAN`, **opt-in**. Both source walkers — the serial
+`scan_source_region_for_cset_refs` and the parallel evacuator's
+`seed_source_region`, which is the default path — now take a `CardSet`
+snapshot of the region's dirty cards, decide what to scan from THAT, and
+rewrite the table once at the end: every card covering the bytes they examined
+is cleaned, then the start card of each object that still references another
+region is put back.
+
+Three properties, three tests:
+
+* `a_card_whose_edge_is_gone_is_cleaned_by_the_pause_that_walks_it`;
+* `a_card_whose_edge_survives_is_left_dirty_by_the_walk` — the soundness half;
+* `cleaning_is_bounded_by_what_the_walk_examined` — a walk that broke early
+  must not clean past the break, or it drops edges nothing looked at.
+
+The snapshot is not incidental. A walk that read the live table while cleaning
+it would answer its own next question wrongly: cards are 512 bytes and objects
+are smaller, so scanning object A, cleaning its card, and then asking whether
+B's card is dirty reports CLEAN for a B nobody examined.
+
+### 12.3 It does not pay, and one run nearly said it did
+
+Four ABBA-interleaved release reps, `HumongousChurn 48 6000 512` at
+`-Xmx160m --nojit` — the `--nojit` arm because it is where the screen is
+actually consulted (§12.4). Medians:
+
+| | cleaning off | cleaning on |
+|---|---:|---:|
+| wall | 7740 ms | 8392 ms |
+| total pause | 3054 ms | 3680 ms |
+| byte skip-rate | 28.7% | 23.4% |
+
+Slower, and the skip-rate did not reliably rise. `checksum=249707433568` on
+all eight runs.
+
+**A single earlier run showed 82.44% against 45.49%** and would have made a
+much better story. It was noise: the per-run skip-rate on this workload ranges
+17%–52% on the SAME arm. Four reps is what it took to see that, and the first
+number is recorded here because a reader who reruns this will get one like it
+and should know it means nothing on its own.
+
+Why it does not pay is not mysterious once the numbers exist: the cost is real
+(a snapshot plus a rewrite pass per region walk) and the benefit is not, because
+most objects in a retained linked structure hold a cross-region reference and
+their cards are kept dirty anyway. Cleaning removes STALE cards, and this shape
+does not make many.
+
+So it ships off. It is sound, it is tested, and it is the mechanism a card
+table needs the moment §12.4 is fixed — but nothing measured licenses turning
+it on.
+
+### 12.4 The 0.2% is not saturation — the screen is bypassed
+
+The same runs answer the original question, and the answer is not the card
+table's contents:
+
+| arm | byte skip-rate |
+|---|---:|
+| JIT warm | 0.79% |
+| `--nojit` | 20%–50% |
+
+The table is the same in both. What differs is how many source regions reach
+the per-object screen at all: `scan_source_region_for_cset_refs` takes a
+`card_screen: bool`, and every caller passes
+`!jit_pinned_regions.contains(&src_idx)` — a JIT-pinned source is walked
+**wholesale**, screen bypassed, by the design §5 sets out (a compiled store
+there is not assumed to have taken the barrier). With the JIT warm, that is
+most of them.
+
+That is where the next measurement goes, and it is a bigger lever than
+anything in §12.2: the screen is not weak, it is switched off for the regions
+that matter. The two ways out are the two §11.1 already names for root
+coverage — precise shadow-stack coverage, which removes JIT pinning
+altogether — or an argument that a JIT-pinned region's cards ARE complete,
+which the F-08 inline barrier would supply since it dirties the card from
+compiled code.
+
+**A diagnostic gap this exposed, now closed.** The `[g1][PINS]` line that
+reports the pin set printed only from `young_collection_serial`. The parallel
+evacuator is the default path, so an investigation into exactly this question
+could not see the pin set on the arm that runs. `young_collection_parallel`
+prints it too now.
+
+### 12.5 The block-start table: not built, and why
+
+F-05's residual asks for a BOT so a dirty-card scan can start at the card
+instead of walking the region from offset 0. It is not here, deliberately.
+
+A BOT's value is proportional to the fraction of objects the screen SKIPS —
+it removes the header read and `object_total_size` for the ones stepped over.
+At the measured engagement (0.79% of bytes skipped on the arm that matters)
+there is nothing for it to remove, and building it against §12.4 would be
+optimising the part of the walk that is not the cost.
+
+The design that would work here, when the engagement is fixed, is worth
+recording because F-05's note rules out the obvious one for a good reason
+(`bump_alloc` sees a whole TLAB carve, not the objects the mutator later writes
+into it): build the table **during a walk** rather than at allocation. Every
+full region walk already steps object-by-object from 0, so it can record each
+card's first object start as it goes and stamp the region with the cursor the
+table is valid up to. A later walk uses it below that mark and walks forward
+above it. Old regions stop growing once they fill, so the table would be valid
+for essentially all of one.
+
+## 13. The card screen was switched off for the regions that matter (2026-09-02)
+
+*`perf/g1-card-screen-jit-pinned-20260902`, branched from `dev` at `86889860a`.
+§12.4 measured the card screen skipping 0.79% of source-walk bytes with the JIT
+warm against 20-50% without it, and named the cause: a JIT-pinned source region
+is walked WHOLESALE. This is that carve-out removed.*
+
+### 13.1 What the carve-out was, and the premise under it
+
+`young_collection`/`mixed_collection` add every JIT-pinned region to the source
+list on top of the remembered set's own, and pass `card_screen = false` for
+them. The reason, from the call site: "JIT-compiled code may have installed
+those references through stores the collector cannot assume went through
+`post_write_barrier_rset`". A card screen is derived from that same assumption,
+so applying it there would trust the belt the wholesale walk exists to double.
+
+The premise is about what compiled code can do behind the collector's back. It
+is worth re-deriving rather than inheriting, because it has changed.
+
+### 13.2 The enumeration
+
+Every path by which compiled code can write a reference into a G1 heap now
+reaches `post_write_barrier_rset`, which records the remembered-set entry AND
+dirties the holder's card:
+
+| path | what forces the barrier |
+|---|---|
+| `putfield` (ref), every inline arm, both tiers | G1-2 gates each arm on `region_bounds_are_live(...)`; G1 publishes nothing into `JIT_REGION_BOUNDS`, and `publishing_the_g1_barrier_table_does_not_make_region_bounds_live` pins that. Every arm takes `jit_putfield_object`. |
+| `putfield` under `CRATONVM_G1_INLINE_BARRIER` (F-08) | The inline filter elides only a null value and a same-region store — the two cases whose callee returns without recording. Everything else calls `jit_g1_post_write_barrier`. |
+| `aastore`, single-pass tier | Stores inline, then calls `helpers.write_barrier` → `jit_write_barrier` → `VmHeap::write_barrier`. The inline card-mark shortcut beside it is generational-only (`inline_card_mark_available()` is a constant `false`). |
+| `aastore`, IR tier | Refused outright: `ir_lower` latches a bailout rather than emit a barrier-less reference store. |
+| statics, natives, reflection, `Unsafe`, `VarHandle`, `arraycopy` | All funnel through the barriered accessors; none is compiled inline. |
+
+There is a second, weaker argument that holds independently and covers the
+default configuration: with `CRATONVM_G1_CARD_CLEAN` off (§12), a card is
+cleared only by `G1Region::reset`. A clean card therefore means "no store into
+this region's contents has EVER been recorded since it was recycled", and
+skipping such an object cannot skip one a store has touched.
+
+### 13.3 Measured
+
+`CRATONVM_G1_CARD_SCREEN_JIT_PINNED`, default-on with a `=0` opt-out.
+Release, `HumongousChurn 48 20000 512` at `-Xmx160m`, JIT warm:
+
+| | screen off (old behaviour) | screen on |
+|---|---:|---:|
+| source-walk bytes scanned | 90.1 MB | 1.70 MB |
+| bytes skipped | 0.21 MB | 88.6 MB |
+| **skip-rate** | **0.23%** | **98.11%** |
+
+Four ABBA-interleaved reps for time, medians: wall 7670 → 6960 ms (**-9.3%**),
+total pause 5639 → 4901 ms (**-13.1%**). The tail moves more than the median:
+the off arm ranges 6190-10469 ms and the on arm 6103-7226 ms, because the walk
+no longer scales with how much of the old generation a warm JIT happens to pin.
+
+### 13.4 Correctness evidence
+
+This is a use-after-free class of change — a lost edge frees a live object — so
+it is worth listing what was actually run rather than what was reasoned:
+
+* `dangling=0` from `verify_no_dangling_into_cset` over 21.4M objects across 16
+  pauses, on both arms, parallel evacuator;
+* `missing=0` from `dbg_verify_rset_completeness` across 6 checks on the serial
+  arm (`CRATONVM_G1_PARALLEL_EVAC=0 CRATONVM_G1_DBG_RSET=1`), both arms;
+* HotSpot-identical checksums on every probe and every kill-switch arm:
+  `G1CardChurn 11 60` (7616601600) with the flag on and off,
+  `G1ChurnPauseProbe 24 200` (111889612800), `HumongousHold 300` (266925450),
+  and `HumongousChurn` (249707433568) under `CRATONVM_G1_CARD_RSET=0`,
+  `CRATONVM_G1_CARD_CLEAN=1` and `--nojit`;
+* `a_jit_pinned_source_is_screened_or_walked_wholesale_by_the_flag` pins both
+  directions — 4096 bytes skipped with the flag on, 0 with it off, and the
+  referent reachable only through the pinned holder survives either way.
+
+The wholesale walk is still the `=0` behaviour, and it is the first thing to
+try for a lost-edge defect dated after this.
+
+### 13.5 What this does NOT change
+
+The JIT-pinned regions are still added to the source set unconditionally, and
+they are still excluded from every collection set. This changes only how much
+of such a region Phase 2 reads. Region pinning itself goes away when precise
+shadow-stack coverage lands (§11.1), which is a different and larger piece of
+work.

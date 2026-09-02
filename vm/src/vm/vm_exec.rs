@@ -10833,10 +10833,7 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
             receiver_class_id = self.shared.mem.heap.class_id_of(receiver);
         }
         // Check if the receiver is a lambda proxy.
-        let call_site = {
-            let proxies = self.shared.classes.lambda_proxies.read();
-            proxies.get(&receiver_class_id).cloned()
-        };
+        let call_site = self.shared.classes.lambda_call_site_for(receiver_class_id);
         if crate::runtime::env_cache::invoke_virtual_entry_trace()
             && method_name == "aotContributedInitializerStartsManagementContext"
         {
@@ -11521,9 +11518,18 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
                         .read()
                         .get_loaded_class_id(&class_name)
                         != Some(receiver_class_id));
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_NEEDS_EXACT_TRACE").is_some()
-                && method_name == "aotContributedInitializerStartsManagementContext"
-            {
+            // Name first, then the (now cached) gate: the name compare fails
+            // on its length for every other method, so the trace costs one
+            // `usize` compare on the path every native->Java callback takes.
+            // `CRATONVM_JIT_HOT_LOOKUP_CACHE=0` restores the original order and
+            // the uncached read.
+            if if crate::runtime::env_cache::hot_lookup_cache() {
+                method_name == "aotContributedInitializerStartsManagementContext"
+                    && crate::runtime::env_cache::needs_exact_trace()
+            } else {
+                cratonvm_types::flags::runtime_var_os("CRATONVM_NEEDS_EXACT_TRACE").is_some()
+                    && method_name == "aotContributedInitializerStartsManagementContext"
+            } {
                 let global_id = self
                     .shared
                     .classes

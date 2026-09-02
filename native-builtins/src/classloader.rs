@@ -8231,14 +8231,26 @@ fn read_string_set_rooted(
 /// because the module registry had not been populated yet, and then freezing
 /// it, is how a memo turns a boot-order accident into a permanent wrong answer.
 fn package_is_platform_defined(ctx: &mut dyn NativeContext, package_slash: &str) -> bool {
-    static MEMO: OnceLock<Mutex<std::collections::HashMap<String, bool>>> = OnceLock::new();
-    let memo = MEMO.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    if let Some(hit) = memo
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(package_slash)
-        .copied()
-    {
+    // `OrderedPlMutex` at the leaf level, not a raw `Mutex`, for the same
+    // reason as `jdk_builtin_module_sets` below: this crate re-enters the VM,
+    // so a global lock with no `LockLevel` is a deadlock the order checker
+    // cannot see, and `lock_discipline_ratchet` refuses one outright ("Do NOT
+    // raise the baseline").
+    //
+    // `Scratch` is the honest level and not merely a convenient one: the guard
+    // is never held across anything. The lookup below runs Java — module-set
+    // construction plus `module_for_package` — and it runs with NOTHING
+    // locked, because both acquisitions are single statements that read or
+    // publish and end.
+    static MEMO: OnceLock<OrderedPlMutex<std::collections::HashMap<String, bool>>> =
+        OnceLock::new();
+    let memo = MEMO
+        .get_or_init(|| OrderedPlMutex::new(std::collections::HashMap::new(), LockLevel::Scratch));
+    // Bound to a local FIRST: an `if let` scrutinee temporary lives to the end
+    // of the whole `if let`, so a guard taken there is still held in an `else`
+    // arm the next edit adds.
+    let hit = memo.lock().get(package_slash).copied();
+    if let Some(hit) = hit {
         return hit;
     }
     let Some(sets) = jdk_builtin_module_sets(ctx) else {
@@ -8248,9 +8260,7 @@ fn package_is_platform_defined(ctx: &mut dyn NativeContext, package_slash: &str)
         return false;
     };
     let answer = sets.platform.contains(&module);
-    memo.lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(package_slash.to_string(), answer);
+    memo.lock().insert(package_slash.to_string(), answer);
     answer
 }
 

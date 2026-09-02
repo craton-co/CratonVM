@@ -11,6 +11,7 @@ pub mod ec_watch;
 pub mod env_cache;
 pub mod exceptions;
 pub mod frame;
+pub mod interp_census;
 pub mod interpreter;
 pub mod invokedynamic;
 pub mod local_liveness;
@@ -70,7 +71,6 @@ pub mod stackwalker;
 pub mod gpu_marshal;
 
 #[cfg(feature = "gpu-offload")]
-pub mod gpu_residency;
 
 /// Built-in device kernels shipped as PTX, for work the bytecode
 /// lowering cannot express (see the module docs).

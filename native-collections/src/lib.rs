@@ -12117,11 +12117,49 @@ fn map_init_capacity_eager(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// the only thing they share. Keeping ONE spelling is the point: this file has
 /// twice found a rule half-applied across a family that shares the contract and
 /// not the code.
-fn map_ctor_capacity_load_check(args: &[Value]) -> Result<(), MethodCallFailed> {
+/// How a map family SPELLS the refusals above.
+///
+/// The doc comment on the helper argues for keeping one spelling. That is the
+/// right instinct when the family shares the contract, and measured against
+/// HotSpot on JDK 25 (`apps/probes/MapCtorMsgProbe.java`) this one does not —
+/// there are five spellings of the same negative-capacity check:
+///
+/// ```text
+///   HashMap / LinkedHashMap / HashSet / LinkedHashSet  Illegal initial capacity: -1
+///   Hashtable                                          Illegal Capacity: -1
+///   WeakHashMap                                        Illegal Initial Capacity: -1
+///   IdentityHashMap                                    expectedMaxSize is negative: -1
+///   ConcurrentHashMap                                  (no message at all)
+/// ```
+///
+/// Only the first row is this helper's. `ConcurrentHashMap` reached it anyway
+/// and inherited a message the JDK does not produce, so the spelling is now a
+/// parameter rather than an assumption.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MapCtorRefusalSpelling {
+    /// `HashMap` and the classes that copy its wording.
+    HashMapFamily,
+    /// `ConcurrentHashMap`: `throw new IllegalArgumentException()`, bare.
+    Messageless,
+}
+
+fn map_ctor_capacity_load_check(
+    args: &[Value],
+    spelling: MapCtorRefusalSpelling,
+) -> Result<(), MethodCallFailed> {
+    // An EMPTY message is this crate's marker for a null `getMessage()` — see
+    // the `IllegalArgumentException` arm of `RuntimeError::render`. `Some("")`
+    // and `None` are different answers to `getMessage()`, and the probe reads
+    // the difference.
+    let messageless = spelling == MapCtorRefusalSpelling::Messageless;
     if let Some(Value::Int(c)) = args.get(1) {
         if *c < 0 {
             return Err(RuntimeError::IllegalArgumentException {
-                message: format!("Illegal initial capacity: {c}"),
+                message: if messageless {
+                    String::new()
+                } else {
+                    format!("Illegal initial capacity: {c}")
+                },
             }
             .into());
         }
@@ -12129,7 +12167,14 @@ fn map_ctor_capacity_load_check(args: &[Value]) -> Result<(), MethodCallFailed> 
     if let Some(Value::Float(f)) = args.get(2) {
         if *f <= 0.0 || f.is_nan() {
             return Err(RuntimeError::IllegalArgumentException {
-                message: format!("Illegal load factor: {f}"),
+                message: if messageless {
+                    String::new()
+                } else {
+                    // `java_float_to_string`, not `{f}`: Rust prints 0.0f32 as
+                    // "0" and Java prints "0.0", so the plain interpolation was
+                    // wrong for every caller at once.
+                    format!("Illegal load factor: {}", java_float_to_string(*f))
+                },
             }
             .into());
         }
@@ -12146,7 +12191,7 @@ fn map_init_capacity_inner(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    map_ctor_capacity_load_check(args)?;
+    map_ctor_capacity_load_check(args, MapCtorRefusalSpelling::HashMapFamily)?;
     let cap = match args.get(1) {
         Some(Value::Int(c)) => {
             // JDK `HashMap(int initialCapacity)` / `HashSet(int)` semantics:
@@ -12265,7 +12310,10 @@ fn native_hashtable_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -
         if !load_factor.is_finite() || *load_factor <= 0.0 {
             return Err(
                 cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                    message: format!("Illegal Load: {load_factor}"),
+                    message: format!(
+                        "Illegal Load: {}",
+                        java_float_to_string(*load_factor)
+                    ),
                 }
                 .into(),
             );
@@ -18953,7 +19001,7 @@ fn register_set_view_carrier_natives(r: &mut NativeMethodRegistry) {
 fn native_hs_init_capacity_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // BEFORE the trim, or the load factor is validated by nobody: the guard
     // reads `args[2]`, and the (I)V path this delegates to never sees it.
-    map_ctor_capacity_load_check(args)?;
+    map_ctor_capacity_load_check(args, MapCtorRefusalSpelling::HashMapFamily)?;
     // Drop the loadFactor (last) arg and reuse the (I)V path.
     let trimmed: Vec<Value> = args.iter().take(2).copied().collect();
     native_hs_init_capacity(ctx, &trimmed)
@@ -19315,7 +19363,7 @@ fn native_hs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 }
 
 fn native_hs_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    map_ctor_capacity_load_check(args)?;
+    map_ctor_capacity_load_check(args, MapCtorRefusalSpelling::HashMapFamily)?;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -21687,7 +21735,12 @@ fn native_al_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // iterators as holding a trailing `null` element.
         return Err(
             cratonvm_types::error::RuntimeError::NoSuchElementException {
-                message: "no more elements".to_string(),
+                // MEASURED on HotSpot 25.0.4+7 (`apps/probes/MapCtorMsgProbe.java`):
+                // an exhausted iterator or enumeration in this family answers a
+                // NULL `getMessage()`. `Vector`'s enumeration is the one that does
+                // not ("Vector Enumeration") and does not come through here. An
+                // EMPTY message is this crate's marker for no message.
+                message: String::new(),
             }
             .into(),
         );
@@ -21840,7 +21893,7 @@ fn native_map_key_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         // own exhausted paths, so the two cannot drift into different reports.
         return Err(
             cratonvm_types::error::RuntimeError::NoSuchElementException {
-                message: "No more elements".to_string(),
+                message: String::new(),
             }
             .into(),
         );
@@ -38453,6 +38506,18 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // A null source map answered an EMPTY MAP here, where the JDK
+    // dereferences it: `HashMap(Map m)` -> `putMapEntries(m, false)` ->
+    // `int s = m.size()`. Silently accepting null is worse than a wrong
+    // message -- the caller does not learn it passed null at all. Only an
+    // explicitly-passed null throws; a missing argument stays the
+    // malformed-call no-op, the distinction `reject_null_functional` draws.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Cannot invoke \"java.util.Map.size()\" because \"m\" is null".to_string()),
+        }
+        .into());
+    }
     let source = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -44857,7 +44922,7 @@ fn native_lhm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 fn native_lhm_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Serves the `(I)V`, `(IF)V` and `(IFZ)V` constructors, so validating
     // `args[1]`/`args[2]` here covers all three.
-    map_ctor_capacity_load_check(args)?;
+    map_ctor_capacity_load_check(args, MapCtorRefusalSpelling::HashMapFamily)?;
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -44943,7 +45008,16 @@ fn lhm_is_access_order(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
 fn native_lhm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // RULE C: `LinkedHashMap(Map)` is `putMapEntries(m, false)`, which reads
     // `m.size()`.
-    reject_null_collection(args.get(1))?;
+    // NOT `reject_null_collection`: that is the
+    // `Objects.requireNonNull(c)` shape, whose NPE carries no message. This
+    // constructor DEREFERENCES its argument (`m.size()`), so the JDK raises a
+    // helpful NPE naming the method and its own parameter name.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Cannot invoke \"java.util.Map.size()\" because \"m\" is null".to_string()),
+        }
+        .into());
+    }
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -49596,7 +49670,7 @@ fn register_queue_deque_interface_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/util/Deque", "isEmpty", "()Z", native_ad_is_empty);
 
     // `java/util/ArrayDeque$Itr` RETIRED 2026-09-02 by the iterator-carrier
-    // census (`docs/internal/fixed-suite-bugs/iterator-carrier-census-20260902.md`).
+    // census (`fixed-suite-bugs/iterator-carrier-census-20260902.md`).
     // `hasNext`/`next`/`remove` were bound here to the 2-field snapshot
     // pattern for a class this crate stopped minting on 2026-08-30, when
     // ArrayDeque's iterator became the real `DeqIterator`.
@@ -51885,11 +51959,17 @@ pub fn gc_overlay_owner_addrs() -> Option<std::collections::HashSet<usize>> {
     let index = overlay_owner_keys()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if index.is_empty() {
-        None
-    } else {
-        Some(index.keys().copied().collect())
-    }
+    // `Some` of an EMPTY set, not `None`, when nothing is registered.
+    //
+    // The two say opposite things to a marker. `None` means "I cannot
+    // enumerate my owners, so do not exclude anything on my behalf"
+    // (`ExternalRootProvider::owner_addrs`), which forces the per-object
+    // overlay lookup -- the provider lock and this mutex -- for every marked
+    // object in the heap. `Some(empty)` is the fact: this provider owns
+    // nothing, so no address needs asking about. A program that touches no
+    // native-backed collection is exactly the case that was paying most for
+    // the ambiguity.
+    Some(index.keys().copied().collect())
 }
 
 /// Return the Rust-side references owned by one already-marked collection.
@@ -55470,7 +55550,16 @@ fn native_tm_descending_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 /// `TreeMap(Map)` — a fresh natural-ordered map, then `putAll`.
 fn native_tm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // RULE C: the JDK's body is `putAll(m)`, which reads `m.size()`.
-    reject_null_collection(args.get(1))?;
+    // NOT `reject_null_collection`: that is the
+    // `Objects.requireNonNull(c)` shape, whose NPE carries no message. This
+    // constructor DEREFERENCES its argument (`map.size()`), so the JDK raises a
+    // helpful NPE naming the method and its own parameter name.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Cannot invoke \"java.util.Map.size()\" because \"map\" is null".to_string()),
+        }
+        .into());
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -59778,7 +59867,7 @@ fn native_chm_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // bytecode runs `new ConcurrentHashMap<>(initialCapacity)`, and THIS
     // constructor validated nothing. One line, the same guard every other
     // hash-ordered constructor in the file now shares.
-    map_ctor_capacity_load_check(args)?;
+    map_ctor_capacity_load_check(args, MapCtorRefusalSpelling::Messageless)?;
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -59870,7 +59959,10 @@ fn native_chm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // the shape `phase-2-worklist` records as the worst a refusal can take,
     // because the caller does not learn it passed null until much later.
     if matches!(args.get(1), None | Some(Value::Object(None))) {
-        return Err(bare_npe());
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Cannot invoke \"java.util.Map.size()\" because \"m\" is null".to_string()),
+        }
+        .into());
     }
     // cceres5: `chm_init_segments` allocates (segments + buckets); `source`
     // sat raw in `args` across it, so `collect_entries_any` below could walk a
@@ -61035,8 +61127,15 @@ fn native_chm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // so it is an NPE and not a silent no-op. A missing argument is a dispatch
     // defect rather than a Java-visible null and keeps the old return — the
     // distinction `reject_null_functional` draws.
+    // The comment above says `m.size()`; MEASURED on HotSpot 25 the
+    // message names `entrySet()`. `ConcurrentHashMap.putAll` is not
+    // `HashMap.putAll`, and the premise had been transcribed from the wrong
+    // class -- which is why this arm is keyed on the measurement.
     if matches!(args.get(1), Some(Value::Object(None))) {
-        return Err(bare_npe());
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Cannot invoke \"java.util.Map.entrySet()\" because \"m\" is null".to_string()),
+        }
+        .into());
     }
     let source = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
@@ -71832,6 +71931,50 @@ fn native_executors_new_scheduled_pool(
 // so the request now equals the declared width.
 const CF_FIELD_RESULT: usize = 0;
 const CF_FIELD_DONE: usize = 1;
+
+/// `CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT` — default-ON, `=0` opts out. Routes
+/// the `postComplete()` callback through `invoke_virtual_bytecode_only`
+/// instead of `invoke_virtual`, i.e. straight to the interpreter's `execute`
+/// rather than through the by-NAME native resolver that misses. See the call
+/// site in `native_cf_complete`.
+fn cf_postcomplete_direct_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static GATE: AtomicU8 = AtomicU8::new(0);
+    match GATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = match cratonvm_types::flags::runtime_var(
+                "CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT",
+            ) {
+                Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+                Err(_) => true,
+            };
+            GATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// `CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP` — default-ON, `=0` opts out. See the
+/// call site in `native_cf_complete`.
+fn cf_postcomplete_skip_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static GATE: AtomicU8 = AtomicU8::new(0);
+    match GATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on =
+                match cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP") {
+                    Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+                    Err(_) => true,
+                };
+            GATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
 /// Number of slots a CratonVM *synthetic* `CompletableFuture` carries — the
 /// real declared width, because `CF_FIELD_RESULT`/`CF_FIELD_DONE` are the only
 /// two slots any native in this crate touches.
@@ -73488,7 +73631,32 @@ fn native_cf_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // cross-thread `complete()` (the timed `get(...)` only "self-heals"
         // because `parkNanos` re-polls `result`). Run `postComplete()` to release
         // waiters — this is the missing half of the synthetic override.
-        ctx.invoke_virtual(this, "postComplete", "()V", &[])?;
+        //
+        // ...but only when there is a stack to pop. `postComplete()`'s whole
+        // body is `while ((h = f.stack) != null || (f != this && (h = (f =
+        // this).stack) != null))`, so with `stack`@1 null it returns having
+        // done nothing — and this callback is not cheap: it is a by-NAME
+        // virtual dispatch out of a native, which resolves through
+        // `invoke_or_native` (two registry probes plus the descriptor-quirk
+        // scan, all of them misses — `postComplete` is not a native) and then
+        // through `invoke_on_class_shared_inner`. The composition page's
+        // "name-keyed lookup, 8.2 %" bucket is that chain: 100 005 missed
+        // `CompletableFuture.postComplete()V` registry lookups in 40 000
+        // chains, 76 % of every miss on the workload.
+        //
+        // A `complete()` with no dependents and no waiter is the common shape
+        // outside a composition benchmark; there the whole chain now costs one
+        // field read. `CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP=0` restores the
+        // unconditional callback so the two arms can be priced in one binary.
+        let no_waiters = matches!(ctx.get_field(this, CF_FIELD_DONE), Value::Object(None))
+            && cf_postcomplete_skip_enabled();
+        if !no_waiters {
+            if cf_postcomplete_direct_enabled() {
+                ctx.invoke_virtual_bytecode_only(this, "postComplete", "()V", &[])?;
+            } else {
+                ctx.invoke_virtual(this, "postComplete", "()V", &[])?;
+            }
+        }
     }
     Ok(Some(Value::Int(1)))
 }
@@ -73565,7 +73733,13 @@ fn native_cf_complete_exceptionally(
     // blocked in untimed `get()`/`join()`. Without this they hang forever on a
     // cross-thread exceptional completion — the same defect fixed in
     // `native_cf_complete`.
-    ctx.invoke_virtual(this, "postComplete", "()V", &[])?;
+    //
+    // `invoke_virtual_bytecode_only`, not `invoke_virtual`, for the reason the
+    // sibling in `native_cf_complete` states and measures: `postComplete` is
+    // ordinary JDK bytecode and can never be a native, so the by-NAME resolver
+    // is two hashes of the 53-byte triple plus the cold descriptor-quirk
+    // rewrite, all of them misses, per completion.
+    ctx.invoke_virtual_bytecode_only(this, "postComplete", "()V", &[])?;
     Ok(Some(Value::Int(1)))
 }
 
@@ -74689,7 +74863,7 @@ mod tests {
     /// No natives may be bound to an iterator class this crate never MINTS.
     ///
     /// The durable output of the iterator-carrier census
-    /// (`docs/internal/fixed-suite-bugs/iterator-carrier-census-20260902.md`).
+    /// (`fixed-suite-bugs/iterator-carrier-census-20260902.md`).
     /// A registration keyed on a class nobody produces is inert until someone
     /// produces one, and then it WINS the slot over the registration that
     /// matches the shape actually minted. It has happened twice:
