@@ -653,8 +653,13 @@ struct Lowerer<'a> {
     /// Did any safepoint actually emit a shadow push?
     shadow_pushed_any: bool,
     /// Compact-layout metadata for the instance fields this method reads:
-    /// `bytecode_pc → (packed byte offset from the object body, is_reference,
-    /// descriptor tag)`. Empty ⇒ every `Op::Load` takes the checked helper.
+    /// `(bytecode_pc, is_reference) → (packed byte offset from the object
+    /// body, is_reference, descriptor tag)`. Empty ⇒ every `Op::Load` takes
+    /// the checked helper.
+    ///
+    /// The key carries `is_reference` because one pc can own two rows: the
+    /// String-access expansion emits a `coder` (Int) and a `value` (Ref)
+    /// load at a single `invokevirtual` pc.
     ///
     /// Present for the same reason the single-pass backend carries it: routing
     /// every field read through `jit_getfield` costs a boundary note, a region
@@ -662,7 +667,7 @@ struct Lowerer<'a> {
     /// JIT emits. The single-pass backend measured that at 4.7x on bintrees-16
     /// when the hardening first landed; the IR tier still paid it, which is why
     /// a forced-C2 bt18 ran 1.85x slower than the C1 body it replaced.
-    compact_fields: HashMap<usize, (u32, bool, u8)>,
+    compact_fields: HashMap<(usize, bool), (u32, bool, u8)>,
     /// Address of the GC's published `JIT_READ_BOUNDS` table, for the guarded
     /// receiver check. Zero ⇒ no inline field read (the guard cannot be
     /// emitted, so the helper stays).
@@ -969,7 +974,7 @@ impl<'a> Lowerer<'a> {
         sr_map: Option<&'a ScalarReplacementMap>,
         direct_calls: &'a HashMap<usize, (usize, bool)>,
         ic_slots: &'a HashMap<usize, (usize, usize)>,
-        compact_fields: &HashMap<usize, (u32, bool, u8)>,
+        compact_fields: &HashMap<(usize, bool), (u32, bool, u8)>,
         inline_scopes: &'a InlineScopeTable,
     ) -> Self {
         // Frame homes of the reference PARAMETERS, in `[rbp - off]` form. Every
@@ -3079,7 +3084,17 @@ impl<'a> Lowerer<'a> {
             crate::metrics::note_ir_getfield_decline(1);
             return false;
         };
-        let Some(&(c_off, c_is_ref, type_tag)) = self.compact_fields.get(&pc) else {
+        // Keyed by `(pc, is_reference)` and not by `pc` alone: the IR
+        // String-access expansion (`ir.rs::try_string_access_intrinsic`)
+        // emits TWO `Op::Load`s at one `invokevirtual` pc — `coder` (Int)
+        // and `value` (Ref) — so a pc-only key could describe at most one
+        // of them and the other would fall to the checked helper for want
+        // of a row rather than for any reason about the field. An ordinary
+        // `getfield` pc carries exactly one row, under its own field's
+        // reference-ness, so nothing about that case changes.
+        let Some(&(c_off, c_is_ref, type_tag)) =
+            self.compact_fields.get(&(pc, node_ty == IrType::Ref))
+        else {
             crate::metrics::note_ir_getfield_decline(2);
             return false;
         };
@@ -11028,7 +11043,7 @@ pub fn lower(
     let empty: HashMap<usize, bool> = HashMap::new();
     let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
     let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
-    let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+    let no_compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
     lower_inner(
         graph,
         schedule,
@@ -11059,7 +11074,7 @@ pub fn lower_with_branch_hints(
 ) -> Option<CompiledMethod> {
     let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
     let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
-    let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+    let no_compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
     lower_inner(
         graph,
         schedule,
@@ -11092,7 +11107,7 @@ pub fn lower_with_scalar_deopt(
     let empty: HashMap<usize, bool> = HashMap::new();
     let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
     let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
-    let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+    let no_compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
     lower_inner(
         graph,
         schedule,
@@ -11144,7 +11159,7 @@ pub(crate) fn lower_inner(
     sr_map: Option<&ScalarReplacementMap>,
     direct_calls: &HashMap<usize, (usize, bool)>,
     ic_slots: &HashMap<usize, (usize, usize)>,
-    compact_fields: &HashMap<usize, (u32, bool, u8)>,
+    compact_fields: &HashMap<(usize, bool), (u32, bool, u8)>,
 ) -> Option<CompiledMethod> {
     // No inlined callee scopes: every deopt point is a single flat frame, which
     // is what this path has always produced.
@@ -11193,10 +11208,11 @@ pub(crate) fn lower_inner_with_scopes(
     // virtual / interface site served from an inline cache. Empty ⇒ every such
     // site keeps the historical helper dispatch.
     ic_slots: &HashMap<usize, (usize, usize)>,
-    // Guarded inline field reads: `pc → (packed body offset, is_reference,
-    // descriptor tag)` for every resolved compact instance field. Empty ⇒ every
-    // `Op::Load` takes the checked helper, as it always did.
-    compact_fields: &HashMap<usize, (u32, bool, u8)>,
+    // Guarded inline field reads: `(pc, is_reference) → (packed body offset,
+    // is_reference, descriptor tag)` for every resolved compact instance field,
+    // plus the two rows the IR String-access expansion needs at its invoke pc.
+    // Empty ⇒ every `Op::Load` takes the checked helper, as it always did.
+    compact_fields: &HashMap<(usize, bool), (u32, bool, u8)>,
     // Which inlined callee each `graph.safepoints` entry belongs to, and the
     // caller scopes above it. Empty ⇒ flat, caller-less deopt frames.
     inline_scopes: &InlineScopeTable,
@@ -13411,7 +13427,7 @@ mod tests {
 
         let empty_hints: HashMap<usize, bool> = HashMap::new();
         let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
-        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let no_compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
         lower_inner(
             &graph,
             &schedule,
@@ -13481,7 +13497,7 @@ mod tests {
         let mut direct: HashMap<usize, (usize, bool)> = HashMap::new();
         direct.insert(invoke_pc, (entry, needs_ctx));
         let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
-        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let no_compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
         lower_inner(
             &graph,
             &schedule,
@@ -13655,7 +13671,7 @@ mod tests {
         let empty_hints: HashMap<usize, bool> = HashMap::new();
         let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
         let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
-        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let no_compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
         let cm = lower_inner(
             &graph,
             &schedule,
@@ -15544,7 +15560,7 @@ mod tests {
         let empty: HashMap<usize, bool> = HashMap::new();
         let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
         let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
-        let no_compact_fields: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let no_compact_fields: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
         let no_scopes = InlineScopeTable::new();
         let buf = ExecutableBuffer::new(4096).expect("executable buffer");
         let helpers = no_helpers();
@@ -16304,7 +16320,7 @@ mod tests {
         let empty: HashMap<usize, bool> = HashMap::new();
         let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
         let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
-        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let no_compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
         let no_scopes = InlineScopeTable::new();
         let buf = ExecutableBuffer::new(4096).expect("executable buffer");
         let helpers = no_helpers();
@@ -16532,7 +16548,7 @@ mod tests {
             let empty: HashMap<usize, bool> = HashMap::new();
             let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
             let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
-            let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+            let no_compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
             let no_scopes = InlineScopeTable::new();
             let buf = ExecutableBuffer::new(4096).expect("executable buffer");
             let helpers = no_helpers();
@@ -16704,7 +16720,7 @@ mod tests {
         let empty: HashMap<usize, bool> = HashMap::new();
         let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
         let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
-        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let no_compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
         let buf = ExecutableBuffer::new(4096).expect("executable buffer");
         let helpers = no_helpers();
         let lowerer = Lowerer::new(
@@ -18595,7 +18611,7 @@ mod tests {
         let empty: &'static HashMap<usize, bool> = Box::leak(Box::new(HashMap::new()));
         let no_direct: &'static HashMap<usize, (usize, bool)> = Box::leak(Box::new(HashMap::new()));
         let no_ic: &'static HashMap<usize, (usize, usize)> = Box::leak(Box::new(HashMap::new()));
-        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let no_compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
         let no_scopes: &'static InlineScopeTable = Box::leak(Box::new(InlineScopeTable::new()));
         let helpers: &'static JitRuntimeHelpers = Box::leak(Box::new(no_helpers()));
         let buf = ExecutableBuffer::new(buf_cap).expect("executable buffer");

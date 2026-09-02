@@ -11,6 +11,43 @@ the CratonVM binary** — a release build was compiling throughout. All edits ar
 confined to `#[cfg(test)]` modules and `tests/` targets; §7 nominates the three
 things that need a non-test change.
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** The status says "this lane did not
+> run `cargo`". It has now been run, on a build from this tree, and **all four
+> guards were run BY NAME** so that a rename or deletion could not hide behind a
+> green file:
+>
+> ```text
+> 1  graalvm_compat::tests::test_register_total_method_count            1 passed, 4215 filtered
+> 2  vm/tests/jck_conformance.rs                                        3 passed
+> 3  wp7_2 ::each_jdbc_core_type_has_registered_natives                 1 passed,    9 filtered
+> 4  opcorpus::tests::there_is_an_entry_for_every_named_opcode_...      1 passed,  181 filtered
+> ```
+>
+> **Guard 2 is the one that proves the repair.** §"the committed baseline
+> document" records that `cargo test -p cratonvm-vm --test jck_conformance
+> -- --nocapture` **"ran zero tests, and had since the `#![cfg]` was added"** —
+> a guard that was green because it executed nothing. Today the same command on
+> default features runs **3**. That is the defect this record is named for, and
+> it is visible only in the COUNT: the `ok` looked identical before and after.
+>
+> **A red in guard 3's file is NOT this record's.** `cargo test -p cratonvm-vm
+> --test wp7_2_jdbc_core_types_reachable` fails today — but on
+> `connection_methods_carry_signatures`, which returns the "probe did not run"
+> sentinel `-100` and drives `Connection.class.getDeclaredMethods()` through
+> `synthetic_jdk_method_decls`. Guard 3 is
+> `each_jdbc_core_type_has_registered_natives`, a different test, and it passes.
+> Judging this record by the FILE would have held it open for a defect that is
+> not its subject; that regression is tracked separately and is not this lane's.
+>
+> Both failure modes in one record, which is worth stating plainly: a green that
+> meant nothing because the binary ran no tests, and a red that meant something
+> else because it was a different test in the same file. Neither is visible from
+> a pass/fail line alone.
+>
+> Unchanged: §6's mutation transcripts remain executable-transcript evidence, not
+> `cargo` runs of the mutants. This note says the four guards run and pass today;
+> it does not re-run the nine mutations.
+
 **Prov:** GraalVM SDK 25.0.2 and the JDK 25 opcode tables were **measured on
 this host today** (§2.1, §5.1). Everything else is source read in this working
 tree. Rust behaviour is asserted by standalone `rustc` harnesses that lift the

@@ -1311,6 +1311,64 @@ fn loop_has_hard_barrier(graph: &Graph, body: &FxHashSet<NodeId>) -> bool {
     })
 }
 
+/// The same question asked about WRITES only, plus stores.
+///
+/// [`loop_has_hard_barrier`] disqualifies a loop from every hoist when its
+/// body holds any impure non-control node outside a small allow-list. Three
+/// of the nodes it therefore rejects write no memory at all:
+///
+/// * `Op::ArrayLoad` and `Op::ArrayLength` are **reads**. A read cannot
+///   clobber the location a hoisted load reads, so it cannot make a hoist
+///   value-unsafe. Each is impure only because it raises NPE on a null base
+///   — a TRAP-ordering fact, not an aliasing one.
+/// * `Op::Guard` carries no memory edge at all (`ir_schedule`: "its ordering
+///   against a store is positional"). It transfers control to a deopt; it
+///   writes nothing.
+///
+/// `Op::Store` is NOT exempt here, unlike in the strict predicate: the
+/// restricted hoist this feeds does no alias analysis, so it wants a body
+/// that writes nothing whatsoever rather than one whose writes it would have
+/// to reason about. Everything else — `Op::ArrayStore`, `Op::Call`,
+/// `Op::New`, `Op::NewArray`, `Op::LoadStatic`, the monitors — stays a
+/// barrier for the same reason it always was.
+///
+/// # What this is for
+///
+/// The IR String-access expansion (`ir.rs::try_string_access_intrinsic`)
+/// emits four `Op::Guard`s, two `Op::ArrayLoad`s and one `Op::ArrayLength`
+/// into the very loop it wants its `String.value` / `String.coder` loads
+/// hoisted OUT of — so it disqualified its own LICM, and `CRATONVM_DBG=licm`
+/// reported `hard_barrier=true` with 0 hoisted on every candidate header of
+/// `probes/CharAtCostCurve.java`. The same shape belongs to any counted loop
+/// carrying a bounds-checked array read.
+fn loop_writes_memory(graph: &Graph, body: &FxHashSet<NodeId>) -> bool {
+    body.iter().any(|&id| {
+        let op = &graph.nodes[id as usize].op;
+        !op.is_pure()
+            && !op.is_control()
+            && !matches!(
+                op,
+                Op::Load(_)
+                    | Op::Phi
+                    | Op::Dead
+                    | Op::Guard { .. }
+                    | Op::ArrayLoad(_)
+                    | Op::ArrayLength
+            )
+    })
+}
+
+/// `CRATONVM_JIT_NO_LICM_READ_HOIST=1` — turn off the restricted invariant-
+/// load hoist for a loop that only its own reads and guards disqualify.
+///
+/// Default ON. The B arm of an in-binary A/B: with this set,
+/// `probes/CharAtCostCurve.java` with the String-intrinsic pin off returns to
+/// re-reading `String.value` and `String.coder` per character, and every
+/// other arm is unchanged.
+fn licm_read_hoist_enabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_LICM_READ_HOIST").is_none()
+}
+
 /// Points-to summary of a reference node, used by the LICM alias oracle to
 /// reason about loads/stores whose base flows through a `Phi` (cross-merge).
 struct RefPointsTo {
@@ -1481,10 +1539,12 @@ fn licm(graph: &mut Graph) -> bool {
                 .filter(|&&id| matches!(graph.nodes[id as usize].op, Op::Load(_)))
                 .count();
             eprintln!(
-                "[DBG_LICM] header {region}: body {} node(s), {} load(s), hard_barrier={}",
+                "[DBG_LICM] header {region}: body {} node(s), {} load(s), \
+                 hard_barrier={} writes_memory={}",
                 body.len(),
                 nloads,
-                loop_has_hard_barrier(graph, &body)
+                loop_has_hard_barrier(graph, &body),
+                loop_writes_memory(graph, &body)
             );
         }
         // The pre-header is the classified loop-entry predecessor — NOT
@@ -1580,6 +1640,135 @@ fn licm(graph: &mut Graph) -> bool {
                 }
                 graph.nodes[al as usize].inputs[0] = preheader;
                 graph.nodes[al as usize].inputs[1] = new_mem;
+                changed = true;
+                hoisted += 1;
+            }
+        }
+
+        // ── Restricted invariant `Op::Load` hoist ───────────────────────────
+        //
+        // For a loop the STRICT rule refuses and `loop_writes_memory` clears:
+        // its body reads and guards, and writes nothing. Placed here, beside
+        // the `Op::ArrayLength` arm and above the pre-header guard below, for
+        // the same reason that arm is: for a nested INNER loop `body`
+        // over-approximates and drags the enclosing loop's pre-header in with
+        // it, and `loop_headers` has already established structurally that
+        // `entry_pred` is outside the natural loop. Over-approximation is the
+        // safe direction for every test below — a bigger `body` makes
+        // `is_loop_invariant` stricter and `header_derefs` smaller, so it can
+        // only refuse a hoist, never admit a wrong one.
+        //
+        // Three obligations, the same three the `ArrayLength` arm discharges:
+        //
+        // 1. **The value cannot change.** Nothing in the body writes memory
+        //    (`loop_writes_memory`), and the base is loop-invariant. So the
+        //    load reads the same location and the same value on every
+        //    iteration, and computing it once at the pre-header is
+        //    value-preserving rather than a claim about aliasing.
+        //
+        // 2. **The throw point does not move.** An `Op::Load` deopts (it does
+        //    not fault) on a null base, and a deopt raised from the pre-header
+        //    would rebuild an interpreter frame at a bci the loop never
+        //    reached. So the base must already be dereferenced on entry to the
+        //    header — either because this load IS control-anchored there (the
+        //    `ArrayLength` arm's own condition) or because some other
+        //    header-anchored load/`arraylength` reads the same base.
+        //    `preheader_may_trap` refuses the remaining case, a pre-header
+        //    that can itself throw.
+        //
+        //    For the shape this exists for that condition is exactly met: a
+        //    counted `for (i = 0; i < s.length(); i++)` expands `s.length()`
+        //    at the header, off the same receiver `s.charAt(i)` uses.
+        //
+        // 3. **The memory token is re-anchored.** Without it the hoist is
+        //    INERT whenever the body threads memory through a read:
+        //    `ir_schedule::find_best_block` places a data node in the deepest
+        //    block dominated by all its inputs, so a load still reading the
+        //    loop's memory phi stays in the loop however its control points.
+        if licm_read_hoist_enabled()
+            && preheader != NO_NODE
+            && loop_has_hard_barrier(graph, &body)
+            && !loop_writes_memory(graph, &body)
+            && !preheader_may_trap(graph, preheader)
+        {
+            let header_derefs: FxHashSet<NodeId> = body
+                .iter()
+                .copied()
+                .filter_map(|id| {
+                    let n = &graph.nodes[id as usize];
+                    if !matches!(n.op, Op::Load(_) | Op::ArrayLength) {
+                        return None;
+                    }
+                    if n.inputs.len() < 3 || n.inputs[0] != region {
+                        return None;
+                    }
+                    Some(n.inputs[2])
+                })
+                .collect();
+            let entry_mem = loop_entry_memory(graph, region, entry_pred);
+            let read_load_ids: Vec<NodeId> = body
+                .iter()
+                .copied()
+                .filter(|&id| matches!(graph.nodes[id as usize].op, Op::Load(_)))
+                .collect();
+            for load in read_load_ids {
+                let inputs = graph.nodes[load as usize].inputs.clone();
+                // Full `[ctrl, mem, base, offset?]` form only: the compact
+                // EA-bridge shapes carry no control or memory slot to move,
+                // and this arm's whole content is moving those two.
+                if inputs.len() < 3 {
+                    continue;
+                }
+                let base = inputs[2];
+                let addr = if inputs.len() >= 4 { inputs[3] } else { NO_NODE };
+                if !is_loop_invariant(graph, base, region, &body) {
+                    if dbg {
+                        eprintln!("[DBG_LICM] read-hoist load {load}: skip — base {base} variant");
+                    }
+                    continue;
+                }
+                if addr != NO_NODE && !is_loop_invariant(graph, addr, region, &body) {
+                    if dbg {
+                        eprintln!("[DBG_LICM] read-hoist load {load}: skip — addr {addr} variant");
+                    }
+                    continue;
+                }
+                if inputs[0] != region && !header_derefs.contains(&base) {
+                    if dbg {
+                        eprintln!(
+                            "[DBG_LICM] read-hoist load {load}: skip — base {base} is not \
+                             dereferenced at the header"
+                        );
+                    }
+                    continue;
+                }
+                let new_mem = if is_loop_invariant(graph, inputs[1], region, &body) {
+                    inputs[1]
+                } else {
+                    match entry_mem {
+                        Some(m) => m,
+                        None => {
+                            if dbg {
+                                eprintln!(
+                                    "[DBG_LICM] read-hoist load {load}: skip — no loop-entry memory"
+                                );
+                            }
+                            continue;
+                        }
+                    }
+                };
+                if inputs[0] == preheader && inputs[1] == new_mem {
+                    continue;
+                }
+                if dbg {
+                    eprintln!(
+                        "[DBG_LICM] read-hoist load {load} (inputs {inputs:?}): HOIST to \
+                         preheader {preheader}, mem {} -> {new_mem}",
+                        inputs[1]
+                    );
+                }
+                graph.nodes[load as usize].inputs[0] = preheader;
+                graph.nodes[load as usize].inputs[1] = new_mem;
                 changed = true;
                 hoisted += 1;
             }

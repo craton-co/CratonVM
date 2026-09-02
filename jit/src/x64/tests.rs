@@ -1362,6 +1362,60 @@ fn test_compile_branch() {
     );
 }
 
+/// The spill census must be WIRED, not merely defined.
+///
+/// Every column here was a `pub fn` away from being another counter nobody
+/// calls — the exact defect the census exists to fix one level up. This drives
+/// a real compile and asserts the columns move, so losing a `note_spill_*` call
+/// site fails a test instead of silently reporting zeros forever.
+///
+/// It asserts DIRECTION, not magnitude: the numbers are global across every
+/// compile the test binary has done, so an exact value would be an assertion
+/// about test ordering.
+#[test]
+fn the_spill_census_is_wired_to_the_cursor() {
+    let before = crate::spill_cursor_counts();
+
+    // Any body with an operand stack will do; `push_stack` is on the path of
+    // essentially every opcode that produces a value.
+    let code: Vec<u8> = vec![
+        0x1a, // 0: iload_0
+        0x1b, // 1: iload_1
+        0x60, // 2: iadd
+        0xac, // 3: ireturn
+        0, 0,
+    ];
+    let compiled = compile_array_test(&code, 4, 2, 2);
+    // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
+    let got = unsafe { compiled.try_call(&[20, 22]).expect("test JIT call") };
+    assert_eq!(got, 42, "the compiled body must still compute the sum");
+
+    let after = crate::spill_cursor_counts();
+    assert!(
+        after[crate::SPILL_RES_TOTAL] > before[crate::SPILL_RES_TOTAL],
+        "res-total did not move across a compile that pushes operands: the          census is defined but not wired ({} -> {})",
+        before[crate::SPILL_RES_TOTAL],
+        after[crate::SPILL_RES_TOTAL]
+    );
+    assert!(
+        after[crate::SPILL_RES_PUSH] > before[crate::SPILL_RES_PUSH],
+        "res-push did not move, so `push_stack` no longer reports"
+    );
+    assert!(
+        after[crate::SPILL_RES_TOTAL] >= after[crate::SPILL_RES_PUSH],
+        "res-total must bound the columns attributed out of it"
+    );
+    assert!(
+        after[crate::SPILL_MIN_HEADROOM] < u64::MAX,
+        "min-headroom is still its unset sentinel after a successful          reservation, so nothing is recording it"
+    );
+    assert_eq!(
+        after[crate::SPILL_FLUSH_CANONICAL],
+        0,
+        "flush-canonical is a retired column and must stay zero; if this fires,          someone revived the canonical-home flush without revisiting the          measurement that withdrew it (see `Compiler::flush_home`)"
+    );
+}
+
 #[test]
 fn test_compile_fib() {
     // int fib(int n) {

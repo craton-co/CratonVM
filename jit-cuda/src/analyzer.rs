@@ -43,7 +43,18 @@ pub enum ParamKind {
 }
 
 impl ParamKind {
-    fn from_field(ft: &FieldType) -> Option<Self> {
+    /// Map a JVM field type to the kernel parameter kind that carries
+    /// it, or `None` when this crate will not admit the type at all.
+    ///
+    /// `pub` because it is the canonical statement of which array
+    /// element types the GPU pipeline admits, and the VM's marshaller
+    /// is checked against it -- see
+    /// `cratonvm_vm::runtime::offload::is_marshallable_array_element`
+    /// and the `analyzer_and_marshaller_admit_the_same_arrays` test.
+    /// A type admitted here but not marshallable there produces a
+    /// kernel that compiles and then silently falls back to the
+    /// interpreter, which no differential test can detect.
+    pub fn from_field(ft: &FieldType) -> Option<Self> {
         Some(match ft {
             FieldType::Int | FieldType::Boolean | FieldType::Char => ParamKind::I32,
             FieldType::Byte => ParamKind::I32,

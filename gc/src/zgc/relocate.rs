@@ -733,6 +733,96 @@ impl ZRelocateStats {
 ///   would be pure overhead);
 /// * it pre-reserves from the relocation set's live bytes so building it is one
 ///   allocation rather than a rehash cascade.
+/// The from→to table as the **rewrite pass** wants to read it: sorted, owned,
+/// and answered without a lock or a hash.
+///
+/// [`ZRelocationRecord`] is a `Mutex<HashMap<_, _>>`, which is the right shape
+/// for accumulating from several threads and the wrong one for the pass that
+/// consumes it. That pass visits every reference slot of every survivor and
+/// asks "did this target move?" — overwhelmingly the answer is no, and paying
+/// a lock acquire plus a SipHash for each no is the compaction pause. The
+/// stop-the-world slide has a single writer and knows every pair before the
+/// first question is asked, so it can hand the pass this instead:
+///
+/// * a **range check** first. Every entry lies in `[lo, hi]`, so a slot
+///   pointing anywhere else — the unmoved part of the heap, the large-object
+///   end, anything off-heap — is rejected by two compares and never searched.
+/// * a **binary search** for the rest, over one contiguous `Vec` rather than a
+///   hash table's scattered buckets.
+///
+/// It also answers `contains_from`, which is what the two side structures the
+/// slide built alongside the record (`moved_to`, a second `FxHashMap`, and
+/// `moved_from`, an `FxHashSet`) existed for. One table serves all three
+/// readers now.
+#[derive(Debug, Default, Clone)]
+pub struct ZForwardIndex {
+    /// Ascending by `from`, and never holding an identity entry.
+    entries: Vec<(usize, usize)>,
+    lo: usize,
+    hi: usize,
+}
+
+impl ZForwardIndex {
+    /// Build from the slide's pair list. `pairs` need not be sorted: the low
+    /// slide produces them ascending and the high pack descending, so the
+    /// concatenation of the two is neither.
+    pub fn from_pairs(pairs: &[(usize, usize)]) -> Self {
+        let mut entries: Vec<(usize, usize)> = pairs
+            .iter()
+            .copied()
+            .filter(|(from, to)| from != to)
+            .collect();
+        entries.sort_unstable_by_key(|(from, _)| *from);
+        // A `from` recorded twice would make the search's answer depend on
+        // which duplicate it landed on. The slide moves each object once, so
+        // this is a contradiction rather than a case to handle.
+        debug_assert!(
+            entries.windows(2).all(|w| w[0].0 != w[1].0),
+            "one address forwarded to two destinations",
+        );
+        let lo = entries.first().map_or(usize::MAX, |(from, _)| *from);
+        let hi = entries.last().map_or(0, |(from, _)| *from);
+        Self { entries, lo, hi }
+    }
+
+    /// Where `from` moved to, or `None` if it did not move.
+    #[inline]
+    pub fn get(&self, from: usize) -> Option<usize> {
+        if from < self.lo || from > self.hi {
+            return None;
+        }
+        self.entries
+            .binary_search_by_key(&from, |(f, _)| *f)
+            .ok()
+            .map(|i| self.entries[i].1)
+    }
+
+    /// Whether `from` is an address the slide vacated.
+    #[inline]
+    pub fn contains_from(&self, from: usize) -> bool {
+        self.get(from).is_some()
+    }
+
+    /// `from` if it did not move, its destination if it did.
+    #[inline]
+    pub fn resolve(&self, from: usize) -> usize {
+        self.get(from).unwrap_or(from)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The pairs, ascending by `from`.
+    pub fn entries(&self) -> &[(usize, usize)] {
+        &self.entries
+    }
+}
+
 #[derive(Debug)]
 pub struct ZRelocationRecord {
     entries: Mutex<HashMap<usize, usize>>,
@@ -3867,5 +3957,59 @@ mod tests {
         assert_send_sync::<ZRelocationRecord>();
         assert_send_sync::<ZRelocateStats>();
         assert_send_sync::<ZRelocatePage>();
+    }
+
+    /// The index must answer exactly what the map it replaced answered, for
+    /// every address in and around the moved set — including the two ends,
+    /// which the range check special-cases.
+    #[test]
+    fn the_forward_index_answers_what_a_map_of_the_same_pairs_would() {
+        let pairs = [(0x9000, 0x1000), (0x3000, 0x2000), (0x7000, 0x4000)];
+        let index = ZForwardIndex::from_pairs(&pairs);
+        let reference: HashMap<usize, usize> = pairs.iter().copied().collect();
+        for addr in (0..0xC000).step_by(8) {
+            assert_eq!(
+                index.get(addr),
+                reference.get(&addr).copied(),
+                "disagreement at {addr:#x}"
+            );
+            assert_eq!(index.contains_from(addr), reference.contains_key(&addr));
+            assert_eq!(index.resolve(addr), reference.get(&addr).copied().unwrap_or(addr));
+        }
+        assert_eq!(index.len(), 3);
+        assert_eq!(
+            index.entries(),
+            &[(0x3000, 0x2000), (0x7000, 0x4000), (0x9000, 0x1000)],
+            "entries must come back ascending by `from`"
+        );
+    }
+
+    /// An identity pair is not a move. The high pack emits one for a pinned
+    /// survivor it left in place, and recording it would make the rewrite pass
+    /// store a slot's own value back over itself — harmless, but it would also
+    /// make `contains_from` claim the address was vacated, which the
+    /// post-slide verifier reads as a MISSED REWRITE rather than an untouched
+    /// object.
+    #[test]
+    fn an_identity_pair_is_not_a_move() {
+        let index = ZForwardIndex::from_pairs(&[(0x4000, 0x4000), (0x8000, 0x2000)]);
+        assert_eq!(index.get(0x4000), None);
+        assert!(!index.contains_from(0x4000));
+        assert_eq!(index.resolve(0x4000), 0x4000);
+        assert_eq!(index.get(0x8000), Some(0x2000));
+        assert_eq!(index.len(), 1);
+    }
+
+    /// The empty index must not claim the whole address space. `lo`/`hi` are
+    /// seeded `usize::MAX`/`0` so the range check rejects everything before
+    /// the search can look at an empty slice.
+    #[test]
+    fn an_empty_index_forwards_nothing() {
+        let index = ZForwardIndex::from_pairs(&[]);
+        assert!(index.is_empty());
+        for addr in [0usize, 8, 0x1000, usize::MAX / 2, usize::MAX] {
+            assert_eq!(index.get(addr), None);
+            assert_eq!(index.resolve(addr), addr);
+        }
     }
 }

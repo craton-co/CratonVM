@@ -51,9 +51,9 @@ Not investigated here; this is the classification, with the failure signature
 that a reader would otherwise have to rebuild a 4291-test module to see.
 
 ```text
-enum-constant cluster (2, and 2 more ignored above)
-  countdown_latch_await_timeout   NPE: Cannot invoke "TimeUnit.toNanos(long)"      <- constant is null
-  enum_map_put_get_size           NPE: Cannot invoke "Class.getEnumConstantsShared()"
+RETIRED since this table was written (2) - both stale, see the correction above
+  countdown_latch_await_timeout   test passes a null TimeUnit; HotSpot NPEs identically
+  enum_map_put_get_size           test passes a null Class;    HotSpot NPEs identically
 
 null-shaped (4)
   basic_file_attributes_p59       NPE, no message
@@ -75,11 +75,25 @@ other (2)
                                   in the host locale — environment-specific, verify elsewhere
 ```
 
-**The enum-constant cluster is the one to take first.** Four tests point at it —
-two ignored above (`http_*_enums_p60`, whose constants are "not registered") and
-two live (a null `TimeUnit` constant, and `getEnumConstantsShared` on a null
-class). That is one defect wearing four faces, and fixing it closes two of these
-twelve and un-ignores two more.
+> **CORRECTION, same day.** This paragraph read: "The enum-constant cluster is
+> the one to take first. Four tests point at it … one defect wearing four faces,
+> and fixing it closes two of these twelve and un-ignores two more."
+>
+> **It was wrong, and measurement refuted it.** All four are stale tests and
+> none was exercising an enum defect: two pass `null` where the JDK requires
+> non-null and get HotSpot's *identical* NPE message back, and two address an
+> enum CONSTANT as a zero-arg native, which is a retired shape. The two "live"
+> ones are now `#[ignore]`d with the rest.
+>
+> A cluster is a hypothesis. Four tests failing with enum-shaped messages is not
+> four instances of one defect — here it was four instances of "this test
+> predates a stricter implementation".
+>
+> The real enum question was then asked properly, by probe rather than by
+> reading test names, and it did find three general defects — `Enum.valueOf`
+> unimplemented for EVERY enum in `--synthetic-jdk`, `EnumMap.put` registered
+> under the wrong erased descriptor, and `EnumSet.toString` unregistered — all
+> fixed. See `synthetic-jdk-enum-surface-20260902.md`.
 
 ## Flaky, not counted
 

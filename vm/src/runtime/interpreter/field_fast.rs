@@ -843,6 +843,21 @@ pub(super) fn array_store_prim(
         }
         _ => return false,
     }
+    // The host just wrote this array, so any device buffer mirroring
+    // it in the GPU input-residency cache is stale and must go.
+    //
+    // AUDIT 2026-09-02: this is the THIRD `*astore` implementation in
+    // the VM. `interpreter/opcodes.rs`'s `Instruction::Iastore` arm,
+    // `interpreter.rs`'s fast dispatch loop and
+    // `jit::helpers::jit_iastore` all invalidate -- but this quickened
+    // arm runs BEFORE every one of them and writes the element through
+    // a raw pointer, so without this the next submit computes from a
+    // stale device copy. This is the same hole
+    // `bench-gpu/runtime-stress.sh` was written for after the defect in
+    // the fast dispatch loop; four of its seven scenarios fail without
+    // this line.
+    #[cfg(feature = "gpu-offload")]
+    crate::runtime::offload::input_cache::invalidate(arr);
     true
 }
 

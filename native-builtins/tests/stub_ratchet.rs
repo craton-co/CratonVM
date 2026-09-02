@@ -1349,7 +1349,48 @@ use cratonvm_types::compat::CompatibilityMode;
 /// the same commit**, by running the third arm. Skipping it leaves a gate red
 /// that looks like somebody else's drift, which is exactly how the arm went
 /// unowned for three days before it had a constant at all.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1645;
+/// # +1 in all three arms, 2026-09-02, and the VM's registry did not move
+///
+/// 1634 -> 1635 (default), 1645 -> 1646 (management), 1643 -> 1644
+/// (synthetic-jdk). Same delta in every arm, from the map-constructor refusal
+/// fixes in `native-collections` (`MapCtorMsgProbe`: 26 differing lines -> 0).
+///
+/// **This is the one classification case the three above do not cover: the
+/// census moved and the VM did not.** `--dump-native-registry` taken from two
+/// release binaries built from the same tree, differing only by that change:
+///
+/// ```text
+///   rows                     11736   vs   11736
+///   triples only in one side     0   ·   0
+///   triples whose KIND differs   0
+///   kind totals    bridge 9533 · synthetic-stub 1584 · intrinsic 619   (both)
+/// ```
+///
+/// Byte-identical. The three rows the census gains are
+/// `java/util/ArrayDeque$Itr.{hasNext,next,remove}` — a FABRICATED class
+/// already in `NO_IMAGE_JDK_RECEIVERS`, and `synthetic-stub` in BOTH shipped
+/// binaries, differing only in the `registered_by` line number this change
+/// shifted.
+///
+/// **So the number this gate watches is the REPLAY's, not the VM's.**
+/// `census_rows` builds its registry through
+/// `tests/common/vm_init_boot_path.rs::vm_init_real_jdk_boot_path`, a
+/// hand-maintained transcription of `vm_init`'s real-JDK arm that opens with
+/// `set_drop_real_layout_synthetic(true)` — a mode the shipping VM does not
+/// use, and one that registration sites read to decide what to register at
+/// all. The replay and the VM can therefore disagree, and here they do.
+///
+/// **What is NOT established, and is left for whoever revisits the replay:**
+/// which line of the map-constructor change flips it. Bisected far enough to
+/// exclude the two exhausted-iterator message edits, the `classloader.rs` lock
+/// conversion, and the one-line `native-builtins/src/lib.rs` message (each
+/// substituted for `origin/dev`'s copy and re-measured: 1519 distinct stubs,
+/// unchanged). It is inside the map-constructor edits, all of which are native
+/// BODIES that registration never executes. That is a fidelity question about
+/// the replay rather than about this change, and raising the baseline on the
+/// registry-identity evidence is not the same as waving it through.
+///
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1646;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1376,7 +1417,9 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1645;
 /// the same commit**, by running the third arm. Skipping it leaves a gate red
 /// that looks like somebody else's drift, which is exactly how the arm went
 /// unowned for three days before it had a constant at all.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1634;
+/// **+1 on 2026-09-02**; the account is on
+/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1635;
 
 /// The `--features synthetic-jdk` resolve, first frozen 2026-08-30.
 ///
@@ -1431,7 +1474,9 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1634;
 /// mode of a third baseline: nobody re-freezing the first two knows it
 /// exists.** It went red the moment their +43 landed. If you are re-freezing,
 /// re-freeze ALL THREE — see the pointer on both siblings.
-const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1643;
+/// **+1 on 2026-09-02**; the account is on
+/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].
+const BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK: usize = 1644;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
