@@ -6177,12 +6177,66 @@ pub fn native_al_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(Some(old))
 }
 
+/// Is `this` one of the JDK's IMMUTABLE stand-in classes, for which a
+/// structural mutator must raise `UnsupportedOperationException`?
+///
+/// In real-JDK mode these receivers carry real bytecode — `Collections$EmptyList`
+/// inherits `AbstractList.add`, which throws — so nothing here is consulted. In
+/// `--synthetic-jdk` there is no bytecode, the interface-registered natives
+/// serve the call instead, and they mutated happily. Measured 2026-09-02 with
+/// `apps/probes/EmptySingletonImmutable`:
+///
+/// ```text
+///     Collections.emptyList().add("x")        SUCCEEDED   (HotSpot: UOE)
+///     Collections.emptyMap().put("k","v")     SUCCEEDED   (HotSpot: UOE)
+///     Collections.singletonList("a").add("x") SUCCEEDED   (HotSpot: UOE)
+///     Arrays.asList("a","b").add("x")         SUCCEEDED   (HotSpot: UOE)
+/// ```
+///
+/// `List.of` / `Set.of` / `Map.of` / `unmodifiable*` were already correct in
+/// every mode: they carry the `cratonvm/internal/Unmodifiable*` stamp, whose
+/// own natives refuse. These seven are the ones minted under a JDK class name
+/// with no such stamp.
+///
+/// **Structural mutators only.** `Arrays$ArrayList` is fixed-SIZE, not
+/// immutable: `add`/`remove` throw on HotSpot and `set` is legal and writes
+/// through to the backing array. That is why this is consulted from `add` and
+/// `put` rather than from a blanket "any write" check — a guard that also
+/// refused `set` would break `Arrays.asList(a).set(0, x)`, which is the
+/// idiomatic reason to call `asList` at all.
+fn is_immutable_jdk_stand_in(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let Some(name) = ctx.class_name_of_id(ctx.class_id_of_object(this)) else {
+        return false;
+    };
+    matches!(
+        &*name,
+        "java/util/Collections$EmptyList"
+            | "java/util/Collections$EmptySet"
+            | "java/util/Collections$EmptyMap"
+            | "java/util/Collections$SingletonList"
+            | "java/util/Collections$SingletonSet"
+            | "java/util/Collections$SingletonMap"
+            | "java/util/Arrays$ArrayList"
+    )
+}
+
 pub fn native_al_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // An immutable JDK stand-in refuses structurally — see
+    // `is_immutable_jdk_stand_in` for the measurement and for why `set` is not
+    // guarded alongside `add`.
+    if is_immutable_jdk_stand_in(ctx, this) {
+        return Err(
+            cratonvm_types::error::RuntimeError::UnsupportedOperationException {
+                message: String::new(),
+            }
+            .into(),
+        );
+    }
     // A `values()` / TreeMap-`entrySet()` view is an `ArrayList` here, but it is
     // not addable. `Map.values`: "The collection supports element removal ... It
     // does not support the `add` or `addAll` operations"; the JDK's
@@ -12671,6 +12725,19 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     //
     // Deliberately here rather than inside `native_map_put_evict`: the `evict`
     // flag is `LinkedHashMap.removeEldestEntry`'s, and a TreeMap has no eldest.
+    // An immutable JDK stand-in (`Collections$EmptyMap`, `$SingletonMap`)
+    // refuses — see `is_immutable_jdk_stand_in`. Ahead of the TreeMap route
+    // because neither of those is a TreeMap and the refusal is unconditional.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if is_immutable_jdk_stand_in(ctx, *this) {
+            return Err(
+                cratonvm_types::error::RuntimeError::UnsupportedOperationException {
+                    message: String::new(),
+                }
+                .into(),
+            );
+        }
+    }
     if let Some(Value::Object(Some(this))) = args.first() {
         if is_tree_map_receiver(ctx, *this) {
             return native_tm_put(ctx, args);
@@ -23484,7 +23551,14 @@ fn native_collections_empty_list(ctx: &mut dyn NativeContext, _args: &[Value]) -
     if let Some(v) = collections_empty_singleton(ctx, "EMPTY_LIST") {
         return Ok(Some(v));
     }
-    // Fallback (field not yet initialised): fresh synthetic empty list.
+    // See `native_collections_empty_map` for why this precedes the synthetic:
+    // the sibling `native_collections_singleton_list` just below already does
+    // it, which is why `singletonList` reported the right class in
+    // `--synthetic-jdk` while `emptyList` reported `java.util.ArrayList`.
+    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$EmptyList") {
+        return Ok(Some(Value::Object(Some(o))));
+    }
+    // Last resort: fresh synthetic empty list.
     let __al_n_fields = al_slots(ctx).2;
     let list = try_alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields)?;
     let arr = alloc_ref_array(ctx, 0);
@@ -67225,7 +67299,31 @@ fn native_collections_empty_map(ctx: &mut dyn NativeContext, _args: &[Value]) ->
     if let Some(v) = collections_empty_singleton(ctx, "EMPTY_MAP") {
         return Ok(Some(v));
     }
-    // Fallback (field not yet initialised): fresh synthetic empty map.
+    // `alloc_real_jdk` FIRST, exactly as `native_collections_singleton_list`
+    // does one screen up, and for the same reason: it resolves the class the
+    // JDK would have returned in BOTH modes — real-JDK from the image, and
+    // `--synthetic-jdk` from `class_manager`'s fabrication tables, which carry
+    // `Collections$Empty*` field shapes and interface rows already. Only the
+    // static-field cache above is real-JDK-only.
+    //
+    // Without it this fallback minted an ordinary mutable synthetic, so in
+    // `--synthetic-jdk` (measured 2026-09-02, `apps/probes/EmptySingletonImmutable`):
+    //
+    //     Collections.emptyList()  class=java.util.ArrayList
+    //                              instanceof ArrayList = true
+    //                              add("x") = SUCCEEDED
+    //
+    // The `add` is the defect. `ensure_collections_empty_singletons` above
+    // records what a mutable empty singleton cost the last time one shipped —
+    // kotlin-reflect's shaded protobuf tests `instanceof ArrayList` to decide
+    // whether to replace its `emptyList()` placeholder, skipped the
+    // replacement, and mutated the shared object. Here each call happens to
+    // mint a FRESH list, so the write is not shared — it is silently DISCARDED
+    // instead, which is the same class of wrong answer with a quieter failure.
+    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$EmptyMap") {
+        return Ok(Some(Value::Object(Some(o))));
+    }
+    // Last resort: fresh synthetic empty map.
     let map = alloc_backing_map(ctx);
     map_init_eager(ctx, &[Value::Object(Some(map))])?;
     Ok(Some(Value::Object(Some(map))))
@@ -67235,7 +67333,11 @@ fn native_collections_empty_set(ctx: &mut dyn NativeContext, _args: &[Value]) ->
     if let Some(v) = collections_empty_singleton(ctx, "EMPTY_SET") {
         return Ok(Some(v));
     }
-    // Fallback (field not yet initialised): fresh synthetic empty set.
+    // See `native_collections_empty_map` for why this precedes the synthetic.
+    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$EmptySet") {
+        return Ok(Some(Value::Object(Some(o))));
+    }
+    // Last resort: fresh synthetic empty set.
     let set = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
     let inner_map = alloc_backing_map(ctx);
     map_init_eager(ctx, &[Value::Object(Some(inner_map))])?;
