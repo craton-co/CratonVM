@@ -3694,6 +3694,21 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
             // See companion in lib.rs getModule (HIB-CV-29 isNamed follow-up).
             ctx.set_field(m_obj, 0, module_name_val);
             ctx.set_field_by_name(m_obj, "name", module_name_val);
+            // `Module.getClassLoader()` is real bytecode `getfield loader`, and
+            // the JDK keeps a module's answer in step with the answer every
+            // class in it gives: `java.sql.Connection.getClassLoader()` and
+            // `java.sql`'s own are BOTH the platform loader. A boot module's is
+            // `null`, which an unwritten field already reports, so only the
+            // platform side needs a write here.
+            if let Some(module_name) = module_name.as_deref() {
+                if let Some(platform) =
+                    crate::classloader::platform_loader_for_module(ctx, module_name)
+                {
+                    let m_obj = ctx.read_native_pin(pin, m_obj);
+                    ctx.set_field_by_name(m_obj, "loader", Value::Object(Some(platform)));
+                }
+            }
+            let m_obj = ctx.read_native_pin(pin, m_obj);
             ctx.unpin_native_roots(pin);
             ctx.cache_module_mirror(module_name.as_deref(), m_obj);
             Ok(Some(Value::Object(Some(m_obj))))

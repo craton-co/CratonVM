@@ -1,6 +1,6 @@
 adapters 2
 barrier 14
-census 32
+census 35
 forwarding 7
 generation 14
 mark 50

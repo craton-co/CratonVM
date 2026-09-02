@@ -326,6 +326,14 @@ same run as the probe** before proposing a retirement.
 
 ### Retiring a shadow: the four preconditions, and why the corpus is not one
 
+Two drivers implement this, so the method is runnable rather than described:
+[`../../scripts/jdk-only-phase2-sweep.sh`](../../scripts/jdk-only-phase2-sweep.sh)
+arms one receiver at a time and produces CANDIDATES with the three verdicts, and
+[`../../scripts/jdk-only-phase2-battery.sh`](../../scripts/jdk-only-phase2-battery.sh)
+runs the whole probe tree in three columns and reports the signed distance from
+HotSpot. Both print the vacuity checks beside every row, because that is the
+half a green forgets to mention.
+
 Phase 2 armed all 270 classes of the shadow surface one at a time and the dial
 called 236 of them retire-safe. **Arming those 236 together fails 54 of 118
 corpus vectors and breaks 35 of 78 probe families.** So a sweep produces

@@ -619,7 +619,7 @@ Every row that is absent somewhere, or that disagrees across images:
 `weakCompareAndSetObject`, `sun` `ensureClassInitialized` and `sun`
 `shouldBeInitialized` on JDK 25's evidence would have removed the only
 implementation those two images have. That is exactly the failure
-[`WORKER-3-NOTE-2`](WORKER-3-NOTE-2-the-multi-image-method-sweep-says-192-not-342-20260821.md)
+`WORKER-3-NOTE-2` (retired: `WORKER-3-NOTE-2-the-multi-image-method-sweep-says-192-not-342-20260821`)
 recorded, reproduced here on the family it warned about.
 
 The other seven are absent from all three supported images. **They are still

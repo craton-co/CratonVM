@@ -13081,6 +13081,47 @@ pub(crate) fn native_string_code_points(
 /// Extracted so the two cannot drift: the layout notes below were paid for
 /// twice already (a 1-field allocation and a reference-array allocation), and
 /// a second copy of them is a second place to get them wrong.
+///
+/// # JVMS 6.5 census: the class stamped here is an INTERFACE
+///
+/// `java/util/stream/IntStream` is `ACC_INTERFACE`, so no `new` could have
+/// produced the object below, and
+/// `cratonvm_native_api::instantiable::observe_uninstantiable_receiver` says so
+/// once per boot with `requester=` this function -- on a stock `cratonvm Hello`
+/// it is the first of the workspace's seven `IntStream` mints that runs.
+/// AUDITED 2026-09-01: real violation, both repairs assessed, neither belongs
+/// here, allocation and WARN both left alone on purpose.
+///
+/// **(a) mint the concrete class the JDK would produce -- rejected.** That
+/// class is `java.util.stream.IntPipeline$Head`, and it is not a shape: it is
+/// an `AbstractPipeline` stage over a `Spliterator.OfInt`, whose bytecode this
+/// VM does not run. Writing slots 0 and 1 of one would alias
+/// `AbstractPipeline`'s own fields, and -- decisively -- no native is
+/// registered on that name, so every terminal operation would resolve to real
+/// pipeline bytecode over a source that was never built.
+///
+/// **(b) mint a `cratonvm/internal/...` concrete stand-in -- rejected, because
+/// the interface name is what makes these streams WORK.** Two exact-match
+/// tables in `native-collections/src/lib.rs` are keyed on it: every
+/// `IntStream` operation is registered under the literal class name
+/// `"java/util/stream/IntStream"`, and `is_synthetic_stream` -- the predicate
+/// `int_stream_elements` / `prim_stream_values` use to decide whether to read
+/// the backing array in slot 0 -- matches exactly four names, all of them
+/// interfaces. A stream stamped anything else answers `forEach` with
+/// `NoSuchMethodError` and `average()` with an empty stream, which is precisely
+/// the `FMT-REGRESSION-ANONOBJ` failure recorded above `native_string_chars`,
+/// replayed by a different route. Repairing it means moving both tables plus an
+/// arm in `vm/src/runtime/interpreter/typecheck.rs`'s `synthetic_implements`
+/// (so `instanceof IntStream`, which is correct today only because the class IS
+/// the interface, stays correct) -- and all three files are outside this
+/// audit's write scope.
+///
+/// **(c) and it cannot be closed from this file regardless.** The census
+/// dedupes by class name; the same interface is minted at six further sites
+/// (`native-collections/src/lib.rs` `make_int_stream` and `mapToInt`,
+/// `native-builtins/src/phases_late/streams.rs`,
+/// `native-builtins/src/phases_early.rs`), so a local repair would only
+/// re-point `requester=` at one of those.
 fn int_stream_of(ctx: &mut dyn NativeContext, char_values: &[i32]) -> MethodCallResult {
     // 2-field synthetic stream layout: field 0 = elements array, field 1 =
     // close handlers (None -- chars()/codePoints() never register any).
@@ -13092,6 +13133,23 @@ fn int_stream_of(ctx: &mut dyn NativeContext, char_values: &[i32]) -> MethodCall
     // (A concurrent fix independently found this same root cause -- e.g. it
     // also breaks `StringUtils.containsWhitespace` -> `"...".chars().anyMatch(...)`
     // -- via a 1-field allocation; reconciled to the 2-field layout here.)
+    //
+    // CORRECTION (audit, 2026-09-01): "match STREAM_NUM_FIELDS" is no longer
+    // true of the number. W7-65 grew `STREAM_NUM_FIELDS` to 5 -- slot 2 is the
+    // lazy spliterator, 3 the op chain, 4 `AbstractPipeline.linkedOrConsumed`
+    // -- and `make_int_stream` allocates that width. The 2 below is left as it
+    // is, because what the sentence above is actually about is still right and
+    // is the only part that can break something: slot 1 must EXIST or an
+    // `onClose` registration writes out of bounds. The three slots this stream
+    // lacks are all guarded by `object_num_fields` on the reading side, so a
+    // short stream reads as "not lazy, no chain, never linked" rather than
+    // faulting -- and the last of those is the one visible consequence:
+    // `"..".chars()` cannot report `IllegalStateException: stream has already
+    // been operated upon or closed` on reuse. That divergence is already
+    // accepted for every primitive stream (`stream_link_or_consume` is
+    // reference-carrier-only by design), so widening this to 5 would buy
+    // nothing here and is deliberately NOT done as part of an audit that
+    // changes no behaviour.
     let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 2)?;
     // Must be a primitive `int[]`, not a reference array: this stream's
     // consumers (`IntStream.forEach`/`toArray`/etc.) read field 0 as an
