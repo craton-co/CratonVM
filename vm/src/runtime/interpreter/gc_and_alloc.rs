@@ -3401,6 +3401,7 @@ pub(crate) fn tlab_alloc_byte_array(
         // bytes, and uninitialised — hence `ptr::write`, not an assignment.
         unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
     })?;
+    shared.mem.heap.note_thread_tlab_object(ptr as usize, total_size);
     use std::sync::atomic::Ordering;
     shared.mem.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
     shared
@@ -3791,6 +3792,7 @@ pub(super) fn tlab_alloc_shaped_inner(
         // bytes at `ptr`, 8-byte aligned and privately owned until commit.
         unsafe { shape.init_header(ptr, class_id, hash) };
     }) {
+        shared.mem.heap.note_thread_tlab_object(ptr as usize, total_size);
         shared.mem.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
         // Truncation-checked: usize → u64 widening is loss-free on 64-bit
         // platforms; on 32-bit the upper bound (usize::MAX ≈ 4 GiB) still
@@ -3963,6 +3965,7 @@ pub(super) fn tlab_alloc_shaped_inner(
             // 8-byte-aligned, privately-owned `total_size` region.
             unsafe { shape.init_header(ptr, class_id, hash) };
         }) {
+            shared.mem.heap.note_thread_tlab_object(ptr as usize, total_size);
             shared.mem.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
             shared
                 .mem

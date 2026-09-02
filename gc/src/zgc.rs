@@ -807,6 +807,14 @@ struct ZgcCounters {
     /// ...and the starved rung specifically. See
     /// [`Self::tlab_refill_recycled`].
     tlab_refill_starved: AtomicUsize,
+    /// Mutator-owned TLAB chunks (`refill_mutator_tlab`): chunks handed to a
+    /// `JvmThread::tlab`, bytes in them, objects registered from them and
+    /// tail bytes returned at retire. The engagement census for the inline
+    /// TLAB bump under this collector.
+    mutator_tlab_refills: AtomicU64,
+    mutator_tlab_refill_bytes: AtomicUsize,
+    mutator_tlab_objects: AtomicU64,
+    mutator_tlab_tail_bytes: AtomicUsize,
     /// Bytes the starved rung took off the free list.
     tlab_refill_starved_bytes: AtomicUsize,
     /// This heap's own `java.lang.ref` reference processor.
@@ -1868,6 +1876,10 @@ impl ZgcRealHeap {
                 compaction_targets_consumed: AtomicUsize::new(0),
                 tlab_refill_recycled: AtomicUsize::new(0),
                 tlab_refill_starved: AtomicUsize::new(0),
+                mutator_tlab_refills: AtomicU64::new(0),
+                mutator_tlab_refill_bytes: AtomicUsize::new(0),
+                mutator_tlab_objects: AtomicU64::new(0),
+                mutator_tlab_tail_bytes: AtomicUsize::new(0),
                 tlab_refill_starved_bytes: AtomicUsize::new(0),
                 ref_processor: Mutex::new(ReferenceProcessor::new()),
                 pending_finalizer_roots: Mutex::new(Vec::new()),
@@ -1966,6 +1978,14 @@ impl ZgcRealHeap {
         // Ignore the `Err`: `OnceLock::set` can only fail if this ran twice on
         // one heap, which this constructor makes impossible.
         let _ = heap.self_weak.set(std::sync::Arc::downgrade(&heap));
+        // Mutator-owned TLAB tails come back through `Tlab::retire`, which
+        // runs in VM code with no heap in hand; the hook holds a Weak so a
+        // torn-down heap answers "not mine" rather than dangling.
+        let weak = std::sync::Arc::downgrade(&heap);
+        crate::tlab::register_tail_return_hook(std::sync::Arc::new(move |start, end| {
+            weak.upgrade()
+                .is_some_and(|h| h.return_mutator_tail(start, end))
+        }));
         heap
     }
 

@@ -175,6 +175,41 @@ pub struct Tlab {
 /// top; other threads' in-flight spans are not visible cross-thread by design
 /// (see `Tlab::thread_allocated_bytes`), which bounds the under-count by one
 /// TLAB per running thread and keeps the value monotonic.
+// ── Reserved-tail return hooks ──────────────────────────────────────────
+//
+// A collector whose free space is a free LIST rather than a parseable bump
+// region (ZGC's arena) wants the unused tail of a retired thread TLAB back,
+// the way `ZArenaTlab` hands its own tails back. The thread's `Tlab` lives in
+// `JvmThread` and is retired from VM code that has no heap in hand, so the
+// collector registers a hook here (`register_tail_return_hook`) and
+// `Tlab::retire` offers every reserved tail to the registered hooks AFTER the
+// tail filler is installed -- the same order `ZArenaTlab::tlab_retire_locked`
+// keeps, so a block is never on a free list while its filler header is still
+// being written. A hook answers `true` when the tail was inside its arena and
+// it took it; the first taker wins.
+type TailReturnHook = dyn Fn(usize, usize) -> bool + Send + Sync;
+
+static TAIL_RETURN_HOOKS: std::sync::RwLock<Vec<std::sync::Arc<TailReturnHook>>> =
+    std::sync::RwLock::new(Vec::new());
+
+/// Register a collector's tail-return hook (see the module comment above).
+pub fn register_tail_return_hook(hook: std::sync::Arc<TailReturnHook>) {
+    if let Ok(mut hooks) = TAIL_RETURN_HOOKS.write() {
+        hooks.push(hook);
+    }
+}
+
+/// Offer `[start, end)` to the registered hooks; `true` if one took it.
+fn offer_tail_to_hooks(start: usize, end: usize) -> bool {
+    let Ok(hooks) = TAIL_RETURN_HOOKS.read() else {
+        return false;
+    };
+    if hooks.is_empty() {
+        return false;
+    }
+    hooks.iter().any(|hook| hook(start, end))
+}
+
 static PROCESS_ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Cumulative bytes retired into the process-wide total. See
@@ -485,9 +520,18 @@ impl Tlab {
         // Generational (small ones). A counter whose answer depends on which
         // collector is running cannot be measuring the Java work.
         let consumed = self.consumed_bytes() as u64;
+        // The reserved tail, captured BEFORE the filler install consumes it and
+        // offered to the collector hooks AFTER the filler is in place -- the
+        // order `ZArenaTlab::tlab_retire_locked` keeps, so a block is never on
+        // a free list while its filler header is still being written. See
+        // `register_tail_return_hook`.
+        let tail = self.reserved_tail();
         // SAFETY: see method-level note — backing memory valid, single owner.
         unsafe {
             self.install_tail_filler(TLAB_FILLER_CLASS_ID);
+        }
+        if let Some((tail_start, tail_end)) = tail {
+            let _ = offer_tail_to_hooks(tail_start, tail_end);
         }
         // Roll the consumed span into the thread's running total BEFORE the
         // pointers are nulled — `consumed_bytes()` is `cursor - start` and

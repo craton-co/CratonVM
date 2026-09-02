@@ -65,6 +65,18 @@ pub(crate) fn zgc_tlab_enabled_by_default() -> bool {
 /// cursor never leaves the 8-byte grid because every request uses
 /// [`ZGC_TLAB_ALIGN`].)
 #[inline]
+/// Kill switch for the mutator-owned TLAB chunks: `CRATONVM_ZGC_MUTATOR_TLAB=0`.
+pub(crate) fn mutator_tlab_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_ZGC_MUTATOR_TLAB").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
 pub(crate) fn zgc_tlab_footprint(bytes: usize) -> usize {
     bytes.saturating_add(ZGC_TLAB_ALIGN - 1) & !(ZGC_TLAB_ALIGN - 1)
 }
@@ -744,6 +756,130 @@ impl ZgcRealHeap {
     /// There is no keep-the-buffer "direct" path and no HotSpot refill-waste
     /// ratchet, because the remainder is recovered rather than abandoned — see
     /// [`ZArenaTlabRegistry::for_capacity`].
+    // ── Mutator-owned TLAB chunks (the `JvmThread::tlab` the JIT bumps) ──
+    //
+    // `VmHeap::refill_tlab` returned `None` on this collector, so the inline
+    // TLAB bump both JIT tiers emit never hit under the default collector:
+    // `thread.tlab` stayed empty and every compiled `new` was a helper call
+    // into `alloc_raw_tlab`. This gives the thread a chunk carved exactly the
+    // way this heap's own `ZArenaTlab` chunks are, with two differences that
+    // follow from the chunk being owned by VM code this heap cannot see into:
+    //
+    // * every object bump-allocated from it is registered EAGERLY, one at a
+    //   time, by `note_mutator_tlab_object` -- called from the interpreter's
+    //   `alloc_initialized` closure site and from the JIT's post-init helper,
+    //   both after the header is written -- instead of through a pending
+    //   batch, because nothing on this side sees the allocation happen;
+    // * the unused tail comes back through the `Tlab::retire` hook registered
+    //   in `new_shared` (`return_mutator_tail`), not through
+    //   `retire_all_tlabs`, which only reaches this heap's own cells.
+    //
+    // Kill switch: `CRATONVM_ZGC_MUTATOR_TLAB=0` makes `refill_mutator_tlab`
+    // answer `None` again, which is byte-for-byte the previous behaviour.
+
+    /// Carve a chunk for a mutator thread's own `Tlab`, or `None` when the
+    /// heap cannot serve one (switch off, TLABs disabled, chunk budget zero,
+    /// request larger than a chunk, arena exhausted).
+    pub fn refill_mutator_tlab(&self, requested: usize) -> Option<(*mut u8, usize)> {
+        if !mutator_tlab_enabled() || !self.tlab_enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let want = self
+            .tlabs
+            .chunk_bytes_now(self.arena_end.saturating_sub(self.arena_base));
+        if want == 0 || requested == 0 || requested > want {
+            return None;
+        }
+        let carved = {
+            let mut arena = self.arena.lock();
+            let largest = arena.largest_low_free_block();
+            let headroom = arena.low_bump_headroom();
+            let sized = recycled_chunk_size(
+                want,
+                requested,
+                largest,
+                headroom,
+                self.publish_vacated_enabled.load(Ordering::Relaxed),
+                arena.low_free_blocks_at_least(
+                    (want / 8).min(crate::tlab::tlab_max_alloc()),
+                    2,
+                ) >= 2,
+            )
+            .and_then(|size| arena.alloc(size, ZGC_TLAB_ALIGN).map(|p| (p, size)));
+            sized.or_else(|| arena.alloc(want, ZGC_TLAB_ALIGN).map(|p| (p, want)))
+        };
+        let (ptr, size) = carved?;
+        // The refill invariant both JIT tiers rely on: a chunk is zero-filled,
+        // so the inline bump writes only the header.
+        unsafe { std::ptr::write_bytes(ptr, 0, size) };
+        self.note_young_page_span(ptr as usize, size);
+        self.counters.mutator_tlab_refills.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .mutator_tlab_refill_bytes
+            .fetch_add(size, Ordering::Relaxed);
+        Some((ptr, size))
+    }
+
+    /// Register one object bump-allocated from a mutator chunk: the
+    /// object-start registry, the quiescence note, the allocation account and
+    /// the GC trigger it feeds, and black allocation under a live mark -- the
+    /// same four things `alloc_raw` does for an object it hands out itself.
+    /// Called AFTER the header is written (black allocation reads it).
+    pub fn note_mutator_tlab_object(&self, addr: usize, size: usize) {
+        self.audit_registry_insert(addr, size, "mutator_tlab");
+        self.registry.insert(addr);
+        crate::gc_quiescence::note_allocated(&[addr]);
+        let footprint = zgc_tlab_footprint(size);
+        let after = self.allocated.fetch_add(footprint, Ordering::Relaxed) + footprint;
+        if after >= self.gc_threshold && after >= self.gc_rearm.load(Ordering::Relaxed) {
+            self.native_alloc_pressure.store(true, Ordering::Relaxed);
+        }
+        self.allocate_black_if_marking(addr as *mut u8);
+        self.counters.mutator_tlab_objects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The `Tlab::retire` hook: a reserved tail inside this arena goes back on
+    /// the free list, exactly as `tlab_retire_locked` returns an own cell's.
+    /// `false` when the tail is not this heap's, so another hook may take it.
+    pub fn return_mutator_tail(&self, tail_start: usize, tail_end: usize) -> bool {
+        if tail_end <= tail_start {
+            return false;
+        }
+        let mut arena = self.arena.lock();
+        let base = arena.base_ptr() as usize;
+        let end = base.saturating_add(arena.capacity());
+        if tail_start < base || tail_end > end {
+            return false;
+        }
+        arena.add_free_block(tail_start - base, tail_end - tail_start);
+        drop(arena);
+        self.counters
+            .mutator_tlab_tail_bytes
+            .fetch_add(tail_end - tail_start, Ordering::Relaxed);
+        true
+    }
+
+    /// `(refills, refill bytes, objects registered, tail bytes returned)` --
+    /// the engagement census; a zero in the first column under the default
+    /// collector means the switch is off or the chunk budget is zero.
+    pub fn mutator_tlab_counts(&self) -> (u64, usize, u64, usize) {
+        (
+            self.counters.mutator_tlab_refills.load(Ordering::Relaxed),
+            self.counters.mutator_tlab_refill_bytes.load(Ordering::Relaxed),
+            self.counters.mutator_tlab_objects.load(Ordering::Relaxed),
+            self.counters.mutator_tlab_tail_bytes.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Generational bookkeeping for a whole chunk: `alloc_raw` notes one
+    /// address per object; a chunk notes its span once.
+    fn note_young_page_span(&self, addr: usize, size: usize) {
+        if !self.generational_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.mark_young_pages(addr, addr.saturating_add(size));
+    }
+
     pub(crate) fn tlab_refill(&self, tlab: &mut ZArenaTlab, need: usize) -> Option<()> {
         // Sized against the LIVE buffer count, not once at construction — see
         // `ZGC_TLAB_RESERVATION_SHARE`. A request too big for the current chunk

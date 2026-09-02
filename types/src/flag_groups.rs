@@ -1901,6 +1901,7 @@ pub const INVENTORY: &[E] = &[
     // Phase G. `zgc-generational` is a boolean with a real `off` word; the other
     // two are numeric tunables with no negative spelling, like `zgc-parmark`.
     E { group: Group::GC, token: "zgc-generational", on_key: Some("CRATONVM_ZGC_GENERATIONAL"), off_key: None, off_word: Some("0"), since: "2026-08-17" },
+    E { group: Group::GC, token: "zgc-mutator-tlab", on_key: Some("CRATONVM_ZGC_MUTATOR_TLAB"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "zgc-gen-promotion-age", on_key: Some("CRATONVM_ZGC_GEN_PROMOTION_AGE"), off_key: None, off_word: None, since: "2026-08-17" },
     E { group: Group::GC, token: "zgc-gen-minors-per-major", on_key: Some("CRATONVM_ZGC_GEN_MINORS_PER_MAJOR"), off_key: None, off_word: None, since: "2026-08-17" },
     E { group: Group::GC, token: "zgc-gen-nursery-percent", on_key: Some("CRATONVM_ZGC_GEN_NURSERY_PERCENT"), off_key: None, off_word: Some("0"), since: "2026-08-17" },

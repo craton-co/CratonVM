@@ -3550,8 +3550,23 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.refill_tlab(requested_size),
             VmHeap::G1(h) => h.refill_tlab(requested_size),
+            // 2026-09-02: a mutator-owned chunk carved like the heap's own
+            // TLAB chunks. Every object bumped from it must be registered
+            // through `note_thread_tlab_object` (this collector's object-start
+            // registry is a mutator-path oracle, not just a GC one).
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(_) => None,
+            VmHeap::Zgc(h) => h.refill_mutator_tlab(requested_size),
+        }
+    }
+    /// An object was bump-allocated from a thread's own TLAB and its header
+    /// is written: a collector that keeps an object-start registry records it
+    /// here. A no-op on the collectors whose heaps are parsed by header.
+    #[inline]
+    pub fn note_thread_tlab_object(&self, addr: usize, size: usize) {
+        match self {
+            VmHeap::Generational(_) | VmHeap::G1(_) => {}
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.note_mutator_tlab_object(addr, size),
         }
     }
 

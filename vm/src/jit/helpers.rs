@@ -4842,6 +4842,9 @@ pub unsafe extern "C" fn jit_post_tlab_init(
         } else {
             HEADER_SIZE + num_fields as usize * SLOT_SIZE
         };
+        // The header is complete: a registry-keeping collector (ZGC) records
+        // the object now, before the pointer escapes to Java code.
+        vm.mem.heap.note_thread_tlab_object(raw_ptr as usize, total);
         cratonvm_gc::a2dbg::record(
             raw_ptr as usize,
             class_id_raw as u32,
