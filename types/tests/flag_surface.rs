@@ -60,15 +60,23 @@ fn inventory_matches_the_checked_in_surface() {
 }
 
 #[test]
-fn the_surface_users_have_to_learn_is_fifteen_names() {
-    // 642 internal keys, 15 things to know. That ratio is the deliverable; if
+fn the_surface_users_have_to_learn_is_eighteen_names() {
+    // 642 internal keys, 18 things to know. That ratio is the deliverable; if
     // this number climbs, the consolidation is being undone one flag at a time.
     // (The key count itself is *meant* to climb when a previously-undeclared
     // read site is brought inside the boundary — 66 arrived that way in one
     // pass. See docs/config/flag-inventory.md.)
+    //
+    // 15 -> 18 on 2026-09-01. This copy of the count was TWO behind before this
+    // branch touched it: `flag_groups.rs`'s own copy had already moved 15 -> 17
+    // for `CRATONVM_JFR_ENABLE_EVENTS` and the `native.encoding` override, and
+    // this one was left at 15 — so it was red for every lane, which is exactly
+    // the failure mode its sibling's comment describes and then repeated. Both
+    // now read 18, and the argument for the third scalar is stated at the
+    // sibling assertion in `flag_groups.rs` rather than duplicated here.
     let user_facing = Group::ALL.len() + SCALARS.len();
     assert_eq!(
-        user_facing, 15,
+        user_facing, 18,
         "the documented surface changed size; docs/CONFIG.md and \
          audits/flag-census.md have to change with it"
     );

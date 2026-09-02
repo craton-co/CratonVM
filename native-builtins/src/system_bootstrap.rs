@@ -372,6 +372,10 @@ fn native_vm_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
 
     // Misc
     props.push(("java.awt.headless", "true".to_string()));
+    // Only `file.encoding` is pinned to UTF-8 (JEP 400, JDK 18). The stream
+    // encodings and `native.encoding` follow the host — see
+    // `cratonvm_native_api::os_encoding`, and the twin table in
+    // `vm/src/vm/vm_init.rs` that this one has to agree with.
     props.push(("file.encoding", "UTF-8".to_string()));
     // NOT SET, and their absence is the point: `sun.stdout.encoding` and
     // `sun.stderr.encoding`. HotSpot 25 leaves both NULL — measured on the
@@ -392,15 +396,24 @@ fn native_vm_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     // Removing them was checked rather than assumed to be safe: a grep over
     // the whole tree (`*.rs`, `*.java`, `*.md`, `*.txt`) finds no reader at
     // all outside `probes/StdoutEncoding.java`, which prints the key precisely
-    // in order to observe that HotSpot leaves it null. Nothing downstream
-    // moves either, because `stdout.encoding` / `stderr.encoding` are pushed
-    // explicitly on the next two lines, which makes the `putIfAbsent` above a
-    // no-op whatever the `sun.*` keys say. So this is the smaller and more
-    // faithful change: two fewer non-HotSpot keys in `System.getProperties()`,
-    // no behaviour difference today, and the trap disarmed before the next
-    // stage steps in it.
-    props.push(("stdout.encoding", "UTF-8".to_string()));
-    props.push(("stderr.encoding", "UTF-8".to_string()));
+    // in order to observe that HotSpot leaves it null.
+    //
+    // The stage that trap was waiting for landed the same day: `stdout.encoding`
+    // and `stderr.encoding` are now DERIVED, and this table reads the answer
+    // back out of `vm_init.rs`'s map rather than restating it, so the three
+    // copies of these keys cannot disagree. If the map has no such key —
+    // built-in mode, or a caller that never seeded it — answer exactly what
+    // this line answered before 2026-09-01.
+    props.push((
+        "stdout.encoding",
+        ctx.get_system_property("stdout.encoding")
+            .unwrap_or_else(|| "UTF-8".to_string()),
+    ));
+    props.push((
+        "stderr.encoding",
+        ctx.get_system_property("stderr.encoding")
+            .unwrap_or_else(|| "UTF-8".to_string()),
+    ));
     // Session 108: stdin.encoding is consulted by `java/io/Console.<clinit>`
     // (JDK 21+) when computing STDIN_CHARSET. The bytecode is
     // `Charset.forName(System.getProperty("stdin.encoding"), UTF_8)` which
@@ -409,7 +422,11 @@ fn native_vm_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     // IllegalArgumentException("Null charset name") which is NOT caught,
     // tripping a Console.<clinit> swallow in real-JDK mode. Setting the
     // property explicitly mirrors what HotSpot's launcher native code does.
-    props.push(("stdin.encoding", "UTF-8".to_string()));
+    props.push((
+        "stdin.encoding",
+        ctx.get_system_property("stdin.encoding")
+            .unwrap_or_else(|| "UTF-8".to_string()),
+    ));
     // Derived, and read back from the one owner rather than restated: see
     // `vm/src/vm/vm_init.rs::derive_native_encoding`, and the note at the top
     // of `native_platform_properties` for why the copy THERE is the one that
@@ -423,6 +440,10 @@ fn native_vm_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
         ctx.get_system_property("native.encoding")
             .unwrap_or_else(|| "UTF-8".to_string()),
     ));
+    // NOT derived, deliberately — `sun.jnu.encoding` decides how FILE NAMES
+    // are encoded, so it changes class loading rather than printing. Different
+    // blast radius, different change; see
+    // docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-20260901.md.
     props.push(("sun.jnu.encoding", "UTF-8".to_string()));
 
     // --- NIO / ZIP toggles to steer the JDK away from native-memory code
