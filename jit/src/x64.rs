@@ -249,6 +249,11 @@ mod arrays;
 mod deopt_stubs;
 mod objects;
 pub(crate) use objects::note_ungated_ref_store;
+// The barrier-plan readers are shared with the OPTIMIZING tier
+// (`ir_lower`), deliberately: two tiers deciding independently what a
+// published plan means is how one of them ends up skipping a barrier the
+// other pays. `objects` is a private module, so the re-export is the seam.
+pub(crate) use objects::{ref_store_gates_of, ref_store_post_skip_mask_of};
 pub use objects::ref_store_site_counts;
 pub use null_check_elim::receiver_null_check_counts;
 pub use null_check_elim::receiver_null_check_implicit_count;

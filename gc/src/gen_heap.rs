@@ -26059,11 +26059,27 @@ pub fn jit_ref_store_post_skip_mask() -> u8 {
 /// Announce that this process's collector maintains the gates, using the
 /// unsigned age FLOOR to rule the post barrier out.
 ///
-/// Both gates are armed here and only ever relaxed by a later publisher call:
-/// a plan that starts armed can never be observed permissive before its owner
-/// has run once.
+/// The POST gate is armed here and only ever relaxed by its owner, so a plan
+/// can never be observed permissive about old objects before that owner has
+/// run once.
+///
+/// The PRE gate is published as the true disjunction of its two sources
+/// instead, via [`refresh_jit_ref_store_pre_active`]. It used to be a hard `1`
+/// on the same "starts armed" reasoning, and that was wrong in a way nothing
+/// could see: `pre_active` is only ever recomputed by a marker arming or
+/// disarming, so on a run whose collector never enters a concurrent mark phase
+/// there is no later call to relax it. The gate then reads ARMED for the life
+/// of the process and every compiled reference store takes the helper — which
+/// is exactly what a run-time path census found, on both collectors:
+/// 16,384,000 stores, `inline=0`, all of them bailing at this gate.
+///
+/// The disjunction is safe at publication for the reason the hard `1` was
+/// reaching for: the heap being constructed is not yet reachable, so it has no
+/// marking of its own, and any OTHER heap's marking is already counted in
+/// `JIT_REF_STORE_PRE_MARKERS`. The result can only be conservatively armed,
+/// never falsely permissive.
 pub fn publish_jit_ref_store_plan(young_floor: u8) {
-    JIT_REF_STORE_GATES.pre_active.store(1, Ordering::Release);
+    refresh_jit_ref_store_pre_active();
     JIT_REF_STORE_GATES.post_active.store(1, Ordering::Release);
     JIT_REF_STORE_GATES.post_skip_mask.store(0, Ordering::Release);
     JIT_REF_STORE_GATES
@@ -26080,7 +26096,9 @@ pub fn publish_jit_ref_store_plan(young_floor: u8) {
 /// skips for one question, and the age floor is WRONG for a mask publisher (an
 /// old-gen object with `gc_age == 0` sits below it).
 pub fn publish_jit_ref_store_plan_masked(post_skip_mask: u8) {
-    JIT_REF_STORE_GATES.pre_active.store(1, Ordering::Release);
+    // The true disjunction, not a hard `1` -- see `publish_jit_ref_store_plan`
+    // for the census that found the hard `1` pinning this gate armed forever.
+    refresh_jit_ref_store_pre_active();
     JIT_REF_STORE_GATES.post_active.store(1, Ordering::Release);
     JIT_REF_STORE_GATES.young_floor.store(0, Ordering::Release);
     JIT_REF_STORE_GATES
