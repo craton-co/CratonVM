@@ -407,6 +407,20 @@ pub fn evacuation_implausible_class0_copies() -> usize {
     EVAC_IMPLAUSIBLE_CLASS0_COPY.load(Ordering::Relaxed)
 }
 
+/// How many times an evacuation copy's DESTINATION carried a different class,
+/// shape or kind than its source.
+///
+/// The memcpy and the two quartet updates (`set_gc_age`, `add_gc_flags`) are
+/// the only writes `evacuate_object` performs, and none of them touches the
+/// class id, the shape word or the kind. A non-zero value therefore means the
+/// destination span was not exclusively this object's. Expected to be ZERO.
+pub static EVAC_COPY_SHAPE_DRIFT: AtomicUsize = AtomicUsize::new(0);
+
+/// The value of [`EVAC_COPY_SHAPE_DRIFT`].
+pub fn evacuation_copy_shape_drifts() -> usize {
+    EVAC_COPY_SHAPE_DRIFT.load(Ordering::Relaxed)
+}
+
 /// How many objects the evacuation ref-scan refused to WALK because their own
 /// header did not look like a live object. Expected to be ZERO.
 pub static EVAC_HOLDER_REJECTED: AtomicUsize = AtomicUsize::new(0);
@@ -5643,7 +5657,7 @@ impl G1Collector {
             return None;
         }
 
-        self.note_implausible_class0_header(regions, old_ptr, header, "evacuate");
+        self.note_implausible_legacy_header(regions, old_ptr, header, "evacuate-src");
 
         // Decide destination based on age
         let promote = header.gc_age() >= self.config.promotion_age;
@@ -5680,6 +5694,18 @@ impl G1Collector {
                 return Some((old_ptr, true));
             }
         };
+
+        // The SOURCE's shape, before anything is copied. Compared against the
+        // destination below: "the source was already not an object" and "the
+        // copy produced something that is not an object" are different defects
+        // with different producers, and every report this page has carried so
+        // far read the destination only -- after the evacuator had already
+        // written it -- so it could not tell them apart.
+        let src_shape = (
+            header.class_id.as_u32(),
+            header.num_slots(),
+            header.kind(),
+        );
 
         // Copy object data
         unsafe {
@@ -5739,6 +5765,28 @@ impl G1Collector {
         } else {
             new_header.set_gc_age(new_header.gc_age().saturating_add(1));
         }
+        // The destination must carry the source's identity. `set_gc_age` and
+        // `add_gc_flags` touch only quartet bits; nothing here may change the
+        // class, the shape or the kind.
+        let dst_shape = (
+            new_header.class_id.as_u32(),
+            new_header.num_slots(),
+            new_header.kind(),
+        );
+        if dst_shape != src_shape {
+            let n = EVAC_COPY_SHAPE_DRIFT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                tracing::warn!(
+                    "[g1] evacuation COPY CHANGED an object's shape (#{n}): old={:#x} new={:#x} size={obj_size:#x} src=(class {}, slots {}, {:?}) dst=(class {}, slots {}, {:?}) -- the memcpy and the two quartet updates are the only writes here, so a difference means the destination span was not exclusively this object's.",
+                    old_addr,
+                    new_ptr as usize,
+                    src_shape.0, src_shape.1, src_shape.2,
+                    dst_shape.0, dst_shape.1, dst_shape.2,
+                );
+            }
+        }
+        self.note_implausible_legacy_header(regions, new_ptr, new_header, "evacuate-dest");
+
         pointer_map.insert(old_addr, new_ptr as usize);
         *objects_copied += 1;
         *bytes_copied += obj_size;
@@ -5781,20 +5829,35 @@ impl G1Collector {
     /// every rejection so far named the holder after it had already been
     /// copied into a Survivor region, so the carve that produced it was two
     /// moves behind.
-    fn note_implausible_class0_header(
+    fn note_implausible_legacy_header(
         &self,
         regions: &[G1Region],
         obj_ptr: *mut u8,
         header: &ObjectHeader,
         site: &'static str,
     ) {
-        // `class_id == 0` AND a legacy-object kind AND a field count no class
-        // has. Each alone is ordinary; together they are not an object.
+        // Two shapes, both of which `classify_candidate_header` accepts because
+        // it only validates the TAG bytes and an upper bound on `shape`:
+        //
+        //  * a class id no loader could have minted. The screen is the one this
+        //    file already applies to `num_slots` -- `1 << 24` -- and it is if
+        //    anything more generous for a class id, since a process with 16
+        //    million loaded classes has other problems. The first run of this
+        //    report found `class_id=1130142320` and `class_id=1160062808`.
+        //  * class 0 with a field count no class has. `ClassId(0)` is what
+        //    every primitive array carries (`newarray` passes it verbatim) and
+        //    the MIC/PIC empty-slot sentinel; its objects have zero to a
+        //    handful of fields. A reference array whose kind bit is unset reads
+        //    exactly this way.
+        //
+        // Both authorise a SIXTEEN-byte-stride walk over something that is not
+        // a legacy object.
+        const MAX_PLAUSIBLE_CLASS_ID: u32 = 1 << 24;
         const IMPLAUSIBLE_CLASS0_SLOTS: u32 = 1024;
-        if header.class_id.as_u32() != 0
-            || header.kind() != ObjectKind::Object
-            || header.num_slots() < IMPLAUSIBLE_CLASS0_SLOTS
-        {
+        let cid = header.class_id.as_u32();
+        let implausible = cid >= MAX_PLAUSIBLE_CLASS_ID
+            || (cid == 0 && header.num_slots() >= IMPLAUSIBLE_CLASS0_SLOTS);
+        if header.kind() != ObjectKind::Object || !implausible {
             return;
         }
         let n = EVAC_IMPLAUSIBLE_CLASS0_COPY.fetch_add(1, Ordering::Relaxed) + 1;
@@ -5822,7 +5885,8 @@ impl G1Collector {
             })
             .unwrap_or_else(|| "r?".to_string());
         tracing::warn!(
-            "[g1] IMPLAUSIBLE class-0 legacy header at {site} (#{n}): obj={addr:#x}              class_id=0 kind=Object num_slots={} mark={:#018x} claims={:#x} bytes              source={where_from} -- no allocation in this VM produces a class-0 legacy              object with that many fields; a reference array whose kind bit is unset              reads exactly this way, and the walk it authorises is eight times the              array's extent.",
+            "[g1] IMPLAUSIBLE legacy header at {site} (#{n}): obj={addr:#x}              class_id={} kind=Object num_slots={} mark={:#018x} claims={:#x} bytes              source={where_from} -- no allocation in this VM produces a class-0 legacy              object with that many fields; a reference array whose kind bit is unset              reads exactly this way, and the walk it authorises is eight times the              array's extent.",
+            cid,
             header.num_slots(),
             header.mark_word.load(Ordering::Relaxed),
             HEADER_SIZE + header.num_slots() as usize * SLOT_SIZE,
@@ -10260,8 +10324,9 @@ impl G1Collector {
         // run cannot be quoted as evidence for a guard that nothing prints. See
         // `FLAT_WALK_REFUSED_ARRAY` and `KEPT_SEED_REJECTED`.
         eprintln!(
-            "[GC] g1 implausible_class0_copies={}",
+            "[GC] g1 implausible_legacy_headers={} copy_shape_drift={}",
             evacuation_implausible_class0_copies(),
+            evacuation_copy_shape_drifts(),
         );
         eprintln!(
             "[GC] g1 flat_walk_refused_array={} kept_seed_rejected={}",
