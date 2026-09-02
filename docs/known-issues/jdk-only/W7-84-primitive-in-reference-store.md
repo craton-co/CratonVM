@@ -6,6 +6,52 @@ behind a process-wide monotone latch, so `gen_heap`'s compact reference-field
 read is **cheaper than it was** while `zgc`, `g1` and `heap` gain the behaviour
 for one predicted branch.
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** §5's deliverable was built and run.
+> The record's own §5.4 opened "Nothing was executed. No `cargo build`, `check`
+> or `test`" — that was true for **21 days**.
+>
+> ```text
+> cargo test -p cratonvm-gc --test primitive_in_reference_slot   10 passed, 0 failed
+> cargo test -p cratonvm-gc --lib autobox                         5 passed, 0 failed
+> ```
+>
+> Every test §5.3's table names is present and green, including the two that
+> exist to stop the suite going vacuous:
+> `the_two_arms_of_the_ab_are_actually_different_layouts` (the A/B is not
+> comparing one arm with itself) and `the_three_wrong_shapes_are_each_named`
+> (`Object(None)`, a half-boxed wrapper and a raw `Int` are each rejected by
+> name, so "the read returns something" cannot pass). The five in
+> `autobox.rs`'s own `mod tests` are the five §5 names, `the_latch_gates_the_
+> read_half_in_both_directions` among them.
+>
+> **The count was wrong, in the usual direction.** §5 says "seven tests"; there
+> are **ten** — `there_are_exactly_four_field_store_implementations` and
+> `all_four_field_store_implementations_route_through_the_shared_primitive` are
+> not in §5.3's table. A shared file grew after the record was written. Verify
+> the ASSERTIONS, not the count: every one of the four records repaired on
+> 2026-09-01 predicted a count and every one was wrong.
+>
+> **§8's identity claim got independent corroboration from unrelated work.**
+> §5.4 point 2 says there is no Java-level probe for this and that a Java probe
+> which could not fail would be worse than none — which is right, and is why this
+> was not manufactured. But the guard fires on the boot path of *any* program, so
+> it turned up on its own while probing `com.sun.net.httpserver` on 2026-09-02:
+>
+> ```text
+> WARN a non-reference value was stored into a slot the class declares as a
+>   REFERENCE — boxing it into an AUTOBOX_CLASS_ID wrapper ... (W7-84)
+>   class_id=ClassId(12) index=0 value=Int(-1) occurrence=0
+> ```
+>
+> `ClassId(12)` slot `0`, reached from a probe that has nothing to do with this
+> record — the same identity §8 named, from a different direction. Corroboration
+> of §8, not of §§1-7.
+>
+> **What this does NOT verify.** §5.4 point 3 stands: the latch is still priced by
+> inspection, and "not measured" is still not "free". §§1-7's source-level claims
+> are unchanged — this note says the tests that were written to prove them exist,
+> compile and pass, which is what the record owed.
+
 **Nothing in §§1-7 was built or run.** This lane may not invoke `cargo`; the
 orchestrator builds. Every claim about CratonVM in §§1-7 is source-level and
 says so. The only thing executed for those sections was `rustfmt --check` as a

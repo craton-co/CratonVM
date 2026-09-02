@@ -822,6 +822,12 @@ pub struct JvmThread {
     /// shared table would let a `checkcast` fill answer a `new`.
     pub cast_sites: crate::runtime::interpreter::CastSiteCache,
 
+    /// Per-thread memo for the interface receiver-selection re-check that
+    /// `execute_invokevirtual_cached` performs on every `invokeinterface`
+    /// cache hit. See `IfaceSelectSiteCache` for what it stores and why the
+    /// value has to carry the receiver class as well as the site.
+    pub iface_select_sites: crate::runtime::interpreter::IfaceSelectSiteCache,
+
     /// Thread-local cache for the vtable-fast native-shadow guard.
     ///
     /// On invoke-cache misses, `execute_invokevirtual_vtable_fast` checks whether
@@ -1073,6 +1079,7 @@ impl JvmThread {
             method_sites: crate::runtime::interpreter::MethodSiteCache::new(),
             class_sites: crate::runtime::interpreter::ClassSiteCache::new(),
             cast_sites: crate::runtime::interpreter::CastSiteCache::new(),
+            iface_select_sites: crate::runtime::interpreter::IfaceSelectSiteCache::new(),
             native_shadow_cache: FxHashMap::default(),
             kind: ThreadKind::Platform,
             pin_count: 0,

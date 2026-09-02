@@ -274,6 +274,37 @@ fn if_conversion_budget_from_flags() -> u32 {
     })
 }
 
+/// What the kernel's dispatch guard has proved about one register.
+///
+/// The guard every counted-loop kernel opens with — `if (tid >= bound)
+/// return;` — is a range check the body then repeats at every array
+/// access. For the overwhelmingly common shape, `arr[i]` where `i` is
+/// the induction variable, the repeat is provably redundant: the guard
+/// already established `0 <= tid < bound`, and if `bound` IS that
+/// array's length there is nothing left to check.
+///
+/// The `0 <=` half is not free, and getting it wrong would be a heap
+/// overwrite rather than a slow kernel. `tid` is
+/// `ctaid.x * ntid.x + tid.x + tid_base`, computed in `u32` and
+/// reinterpreted as `s32`; a launch covering `i32::MAX` elements creates
+/// up to `block - 1` threads past `2^31`, whose `s32` index is NEGATIVE.
+/// A signed `tid >= bound` test lets those through — today they are
+/// caught by the per-access `index < 0` check and deopt to the CPU. So
+/// the guard has to prove non-negativity itself before the per-access
+/// check can be removed; see [`Emitter::emit_loop_guard`] for the two
+/// forms it emits and which one each bound gets.
+#[derive(Clone, Debug)]
+pub(crate) struct IndexProof {
+    /// The register proved to satisfy `0 <= index < bound`.
+    pub index: String,
+    /// The register holding that exclusive upper bound.
+    pub bound: String,
+    /// Which parameter's `.length` the bound IS, when it is one — the
+    /// case where an access to that same parameter needs no precondition
+    /// at all.
+    pub bound_is_param_len: Option<usize>,
+}
+
 /// All state the emitter needs while walking a method.
 pub(crate) struct Emitter<'a> {
     pub bytes: &'a [u8],
@@ -292,6 +323,56 @@ pub(crate) struct Emitter<'a> {
     /// `param_ptr_reg`) so each array op can index it instead of
     /// re-running `format!("p{param_idx}_len")` on every access.
     pub param_len_name: Vec<String>,
+    /// For each parameter index: the register its `pN_len` was loaded
+    /// into, once, in the prologue.
+    ///
+    /// AUDIT 2026-09-02: `emit_bounds_check` used to emit its own
+    /// `ld.param.s32` for the length on EVERY array access, plus a
+    /// fresh `mov.s32 %r, 0` for the constant it compared against. Both
+    /// are loop-invariant and neither depends on the access, so a kernel
+    /// touching three arrays paid six redundant instructions per
+    /// element. Loaded once here, in `bind_param_locals`, which
+    /// dominates every access by construction.
+    pub param_len_reg: Vec<Option<Reg>>,
+    /// What the dispatch guard has proved about the induction register.
+    ///
+    /// See [`IndexProof`] and `emit_bounds_check` for how a proof
+    /// retires an access's bounds check entirely.
+    pub(crate) index_proofs: Vec<IndexProof>,
+    /// Per-array preconditions discovered while walking the body, to be
+    /// spliced in at [`Emitter::prologue_splice_at`].
+    ///
+    /// A bounds check is retired by proving `bound <= pN_len` once for
+    /// the whole kernel rather than `index < pN_len` at every access.
+    /// Which arrays need such a precondition is only known after the
+    /// walk — and emitting one for every array parameter up front would
+    /// deopt kernels that never index that array at the loop bound, which
+    /// is a behaviour change, not an optimisation. So they accumulate
+    /// here and are spliced back to a dominating position at the end.
+    pub(crate) bounds_prologue: String,
+    /// Byte offset in `body` immediately after the dispatch guard, where
+    /// [`Emitter::bounds_prologue`] is spliced by `into_body`.
+    ///
+    /// `None` for a shape with no guard (straight-line kernels), where
+    /// nothing is proved and nothing is spliced.
+    pub(crate) prologue_splice_at: Option<usize>,
+    /// `(param index, bound register name)` pairs that already have a
+    /// precondition in `bounds_prologue`, so a kernel with twenty
+    /// accesses to one array emits one.
+    pub(crate) param_len_guarded: Vec<(usize, String)>,
+    /// Set while `try_emit_if_converted` is speculatively emitting an
+    /// arm whose text it may discard.
+    ///
+    /// A discarded arm must leave nothing behind — that is why the
+    /// speculation already saves and restores `writes_param_mask`,
+    /// `reads_param_mask` and `used_bounds_label`. Rather than add
+    /// `bounds_prologue` and `param_len_guarded` to that list, this flag
+    /// stops the one thing that writes them from running at all during
+    /// speculation. That is also the right ANSWER and not merely the
+    /// simpler bookkeeping: a speculated arm is code that may or may not
+    /// have executed, and hoisting a precondition out of it would apply
+    /// it to threads that were never going to take the branch.
+    pub(crate) speculating: bool,
     /// Local slot of the loop induction variable (if we are in a loop).
     pub iv_slot: Option<u16>,
     /// 2-D nested-loop follow-up: local slot of the INNER loop's
@@ -378,6 +459,12 @@ impl<'a> Emitter<'a> {
             param_len_name: (0..sig.param_kinds.len())
                 .map(|i| format!("p{i}_len"))
                 .collect(),
+            param_len_reg: vec![None; sig.param_kinds.len()],
+            index_proofs: Vec::new(),
+            bounds_prologue: String::new(),
+            prologue_splice_at: None,
+            param_len_guarded: Vec::new(),
+            speculating: false,
             iv_slot: None,
             iv_slot_inner: None,
             bound_reg: None,
@@ -445,6 +532,16 @@ impl<'a> Emitter<'a> {
                     writeln!(self.body, "    ld.param.u64 {}, [p{i}_ptr];", r.name).unwrap();
                     self.param_ptr_reg[i] = r.name.clone();
                     self.locals.set(slot, r);
+                    // AUDIT 2026-09-02: hoist the length load. Every
+                    // bounds check used to emit its own
+                    // `ld.param.s32 [pN_len]`; it is loop-invariant, so
+                    // one load here — at a point that dominates every
+                    // access by construction — serves the whole kernel.
+                    // ptxas removes it again if the array is never
+                    // indexed, which is the only case it costs anything.
+                    let len = self.regs.fresh_reg(RegKind::S32);
+                    writeln!(self.body, "    ld.param.s32 {}, [p{i}_len];", len.name).unwrap();
+                    self.param_len_reg[i] = Some(len);
                     slot += 1;
                 }
             }
@@ -554,23 +651,63 @@ impl<'a> Emitter<'a> {
         self.tid_reg = Some(r);
     }
 
-    /// Emit `if (tid >= bound) ret;` using a fresh predicate register.
+    /// Emit the dispatch guard — `if (tid outside [0, bound)) return;` —
+    /// and record what it proves.
     ///
-    /// This `tid >= bound` dispatch (one thread runs iff `0 <= tid <
+    /// This `tid < bound` dispatch (one thread runs iff `0 <= tid <
     /// bound`) is the GPU analogue of the canonical Java loop
     /// `for (int i = 0; i < bound; i++)`. It is *only* correct for that
-    /// exact shape: stride +1, strict-`<` exit, and a start value that
-    /// is either `0` or has already been folded into `tid` by
+    /// exact shape: stride +1, strict-`<` exit, and a start value that is
+    /// either `0` or has already been folded into `tid` by
     /// `apply_loop_start_offset` (so `tid` here may really mean
     /// `tid + K`). The loop recognizer
-    /// ([`crate::lowering::loop_recog::detect_loop`]) has already
-    /// rejected every other shape — `<=`/`!=`/`>`/`>=` exits, non-unit
-    /// strides, negative or non-constant starts — before emission
-    /// reaches here. The `debug_assert!`s below pin that contract: if a
-    /// future change to the recognizer ever lets a non-canonical loop
-    /// through, a debug build trips here instead of silently corrupting
-    /// data.
-    pub fn emit_loop_guard(&mut self, bound: &Reg, loop_info: &CountedLoop) {
+    /// ([`crate::lowering::loop_recog::detect_loop`]) has already rejected
+    /// every other shape — `<=`/`!=`/`>`/`>=` exits, non-unit strides,
+    /// negative or non-constant starts — before emission reaches here.
+    /// The `debug_assert!`s below pin that contract: if a future change to
+    /// the recognizer ever lets a non-canonical loop through, a debug
+    /// build trips here instead of silently corrupting data.
+    ///
+    /// # Two forms, and why the guard has to prove `tid >= 0`
+    ///
+    /// AUDIT 2026-09-02: the guard used to be a single `setp.ge.s32`,
+    /// which retires every thread whose index is too large and says
+    /// nothing about one whose index is negative. That was fine while
+    /// every access re-checked `index < 0` for itself. It stops being
+    /// fine the moment [`Emitter::prove_index_within_param`] uses the
+    /// guard to retire those checks — and the negative case is real, not
+    /// theoretical: `tid` is `ctaid.x * ntid.x + tid.x + tid_base`
+    /// computed in `u32` and reinterpreted as `s32`, so a launch covering
+    /// close to `i32::MAX` elements creates up to `block - 1` threads
+    /// past `2^31`, whose `s32` index is negative.
+    ///
+    /// * `bound_nonneg` — the bound is an array length, or a literal that
+    ///   is not negative. One `setp.ge.u32` then decides both halves:
+    ///   reinterpreted as `u32` a negative `tid` is at least `2^31`,
+    ///   which exceeds any bound that fits in a non-negative `s32`. Same
+    ///   instruction count as before, strictly more proved.
+    /// * otherwise — the bound is an `int` PARAMETER, which may legally be
+    ///   negative (`for (i = 0; i < n; i++)` with `n < 0` runs zero
+    ///   times). An unsigned compare would read that as an enormous bound
+    ///   and run the body, so this form keeps the signed comparison and
+    ///   pays one extra compare-and-branch to reject a negative `tid`
+    ///   explicitly.
+    ///
+    /// Retiring an out-of-range thread to `L_done` rather than to the
+    /// bounds-failure block is correct in both forms: such a thread
+    /// corresponds to no loop iteration at all, so there is nothing for
+    /// the CPU to re-run.
+    ///
+    /// `bound_is_param_len` names the parameter whose `.length` the bound
+    /// IS, when it is one — the case where an access to that same
+    /// parameter needs no precondition either.
+    pub fn emit_loop_guard(
+        &mut self,
+        bound: &Reg,
+        loop_info: &CountedLoop,
+        bound_is_param_len: Option<usize>,
+        bound_nonneg: bool,
+    ) {
         debug_assert_eq!(
             loop_info.exit_op, 0xA2,
             "emit_loop_guard: counted loop reached emission with a \
@@ -584,14 +721,37 @@ impl<'a> Emitter<'a> {
             loop_info.iv_stride
         );
         let tid = self.tid_reg.clone().expect("emit_tid was called");
-        let p = self.regs.fresh_reg(RegKind::Pred);
-        writeln!(
-            self.body,
-            "    setp.ge.s32 {}, {}, {};",
-            p.name, tid.name, bound.name
-        )
-        .unwrap();
-        writeln!(self.body, "    @{} bra L_done;", p.name).unwrap();
+        if bound_nonneg {
+            let p = self.regs.fresh_reg(RegKind::Pred);
+            writeln!(
+                self.body,
+                "    setp.ge.u32 {}, {}, {};",
+                p.name, tid.name, bound.name
+            )
+            .unwrap();
+            writeln!(self.body, "    @{} bra L_done;", p.name).unwrap();
+        } else {
+            let neg = self.regs.fresh_reg(RegKind::Pred);
+            writeln!(self.body, "    setp.lt.s32 {}, {}, 0;", neg.name, tid.name).unwrap();
+            writeln!(self.body, "    @{} bra L_done;", neg.name).unwrap();
+            let p = self.regs.fresh_reg(RegKind::Pred);
+            writeln!(
+                self.body,
+                "    setp.ge.s32 {}, {}, {};",
+                p.name, tid.name, bound.name
+            )
+            .unwrap();
+            writeln!(self.body, "    @{} bra L_done;", p.name).unwrap();
+        }
+        self.index_proofs.push(IndexProof {
+            index: tid.name.clone(),
+            bound: bound.name.clone(),
+            bound_is_param_len,
+        });
+        // Everything emitted from here on is dominated by the guard, so
+        // this is where a per-array precondition discovered during the
+        // walk gets spliced back to. See `Emitter::bounds_prologue`.
+        self.prologue_splice_at = Some(self.body.len());
     }
 
     /// 2-D nested-loop follow-up: emit the nested-loop guard and index
@@ -712,47 +872,215 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Emit a bounds check: if `index >= len` jump to failure label.
-    /// `param_idx` selects the cached `pN_len` kernel-parameter name
-    /// (see `param_len_name`).
+    /// Emit the Java bounds check for `index` against parameter
+    /// `param_idx`'s length: on failure, jump to the shared failure
+    /// block, which raises the flag the host reads to deopt.
+    ///
+    /// # One unsigned compare, not two signed ones
+    ///
+    /// Java's check is `index < 0 || index >= len`, and this used to
+    /// emit it literally: materialise `0`, compare, branch, compare
+    /// again, branch again — six instructions and two branches per
+    /// access. A single unsigned compare decides both halves at once.
+    /// Reinterpreted as `u32` a negative index is at least `2^31`, and
+    /// an array length is at most `i32::MAX`, so `index >=u len` holds
+    /// exactly when `index < 0 || index >= len` does. This is the same
+    /// identity HotSpot's own bounds check has used for decades.
+    ///
+    /// It rests on `pN_len` being non-negative, which the marshaller
+    /// guarantees: it is a JVM array length, read from the object
+    /// header, and the JVM has no negative-length array.
+    ///
+    /// # …and often no compare at all
+    ///
+    /// Before emitting anything, ask whether the dispatch guard already
+    /// settled it. See [`IndexProof`] for what the guard proves and
+    /// [`Emitter::prove_index_within_param`] for the two ways a proof
+    /// discharges an access.
     fn emit_bounds_check(&mut self, index: &Reg, param_idx: usize) {
+        if self.prove_index_within_param(index, param_idx) {
+            return;
+        }
         self.used_bounds_label = true;
-        let len = self.regs.fresh_reg(RegKind::S32);
-        let p_neg = self.regs.fresh_reg(RegKind::Pred);
-        let p_ge = self.regs.fresh_reg(RegKind::Pred);
+        let len = self.param_len_operand(param_idx);
+        let p = self.regs.fresh_reg(RegKind::Pred);
+        // `.u32` on registers declared `.s32`: PTX's relaxed
+        // source-operand typing makes signed and unsigned integers of the
+        // same width compatible, and the reinterpretation is the point.
+        writeln!(
+            self.body,
+            "    setp.ge.u32 {}, {}, {};",
+            p.name, index.name, len
+        )
+        .unwrap();
+        writeln!(self.body, "    @{} bra {};", p.name, self.bounds_fail_label).unwrap();
+    }
+
+    /// The operand naming parameter `param_idx`'s length — the register
+    /// `bind_param_locals` hoisted it into, or a freshly-loaded one for a
+    /// caller that never ran `bind_param_locals` (only the unit tests
+    /// that drive `walk` directly do that).
+    fn param_len_operand(&mut self, param_idx: usize) -> String {
+        if let Some(r) = &self.param_len_reg[param_idx] {
+            return r.name.clone();
+        }
+        let r = self.regs.fresh_reg(RegKind::S32);
         writeln!(
             self.body,
             "    ld.param.s32 {}, [{}];",
-            len.name, self.param_len_name[param_idx]
+            r.name, self.param_len_name[param_idx]
         )
         .unwrap();
-        // index < 0 also fails — Java semantics.
-        let zero = self.regs.fresh_reg(RegKind::S32);
-        writeln!(self.body, "    mov.s32 {}, 0;", zero.name).unwrap();
+        let name = r.name.clone();
+        self.param_len_reg[param_idx] = Some(r);
+        name
+    }
+
+    /// Whether the dispatch guard already proves `index` is in range for
+    /// parameter `param_idx`, so the per-access check can be omitted.
+    ///
+    /// Two ways it can:
+    ///
+    /// 1. **The bound IS this array's length.** `for (i = 0; i < a.length;
+    ///    i++) a[i] = …` — the guard retired every thread whose index
+    ///    falls outside `[0, a.length)` before the body started. Nothing
+    ///    to emit here, and nothing once per kernel either.
+    /// 2. **The bound is no larger than this array's length.** The other
+    ///    arrays in `out[i] = a[i] + b[i]`, whose lengths the guard says
+    ///    nothing about. One precondition per array — `if (a.length <
+    ///    bound) deopt;` — discharges every access to it, however many
+    ///    there are. It is spliced back to a dominating position (see
+    ///    [`Emitter::bounds_prologue`]) rather than left where it was
+    ///    discovered.
+    ///
+    /// Case 2 replaces a per-access check with a weaker precondition, not
+    /// a stronger one: it deopts exactly the launches on which some
+    /// access WOULD have gone out of bounds, and Java's semantics for
+    /// those is an `ArrayIndexOutOfBoundsException` anyway. It fires
+    /// earlier than the failing access, which the deopt contract already
+    /// permits — the host discards the device result and re-runs the
+    /// whole method on the CPU, where the exception is raised at the
+    /// right place with the right message.
+    ///
+    /// Deliberately NOT applied to the nested (2-D) shape. There the
+    /// guard is `tid < R * C` with the product computed in `s32`, so a
+    /// large `R` and `C` overflow it and a "proof" resting on it would
+    /// admit indices past the end. Fixing that means widening the
+    /// multiply, which changes the nested guard's shape and its
+    /// measurements; until then the nested kernels keep the (now
+    /// single-compare) check. `emit_nested_loop_guard_and_decompose`
+    /// registers no proof, so this returns `false` there by construction.
+    fn prove_index_within_param(&mut self, index: &Reg, param_idx: usize) -> bool {
+        let Some(proof) = self
+            .index_proofs
+            .iter()
+            .find(|p| p.index == index.name)
+            .cloned()
+        else {
+            return false;
+        };
+        if proof.bound_is_param_len == Some(param_idx) {
+            return true;
+        }
+        if self
+            .param_len_guarded
+            .iter()
+            .any(|(i, b)| *i == param_idx && *b == proof.bound)
+        {
+            return true;
+        }
+        if !self.unconditional_since_guard() {
+            // The access sits behind a branch, so it may not execute.
+            // A precondition hoisted out of it would deopt launches on
+            // which Java would have thrown nothing at all — a silent
+            // performance cliff rather than a wrong answer, but a
+            // behaviour change either way. Fall back to the per-access
+            // check, which is still one unsigned compare rather than the
+            // six this used to be.
+            //
+            // Case 1 above does NOT need this guard: it emits nothing.
+            // It is a statement about the VALUE of the index, which the
+            // dispatch guard established for every thread that reached
+            // the body, and that stays true wherever inside the body the
+            // access happens to sit.
+            return false;
+        }
+        let Some(len) = self.param_len_reg[param_idx].clone() else {
+            // No hoisted length means `bind_param_locals` never ran — a
+            // unit test driving `walk` directly. Nothing to prove
+            // against; fall back to the per-access check.
+            return false;
+        };
+        // `bound <= pN_len` plus the guard's `0 <= index < bound` gives
+        // `0 <= index < pN_len`, which is the check being retired.
+        // Signed, not unsigned: a `ParamScalar` bound may legitimately be
+        // negative (a loop that runs zero times), and the guard's own
+        // form already accounts for that.
+        self.used_bounds_label = true;
+        let p = self.regs.fresh_reg(RegKind::Pred);
         writeln!(
-            self.body,
+            self.bounds_prologue,
             "    setp.lt.s32 {}, {}, {};",
-            p_neg.name, index.name, zero.name
+            p.name, len.name, proof.bound
         )
         .unwrap();
         writeln!(
-            self.body,
+            self.bounds_prologue,
             "    @{} bra {};",
-            p_neg.name, self.bounds_fail_label
+            p.name, self.bounds_fail_label
         )
         .unwrap();
+        self.param_len_guarded.push((param_idx, proof.bound));
+        true
+    }
+
+    /// Whether everything emitted since the dispatch guard is
+    /// straight-line, so the current emission point is reached by every
+    /// thread that passed the guard.
+    ///
+    /// Answered by looking for a branch in the body text rather than by
+    /// tracking block structure, for the same reason
+    /// `check_every_branch_has_its_label` and `speculation_cost` read the
+    /// text: there is no IR to ask. It is sound in the direction that
+    /// matters — any conditional control flow in this emitter goes
+    /// through a `bra`, so no branch means no condition. A `bra` that is
+    /// unconditional (the end-of-body jump to `L_done`) reads as
+    /// conditional here and merely gives up an optimisation.
+    ///
+    /// `false` during speculation and for shapes with no guard at all.
+    fn unconditional_since_guard(&self) -> bool {
+        if self.speculating {
+            return false;
+        }
+        match self.prologue_splice_at {
+            Some(at) if at <= self.body.len() => !self.body[at..].contains("bra "),
+            _ => false,
+        }
+    }
+
+    /// Emit the address of element `index` of the array based at `base`,
+    /// and return the register holding it.
+    ///
+    /// One instruction. `mad.wide.s32 %rd, %r, <size>, %rd_base`
+    /// sign-extends the 32-bit index, multiplies it by the element size
+    /// and adds the 64-bit base, which is a single `IMAD.WIDE` in SASS.
+    ///
+    /// AUDIT 2026-09-02: this used to be three — `cvt.s64.s32` to widen,
+    /// `mul.lo.s64` to scale, `add.u64` to offset — plus two 64-bit
+    /// temporaries live across them. ptxas contracts that pattern
+    /// sometimes and is not obliged to, and certainly not across the
+    /// bounds-check branches that used to sit in between. The register
+    /// saving matters as much as the instruction count: 64-bit
+    /// temporaries are what push an index-heavy kernel into spilling.
+    fn emit_element_addr(&mut self, index: &Reg, base: &Reg, elem_size: usize) -> Reg {
+        let addr = self.regs.fresh_reg(RegKind::U64);
         writeln!(
             self.body,
-            "    setp.ge.s32 {}, {}, {};",
-            p_ge.name, index.name, len.name
+            "    mad.wide.s32 {}, {}, {}, {};",
+            addr.name, index.name, elem_size, base.name
         )
         .unwrap();
-        writeln!(
-            self.body,
-            "    @{} bra {};",
-            p_ge.name, self.bounds_fail_label
-        )
-        .unwrap();
+        addr
     }
 
     /// Walk a region of bytecode from `start` to `end` (exclusive),
@@ -1184,6 +1512,10 @@ impl<'a> Emitter<'a> {
         let saved_bounds_label = self.used_bounds_label;
 
         let real_body = std::mem::take(&mut self.body);
+        // Nothing emitted from here to the restore below may escape into
+        // the kernel prologue; see the `speculating` field.
+        let was_speculating = self.speculating;
+        self.speculating = true;
         let then_ok = self.walk_straight(plan.then_start, plan.then_goto_pc, loop_info);
         let then_text = std::mem::take(&mut self.body);
         let then_state = BlockState {
@@ -1205,6 +1537,7 @@ impl<'a> Emitter<'a> {
         };
 
         self.body = real_body;
+        self.speculating = was_speculating;
         let budget = self.if_convert_budget;
         let cost = speculation_cost(&then_text)
             .zip(speculation_cost(&else_text))
@@ -3938,28 +4271,8 @@ impl<'a> Emitter<'a> {
         // Element read: see `reads_param_mask` (chunked-writeback guard).
         self.mark_param_read(param_idx);
         self.emit_bounds_check(&index, param_idx);
-        let offset = self.regs.fresh_reg(RegKind::U64);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
-        let addr = self.regs.fresh_reg(RegKind::U64);
+        let addr = self.emit_element_addr(&index, &array_ref, elem_size);
         let result = self.regs.fresh_reg(elem_kind);
-        writeln!(
-            self.body,
-            "    cvt.s64.s32 {}, {};",
-            byte_idx.name, index.name
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    mul.lo.s64 {}, {}, {};",
-            offset.name, byte_idx.name, elem_size
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    add.u64 {}, {}, {};",
-            addr.name, array_ref.name, offset.name
-        )
-        .unwrap();
         writeln!(
             self.body,
             "    ld.global{} {}, [{}];",
@@ -3977,22 +4290,9 @@ impl<'a> Emitter<'a> {
         // Element read: see `reads_param_mask` (chunked-writeback guard).
         self.mark_param_read(param_idx);
         self.emit_bounds_check(&index, param_idx);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
-        let addr = self.regs.fresh_reg(RegKind::U64);
+        let addr = self.emit_element_addr(&index, &array_ref, 1);
         let raw = self.regs.fresh_reg(RegKind::S32);
         let result = self.regs.fresh_reg(RegKind::S32);
-        writeln!(
-            self.body,
-            "    cvt.s64.s32 {}, {};",
-            byte_idx.name, index.name
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    add.u64 {}, {}, {};",
-            addr.name, array_ref.name, byte_idx.name
-        )
-        .unwrap();
         // Load signed 8-bit, widen to 32-bit (sign-extended) — Java baload semantics.
         writeln!(self.body, "    ld.global.s8 {}, [{}];", raw.name, addr.name).unwrap();
         writeln!(self.body, "    cvt.s32.s8 {}, {};", result.name, raw.name).unwrap();
@@ -4015,29 +4315,9 @@ impl<'a> Emitter<'a> {
         // Element read: see `reads_param_mask` (chunked-writeback guard).
         self.mark_param_read(param_idx);
         self.emit_bounds_check(&index, param_idx);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
-        let offset = self.regs.fresh_reg(RegKind::U64);
-        let addr = self.regs.fresh_reg(RegKind::U64);
+        let addr = self.emit_element_addr(&index, &array_ref, 2);
         let raw = self.regs.fresh_reg(RegKind::S32);
         let result = self.regs.fresh_reg(RegKind::S32);
-        writeln!(
-            self.body,
-            "    cvt.s64.s32 {}, {};",
-            byte_idx.name, index.name
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    mul.lo.s64 {}, {}, 2;",
-            offset.name, byte_idx.name
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    add.u64 {}, {}, {};",
-            addr.name, array_ref.name, offset.name
-        )
-        .unwrap();
         let load_suffix = if is_char { "u16" } else { "s16" };
         let cvt = if is_char {
             "cvt.u32.u16"
@@ -4078,27 +4358,7 @@ impl<'a> Emitter<'a> {
             u64::MAX
         };
         self.emit_bounds_check(&index, param_idx);
-        let offset = self.regs.fresh_reg(RegKind::U64);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
-        let addr = self.regs.fresh_reg(RegKind::U64);
-        writeln!(
-            self.body,
-            "    cvt.s64.s32 {}, {};",
-            byte_idx.name, index.name
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    mul.lo.s64 {}, {}, {};",
-            offset.name, byte_idx.name, elem_size
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    add.u64 {}, {}, {};",
-            addr.name, array_ref.name, offset.name
-        )
-        .unwrap();
+        let addr = self.emit_element_addr(&index, &array_ref, elem_size);
         writeln!(
             self.body,
             "    st.global{} [{}], {};",
@@ -4120,20 +4380,7 @@ impl<'a> Emitter<'a> {
             u64::MAX
         };
         self.emit_bounds_check(&index, param_idx);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
-        let addr = self.regs.fresh_reg(RegKind::U64);
-        writeln!(
-            self.body,
-            "    cvt.s64.s32 {}, {};",
-            byte_idx.name, index.name
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    add.u64 {}, {}, {};",
-            addr.name, array_ref.name, byte_idx.name
-        )
-        .unwrap();
+        let addr = self.emit_element_addr(&index, &array_ref, 1);
         // Truncate value to s8 implicitly via st.global.s8 (PTX OK).
         writeln!(
             self.body,
@@ -4156,27 +4403,7 @@ impl<'a> Emitter<'a> {
             u64::MAX
         };
         self.emit_bounds_check(&index, param_idx);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
-        let offset = self.regs.fresh_reg(RegKind::U64);
-        let addr = self.regs.fresh_reg(RegKind::U64);
-        writeln!(
-            self.body,
-            "    cvt.s64.s32 {}, {};",
-            byte_idx.name, index.name
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    mul.lo.s64 {}, {}, {};",
-            offset.name, byte_idx.name, elem_size
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    add.u64 {}, {}, {};",
-            addr.name, array_ref.name, offset.name
-        )
-        .unwrap();
+        let addr = self.emit_element_addr(&index, &array_ref, elem_size);
         writeln!(
             self.body,
             "    st.global.s16 [{}], {};",
@@ -4186,16 +4413,27 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// `arraylength` — the parameter's `pN_len`, which the prologue
+    /// already holds in a register.
+    ///
+    /// AUDIT 2026-09-02: this issued its own `ld.param.s32`, so a kernel
+    /// whose loop bound is written `a.length` inline loaded the same
+    /// kernel parameter twice. Reusing the hoisted register also makes
+    /// the value the loop bound compares against and the value the
+    /// bounds check compares against the SAME register, which is the
+    /// identity `Emitter::prove_index_within_param` matches on.
     fn arraylength(&mut self) -> Result<(), LoweringError> {
         let array_ref = self.stack.pop()?;
         let (param_idx, _kind) = self.array_param_of(&array_ref)?;
-        let r = self.regs.fresh_reg(RegKind::S32);
-        writeln!(
-            self.body,
-            "    ld.param.s32 {}, [{}];",
-            r.name, self.param_len_name[param_idx]
-        )
-        .unwrap();
+        let name = self.param_len_operand(param_idx);
+        let r = self
+            .param_len_reg[param_idx]
+            .clone()
+            .unwrap_or_else(|| Reg {
+                kind: RegKind::S32,
+                name,
+                wide: false,
+            });
         self.stack.push(r);
         Ok(())
     }

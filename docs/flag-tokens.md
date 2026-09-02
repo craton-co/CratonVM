@@ -577,7 +577,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-270 tokens.
+274 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -703,6 +703,7 @@ export inherited from a parent shell.
 | `varhandle-read-direct-helpers` | `CRATONVM_JIT_VARHANDLE_READ_DIRECT_HELPERS` |
 | `varhandle-cas-direct-helpers` | `CRATONVM_JIT_VARHANDLE_CAS_DIRECT_HELPERS` |
 | `varhandle-ref-read-direct` | `CRATONVM_JIT_VARHANDLE_REF_READ_DIRECT` |
+| `native-cf-complete` | `CRATONVM_NATIVE_CF_COMPLETE` |
 | `varhandle-write-direct-helpers` | `CRATONVM_JIT_VARHANDLE_WRITE_DIRECT_HELPERS` |
 | `varhandle-cas-funnel-fast` | `CRATONVM_JIT_VARHANDLE_CAS_FUNNEL_FAST` |
 | `longroot-strict` | `CRATONVM_LONGROOT_STRICT` |
@@ -774,6 +775,9 @@ export inherited from a parent shell.
 | `cast-site-cache` | `CRATONVM_JIT_NO_CAST_SITE_CACHE` |
 | `code-ptr-memo` | `CRATONVM_JIT_NO_CODE_PTR_MEMO` |
 | `param-tag-scan` | `CRATONVM_JIT_NO_PARAM_TAG_SCAN` |
+| `descriptor-facts` | `CRATONVM_JIT_NO_DESCRIPTOR_FACTS` |
+| `backedge-poll-gate` | `CRATONVM_JIT_NO_BACKEDGE_POLL_GATE` |
+| `iface-select-memo` | `CRATONVM_JIT_NO_IFACE_SELECT_MEMO` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
 | `ir-unresumable-trap-guard` | `CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD` |
 | `compiled-ldc-const-cache` | `CRATONVM_JIT_COMPILED_LDC_CONST_CACHE` |
@@ -854,7 +858,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-86 tokens.
+91 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -863,6 +867,8 @@ export inherited from a parent shell.
 | `moving-young-bounds-guard` | `CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD` |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
 | `card-table-only` | `CRATONVM_CARD_TABLE_ONLY` |
+| `full-rset-scan` | `CRATONVM_GC_FULL_RSET_SCAN` |
+| `verify-rset` | `CRATONVM_GC_VERIFY_RSET` |
 | `compact-ref-fields` | `CRATONVM_COMPACT_REF_FIELDS` |
 | `pack-fields-by-width` | `CRATONVM_PACK_FIELDS_BY_WIDTH` |
 | `compressed-oops` | `CRATONVM_COMPRESSED_OOPS` |
@@ -887,6 +893,8 @@ export inherited from a parent shell.
 | `g1-verify-budget` | `CRATONVM_G1_VERIFY_BUDGET` |
 | `gpu-chunk-streams` | `CRATONVM_GPU_CHUNK_STREAMS` |
 | `gpu-chunks` | `CRATONVM_GPU_CHUNKS` |
+| `gpu-dispatch-streams` | `CRATONVM_GPU_DISPATCH_STREAMS` |
+| `gpu-jit-array-writers` | `CRATONVM_GPU_JIT_ARRAY_WRITERS` |
 | `gpu-critical-lease-ms` | `CRATONVM_GPU_CRITICAL_LEASE_MS` |
 | `gpu-critical-wait-ms` | `CRATONVM_GPU_CRITICAL_WAIT_MS` |
 | `gpu-zerocopy` | `CRATONVM_GPU_NO_ZEROCOPY` |
@@ -913,6 +921,7 @@ export inherited from a parent shell.
 | `promotion-oom-guard-broad` | `CRATONVM_PROMOTION_OOM_GUARD_BROAD` |
 | `selective-promote` | `CRATONVM_NO_SELECTIVE_PROMOTE` |
 | `stress` | `CRATONVM_GC_STRESS` |
+| `young-trigger-percent` | `CRATONVM_GC_YOUNG_TRIGGER_PERCENT` |
 | `sweep-anchor-stride` | `CRATONVM_GC_SWEEP_ANCHOR_STRIDE` |
 | `tlab-gc-trigger` | `CRATONVM_TLAB_GC_TRIGGER` |
 | `weakref-clear` | `CRATONVM_WEAKREF_CLEAR` |
@@ -983,10 +992,12 @@ export inherited from a parent shell.
 
 ## `CRATONVM_LOADER`
 
-14 tokens.
+16 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `dup-name-field-gate` | `CRATONVM_LOADER_NO_DUP_NAME_FIELD_GATE` |
+| `ann-proxy-latch` | `CRATONVM_LOADER_NO_ANN_PROXY_LATCH` |
 | `allow-jsr-ret` | `CRATONVM_ALLOW_JSR_RET` |
 | `enforce-native-shadow` | `CRATONVM_ENFORCE_NATIVE_SHADOW` |
 | `cf-delegating-yield` | `CRATONVM_CF_DELEGATING_YIELD` |

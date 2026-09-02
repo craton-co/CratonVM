@@ -15,6 +15,12 @@ pub(crate) fn probe_device(_device_ordinal: u32) -> Result<DeviceCaps> {
     Err(DeviceError::NoDriver)
 }
 
+/// Stub twin of the cuda backend's driver-version query. No driver, no
+/// version — the caller reads this as "do not clamp the target".
+pub(crate) fn driver_cuda_version() -> Result<u32> {
+    Err(DeviceError::NoDriver)
+}
+
 #[derive(Clone)]
 pub(crate) struct DeviceContextInner;
 

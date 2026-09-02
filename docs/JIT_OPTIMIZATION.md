@@ -291,24 +291,40 @@ what they always did.
 * on all five probe kernels above it never runs at all: *"refused: liveness and
   colourer disagree about which values want a home"*, 5 of 5.
 
-That refusal is a **pre-existing** gate, not something the GP file introduced.
+That refusal was a **pre-existing** gate, not something the GP file introduced.
 `regalloc::ir_op_defines_value` (through `wants_loc`) and `ir_lower`'s
 `op_defines_result_slot` (through `node_color`) are two enumerations of one
 question — the second and third of the three `the_three_ir_op_enumerations`
 names — and any disagreement declines the whole method. It was declining the XMM
 cache the same way and nobody could see it, because the flag printed only on
-success. Both halves of that are fixed here: every refusal now carries a reason,
-the enumeration disagreement names the offending node and op, and a successful
-plan reports its per-cause skip census (`split_or_spilled`,
-`wrong_bank_or_type`, `no_home`, `phi`).
+success. Both halves of that are fixed: every refusal now carries a reason, the
+enumeration disagreement names the offending node and op, and a successful plan
+reports its per-cause skip census (`split_or_spilled`, `wrong_bank_or_type`,
+`no_home`, `phi`).
 
-So the capability is built, tested and safe, and the flip is a separate decision
-that wants two things this change does not have: the two enumerations
-reconciled, so the kernels that show the inversion can actually reach the
-allocator, and a wall-clock measurement on a quiet host — which the host this
-landed on could not supply (load 30–63 for the second half of the session).
-**Do not flip it on the strength of the table above; that table is the problem
-statement, not a result.**
+**The disagreement itself is fixed too, and it was exactly two ops.**
+`op_defines_result_slot` lists `Op::ArrayLength` and `Op::NewArray`;
+`ir_op_defines_value` did not — while its own doc comment asserted lockstep and
+named those two as *"absent there and absent here"*. The comment written to
+prevent the drift was the drift. Every counted loop spelled
+`for (i = 0; i < a.length; i++)` contains an `arraylength`, which is why the
+five array-touching kernels declined and `BinTrees.itemCheck`, which touches no
+array, was the one that promoted. Nothing was ever miscompiled — the agreement
+check did its job and declined — but the optimization was unavailable wherever
+arrays are, which is most places.
+
+The lockstep claim is now enforced rather than asserted:
+`the_two_value_defining_enumerations_agree` parses both function bodies out of
+the two source files and compares the sets, so adding an arm to one list and
+forgetting the other fails a test instead of surfacing as an unexplained
+refusal months later.
+
+So the capability is built, tested, safe, and no longer structurally blocked.
+The flip is a separate decision that still wants a **measurement on a quiet
+host**, which is what this work could not supply: the box ran at load 30–352
+throughout, with the fat-LTO link of the verifying binary SIGKILLed by the OOM
+killer at load 352. **Do not flip it on the strength of the table above; that
+table is the problem statement, not a result.**
 
 Off is exactly the pre-change emission: no register handed out, no save area
 reserved, every read from its home word.

@@ -355,6 +355,8 @@ fn rh7_oopmap_scaffolding_retains_references() {
         local_oop_mask: None,
         num_locals: 0,
         inline_local_scopes: Vec::new(),
+        non_oop_stack_slots: Vec::new(),
+        stack_marks_exact: false,
     });
     cm.push_oop_map(OopMapEntry {
         bytecode_pc: 0,
@@ -365,6 +367,8 @@ fn rh7_oopmap_scaffolding_retains_references() {
         local_oop_mask: None,
         num_locals: 0,
         inline_local_scopes: Vec::new(),
+        non_oop_stack_slots: Vec::new(),
+        stack_marks_exact: false,
     });
     assert!(cm.has_precise_oop_maps());
 
