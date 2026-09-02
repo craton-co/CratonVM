@@ -435,21 +435,21 @@ impl Compiler {
                                                     //    JIT_READ_BOUNDS, STORE callers JIT_REGION_BOUNDS; see above.
         self.emit_mov_imm64(RDX, bounds_addr as i64);
         // region 0: RAX >= b0 && RAX < e0 → ok
-        self.emit_cmp_r64_mem_disp32(RAX, RDX, 0);
+        self.emit_cmp_r64_mem_disp(RAX, RDX, 0);
         let below_b0 = self.emit_jcc_rel32_patch(0x82); // JB → try region 1
-        self.emit_cmp_r64_mem_disp32(RAX, RDX, 8);
+        self.emit_cmp_r64_mem_disp(RAX, RDX, 8);
         let ok0 = self.emit_jcc_rel32_patch(0x82); // JB → in region 0
         self.patch_rel32_to_here(below_b0);
         // region 1
-        self.emit_cmp_r64_mem_disp32(RAX, RDX, 16);
+        self.emit_cmp_r64_mem_disp(RAX, RDX, 16);
         let below_b1 = self.emit_jcc_rel32_patch(0x82); // JB → try region 2
-        self.emit_cmp_r64_mem_disp32(RAX, RDX, 24);
+        self.emit_cmp_r64_mem_disp(RAX, RDX, 24);
         let ok1 = self.emit_jcc_rel32_patch(0x82); // JB → in region 1
         self.patch_rel32_to_here(below_b1);
         // region 2 — last chance: outside → slow.
-        self.emit_cmp_r64_mem_disp32(RAX, RDX, 32);
+        self.emit_cmp_r64_mem_disp(RAX, RDX, 32);
         slow.push(self.emit_jcc_rel32_patch(0x82)); // JB → slow
-        self.emit_cmp_r64_mem_disp32(RAX, RDX, 40);
+        self.emit_cmp_r64_mem_disp(RAX, RDX, 40);
         slow.push(self.emit_jcc_rel32_patch(0x83)); // JAE → slow
                                                     // fall-through / ok: receiver is inside a published live region.
         self.patch_rel32_to_here(ok0);

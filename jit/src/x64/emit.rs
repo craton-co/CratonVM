@@ -1059,6 +1059,45 @@ impl Compiler {
         self.buf.emit(&disp.to_le_bytes());
     }
 
+    /// Emit `CMP r64, [base + disp]` choosing the **smallest legal**
+    /// displacement form, for a `base` that is not RSP/R12.
+    ///
+    /// Split from [`Self::emit_cmp_r64_mem_disp32`] rather than folded into it
+    /// because that one is named for the width it emits and several callers
+    /// pin its bytes. The receiver-containment guard is the caller this exists
+    /// for: it reads six table words at displacements 0..40, every one of which
+    /// fits a `disp8`, and paid three wasted bytes on each.
+    ///
+    /// `base & 7 == 0b100` (RSP/R12) would need a SIB byte, which neither this
+    /// nor the disp32 form emits; such a base falls back to the disp32 form so
+    /// this function never becomes the place a SIB-less RSP operand is
+    /// introduced. `base & 7 == 0b101` (RBP/R13) has no `mod=00` form, so a
+    /// zero displacement there still takes the explicit `disp8` arm.
+    pub(super) fn emit_cmp_r64_mem_disp(&mut self, lhs: u8, base: u8, disp: i32) {
+        if base & 7 == 0b100 || !(i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&disp) {
+            self.emit_cmp_r64_mem_disp32(lhs, base, disp);
+            return;
+        }
+        let mut rex = 0x48u8;
+        if lhs >= 8 {
+            rex |= 0x04;
+        }
+        if base >= 8 {
+            rex |= 0x01;
+        }
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x3B); // CMP r64, r/m64
+        if disp == 0 && base & 7 != 0b101 {
+            // mod=00 — no displacement byte at all.
+            self.buf.emit_byte(((lhs & 7) << 3) | (base & 7));
+        } else {
+            // mod=01 — disp8.
+            self.buf.emit_byte(0x40 | ((lhs & 7) << 3) | (base & 7));
+            // Cast: guarded by the range check above.
+            self.buf.emit_byte(disp as u8);
+        }
+    }
+
     /// Emit `MOV r64, r64` (register-to-register move).
     pub(super) fn emit_mov_r64_r64(&mut self, dst: u8, src: u8) {
         // Peephole: skip self-moves (no-op). Matches `emit_mov_reg_reg`.

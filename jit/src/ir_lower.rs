@@ -1883,9 +1883,8 @@ impl<'a> Lowerer<'a> {
     fn emit_xmm_frame_move(&mut self, reg: u8, off: i32, store: bool) {
         debug_assert!(reg < 8, "xmm{reg} needs REX.R, which this encoding omits");
         self.buf.emit(&[0x0F, if store { 0x11 } else { 0x10 }]);
-        // ModRM: mod=10 (disp32), reg=xmm, rm=101 (rbp-relative).
-        self.buf.emit_byte(0x85 | ((reg & 7) << 3));
-        self.buf.emit(&(-off).to_le_bytes());
+        // ModRM + displacement for `[rbp - off]`, smallest legal form.
+        self.emit_rbp_modrm_disp(reg, off);
     }
 
     /// Restore the callee-saved XMM registers. Emitted at every exit, and it
@@ -3003,32 +3002,56 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// MOV reg, [RBP - offset]  (REX.W [+ REX.R]; disp32 form). General form of
-    /// `load_to_rax`/`load_to_rcx` for an arbitrary (possibly extended) dest.
-    fn load_reg_from_frame(&mut self, reg: u8, offset: i32) {
+    /// Emit the ModRM byte and displacement of a `[RBP - offset]` operand whose
+    /// ModRM `reg` field is `reg`, choosing the **smallest legal form**.
+    ///
+    /// RBP has no `mod=00` encoding — that bit pattern is RIP-relative — so the
+    /// two forms are `mod=01` + disp8 and `mod=10` + disp32, and a zero
+    /// displacement still needs an explicit disp8 of `0`. Same rule
+    /// `x64::disp` states for the single-pass backend, applied here because
+    /// this is the backend that touches the frame on *every* value read.
+    ///
+    /// One helper rather than the rule repeated per emitter: the per-emitter
+    /// shape is exactly how `store_abi_reg` came to pick the short form while
+    /// `load_reg_from_frame` directly below it kept emitting disp32.
+    fn emit_rbp_modrm_disp(&mut self, reg: u8, offset: i32) {
         let neg = -offset;
+        if (i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&neg) {
+            // mod=01, r/m=RBP(101), disp8
+            self.buf.emit_byte(0x45 | ((reg & 7) << 3));
+            // Cast: guarded by the range check above.
+            self.buf.emit_byte(neg as u8);
+        } else {
+            // mod=10, r/m=RBP(101), disp32
+            self.buf.emit_byte(0x85 | ((reg & 7) << 3));
+            self.buf.emit(&neg.to_le_bytes());
+        }
+    }
+
+    /// MOV reg, [RBP - offset]  (REX.W [+ REX.R]; smallest displacement form).
+    /// General form of `load_to_rax`/`load_to_rcx` for an arbitrary (possibly
+    /// extended) destination.
+    fn load_reg_from_frame(&mut self, reg: u8, offset: i32) {
         let mut prefix = 0x48u8;
         if reg >= 8 {
             prefix |= 0x04;
         }
         self.buf.emit_byte(prefix);
         self.buf.emit_byte(0x8B);
-        self.buf.emit_byte(0x85 | ((reg & 7) << 3));
-        self.buf.emit(&neg.to_le_bytes());
+        self.emit_rbp_modrm_disp(reg, offset);
     }
 
-    /// LEA reg, [RBP - offset]  (REX.W [+ REX.R]; disp32 form). Used to compute
-    /// the `args_ptr` the dispatch helper reads the marshalled Java args from.
+    /// LEA reg, [RBP - offset]  (REX.W [+ REX.R]; smallest displacement form).
+    /// Used to compute the `args_ptr` the dispatch helper reads the marshalled
+    /// Java args from.
     fn lea_reg_from_frame(&mut self, reg: u8, offset: i32) {
-        let neg = -offset;
         let mut prefix = 0x48u8;
         if reg >= 8 {
             prefix |= 0x04;
         }
         self.buf.emit_byte(prefix);
         self.buf.emit_byte(0x8D);
-        self.buf.emit_byte(0x85 | ((reg & 7) << 3));
-        self.buf.emit(&neg.to_le_bytes());
+        self.emit_rbp_modrm_disp(reg, offset);
     }
 
     /// `MOV qword [rbp - off], 0` (mod=10 disp32, /0).
@@ -3160,27 +3183,25 @@ impl<'a> Lowerer<'a> {
     // XMM: a float/double constant is just its bit pattern written via a GPR
     // immediate, and negation is a sign-bit XOR on the integer bit pattern.
     // XMM0/XMM1 are the FP analogues of RAX/RCX. Both are < 8, so no REX is
-    // needed; `[rbp - offset]` always uses the disp32 ModRM form (mod=10, the
-    // `0x85 | reg<<3` byte) for simplicity.
+    // needed; the `[rbp - offset]` operand goes through
+    // `emit_rbp_modrm_disp`, which picks disp8 or disp32 — the ModRM `reg`
+    // field is an XMM number here rather than a GPR number, which changes
+    // nothing about the encoding of the memory half.
 
     /// MOVSS/MOVSD xmm, [rbp - offset] — load a 32/64-bit FP value from a slot.
     fn fp_load(&mut self, xmm: u8, offset: i32, is_double: bool) {
-        let neg = -offset;
         self.buf.emit_byte(if is_double { 0xF2 } else { 0xF3 });
         self.buf.emit(&[0x0F, 0x10]);
-        self.buf.emit_byte(0x85 | ((xmm & 7) << 3));
-        self.buf.emit(&neg.to_le_bytes());
+        self.emit_rbp_modrm_disp(xmm, offset);
     }
 
     /// MOVSS/MOVSD [rbp - offset], xmm — store an FP value to a slot. A `MOVSS`
     /// writes only the low 4 bytes; the slot's high 4 are left stale, which is
     /// harmless because every float consumer reads it back with `MOVSS` (4 bytes).
     fn fp_store(&mut self, offset: i32, xmm: u8, is_double: bool) {
-        let neg = -offset;
         self.buf.emit_byte(if is_double { 0xF2 } else { 0xF3 });
         self.buf.emit(&[0x0F, 0x11]);
-        self.buf.emit_byte(0x85 | ((xmm & 7) << 3));
-        self.buf.emit(&neg.to_le_bytes());
+        self.emit_rbp_modrm_disp(xmm, offset);
     }
 
     /// Scalar FP binary op (`<prefix> 0F <op>`), reg-reg form `dst op= src`.
@@ -16803,14 +16824,31 @@ mod tests {
         lowerer
     }
 
-    /// `MOVUPS [rbp - disp32], xmm` and its load counterpart, for `reg < 8`.
+    /// `MOVUPS [rbp - disp], xmm` and its load counterpart, for `reg < 8`.
+    ///
+    /// **Both** displacement forms, because `emit_rbp_modrm_disp` picks the
+    /// smallest legal one: `mod=10` (`0x85 | reg<<3`, disp32) for a deep frame
+    /// and `mod=01` (`0x45 | reg<<3`, disp8) for a shallow one. A needle
+    /// spelling only one of them silently counts zero on the other, which reads
+    /// as "the restore is missing" — the exact failure this test exists to
+    /// report, arriving for the wrong reason.
     #[cfg(test)]
-    fn movups_frame_needle(reg: u8, store: bool) -> [u8; 3] {
+    fn movups_frame_needles(reg: u8, store: bool) -> [[u8; 3]; 2] {
+        let op = if store { 0x11 } else { 0x10 };
         [
-            0x0F,
-            if store { 0x11 } else { 0x10 },
-            0x85 | ((reg & 7) << 3),
+            [0x0F, op, 0x85 | ((reg & 7) << 3)],
+            [0x0F, op, 0x45 | ((reg & 7) << 3)],
         ]
+    }
+
+    /// Occurrences of a frame `MOVUPS` for `reg` in `code`, either
+    /// displacement form. See [`movups_frame_needles`].
+    #[cfg(test)]
+    fn count_movups_frame(code: &[u8], reg: u8, store: bool) -> usize {
+        movups_frame_needles(reg, store)
+            .iter()
+            .map(|n| count_seq(code, n))
+            .sum()
     }
 
     /// **The** invariant: every exit restores exactly what the prologue saved.
@@ -16825,8 +16863,10 @@ mod tests {
         let _flag = LsForce::on();
         let expect = usize::from(!IR_LOWER_SAVED_XMMS.is_empty());
         let reg = *IR_LOWER_SAVED_XMMS.first().unwrap_or(&6);
-        let save = movups_frame_needle(reg, true);
-        let restore = movups_frame_needle(reg, false);
+        // Closures rather than fixed byte needles: the displacement form depends
+        // on the frame depth, so the count has to accept either one.
+        let saves_in = |c: &[u8]| count_movups_frame(c, reg, true);
+        let restores_in = |c: &[u8]| count_movups_frame(c, reg, false);
 
         // ── exit 1: the method epilogue ──────────────────────────────
         let mut lo = lowerer_with_resident_xmm(4096, Some(reg));
@@ -16834,13 +16874,13 @@ mod tests {
         let after_prologue = lo.buf.pos();
         lo.emit_epilogue();
         let code = lo.buf.as_slice().to_vec();
-        let saves = count_seq(&code[..after_prologue], &save);
+        let saves = saves_in(&code[..after_prologue]);
         assert_eq!(
             saves, expect,
             "the prologue saved {saves} of xmm{reg}, expected {expect} on this target",
         );
         assert_eq!(
-            count_seq(&code[after_prologue..], &restore),
+            restores_in(&code[after_prologue..]),
             saves,
             "the epilogue did not restore what the prologue saved",
         );
@@ -16858,7 +16898,7 @@ mod tests {
         lo.emit_call_exc_stub();
         let code = lo.buf.as_slice().to_vec();
         assert_eq!(
-            count_seq(&code[after_prologue..], &restore),
+            restores_in(&code[after_prologue..]),
             saves,
             "the call-exception bail stub returns the sentinel without \
              restoring the caller's registers",
@@ -16873,7 +16913,7 @@ mod tests {
         lo.emit_deopt_stub();
         let code = lo.buf.as_slice().to_vec();
         assert_eq!(
-            count_seq(&code[after_prologue..], &restore),
+            restores_in(&code[after_prologue..]),
             saves,
             "the deopt stub inlines its own teardown and skipped the restore",
         );
@@ -16972,7 +17012,7 @@ mod tests {
             let code = lo.buf.as_slice().to_vec();
             for &reg in IR_LOWER_SAVED_XMMS {
                 assert_eq!(
-                    count_seq(&code, &movups_frame_needle(reg, true)),
+                    count_movups_frame(&code, reg, true),
                     0,
                     "saved xmm{reg} for a plan that never used it ({plan:?})",
                 );
