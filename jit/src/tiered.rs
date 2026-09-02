@@ -1405,6 +1405,31 @@ pub fn dump_method_stats_to_stderr() {
             .filter(|(_, _, fail, inelig, _, _)| *fail > 0 && !*inelig)
             .count(),
     );
+    // The String-intrinsic pin's ENGAGEMENT census (`crate::string_intrinsic_pin_census`).
+    //
+    // A site count and an engagement count answer different questions, and the
+    // whole value of this line is that a ZERO is readable. An audit measured
+    // `String.charAt` at a flat 186-196 ns/char where a byte-identical body
+    // reaches 3.0 ns/char elsewhere in the same binary, and neither documented
+    // lever moved it: `CRATONVM_JIT_NO_STRING_INTRINSIC_PIN=1` gave 326.3/328.6
+    // ns/char against a default of 329.5/333.7. Switching the pin OFF costing
+    // nothing is exactly what "it was never on" looks like from the outside,
+    // and no timing can tell that apart from "it fired and did not help".
+    // `fired=0` can, in one line, at the end of any run.
+    //
+    // The other three counts are printed beside it because they are the
+    // candidate REASONS for a `fired=0`: no resolved `java/lang/String` field
+    // layout, no constant-pool invoke resolver at the door that asked, or the
+    // fail-closed rule declining on a missing resolver's behalf. All three
+    // production doors pass a resolver, so `blind-no-resolver` is EXPECTED to
+    // read zero — which is what makes a non-zero one worth the line: it would
+    // name a door nobody knew existed.
+    let (sp_fired, sp_no_layout, sp_no_resolver, sp_fail_closed) =
+        crate::string_intrinsic_pin_census();
+    eprintln!(
+        "[cratonvm] JIT String-intrinsic pin: fired={sp_fired} blind-no-layout={sp_no_layout} \
+         blind-no-resolver={sp_no_resolver} fail-closed={sp_fail_closed}"
+    );
     // Methods sealed out of compilation BEFORE any attempt, by reason. A
     // different and larger population than `hot_but_stuck` — a Spring Boot
     // context startup seals ~856 here against ~69 refused compiles — and until

@@ -30638,9 +30638,19 @@ pub(crate) const BUFFER_ADDRESS_SENTINEL: usize = 0x7fff_ffff_ffff_fffe;
 pub(crate) fn array_index_scale_for_name(name: &str) -> i32 {
     let bytes = name.as_bytes();
     if bytes.first() != Some(&b'[') {
-        // A NON-ARRAY class answers 0, which is what
-        // `sun.misc.Unsafe.arrayIndexScale`'s javadoc specifies and what
-        // callers guard on (`if (scale == 0) throw`). It answered the
+        // A NON-ARRAY class answers 0. NOT because the javadoc says so --
+        // it does not, and this comment claimed otherwise until 2026-09-02.
+        // JDK 25's javadoc reads "arrays of 'narrow' types will generally not
+        // work properly with accessors like getByte(Object, long), so the
+        // scale factor for such classes is reported as zero": that is about
+        // ARRAYS of narrow types, and it says nothing about a non-array.
+        //
+        // So 0 is this VM's CHOICE. The reason it is the right one: HotSpot
+        // intends a refusal here and fails to deliver it (see below), and
+        // reproducing a botched throw would make us wrong the day the JDK
+        // fixes it -- while 0 is the answer callers guard on
+        // (`if (scale == 0) throw`) and the safe direction for a caller doing
+        // address arithmetic. It answered the
         // catch-all 1 until 2026-08-29 -- a plausible basis for address
         // arithmetic over a class that has no elements, which in this family
         // is the dangerous direction.

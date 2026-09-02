@@ -8047,9 +8047,23 @@ thread_local! {
 }
 
 fn jdk_builtin_module_sets(ctx: &mut dyn NativeContext) -> Option<Arc<BuiltinModuleSets>> {
-    static CACHE: OnceLock<Mutex<Option<Arc<BuiltinModuleSets>>>> = OnceLock::new();
-    let cell = CACHE.get_or_init(|| Mutex::new(None));
-    if let Some(hit) = cell.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+    // `OrderedPlMutex` at the leaf level, not a raw `Mutex`: this crate
+    // re-enters the VM, so a global lock with no `LockLevel` is a deadlock the
+    // order checker cannot see, and `lock_discipline_ratchet` refuses one
+    // ("Do NOT raise the baseline").
+    //
+    // `Scratch` is honest here rather than convenient. The guard is never held
+    // across anything: the read below runs Java -- a class initialisation and
+    // three `invoke_virtual`s -- and it runs with NOTHING locked, because both
+    // acquisitions are single statements that publish or fetch an `Arc` and
+    // end. Nothing is taken while holding this, which is exactly what L0 means.
+    static CACHE: OnceLock<OrderedPlMutex<Option<Arc<BuiltinModuleSets>>>> = OnceLock::new();
+    let cell = CACHE.get_or_init(|| OrderedPlMutex::new(None, LockLevel::Scratch));
+    // Bound to a local FIRST. An `if let` scrutinee temporary lives to the end
+    // of the whole `if let`, so a guard taken there would still be held in an
+    // `else` arm the next edit adds.
+    let hit = cell.lock().clone();
+    if let Some(hit) = hit {
         return Some(hit);
     }
     if READING_MODULE_SETS.with(|f| f.replace(true)) {
@@ -8058,7 +8072,7 @@ fn jdk_builtin_module_sets(ctx: &mut dyn NativeContext) -> Option<Arc<BuiltinMod
     let sets = jdk_builtin_module_sets_uncached(ctx);
     READING_MODULE_SETS.with(|f| f.set(false));
     let sets = sets?;
-    *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&sets));
+    *cell.lock() = Some(Arc::clone(&sets));
     Some(sets)
 }
 

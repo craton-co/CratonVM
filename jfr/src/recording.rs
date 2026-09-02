@@ -467,6 +467,28 @@ impl FlightRecorder {
         self.running_ids.clone()
     }
 
+    /// Does some currently-running recording name `event_name` **explicitly**
+    /// in its [`RecordingSettings::enabled_event_names`] filter?
+    ///
+    /// This is deliberately stricter than [`RecordingSettings::name_filter_admits`],
+    /// which a `None` filter satisfies for every event: a recording that
+    /// installs no filter keeps whatever arrives, but it has not *asked* for
+    /// anything. Default-off diagnostic events — see
+    /// [`crate::jit_decision`] — are armed on the producer side, where the cost
+    /// of building the payload is paid before any recording ever sees it, and
+    /// "keep whatever arrives" is not a good enough reason to pay it. Only an
+    /// explicit `Recording.enable(name)` counts.
+    pub fn any_running_recording_names_event(&self, event_name: &str) -> bool {
+        self.running_ids.iter().any(|id| {
+            self.recordings.get(id).is_some_and(|rec| {
+                rec.settings
+                    .enabled_event_names
+                    .as_ref()
+                    .is_some_and(|names| names.contains(event_name))
+            })
+        })
+    }
+
     /// Recompute the cached running-recording IDs and update the global
     /// `JFR_ENABLED` flag accordingly. Called after every state transition.
     fn refresh_running_ids(&mut self) {
@@ -479,6 +501,12 @@ impl FlightRecorder {
         let now = self.running_ids.len();
         let prev = std::mem::replace(&mut self.published_running, now);
         crate::publish_running_delta(prev, now);
+        // Default-off diagnostic events keep their own producer-side gate, and
+        // a state transition is the only moment the answer can change without
+        // somebody mutating a recording's settings by hand. (The `jdk.jfr`
+        // Java boundary does mutate them by hand — `Recording.enable(...)`
+        // changes no state — so it calls `sync_jit_decision_gate` itself.)
+        crate::jit_decision::sync_jit_decision_gate(self);
     }
 
     fn running_ids_are_current(&self) -> bool {

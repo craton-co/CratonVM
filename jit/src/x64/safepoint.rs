@@ -103,19 +103,20 @@ pub mod map_incomplete_cause {
     /// local is unnamed. That is a real hole in the shape of the one
     /// `bug-h2-testrandommapops-small-heap-corruption-20260829.md` is about.
     ///
-    /// **Measured 2026-09-02, and it reads ZERO** on the witness that page now
-    /// carries (`StringConcatHelper.doConcat`, whose frames keep a live pre-move
-    /// reference while all other causes are zero). The dataflow does reach those
-    /// safepoints and does hand back a mask; the mask is simply WRONG — it names
-    /// locals 0, 1 and 4 (`Some(19)`) and omits local 3, which holds a live
-    /// reference at that pc. So this counter is kept as a ruled-out hypothesis
-    /// rather than a live lead: it is the `tlab_retire_skipped` pattern, where
-    /// the point of printing a zero is that the hypothesis it eliminates is a
-    /// good one and the next reader should not have to re-derive it.
+    /// **Measured 2026-09-02, and it reads ZERO** on every method of
+    /// `probes/SafepointMapResidue.java`, including the one whose frames the
+    /// residue instrument flags. The dataflow does reach those safepoints and
+    /// does hand back a mask, and the mask is correct — `javap -c` on the
+    /// flagged method shows the slot the instrument called a missed root is an
+    /// `int` local at that pc. Kept as a ruled-out hypothesis rather than a
+    /// live lead: the `tlab_retire_skipped` pattern, where the point of
+    /// printing a zero is that the hypothesis it eliminates is a good one.
     ///
-    /// The remaining hole is a level below: there is no `local_oop_masks_exact`
-    /// flag the way there is a `stack_oop_marks_exact`, so a mask that is
-    /// believed exact and is not is invisible to every counter in this module.
+    /// The hole it guards is still real even though it has not been observed:
+    /// a `None` from `local_oop_mask_at_current_pc()` would contribute no
+    /// slots, set no `map_incomplete` and bump nothing, so the safepoint would
+    /// publish a map claiming complete coverage while every live reference
+    /// local went unnamed. This counter is what would show that happening.
     pub static LOCAL_MASK_UNREACHED: AtomicUsize = AtomicUsize::new(0);
 
     /// How many causes [`snapshot`] returns.
@@ -1662,9 +1663,18 @@ impl Compiler {
         // parked mutator remaps itself through, the map is what
         // `remap_active_jit_frames` rewrites, and a moving cycle needs BOTH.
         // A scope that cannot classify its locals fails the safepoint closed.
+        let mut inline_local_scopes: Vec<(i32, u16, u64)> = Vec::new();
         for scope in &self.inline_oop_scopes {
             match scope.mask_at_cur() {
                 Some(mask) => {
+                    // The same record the java-locals oracle keeps, for a band
+                    // it cannot address. Diagnostic only; see
+                    // `OopMapEntry::inline_local_scopes`.
+                    inline_local_scopes.push((
+                        scope.local_base,
+                        u16::try_from(scope.num_locals).unwrap_or(u16::MAX),
+                        mask,
+                    ));
                     for k in 0..scope.num_locals.min(64) {
                         if mask & (1u64 << k) == 0 {
                             continue;
@@ -1768,6 +1778,19 @@ impl Compiler {
                     map_incomplete,
                 ),
                 live_frame_hi,
+                // The oracle a stale-word report needs to say "live". Taken
+                // through the shared accessor so the method-entry poll records
+                // its parameter mask rather than a `None` (see
+                // `local_oop_mask_at_current_pc`), and left `None` when the
+                // masks are unavailable at all (`max_locals > 64`), which is
+                // the same "no claim" the dataflow itself makes there.
+                local_oop_mask: if self.local_oop_masks.is_empty() {
+                    None
+                } else {
+                    self.local_oop_mask_at_current_pc()
+                },
+                num_locals: u16::try_from(self.num_locals).unwrap_or(u16::MAX),
+                inline_local_scopes,
             });
             self.pending_shadow_coverage_complete = false;
         }

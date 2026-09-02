@@ -545,14 +545,31 @@ helper_fn_slots! {
     HelperFnNewObject, new_object, new_object_fn, (i64, i64, i64) -> i64;
     HelperFnAnewarrayObject, anewarray_object, anewarray_object_fn, (i64, i64, i64) -> i64;
 
-    // Array access. Loads: (array_ptr, index). Primitive stores:
-    // (array_ptr, index, val). `aastore` additionally takes `vm_ptr` first
-    // because a reference store runs the write barrier.
+    // Array access. Primitive loads: (array_ptr, index). Primitive stores:
+    // (array_ptr, index, val). `aaload` and `aastore` additionally take
+    // `vm_ptr` FIRST, for the symmetric reason: a reference LOAD runs the ZGC
+    // read barrier and a reference STORE runs the write barrier, and both need
+    // a `&VmHeap` to reach one.
+    //
+    // `aaload` gained its `vm_ptr` on 2026-09-01 (`.agent-requests/B8-abi.txt`).
+    // A JIT-helper ABI change is normally expensive; this one was affordable
+    // because NO emitter calls `helpers.aaload`. `aaload` is lowered inline by
+    // `jit/src/x64/arrays.rs::emit_ref_aload_regs`, `grep -rn "helpers\.aaload"
+    // jit/src` is empty, and the aarch64 backend does not call it either -- so
+    // there was no emitted `call` whose argument registers had to move and no
+    // `stack_arg_block_size` / shadow-space accounting to revisit. Nothing
+    // consumes the declared arity except this file's own assertions (3 <= 4, so
+    // `HELPERS_NEEDING_WIN64_STACK_ARGS` is unchanged).
+    //
+    // The row still has to be honest BEFORE anything routes `aaload` back to
+    // the helper under an armed barrier, which is what
+    // `let _: HelperFnAaload = jit_aaload;` in `vm/src/jit/helpers.rs`
+    // enforces: the two halves cannot disagree and still compile.
     HelperFnBaload, baload, baload_fn, (i64, i64) -> i64;
     HelperFnBastore, bastore, bastore_fn, (i64, i64, i64) -> ();
     HelperFnIaload, iaload, iaload_fn, (i64, i64) -> i64;
     HelperFnIastore, iastore, iastore_fn, (i64, i64, i64) -> ();
-    HelperFnAaload, aaload, aaload_fn, (i64, i64) -> i64;
+    HelperFnAaload, aaload, aaload_fn, (i64, i64, i64) -> i64;
     HelperFnAastore, aastore, aastore_fn, (i64, i64, i64, i64) -> ();
     HelperFnMultianewarray2d, multianewarray_2d, multianewarray_2d_fn,
         (i64, i64, i64, i64) -> i64;
