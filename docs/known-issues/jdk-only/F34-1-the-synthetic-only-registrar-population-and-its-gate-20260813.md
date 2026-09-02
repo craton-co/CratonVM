@@ -455,6 +455,25 @@ vacuous green the gate exists to prevent, and it took a second look to see it.
   `extern` registrar, and a green mutation table is not a proof of a correct
   parser.
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** "Assumed / not verified" listed
+> **"That `registrar_reachability.rs` compiles and passes. It was never given to
+> `cargo` ... Run it before treating this gate as live."** It has now been run,
+> on a build from this tree:
+>
+> ```text
+> cargo test -p cratonvm-native-builtins --test registrar_reachability   5 passed, 0 failed
+> cargo test -p cratonvm-native-builtins --test essential_wiring_ratchet 5 passed, 0 failed
+> ```
+>
+> It compiles and passes, so **the gate is live** and the mirror held: no type
+> error, no borrow error, no mis-remembered `std` API. The floors in §6 are
+> satisfied as written — the instruction was to re-take them rather than relax
+> them if the numbers moved, and they did not move.
+>
+> Two things this does NOT settle, both still on the same list: the runtime cost
+> is still "estimated seconds, not measured", and the shipping-root definition is
+> still unchecked against `vm_init`'s real-JDK arm. Running a gate proves it runs.
+
 **Assumed / not verified.**
 
 * **That `registrar_reachability.rs` compiles and passes.** It was never given

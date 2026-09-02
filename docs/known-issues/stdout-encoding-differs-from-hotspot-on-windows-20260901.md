@@ -323,8 +323,17 @@ divergence that is not one.** That is a gap in a feature that just shipped, and
 it is the strongest practical argument on this page — it is, after all, exactly
 how the ten rows were found.
 
-Two things would close the gap without touching `System.out` at all, and both
-are separable from the compatibility judgement in §9:
+**Both were done, and then the gap closed underneath them.** Items 1 and 2
+landed in `docs/testing/diff-hotspot.md` §5.1 on 2026-09-01 — an injective
+byte-to-text escape so the reference side is never mangled, plus a report hint
+that names an encoding-shaped divergence and prints the pin. On 2026-09-02 the
+compatibility judgement in §9 was taken as well, so both VMs now derive the
+encoding from the same host and this class of false red cannot arise: with one
+machine and one rule there is nothing left to disagree about. §5.1 keeps the
+escape and the hint, because `CRATONVM_STDOUT_ENCODING` can still pin one side
+by hand and a genuine charset defect has the same shape.
+
+The two items, as originally stated:
 
 1. **Say so in `docs/testing/diff-hotspot.md` §5 or §8**, with the workaround:
    both sides accept `-Dstdout.encoding=UTF-8` and it is forwarded to the

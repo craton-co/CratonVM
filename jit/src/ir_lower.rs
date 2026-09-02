@@ -686,6 +686,11 @@ struct Lowerer<'a> {
     /// locals region (locals + context + the five bookkeeping words: sp-id,
     /// cached thread, shadow save-base, shadow save-top, phi-copy scratch).
     first_spill: i32,
+    /// Frame offsets (`[rbp - off]`) of every slot the colouring proved holds
+    /// no reference, computed once from [`SlotPlan::prim_colors`] and published
+    /// on every safepoint map as `OopMapEntry::non_oop_stack_slots`. The IR
+    /// tier's half of the stale-word oracle; nothing gates on it.
+    prim_slot_offsets: Vec<i16>,
     /// Per-safepoint oop maps published for the moving-young relocation
     /// contract. An empty vector means "no precise coverage", which
     /// `conservative_roots` reads as a refusal — the fail-closed direction.
@@ -1128,6 +1133,25 @@ impl<'a> Lowerer<'a> {
             node_slot: vec![None; graph.nodes.len()],
             unallocated_slot_use: std::cell::Cell::new(false),
             latched_bailout: std::cell::RefCell::new(None),
+            prim_slot_offsets: {
+                // Same arithmetic as `planned_slot_off`: colour `c` lives at
+                // `[rbp - (first_spill + 8c)]`. An offset past `i16` is dropped
+                // rather than truncated -- the map's own slot list has the same
+                // bound, and a silently wrong offset would accuse the wrong
+                // slot.
+                let mut offs: Vec<i16> = slot_plan
+                    .prim_colors()
+                    .into_iter()
+                    .filter_map(|c| {
+                        i32::try_from(u64::from(c).saturating_mul(8))
+                            .ok()
+                            .and_then(|d| first_spill.checked_add(d))
+                            .and_then(|o| i16::try_from(o).ok())
+                    })
+                    .collect();
+                offs.sort_unstable();
+                offs
+            },
             slot_plan,
             spill_high_water: first_spill,
             block_offsets: vec![0; schedule.blocks.len()],
@@ -1831,8 +1855,21 @@ impl<'a> Lowerer<'a> {
             local_oop_mask: None,
             num_locals: 0,
             inline_local_scopes: Vec::new(),
-            non_oop_stack_slots: Vec::new(),
-            stack_marks_exact: false,
+            // The IR tier has no java-locals band to speak for, but its slot
+            // COLOURING is a proof about every spill slot it allocated: a
+            // non-`Ref` colour never holds an object pointer, because
+            // `assign_colors` never moves a colour between its two free lists.
+            // Exact because `verify_slot_colouring` re-derives the no-aliasing
+            // property rather than trusting it.
+            //
+            // The premise is `IrType::Ref`, which is the SAME premise this
+            // function publishes roots on a few lines above. So the oracle
+            // cannot be wrong here unless the map itself already is: a
+            // non-`Ref` node holding a real object pointer would be an
+            // unpublished root today, with or without this field. It is not an
+            // independent check of that, and must not be read as one.
+            non_oop_stack_slots: self.prim_slot_offsets.clone(),
+            stack_marks_exact: true,
         });
     }
 
@@ -8539,6 +8576,45 @@ struct SlotPlan {
     peak_live: usize,
 }
 
+impl SlotPlan {
+    /// The colours that provably never hold a reference.
+    ///
+    /// `assign_colors` keeps two free lists and never moves a colour between
+    /// them: a colour first taken by a non-`Ref` value is returned to
+    /// `free_prim` and can only ever be recycled by another non-`Ref` value. So
+    /// a colour is single-class for the life of the method, and a `Prim` colour
+    /// holds a live primitive or dead bytes left by one -- never an object
+    /// pointer.
+    ///
+    /// This is the IR tier's half of the stale-word oracle. Without it an IR
+    /// frame carries no dataflow at all and every stale word in it reports as
+    /// unexplained, which is exactly where the last two unattributed words of
+    /// the 2026-09-02 `TestRandomMapOps` measurement were. See
+    /// `OopMapEntry::non_oop_stack_slots`.
+    fn prim_colors(&self) -> Vec<u32> {
+        // Marked by colour, not searched per node: this runs on the compile
+        // path of every IR method, and a linear `contains` would make it
+        // quadratic in the colour count on exactly the large graphs that can
+        // least afford it.
+        let mut seen = vec![false; self.slots];
+        for (id, class) in self.class.iter().enumerate() {
+            if !matches!(class, Some(SlotClass::Prim)) {
+                continue;
+            }
+            if let Some(Some(color)) = self.node_color.get(id).copied() {
+                if let Some(flag) = seen.get_mut(color as usize) {
+                    *flag = true;
+                }
+            }
+        }
+        seen.iter()
+            .enumerate()
+            .filter(|(_, &f)| f)
+            .map(|(c, _)| c as u32)
+            .collect()
+    }
+}
+
 /// Work budget for the liveness fixed point, in `nodes × blocks` units.
 ///
 /// Past this the analysis is skipped and every value keeps a dedicated slot —
@@ -15206,6 +15282,21 @@ mod tests {
                 "n{id} is a primitive on the reference's word",
             );
         }
+
+        // …and the stale-word oracle's view of the same plan agrees: every
+        // primitive's colour is offered as "provably not a reference", and the
+        // reference's colour is not. This is what an IR frame publishes as
+        // `OopMapEntry::non_oop_stack_slots`, and a colour wrongly listed here
+        // would let the residue report call a live root dead storage.
+        let prim = plan.prim_colors();
+        for id in [a, t, u, v] {
+            let c = plan.node_color[id as usize].expect("a coloured primitive");
+            assert!(prim.contains(&c), "n{id}'s word {c} is missing from prim_colors");
+        }
+        assert!(
+            !prim.contains(&r_color),
+            "the reference's word {r_color} must never be offered as a non-reference",
+        );
     }
 
     /// COV-02: an `aaload` result is a GC ROOT, and this is the executed proof.

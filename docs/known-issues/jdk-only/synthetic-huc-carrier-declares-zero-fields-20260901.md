@@ -44,7 +44,7 @@ CRATONVM_ZGC_RELOCATE=0   ->  identical warnings, identical DIFF
 
 The object really does declare zero slots.
 
-## 2. Where it comes from — and one fact that does not reconcile
+## 2. Where it comes from — and why the census looked past it
 
 `--dump-native-registry --synthetic-jdk` says `java/net/URL.openConnection`
 `owns=True` at `native-builtins/src/net_phase_e.rs`, and that body allocates the
@@ -72,29 +72,55 @@ census's own text lists what `real_fields=0` can mean and puts this case third:
 *"a fabricated stub / the `ClassId::new(0)` fallback arm standing in for a class
 whose real layout is WIDER, in which case this object is SHORT."*
 
-**The two instruments do not agree, and this record does not pretend they do.**
-The census says the object is *"exactly `requested_fields` wide"* — 16. The GC
-guard reads `header.num_slots()` and reports **0**:
+**The two instruments disagree, and the disagreement is the finding.** The
+census says the object is *"exactly `requested_fields` wide"* — 16. The GC guard
+reads `header.num_slots()` and reports **0**:
 
 ```text
 WARN zgc: zgc real: field index OOB index=0 num_slots=0 op="set"
 ```
 
-Both are measured, on the same run, about the same class. They cannot both
-describe the same object, so one of these is true and none of them has been
-shown:
+They are both right, about **different objects**, and the code settles it
+without another run:
 
-* the funnel asked for 16 and something downstream still produced a 0-slot
-  header (in which case the clamp the census believes in did not happen);
-* the guard is reading a *different* `HttpURLConnection` — one allocated by
-  another path that never reached the funnel, so the census never saw it;
-* the header is 16 wide and `num_slots()` is answering from somewhere other
-  than the allocation.
+* `ObjectHeader::num_slots()` is `self.shape`, a stored word, and
+  `Zgc::alloc_object` sets it straight from its `num_fields` argument
+  (`ObjectHeader::new(class_id, .., u32::try_from(num_fields)..)`). So
+  `num_slots == 0` means that object was allocated asking for **zero** fields —
+  it is not a 16-slot object whose accesses are refused.
+* Both census rows report `requested_fields=16`. Neither of them is the object
+  the guard is complaining about.
 
-Deciding between them is a `CRATONVM_DBG_ZGC_CORPSE` / header-dump question and
-is exactly the work this page is holding open. What is NOT in doubt is the
-symptom: every accessor on the carrier is refused, `getURL()` reads null, and
-`getDoInput()` is absent from the registry entirely.
+So a second path allocates `java/net/HttpURLConnection` with **0** fields, and
+that is the one every accessor then walks off the end of.
+
+### The census cannot see it, by construction
+
+`layout_alias::classify` opens with
+
+```rust
+if requested == 0 {
+    return None;
+}
+```
+
+A zero-slot allocation is therefore **structurally invisible** to the census —
+whatever the class declares. That is a THIRD blind spot beside the two
+`vm_exec.rs` already documents for this detector ("`under` cannot fire because
+the clamp runs first, and this path cannot fire because the substitution makes
+the widths agree"). The census is the instrument that answers "does this class
+have two layouts", and for the shape that actually breaks this carrier it
+answers by saying nothing.
+
+That is why turning the census on found the 16-slot funnel allocation and not
+the 0-slot one: it was never going to. The guard is the only instrument that
+sees the object that matters, and the guard cannot name a class.
+
+**What is still unknown** is which call site allocates the 0-field carrier. The
+census will not name it while `requested == 0` short-circuits first, so finding
+it needs either a header dump (`CRATONVM_DBG_ZGC_CORPSE`,
+`CRATONVM_DBG_LAYOUT`) or a `requested == 0` arm in `classify` — and the second
+one is a change to a detector whose own comment warns against widening it blind.
 
 The funnel already knows about this species in the abstract. Its own comment:
 
@@ -118,6 +144,15 @@ registrar therefore cannot be resolved by measurement today.
 * Not shown to be `HttpURLConnection`-specific. `try_alloc_concurrent_synthetic`
   has ~2,000 call sites and the funnel's comment says the over-allocating
   population has never been counted; this is one member of it, not a survey.
+* The `requested == 0` blind spot in §2 is shown from `classify`'s source, not
+  from a census run that failed to report — it cannot report, so there is no run
+  that would demonstrate it. Its SIZE is unknown for the same reason: nothing
+  currently counts zero-slot allocations of a named class, so "how many other
+  classes are allocated this way" has no measurement behind it and none is
+  claimed here.
+* The 0-field allocation's call site is NOT identified. `net_phase_e.rs:10794`
+  is where the census saw a 16-slot allocation of the same class; it is not
+  established that the 0-slot object comes from there or anywhere near it.
 * The fix is not obvious and is not attempted here. Making the funnel refuse, or
   mint a class declaring `num_fields`, is the change its own comment warns
   against making blind.
