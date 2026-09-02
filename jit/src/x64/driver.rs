@@ -2651,6 +2651,22 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     cm.has_dispatch = has_dispatch;
     if !implicit_null_sites.is_empty() {
         let base = cm.entry as usize;
+        // The entry MUST be the buffer base, because `CompiledMethod::drop`
+        // retires `[entry, entry + buffer.pos())` while this registers at
+        // `entry + fault_off`. Today they agree (`entry_offset = 0` above, and
+        // the OSR-trampoline purge in that same `Drop` already leans on it).
+        // If a future prologue moves the entry, every site below it silently
+        // stops being retired -- a stale entry pointing into a reused buffer,
+        // which is the exact hazard this design exists to prevent, arriving
+        // through the one door nobody would think to check.
+        //
+        // So it is checked, and a mismatch registers NOTHING: the sites keep
+        // their elided checks and the faults they would have caught go to the
+        // crash reporter. That is a real loss of NPEs and it is the safe
+        // direction -- a crash is diagnosable, a stale recovery is not.
+        if base != cm.code_bytes().as_ptr() as usize {
+            crate::note_jit_bail_site_at("implicit-null-entry-not-base", 0, 0);
+        } else {
         for (fault_off, recover_off) in implicit_null_sites {
             // A full table DECLINES. The site keeps its elided check, and the
             // fault it would have caught then arrives as a crash instead of an
@@ -2658,6 +2674,7 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
             // and that is why `implicit_null::counts` prints it rather than
             // swallowing it.
             let _ = crate::implicit_null::register(base + fault_off, base + recover_off);
+        }
         }
     }
 
