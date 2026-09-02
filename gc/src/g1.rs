@@ -421,6 +421,21 @@ pub fn evacuation_copy_shape_drifts() -> usize {
     EVAC_COPY_SHAPE_DRIFT.load(Ordering::Relaxed)
 }
 
+/// How many CSet roots were left unevacuated because they are not the start of
+/// a live object.
+///
+/// Replaces [`NON_OBJECT_ROOT_COPIED`]'s subject: the collector used to copy
+/// such a root and rewrite the root slot to the copy. Non-zero means a
+/// conservatively-scanned stack word named an interior or dead address, which
+/// is the condition conservative scanning exists to tolerate -- and which,
+/// until 2026-09-02, this collector turned into a fabricated object.
+pub static NON_OBJECT_ROOT_SKIPPED: AtomicUsize = AtomicUsize::new(0);
+
+/// The value of [`NON_OBJECT_ROOT_SKIPPED`].
+pub fn non_object_roots_skipped() -> usize {
+    NON_OBJECT_ROOT_SKIPPED.load(Ordering::Relaxed)
+}
+
 /// How many objects the evacuation ref-scan refused to WALK because their own
 /// header did not look like a live object. Expected to be ZERO.
 pub static EVAC_HOLDER_REJECTED: AtomicUsize = AtomicUsize::new(0);
@@ -533,6 +548,14 @@ pub static EMPTY_JIT_PUBLICATION_SEEN: AtomicUsize = AtomicUsize::new(0);
 /// address by `evacuate_object` — i.e. how many times the evacuator computed a
 /// size from garbage, memcpy'd that many bytes, installed a forwarding entry
 /// for the address, and rewrote the root to point at the copy.
+///
+/// STRUCTURALLY ZERO since 2026-09-02: the root loops now `continue` on a
+/// non-object root instead of evacuating it, so nothing can increment this.
+/// It is kept, still printed, and paired with [`NON_OBJECT_ROOT_SKIPPED`],
+/// because the pair is the readable form of the change — "seen, and NOT
+/// copied" — and because a counter that silently disappears takes its own
+/// regression guard with it: if a future edit reintroduces the copy, this goes
+/// non-zero in the same line that reports the skips.
 pub static NON_OBJECT_ROOT_COPIED: AtomicUsize = AtomicUsize::new(0);
 
 /// The values of [`NON_OBJECT_ROOT_SEEN`] and [`NON_OBJECT_ROOT_COPIED`].
@@ -3914,6 +3937,49 @@ impl G1Collector {
             if let Some(region_idx) = self.region_for_ptr(&regions, old_ptr) {
                 if cset_set.contains(&region_idx) {
                     let plausible = self.note_root_object_plausibility(&regions, old_ptr as usize);
+                    // A ROOT THAT IS NOT AN OBJECT START IS NOT EVACUATED.
+                    //
+                    // Measured on `TestKillProcessWhileWriting` (2026-09-02): a
+                    // CSet root landed 0x28 bytes INSIDE a live reference array
+                    // (`grid=INTERIOR of=0x108 delta=0x28 size=0x110 cid=185
+                    // kind=Array`, the extent independently confirmed by the
+                    // region's own carve trail). `evacuate_object` then read
+                    // that ELEMENT as a header: a heap pointer's low half became
+                    // the class id and its high half became `num_slots` --
+                    // 0x200, which is why every holder in that investigation
+                    // reported `num_slots=512` -- so the object was sized at
+                    // 0x2010, eight kilobytes were copied into a Survivor
+                    // region, and `*root` was rewritten to name the result.
+                    // Scanning that fake object as 512 legacy slots is the
+                    // source of the rejected candidates, the dangling references
+                    // and the segfault this class is filed for.
+                    //
+                    // Copying it was never right. `note_root_object_plausibility`
+                    // has reported the condition since it was written and
+                    // `NON_OBJECT_ROOT_COPIED` counted the copies -- the guard
+                    // was measurement-only, and what it measured was the
+                    // collector manufacturing an object out of an array element.
+                    //
+                    // Leaving the root alone cannot be worse. A conservative JIT
+                    // root is a stack word that merely LOOKS like a pointer, so
+                    // an interior or garbage one names nothing the mutator reads
+                    // through; and pinning its region keeps whatever it is
+                    // interior to from moving out from under it, which is the
+                    // treatment `pin_region_for_addr` already exists to give a
+                    // conservatively-discovered root.
+                    if !plausible {
+                        let n = NON_OBJECT_ROOT_SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 8 || n.is_power_of_two() {
+                            tracing::warn!(
+                                "[g1] a NON-OBJECT root was SKIPPED (#{n}): 0x{:x} — it is not the start of a live object, so evacuating it would have sized an object from bytes that are not a header. The root is left unchanged and its region pinned.",
+                                old_ptr as usize,
+                            );
+                        }
+                        if let Some(idx) = self.lookup_region_for_addr(old_ptr as usize) {
+                            regions[idx].pinned = true;
+                        }
+                        continue;
+                    }
                     // Step 9: `fresh` is ignored here — the root loop keeps its
                     // existing unconditional push (a duplicate root re-scans
                     // idempotently). Gating it on `fresh` is deferred to the
@@ -3927,17 +3993,6 @@ impl G1Collector {
                         &mut bytes_copied,
                         &cset_set,
                     ) {
-                        if !plausible && new_ptr != old_ptr {
-                            let n = NON_OBJECT_ROOT_COPIED.fetch_add(1, Ordering::Relaxed) + 1;
-                            if n <= 8 || n.is_power_of_two() {
-                                tracing::warn!(
-                                    "[g1] a NON-OBJECT root was COPIED (#{n}, young): \
-                                     0x{:x} -> 0x{:x}",
-                                    old_ptr as usize,
-                                    new_ptr as usize,
-                                );
-                            }
-                        }
                         *root = unsafe { ObjectRef::from_raw(new_ptr) };
                         work_list.push(new_ptr);
                     }
@@ -4464,6 +4519,49 @@ impl G1Collector {
             if let Some(region_idx) = self.region_for_ptr(&regions, old_ptr) {
                 if cset_set.contains(&region_idx) {
                     let plausible = self.note_root_object_plausibility(&regions, old_ptr as usize);
+                    // A ROOT THAT IS NOT AN OBJECT START IS NOT EVACUATED.
+                    //
+                    // Measured on `TestKillProcessWhileWriting` (2026-09-02): a
+                    // CSet root landed 0x28 bytes INSIDE a live reference array
+                    // (`grid=INTERIOR of=0x108 delta=0x28 size=0x110 cid=185
+                    // kind=Array`, the extent independently confirmed by the
+                    // region's own carve trail). `evacuate_object` then read
+                    // that ELEMENT as a header: a heap pointer's low half became
+                    // the class id and its high half became `num_slots` --
+                    // 0x200, which is why every holder in that investigation
+                    // reported `num_slots=512` -- so the object was sized at
+                    // 0x2010, eight kilobytes were copied into a Survivor
+                    // region, and `*root` was rewritten to name the result.
+                    // Scanning that fake object as 512 legacy slots is the
+                    // source of the rejected candidates, the dangling references
+                    // and the segfault this class is filed for.
+                    //
+                    // Copying it was never right. `note_root_object_plausibility`
+                    // has reported the condition since it was written and
+                    // `NON_OBJECT_ROOT_COPIED` counted the copies -- the guard
+                    // was measurement-only, and what it measured was the
+                    // collector manufacturing an object out of an array element.
+                    //
+                    // Leaving the root alone cannot be worse. A conservative JIT
+                    // root is a stack word that merely LOOKS like a pointer, so
+                    // an interior or garbage one names nothing the mutator reads
+                    // through; and pinning its region keeps whatever it is
+                    // interior to from moving out from under it, which is the
+                    // treatment `pin_region_for_addr` already exists to give a
+                    // conservatively-discovered root.
+                    if !plausible {
+                        let n = NON_OBJECT_ROOT_SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 8 || n.is_power_of_two() {
+                            tracing::warn!(
+                                "[g1] a NON-OBJECT root was SKIPPED (#{n}): 0x{:x} — it is not the start of a live object, so evacuating it would have sized an object from bytes that are not a header. The root is left unchanged and its region pinned.",
+                                old_ptr as usize,
+                            );
+                        }
+                        if let Some(idx) = self.lookup_region_for_addr(old_ptr as usize) {
+                            regions[idx].pinned = true;
+                        }
+                        continue;
+                    }
                     // Step 9: `fresh` is ignored here — the root loop keeps its
                     // existing unconditional push (a duplicate root re-scans
                     // idempotently). Gating it on `fresh` is deferred to the
@@ -4477,17 +4575,6 @@ impl G1Collector {
                         &mut bytes_copied,
                         &cset_set,
                     ) {
-                        if !plausible && new_ptr != old_ptr {
-                            let n = NON_OBJECT_ROOT_COPIED.fetch_add(1, Ordering::Relaxed) + 1;
-                            if n <= 8 || n.is_power_of_two() {
-                                tracing::warn!(
-                                    "[g1] a NON-OBJECT root was COPIED (#{n}, mixed): \
-                                     0x{:x} -> 0x{:x}",
-                                    old_ptr as usize,
-                                    new_ptr as usize,
-                                );
-                            }
-                        }
                         *root = unsafe { ObjectRef::from_raw(new_ptr) };
                         work_list.push(new_ptr);
                     }
@@ -10422,6 +10509,10 @@ impl G1Collector {
         // consumer anywhere in the tree, which makes their zero unciteable: a
         // run cannot be quoted as evidence for a guard that nothing prints. See
         // `FLAT_WALK_REFUSED_ARRAY` and `KEPT_SEED_REJECTED`.
+        eprintln!(
+            "[GC] g1 non_object_roots_skipped={}",
+            non_object_roots_skipped(),
+        );
         eprintln!(
             "[GC] g1 implausible_legacy_headers={} copy_shape_drift={}",
             evacuation_implausible_class0_copies(),
