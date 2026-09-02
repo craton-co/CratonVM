@@ -374,6 +374,70 @@ const SIG_DSA_REAL: i32 = 24;
 /// refusal has to come from the platform's own SPI rather than from a guess
 /// here.
 const SIG_HSS_LMS: i32 = 25;
+/// The nine `SunRsaSign` PKCS#1 v1.5 names that were ADVERTISED, admitted by
+/// `getInstance`, and then failed at `sign()`/`verify()` — the gap
+/// `W7-63-jca-advertise-vs-serve.md` §8 records as "ordinary unimplemented-
+/// algorithm" and §3 #5 declines to close.
+///
+/// ONE index per digest rather than one per name, because the digest is the
+/// only thing that varies: PKCS#1 v1.5 over RSA is `hash`, then a `DigestInfo`
+/// whose only per-digest inputs are an OID and a length
+/// (`DigestAlgorithm::pkcs1v15_digest_info_prefix`), then block type 1. Every
+/// one of the nine digests was already implemented in this tree — MD2 by this
+/// very record's §3 #1, the rest by `compute_digest`'s own arms — so what was
+/// missing was the arm, not the cryptography.
+/// Every OTHER member of the `sun.security.ec.ECDSASignature` family — the
+/// seventeen names `SHA{256,384,512}withECDSA` are the only three of.
+///
+/// Same shape and same reason as `SIG_DSA_REAL`: this engine computes no ECDSA
+/// itself (the three that work are already the platform's SPI, driven by
+/// `drive_real_signature_spi`), and the concrete class is a function of the
+/// caller's spelling. Ten of the seventeen are `inP1363Format` twins, which are
+/// separate classes emitting the fixed-width `r || s` rather than the DER
+/// `SEQUENCE` — so routing to the class is what makes the ENCODING right, not
+/// only the signature.
+///
+/// Fourteen of them were ADVERTISED and admitted by `getInstance` and then
+/// failed at `sign()`; four were not advertised at all. Both halves are the
+/// species `W7-63-jca-advertise-vs-serve.md` is named for, and §8's second
+/// bullet counts only the RSA nine.
+const SIG_ECDSA_REAL: i32 = 35;
+const SIG_MD2_RSA: i32 = 26;
+const SIG_MD5_RSA: i32 = 27;
+const SIG_SHA224_RSA: i32 = 28;
+const SIG_SHA512_224_RSA: i32 = 29;
+const SIG_SHA512_256_RSA: i32 = 30;
+const SIG_SHA3_224_RSA: i32 = 31;
+const SIG_SHA3_256_RSA: i32 = 32;
+const SIG_SHA3_384_RSA: i32 = 33;
+const SIG_SHA3_512_RSA: i32 = 34;
+
+/// The `DigestAlgorithm` a PKCS#1 v1.5 RSA index signs and verifies with, or
+/// `None` when the index is not one of them.
+///
+/// One table for both directions: `sign_dispatch` and `verify_dispatch` used to
+/// carry parallel per-index arms, which is how `SHA512withRSA` came to sign
+/// after the verify side had taken a `DigestAlgorithm` "all along" (the comment
+/// on `SIG_SHA1_RSA`'s sign arm records that asymmetry).
+fn rsa_pkcs1_digest(alg: i32) -> Option<cratonvm_native_builtins_crypto::signature::DigestAlgorithm> {
+    use cratonvm_native_builtins_crypto::signature::DigestAlgorithm as D;
+    Some(match alg {
+        SIG_MD2_RSA => D::Md2,
+        SIG_MD5_RSA => D::Md5,
+        SIG_SHA1_RSA => D::Sha1,
+        SIG_SHA224_RSA => D::Sha224,
+        SIG_SHA256_RSA => D::Sha256,
+        SIG_SHA384_RSA => D::Sha384,
+        SIG_SHA512_RSA => D::Sha512,
+        SIG_SHA512_224_RSA => D::Sha512_224,
+        SIG_SHA512_256_RSA => D::Sha512_256,
+        SIG_SHA3_224_RSA => D::Sha3_224,
+        SIG_SHA3_256_RSA => D::Sha3_256,
+        SIG_SHA3_384_RSA => D::Sha3_384,
+        SIG_SHA3_512_RSA => D::Sha3_512,
+        _ => return None,
+    })
+}
 
 fn algo_idx(name: &str) -> i32 {
     let upper = name.to_ascii_uppercase();
@@ -382,6 +446,18 @@ fn algo_idx(name: &str) -> i32 {
         "SHA384WITHRSA" => SIG_SHA384_RSA,
         "SHA512WITHRSA" => SIG_SHA512_RSA,
         "SHA1WITHRSA" | "SHA-1WITHRSA" => SIG_SHA1_RSA,
+        // The nine that were advertised and refused at `sign()`. Both
+        // spellings of each, since JCA lookup is case-insensitive and callers
+        // write the digest hyphenated as often as not.
+        "MD2WITHRSA" => SIG_MD2_RSA,
+        "MD5WITHRSA" => SIG_MD5_RSA,
+        "SHA224WITHRSA" | "SHA-224WITHRSA" => SIG_SHA224_RSA,
+        "SHA512/224WITHRSA" | "SHA-512/224WITHRSA" => SIG_SHA512_224_RSA,
+        "SHA512/256WITHRSA" | "SHA-512/256WITHRSA" => SIG_SHA512_256_RSA,
+        "SHA3-224WITHRSA" => SIG_SHA3_224_RSA,
+        "SHA3-256WITHRSA" => SIG_SHA3_256_RSA,
+        "SHA3-384WITHRSA" => SIG_SHA3_384_RSA,
+        "SHA3-512WITHRSA" => SIG_SHA3_512_RSA,
         "NONEWITHRSA" => SIG_NONE_RSA,
         "MD5ANDSHA1WITHRSA" => SIG_MD5_SHA1_RSA,
         // RSASSA-PSS (JWA PS256/384/512). keycloak's `JavaAlgorithm` resolves
@@ -433,9 +509,92 @@ fn algo_idx(name: &str) -> i32 {
         // `SHA{224,384,512}withDSA`, `SHA3-{224,256,384,512}withDSA` and the
         // nine `inP1363Format` twins. Last, so every explicit arm above wins.
         "HSS/LMS" => SIG_HSS_LMS,
+        other if ecdsa_family_spi_class(other).is_some() => SIG_ECDSA_REAL,
         other if dsa_family_spi_class(other).is_some() => SIG_DSA_REAL,
         _ => -1,
     }
+}
+
+/// The real SunEC `sun.security.ec.ECDSASignature$*` SPI class for an
+/// ECDSA-family signature name, or `None` when the name is not one.
+///
+/// Derived rather than tabulated, exactly as `dsa_family_spi_class` is, and by
+/// the same two substitutions: the digest's `-` becomes `_` (`SHA3-256` ->
+/// `$SHA3_256`, since `-` is not a Java identifier character) and `NONE` is
+/// spelled `Raw`. Verified against HotSpot 25's own
+/// `Security.getProvider("SunEC").getServices()` rather than recalled — every
+/// string below appears there verbatim as a service's `getClassName()`.
+fn ecdsa_family_spi_class(name: &str) -> Option<&'static str> {
+    let upper = name.to_ascii_uppercase();
+    let (digest, p1363) = match upper.strip_suffix("INP1363FORMAT") {
+        Some(rest) => (rest.strip_suffix("WITHECDSA")?, true),
+        None => (upper.as_str().strip_suffix("WITHECDSA")?, false),
+    };
+    Some(match (digest, p1363) {
+        ("NONE", false) => "sun/security/ec/ECDSASignature$Raw",
+        ("NONE", true) => "sun/security/ec/ECDSASignature$RawinP1363Format",
+        ("SHA1", false) | ("SHA-1", false) => "sun/security/ec/ECDSASignature$SHA1",
+        ("SHA1", true) | ("SHA-1", true) => {
+            "sun/security/ec/ECDSASignature$SHA1inP1363Format"
+        }
+        ("SHA224", false) | ("SHA-224", false) => "sun/security/ec/ECDSASignature$SHA224",
+        ("SHA224", true) | ("SHA-224", true) => {
+            "sun/security/ec/ECDSASignature$SHA224inP1363Format"
+        }
+        ("SHA256", false) | ("SHA-256", false) => "sun/security/ec/ECDSASignature$SHA256",
+        ("SHA256", true) | ("SHA-256", true) => {
+            "sun/security/ec/ECDSASignature$SHA256inP1363Format"
+        }
+        ("SHA384", false) | ("SHA-384", false) => "sun/security/ec/ECDSASignature$SHA384",
+        ("SHA384", true) | ("SHA-384", true) => {
+            "sun/security/ec/ECDSASignature$SHA384inP1363Format"
+        }
+        ("SHA512", false) | ("SHA-512", false) => "sun/security/ec/ECDSASignature$SHA512",
+        ("SHA512", true) | ("SHA-512", true) => {
+            "sun/security/ec/ECDSASignature$SHA512inP1363Format"
+        }
+        ("SHA3-224", false) => "sun/security/ec/ECDSASignature$SHA3_224",
+        ("SHA3-224", true) => "sun/security/ec/ECDSASignature$SHA3_224inP1363Format",
+        ("SHA3-256", false) => "sun/security/ec/ECDSASignature$SHA3_256",
+        ("SHA3-256", true) => "sun/security/ec/ECDSASignature$SHA3_256inP1363Format",
+        ("SHA3-384", false) => "sun/security/ec/ECDSASignature$SHA3_384",
+        ("SHA3-384", true) => "sun/security/ec/ECDSASignature$SHA3_384inP1363Format",
+        ("SHA3-512", false) => "sun/security/ec/ECDSASignature$SHA3_512",
+        ("SHA3-512", true) => "sun/security/ec/ECDSASignature$SHA3_512inP1363Format",
+        _ => return None,
+    })
+}
+
+/// Every ECDSA-family signature name this engine offers, in HotSpot's own
+/// spelling — the seed list, kept one set with [`ecdsa_family_spi_class`] by
+/// `every_ecdsa_family_signature_name_maps_to_an_spi_class`.
+pub(crate) const ECDSA_FAMILY_SIGNATURE_NAMES: &[&str] = &[
+    "NONEwithECDSA",
+    "SHA1withECDSA",
+    "SHA224withECDSA",
+    "SHA256withECDSA",
+    "SHA384withECDSA",
+    "SHA512withECDSA",
+    "SHA3-224withECDSA",
+    "SHA3-256withECDSA",
+    "SHA3-384withECDSA",
+    "SHA3-512withECDSA",
+    "NONEwithECDSAinP1363Format",
+    "SHA1withECDSAinP1363Format",
+    "SHA224withECDSAinP1363Format",
+    "SHA256withECDSAinP1363Format",
+    "SHA384withECDSAinP1363Format",
+    "SHA512withECDSAinP1363Format",
+    "SHA3-224withECDSAinP1363Format",
+    "SHA3-256withECDSAinP1363Format",
+    "SHA3-384withECDSAinP1363Format",
+    "SHA3-512withECDSAinP1363Format",
+];
+
+/// The JDK class each name in [`ECDSA_FAMILY_SIGNATURE_NAMES`] resolves to, in
+/// the source spelling `Provider.Service.getClassName()` reports.
+pub(crate) fn ecdsa_family_service_class(name: &str) -> Option<String> {
+    ecdsa_family_spi_class(name).map(|c| c.replace('/', "."))
 }
 
 /// The real JDK `sun.security.provider.DSA$*` SPI class for a DSA-family
@@ -538,6 +697,15 @@ fn algo_name(idx: i32) -> &'static str {
         SIG_SHA384_RSA => "SHA384withRSA",
         SIG_SHA512_RSA => "SHA512withRSA",
         SIG_SHA1_RSA => "SHA1withRSA",
+        SIG_MD2_RSA => "MD2withRSA",
+        SIG_MD5_RSA => "MD5withRSA",
+        SIG_SHA224_RSA => "SHA224withRSA",
+        SIG_SHA512_224_RSA => "SHA512/224withRSA",
+        SIG_SHA512_256_RSA => "SHA512/256withRSA",
+        SIG_SHA3_224_RSA => "SHA3-224withRSA",
+        SIG_SHA3_256_RSA => "SHA3-256withRSA",
+        SIG_SHA3_384_RSA => "SHA3-384withRSA",
+        SIG_SHA3_512_RSA => "SHA3-512withRSA",
         SIG_NONE_RSA => "NONEwithRSA",
         SIG_MD5_SHA1_RSA => "MD5andSHA1withRSA",
         SIG_SHA384_ECDSA => "SHA384withECDSA",
@@ -760,9 +928,15 @@ fn sign_dispatch_with(
         // with "this VM has no native implementation for that algorithm" —
         // after `getInstance` had already advertised the name and `initSign`
         // had already accepted the key.
-        SIG_SHA1_RSA => crypto_impl::rsa_sign_digest(key_id, D::Sha1, data),
-        SIG_SHA384_RSA => crypto_impl::rsa_sign_digest(key_id, D::Sha384, data),
-        SIG_SHA512_RSA => crypto_impl::rsa_sign_digest(key_id, D::Sha512, data),
+        // ONE arm for every PKCS#1 v1.5 name, resolved through
+        // `rsa_pkcs1_digest`. This was four hand-written arms (SHA-1/256/384/
+        // 512) and nine advertised names with none, which is why
+        // `Signature.getInstance("SHA3-256withRSA").sign()` raised
+        // `SignatureException` after `getInstance` had accepted the name and
+        // `initSign` had accepted the key — W7-63 §8's second bullet.
+        other if rsa_pkcs1_digest(other).is_some() => {
+            crypto_impl::rsa_sign_digest(key_id, rsa_pkcs1_digest(other)?, data)
+        }
         SIG_MD5_SHA1_RSA => crypto_impl::rsa_sign_md5_sha1(key_id, data),
         SIG_NONE_RSA => crypto_impl::rsa_sign_none(key_id, data),
         SIG_PSS_SHA256 => {
@@ -910,9 +1084,12 @@ fn verify_dispatch_with(
     }
     match alg {
         SIG_SHA256_RSA => crypto_impl::rsa_verify(key_id, data, sig),
-        SIG_SHA1_RSA => crypto_impl::rsa_verify_digest(key_id, D::Sha1, data, sig),
-        SIG_SHA384_RSA => crypto_impl::rsa_verify_digest(key_id, D::Sha384, data, sig),
-        SIG_SHA512_RSA => crypto_impl::rsa_verify_digest(key_id, D::Sha512, data, sig),
+        // The verify twin of the sign arm above, through the same table, so
+        // the two directions cannot come to disagree about which digest a name
+        // means.
+        other if rsa_pkcs1_digest(other).is_some() => {
+            crypto_impl::rsa_verify_digest(key_id, rsa_pkcs1_digest(other)?, data, sig)
+        }
         SIG_MD5_SHA1_RSA => crypto_impl::rsa_verify_md5_sha1(key_id, data, sig),
         SIG_NONE_RSA => crypto_impl::rsa_verify_none(key_id, data, sig),
         SIG_PSS_SHA256 => {
@@ -953,7 +1130,7 @@ fn verify_dispatch_with(
 /// EC key carries a `crypto_impl` `key_id` that a SunEC SPI cannot read, and a
 /// real `ECPrivateKeyImpl` carries no `key_id` for the synthetic dispatch. Both
 /// keys and both signature operations therefore key off the same question.
-fn ecdsa_real_spi_class(ctx: &dyn NativeContext, alg: i32) -> Option<&'static str> {
+fn ecdsa_real_spi_class(ctx: &dyn NativeContext, alg: i32, name: &str) -> Option<&'static str> {
     if !crate::route_ec_to_real() {
         return None;
     }
@@ -961,6 +1138,11 @@ fn ecdsa_real_spi_class(ctx: &dyn NativeContext, alg: i32) -> Option<&'static st
         SIG_SHA256_ECDSA => "sun/security/ec/ECDSASignature$SHA256",
         SIG_SHA384_ECDSA => "sun/security/ec/ECDSASignature$SHA384",
         SIG_SHA512_ECDSA => "sun/security/ec/ECDSASignature$SHA512",
+        // `SIG_ECDSA_REAL` carries the other seventeen and resolves its class
+        // from the caller's spelling — see `ecdsa_family_spi_class`. The three
+        // above keep their own indices so nothing that already resolves
+        // changes route.
+        SIG_ECDSA_REAL => ecdsa_family_spi_class(name)?,
         _ => return None,
     };
     if ctx.would_fabricate_synthetic_stub(cls) {
@@ -2119,7 +2301,8 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     }
     let alg = require_sig_algo(ctx, this)?;
     // EC: drive the real SunEC ECDSASignature SPI (real key, real DER output).
-    if let Some(spi_class) = ecdsa_real_spi_class(ctx, alg) {
+    let sig_name = sig_algorithm_name(ctx, this);
+    if let Some(spi_class) = ecdsa_real_spi_class(ctx, alg, &sig_name) {
         return drive_real_signature_spi(ctx, this, spi_class, None);
     }
     if let Some(spi_class) = eddsa_real_spi_class(alg) {
@@ -2264,7 +2447,8 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     }
     let alg = require_sig_algo(ctx, this)?;
     // EC: drive the real SunEC ECDSASignature SPI (real key, real DER verify).
-    if let Some(spi_class) = ecdsa_real_spi_class(ctx, alg) {
+    let sig_name = sig_algorithm_name(ctx, this);
+    if let Some(spi_class) = ecdsa_real_spi_class(ctx, alg, &sig_name) {
         let provided = match args.get(1) {
             Some(Value::Object(Some(arr))) => read_byte_array_full(ctx, *arr),
             _ => Vec::new(),
@@ -2937,6 +3121,119 @@ mod tests {
     /// nothing advertises serves a name `Security.getAlgorithms("Signature")`
     /// says does not exist.
     #[test]
+    /// The ECDSA twin of `every_dsa_family_signature_name_maps_to_an_spi_class`,
+    /// and it exists because the list it replaces had already drifted.
+    ///
+    /// `seed_sunec_services` carried sixteen hand-written `(name, class)` pairs
+    /// where HotSpot has twenty; the four `SHA3-*withECDSAinP1363Format` rows
+    /// were simply missing. Both sides are derived from the same two functions
+    /// now, so the advertised set and the SPI the engine drives cannot
+    /// disagree — but only while every name in the list still maps, which is
+    /// what this asserts.
+    #[test]
+    fn every_ecdsa_family_signature_name_maps_to_an_spi_class() {
+        for name in ECDSA_FAMILY_SIGNATURE_NAMES {
+            assert!(
+                ecdsa_family_spi_class(name).is_some(),
+                "{name} is advertised and has no SPI class",
+            );
+            let idx = algo_idx(name);
+            assert!(
+                idx >= 0,
+                "{name} must resolve to an index, or getInstance refuses it",
+            );
+            assert_eq!(
+                ecdsa_family_spi_class(&name.to_ascii_lowercase()),
+                ecdsa_family_spi_class(name),
+                "{name} must resolve case-insensitively",
+            );
+        }
+        assert_eq!(ECDSA_FAMILY_SIGNATURE_NAMES.len(), 20);
+        // Not ECDSA names, and the DSA family in particular must not be
+        // captured: `withDSA` and `withECDSA` differ by two characters and the
+        // suffix test is what separates them.
+        for other in [
+            "SHA256withDSA",
+            "SHA256withDSAinP1363Format",
+            "SHA256withRSA",
+            "Ed25519",
+            "ECDSA",
+        ] {
+            assert_eq!(
+                ecdsa_family_spi_class(other),
+                None,
+                "{other} must not be read as an ECDSA-family name",
+            );
+        }
+        // The two encodings are different classes — the reason the
+        // `inP1363Format` names route rather than being a flag this engine
+        // could apply.
+        assert_ne!(
+            ecdsa_family_spi_class("SHA256withECDSA"),
+            ecdsa_family_spi_class("SHA256withECDSAinP1363Format"),
+        );
+        // And no two names share a class, which is where a copied arm hides.
+        let mut seen = std::collections::HashSet::new();
+        for name in ECDSA_FAMILY_SIGNATURE_NAMES {
+            assert!(
+                seen.insert(ecdsa_family_spi_class(name).unwrap()),
+                "{name} shares an SPI class with another name",
+            );
+        }
+    }
+
+    /// Every PKCS#1 v1.5 RSA name this engine offers maps to exactly one
+    /// digest, and no two names share it.
+    ///
+    /// The nine that were advertised-and-refused all had the same failure —
+    /// no arm — and the shape of the fix (one index per digest, one table for
+    /// sign and verify) is what makes a future tenth a two-line change. The
+    /// distinctness half is the one that matters: `SHA-256`, `SHA-512/256` and
+    /// `SHA3-256` all produce 32 bytes, so a copied arm gives a signature of
+    /// the right size that verifies against nothing.
+    #[test]
+    fn every_pkcs1v15_rsa_name_maps_to_a_distinct_digest() {
+        use cratonvm_native_builtins_crypto::signature::DigestAlgorithm as D;
+        let names: &[(&str, D)] = &[
+            ("MD2withRSA", D::Md2),
+            ("MD5withRSA", D::Md5),
+            ("SHA1withRSA", D::Sha1),
+            ("SHA224withRSA", D::Sha224),
+            ("SHA256withRSA", D::Sha256),
+            ("SHA384withRSA", D::Sha384),
+            ("SHA512withRSA", D::Sha512),
+            ("SHA512/224withRSA", D::Sha512_224),
+            ("SHA512/256withRSA", D::Sha512_256),
+            ("SHA3-224withRSA", D::Sha3_224),
+            ("SHA3-256withRSA", D::Sha3_256),
+            ("SHA3-384withRSA", D::Sha3_384),
+            ("SHA3-512withRSA", D::Sha3_512),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (name, want) in names {
+            let idx = algo_idx(name);
+            assert!(idx >= 0, "{name} has no algo_idx arm");
+            assert_eq!(
+                rsa_pkcs1_digest(idx),
+                Some(*want),
+                "{name} resolves to the wrong digest",
+            );
+            assert!(
+                seen.insert(*want),
+                "{name} shares a digest with another RSA signature name",
+            );
+        }
+        // The PSS and no-digest names are NOT in this table: they are different
+        // padding schemes and must never be reached through it.
+        for other in ["RSASSA-PSS", "NONEwithRSA", "MD5andSHA1withRSA"] {
+            assert_eq!(
+                rsa_pkcs1_digest(algo_idx(other)),
+                None,
+                "{other} is not a PKCS#1 v1.5 DigestInfo signature",
+            );
+        }
+    }
+
     fn every_dsa_family_signature_name_maps_to_an_spi_class() {
         for name in DSA_FAMILY_SIGNATURE_NAMES {
             assert!(
