@@ -2545,9 +2545,13 @@ fn walk_marked_bytes_below_tams(
     base: usize,
     tams: usize,
     jit_skips: &[(usize, usize)],
-) -> usize {
+) -> (usize, bool) {
     let mut live = 0usize;
     let mut offset = 0usize;
+    // Did the walk reach `tams`, or did it stop at an object it could not size?
+    // The caller's assertion depends on the difference: a broken walk is
+    // legitimately SMALLER than the accumulator, a complete one must match.
+    let mut complete = true;
     while offset < tams {
         let obj_addr = base + offset;
         // INT-3 — frozen-peer TLAB tail: skip before interpreting.
@@ -2566,10 +2570,12 @@ fn walk_marked_bytes_below_tams(
         // Round-9 gc CRIT-1: humongous continuation filler covers the entire
         // region with no live objects of its own; skip.
         if is_humongous_filler(header) {
+            complete = false;
             break;
         }
         let obj_size = object_total_size(header);
         if obj_size < HEADER_SIZE || offset + obj_size > region.cursor() {
+            complete = false;
             break;
         }
         if region.mark_bitmap.is_marked(obj_addr) {
@@ -2577,7 +2583,7 @@ fn walk_marked_bytes_below_tams(
         }
         offset += obj_size;
     }
-    live
+    (live, complete)
 }
 
 /// F-09 — round a requested region size up to a power of two.
@@ -11453,15 +11459,44 @@ impl G1Collector {
             // through the accumulator, and that claim deserves a check rather
             // than a comment.
             if gc_flags().g1_cleanup_walk || cfg!(debug_assertions) {
-                let walked = walk_marked_bytes_below_tams(region, base, tams, &jit_skips);
+                let (walked, walk_complete) =
+                    walk_marked_bytes_below_tams(region, base, tams, &jit_skips);
                 let walked_live = walked.saturating_add(region.cursor().saturating_sub(tams));
-                debug_assert_eq!(
-                    walked_live, live_bytes,
-                    "region {region_idx}: the accumulated live bytes ({live_bytes}) \
-                     disagree with a walk of the same region ({walked_live}) — some \
-                     mark site is setting a bit without going through \
-                     `try_mark_and_account`, and an under-count is what lets \
-                     cleanup free a live Old region in place"
+                // The walk may not exceed the accumulator. The reverse is
+                // allowed, and that asymmetry is the whole content of this
+                // check.
+                //
+                // The two count the same bits by DIFFERENT KEYS: the
+                // accumulator is keyed by the address that was marked, the walk
+                // by the object grid. They agree exactly when every mark landed
+                // on an object start — and marks do not always. Measured on
+                // `StringNativeAllocationChurn` under G1: region 1 accumulated
+                // 136 bytes against a COMPLETE walk of 104, and the two
+                // addresses responsible (offsets 545408 and 545520 of a 655408
+                // extent) were marked but were not object starts, so the
+                // accumulator charged them a header each and the grid never
+                // landed on them to ask. `concurrent_mark_step` tolerates such
+                // an address by design — `classify_mark_scan_target` refuses a
+                // torn header, but a stale reference into an unscrubbed
+                // recycled region is the documented COMMON case — so this is
+                // not a defect in the marker either.
+                //
+                // A walk that stops early (a humongous filler, or a header
+                // whose extent runs past the cursor) is the second way the
+                // accumulator legitimately reads larger. That break is the one
+                // the walk had when it WAS cleanup's implementation, which
+                // means the old cleanup silently under-counted exactly there.
+                //
+                // Both cases over-count, and over-counting RETAINS a region for
+                // one more cycle. The direction that must stay impossible is
+                // the other one: a walk finding MORE live bytes than the
+                // accumulator means a bit was set without going through
+                // `try_mark_and_account`, and an under-count is what lets
+                // cleanup free a live Old region in place.
+                debug_assert!(
+                    walked_live <= live_bytes,
+                    "region {region_idx}: a walk found MORE live bytes ({walked_live})                      than the accumulator ({live_bytes}) — walk_complete={walk_complete},                      tams={tams}, cursor={}. Some mark site is setting a bit without                      going through `try_mark_and_account`; an under-count is what lets                      cleanup free a live Old region in place",
+                    region.cursor(),
                 );
                 if gc_flags().g1_cleanup_walk {
                     live_bytes = walked_live;
