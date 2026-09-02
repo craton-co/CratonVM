@@ -475,14 +475,26 @@ impl WaitOutcome {
     /// May the collector run a *moving* cycle as far as GPU coordination
     /// is concerned?
     ///
-    /// `true` only for [`WaitOutcome::Drained`]. This deliberately answers
-    /// `false` for **every** timeout, not merely for
-    /// `relocation_forbidden` ones: an outstanding `KeepAliveOnly` token
-    /// still has a `MarshalWriteback` holding raw `ObjectRef`s that are
-    /// in no rewritable root family, so moving them out from under an
-    /// in-flight submission corrupts the writeback.
+    /// `true` for [`WaitOutcome::Drained`], and for a timeout whose
+    /// outstanding tokens are all [`Relocation::KeepAliveOnly`].
+    ///
+    /// AUDIT 2026-09-02: this used to answer `false` for every timeout,
+    /// on the grounds that a `KeepAliveOnly` holder still had raw
+    /// `ObjectRef`s captured at acquisition. That holder now reads its
+    /// addresses back through [`CriticalToken::keepalive_addrs`] after
+    /// the collector's [`Registry::remap_keepalive`] has rewritten them,
+    /// so a moving cycle under a keep-alive token is exactly what the
+    /// keep-alive-and-remap contract was built for. Only a token that
+    /// declared `Forbidden` — one whose holder has handed the device a
+    /// heap address for the length of a DMA — still forbids the move.
     pub fn may_relocate(&self) -> bool {
-        self.drained()
+        match self {
+            WaitOutcome::Drained { .. } => true,
+            WaitOutcome::TimedOut {
+                relocation_forbidden,
+                ..
+            } => !relocation_forbidden,
+        }
     }
 
     /// How long the wait took, either way.
@@ -608,6 +620,20 @@ impl CriticalToken {
     pub fn release(mut self) {
         self.released = true;
         self.registry.release_inner(self.id, ReleaseCause::Released);
+    }
+
+    /// The keep-alive addresses this token declared, **as the collector
+    /// last left them**.
+    ///
+    /// This is the read half of [`Registry::remap_keepalive`]. A holder
+    /// that captured `ObjectRef`s at acquisition and then let a moving
+    /// collector run must not write through those captures; it reads
+    /// the current addresses back here, in declaration order, and uses
+    /// those. Empty once the token has been revoked, so a revoked holder
+    /// that forgets to check [`CriticalToken::is_revoked`] still has
+    /// nothing to write through.
+    pub fn keepalive_addrs(&self) -> Vec<usize> {
+        self.registry.keepalive_addrs_of(self.id).unwrap_or_default()
     }
 }
 
@@ -855,6 +881,11 @@ pub struct Registry {
     /// report taken after the fact.
     reap_log: Mutex<VecDeque<TokenFacts>>,
     counters: Counters,
+    /// Set while a collector is running a cycle that MAY relocate. A
+    /// [`Relocation::Forbidden`] acquisition blocks while this is set —
+    /// see [`Registry::acquire_with`] for why a bounded collector wait
+    /// alone is not enough.
+    moving_cycle: AtomicBool,
 }
 
 impl Registry {
@@ -868,7 +899,111 @@ impl Registry {
             mirror: OnceLock::new(),
             reap_log: Mutex::new(VecDeque::new()),
             counters: Counters::new(),
+            moving_cycle: AtomicBool::new(false),
         })
+    }
+
+    /// The collector is about to run a cycle that may relocate objects.
+    ///
+    /// Until [`Registry::end_moving_cycle`], any thread asking for a
+    /// [`Relocation::Forbidden`] token waits. This closes the window the
+    /// bounded wait cannot: the collector checks for forbidding holders
+    /// once, before the cycle, but a thread the stop-the-world barrier
+    /// does not stop — the VM's completion reaper, which is not a
+    /// mutator — could otherwise acquire one and start a DMA into the
+    /// arena while the slide is under way. Mutators cannot reach here
+    /// during a pause, so the gate never deadlocks a stopped thread.
+    pub fn begin_moving_cycle(&self) {
+        self.moving_cycle.store(true, Ordering::Release);
+    }
+
+    /// See [`Registry::begin_moving_cycle`].
+    pub fn end_moving_cycle(&self) {
+        self.moving_cycle.store(false, Ordering::Release);
+    }
+
+    /// Whether a collector has declared a moving cycle in progress.
+    pub fn moving_cycle_in_progress(&self) -> bool {
+        self.moving_cycle.load(Ordering::Acquire)
+    }
+
+    /// Tokens outstanding that forbid relocation. Takes the lock; the
+    /// collector's fast path checks [`Registry::outstanding`] first.
+    pub fn outstanding_relocation_forbidden(&self) -> u32 {
+        self.live()
+            .values()
+            .filter(|r| r.relocation == Relocation::Forbidden)
+            .count() as u32
+    }
+
+    /// The keep-alive addresses token `id` currently declares, in
+    /// declaration order, or `None` for a token the registry no longer
+    /// holds.
+    pub fn keepalive_addrs_of(&self, id: u64) -> Option<Vec<usize>> {
+        self.live().get(&id).map(|r| r.keepalive.clone())
+    }
+
+    /// Wait, bounded by `budget`, until no outstanding token forbids
+    /// relocation.
+    ///
+    /// The collector's question is narrower than "has everything
+    /// drained": a [`Relocation::KeepAliveOnly`] token may stay
+    /// outstanding for the whole of a kernel — that is its purpose — and
+    /// a collector that waited for it would sit out every kernel. What
+    /// the collector must not do is move memory a device is reading or
+    /// writing THROUGH A HEAP ADDRESS, and only a `Forbidden` token says
+    /// that is happening. So this waits for those, reaps expired leases
+    /// on the way, and reports. Keep-alive addresses of every outstanding
+    /// token are still spliced in by the caller via
+    /// [`Registry::outstanding_keepalive_addrs`].
+    ///
+    /// [`WaitOutcome::TimedOut`] here always has `relocation_forbidden`
+    /// set — that is the only thing it waited for — and the collector's
+    /// obligation is the documented one: a non-moving cycle.
+    pub fn wait_for_relocation_clearance(&self, budget: Duration) -> WaitOutcome {
+        self.counters.waits_entered.fetch_add(1, Ordering::Relaxed);
+        if self.outstanding.load(Ordering::Acquire) == 0
+            || self.outstanding_relocation_forbidden() == 0
+        {
+            self.counters.waits_drained.fetch_add(1, Ordering::Relaxed);
+            return WaitOutcome::Drained {
+                waited: Duration::ZERO,
+            };
+        }
+        let start = Instant::now();
+        let mut spins: u32 = 0;
+        loop {
+            self.reap_expired();
+            if self.outstanding_relocation_forbidden() == 0 {
+                let waited = start.elapsed();
+                self.counters.waits_drained.fetch_add(1, Ordering::Relaxed);
+                self.counters.wait_nanos.fetch_add(
+                    waited.as_nanos().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
+                return WaitOutcome::Drained { waited };
+            }
+            let waited = start.elapsed();
+            if waited >= budget {
+                self.counters
+                    .waits_timed_out
+                    .fetch_add(1, Ordering::Relaxed);
+                self.counters.wait_nanos.fetch_add(
+                    waited.as_nanos().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
+                return self.timed_out(waited);
+            }
+            spins = spins.saturating_add(1);
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else if spins < 128 {
+                std::thread::yield_now();
+            } else {
+                let remaining = budget.saturating_sub(waited);
+                std::thread::sleep(remaining.min(Duration::from_micros(200)));
+            }
+        }
     }
 
     /// Lock `live`, recovering from poisoning.
@@ -954,6 +1089,20 @@ impl Registry {
         keepalive: &[usize],
     ) -> CriticalToken {
         let this: &Self = registry;
+        // A holder about to hand the device a heap address must not do so
+        // while a collector is sliding objects. See `begin_moving_cycle`.
+        // Bounded only by the cycle itself, which is bounded.
+        if relocation == Relocation::Forbidden {
+            let mut spins: u32 = 0;
+            while this.moving_cycle.load(Ordering::Acquire) {
+                spins = spins.saturating_add(1);
+                if spins < 64 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::sleep(Duration::from_micros(50));
+                }
+            }
+        }
         let id = this.next_id.fetch_add(1, Ordering::Relaxed);
         let revoked = Arc::new(AtomicBool::new(false));
         let record = Record {
@@ -1649,9 +1798,13 @@ mod tests {
             !outcome.drained(),
             "a stalled token must not report drained"
         );
+        // AUDIT 2026-09-02: a keep-alive-only holder reads its addresses
+        // back after the move (`CriticalToken::keepalive_addrs`), so its
+        // timeout no longer vetoes relocation. Only a `Forbidden` holder
+        // does — pinned by `a_forbidden_holder_vetoes_relocation_on_timeout`.
         assert!(
-            !outcome.may_relocate(),
-            "a timeout must never authorize relocation",
+            outcome.may_relocate(),
+            "a keep-alive-only timeout must not veto relocation: the holder remaps",
         );
         assert!(
             elapsed >= budget,
@@ -1931,13 +2084,98 @@ mod tests {
 
     // ── 5. GC-latency attribution ───────────────────────────────────────
 
+    /// Only a `Forbidden` holder vetoes relocation on expiry; a
+    /// keep-alive-only one is remapped instead. See
+    /// `WaitOutcome::may_relocate`.
+    #[test]
+    fn a_forbidden_holder_vetoes_relocation_on_timeout() {
+        let reg = Registry::new();
+        let _dma = reg.acquire_with(
+            owner("zero-copy-upload"),
+            Duration::from_secs(3_600),
+            Relocation::Forbidden,
+            &[],
+        );
+        let outcome = reg.wait_for_drain(Duration::from_millis(2));
+        assert!(!outcome.drained());
+        assert!(!outcome.may_relocate(), "a DMA against the arena forbids the move");
+        // The narrower wait the collector actually uses agrees.
+        let clearance = reg.wait_for_relocation_clearance(Duration::from_millis(2));
+        assert!(!clearance.may_relocate());
+        assert_eq!(reg.outstanding_relocation_forbidden(), 1);
+    }
+
+    /// The collector waits only for relocation-forbidding holders: a
+    /// keep-alive token outstanding for the life of a kernel must not
+    /// cost it the budget on every cycle.
+    #[test]
+    fn a_keep_alive_holder_does_not_delay_relocation_clearance() {
+        let reg = Registry::new();
+        let _kernel = reg.acquire_with(
+            owner("in-flight-kernel"),
+            Duration::from_secs(3_600),
+            Relocation::KeepAliveOnly,
+            &[0x40],
+        );
+        let started = Instant::now();
+        let outcome = reg.wait_for_relocation_clearance(Duration::from_millis(500));
+        assert!(outcome.drained(), "nothing forbids relocation");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "the clearance wait must return at once when no holder forbids relocation"
+        );
+        // ...and the keep-alive roots are still available to splice.
+        assert_eq!(reg.outstanding_keepalive_addrs(), vec![0x40]);
+    }
+
+    /// A relocation-forbidding acquisition waits out a declared moving
+    /// cycle — the gate that keeps an unstopped thread from starting a
+    /// DMA against memory the collector is sliding.
+    #[test]
+    fn a_forbidden_acquisition_waits_for_the_moving_cycle_to_end() {
+        let reg = Registry::new();
+        reg.begin_moving_cycle();
+        let reg2 = reg.clone();
+        let acquirer = std::thread::spawn(move || {
+            let started = Instant::now();
+            let _t = reg2.acquire_with(
+                owner("writeback"),
+                Duration::from_secs(1),
+                Relocation::Forbidden,
+                &[],
+            );
+            started.elapsed()
+        });
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            reg.outstanding(),
+            0,
+            "the acquisition must not complete while the cycle is declared"
+        );
+        reg.end_moving_cycle();
+        let waited = acquirer.join().unwrap();
+        assert!(waited >= Duration::from_millis(50), "waited {waited:?}");
+        // A keep-alive-only acquisition is never gated.
+        reg.begin_moving_cycle();
+        let _k = reg.acquire_with(
+            owner("keep-alive"),
+            Duration::from_secs(1),
+            Relocation::KeepAliveOnly,
+            &[],
+        );
+        reg.end_moving_cycle();
+    }
+
     #[test]
     fn forced_non_moving_collections_are_attributed_to_gpu_waiting() {
         let reg = Registry::new();
+        // A DMA window that outlasts the budget: the shape that forces a
+        // non-moving cycle. (A keep-alive-only holder would not — see
+        // `a_keep_alive_holder_does_not_delay_relocation_clearance`.)
         let _t = reg.acquire_with(
-            owner("long-kernel"),
+            owner("long-writeback-dma"),
             Duration::from_secs(3_600),
-            Relocation::KeepAliveOnly,
+            Relocation::Forbidden,
             &[0x40, 0x80],
         );
 

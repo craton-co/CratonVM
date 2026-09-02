@@ -229,13 +229,20 @@ fn register_thread_satb_buffer(buf: &Arc<Mutex<ThreadSatbPartitions>>) {
 /// taken unless the per-thread bucket fills (amortized one lock per 256
 /// reference stores).
 #[inline]
-pub fn satb_thread_local_log(queue: &SatbQueue, old_ref_addr: usize) {
+pub fn satb_thread_local_log(queue: &SatbQueue, old_ref_addr: usize) -> bool {
     if old_ref_addr == 0 {
-        return;
+        return false;
     }
     let to_flush = THREAD_SATB_BUFFER.with(|g| g.buffer.lock().log(queue.id(), old_ref_addr));
-    if let Some(entries) = to_flush {
-        queue.flush(entries);
+    // Returns whether this log SPILLED the thread's bucket into the shared
+    // queue — the moment new gray work became visible to a marker (item 9b:
+    // the caller wakes a parked worker on it).
+    match to_flush {
+        Some(entries) => {
+            queue.flush(entries);
+            true
+        }
+        None => false,
     }
 }
 

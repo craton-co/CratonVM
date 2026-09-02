@@ -541,6 +541,7 @@ dependencies = [
 name = "cratonvm-gc"
 version = "0.3.0"
 dependencies = [
+ "cratonvm-cuda-bridge",
  "cratonvm-jfr",
  "cratonvm-jit",
  "cratonvm-types",

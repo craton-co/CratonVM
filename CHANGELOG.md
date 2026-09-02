@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-09-02 `String` is `final`, and that is what killed its own intrinsic — 170x on `charAt`
+
+`String.charAt` in a compiled counted loop cost ~400 ns/char while a
+byte-identical body elsewhere in the same binary cost 3, and no documented
+lever moved it. `string-charat-loop-cost-and-the-unsteerable-intrinsic-20260901`
+tested five hypotheses about the METHOD, refuted all five, correctly located
+the discriminator as the compile DOOR, and stopped one question short of why
+the doors differ.
+
+They differ because `java/lang/String` is `final`.
+`invokevirtual_site_final_owner` therefore answers for every
+`String.charAt`/`length`/`isEmpty`/`hashCode` site in the tree, and
+`try_compile_inner`'s invoke loop rewrites `invoke_kind` 0 -> 1 on that
+answer. Correct about dispatch, disastrous about codegen: the instance
+call-site intrinsic gate is `invoke_kind == 0 || invoke_kind == 2`, and a
+kind-1 site enters the inline/direct-bind ladder first and leaves the loop
+through its `continue`. So the site was bound to a real `CALL` into
+`charAt -> isLatin1 -> StringLatin1.charAt -> checkIndex ->
+Preconditions.checkIndex` and never offered the inline decode — silently, past
+all three `string-intrinsic` diagnostics and invisible to the pin's four
+counters. The OSR door runs no such rewrite, which is the whole of the 100x.
+
+The rewrite now yields: a site `try_resolve_intrinsic` or
+`try_resolve_string_intrinsic` would take stays at kind 0 for the gate to
+claim. The JVMS 5.4.6 rule the rewrite exists for is untouched — no intrinsic
+matches a private method, so `String.isLatin1`, `coder` and `checkIndex` stay
+pinned, and a test asserts it.
+
+`probes/CharAtCostCurve.java`'s `charAt` rows go from **~560 to ~3.3 ns/char**
+one binary, one flag (`CRATONVM_JIT_NO_DEVIRT_INTRINSIC_YIELD`) — ~1700x
+HotSpot to ~14x. `probes/CharAtDoorProbe.java`, added here, puts five
+byte-identical bodies in one class: the affected arm moves 262.70 -> 1.88 and
+the four unaffected arms do not move at all.
+
+Two things this also settles. The pin is **not** retirable: with the intrinsic
+actually reaching the emitter, `CRATONVM_JIT_NO_STRING_INTRINSIC_PIN=1` is now
+30x WORSE (~100 ns/char against ~3.3), where the page had measured it 3-5x
+better — both arms of that comparison were pricing a program the pin was no
+longer protecting. And the IR expander's design premise is false: measured with
+`CRATONVM_DBG_LICM=1`, `loop_has_hard_barrier=true` on every header, so the
+`value`/`coder` loads it depends on hoisting never leave the loop.
+
+Counted (`DEVIRT_YIELDED_TO_INTRINSIC`), printed beside the pin census. See
+`string-charat-loop-cost-and-the-unsteerable-intrinsic-FIXED-20260902.md`.
+
 ### 2026-09-02 The generational young collector's copy phase can run in parallel
 
 `GenerationalHeap`'s moving (Cheney) young cycle copied its survivors on one
@@ -147,29 +192,38 @@ to 49,855 at 16) — so the extra workers really do take work rather than merely
 existing. Two runs reported `cycles=0`; the census says so rather than letting
 a vacuous run read as a pass.
 
-**Copy-phase cost**, `cheney_drain` out of the `CRATONVM_DBG_GCPAUSE=1`
-breakdown, on `BinT` depth 18 at `-Xmx512m` — one large cycle copying ~1.0-1.5M
-objects out of a 128 MB from-space. ABBA-interleaved (P S S P), first pair
-discarded as cold, `objects_copied` checked equal within every pair:
+**Measured on the merged tree**, `BinT` depth 18 at `-Xmx512m` — one large
+cycle copying ~1.5M objects out of a 128 MB from-space. ABBA-interleaved
+(P S S P), first pair discarded as cold, `objects_copied` checked equal within
+every pair, and runs that took the NON-moving sweep retried rather than counted
+(only about half of them take the moving path).
 
-| arm | n | min | median | max |
-|---|---|---|---|---|
-| parallel, 8 workers | 8 | 2,198 ms | **3,554 ms** | 5,243 ms |
-| serial | 8 | 7,002 ms | **14,100 ms** | 16,720 ms |
+| | arm | n | min | median | max |
+|---|---|---|---|---|---|
+| `cheney_drain` | parallel, 8 workers | 8 | 2,304 ms | **3,008 ms** | 3,601 ms |
+| `cheney_drain` | serial | 8 | 8,693 ms | **11,560 ms** | 14,098 ms |
+| whole pause | parallel, 8 workers | 6 | 2,035 ms | **2,664 ms** | 2,901 ms |
+| whole pause | serial | 5 | 6,316 ms | **9,760 ms** | 12,412 ms |
 
-The ranges are DISJOINT — parallel's worst sample beats serial's best — which
-is what makes this a result on a shared host rather than a ratio between two
-noisy medians. Median 3.97x; the pessimal pairing is still 1.34x.
+Both pairs of ranges are DISJOINT — the parallel arm's worst sample beats the
+serial arm's best — which is what makes this a result on a shared host rather
+than a ratio between two noisy medians. Copy phase: median 3.84x, pessimal
+pairing 2.41x. Whole pause: median 3.66x, pessimal 2.18x. Taken with the host
+at 100% CPU throughout, and the parallel arm's spread was TIGHTER than in an
+earlier quiet-host run (1.6x against 2.4x), so contention is not what produced
+the separation.
 
-Read with three caveats, none of which the numbers above state on their own.
-This is a **debug build**: the per-object copy is unoptimised on both arms, and
-release is likely to narrow the ratio, since optimisation makes the copy cheaper
-while the coordination stays. It is **one workload**, chosen because it is
-survivor-heavy and therefore the best case for parallel copying. And it is the
-copy PHASE, not the pause: in the same breakdown `pre_evacuate` costs 3,174 ms,
-so after this change **`pre_evacuate` — the from-space object-start walk — is
-the largest phase of a moving young pause**, and is where the next pause work
-should go.
+The pause tracks the phase now because `pre_evacuate` — the from-space
+object-start walk, 3,174 ms and the largest phase when this change was first
+measured on its own branch — is **0 ms** on the merged tree: another lane
+parallelised it. An earlier draft of this entry named it as the next place to
+work; that was true of the branch and is not true of `dev`.
+
+Two caveats the numbers do not state. This is a **debug build**: the
+per-object copy is unoptimised on both arms, and release is likely to narrow
+the ratio, since optimisation makes the copy cheaper while the coordination
+stays. And it is **one workload**, chosen because it is survivor-heavy and
+therefore the best case for parallel copying.
 
 An earlier wall-clock A/B under `CRATONVM_DBG_GC_STRESS` was discarded rather
 than reported: it showed a 6x spread WITHIN one arm against an 11% median gap.

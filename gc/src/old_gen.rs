@@ -350,7 +350,26 @@ impl OldGen {
     /// (`HEADER_SIZE`-or-larger, 8-byte aligned) so every call returns
     /// a fresh, non-aliasing block.
     pub fn alloc(&mut self, size: usize, align: usize) -> Option<*mut u8> {
-        if let Some(p) = self.alloc_from_buckets(size, align) {
+        self.alloc_impl(size, align, true)
+    }
+
+    /// [`Self::alloc`] without the zeroing pass.
+    ///
+    /// For a caller that overwrites every byte it is handed before anything
+    /// can read the block: the parallel evacuator's promotion buffers
+    /// (`gen_evac`), where the copy is the write. Zeroing there was one
+    /// `memset` of every promoted byte followed by one `memcpy` over it.
+    ///
+    /// The caller inherits the obligation `alloc`'s zeroing discharged: no
+    /// walker may reach the block before it holds objects end to end, and an
+    /// unused tail must go back through [`Self::release_unused_tail`] before
+    /// the next `walk_objects`.
+    pub fn alloc_unzeroed(&mut self, size: usize, align: usize) -> Option<*mut u8> {
+        self.alloc_impl(size, align, false)
+    }
+
+    fn alloc_impl(&mut self, size: usize, align: usize, zero: bool) -> Option<*mut u8> {
+        if let Some(p) = self.alloc_from_buckets(size, align, zero) {
             return Some(p);
         }
         // FRAGMENTATION FIX (xt-helper-window OOM, 2026-07-31): the free list
@@ -366,7 +385,7 @@ impl OldGen {
         // nothing on the success path, and turns a spurious `OutOfMemoryError`
         // into an allocation whenever the bytes are physically there.
         if self.coalesce_free_blocks() > 0 {
-            return self.alloc_from_buckets(size, align);
+            return self.alloc_from_buckets(size, align, zero);
         }
         None
     }
@@ -468,7 +487,7 @@ impl OldGen {
 
     /// The size-segregated bucket walk. Split out of [`Self::alloc`] so the
     /// coalesce-and-retry step can run it twice.
-    fn alloc_from_buckets(&mut self, size: usize, align: usize) -> Option<*mut u8> {
+    fn alloc_from_buckets(&mut self, size: usize, align: usize, zero: bool) -> Option<*mut u8> {
         // Round-9 gc CRIT-3: reserve at least HEADER_SIZE bytes (and
         // never less than 8 for alignment headroom) so an `alloc(0)`
         // can't alias an existing allocation.
@@ -545,8 +564,10 @@ impl OldGen {
             // this path.
             // SAFETY: ptr points to alloc_offset within the data buffer with at
             // least size bytes available. Zero-initializing the allocated region.
-            unsafe {
-                std::ptr::write_bytes(ptr, 0, size);
+            if zero {
+                unsafe {
+                    std::ptr::write_bytes(ptr, 0, size);
+                }
             }
             return Some(ptr);
         }
@@ -611,6 +632,36 @@ impl OldGen {
         // Coalescing happens during the next `compact()` call.
         self.buckets[bucket_for(size)].push(FreeBlock { offset, size });
         // PERF (gc-oldgen-perf): a new free block changes the sorted view.
+        self.invalidate_sorted_free();
+    }
+
+    /// Hand back the NEVER-WRITTEN tail of a block [`Self::alloc_unzeroed`]
+    /// carved, without stamping [`Self::reclaim_epoch`].
+    ///
+    /// [`Self::free`] bumps the epoch because the bytes it releases held an
+    /// object whose address a concurrent marker's remark snapshot may still
+    /// name; hand the address to a new object and "existed at remark, not
+    /// marked" becomes a licence to free something live. A promotion buffer's
+    /// tail never held an object: it was free space at every remark that
+    /// preceded this pause (a block that was live at the remark reaches the
+    /// buckets only through `free`, which bumped the epoch already), so no
+    /// snapshot can name any address in it, and returning it changes nothing
+    /// any address-keyed cache believes. That is why a young collection can
+    /// retire its buffers every cycle without invalidating an in-flight
+    /// concurrent old-gen sweep.
+    ///
+    /// # Safety
+    /// `[ptr, ptr + size)` must be the unused tail of a block obtained from
+    /// this old gen, at least `HEADER_SIZE` bytes, 8-aligned, and never
+    /// written since it was carved.
+    pub unsafe fn release_unused_tail(&mut self, ptr: *mut u8, size: usize) {
+        debug_assert!(size >= HEADER_SIZE && size % 8 == 0 && (ptr as usize) % 8 == 0);
+        let base = self.data.as_ptr() as usize;
+        let addr = ptr as usize;
+        debug_assert!(addr >= base && addr + size <= base + self.data.len());
+        let offset = addr - base;
+        self.used_bytes = self.used_bytes.saturating_sub(size);
+        self.buckets[bucket_for(size)].push(FreeBlock { offset, size });
         self.invalidate_sorted_free();
     }
 
@@ -1824,6 +1875,23 @@ mod tests {
     fn card_range_walk_with_no_ranges_collects_nothing() {
         let (og, _offsets) = old_gen_with_objects(4, 2);
         assert!(collected_offsets(&og, &[]).is_empty());
+    }
+
+    /// gen-gc-five: a promotion buffer's unused tail goes back to the free
+    /// list without stamping the reclaim epoch (it never held an object, so
+    /// no remark snapshot can name it), and is servable again at once.
+    #[test]
+    fn releasing_an_unused_tail_keeps_the_reclaim_epoch() {
+        let mut og = OldGen::new(64 * 1024);
+        let epoch = og.reclaim_epoch();
+        let p = og.alloc_unzeroed(4096, 8).unwrap();
+        let used = og.used();
+        // SAFETY: `[p + 1024, p + 4096)` is the untouched tail of the block just carved.
+        unsafe { og.release_unused_tail(p.add(1024), 3072) };
+        assert_eq!(og.reclaim_epoch(), epoch, "a never-used tail is not a reclaim");
+        assert_eq!(og.used(), used - 3072);
+        let again = og.alloc(3072, 8).expect("the tail is a servable free block");
+        assert_eq!(again as usize, p as usize + 1024);
     }
 
     #[test]

@@ -1682,6 +1682,53 @@ mod tests {
         assert!(text.contains("[ret_ptr]"));
     }
 
+    /// A reduction folds each warp with shuffles and issues ONE atomic
+    /// per warp, from lane 0, and every thread the guard retires joins
+    /// the tree carrying zero instead of returning.
+    ///
+    /// AUDIT 2026-09-02. Until this date every thread issued its own
+    /// `red.global.add` into the single accumulator: 2^24 atomics to one
+    /// line for a 2^24-element dot product. Asserted as exact counts,
+    /// because the failure that matters is one step of the tree going
+    /// missing (a wrong sum, not a slow one), and because a second
+    /// `red` would mean a thread found a way around the tree.
+    #[test]
+    fn reduction_folds_each_warp_before_the_one_atomic() {
+        let m = lower_fixture("EligibleDotProduct", "dot", "([I[I)J");
+        let text = m.render();
+        // A `long` accumulator travels as two 32-bit halves, five steps
+        // each: 16, 8, 4, 2, 1.
+        assert_eq!(
+            text.matches("shfl.sync.down.b32").count(),
+            10,
+            "five tree steps of two halves each\n{text}"
+        );
+        for offset in [16, 8, 4, 2, 1] {
+            assert!(
+                text.contains(&format!(", {offset}, 0x1f, 0xffffffff;")),
+                "tree step with offset {offset} missing\n{text}"
+            );
+        }
+        assert_eq!(
+            text.matches("red.global.add.u64").count(),
+            1,
+            "exactly one atomic, from lane 0\n{text}"
+        );
+        assert!(text.contains("%laneid"), "lane 0 is chosen by %laneid\n{text}");
+        // The retired-thread path: the guard branches to the zero label,
+        // never straight to `L_done`, and that label feeds the tree.
+        assert!(
+            text.contains("bra L_reduce_zero;"),
+            "the dispatch guard must send a retired thread into the tree with a zero\n{text}"
+        );
+        assert!(
+            !text.contains("bra L_done;\n") || text.matches("bra L_done;").count() == 0,
+            "a reduction kernel has no path that skips the warp tree\n{text}"
+        );
+        assert!(text.contains("L_reduce_zero:\n    mov.s64"), "zero contribution\n{text}");
+        assert!(text.contains("L_reduce:"), "join label\n{text}");
+    }
+
     #[test]
     #[ignore = "diagnostic — prints PTX to stdout; run with --nocapture"]
     fn dump_vector_add_ptx() {
