@@ -1324,6 +1324,23 @@ pub fn dump_method_stats_to_stderr() {
             crate::x64::inline_call_map_at_return_counts(),
             crate::x64::inline_miss_edge_poison_counts(),
         );
+        // What the operand-spill cursor did. `exhausted` is a REFUSED COMPILE:
+        // the method keeps running interpreted and the only thing that ever
+        // said so was a single-slot "last bail site" with no count, so "does
+        // this happen, and on what?" had no answer at all. A non-zero
+        // `flush-canonical` is the engagement counter for the canonical-home
+        // flush — a zero there beside a non-zero `flush-reserved` means that
+        // path never ran, which is a different finding from it running and not
+        // helping. `peak-words` is a MAX over compiles, never a sum.
+        eprintln!(
+            "[cratonvm] spill cursor: {}",
+            crate::spill_cursor_counts()
+                .iter()
+                .zip(crate::SPILL_CURSOR_SLOT_NAMES.iter())
+                .map(|(c, n)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         // And how often a compiled entry was dropped as the same activation as
         // an interpreter frame. `call-opcode` is the row worth reading: that
         // rule's revert shape is asserted by no test, because the only arm that

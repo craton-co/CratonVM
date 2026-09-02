@@ -152,10 +152,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`, `native-builtins/src/tls.rs`, this lane's files); NOMINATED (the rest).**",
     ),
     (
-        "docs/known-issues/jdk-only/E33-R11-FOUR-UNFALSIFIABLE-GUARDS-20260813.md",
-        "status block says: **Status:** FIXED-UNVERIFIED-BY-CARGO. Every repair is mutation-checked by",
-    ),
-    (
         "docs/known-issues/jdk-only/E42-1-the-slot-that-was-never-there-and-the-predicate-that-was-its-own-negation.md",
         "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/phases_late/ssl_security.rs`, this lane's file); NOMINATED (the rest).**",
     ),
@@ -273,10 +269,6 @@ const ALLOWED: &[(&str, &str)] = &[
     ),
     (
         "docs/known-issues/jdk-only/W5-1-loadlibrary-allowlist-too-wide.md",
-        "status block says: nothing here was built or run):**",
-    ),
-    (
-        "docs/known-issues/jdk-only/W6-6-nativelibraries-load-fabricated-success.md",
         "status block says: nothing here was built or run):**",
     ),
     (

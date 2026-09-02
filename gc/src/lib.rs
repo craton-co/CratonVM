@@ -194,8 +194,9 @@ pub use gc_metrics::{
 };
 pub use gen_heap::{
     clear_jit_read_bounds, clear_jit_ref_store_plan, jit_g1_barrier_addr, jit_read_bounds_addr,
-    jit_ref_store_gate_addrs, jit_region_bounds_addr, publish_jit_read_bounds,
-    publish_jit_ref_store_plan, set_jit_ref_store_post_active, set_jit_ref_store_pre_active,
+    jit_ref_store_armed_markers, jit_ref_store_gate_addrs, jit_ref_store_post_skip_mask,
+    jit_region_bounds_addr, publish_jit_read_bounds, publish_jit_ref_store_plan,
+    publish_jit_ref_store_plan_masked, set_jit_ref_store_post_active, set_jit_ref_store_pre_active,
     GenerationalHeap, HeapStats, HeapStatsSnapshot, JitG1BarrierTable, JitReadBoundsTable,
     JitRefStoreGates, JitRegionBoundsTable, JIT_G1_BARRIER, JIT_READ_BOUNDS, JIT_REF_STORE_GATES,
     JIT_REGION_BOUNDS, JIT_YOUNG_FLOOR_AGE_ZERO,

@@ -20,7 +20,7 @@ pub use cratonvm_classloading::vtype;
 
 pub use cratonvm_classloading::{
     any_annotation_proxy_defined,
-    any_class_redefined, any_duplicate_class_name, bump_jit_supersede_epoch,
+    any_class_redefined, any_duplicate_class_name, bump_jit_supersede_epoch, class_is_java_util,
     class_definition_epoch, find_field_recursive,
     find_field_recursive_by_descriptor, find_method_recursive, invokespecial_selection_start,
     invokevirtual_final_declaring_class, invokevirtual_private_declaring_class,
