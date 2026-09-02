@@ -5396,6 +5396,14 @@ fn execute_frame_from_index(
     // contract and for what turns them off. Hoisted per `execute_frame`
     // entry like every other gate above (same pgo-style tradeoff).
     let fast_field_zgc = field_fast::fast_field_zgc(shared);
+    // ── Stack-dump hook admission (2026-09-02) ──────────────────────────
+    // The dump hook at the top of the loop is a load of an atomic that
+    // NOTHING can set unless a watchdog or sampler was armed, and both are
+    // armed before Java starts running. A run with neither — every run that
+    // is not being debugged — skips the hook entirely on this hoisted bool.
+    // See `SharedVm::arm_stack_dump_watch` for why arming happens at spawn
+    // time rather than at fire time.
+    let stack_dump_possible = shared.stack_dump_watch_armed();
     // ── Invoke fast door admission (2026-09-02) ─────────────────────────
     // Off while anything the general dispatcher would have to observe per
     // call is armed: PGO (it records call sites and receivers), the invoke
@@ -5592,25 +5600,91 @@ fn execute_frame_from_index(
     }
 
     loop {
-        // Route callee-thrown Java exceptions before the safepoint poll below.
-        // `pending_java_exception` is only a Rust local between the callee's
-        // return and this block; it is not present in any GC-scanned frame slot
-        // yet. Polling first can let STW reclaim the Throwable before a caller
-        // catch handler stores it.
-        if let Some((exc, invoke_pc)) = pending_java_exception.take() {
-            // The handler walk and its GC pin live in
-            // `exception_dispatch::unwind_to_handler` — shared with the
-            // `pending_runtime_error` arm below, which used to carry a
-            // byte-identical copy (ARCH-2026-08-04 A4a).
-            unwind_to_handler(
-                shared,
-                thread,
-                &mut frame_idx,
-                initial_frame_idx,
-                exc,
-                invoke_pc,
-            )?;
-            continue;
+        // Route a pending signal from the previous iteration's fast path —
+        // a callee-thrown Java exception, or a `RuntimeError` an arm could not
+        // throw in place — before the safepoint poll below. Both are only Rust
+        // locals at this point, not present in any GC-scanned frame slot, so
+        // polling first can let STW reclaim a Throwable before a caller's catch
+        // handler stores it.
+        //
+        // One branch, not two: `|` tests the OR of both discriminants, and the
+        // arms inside each `continue` or return, so the common path (neither
+        // set) pays a single predicted-not-taken test per bytecode.
+        if pending_java_exception.is_some() | pending_runtime_error.is_some() {
+            if let Some((exc, invoke_pc)) = pending_java_exception.take() {
+                // The handler walk and its GC pin live in
+                // `exception_dispatch::unwind_to_handler` — shared with the
+                // `pending_runtime_error` arm below, which used to carry a
+                // byte-identical copy (ARCH-2026-08-04 A4a).
+                unwind_to_handler(
+                    shared,
+                    thread,
+                    &mut frame_idx,
+                    initial_frame_idx,
+                    exc,
+                    invoke_pc,
+                )?;
+                continue;
+            }
+            // Handle any pending runtime error from the previous iteration's fast path.
+            if let Some((re, invoke_pc)) = pending_runtime_error.take() {
+                if aioobe2_dbg() {
+                    if let RuntimeError::ArrayIndexOutOfBoundsException { index, message } = &re {
+                        let f = &thread.frames[frame_idx];
+                        eprintln!(
+                            "[AIOOBE2] index={} message={} class={} method={}{} pc={}",
+                            index,
+                            message.as_deref().unwrap_or("<none>"),
+                            f.class_name(),
+                            f.method_name(),
+                            f.method_descriptor(),
+                            invoke_pc
+                        );
+                    }
+                }
+                // Normalize the operand-stack overflow BEFORE throwing, exactly as
+                // the decoded path's conversion does further down.
+                //
+                // That site calls itself "the only point that converts runtime
+                // errors into Java exceptions". It is not, and has not been for as
+                // long as the invoke fast paths have routed through here: this arm
+                // converts too. `ValueStack` reports an overflow as
+                // `NotImplemented { feature: "operand stack overflow" }`, which
+                // `throw_runtime_error` maps to an *uncatchable* internal error, so
+                // a stack overflow arriving through a fast-path arm hard-unwound
+                // the whole call stack instead of surfacing as a catchable
+                // `java.lang.StackOverflowError` that an in-method
+                // `catch (StackOverflowError)` / `catch (Throwable)` can observe.
+                // Two conversion points that disagree is one conversion point too
+                // many; until they are merged they must at least agree.
+                let re = match re {
+                    RuntimeError::NotImplemented { feature } if feature == "operand stack overflow" => {
+                        RuntimeError::StackOverflowError
+                    }
+                    other => other,
+                };
+                let exc_result = super::exceptions::throw_runtime_error(shared, thread, re);
+                match exc_result {
+                    MethodCallFailed::ExceptionThrown(exc) => {
+                        // Same walk as the `pending_java_exception` arm above, and
+                        // now literally the same code (ARCH-2026-08-04 A4a). The
+                        // two copies had already drifted in comments only, but the
+                        // GC pin they share is subtle enough that a fix landing in
+                        // one and not the other is a use-after-free reproducing on
+                        // just one of the two throw paths.
+                        unwind_to_handler(
+                            shared,
+                            thread,
+                            &mut frame_idx,
+                            initial_frame_idx,
+                            exc,
+                            invoke_pc,
+                        )?;
+                        continue;
+                    }
+                    other => return Err(other),
+                }
+            }
         }
 
         // T19.H1 — opportunistic stack-dump hook.
@@ -5644,7 +5718,10 @@ fn execute_frame_from_index(
         // three-bytecode callee behind an `invokevirtual` takes 54% of the
         // samples at its entry and one sample anywhere in its body, and that
         // share tracks the separately-timed invoke delta (290-417 ns).
-        if (!stack_dump_emitted || shared.stack_sample_mode()) && shared.stack_dump_pending() {
+        if stack_dump_possible
+            && (!stack_dump_emitted || shared.stack_sample_mode())
+            && shared.stack_dump_pending()
+        {
             shared.dump_current_thread_frames(thread);
             if shared.stack_sample_mode() {
                 shared.clear_stack_dump_request();
@@ -5677,66 +5754,6 @@ fn execute_frame_from_index(
             .load(std::sync::atomic::Ordering::Acquire)
         {
             safepoint_check(shared, thread);
-        }
-
-        // Handle any pending runtime error from the previous iteration's fast path.
-        if let Some((re, invoke_pc)) = pending_runtime_error.take() {
-            if aioobe2_dbg() {
-                if let RuntimeError::ArrayIndexOutOfBoundsException { index, message } = &re {
-                    let f = &thread.frames[frame_idx];
-                    eprintln!(
-                        "[AIOOBE2] index={} message={} class={} method={}{} pc={}",
-                        index,
-                        message.as_deref().unwrap_or("<none>"),
-                        f.class_name(),
-                        f.method_name(),
-                        f.method_descriptor(),
-                        invoke_pc
-                    );
-                }
-            }
-            // Normalize the operand-stack overflow BEFORE throwing, exactly as
-            // the decoded path's conversion does further down.
-            //
-            // That site calls itself "the only point that converts runtime
-            // errors into Java exceptions". It is not, and has not been for as
-            // long as the invoke fast paths have routed through here: this arm
-            // converts too. `ValueStack` reports an overflow as
-            // `NotImplemented { feature: "operand stack overflow" }`, which
-            // `throw_runtime_error` maps to an *uncatchable* internal error, so
-            // a stack overflow arriving through a fast-path arm hard-unwound
-            // the whole call stack instead of surfacing as a catchable
-            // `java.lang.StackOverflowError` that an in-method
-            // `catch (StackOverflowError)` / `catch (Throwable)` can observe.
-            // Two conversion points that disagree is one conversion point too
-            // many; until they are merged they must at least agree.
-            let re = match re {
-                RuntimeError::NotImplemented { feature } if feature == "operand stack overflow" => {
-                    RuntimeError::StackOverflowError
-                }
-                other => other,
-            };
-            let exc_result = super::exceptions::throw_runtime_error(shared, thread, re);
-            match exc_result {
-                MethodCallFailed::ExceptionThrown(exc) => {
-                    // Same walk as the `pending_java_exception` arm above, and
-                    // now literally the same code (ARCH-2026-08-04 A4a). The
-                    // two copies had already drifted in comments only, but the
-                    // GC pin they share is subtle enough that a fix landing in
-                    // one and not the other is a use-after-free reproducing on
-                    // just one of the two throw paths.
-                    unwind_to_handler(
-                        shared,
-                        thread,
-                        &mut frame_idx,
-                        initial_frame_idx,
-                        exc,
-                        invoke_pc,
-                    )?;
-                    continue;
-                }
-                other => return Err(other),
-            }
         }
 
         // ── Frame-pointer hoist, preamble (frame-arena.md §6.1) ──────────

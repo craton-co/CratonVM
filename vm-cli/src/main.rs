@@ -4901,6 +4901,11 @@ fn run() -> Result<()> {
             // the actionable diagnostic for "main thread is in native code".
             cratonvm_vm::dispatch_trace::enable();
         }
+        // Arm the interpreter's dump gate BEFORE the watchdog exists, so a
+        // thread that is already deep inside one `execute_frame` when the
+        // deadline fires still observes the request (see
+        // `SharedVm::arm_stack_dump_watch`).
+        vm.shared.arm_stack_dump_watch();
         let shared_for_watchdog = std::sync::Arc::clone(&vm.shared);
         // RKC16N.5 — capture the audit-dump paths into the watchdog
         // thread so a hung run still produces a missing-natives

@@ -18,49 +18,79 @@
 //!
 //! Almost all of that is constant per call site and per receiver class. This
 //! module memoizes it on the site: once the slow handler has resolved a field
-//! for a receiver, it records `(receiver class id, num_slots, byte offset,
-//! storage kind)` in `JvmThread::fast_field_sites`, and the next access whose
-//! receiver header matches loads or stores at that offset directly.
+//! for a receiver, it records the receiver's `(class id, num_slots)` shape and
+//! the byte offset of the field inside it, and the next access whose receiver
+//! header matches loads or stores at that offset directly.
+//!
+//! # The two body layouts, and why both are here
+//!
+//! A ZGC object body is one of two things, and which one it is depends on how
+//! it was allocated, not on the class:
+//!
+//! * a **compact** body — fields packed at the offsets of the class's
+//!   registered `CompactLayout`, each in its natural width, marked
+//!   `GC_FLAG_COMPACT` in the header. `GarbageCollector::alloc_object` builds
+//!   these when the class has a layout.
+//! * a **legacy** body — one 16-byte tagged `Value` cell per field, no flag.
+//!   `ZgcRealHeap::try_alloc_object`, the TLAB path
+//!   `interpreter::alloc_object_shared` takes, builds *only* these: it sizes
+//!   the allocation `num_fields * SLOT_SIZE` and never calls
+//!   `set_compact_shape`. So on this collector essentially every object the
+//!   interpreter allocates is legacy, and a fast path that handled compact
+//!   bodies alone measured `fast-field: get hit=0 miss=1801267` on
+//!   `probes/FieldShape.java` — it never fired once.
+//!
+//! Both are handled here, chosen per site by what the receiver's header says
+//! and re-checked on every access. The compact arm reads and writes the field
+//! at its packed width; the legacy arm reads and writes the whole cell with
+//! `read_value_checked_atomic` / `write_value_atomic`, which is what
+//! `ZgcRealHeap::get_field` / `set_field` do for it — the same checked decode,
+//! the same padding-free store.
 //!
 //! # Correctness contract
 //!
-//! * A site is only filled for a **non-static, non-volatile** field of a
-//!   **compact-layout** receiver, on a **ZGC** heap, when the storage kind the
+//! * A site is only filled for a **non-static, non-volatile** field on a
+//!   **ZGC** heap, and for a compact receiver only when the storage kind the
 //!   layout assigned agrees with the field descriptor. Anything else keeps the
 //!   full handler.
-//! * The fast arm re-checks the receiver's `class_id` and `num_slots` against
-//!   the site (the compact layout registry is keyed by exactly that pair) and
-//!   that the object carries the compact flag. A mismatch falls back to the
-//!   full handler, which refills the site for the new receiver. Polymorphic
-//!   sites therefore thrash the memo and run mostly slow, which is the same
-//!   shape as the monomorphic invoke cache.
+//! * The fast arm re-checks the receiver's `class_id`, `num_slots` and compact
+//!   flag against the site (the compact layout registry is keyed by exactly
+//!   `(class_id, field_count)`, and the flag says which body shape the object
+//!   actually has). A mismatch falls back to the full handler, which refills
+//!   the site for the new receiver. Polymorphic sites therefore thrash the
+//!   memo and run mostly slow, which is the same shape as the monomorphic
+//!   inline cache for invokes.
 //! * Sites are epoch-validated by `SiteCache` (class definition epoch and
 //!   resolution epoch) and dropped wholesale on class redefinition, exactly
 //!   like `field_sites`.
 //! * Every diagnostic the slow handlers honour per access
 //!   (`CRATONVM_DBG_FIELD*`, the corrupt-cell watch, the punned-store watch,
-//!   the vacated-frames ledger, the remap trace, the stray-stack probe) and
-//!   every JVMTI field watchpoint turns the fast arms off, so an armed run
-//!   sees exactly what it saw before.
+//!   the vacated-frames ledger, the remap trace, the stray-stack probe, the
+//!   EC watch) and every JVMTI field watchpoint turns the fast arms off, so an
+//!   armed run sees exactly what it saw before.
 //! * A `null` or non-object receiver falls back so the helpful-NPE message is
 //!   built by the code that owns it.
 //! * Reference loads keep the receiver-side `load_and_forward` on the loaded
-//!   value and mint the operand-stack slot through
-//!   `CompactValue::try_from_pointer`, i.e. the same provenance record the
-//!   `Value::Object` push made. A heap that has ever minted an autobox wrapper
-//!   (`cratonvm_gc::autobox::wrapper_exists`) keeps reference loads slow, so
-//!   the unboxing `get_field` performs is never skipped.
-//! * Reference stores run the SATB pre-barrier while marking is active and
-//!   the generational card note afterwards, the two things `ZgcRealHeap::
-//!   set_field` does around the raw write. Primitive stores never carded an
-//!   old→young edge, so the note is skipped for them.
+//!   value, and a heap that has ever minted an autobox wrapper
+//!   (`cratonvm_gc::autobox::wrapper_exists`) keeps compact reference loads
+//!   slow, so the unboxing `get_field` performs is never skipped.
+//! * Reference stores run the SATB pre-barrier while marking is active and the
+//!   generational card note afterwards — the two things `ZgcRealHeap::
+//!   set_field` does around the raw write, in that order. ZGC leaves
+//!   `GarbageCollector::write_barrier_pre` at its empty default, so the
+//!   explicit call `op_putfield` makes before the store is a no-op here and
+//!   has no fast-path counterpart.
 //! * Category-2 stores only take the fast path when the operand-stack kind
 //!   mark says the slot was pushed by a genuine `long` / `double` producer;
 //!   the slow handler owns every decode heuristic for the unmarked shapes.
+//! * A legacy cell that fails `read_value_checked_atomic` (a corrupt cell)
+//!   falls back, so the corrupt-cell census and its report stay with the
+//!   handler that owns them.
 //!
 //! Kill switch: `CRATONVM_JIT_NO_FIELD_FAST_PATH=1` (`CRATONVM_JIT=
 //! -field-fast-path`). Engagement: `CRATONVM_DBG_FIELD_SITE=1` prints
-//! `fast-field: get hit/miss/fill put hit/miss/fill unusable`.
+//! `fast-field: get hit/miss/fill put hit/miss/fill unusable`, and names the
+//! first few reasons a site could not be quickened.
 
 use super::site_cache::{site_stats, FastFieldSite, FastFieldSiteCache, FieldSiteCache};
 use crate::runtime::frame::Frame;
@@ -70,7 +100,9 @@ use crate::vm::SharedVm;
 use cratonvm_classloading::resolution::ResolvedField;
 use cratonvm_gc::zgc::ZgcRealHeap;
 use cratonvm_gc::{ArrayElementType, ObjectHeader, ObjectKind};
-use cratonvm_types::{ClassId, CompactValue, FieldStorageKind, ObjectRef, HEADER_SIZE};
+use cratonvm_types::{
+    ClassId, CompactValue, FieldStorageKind, ObjectRef, Value, HEADER_SIZE, SLOT_SIZE,
+};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 /// Per-`execute_frame` admission for the quickened field and array arms.
@@ -162,7 +194,10 @@ unsafe fn store_ref(p: *mut u8, raw: u64) {
 ///
 /// The `is_object_address` probe is what `class_id_of` does before reading a
 /// header; it keeps a stale operand-stack reference to an uncommitted page
-/// from faulting where the slow handler would have answered `class 0`.
+/// from faulting where the slow handler would have answered `class 0`. The
+/// compact-flag comparison is what makes the two body layouts safe to mix in
+/// one cache: a site filled against a legacy receiver refuses a compact one
+/// and vice versa, even at the same class id.
 #[inline(always)]
 fn field_ptr_for(zgc: &ZgcRealHeap, ptr: u64, site: &FastFieldSite) -> Option<*mut u8> {
     if zgc.is_object_address(ptr as usize).is_none() {
@@ -173,12 +208,14 @@ fn field_ptr_for(zgc: &ZgcRealHeap, ptr: u64, site: &FastFieldSite) -> Option<*m
     let header = unsafe { &*(ptr as *const ObjectHeader) };
     if header.class_id != site.receiver_class_id
         || header.num_slots() != site.num_slots
-        || !cratonvm_types::is_compact_object(header)
+        || cratonvm_types::is_compact_object(header) != site.storage.is_some()
     {
         return None;
     }
-    // SAFETY: the site's offset was produced by the compact layout registered
-    // for exactly this `(class_id, num_slots)`, so it lies inside the object.
+    // SAFETY: for a compact receiver the offset came from the layout
+    // registered for exactly this `(class_id, num_slots)`; for a legacy one it
+    // is `field_index * SLOT_SIZE` with `field_index < num_slots` checked at
+    // fill. Either way it lies inside the object body.
     Some(unsafe { (ptr as *mut u8).add(HEADER_SIZE + site.offset as usize) })
 }
 
@@ -201,7 +238,7 @@ pub(super) fn getfield_fast(
 /// trivial-getter shortcut: the site belongs to the getter's declaring class
 /// and constant pool, while the operand stack is the caller's (the receiver
 /// on top is the getter's `this`). `ret_opcode` is the getter's `xreturn`
-/// opcode, checked against the field's storage kind the way
+/// opcode, checked against the field's type the way
 /// `try_execute_cached_trivial_instance_getter` checks it against the
 /// descriptor; `0` skips the check for a plain `getfield`.
 #[inline]
@@ -230,32 +267,18 @@ pub(super) fn getfield_fast_keyed(
             return false;
         }
     };
-    if ret_opcode != 0 {
-        let agrees = matches!(
-            (site.storage, ret_opcode),
-            (FieldStorageKind::Long, 0xad)
-                | (FieldStorageKind::Float, 0xae)
-                | (FieldStorageKind::Double, 0xaf)
-                | (FieldStorageKind::Reference, 0xb0)
-                | (
-                    FieldStorageKind::Int
-                        | FieldStorageKind::Boolean
-                        | FieldStorageKind::Byte
-                        | FieldStorageKind::Char
-                        | FieldStorageKind::Short,
-                    0xac
-                )
-        );
-        if !agrees {
-            return false;
-        }
+    if ret_opcode != 0 && !return_opcode_agrees(&site, ret_opcode) {
+        return false;
     }
     let Some(fp) = field_ptr_for(zgc, ptr, &site) else {
         return false;
     };
+    let Some(storage) = site.storage else {
+        return getfield_legacy(shared, stack, fp, &site);
+    };
     // SAFETY (every raw load below): `fp` addresses the field inside a live,
     // header-validated compact object; the width is the layout's own.
-    let pushed = match site.storage {
+    let pushed = match storage {
         FieldStorageKind::Int => CompactValue::int(unsafe { load_u32(fp) } as i32),
         FieldStorageKind::Boolean => CompactValue::int((unsafe { load_u8(fp) } != 0) as i32),
         FieldStorageKind::Byte => CompactValue::int(unsafe { load_u8(fp) } as i8 as i32),
@@ -305,6 +328,91 @@ pub(super) fn getfield_fast_keyed(
     true
 }
 
+/// The legacy half of [`getfield_fast_keyed`]: one 16-byte tagged `Value`
+/// cell, decoded and converted exactly as `op_getfield`'s tail does.
+#[inline]
+fn getfield_legacy(
+    shared: &SharedVm,
+    stack: &mut ValueStack,
+    cell: *mut u8,
+    site: &FastFieldSite,
+) -> bool {
+    // SAFETY: `cell` is a 16-byte field cell of a live legacy object.
+    let Some(raw) = (unsafe { cratonvm_types::read_value_checked_atomic(cell as *const Value) })
+    else {
+        // A corrupt cell: leave it to the handler that owns the census.
+        return false;
+    };
+    match site.desc_byte {
+        b'J' => {
+            let bits: i64 = match raw {
+                Value::Long(x) => x,
+                Value::Double(x) => x.to_bits() as i64,
+                Value::Int(x) => x as i64,
+                Value::Object(None) | Value::Uninitialized => 0,
+                Value::Object(Some(r)) => r.as_ptr() as usize as i64,
+                Value::Float(x) => x.to_bits() as i64,
+                Value::ReturnAddress(pc) => pc as i64,
+            };
+            stack.pop_compact();
+            stack.push_compact_long(CompactValue::long(bits));
+        }
+        b'D' => {
+            let d: f64 = match raw {
+                Value::Double(x) => x,
+                Value::Long(x) => f64::from_bits(x as u64),
+                Value::Int(x) => x as f64,
+                Value::Object(None) | Value::Uninitialized => 0.0,
+                Value::Object(Some(r)) => f64::from_bits(r.as_ptr() as usize as u64),
+                Value::Float(x) => x as f64,
+                Value::ReturnAddress(pc) => pc as f64,
+            };
+            stack.pop_compact();
+            stack.push_compact_double(CompactValue::double_raw(d));
+        }
+        desc => {
+            let mut value = raw;
+            if site.is_reference {
+                match value {
+                    Value::Int(0) | Value::Long(0) => value = Value::Object(None),
+                    _ => {}
+                }
+            } else {
+                match value {
+                    Value::Object(None) => value = Value::Int(0),
+                    Value::Object(Some(r)) => {
+                        value = Value::Int(r.as_ptr() as usize as u64 as i32);
+                    }
+                    _ => {}
+                }
+                value = super::narrow_int_to_field_type(value, desc);
+            }
+            if let Value::Object(Some(inner)) = value {
+                value = Value::Object(Some(shared.mem.heap.load_and_forward(inner)));
+            }
+            stack.pop_compact();
+            stack.push_unchecked(value);
+        }
+    }
+    site_stats::bump(site_stats::FAST_GET_HIT);
+    true
+}
+
+/// Whether a trivial getter's `xreturn` opcode agrees with the field's type,
+/// the check `try_execute_cached_trivial_instance_getter` makes against the
+/// descriptor before it answers a getter without a frame.
+#[inline(always)]
+fn return_opcode_agrees(site: &FastFieldSite, ret_opcode: u8) -> bool {
+    matches!(
+        (site.desc_byte, ret_opcode),
+        (b'J', 0xad)
+            | (b'F', 0xae)
+            | (b'D', 0xaf)
+            | (b'L' | b'[', 0xb0)
+            | (b'Z' | b'B' | b'C' | b'S' | b'I', 0xac)
+    )
+}
+
 /// Quickened `putfield`. Pops the value and the receiver and stores, or
 /// leaves the stack untouched and returns `false` so the caller runs
 /// `op_putfield`.
@@ -335,8 +443,11 @@ pub(super) fn putfield_fast(
     let Some(fp) = field_ptr_for(zgc, ptr, &site) else {
         return false;
     };
+    let Some(storage) = site.storage else {
+        return putfield_legacy(zgc, &mut frame.stack, fp, ptr, &site, val, kind);
+    };
     // SAFETY (every raw store below): see `field_ptr_for`.
-    match site.storage {
+    match storage {
         FieldStorageKind::Int => {
             let Some(v) = val.as_int() else {
                 return false;
@@ -395,17 +506,85 @@ pub(super) fn putfield_fast(
                 }
             }
             unsafe { store_ref(fp, raw) };
-            zgc.note_ref_store(ptr as usize);
         }
     }
+    zgc.note_ref_store(ptr as usize);
     frame.stack.pop_compact();
     frame.stack.pop_compact();
     site_stats::bump(site_stats::FAST_PUT_HIT);
     true
 }
 
+/// The legacy half of [`putfield_fast`]: decode the operand-stack slot the way
+/// `op_putfield` does for this descriptor, then commit the whole 16-byte cell
+/// with the same barrier order `ZgcRealHeap::set_field` uses.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn putfield_legacy(
+    zgc: &ZgcRealHeap,
+    stack: &mut ValueStack,
+    cell: *mut u8,
+    recv: u64,
+    site: &FastFieldSite,
+    val: CompactValue,
+    kind: u8,
+) -> bool {
+    let value = match site.desc_byte {
+        b'J' => {
+            if kind != ValueStack::KIND_MARK_LONG {
+                return false;
+            }
+            Value::Long(val.as_long_unchecked())
+        }
+        b'D' => {
+            if kind != ValueStack::KIND_MARK_DOUBLE {
+                return false;
+            }
+            Value::Double(f64::from_bits(val.raw_bits()))
+        }
+        b'L' | b'[' => {
+            // `coerce_value_for_return_validated` is the identity on a slot
+            // that is already a reference or null; every other shape (an
+            // `Int(0)`, a smuggled long) keeps the slow path that owns it.
+            if val.is_null() {
+                Value::Object(None)
+            } else if let Some(p) = val.as_object_ptr() {
+                // SAFETY: an `Object`-tagged slot holds a heap address.
+                Value::Object(Some(unsafe { ObjectRef::from_raw(p as *mut u8) }))
+            } else {
+                return false;
+            }
+        }
+        desc => {
+            let Some(v) = val.as_int() else {
+                return false;
+            };
+            super::narrow_int_to_field_type(Value::Int(v), desc)
+        }
+    };
+    // The two things `ZgcRealHeap::set_field` does around the raw store, in
+    // its order: the SATB pre-barrier on the overwritten reference while
+    // marking is active, then the write, then the card note.
+    if zgc.mark_active() {
+        // SAFETY: `cell` is a live 16-byte field cell.
+        if let Some(Value::Object(Some(old))) =
+            unsafe { cratonvm_types::read_value_checked_atomic(cell as *const Value) }
+        {
+            zgc.satb_pre_barrier(old.as_ptr() as usize);
+        }
+    }
+    // SAFETY: `cell` is a live 16-byte field cell; `write_value_atomic` is the
+    // padding-free, marker-safe store `set_field` uses for this layout.
+    unsafe { cratonvm_types::write_value_atomic(cell as *mut Value, value) };
+    zgc.note_ref_store(recv as usize);
+    stack.pop_compact();
+    stack.pop_compact();
+    site_stats::bump(site_stats::FAST_PUT_HIT);
+    true
+}
+
 /// Record the site the slow handler just resolved, so the next access with a
-/// receiver of the same class takes the fast arm. Called by `op_getfield` and
+/// receiver of the same shape takes the fast arm. Called by `op_getfield` and
 /// `op_putfield` after the access succeeded.
 pub(super) fn fill_site(
     shared: &SharedVm,
@@ -436,19 +615,36 @@ pub(super) fn fill_site(
     }
     // SAFETY: `obj` is a registered object start (checked above).
     let header = unsafe { &*(obj.as_ptr() as *const ObjectHeader) };
-    let Some((offset, storage)) =
-        cratonvm_types::compact_object_field_storage(header, field.field_index)
-    else {
-        site_stats::bump(site_stats::FAST_FIELD_UNUSABLE);
-        return;
-    };
-    if FieldStorageKind::from_descriptor_byte(field.desc_byte) != Some(storage) {
-        site_stats::bump(site_stats::FAST_FIELD_UNUSABLE);
-        return;
-    }
+    let (offset, storage) =
+        match cratonvm_types::compact_object_field_storage(header, field.field_index) {
+            Some((offset, storage)) => {
+                if FieldStorageKind::from_descriptor_byte(field.desc_byte) != Some(storage) {
+                    site_stats::bump(site_stats::FAST_FIELD_UNUSABLE);
+                    report_unusable_once(header, field, "descriptor / storage disagree");
+                    return;
+                }
+                (offset, Some(storage))
+            }
+            None => {
+                if cratonvm_types::is_compact_object(header) {
+                    // A compact object whose `(class_id, field_count)` has no
+                    // registered layout: `get_field` itself refuses this one.
+                    site_stats::bump(site_stats::FAST_FIELD_UNUSABLE);
+                    report_unusable_once(header, field, "compact receiver, no layout");
+                    return;
+                }
+                if field.field_index >= header.num_slots() as usize {
+                    site_stats::bump(site_stats::FAST_FIELD_UNUSABLE);
+                    report_unusable_once(header, field, "field index beyond the legacy body");
+                    return;
+                }
+                (field.field_index * SLOT_SIZE, None)
+            }
+        };
     let (Ok(offset), Ok(field_index)) = (u32::try_from(offset), u32::try_from(field.field_index))
     else {
         site_stats::bump(site_stats::FAST_FIELD_UNUSABLE);
+        report_unusable_once(header, field, "offset or index out of u32 range");
         return;
     };
     thread.fast_field_sites.put(
@@ -461,6 +657,8 @@ pub(super) fn fill_site(
             offset,
             storage,
             field_index,
+            desc_byte: field.desc_byte,
+            is_reference: field.is_reference,
         },
     );
     site_stats::bump(if is_put {
@@ -468,6 +666,29 @@ pub(super) fn fill_site(
     } else {
         site_stats::FAST_GET_FILL
     });
+}
+
+/// Under `CRATONVM_DBG_FIELD_SITE=1`, say once per reason why a site could not
+/// be quickened — the engagement census counts `unusable` and this names it.
+#[cold]
+#[inline(never)]
+fn report_unusable_once(header: &ObjectHeader, field: &ResolvedField, why: &'static str) {
+    static REPORTED: AtomicU32 = AtomicU32::new(0);
+    if !site_stats::on() || REPORTED.fetch_add(1, Ordering::Relaxed) >= 8 {
+        return;
+    }
+    eprintln!(
+        "[fast-field] unusable: {why}: receiver class_id={} num_slots={} gc_flags={:#x} compact={} \
+         field_index={} desc_byte={:?} is_ref={} volatile={}",
+        header.class_id.as_u32(),
+        header.num_slots(),
+        header.gc_flags(),
+        cratonvm_types::is_compact_object(header),
+        field.field_index,
+        field.desc_byte as char,
+        field.is_reference,
+        field.is_volatile,
+    );
 }
 
 /// Snapshot the epochs a fill must be validated against; taken at slow
@@ -517,8 +738,8 @@ fn prim_elem_ptr(zgc: &ZgcRealHeap, arr: ObjectRef, index: i32, opcode: u8) -> O
         return None;
     }
     let actual = header.element_type();
-    let type_ok = actual == et
-        || (et == ArrayElementType::Byte && actual == ArrayElementType::Boolean);
+    let type_ok =
+        actual == et || (et == ArrayElementType::Byte && actual == ArrayElementType::Boolean);
     if !type_ok {
         return None;
     }
@@ -559,10 +780,9 @@ pub(super) fn array_load_prim(
     true
 }
 
-/// Quickened primitive `*astore`: stores `val` (already popped with its kind
-/// mark) and returns `true`, or returns `false` so the caller keeps the general
-/// path. The caller must not have popped the index and array yet unless it
-/// re-pushes them on `false`.
+/// Quickened primitive `*astore`: stores `val` (already peeked with its kind
+/// mark) and returns `true`, or returns `false` so the caller keeps the
+/// general path.
 #[inline]
 pub(super) fn array_store_prim(
     zgc: &ZgcRealHeap,

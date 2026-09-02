@@ -326,13 +326,25 @@ pub struct FastFieldSite {
     /// `ObjectHeader::num_slots()` of that receiver; the compact layout
     /// registry is keyed by `(class_id, field_count)`.
     pub num_slots: u32,
-    /// Byte offset of the field from the end of the object header.
+    /// Byte offset of the field from the end of the object header: the
+    /// layout's own for a compact body, `field_index * SLOT_SIZE` for a
+    /// legacy one.
     pub offset: u32,
-    /// Storage kind the layout assigned to the field.
-    pub storage: cratonvm_types::FieldStorageKind,
+    /// Storage kind the compact layout assigned to the field, or `None` when
+    /// the receiver has a **legacy** body — one 16-byte tagged `Value` cell
+    /// per field, which is what `ZgcRealHeap::try_alloc_object` (the TLAB path
+    /// the interpreter allocates through) produces. This doubles as the
+    /// body-shape discriminant the fast arms re-check against the receiver's
+    /// `GC_FLAG_COMPACT`.
+    pub storage: Option<cratonvm_types::FieldStorageKind>,
     /// `ResolvedField::field_index`, for the JVMTI watch check and the
     /// slow-path barrier calls that take a slot index.
     pub field_index: u32,
+    /// `ResolvedField::desc_byte` — the legacy arm converts the cell's
+    /// `Value` by descriptor exactly as `op_getfield` / `op_putfield` do.
+    pub desc_byte: u8,
+    /// `ResolvedField::is_reference`, for the same reason.
+    pub is_reference: bool,
 }
 
 pub type FastFieldSiteCache = SiteCache<FastFieldSite>;
@@ -521,7 +533,7 @@ pub mod site_stats {
     const ZERO: AtomicU64 = AtomicU64::new(0);
     static COUNTS: [AtomicU64; N] = [ZERO; N];
 
-    pub(super) fn on() -> bool {
+    pub fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| {
             cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FIELD_SITE").is_some()
