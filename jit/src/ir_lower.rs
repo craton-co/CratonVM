@@ -716,6 +716,11 @@ struct Lowerer<'a> {
     /// it from a flag read a second time would silently write outside its own
     /// reservation if the two reads ever disagreed.
     saved_xmm_bytes: i32,
+    /// Bytes reserved for the callee-saved GPR save area, immediately below
+    /// the XMM one: `[spill_cap_off, spill_cap_off + saved_gpr_bytes)`.
+    ///
+    /// Latched at construction for the same reason `saved_xmm_bytes` is.
+    saved_gpr_bytes: i32,
     /// Native offsets of `JE rel32` instructions emitted after each dispatch
     /// call (the exception sentinel check) that jump to the shared bail stub,
     /// each paired with the bytecode pc of the instruction whose exceptional
@@ -830,6 +835,15 @@ struct Lowerer<'a> {
     /// register that was never written. Adding a converted definition site is
     /// therefore additive; forgetting one is not a correctness event.
     reg_live: Vec<bool>,
+    /// `gp_reg_of[id]` = the GENERAL-PURPOSE register
+    /// [`plan_register_residency`] gave node `id` for its whole life. The
+    /// integer twin of `reg_of`; empty when the path is off.
+    gp_reg_of: Vec<Option<u8>>,
+    /// The same safety interlock as `reg_live`, for the GP file. A read
+    /// consults this and never `gp_reg_of` directly, so an unconverted
+    /// definition arm costs an optimization and can never produce a read of a
+    /// register nothing wrote.
+    gp_reg_live: Vec<bool>,
     /// Register → memory transitions this backend EMITTED for resident values
     /// (one per resident definition, because the wiring is write-through).
     /// Reported as `CompilationReport::spills`.
@@ -984,6 +998,7 @@ impl<'a> Lowerer<'a> {
         // could.
         let frame_size = estimate_frame_bytes(num_locals, slot_plan.slots, &needs) as i32;
         let saved_xmm_bytes = ir_saved_xmm_bytes();
+        let saved_gpr_bytes = ir_saved_gpr_bytes();
         debug_assert_eq!(
             frame_size,
             ((locals_size
@@ -991,6 +1006,7 @@ impl<'a> Lowerer<'a> {
                 + bookkeeping_size
                 + spill_size
                 + saved_xmm_bytes
+                + saved_gpr_bytes
                 + args_stage_size
                 + shadow
                 + stack_arg_reserve)
@@ -1084,8 +1100,15 @@ impl<'a> Lowerer<'a> {
         // 16*(i+1))]` and the 16 bytes it writes run up to `rbp -
         // spill_cap_off` exclusive — inside the reservation, never over a
         // spill.
-        let spill_cap_off =
-            frame_size - shadow - stack_arg_reserve - args_stage_size - saved_xmm_bytes;
+        // The GPR band sits below the XMM one and is excluded from the spill
+        // range on exactly the same footing: a spill that overlapped it would
+        // be silently destroyed by the prologue save.
+        let spill_cap_off = frame_size
+            - shadow
+            - stack_arg_reserve
+            - args_stage_size
+            - saved_xmm_bytes
+            - saved_gpr_bytes;
 
         Lowerer {
             graph,
@@ -1156,6 +1179,7 @@ impl<'a> Lowerer<'a> {
             args_stage_top_off,
             spill_cap_off,
             saved_xmm_bytes,
+            saved_gpr_bytes,
             call_exc_patches: Vec::new(),
             self_call_patches: Vec::new(),
             direct_calls,
@@ -1188,6 +1212,8 @@ impl<'a> Lowerer<'a> {
             // absent plan costs one bounds check and no allocation.
             reg_of: Vec::new(),
             reg_live: Vec::new(),
+            gp_reg_of: Vec::new(),
+            gp_reg_live: Vec::new(),
             ls_spills: 0,
             ls_reloads: 0,
             mir: None,
@@ -1205,6 +1231,8 @@ impl<'a> Lowerer<'a> {
     fn set_residency(&mut self, residency: RegResidency) {
         self.reg_live = vec![false; residency.reg_of.len()];
         self.reg_of = residency.reg_of;
+        self.gp_reg_live = vec![false; residency.gp_reg_of.len()];
+        self.gp_reg_of = residency.gp_reg_of;
     }
 
     /// Install the level-2 machine list. Called once, after construction and
@@ -1311,6 +1339,94 @@ impl<'a> Lowerer<'a> {
             self.ls_reloads += 1;
             self.mark_reg_live(id);
         }
+    }
+
+    // ── The general-purpose half of the same cache ──────────────────────
+    //
+    // Identical contract to the FP accessors above, over `IR_LOWER_LS_GPRS`
+    // rather than `IR_LOWER_LS_XMMS`: write-through, gated on `gp_reg_live` so
+    // a value is readable from a register only once its definition published it
+    // there, and `None` everywhere means the read falls back to the home word.
+    //
+    // This is the half that reaches an `int` loop counter — the gap the FP-only
+    // wiring's own doc comment named, and the reason this backend's bodies
+    // measured slower than the single-pass bodies they supersede.
+
+    /// The GP register `id`'s value is CURRENTLY resident in, if any.
+    fn resident_gpr(&self, id: NodeId) -> Option<u8> {
+        if !self.gp_reg_live.get(id as usize).copied().unwrap_or(false) {
+            return None;
+        }
+        self.gp_reg_of.get(id as usize).copied().flatten()
+    }
+
+    /// The register `id`'s value has been ASSIGNED, whether or not its
+    /// definition has published it yet. Only publishing sites may use this;
+    /// every reader goes through [`Self::resident_gpr`].
+    fn assigned_gpr(&self, id: NodeId) -> Option<u8> {
+        self.gp_reg_of.get(id as usize).copied().flatten()
+    }
+
+    /// Mark `id` readable from its assigned GP register.
+    fn mark_gp_reg_live(&mut self, id: NodeId) {
+        if let Some(cell) = self.gp_reg_live.get_mut(id as usize) {
+            *cell = true;
+        }
+    }
+
+    /// Load `id`'s value into `dst`, from its resident register when it has one
+    /// and from its home word otherwise.
+    ///
+    /// The read half of the GP cache. A site that still calls
+    /// `load_to_rax(self.slot_of(id))` directly is simply not accelerated,
+    /// which is a missed optimization and never wrong code: the home word is
+    /// written unconditionally.
+    fn gp_load_value(&mut self, dst: u8, id: NodeId) {
+        match self.resident_gpr(id) {
+            Some(src) => self.emit_mov_reg_reg64(dst, src),
+            None => {
+                let off = self.slot_of(id);
+                self.load_reg_from_frame(dst, off);
+            }
+        }
+    }
+
+    /// Write `id`'s result from `src`: ALWAYS to the home word, and
+    /// additionally into its resident register.
+    ///
+    /// The write-through invariant lives here. The home store is emitted
+    /// unconditionally and first, so the frame image is complete at every
+    /// instruction boundary — which is what lets `emit_safepoint_map`,
+    /// `build_deopt_points` and `emit_phi_copies` stay untouched.
+    fn gp_store_value(&mut self, id: NodeId, slot: i32, src: u8) {
+        self.store_abi_reg(src, slot);
+        if let Some(dst) = self.assigned_gpr(id) {
+            self.emit_mov_reg_reg64(dst, src);
+            self.ls_spills += 1;
+            self.mark_gp_reg_live(id);
+        }
+    }
+
+    /// Publish a result already stored to its home word into its register — the
+    /// memory → register transition, for definition sites whose result reaches
+    /// the home word by a route this cache does not intercept.
+    fn publish_gp_from_slot(&mut self, id: NodeId, slot: i32) {
+        if let Some(dst) = self.assigned_gpr(id) {
+            self.load_reg_from_frame(dst, slot);
+            self.ls_reloads += 1;
+            self.mark_gp_reg_live(id);
+        }
+    }
+
+    /// `MOV dst, src` — 64-bit register to register, for any pair including the
+    /// extended registers the GP file is made of.
+    fn emit_mov_reg_reg64(&mut self, dst: u8, src: u8) {
+        if dst == src {
+            return;
+        }
+        let rex = 0x48u8 | (((src >= 8) as u8) << 2) | ((dst >= 8) as u8);
+        self.buf
+            .emit(&[rex, 0x89, 0xC0 | ((src & 7) << 3) | (dst & 7)]);
     }
 
     /// Latch a structured bailout raised from an infallible legacy accessor.
@@ -1889,19 +2005,58 @@ impl<'a> Lowerer<'a> {
     fn emit_xmm_frame_move(&mut self, reg: u8, off: i32, store: bool) {
         debug_assert!(reg < 8, "xmm{reg} needs REX.R, which this encoding omits");
         self.buf.emit(&[0x0F, if store { 0x11 } else { 0x10 }]);
-        // ModRM: mod=10 (disp32), reg=xmm, rm=101 (rbp-relative).
-        self.buf.emit_byte(0x85 | ((reg & 7) << 3));
-        self.buf.emit(&(-off).to_le_bytes());
+        // ModRM + displacement for `[rbp - off]`, smallest legal form.
+        self.emit_rbp_modrm_disp(reg, off);
     }
 
-    /// Restore the callee-saved XMM registers. Emitted at every exit, and it
-    /// must not disturb RAX — a method's return value and the `i64::MIN`
-    /// exception/deopt sentinel both travel there — which `MOVUPS` into an XMM
-    /// satisfies for free.
+    /// The callee-saved GPRs this method actually parked a value in, paired
+    /// with the frame offset each is saved at.
+    ///
+    /// The GPR band sits immediately below the XMM one, so register `i` of
+    /// [`IR_LOWER_SAVED_GPRS`] lives at
+    /// `spill_cap_off + saved_xmm_bytes + 8*(i+1)` — the same "+1 so the
+    /// store's bytes land inside the reservation" shape `saved_xmm_regs` uses.
+    ///
+    /// Dynamic against a static reservation, for the reason stated there: the
+    /// residency plan is installed before `lower()` runs, so this set can only
+    /// shrink relative to [`IR_LOWER_SAVED_GPRS`], never grow past it. A method
+    /// that promotes nothing emits no save and no restore.
+    fn saved_gpr_regs(&self) -> impl Iterator<Item = (u8, i32)> + '_ {
+        let base = self.spill_cap_off + self.saved_xmm_bytes;
+        let reserved = self.saved_gpr_bytes;
+        IR_LOWER_SAVED_GPRS
+            .iter()
+            .enumerate()
+            .filter(move |_| reserved > 0)
+            .filter(move |(_, reg)| self.gp_reg_of.iter().any(|r| *r == Some(**reg)))
+            // Cast: `IR_LOWER_SAVED_GPRS` has five elements.
+            .map(move |(i, reg)| (*reg, base + (i as i32 + 1) * 8))
+    }
+
+    /// `MOV [rbp - off], reg` (save) or `MOV reg, [rbp - off]` (restore), for a
+    /// callee-saved GPR. Both directions already exist as frame accessors that
+    /// pick the smallest displacement form; this names the pair.
+    fn emit_gpr_frame_move(&mut self, reg: u8, off: i32, store: bool) {
+        if store {
+            self.store_abi_reg(reg, off);
+        } else {
+            self.load_reg_from_frame(reg, off);
+        }
+    }
+
+    /// Restore the callee-saved registers. Emitted at every exit, and it must
+    /// not disturb RAX — a method's return value and the `i64::MIN`
+    /// exception/deopt sentinel both travel there. `MOVUPS` into an XMM
+    /// satisfies that for free, and the GPR restores target RBX/R12–R15, which
+    /// is a set RAX could never have been in: see `IR_GP_LINEAR_SCAN`.
     fn emit_callee_saved_restore(&mut self) {
         let restores: Vec<(u8, i32)> = self.saved_xmm_regs().collect();
         for (reg, off) in restores {
             self.emit_xmm_frame_move(reg, off, false);
+        }
+        let gpr_restores: Vec<(u8, i32)> = self.saved_gpr_regs().collect();
+        for (reg, off) in gpr_restores {
+            self.emit_gpr_frame_move(reg, off, false);
         }
     }
 
@@ -1922,6 +2077,12 @@ impl<'a> Lowerer<'a> {
         let saves: Vec<(u8, i32)> = self.saved_xmm_regs().collect();
         for (reg, off) in saves {
             self.emit_xmm_frame_move(reg, off, true);
+        }
+        // …and the callee-saved GPR file, on the same footing and for the same
+        // reason: every register in it belongs to the caller on both ABIs.
+        let gpr_saves: Vec<(u8, i32)> = self.saved_gpr_regs().collect();
+        for (reg, off) in gpr_saves {
+            self.emit_gpr_frame_move(reg, off, true);
         }
 
         // Store params from ABI registers to local frame slots.
@@ -2584,7 +2745,7 @@ impl<'a> Lowerer<'a> {
         let cell_off = (HEADER_SIZE + c_off as usize) as i32;
         let mut slow: Vec<usize> = Vec::new();
 
-        self.load_to_rax(self.slot_of(base));
+        self.gp_load_value(RAX, base);
         // 1. null → slow (the helper raises the NPE).
         self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
         slow.push(self.emit_jcc_rel32(0x84)); // JZ
@@ -3009,32 +3170,56 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// MOV reg, [RBP - offset]  (REX.W [+ REX.R]; disp32 form). General form of
-    /// `load_to_rax`/`load_to_rcx` for an arbitrary (possibly extended) dest.
-    fn load_reg_from_frame(&mut self, reg: u8, offset: i32) {
+    /// Emit the ModRM byte and displacement of a `[RBP - offset]` operand whose
+    /// ModRM `reg` field is `reg`, choosing the **smallest legal form**.
+    ///
+    /// RBP has no `mod=00` encoding — that bit pattern is RIP-relative — so the
+    /// two forms are `mod=01` + disp8 and `mod=10` + disp32, and a zero
+    /// displacement still needs an explicit disp8 of `0`. Same rule
+    /// `x64::disp` states for the single-pass backend, applied here because
+    /// this is the backend that touches the frame on *every* value read.
+    ///
+    /// One helper rather than the rule repeated per emitter: the per-emitter
+    /// shape is exactly how `store_abi_reg` came to pick the short form while
+    /// `load_reg_from_frame` directly below it kept emitting disp32.
+    fn emit_rbp_modrm_disp(&mut self, reg: u8, offset: i32) {
         let neg = -offset;
+        if (i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&neg) {
+            // mod=01, r/m=RBP(101), disp8
+            self.buf.emit_byte(0x45 | ((reg & 7) << 3));
+            // Cast: guarded by the range check above.
+            self.buf.emit_byte(neg as u8);
+        } else {
+            // mod=10, r/m=RBP(101), disp32
+            self.buf.emit_byte(0x85 | ((reg & 7) << 3));
+            self.buf.emit(&neg.to_le_bytes());
+        }
+    }
+
+    /// MOV reg, [RBP - offset]  (REX.W [+ REX.R]; smallest displacement form).
+    /// General form of `load_to_rax`/`load_to_rcx` for an arbitrary (possibly
+    /// extended) destination.
+    fn load_reg_from_frame(&mut self, reg: u8, offset: i32) {
         let mut prefix = 0x48u8;
         if reg >= 8 {
             prefix |= 0x04;
         }
         self.buf.emit_byte(prefix);
         self.buf.emit_byte(0x8B);
-        self.buf.emit_byte(0x85 | ((reg & 7) << 3));
-        self.buf.emit(&neg.to_le_bytes());
+        self.emit_rbp_modrm_disp(reg, offset);
     }
 
-    /// LEA reg, [RBP - offset]  (REX.W [+ REX.R]; disp32 form). Used to compute
-    /// the `args_ptr` the dispatch helper reads the marshalled Java args from.
+    /// LEA reg, [RBP - offset]  (REX.W [+ REX.R]; smallest displacement form).
+    /// Used to compute the `args_ptr` the dispatch helper reads the marshalled
+    /// Java args from.
     fn lea_reg_from_frame(&mut self, reg: u8, offset: i32) {
-        let neg = -offset;
         let mut prefix = 0x48u8;
         if reg >= 8 {
             prefix |= 0x04;
         }
         self.buf.emit_byte(prefix);
         self.buf.emit_byte(0x8D);
-        self.buf.emit_byte(0x85 | ((reg & 7) << 3));
-        self.buf.emit(&neg.to_le_bytes());
+        self.emit_rbp_modrm_disp(reg, offset);
     }
 
     /// `MOV qword [rbp - off], 0` (mod=10 disp32, /0).
@@ -3166,27 +3351,25 @@ impl<'a> Lowerer<'a> {
     // XMM: a float/double constant is just its bit pattern written via a GPR
     // immediate, and negation is a sign-bit XOR on the integer bit pattern.
     // XMM0/XMM1 are the FP analogues of RAX/RCX. Both are < 8, so no REX is
-    // needed; `[rbp - offset]` always uses the disp32 ModRM form (mod=10, the
-    // `0x85 | reg<<3` byte) for simplicity.
+    // needed; the `[rbp - offset]` operand goes through
+    // `emit_rbp_modrm_disp`, which picks disp8 or disp32 — the ModRM `reg`
+    // field is an XMM number here rather than a GPR number, which changes
+    // nothing about the encoding of the memory half.
 
     /// MOVSS/MOVSD xmm, [rbp - offset] — load a 32/64-bit FP value from a slot.
     fn fp_load(&mut self, xmm: u8, offset: i32, is_double: bool) {
-        let neg = -offset;
         self.buf.emit_byte(if is_double { 0xF2 } else { 0xF3 });
         self.buf.emit(&[0x0F, 0x10]);
-        self.buf.emit_byte(0x85 | ((xmm & 7) << 3));
-        self.buf.emit(&neg.to_le_bytes());
+        self.emit_rbp_modrm_disp(xmm, offset);
     }
 
     /// MOVSS/MOVSD [rbp - offset], xmm — store an FP value to a slot. A `MOVSS`
     /// writes only the low 4 bytes; the slot's high 4 are left stale, which is
     /// harmless because every float consumer reads it back with `MOVSS` (4 bytes).
     fn fp_store(&mut self, offset: i32, xmm: u8, is_double: bool) {
-        let neg = -offset;
         self.buf.emit_byte(if is_double { 0xF2 } else { 0xF3 });
         self.buf.emit(&[0x0F, 0x11]);
-        self.buf.emit_byte(0x85 | ((xmm & 7) << 3));
-        self.buf.emit(&neg.to_le_bytes());
+        self.emit_rbp_modrm_disp(xmm, offset);
     }
 
     /// Scalar FP binary op (`<prefix> 0F <op>`), reg-reg form `dst op= src`.
@@ -3554,18 +3737,25 @@ impl<'a> Lowerer<'a> {
         has_receiver: bool,
         bci: usize,
     ) {
-        for i in 0..num_args {
-            let arg = inputs[2 + i];
-            self.load_to_rax(self.slot_of(arg));
-            // JVMS 6.5 on argument 0 of a receiver-bearing call. Deopt rather
-            // than raise inline: the interpreter re-executes this invoke and
-            // owns the canonical NPE, its message and its stack trace, exactly
-            // as it does for the field-access null checks above.
-            if i == 0 && has_receiver {
-                self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
-                self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
-            }
-            self.store_rax(self.args_stage_top_off - (i as i32) * 8);
+        // JVMS 6.5 on argument 0 of a receiver-bearing call. Deopt rather than
+        // raise inline: the interpreter re-executes this invoke and owns the
+        // canonical NPE, its message and its stack trace, exactly as it does
+        // for the field-access null checks elsewhere in this lowerer.
+        //
+        // This is all that survives of the loop that used to run here. The
+        // rest of it copied every argument into the staging region, whose only
+        // reader is `emit_inline_callee_deopt_service` — reached when the
+        // callee returns the deopt sentinel, and otherwise never. Paying N
+        // loads and N stores on the hot path so a cold path could read a
+        // contiguous array made every call cost 3N memory operations where N
+        // does: the register marshal below reads the same frame slots again.
+        // The staging now happens inside that cold block, out of those same
+        // slots, which still hold the same values there because nothing
+        // between the marshal and the sentinel test writes them.
+        if has_receiver && num_args > 0 {
+            self.gp_load_value(RAX, inputs[2]);
+            self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+            self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
         }
         let base = usize::from(callee_needs_ctx);
         // Java arguments that fit the register file, and the remainder that
@@ -3584,7 +3774,7 @@ impl<'a> Lowerer<'a> {
         // it is loaded.
         for k in 0..stack_args {
             let arg = inputs[2 + reg_capacity + k];
-            self.load_to_rax(self.slot_of(arg));
+            self.gp_load_value(RAX, arg);
             // Cast: a stack-arg index is bounded by the callee's parameter
             // count, so `k * 8` cannot overflow an x86-64 displacement.
             self.emit_mov_rsp_disp_from_rax(base_disp + (k as i32) * 8);
@@ -3594,7 +3784,7 @@ impl<'a> Lowerer<'a> {
         }
         for i in 0..num_args.min(reg_capacity) {
             let arg = inputs[2 + i];
-            self.load_reg_from_frame(ENTRY_ABI_REGS[base + i], self.slot_of(arg));
+            self.gp_load_value(ENTRY_ABI_REGS[base + i], arg);
         }
         // MOV RAX, entry ; CALL RAX.
         self.emit_mov_reg_imm64(RAX, entry as u64);
@@ -3606,7 +3796,7 @@ impl<'a> Lowerer<'a> {
         if total_sub > 0 {
             self.emit_add_rsp_imm32(total_sub);
         }
-        self.emit_inline_callee_deopt_service(info_ptr, num_args);
+        self.emit_inline_callee_deopt_service(info_ptr, num_args, inputs);
         self.emit_call_return_check(slot, ty);
     }
 
@@ -3632,9 +3822,27 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Service an exceptional return from an inline cached compiled callee.
-    /// The arguments already live in the fixed staging area, so this preserves
-    /// the callee identity and incoming locals until its own handler can run.
-    fn emit_inline_callee_deopt_service(&mut self, info_ptr: usize, num_args: usize) {
+    ///
+    /// The service reads the outgoing Java arguments as a contiguous array, so
+    /// they have to be materialised into the staging region — but **here**, on
+    /// the sentinel-taken side of the branch, not at the call site.
+    ///
+    /// They used to be staged unconditionally before every call, which cost N
+    /// loads and N stores on a path that then loaded the same N frame slots
+    /// again to marshal them into ABI registers: 3N memory operations per call
+    /// for a cold path's convenience. Staging here is sound because the
+    /// arguments live in the lowerer's own frame slots and nothing between the
+    /// marshal and this test writes them — the callee cannot, it owns a
+    /// different frame, and the marshal only reads.
+    ///
+    /// `inputs` is the call node's input list; arguments start at index 2, the
+    /// same convention every caller in this file uses.
+    fn emit_inline_callee_deopt_service(
+        &mut self,
+        info_ptr: usize,
+        num_args: usize,
+        inputs: &[NodeId],
+    ) {
         if self.service_callee_deopt == 0 {
             return;
         }
@@ -3643,6 +3851,15 @@ impl<'a> Lowerer<'a> {
         self.buf.emit(&[0x0F, 0x85]); // JNE .done
         let skip = self.buf.pos();
         self.buf.emit(&[0, 0, 0, 0]);
+        // ── cold from here ──────────────────────────────────────────────
+        // RAX holds the sentinel, so it is free as the transfer scratch.
+        for i in 0..num_args {
+            let arg = inputs[2 + i];
+            self.gp_load_value(RAX, arg);
+            // Cast: an argument index is bounded by the callee's parameter
+            // count, so `i * 8` cannot overflow an x86-64 displacement.
+            self.store_rax(self.args_stage_top_off - (i as i32) * 8);
+        }
         self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
         self.emit_mov_reg_imm64(CALL_ARG_REGS[1], info_ptr as u64);
         self.lea_reg_from_frame(CALL_ARG_REGS[2], self.args_stage_top_off);
@@ -3717,7 +3934,7 @@ impl<'a> Lowerer<'a> {
         };
         for i in 0..num_args {
             let arg = inputs[2 + i];
-            self.load_reg_from_frame(ENTRY_ABI_REGS[base + i], self.slot_of(arg));
+            self.gp_load_value(ENTRY_ABI_REGS[base + i], arg);
         }
     }
 
@@ -3894,15 +4111,24 @@ impl<'a> Lowerer<'a> {
         );
         let mut done_patches: Vec<usize> = Vec::new();
         let mut slow_patches: Vec<usize> = Vec::new();
-        // The MIC/PIC hit service needs the exact outgoing Java arguments too.
-        for i in 0..num_args {
-            let arg = inputs[2 + i];
-            self.load_to_rax(self.slot_of(arg));
-            self.store_rax(self.args_stage_top_off - (i as i32) * 8);
-        }
+        // The staging loop that used to run HERE — N loads and N stores ahead
+        // of the guards, on every execution of every virtual call site — is
+        // gone. Its three readers now each populate the block on their own cold
+        // side:
+        //
+        //   * a MIC or PIC hit that returns the deopt sentinel — staged inside
+        //     `emit_inline_callee_deopt_service`, past its `JNE .done`;
+        //   * the shared hashed/vtable stub — staged immediately before it, in
+        //     the megamorphic region rather than ahead of the monomorphic
+        //     guard;
+        //   * the resolving slow helper — which already re-staged for itself,
+        //     which is what made the copy up here redundant even before this.
+        //
+        // All three read the same frame slots, and nothing between this point
+        // and any of them writes those slots.
 
         // Receiver = arg0. Load it and its class id ONCE for the whole cascade.
-        self.load_to_rax(self.slot_of(inputs[2]));
+        self.gp_load_value(RAX, inputs[2]);
         self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
         slow_patches.push(self.emit_jcc_rel32(0x84)); // JZ .slow
                                                       // Array-receiver guard — `ObjectHeader.class_id` (offset 0) holds a
@@ -3934,7 +4160,7 @@ impl<'a> Lowerer<'a> {
         self.emit_ic_abi_marshal(inputs, num_args, false);
         self.patch_rel32_to_here(mic_call);
         self.emit_call_cached_entry(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8);
-        self.emit_inline_callee_deopt_service(info_ptr, num_args);
+        self.emit_inline_callee_deopt_service(info_ptr, num_args, inputs);
         done_patches.push(self.emit_jmp_rel32());
 
         // ── Polymorphic 4-way cascade ───────────────────────────────
@@ -3963,7 +4189,7 @@ impl<'a> Lowerer<'a> {
             self.emit_ic_abi_marshal(inputs, num_args, false);
             self.patch_rel32_to_here(call);
             self.emit_call_cached_entry(JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8);
-            self.emit_inline_callee_deopt_service(info_ptr, num_args);
+            self.emit_inline_callee_deopt_service(info_ptr, num_args, inputs);
             done_patches.push(self.emit_jmp_rel32());
         }
         debug_assert!(next_entry.is_none());
@@ -3973,11 +4199,22 @@ impl<'a> Lowerer<'a> {
             self.patch_rel32_to_here(p);
         }
         let arg_offsets: Vec<i32> = (0..num_args).map(|i| self.slot_of(inputs[2 + i])).collect();
+        // Populate the staging block for the stub's own callee-deopt service.
+        // This is the megamorphic region — reached only after the MIC and all
+        // four PIC entries missed — so the copy costs nothing on a
+        // monomorphic site, which is where it used to be paid.
+        for i in 0..num_args {
+            let arg = inputs[2 + i];
+            self.gp_load_value(RAX, arg);
+            // Cast: an argument index is bounded by the callee's parameter
+            // count, so `i * 8` cannot overflow an x86-64 displacement.
+            self.store_rax(self.args_stage_top_off - (i as i32) * 8);
+        }
         // `arg_offsets` are each argument's own register-allocated home slot,
         // which the stub loads into the ABI registers one at a time. They are
         // NOT a contiguous block, so the callee-deopt service -- which reads
         // `num_args` consecutive slots to rebuild the callee's incoming
-        // locals -- must be pointed at the staging block written above instead.
+        // locals -- must be pointed at the staging block just written instead.
         done_patches.extend(crate::runtime_lowering::emit_hashed_vtable_stub(
             &mut self.buf,
             pic,
@@ -3994,7 +4231,7 @@ impl<'a> Lowerer<'a> {
         // marshalling is identical to the generic path below.
         for i in 0..num_args {
             let arg = inputs[2 + i];
-            self.load_to_rax(self.slot_of(arg));
+            self.gp_load_value(RAX, arg);
             self.store_rax(self.args_stage_top_off - (i as i32) * 8);
         }
         self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off); // vm_ptr
@@ -4495,8 +4732,8 @@ impl<'a> Lowerer<'a> {
                     self.fp_binop(0x58, XMM0, XMM1, is_d);
                     self.fp_store_value(id, slot, XMM0, is_d);
                 } else {
-                    self.load_to_rax(self.slot_of(node.inputs[0]));
-                    self.load_to_rcx(self.slot_of(node.inputs[1]));
+                    self.gp_load_value(RAX, node.inputs[0]);
+                    self.gp_load_value(RCX, node.inputs[1]);
                     if node.ty == IrType::Int {
                         // ADD EAX, ECX
                         self.buf.emit(&[0x01, 0xC8]);
@@ -4517,8 +4754,8 @@ impl<'a> Lowerer<'a> {
                     self.fp_binop(0x5C, XMM0, XMM1, is_d);
                     self.fp_store_value(id, slot, XMM0, is_d);
                 } else {
-                    self.load_to_rax(self.slot_of(node.inputs[0]));
-                    self.load_to_rcx(self.slot_of(node.inputs[1]));
+                    self.gp_load_value(RAX, node.inputs[0]);
+                    self.gp_load_value(RCX, node.inputs[1]);
                     if node.ty == IrType::Int {
                         // SUB EAX, ECX
                         self.buf.emit(&[0x29, 0xC8]);
@@ -4539,8 +4776,8 @@ impl<'a> Lowerer<'a> {
                     self.fp_binop(0x59, XMM0, XMM1, is_d);
                     self.fp_store_value(id, slot, XMM0, is_d);
                 } else {
-                    self.load_to_rax(self.slot_of(node.inputs[0]));
-                    self.load_to_rcx(self.slot_of(node.inputs[1]));
+                    self.gp_load_value(RAX, node.inputs[0]);
+                    self.gp_load_value(RCX, node.inputs[1]);
                     if node.ty == IrType::Int {
                         // IMUL EAX, ECX
                         self.buf.emit(&[0x0F, 0xAF, 0xC1]);
@@ -4566,8 +4803,8 @@ impl<'a> Lowerer<'a> {
                 }
                 let ty = node.ty;
                 let bpc = node.bytecode_pc;
-                self.load_to_rax(self.slot_of(node.inputs[0]));
-                self.load_to_rcx(self.slot_of(node.inputs[1]));
+                self.gp_load_value(RAX, node.inputs[0]);
+                self.gp_load_value(RCX, node.inputs[1]);
                 let zero_after = self.emit_div_zero_guard(ty, bpc);
                 // JVMS MIN/-1 overflow guard: materialise MIN and skip the IDIV
                 // (a raw IDIV on MIN/-1 raises #DE).
@@ -4617,8 +4854,8 @@ impl<'a> Lowerer<'a> {
                 }
                 let ty = node.ty;
                 let bpc = node.bytecode_pc;
-                self.load_to_rax(self.slot_of(node.inputs[0]));
-                self.load_to_rcx(self.slot_of(node.inputs[1]));
+                self.gp_load_value(RAX, node.inputs[0]);
+                self.gp_load_value(RCX, node.inputs[1]);
                 let zero_after = self.emit_div_zero_guard(ty, bpc);
                 // JVMS MIN/-1 overflow guard: materialise remainder 0 and skip
                 // the IDIV (a raw IDIV on MIN/-1 raises #DE).
@@ -4845,7 +5082,7 @@ impl<'a> Lowerer<'a> {
             }
             Op::Neg => {
                 let slot = self.alloc_slot(id);
-                self.load_to_rax(self.slot_of(node.inputs[0]));
+                self.gp_load_value(RAX, node.inputs[0]);
                 match node.ty {
                     // FP negation = flip the IEEE sign bit of the bit pattern
                     // (correct for ±0.0 and NaN, unlike `0.0 - x`). Done on the
@@ -4880,32 +5117,32 @@ impl<'a> Lowerer<'a> {
             }
             Op::And => {
                 let slot = self.alloc_slot(id);
-                self.load_to_rax(self.slot_of(node.inputs[0]));
-                self.load_to_rcx(self.slot_of(node.inputs[1]));
+                self.gp_load_value(RAX, node.inputs[0]);
+                self.gp_load_value(RCX, node.inputs[1]);
                 // AND RAX, RCX
                 self.buf.emit(&[0x48, 0x21, 0xC8]);
                 self.store_rax(slot);
             }
             Op::Or => {
                 let slot = self.alloc_slot(id);
-                self.load_to_rax(self.slot_of(node.inputs[0]));
-                self.load_to_rcx(self.slot_of(node.inputs[1]));
+                self.gp_load_value(RAX, node.inputs[0]);
+                self.gp_load_value(RCX, node.inputs[1]);
                 // OR RAX, RCX
                 self.buf.emit(&[0x48, 0x09, 0xC8]);
                 self.store_rax(slot);
             }
             Op::Xor => {
                 let slot = self.alloc_slot(id);
-                self.load_to_rax(self.slot_of(node.inputs[0]));
-                self.load_to_rcx(self.slot_of(node.inputs[1]));
+                self.gp_load_value(RAX, node.inputs[0]);
+                self.gp_load_value(RCX, node.inputs[1]);
                 // XOR RAX, RCX
                 self.buf.emit(&[0x48, 0x31, 0xC8]);
                 self.store_rax(slot);
             }
             Op::Shl => {
                 let slot = self.alloc_slot(id);
-                self.load_to_rax(self.slot_of(node.inputs[0]));
-                self.load_to_rcx(self.slot_of(node.inputs[1]));
+                self.gp_load_value(RAX, node.inputs[0]);
+                self.gp_load_value(RCX, node.inputs[1]);
                 if node.ty == IrType::Int {
                     // SHL EAX, CL
                     self.buf.emit(&[0xD3, 0xE0]);
@@ -4917,8 +5154,8 @@ impl<'a> Lowerer<'a> {
             }
             Op::Shr => {
                 let slot = self.alloc_slot(id);
-                self.load_to_rax(self.slot_of(node.inputs[0]));
-                self.load_to_rcx(self.slot_of(node.inputs[1]));
+                self.gp_load_value(RAX, node.inputs[0]);
+                self.gp_load_value(RCX, node.inputs[1]);
                 if node.ty == IrType::Int {
                     // SAR EAX, CL
                     self.buf.emit(&[0xD3, 0xF8]);
@@ -4930,8 +5167,8 @@ impl<'a> Lowerer<'a> {
             }
             Op::UShr => {
                 let slot = self.alloc_slot(id);
-                self.load_to_rax(self.slot_of(node.inputs[0]));
-                self.load_to_rcx(self.slot_of(node.inputs[1]));
+                self.gp_load_value(RAX, node.inputs[0]);
+                self.gp_load_value(RCX, node.inputs[1]);
                 if node.ty == IrType::Int {
                     // SHR EAX, CL
                     self.buf.emit(&[0xD3, 0xE8]);
@@ -4943,8 +5180,8 @@ impl<'a> Lowerer<'a> {
             }
             Op::Cmp(cc) => {
                 let slot = self.alloc_slot(id);
-                self.load_to_rax(self.slot_of(node.inputs[0]));
-                self.load_to_rcx(self.slot_of(node.inputs[1]));
+                self.gp_load_value(RAX, node.inputs[0]);
+                self.gp_load_value(RCX, node.inputs[1]);
                 // CMP EAX, ECX — 32-bit for the int comparisons this node was
                 // introduced for. A REFERENCE comparison (`ifnull`,
                 // `if_acmpeq`) must compare all 64 bits: a heap pointer whose
@@ -4988,8 +5225,8 @@ impl<'a> Lowerer<'a> {
             // correctly (the typical consumer is an `if<cond>` against 0).
             Op::LCmp => {
                 let slot = self.alloc_slot(id);
-                self.load_to_rax(self.slot_of(node.inputs[0])); // a
-                self.load_to_rcx(self.slot_of(node.inputs[1])); // b
+                self.gp_load_value(RAX, node.inputs[0]); // a
+                self.gp_load_value(RCX, node.inputs[1]); // b
                 self.buf.emit(&[0x48, 0x39, 0xC8]); // CMP RAX, RCX (signed, 64-bit)
                 self.buf.emit(&[0x0F, 0x9F, 0xC0]); // SETG AL  (a > b)
                 self.buf.emit(&[0x0F, 0x9C, 0xC2]); // SETL DL  (a < b)
@@ -5044,14 +5281,14 @@ impl<'a> Lowerer<'a> {
             }
             Op::I2L => {
                 let slot = self.alloc_slot(id);
-                self.load_to_rax(self.slot_of(node.inputs[0]));
+                self.gp_load_value(RAX, node.inputs[0]);
                 // MOVSXD RAX, EAX
                 self.buf.emit(&[0x48, 0x63, 0xC0]);
                 self.store_rax(slot);
             }
             Op::L2I => {
                 let slot = self.alloc_slot(id);
-                self.load_to_rax(self.slot_of(node.inputs[0]));
+                self.gp_load_value(RAX, node.inputs[0]);
                 // MOV EAX, EAX (zero-extend / truncate to 32 bits)
                 self.buf.emit(&[0x89, 0xC0]);
                 self.store_rax(slot);
@@ -5217,7 +5454,7 @@ impl<'a> Lowerer<'a> {
                         + FIELD_CELL_PAYLOAD32_OFFSET as i32;
                     // Receiver pointer → RAX (64-bit; a Param slot holds the full
                     // pointer the prologue stored from the argument register).
-                    self.load_to_rax(self.slot_of(base));
+                    self.gp_load_value(RAX, base);
                     // TEST RAX,RAX ; JE +9 → null path (the trailing XOR EAX,EAX).
                     self.buf.emit(&[0x48, 0x85, 0xC0]);
                     self.buf.emit(&[0x74, 0x09]);
@@ -5275,7 +5512,7 @@ impl<'a> Lowerer<'a> {
                 // implausible receiver, so calling it unguarded would convert a
                 // NullPointerException into a dropped store.
                 if matches!(kind, MemKind::Ref) {
-                    self.load_to_rax(self.slot_of(base));
+                    self.gp_load_value(RAX, base);
                     self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
                     self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
                     // jit_putfield_object(vm_ptr, obj_ptr, field_index, val).
@@ -5302,7 +5539,7 @@ impl<'a> Lowerer<'a> {
                     _ => None,
                 };
                 if let Some(helper) = wide_helper {
-                    self.load_to_rax(self.slot_of(base));
+                    self.gp_load_value(RAX, base);
                     self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
                     self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
                     self.load_reg_from_frame(CALL_ARG_REGS[0], self.slot_of(base));
@@ -5324,7 +5561,7 @@ impl<'a> Lowerer<'a> {
                 // dropped store — the exact silent-data-loss defect the inline
                 // path was fixed for in cd451faccc.
                 if cratonvm_types::compact_ref_fields_enabled() {
-                    self.load_to_rax(self.slot_of(base));
+                    self.gp_load_value(RAX, base);
                     self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
                     self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
                     // jit_putfield_int(obj_ptr, field_index, val) — no context.
@@ -5339,8 +5576,8 @@ impl<'a> Lowerer<'a> {
                     return;
                 }
                 // Receiver → RAX, value → RCX.
-                self.load_to_rax(self.slot_of(base));
-                self.load_to_rcx(self.slot_of(value));
+                self.gp_load_value(RAX, base);
+                self.gp_load_value(RCX, value);
                 // A null receiver is a NullPointerException, not a no-op. This
                 // arm used to `JE` over the store, silently dropping it and
                 // continuing — the same silent-data-loss defect fixed in the
@@ -5385,16 +5622,16 @@ impl<'a> Lowerer<'a> {
                 // the header displacement are identical for every width — the
                 // only thing that varies is one instruction.
                 if !matches!(kind, MemKind::Float | MemKind::Double) {
-                    self.load_to_rax(self.slot_of(node.inputs[2])); // array → RAX
-                    self.load_to_rcx(self.slot_of(node.inputs[3])); // index → RCX
+                    self.gp_load_value(RAX, node.inputs[2]); // array → RAX
+                    self.gp_load_value(RCX, node.inputs[3]); // index → RCX
                     self.emit_array_null_bounds_guards(bci);
                     self.emit_gpr_array_elem_load(*kind);
                     self.store_rax(slot);
                     return;
                 }
                 let is_d = matches!(kind, MemKind::Double);
-                self.load_to_rax(self.slot_of(node.inputs[2])); // array → RAX
-                self.load_to_rcx(self.slot_of(node.inputs[3])); // index → RCX
+                self.gp_load_value(RAX, node.inputs[2]); // array → RAX
+                self.gp_load_value(RCX, node.inputs[3]); // index → RCX
                 self.emit_array_null_bounds_guards(bci);
                 // MOVSS/MOVSD XMM0, [RAX + RCX*{4,8} + HEADER_SIZE]. ModRM 0x44
                 // (mod=01, reg=XMM0, r/m=SIB); SIB 0x88 (*4) / 0xC8 (*8), idx=RCX,
@@ -5434,16 +5671,16 @@ impl<'a> Lowerer<'a> {
                         return;
                     }
                     self.load_reg_from_frame(RDX, self.slot_of(node.inputs[4])); // value → RDX
-                    self.load_to_rax(self.slot_of(node.inputs[2])); // array → RAX
-                    self.load_to_rcx(self.slot_of(node.inputs[3])); // index → RCX
+                    self.gp_load_value(RAX, node.inputs[2]); // array → RAX
+                    self.gp_load_value(RCX, node.inputs[3]); // index → RCX
                     self.emit_array_null_bounds_guards(bci);
                     self.emit_gpr_array_elem_store(*kind);
                     return;
                 }
                 let is_d = matches!(kind, MemKind::Double);
                 self.fp_load_value(XMM0, node.inputs[4], is_d); // value → XMM0
-                self.load_to_rax(self.slot_of(node.inputs[2])); // array → RAX
-                self.load_to_rcx(self.slot_of(node.inputs[3])); // index → RCX
+                self.gp_load_value(RAX, node.inputs[2]); // array → RAX
+                self.gp_load_value(RCX, node.inputs[3]); // index → RCX
                 self.emit_array_null_bounds_guards(bci);
                 // MOVSS/MOVSD [RAX + RCX*{4,8} + HEADER_SIZE], XMM0 (opcode 0x11).
                 let prefix = if is_d { 0xF2 } else { 0xF3 };
@@ -5469,7 +5706,7 @@ impl<'a> Lowerer<'a> {
             Op::ArrayLength => {
                 let slot = self.alloc_slot(id);
                 let bci = node.bytecode_pc.unwrap_or(0);
-                self.load_to_rax(self.slot_of(node.inputs[2])); // array → RAX
+                self.gp_load_value(RAX, node.inputs[2]); // array → RAX
                 self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
                 self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
                 self.buf.emit(&[
@@ -5640,7 +5877,7 @@ impl<'a> Lowerer<'a> {
                 // 1. Marshal each Java arg into the staging region.
                 for i in 0..num_args {
                     let arg = node.inputs[2 + i];
-                    self.load_to_rax(self.slot_of(arg));
+                    self.gp_load_value(RAX, arg);
                     self.store_rax(self.args_stage_top_off - (i as i32) * 8);
                 }
                 // 2. Load the helper's four register arguments.
@@ -6029,14 +6266,14 @@ impl<'a> Lowerer<'a> {
             // int → float / double. Load the int operand to EAX and convert.
             Op::I2F => {
                 let slot = self.alloc_slot(id);
-                self.load_to_rax(self.slot_of(node.inputs[0]));
+                self.gp_load_value(RAX, node.inputs[0]);
                 // CVTSI2SS XMM0, EAX
                 self.buf.emit(&[0xF3, 0x0F, 0x2A, 0xC0]);
                 self.fp_store_value(id, slot, XMM0, false);
             }
             Op::I2D => {
                 let slot = self.alloc_slot(id);
-                self.load_to_rax(self.slot_of(node.inputs[0]));
+                self.gp_load_value(RAX, node.inputs[0]);
                 // CVTSI2SD XMM0, EAX
                 self.buf.emit(&[0xF2, 0x0F, 0x2A, 0xC0]);
                 self.fp_store_value(id, slot, XMM0, true);
@@ -6044,14 +6281,14 @@ impl<'a> Lowerer<'a> {
             // long → float / double (64-bit source operand in RAX).
             Op::L2F => {
                 let slot = self.alloc_slot(id);
-                self.load_to_rax(self.slot_of(node.inputs[0]));
+                self.gp_load_value(RAX, node.inputs[0]);
                 // CVTSI2SS XMM0, RAX (REX.W)
                 self.buf.emit(&[0xF3, 0x48, 0x0F, 0x2A, 0xC0]);
                 self.fp_store_value(id, slot, XMM0, false);
             }
             Op::L2D => {
                 let slot = self.alloc_slot(id);
-                self.load_to_rax(self.slot_of(node.inputs[0]));
+                self.gp_load_value(RAX, node.inputs[0]);
                 // CVTSI2SD XMM0, RAX (REX.W)
                 self.buf.emit(&[0xF2, 0x48, 0x0F, 0x2A, 0xC0]);
                 self.fp_store_value(id, slot, XMM0, true);
@@ -6176,6 +6413,32 @@ impl<'a> Lowerer<'a> {
                 ));
             }
         }
+
+        // ── Publish this definition into its GP register, if it has one ──
+        //
+        // ONE site rather than a conversion inside every arm, and that is the
+        // point: an arm this wave did not think about still publishes, so the
+        // set of accelerated definitions cannot silently disagree with the set
+        // of accelerated reads. Every read is gated on `gp_reg_live`, which
+        // only this line sets, so the interlock reads "published here,
+        // readable everywhere" with nothing in between.
+        //
+        // The copy is memory → register, out of the home word the arm above
+        // just wrote. One load per resident DEFINITION, buying one load per
+        // resident USE — the trade that pays inside a loop and breaks even
+        // outside one. A per-arm register-to-register publish would be cheaper
+        // still; it is not what separates reading a loop counter out of memory
+        // from reading it out of a register.
+        //
+        // Guarded on the home slot existing, which is belt-and-braces: a node
+        // the colourer gave no home was never promotable in the first place
+        // (`plan_register_residency` requires one).
+        if self.assigned_gpr(id).is_some() {
+            if let Some(off) = self.node_slot.get(id as usize).copied().flatten() {
+                let slot = off.get() as i32;
+                self.publish_gp_from_slot(id, slot);
+            }
+        }
     }
 
     fn lower_terminator(&mut self, term: NodeId, block_idx: usize) {
@@ -6239,7 +6502,7 @@ impl<'a> Lowerer<'a> {
                     // Has return value — move to RAX
                     let val_id = node.inputs[1];
                     if val_id != NO_NODE {
-                        self.load_to_rax(self.slot_of(val_id));
+                        self.gp_load_value(RAX, val_id);
                         returned_a_value = true;
                     }
                 }
@@ -6273,7 +6536,7 @@ impl<'a> Lowerer<'a> {
             Op::If => {
                 // Load condition into RAX
                 let cond_id = node.inputs[1];
-                self.load_to_rax(self.slot_of(cond_id));
+                self.gp_load_value(RAX, cond_id);
                 // TEST EAX, EAX  (does not disturb RAX; sets ZF)
                 self.buf.emit(&[0x85, 0xC0]);
 
@@ -7593,11 +7856,14 @@ fn estimate_frame_bytes(num_locals: usize, spill_slots: usize, needs: &FrameNeed
     let stack_arg_reserve = 16usize;
     // Cast: `ir_saved_xmm_bytes` returns 0 or 32.
     let saved_xmms = ir_saved_xmm_bytes() as usize;
+    // Cast: `ir_saved_gpr_bytes` returns 0 or 40.
+    let saved_gprs = ir_saved_gpr_bytes() as usize;
     let total = locals
         .saturating_add(context)
         .saturating_add(bookkeeping)
         .saturating_add(spills)
         .saturating_add(saved_xmms)
+        .saturating_add(saved_gprs)
         .saturating_add(args_stage)
         .saturating_add(shadow)
         .saturating_add(stack_arg_reserve);
@@ -8789,6 +9055,47 @@ fn ir_saved_xmm_bytes() -> i32 {
     IR_LOWER_SAVED_XMMS.len() as i32 * 16
 }
 
+/// The **general-purpose** linear-scan file: the registers an `int` or `long`
+/// value may live in for a whole method.
+///
+/// This is the half the XMM wiring's own doc comment named as missing —
+/// *"this wiring is still FP-only. An `int` loop counter gets nothing out of
+/// it"* — and it is what made the optimizing tier emit slower code than the
+/// baseline tier on every loop measured: `x64.rs` colours Java locals into
+/// callee-saved GPRs, while this backend read every value out of a frame word.
+///
+/// Same shape as the FP file and for the same reasons: write-through, so the
+/// frame image stays authoritative at every instruction boundary and no oop
+/// map, deopt frame state or phi copy changes; single-segment allocations
+/// only, because there is no reload machinery; and a definition site that does
+/// not publish simply leaves its reads in memory.
+///
+/// The one obligation that is genuinely new is the **safepoint** one, and it is
+/// discharged by type rather than by structure: see
+/// `regalloc::xmm_roles::IR_GP_LINEAR_SCAN`.
+const IR_LOWER_LS_GPRS: [u8; 5] = crate::regalloc::xmm_roles::IR_GP_LINEAR_SCAN;
+
+/// The GP registers [`Lowerer::emit_prologue`] saves and every exit restores.
+///
+/// All of [`IR_LOWER_LS_GPRS`]: every one is callee-saved on both System V and
+/// Win64, which is why they are the file. Unlike the XMM list this is not
+/// platform-conditional.
+const IR_LOWER_SAVED_GPRS: &[u8] = crate::regalloc::xmm_roles::IR_GP_PROLOGUE_SAVED;
+
+/// Bytes the frame reserves for [`IR_LOWER_SAVED_GPRS`].
+///
+/// Eight per register — a GPR is 8 bytes and, unlike the XMM band, there is no
+/// wider value hiding in it. Zero unless the linear-scan path is on, for the
+/// same reason `ir_saved_xmm_bytes` returns zero then: a frame must not pay for
+/// a register nothing can hand out.
+fn ir_saved_gpr_bytes() -> i32 {
+    if IR_LOWER_SAVED_GPRS.is_empty() || !linear_scan_enabled() {
+        return 0;
+    }
+    // Cast: a five-element compile-time constant.
+    IR_LOWER_SAVED_GPRS.len() as i32 * 8
+}
+
 /// `CRATONVM_JIT_IR_ISEL_SHADOW` — run the instruction selector over this
 /// compile's blocks, count what it would have produced, and **discard it**.
 ///
@@ -9322,14 +9629,54 @@ fn verify_mir_allocation(
     })
 }
 
-/// `CRATONVM_JIT_IR_LINEAR_SCAN=1` — run the linear-scan allocator and use its
-/// result as a register read cache. Default OFF.
+/// Run the linear-scan allocator and use its result as a register read cache.
+/// `CRATONVM_JIT_IR_LINEAR_SCAN=1`, **default OFF**.
+///
+/// # What this file gained, and why the default did not move with it
+///
+/// It shipped OFF while the file was XMM-only, and while it was XMM-only that
+/// was the right default: the wiring's own comment said *"this wiring is still
+/// FP-only. An `int` loop counter gets nothing out of it"*, so turning it on
+/// bought two callee-saved XMM registers on Windows and nothing anywhere else.
+///
+/// [`IR_LOWER_LS_GPRS`] closes that half. It is the answer to a measured
+/// inversion: this backend read every `int` value out of a frame word while the
+/// single-pass backend it supersedes colours Java locals into callee-saved
+/// GPRs, and on five one-line kernels — same binary, `CRATONVM_JIT_IR_LONG=0`
+/// to route them to single-pass — the optimizing tier came out **1.25x to 1.9x
+/// slower** on Windows and **~3.2x** slower on a quieter Linux host, on every
+/// kernel whose cost was not already dominated by an out-of-line helper call.
+///
+/// **The default stays off because the fix does not yet reach those kernels,
+/// and the census says so rather than a guess.** With
+/// `CRATONVM_DBG_IR_LINEAR_SCAN=1`:
+///
+/// * on `BinTrees.itemCheck` the file works —
+///   `resident=7 (fp=0 gp=7) demoted=0`, `phi=0`, with 13 candidates lost to
+///   splits and 2 to type;
+/// * on all five probe kernels it never runs at all: `refused: liveness and
+///   colourer disagree about which values want a home`, 5 of 5.
+///
+/// That refusal is a PRE-EXISTING gate, not something the GP file introduced —
+/// `regalloc::ir_op_defines_value` and `ir_lower`'s `op_defines_result_slot`
+/// are two enumerations of one question (the second and third of the three
+/// `the_three_ir_op_enumerations` names), and any disagreement declines the
+/// whole method. It was declining the XMM cache the same way and nobody could
+/// see it, because the flag printed only on success. The refusal now names the
+/// op, so reconciling the two is a one-line fix with a test rather than a
+/// search through fifty variants.
+///
+/// So: the capability is built, verified and safe, and flipping this default is
+/// a decision that wants a wall-clock measurement on a quiet host — which the
+/// host this landed on could not supply (load 30–63 throughout). Reconcile the
+/// enumerations first; the flip is worth little until the kernels that showed
+/// the inversion can actually reach the allocator.
+///
+/// Off is exactly the pre-change emission: no register is handed out, no save
+/// area is reserved, every read goes to its home word.
 ///
 /// Declared in `types/src/flag_groups.rs` as `jit/ir-linear-scan`, so `-XX:`
-/// options and `flags::with_thread_overrides` reach it. (This comment used to
-/// say the declaration was still missing; it landed, and the tests never
-/// depended on either spelling — they drive [`LsForce`] — so nothing here went
-/// vacuous in the meantime.)
+/// options and `flags::with_thread_overrides` reach it.
 fn linear_scan_enabled() -> bool {
     #[cfg(test)]
     {
@@ -9337,10 +9684,10 @@ fn linear_scan_enabled() -> bool {
             return forced;
         }
     }
-    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_LINEAR_SCAN") {
-        Ok(v) => !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
-    }
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_LINEAR_SCAN").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
 }
 
 #[cfg(test)]
@@ -9367,6 +9714,17 @@ impl LsForce {
         LS_FORCE.with(|c| c.set(Some(true)));
         LsForce
     }
+
+    /// Force the cache OFF for the duration.
+    ///
+    /// Needed by the level-2 tests: residency and the selector are mutually
+    /// exclusive in production (see `lower_inner_with_scopes`), so a test that
+    /// compares a MIR-mode body against a no-mode body is otherwise comparing
+    /// two different backends and not the selector at all.
+    fn off() -> LsForce {
+        LS_FORCE.with(|c| c.set(Some(false)));
+        LsForce
+    }
 }
 
 #[cfg(test)]
@@ -9384,6 +9742,10 @@ struct RegResidency {
     /// definition to its last use, with no split, no spill and no reload.
     /// `None` for everything else, which is the majority.
     reg_of: Vec<Option<u8>>,
+    /// `gp_reg_of[id]` = the same, in the GENERAL-PURPOSE file. Disjoint from
+    /// `reg_of` by construction: a node has one type, and the two files serve
+    /// disjoint type sets (FP here, int/long there, `Ref` in neither).
+    gp_reg_of: Vec<Option<u8>>,
     /// How many values that is.
     promoted: usize,
     /// Values the allocator promoted that this file then refused, because the
@@ -9481,6 +9843,19 @@ fn ir_lower_machine_model(
 /// [`crate::regalloc::verify_allocation`] rejecting the allocation, which is a
 /// compiler bug — that returns `Err` and the caller refuses the compile rather
 /// than emitting against an allocation nothing proved.
+/// Report why residency was declined, under `CRATONVM_DBG_IR_LINEAR_SCAN`.
+///
+/// Every refusal in `plan_register_residency` used to be a bare `Ok(None)`,
+/// and the flag printed only on SUCCESS -- so "no output" meant "declined,
+/// somewhere, for one of four reasons" and could not be acted on. Naming the
+/// conjunct is the difference between a count and a diagnosis.
+fn ls_refuse(reason: &str) -> Option<RegResidency> {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
+        eprintln!("[ir-ls] refused: {reason}");
+    }
+    None
+}
+
 fn plan_register_residency(
     graph: &Graph,
     schedule: &Schedule,
@@ -9495,7 +9870,7 @@ fn plan_register_residency(
     if !live.converged {
         // Every range is the whole method; nothing is promotable and the scan
         // would only burn compile time proving it.
-        return Ok(None);
+        return Ok(ls_refuse("liveness model did not converge"));
     }
 
     // ── Release the deopt pins, and why that is legal HERE ───────────
@@ -9535,20 +9910,62 @@ fn plan_register_residency(
         .map(|b| b.nodes.len() + usize::from(b.terminator.is_some()) + 1)
         .sum();
     if live.total_positions != expected_positions {
-        return Ok(None);
+        return Ok(ls_refuse("position models disagree (live vs schedule)"));
     }
-    if live.wants_loc.len() != plan.node_color.len()
-        || live
-            .wants_loc
+    // Two enumerations of "does this op define a value" have to agree here:
+    // `regalloc::ir_op_defines_value` (via `wants_loc`) and `ir_lower`'s own
+    // `op_defines_result_slot` (via `node_color`). They are the second and
+    // third of the three enumerations the module comment at
+    // `the_three_ir_op_enumerations` names, and a disagreement declines the
+    // whole method.
+    //
+    // Name the OP that disagrees, not just the fact. "Declined" sends the
+    // reader looking through fifty variants; "declined because `Op::X` is in
+    // one enumeration and not the other" is a one-line fix with a test.
+    let disagreement = if live.wants_loc.len() != plan.node_color.len() {
+        Some("node-count mismatch".to_string())
+    } else {
+        live.wants_loc
             .iter()
             .zip(plan.node_color.iter())
-            .any(|(wants, color)| *wants != color.is_some())
-    {
-        return Ok(None);
+            .enumerate()
+            .find(|(_, (wants, color))| **wants != color.is_some())
+            .map(|(id, (wants, _))| {
+                let op = graph
+                    .nodes
+                    .get(id)
+                    .map(|node| format!("{:?}", node.op))
+                    .unwrap_or_else(|| "<out of range>".to_string());
+                let (yes, no) = if *wants {
+                    ("liveness", "colourer")
+                } else {
+                    ("colourer", "liveness")
+                };
+                format!("n{id} ({op}): {yes} says it wants a home, {no} says it does not")
+            })
+    };
+    if let Some(what) = disagreement {
+        return Ok(ls_refuse(&format!(
+            "liveness and colourer disagree about which values want a home -- {what}"
+        )));
     }
 
     // ── The register file ────────────────────────────────────────────
-    let regs = RegFile::from_specs(IR_LOWER_LS_XMMS.iter().map(|&n| RegSpec {
+    //
+    // Two banks, not one. The GP half is what makes an `int` loop counter
+    // register-resident; the FP half is unchanged.
+    let gp_specs = IR_LOWER_LS_GPRS.iter().map(|&n| RegSpec {
+        reg: PhysReg::gp(n),
+        // RBX and R12–R15 are callee-saved on BOTH ABIs, and this prologue
+        // saves every one it hands out (`IR_LOWER_SAVED_GPRS` is the whole
+        // file), so `caller_saved` is uniformly false and a value may live
+        // across a call. That is exactly the property the GP file was selected
+        // for: this backend emits calls constantly and has no reload
+        // machinery, so a value whose register did not survive a call could
+        // not be promoted at all.
+        caller_saved: !IR_LOWER_SAVED_GPRS.contains(&n),
+    });
+    let xmm_specs = IR_LOWER_LS_XMMS.iter().map(|&n| RegSpec {
         reg: PhysReg::xmm(n),
         // Not "the ABI says so" but "does THIS frame save it", which is the
         // property that matters: a value may stay in a register across a call
@@ -9564,7 +9981,8 @@ fn plan_register_residency(
         // in a platform `cfg` because the two facts that make it true — the
         // ABI's and this frame's — are both already in `IR_LOWER_SAVED_XMMS`.
         caller_saved: !IR_LOWER_SAVED_XMMS.contains(&n),
-    }));
+    });
+    let regs = RegFile::from_specs(gp_specs.chain(xmm_specs));
     let model = ir_lower_machine_model(graph, schedule, &live, regs);
 
     let alloc = match allocate_linear_scan(graph, &live, &model) {
@@ -9574,7 +9992,7 @@ fn plan_register_residency(
         // Decline to promote and keep the frame layout the colourer already
         // produced; there is no reason to lose the whole optimized body over
         // an optimization that did not fit.
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(ls_refuse("linear scan declined (pressure, fixed constraint or split budget)")),
     };
     // `allocate_linear_scan` verifies its own result. Re-verify anyway: this
     // call site's guarantee must not rest on an internal detail of another
@@ -9588,7 +10006,13 @@ fn plan_register_residency(
 
     let n = graph.nodes.len();
     let mut reg_of: Vec<Option<u8>> = vec![None; n];
+    let mut gp_reg_of: Vec<Option<u8>> = vec![None; n];
     let mut demoted = 0usize;
+    // Per-CAUSE refusal census. A bare "promoted 0 of N" is a count and cannot
+    // be acted on: the four causes below call for four different next steps,
+    // and `skip_phi` in particular is the one that decides whether this file
+    // can ever reach a LOOP COUNTER -- which is a phi, at every loop header.
+    let (mut skip_split, mut skip_bank, mut skip_home, mut skip_phi) = (0usize, 0, 0, 0);
     for id in 0..n {
         let Some(segs) = alloc.segments.get(id) else {
             continue;
@@ -9600,24 +10024,50 @@ fn plan_register_residency(
         let reg = match segs.as_slice() {
             [seg] => match seg.reg {
                 Some(reg) => reg,
-                None => continue,
+                None => {
+                    skip_split += 1;
+                    continue;
+                }
             },
-            _ => continue,
+            _ => {
+                skip_split += 1;
+                continue;
+            }
         };
-        // Defensive, all three: the file is XMM-only and FP-only by
-        // construction, so a `Ref` (or an `int`, or XMM8) arriving here means
-        // the file or `RegClass::of` changed under this code.
-        if reg.class != RegClass::Xmm || !IR_LOWER_LS_XMMS.contains(&reg.num) {
-            continue;
-        }
-        if !matches!(
-            graph.nodes.get(id).map(|node| node.ty),
-            Some(IrType::Float) | Some(IrType::Double)
-        ) {
-            continue;
-        }
+        let ty = graph.nodes.get(id).map(|node| node.ty);
+        // Which bank, and is the type one that bank may hold?
+        //
+        // **`IrType::Ref` is admitted by neither, and that is the safepoint
+        // obligation, not a tuning choice.** A GC root walk reads a frame it
+        // did not stop, through RBP, and `OopMapEntry` names frame slots only —
+        // there is no register a collector could be told about, walk, or update
+        // on an evacuation. The XMM file discharged this structurally (no
+        // register a `Ref` could occupy); the GP file has to discharge it by
+        // refusing the type here, which is what this match does and what
+        // `a_reference_is_never_promoted_into_the_gp_file` pins.
+        //
+        // Everything else in the match is defensive: a register outside its own
+        // file, or a type outside its bank, means the file or `RegClass::of`
+        // changed under this code.
+        let is_gp = match (reg.class, ty) {
+            (RegClass::Xmm, Some(IrType::Float) | Some(IrType::Double))
+                if IR_LOWER_LS_XMMS.contains(&reg.num) =>
+            {
+                false
+            }
+            (RegClass::Gp, Some(IrType::Int) | Some(IrType::Long))
+                if IR_LOWER_LS_GPRS.contains(&reg.num) =>
+            {
+                true
+            }
+            _ => {
+                skip_bank += 1;
+                continue;
+            }
+        };
         // Write-through needs a home to write to.
         if plan.node_color.get(id).copied().flatten().is_none() {
+            skip_home += 1;
             continue;
         }
         // A phi's home is written by `emit_phi_copies` at each incoming edge,
@@ -9636,9 +10086,14 @@ fn plan_register_residency(
             .get(id)
             .is_some_and(|node| matches!(node.op, Op::Phi));
         if is_phi {
+            skip_phi += 1;
             continue;
         }
-        reg_of[id] = Some(reg.num);
+        if is_gp {
+            gp_reg_of[id] = Some(reg.num);
+        } else {
+            reg_of[id] = Some(reg.num);
+        }
     }
 
     // ── Second opinion on the aliasing property ──────────────────────
@@ -9648,10 +10103,20 @@ fn plan_register_residency(
     // `plan_slots`' independently computed ranges. If the two models disagree
     // about an overlap, both values lose the register — the disagreement
     // itself is the reason not to trust either answer for that pair.
-    let mut holders: HashMap<u8, Vec<usize>> = HashMap::new();
+    //
+    // Keyed by `(bank, number)` now that there are two files: `Gp(3)` and
+    // `Xmm(3)` are different registers, and a map keyed by the number alone
+    // would report them as one holder and demote a healthy pair. That is the
+    // same aliasing hazard `PhysReg` carries its class for.
+    let mut holders: HashMap<(bool, u8), Vec<usize>> = HashMap::new();
+    for (id, reg) in gp_reg_of.iter().enumerate() {
+        if let Some(reg) = reg {
+            holders.entry((true, *reg)).or_default().push(id);
+        }
+    }
     for (id, reg) in reg_of.iter().enumerate() {
         if let Some(reg) = reg {
-            holders.entry(*reg).or_default().push(id);
+            holders.entry((false, *reg)).or_default().push(id);
         }
     }
     let mut drop_ids: Vec<usize> = Vec::new();
@@ -9676,32 +10141,42 @@ fn plan_register_residency(
     //
     // The same idea for `verify_allocation`'s clobber check: re-run it against
     // `plan_slots`' range for the value rather than the allocator's.
-    for (id, reg) in reg_of.iter().enumerate() {
-        let Some(reg) = reg else { continue };
-        let Some(range) = plan.range.get(id).copied().flatten() else {
-            continue;
-        };
-        let me = PhysReg::xmm(*reg);
-        if model
-            .clobbers
-            .iter()
-            .any(|(pos, regs)| *pos >= range.lo && *pos <= range.hi && regs.contains(&me))
-        {
-            drop_ids.push(id);
+    for (bank, file) in [(false, &reg_of), (true, &gp_reg_of)] {
+        for (id, reg) in file.iter().enumerate() {
+            let Some(reg) = reg else { continue };
+            let Some(range) = plan.range.get(id).copied().flatten() else {
+                continue;
+            };
+            let me = if bank {
+                PhysReg::gp(*reg)
+            } else {
+                PhysReg::xmm(*reg)
+            };
+            if model
+                .clobbers
+                .iter()
+                .any(|(pos, regs)| *pos >= range.lo && *pos <= range.hi && regs.contains(&me))
+            {
+                drop_ids.push(id);
+            }
         }
     }
     for id in drop_ids {
-        if reg_of[id].take().is_some() {
+        // A node lives in at most one bank (its type picks the bank), so
+        // clearing both is clearing the one it is in.
+        if reg_of[id].take().is_some() || gp_reg_of[id].take().is_some() {
             demoted += 1;
         }
     }
 
-    let promoted = reg_of.iter().filter(|r| r.is_some()).count();
+    let fp_promoted = reg_of.iter().filter(|r| r.is_some()).count();
+    let gp_promoted = gp_reg_of.iter().filter(|r| r.is_some()).count();
+    let promoted = fp_promoted + gp_promoted;
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
         eprintln!(
             "[ir-ls] nodes={n} positions={} peak_live={} deopt_pins_released={released} \
-             scan_promoted={} resident={promoted} demoted={demoted} splits={} \
-             scan_spills={} scan_reloads={}",
+             scan_promoted={} resident={promoted} (fp={fp_promoted} gp={gp_promoted}) \
+             demoted={demoted} splits={} scan_spills={} scan_reloads={}",
             live.total_positions,
             live.peak_live,
             alloc.promoted,
@@ -9710,11 +10185,21 @@ fn plan_register_residency(
             alloc.reloads,
         );
     }
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
+        eprintln!(
+            "[ir-ls] skipped: split_or_spilled={skip_split} \
+             wrong_bank_or_type={skip_bank} no_home={skip_home} phi={skip_phi}"
+        );
+    }
     if promoted == 0 {
-        return Ok(None);
+        return Ok(ls_refuse(
+            "the scan promoted nothing this file could take -- every candidate \
+             was split, spilled, a phi, homeless, or of a type neither bank holds",
+        ));
     }
     Ok(Some(RegResidency {
         reg_of,
+        gp_reg_of,
         promoted,
         demoted,
         peak_live: live.peak_live,
@@ -10481,8 +10966,22 @@ pub(crate) fn lower_inner_with_scopes(
     // Everything else it can decline (register pressure, a liveness-model
     // disagreement, a value it cannot prove) comes back as `Ok(None)` and
     // leaves the colourer's memory layout in charge.
+    //
+    // The level-2 selector and this cache are MUTUALLY EXCLUSIVE, and the
+    // exclusion belongs here rather than in either of them. `isel`'s encoder is
+    // anchored byte-for-byte against the per-opcode arms under the assumption
+    // that "the frame-homed allocation the encoder assumes IS this backend's
+    // allocation" — which residency makes false, because an arm then reads its
+    // operand out of a register while the tiler still emits a frame load.
+    //
+    // Neither outcome is unsound (write-through keeps the home word correct, so
+    // the tiler's frame read gets the right value, and `Verify` mode is
+    // fail-closed), but the two would silently disagree about bytes, which is
+    // the one property the level-2 lane exists to be able to check. So while a
+    // MIR mode is on, residency is off and the selector is compared against the
+    // emission it was anchored to.
     let mut ls_active = false;
-    if linear_scan_enabled() {
+    if linear_scan_enabled() && !isel_emit_enabled() && !isel_verify_enabled() {
         match plan_register_residency(graph, schedule, &slot_plan) {
             Ok(Some(residency)) => {
                 if crate::ir_stage_reporting() {
@@ -10670,6 +11169,7 @@ pub(crate) fn lower_inner_with_scopes(
     let first_spill = lowerer.first_spill;
     let spill_cap_off = lowerer.spill_cap_off;
     let saved_xmm_bytes = lowerer.saved_xmm_bytes;
+    let saved_gpr_bytes = lowerer.saved_gpr_bytes;
     let frame_size = lowerer.frame_size;
 
     // ── Install-time deopt-metadata verification ─────────────────────
@@ -10899,10 +11399,11 @@ pub(crate) fn lower_inner_with_scopes(
     // `osr_xmm_saved_base` here so the trampoline saves what the epilogue
     // restores — not to delete this assertion.
     debug_assert!(
-        saved_xmm_bytes == 0 || cm.osr_pc_to_native.is_none(),
-        "this frame saves {saved_xmm_bytes} bytes of callee-saved XMM in its \
-         prologue but publishes an OSR entry table; the trampoline enters past \
-         the prologue and every exit would restore what was never saved",
+        (saved_xmm_bytes == 0 && saved_gpr_bytes == 0) || cm.osr_pc_to_native.is_none(),
+        "this frame saves {saved_xmm_bytes} bytes of callee-saved XMM and \
+         {saved_gpr_bytes} of callee-saved GPR in its prologue but publishes an \
+         OSR entry table; the trampoline enters past the prologue and every \
+         exit would restore what was never saved",
     );
     // Where the reader finds what the emission side published. Without these
     // three, `shadow_window_from_frame` cannot even locate the shadow stack —
@@ -14973,17 +15474,25 @@ mod tests {
                 estimate_frame_bytes(num_locals, plan.slots, &needs) as i32,
             );
             // …and that number really does account for locals + 5 bookkeeping
-            // words + the spill band + the 16-byte stack-arg reserve + the
-            // 32-byte ABI shadow. `add_one_graph` needs no context slot and
-            // stages no call arguments.
+            // words + the spill band + the callee-saved save bands + the
+            // 16-byte stack-arg reserve + the 32-byte ABI shadow.
+            // `add_one_graph` needs no context slot and stages no call
+            // arguments.
+            //
+            // The two save bands are read from the same functions the frame
+            // was laid out with rather than spelled as literals: they are
+            // platform- and flag-dependent (`IR_LOWER_SAVED_XMMS` is empty on
+            // System V; both are empty with the linear-scan path off), and a
+            // literal here would pin this test to one configuration.
             let locals_size = (num_locals as i32) * 8;
             let bookkeeping = 8 * 5;
+            let saved = ir_saved_xmm_bytes() + ir_saved_gpr_bytes();
             let tail = 32 + 16;
             assert_eq!(
                 lowerer.frame_size,
-                ((locals_size + bookkeeping + (plan.slots as i32) * 8 + tail) + 15) & !15,
+                ((locals_size + bookkeeping + (plan.slots as i32) * 8 + saved + tail) + 15) & !15,
             );
-            assert_eq!(lowerer.spill_cap_off, lowerer.frame_size - tail);
+            assert_eq!(lowerer.spill_cap_off, lowerer.frame_size - tail - saved);
             // Offsets are 1-based — `[rbp - 0]` is the saved caller RBP — so the
             // first spill word sits one word past the locals + bookkeeping bytes.
             assert_eq!(lowerer.first_spill, locals_size + bookkeeping + 8);
@@ -15683,6 +16192,12 @@ mod tests {
 
     #[cfg(test)]
     fn mir_emitted_bytes(mode: Option<MirMode>) -> Vec<u8> {
+        // Both arms with the register cache OFF. Production makes the two
+        // mutually exclusive, so a comparison that left it on for the no-mode
+        // arm and off for the MIR arm would measure residency rather than the
+        // selector -- and would report the selector as having changed bytes it
+        // never touched.
+        let _ls = LsForce::off();
         let _force = mode.map(MirForce::set);
         let cm = compile_via_ir(&MIR_ALU_CODE, 6, 2, 2).expect("compiles");
         // SAFETY: the artifact is alive for the duration of this borrow, and
@@ -16693,6 +17208,10 @@ mod tests {
         let (graph, schedule) = fp_chain_graph();
 
         let (off_code, off_bits) = {
+            // Forced OFF, not merely left alone: the cache is default-ON now,
+            // so an unforced arm is the SAME configuration as the forced-on one
+            // and every comparison below would be between a body and itself.
+            let _flag = LsForce::off();
             let cm = lower(&graph, &schedule, 1, 1, &no_helpers()).expect("lowers");
             // SAFETY: one incoming argument, delivered as the raw bits of a
             // double in an integer ABI register, exactly as `Op::Param`
@@ -16725,25 +17244,43 @@ mod tests {
             "the register cache changed the computed value"
         );
 
-        // MOVAPS xmm, xmm — the register copy, emitted only by the cache.
-        // Compared rather than counted absolutely: a two-byte needle can also
-        // fall inside some other instruction's encoding.
+        // The register copy, emitted only by the cache — in EITHER bank.
+        // `MOVAPS xmm, xmm` (0F 28) is the FP file's; `MOV r64, r64` (REX.W in
+        // 48..4F, opcode 89, ModRM mod=11) is the GP one's. Which bank a given
+        // fixture promotes into is the allocator's business, and a needle
+        // naming only one of them makes this assertion vacuous the moment that
+        // changes.
+        //
+        // Compared rather than counted absolutely: a short needle can also fall
+        // inside some other instruction's encoding.
+        let reg_copies = |code: &[u8]| -> usize {
+            count_seq(code, &[0x0F, 0x28])
+                + code
+                    .windows(3)
+                    .filter(|w| (0x48..=0x4F).contains(&w[0]) && w[1] == 0x89 && w[2] >= 0xC0)
+                    .count()
+        };
         assert!(
-            count_seq(&on_code, &[0x0F, 0x28]) > count_seq(&off_code, &[0x0F, 0x28]),
+            reg_copies(&on_code) > reg_copies(&off_code),
             "the enabled body emitted no register copy, so the wiring did \
              nothing and the rest of this test is vacuous"
         );
 
-        // MOVSD [rbp - disp32], xmm0 — the home store. Write-through means the
-        // cached body emits at least as many as the uncached one.
-        let home_store = [0xF2u8, 0x0F, 0x11, 0x85];
-        let off_stores = count_seq(&off_code, &home_store);
+        // MOVSD [rbp - disp], xmm0 — the home store. Write-through means the
+        // cached body emits at least as many as the uncached one. Both
+        // displacement forms, because `emit_rbp_modrm_disp` picks the smallest
+        // and a needle spelling one of them counts zero on the other.
+        let home_stores = |code: &[u8]| -> usize {
+            count_seq(code, &[0xF2u8, 0x0F, 0x11, 0x85])
+                + count_seq(code, &[0xF2u8, 0x0F, 0x11, 0x45])
+        };
+        let off_stores = home_stores(&off_code);
         assert!(
             off_stores > 0,
             "the fixture must store FP results to memory"
         );
         assert!(
-            count_seq(&on_code, &home_store) >= off_stores,
+            home_stores(&on_code) >= off_stores,
             "a home store disappeared: the frame image is no longer complete \
              at every instruction boundary, which is what `emit_safepoint_map` \
              and `build_deopt_points` rely on"
@@ -16801,6 +17338,9 @@ mod tests {
         if let Some(reg) = reg {
             lowerer.set_residency(RegResidency {
                 reg_of: vec![Some(reg)],
+                // This helper drives the XMM half; the GP file is exercised by
+                // its own tests.
+                gp_reg_of: Vec::new(),
                 promoted: 1,
                 demoted: 0,
                 peak_live: 1,
@@ -16809,14 +17349,31 @@ mod tests {
         lowerer
     }
 
-    /// `MOVUPS [rbp - disp32], xmm` and its load counterpart, for `reg < 8`.
+    /// `MOVUPS [rbp - disp], xmm` and its load counterpart, for `reg < 8`.
+    ///
+    /// **Both** displacement forms, because `emit_rbp_modrm_disp` picks the
+    /// smallest legal one: `mod=10` (`0x85 | reg<<3`, disp32) for a deep frame
+    /// and `mod=01` (`0x45 | reg<<3`, disp8) for a shallow one. A needle
+    /// spelling only one of them silently counts zero on the other, which reads
+    /// as "the restore is missing" — the exact failure this test exists to
+    /// report, arriving for the wrong reason.
     #[cfg(test)]
-    fn movups_frame_needle(reg: u8, store: bool) -> [u8; 3] {
+    fn movups_frame_needles(reg: u8, store: bool) -> [[u8; 3]; 2] {
+        let op = if store { 0x11 } else { 0x10 };
         [
-            0x0F,
-            if store { 0x11 } else { 0x10 },
-            0x85 | ((reg & 7) << 3),
+            [0x0F, op, 0x85 | ((reg & 7) << 3)],
+            [0x0F, op, 0x45 | ((reg & 7) << 3)],
         ]
+    }
+
+    /// Occurrences of a frame `MOVUPS` for `reg` in `code`, either
+    /// displacement form. See [`movups_frame_needles`].
+    #[cfg(test)]
+    fn count_movups_frame(code: &[u8], reg: u8, store: bool) -> usize {
+        movups_frame_needles(reg, store)
+            .iter()
+            .map(|n| count_seq(code, n))
+            .sum()
     }
 
     /// **The** invariant: every exit restores exactly what the prologue saved.
@@ -16831,8 +17388,10 @@ mod tests {
         let _flag = LsForce::on();
         let expect = usize::from(!IR_LOWER_SAVED_XMMS.is_empty());
         let reg = *IR_LOWER_SAVED_XMMS.first().unwrap_or(&6);
-        let save = movups_frame_needle(reg, true);
-        let restore = movups_frame_needle(reg, false);
+        // Closures rather than fixed byte needles: the displacement form depends
+        // on the frame depth, so the count has to accept either one.
+        let saves_in = |c: &[u8]| count_movups_frame(c, reg, true);
+        let restores_in = |c: &[u8]| count_movups_frame(c, reg, false);
 
         // ── exit 1: the method epilogue ──────────────────────────────
         let mut lo = lowerer_with_resident_xmm(4096, Some(reg));
@@ -16840,13 +17399,13 @@ mod tests {
         let after_prologue = lo.buf.pos();
         lo.emit_epilogue();
         let code = lo.buf.as_slice().to_vec();
-        let saves = count_seq(&code[..after_prologue], &save);
+        let saves = saves_in(&code[..after_prologue]);
         assert_eq!(
             saves, expect,
             "the prologue saved {saves} of xmm{reg}, expected {expect} on this target",
         );
         assert_eq!(
-            count_seq(&code[after_prologue..], &restore),
+            restores_in(&code[after_prologue..]),
             saves,
             "the epilogue did not restore what the prologue saved",
         );
@@ -16864,7 +17423,7 @@ mod tests {
         lo.emit_call_exc_stub();
         let code = lo.buf.as_slice().to_vec();
         assert_eq!(
-            count_seq(&code[after_prologue..], &restore),
+            restores_in(&code[after_prologue..]),
             saves,
             "the call-exception bail stub returns the sentinel without \
              restoring the caller's registers",
@@ -16879,7 +17438,7 @@ mod tests {
         lo.emit_deopt_stub();
         let code = lo.buf.as_slice().to_vec();
         assert_eq!(
-            count_seq(&code[after_prologue..], &restore),
+            restores_in(&code[after_prologue..]),
             saves,
             "the deopt stub inlines its own teardown and skipped the restore",
         );
@@ -16978,7 +17537,7 @@ mod tests {
             let code = lo.buf.as_slice().to_vec();
             for &reg in IR_LOWER_SAVED_XMMS {
                 assert_eq!(
-                    count_seq(&code, &movups_frame_needle(reg, true)),
+                    count_movups_frame(&code, reg, true),
                     0,
                     "saved xmm{reg} for a plan that never used it ({plan:?})",
                 );
