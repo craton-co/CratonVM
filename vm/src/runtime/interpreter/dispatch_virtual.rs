@@ -21,7 +21,23 @@
 //! the answer lives in `interpreter/native_override.rs` and can differ per
 //! subclass.
 
+use super::site_cache::{site_stats, IfaceSelectSiteCache};
 use super::*;
+
+/// Kill switch for the interface receiver-selection memo
+/// (`CRATONVM_JIT_NO_IFACE_SELECT_MEMO=1`, or
+/// `CRATONVM_JIT=-iface-select-memo`). Set, every `invokeinterface` cache hit
+/// takes the `class_manager` read lock and walks the hierarchy again, exactly
+/// as it did before the memo — which is what makes the two arms comparable
+/// inside one binary. Gates the read AND the write, so a disabled run cannot
+/// leave entries behind for an enabled one to redeem.
+#[inline]
+fn iface_select_memo_disabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_IFACE_SELECT_MEMO").is_some()
+    })
+}
 
 // ---------------------------------------------------------------------------
 // invokestatic
@@ -920,7 +936,7 @@ pub(super) fn execute_invokevirtual_vtable_fast(
     // ONE forward scan for the whole descriptor. This closure used to call
     // `nth_param_tag_byte` per argument, and that rescans from `(` each time,
     // so popping N args cost O(N^2) tokenising of a string fixed per call site.
-    let param_tags = ParamTags::of(&entry_cached.method_descriptor);
+    let param_tags = ParamTags::for_method(&entry_cached);
     let arg_desc_byte =
         |i: usize| -> u8 { param_tags.get_with_receiver(&entry_cached.method_descriptor, i) };
     let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
@@ -1824,22 +1840,98 @@ pub(super) fn execute_invokevirtual_cached(
                     // selects. This prevents a parent-interface default from
                     // remaining cached after it masked a covariant bridge on a
                     // receiver subinterface.
-                    if is_interface {
-                        let cm = shared.classes.class_manager.read();
-                        let receiver_selected = crate::classloading::find_method_recursive(
-                            actual_class_id,
-                            &cached.method_name,
-                            &cached.method_descriptor,
-                            &cm.class_store,
-                        )
-                        .map(|(_, declaring_id)| declaring_id);
-                        drop(cm);
-                        if receiver_selected != Some(cached.declaring_class_id) {
-                            thread
-                                .invoke_cache
-                                .evict(caller_class_id, cp_index, is_special);
-                            return Ok(CachedCallResult::CacheMiss);
+                    //
+                    // ── Why this is memoized (2026-09-02) ────────────────
+                    //
+                    // The answer is a property of `(actual_class_id, method
+                    // name, descriptor)`, all three fixed for as long as the
+                    // entry is valid — but it was being re-derived on EVERY
+                    // `invokeinterface` cache hit, with a `class_manager` read
+                    // lock and a full `find_method_recursive` hierarchy walk.
+                    //
+                    // `invokeinterface` and `invokevirtual` reach this same
+                    // function and differ in exactly this block, so the cost is
+                    // directly attributable: `probes/Dispatch.java` (`--nojit`,
+                    // min-of-7, arms interleaved) put interface-over-virtual at
+                    // **114 ns**, against **3.4 ns** on HotSpot's template
+                    // interpreter.
+                    //
+                    // Two steps, cheapest first:
+                    //
+                    //  1. If the receiver's own class IS the cached method's
+                    //     declaring class, receiver-rooted selection starts
+                    //     there and finds it there. Nothing to check — one
+                    //     integer compare replaces the whole block.
+                    //  2. Otherwise consult the per-thread memo, which stores
+                    //     the `(receiver, declaring)` pair a previous walk
+                    //     verified. Both halves are compared, because one
+                    //     interface site can see several receiver classes and
+                    //     the answer belongs to the receiver, not the site; a
+                    //     rotating site simply misses and re-walks, which is
+                    //     exactly today's behaviour.
+                    //
+                    // Validity is `SiteCache`'s, and here that set is precise
+                    // rather than merely sufficient: a class's superclass and
+                    // superinterface chain is fixed at load time, so the walk's
+                    // answer can only move under a JVMTI redefine (the
+                    // `any_class_redefined` latch, checked inside `get`/`put`)
+                    // or an `upgrade_synthetic_class` /
+                    // `recompute_subclass_layouts` rewrite under an unchanged
+                    // `ClassId` (the resolution epoch, which the invalidate
+                    // hook bumps and which nothing else on the invoke-cache
+                    // path observes).
+                    //
+                    // The kill switch disables BOTH steps, not just the memo.
+                    // A switch that left the short-circuit in place would not
+                    // restore the pre-change path, so its "off" arm would not
+                    // be a control — and this is not hypothetical: the first
+                    // A/B of this change compared an arm the switch could not
+                    // reach and separated nothing.
+                    let iface_fast_off = iface_select_memo_disabled();
+                    if is_interface
+                        && (iface_fast_off || actual_class_id != cached.declaring_class_id)
+                    {
+                        let memo_hit = !iface_fast_off
+                            && thread
+                                .iface_select_sites
+                                .get(caller_class_id, cp_index)
+                                .is_some_and(|&(recv, decl)| {
+                                    recv == actual_class_id
+                                        && decl == cached.declaring_class_id
+                                });
+                        if memo_hit {
+                            site_stats::bump(site_stats::IFACE_SELECT_HIT);
+                        } else {
+                            site_stats::bump(site_stats::IFACE_SELECT_MISS);
+                            // Read BEFORE the walk; see `SiteCache::put`.
+                            let epochs_at_entry = IfaceSelectSiteCache::epochs_now();
+                            let cm = shared.classes.class_manager.read();
+                            let receiver_selected = crate::classloading::find_method_recursive(
+                                actual_class_id,
+                                &cached.method_name,
+                                &cached.method_descriptor,
+                                &cm.class_store,
+                            )
+                            .map(|(_, declaring_id)| declaring_id);
+                            drop(cm);
+                            if receiver_selected != Some(cached.declaring_class_id) {
+                                thread
+                                    .invoke_cache
+                                    .evict(caller_class_id, cp_index, is_special);
+                                return Ok(CachedCallResult::CacheMiss);
+                            }
+                            if !iface_fast_off {
+                                site_stats::bump(site_stats::IFACE_SELECT_FILL);
+                                thread.iface_select_sites.put(
+                                    caller_class_id,
+                                    cp_index,
+                                    epochs_at_entry,
+                                    (actual_class_id, cached.declaring_class_id),
+                                );
+                            }
                         }
+                    } else if is_interface {
+                        site_stats::bump(site_stats::IFACE_SELECT_TRIVIAL);
                     }
 
                     if thread.frames.len() >= shared.config.max_stack_depth {
@@ -1857,7 +1949,7 @@ pub(super) fn execute_invokevirtual_cached(
                     // gaps/bc-ec-mod-mododdinverse-investigation.md.
                     // ONE forward scan; the per-argument form rescanned from `(` each time.
 
-                    let param_tags = ParamTags::of(&cached.method_descriptor);
+                    let param_tags = ParamTags::for_method(&cached);
 
                     let arg_desc_byte = |i: usize| -> u8 {
                         param_tags.get_with_receiver(&cached.method_descriptor, i)
@@ -2243,7 +2335,7 @@ pub(super) fn execute_invokevirtual_cached(
                             None
                         });
                         if let Some(compiled) = compiled_opt {
-                            let ret = crate::jit::return_type(&cached.method_descriptor);
+                            let ret = cached.return_tag();
                             let heap = compiled.needs_heap();
                             // total_args = receiver + declared params; the decoded
                             // dispatcher treats arg 0 as the receiver.
@@ -2645,7 +2737,7 @@ pub(super) fn execute_invokevirtual_cached(
             // pattern long args. See gaps/bc-ec-mod-mododdinverse-investigation.md.
             // ONE forward scan; the per-argument form rescanned from `(` each time.
 
-            let param_tags = ParamTags::of(&cached.method_descriptor);
+            let param_tags = ParamTags::for_method(&cached);
 
             let arg_desc_byte =
                 |i: usize| -> u8 { param_tags.get_with_receiver(&cached.method_descriptor, i) };
@@ -3783,6 +3875,7 @@ pub(super) fn populate_virtual_invoke_cache(
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
+        descriptor_facts_cache: std::sync::OnceLock::new(),
         intercept_shape_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),

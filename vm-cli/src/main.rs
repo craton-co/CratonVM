@@ -244,6 +244,23 @@ fn maybe_dump_shutdown_reports() {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        // Reference-store barrier gating. BOTH numbers, always: a zero on the
+        // left alone cannot distinguish "this collector published no barrier
+        // plan" from "this workload compiled no reference stores", and those
+        // call for opposite next steps. `gated` counts sites that got the
+        // inline SATB/post-barrier gate sequence; `declined` counts sites that
+        // asked and kept the full `jit_putfield_object` path.
+        //
+        // The switch this replaces measured nothing:
+        // `CRATONVM_NO_JIT_INLINE_PUTFIELD` was a no-op under the default
+        // collector because the path it disabled was already unreachable
+        // (`region_bounds_are_live` is false under G1 and ZGC).
+        {
+            let (gated, declined) = cratonvm_jit::x64::ref_store_site_counts();
+            eprintln!(
+                "[cratonvm] compiled reference stores: gated={gated} declined={declined}"
+            );
+        }
         // Reference loads whose slot did NOT hold a reference, contained by
         // `GETFIELD_EXPECT_REFERENCE` instead of being handed to compiled code
         // as a pointer. Printed even when zero, and on the same switch: this
@@ -6827,8 +6844,45 @@ fn main() {
             .map(|s| s.to_string())
             .or_else(|| info.payload().downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "<panic payload was not a string>".to_string());
-        let thread = std::thread::current();
-        let thread_name = thread.name().unwrap_or("<unnamed>");
+        // NOT `std::thread::current()`. That call PANICS once this thread's
+        // thread-local data has been destroyed, and a panic inside a panic
+        // hook is a panic-while-panicking: Rust aborts the process on the
+        // spot, before this hook has printed a single byte about the panic it
+        // was called for. Reading one cosmetic name that way cost 183 of 206
+        // Hibernate Reactive classes under `--jdk-only` -- every one of them
+        // rc=134 (SIGABRT), and every one of them reporting `thread/
+        // current.rs:315:9`, which is the *second* panic and says nothing
+        // about the first. See
+        // `hibernate-reactive-double-panic-abort-FIXED-20260901` and
+        // `crash_handler::current_thread_name`.
+        let thread_name_owned =
+            cratonvm_vm::runtime::crash_handler::current_thread_name();
+        let thread_name = thread_name_owned.as_deref().unwrap_or("<unnamed>");
+
+        // Is this thread's thread-local storage still usable?
+        //
+        // `tracing`'s dispatcher and its subscriber stack reach several
+        // `thread_local!`s and PANIC (they do not degrade) once those are
+        // gone, and a panic raised inside a panic hook aborts the process
+        // immediately. That is the second half of
+        // `hibernate-reactive-double-panic-abort-FIXED-20260901`:
+        // after the `std::thread::current()` call above was fixed, this
+        // hook printed the real panic correctly and then aborted anyway on
+        // its own `tracing::warn!` tail.
+        //
+        // A never-otherwise-touched, destructor-bearing key is a sound probe
+        // for the phase that matters. MEASURED (glibc 2.39, rustc 1.97.1):
+        // throughout `__nptl_deallocate_tsd` — the `pthread` thread-specific-
+        // data phase this hook is reached from when a JNI library's TSD
+        // destructor panics — every `try_with` on the thread answers
+        // `Err(AccessError)`, initialized or not; during Rust's own TLS
+        // destructors even an untouched key still initializes. So `Ok` here
+        // means the tracing stack is safe to enter, and the normal panic
+        // keeps its tracing mirror.
+        thread_local! {
+            static TLS_LIVENESS_PROBE: Box<u8> = Box::new(0);
+        }
+        let tls_usable = TLS_LIVENESS_PROBE.try_with(|_| ()).is_ok();
 
         // Mirror `safe_native_call`'s well-known bootstrap-path quiet
         // list (vm/src/vm/vm_exec.rs:253). These are caught one frame
@@ -6848,6 +6902,12 @@ fn main() {
             (msg.contains("unaligned pointer") || msg.contains("null pointer")) && in_bootstrap;
 
         if is_known_bootstrap_quiet {
+            if !tls_usable {
+                // Quiet by intent and unable to reach `tracing` — say nothing
+                // rather than abort the process to log a panic that is caught
+                // one frame up anyway.
+                return;
+            }
             if let Some(loc) = info.location() {
                 tracing::debug!(
                     target: "cratonvm::panic",
@@ -6907,6 +6967,16 @@ fn main() {
         // the direct stderr write so the user-visible message lands
         // even when the tracing subscriber is unavailable or filtering
         // it out.
+        if !tls_usable {
+            // The stderr write above already carries the whole panic. Entering
+            // `tracing` from a thread whose TLS is gone would panic inside this
+            // hook and abort the process, discarding what we just printed.
+            let _ = writeln!(
+                std::io::stderr(),
+                "[cratonvm] (panic raised after this thread's TLS was destroyed                  -- the tracing mirror of this panic is skipped)",
+            );
+            return;
+        }
         if let Some(loc) = info.location() {
             tracing::warn!(
                 target: "cratonvm::panic",

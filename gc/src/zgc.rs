@@ -264,6 +264,14 @@ impl Drop for ZgcRealHeap {
         // publishes wrote into slot 0.
         crate::gen_heap::clear_jit_read_bounds_owned_by(self.arena_base);
         crate::gen_heap::clear_movable_bounds_owned_by(self.arena_base);
+        // Withdraw the reference-store plan. Unlike the two tables above this
+        // is NOT owner-checked, and does not need to be: withdrawal leaves both
+        // gates ARMED, so the worst a short-lived probe heap can do to a
+        // still-live one is make its compiled code pay helper calls. The
+        // owner-checked shape would be strictly worse here — it would let a
+        // dropped heap leave a PERMISSIVE gate behind if the check ever went
+        // wrong, which is the direction that loses a card.
+        crate::gen_heap::clear_jit_ref_store_plan();
     }
 }
 
@@ -1692,6 +1700,21 @@ impl ZgcRealHeap {
         // call in this file — so it cannot go stale between the root scan and
         // the pause, which a cursor-tight bound could.
         crate::gen_heap::publish_movable_bounds(0, arena_base, arena_end);
+        // Publish the reference-store barrier plan. Three bytes that let
+        // compiled code skip a barrier CALL exactly when this collector's own
+        // helper would have returned on its first test:
+        //
+        //   * pre   = `mark_active`     — `satb_pre_barrier`'s first load;
+        //   * post  = `has_old_objects` — `note_ref_store`'s first load;
+        //   * floor = age 0             — `note_ref_store_slow`'s age test,
+        //     restricted to the bound that carries no ordering obligation
+        //     (see `JIT_YOUNG_FLOOR_AGE_ZERO`).
+        //
+        // Both gates start ARMED and are only ever relaxed by the mirroring
+        // calls in `set_mark_active`, `reset_generational_state` and the
+        // promotion path, so a plan cannot be observed permissive before its
+        // owner has run.
+        crate::gen_heap::publish_jit_ref_store_plan(crate::gen_heap::JIT_YOUNG_FLOOR_AGE_ZERO);
         let heap = Self {
             layout_domain: std::sync::atomic::AtomicU32::new(cratonvm_types::FIRST_LAYOUT_DOMAIN),
             _bounds_registration: crate::gen_heap::RelocatableHeapRegistration::new(),
@@ -3204,9 +3227,18 @@ impl ZgcRealHeap {
     pub fn set_mark_active(&self, active: bool) {
         if !active {
             self.mark_active.store(false, Ordering::Relaxed);
+            // The JIT gate is lowered AFTER the truth, never before. While it
+            // still reads armed, compiled code pays a helper call it did not
+            // need — the harmless direction. See `JitRefStoreGates`.
+            crate::gen_heap::set_jit_ref_store_pre_active(false);
             // `clear` resets the buckets' cumulative counts too.
             self.counters.mark_ingress.clear();
         } else {
+            // Raised BEFORE the truth. Arming happens inside the mark-start
+            // pause, so no mutator can sit between its inline gate test and its
+            // store while this flips; raising the mirror first also covers any
+            // caller that is not inside such a pause.
+            crate::gen_heap::set_jit_ref_store_pre_active(true);
             // `clear` resets the buckets' cumulative counts too.
             self.counters.mark_ingress.clear();
             self.mark_active.store(true, Ordering::Relaxed);
@@ -4017,6 +4049,9 @@ impl ZgcRealHeap {
             self.remembered.remove(page);
         }
         self.has_old_objects.store(false, Ordering::Relaxed);
+        // Lowered AFTER the truth, so the JIT gate is never permissive before
+        // the state it mirrors is. See `JitRefStoreGates`.
+        crate::gen_heap::set_jit_ref_store_post_active(false);
     }
 
     /// Turn young-only collections on or off for THIS heap.
@@ -12339,6 +12374,12 @@ impl GarbageCollector for ZgcRealHeap {
             // this bit set finds a table that already names the objects it has
             // to name.
             self.has_old_objects.store(true, Ordering::Relaxed);
+            // Mirror for the JIT post gate. Raised after the truth here is
+            // still safe because the mirror STARTS armed (see
+            // `publish_jit_ref_store_plan`) and this is the first time it
+            // could ever be lowered; it is only ever lowered in
+            // `reset_generational_state`, which lowers the truth first.
+            crate::gen_heap::set_jit_ref_store_post_active(true);
         }
         if self.gen_nursery_triggered.swap(false, Ordering::Relaxed) {
             self.counters.gen_nursery_triggers.fetch_add(1, Ordering::Relaxed);

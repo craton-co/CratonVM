@@ -20796,13 +20796,28 @@ pub(crate) fn re10_create_server(
 
 /// `HttpServer.create()` — a server that is deliberately NOT bound yet.
 ///
-/// Minted under the PUBLIC class name rather than `HS_IMPL_CLASS`: the
-/// `alias_class` snapshot taken at the end of `register_re10_http_server`
-/// cannot see the phase-72 natives registered afterwards, and this factory's
-/// callers (`createContext(String)`, `getAttributes()`, `getServer()`) are
-/// exactly those. See [`re10_create_server`].
+/// Minted under `HS_IMPL_CLASS`, exactly like the two-arg factory above.
+///
+/// It used to mint under the PUBLIC name `com/sun/net/httpserver/HttpServer`,
+/// to reach phase-72 natives registered on that key AFTER the `alias_class`
+/// snapshot at the end of `register_re10_http_server` — `createContext(String)`,
+/// `getAttributes()`, `getServer()`. **Those rows are not in the registry.** A
+/// `--dump-native-registry` census over a boot in compatible mode reports all
+/// eleven `com/sun/net/httpserver/HttpServer` rows as
+/// `registered_by = net_phase_e.rs` with `overwrote = null`, and phase 72 runs
+/// AFTER phase E — had it registered these keys it would own the slots. The
+/// alias therefore copies the complete surface (eleven rows on each class, the
+/// same eleven method keys), and nothing is lost by minting the impl class.
+///
+/// What WAS lost by minting the public name: `com.sun.net.httpserver.HttpServer`
+/// is ABSTRACT. `create()` handed the application an instance of an abstract
+/// class, so `getClass().getName()` answered a class no JDK can instantiate,
+/// where HotSpot answers `sun.net.httpserver.HttpServerImpl`. That is observable
+/// from ordinary code, it survived `--jdk-only`, and an `instanceof` or cast
+/// against the impl type could not match. See
+/// `docs/known-issues/jdk-only/the-abstract-httpserver-instance-20260902.md`.
 pub(crate) fn re10_create_unbound_server(ctx: &mut dyn NativeContext) -> MethodCallResult {
-    let srv = re10_alloc_server(ctx, "com/sun/net/httpserver/HttpServer", None);
+    let srv = re10_alloc_server(ctx, HS_IMPL_CLASS, None);
     Ok(Some(Value::Object(Some(srv?))))
 }
 
@@ -21143,6 +21158,20 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
                     });
                 }
             }
+            // Record the owning server so `HttpContext.getServer()` can answer
+            // it: the 2-slot context layout has no room for a back-pointer, so
+            // the link table carries it. Phase 72's ONE-arg `createContext` has
+            // always done this; this TWO-arg one -- the overload javac emits for
+            // `createContext(path, handler)`, and the only one registered in a
+            // real-JDK build -- never did, so the documented
+            // `context.getServer().getExecutor()` idiom saw a null server in
+            // every mode.
+            crate::phases_late::net_channels::http_link_set(
+                ctx,
+                crate::phases_late::net_channels::HTTP_LINK_CONTEXT_SERVER,
+                hctx,
+                Some(this),
+            );
             // Releases the whole batch (handler + context).
             ctx.unpin_native_roots(h_pin);
             Ok(Some(Value::Object(Some(hctx))))
@@ -21483,6 +21512,13 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     // Native dispatch is keyed by the receiver class rather than Java
     // inheritance. Mirror the complete public HttpServer bridge surface onto
     // the concrete class returned by the factory, including set/getExecutor.
+    // The HttpContext accessors, in EVERY mode. They lived only in phase 72
+    // (reachable solely from `register_synthetic_overrides`) while
+    // `createContext` minted the carrier in every mode, so on the shipping
+    // arms `getPath`/`getServer`/`getHandler`/`getAttributes` all resolved to
+    // the abstract declaration and threw AbstractMethodError.
+    crate::phases_late::net_channels::register_http_context_surface(r);
+
     r.alias_class(hs, HS_IMPL_CLASS);
     ()
 }

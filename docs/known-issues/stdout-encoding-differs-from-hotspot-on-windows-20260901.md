@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | **OPEN — not fixed here, deliberately.** Deciding what `System.out`'s default charset should be is a compatibility judgement with a blast radius across every Windows user; it belongs in a reviewed change of its own. §9 states the options and a recommendation. |
+| **Status** | **MOSTLY FIXED 2026-09-01 — §9's recommendation (A with C as its kill switch) is implemented.** `native.encoding` and the three stream encodings now follow the host, and `install_charset` stamps the stream's own charset, so the bytes follow too; `CRATONVM_STDOUT_ENCODING=UTF-8` restores the old behaviour in one binary. **Two items are still open** and are listed in §10: `sun.jnu.encoding`, and a CratonVM run on a real Windows console. |
 | **Symptom** | A 273-assertion HotSpot differential that reports **zero** divergences on Linux reports **ten** on Windows. All ten are the same shape: HotSpot prints `?` where CratonVM prints the character. |
 | **Cause** | CratonVM pins `stdout.encoding`, `stderr.encoding` and `native.encoding` to the literal `"UTF-8"` at boot and stamps a literal `"UTF-8"` `Charset` on `System.out` / `System.err`. Nothing in the tree ever asks the host what its console or locale encoding is — `GetConsoleOutputCP`, `GetACP` and `GetOEMCP` appear **zero** times in the repository. HotSpot derives the value from the host, which JEP 400 left it doing on purpose. |
 | **Not a semantics defect** | Re-running **both** VMs with `-Dstdout.encoding=UTF-8 -Dfile.encoding=UTF-8` gives **0 divergences on both probes**. The characters are right in both VMs. This is a disagreement about which bytes carry them. |
@@ -476,3 +476,73 @@ stdout stops being a console. CratonVM's cannot.
   stdout diff must not carry an encoding-dependent byte.
 * `docs/testing/diff-hotspot.md` §5 — the maskers, and where this belongs.
 * `probes/StdoutEncoding.java` — the witness.
+
+
+## 10. 2026-09-01 — §9's recommendation, implemented
+
+§9 recommended **A with C as its kill switch, staged**. Both stages landed the
+same day, from two lanes:
+
+* **Stage 3, `native.encoding` alone** — `86d840a87`, `derive_native_encoding`
+  in `vm/src/vm/vm_init.rs`, behind `CRATONVM_NATIVE_ENCODING`.
+* **Stage 4, the stream keys and the `install_charset` stamp** —
+  `fix/charset-encoding-fidelity-and-jmx-20260901`, behind
+  `CRATONVM_STDOUT_ENCODING`, registered in `types/src/flag_groups.rs`,
+  `types/tests/flag-surface.txt` and `docs/config/flag-inventory.md` as §9 step
+  4 asked.
+
+The two met in a merge, and stage 4's derivation replaced stage 3's. That is
+not a preference: stage 3 read the codeset out of the locale NAME and its own
+doc comment named both gaps — a name cannot tell an installed locale from a
+merely requested one (`LANG=en_US.ISO-8859-1`: HotSpot answers
+`ANSI_X3.4-1968` because `setlocale` failed, a name-parse answers
+`ISO-8859-1`), and the Windows leg answered a constant because no code page was
+read anywhere in the tree. `cratonvm_native_api::os_encoding` closes both: it
+calls `setlocale(LC_CTYPE, "")` + `nl_langinfo(CODESET)` on Unix — once, on one
+thread, restoring the previous locale, so the process-global state
+`derive_host_locale` declines to touch is left as found — and `GetACP` plus the
+attached console's code page on Windows. `derive_native_encoding` and its kill
+switch survive unchanged as the entry point.
+
+### What §1's witness looks like now
+
+MEASURED on Linux, which §3 established reproduces the Windows mechanism
+exactly, one binary, both modes, `regression-suite/src/REncodingFidelity.java`:
+
+```text
+                          LANG=C.UTF-8              LC_ALL=C
+                        HotSpot   CratonVM      HotSpot        CratonVM
+native.encoding         UTF-8     UTF-8         ANSI_X3.4-1968 ANSI_X3.4-1968
+stdout.encoding         UTF-8     UTF-8         ANSI_X3.4-1968 ANSI_X3.4-1968
+stdin.encoding          UTF-8     UTF-8         ANSI_X3.4-1968 ANSI_X3.4-1968
+System.out.charset()    UTF-8     UTF-8         US-ASCII       US-ASCII
+Charset.defaultCharset  UTF-8     UTF-8         UTF-8          UTF-8
+System.out.print("[Ж]") 5bd0965d  5bd0965d      5b3f5d         5b3f5d
+```
+
+The last row is §1's `s_lower` shape, on the platform that can run it in CI:
+the `?` HotSpot substitutes is now the `?` this VM substitutes. §2's proof
+still holds in the other direction — both VMs still print the character when
+both are given `-Dstdout.encoding=UTF-8`.
+
+## 11. Still open
+
+1. **`sun.jnu.encoding` is still pinned to `UTF-8`.** HotSpot derives it, so
+   under a C locale the two VMs disagree about that one key. It is left alone
+   on purpose and the reason is the one §9 gave for staging at all: this key
+   decides how FILE NAMES are encoded, so moving it changes class loading
+   rather than printing. `regression-suite/src/REncodingFidelity.java`
+   deliberately does not diff it — a chosen divergence must not become a red
+   gate on every non-UTF-8 host — and `probes/EncodingFidelity.java` prints it
+   so it stays observable.
+
+2. **The Windows arm is implemented but not RUN.** `GetACP` /
+   `GetConsoleOutputCP` / `GetConsoleMode` are called, and the two spellings
+   they produce (`Cp1251` for the ANSI code page, `cp866` for an attached
+   console) are measured — but measured from **HotSpot** on the 1251 machine,
+   in one `-XshowSettings:properties` run with stdout redirected and stdin
+   still on the console. No CratonVM binary has been built on Windows and run
+   against §1's witness. Everything in §10's table is Linux, which §3 is why
+   that is worth something and not everything. The unit tests in
+   `cratonvm_native_api::os_encoding` pin the two spelling rules; the console
+   detection itself is unexercised.

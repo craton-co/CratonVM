@@ -287,10 +287,13 @@ pub fn set_jni_context_arc(shared: Arc<SharedVm>) {
 /// Clear the JNI thread-local context after returning from native code.
 /// Drops the `Arc<SharedVm>`, decrementing the reference count.
 pub fn clear_jni_context() {
-    JNI_SHARED_VM.with(|c| {
+    // `try_with`: this is reached from `DetachCurrentThread`, which a JNI
+    // library's `pthread` TSD destructor can call after this thread's TLS is
+    // already gone. There is nothing to clear then, and `with` would panic.
+    let _ = JNI_SHARED_VM.try_with(|c| {
         *c.borrow_mut() = None;
     });
-    JNI_CONTEXT_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+    let _ = JNI_CONTEXT_GENERATION.try_with(|g| g.set(g.get().wrapping_add(1)));
 }
 
 /// Install the JNI context and hand back what was there, so the caller can put
@@ -384,7 +387,8 @@ pub unsafe fn restore_jni_thread(prev: *mut JvmThread) {
 
 /// Clear the JNI thread pointer on native code return.
 pub fn clear_jni_thread() {
-    JNI_THREAD.with(|c| c.set(std::ptr::null_mut()));
+    // `try_with` for the same reason as `clear_jni_context`.
+    let _ = JNI_THREAD.try_with(|c| c.set(std::ptr::null_mut()));
 }
 
 // ---------------------------------------------------------------------------
@@ -560,10 +564,49 @@ thread_local! {
     > = std::cell::RefCell::new(None);
 }
 
+// ---------------------------------------------------------------------------
+// Detaching from a `pthread` thread-specific-data destructor
+// ---------------------------------------------------------------------------
+//
+// `DetachCurrentThread` does not only arrive from application code. The
+// libraries that attach host threads register their own per-thread cleanup
+// with `pthread_key_create` (BoringSSL and APR through netty_tcnative, and
+// the native transports underneath Vert.x), and glibc runs those destructors
+// in `__nptl_deallocate_tsd` — which is *after* `__call_tls_dtors`, i.e.
+// after every Rust `thread_local!` on that thread has already been destroyed.
+//
+// MEASURED (glibc 2.39 / Linux 6.17, rustc 1.97.1): in that phase every
+// `LocalKey::try_with` on the thread answers `Err(AccessError)` — whether or
+// not the key was ever initialized — while during Rust's *own* TLS
+// destructors even a never-touched key still initializes normally. So the
+// TSD phase is all-or-nothing: a detach arriving there can reach none of the
+// attachment state below.
+//
+// `LocalKey::with` PANICS in that state rather than returning an error, and
+// `jni_detach_current_thread` is an `extern "C"` function reached from a C
+// destructor, so the unwind is undefined behaviour, not a diagnosable
+// failure. What it did in practice was worse than either: the panic hook ran,
+// touched thread-locals of its own, and the resulting panic-while-panicking
+// aborted the process with SIGABRT — on 183 of 206 Hibernate Reactive classes
+// under `--jdk-only`, every one of them *after* the class had already printed
+// its passing `@@RESULT`. See
+// `hibernate-reactive-double-panic-abort-FIXED-20260901`.
+//
+// Every thread-local access on the detach path therefore goes through
+// `try_with` with a defined answer for "the thread is already gone". A detach
+// that arrives in the TSD phase has nothing left to do: `FOREIGN_THREAD_BOX`'s
+// own destructor has already dropped the `JvmThread` it owned.
+
 /// True if the calling OS thread is currently foreign-attached (owns a
 /// `JvmThread` parked in [`FOREIGN_THREAD_BOX`]).
+///
+/// `false` once this thread's TLS has been destroyed — see the note above: at
+/// that point the box is gone, so "not attached" is the truthful answer and
+/// the only one that can be given without panicking.
 pub fn is_foreign_attached() -> bool {
-    FOREIGN_THREAD_BOX.with(|c| c.borrow().is_some())
+    FOREIGN_THREAD_BOX
+        .try_with(|c| c.borrow().is_some())
+        .unwrap_or(false)
 }
 
 /// Build, register, and install a foreign (host-created) OS thread as a
@@ -687,7 +730,10 @@ pub fn attach_foreign_thread(
 /// reclamation does not race a live stop-the-world — see §3.4) and for clearing
 /// the `JNI_THREAD` / `JNI_SHARED_VM` TLS afterwards.
 pub fn detach_foreign_thread(shared: &SharedVm) -> bool {
-    let jt = FOREIGN_THREAD_BOX.with(|c| c.borrow_mut().take());
+    let jt = FOREIGN_THREAD_BOX
+        .try_with(|c| c.borrow_mut().take())
+        .ok()
+        .flatten();
     let mut jt = match jt {
         Some(j) => j,
         None => return false,
@@ -721,11 +767,13 @@ pub fn detach_foreign_thread(shared: &SharedVm) -> bool {
     // trace, so no dangling reference is possible either way, but leaving it in
     // place would make a later fault on this (now plain host) OS thread render
     // the stack of a Java thread that no longer exists.
-    let crash_guard =
-        FOREIGN_CRASH_FRAMES.with(|c| c.try_borrow_mut().ok().and_then(|mut slot| slot.take()));
+    let crash_guard = FOREIGN_CRASH_FRAMES
+        .try_with(|c| c.try_borrow_mut().ok().and_then(|mut slot| slot.take()))
+        .ok()
+        .flatten();
     drop(crash_guard);
     drop(jt);
-    FOREIGN_CALL_DEPTH.with(|c| c.set(0));
+    let _ = FOREIGN_CALL_DEPTH.try_with(|c| c.set(0));
     true
 }
 
@@ -736,7 +784,10 @@ pub fn detach_foreign_thread(shared: &SharedVm) -> bool {
 /// the attach/detach paths and the foreign-call transitions, which run strictly
 /// before a call begins or after it returns — never concurrently with the call.
 fn with_foreign_thread<R>(f: impl FnOnce(&mut JvmThread) -> R) -> Option<R> {
-    FOREIGN_THREAD_BOX.with(|c| c.borrow_mut().as_mut().map(|b| f(&mut **b)))
+    FOREIGN_THREAD_BOX
+        .try_with(|c| c.borrow_mut().as_mut().map(|b| f(&mut **b)))
+        .ok()
+        .flatten()
 }
 
 /// Declare the **current OS thread** as parked in host-native code so a garbage
@@ -8258,12 +8309,19 @@ fn attach_current_thread_impl(
 }
 
 extern "C" fn jni_detach_current_thread(_vm: JavaVM) -> JInt {
-    // Foreign-attached thread: full teardown (deregister + reclaim JvmThread).
+    // Reachable from a `pthread` TSD destructor with this thread's TLS already
+    // destroyed — see the note above `is_foreign_attached`. Nothing below may
+    // use `LocalKey::with`.
+    //
+    // `is_foreign_attached()` answers `false` in that state, and the
+    // never-attached tail below is `try_with`-safe too, so the whole function
+    // degrades to "nothing to detach, report success" rather than panicking
+    // out of an `extern "C"` frame.
     if is_foreign_attached() {
         // JNI forbids detaching a thread that still has Java frames on its stack;
         // for us that means a call is in flight on this OS thread (depth > 0).
         // Return JNI_ERR rather than corrupt state (matches HotSpot).
-        if FOREIGN_CALL_DEPTH.with(|c| c.get()) != 0 {
+        if FOREIGN_CALL_DEPTH.try_with(|c| c.get()).unwrap_or(0) != 0 {
             tracing::warn!("JNI DetachCurrentThread: refusing detach with a Java call in flight");
             return JNI_ERR;
         }
@@ -8287,8 +8345,8 @@ extern "C" fn jni_detach_current_thread(_vm: JavaVM) -> JInt {
             detach_foreign_thread(&shared);
         } else {
             // No live VM (process shutdown) — just drop our owned box.
-            FOREIGN_THREAD_BOX.with(|c| *c.borrow_mut() = None);
-            FOREIGN_CALL_DEPTH.with(|c| c.set(0));
+            let _ = FOREIGN_THREAD_BOX.try_with(|c| *c.borrow_mut() = None);
+            let _ = FOREIGN_CALL_DEPTH.try_with(|c| c.set(0));
         }
         clear_jni_thread();
         clear_jni_context();
@@ -8298,7 +8356,9 @@ extern "C" fn jni_detach_current_thread(_vm: JavaVM) -> JInt {
 
     // Non-foreign thread (bootstrap/creating thread, or never-attached): clear
     // the JNI TLS context if present — historical behaviour, unchanged.
-    let had_context = JNI_SHARED_VM.with(|c| c.borrow().is_some());
+    let had_context = JNI_SHARED_VM
+        .try_with(|c| c.borrow().is_some())
+        .unwrap_or(false);
     if had_context {
         clear_jni_context();
         clear_jni_thread();
@@ -8529,6 +8589,62 @@ mod tests {
             CALLS.load(Ordering::SeqCst),
             1,
             "hook must not run again after being taken"
+        );
+    }
+
+    /// The detach path must ANSWER, not panic, when it is reached from a
+    /// `pthread` thread-specific-data destructor.
+    ///
+    /// That is how `DetachCurrentThread` actually arrives for a host thread a
+    /// JNI library attached: the library registers its per-thread cleanup with
+    /// `pthread_key_create`, and glibc runs those destructors in
+    /// `__nptl_deallocate_tsd`, which is AFTER `__call_tls_dtors` — so every
+    /// Rust `thread_local!` on the thread is already destroyed and
+    /// `LocalKey::with` panics. Panicking out of an `extern "C"` frame is
+    /// undefined behaviour, and what it did in practice was abort the process:
+    /// 183 of 206 Hibernate Reactive classes on rc=134, each one *after* it had
+    /// printed a passing `@@RESULT`. See
+    /// `hibernate-reactive-double-panic-abort-FIXED-20260901`.
+    ///
+    /// A regression re-panics inside a TLS destructor, which aborts the test
+    /// process — so this fails loudly rather than quietly.
+    #[cfg(unix)]
+    #[test]
+    fn detach_path_answers_from_a_pthread_tsd_destructor() {
+        use std::sync::atomic::{AtomicI32, Ordering as AtomicOrdering};
+
+        static ANSWER: AtomicI32 = AtomicI32::new(-1);
+
+        unsafe extern "C" fn tsd_dtor(_v: *mut std::ffi::c_void) {
+            // Reached with this thread's Rust TLS already gone.
+            ANSWER.store(i32::from(is_foreign_attached()), AtomicOrdering::SeqCst);
+        }
+
+        let mut key: libc::pthread_key_t = 0;
+        assert_eq!(
+            unsafe { libc::pthread_key_create(&mut key, Some(tsd_dtor)) },
+            0,
+            "pthread_key_create failed"
+        );
+
+        std::thread::Builder::new()
+            .name("tsdprobe".to_string())
+            .spawn(move || {
+                // Give the thread some Rust TLS to tear down, then arm the
+                // pthread key so its destructor runs after that teardown.
+                let _ = is_foreign_attached();
+                unsafe {
+                    libc::pthread_setspecific(key, 1_usize as *const std::ffi::c_void);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert_eq!(
+            ANSWER.load(AtomicOrdering::SeqCst),
+            0,
+            "the TSD destructor never ran, so this test proved nothing"
         );
     }
 

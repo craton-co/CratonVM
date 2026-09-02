@@ -301,8 +301,12 @@ and can be overridden by editing the `Default for VmConfig` impl:
 
 ## Environment variables
 
-Everything the VM reads from the environment is one of **fifteen** variables:
-ten grouped ones that take a comma-separated token list, and five scalars.
+Everything the VM reads from the environment is one of **eighteen**
+variables: ten grouped ones that take a comma-separated token list, and eight
+scalars. (Fifteen until 2026-09-01; the three that arrived that day are
+`CRATONVM_JFR_ENABLE_EVENTS`, `CRATONVM_NATIVE_ENCODING` and
+`CRATONVM_STDOUT_ENCODING`, each a scalar because it carries a VALUE and the
+token model is presence-only.)
 
 ```sh
 CRATONVM_JIT=-bce,unroll,threshold=200
@@ -473,6 +477,6 @@ from a parent shell.
 > disappear without notice.
 >
 > The surface reached 692 identifiers by growing roughly one per fixed bug
-> with no retirement path; the fifteen variables above are pinned by
+> with no retirement path; the eighteen variables above are pinned by
 > `types/tests/flag_surface.rs`, so a new raw `std::env::var("CRATONVM_…")`
 > call site is a deliberate two-file edit.

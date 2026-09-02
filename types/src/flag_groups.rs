@@ -183,6 +183,16 @@ pub const SCALARS: &[&str] = &[
     // `file.encoding` only, and `System.java` specifies `native.encoding` as
     // host-derived and command-line-immune).
     "CRATONVM_NATIVE_ENCODING",
+    // 2026-09-01: pin the three stream encodings — `stdout.encoding`,
+    // `stderr.encoding`, `stdin.encoding` — and with them the `Charset`
+    // `install_charset` stamps on `System.out`/`System.err`, which is what
+    // decides the BYTES. Scalar for the same reason as the row above: it
+    // carries a VALUE. Unset = derived from the host (the locale codeset on
+    // Unix, the console/ANSI code page on Windows); `=UTF-8` restores the
+    // constant this VM hard-coded before that date, in one binary, which is
+    // the A/B `stdout-encoding-differs-from-hotspot-on-windows-20260901.md`
+    // §9 asked for when it recommended following the host.
+    "CRATONVM_STDOUT_ENCODING",
 ];
 
 /// One knob: a token in a group, and the legacy key(s) it expands to.
@@ -1160,8 +1170,21 @@ pub const INVENTORY: &[E] = &[
     // this row is the whole fix.
     E { group: Group::JIT, token: "precise-getstatic-checkcast", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST"), off_word: None, since: "2026-08-11" },
     E { group: Group::JIT, token: "precise-alloc-athrow", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW"), off_word: None, since: "2026-08-17" },
+    // Opt-in. The GP register file landed beside the FP one on 2026-09-02, but
+    // the flip still wants a wall-clock measurement -- see
+    // `ir_lower::linear_scan_enabled`. `since` stays 2026-08-01: the flag is the
+    // same flag, and this column dates the KNOB, not its capability.
     E { group: Group::JIT, token: "ir-linear-scan", on_key: Some("CRATONVM_JIT_IR_LINEAR_SCAN"), off_key: None, off_word: None, since: "2026-08-01" },
     E { group: Group::JIT, token: "ir-long", on_key: Some("CRATONVM_JIT_IR_LONG"), off_key: None, off_word: None, since: "2026-06-21" },
+    // Default-ON A/B lever: `x64::gated_ref_store_enabled` reads `0`. Its
+    // predecessor `CRATONVM_NO_JIT_INLINE_PUTFIELD` measured exactly zero under
+    // the default collector, because the path it disabled was already
+    // unreachable there.
+    E { group: Group::JIT, token: "gated-ref-store", on_key: Some("CRATONVM_JIT_GATED_REF_STORE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // OPT-IN, and known to miscompile until the ARG_REGS audit lands -- see
+    // `x64::operand_cache_enabled`. Declared so the two arms are measurable in
+    // one binary, which is what the previous shape (no flag at all) prevented.
+    E { group: Group::JIT, token: "operand-cache", on_key: Some("CRATONVM_JIT_OPERAND_CACHE"), off_key: None, off_word: None, since: "2026-09-02" },
     // Default-ON A/B lever: `ir_lower::reloc_emit_enabled` reads `0`/`false`.
     E { group: Group::JIT, token: "ir-reloc-emit", on_key: Some("CRATONVM_JIT_IR_RELOC_EMIT"), off_key: None, off_word: Some("0"), since: "2026-07-31" },
     // Declared 2026-08-30 with the relocation-gate coupling. Default-ON, so a
@@ -1415,6 +1438,34 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "code-ptr-memo", on_key: None, off_key: Some("CRATONVM_JIT_NO_CODE_PTR_MEMO"), off_word: None, since: "2026-08-21" },
     E { group: Group::DBG, token: "invoke-phases", on_key: Some("CRATONVM_DBG_INVOKE_PHASES"), off_key: None, off_word: None, since: "2026-08-19" },
     E { group: Group::JIT, token: "param-tag-scan", on_key: None, off_key: Some("CRATONVM_JIT_NO_PARAM_TAG_SCAN"), off_word: None, since: "2026-08-18" },
+    // ── Interpreter hot-path memoizations, 2026-09-02 ────────────────────
+    // Each of the five below removes work that was being repeated per
+    // operation but is fixed per method, per call site or per process. Each
+    // ships with an off switch for the same reason `code-ptr-memo` above
+    // does: a change worth single-digit nanoseconds, on a host whose
+    // run-to-run spread is 20%, can only be measured by A/B-ing ONE binary.
+    // The `iface-select-memo` switch had to be widened once already -- it
+    // gated the memo but not the short-circuit beside it, so its "off" arm
+    // was not the pre-change path and the first A/B separated nothing.
+    //
+    // `descriptor-facts` — off routes `ParamTags::for_method` and
+    // `Frame::return_tag` back through the per-call descriptor scans they
+    // replaced (`ParamTags::of`, `cratonvm_jit::return_type`).
+    E { group: Group::JIT, token: "descriptor-facts", on_key: None, off_key: Some("CRATONVM_JIT_NO_DESCRIPTOR_FACTS"), off_word: None, since: "2026-09-02" },
+    // `backedge-poll-gate` — off restores the unconditional
+    // `safepoint_check` call on every backward branch.
+    E { group: Group::JIT, token: "backedge-poll-gate", on_key: None, off_key: Some("CRATONVM_JIT_NO_BACKEDGE_POLL_GATE"), off_word: None, since: "2026-09-02" },
+    // `iface-select-memo` — off makes every `invokeinterface` cache hit
+    // retake the class-manager read lock and rewalk the receiver hierarchy
+    // to re-verify maximally-specific selection.
+    E { group: Group::JIT, token: "iface-select-memo", on_key: None, off_key: Some("CRATONVM_JIT_NO_IFACE_SELECT_MEMO"), off_word: None, since: "2026-09-02" },
+    // `dup-name-field-gate` — off makes every instance field access walk
+    // `retarget_instance_field_to_receiver` in full, whether or not any
+    // binary name in this process resolves to two `ClassId`s.
+    E { group: Group::LOADER, token: "dup-name-field-gate", on_key: None, off_key: Some("CRATONVM_LOADER_NO_DUP_NAME_FIELD_GATE"), off_word: None, since: "2026-09-02" },
+    // `ann-proxy-latch` — off restores the epoch-keyed negative in
+    // `ClassRealm::is_annotation_proxy_class`.
+    E { group: Group::LOADER, token: "ann-proxy-latch", on_key: None, off_key: Some("CRATONVM_LOADER_NO_ANN_PROXY_LATCH"), off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "ldc-const-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_LDC_CONST_CACHE"), off_word: None, since: "2026-08-18" },
     E { group: Group::JIT, token: "ir-unresumable-trap-guard", on_key: Some("CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD"), off_key: None, off_word: Some("0"), since: "2026-08-21" },
     E { group: Group::JIT, token: "compiled-ldc-const-cache", on_key: Some("CRATONVM_JIT_COMPILED_LDC_CONST_CACHE"), off_key: None, off_word: Some("0"), since: "2026-08-20" },
@@ -1582,6 +1633,8 @@ pub const INVENTORY: &[E] = &[
     // leaves its canonical spelling ambiguous, which is the whole point of that
     // invariant. Nothing referenced the `CRATONVM_GC=dbg-*` spellings.
     E { group: Group::GC, token: "card-table-only", on_key: Some("CRATONVM_CARD_TABLE_ONLY"), off_key: None, off_word: None, since: "2026-07-16" },
+    E { group: Group::GC, token: "full-rset-scan", on_key: Some("CRATONVM_GC_FULL_RSET_SCAN"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::GC, token: "verify-rset", on_key: Some("CRATONVM_GC_VERIFY_RSET"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "compact-ref-fields", on_key: Some("CRATONVM_COMPACT_REF_FIELDS"), off_key: None, off_word: None, since: "2026-06-22" },
     E { group: Group::GC, token: "pack-fields-by-width", on_key: Some("CRATONVM_PACK_FIELDS_BY_WIDTH"), off_key: None, off_word: None, since: "2026-08-06" },
     E { group: Group::GC, token: "compressed-oops", on_key: Some("CRATONVM_COMPRESSED_OOPS"), off_key: None, off_word: None, since: "2026-07-25" },
@@ -1665,6 +1718,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "promotion-oom-guard-broad", on_key: Some("CRATONVM_PROMOTION_OOM_GUARD_BROAD"), off_key: None, off_word: None, since: "2026-06-23" },
     E { group: Group::GC, token: "selective-promote", on_key: None, off_key: Some("CRATONVM_NO_SELECTIVE_PROMOTE"), off_word: None, since: "2026-06-05" },
     E { group: Group::GC, token: "stress", on_key: Some("CRATONVM_GC_STRESS"), off_key: None, off_word: None, since: "2026-06-18" },
+    E { group: Group::GC, token: "young-trigger-percent", on_key: Some("CRATONVM_GC_YOUNG_TRIGGER_PERCENT"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "sweep-anchor-stride", on_key: Some("CRATONVM_GC_SWEEP_ANCHOR_STRIDE"), off_key: None, off_word: None, since: "2026-07-25" },
     E { group: Group::GC, token: "tlab-gc-trigger", on_key: Some("CRATONVM_TLAB_GC_TRIGGER"), off_key: None, off_word: None, since: "2026-07-24" },
     E { group: Group::GC, token: "weakref-clear", on_key: Some("CRATONVM_WEAKREF_CLEAR"), off_key: None, off_word: None, since: "2026-06-29" },
@@ -1991,6 +2045,13 @@ pub const INVENTORY: &[E] = &[
     // unconditional per-read rebuild, which is the A/B a same-binary
     // bisection needs.
     E { group: Group::COMPAT, token: "map-view-cache", on_key: Some("CRATONVM_MAP_VIEW_CACHE"), off_key: None, off_word: Some("0"), since: "2026-08-23" },
+    // `ClassLoader.getResource` / `Class.getResource` stopping at the first
+    // matching classpath entry, default-ON. `0` restores the whole-list walk
+    // that built every matching URL and returned element 0. The two are
+    // required to answer identically, so the flag can only change how much of
+    // the classpath was touched — which makes it the same-binary A/B for that
+    // cost.
+    E { group: Group::COMPAT, token: "getresource-first-hit", on_key: Some("CRATONVM_GETRESOURCE_FIRST_HIT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     // Take the elision decision, then rebuild anyway and compare, panicking
     // on divergence. Turns the soundness claim into something measured
     // rather than argued; expensive, so default-OFF.
@@ -3503,22 +3564,29 @@ mod tests {
     }
 
     #[test]
-    fn the_whole_surface_is_seventeen_variables() {
+    fn the_whole_surface_is_eighteen_variables() {
         // This is the number the refactor exists to hold down. Raising it wants
         // an argument, not a merge.
         //
-        // 15 -> 17 on 2026-09-01, and both arguments were already made — at the
-        // entries themselves, in `SCALARS`, by the changes that added them:
-        // `CRATONVM_JFR_ENABLE_EVENTS` (B10) and the `native.encoding` override
-        // (D3). Each is a scalar rather than an `INVENTORY` token for the same
-        // stated reason: it carries a VALUE, and the `E` model is
-        // presence-only. Only the count here was left behind, which is why this
-        // test was red on `dev` for every lane rather than for the one that
-        // grew the surface.
+        // 15 -> 17 -> 18 on 2026-09-01, and every argument was made at the
+        // entry itself, in `SCALARS`, by the change that added it:
+        // `CRATONVM_JFR_ENABLE_EVENTS` (B10), the `native.encoding` override
+        // (D3), and `CRATONVM_STDOUT_ENCODING`.
+        //
+        // The argument for the third, since this is where it is owed: it is the
+        // opt-out for deriving `stdout.encoding` / `stderr.encoding` /
+        // `stdin.encoding` from the host instead of pinning UTF-8, which
+        // `docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-
+        // 20260901.md` §9 asked for by name when it recommended following the
+        // host — that key decides the `Charset` stamped on `System.out`, so the
+        // change moves BYTES and not only a property string, and a change that
+        // moves bytes on every non-UTF-8 host needs a same-binary way back.
+        // A scalar rather than an `INVENTORY` token for the same reason as the
+        // two above: it carries a VALUE, and the `E` model is presence-only.
         //
         // Two GROUPS were not added — `Group::ALL` is still ten. Adding one of
         // those is the move that would want a fresh argument.
-        assert_eq!(Group::ALL.len() + SCALARS.len(), 17);
+        assert_eq!(Group::ALL.len() + SCALARS.len(), 18);
     }
     /// The repository's first commit. No knob can predate it, so a `since:`
     /// earlier than this is a typo rather than a very old flag.

@@ -246,6 +246,8 @@ mod arith;
 mod arrays;
 mod deopt_stubs;
 mod objects;
+pub(crate) use objects::note_ungated_ref_store;
+pub use objects::ref_store_site_counts;
 mod osr;
 mod simd;
 
@@ -282,12 +284,20 @@ enum StackSlot {
     /// round-trip when a register-mapped local is loaded and then immediately
     /// used by an arithmetic or branch operation.
     CalleeSaved(u8),
-    /// Value is in a caller-saved scratch register (R8/R9). Used as a
-    /// deferred-spill cache: `push_from_rax` moves the result into a scratch
-    /// register instead of storing to the frame, avoiding the store+load
-    /// round-trip when the value is consumed by the very next operation.
-    /// Scratch slots MUST be flushed before any call, backward branch, or return.
-    Scratch(u8),
+    /// Value is in a caller-saved scratch register (R8/R9), paired with the
+    /// frame word its push already reserved for it. Used as a deferred-spill
+    /// cache: `push_from_rax` moves the result into a scratch register instead
+    /// of storing to the frame, avoiding the store+load round-trip when the
+    /// value is consumed by the very next operation.
+    ///
+    /// Scratch slots MUST be flushed before any call, backward branch or
+    /// return, and the flush stores into **this** home rather than reserving
+    /// another. Carrying the home in the slot is what bounds the spill region:
+    /// without it a straight-line stretch with several calls reserved a fresh
+    /// word at every flush and grew the frame until the range was exhausted,
+    /// which is the "call-heavy regression" that had confined this whole
+    /// mechanism to methods containing no calls at all.
+    Scratch(u8, i32),
     /// Value is in an XMM register (XMM0-XMM15). Used for FP locals loaded via
     /// dload/fload from XMM-allocated locals. Avoids the XMM→RAX→frame round-trip
     /// when the value is immediately consumed by a double/float arithmetic op.
