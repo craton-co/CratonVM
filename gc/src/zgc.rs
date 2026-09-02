@@ -3744,6 +3744,23 @@ pub struct ZgcRealHeap {
     /// [`Self::relocations`]. See [`Self::forwarding_word_engagement`].
     forwarding_words_stamped: AtomicUsize,
     forwarding_words_read: AtomicUsize,
+    /// The address range the last slide's forwarding records occupy, and the
+    /// only range [`Self::forwarding_word_at`] will dereference.
+    ///
+    /// Empty (`hi == 0`, `lo == usize::MAX`) between slides. It exists because
+    /// the heap commits lazily: an arbitrary in-arena address is not
+    /// necessarily mapped, so a read has to be bounded by something the
+    /// collector VERIFIED rather than by an argument about where a slide leaves
+    /// things.
+    stamp_lo: AtomicUsize,
+    stamp_hi: AtomicUsize,
+    /// Bytes this heap has returned to the OS, summed over collections.
+    ///
+    /// The engagement counter for the reserving backing store's second half. A
+    /// run with a large peak and a zero here is one where lazy commit bought
+    /// the startup charge and nothing else -- which is the state before
+    /// `Arena::decommit_unbumped_middle` existed.
+    bytes_uncommitted: AtomicUsize,
 
     /// Allocate-black claims that actually had to touch the bitmap, i.e. the
     /// residual after the per-chunk blackening. `conc_black_allocations` counts
@@ -4037,6 +4054,9 @@ impl ZgcRealHeap {
             sweep_worker_count: AtomicUsize::new(Self::sweep_workers_requested()),
             forwarding_words_stamped: AtomicUsize::new(0),
             forwarding_words_read: AtomicUsize::new(0),
+            stamp_lo: AtomicUsize::new(usize::MAX),
+            stamp_hi: AtomicUsize::new(0),
+            bytes_uncommitted: AtomicUsize::new(0),
             conc_black_claims: AtomicUsize::new(0),
             relocation_on_page_pins: AtomicUsize::new(0),
             conc_start_adaptive: AtomicBool::new(conc_start_is_adaptive()),
@@ -9572,6 +9592,16 @@ impl ZgcRealHeap {
             return;
         }
         let mut stamped = 0usize;
+        let mut lo = usize::MAX;
+        let mut hi = 0usize;
+        // READABILITY IS NOT A GIVEN ANY MORE. The backing store commits
+        // lazily and gives granules back (`crate::reservation`), so a span the
+        // allocator has retracted past may be reserved-but-uncommitted -- where
+        // a write faults instead of landing. The arena is the only thing that
+        // knows; asking it once per stamp is free at a safepoint, and it is the
+        // difference between a record and a `STATUS_ACCESS_VIOLATION`.
+        let arena = self.arena.lock();
+        let arena_base = arena.base_ptr() as usize;
         for &(from, to) in pairs {
             // Inside the zeroed, provably-empty tail...
             if from < tail.start || from >= tail.end {
@@ -9589,6 +9619,9 @@ impl ZgcRealHeap {
             if self.registry.contains(from) {
                 continue;
             }
+            if from < arena_base || !arena.is_readable_at(from - arena_base) {
+                continue;
+            }
             // SAFETY: `from` is an 8-aligned address inside the arena envelope
             // (it was an allocation base until this slide), `from + 16` is
             // bounded above, and the span is zero-filled and unreferenced by
@@ -9601,9 +9634,31 @@ impl ZgcRealHeap {
                 );
             }
             stamped += 1;
+            lo = lo.min(from);
+            hi = hi.max(from + MARK_WORD_OFFSET + 8);
+        }
+        drop(arena);
+        // THE EXACT RANGE THAT WAS STAMPED, so the read side never dereferences
+        // an address on the strength of an argument about geometry. Cleared by
+        // `Arena::decommit_unbumped_middle`'s caller before the space can go
+        // away; see `forwarding_word_at`.
+        if stamped > 0 {
+            self.stamp_lo.store(lo, Ordering::Release);
+            self.stamp_hi.store(hi, Ordering::Release);
         }
         self.forwarding_words_stamped
             .fetch_add(stamped, Ordering::Relaxed);
+    }
+
+    /// Forget the last slide's forwarding records.
+    ///
+    /// **Call immediately before anything can decommit the span they live in.**
+    /// The records sit in the vacated tail, which is exactly the space
+    /// `Arena::decommit_unbumped_middle` releases -- so the read side has to
+    /// stop believing in them before, not after.
+    fn retire_forwarding_words(&self) {
+        self.stamp_hi.store(0, Ordering::Release);
+        self.stamp_lo.store(usize::MAX, Ordering::Release);
     }
 
     /// Read a forwarding word stamped by [`Self::stamp_forwarding_words`].
@@ -9624,6 +9679,23 @@ impl ZgcRealHeap {
     ///   since died must answer `None`, not hand back a freed address. The
     ///   table lookup this parallels ends with the identical check.
     fn forwarding_word_at(&self, addr: usize) -> Option<usize> {
+        // INSIDE THE RANGE THE LAST SLIDE ACTUALLY STAMPED, first and cheapest.
+        //
+        // Two relaxed-ish loads and two compares, and they are what makes this
+        // read SAFE rather than merely likely to hit: the heap commits lazily
+        // and hands granules back, so an arbitrary in-arena address is not
+        // necessarily mapped. Every address in `[stamp_lo, stamp_hi)` was
+        // verified readable when it was written and is retired before anything
+        // can take the space -- see `retire_forwarding_words`.
+        //
+        // It is also the whole of the "did this cycle stamp anything" test: the
+        // range is empty (`hi == 0`) whenever no slide has run since the last
+        // retire, so a heap that never compacts pays two loads.
+        if addr < self.stamp_lo.load(Ordering::Acquire)
+            || addr.saturating_add(MARK_WORD_OFFSET + 8) > self.stamp_hi.load(Ordering::Acquire)
+        {
+            return None;
+        }
         if addr < self.arena_base
             || addr.saturating_add(MARK_WORD_OFFSET + 8) > self.arena_end
             || (addr - self.arena_base) & 7 != 0
@@ -9651,6 +9723,20 @@ impl ZgcRealHeap {
     /// the slide refilled everything it emptied; `from_word` at zero with
     /// `stamped` high means the barrier is never asked about the tail, and the
     /// table is carrying the whole load after all.
+    /// `(bytes committed for this heap right now, bytes returned to the OS
+    /// over its life)`.
+    ///
+    /// The two numbers that say whether the reserving backing store is doing
+    /// anything. `committed` well below `-Xmx` is lazy commit working;
+    /// `returned` above zero is the give-back working. Both are the honest
+    /// `capacity` and `0` on the wholly-committed fallback.
+    pub fn commit_stats(&self) -> (usize, usize) {
+        (
+            self.arena.lock().committed_bytes(),
+            self.bytes_uncommitted.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn forwarding_word_engagement(&self) -> (usize, usize) {
         (
             self.forwarding_words_stamped.load(Ordering::Relaxed),
@@ -14775,6 +14861,37 @@ impl GarbageCollector for ZgcRealHeap {
         // already there before this call.
         self.retire_all_tlabs();
 
+        // ---- GIVE THE UN-BUMPED MIDDLE BACK TO THE OS --------------------
+        //
+        // Here, and not where the space became free. Everything between the two
+        // cursors belongs to neither end and can only be reached by moving a
+        // cursor -- which commits what it passes over -- so releasing its whole
+        // granules asks no liveness question at all.
+        //
+        // It is at the START of a collection rather than the end of the last
+        // one because the last slide's forwarding records live in exactly that
+        // span (`stamp_forwarding_words`), and a record has to stop being
+        // believed BEFORE the page under it can go away.
+        // `retire_forwarding_words` is that statement, and the ordering of the
+        // two lines is the whole of it.
+        //
+        // The pair is what makes `-Xmx` a ceiling rather than a charge: with a
+        // reserving backing store this is the only thing that returns the peak
+        // to the OS, and a JVM that peaks and then idles used to hold its peak
+        // for the life of the process.
+        self.retire_forwarding_words();
+        {
+            let released = self.arena.lock().decommit_unbumped_middle();
+            if released != 0 {
+                self.bytes_uncommitted.fetch_add(released, Ordering::Relaxed);
+                tracing::debug!(
+                    target: "cratonvm::gc",
+                    bytes = released,
+                    "zgc: returned the un-bumped middle to the OS",
+                );
+            }
+        }
+
         // ---- Mark phase --------------------------------------------------
         // Snapshot the registry of all live-or-dead allocations: marking reads
         // object bytes in place and does not allocate, so it needs no arena
@@ -17041,6 +17158,161 @@ pub(crate) mod tests {
         heap.collect_garbage(&stw, &mut roots, monitors);
         let still = addrs.iter().filter(|a| heap.registry.contains(**a)).count();
         (addrs, still)
+    }
+
+    // ---- D1: the backing store commits lazily and gives memory back -------
+
+    /// **A fresh heap has not committed its `-Xmx`.**
+    ///
+    /// The user-visible half of the finding. On Windows the `alloc_zeroed`
+    /// block this replaced went to `VirtualAlloc(MEM_COMMIT | MEM_RESERVE)` and
+    /// took the full commit charge against the page file before the VM had
+    /// executed a bytecode, which is also why `-Xms` meant nothing.
+    ///
+    /// Skipped on the wholly-committed fallback, where the claim is false by
+    /// design and `commit_stats` says so honestly rather than pretending.
+    #[test]
+    fn a_fresh_heap_has_not_committed_its_capacity() {
+        const CAP: usize = 256 * 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(CAP);
+        let (committed, returned) = heap.commit_stats();
+        if committed == heap.heap_capacity() {
+            eprintln!(
+                "[d1] SKIPPED: this process is on the wholly-committed fallback                  store (CRATONVM_GC_RESERVE=0, or the OS refused the reservation)"
+            );
+            return;
+        }
+        assert_eq!(returned, 0, "a heap that has not collected returned nothing");
+        assert!(
+            committed * 8 < CAP,
+            "a fresh 256 MiB heap has committed {committed} bytes; lazy commit \
+             is not engaging"
+        );
+    }
+
+    /// **Committing follows the allocator, not the capacity.**
+    ///
+    /// The commit must track what has actually been handed out -- a granule at
+    /// a time -- rather than jumping to the whole heap on the first object.
+    #[test]
+    fn committing_tracks_what_the_allocator_hands_out() {
+        const CAP: usize = 256 * 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(CAP);
+        heap.set_tlab_enabled(false);
+        let (before, _) = heap.commit_stats();
+        if before == heap.heap_capacity() {
+            return; // fallback store
+        }
+        // ~8 MiB of live objects.
+        let mut roots = Vec::new();
+        while heap.allocated_bytes() < 8 * 1024 * 1024 {
+            roots.push(heap.alloc_object(ClassId::new(4), 8));
+        }
+        let (after, _) = heap.commit_stats();
+        assert!(after > before, "allocating committed nothing");
+        assert!(
+            after < CAP / 4,
+            "8 MiB of objects committed {after} bytes of a {CAP}-byte heap"
+        );
+    }
+
+    /// **A collection returns the un-bumped middle to the OS.**
+    ///
+    /// The other half of the finding: before this the sweep retracted the
+    /// cursor, the compactor emptied whole megabytes, and the pages stayed
+    /// resident for the life of the process. A JVM that peaks and then idles
+    /// held its peak forever.
+    ///
+    /// The exact edit that trips it: removing the `decommit_unbumped_middle`
+    /// call from `collect_garbage`.
+    #[test]
+    fn a_collection_returns_the_unbumped_middle_to_the_os() {
+        const CAP: usize = 256 * 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(CAP);
+        heap.set_tlab_enabled(false);
+        if heap.commit_stats().0 == heap.heap_capacity() {
+            return; // fallback store
+        }
+        // Allocate a big transient population, keep none of it.
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        while heap.allocated_bytes() < 48 * 1024 * 1024 {
+            heap.alloc_object(ClassId::new(4), 8);
+        }
+        let peak = heap.commit_stats().0;
+        assert!(peak > 32 * 1024 * 1024, "the fixture did not commit a peak");
+        {
+            // SAFETY: single-threaded unit test.
+            let stw = unsafe { StopTheWorldToken::new() };
+            heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            // The FIRST collection sweeps and retracts the cursor; the second
+            // is what finds the middle un-bumped and hands it back, because the
+            // give-back runs at the start of a collection (see the note there
+            // about the forwarding records it must not destroy).
+            heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+        }
+        let (committed, returned) = heap.commit_stats();
+        assert!(
+            returned > 0,
+            "two collections over a 48 MiB dead population returned nothing to \
+             the OS (committed is still {committed} of a {peak} peak)"
+        );
+        assert!(
+            committed < peak,
+            "committed {committed} did not fall below the {peak} peak"
+        );
+    }
+
+    /// **The kill switch restores the wholly-committed block.**
+    ///
+    /// A bisect lever, and the thing that makes `CRATONVM_GC_RESERVE=0` a
+    /// re-run rather than a rebuild. Asserted on `Arena` directly, because the
+    /// switch is read once per process and a heap built in this test binary has
+    /// already taken whichever arm the environment chose.
+    #[test]
+    fn the_reservation_kill_switch_yields_a_wholly_committed_store() {
+        use crate::reservation::HeapStore;
+        let mut owned = HeapStore::Owned(vec![0u8; 4 * 1024 * 1024]);
+        assert_eq!(owned.committed_bytes(), owned.len());
+        assert!(owned.commit_range(0, owned.len()));
+        assert_eq!(
+            owned.decommit_range(0, 4 * 1024 * 1024),
+            0,
+            "the owned store has nothing to give back and must say so"
+        );
+        assert!(
+            owned.is_committed_at(0) && owned.is_committed_at(4 * 1024 * 1024 - 1),
+            "every byte of the owned store is readable"
+        );
+    }
+
+    /// **A slide's forwarding records survive the collection they were written
+    /// in.**
+    ///
+    /// The collision this feature and D6 had, asserted so it cannot come back:
+    /// the records live in the vacated tail, which is exactly the span the
+    /// give-back releases. Decommitting it inside `compact_low_to` destroyed
+    /// them as they were written -- and on Windows a later read was a
+    /// `STATUS_ACCESS_VIOLATION`, not a miss.
+    ///
+    /// The exact edit that trips it: moving `decommit_unbumped_middle` back
+    /// into `compact_low_to`, or calling `retire_forwarding_words` after it
+    /// rather than before.
+    #[test]
+    fn the_give_back_does_not_destroy_the_slides_forwarding_records() {
+        let (heap, before, _roots, map) = slide_a_low_region();
+        let (stamped, _) = heap.forwarding_word_engagement();
+        assert!(stamped > 0, "the slide stamped nothing to protect");
+        let mut readable = 0usize;
+        for old in &before {
+            if map.contains_key(old) && heap.forwarding_word_at(*old).is_some() {
+                readable += 1;
+            }
+        }
+        assert!(
+            readable > 0,
+            "{stamped} forwarding records were written and none of them can be \
+             read back -- the space under them was handed to the OS"
+        );
     }
 
     // ---- D5: the relocation refusal, per page rather than per cycle -------
