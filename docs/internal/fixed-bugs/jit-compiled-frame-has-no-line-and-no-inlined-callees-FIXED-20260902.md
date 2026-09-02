@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | **CLOSED 2026-09-02.** Five defects fixed; all seven residuals the 2026-09-01 page left open are closed — five by code, one by a proof that it is unreachable, one because it was stale when it was written. Two further defects were found by measuring the closure and are fixed here. Opened 2026-09-01 on `dev` @ `56d6c3722`, re-scoped the same day, merged binary measured 2026-09-02 @ `eb79f5904`, residuals closed on `fix/stacktrace-residuals-20260902`. |
+| **Status** | **CLOSED 2026-09-02.** Five defects fixed; all seven residuals the 2026-09-01 page left open are closed — five by code, one by a proof that it is unreachable, one because it was stale when it was written. Two further defects were found by measuring the closure and are fixed here. Opened 2026-09-01 on `dev` @ `56d6c3722`, re-scoped the same day; residuals closed on `fix/stacktrace-residuals-20260902`, measured 2026-09-02 on that branch merged with `origin/dev` @ `9874c587e`. |
 | **Symptom** | A stack trace captured after warm-up lost frames, printed `-1` for the line of a compiled frame, and reported the OSR back-edge instead of the real call site. Cold traces were correct. Nothing threw and nothing logged. |
 | **Cause** | Five independent defects with one habit under them: *a program point that was already recorded somewhere was not carried to the one consumer that wanted it.* The bci was in the frame's safepoint-id slot; the inlined callees were known to the splicer; the OSR continuation was known to the entry site; the trapping bci was in the emitter's hand; the callee's `ClassId` was in the resolver's hand. Each was dropped one function short of the walk. |
 | **Fix** | Carry each of them — plus the one thing that was genuinely absent: a translation from the optimizing tier's safepoint COUNTER to a bytecode index. |
@@ -52,9 +52,9 @@ several times in one process with only the amount of prior warm-up differing.
 
 | row | HotSpot 25 | CratonVM 2026-09-01 (opened) | CratonVM now |
 | --- | --- | --- | --- |
-| `before_any_warm` | `len=5 [leaf:25 mid:26 outer:27 probe:42 main:54]` | same | same |
-| `after_helper_warm` | `len=5 [leaf:25 mid:26 outer:27 probe:42 main:58]` | same, **27 of 30** | **28 of 28** |
-| `after_main_osr` | `len=5 [leaf:25 mid:26 outer:27 probe:42 main:66]` | `len=3 [leaf:25 probe:-1 main:62]` | identical |
+| `before_any_warm` | `len=5 [leaf:25 mid:26 outer:27 probe:42 main:54]` | same | 30/30 identical |
+| `after_helper_warm` | `len=5 [leaf:25 mid:26 outer:27 probe:42 main:58]` | same, **27 of 30** | **30/30 identical** |
+| `after_main_osr` | `len=5 [leaf:25 mid:26 outer:27 probe:42 main:66]` | `len=3 [leaf:25 probe:-1 main:62]` | 30/30 identical |
 
 `probes/StackTraceCompiledCallee.java` — the callee is padded past
 `MAX_INLINE_BYTECODE_SIZE` (325) so it is **compiled and called**, which is the
@@ -62,9 +62,9 @@ shape the first probe cannot reach:
 
 | row | HotSpot 25 | CratonVM 2026-09-01 | CratonVM now |
 | --- | --- | --- | --- |
-| `cold` | `[big:42 probe:56 main:65]` | same | same |
-| `after_warm` | `[big:42 probe:56 main:67]` | `[probe:56 main:67]` | identical |
-| `after_osr` | `[big:42 probe:56 main:71]` | `[main:71]` | identical |
+| `cold` | `[big:42 probe:56 main:65]` | same | 30/30 identical |
+| `after_warm` | `[big:42 probe:56 main:67]` | `[probe:56 main:67]` | **30/30 identical** |
+| `after_osr` | `[big:42 probe:56 main:71]` | `[main:71]` | **30/30 identical** |
 
 `CRATONVM_DISABLE_JIT=1` restores every row on the same binary and the same
 `.class` file. That is the A/B, and it is why none of this was ever a
@@ -72,14 +72,127 @@ class-file, `LineNumberTable` or resolution problem.
 
 ---
 
-<<RESIDUAL ROUND MEASURED>>
+## The residual round, measured
+
+2026-09-02, x86-64 **Linux**, release (`opt-level=3`, fat LTO), JDK 25, real-JDK
+mode, on the branch AFTER merging `origin/dev` — 38 commits had landed under it
+while this was being written, and a measurement on the pre-merge tree would have
+been a measurement of a tree nobody is going to run.
+
+### Both witnesses, 30 runs each
+
+| probe | row | HotSpot 25 | CratonVM, 30 runs |
+| --- | --- | --- | --- |
+| `StackTraceAfterOsr` | `before_any_warm` | `len=5 [leaf:25 mid:26 outer:27 probe:42 main:54]` | **30/30 identical** |
+| | `after_helper_warm` | `len=5 [leaf:25 mid:26 outer:27 probe:42 main:58]` | **30/30 identical** |
+| | `after_main_osr` | `len=5 [leaf:25 mid:26 outer:27 probe:42 main:66]` | **30/30 identical** |
+| `StackTraceCompiledCallee` | `cold` | `[big:42 probe:56 main:65]` | **30/30 identical** |
+| | `after_warm` | `[big:42 probe:56 main:67]` | **30/30 identical** |
+| | `after_osr` | `[big:42 probe:56 main:71]` | **30/30 identical** |
+
+Sixty runs, six rows, no exception. The three things the 2026-09-01 page could
+not close all fall inside that: `after_helper_warm` was 27 of 30 there,
+`after_main_osr` collapsed to one frame about 1 run in 80, and
+`StackTraceCompiledCallee` had never had a correct `after_warm` or `after_osr`
+row at all.
+
+### The A/B arms — every switch reverts exactly its own half
+
+Three runs each, same binary, same `.class` files:
+
+| arm | `after_main_osr` (spliced witness) |
+| --- | --- |
+| default | `len=5 [leaf:25 mid:26 outer:27 probe:42 main:66]` |
+| `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` | `len=3 [leaf:25 probe:42 main:66]` — the inlined callees go |
+| `CRATONVM_JIT_NO_OSR_PC_REFRESH=1` | `len=5 [… main:62]` — the back-edge comes back, frames intact |
+| `CRATONVM_JIT_NO_COMPILED_FRAME_LINES=1` | `len=3 [leaf:25 probe:-1 main:62]` — the whole pre-fix row |
+| `CRATONVM_JIT_NO_IR_FRAME_LINES=1` | unchanged here; reverts `outer:-1` in `after_helper_warm` |
+| `CRATONVM_DISABLE_JIT=1` | identical to default — the interpreter reference |
+
+| arm | `after_osr` (called-callee witness) |
+| --- | --- |
+| default | `[big:42 probe:56 main:71]` |
+| `CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT=1` | `[main:71]` — the historical answer, 3/3 |
+| `CRATONVM_JIT_NO_NPE_TRAP_LINES=1` | `[big:-1 probe:56 main:71]` — the frame survives, its line does not, 3/3 |
+| `CRATONVM_DISABLE_JIT=1` | identical to default |
+
+No arm was inert. Each moved the row it claims to isolate, which is what
+separates "this half works" from "this half never engaged".
+
+The `CRATONVM_JIT_NO_IR_FRAME_LINES=1` arm is the one worth reading twice. It
+changes nothing on the row this page was opened over and reverts `outer` to
+`-1` on the row the page could not explain — which is the whole of residual 4
+and the whole of the `after_helper_warm` 27/30, in one two-arm comparison
+inside one binary.
+
+### The census
+
+`CRATONVM_DBG=jit-method-stats`, over the same 60 runs:
+
+```
+compiled-frame lines: single-pass=3..5 ir=0..3 npe-trap=1..2
+                      no-sp-id=0 id-unrecorded=1..2 ir-untranslated=0
+                      out-of-range=0 switched-off=0
+```
+
+Three things it says that nothing else could:
+
+* **`ir` is non-zero and `ir-untranslated` is zero.** The optimizing tier is
+  answering, and it is answering through the table rather than falling back.
+  On the 15 runs of 30 where `ir=0`, no IR-compiled frame was on the trace at
+  all — which is why the row was 27/30 and not 0/30.
+* **`npe-trap` tracks `id-unrecorded` exactly.** That pairing IS the designed
+  flow, not a coincidence: the trapping frame's safepoint-id slot names no map
+  of its own (an inline null check is not a safepoint), `activation_bci`
+  refuses — `id-unrecorded` — and the trap site then supplies the bci the walk
+  could not recover. A run where those two diverged would mean the side channel
+  had fired for a frame that did not need it.
+* **`switched-off` is zero**, so no arm of this measurement was silently
+  running with a kill switch left set in the environment.
+
+`inline-map-at-return=[2,0,0,0,0]` on the spliced witness and `[0,…]` on the
+other: the exact return-address key is being spent where there is a splice to
+spend it on, and nowhere else.
+
+### Suite
+
+`regression-suite`, full core list, output-compared against HotSpot 25.
+
+* On the branch **before** merging `origin/dev`: **83 of 83 passed, 0 failed.**
+  `RJitStackTraceLines` — the vector whose assertion this page's predecessor had
+  weakened to `p > 0 || p == -1`, restored here to unconditional — passes.
+* On the branch **after** the merge: **82 of 85 passed, 3 failed** —
+  `RMapGcStress`, `RJdkIntrinsics3`, `RBufferPoolCount`. `RJitStackTraceLines`
+  still passes.
+
+The three are not this branch's. Two independent arms say so:
+
+* With **all ten** switches of the dependency chains below set at once — every
+  behaviour this page ships, reverted — the same three fail identically.
+  Nothing here is the difference.
+* A binary from an unrelated worktree (`perf/jit-residuals-20260902`), which
+  contains this branch's merge base and **none** of its commits, fails the same
+  three with the same messages.
+
+`RBufferPoolCount` arrived with the merge and has never run on this branch's own
+tree; the other two passed on the pre-merge build and fail on any post-merge
+binary, mine or not. Their subjects — a GC stress map, a `NoSuchMethodError`
+from an intrinsic, and a direct-buffer pool bean — touch nothing this page
+changed, and the last of them names the very commit
+(`fix(encoding,jmx): the platform encoding is not UTF-8, and the direct pool
+bean was not zero`) whose worktree is still open.
+
+Recording them here rather than quietly reporting the pre-merge 83 is the point:
+a green number from the tree you did not merge is a measurement of a tree nobody
+is going to run.
 
 ---
 
 ## The switches, and which of them depend on which
 
-There are now nine, and reading them as nine peers gets the wrong answer. They
-are two dependency chains and two free-standing names.
+There are now ten, and reading them as ten peers gets the wrong answer. They
+are three roots with children plus one free-standing name, and the children are
+what make a suspect line attributable to one half rather than to a rebuild.
 
 ```
 CRATONVM_JIT_NO_COMPILED_FRAME_LINES=1      reverts the bci recovery on BOTH backends
@@ -384,9 +497,11 @@ concluded the residual predated that work and wanted its own investigation. It
 was right that it predated it. It was also residual 4.
 
 The three failures were line-only (`leaf:-1`, `mid:-1`) — a compiled frame
-whose `activation_bci` refused. With the optimizing tier's translation in
-place the row is **28 of 28**, and the census says why: `ir=1..3` frames
-answered per run, `ir-untranslated=0`.
+whose `activation_bci` refused. With the optimizing tier's translation in place
+the row is **30 of 30**, and the census says why: `ir=1..3` frames answered on
+the runs that have one, `ir-untranslated=0` on every run. The two-arm proof is
+`CRATONVM_JIT_NO_IR_FRAME_LINES=1`, which puts `outer:-1` back on this row and
+changes nothing on the row the page was opened over.
 
 That is the value of a refusal census stated as plainly as it can be: the
 symptom was known for a day, the cause was one of five populations, and no
