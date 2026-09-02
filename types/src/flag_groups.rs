@@ -1183,6 +1183,12 @@ pub const INVENTORY: &[E] = &[
     // `ir_lower::linear_scan_enabled`. `since` stays 2026-08-01: the flag is the
     // same flag, and this column dates the KNOB, not its capability.
     E { group: Group::JIT, token: "ir-linear-scan", on_key: Some("CRATONVM_JIT_IR_LINEAR_SCAN"), off_key: None, off_word: None, since: "2026-08-01" },
+    // Default-ON A/B levers: `ir_lower` reads `0`/`false` on both. The inline
+    // TLAB bump is unreachable until `CRATONVM_JIT_C2_ALLOC_UPGRADE` opens the
+    // optimizing tier to allocation-bearing methods, which is what having it
+    // makes possible.
+    E { group: Group::JIT, token: "ir-inline-tlab", on_key: Some("CRATONVM_JIT_IR_INLINE_TLAB"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::JIT, token: "ir-cold-arg-stage", on_key: Some("CRATONVM_JIT_IR_COLD_ARG_STAGE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "ir-long", on_key: Some("CRATONVM_JIT_IR_LONG"), off_key: None, off_word: None, since: "2026-06-21" },
     // Default-ON A/B lever: `x64::gated_ref_store_enabled` reads `0`. Its
     // predecessor `CRATONVM_NO_JIT_INLINE_PUTFIELD` measured exactly zero under
@@ -1779,6 +1785,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "oldgen-compact", on_key: Some("CRATONVM_OLDGEN_COMPACT"), off_key: None, off_word: None, since: "2026-08-03" },
     E { group: Group::GC, token: "overhead-limit", on_key: Some("CRATONVM_GC_OVERHEAD_LIMIT"), off_key: None, off_word: None, since: "2026-06-21" },
     E { group: Group::GC, token: "owner-class-filter", on_key: Some("CRATONVM_OWNER_CLASS_FILTER"), off_key: None, off_word: None, since: "2026-08-01" },
+    E { group: Group::GC, token: "par-evac", on_key: Some("CRATONVM_GC_PAR_EVAC"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "par-min-bytes", on_key: Some("CRATONVM_GC_PAR_MIN_BYTES"), off_key: None, off_word: None, since: "2026-07-25" },
     E { group: Group::GC, token: "par-threads", on_key: Some("CRATONVM_GC_PAR_THREADS"), off_key: None, off_word: None, since: "2026-07-25" },
     E { group: Group::GC, token: "promotion-guard", on_key: None, off_key: Some("CRATONVM_NO_GC_PROMOTION_GUARD"), off_word: None, since: "2026-06-21" },

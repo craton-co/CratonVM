@@ -3516,6 +3516,32 @@ impl VmHeap {
         // Card / remembered-set costs, raw and normalized per allocated object
         // and per live byte.
         eprintln!("{}", crate::gc_metrics::gc_metrics_report());
+        // Parallel young evacuation. Printed UNCONDITIONALLY, including the
+        // all-zero line: the path is gated four ways over (moving cycle,
+        // `CRATONVM_GC_PAR_EVAC`, the worker policy, and `ParEvac::plan`'s
+        // to-space slack), so "never engaged" is the common outcome and a
+        // counter that only appears when non-zero would make it
+        // indistinguishable from "the report is missing".
+        //
+        // `helper_scans` is the one to read second. `cycles > 0` only says the
+        // copy phase dispatched; `helper_scans == 0` beside it says the driver
+        // did all of it, which is a load-balancing regression every
+        // correctness test in the suite passes (see `gen_evac`).
+        {
+            let c = crate::gen_evac::par_evac_census();
+            eprintln!(
+                "[GC] par_evac: cycles={} helper_scans={} cas_losses={} \
+                 declined_for_slack={} filler_bytes={} promotions={} \
+                 deferred_cards={}",
+                c.cycles,
+                c.helper_scans,
+                c.cas_losses,
+                c.declined_for_slack,
+                c.filler_bytes,
+                c.promotions,
+                c.deferred_cards,
+            );
+        }
         let fallbacks = crate::gc_quiescence::moving_young_coverage_fallback_count();
         if crate::gc_quiescence::moving_young_enabled() || fallbacks > 0 {
             // Both numbers, always. A correct answer while `cycles == 0` means

@@ -1,15 +1,24 @@
-# The JCA gap is 5 services, not 84 — and a service row IS sufficient when it names a class
+# The JCA gap is 0 services, not 84 — and a service row IS sufficient when it names a class
 
 ## Status
 
 **FIXED and RETIRED 2026-09-02.** The functional gap this page sizes at 84 is
-**5**, the enumeration gap it sizes at 186 is **9**, and this VM now advertises
+**0**, the enumeration gap it sizes at 186 is **0**, and this VM now advertises
 nothing HotSpot does not.
+
+> The title and the numbers below said **5** for most of that day, which was the
+> honest count while the five `SunTls*` `KeyGenerator` KDFs were deferred for a
+> stated structural reason. That reason was addressed the same evening
+> (`W7-63-jca-advertise-vs-serve.md` §8f), so the ledger closes at zero:
+> **335 of HotSpot's 335** services across `SUN`, `SunRsaSign`, `SunJCE`,
+> `SunEC` and `SunJSSE`. The "2026-09-02" column is kept as first measured, with
+> the later figure beside it, because the point of this page is that a count is
+> only as good as the screen behind it.
 
 | | this page, 2026-08-30 | 2026-09-02 |
 |---|---:|---:|
 | services enumerated (SunJCE + SUN) | 147 | **250** (HotSpot 259) |
-| services HotSpot has and this VM does not | 117 † | **9** |
+| services HotSpot has and this VM does not | 117 † | **9**, then **0** |
 | services this VM advertises and HotSpot does not | 5 | **0** |
 | `getInstance` refusals among them | 84 | **5** |
 
@@ -20,7 +29,12 @@ are a spelling difference; the count of absent SERVICES was 117. See
 
 **What is left, and why**, measured rather than asserted:
 
-* **5 `KeyGenerator SunTls*`.** TLS-internal KDFs taking
+* ~~**5 `KeyGenerator SunTls*`.**~~ **CLOSED 2026-09-02** — the engine change
+  below was made; see `W7-63-jca-advertise-vs-serve.md` §8f. The functional gap
+  this page sizes at 84 is now **0**, and the enumerated total is 335 of
+  HotSpot's 335. The original text follows.
+
+  TLS-internal KDFs taking
   `TlsKeyMaterialParameterSpec`-family specs. This engine's `KeyGenerator` is a
   two-field synthetic whose `init` surface cannot carry them, so serving them
   means handing back a real `javax.crypto.KeyGenerator` over the platform's SPI
@@ -403,7 +417,7 @@ Every probe below is run on HotSpot 25.0.3 and on this VM and diffed on stdout.
 | `JcaMacVectors` | 18 | identical |
 | `JcaCipherVectors` | 24 | identical |
 | `JcaDsaFamilyVectors` | 20 | identical — `self=true`, `crossVerify=true` against signatures HotSpot produced, and DER vs P1363 encodings distinct |
-| `JcaKeyGeneratorDefaults` | 24 | identical but the five `SunTls*` |
+| `JcaKeyGeneratorDefaults` | 24 | identical (was "identical but the five `SunTls*`" until 2026-09-02) |
 | `JcaKeygenScrub` | 5 | identical |
 | `JcaModernEngines` | 8 | identical but `DHKEM` on XDH |
 | `DhkemKeyTypes` | 5 | identical on all three EC curves |
