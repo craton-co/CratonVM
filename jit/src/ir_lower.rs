@@ -672,7 +672,24 @@ struct Lowerer<'a> {
     /// cannot fault". The store question -- which G1/ZGC answer by leaving
     /// `JIT_REGION_BOUNDS` empty (`audits/g1-audit.md` 8.1) -- has no site
     /// here to ask it.
+    ///
+    /// **Since 2026-09-02 there is such a site** — `emit_gated_ir_ref_putfield`
+    /// below — and it asks the same READ question for the same reason: its
+    /// barrier decision comes from the collector's published PLAN, not from a
+    /// region table. `JIT_REGION_BOUNDS` is still never consulted here, so the
+    /// G1/ZGC interlock that leaves it empty is untouched.
     read_bounds_addr: usize,
+    /// `(pre, post, young_floor)` — the collector's published reference-store
+    /// barrier plan, resolved once at construction. `None` ⇒ no plan, and every
+    /// reference store keeps the unconditional `jit_putfield_object` call.
+    ///
+    /// Read through the SAME `x64::objects` predicate the single-pass backend
+    /// uses. Two tiers deciding independently what a published plan means is
+    /// how one of them ends up skipping a barrier the other pays.
+    ref_store_gates: Option<(usize, usize, usize)>,
+    /// The published post-barrier skip mask, when the plan uses that shape
+    /// rather than the unsigned age floor.
+    ref_store_post_skip_mask: Option<u8>,
     /// Emitted shadow push / reload sequence counts.
     ///
     /// Every push must have exactly one reload: a push advances the thread's
@@ -1214,6 +1231,8 @@ impl<'a> Lowerer<'a> {
             shadow_pushed_any: false,
             compact_fields: compact_fields.clone(),
             read_bounds_addr: helpers.read_bounds_addr,
+            ref_store_gates: crate::x64::ref_store_gates_of(helpers),
+            ref_store_post_skip_mask: crate::x64::ref_store_post_skip_mask_of(helpers),
             shadow_pushes: 0,
             shadow_reloads: 0,
             locals_size,
@@ -2690,6 +2709,241 @@ impl<'a> Lowerer<'a> {
         true
     }
 
+    /// Receiver alignment + containment in one of the three published
+    /// `JIT_READ_BOUNDS` regions, with RAX holding the receiver. Failures push
+    /// their patch offsets onto `slow`.
+    ///
+    /// Shared by the inline `getfield` read and the gated reference `putfield`
+    /// below, deliberately: both answer the same question — "is this address
+    /// one this heap handed out, so the header reads cannot fault" — and a
+    /// second transcription of six compares against a six-word table is a place
+    /// for the two to disagree about a region index.
+    ///
+    /// Clobbers RCX and RDX. A caller that needs the flags byte in CL must read
+    /// it AFTER this.
+    fn emit_receiver_align_and_containment(&mut self, slow: &mut Vec<usize>) {
+        // alignment: the low three bits must be clear.
+        self.buf.emit(&[0x48, 0x89, 0xC1]); // MOV RCX, RAX
+        self.buf.emit(&[0x48, 0x83, 0xE1, 0x07]); // AND RCX, 7
+        slow.push(self.emit_jcc_rel32(0x85)); // JNZ
+                                              // containment in one of the three published regions.
+                                              // RDX = &JIT_READ_BOUNDS = [b0, e0, b1, e1, b2, e2].
+        self.emit_mov_reg_imm64(RDX, self.read_bounds_addr as u64);
+        self.emit_cmp_rax_mem_rdx(0);
+        let below_b0 = self.emit_jcc_rel32(0x82); // JB -> try region 1
+        self.emit_cmp_rax_mem_rdx(8);
+        let ok0 = self.emit_jcc_rel32(0x82); // JB -> inside region 0
+        self.patch_rel32_to_here(below_b0);
+        self.emit_cmp_rax_mem_rdx(16);
+        let below_b1 = self.emit_jcc_rel32(0x82); // JB -> try region 2
+        self.emit_cmp_rax_mem_rdx(24);
+        let ok1 = self.emit_jcc_rel32(0x82); // JB -> inside region 1
+        self.patch_rel32_to_here(below_b1);
+        self.emit_cmp_rax_mem_rdx(32);
+        slow.push(self.emit_jcc_rel32(0x82)); // JB -> slow
+        self.emit_cmp_rax_mem_rdx(40);
+        slow.push(self.emit_jcc_rel32(0x83)); // JAE -> slow
+        self.patch_rel32_to_here(ok0);
+        self.patch_rel32_to_here(ok1);
+    }
+
+    /// COV-03 — the optimizing tier's **gated** compact reference `putfield`.
+    ///
+    /// The caller has already loaded the receiver into RAX and emitted the
+    /// inline null check that DEOPTS, so this sequence starts from a non-null
+    /// receiver and never has to reproduce the NullPointerException semantics.
+    /// Returns `false` without emitting anything when the site is not admitted,
+    /// leaving the caller's unconditional `jit_putfield_object` call in place.
+    ///
+    /// # Why this exists
+    ///
+    /// The single-pass backend got a gated reference store on 2026-09-02 and
+    /// this tier did not, so the barrier plan the generational collector
+    /// publishes was inert exactly where hot loops are compiled. A probe of
+    /// nothing but reference stores in a counted loop reported `gated=0
+    /// declined=0` on that tier's counter while the method's own admission line
+    /// said `admitted to the optimizing pipeline`: not refused — never asked.
+    ///
+    /// # What makes this sound
+    ///
+    /// The gates are `x64::objects::emit_gated_compact_ref_putfield`'s, read
+    /// through the same predicate, and each names a PREFIX of the barrier
+    /// helper's own control flow — a skipped call is a call that would have
+    /// returned having done nothing. The one structural difference is where the
+    /// store sits relative to the post-barrier decision:
+    ///
+    /// * the single-pass arm stores INLINE, then decides, and on "barrier
+    ///   needed" calls the collector's own `write_barrier`;
+    /// * this arm decides FIRST, and on "barrier needed" takes the full
+    ///   `jit_putfield_object`, which performs the store itself.
+    ///
+    /// That is not a shortcut, it is the absence of one: this tier has no heap
+    /// pointer in its frame (`write_barrier`'s first argument), and inventing a
+    /// second route to a collector's remembered set is the mistake
+    /// `inline_card_mark_available` was hard-`false`d to stop. Deciding first
+    /// costs one forward branch on the barriered path and keeps ONE piece of
+    /// code — the helper — responsible for every store that needs a barrier.
+    ///
+    /// Declining is always safe, and is the only thing a missing plan, an
+    /// unresolved compact slot or a disagreeing descriptor can produce.
+    fn emit_gated_ir_ref_putfield(
+        &mut self,
+        node_pc: Option<usize>,
+        base: NodeId,
+        value: NodeId,
+        field_index: i64,
+    ) -> bool {
+        if !crate::x64::ir_gated_ref_store_enabled() {
+            crate::metrics::note_ir_ref_store_decline(0);
+            return false;
+        }
+        let Some(pc) = node_pc else {
+            crate::metrics::note_ir_ref_store_decline(1);
+            return false;
+        };
+        // The resolved compact offset for THIS site. Without it there is no
+        // inline address to store to — `HEADER_SIZE + field_index * SLOT_SIZE`
+        // is the legacy cell displacement and a compact object does not obey
+        // it. This is the plumbing COV-03 named as the blocker.
+        let Some(&(c_off, c_is_ref, type_tag)) = self.compact_fields.get(&pc) else {
+            crate::metrics::note_ir_ref_store_decline(2);
+            return false;
+        };
+        // Narrow oops would make the stored word an encoded 32-bit reference
+        // rather than the bare pointer this emits; legacy layout would make
+        // `c_off` the wrong displacement even when one is resolved.
+        if crate::x64::narrow_oops_block_inline_fields()
+            || !cratonvm_types::compact_ref_fields_enabled()
+        {
+            crate::metrics::note_ir_ref_store_decline(3);
+            return false;
+        }
+        // No published plan ⇒ no way to rule either barrier out — and the
+        // collectors that publish none (G1, ZGC) are exactly the ones whose
+        // empty region table is load-bearing. This is where they decline.
+        let Some((pre, post, floor)) = self.ref_store_gates else {
+            crate::metrics::note_ir_ref_store_decline(4);
+            return false;
+        };
+        // Descriptor agreement — the same defence the inline `getfield` arm
+        // applies and for the same reason: a resolver that fabricated a compact
+        // slot (the WildFly Host Controller SIGSEGV) must not steer a store,
+        // where it would write a full pointer over a primitive cell.
+        if !c_is_ref || !matches!(type_tag, b'L' | b'[') {
+            crate::metrics::note_ir_ref_store_decline(5);
+            return false;
+        }
+        // Receiver validity. A base node typed `IrType::Ref` is the IR's own
+        // proof that this is an oop — at least as strong as the single-pass
+        // `stack_oop_marks` argument its trusted-oop arm rests on — and the
+        // caller's null check has already run. Anything else needs the
+        // published READ bounds; without them there is no proof to be had, and
+        // the site declines rather than dereference an unvalidated address.
+        let trusted_oop_receiver = crate::x64::trusted_oop_receiver_getfield_enabled()
+            && self.graph.nodes[base as usize].ty == IrType::Ref;
+        if !trusted_oop_receiver && self.read_bounds_addr == 0 {
+            crate::metrics::note_ir_ref_store_decline(6);
+            return false;
+        }
+
+        // RAX holds the non-null receiver on entry.
+        let mut bail: Vec<usize> = Vec::new();
+        if !trusted_oop_receiver {
+            self.emit_receiver_align_and_containment(&mut bail);
+        }
+
+        // -- SATB pre-barrier gate --------------------------------------
+        // Marking armed ⇒ the overwritten reference has to reach the snapshot,
+        // which is the helper's job. Armed only during a concurrent mark phase.
+        self.emit_mov_reg_imm64(R11, pre as u64);
+        self.buf.emit(&[0x41, 0x80, 0x3B, 0x00]); // CMP byte [R11], 0
+        bail.push(self.emit_jcc_rel32(0x85)); // JNE -> helper
+
+        // -- layout guard, out of ONE header byte ------------------------
+        // `GC_FLAGS_BYTE_OFFSET` carries the GC flags in bits 0..3 and `gc_age`
+        // in bits 4..7, so this single byte answers both the compactness
+        // question here and the young-receiver question below. A class with a
+        // registered compact layout can still have legacy-cell instances — the
+        // TLAB fast path writes a legacy header unconditionally — so this is
+        // not a formality.
+        self.buf.emit(&[0x0F, 0xB6, 0x88]); // MOVZX ECX, byte [RAX + disp32]
+        self.buf
+            .emit(&(cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32).to_le_bytes());
+        self.buf.emit(&[0xF6, 0xC1, cratonvm_types::GC_FLAG_COMPACT]); // TEST CL, imm8
+        bail.push(self.emit_jcc_rel32(0x84)); // JZ -> helper (legacy cell layout)
+
+        // -- slot bounds ------------------------------------------------
+        // `field_index < num_slots`, which for a compact object is the FIELD
+        // COUNT (see `heap.rs` on the two meanings that word carries). A
+        // failure DROPS the store, matching `jit_putfield_object`'s own
+        // out-of-bounds behaviour, so it targets its own label rather than the
+        // helper.
+        self.buf.emit(&[0x44, 0x8B, 0x98]); // MOV R11D, dword [RAX + disp32]
+        self.buf
+            .emit(&(cratonvm_types::NUM_SLOTS_OFFSET as i32).to_le_bytes());
+        self.emit_mov_reg_imm64(R10, field_index as u64);
+        self.buf.emit(&[0x45, 0x3B, 0xD3]); // CMP R10D, R11D
+        let oob = self.emit_jcc_rel32(0x83); // JAE -> drop
+
+        // -- post-barrier gates ------------------------------------------
+        // CL still holds the receiver's flags byte. Two shapes can rule the
+        // post barrier out, and a publisher supplies exactly one of them
+        // (`ref_store_gates_of` enforces that).
+        let mut inline_store: Vec<usize> = Vec::new();
+        if let Some(mask) = self.ref_store_post_skip_mask {
+            // MASK — "the receiver carries none of the bits that could make a
+            // post barrier necessary". The generational shape: `GC_FLAG_OLD_GEN`
+            // clear means young, and a young receiver needs no card. Baked as an
+            // immediate, because which collector is running cannot change after
+            // start-up.
+            self.buf.emit(&[0xF6, 0xC1, mask]); // TEST CL, mask
+            inline_store.push(self.emit_jcc_rel32(0x84)); // JZ -> young receiver
+        } else {
+            // FLOOR — `age << 4 | flags` compared unsigned against
+            // `promotion_floor << 4` is an EXACT test of `gc_age <
+            // promotion_floor`, because the flags nibble is at most 15 and
+            // cannot carry `a << 4` up to `(a + 1) << 4`.
+            self.emit_mov_reg_imm64(R11, floor as u64);
+            self.buf.emit(&[0x41, 0x3A, 0x0B]); // CMP CL, byte [R11]
+            inline_store.push(self.emit_jcc_rel32(0x82)); // JB -> young receiver
+        }
+        self.emit_mov_reg_imm64(R11, post as u64);
+        self.buf.emit(&[0x41, 0x80, 0x3B, 0x00]); // CMP byte [R11], 0
+        inline_store.push(self.emit_jcc_rel32(0x84)); // JZ -> no old objects
+                                                      // Neither gate ruled the barrier out: the helper does the store.
+        bail.push(self.emit_jmp_rel32());
+
+        // -- the barrier-free store --------------------------------------
+        // A compact reference field is the bare 8-byte pointer at the cell
+        // base, which is exactly what the inline `getfield` arm reads back.
+        for patch in inline_store {
+            self.patch_rel32_to_here(patch);
+        }
+        // Cast: a compact field offset plus the header is bounded by the
+        // object size.
+        let cell_off = (HEADER_SIZE + c_off as usize) as i32;
+        self.gp_load_value(RDX, value);
+        self.buf.emit(&[0x48, 0x89, 0x90]); // MOV [RAX + disp32], RDX
+        self.buf.emit(&cell_off.to_le_bytes());
+        let stored = self.emit_jmp_rel32();
+
+        // -- helper fallback: the full SATB + store + post barrier --------
+        for patch in bail {
+            self.patch_rel32_to_here(patch);
+        }
+        self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
+        self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
+        self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as i64 as u64);
+        self.load_reg_from_frame(CALL_ARG_REGS[3], self.slot_of(value));
+        self.emit_mov_reg_imm64(RAX, self.putfield_object as u64);
+        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+
+        self.patch_rel32_to_here(oob);
+        self.patch_rel32_to_here(stored);
+        crate::metrics::note_ir_ref_store_gated();
+        true
+    }
+
     /// Guarded inline read of a compact instance field, with the checked
     /// `jit_getfield` helper as the slow path. Returns `false` when the site is
     /// not eligible, leaving the caller's helper-only lowering in place.
@@ -2836,29 +3090,7 @@ impl<'a> Lowerer<'a> {
         self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
         slow.push(self.emit_jcc_rel32(0x84)); // JZ
         if guarded && !raw_mode && !trusted_oop_receiver {
-            // 2. alignment: the low three bits must be clear.
-            self.buf.emit(&[0x48, 0x89, 0xC1]); // MOV RCX, RAX
-            self.buf.emit(&[0x48, 0x83, 0xE1, 0x07]); // AND RCX, 7
-            slow.push(self.emit_jcc_rel32(0x85)); // JNZ
-                                                  // 3. containment in one of the three published regions.
-                                                  //    RDX = &JIT_READ_BOUNDS = [b0, e0, b1, e1, b2, e2].
-            self.emit_mov_reg_imm64(RDX, self.read_bounds_addr as u64);
-            self.emit_cmp_rax_mem_rdx(0);
-            let below_b0 = self.emit_jcc_rel32(0x82); // JB → try region 1
-            self.emit_cmp_rax_mem_rdx(8);
-            let ok0 = self.emit_jcc_rel32(0x82); // JB → inside region 0
-            self.patch_rel32_to_here(below_b0);
-            self.emit_cmp_rax_mem_rdx(16);
-            let below_b1 = self.emit_jcc_rel32(0x82); // JB → try region 2
-            self.emit_cmp_rax_mem_rdx(24);
-            let ok1 = self.emit_jcc_rel32(0x82); // JB → inside region 1
-            self.patch_rel32_to_here(below_b1);
-            self.emit_cmp_rax_mem_rdx(32);
-            slow.push(self.emit_jcc_rel32(0x82)); // JB → slow
-            self.emit_cmp_rax_mem_rdx(40);
-            slow.push(self.emit_jcc_rel32(0x83)); // JAE → slow
-            self.patch_rel32_to_here(ok0);
-            self.patch_rel32_to_here(ok1);
+            self.emit_receiver_align_and_containment(&mut slow);
         }
         // 4. per-OBJECT compactness. A class with a registered compact layout
         //    can still have legacy 16-byte-cell instances — and in practice
@@ -5777,6 +6009,20 @@ impl<'a> Lowerer<'a> {
                     self.gp_load_value(RAX, base);
                     self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
                     self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
+                    // GATED reference store — tried first, and complete when it
+                    // takes: the barrier-free store, both gate sequences, the
+                    // helper fallback and the out-of-bounds drop all converge
+                    // at its end. `false` means "not admitted", and the
+                    // unconditional helper call below then runs exactly as it
+                    // did before. See `emit_gated_ir_ref_putfield`.
+                    if self.emit_gated_ir_ref_putfield(
+                        node.bytecode_pc,
+                        base,
+                        value,
+                        field_index,
+                    ) {
+                        return;
+                    }
                     // jit_putfield_object(vm_ptr, obj_ptr, field_index, val).
                     // Unlike every other putfield helper it takes the context
                     // pointer; `scan_frame_needs` reserves the slot for it.
@@ -12406,6 +12652,257 @@ mod tests {
         assert!(
             cm.needs_context(),
             "a reference putfield must make the artifact `needs_context`"
+        );
+    }
+
+    /// Lower `void set(Corpus o, X v) { o.f = v; }` with a resolved compact
+    /// slot for the store site, and return the emitted bytes.
+    ///
+    /// `plan` publishes the collector's reference-store barrier gates; without
+    /// it the helpers describe a collector that published none, which is the
+    /// control arm for every assertion below.
+    const COMPACT_REF_PUTFIELD_HELPER: usize = 0x1111_2222_3333_4450;
+
+    fn lower_compact_ref_putfield(plan: bool, c_off: u32) -> Vec<u8> {
+        // Static gate bytes and a read-bounds table. Real addresses of real
+        // storage: the emitter bakes them as imm64 and the assertions read the
+        // same values back, so a wrong one shows up as a missing sequence
+        // rather than as a fault (nothing executes this code).
+        static PRE_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        static POST_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+        static READ_BOUNDS: [u64; 6] = [0; 6];
+
+        let graph = ref_or_wide_putfield_graph(b'L', 0x19, IrType::Ref);
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.putfield_object = COMPACT_REF_PUTFIELD_HELPER;
+        helpers.putfield_int = COMPACT_REF_PUTFIELD_HELPER ^ 0xF;
+        helpers.read_bounds_addr = std::ptr::addr_of!(READ_BOUNDS) as usize;
+        if plan {
+            helpers.ref_store_pre_gate = std::ptr::addr_of!(PRE_GATE) as usize;
+            helpers.ref_store_post_gate = std::ptr::addr_of!(POST_GATE) as usize;
+            helpers.ref_store_post_skip_mask = cratonvm_types::GC_FLAG_OLD_GEN as usize;
+        }
+
+        // The builder puts the `putfield` at pc 3 (`aload_0; aload_1;
+        // putfield`), which is the key `set_field_info` uses above.
+        let mut compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        compact.insert(3usize, (c_off, true, b'L'));
+        let empty_hints: HashMap<usize, bool> = HashMap::new();
+        let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        lower_inner(
+            &graph,
+            &schedule,
+            2,
+            4,
+            &helpers,
+            &empty_hints,
+            &[],
+            None,
+            &no_direct,
+            &no_ic,
+            &compact,
+        )
+        .expect("a reference putfield with its helper wired must compile")
+        .code_bytes()
+        .to_vec()
+    }
+
+    /// The optimizing tier emits the BARRIER-FREE store only when a collector
+    /// published a barrier plan — and emits none without one.
+    ///
+    /// This is the pair, not the positive alone. Until 2026-09-02 this tier
+    /// lowered every reference store to `jit_putfield_object` unconditionally,
+    /// so a test that only asserted "the helper address is baked" passed both
+    /// before and after the arm existed and could not tell them apart. The
+    /// control arm here is a helper table with no plan, which is what G1 and
+    /// ZGC actually present, and it must produce no inline store at all.
+    #[test]
+    fn the_optimizing_tier_stores_inline_only_behind_a_published_barrier_plan() {
+        let c_off = 8u32;
+        // MOV [RAX + disp32], RDX — the barrier-free compact reference store.
+        let mut store_seq: Vec<u8> = vec![0x48, 0x89, 0x90];
+        store_seq.extend_from_slice(&((HEADER_SIZE + c_off as usize) as i32).to_le_bytes());
+
+        let without = lower_compact_ref_putfield(false, c_off);
+        assert!(
+            !contains_seq(&without, &store_seq),
+            "with NO published barrier plan the optimizing tier must emit no \
+             inline reference store — a store whose barrier nothing ruled out \
+             is a lost card, invisible until the next collection"
+        );
+
+        let with = lower_compact_ref_putfield(true, c_off);
+        assert!(
+            contains_seq(&with, &store_seq),
+            "with a published plan the optimizing tier must emit the inline \
+             compact store at the RESOLVED offset — that offset is the whole \
+             plumbing this arm needed, and the uniform slot displacement the \
+             fallback derives is one a compact object does not obey"
+        );
+        // The helper is still the fallback. Every gate that cannot rule a
+        // barrier out branches to it, so its address must remain baked: an arm
+        // that inlined the store and dropped the fallback would be exactly the
+        // missing-barrier defect this whole sequence is built to avoid.
+        assert!(
+            contains_seq(&with, &(COMPACT_REF_PUTFIELD_HELPER as u64).to_le_bytes()),
+            "the gated arm must keep `jit_putfield_object` as its fallback"
+        );
+    }
+
+    /// The gated arm reads the receiver's flags byte ONCE and asks both
+    /// questions of it: compactness, then the post-barrier skip mask.
+    ///
+    /// Both are `TEST CL, imm8` against a bit in `GC_FLAGS_BYTE_OFFSET`, which
+    /// packs `gc_age` in bits 4..7 and the GC flags in bits 0..3. The mask
+    /// shape exists because the floor shape cannot express the generational
+    /// question: an old-gen object allocated at `gc_age == 0` has flags byte
+    /// `0x01` and sorts BELOW a young object that survived three collections
+    /// (`0x30`), so an unsigned floor would skip the card the first one needs.
+    #[test]
+    fn the_gated_arm_tests_the_flags_byte_for_compactness_and_for_the_skip_mask() {
+        let code = lower_compact_ref_putfield(true, 8);
+        assert!(
+            contains_seq(
+                &code,
+                &[0xF6, 0xC1, cratonvm_types::GC_FLAG_COMPACT]
+            ),
+            "the arm must test GC_FLAG_COMPACT — a class with a registered \
+             compact layout can still have legacy-cell instances, and storing \
+             a pointer at the packed offset into one of those corrupts a \
+             neighbouring field"
+        );
+        assert!(
+            contains_seq(
+                &code,
+                &[0xF6, 0xC1, cratonvm_types::GC_FLAG_OLD_GEN]
+            ),
+            "the arm must test the published skip mask to rule the post \
+             barrier out"
+        );
+        // MOVZX ECX, byte [RAX + GC_FLAGS_BYTE_OFFSET] — read once, asked
+        // twice. A second read would be a second chance for the two answers to
+        // come from different bytes.
+        let mut read_seq: Vec<u8> = vec![0x0F, 0xB6, 0x88];
+        read_seq
+            .extend_from_slice(&(cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32).to_le_bytes());
+        assert!(
+            contains_seq(&code, &read_seq),
+            "the flags byte must be read as a BYTE at its own offset, not as \
+             the dword the older arms use — that dword starts 15 bytes into a \
+             16-byte header and takes three of its four bytes from the first \
+             instance field"
+        );
+    }
+
+    /// A site with no resolved compact slot keeps the unconditional helper.
+    ///
+    /// The refusal that matters most: `HEADER_SIZE + field_index * SLOT_SIZE`
+    /// is the legacy cell displacement, and emitting a store there for a
+    /// compact object would write a pointer over an unrelated field. The
+    /// snapshot being absent is the ordinary case for an unresolved site, not
+    /// an error.
+    #[test]
+    fn a_reference_store_with_no_resolved_compact_slot_keeps_the_helper() {
+        static PRE_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        static POST_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+        static READ_BOUNDS: [u64; 6] = [0; 6];
+        unsafe extern "C" fn fake_putfield_object(_vm: i64, _obj: i64, _idx: i64, _val: i64) {}
+
+        let graph = ref_or_wide_putfield_graph(b'L', 0x19, IrType::Ref);
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.putfield_object = fake_putfield_object as *const () as usize;
+        helpers.putfield_int = fake_putfield_object as *const () as usize;
+        helpers.read_bounds_addr = std::ptr::addr_of!(READ_BOUNDS) as usize;
+        helpers.ref_store_pre_gate = std::ptr::addr_of!(PRE_GATE) as usize;
+        helpers.ref_store_post_gate = std::ptr::addr_of!(POST_GATE) as usize;
+        helpers.ref_store_post_skip_mask = cratonvm_types::GC_FLAG_OLD_GEN as usize;
+
+        let empty_hints: HashMap<usize, bool> = HashMap::new();
+        let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let code = lower_inner(
+            &graph,
+            &schedule,
+            2,
+            4,
+            &helpers,
+            &empty_hints,
+            &[],
+            None,
+            &no_direct,
+            &no_ic,
+            &no_compact,
+        )
+        .expect("the store must still compile through the helper")
+        .code_bytes()
+        .to_vec();
+        assert!(
+            !contains_seq(&code, &[0xF6, 0xC1, cratonvm_types::GC_FLAG_COMPACT]),
+            "with no resolved compact slot the gated arm must not be emitted \
+             at all, published plan or not"
+        );
+        assert!(
+            contains_seq(
+                &code,
+                &(fake_putfield_object as *const () as u64).to_le_bytes()
+            ),
+            "the unconditional `jit_putfield_object` lowering must remain"
+        );
+    }
+
+    /// A plan is all three gates or none, and the optimizing tier reads that
+    /// through the SAME predicate the single-pass backend uses.
+    ///
+    /// The shared reader is the point. A pre-gate with a dead post-gate would
+    /// let compiled code skip the post barrier on the strength of a word nobody
+    /// maintains, and two tiers deciding that independently is how one of them
+    /// ends up skipping a barrier the other pays.
+    #[test]
+    fn a_half_published_plan_leaves_the_optimizing_tier_on_the_helper() {
+        static PRE_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        static READ_BOUNDS: [u64; 6] = [0; 6];
+        unsafe extern "C" fn fake_putfield_object(_vm: i64, _obj: i64, _idx: i64, _val: i64) {}
+
+        let graph = ref_or_wide_putfield_graph(b'L', 0x19, IrType::Ref);
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.putfield_object = fake_putfield_object as *const () as usize;
+        helpers.putfield_int = fake_putfield_object as *const () as usize;
+        helpers.read_bounds_addr = std::ptr::addr_of!(READ_BOUNDS) as usize;
+        // Pre-gate only: no post-gate, no post shape.
+        helpers.ref_store_pre_gate = std::ptr::addr_of!(PRE_GATE) as usize;
+
+        let mut compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        compact.insert(3usize, (8u32, true, b'L'));
+        let empty_hints: HashMap<usize, bool> = HashMap::new();
+        let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        let code = lower_inner(
+            &graph,
+            &schedule,
+            2,
+            4,
+            &helpers,
+            &empty_hints,
+            &[],
+            None,
+            &no_direct,
+            &no_ic,
+            &compact,
+        )
+        .expect("the store must still compile through the helper")
+        .code_bytes()
+        .to_vec();
+        let mut store_seq: Vec<u8> = vec![0x48, 0x89, 0x90];
+        store_seq.extend_from_slice(&((HEADER_SIZE + 8usize) as i32).to_le_bytes());
+        assert!(
+            !contains_seq(&code, &store_seq),
+            "a plan missing its post-barrier gate must decline the whole fast \
+             path, not emit a store gated only on the half that was published"
         );
     }
 

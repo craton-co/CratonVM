@@ -381,6 +381,16 @@ audit the shrink was planned from:
   because the compact-only arm sent every legacy receiver to `jit_getfield`,
   which measured as 100% of that helper's calls on Generational; see
   fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md.
+- `ir_lower.rs::emit_gated_ir_ref_putfield` (added 2026-09-02) —
+  `(HEADER_SIZE + packed_body_offset) as i32`, the optimizing tier's gated
+  compact reference **store**, emitted as the disp32 of
+  `MOV [RAX+disp32], RDX` (`48 89 90`). It is the exact mirror of the compact
+  `getfield` read listed above — same cell, same address expression — and it
+  is a disp32 site, so no disp8 hazard; it is listed because it bakes the
+  header size into machine code. Unlike the read there is **no legacy twin**
+  to keep in step: a non-compact receiver leaves this arm for
+  `jit_putfield_object`, which resolves the offset itself, so a smaller header
+  has one site here and not two.
 - `ir_lower.rs::emit_inline_getstatic` (added 2026-08-03, cov-01) — the direct
   `getstatic` read: `field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD{32,64}_OFFSET`
   as a disp32, from the class's **statics block** base. It bakes the field-cell

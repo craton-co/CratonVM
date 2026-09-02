@@ -260,6 +260,20 @@ fn maybe_dump_shutdown_reports() {
             eprintln!(
                 "[cratonvm] compiled reference stores: gated={gated} declined={declined}"
             );
+            // The OPTIMIZING tier's own pair, never folded into the one above.
+            // Until 2026-09-02 that tier lowered every reference store to the
+            // helper unconditionally, so it reported neither number -- and a
+            // hot loop is compiled there, which is why a healthy single-pass
+            // count said nothing about where the time went. Zero on BOTH sides
+            // here means the tier compiled no reference store at all; a
+            // declined count with the reasons below means it asked and refused.
+            let (ir_gated, ir_declined) = cratonvm_jit::metrics::ir_ref_store_site_counts();
+            eprintln!(
+                "[cratonvm] optimizing-tier reference stores: gated={ir_gated} declined={ir_declined}"
+            );
+            for (name, count) in cratonvm_jit::metrics::ir_ref_store_declines() {
+                eprintln!("[cratonvm]   ir ref-store declined {name}: {count}");
+            }
             // Optimizing-tier allocation. A zero on the left is the EXPECTED
             // reading under a default configuration -- `c2_alloc_upgrade` is
             // opt-in, so no method containing a `new` reaches that tier -- and
