@@ -4036,6 +4036,12 @@ impl G1Collector {
         phases.fixup_regions = census.walked_regions;
         phases.fixup_bytes = census.walked_bytes;
         phase_mark = std::time::Instant::now();
+        // F-02: retire the from-space forwards this pause installed, before
+        // Phase 5 decides which regions to free and which to keep. After the
+        // fix-up (which resolves them), before the reclaim (which is what makes
+        // a kept region's stale forward outlive the pause). See
+        // `retire_forwards`.
+        self.retire_forwards(&pointer_map);
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
         phases.free_us = phase_mark.elapsed().as_micros() as u64;
         phase_mark = std::time::Instant::now();
@@ -4164,6 +4170,24 @@ impl G1Collector {
         ) {
             return self.young_collection_parallel(roots, monitors);
         }
+        self.young_collection_serial(roots, monitors)
+    }
+
+    /// The single-threaded young evacuation. [`Self::young_collection`] is the
+    /// dispatcher; this is the body it falls back to.
+    ///
+    /// Split out for F-02: the serial and parallel drivers now install
+    /// forwarding pointers by the same protocol but retire them in different
+    /// places (the parallel one inside `parallel_evacuate`, this one between
+    /// Phases 4 and 5), and a test that goes through the dispatcher exercises
+    /// whichever the ambient flags select. A retirement test that silently ran
+    /// the OTHER path passed with `retire_forwards` deleted, which is exactly
+    /// the vacuous check this split exists to prevent.
+    pub(crate) fn young_collection_serial(
+        &self,
+        roots: &mut [ObjectRef],
+        monitors: &dyn MonitorCleanup,
+    ) -> GcResult {
         let start = std::time::Instant::now();
         let mut regions = self.regions.lock();
         // SECURITY FIX (V7a): this collection will reset/retype CSet
@@ -4485,6 +4509,12 @@ impl G1Collector {
         phase_mark = std::time::Instant::now();
 
         // Phase 5: Free evacuated regions
+        // F-02: retire the from-space forwards this pause installed, before
+        // Phase 5 decides which regions to free and which to keep. After the
+        // fix-up (which resolves them), before the reclaim (which is what makes
+        // a kept region's stale forward outlive the pause). See
+        // `retire_forwards`.
+        self.retire_forwards(&pointer_map);
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
         // Humongous spans are never evacuated, so this is the only point in a
@@ -4991,6 +5021,12 @@ impl G1Collector {
         phases.fixup_bytes = census.walked_bytes;
         phase_mark = std::time::Instant::now();
 
+        // F-02: retire the from-space forwards this pause installed, before
+        // Phase 5 decides which regions to free and which to keep. After the
+        // fix-up (which resolves them), before the reclaim (which is what makes
+        // a kept region's stale forward outlive the pause). See
+        // `retire_forwards`.
+        self.retire_forwards(&pointer_map);
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
         // Humongous spans are never evacuated, so this is the only point in a
@@ -6173,6 +6209,46 @@ impl G1Collector {
         }
     }
 
+    /// F-02 — clear the forwarding tag from every from-space object this pause
+    /// forwarded, restoring the "no object carries a forward at collection
+    /// start" invariant.
+    ///
+    /// The serial evacuator installs forwards in from-space mark words since
+    /// F-02, which means it inherits the obligation the parallel evacuator
+    /// already carries (its DEFECT-2 part 2). Phase 5 zero-fills a FREED
+    /// region, so a forward left in one is harmless — but a region holding a
+    /// self-forwarded object is KEPT, and every from-space body in it survives
+    /// the pause. A forward left on one of those is read by the NEXT cycle's
+    /// fast path as a this-cycle answer, which strands a root on an abandoned
+    /// object.
+    ///
+    /// Clearing every key rather than only the self-forwards (`k == v`) is
+    /// deliberate and is the correction that half-fix needed: the
+    /// normally-evacuated bodies left behind in a kept region are stale in
+    /// exactly the same way.
+    ///
+    /// NEUTRAL is the right resting lock state — the live copy carries the mark
+    /// word this evacuation transferred to it — but the QUARTET must survive:
+    /// `kind` and `element_type` are what every linear region walker sizes a
+    /// from-space object from, and Phase 5 has not zeroed the region yet.
+    /// Storing a bare `MARK_NEUTRAL` here would leave an abandoned copy
+    /// claiming to be a zero-slot plain object.
+    ///
+    /// Must run AFTER Phase 4 (which resolves forwards) and BEFORE Phase 5.
+    fn retire_forwards(&self, pointer_map: &cratonvm_types::PointerMap) {
+        for &k in pointer_map.keys() {
+            // SAFETY: `k` is a from-space object address forwarded this pause;
+            // its header is intact and its region is held under the
+            // collection's `regions` lock (Phase 5 has not run yet).
+            unsafe {
+                let h = &*(k as *const ObjectHeader);
+                let quartet = ObjectHeader::quartet_of(h.mark_word.load(Ordering::Relaxed));
+                h.mark_word
+                    .store(quartet | cratonvm_types::MARK_NEUTRAL, Ordering::Relaxed);
+            }
+        }
+    }
+
     fn evacuate_object(
         &self,
         regions: &mut Vec<G1Region>,
@@ -6184,9 +6260,34 @@ impl G1Collector {
     ) -> Option<(*mut u8, bool)> {
         let old_addr = old_ptr as usize;
 
-        // Already forwarded (not fresh) — return the existing forward.
-        if let Some(&new_addr) = pointer_map.get(&old_addr) {
-            return Some((new_addr as *mut u8, false));
+        // F-02 — the "already forwarded?" test is a LOAD AND A TAG COMPARE, not
+        // a hash probe.
+        //
+        // Since the 32 -> 24 header shrink the forwarding slot IS the mark word,
+        // and the parallel evacuator has always used it (`SharedEvac::evacuate`
+        // CAS-installs there). The serial path kept its answer in the per-cycle
+        // `pointer_map` instead and paid `FxHashMap::get` on every visit to
+        // every reference slot pointing into the collection set — inside the
+        // Cheney closure, which is the largest phase of a young pause.
+        //
+        // The two evacuators now share one protocol, which is worth as much as
+        // the cycles: "where did this object go" had two answers maintained by
+        // two mechanisms, and only one of them was visible to the other path.
+        //
+        // `pointer_map` is still built. It is the pause's OUTPUT — the VM's
+        // root/monitor/JNI-handle/dedup-table/mark-worklist remaps all consume
+        // it — it is what Phase 5 reads to tell a self-forward from a real
+        // copy, and it is the list `retire_forwards` walks. What it stops being
+        // is the collector's own lookup structure.
+        //
+        // SAFETY: every caller has already established that `old_ptr` is a
+        // plausible object header inside a live CSet region (roots go through
+        // `note_root_object_plausibility`, slots through
+        // `evacuation_candidate_is_an_object`), and the regions guard is held.
+        let mark_atomic = unsafe { &(*(old_ptr as *const ObjectHeader)).mark_word };
+        let observed = mark_atomic.load(Ordering::Acquire);
+        if ObjectHeader::is_forwarded_mark(observed) {
+            return Some((ObjectHeader::forwarding_target(observed), false));
         }
 
         let header = unsafe { &*(old_ptr as *const ObjectHeader) };
@@ -6242,6 +6343,16 @@ impl G1Collector {
                 // so nothing is lost. The heap is then simply not reclaimed → the
                 // triggering mutator allocation fails → a clean, catchable
                 // OutOfMemoryError, exactly as the generational collector does.
+                // F-02: install the identity forward in the header too, so a
+                // later visit in this same pause takes the tag-compare fast
+                // path above instead of re-deciding. `retire_forwards` clears
+                // it before Phase 5 — which matters most here, because a
+                // self-forwarded object's region is KEPT, so a forward left on
+                // it would outlive the pause.
+                mark_atomic.store(
+                    ObjectHeader::make_forwarded(observed, old_addr),
+                    Ordering::Release,
+                );
                 pointer_map.insert(old_addr, old_addr);
                 return Some((old_ptr, true));
             }
@@ -6262,16 +6373,18 @@ impl G1Collector {
         // NOTE: a future concurrent G1 collector needs a different
         // forwarding protocol — CAS-install the forwarding pointer and
         // re-read the mark word if a mutator raced the evacuation.
+        //
+        // F-02: `observed`, NOT a fresh load — the same reasoning the parallel
+        // evacuator states at its own mark-word transfer. The mark word is the
+        // forwarding slot, so re-reading it after the install below would stamp
+        // the DESTINATION as forwarded. The snapshot was taken before the copy
+        // and is known non-forwarded.
         // SAFETY: both pointers reference a fully written ObjectHeader.
         unsafe {
-            let old_header_ptr = old_ptr as *const ObjectHeader;
             let new_header_ptr = new_ptr as *mut ObjectHeader;
-            let mark = (*old_header_ptr)
-                .mark_word
-                .load(std::sync::atomic::Ordering::Relaxed);
             (*new_header_ptr)
                 .mark_word
-                .store(mark, std::sync::atomic::Ordering::Relaxed);
+                .store(observed, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Increment GC age on the new copy
@@ -6305,6 +6418,14 @@ impl G1Collector {
         } else {
             new_header.set_gc_age(new_header.gc_age().saturating_add(1));
         }
+        // F-02: install the forward on the FROM-space header, after the
+        // destination is fully written. Ordering matters for the same reason it
+        // does in the parallel evacuator: the forward is what makes the copy
+        // findable, so it must not become visible before the copy is complete.
+        mark_atomic.store(
+            ObjectHeader::make_forwarded(observed, new_ptr as usize),
+            Ordering::Release,
+        );
         pointer_map.insert(old_addr, new_ptr as usize);
         *objects_copied += 1;
         *bytes_copied += obj_size;
@@ -7199,6 +7320,13 @@ impl G1Collector {
         // CSet) is recorded so the next collection scans this region as a source.
         // (Edges are collected and applied after the walk to keep borrows simple;
         // `add_reference` dedups.)
+        // F-02 — the CSet-screened forwarding lookup this walk resolves slots
+        // through. See `ForwardLookup`.
+        let forwards = ForwardLookup {
+            collector: self,
+            cset,
+            map: pointer_map,
+        };
         let mut new_rset_edges: Vec<(usize, usize)> = Vec::new();
         // G1AUD-9 — the `(target, holder)` pairs already emitted for the region
         // being walked. `holder` is constant for a whole region walk and an
@@ -7309,7 +7437,7 @@ impl G1Collector {
                 }
 
                 if rewrite {
-                    update_object_refs(obj_ptr, header, pointer_map);
+                    update_object_refs(obj_ptr, header, &forwards);
                 }
                 self.collect_outgoing_cross_region_edges(
                     regions,
@@ -14225,12 +14353,52 @@ fn is_collectable_region_type(region_type: RegionType) -> bool {
     )
 }
 
+/// F-02 — resolve a reference slot's forwarding target, without hashing the
+/// slots that cannot have one.
+///
+/// # Why the CSet test comes first
+///
+/// Phase 4 walks the NON-collection-set regions — in a young pause, the whole
+/// old generation — and asked `pointer_map.get(raw)` for every non-null
+/// reference slot in it. Almost none of those can be answered: an object is
+/// only in the forwarding map if it was EVACUATED, and only a collection-set
+/// resident is ever evacuated, so on a heap with a large old generation the
+/// overwhelming majority of those probes are hash-and-miss over slots pointing
+/// at objects that never moved.
+///
+/// `lookup_region_for_addr` is O(1) arithmetic (a shift, since F-09) and CSet
+/// membership is a bitset test (since F-03), so screening on "does this
+/// reference even point into the collection set?" turns the common case from a
+/// hash probe into four instructions. It is exactly equivalent, not an
+/// approximation: every key of `pointer_map` is a from-space address, and
+/// `evacuate_object` is only ever called for collection-set residents — the
+/// self-forwarded (`k == v`) entries included.
+///
+/// The map, not the from-space object's forwarding mark word, stays the
+/// authority here. The header would answer in one load, but `raw` at this point
+/// is an unvalidated word out of a reference slot: it is only known to be
+/// in-region, and reading a header at an arbitrary in-region address could
+/// decode stale bytes as a forward and rewrite a live slot to a bogus address.
+/// The map cannot do that.
+struct ForwardLookup<'a> {
+    collector: &'a G1Collector,
+    cset: &'a RegionSet,
+    map: &'a cratonvm_types::PointerMap,
+}
+
+impl ForwardLookup<'_> {
+    #[inline]
+    fn resolve(&self, raw: usize) -> Option<usize> {
+        let idx = self.collector.lookup_region_for_addr(raw)?;
+        if !self.cset.contains(&idx) {
+            return None;
+        }
+        self.map.get(&raw).copied()
+    }
+}
+
 /// Update reference fields in an object using the forwarding map.
-fn update_object_refs(
-    obj_ptr: *mut u8,
-    header: &ObjectHeader,
-    pointer_map: &cratonvm_types::PointerMap,
-) {
+fn update_object_refs(obj_ptr: *mut u8, header: &ObjectHeader, forwards: &ForwardLookup<'_>) {
     let data_start = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
 
     if header.kind() == ObjectKind::Array {
@@ -14239,7 +14407,7 @@ fn update_object_refs(
                 let slot_ptr = unsafe { data_start.add(i * 8) };
                 let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
                 if raw != 0 {
-                    if let Some(&new_addr) = pointer_map.get(&(raw as usize)) {
+                    if let Some(new_addr) = forwards.resolve(raw as usize) {
                         unsafe {
                             std::ptr::write(slot_ptr as *mut u64, new_addr as u64);
                         }
@@ -14249,7 +14417,7 @@ fn update_object_refs(
         }
     } else {
         for_each_flat_object_reference_trusting_header(obj_ptr, header, 0, |slot, raw, compact| {
-            if let Some(&new_addr) = pointer_map.get(&raw) {
+            if let Some(new_addr) = forwards.resolve(raw) {
                 write_flat_object_reference(slot, new_addr, compact);
             }
         });
@@ -15289,6 +15457,185 @@ mod tests {
         assert!(
             dead.is_empty(),
             "a rooted finalizable object survived normally and must not be enqueued"
+        );
+    }
+
+    // -- F-02: forwarding lives in the mark word --
+
+    /// Every object below every region's cursor whose mark word still carries
+    /// a forwarding tag.
+    fn forwarded_objects_in_heap(gc: &G1Collector) -> Vec<usize> {
+        let mut out = Vec::new();
+        let regions = gc.regions.lock();
+        for r in regions.iter() {
+            if matches!(
+                r.region_type,
+                RegionType::Free | RegionType::HumongousContinuation
+            ) {
+                continue;
+            }
+            let base = r.data.as_ptr() as usize;
+            let mut off = 0usize;
+            while off < r.cursor {
+                let addr = base + off;
+                let header = unsafe { &*(addr as *const ObjectHeader) };
+                let size = object_total_size(header);
+                if size < HEADER_SIZE || off + size > r.cursor {
+                    break;
+                }
+                if header.is_forwarded() {
+                    out.push(addr);
+                }
+                off += size;
+            }
+        }
+        out
+    }
+
+    /// F-02 — the serial evacuator installs forwards in from-space mark words,
+    /// so it inherits the obligation to retire them. A forward that survives a
+    /// pause is read by the NEXT cycle's fast path as a this-cycle answer,
+    /// which strands a root on an abandoned object.
+    ///
+    /// The pause that can show this is one that KEEPS a region. Phase 5
+    /// zero-fills a freed region, so a forward left in one is invisible — and
+    /// the first version of this test ran a healthy pause and passed with
+    /// `retire_forwards` commented out, i.e. it was checking nothing. To-space
+    /// is therefore exhausted deliberately here: every region that is not Eden
+    /// is made a full Old region, so no destination of either type has room and
+    /// no Free region can be claimed, and every reached object self-forwards.
+    #[test]
+    fn no_object_carries_a_forwarding_tag_after_a_pause_that_keeps_regions() {
+        let gc = G1Collector::new(G1CollectorConfig {
+            heap_size: 4 * 1024 * 1024,
+            region_size: 256 * 1024,
+            ..small_config()
+        });
+
+        // A retained chain, so the pause has live objects to relocate.
+        let head = gc.alloc_object(ClassId::new(1), 1);
+        let mut prev = head;
+        for _ in 0..32 {
+            let next = gc.alloc_object(ClassId::new(1), 1);
+            gc.set_field(prev, 0, Value::Object(Some(next)));
+            prev = next;
+        }
+
+        // Leave the evacuator nowhere to copy to.
+        gc.with_regions_mut(|regions| {
+            for r in regions.iter_mut() {
+                if r.region_type == RegionType::Free {
+                    r.region_type = RegionType::Old;
+                    r.cursor = r.data.len();
+                }
+            }
+        });
+
+        let mut roots: Vec<ObjectRef> = vec![head];
+        // The SERIAL body, explicitly: the dispatcher would pick the parallel
+        // evacuator here, which retires its forwards inside `parallel_evacuate`
+        // and would make this test vacuous.
+        let result = gc.young_collection_serial(&mut roots, &NoopMonitors);
+        assert!(
+            result.pointer_map.iter().any(|(k, v)| k == v),
+            "test setup: the pause must have SELF-FORWARDED something, or no \
+             region is kept and this test cannot observe a surviving forward"
+        );
+        assert_eq!(
+            gc.count_regions(RegionType::Survivor),
+            1,
+            "test setup: the kept Eden region is retyped to Survivor by Phase 5"
+        );
+
+        let offenders = forwarded_objects_in_heap(&gc);
+        assert!(
+            offenders.is_empty(),
+            "{} object(s) still carry a forwarding tag after the pause, e.g. \
+             0x{:x} — `retire_forwards` did not cover them",
+            offenders.len(),
+            offenders.first().copied().unwrap_or(0)
+        );
+    }
+
+    /// ...and the retirement must not destroy the QUARTET. `kind` and
+    /// `element_type` live in the mark word, and every linear region walker
+    /// sizes a from-space object from them while Phase 5 has not yet zeroed the
+    /// region. Storing a bare `MARK_NEUTRAL` would leave an abandoned array
+    /// claiming to be a zero-slot plain object, and the walk would desynchronize.
+    #[test]
+    fn retiring_a_forward_preserves_the_kind_quartet() {
+        let gc = make_collector();
+        let arr = gc.alloc_array(ClassId::new(9), ArrayElementType::Long, 4);
+        let addr = arr.as_ptr() as usize;
+
+        let before = {
+            let header = unsafe { &*(addr as *const ObjectHeader) };
+            (header.kind(), header.element_type(), object_total_size(header))
+        };
+
+        let mut map = cratonvm_types::PointerMap::default();
+        map.insert(addr, addr);
+        gc.retire_forwards(&map);
+
+        let header = unsafe { &*(addr as *const ObjectHeader) };
+        assert!(
+            !header.is_forwarded(),
+            "the tag must be gone — that is the whole job"
+        );
+        assert_eq!(
+            (header.kind(), header.element_type(), object_total_size(header)),
+            before,
+            "but the quartet must survive, or a linear walk over the abandoned \
+             body desynchronizes"
+        );
+    }
+
+    /// F-02 — the Phase-4 screen is equivalent, not an approximation: it
+    /// answers for a collection-set resident and declines for everything else,
+    /// which is sound only because every key of a pause's forwarding map IS a
+    /// collection-set resident.
+    #[test]
+    fn the_phase4_forward_lookup_screens_on_collection_set_membership() {
+        let gc = make_collector();
+        let a = gc.alloc_object(ClassId::new(1), 0);
+        let b = gc.alloc_object(ClassId::new(2), 0);
+        let (a_addr, b_addr) = (a.as_ptr() as usize, b.as_ptr() as usize);
+
+        let a_region = gc.lookup_region_for_addr(a_addr).unwrap();
+        let mut cset = RegionSet::new();
+        cset.insert(a_region);
+
+        let mut map = cratonvm_types::PointerMap::default();
+        map.insert(a_addr, 0xdead_0000);
+        // A key outside the collection set cannot occur in production; putting
+        // one here is how the screen's behaviour becomes observable.
+        map.insert(b_addr, 0xbeef_0000);
+
+        let lookup = ForwardLookup {
+            collector: &gc,
+            cset: &cset,
+            map: &map,
+        };
+        assert_eq!(
+            lookup.resolve(a_addr),
+            Some(0xdead_0000),
+            "a collection-set resident with a forward resolves"
+        );
+        assert_eq!(
+            lookup.resolve(b_addr),
+            if gc.lookup_region_for_addr(b_addr) == Some(a_region) {
+                // Both objects landed in one region, so `b` IS in the screened
+                // set and the map answers for it. The assertion below is the
+                // one that carries the test in that case.
+                Some(0xbeef_0000)
+            } else {
+                None
+            },
+        );
+        assert_eq!(
+            lookup.resolve(0x10),
+            None,
+            "an address outside the heap resolves to nothing rather than hashing"
         );
     }
 
