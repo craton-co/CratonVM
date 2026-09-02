@@ -133,6 +133,12 @@ pub struct G1ConfigOverrides {
     /// `-Xms` — bytes to commit up front (F-16). `None` leaves
     /// `initial_heap_size` at its `0` = ergonomic default.
     pub initial_heap_size: Option<usize>,
+    /// `-XX:G1MixedGCLiveThresholdPercent=<n>` (clamped to 1..=100) — an Old
+    /// region at or above this percent live is never a mixed candidate.
+    pub mixed_gc_live_threshold_percent: Option<u8>,
+    /// `-XX:G1HeapWastePercent=<n>` (clamped to 0..=100) — the mixed phase
+    /// ends once the candidates' garbage is below this percent of the heap.
+    pub heap_waste_percent: Option<u8>,
 }
 
 // ─── GPU-offload coordination (Phase 6 item 1) ───────────────────────────
@@ -352,6 +358,12 @@ impl VmHeap {
                 }
                 if let Some(pause) = overrides.max_gc_pause_ms {
                     config.max_gc_pause_ms = pause.max(1);
+                }
+                if let Some(p) = overrides.mixed_gc_live_threshold_percent {
+                    config.mixed_gc_live_threshold_percent = p.clamp(1, 100);
+                }
+                if let Some(p) = overrides.heap_waste_percent {
+                    config.heap_waste_percent = p.min(100);
                 }
                 if let Some(dedup) = overrides.string_dedup {
                     config.string_dedup_enabled = dedup;

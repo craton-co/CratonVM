@@ -867,10 +867,19 @@ pub struct GcFlags {
     /// has already overrun, so the first (largest) pause is always paid in
     /// full and it is the one p99 reports. The flag delivers a real median
     /// improvement and a real throughput cost, which is a trade a specific
-    /// latency-sensitive workload may well want — but it is not a default, and
-    /// nothing measured here says it should be one.
+    /// latency-sensitive workload may well want — which is why, on that
+    /// measurement, it shipped opt-in.
     ///
-    /// Turn it on and measure YOUR pause distribution before keeping it.
+    /// # Default ON since 2026-09-02 (ten-findings item 10)
+    ///
+    /// What made the goal unhonourable was not this sizing but the pause it
+    /// was sizing against: every young pause walked the whole old generation
+    /// in its fix-up phase (and any humongous span made that unconditional),
+    /// and the mixed CSet's copy budget priced only the copying. With the
+    /// fix-up narrow on every pause and the mixed budget charged for the
+    /// walk's measured cost, the target is the only piece of `MaxGCPauseMillis`
+    /// that was still off. `CRATONVM_G1_YOUNG_PAUSE_TARGET=0` restores the
+    /// free-pool-only trigger.
     pub g1_young_pause_target: bool,
     /// `CRATONVM_G1_SCRUB_FREE` — zero a region's bytes when a collection
     /// frees it. **Opt-in** ([`parse::present`]); off means the allocator's own
@@ -1404,7 +1413,7 @@ impl GcFlags {
             g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
             g1_parallel_evac_in_jit: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC_IN_JIT"),
             g1_eager_humongous: on_unless_zero(src, "CRATONVM_G1_EAGER_HUMONGOUS"),
-            g1_young_pause_target: present(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
+            g1_young_pause_target: on_unless_zero(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
             g1_scrub_free: present(src, "CRATONVM_G1_SCRUB_FREE"),
             g1_narrow_fixup: on_unless_zero(src, "CRATONVM_G1_NARROW_FIXUP"),
             g1_cleanup_walk: present(src, "CRATONVM_G1_CLEANUP_WALK"),
