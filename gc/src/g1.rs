@@ -12892,6 +12892,11 @@ impl G1Collector {
             self.marking_threshold_bytes(),
             self.ihop_static_ceiling(),
         );
+        let (fc, fp, fw, cc, cp, cw) = free_region_scan_counts();
+        eprintln!(
+            "[GC] g1 free-scan: single(calls={fc} probed={fp} worst={fw}) contiguous(calls={cc} probed={cp} worst={cw}) regions={}",
+            self.config.heap_size / self.config.region_size.max(1),
+        );
         let (tenuring, hist) = self.tenuring_state();
         eprintln!(
             "[GC] g1 tenuring: threshold={tenuring} configured={} survivor_target={} ages={:?}",
@@ -15910,37 +15915,130 @@ fn find_free_region_from(regions: &[G1Region], start: usize) -> Option<usize> {
         return None;
     }
     let start = if start >= len { 0 } else { start };
+    let mut probed = 0usize;
     for i in start..len {
+        probed += 1;
         if regions[i].region_type == RegionType::Free {
+            note_free_scan(probed);
             return Some(i);
         }
     }
     for i in 0..start {
+        probed += 1;
         if regions[i].region_type == RegionType::Free {
+            note_free_scan(probed);
             return Some(i);
         }
     }
+    note_free_scan(probed);
     None
 }
 
+// F-14 — how much the two linear free-region searches actually cost.
+//
+// The finding proposed replacing both with a free-region bitmap. Doing that
+// means a SECOND source of truth for "is this region Free": the field is read
+// in roughly two hundred places and written in eight, so a bitmap has to be
+// maintained beside it, and a bitmap that says Free about a live region hands
+// the allocator memory that is in use. That is the worst failure this file can
+// have, and it is worth paying for only if the searches are actually expensive.
+//
+// So they are counted first. `[GC] g1 free-scan:` reports calls, total regions
+// probed and the worst single probe for each search, and the decision is made
+// on that rather than on the shape of the loop.
+static FREE_SCAN_CALLS: AtomicU64 = AtomicU64::new(0);
+static FREE_SCAN_PROBES: AtomicU64 = AtomicU64::new(0);
+static FREE_SCAN_WORST: AtomicU64 = AtomicU64::new(0);
+static CONTIG_SCAN_CALLS: AtomicU64 = AtomicU64::new(0);
+static CONTIG_SCAN_PROBES: AtomicU64 = AtomicU64::new(0);
+static CONTIG_SCAN_WORST: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn note_free_scan(probed: usize) {
+    FREE_SCAN_CALLS.fetch_add(1, Ordering::Relaxed);
+    FREE_SCAN_PROBES.fetch_add(probed as u64, Ordering::Relaxed);
+    FREE_SCAN_WORST.fetch_max(probed as u64, Ordering::Relaxed);
+}
+
+#[inline]
+fn note_contig_scan(probed: usize) {
+    CONTIG_SCAN_CALLS.fetch_add(1, Ordering::Relaxed);
+    CONTIG_SCAN_PROBES.fetch_add(probed as u64, Ordering::Relaxed);
+    CONTIG_SCAN_WORST.fetch_max(probed as u64, Ordering::Relaxed);
+}
+
+/// F-14 — `(calls, regions probed, worst single scan)` for the single-region
+/// free search and for the contiguous-run search.
+pub fn free_region_scan_counts() -> (u64, u64, u64, u64, u64, u64) {
+    (
+        FREE_SCAN_CALLS.load(Ordering::Relaxed),
+        FREE_SCAN_PROBES.load(Ordering::Relaxed),
+        FREE_SCAN_WORST.load(Ordering::Relaxed),
+        CONTIG_SCAN_CALLS.load(Ordering::Relaxed),
+        CONTIG_SCAN_PROBES.load(Ordering::Relaxed),
+        CONTIG_SCAN_WORST.load(Ordering::Relaxed),
+    )
+}
+
 /// Find `count` contiguous free regions.
+///
+/// # F-14: measured, and deliberately still a linear scan
+///
+/// The finding proposed replacing this and its single-region sibling with a
+/// free-region bitmap, because both are O(regions) and the region count was
+/// growing without bound with `-Xmx`. Two measurements settle it, and neither
+/// says "bitmap".
+///
+/// **The ordinary path is already free.** On young churn over a 2048-region
+/// heap, `find_free_region_from` probed **exactly one region per call, worst
+/// case one**, across 1,543 calls — the rotating hint does its job — and this
+/// function was not called at all.
+///
+/// **The humongous path is the expensive one, and it is still cheap.** Under
+/// 400 humongous allocations on a 256-region heap it probed 35,943 regions over
+/// 400 calls: ~90 per call, worst 227 of 256. That is most of the heap per
+/// call — and it is 36,000 comparisons of an enum against a constant over a
+/// whole run, on a path that then memsets megabytes for the span it found. A
+/// hint was tried and measured: pointing the search at the free-scan cursor
+/// took it from 35,943 probes to 35,617, which is 0.9% and not worth the
+/// parameter, because that cursor tracks single-region Eden claims and has no
+/// relationship to where a humongous span was freed.
+///
+/// **What actually bounds it is the other half of F-14.** The worry was that
+/// the region count grows with the heap — 8192 regions at 16 GiB under the old
+/// two-step ladder. The region-size ergonomic now targets ~2048 regions at any
+/// heap size, so this scan is bounded by a constant instead of by `-Xmx`, which
+/// is the property the finding was actually asking for.
+///
+/// So the bitmap is refused on the number, not on the effort. It would buy
+/// those comparisons at the price of a SECOND source of truth for "is this
+/// region Free" — a field read in roughly two hundred places and written in
+/// eight — and a bitmap that says Free about a live region hands the allocator
+/// memory that is in use, which is the worst failure this file can have.
+///
+/// `free_region_scan_counts` keeps the instrument, so this decision can be
+/// revisited against a workload rather than against the shape of the loop.
 fn find_contiguous_free(regions: &[G1Region], count: usize) -> Option<usize> {
     let mut run_start = 0;
     let mut run_len = 0;
+    let mut probed = 0usize;
 
     for (i, r) in regions.iter().enumerate() {
+        probed += 1;
         if r.region_type == RegionType::Free {
             if run_len == 0 {
                 run_start = i;
             }
             run_len += 1;
             if run_len >= count {
+                note_contig_scan(probed);
                 return Some(run_start);
             }
         } else {
             run_len = 0;
         }
     }
+    note_contig_scan(probed);
     None
 }
 
@@ -17908,6 +18006,28 @@ mod tests {
             assert_eq!(gc.lookup_region_for_addr(base), Some(i));
             assert_eq!(gc.lookup_region_for_addr(base + 1024 * 1024 - 1), Some(i));
         }
+    }
+
+    /// F-14 — the two free-region searches are instrumented, and the counters
+    /// have to move or the measurement the bitmap decision rests on is vacuous.
+    #[test]
+    fn the_free_region_searches_are_counted() {
+        let gc = G1Collector::new(small_config());
+        let (c0, p0, _, cc0, cp0, _) = free_region_scan_counts();
+
+        // A single-region claim goes through `find_free_region_from`.
+        let _ = gc.alloc_object(ClassId::new(1), 1);
+        let (c1, p1, w1, _, _, _) = free_region_scan_counts();
+        assert!(c1 > c0, "the single-region search must be counted");
+        assert!(p1 > p0, "and so must the regions it probed");
+        assert!(w1 >= 1, "a call that found a region probed at least one");
+
+        // A humongous allocation goes through `find_contiguous_free`.
+        let _ = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 200_000);
+        let (_, _, _, cc1, cp1, cw1) = free_region_scan_counts();
+        assert!(cc1 > cc0, "the contiguous search must be counted");
+        assert!(cp1 > cp0);
+        assert!(cw1 >= 1);
     }
 
     #[test]

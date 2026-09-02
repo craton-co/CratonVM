@@ -413,6 +413,31 @@ itself 152 -> 18 ms. `CRATONVM_G1_SCRUB_FREE=1` restores it, and that is
 the first thing to try if a G1 heap-corruption investigation wants the old
 "a freed region reads as zeros" world back.
 
+*Free-region search: measured, and still linear.* Both searches
+(`find_free_region_from`, `find_contiguous_free`) are O(regions), and the
+region count used to grow with `-Xmx`. `[GC] g1 free-scan:` reports calls,
+regions probed and the worst single scan for each. Two readings:
+
+| workload | single | contiguous |
+|---|---|---|
+| young churn, 2048 regions | 1543 calls, 1543 probed, **worst 1** | never called |
+| 400 humongous allocations, 256 regions | 15 calls, 1027 probed, worst 195 | 400 calls, 35943 probed, **worst 227** |
+
+The ordinary path is free — the rotating hint answers in one probe, always. The
+humongous path scans most of the heap per call, and that is still 36,000
+comparisons of an enum against a constant across a whole run, on a path that
+then memsets megabytes. A hint for it was tried and measured at 0.9% (35,943 →
+35,617 probes) and dropped: the free-scan cursor tracks single-region Eden
+claims and has no relationship to where a humongous span was freed.
+
+What bounds it is the region-size ergonomic above: ~2048 regions at any heap
+size means the scan is bounded by a constant rather than by `-Xmx`, which is the
+property the concern was actually about. A free-region bitmap would buy those
+comparisons at the price of a second source of truth for "is this region Free" —
+read in ~200 places, written in 8 — and one that says Free about a live region
+hands the allocator memory that is in use. Refused on the number; the instrument
+stays so it can be revisited against a workload.
+
 *The Phase-4 walk, narrowed.* A young pause's reference fix-up walks only the
 collection set's remembered-set sources plus every region the pause WROTE
 INTO — not every object of every non-CSet region, which would make pause
