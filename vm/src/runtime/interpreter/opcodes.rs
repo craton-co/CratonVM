@@ -3614,128 +3614,7 @@ pub(super) fn op_putfield(
         }
     }
     if crate::runtime::env_cache::any_field_diag() {
-        // Gated diagnostic (CRATONVM_DBG_FIELDADDR): trace put for specific
-        // fields — object address + resolved slot — to localize a write
-        // that doesn't reach the read site.
-        if crate::runtime::env_cache::field_addr_dbg() {
-            let field_name = resolve_field_name(shared, current_class_id, *index);
-            if let Some(fname) = field_name.as_deref() {
-                if matches!(
-                    fname,
-                    "unsharedLongs" | "threadFactory" | "runningThreads" | "submittedTaskCounter"
-                ) {
-                    eprintln!(
-                        "[FIELDADDR] PUT {} obj=0x{:x} slot={} num_slots={} valObj={} in {}",
-                        fname,
-                        // Cast: object/code pointer to integer address
-                        obj_ref.as_ptr() as usize,
-                        field.field_index,
-                        shared.mem.heap.get_header(obj_ref).num_slots(),
-                        matches!(value, Value::Object(Some(_))),
-                        thread.frames[frame_idx].class_name(),
-                    );
-                }
-            }
-        }
-        // bc math-ec 0x4 (CRATONVM_DBG_STRAYSTACK): catch a STRAY/STALE
-        // receiver reaching putfield. The corruption's reliable face is the
-        // `set_field out-of-bounds` flood: a relocated-but-unremapped (or
-        // wild) `objectref` whose header reads `num_slots=0` (real obj NOT
-        // forwarded; class_id reads a Value-disc 0/1/4) or `num_slots` huge
-        // (real obj forwarded → forwarding_ptr low bits). Dump the Java
-        // stack + receiver so we can trace where the stale ref originates
-        // (operand-stack slot not remapped after a young GC). Rate-limited.
-        if straystack_enabled() {
-            let h = shared.mem.heap.get_header(obj_ref);
-            // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
-            let ns = h.num_slots() as usize;
-            if field.field_index >= ns || h.num_slots() > (1 << 24) {
-                use std::sync::atomic::{AtomicUsize, Ordering};
-                static N: AtomicUsize = AtomicUsize::new(0);
-                let k = N.fetch_add(1, Ordering::Relaxed);
-                if k < 12 {
-                    let field_name = resolve_field_name(shared, current_class_id, *index);
-                    eprintln!(
-                            "[straystack] #{k} STRAY putfield recv@0x{:x} cid={} num_slots={} array_len={} kind={} -> field '{}' idx={} is_ref={} value={:?}",
-                            // Cast: object/code pointer to integer address
-                            obj_ref.as_ptr() as usize,
-                            // Truncation: integer -> u8 (intentional low 8 bits)
-                            h.class_id.as_u32(), h.num_slots(), h.array_length(), cratonvm_types::ObjectHeader::kind_tag(h.mark_word.load(std::sync::atomic::Ordering::Relaxed)),
-                            field_name.as_deref().unwrap_or("?"),
-                            field.field_index, field.is_reference, value,
-                        );
-                    eprintln!("[straystack] Java stack (top first):");
-                    for f in thread.frames.iter().rev().take(28) {
-                        eprintln!(
-                            "[straystack]   {}.{}{} pc={}",
-                            f.class_name(),
-                            f.method_name(),
-                            f.method_descriptor(),
-                            f.pc,
-                        );
-                    }
-                }
-            }
-        }
-        if crate::runtime::env_cache::hashtableofint_trace() {
-            let cname = thread.frames[frame_idx].class_name();
-            let mname = thread.frames[frame_idx].method_name();
-            if cname.contains("HashtableOfInt") {
-                let field_name = resolve_field_name(shared, current_class_id, *index);
-                let nf = shared
-                    .classes
-                    .class_manager
-                    .read()
-                    .get_class(field.declaring_class_id)
-                    .map(|c| c.num_total_fields)
-                    .unwrap_or(0);
-                eprintln!(
-                        "[HTI-PUT] {cname}.{mname} cp#{idx} fld={fn2:?} declaring={decl:?} field_index={fi} is_ref={ir} num_total_fields={nf} obj_ptr={op:p} value={v:?}",
-                        idx = *index,
-                        fn2 = field_name,
-                        decl = field.declaring_class_id,
-                        fi = field.field_index,
-                        ir = field.is_reference,
-                        op = obj_ref.as_ptr(),
-                        v = value,
-                    );
-            }
-        }
-        if crate::runtime::env_cache::baos_dbg() {
-            let field_name = resolve_field_name(shared, current_class_id, *index);
-            if matches!(field_name.as_deref(), Some("buf") | Some("count")) {
-                let cm = shared.classes.class_manager.read();
-                let recv_cid = shared.mem.heap.class_id_of(obj_ref);
-                let rn = cm
-                    .get_class(recv_cid)
-                    .map(|c| c.name.to_string())
-                    .unwrap_or_default();
-                let rnf = cm
-                    .get_class(recv_cid)
-                    .map(|c| c.num_total_fields)
-                    .unwrap_or(0);
-                let rffi = cm
-                    .get_class(recv_cid)
-                    .map(|c| c.first_field_index)
-                    .unwrap_or(0);
-                let dn = cm
-                    .get_class(field.declaring_class_id)
-                    .map(|c| c.name.to_string())
-                    .unwrap_or_default();
-                let dnf = cm
-                    .get_class(field.declaring_class_id)
-                    .map(|c| c.num_total_fields)
-                    .unwrap_or(0);
-                let dffi = cm
-                    .get_class(field.declaring_class_id)
-                    .map(|c| c.first_field_index)
-                    .unwrap_or(0);
-                eprintln!(
-                        "[BAOS-DBG] putfield {fld:?} recv={rn}(nf={rnf},ffi={rffi}) decl={dn}(nf={dnf},ffi={dffi}) field_index={fi} value={v:?}",
-                        fld = field_name, fi = field.field_index, v = value,
-                    );
-            }
-        }
+        diag_putfield_consolidated(shared, thread, frame_idx, current_class_id, *index, obj_ref, &field, value)?;
     } // end `if any_field_diag()` — consolidated putfield diagnostics
       // T17.Δ.4 — JVMTI FieldModification watchpoint, scoped to this VM.
     if crate::runtime::jvmti::any_field_watchpoint_active() {
@@ -3771,39 +3650,7 @@ pub(super) fn op_putfield(
     // address watch list). See fixed-suite-bugs/h2-suite-bugs/
     // bug-h2-suite-residual-fail-triage-FIXED.md.
     if crate::runtime::env_cache::dbg_field_watch() {
-        let decl_name = shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(field.declaring_class_id)
-            .map(|c| c.name.to_string())
-            .unwrap_or_default();
-        let field_name = resolve_field_name(shared, current_class_id, *index);
-        if crate::runtime::env_cache::field_watch_class_matches(&format!(
-            "{}.{}",
-            decl_name,
-            field_name.as_deref().unwrap_or("?")
-        )) {
-            let fr = &thread.frames[frame_idx];
-            eprintln!(
-                        "[PUTFIELD-WATCH] obj={:p} decl_class={} field={:?} field_index={} old={:?} new={:?} in {}.{} pc={} thread={}",
-                        obj_ref.as_ptr(),
-                        decl_name,
-                        field_name,
-                        field.field_index,
-                        old_value,
-                        value,
-                        fr.class_name(),
-                        fr.method_name(),
-                        fr.pc,
-                        thread.thread_id.0,
-                    );
-            // A watched field almost always raises a "who did this?"
-            // question next, and the answer is the Java call chain.
-            for f in thread.frames.iter().rev().take(24) {
-                eprintln!("    at {}.{} pc={}", f.class_name(), f.method_name(), f.pc);
-            }
-        }
+        diag_putfield_watch(shared, thread, frame_idx, current_class_id, *index, obj_ref, &field, value)?;
     }
     // CRATONVM_DBG_CORRUPT_CELL, the interpreter's own WRITE door.
     // The read doors were instrumented first, and a producer that only
@@ -4027,38 +3874,7 @@ pub(super) fn op_getfield(
     // exactly like its putfield sibling, so the two doors are armed by
     // one variable and cannot drift.
     if straystack_enabled() {
-        let h = shared.mem.heap.get_header(obj_ref);
-        let ns = h.num_slots() as usize;
-        if field.field_index >= ns || h.num_slots() > (1 << 24) {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static N: AtomicUsize = AtomicUsize::new(0);
-            let k = N.fetch_add(1, Ordering::Relaxed);
-            if k < 12 {
-                let field_name = resolve_field_name(shared, current_class_id, *index);
-                eprintln!(
-                            "[straystack] #{k} OOB getfield recv@0x{:x} cid={} num_slots={} kind={} -> field '{}' idx={} declaring={:?}",
-                            obj_ref.as_ptr() as usize,
-                            h.class_id.as_u32(),
-                            h.num_slots(),
-                            cratonvm_types::ObjectHeader::kind_tag(
-                                h.mark_word.load(std::sync::atomic::Ordering::Relaxed)
-                            ),
-                            field_name.as_deref().unwrap_or("?"),
-                            field.field_index,
-                            field.declaring_class_id,
-                        );
-                eprintln!("[straystack] Java stack (top first):");
-                for f in thread.frames.iter().rev().take(28) {
-                    eprintln!(
-                        "[straystack]   {}.{}{} pc={}",
-                        f.class_name(),
-                        f.method_name(),
-                        f.method_descriptor(),
-                        f.pc,
-                    );
-                }
-            }
-        }
+        diag_getfield_straystack(shared, thread, frame_idx, current_class_id, *index, obj_ref, &field)?;
     }
     // Perf: ALL of the per-getfield diagnostic blocks below are gated
     // behind a SINGLE cached "any field diagnostic enabled" branch, so
@@ -4070,141 +3886,7 @@ pub(super) fn op_getfield(
     // only ever reachable when its var is set (and `any_field_diag()` is
     // then `true`). See `env_cache::any_field_diag`.
     if crate::runtime::env_cache::any_field_diag() {
-        if crate::runtime::env_cache::field_addr_dbg() {
-            let field_name = resolve_field_name(shared, current_class_id, *index);
-            if let Some(fname) = field_name.as_deref() {
-                if matches!(
-                    fname,
-                    "unsharedLongs" | "threadFactory" | "runningThreads" | "submittedTaskCounter"
-                ) {
-                    let raw = shared.mem.heap.get_field(obj_ref, field.field_index);
-                    eprintln!(
-                        "[FIELDADDR] GET {} obj=0x{:x} slot={} num_slots={} readObj={} in {}",
-                        fname,
-                        // Cast: object/code pointer to integer address
-                        obj_ref.as_ptr() as usize,
-                        field.field_index,
-                        shared.mem.heap.get_header(obj_ref).num_slots(),
-                        matches!(raw, Value::Object(Some(_))),
-                        thread.frames[frame_idx].class_name(),
-                    );
-                }
-            }
-        }
-        // CRATONVM_DBG_BADRECV — localize the H2 TestScript SEGV: a getfield
-        // whose receiver is a corrupted `Object(Some(ptr))` not pointing into
-        // any managed arena (e.g. ptr=6) faults in `get_field`'s header read.
-        // Log the Java frame stack + field + a Rust backtrace (to name the
-        // native that drove this method via invoke_virtual), then raise NPE
-        // instead of dereferencing the wild pointer.
-        if crate::runtime::env_cache::badrecv_dbg() {
-            // Cast: object/code pointer to integer address
-            let p = obj_ref.as_ptr() as usize;
-            if p != 0 && shared.mem.heap.is_heap_addr(p).is_none() {
-                use std::sync::atomic::{AtomicUsize, Ordering};
-                static N: AtomicUsize = AtomicUsize::new(0);
-                let n = N.fetch_add(1, Ordering::Relaxed);
-                if n < 8 {
-                    let field_name = resolve_field_name(shared, current_class_id, *index);
-                    let cn = thread.frames[frame_idx].class_name().to_string();
-                    let mn = thread.frames[frame_idx].method_name().to_string();
-                    let pc = thread.frames[frame_idx].pc;
-                    eprintln!(
-                        "[BADRECV #{n}] getfield receiver=0x{p:x} field={field_name:?} \
-                             field_index={} is_ref={} in {cn}.{mn} pc={pc}",
-                        field.field_index, field.is_reference,
-                    );
-                    eprintln!("[BADRECV #{n}] Java frames (innermost first):");
-                    for f in thread.frames.iter().rev().take(24) {
-                        eprintln!("    {}.{}", f.class_name(), f.method_name());
-                    }
-                    eprintln!(
-                        "[BADRECV #{n}] Rust backtrace:\n{}",
-                        std::backtrace::Backtrace::force_capture()
-                    );
-                    use std::io::Write;
-                    let _ = std::io::stderr().flush();
-                }
-                return Err(RuntimeError::NullPointerException {
-                    message: Some(format!("[BADRECV] non-heap getfield receiver 0x{p:x}")),
-                }
-                .into());
-            }
-            // DoHead freed-while-live forensics (2026-07-15): the other
-            // stale-receiver face — a VALID heap address whose object
-            // was zeroed (all-zero header: ClassId(0), num_slots=0)
-            // while a long-lived holder kept serving it. The gc guard
-            // contains each read but names no Java context; print it
-            // here (capped) so the holder structure is identifiable.
-            // A getfield on a 0-slot object is always OOB, so this
-            // never fires for a legitimate zero-hash ClassId(0)
-            // container with fields.
-            if p != 0 && shared.mem.heap.is_heap_addr(p).is_some() {
-                let h = shared.mem.heap.get_header(obj_ref);
-                if h.class_id.as_u32() == 0 && h.num_slots() == 0 {
-                    use std::sync::atomic::{AtomicUsize, Ordering};
-                    static NZ: AtomicUsize = AtomicUsize::new(0);
-                    let n = NZ.fetch_add(1, Ordering::Relaxed);
-                    if n < 12 {
-                        let field_name = resolve_field_name(shared, current_class_id, *index);
-                        let cn = thread.frames[frame_idx].class_name().to_string();
-                        let mn = thread.frames[frame_idx].method_name().to_string();
-                        let pc = thread.frames[frame_idx].pc;
-                        eprintln!(
-                            "[BADRECV-Z #{n}] getfield ZEROED receiver=0x{p:x} \
-                                 field={field_name:?} field_index={} in {cn}.{mn} pc={pc}",
-                            field.field_index,
-                        );
-                        eprintln!("[BADRECV-Z #{n}] Java frames (innermost first):");
-                        for f in thread.frames.iter().rev().take(24) {
-                            eprintln!("    {}.{}", f.class_name(), f.method_name());
-                        }
-                        use std::io::Write;
-                        let _ = std::io::stderr().flush();
-                    }
-                }
-            }
-        }
-        if crate::runtime::env_cache::hashtableofint_trace() {
-            let cname = thread.frames[frame_idx].class_name();
-            let mname = thread.frames[frame_idx].method_name();
-            if cname.contains("HashtableOfInt") {
-                let field_name = resolve_field_name(shared, current_class_id, *index);
-                let v = shared.mem.heap.get_field(obj_ref, field.field_index);
-                let nf = shared
-                    .classes
-                    .class_manager
-                    .read()
-                    .get_class(field.declaring_class_id)
-                    .map(|c| c.num_total_fields)
-                    .unwrap_or(0);
-                eprintln!(
-                        "[HTI-GET] {cname}.{mname} cp#{idx} fld={field_name:?} declaring={decl:?} field_index={fi} is_ref={ir} num_total_fields={nf} obj_ptr={op:p} value={v:?}",
-                        idx = *index,
-                        decl = field.declaring_class_id,
-                        fi = field.field_index,
-                        ir = field.is_reference,
-                        op = obj_ref.as_ptr(),
-                    );
-            }
-        }
-        if crate::runtime::env_cache::bd_debug() {
-            let mname = thread.frames[frame_idx].method_name().to_string();
-            let cname = thread.frames[frame_idx].class_name().to_string();
-            if cname.contains("BigDecimal") && mname == "intValue" {
-                let field_name = resolve_field_name(shared, current_class_id, *index);
-                let v = if field.is_volatile {
-                    shared
-                        .mem
-                        .heap
-                        .get_field_volatile(obj_ref, field.field_index)
-                } else {
-                    shared.mem.heap.get_field(obj_ref, field.field_index)
-                };
-                eprintln!("[Getfield in BigDecimal.intValue] cp_index={} field_name={:?} field_index={} is_ref={} obj={:p} value={:?}",
-                              *index, field_name, field.field_index, field.is_reference, obj_ref.as_ptr(), v);
-            }
-        }
+        diag_getfield_consolidated(shared, thread, frame_idx, current_class_id, *index, obj_ref, &field)?;
     } // end `if any_field_diag()` — consolidated getfield diagnostics
       // Read side of the [PUTFIELD-WATCH] ledger further down: with both
       // halves on one filter a "the constructor stored it but the reader
@@ -4212,46 +3894,7 @@ pub(super) fn op_getfield(
       // guessing which of the two sides is wrong. Same class filter
       // (`CRATONVM_DBG_FIELD_WATCH=<substr>[,<substr>…]`).
     if crate::runtime::env_cache::dbg_field_watch() {
-        let decl_name = shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(field.declaring_class_id)
-            .map(|c| c.name.to_string())
-            .unwrap_or_default();
-        let field_name = resolve_field_name(shared, current_class_id, *index);
-        if crate::runtime::env_cache::field_watch_class_matches(&format!(
-            "{}.{}",
-            decl_name,
-            field_name.as_deref().unwrap_or("?")
-        )) {
-            let watched = if field.is_volatile {
-                shared
-                    .mem
-                    .heap
-                    .get_field_volatile(obj_ref, field.field_index)
-            } else {
-                shared.mem.heap.get_field(obj_ref, field.field_index)
-            };
-            let fr = &thread.frames[frame_idx];
-            eprintln!(
-                        "[GETFIELD-WATCH] obj={:p} decl_class={} field={:?} field_index={} value={:?} in {}.{} pc={} thread={}",
-                        obj_ref.as_ptr(),
-                        decl_name,
-                        field_name,
-                        field.field_index,
-                        watched,
-                        fr.class_name(),
-                        fr.method_name(),
-                        fr.pc,
-                        thread.thread_id.0,
-                    );
-            // A watched field almost always raises a "who did this?"
-            // question next, and the answer is the Java call chain.
-            for f in thread.frames.iter().rev().take(24) {
-                eprintln!("    at {}.{} pc={}", f.class_name(), f.method_name(), f.pc);
-            }
-        }
+        diag_getfield_watch(shared, thread, frame_idx, current_class_id, *index, obj_ref, &field)?;
     }
     // K2 (T10.9.E) — category-2 primitive tag hint.  `ResolvedField`
     // records only is_reference/is_volatile, so we re-read the first
@@ -4675,6 +4318,490 @@ pub(super) fn op_getstatic(
             field.is_reference,
             desc_byte,
         )?;
+    }
+    Ok(())
+}
+
+/// Cold half of `op_putfield`: the diagnostics behind `crate::runtime::env_cache::dbg_field_watch()`,
+/// moved out of the handler body verbatim (2026-09-02) so the unarmed
+/// path keeps one gate load and none of the code. Takes the handler
+/// locals the block read; a `return Err` inside the block
+/// becomes an `Err` the handler propagates with `?`.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn diag_getfield_watch(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    current_class_id: ClassId,
+    index: u16,
+    obj_ref: ObjectRef,
+    field: &ResolvedField,
+) -> Result<(), MethodCallFailed> {
+    let index = &index;
+    let _ = (frame_idx, thread.thread_id, current_class_id, obj_ref, field.field_index);
+    if crate::runtime::env_cache::dbg_field_watch() {
+        let decl_name = shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(field.declaring_class_id)
+            .map(|c| c.name.to_string())
+            .unwrap_or_default();
+        let field_name = resolve_field_name(shared, current_class_id, *index);
+        if crate::runtime::env_cache::field_watch_class_matches(&format!(
+            "{}.{}",
+            decl_name,
+            field_name.as_deref().unwrap_or("?")
+        )) {
+            let watched = if field.is_volatile {
+                shared
+                    .mem
+                    .heap
+                    .get_field_volatile(obj_ref, field.field_index)
+            } else {
+                shared.mem.heap.get_field(obj_ref, field.field_index)
+            };
+            let fr = &thread.frames[frame_idx];
+            eprintln!(
+                        "[GETFIELD-WATCH] obj={:p} decl_class={} field={:?} field_index={} value={:?} in {}.{} pc={} thread={}",
+                        obj_ref.as_ptr(),
+                        decl_name,
+                        field_name,
+                        field.field_index,
+                        watched,
+                        fr.class_name(),
+                        fr.method_name(),
+                        fr.pc,
+                        thread.thread_id.0,
+                    );
+            // A watched field almost always raises a "who did this?"
+            // question next, and the answer is the Java call chain.
+            for f in thread.frames.iter().rev().take(24) {
+                eprintln!("    at {}.{} pc={}", f.class_name(), f.method_name(), f.pc);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Cold half of `op_putfield`: the diagnostics behind `crate::runtime::env_cache::any_field_diag()`,
+/// moved out of the handler body verbatim (2026-09-02) so the unarmed
+/// path keeps one gate load and none of the code. Takes the handler
+/// locals the block read; a `return Err` inside the block
+/// becomes an `Err` the handler propagates with `?`.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn diag_getfield_consolidated(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    current_class_id: ClassId,
+    index: u16,
+    obj_ref: ObjectRef,
+    field: &ResolvedField,
+) -> Result<(), MethodCallFailed> {
+    let index = &index;
+    let _ = (frame_idx, thread.thread_id, current_class_id, obj_ref, field.field_index);
+    if crate::runtime::env_cache::any_field_diag() {
+        if crate::runtime::env_cache::field_addr_dbg() {
+            let field_name = resolve_field_name(shared, current_class_id, *index);
+            if let Some(fname) = field_name.as_deref() {
+                if matches!(
+                    fname,
+                    "unsharedLongs" | "threadFactory" | "runningThreads" | "submittedTaskCounter"
+                ) {
+                    let raw = shared.mem.heap.get_field(obj_ref, field.field_index);
+                    eprintln!(
+                        "[FIELDADDR] GET {} obj=0x{:x} slot={} num_slots={} readObj={} in {}",
+                        fname,
+                        // Cast: object/code pointer to integer address
+                        obj_ref.as_ptr() as usize,
+                        field.field_index,
+                        shared.mem.heap.get_header(obj_ref).num_slots(),
+                        matches!(raw, Value::Object(Some(_))),
+                        thread.frames[frame_idx].class_name(),
+                    );
+                }
+            }
+        }
+        // CRATONVM_DBG_BADRECV — localize the H2 TestScript SEGV: a getfield
+        // whose receiver is a corrupted `Object(Some(ptr))` not pointing into
+        // any managed arena (e.g. ptr=6) faults in `get_field`'s header read.
+        // Log the Java frame stack + field + a Rust backtrace (to name the
+        // native that drove this method via invoke_virtual), then raise NPE
+        // instead of dereferencing the wild pointer.
+        if crate::runtime::env_cache::badrecv_dbg() {
+            // Cast: object/code pointer to integer address
+            let p = obj_ref.as_ptr() as usize;
+            if p != 0 && shared.mem.heap.is_heap_addr(p).is_none() {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static N: AtomicUsize = AtomicUsize::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    let field_name = resolve_field_name(shared, current_class_id, *index);
+                    let cn = thread.frames[frame_idx].class_name().to_string();
+                    let mn = thread.frames[frame_idx].method_name().to_string();
+                    let pc = thread.frames[frame_idx].pc;
+                    eprintln!(
+                        "[BADRECV #{n}] getfield receiver=0x{p:x} field={field_name:?} \
+                             field_index={} is_ref={} in {cn}.{mn} pc={pc}",
+                        field.field_index, field.is_reference,
+                    );
+                    eprintln!("[BADRECV #{n}] Java frames (innermost first):");
+                    for f in thread.frames.iter().rev().take(24) {
+                        eprintln!("    {}.{}", f.class_name(), f.method_name());
+                    }
+                    eprintln!(
+                        "[BADRECV #{n}] Rust backtrace:\n{}",
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                    use std::io::Write;
+                    let _ = std::io::stderr().flush();
+                }
+                return Err(RuntimeError::NullPointerException {
+                    message: Some(format!("[BADRECV] non-heap getfield receiver 0x{p:x}")),
+                }
+                .into());
+            }
+            // DoHead freed-while-live forensics (2026-07-15): the other
+            // stale-receiver face — a VALID heap address whose object
+            // was zeroed (all-zero header: ClassId(0), num_slots=0)
+            // while a long-lived holder kept serving it. The gc guard
+            // contains each read but names no Java context; print it
+            // here (capped) so the holder structure is identifiable.
+            // A getfield on a 0-slot object is always OOB, so this
+            // never fires for a legitimate zero-hash ClassId(0)
+            // container with fields.
+            if p != 0 && shared.mem.heap.is_heap_addr(p).is_some() {
+                let h = shared.mem.heap.get_header(obj_ref);
+                if h.class_id.as_u32() == 0 && h.num_slots() == 0 {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static NZ: AtomicUsize = AtomicUsize::new(0);
+                    let n = NZ.fetch_add(1, Ordering::Relaxed);
+                    if n < 12 {
+                        let field_name = resolve_field_name(shared, current_class_id, *index);
+                        let cn = thread.frames[frame_idx].class_name().to_string();
+                        let mn = thread.frames[frame_idx].method_name().to_string();
+                        let pc = thread.frames[frame_idx].pc;
+                        eprintln!(
+                            "[BADRECV-Z #{n}] getfield ZEROED receiver=0x{p:x} \
+                                 field={field_name:?} field_index={} in {cn}.{mn} pc={pc}",
+                            field.field_index,
+                        );
+                        eprintln!("[BADRECV-Z #{n}] Java frames (innermost first):");
+                        for f in thread.frames.iter().rev().take(24) {
+                            eprintln!("    {}.{}", f.class_name(), f.method_name());
+                        }
+                        use std::io::Write;
+                        let _ = std::io::stderr().flush();
+                    }
+                }
+            }
+        }
+        if crate::runtime::env_cache::hashtableofint_trace() {
+            let cname = thread.frames[frame_idx].class_name();
+            let mname = thread.frames[frame_idx].method_name();
+            if cname.contains("HashtableOfInt") {
+                let field_name = resolve_field_name(shared, current_class_id, *index);
+                let v = shared.mem.heap.get_field(obj_ref, field.field_index);
+                let nf = shared
+                    .classes
+                    .class_manager
+                    .read()
+                    .get_class(field.declaring_class_id)
+                    .map(|c| c.num_total_fields)
+                    .unwrap_or(0);
+                eprintln!(
+                        "[HTI-GET] {cname}.{mname} cp#{idx} fld={field_name:?} declaring={decl:?} field_index={fi} is_ref={ir} num_total_fields={nf} obj_ptr={op:p} value={v:?}",
+                        idx = *index,
+                        decl = field.declaring_class_id,
+                        fi = field.field_index,
+                        ir = field.is_reference,
+                        op = obj_ref.as_ptr(),
+                    );
+            }
+        }
+        if crate::runtime::env_cache::bd_debug() {
+            let mname = thread.frames[frame_idx].method_name().to_string();
+            let cname = thread.frames[frame_idx].class_name().to_string();
+            if cname.contains("BigDecimal") && mname == "intValue" {
+                let field_name = resolve_field_name(shared, current_class_id, *index);
+                let v = if field.is_volatile {
+                    shared
+                        .mem
+                        .heap
+                        .get_field_volatile(obj_ref, field.field_index)
+                } else {
+                    shared.mem.heap.get_field(obj_ref, field.field_index)
+                };
+                eprintln!("[Getfield in BigDecimal.intValue] cp_index={} field_name={:?} field_index={} is_ref={} obj={:p} value={:?}",
+                              *index, field_name, field.field_index, field.is_reference, obj_ref.as_ptr(), v);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Cold half of `op_putfield`: the diagnostics behind `straystack_enabled()`,
+/// moved out of the handler body verbatim (2026-09-02) so the unarmed
+/// path keeps one gate load and none of the code. Takes the handler
+/// locals the block read; a `return Err` inside the block
+/// becomes an `Err` the handler propagates with `?`.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn diag_getfield_straystack(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    current_class_id: ClassId,
+    index: u16,
+    obj_ref: ObjectRef,
+    field: &ResolvedField,
+) -> Result<(), MethodCallFailed> {
+    let index = &index;
+    let _ = (frame_idx, thread.thread_id, current_class_id, obj_ref, field.field_index);
+    if straystack_enabled() {
+        let h = shared.mem.heap.get_header(obj_ref);
+        let ns = h.num_slots() as usize;
+        if field.field_index >= ns || h.num_slots() > (1 << 24) {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let k = N.fetch_add(1, Ordering::Relaxed);
+            if k < 12 {
+                let field_name = resolve_field_name(shared, current_class_id, *index);
+                eprintln!(
+                            "[straystack] #{k} OOB getfield recv@0x{:x} cid={} num_slots={} kind={} -> field '{}' idx={} declaring={:?}",
+                            obj_ref.as_ptr() as usize,
+                            h.class_id.as_u32(),
+                            h.num_slots(),
+                            cratonvm_types::ObjectHeader::kind_tag(
+                                h.mark_word.load(std::sync::atomic::Ordering::Relaxed)
+                            ),
+                            field_name.as_deref().unwrap_or("?"),
+                            field.field_index,
+                            field.declaring_class_id,
+                        );
+                eprintln!("[straystack] Java stack (top first):");
+                for f in thread.frames.iter().rev().take(28) {
+                    eprintln!(
+                        "[straystack]   {}.{}{} pc={}",
+                        f.class_name(),
+                        f.method_name(),
+                        f.method_descriptor(),
+                        f.pc,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Cold half of `op_putfield`: the diagnostics behind `crate::runtime::env_cache::dbg_field_watch()`,
+/// moved out of the handler body verbatim (2026-09-02) so the unarmed
+/// path keeps one gate load and none of the code. Takes the handler
+/// locals the block read and the value being stored; a `return Err` inside the block
+/// becomes an `Err` the handler propagates with `?`.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn diag_putfield_watch(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    current_class_id: ClassId,
+    index: u16,
+    obj_ref: ObjectRef,
+    field: &ResolvedField,
+    value: Value,
+) -> Result<(), MethodCallFailed> {
+    let index = &index;
+    let _ = (frame_idx, thread.thread_id, current_class_id, obj_ref, field.field_index);
+    if crate::runtime::env_cache::dbg_field_watch() {
+        let decl_name = shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(field.declaring_class_id)
+            .map(|c| c.name.to_string())
+            .unwrap_or_default();
+        let field_name = resolve_field_name(shared, current_class_id, *index);
+        if crate::runtime::env_cache::field_watch_class_matches(&format!(
+            "{}.{}",
+            decl_name,
+            field_name.as_deref().unwrap_or("?")
+        )) {
+            let fr = &thread.frames[frame_idx];
+            eprintln!(
+                        "[PUTFIELD-WATCH] obj={:p} decl_class={} field={:?} field_index={} old={:?} new={:?} in {}.{} pc={} thread={}",
+                        obj_ref.as_ptr(),
+                        decl_name,
+                        field_name,
+                        field.field_index,
+                        old_value,
+                        value,
+                        fr.class_name(),
+                        fr.method_name(),
+                        fr.pc,
+                        thread.thread_id.0,
+                    );
+            // A watched field almost always raises a "who did this?"
+            // question next, and the answer is the Java call chain.
+            for f in thread.frames.iter().rev().take(24) {
+                eprintln!("    at {}.{} pc={}", f.class_name(), f.method_name(), f.pc);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Cold half of `op_putfield`: the diagnostics behind `crate::runtime::env_cache::any_field_diag()`,
+/// moved out of the handler body verbatim (2026-09-02) so the unarmed
+/// path keeps one gate load and none of the code. Takes the handler
+/// locals the block read and the value being stored; a `return Err` inside the block
+/// becomes an `Err` the handler propagates with `?`.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn diag_putfield_consolidated(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    current_class_id: ClassId,
+    index: u16,
+    obj_ref: ObjectRef,
+    field: &ResolvedField,
+    value: Value,
+) -> Result<(), MethodCallFailed> {
+    let index = &index;
+    let _ = (frame_idx, thread.thread_id, current_class_id, obj_ref, field.field_index);
+    if crate::runtime::env_cache::any_field_diag() {
+        // Gated diagnostic (CRATONVM_DBG_FIELDADDR): trace put for specific
+        // fields — object address + resolved slot — to localize a write
+        // that doesn't reach the read site.
+        if crate::runtime::env_cache::field_addr_dbg() {
+            let field_name = resolve_field_name(shared, current_class_id, *index);
+            if let Some(fname) = field_name.as_deref() {
+                if matches!(
+                    fname,
+                    "unsharedLongs" | "threadFactory" | "runningThreads" | "submittedTaskCounter"
+                ) {
+                    eprintln!(
+                        "[FIELDADDR] PUT {} obj=0x{:x} slot={} num_slots={} valObj={} in {}",
+                        fname,
+                        // Cast: object/code pointer to integer address
+                        obj_ref.as_ptr() as usize,
+                        field.field_index,
+                        shared.mem.heap.get_header(obj_ref).num_slots(),
+                        matches!(value, Value::Object(Some(_))),
+                        thread.frames[frame_idx].class_name(),
+                    );
+                }
+            }
+        }
+        // bc math-ec 0x4 (CRATONVM_DBG_STRAYSTACK): catch a STRAY/STALE
+        // receiver reaching putfield. The corruption's reliable face is the
+        // `set_field out-of-bounds` flood: a relocated-but-unremapped (or
+        // wild) `objectref` whose header reads `num_slots=0` (real obj NOT
+        // forwarded; class_id reads a Value-disc 0/1/4) or `num_slots` huge
+        // (real obj forwarded → forwarding_ptr low bits). Dump the Java
+        // stack + receiver so we can trace where the stale ref originates
+        // (operand-stack slot not remapped after a young GC). Rate-limited.
+        if straystack_enabled() {
+            let h = shared.mem.heap.get_header(obj_ref);
+            // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
+            let ns = h.num_slots() as usize;
+            if field.field_index >= ns || h.num_slots() > (1 << 24) {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static N: AtomicUsize = AtomicUsize::new(0);
+                let k = N.fetch_add(1, Ordering::Relaxed);
+                if k < 12 {
+                    let field_name = resolve_field_name(shared, current_class_id, *index);
+                    eprintln!(
+                            "[straystack] #{k} STRAY putfield recv@0x{:x} cid={} num_slots={} array_len={} kind={} -> field '{}' idx={} is_ref={} value={:?}",
+                            // Cast: object/code pointer to integer address
+                            obj_ref.as_ptr() as usize,
+                            // Truncation: integer -> u8 (intentional low 8 bits)
+                            h.class_id.as_u32(), h.num_slots(), h.array_length(), cratonvm_types::ObjectHeader::kind_tag(h.mark_word.load(std::sync::atomic::Ordering::Relaxed)),
+                            field_name.as_deref().unwrap_or("?"),
+                            field.field_index, field.is_reference, value,
+                        );
+                    eprintln!("[straystack] Java stack (top first):");
+                    for f in thread.frames.iter().rev().take(28) {
+                        eprintln!(
+                            "[straystack]   {}.{}{} pc={}",
+                            f.class_name(),
+                            f.method_name(),
+                            f.method_descriptor(),
+                            f.pc,
+                        );
+                    }
+                }
+            }
+        }
+        if crate::runtime::env_cache::hashtableofint_trace() {
+            let cname = thread.frames[frame_idx].class_name();
+            let mname = thread.frames[frame_idx].method_name();
+            if cname.contains("HashtableOfInt") {
+                let field_name = resolve_field_name(shared, current_class_id, *index);
+                let nf = shared
+                    .classes
+                    .class_manager
+                    .read()
+                    .get_class(field.declaring_class_id)
+                    .map(|c| c.num_total_fields)
+                    .unwrap_or(0);
+                eprintln!(
+                        "[HTI-PUT] {cname}.{mname} cp#{idx} fld={fn2:?} declaring={decl:?} field_index={fi} is_ref={ir} num_total_fields={nf} obj_ptr={op:p} value={v:?}",
+                        idx = *index,
+                        fn2 = field_name,
+                        decl = field.declaring_class_id,
+                        fi = field.field_index,
+                        ir = field.is_reference,
+                        op = obj_ref.as_ptr(),
+                        v = value,
+                    );
+            }
+        }
+        if crate::runtime::env_cache::baos_dbg() {
+            let field_name = resolve_field_name(shared, current_class_id, *index);
+            if matches!(field_name.as_deref(), Some("buf") | Some("count")) {
+                let cm = shared.classes.class_manager.read();
+                let recv_cid = shared.mem.heap.class_id_of(obj_ref);
+                let rn = cm
+                    .get_class(recv_cid)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_default();
+                let rnf = cm
+                    .get_class(recv_cid)
+                    .map(|c| c.num_total_fields)
+                    .unwrap_or(0);
+                let rffi = cm
+                    .get_class(recv_cid)
+                    .map(|c| c.first_field_index)
+                    .unwrap_or(0);
+                let dn = cm
+                    .get_class(field.declaring_class_id)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_default();
+                let dnf = cm
+                    .get_class(field.declaring_class_id)
+                    .map(|c| c.num_total_fields)
+                    .unwrap_or(0);
+                let dffi = cm
+                    .get_class(field.declaring_class_id)
+                    .map(|c| c.first_field_index)
+                    .unwrap_or(0);
+                eprintln!(
+                        "[BAOS-DBG] putfield {fld:?} recv={rn}(nf={rnf},ffi={rffi}) decl={dn}(nf={dnf},ffi={dffi}) field_index={fi} value={v:?}",
+                        fld = field_name, fi = field.field_index, v = value,
+                    );
+            }
+        }
     }
     Ok(())
 }
