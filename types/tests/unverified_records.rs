@@ -264,20 +264,12 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status: FIXED-UNVERIFIED — no binary carrying these changes has been built or",
     ),
     (
-        "docs/known-issues/jdk-only/H9-1-hashset-owns-no-state-20260820.md",
-        "status block says: **Status: FIXED-UNVERIFIED — no binary carrying these changes has been built or",
-    ),
-    (
         "docs/known-issues/jdk-only/W5-1-loadlibrary-allowlist-too-wide.md",
         "status block says: nothing here was built or run):**",
     ),
     (
         "docs/known-issues/jdk-only/W7-14-fjp-common-factory-bound-by-name.md",
         "status block says: call.** Not rebuilt in this lane: no claim is made that the change compiles or",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-30-stub-ratchet-boot-path-scope.md",
-        "status block says: the whole time**: §9. Nothing was built or run on 2026-08-12; every claim",
     ),
     (
         "docs/known-issues/jdk-only/W7-36-differential-view-families.md",
@@ -294,10 +286,6 @@ const ALLOWED: &[(&str, &str)] = &[
     (
         "docs/known-issues/jdk-only/W7-49-slot-index-recensus.md",
         "status block says: Branch `fix/w44-slot-index-sweep-20260812`. Nothing here is built or run. Every",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-5-registrars-that-never-shipped.md",
-        "status block says: Wave 7, lane W7-5. Nothing was built or run on 2026-08-12.",
     ),
     (
         "docs/known-issues/jdk-only/W7-55-record-reconciliation.md",

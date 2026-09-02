@@ -327,6 +327,34 @@ nothing checks becomes a floor by two.
 
 **(b) is DONE.** See §7.1.
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** Both ratchets this section names have
+> been run, on a build from this tree:
+>
+> ```text
+> the_inline_registrations_in_vm_init_are_enumerated ... ok   (the floor of 1)
+> the_replayed_sequence_matches_vm_init ............... ok   (§7's replay)
+> stub_ratchet, management     1645 stubs / 13897 total, baseline 1645, slack 0
+> stub_ratchet, no-management  1634 stubs / 13529 total, baseline 1634, slack 0
+> duplicate_registration_gate  6 passed
+> ```
+>
+> Both arms of the stub ratchet were run separately and pasted separately, never
+> derived from one another.
+>
+> **The numbers in this record's banner are STALE and cannot be re-checked.** It
+> says "the gate is now FIRING (1253 -> 1261)" and that `stub_ratchet.rs`'s
+> prediction of `1269 / 1259` is "short by exactly two rows". Today's baselines
+> are **1645 / 1634**, and the gate is GREEN with slack 0 — someone re-froze it
+> in the three weeks since. The +8 derivation in §11 no longer has a subtrahend
+> in the tree, exactly as `H3-1` §5's `−7` no longer does. Stale, not wrong:
+> nobody can now tell whether those eight rows arrived as derived.
+>
+> **§7's residual is still true and is now visible from the other side.** The
+> boot-path model exists twice, and the second copy is in
+> `essential_wiring_ratchet.rs` alongside `W7-5`'s three tests — so that file
+> reads as five tests where `W7-5` §6.3.1 describes three. Two records, one
+> file, both green.
+
 ## 7. Residual: the boot-path model now exists twice
 
 `native-builtins/tests/duplicate_registration_gate.rs` already carried a

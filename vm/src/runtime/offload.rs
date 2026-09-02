@@ -3891,6 +3891,35 @@ pub fn lookup_submission(handle: u64) -> Option<std::sync::Arc<StreamSubmission>
 /// Drop the registry's reference to the submission with this handle.
 /// Safe to call on an unknown handle (no-op). Idempotent. Once
 /// released, [`lookup_submission`] returns `None`.
+///
+/// # NO PRODUCTION CALLER since 2026-09-02 — and do not "fix" that by
+/// deleting this
+///
+/// The `submissions().write().remove(&handle)` below is the **only** remove
+/// from the registry, against exactly one insert in
+/// [`register_submission`]. `b6133b92d` moved the synchronous JIT-caller
+/// path onto `dispatch_method_sync`, which never registers a submission and
+/// therefore has nothing to release — correct in itself, and it happened to
+/// delete the last call to this function. So today **nothing drains the map**
+/// and every async submission leaks its entry, its CUDA stream and its event
+/// for the life of the process.
+///
+/// Putting the call back in the reaper or at the end of
+/// [`finalize_submission`] does not work: both run before or independently of
+/// the Java side reading the result, and `GpuFuture.get()` resolves through
+/// [`lookup_submission`], which answers `None` for a released handle. The old
+/// synchronous caller only got away with it by holding its own `Arc` across
+/// the release, which does not generalise to a handle Java still owns.
+///
+/// The drain has to belong to whoever owns the handle's lifetime —
+/// a `GpuExecutor.releaseSubmission` native (the API the overflow warning in
+/// [`register_submission`] already tells callers to use, and which
+/// `bench-gpu/GpuAsyncChainBench.java` already calls, and which is NOT
+/// registered in `native-builtins/src/craton_gpu.rs`), or an executor-close
+/// path. See
+/// `docs/known-issues/gpu/submission-registry-has-no-drain-20260902.md`, and
+/// `vm/tests/no_test_only_public_api.rs`'s baseline note, which carries the
+/// resulting +1 rather than hiding it.
 #[cfg(feature = "gpu-offload")]
 pub fn release_submission(handle: u64) {
     submissions().write().remove(&handle);
@@ -6272,6 +6301,8 @@ pub(crate) mod input_cache {
         I64(Arc<DeviceBuffer<i64>>),
         F32(Arc<DeviceBuffer<f32>>),
         F64(Arc<DeviceBuffer<f64>>),
+        I16(Arc<DeviceBuffer<i16>>),
+        I8(Arc<DeviceBuffer<i8>>),
     }
 
     pub(crate) struct Entry {
@@ -6426,6 +6457,52 @@ pub(crate) mod input_cache {
                 buf: CachedBuffer::F64(buf),
                 len,
                 element_type: ArrayElementType::Double,
+            },
+        );
+    }
+    pub(crate) fn get_i16(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<i16>>> {
+        let g = map().lock();
+        let e = g.get(&vm)?.get(&obj)?;
+        if e.element_type != ArrayElementType::Short || e.len != len {
+            return None;
+        }
+        if let CachedBuffer::I16(a) = &e.buf {
+            Some(a.clone())
+        } else {
+            None
+        }
+    }
+    pub(crate) fn put_i16(vm: usize, obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<i16>>) {
+        insert(
+            vm,
+            obj,
+            Entry {
+                buf: CachedBuffer::I16(buf),
+                len,
+                element_type: ArrayElementType::Short,
+            },
+        );
+    }
+    pub(crate) fn get_i8(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<i8>>> {
+        let g = map().lock();
+        let e = g.get(&vm)?.get(&obj)?;
+        if e.element_type != ArrayElementType::Byte || e.len != len {
+            return None;
+        }
+        if let CachedBuffer::I8(a) = &e.buf {
+            Some(a.clone())
+        } else {
+            None
+        }
+    }
+    pub(crate) fn put_i8(vm: usize, obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<i8>>) {
+        insert(
+            vm,
+            obj,
+            Entry {
+                buf: CachedBuffer::I8(buf),
+                len,
+                element_type: ArrayElementType::Byte,
             },
         );
     }
@@ -6855,6 +6932,11 @@ fn take_chunkable_writeback(
                     | MarshalWriteback::F32 { .. }
                     | MarshalWriteback::F64 { .. }
             );
+            // I16/I8 are deliberately absent: `ChunkedStage` has no arm
+            // for them, so they fall into `other_array` below and turn
+            // chunking off for the whole dispatch. That is the safe
+            // direction -- the whole-array writeback still runs and is
+            // correct; only the copy/compute overlap is given up.
             let other_array = wb.array_len().is_some() && !plain;
             if other_array {
                 // A resident/GpuArray writeback in the mix: bail rather
@@ -7111,6 +7193,16 @@ pub enum MarshalWriteback {
         buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f64>>,
         len: usize,
     },
+    I16 {
+        obj: cratonvm_types::ObjectRef,
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i16>>,
+        len: usize,
+    },
+    I8 {
+        obj: cratonvm_types::ObjectRef,
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i8>>,
+        len: usize,
+    },
     // Phase 6 #3 / Phase 7 #2 — GpuArray-backed args. The
     // `DeviceBuffer<T>` is shared with `device_cache` so the next
     // kernel using the same `handle` reuses it instead of
@@ -7268,6 +7360,16 @@ impl MarshalWriteback {
                     .map_err(|e| format!("download f64: {e}"))?;
                 Ok(None)
             }
+            Self::I16 { obj, buf, .. } => {
+                gpu_marshal::download_obj_i16(buf.as_ref(), *obj, &shared.mem.heap, token)
+                    .map_err(|e| format!("download i16: {e}"))?;
+                Ok(None)
+            }
+            Self::I8 { obj, buf, .. } => {
+                gpu_marshal::download_obj_i8(buf.as_ref(), *obj, &shared.mem.heap, token)
+                    .map_err(|e| format!("download i8: {e}"))?;
+                Ok(None)
+            }
             // Phase 9 #1 — Resident-arg writebacks no longer
             // download to host bytes eagerly. They mark the cache
             // entry dirty; the next `Native.arrayToHost(handle)`
@@ -7380,6 +7482,8 @@ impl MarshalWriteback {
                 | Self::I64 { .. }
                 | Self::F32 { .. }
                 | Self::F64 { .. }
+                | Self::I16 { .. }
+                | Self::I8 { .. }
         )
     }
 
@@ -7412,7 +7516,9 @@ impl MarshalWriteback {
             | Self::I32 { obj, .. }
             | Self::I64 { obj, .. }
             | Self::F32 { obj, .. }
-            | Self::F64 { obj, .. } => Some(*obj),
+            | Self::F64 { obj, .. }
+            | Self::I16 { obj, .. }
+            | Self::I8 { obj, .. } => Some(*obj),
             _ => None,
         }
     }
@@ -7428,7 +7534,9 @@ impl MarshalWriteback {
             | Self::I32 { obj, .. }
             | Self::I64 { obj, .. }
             | Self::F32 { obj, .. }
-            | Self::F64 { obj, .. } => Some(obj),
+            | Self::F64 { obj, .. }
+            | Self::I16 { obj, .. }
+            | Self::I8 { obj, .. } => Some(obj),
             _ => None,
         }
     }
@@ -7442,6 +7550,8 @@ impl MarshalWriteback {
             | Self::I64 { len, .. }
             | Self::F32 { len, .. }
             | Self::F64 { len, .. }
+            | Self::I16 { len, .. }
+            | Self::I8 { len, .. }
             | Self::ResidentI32 { len, .. }
             | Self::ResidentI64 { len, .. }
             | Self::ResidentF32 { len, .. }
@@ -7717,6 +7827,40 @@ fn try_unbox_primitive(
 /// `None` saves the matching `wb_arc` clone the cache-only path
 /// would have produced; the Arc inside `input_cache` keeps the
 /// buffer alive across submits.
+/// The array element types [`marshal_array_arg`] can hand to a device.
+///
+/// **INVARIANT: this is exactly the set
+/// `jit_cuda::analyzer::ParamKind::from_field` admits for
+/// `FieldType::Array(_)`.** The two are on opposite sides of the
+/// offload pipeline and nothing structural forces them to agree, so
+/// both directions of disagreement are guarded:
+///
+/// * A type the *analyzer* admits and this refuses is INVISIBLE at
+///   runtime. The kernel is analyzed, lowered to PTX, compiled and
+///   cached; the dispatch then fails at marshalling and the VM falls
+///   back to the interpreter. The answers stay correct, so no
+///   differential test can see it -- the arm is comparing the
+///   interpreter with itself. That is exactly how `short[]` and
+///   `byte[]` stayed unreachable from the day their marshalling was
+///   written until 2026-09-02, with `gpu_marshal`'s
+///   `direct_xfer!(upload_obj_i16, ...)` fully implemented and unit
+///   tested the whole time.
+/// * A type this claims and `marshal_array_arg` has no arm for trips
+///   the `debug_assert!` in that function's catch-all.
+///
+/// `analyzer_and_marshaller_admit_the_same_arrays` in
+/// `vm/tests/gpu_offload_features.rs` pins the first direction; it
+/// needs no device, which is the point -- the gap it guards is one
+/// that only end-to-end hardware runs could otherwise expose, and then
+/// only if they counted dispatches rather than compared values.
+pub fn is_marshallable_array_element(t: cratonvm_types::ArrayElementType) -> bool {
+    use cratonvm_types::ArrayElementType as A;
+    matches!(
+        t,
+        A::Int | A::Long | A::Float | A::Double | A::Short | A::Byte
+    )
+}
+
 #[cfg(feature = "gpu-offload")]
 fn marshal_array_arg(
     shared: &crate::vm::SharedVm,
@@ -7849,11 +7993,135 @@ fn marshal_array_arg(
             "f64",
             8
         ),
+        // short[]/byte[] marshal exactly like the four above:
+        // `gpu_marshal`'s `direct_xfer!` generates their upload/download
+        // pair from the same macro, and their heap slots are
+        // natural-width and packed, so the zero-copy reinterpret has the
+        // same contiguous-span guarantee.
+        //
+        // They were unreachable until 2026-09-02. The analyzer admitted a
+        // short[]/byte[] kernel and the lowering emitted PTX for it, but
+        // this match had no arm, so every such dispatch died below with
+        // "unsupported array element type" and fell back to the
+        // interpreter -- correct answers, never offloaded, and nothing
+        // said so above `WARN`.
+        ArrayElementType::Short => arm!(
+            i16,
+            I16,
+            gpu_marshal::upload_obj_i16,
+            input_cache::get_i16,
+            input_cache::put_i16,
+            "i16",
+            2
+        ),
+        ArrayElementType::Byte => arm!(
+            i8,
+            I8,
+            gpu_marshal::upload_obj_i8,
+            input_cache::get_i8,
+            input_cache::put_i8,
+            "i8",
+            1
+        ),
         other => {
+            // If the predicate says this type is marshallable, the match
+            // above owes it an arm. Loud in a debug build rather than a
+            // silent interpreter fallback.
+            debug_assert!(
+                !is_marshallable_array_element(other),
+                concat!(
+                    "is_marshallable_array_element admits {:?} but the ",
+                    "marshal loop has no arm for it -- a kernel taking ",
+                    "this array type will compile, fail to dispatch, and ",
+                    "quietly re-run on the interpreter"
+                ),
+                other
+            );
             return Err(format!(
                 "submitMethod: unsupported array element type: {other:?}"
             ))
         }
     };
     Ok((push, wb, bytes_uploaded))
+}
+
+#[cfg(all(test, feature = "gpu-offload"))]
+mod marshaller_analyzer_agreement {
+    use super::is_marshallable_array_element;
+    use cratonvm_reader::field_type::FieldType;
+    use cratonvm_types::ArrayElementType;
+    use jit_cuda::analyzer::ParamKind;
+
+    /// The analyzer decides which kernels are admitted; the marshaller
+    /// decides which arrays it can actually push to a device. Nothing
+    /// structural ties the two together, and when they disagree in the
+    /// analyzer-admits/marshaller-refuses direction the failure is
+    /// SILENT: `dispatch_method_from_native` returns an error, the VM
+    /// re-runs the method on the interpreter, and every answer is still
+    /// correct. A value differential cannot see it -- it ends up
+    /// comparing the interpreter with itself and reporting a pass.
+    ///
+    /// That is precisely what happened to `short[]` and `byte[]`:
+    /// `ParamKind::I16Array`/`I8Array` were admitted, `gpu_marshal`
+    /// generated the whole `upload_obj_i16`/`download_obj_i16` pair via
+    /// `direct_xfer!`, `host_view_i16`/`write_back_i16` had unit tests
+    /// at this altitude -- and the marshal loop's `match element_type`
+    /// had no arm, so not one such kernel ever reached a GPU. Fixed
+    /// 2026-09-02; this test is what keeps it fixed, and it needs no
+    /// device to run.
+    #[test]
+    fn analyzer_and_marshaller_admit_the_same_arrays() {
+        let cases = [
+            (FieldType::Int, ArrayElementType::Int),
+            (FieldType::Long, ArrayElementType::Long),
+            (FieldType::Float, ArrayElementType::Float),
+            (FieldType::Double, ArrayElementType::Double),
+            (FieldType::Short, ArrayElementType::Short),
+            (FieldType::Byte, ArrayElementType::Byte),
+            (FieldType::Char, ArrayElementType::Char),
+            (FieldType::Boolean, ArrayElementType::Boolean),
+        ];
+        for (component, elem) in cases {
+            let array_ty = FieldType::Array(Box::new(component.clone()));
+            let analyzer_admits =
+                ParamKind::from_field(&array_ty).is_some_and(ParamKind::is_array);
+            let marshaller_admits = is_marshallable_array_element(elem);
+            assert_eq!(
+                analyzer_admits, marshaller_admits,
+                concat!(
+                    "{:?}[]: the analyzer {} it but the marshaller ",
+                    "{} it. Analyzer-admits/marshaller-refuses is the SILENT ",
+                    "direction: such a kernel compiles, fails to dispatch, ",
+                    "and quietly re-runs on the interpreter with correct ",
+                    "results, so no value differential can see it."
+                ),
+                component,
+                if analyzer_admits { "admits" } else { "rejects" },
+                if marshaller_admits { "accepts" } else { "refuses" },
+            );
+        }
+    }
+
+    /// The six the pipeline really carries, spelled out so a silent
+    /// widening or narrowing of either side has to edit this list.
+    #[test]
+    fn the_admitted_set_is_exactly_the_six_primitive_widths() {
+        for t in [
+            ArrayElementType::Int,
+            ArrayElementType::Long,
+            ArrayElementType::Float,
+            ArrayElementType::Double,
+            ArrayElementType::Short,
+            ArrayElementType::Byte,
+        ] {
+            assert!(is_marshallable_array_element(t), "{t:?} must be marshallable");
+        }
+        for t in [
+            ArrayElementType::Char,
+            ArrayElementType::Boolean,
+            ArrayElementType::Reference,
+        ] {
+            assert!(!is_marshallable_array_element(t), "{t:?} must not be marshallable");
+        }
+    }
 }

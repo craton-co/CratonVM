@@ -11,8 +11,78 @@
 //!
 //! TLABs dramatically reduce lock contention on the allocation path.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{OnceLock, RwLock, Weak};
 use std::time::Instant;
+
+// ---------------------------------------------------------------------------
+// Tail sinks: who gets the unused end of a retiring TLAB
+// ---------------------------------------------------------------------------
+//
+// A TLAB is carved by a heap and handed to a thread; when the thread retires
+// it, the bytes between the cursor and the end have to go SOMEWHERE the
+// collector can account for. The two collectors that own linear-walkable
+// storage (Generational, G1) get an `int[]` filler written over the tail so
+// their sweeps can parse across it (`install_tail_filler`). ZGC's sweep walks
+// an object-start registry rather than memory, so a filler it never registered
+// would simply never be reclaimed: the tail has to go back to the arena's free
+// list instead, exactly as `zgc::arena_tlab` returns its own tails.
+//
+// `Tlab::retire` has no heap in scope -- it is called from three dozen VM
+// sites that hold only the thread -- so the heap that carved the chunk
+// registers itself here as a sink. A sink DECLINES a tail outside its own
+// address range, which is what makes the registry safe when several heaps
+// exist in one process (every gc-crate unit test builds its own): a tail from
+// a Generational test arena is declined by every ZGC sink and takes the
+// filler path it always did. The registry holds `Weak`s so a dropped heap
+// simply stops answering; nothing has to unregister on the way out.
+
+/// A heap that can take back the unused tail of a retiring [`Tlab`].
+pub trait TlabTailSink: Send + Sync {
+    /// Reclaim `[start, end)` -- an 8-aligned, non-empty span the owning
+    /// thread bump-allocated nothing into. Return `false` to decline (the span
+    /// is not this heap's); the caller then installs a filler object instead.
+    fn reclaim_tlab_tail(&self, start: usize, end: usize) -> bool;
+}
+
+/// Non-zero once any sink has registered. Read with one atomic load on every
+/// retire so a process with no sink never touches the lock.
+static TAIL_SINK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn tail_sinks() -> &'static RwLock<Vec<Weak<dyn TlabTailSink>>> {
+    static SINKS: OnceLock<RwLock<Vec<Weak<dyn TlabTailSink>>>> = OnceLock::new();
+    SINKS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Register a heap as a tail sink. Dead entries (heaps already dropped) are
+/// pruned on every registration, so the list is as long as the number of live
+/// heaps rather than the number ever built.
+pub fn register_tlab_tail_sink(sink: Weak<dyn TlabTailSink>) {
+    let mut sinks = tail_sinks().write().unwrap_or_else(|e| e.into_inner());
+    sinks.retain(|w| w.strong_count() > 0);
+    sinks.push(sink);
+    TAIL_SINK_COUNT.store(sinks.len(), Ordering::Release);
+}
+
+/// How many sinks are registered (live, or dead and not yet pruned).
+pub fn tlab_tail_sink_count() -> usize {
+    TAIL_SINK_COUNT.load(Ordering::Acquire)
+}
+
+fn reclaim_tail_via_sinks(start: usize, end: usize) -> bool {
+    if TAIL_SINK_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let sinks = tail_sinks().read().unwrap_or_else(|e| e.into_inner());
+    for weak in sinks.iter() {
+        if let Some(sink) = weak.upgrade() {
+            if sink.reclaim_tlab_tail(start, end) {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 /// Default TLAB size: 256 KB — large enough to amortize the lock cost
 /// across ~10k small-object allocations in a tight loop and to keep
@@ -485,9 +555,20 @@ impl Tlab {
         // Generational (small ones). A counter whose answer depends on which
         // collector is running cannot be measuring the Java work.
         let consumed = self.consumed_bytes() as u64;
-        // SAFETY: see method-level note — backing memory valid, single owner.
-        unsafe {
-            self.install_tail_filler(TLAB_FILLER_CLASS_ID);
+        // A registered sink (ZGC) takes the unused tail back into its free
+        // list; otherwise the tail becomes a filler object the linear sweeps
+        // can parse across. Either way the TLAB owns nothing afterwards.
+        let reclaimed = match self.reserved_tail() {
+            Some((tail_start, tail_end)) => reclaim_tail_via_sinks(tail_start, tail_end),
+            None => false,
+        };
+        if reclaimed {
+            self.cursor = self.end;
+        } else {
+            // SAFETY: see method-level note — backing memory valid, single owner.
+            unsafe {
+                self.install_tail_filler(TLAB_FILLER_CLASS_ID);
+            }
         }
         // Roll the consumed span into the thread's running total BEFORE the
         // pointers are nulled — `consumed_bytes()` is `cursor - start` and
@@ -513,6 +594,27 @@ impl Tlab {
              reserved tail — the STW census assumes exactly that of every parked \
              and blocked peer",
         );
+    }
+
+    /// Retire, handing the reserved tail to the CALLER instead of to a sink or
+    /// a filler. For an allocator that owns both the buffer and the arena it
+    /// was carved from (`zgc::arena_tlab`), which returns the tail to its own
+    /// free list and must not have a process-wide sink do it a second time.
+    ///
+    /// Same accounting as [`Self::retire`]: the consumed span is credited to
+    /// the thread and process totals, the three pointers are nulled, and the
+    /// "sized before retired" tripwire is armed.
+    pub fn retire_taking_tail(&mut self) -> Option<(usize, usize)> {
+        let consumed = self.consumed_bytes() as u64;
+        let tail = self.reserved_tail();
+        self.thread_alloc_carry = self.thread_alloc_carry.saturating_add(consumed);
+        credit_process_total(consumed);
+        self.start = std::ptr::null_mut();
+        self.cursor = std::ptr::null_mut();
+        self.end = std::ptr::null_mut();
+        self.pressure.retired_since_refill = true;
+        debug_assert!(self.is_retired() && self.reserved_tail().is_none());
+        tail
     }
 
     /// Round-5 #9 / round-7 #9 — Install a synthetic `int[]` filler object

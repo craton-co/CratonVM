@@ -798,6 +798,11 @@ call**. `iface1` is 3/4 clean with one 420 outlier that still sits below the
 
 **`invokestatic` and `invokespecial` are not wired to the door and are the
 internal controls**: `static0` and `special1` overlap across all three arms.
+(Correction, third pass: `special1` is not an `invokespecial` — `javac` 25
+emits `invokevirtual` for a private instance method, and the door declined it
+because its target caches as `Bytecode` rather than `VirtualBytecode`. It was
+a genuine control for *this* pass, but for the wrong reason. See the third
+pass below.)
 `probes/Arity.java` reproduces it independently — `virtual1` base 465/485/474,
 off 443/491/467, new 246/249/269 — while its `static0..static6` ladder shows no
 door effect at all.
@@ -880,7 +885,8 @@ items do not touch these arms.
   `special1` at ~430 ns are now the two worst interpreted call shapes by a wide
   margin, and they are the obvious next target: `0xb8` has a cached dispatcher
   of its own (`execute_invokestatic_cached`) that pays the same per-call
-  constants the virtual door now memoizes.
+  constants the virtual door now memoizes. **Taken by the third pass below**,
+  which also found that `special1` was never an `invokespecial`.
 
 ### Still open
 
@@ -922,6 +928,146 @@ done
 
 `CRATONVM_DBG_FIELD_SITE=1` adds the `fast-field:` census and names the first
 few reasons a site could not be quickened.
+
+## The third pass: `invokestatic`, and the call shape the probe was mislabelling
+
+The second pass left `invokestatic` (~250 ns) and what it called
+`invokespecial` (~430 ns) as its two untouched controls, and named them the
+obvious next target. This pass takes both. Same instrument: one Azure host at
+load 13-19, three arms interleaved in both directions over four passes, with
+control arms the change cannot reach.
+
+| arm | binary | switches |
+|---|---|---|
+| `base` | `origin/dev` at `46ddd2bd4` | — |
+| `new` | this branch | none |
+| `off` | this branch | `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR=1` |
+
+`vm/src/runtime/interpreter/invoke_fast.rs` holds the shared machinery — the
+verbatim argument read, the frame push, the per-callee constants and the
+batched invocation credit — plus the two doors. Kill switch:
+`CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` (`CRATONVM_JIT=-nonvirtual-fast-door`);
+the virtual door keeps its own.
+
+### A correction to this page: `Dispatch.special1` is not an `invokespecial`
+
+The second pass reported "`invokespecial` at ~430 ns" and used `special1` as a
+control on the grounds that the virtual door could not reach it. Both halves
+were wrong about the same fact:
+
+**`javac` 25 emits `invokevirtual` for a private instance method.** JEP 181
+(nestmates) removed the need for `invokespecial` there, and
+`javap -c -p Dispatch` shows `invokevirtual #24 // Method p1:(I)I` in `cP1`.
+So `special1` measures an `invokevirtual` whose target is *not* virtually
+dispatched — the resolver caches it as `CachedInvokeTarget::Bytecode`, with no
+receiver class and no vtable slot, and `execute_invokevirtual_fast_door`
+accepts only `VirtualBytecode`. That is the whole explanation for the 430 ns
+against a virtual call's 245 ns, and it means the second pass's `special1`
+column was measuring a gap its own door had left open rather than a call shape
+out of reach.
+
+The number stands; the label did not. A door that covers "the target is a
+fixed method" now serves both `invokespecial` and that case, and `0xb6` tries
+it after the virtual door declines.
+
+### What the doors remove
+
+Both dispatchers pay the three costs the virtual door removed: the cache entry
+is cloned (two `Arc` increments and two decrements, `RedefineGate` carrying its
+own `Arc<AtomicU32>`), every argument goes `CompactValue -> Value ->
+CompactValue` through a stack array, and `invokestatic` takes a sharded
+`RwLock` read plus a hash lookup for the invocation counter **on every call**.
+A door borrows the entry, transfers arguments verbatim into the callee's
+locals, and counts on the `CachedBytecodeMethod` itself, folding sixteen calls
+at a time into the profile store so the census still sees every call.
+
+`invokespecial`'s door deliberately does **not** count: neither arm a cached
+`invokespecial` can land in has a tier-up block (the `VirtualBytecode` arm's is
+guarded by `!is_special`, the `Bytecode` arm has none), and adding one would
+widen which methods reach the optimizing tier. A door must not change tier-up
+policy on its way past.
+
+### Engagement first
+
+`CRATONVM_DBG_FIELD_SITE=1` now prints a door census beside the site caches.
+`probes/Dispatch.java` at 150k x 2 on the measured binary:
+
+```
+door: static hit=900168 miss=378 special hit=300710 miss=802
+```
+
+99.96% and 99.7%. **Two of this pass's three findings came from that counter,
+not from the clock**, and neither would have been visible in a timing run:
+
+* the first `invokespecial` door measured `special hit=0 miss=997`, declining
+  on `loader_aware_resolution`, which is **default-on** — not the rare mode it
+  was taken for. It now performs the same owner re-check the general path does
+  (early-returning on a one-way latch for an ordinary application).
+* the census then still showed `hit=463` against 450 000 calls on the arm that
+  should have been all hits, which is what sent me to `javap` and the
+  nestmates finding above.
+
+### The numbers
+
+`probes/Dispatch.java`, 200k x 5, ns/iteration, four interleaved passes:
+
+| arm | base | new | off |
+|---|---|---|---|
+| `nocall` (control) | 51 49 65 62 | 52 52 51 49 | 51 60 61 52 |
+| `virtual1` (control) | 250 286 278 266 | 246 273 233 282 | 248 251 236 239 |
+| `ifaceInherited` (control) | 259 263 316 267 | 264 301 234 356 | 257 266 245 257 |
+| **`special1`** (private target) | 430 454 460 506 | **245 239 250 269** | 460 480 427 455 |
+| **`static0`** | 234 262 279 278 | **212 231 200 211** | 243 305 272 247 |
+| **`static1`** | 275 293 286 296 | **223 239 219 230** | 272 326 265 267 |
+| **`static4`** | 331 382 363 363 | **260 254 258 278** | 348 359 335 346 |
+
+4/4 with no overlap on every test arm — `new`'s worst is better than `off`'s
+best in each case. **A call to a fixed target falls from ~455 ns to ~250 ns**,
+level with a virtual call; a four-argument static call loses ~85 ns.
+
+`probes/Arity.java`, 800k x 5, is the independent confirmation and shows where
+the static gain comes from:
+
+| arm | base | new | off |
+|---|---|---|---|
+| `nocall` (control) | 54 55 60 52 | 52 55 59 49 | 56 52 55 53 |
+| `virtual1` (control) | 234 252 235 272 | 277 264 276 246 | 277 271 293 309 |
+| `static0` | 248 255 274 268 | **211 209 226 199** | 249 256 265 280 |
+| `static1` | 269 271 328 287 | **234 235 219 254** | 313 277 311 277 |
+| `static2` | 327 323 302 297 | **254 249 257 258** | 346 313 325 302 |
+| `static4` | 373 358 383 347 | **263 283 260 281** | 372 382 363 377 |
+| `static6` | 401 406 437 389 | **295 296 294 312** | 422 417 431 461 |
+
+4/4, no overlap, on all five. The gap widens from ~50 ns at zero arguments to
+~125 ns at six — **about 12-15 ns per argument**, which is the round trip the
+verbatim transfer deletes and is the same slope the first pass measured and
+could not then remove.
+
+### Where the interpreted call now stands
+
+Every interpreted call shape that reaches a cached bytecode target is now
+served by a door, and they land within ~50 ns of each other:
+
+| shape | before this pass | after |
+|---|---:|---:|
+| `invokestatic`, 0 args | ~250 | ~210 |
+| `invokestatic`, 4 args | ~360 | ~265 |
+| `invokevirtual` | ~245 | ~245 |
+| `invokeinterface`, inherited | ~260 | ~260 |
+| fixed target (private / `invokespecial`) | ~455 | ~250 |
+
+What remains between that and HotSpot's ~4 ns is the frame itself, which is
+the open structural item both earlier passes name: four pooled buffers per
+frame and a by-value push, where a per-thread value arena would let the
+callee's locals overlap the caller's outgoing arguments.
+
+### The probes
+
+Unchanged: `probes/Dispatch.java` and `probes/Arity.java`, interleaved in both
+directions with `nocall` and the arms the change cannot reach as controls.
+`CRATONVM_DBG_FIELD_SITE=1` prints `door: static hit/miss special hit/miss`
+and names the first dozen reasons a door declined — **read it before reading a
+clock**, on the evidence of this pass.
 
 ## Exit criteria
 

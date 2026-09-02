@@ -1786,7 +1786,18 @@ pub(crate) fn p58_cf_complete_exceptionally(
                 )?
                 .and_then(|value| value.as_int())
                 .unwrap_or(0);
-            ctx.invoke_virtual(this, "postComplete", "()V", &[])?;
+            // `invoke_virtual_bytecode_only`, not `invoke_virtual`:
+            // `postComplete` is ordinary JDK bytecode and can never be a
+            // native, so asking the by-NAME native resolver is two hashes of
+            // the 53-byte triple plus the cold descriptor-quirk rewrite, all
+            // of them misses, on every completion. Measured on the sibling
+            // call in `native_cf_complete`: 1.154x of the whole composition
+            // workload, and it takes the registry's own miss census from
+            // 100 008 rows for this one triple to zero. This site is not on
+            // that measured path, and is changed with it because a fix that
+            // lands for one of five identical call sites is at the wrong
+            // level.
+            ctx.invoke_virtual_bytecode_only(this, "postComplete", "()V", &[])?;
             Ok(Some(Value::Int(completed)))
         }
     }

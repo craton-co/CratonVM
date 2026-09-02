@@ -46,6 +46,16 @@
 //!   and jump into the wrong method. Leaking is the cheap way to make that
 //!   unrepresentable rather than merely unlikely.
 //!
+//! [`unregister_range`] and [`register`] agree on the base address only because
+//! **the method entry IS the buffer base**. `CompiledMethod::drop` retires
+//! `[entry, entry + buffer.pos())` while registration keys sites off
+//! `cm.entry + fault_off`; `x64::driver` establishes the equality in as many
+//! words (`let entry_offset = 0; // prologue starts at offset 0`), and the
+//! OSR-trampoline purge in that same `Drop` already leans on it. Give the
+//! prologue a non-zero offset and every site below the new entry silently stops
+//! being retired — which is exactly the stale-entry hazard this design exists
+//! to prevent, arriving through the one door nobody would think to check.
+//!
 //! Retirement cannot race a fault in the method being retired, and the reason
 //! is an invariant this file borrows rather than establishes: a
 //! `CompiledMethod` is only dropped when **no frame of it is live** — the same
@@ -115,17 +125,39 @@ static RETIRED: AtomicUsize = AtomicUsize::new(0);
 static RECOVERED: AtomicUsize = AtomicUsize::new(0);
 static DECLINED: AtomicUsize = AtomicUsize::new(0);
 
-/// Is the implicit null check enabled? **Default OFF.**
+/// Is the implicit null check enabled? **Default ON** since 2026-09-02; opt
+/// out with `CRATONVM_JIT_IMPLICIT_NULL_CHECK=0`.
 ///
-/// Opt in with `CRATONVM_JIT_IMPLICIT_NULL_CHECK=1`. It is off by default
-/// because the failure mode of getting it wrong is not a wrong answer, it is
-/// resumed execution at an address chosen by a stale table — and unlike every
-/// other switch in this backend, the arm that is wrong is *silent*.
+/// # What the off arm restores, exactly
+///
+/// `emit_trusted_oop_receiver_check` at both `getfield` arms, unconditionally
+/// — the behaviour of every binary before this feature existed. Nothing
+/// registers, so [`recover`] scans an empty table and answers `None` on the
+/// first load, and a fault in compiled code reaches the crash reporter exactly
+/// as it always did. There is no degraded middle state.
+///
+/// # Read this before deciding the flag is unnecessary
+///
+/// This switch guards the only mechanism in this backend whose wrong arm is
+/// **silent**. Every other one produces a wrong answer, which a test catches;
+/// a stale or mis-shaped entry here resumes execution at an address the table
+/// chose, which nothing catches. That is why the kill switch exists and why it
+/// should keep existing even though the default moved: the first thing anyone
+/// debugging an unexplained crash in compiled code should be able to do is
+/// take this out of the picture in one run, on the same binary.
+///
+/// It was default-off through its soak (see `docs/JIT_OPTIMIZATION.md`): about
+/// an hour of continuous execution plus two full regression-suite passes, with
+/// 11,663 of 11,719 null dereferences recovered as translated hardware faults
+/// under GC pressure, every checksum matching HotSpot, and 87/87 twice.
 pub fn enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IMPLICIT_NULL_CHECK").is_some()
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IMPLICIT_NULL_CHECK").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
     })
 }
 

@@ -249,6 +249,11 @@ mod arrays;
 mod deopt_stubs;
 mod objects;
 pub(crate) use objects::note_ungated_ref_store;
+// The barrier-plan readers are shared with the OPTIMIZING tier
+// (`ir_lower`), deliberately: two tiers deciding independently what a
+// published plan means is how one of them ends up skipping a barrier the
+// other pays. `objects` is a private module, so the re-export is the seam.
+pub(crate) use objects::{ref_store_gates_of, ref_store_post_skip_mask_of};
 pub use objects::ref_store_site_counts;
 pub use null_check_elim::receiver_null_check_counts;
 pub use null_check_elim::receiver_null_check_implicit_count;
@@ -271,6 +276,7 @@ thread_local! {
 mod emit;
 mod frames;
 mod operand_stack;
+pub use operand_stack::spill_slots_cap;
 pub mod safepoint;
 // ---------------------------------------------------------------------------
 // Compile bytecode to x86-64
@@ -2393,8 +2399,15 @@ impl Compiler {
                                                                                               // than `DIRECT_CALL_SERVICE_HEADROOM_SLOTS` arguments simply fails the
                                                                                               // reservation and falls back, exactly as an over-wide method does today.
         const DIRECT_CALL_SERVICE_HEADROOM_SLOTS: usize = 16;
-        let spill_slots =
-            max_stack.saturating_add(max_stack.min(DIRECT_CALL_SERVICE_HEADROOM_SLOTS));
+        let spill_slots = spill_slots_cap()
+            .map_or_else(
+                || max_stack.saturating_add(max_stack.min(DIRECT_CALL_SERVICE_HEADROOM_SLOTS)),
+                |cap| {
+                    max_stack
+                        .saturating_add(max_stack.min(DIRECT_CALL_SERVICE_HEADROOM_SLOTS))
+                        .min(cap)
+                },
+            );
         let spill_size = (spill_slots.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
         let shadow_space = 32i32; // Windows x64 shadow space for helper calls
                                   // Reserved bytes ABOVE the shadow region for in-frame stack args to

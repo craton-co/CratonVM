@@ -582,6 +582,12 @@ pub fn run_shutdown_hooks(ctx: &mut dyn NativeContext, trigger: &str) {
          unjoined={unjoined} trigger={trigger}"
     );
     report_vector_intrinsics();
+    // The FFM element fast path's engagement, on the same exit path and
+    // for the same reason as the censuses below: a JUnit runner or a
+    // benchmark harness leaves through `System.exit`, so a line printed
+    // anywhere else appears in zero logs of the runs that matter. Silent
+    // unless the process touched a segment. See `ffm_fast::exit_summary`.
+    crate::ffm_fast::exit_summary();
     report_filechannel_fast_io();
     crate::craton_gpu::dispatch_timing::report();
     // The corrupt-cell census. HERE and not in `vm-cli`, because a JUnit runner

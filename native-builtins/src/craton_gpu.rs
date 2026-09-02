@@ -3162,10 +3162,14 @@ mod tests {
 
         // A second release of the same (already-released) handle must
         // not panic and must leave the array absent, matching
-        // `ResidencyTracker::release`'s documented idempotency
-        // (`vm/src/runtime/gpu_residency.rs`) and `releaseFuture`'s
-        // remove-is-a-no-op-on-missing-key shape used elsewhere in this
-        // file.
+        // `releaseFuture`'s remove-is-a-no-op-on-missing-key shape used
+        // elsewhere in this file.
+        //
+        // (This used to cite `ResidencyTracker::release` in
+        // `vm/src/runtime/gpu_residency.rs` as the convention being
+        // matched. That module was dead code -- nothing outside its own
+        // tests ever constructed one -- and was removed 2026-09-02. The
+        // resident store in this file is the only implementation.)
         builtin_release_array(&mut ctx, &[Value::Long(handle)]).unwrap();
         assert_eq!(
             builtin_array_is_resident(&mut ctx, &[Value::Long(handle)]).unwrap(),

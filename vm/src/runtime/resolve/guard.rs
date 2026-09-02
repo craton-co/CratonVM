@@ -415,13 +415,17 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
         "vm/src/runtime/invokedynamic.rs",
         ".resolution_cache",
-        7,
+        8,
         "migration step 3c: the call-site cache for `invokedynamic` and \
          method handles. This is NOT the gap constants.rs had, which is now \
          migrated: `MemberResolver::probe_constant` records a resolved \
          CONSTANT_* value, whereas `ResolvedCallSite` is a third member kind \
          alongside method and field, and giving it a resolver method is its \
-         own design step.",
+         own design step. The eighth (2026-09-02) is \
+         `execute_jit_indy_generic_raw`'s frame-free fast path, which reads \
+         an ALREADY-bootstrapped `ResolvedCallSite::Lambda` and does nothing \
+         else - the same probe the seven above make, from the compiled door \
+         rather than the interpreted one.",
     ),
     // ---------------------------------------------------------------
     // Migration step 4 — hard-coded field offsets in the VM's own plumbing.
