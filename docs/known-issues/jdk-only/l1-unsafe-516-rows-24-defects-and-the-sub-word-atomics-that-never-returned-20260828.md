@@ -1268,7 +1268,15 @@ as originally written, and this sentence was a false claim about
 After the fix, the `ClinitProbe` diff against HotSpot loses both rows: bci 157
 and bci 166 now match.
 
-### 17.2 What is deliberately NOT fixed
+### 17.2 What is deliberately NOT fixed — SUPERSEDED by §19
+
+> **This section is now WRONG and is kept for its reasoning, not its
+> conclusion.** The latch pair WAS repaired in §19: the R5 warn is 0 on
+> both H2 vectors and on the 40-line repro. What the text below gets
+> right is the mechanism; what it gets wrong is calling it unreachable,
+> because it assumed the repair had to SYNTHESISE an offset encoding.
+> It does not — `staticFieldOffset` mints AND REGISTERS, and making
+> the same call is what fixed it.
 
 `MEMORY_ACCESS_WARNED_BASE`/`_OFFSET` (bci 185/195) still hold their defaults,
 so the R5 warn still fires. Backfilling them needs the class mirror and this
@@ -1537,7 +1545,14 @@ files.
 their per-vector flags and classpath entries, so 4 of 120 exited non-zero and
 exercised less than the suite gives them.
 
-### 21.2 What this does and does not license
+### 21.2 What this does and does not license — SUPERSEDED by §24
+
+> **The refusal this section declines to make HAS since been made
+> (§24).** Two things changed: the count was widened to 136 Netty
+> buffer/util classes, and—the load-bearing correction—the rescues this
+> section is protecting run through the CLASSIFIED paths, not through
+> the case being refused. Re-reading the classifier instead of its
+> summary is what settled it.
 
 **Discharged for four workload families**: the regression corpus, H2, Spring
 Boot and Tomcat+SSL. Nothing in any of them reaches the fallback, and the
