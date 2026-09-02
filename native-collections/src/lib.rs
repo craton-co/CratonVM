@@ -22722,6 +22722,15 @@ fn native_opt_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 // ===========================================================================
 
 fn native_arrays_sort_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `Arrays.sort(null)` reads `a.length` on its first line, so it is an NPE
+    // and not the silent no-op this body used to answer.
+    // MEASURED: `apps/probes/NullArgMsgProbe.java` row 56.
+    if matches!(args.first(), Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Cannot read the array length because \"a\" is null".to_string()),
+        }
+        .into());
+    }
     let arr = match args.first() {
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(None),
@@ -49159,6 +49168,19 @@ fn native_hs_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // `addAll(null)` reaches `AbstractCollection.addAll`, whose `for (E e : c)`
+    // dereferences immediately. Answering `false` told the caller the set was
+    // unchanged and hid the null. Only an explicitly-passed null throws; a
+    // missing argument stays the malformed-call no-op.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"java.util.Collection.iterator()\" because \"c\" is null"
+                    .to_string(),
+            ),
+        }
+        .into());
+    }
     let coll = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
@@ -49309,6 +49331,12 @@ fn native_hs_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // `retainAll(null)` throws too, but with NO message: the JDK reaches
+    // `Objects.requireNonNull(c)` here rather than a dereference, which is the
+    // distinction this file's two refusal helpers draw.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(bare_npe());
+    }
     let coll = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
