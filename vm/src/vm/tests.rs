@@ -19295,7 +19295,7 @@ fn linked_list_add_all() {
 ///
 /// Kept rather than deleted for the reason the census gives: the assertions are
 /// the right ones if an ArrayDeque iterator is ever minted here again.
-/// `docs/internal/fixed-suite-bugs/iterator-carrier-census-20260902.md`.
+/// `fixed-suite-bugs/iterator-carrier-census-20260902.md`.
 #[ignore = "ArrayDeque.iterator() and ArrayDeque$Itr are both deliberately             unregistered; see the iterator-carrier census"]
 #[test]
 fn array_deque_iterator() {
