@@ -2627,9 +2627,17 @@ pub(crate) fn native_class_get_resource(
     // resolves to a real on-disk location. Fall back to `classpath:<name>`
     // only when the structured walk finds nothing but raw bytes still exist
     // (covers synthetic loaders that override `find_resource` directly).
-    let urls = ctx.find_all_resource_urls(&resource_name);
-    let url_str = if let Some(first) = urls.first() {
-        first.clone()
+    // Stop at the first hit, exactly as `ClassLoader.getResource` does — this
+    // is that method's sibling door and had the same whole-list-then-discard
+    // shape. The incremental walk yields the same elements in the same order,
+    // so element 0 is unchanged; what changes is that the remaining classpath
+    // entries are no longer probed after the answer is known (44 of the 309
+    // entries on the quarkus harness classpath are DIRECTORIES, i.e. an
+    // `exists()` plus a canonicalize each). Shares
+    // `CRATONVM_GETRESOURCE_FIRST_HIT` with the ClassLoader door: one lever
+    // for one behaviour, or a bisect lands on whichever door it reached.
+    let url_str = if let Some(first) = crate::classloader::first_resource_url(ctx, &resource_name) {
+        first
     } else if ctx.find_resource(&resource_name).is_some() {
         format!("classpath:{resource_name}")
     } else {
