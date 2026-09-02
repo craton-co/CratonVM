@@ -577,7 +577,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-280 tokens.
+279 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -860,7 +860,6 @@ export inherited from a parent shell.
 | `direct-call-arg-maps` | `CRATONVM_JIT_DIRECT_CALL_ARG_MAPS` |
 | `ir-gc-point-maps` | `CRATONVM_JIT_IR_GC_POINT_MAPS` |
 | `zero-spid` | `CRATONVM_JIT_ZERO_SPID` |
-| `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 
 ## `CRATONVM_GC`
 
