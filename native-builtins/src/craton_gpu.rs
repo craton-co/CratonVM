@@ -3245,6 +3245,7 @@ pub mod dispatch_timing {
         // read as a clean run.
         cratonvm_types::gpu_event_census::exit_summary();
         cratonvm_types::gpu_dispatch_memo_census::exit_summary();
+        cratonvm_types::gpu_residency_census::exit_summary();
         let calls = CALLS.load(Ordering::Relaxed);
         if calls == 0 {
             return;

@@ -677,6 +677,72 @@ pub mod gpu_dispatch_memo_census {
     }
 }
 
+/// What the GPU input-residency cache did across garbage collections.
+///
+/// The cache is keyed by `ObjectRef` -- a raw heap address -- so every
+/// collection has to re-key the entries whose arrays moved and drop the
+/// ones whose arrays died. Until 2026-09-02 the ONLY account of that was
+/// a `tracing::debug!` inside `input_cache::remap_and_sweep`, and
+/// `tracing` is built here with `max_level_info`: the statement is
+/// compiled out of every release build, so the path was unobservable in
+/// any binary anyone actually runs. A test that tried to confirm the
+/// remap carried the new `short[]`/`byte[]` entries read zero from it
+/// and could not tell "nothing moved" from "nothing can be reported".
+///
+/// `gcs` counts collections seen by the cache including the ones where
+/// it had nothing to do, so a zero in `rekeyed` can be read: no
+/// collections at all, versus collections that never moved a cached
+/// array.
+pub mod gpu_residency_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static GCS: AtomicU64 = AtomicU64::new(0);
+    static REKEYED: AtomicU64 = AtomicU64::new(0);
+    static RETAINED: AtomicU64 = AtomicU64::new(0);
+    static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+    /// One collection's worth of remap accounting.
+    #[inline]
+    pub fn note_gc(rekeyed: u64, retained: u64, dropped: u64) {
+        GCS.fetch_add(1, Ordering::Relaxed);
+        if rekeyed != 0 {
+            REKEYED.fetch_add(rekeyed, Ordering::Relaxed);
+        }
+        if retained != 0 {
+            RETAINED.fetch_add(retained, Ordering::Relaxed);
+        }
+        if dropped != 0 {
+            DROPPED.fetch_add(dropped, Ordering::Relaxed);
+        }
+    }
+
+    /// `(collections, re-keyed, retained, dropped)`.
+    #[must_use]
+    pub fn totals() -> (u64, u64, u64, u64) {
+        (
+            GCS.load(Ordering::Relaxed),
+            REKEYED.load(Ordering::Relaxed),
+            RETAINED.load(Ordering::Relaxed),
+            DROPPED.load(Ordering::Relaxed),
+        )
+    }
+
+    /// One line on the exit path, when the cache saw any collection.
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let (gcs, rekeyed, retained, dropped) = totals();
+        if gcs == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            eprintln!(
+                "[cratonvm] gpu residency across GC: collections={gcs} \
+                 entries re-keyed={rekeyed} retained={retained} dropped={dropped}"
+            );
+        });
+    }
+}
+
 pub mod gpu_event_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 
