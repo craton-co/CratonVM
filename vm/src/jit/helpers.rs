@@ -886,7 +886,11 @@ pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
         // abnormal JIT exit (exception/deopt skipping a method epilogue) left
         // unbalanced. Captured after `ensure_allocated` so `top` is valid.
         saved_shadow_top = Some(thread.shadow_stack.top);
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW").is_some() {
+        if if crate::runtime::env_cache::hot_lookup_cache() {
+            crate::runtime::env_cache::dbg_shadow()
+        } else {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW").is_some()
+        } {
             use std::sync::atomic::{AtomicBool, Ordering};
             static ONCE: AtomicBool = AtomicBool::new(false);
             if !ONCE.swap(true, Ordering::Relaxed) {
@@ -17255,6 +17259,7 @@ static INTEGER_INT_VALUE_INFO: JitInvokeInfo = JitInvokeInfo {
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
+    let census = crate::runtime::interp_census::direct_binds_enabled();
     let raw = receiver as u64;
     if raw == 0 {
         set_jit_pending_npe();
@@ -17271,6 +17276,9 @@ pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64
         // costs ~0 here (see the hashmap-half-gap closeout doc: restoring all
         // three probes measured inside run-to-run noise).
         if let Some(object) = vm.mem.heap.is_object_address(raw as usize) {
+            if census {
+                crate::runtime::interp_census::note_int_value_direct(false);
+            }
             return match vm.mem.heap.get_field(object, 0) {
                 Value::Int(value) => value as i64,
                 _ => 0,
@@ -17279,6 +17287,9 @@ pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64
     }
     // Defensive fallback: hand the call to the generic dispatcher (same
     // machinery the non-direct site would have used).
+    if census {
+        crate::runtime::interp_census::note_int_value_direct(true);
+    }
     let args = [receiver];
     jit_invoke_dispatch(
         vm_ptr,
@@ -17488,6 +17499,7 @@ pub unsafe extern "C" fn jit_long_value_of_direct(vm_ptr: i64, value: i64) -> i6
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_long_long_value_direct(vm_ptr: i64, receiver: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
+    let census = crate::runtime::interp_census::direct_binds_enabled();
     let raw = receiver as u64;
     if raw == 0 {
         set_jit_pending_npe();
@@ -17502,8 +17514,18 @@ pub unsafe extern "C" fn jit_long_long_value_direct(vm_ptr: i64, receiver: i64) 
         // `get_field` dereference.
         if let Some(object) = vm.mem.heap.is_object_address(raw as usize) {
             match vm.mem.heap.get_field(object, 0) {
-                Value::Long(value) => return value,
-                Value::Int(value) => return i64::from(value),
+                Value::Long(value) => {
+                    if census {
+                        crate::runtime::interp_census::note_long_value_direct(false);
+                    }
+                    return value;
+                }
+                Value::Int(value) => {
+                    if census {
+                        crate::runtime::interp_census::note_long_value_direct(false);
+                    }
+                    return i64::from(value);
+                }
                 // Anything else is a shape the registered native answers 0 for;
                 // hand it to the generic dispatcher rather than guessing, so the
                 // two paths cannot disagree.
@@ -17513,6 +17535,9 @@ pub unsafe extern "C" fn jit_long_long_value_direct(vm_ptr: i64, receiver: i64) 
     }
     // Defensive fallback: hand the call to the generic dispatcher (same
     // machinery the non-direct site would have used).
+    if census {
+        crate::runtime::interp_census::note_long_value_direct(true);
+    }
     let args = [receiver];
     jit_invoke_dispatch(
         vm_ptr,

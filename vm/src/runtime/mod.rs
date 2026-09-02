@@ -11,6 +11,7 @@ pub mod ec_watch;
 pub mod env_cache;
 pub mod exceptions;
 pub mod frame;
+pub mod interp_census;
 pub mod interpreter;
 pub mod invokedynamic;
 pub mod local_liveness;

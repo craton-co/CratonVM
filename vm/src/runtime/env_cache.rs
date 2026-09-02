@@ -1164,6 +1164,148 @@ pub fn jit_virtual_tierup() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS` — nomination is not promotion.
+///
+/// **DEFAULT-OFF, `=1` opts in, and the default is the measurement's.** With
+/// it on, `HibfixComposeProbe2` tracks 19 methods instead of 8 and compiles 12
+/// at C2 instead of 3 — and costs **0.994x** (8 interleaved reps, quiet host,
+/// user CPU, ranges 15.80-16.60 against 15.86-16.45). It buys nothing here
+/// because the site that does the counting is still the site that may not
+/// PROMOTE: `getNow` is compiled and is still entered interpreted 40 000 times
+/// in 40 000 chains. Nominating more methods is not what composition was short
+/// of — that is the finding, and it is why the lever ships off rather than
+/// being deleted: it is the instrument that establishes it, and the arm anyone
+/// re-opening the promotion question has to run first.
+///
+/// `execute_invokevirtual_cached`'s tier-up chain
+/// used to gate the invocation COUNTER on the same two conditions that gate
+/// the SITE's promotion to a direct compiled entry — a `java/util/` receiver
+/// and a callee that declares an exception table. Those two are promotion
+/// hazards; neither is a reason to stop counting a callee's invocations.
+///
+/// The cost of conflating them is measured, not argued.
+/// `CRATONVM_DBG_TIERUP_DECLINE=1` on `HibfixComposeProbe2` reports 46 364
+/// declines over 40 000 chains and **every** meaningful row is
+/// `receiver_is_java_util` — `java/util/concurrent/` is inside the prefix, so
+/// the whole of `CompletableFuture` is refused. `CompletableFuture.getNow`
+/// takes 39 998 of them and is still interpreted on call 40 000; it is 1.00
+/// interpreted frame per chain in the `CRATONVM_DBG_INTERP_FRAMES` census.
+/// This is the mechanism behind
+/// `known-issues/perf/completablefuture-composition-is-20x-and-5-percent-compiled-20260901.md`
+/// finding #2: lowering `CRATONVM_JIT_THRESHOLD` 25x bought 6 more tracked
+/// methods and no time, because the methods that matter never reach the
+/// counter at all.
+///
+/// The 2026-08-05 measurement that refused to narrow the `java/util/` prefix
+/// (`retired/aqs-thread-handoff-latency-RETIRED-20260805.md` item 3, a
+/// `ReentrantLock` loop 30 % SLOWER with tier-up admitted) priced ADMITTING
+/// THE PROMOTION. This gate does not admit it: `promotion_barred` still
+/// suppresses the `jit_cache` probe and the inline upgrade for exactly the
+/// same set. Only the counter and the tiered nomination are hoisted, so a
+/// nominated java.util callee becomes reachable through the doors that carry
+/// their own exception-table guards (`mic_callee_has_exception_table`,
+/// `osr_callee_bars_direct_call`) and never through this one.
+#[inline]
+pub fn jit_virtual_nominate_always() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        // Explicit opt-IN: `1` / `true` enable, unset or anything else leaves
+        // the chain exactly as it was before 2026-09-02.
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS") {
+            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            Err(_) => false,
+        }
+    })
+}
+
+/// `CRATONVM_JIT_HOT_LOOKUP_CACHE` — default-ON, `=0` opts out.
+///
+/// The kill switch for the three per-call lookups this change removed from
+/// paths the composition workload runs several times per chain: the two
+/// uncached declared-flag reads ([`dbg_shadow`], [`needs_exact_trace`]) and
+/// the un-range-guarded `lambda_proxies` probe in
+/// `NativeContextImpl::invoke_virtual`. They are grouped under one switch
+/// because they are one finding — a lookup on a hot path whose answer never
+/// changes — and because none of them is separately interesting.
+///
+/// A declared-flag read is not cheap: `runtime_var_os` converts the `OsStr`,
+/// FxHashes the ~20-byte name against the declared-flag SET, and then hashes
+/// it AGAIN against the legacy-value MAP. `CRATONVM_DBG_FLAGREADS=1` on
+/// `HibfixComposeProbe2` counted 400 000 of these in 80 000 chains, 98 % of
+/// them the two names above.
+#[inline]
+pub fn hot_lookup_cache() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_HOT_LOOKUP_CACHE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
+/// `CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL` — default-OFF, `=1` opts in.
+///
+/// Admits a `java/util/` receiver to the cached-virtual PROMOTION, i.e. lets
+/// `execute_invokevirtual_cached` enter a compiled body directly at a site the
+/// `receiver_is_java_util` exclusion has always barred. The exception-table
+/// half of `promotion_barred` is NOT relaxed by this: that one is a
+/// correctness hazard (a handler-bearing callee entered by a direct compiled
+/// call has no interpreter boundary at which its own handler can be resumed),
+/// where the prefix is a performance policy.
+///
+/// It exists because the policy has never been priced on its own.
+/// `retired/aqs-thread-handoff-latency-RETIRED-20260805.md` item 3 measured
+/// `ReentrantLock` against a user subclass `MyLock extends ReentrantLock` and
+/// found the subclass 0.77x — but those are two receiver classes in two loop
+/// methods, so the comparison carries "different class, different call site,
+/// different inlining" along with the tier-up. With this switch the SAME
+/// receiver in ONE binary is the A/B.
+///
+/// Pair it with [`jit_virtual_nominate_always`]: with nomination barred there
+/// is usually no compiled body to promote to, so a promotion arm measured
+/// alone re-measures the conflated thing from the other side.
+#[inline]
+pub fn jit_virtual_promote_java_util() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL") {
+            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            Err(_) => false,
+        }
+    })
+}
+
+/// `CRATONVM_DBG_SHADOW` — one-shot shadow-stack trace in `set_jit_thread`.
+///
+/// Cached because it is read on EVERY interpreter->JIT boundary crossing.
+/// `CRATONVM_DBG_FLAGREADS=1` on `HibfixComposeProbe2` put it at 250 135 of
+/// 400 000 flag reads (3.1 per composition chain), each one an `OsStr`
+/// conversion, an FxHash of the name and a probe of the declared-flag set —
+/// which is what the `HashMap<&str, ()>::contains_key` and part of the
+/// `__memcmp_evex_movbe` line in that page's profile actually are. The read
+/// sat IN FRONT of the `ONCE` swap that makes the trace one-shot, so it kept
+/// paying long after the trace could ever fire again.
+#[inline]
+pub fn dbg_shadow() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW").is_some()
+    })
+}
+
+/// `CRATONVM_NEEDS_EXACT_TRACE` — the sibling of [`dbg_shadow`], 141 112 reads
+/// (1.76 per chain) in the same census. Its call site is
+/// `NativeContextImpl::invoke_virtual`, i.e. every native that calls back into
+/// Java by name; the trace it guards fires for ONE hard-coded method name.
+#[inline]
+pub fn needs_exact_trace() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NEEDS_EXACT_TRACE").is_some()
+    })
+}
+
 /// `CRATONVM_JIT_LAMBDA_TIERUP` — count invocations of a lambda SAM
 /// implementation, and enter its compiled body directly once one exists.
 ///

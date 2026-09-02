@@ -1055,6 +1055,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "c2-supersede", on_key: Some("CRATONVM_C2_SUPERSEDE"), off_key: None, off_word: None, since: "2026-07-06" },
     E { group: Group::JIT, token: "callee-oop-flush", on_key: None, off_key: Some("CRATONVM_JIT_NO_CALLEE_OOP_FLUSH"), off_word: None, since: "2026-06-21" },
     E { group: Group::JIT, token: "spill-slots-cap", on_key: Some("CRATONVM_JIT_SPILL_SLOTS_CAP"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::JIT, token: "inline-reserve-path", on_key: None, off_key: Some("CRATONVM_JIT_NO_INLINE_RESERVE_PATH"), off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "code-cache-max-mb", on_key: Some("CRATONVM_JIT_CODE_CACHE_MAX_MB"), off_key: None, off_word: None, since: "2026-06-21" },
     E { group: Group::JIT, token: "conservative-locals", on_key: None, off_key: Some("CRATONVM_NO_CONSERVATIVE_LOCALS"), off_word: None, since: "2026-06-16" },
     E { group: Group::JIT, token: "ctor-direct-call", on_key: None, off_key: Some("CRATONVM_NO_CTOR_DIRECT_CALL"), off_word: None, since: "2026-06-22" },
@@ -1759,6 +1760,26 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "g1-pin-empty-publication", on_key: Some("CRATONVM_G1_PIN_EMPTY_PUBLICATION"), off_key: None, off_word: None, since: "2026-08-20" },
     E { group: Group::GC, token: "g1-precise-only-roots", on_key: Some("CRATONVM_G1_PRECISE_ONLY_ROOTS"), off_key: None, off_word: None, since: "2026-08-20" },
     E { group: Group::GC, token: "precise-only-roots", on_key: Some("CRATONVM_GC_PRECISE_ONLY_ROOTS"), off_key: None, off_word: None, since: "2026-08-22" },
+    // --- composition residuals, 2026-09-02 ----------------------------------
+    // Three default-off diagnostics and four A/B switches from
+    // `performance/completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`.
+    // Every one of them exists so a claim on that page can be re-priced in ONE
+    // binary; two of them were built specifically to refute a hypothesis, and
+    // one of those did.
+    E { group: Group::DBG, token: "interp-frames", on_key: Some("CRATONVM_DBG_INTERP_FRAMES"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::DBG, token: "tierup-decline", on_key: Some("CRATONVM_DBG_TIERUP_DECLINE"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::DBG, token: "direct-binds", on_key: Some("CRATONVM_DBG_DIRECT_BINDS"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::JIT, token: "int-value-direct", on_key: Some("CRATONVM_JIT_INT_VALUE_DIRECT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::JIT, token: "indy-lambda-fast", on_key: Some("CRATONVM_JIT_INDY_LAMBDA_FAST"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::JIT, token: "hot-lookup-cache", on_key: Some("CRATONVM_JIT_HOT_LOOKUP_CACHE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::JIT, token: "virtual-nominate-always", on_key: Some("CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::JIT, token: "virtual-promote-java-util", on_key: Some("CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::JIT, token: "native-cf-postcomplete-skip", on_key: Some("CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::JIT, token: "native-cf-postcomplete-direct", on_key: Some("CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // `CRATONVM_JIT_IR_COLD_ARG_STAGE` was declared here too, as a courtesy,
+    // and dev declared it concurrently -- both rows merged with no conflict,
+    // which is the append-anywhere hazard. Dev's row is kept; this note is the
+    // tombstone so the next session does not re-add a third.
     E { group: Group::GC, token: "g1-evac-retry", on_key: None, off_key: Some("CRATONVM_G1_NO_EVAC_RETRY"), off_word: None, since: "2026-07-03" },
     E { group: Group::GC, token: "g1-live-region-memo", on_key: None, off_key: Some("CRATONVM_G1_NO_LIVE_REGION_MEMO"), off_word: None, since: "2026-08-17" },
     E { group: Group::GC, token: "g1-parallel-evac", on_key: Some("CRATONVM_G1_PARALLEL_EVAC"), off_key: None, off_word: Some("0"), since: "2026-06-21" },
@@ -1782,6 +1803,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "g1-uncommit", on_key: Some("CRATONVM_G1_UNCOMMIT"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "g1-card-rset", on_key: Some("CRATONVM_G1_CARD_RSET"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "g1-card-clean", on_key: Some("CRATONVM_G1_CARD_CLEAN"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::GC, token: "g1-card-screen-jit-pinned", on_key: Some("CRATONVM_G1_CARD_SCREEN_JIT_PINNED"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "g1-inline-barrier", on_key: Some("CRATONVM_G1_INLINE_BARRIER"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "g1-mark-lock-yield", on_key: Some("CRATONVM_G1_MARK_LOCK_YIELD"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "g1-shared-alloc", on_key: Some("CRATONVM_G1_SHARED_ALLOC"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
@@ -2229,6 +2251,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::COMPAT, token: "mockito-legacy-selectors", on_key: Some("CRATONVM_MOCKITO_LEGACY_SELECTORS"), off_key: None, off_word: None, since: "2026-07-27" },
     E { group: Group::COMPAT, token: "stackwalker-jdk-walk", on_key: Some("CRATONVM_SW_JDK_WALK"), off_key: None, off_word: None, since: "2026-08-24" },
     E { group: Group::COMPAT, token: "jdk-random", on_key: Some("CRATONVM_JDK_RANDOM"), off_key: None, off_word: None, since: "2026-08-30" },
+    E { group: Group::COMPAT, token: "jdk-scanner", on_key: Some("CRATONVM_JDK_SCANNER"), off_key: None, off_word: None, since: "2026-09-01" },
     E { group: Group::GC, token: "stream-refresh-each", on_key: Some("CRATONVM_GC_STREAM_REFRESH_EACH"), off_key: None, off_word: None, since: "2026-08-24" },
     E { group: Group::GC, token: "noflag-deposit-skip-jit-scan", on_key: Some("CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN"), off_key: None, off_word: None, since: "2026-08-26" },
     E { group: Group::GC, token: "identity-hash-evict", on_key: Some("CRATONVM_IDENTITY_HASH_EVICT"), off_key: None, off_word: Some("0"), since: "2026-08-30" },
