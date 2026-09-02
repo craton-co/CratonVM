@@ -7,6 +7,176 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 2026-09-02 The generational young collector's copy phase can run in parallel
+
+`GenerationalHeap`'s moving (Cheney) young cycle copied its survivors on one
+thread, and the reason was structural rather than incidental:
+`forward_object` takes `&mut Arena` for to-space and `&mut OldGen` for
+promotions, so the borrow checker enforced a single copier. The mark closure
+and the sweep's span zeroing had already gone parallel, which left `cheney_drain`
+as the one serial phase of a moving pause — and on a survivor-heavy cycle it
+*is* the pause.
+
+New `gc/src/gen_evac.rs` supplies the pieces that let N workers copy at once:
+
+* **Copy-then-CAS forwarding.** A worker copies speculatively, then claims the
+  object with a tagged compare-exchange on the source mark word. The loser
+  abandons its copy and adopts the winner's address, so every reference
+  converges. This is the protocol `g1::SharedEvac::evacuate` already uses,
+  carried over with the lesson its two `DEFECT-2` sites paid for: a CAS loser,
+  and an already-forwarded fast-path hit, must still RECORD `old -> new`, or a
+  root naming `old` is never remapped and dangles once from-space is reset.
+* **Per-worker to-space buffers**, carved out of the arena's un-bumped tail by
+  one atomic `fetch_add` (`Arena::parallel_evacuation_region` /
+  `commit_parallel_evacuation`). A retired buffer's tail is stamped with the
+  TLAB retire path's existing `TLAB_FILLER` / `GAP_FILLER` sentinels, so the
+  arena stays walkable object-by-object when the next cycle reads it as
+  from-space. Objects at or above an eighth of a buffer bypass it entirely so
+  one large object cannot displace a buffer's worth of small ones; what bounds
+  the wasted tail is `ParEvac::plan`'s spendable allowance (see below).
+* **Per-worker output shards** for the forwarding map, the deferred dirty
+  cards and the copy tally, merged by the driver after the completion barrier.
+  The copy tally's thread-local carried a comment asserting the copy phase was
+  single-threaded; it now says which half of that is still true and the driver
+  folds each shard in with `copy_tally_merge`.
+
+Five things were wrong on the first cut and are worth recording, because every
+one of them was invisible to the correctness tests — the object graph came out
+right each time. The last two were invisible to the unit tests ENTIRELY and
+took an end-to-end run to surface:
+
+* **The helpers did nothing.** Measured on a 6144-node DAG, 96 layers deep,
+  eight workers: the driver copied all 6144 and the helpers copied zero. The
+  drain only published work once a local stack passed 2048 entries, and a
+  transitive closure over a graph like that keeps a frontier of about `width`.
+  The load-bearing rule is now the other one — publish half the local stack the
+  moment any worker is idle, off a relaxed `idle_hint` load — plus a fair
+  `len / threads` acquire share instead of letting the first waking worker
+  swallow a seed set smaller than the chunk.
+* **The threads were spawned per pause.** With the sharing rule fixed the
+  helpers still scanned nothing across twelve consecutive collections: the
+  driver drained the whole closure in about a millisecond while seven fresh OS
+  threads were still on their way to their first lock. Switching to the
+  persistent `evac_pool` — which exists for exactly this, and whose module note
+  makes the same argument for G1 — took helper participation from 0 to ~85% of
+  destinations scanned, and the test that measures it from 3–5 s of retries to
+  0.07 s on the first attempt.
+* **The buffers were a constant.** Eight workers each holding a fixed 64 KiB
+  buffer retired **327 KiB of filler for 393 KiB of survivors**. Sizing the
+  buffer against the live set (`from_used / (workers * 4)`, clamped to
+  4 KiB…64 KiB) brought that to tens of KiB with no loss of participation.
+* **The reservation was worst-cased, and that made the feature unreachable.**
+  Only a real workload could show it. `bench/BinT.java` at depth 18,
+  `-Xmx512m`, first moving cycle: `to_headroom=134217728` against
+  `from_used=134096736` — a young GC triggers with from-space **99.91% full**,
+  so the Cheney invariant's `to_headroom >= from_used` left 120,992 bytes and
+  nothing more. The budget asked for `from_used/7` (19 MB) of worst-case
+  abandoned buffer tails on top, so it declined — and would have declined on
+  every cycle of every real workload, with all twenty unit tests green because
+  each sizes its to-space generously. The waste is now BUDGETED instead:
+  the slack that exists is split half to in-flight buffers and half to a
+  spendable `waste_allowance`, and once that is gone `plab_alloc` serves
+  objects from exact per-object spans rather than abandoning another tail.
+  Region consumption is then provably `<= from_used + allowance +
+  workers * plab`, i.e. exactly the headroom. `plan_accepts_the_measured_shape_of_a_real_young_collection`
+  freezes those two numbers so the regression cannot come back.
+* **And the fix for that was still not enough**, which only a second real run
+  showed: with buffers sized from the slack, eight workers need
+  `8 * 4 KiB` of it, and the slack at the trigger point lands either side of
+  that from one collection to the next — so the copy phase engaged on roughly
+  half of bt18's cycles and fell back to serial on the rest, invisibly.
+  Buffers are an OPTIMISATION, not a precondition: with `plab_bytes == 0`
+  every object takes its own exact span off the shared cursor, consuming
+  exactly the survivors, which `to_headroom >= from_used` already guarantees.
+  The cycle now runs bufferless rather than serial when the slack is thin, and
+  `declined_for_slack` is reserved for the one case the collection's own
+  backstop should have caught first. Measured after: `cycles=1`,
+  `declined_for_slack=0` on five consecutive bt18 runs, against roughly one in
+  two before.
+
+`PAR_EVAC_HELPER_SCANS` exists so the first of those is a number rather than a
+wall-clock mystery next time: "it engaged" and "it spread the work" are
+different claims, and the first held while the second did not.
+
+The three seed phases (precise roots, overlay-held edges, dirty-card
+old→young slots) are now `seed_roots` / `seed_overlay_roots` /
+`seed_dirty_card_roots`, called by BOTH evacuators. Seeding is where the two
+could have drifted invisibly — a card slot the parallel path forgot surfaces
+as a live object reclaimed, a week later, on the other collector.
+
+`CRATONVM_GC_PAR_EVAC=0` forces the serial evacuator. It is default-on because
+it cannot engage on its own: the cycle must be a moving one and the existing
+`CRATONVM_GC_PAR_THREADS` policy must already want two or more workers.
+`gen_evac::par_evac_census()` reports
+`(cycles, cas_losses, declined_for_slack, filler_bytes, helper_scans)`, so
+"it never engaged" and "it engaged and did nothing" are distinguishable.
+
+Covered by eight end-to-end young-GC tests (each asserting on a PER-THREAD
+cycle counter that the parallel path really ran — the process-global one is
+bumped by every other test in the binary) and nine unit tests of `evacuate`'s
+refusal and convergence arms, the buffer sizing, and the reservation. The CAS-loser arm needed
+a `cfg(test)` seam: on the first cut, measured across the whole young-GC suite,
+a 500-parent fan-in produced **zero** CAS losses — every second reader took the
+already-forwarded fast path — so a test relying on a real race would have been
+asserting nothing. (With the drain sharing work properly the arm now also fires
+naturally, a few times per cycle on the wide DAG; the seam stays because that
+is a schedule, not a guarantee.)
+
+End-to-end on `bench/BinT.java` depth 18 (`--XX:UseGc Generational -Xmx512m
+CRATONVM_MOVING_YOUNG=1 CRATONVM_GC_PAR_THREADS=8`), five consecutive runs: the
+copy phase engages every time (`cycles=1 declined_for_slack=0`), helpers scan
+~1.3M destinations, and the program's checksum is identical to the
+`CRATONVM_GC_PAR_EVAC=0` run. The census is printed by `--verbose:gc` as
+`[GC] par_evac:`, unconditionally, including the all-zero line — which is how
+both of the reservation defects above were found.
+
+**Soak.** Driven by `CRATONVM_DBG_GC_STRESS` so the copy phase runs hundreds of
+times per process rather than once, and checked against closed-form oracles
+(each benchmark's own documented checksum, never a second run of this VM):
+
+| dimension | coverage |
+|---|---|
+| object shapes | `BinT` two-reference nodes; `HashMapOnly` boxed Integers over a resizing REFERENCE ARRAY plus compact-layout nodes; `StringRegexOnly` primitive arrays, Strings and a stateful `Matcher` |
+| heap sizes | 128m / 256m / 512m |
+| GC stress | 250 KB and 1–2 MB per forced collection |
+| worker counts | 2, 3, 4, 8, 16 |
+
+**45 runs, 45 correct checksums, ~12,950 parallel copy cycles**, and
+`helper_scans` rises monotonically with the worker count (29,855 at 2 workers
+to 49,855 at 16) — so the extra workers really do take work rather than merely
+existing. Two runs reported `cycles=0`; the census says so rather than letting
+a vacuous run read as a pass.
+
+**Copy-phase cost**, `cheney_drain` out of the `CRATONVM_DBG_GCPAUSE=1`
+breakdown, on `BinT` depth 18 at `-Xmx512m` — one large cycle copying ~1.0-1.5M
+objects out of a 128 MB from-space. ABBA-interleaved (P S S P), first pair
+discarded as cold, `objects_copied` checked equal within every pair:
+
+| arm | n | min | median | max |
+|---|---|---|---|---|
+| parallel, 8 workers | 8 | 2,198 ms | **3,554 ms** | 5,243 ms |
+| serial | 8 | 7,002 ms | **14,100 ms** | 16,720 ms |
+
+The ranges are DISJOINT — parallel's worst sample beats serial's best — which
+is what makes this a result on a shared host rather than a ratio between two
+noisy medians. Median 3.97x; the pessimal pairing is still 1.34x.
+
+Read with three caveats, none of which the numbers above state on their own.
+This is a **debug build**: the per-object copy is unoptimised on both arms, and
+release is likely to narrow the ratio, since optimisation makes the copy cheaper
+while the coordination stays. It is **one workload**, chosen because it is
+survivor-heavy and therefore the best case for parallel copying. And it is the
+copy PHASE, not the pause: in the same breakdown `pre_evacuate` costs 3,174 ms,
+so after this change **`pre_evacuate` — the from-space object-start walk — is
+the largest phase of a moving young pause**, and is where the next pause work
+should go.
+
+An earlier wall-clock A/B under `CRATONVM_DBG_GC_STRESS` was discarded rather
+than reported: it showed a 6x spread WITHIN one arm against an 11% median gap.
+GC stress is the right instrument for a soak and the wrong one for a throughput
+measurement — it maximises the number of cycles while minimising the work in
+each, which is exactly where a parallel copy has least to offer.
+
 ### 2026-08-06 The `ThreadPoolExecutor.execute` receiver-shape special case is gone
 
 Nine dispatch sites across four files decided whether to run

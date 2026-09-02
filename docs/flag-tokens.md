@@ -833,7 +833,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-85 tokens.
+86 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -886,6 +886,7 @@ export inherited from a parent shell.
 | `oldgen-compact` | `CRATONVM_OLDGEN_COMPACT` |
 | `overhead-limit` | `CRATONVM_GC_OVERHEAD_LIMIT` |
 | `owner-class-filter` | `CRATONVM_OWNER_CLASS_FILTER` |
+| `par-evac` | `CRATONVM_GC_PAR_EVAC` |
 | `par-min-bytes` | `CRATONVM_GC_PAR_MIN_BYTES` |
 | `par-threads` | `CRATONVM_GC_PAR_THREADS` |
 | `promotion-guard` | `CRATONVM_NO_GC_PROMOTION_GUARD` |

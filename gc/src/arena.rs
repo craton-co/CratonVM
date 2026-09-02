@@ -2455,6 +2455,52 @@ impl Arena {
         self.data.len()
     }
 
+    /// The LOW bump tail as `(first free address, byte count)` — the span a
+    /// parallel evacuation may carve into per-worker buffers.
+    ///
+    /// # Why an evacuator cannot just call `alloc`
+    ///
+    /// [`Self::alloc`] takes `&mut self`, which is precisely what makes a
+    /// copying collector's copy phase single-threaded. Handing the un-bumped
+    /// tail out as two plain words lets N workers bump a shared atomic cursor
+    /// inside it instead, with the arena itself untouched until
+    /// [`Self::commit_parallel_evacuation`] publishes the result.
+    ///
+    /// The tail is returned rather than the whole arena on purpose: the free
+    /// list holds spans whose neighbours are live objects, and an evacuator
+    /// bumping through those would overwrite them.
+    pub fn parallel_evacuation_region(&self) -> (usize, usize) {
+        (
+            self.data.as_ptr() as usize + self.cursor,
+            self.low_bump_headroom(),
+        )
+    }
+
+    /// Publish the outcome of a parallel evacuation: `bytes` were consumed
+    /// from the tail [`Self::parallel_evacuation_region`] handed out.
+    ///
+    /// The caller must already have made every byte below the new cursor
+    /// walkable — object copies, and a filler over every retired per-worker
+    /// buffer's tail (`gen_evac::install_gap_filler`). This method deliberately
+    /// does NOT take the gaps and push them on the free list instead: a free
+    /// block is invisible to `walk_objects` and friends, and this arena is
+    /// about to become the next cycle's FROM-space, where several walks
+    /// reconstruct the object grid without consulting the free list at all.
+    ///
+    /// # Panics
+    /// If `end_addr` is outside the tail that was handed out — below its start
+    /// would lose live copies, above it would put the cursor past the arena's
+    /// own capacity.
+    pub fn commit_parallel_evacuation(&mut self, end_addr: usize) {
+        let (start, len) = self.parallel_evacuation_region();
+        assert!(
+            end_addr >= start && end_addr <= start + len,
+            "parallel evacuation ended at {end_addr:#x}, outside the tail [{start:#x},{:#x})",
+            start + len,
+        );
+        self.cursor += end_addr - start;
+    }
+
     /// Retract the bump cursor into a free span that ends exactly at it,
     /// returning the bytes handed back to the un-bumped tail.
     ///
