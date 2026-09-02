@@ -12117,11 +12117,49 @@ fn map_init_capacity_eager(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// the only thing they share. Keeping ONE spelling is the point: this file has
 /// twice found a rule half-applied across a family that shares the contract and
 /// not the code.
-fn map_ctor_capacity_load_check(args: &[Value]) -> Result<(), MethodCallFailed> {
+/// How a map family SPELLS the refusals above.
+///
+/// The doc comment on the helper argues for keeping one spelling. That is the
+/// right instinct when the family shares the contract, and measured against
+/// HotSpot on JDK 25 (`apps/probes/MapCtorMsgProbe.java`) this one does not —
+/// there are five spellings of the same negative-capacity check:
+///
+/// ```text
+///   HashMap / LinkedHashMap / HashSet / LinkedHashSet  Illegal initial capacity: -1
+///   Hashtable                                          Illegal Capacity: -1
+///   WeakHashMap                                        Illegal Initial Capacity: -1
+///   IdentityHashMap                                    expectedMaxSize is negative: -1
+///   ConcurrentHashMap                                  (no message at all)
+/// ```
+///
+/// Only the first row is this helper's. `ConcurrentHashMap` reached it anyway
+/// and inherited a message the JDK does not produce, so the spelling is now a
+/// parameter rather than an assumption.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MapCtorRefusalSpelling {
+    /// `HashMap` and the classes that copy its wording.
+    HashMapFamily,
+    /// `ConcurrentHashMap`: `throw new IllegalArgumentException()`, bare.
+    Messageless,
+}
+
+fn map_ctor_capacity_load_check(
+    args: &[Value],
+    spelling: MapCtorRefusalSpelling,
+) -> Result<(), MethodCallFailed> {
+    // An EMPTY message is this crate's marker for a null `getMessage()` — see
+    // the `IllegalArgumentException` arm of `RuntimeError::render`. `Some("")`
+    // and `None` are different answers to `getMessage()`, and the probe reads
+    // the difference.
+    let messageless = spelling == MapCtorRefusalSpelling::Messageless;
     if let Some(Value::Int(c)) = args.get(1) {
         if *c < 0 {
             return Err(RuntimeError::IllegalArgumentException {
-                message: format!("Illegal initial capacity: {c}"),
+                message: if messageless {
+                    String::new()
+                } else {
+                    format!("Illegal initial capacity: {c}")
+                },
             }
             .into());
         }
@@ -12129,7 +12167,14 @@ fn map_ctor_capacity_load_check(args: &[Value]) -> Result<(), MethodCallFailed> 
     if let Some(Value::Float(f)) = args.get(2) {
         if *f <= 0.0 || f.is_nan() {
             return Err(RuntimeError::IllegalArgumentException {
-                message: format!("Illegal load factor: {f}"),
+                message: if messageless {
+                    String::new()
+                } else {
+                    // `java_float_to_string`, not `{f}`: Rust prints 0.0f32 as
+                    // "0" and Java prints "0.0", so the plain interpolation was
+                    // wrong for every caller at once.
+                    format!("Illegal load factor: {}", java_float_to_string(*f))
+                },
             }
             .into());
         }
@@ -12146,7 +12191,7 @@ fn map_init_capacity_inner(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    map_ctor_capacity_load_check(args)?;
+    map_ctor_capacity_load_check(args, MapCtorRefusalSpelling::HashMapFamily)?;
     let cap = match args.get(1) {
         Some(Value::Int(c)) => {
             // JDK `HashMap(int initialCapacity)` / `HashSet(int)` semantics:
@@ -12265,7 +12310,10 @@ fn native_hashtable_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -
         if !load_factor.is_finite() || *load_factor <= 0.0 {
             return Err(
                 cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                    message: format!("Illegal Load: {load_factor}"),
+                    message: format!(
+                        "Illegal Load: {}",
+                        java_float_to_string(*load_factor)
+                    ),
                 }
                 .into(),
             );
@@ -18953,7 +19001,7 @@ fn register_set_view_carrier_natives(r: &mut NativeMethodRegistry) {
 fn native_hs_init_capacity_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // BEFORE the trim, or the load factor is validated by nobody: the guard
     // reads `args[2]`, and the (I)V path this delegates to never sees it.
-    map_ctor_capacity_load_check(args)?;
+    map_ctor_capacity_load_check(args, MapCtorRefusalSpelling::HashMapFamily)?;
     // Drop the loadFactor (last) arg and reuse the (I)V path.
     let trimmed: Vec<Value> = args.iter().take(2).copied().collect();
     native_hs_init_capacity(ctx, &trimmed)
@@ -19315,7 +19363,7 @@ fn native_hs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 }
 
 fn native_hs_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    map_ctor_capacity_load_check(args)?;
+    map_ctor_capacity_load_check(args, MapCtorRefusalSpelling::HashMapFamily)?;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -21687,7 +21735,12 @@ fn native_al_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // iterators as holding a trailing `null` element.
         return Err(
             cratonvm_types::error::RuntimeError::NoSuchElementException {
-                message: "no more elements".to_string(),
+                // MEASURED on HotSpot 25.0.4+7 (`apps/probes/MapCtorMsgProbe.java`):
+                // an exhausted iterator or enumeration in this family answers a
+                // NULL `getMessage()`. `Vector`'s enumeration is the one that does
+                // not ("Vector Enumeration") and does not come through here. An
+                // EMPTY message is this crate's marker for no message.
+                message: String::new(),
             }
             .into(),
         );
@@ -21840,7 +21893,7 @@ fn native_map_key_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         // own exhausted paths, so the two cannot drift into different reports.
         return Err(
             cratonvm_types::error::RuntimeError::NoSuchElementException {
-                message: "No more elements".to_string(),
+                message: String::new(),
             }
             .into(),
         );
@@ -38453,6 +38506,18 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // A null source map answered an EMPTY MAP here, where the JDK
+    // dereferences it: `HashMap(Map m)` -> `putMapEntries(m, false)` ->
+    // `int s = m.size()`. Silently accepting null is worse than a wrong
+    // message -- the caller does not learn it passed null at all. Only an
+    // explicitly-passed null throws; a missing argument stays the
+    // malformed-call no-op, the distinction `reject_null_functional` draws.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Cannot invoke \"java.util.Map.size()\" because \"m\" is null".to_string()),
+        }
+        .into());
+    }
     let source = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -44857,7 +44922,7 @@ fn native_lhm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 fn native_lhm_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Serves the `(I)V`, `(IF)V` and `(IFZ)V` constructors, so validating
     // `args[1]`/`args[2]` here covers all three.
-    map_ctor_capacity_load_check(args)?;
+    map_ctor_capacity_load_check(args, MapCtorRefusalSpelling::HashMapFamily)?;
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -44943,7 +45008,16 @@ fn lhm_is_access_order(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
 fn native_lhm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // RULE C: `LinkedHashMap(Map)` is `putMapEntries(m, false)`, which reads
     // `m.size()`.
-    reject_null_collection(args.get(1))?;
+    // NOT `reject_null_collection`: that is the
+    // `Objects.requireNonNull(c)` shape, whose NPE carries no message. This
+    // constructor DEREFERENCES its argument (`m.size()`), so the JDK raises a
+    // helpful NPE naming the method and its own parameter name.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Cannot invoke \"java.util.Map.size()\" because \"m\" is null".to_string()),
+        }
+        .into());
+    }
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -55476,7 +55550,16 @@ fn native_tm_descending_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 /// `TreeMap(Map)` — a fresh natural-ordered map, then `putAll`.
 fn native_tm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // RULE C: the JDK's body is `putAll(m)`, which reads `m.size()`.
-    reject_null_collection(args.get(1))?;
+    // NOT `reject_null_collection`: that is the
+    // `Objects.requireNonNull(c)` shape, whose NPE carries no message. This
+    // constructor DEREFERENCES its argument (`map.size()`), so the JDK raises a
+    // helpful NPE naming the method and its own parameter name.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Cannot invoke \"java.util.Map.size()\" because \"map\" is null".to_string()),
+        }
+        .into());
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -59784,7 +59867,7 @@ fn native_chm_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // bytecode runs `new ConcurrentHashMap<>(initialCapacity)`, and THIS
     // constructor validated nothing. One line, the same guard every other
     // hash-ordered constructor in the file now shares.
-    map_ctor_capacity_load_check(args)?;
+    map_ctor_capacity_load_check(args, MapCtorRefusalSpelling::Messageless)?;
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -59876,7 +59959,10 @@ fn native_chm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // the shape `phase-2-worklist` records as the worst a refusal can take,
     // because the caller does not learn it passed null until much later.
     if matches!(args.get(1), None | Some(Value::Object(None))) {
-        return Err(bare_npe());
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Cannot invoke \"java.util.Map.size()\" because \"m\" is null".to_string()),
+        }
+        .into());
     }
     // cceres5: `chm_init_segments` allocates (segments + buckets); `source`
     // sat raw in `args` across it, so `collect_entries_any` below could walk a
@@ -61041,8 +61127,15 @@ fn native_chm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // so it is an NPE and not a silent no-op. A missing argument is a dispatch
     // defect rather than a Java-visible null and keeps the old return — the
     // distinction `reject_null_functional` draws.
+    // The comment above says `m.size()`; MEASURED on HotSpot 25 the
+    // message names `entrySet()`. `ConcurrentHashMap.putAll` is not
+    // `HashMap.putAll`, and the premise had been transcribed from the wrong
+    // class -- which is why this arm is keyed on the measurement.
     if matches!(args.get(1), Some(Value::Object(None))) {
-        return Err(bare_npe());
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Cannot invoke \"java.util.Map.entrySet()\" because \"m\" is null".to_string()),
+        }
+        .into());
     }
     let source = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,

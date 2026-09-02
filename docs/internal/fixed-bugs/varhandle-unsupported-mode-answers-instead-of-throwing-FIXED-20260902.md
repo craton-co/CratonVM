@@ -81,10 +81,11 @@ passed.**
 ## Still open, from the same sweep
 
 A **read-only (final-field) handle**: HotSpot refuses every write mode,
-CratonVM performs the write. Different rule, different route — it is a property
-of the HANDLE rather than of the variable's type, and needs field-level access
-flags to reach a native. Filed as
-[`../../known-issues/jdk-only/varhandle-final-field-handle-performs-the-write-20260902.md`](../../known-issues/jdk-only/varhandle-final-field-handle-performs-the-write-20260902.md).
+CratonVM performs the write. Different rule, different route — it is a property of the HANDLE rather than
+of the variable's type. **Fixed the same day**, and the "needs field-level
+access flags to reach a native" this page gave as the reason to defer it was
+wrong: `FieldMetadata` already carries `access_flags`. See
+[`varhandle-final-field-handle-performs-the-write-FIXED-20260902.md`](varhandle-final-field-handle-performs-the-write-FIXED-20260902.md).
 
 ## Related
 
