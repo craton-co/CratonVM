@@ -2830,7 +2830,11 @@ impl<'a> Lowerer<'a> {
         // inline address to store to — `HEADER_SIZE + field_index * SLOT_SIZE`
         // is the legacy cell displacement and a compact object does not obey
         // it. This is the plumbing COV-03 named as the blocker.
-        let Some(&(c_off, c_is_ref, type_tag)) = self.compact_fields.get(&pc) else {
+        // Keyed by `(pc, is_reference)` since 2026-09-02 — the IR String-access
+        // expansion emits two accesses at one pc, one Int and one Ref, so a
+        // pc-only key could name at most one of them. A reference STORE is
+        // always the `true` half.
+        let Some(&(c_off, c_is_ref, type_tag)) = self.compact_fields.get(&(pc, true)) else {
             crate::metrics::note_ir_ref_store_decline(2);
             return false;
         };
@@ -12783,8 +12787,8 @@ mod tests {
 
         // The builder puts the `putfield` at pc 3 (`aload_0; aload_1;
         // putfield`), which is the key `set_field_info` uses above.
-        let mut compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
-        compact.insert(3usize, (c_off, true, b'L'));
+        let mut compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
+        compact.insert((3usize, true), (c_off, true, b'L'));
         let empty_hints: HashMap<usize, bool> = HashMap::new();
         let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
         let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
@@ -12968,7 +12972,7 @@ mod tests {
         let empty_hints: HashMap<usize, bool> = HashMap::new();
         let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
         let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
-        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        let no_compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
         let code = lower_inner(
             &graph,
             &schedule,
@@ -13021,8 +13025,8 @@ mod tests {
         // Pre-gate only: no post-gate, no post shape.
         helpers.ref_store_pre_gate = std::ptr::addr_of!(PRE_GATE) as usize;
 
-        let mut compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
-        compact.insert(3usize, (8u32, true, b'L'));
+        let mut compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
+        compact.insert((3usize, true), (8u32, true, b'L'));
         let empty_hints: HashMap<usize, bool> = HashMap::new();
         let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
         let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
