@@ -384,6 +384,29 @@ pub fn evacuation_refs_rejected_torn() -> usize {
     EVAC_REF_REJECTED_TORN.load(Ordering::Relaxed)
 }
 
+/// How many times the evacuator copied a header claiming to be a LEGACY OBJECT
+/// of class 0 with an implausible field count.
+///
+/// `ClassId(0)` is the class every primitive array carries (`newarray` passes
+/// it verbatim) and the MIC/PIC empty-slot sentinel; the objects allocated
+/// under it have zero to a handful of fields. Nothing in this VM allocates a
+/// class-0 legacy object with thousands of slots, so such a header is not an
+/// object -- and a legacy slot count is a SIXTEEN-byte stride, so the walk it
+/// authorises is eight times the extent of the reference array whose torn
+/// header reads this way.
+///
+/// The report is the producer question this counter exists to answer: it names
+/// the SOURCE region, offset and reuse epoch, and -- under
+/// `CRATONVM_G1_DBG_REACH=1` -- the allocation site that carved that span, which
+/// is what separates "a TLAB handed this out" from "the out-of-line allocator
+/// did". Expected to be ZERO.
+pub static EVAC_IMPLAUSIBLE_CLASS0_COPY: AtomicUsize = AtomicUsize::new(0);
+
+/// The value of [`EVAC_IMPLAUSIBLE_CLASS0_COPY`].
+pub fn evacuation_implausible_class0_copies() -> usize {
+    EVAC_IMPLAUSIBLE_CLASS0_COPY.load(Ordering::Relaxed)
+}
+
 /// How many objects the evacuation ref-scan refused to WALK because their own
 /// header did not look like a live object. Expected to be ZERO.
 pub static EVAC_HOLDER_REJECTED: AtomicUsize = AtomicUsize::new(0);
@@ -5620,6 +5643,8 @@ impl G1Collector {
             return None;
         }
 
+        self.note_implausible_class0_header(regions, old_ptr, header, "evacuate");
+
         // Decide destination based on age
         let promote = header.gc_age() >= self.config.promotion_age;
         let dest_type = if promote {
@@ -5747,6 +5772,63 @@ impl G1Collector {
     /// no such API), so the invariant is enforced by the type-level
     /// `&mut Vec<G1Region>` parameter (only the lock holder can produce
     /// it) plus this contract comment.
+    /// Report -- once per power of two -- a header that claims to be a legacy
+    /// object of class 0 with an implausible field count, and say WHERE the
+    /// bytes came from. See [`EVAC_IMPLAUSIBLE_CLASS0_COPY`].
+    ///
+    /// Measurement only: the caller's behaviour is unchanged. The point is the
+    /// SOURCE-side context, which no report on this page has ever carried --
+    /// every rejection so far named the holder after it had already been
+    /// copied into a Survivor region, so the carve that produced it was two
+    /// moves behind.
+    fn note_implausible_class0_header(
+        &self,
+        regions: &[G1Region],
+        obj_ptr: *mut u8,
+        header: &ObjectHeader,
+        site: &'static str,
+    ) {
+        // `class_id == 0` AND a legacy-object kind AND a field count no class
+        // has. Each alone is ordinary; together they are not an object.
+        const IMPLAUSIBLE_CLASS0_SLOTS: u32 = 1024;
+        if header.class_id.as_u32() != 0
+            || header.kind() != ObjectKind::Object
+            || header.num_slots() < IMPLAUSIBLE_CLASS0_SLOTS
+        {
+            return;
+        }
+        let n = EVAC_IMPLAUSIBLE_CLASS0_COPY.fetch_add(1, Ordering::Relaxed) + 1;
+        if n > 8 && !n.is_power_of_two() {
+            return;
+        }
+        let addr = obj_ptr as usize;
+        let where_from = self
+            .lookup_region_for_addr(addr)
+            .and_then(|i| regions.get(i).map(|r| (i, r)))
+            .map(|(i, r)| {
+                let base = r.data.as_ptr() as usize;
+                let off = addr.wrapping_sub(base);
+                format!(
+                    "r{i}/{:?}/off={off:#x}/cursor={:#x}/reuse_epoch={}/recycled_in_generation={} {}",
+                    r.region_type,
+                    r.cursor,
+                    r.reuse_epoch,
+                    r.recycled_in_generation,
+                    // The carve that produced this span, when the trails are
+                    // recording. This is the whole point of the report.
+                    r.tlab_trail
+                        .describe_owner_or(&r.bump_trail, r.reuse_epoch, off),
+                )
+            })
+            .unwrap_or_else(|| "r?".to_string());
+        tracing::warn!(
+            "[g1] IMPLAUSIBLE class-0 legacy header at {site} (#{n}): obj={addr:#x}              class_id=0 kind=Object num_slots={} mark={:#018x} claims={:#x} bytes              source={where_from} -- no allocation in this VM produces a class-0 legacy              object with that many fields; a reference array whose kind bit is unset              reads exactly this way, and the walk it authorises is eight times the              array's extent.",
+            header.num_slots(),
+            header.mark_word.load(Ordering::Relaxed),
+            HEADER_SIZE + header.num_slots() as usize * SLOT_SIZE,
+        );
+    }
+
     /// Reject a candidate reference the evacuator is about to DEREFERENCE
     /// when it does not look like a live object header, and say so once.
     ///
@@ -10177,6 +10259,10 @@ impl G1Collector {
         // consumer anywhere in the tree, which makes their zero unciteable: a
         // run cannot be quoted as evidence for a guard that nothing prints. See
         // `FLAT_WALK_REFUSED_ARRAY` and `KEPT_SEED_REJECTED`.
+        eprintln!(
+            "[GC] g1 implausible_class0_copies={}",
+            evacuation_implausible_class0_copies(),
+        );
         eprintln!(
             "[GC] g1 flat_walk_refused_array={} kept_seed_rejected={}",
             flat_walks_refused_for_array(),
