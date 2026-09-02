@@ -874,7 +874,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-112 tokens.
+114 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -931,6 +931,7 @@ export inherited from a parent shell.
 | `gpu-critical-wait-ms` | `CRATONVM_GPU_CRITICAL_WAIT_MS` |
 | `gpu-host-callback` | `CRATONVM_GPU_HOST_CALLBACK` |
 | `gpu-device-pool` | `CRATONVM_GPU_DEVICE_POOL` |
+| `gpu-wait-latch` | `CRATONVM_GPU_WAIT_LATCH` |
 | `gpu-zerocopy` | `CRATONVM_GPU_NO_ZEROCOPY` |
 | `lhm-root-all` | `CRATONVM_LHM_ROOT_ALL` |
 | `max-inflated-bytes` | `CRATONVM_MAX_INFLATED_BYTES` |
@@ -953,6 +954,7 @@ export inherited from a parent shell.
 | `par-evac` | `CRATONVM_GC_PAR_EVAC` |
 | `par-threads` | `CRATONVM_GC_PAR_THREADS` |
 | `sync-young-wipe` | `CRATONVM_GC_SYNC_YOUNG_WIPE` |
+| `jit-ref-store-gates` | `CRATONVM_GC_JIT_REF_STORE_GATES` |
 | `promotion-guard` | `CRATONVM_NO_GC_PROMOTION_GUARD` |
 | `promotion-oom-guard-broad` | `CRATONVM_PROMOTION_OOM_GUARD_BROAD` |
 | `selective-promote` | `CRATONVM_NO_SELECTIVE_PROMOTE` |
@@ -1118,7 +1120,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-23 tokens.
+24 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1145,6 +1147,7 @@ export inherited from a parent shell.
 | `tomcat-mapper-natives` | `CRATONVM_TOMCAT_MAPPER_NATIVES` |
 | `vh-strict-reference-return` | `CRATONVM_VH_STRICT_REFERENCE_RETURN` |
 | `vh-null-coordinate-npe` | `CRATONVM_VH_NULL_COORDINATE_NPE` |
+| `vh-unsupported-mode-uoe` | `CRATONVM_VH_UNSUPPORTED_MODE_UOE` |
 
 ## `CRATONVM_TEST`
 
