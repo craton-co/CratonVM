@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-511 tokens.
+514 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -573,11 +573,14 @@ export inherited from a parent shell.
 | `zero-ranges` | `CRATONVM_DBG_ZERO_RANGES` |
 | `ir-string` | `CRATONVM_DBG_IR_STRING` |
 | `invoke-phases` | `CRATONVM_DBG_INVOKE_PHASES` |
+| `interp-frames` | `CRATONVM_DBG_INTERP_FRAMES` |
+| `tierup-decline` | `CRATONVM_DBG_TIERUP_DECLINE` |
+| `direct-binds` | `CRATONVM_DBG_DIRECT_BINDS` |
 | `g1-dbg-rset` | `CRATONVM_G1_DBG_RSET` |
 
 ## `CRATONVM_JIT`
 
-294 tokens.
+301 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -875,6 +878,13 @@ export inherited from a parent shell.
 | `direct-call-arg-maps` | `CRATONVM_JIT_DIRECT_CALL_ARG_MAPS` |
 | `ir-gc-point-maps` | `CRATONVM_JIT_IR_GC_POINT_MAPS` |
 | `zero-spid` | `CRATONVM_JIT_ZERO_SPID` |
+| `int-value-direct` | `CRATONVM_JIT_INT_VALUE_DIRECT` |
+| `indy-lambda-fast` | `CRATONVM_JIT_INDY_LAMBDA_FAST` |
+| `hot-lookup-cache` | `CRATONVM_JIT_HOT_LOOKUP_CACHE` |
+| `virtual-nominate-always` | `CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS` |
+| `virtual-promote-java-util` | `CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL` |
+| `native-cf-postcomplete-skip` | `CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP` |
+| `native-cf-postcomplete-direct` | `CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT` |
 
 ## `CRATONVM_GC`
 

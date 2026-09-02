@@ -1986,6 +1986,7 @@ pub(super) fn compile_osr_artifact(
                     {
                         let entry =
                             crate::jit::helpers::jit_integer_int_value_direct as *const () as usize;
+                        cratonvm_jit::note_integer_int_value_direct_site();
                         direct_calls2.push((
                             pc,
                             crate::jit::JitDirectCall {

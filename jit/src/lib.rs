@@ -10739,6 +10739,53 @@ pub fn collection_direct_helper_sites() -> (u64, u64, u64) {
     )
 }
 
+/// `CRATONVM_JIT_INT_VALUE_DIRECT` — default-ON, `=0` opts out. The kill switch
+/// for the `Integer.intValue` / `Long.longValue` binds at BOTH doors; see
+/// [`INTEGER_INT_VALUE_DIRECT_SITES`].
+pub fn int_value_direct_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_INT_VALUE_DIRECT") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
+/// Compile-time engagement counter for the `Integer.intValue` bind — how many
+/// call sites any of the three doors actually bound. Read by
+/// `CRATONVM_DBG_DIRECT_BINDS=1`; see `vm::runtime::interp_census`.
+pub static INTEGER_INT_VALUE_DIRECT_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `Long.longValue()` sibling of [`INTEGER_INT_VALUE_DIRECT_SITES`].
+///
+/// Separate because the two binds answer separate questions and one counter
+/// covering both cannot be read: the composition workload binds two `intValue`
+/// sites and one `longValue` site, and a single `sites_bound=3` says which of
+/// the two recognitions fired only if you already know.
+pub static LONG_LONG_VALUE_DIRECT_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read [`INTEGER_INT_VALUE_DIRECT_SITES`].
+pub fn integer_int_value_direct_sites() -> u64 {
+    INTEGER_INT_VALUE_DIRECT_SITES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Read [`LONG_LONG_VALUE_DIRECT_SITES`].
+pub fn long_long_value_direct_sites() -> u64 {
+    LONG_LONG_VALUE_DIRECT_SITES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Count one bound `Integer.intValue` site. Called by the two doors in the
+/// `vm` crate, which cannot name the static across the dependency edge in a
+/// `static` initialiser but can call this.
+pub fn note_integer_int_value_direct_site() {
+    INTEGER_INT_VALUE_DIRECT_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one bound `Long.longValue` site.
+pub fn note_long_long_value_direct_site() {
+    LONG_LONG_VALUE_DIRECT_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Register the `Integer.intValue` thin direct-call helper (called once from
 /// the VM's `build_helpers`).
 pub fn set_integer_int_value_direct_fn(addr: usize) {
@@ -23712,6 +23759,63 @@ fn try_compile_inner(
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                             }
+                            // `Integer.intValue()` / `Long.longValue()` at the
+                            // OPTIMIZING door.
+                            //
+                            // The scope note above says these are
+                            // "single-pass-only" because they are
+                            // `invokevirtual` and this door is gated
+                            // `is_static || is_special`. That was true when it
+                            // was written and is not true now:
+                            // `invokevirtual_site_final_owner` pins an
+                            // unoverridable `invokevirtual` as statically
+                            // bound, and BOTH wrapper classes are `final`, so
+                            // `private_virtual_owner` is `Some` and the site
+                            // arrives here as `is_special` with `direct_class`
+                            // already the declaring class. The door the note
+                            // says these sites cannot reach is the door they
+                            // now come through.
+                            //
+                            // `needs_ctx = true` puts `vm_ptr` in ARG_REGS[0]
+                            // ahead of the receiver, which is the helpers' own
+                            // `(vm_ptr, receiver)` signature — the same
+                            // convention `Thread.currentThread` uses above.
+                            //
+                            // `Long.longValue` is NOT bound here, and the
+                            // reason is a measurement rather than an argument.
+                            // The argument applies unchanged -- `java/lang/Long`
+                            // is `final` too, so its sites arrive here pinned
+                            // exactly as `Integer`'s do -- but the arm was
+                            // written, built and measured, and
+                            // `CRATONVM_DBG_DIRECT_BINDS=1` reported
+                            // `Long.longValue: sites_bound=0` against
+                            // `Integer.intValue: sites_bound=4 served=159 199`
+                            // on the same run. Nothing on the workload this
+                            // change is measured against reaches it, so it
+                            // ships as a follow-up rather than as unexercised
+                            // code: re-add the `Long` half and watch
+                            // `sites_bound` move before believing it.
+                            if direct_target.is_none()
+                                && int_value_direct_enabled()
+                                && !is_static
+                                && direct_class == "java/lang/Integer"
+                                && mn == "intValue"
+                                && desc == "()I"
+                            {
+                                let entry = direct_native_helper(
+                                    &INTEGER_INT_VALUE_DIRECT_FN,
+                                    jdk_only,
+                                    intrinsic_resolver,
+                                    direct_class,
+                                    &mn,
+                                    &desc,
+                                );
+                                if entry != 0 {
+                                    direct_target = Some((entry, true));
+                                    direct_target_is_thin_helper = true;
+                                    note_integer_int_value_direct_site();
+                                }
+                            }
                             if direct_target.is_none()
                                 && !closes_cycle
                                 && !jit_direct_call_requires_dispatch(direct_class, &mn, &desc)
@@ -25508,6 +25612,50 @@ fn try_compile_inner(
             // is an acceptable trade for not running unaudited machinery on
             // every unrelated JIT compile.
             let virtual_interface_inline_admitted = class_id_name_resolver.is_some();
+            // `Integer.intValue()` at a site `invokevirtual_site_final_owner`
+            // pinned as statically bound (`invoke_kind == 1`). The arm further
+            // down still owns `invoke_kind == 0`; this one exists because that
+            // arm can no longer see these sites at all, and widening ITS
+            // condition would hand every other recogniser inside the
+            // `(0 | 2)` block a shape none of them was written for.
+            //
+            // `class_name` is already the pin's substituted DECLARING class,
+            // which for `intValue` is `java/lang/Integer` itself. The opcode is
+            // still `0xb6`, so the x64 ladder adds the receiver back exactly as
+            // it does for the unpinned shape. See
+            // [`INTEGER_INT_VALUE_DIRECT_SITES`].
+            if !is_recursive_call
+                && invoke_kind == 1
+                && direct_jit_callee_calls_enabled
+                && int_value_direct_enabled()
+                && class_name == "java/lang/Integer"
+                && method_name == "intValue"
+                && descriptor == "()I"
+            {
+                let entry = direct_native_helper(
+                    &INTEGER_INT_VALUE_DIRECT_FN,
+                    jdk_only,
+                    intrinsic_resolver,
+                    &class_name,
+                    &method_name,
+                    &descriptor,
+                );
+                if entry != 0 {
+                    needs_heap = true;
+                    note_integer_int_value_direct_site();
+                    direct_calls.push((
+                        pc,
+                        JitDirectCall {
+                            entry,
+                            needs_context: true,
+                            num_params: 0,
+                            return_type: b'I',
+                            guard_class_id: 0,
+                        },
+                    ));
+                    continue;
+                }
+            }
             if !is_recursive_call
                 && (invoke_kind == 3
                     || invoke_kind == 1
@@ -26395,6 +26543,7 @@ fn try_compile_inner(
                 // plain guard-free virtual direct-call path is sound, and
                 // the helper handles the null-receiver NPE itself.
                 if direct_jit_callee_calls_enabled
+                    && int_value_direct_enabled()
                     && invoke_kind == 0
                     && class_name == "java/lang/Integer"
                     && method_name == "intValue"
@@ -26412,6 +26561,7 @@ fn try_compile_inner(
                     );
                     if entry != 0 {
                         needs_heap = true;
+                        note_integer_int_value_direct_site();
                         direct_calls.push((
                             pc,
                             JitDirectCall {
