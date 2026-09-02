@@ -186,6 +186,14 @@ is not evidence in either direction, which is the reason the probe exists.
 | G1 | `gated=0 declined=2` | — (`no-published-barrier-plan`) |
 | `CRATONVM_JIT_IR_REF_STORE=0` | `gated=0 declined=2` | — (`switch-off`) |
 
+Engagement is high but not per-run certain: across 13 Generational runs on the
+merged tip, 12 read `inline=16,384,000` and one read `gated=2` with **no**
+execution line at all — the IR body was compiled and never entered, the loop
+having finished on the tier below it first. That is an ordinary tiering race
+and not a property of this arm, but it is the reason to read the execution
+census per run rather than assume the site count implies it. It is also a
+second illustration of this page's point: `gated=2` was true in that run too.
+
 ## Levers
 
 - `CRATONVM_JIT_IR_REF_STORE=0` — this emitter off, back to the unconditional
