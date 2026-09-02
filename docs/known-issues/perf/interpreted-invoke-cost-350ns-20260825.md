@@ -75,6 +75,233 @@ by-value struct and it is **moved on every push and every pop**. That is a
 data-structure change to the interpreter's frame stack, and it is the shape of
 the remaining gap.
 
+## The 2026-09-02 pass: five costs that were fixed per method and paid per operation
+
+A separate probe set (below) priced the interpreter against HotSpot's template
+interpreter operation by operation, rather than pricing one workload. The shape
+that came out is worth stating before the individual items, because it is what
+made them findable:
+
+| operation | CratonVM `--nojit` | HotSpot `-Xint` | ratio |
+|---|---:|---:|---:|
+| one bytecode, straight-line arithmetic | 11.0 ns | 0.86 ns | 12.8x |
+| one backward branch | 33-37 ns | 4.9 ns | 7.1x |
+| instance field read or write | 160-200 ns | ~1 ns | ~170x |
+| static field read or write | 63-68 ns | ~1 ns | ~65x |
+| `invokestatic`, 0 args, fixed | 268-289 ns | 14.4 ns | 19x |
+| each extra `int` argument | ~35 ns | ~0.85 ns | 41x |
+| `invokevirtual` over `invokestatic` | 151-213 ns | -0.2 ns | - |
+| **`invokeinterface` over `invokevirtual`** | **114 ns** | **3.4 ns** | 33x |
+| `tableswitch` loop iteration | 209 ns | 18.2 ns | 11.5x |
+| `byte[]` load + store iteration | 322 ns | 23.3 ns | 13.8x |
+
+Straight-line bytecode, switches and array access all sit in one 9-14x band.
+Everything that crosses a **method boundary** or touches an **object field** is
+one to two orders worse - and in each case the excess turned out to be work
+that is constant per method, or per call site, being redone per operation.
+
+### What was fixed
+
+Every figure below is an **internal control**: a difference between two arms in
+the same process, measured on ONE binary with the change's own kill switch, arms
+interleaved in both orders. The development host ran at 73-94% CPU throughout,
+so no absolute number here is a quiet-host number - but a difference between two
+arms of one process is not a wall-clock claim.
+
+1. **`retarget_instance_field_to_receiver` ran on every instance field access.**
+   `CRATONVM_DBG_HOTPATH_COUNTS=1` reported `retarget_field=3000000` on a run
+   with exactly three million field accesses. Its slow half exists only for the
+   loader-split case - one class NAME under two `ClassId`s - and its first act
+   is to discover the names differ and return `None`. Reaching that cost a
+   `class_manager` read lock, three class lookups and a constant-pool walk, on
+   the majority of accesses (any *inherited* field has receiver class != the
+   declaring class). `any_duplicate_class_name()` is a one-way latch maintained
+   off the `name_definitions` index the class manager already keeps, so the
+   answer is one relaxed load.
+
+   `probes/FieldShape.java`, inherited-minus-own field pair, ns:
+
+   | | pass 1 | pass 2 | pass 3 | pass 4 |
+   |---|---:|---:|---:|---:|
+   | gate on | -5.6 | -28.6 | -14.5 | -37.7 |
+   | gate off | +52.1 | +123.5 | +54.8 | +63.5 |
+
+   4/4, no overlap. With the gate the delta collapses to ~0, which is what it
+   must do once both arms run one path. Kill switch:
+   `CRATONVM_LOADER_NO_DUP_NAME_FIELD_GATE=1`.
+
+2. **Every backward branch called `safepoint_check` unconditionally**, then
+   `continue`d into the loop-top poll thirty lines later, which asks
+   `stw_requested` first and makes the same call. The redundant call's only
+   unique work was the async-exception drain - a thread-local `RefCell` borrow,
+   an `Arc::clone`, a `swap(AcqRel)` and an `Arc` drop, i.e. **three locked
+   read-modify-writes per loop iteration**, inside a function too large to
+   inline. The slot handle is now hoisted once per `execute_frame` (the same
+   discipline as `pgo_enabled`) and the four back-edge sites test two relaxed
+   loads.
+
+   `probes/BackEdge.java` - two loops with identical total body-bytecode counts
+   and an 8x difference in back-edge count, so the per-back-edge cost falls out
+   of the difference. ns per back edge:
+
+   | | pass 1 | pass 2 | pass 3 | pass 4 |
+   |---|---:|---:|---:|---:|
+   | gate on | 22.7 | 28.7 | 24.3 | 9.1 |
+   | gate off | 30.2 | 34.2 | 41.6 | 25.5 |
+
+   4/4 in the same direction; medians 23.5 vs 32.2. Kill switch:
+   `CRATONVM_JIT_NO_BACKEDGE_POLL_GATE=1`.
+
+3. **The interface receiver-selection re-check ran a hierarchy walk under a lock
+   on every `invokeinterface` cache hit.** `invokeinterface` and
+   `invokevirtual` reach the same dispatcher and differ in exactly that block,
+   which is why the 114 ns above is attributable rather than inferred. It is now
+   a receiver-equals-declaring short-circuit followed by `IfaceSelectSiteCache`,
+   the existing audited `SiteCache` keyed on the call site and storing the
+   `(receiver, declaring)` pair a walk verified. A polymorphic site misses and
+   re-walks, exactly as before. Kill switch:
+   `CRATONVM_JIT_NO_IFACE_SELECT_MEMO=1`; `CRATONVM_DBG_FIELD_SITE=1` adds
+   `iface-select: hit / miss / fill / trivial`.
+
+4. **Two descriptor scans that are constant per method.** `ParamTags::of`
+   rescanned `cached.method_descriptor` on every invoke through the inline
+   cache; `areturn` called `jit::return_type(frame.method_descriptor())` - a
+   linear scan for the closing paren - on every reference return. Both now read
+   a `DescriptorFacts` memoized on `CachedBytecodeMethod` beside the four memo
+   cells already there.
+
+   `probes/RetTag.java` - two arms with identical bodies and argument lists
+   differing only in RETURN DESCRIPTOR LENGTH, so the delta is the scan. ns:
+
+   | | pass 1 | pass 2 | pass 3 | pass 4 |
+   |---|---:|---:|---:|---:|
+   | memo on | -2.0 | +4.3 | +13.2 | -32.0 |
+   | memo off | +69.0 | +35.2 | +36.1 | +20.9 |
+
+   4/4, no overlap, and the memo-on delta collapses to ~0 because descriptor
+   length stops mattering.
+
+5. **Frame push wrote every argument slot twice.** `init_locals_from_parts`
+   sized locals and kinds to `max_locals` with filler, then overwrote the
+   leading argument slots. It now pushes the arguments and resizes the
+   remainder, so each slot is written once. Not separately measured; it is a
+   deletion, pinned byte-for-byte against the old layout by two tests covering
+   category-2 arguments, unset tails, the defensive clamp, and pool recycling.
+
+### A recorded non-separation, and a corrected claim
+
+**The `ParamTags` half of item 4 did not separate.** `probes/Arity.java`
+per-extra-argument slope, four passes per arm: memo on 41.9 / 54.1 / 45.3 /
+49.2, memo off 39.1 / 53.6 / 24.8 / 44.4. The no-call control arm moved 10%
+between passes and the effect is ~1% of the arm. It is recorded as unresolved,
+not as a win. The change was kept on the same grounds this page already applies
+to piece 4 above: it *deletes* a per-call string scan and adds no cache
+invalidation, and its equivalence to both scans it replaces is pinned by
+`param_tags_match_nth_param_tag_byte`.
+
+**One claim in this pass was overstated and is corrected here.**
+`ClassRealm::is_annotation_proxy_class` was read as taking a `class_manager`
+read lock on *every* virtual invoke while classes were loading. It does not:
+the cold resolver stamps `class_definition_epoch()` on its negative, so the
+lock is taken once per class **definition**, not once per invoke. What is left
+is an out-of-line `#[cold]` call plus two atomic loads on every virtual invoke,
+for a class most programs never mint - real, but small.
+`any_annotation_proxy_defined()` removes it in one relaxed load and is kept on
+those grounds, not on a measurement. `CRATONVM_LOADER_NO_ANN_PROXY_LATCH=1`.
+
+### The argument round-trip, which is still open
+
+Each additional `int` argument costs ~35 ns against HotSpot's ~0.85 ns, and
+about 11 ns of that is the caller's own `iload` bytecode, so ~25 ns per
+argument is the invoke path itself. The shape is known and is **not** fixed:
+
+The caller's operand stack already holds arguments as 8-byte `CompactValue`
+slots and the callee's locals want exactly that representation, but between
+them every argument goes `CompactValue -> Value -> CompactValue`:
+`pop_arg_for_descriptor_checked` decodes into the 16-byte `Value` enum,
+`args_buf: [Value; 16]` holds it (a 256-byte stack array initialised on every
+invoke, zero-argument calls included), and `copy_args_to_locals` converts it
+back via `from_value_kinded` plus `lkind_of_value`.
+
+**Why it was not taken in this pass.** `args_slice: &[Value]` is consumed
+between those two ends by the whole interception chain
+(`intercept_classloader_set_default_assertion_status`,
+`surefire_lazy_launcher_discover_native`,
+`native_override_for_cached_reflect_invoke`,
+`intercept_force_registered_native_cached`,
+`try_execute_cached_trivial_instance_getter`), by the synchronized-method
+monitor enter, and by JVMTI. Skipping the materialisation means restructuring
+all of that, and `decode_by_descriptor` is exactly the code whose comments
+record three separate already-fixed silent-corruption bugs (the BouncyCastle
+SM2 `SUB_INT` collision, the JNI smuggled-`jobject` path, and `-0.0` under a
+`D` descriptor). It is a project, not a point fix.
+
+**What the next attempt should do.** Precompute the descriptor-driven
+argument slot map alongside `DescriptorFacts` (the category-2 expansion is
+static per method), then add a raw `CompactValue`-to-`CompactValue` transfer
+for the case where the popped kind byte and compact tag already agree with the
+descriptor tag, falling back to today's `Value` path for every shape that does
+not. Keep it behind a switch and A/B it with `probes/Arity.java`'s
+per-argument slope, whose control arm is the zero-argument call.
+
+**Do not bother with the `[Value; 16]` initialisation on its own.** It is a
+256-byte memset per invoke, which is ~1-2% of a 289 ns call - below this
+host's resolution, and not worth the `MaybeUninit` it would take to remove.
+
+### What this pass did NOT find, so nobody re-derives it
+
+* **Fast-path arms for `tableswitch` / `lookupswitch` are not a lever.** Both do
+  fall through to the decoded handler - confirmed, `decoded_instr` rises by
+  exactly one per iteration - but they measure 11.0-11.5x, the same band as
+  arithmetic that never leaves the fast path. The quickened stream plus
+  `execute_instruction` costs about what a fast-path arm costs.
+  `invokedynamic`, `newarray`, `anewarray`, `athrow`, `wide` and `goto_w` share
+  that path; only `newarray` was priced (8.9x, dominated by allocation).
+* **Field *resolution* caching is already solved.** `FieldSiteCache` measured
+  `hit=5402347 miss=332` - 99.994%. The remaining field cost is downstream of
+  resolution, which is how item 1 was found.
+* **Array element access needs nothing of its own.** The whole `0x2e..=0x35`
+  and store family is on the fast path under a range arm; the `byte[]` loop's
+  13.8x is the base dispatch ratio and nothing more.
+* **Deferring the per-bytecode `last_instr_pc` store was considered and
+  declined.** ~30 readers including `stackwalker`, which runs at cross-thread
+  safepoints; the store is to a cache line the frame is touching anyway. Risk
+  far exceeds the ~1 ns.
+* **Hoisting the frame pointer past the second `&mut thread.frames[frame_idx]`
+  was considered and declined.** `interpreter.rs`'s own hoist note records that
+  the checked borrow is deliberate - it is what makes the ~150 arms'
+  `let _ = frame;` discipline compile-time-enforced - and both computations
+  derive from the same base in the same basic block after a null check that
+  already proves the index in range, so the bounds check is plausibly folded
+  already. Needs a disassembly, not a profile.
+
+### The probes
+
+`probes/FieldShape.java`, `probes/BackEdge.java`, `probes/Arity.java`,
+`probes/Dispatch.java`, `probes/RetTag.java`, `probes/DecodedShare.java`. All
+self-time, interleave their arms in both directions on alternating rounds, and
+report min-of-N. Every one of them carries a control arm in the same process,
+which is what makes them usable on a host at 90% CPU - the arms move together,
+the difference does not.
+
+```bash
+javac -d /tmp/probe probes/FieldShape.java probes/BackEdge.java \
+    probes/Arity.java probes/Dispatch.java probes/RetTag.java \
+    probes/DecodedShare.java
+
+cratonvm --java-home <JDK 25> --nojit -c /tmp/probe FieldShape 1000000 9
+cratonvm --java-home <JDK 25> --nojit -c /tmp/probe BackEdge   4000000 9
+cratonvm --java-home <JDK 25> --nojit -c /tmp/probe Arity      1500000 9
+cratonvm --java-home <JDK 25> --nojit -c /tmp/probe Dispatch   1000000 9
+cratonvm --java-home <JDK 25> --nojit -c /tmp/probe RetTag     1500000 9
+
+java -Xint -cp /tmp/probe <Probe> ...            # the reference column
+```
+
+`BackEdge` is the one that needs a quiet host: it is a small difference between
+two large arms, and one A/B pass of it produced an impossible value (turning
+OSR off cannot make a back edge more expensive) purely from load.
+
 ## What has already been taken off it
 
 Four pieces were removed by the retired page's sessions. They are recorded here
