@@ -935,6 +935,26 @@ pub struct GcFlags {
     /// regression: under it the collector tenures exactly where every G1 result
     /// before this flag did.
     pub g1_adaptive_tenuring: bool,
+    /// `CRATONVM_G1_RESERVE_HEAP` — RESERVE `-Xmx` as address space and COMMIT
+    /// only what the collector has actually claimed, instead of allocating and
+    /// zeroing the whole heap in the constructor. Default **ON**
+    /// ([`parse::on_unless_zero`]); `=0` commits every byte up front.
+    ///
+    /// Before F-16 there was no `-Xms` (the flag was parsed and discarded), no
+    /// expansion and no uncommit, so `-Xmx16g` charged 16 GiB against the
+    /// process at startup whether or not a byte of it was used — on Windows,
+    /// 16 GiB of commit charge against the page file immediately.
+    ///
+    /// The committed set is a PREFIX, not an arbitrary subset, because
+    /// `gen_heap::publish_jit_read_bounds` asserts "a raw load anywhere in this
+    /// range cannot fault" and that claim is only expressible as a range.
+    ///
+    /// `=0` is the bisection lever, and the first thing to try for any G1 fault
+    /// at a heap address that looks mapped: under it the whole reservation is
+    /// backed from the start, which is where every G1 result before this flag
+    /// was produced. Note that a platform without a reservation implementation
+    /// takes that path anyway — `G1Collector::heap_is_reserved` says which.
+    pub g1_reserve_heap: bool,
     /// `CRATONVM_G1_DBG_RSET` — after every G1 evacuation pause, verify that
     /// every cross-region reference into a COLLECTABLE region is named in that
     /// region's remembered set. Opt-in diagnostic; whole-heap and O(live
@@ -1210,6 +1230,7 @@ impl GcFlags {
             g1_cleanup_walk: present(src, "CRATONVM_G1_CLEANUP_WALK"),
             g1_adaptive_ihop: on_unless_zero(src, "CRATONVM_G1_ADAPTIVE_IHOP"),
             g1_adaptive_tenuring: on_unless_zero(src, "CRATONVM_G1_ADAPTIVE_TENURING"),
+            g1_reserve_heap: on_unless_zero(src, "CRATONVM_G1_RESERVE_HEAP"),
             identity_hash_evict: on_unless_zero(src, "CRATONVM_IDENTITY_HASH_EVICT"),
             g1_dbg_rset: present(src, "CRATONVM_G1_DBG_RSET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),

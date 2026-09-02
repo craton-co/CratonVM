@@ -130,6 +130,9 @@ pub struct G1ConfigOverrides {
     /// `-XX:ParallelGCThreads=<n>` — evacuation worker count (F-13). `None`
     /// leaves `gc_worker_threads` at its `0` = machine-derived default.
     pub parallel_gc_threads: Option<usize>,
+    /// `-Xms` — bytes to commit up front (F-16). `None` leaves
+    /// `initial_heap_size` at its `0` = ergonomic default.
+    pub initial_heap_size: Option<usize>,
 }
 
 // ─── GPU-offload coordination (Phase 6 item 1) ───────────────────────────
@@ -361,6 +364,13 @@ impl VmHeap {
                     if n > 0 {
                         config.gc_worker_threads = n;
                     }
+                }
+                // F-16: `-Xms`. Clamped to the reservation by
+                // `G1Collector::new`, so an `-Xms` above `-Xmx` yields a heap
+                // rather than a refusal — the two are specified separately and
+                // a user who oversizes one should still get a VM.
+                if let Some(n) = overrides.initial_heap_size {
+                    config.initial_heap_size = n;
                 }
                 VmHeap::G1(G1State::new(config))
             }

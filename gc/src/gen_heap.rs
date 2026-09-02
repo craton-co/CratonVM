@@ -1634,6 +1634,22 @@ pub fn publish_jit_read_bounds(slot: usize, base: usize, end: usize) {
     JIT_READ_BOUNDS.words[slot * 2 + 1].store(end, Ordering::Release);
 }
 
+/// Read back one `[base, end)` pair from [`JIT_READ_BOUNDS`]. `(0, 0)` for an
+/// out-of-range slot or one that was never published.
+///
+/// F-16 needs this: under a reserved-and-committed-on-demand heap the published
+/// bound must never outrun the committed prefix, and that is only checkable by
+/// reading what was published.
+pub fn jit_read_bounds_slot(slot: usize) -> (usize, usize) {
+    if slot >= 3 {
+        return (0, 0);
+    }
+    (
+        JIT_READ_BOUNDS.words[slot * 2].load(Ordering::Acquire),
+        JIT_READ_BOUNDS.words[slot * 2 + 1].load(Ordering::Acquire),
+    )
+}
+
 /// Zero the whole read table — the teardown counterpart, so a dropped heap can
 /// never leave bounds that would admit a load into freed arena memory.
 pub fn clear_jit_read_bounds() {

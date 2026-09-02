@@ -936,6 +936,14 @@ impl<'a> SharedEvac<'a> {
                 return None;
             }
             let idx = self.pool[i];
+            // F-16: the pool is FREE regions, which under a reserved heap may
+            // be address space rather than memory. Commit before the region is
+            // retyped and written into. A refusal is to-space exhaustion, which
+            // this loop's caller already handles by self-forwarding — the same
+            // outcome as an empty pool, reached one region earlier.
+            if !self.collector.commit_through_region(idx) {
+                return None;
+            }
             let region = &mut *self.regions_base.0.add(idx);
             region.region_type = tlab.dest_type;
             if tlab.dest_type == RegionType::Survivor {
@@ -1542,8 +1550,17 @@ impl<'a> SharedEvac<'a> {
 /// Configuration for the G1 garbage collector.
 #[derive(Debug, Clone)]
 pub struct G1CollectorConfig {
-    /// Total heap size in bytes (default 256 MB).
+    /// Total heap size in bytes (default 256 MB). This is `-Xmx`: since F-16
+    /// it is the size of the RESERVATION — address space — not of the memory
+    /// charged to the process at startup.
     pub heap_size: usize,
+    /// F-16 — bytes to commit up front (`-Xms`). `0` means "use the
+    /// ergonomic", which is a sixteenth of the heap with a four-region floor.
+    ///
+    /// Before F-16 the whole of `heap_size` was allocated and zeroed in the
+    /// constructor and `-Xms` was parsed and discarded, so `-Xmx16g` charged
+    /// 16 GiB against the process whether or not a byte was used.
+    pub initial_heap_size: usize,
     /// Region size in bytes (default 1 MB).
     pub region_size: usize,
     /// Target maximum GC pause in milliseconds (default 200).
@@ -1576,6 +1593,8 @@ impl Default for G1CollectorConfig {
     fn default() -> Self {
         Self {
             heap_size: 256 * 1024 * 1024,
+            // F-16: 0 = the ergonomic. See the field doc.
+            initial_heap_size: 0,
             region_size: 1024 * 1024,
             max_gc_pause_ms: 200,
             // T19.3.G1: raised from 45 → 70 so static-init bursts
@@ -2424,7 +2443,7 @@ pub struct G1Collector {
     /// lifetime. `Box<[u8]>` (not `Vec`) to make the no-realloc contract
     /// explicit. Dropped with the collector — no leak.
     #[allow(dead_code)]
-    arena: Box<[u8]>,
+    arena: crate::heap_reservation::ReservedHeap,
     /// All heap regions.
     regions: Mutex<Vec<G1Region>>,
 
@@ -3010,7 +3029,7 @@ static NEXT_G1_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 /// into slot 0.
 impl Drop for G1Collector {
     fn drop(&mut self) {
-        crate::gen_heap::clear_jit_read_bounds_owned_by(self.arena.as_ptr() as usize);
+        crate::gen_heap::clear_jit_read_bounds_owned_by(self.arena.base());
     }
 }
 
@@ -3054,11 +3073,37 @@ impl G1Collector {
         // Fallible, so an -Xmx the OS will not reserve is reported as a heap
         // reservation failure rather than as `handle_alloc_error`'s bare
         // `memory allocation of N bytes failed` — see `alloc_zeroed_heap`.
-        let arena: Box<[u8]> =
-            crate::arena::alloc_zeroed_heap(num_regions * config.region_size, "G1 region array")
-                .into_boxed_slice();
-        let arena_base = arena.as_ptr() as usize;
-        let arena_end = arena_base + arena.len();
+        // F-16 — RESERVE the whole heap, COMMIT a prefix of it.
+        //
+        // `-Xmx` is address space from here on. The committed prefix starts at
+        // `-Xms` (or the ergonomic when it is unset) and grows when a region is
+        // claimed above it; see `commit_through_region`. On a platform without
+        // a reservation implementation, or if the OS refuses one,
+        // `ReservedHeap` falls back to exactly the previous fully-committed
+        // allocation and the rest of the collector cannot tell.
+        //
+        // `CRATONVM_G1_RESERVE_HEAP=0` asks for that fallback deliberately:
+        // every byte committed up front, which is where every G1 result before
+        // F-16 was produced.
+        let reserved = num_regions * config.region_size;
+        let initial_commit = if !gc_flags().g1_reserve_heap {
+            reserved
+        } else if config.initial_heap_size > 0 {
+            config.initial_heap_size.min(reserved)
+        } else {
+            // A sixteenth of the heap, floored at four regions. Small enough
+            // that a short-lived process pays almost nothing for a large
+            // `-Xmx`, large enough that a normal startup does not spend its
+            // first hundred allocations growing.
+            (reserved / 16).max(config.region_size.saturating_mul(4)).min(reserved)
+        };
+        let arena = crate::heap_reservation::ReservedHeap::new(
+            reserved,
+            initial_commit,
+            "G1 region array",
+        );
+        let arena_base = arena.base();
+        let arena_end = arena_base + arena.reserved_len();
 
         let regions: Vec<G1Region> = (0..num_regions)
             .map(|i| G1Region::from_arena(arena_base + i * config.region_size, config.region_size))
@@ -3103,7 +3148,11 @@ impl G1Collector {
         // makes it worth doing: a G1 reference field is a plain pointer (no
         // colored words, no load barrier), unlike ZGC's, which is why ZGC does
         // not publish here.
-        crate::gen_heap::publish_jit_read_bounds(0, arena_base, arena_end);
+        // F-16: the COMMITTED prefix, not the whole reservation. This table
+        // asserts "a raw load anywhere in this range cannot fault", and past
+        // the committed prefix that is exactly false. `commit_through_region`
+        // republishes it as the prefix grows.
+        crate::gen_heap::publish_jit_read_bounds(0, arena_base, arena_base + arena.committed_len());
 
         Self {
             layout_domain: std::sync::atomic::AtomicU32::new(cratonvm_types::FIRST_LAYOUT_DOMAIN),
@@ -3190,16 +3239,76 @@ impl G1Collector {
         self.regions.lock().len()
     }
 
-    /// Bytes committed for the Java heap — this collector's single arena. See
+    /// Bytes committed for the Java heap. See
     /// [`crate::vm_heap::VmHeap::committed_bytes`] for what the quantity is for
     /// and why it must not track live bytes.
     ///
-    /// Fixed for the collector's lifetime: every region is a slice of one
-    /// allocation made in [`Self::new`] and never moved or reallocated (see the
-    /// `arena` field's own note), so this is `num_regions * region_size` and
-    /// needs no lock.
+    /// F-16: this used to be `num_regions * region_size` and constant for the
+    /// collector's lifetime, because the whole heap was allocated in the
+    /// constructor. It now reports what is actually charged to the process,
+    /// which grows as regions are claimed — the number an operator watching
+    /// footprint wants, and the one `Runtime.totalMemory` should be built from.
+    /// [`Self::reserved_bytes`] is the old quantity.
     pub fn committed_bytes(&self) -> usize {
-        self.arena.len()
+        self.arena.committed_len()
+    }
+
+    /// F-16 — bytes of address space reserved, i.e. `-Xmx` rounded to the
+    /// region grid. Fixed for the collector's lifetime.
+    pub fn reserved_bytes(&self) -> usize {
+        self.arena.reserved_len()
+    }
+
+    /// F-16 — is the heap a real reservation, or the fully-committed fallback?
+    /// Diagnostics and tests.
+    pub fn heap_is_reserved(&self) -> bool {
+        self.arena.is_reserved()
+    }
+
+    /// F-16 — make sure every byte up to the END of region `idx` is committed,
+    /// and republish the JIT read bounds if the prefix grew.
+    ///
+    /// Returns `false` when the OS refused, which the caller must treat as "no
+    /// such free region": the address space is reserved but the pages are not
+    /// there, and handing the allocator a pointer into them is a fault, not an
+    /// allocation.
+    ///
+    /// # Why through, and not just this region
+    ///
+    /// The committed set has to be a RANGE, because
+    /// `gen_heap::publish_jit_read_bounds` — which compiled `getfield` fast
+    /// paths test against to decide whether a raw load can fault — can only
+    /// express one. Committing region `idx` therefore commits everything below
+    /// it too. That costs almost nothing in practice: `claim_free_region`
+    /// starts at zero and advances a rotating hint, so claims run roughly in
+    /// index order.
+    ///
+    /// # The invariant, and why no lock is needed
+    ///
+    /// The published bound may LAG the committed prefix; it must never EXCEED
+    /// it. A bound that is too narrow costs a compiled `getfield` a helper call
+    /// and nothing else; a bound that is too wide is a fault.
+    ///
+    /// Commit happens before the republish, and the prefix only grows while
+    /// mutators are running, so a racing republish can only ever publish a
+    /// value that was committed at the moment it read it. That is why this is
+    /// callable from an evacuation worker (which holds no lock but runs with
+    /// every mutator parked) as well as from the allocator (which holds the
+    /// regions lock for other reasons).
+    pub(crate) fn commit_through_region(&self, idx: usize) -> bool {
+        let want = (idx + 1).saturating_mul(self.config.region_size);
+        if want <= self.arena.committed_len() {
+            return true;
+        }
+        if !self.arena.commit_to(want) {
+            return false;
+        }
+        crate::gen_heap::publish_jit_read_bounds(
+            0,
+            self.arena_base,
+            self.arena_base + self.arena.committed_len(),
+        );
+        true
     }
 
     /// Generate the next identity hash code.
@@ -3357,6 +3466,14 @@ impl G1Collector {
     fn claim_free_region(&self, regions: &[G1Region]) -> Option<usize> {
         let start = self.free_scan_hint.load(Ordering::Relaxed);
         let idx = find_free_region_from(regions, start)?;
+        // F-16: a Free region above the committed prefix is address space, not
+        // memory. Commit through it before handing it out; a refusal is
+        // indistinguishable, to every caller, from there being no free region —
+        // which is the truth, and routes to a collection and then to a clean
+        // OutOfMemoryError exactly as heap exhaustion always has.
+        if !self.commit_through_region(idx) {
+            return None;
+        }
         // Resume AFTER this region next time: the caller is about to retype it,
         // so it will not be Free on the next probe.
         let next = if idx + 1 >= regions.len() { 0 } else { idx + 1 };
@@ -3431,9 +3548,16 @@ impl G1Collector {
             return result;
         }
 
-        // Try current Eden region
+        // Try current Eden region. F-16: an Eden region was committed when it
+        // was claimed, so this is an atomic load and a compare — but it is here
+        // rather than assumed, because the rule this file has to keep is "no
+        // byte is touched above the committed prefix", and an assumption is not
+        // a rule.
         let cur = self.current_eden.load(Ordering::Relaxed);
-        if cur < regions.len() && regions[cur].region_type == RegionType::Eden {
+        if cur < regions.len()
+            && regions[cur].region_type == RegionType::Eden
+            && self.commit_through_region(cur)
+        {
             if let Some(result) = regions[cur].bump_alloc(size, 8, "obj:cur-eden") {
                 return Some((result.0, cur));
             }
@@ -3497,6 +3621,13 @@ impl G1Collector {
         let regions_needed = size.div_ceil(region_size).max(1);
 
         let start = find_contiguous_free(regions, regions_needed)?;
+        // F-16: the span crosses `regions_needed` regions and the object's
+        // payload flows straight through them, so every one must be committed
+        // before a byte is written. Committing through the LAST covers them all
+        // (the prefix rule), and a refusal is a failed humongous allocation.
+        if !self.commit_through_region(start + regions_needed - 1) {
+            return None;
+        }
 
         // Classify the span. `cursor = size` on the start makes walkers read
         // the one object; `cursor = 0` on continuations makes walkers skip them.
@@ -3579,6 +3710,7 @@ impl G1Collector {
             if hint < regions.len()
                 && regions[hint].region_type == target_type
                 && !cset.contains(&hint)
+                && self.commit_through_region(hint)
             {
                 if let Some((ptr, _)) = regions[hint].bump_alloc(size, 8, "evac:hint-dest") {
                     return Some(ptr);
@@ -3615,7 +3747,10 @@ impl G1Collector {
         // the semi-space "never allocate into from-space" invariant the
         // generational collector and the Step-9 parallel TLAB path already honour.
         for i in 0..regions.len() {
-            if regions[i].region_type == target_type && !cset.contains(&i) {
+            if regions[i].region_type == target_type
+                && !cset.contains(&i)
+                && this.commit_through_region(i)
+            {
                 if let Some((ptr, _)) = regions[i].bump_alloc(size, 8, "evac:cur-dest") {
                     return Some((ptr, i));
                 }
@@ -11563,7 +11698,10 @@ impl G1Collector {
 
         // Try current Eden region
         let cur = self.current_eden.load(Ordering::Relaxed);
-        if cur < regions.len() && regions[cur].region_type == RegionType::Eden {
+        if cur < regions.len()
+            && regions[cur].region_type == RegionType::Eden
+            && self.commit_through_region(cur)
+        {
             let remaining = regions[cur].remaining();
             if remaining >= 256 {
                 let actual = tlab_carve_size(requested_size, remaining);
@@ -15191,6 +15329,7 @@ mod tests {
     fn small_config() -> G1CollectorConfig {
         G1CollectorConfig {
             heap_size: 8 * 1024 * 1024, // 8 MB
+            initial_heap_size: 0,       // F-16: the ergonomic
             region_size: 1024 * 1024,   // 1 MB
             max_gc_pause_ms: 200,
             ihop_percent: 45,
@@ -15766,9 +15905,13 @@ mod tests {
         assert_eq!(gc.region_shift, 20);
         assert_eq!(gc.num_regions(), 8);
         assert_eq!(
-            gc.committed_bytes(),
+            gc.reserved_bytes(),
             8 * 1024 * 1024,
-            "the arena is num_regions * the ROUNDED size"
+            "the reservation is num_regions * the ROUNDED size"
+        );
+        assert!(
+            gc.committed_bytes() <= gc.reserved_bytes(),
+            "F-16: committed tracks what has actually been claimed"
         );
         let bases: Vec<usize> = gc.regions.lock().iter().map(|r| r.data.addr()).collect();
         for (i, base) in bases.into_iter().enumerate() {
@@ -15972,7 +16115,14 @@ mod tests {
             prev = next;
         }
 
-        // Leave the evacuator nowhere to copy to.
+        // Leave the evacuator nowhere to copy to. F-16: a region the fixture
+        // declares FULL has to be committed as well as re-typed — a real full
+        // heap reached that state by allocating into it, and the walkers this
+        // pause runs will read every byte below the cursor.
+        let region_count = gc.num_regions();
+        for i in 0..region_count {
+            assert!(gc.commit_through_region(i), "fixture: commit must succeed");
+        }
         gc.with_regions_mut(|regions| {
             for r in regions.iter_mut() {
                 if r.region_type == RegionType::Free {
@@ -17119,6 +17269,146 @@ mod tests {
         gc.update_ihop(0);
         let after = gc.marking_threshold_bytes();
         assert!(after >= before);
+    }
+
+    // -- F-16: the heap is reserved, and committed on demand --
+
+    #[test]
+    fn a_large_heap_does_not_commit_itself_at_startup() {
+        let gc = G1Collector::new(G1CollectorConfig {
+            heap_size: 512 * 1024 * 1024,
+            initial_heap_size: 4 * 1024 * 1024,
+            ..small_config()
+        });
+        assert_eq!(gc.reserved_bytes(), 512 * 1024 * 1024);
+        if gc.heap_is_reserved() {
+            assert_eq!(
+                gc.committed_bytes(),
+                4 * 1024 * 1024,
+                "-Xmx is address space; -Xms is memory"
+            );
+        } else {
+            assert_eq!(
+                gc.committed_bytes(),
+                gc.reserved_bytes(),
+                "the fallback commits everything, which is the pre-F-16 behaviour"
+            );
+        }
+    }
+
+    #[test]
+    fn allocating_past_the_initial_prefix_grows_it() {
+        let gc = G1Collector::new(G1CollectorConfig {
+            heap_size: 16 * 1024 * 1024,
+            region_size: 1024 * 1024,
+            initial_heap_size: 1024 * 1024,
+            ..small_config()
+        });
+        if !gc.heap_is_reserved() {
+            return; // nothing to grow; the fallback is fully committed
+        }
+        let before = gc.committed_bytes();
+        assert_eq!(before, 1024 * 1024, "one region committed to start with");
+
+        // Consume more than one region's worth. Each object is small, so this
+        // is a lot of them — but the point is the region CLAIM, so drive it
+        // through the allocator rather than reaching into the region table.
+        let mut kept: Vec<ObjectRef> = Vec::new();
+        for _ in 0..40_000 {
+            kept.push(gc.alloc_object(ClassId::new(1), 2));
+        }
+        assert!(
+            gc.committed_bytes() > before,
+            "claiming a region above the committed prefix must commit through it \
+             ({} -> {})",
+            before,
+            gc.committed_bytes()
+        );
+        assert!(gc.committed_bytes() <= gc.reserved_bytes());
+
+        // Every object handed out must be readable — this is the assertion that
+        // would fault, not fail, if a region were handed out uncommitted.
+        for (i, obj) in kept.iter().enumerate() {
+            gc.set_field(*obj, 0, Value::Int(i as i32));
+        }
+        for (i, obj) in kept.iter().enumerate() {
+            assert_eq!(gc.get_field(*obj, 0), Value::Int(i as i32));
+        }
+    }
+
+    #[test]
+    fn a_humongous_span_commits_every_region_it_covers() {
+        let gc = G1Collector::new(G1CollectorConfig {
+            heap_size: 16 * 1024 * 1024,
+            region_size: 1024 * 1024,
+            initial_heap_size: 1024 * 1024,
+            ..small_config()
+        });
+        // Three regions' worth of payload: the span crosses region boundaries
+        // and the object's bytes flow straight through them, so a partially
+        // committed span is a fault in the middle of an array write.
+        let elems = 3 * 1024 * 1024 / 8;
+        let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, elems);
+        assert!(
+            gc.committed_bytes() >= 3 * 1024 * 1024,
+            "the whole span must be committed before a byte of it is written"
+        );
+        // Touch both ends, which is where a short commit would show.
+        gc.set_array_element(arr, 0, Value::Long(0x1111)).unwrap();
+        gc.set_array_element(arr, elems - 1, Value::Long(0x2222))
+            .unwrap();
+        assert_eq!(gc.get_array_element(arr, 0).unwrap(), Value::Long(0x1111));
+        assert_eq!(
+            gc.get_array_element(arr, elems - 1).unwrap(),
+            Value::Long(0x2222)
+        );
+    }
+
+    /// The JIT read bounds say "a raw load anywhere in this range cannot
+    /// fault". Under a reserved heap that is only true of the COMMITTED prefix,
+    /// and a bound that outran it would be a fault in compiled code rather than
+    /// a failing test.
+    #[test]
+    fn the_published_jit_read_bounds_never_outrun_the_committed_prefix() {
+        let gc = G1Collector::new(G1CollectorConfig {
+            heap_size: 16 * 1024 * 1024,
+            region_size: 1024 * 1024,
+            initial_heap_size: 1024 * 1024,
+            ..small_config()
+        });
+        let check = |when: &str| {
+            let (base, end) = crate::gen_heap::jit_read_bounds_slot(0);
+            if base == 0 && end == 0 {
+                return; // another collector in this process owns the table
+            }
+            if base != gc.arena_base {
+                return; // ...or it names a different heap
+            }
+            assert!(
+                end <= gc.arena_base + gc.committed_bytes(),
+                "{when}: published read bound {end:#x} is past the committed \
+                 prefix {:#x} — a compiled getfield would issue a raw load into \
+                 memory that is reserved but not mapped",
+                gc.arena_base + gc.committed_bytes()
+            );
+        };
+        check("at construction");
+        for _ in 0..40_000 {
+            let _ = gc.alloc_object(ClassId::new(1), 2);
+            check("after growth");
+        }
+    }
+
+    #[test]
+    fn an_initial_size_at_the_heap_size_commits_everything() {
+        // The `CRATONVM_G1_RESERVE_HEAP=0` shape, expressed through the config
+        // rather than the flag: nothing is lazy, which is the pre-F-16 world.
+        let gc = G1Collector::new(G1CollectorConfig {
+            heap_size: 8 * 1024 * 1024,
+            initial_heap_size: 8 * 1024 * 1024,
+            ..small_config()
+        });
+        assert_eq!(gc.committed_bytes(), gc.reserved_bytes());
     }
 
     // -- F-15: adaptive IHOP on the allocation rate --
@@ -21352,6 +21642,7 @@ mod tests {
         let region_size = 1024 * 1024;
         G1CollectorConfig {
             heap_size: region_size * region_count,
+            initial_heap_size: 0,
             region_size,
             max_gc_pause_ms: 200,
             ihop_percent: 45,
