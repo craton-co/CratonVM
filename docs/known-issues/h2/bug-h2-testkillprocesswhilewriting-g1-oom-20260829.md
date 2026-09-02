@@ -145,11 +145,12 @@ The candidates it yields (`0x2004520df70`, `+0x20`, `+0x18`, `+0x18`, ...) are
 plausible heap addresses that are not object headers, so the slots are being
 read as references either way.
 
-### 4b. 2026-09-01: what a `class_id=0 kind=Object num_slots=8192` object is -- G1 published the address BEFORE the header
+### 4b. 2026-09-02: G1 published every out-of-line allocation BEFORE its header -- a real defect, and a CANDIDATE answer to 4a that the measurement does NOT confirm
 
-Section 4a's question has an answer, and it does not need a debugger: it is a
-**torn `ObjectHeader` store on an array**, read through a cursor that already
-said an object was there.
+Read this section for the defect it closes. It also offers an explanation of
+section 4a's holder shape, and **section 4c measures that explanation and does
+not confirm it** -- the shape survives the fix. Do not carry 4b's story forward
+without 4c.
 
 `G1Region::bump_alloc` advanced `self.cursor` FIRST and zeroed the span
 afterwards, and all four of G1's header-writing allocation entry points --
@@ -205,7 +206,7 @@ implements it with a Release fence. **G1 was the only backend without it.**
 This page's own control -- "the class passes under the default collector; only
 the explicit `-XX:+UseG1GC` arm fails" -- is that difference.
 
-#### What was fixed
+#### What was fixed (independently of whether it is 4a's producer)
 
 * `G1Region::bump_alloc_initialized` and
   `G1Collector::alloc_in_region_initialized` run the caller's header write over
@@ -229,9 +230,101 @@ the explicit `-XX:+UseG1GC` arm fails" -- is that difference.
   its own region's OBJECT GRID plus its raw mark word. `[GC] g1
   evac_ref_rejected=` carries the split.
 
+### 4c. 2026-09-02, MEASURED: the OOM face stays gone, the control passes, and 4b is NOT this workload's producer
+
+One binary (`8e9c0724`, `lto=false` -- a correctness run, not a timing one),
+three arms interleaved, 900 s cap, `CRATONVM_GC_STATS=1`, Azure Linux
+`--Xmx 1g`. Loads recorded because this host ran between 27 and 250 during the
+window and the page has been misled by a contended arm before.
+
+| arm | rc | secs | loadavg | real `OutOfMemoryError` | `[SECURITY V7b]` lines |
+|---|---:|---:|---|---:|---:|
+| A `-XX:+UseG1GC` | 124 (cap) | 901 | 27 -> 74 | **0** | 28 |
+| B same + `CRATONVM_G1_LATE_HEADER_WRITE=1` | 124 (cap) | 900 | 74 -> **250** | **0** | 0 |
+| C default collector | **0 (PASS)** | 811 | 250 -> 66 | 0 | 0 |
+
+Three things this table does and does not say.
+
+* **The control is not vacuous.** C passes in 811 s under a load excursion, so
+  the 900 s cap is reachable on this host on this day; A and B capping is a
+  failure, not a slow machine. That is the arm this page asserts and it now has
+  a same-day, same-binary measurement.
+* **The OOM face stays gone**, on both G1 arms, which is the 2026-08-30 fix
+  holding rather than anything new here.
+* **A vs B is NOT usable.** B ran through a load-250 excursion; per this repo's
+  own rule a contended arm can invert a verdict, so the kill switch has not yet
+  been exercised on comparable ground. It exists (`CRATONVM_G1_LATE_HEADER_WRITE=1`,
+  one binary) so that comparison can be made on a quiet host.
+
+The V7b line counts are **not** comparable to this page's 48 617 / 50 747: the
+2026-08-30 addendum deduplicated that report to one line per distinct
+`(holder, target)` pair. 28 and 0 are distinct pairs against six.
+
+#### And the 4a holder shape SURVIVES the ordering fix
+
+Arm A, with the allocation-ordering fix active, still produces it:
+
+```text
+REJECTED a non-object candidate (#1, torn=false torn_total=0 verdict=AboveCursor):
+    holder=0x20042800000 class_id=0 kind=Object num_slots=8192 array_len=0
+    holder_mark=0x1000000000000000
+    holder_region=r4/Survivor/off=0/cursor=144904
+    grid=OBJECT-START idx=0 size=0x20010 slot=49872 candidate=0x20044b0e070
+```
+
+The two new fields settle two things at once. `grid=OBJECT-START idx=0` says the
+holder is the FIRST object in its region's own grid, not an interior address
+someone mis-derived. And `holder_mark=0x1000000000000000` is `gc_age=1` and
+nothing else -- an evacuated 8192-element reference array would read
+`0x1001000000000000`, so this is that word **with exactly the kind bit (48)
+missing**, and with the age bump present, meaning the evacuator wrote it.
+
+A second run reproduces the same POSITION with different contents --
+`class_id=1130142320 num_slots=512 size=0x2010` and `class_id=1160062808`, both
+at `off=0` of a Survivor region, `idx=0`. So the invariant is not "class 0", and
+it is not "8192": it is **the first object copied into a Survivor region has a
+header that is not an object**.
+
+#### What the source/destination split rules out
+
+`evacuate_object` now snapshots the source's `(class_id, shape, kind)` and
+compares the destination's after the copy and the two quartet updates. Over a
+500 s run: **`copy_shape_drift=0`**. The memcpy and `set_gc_age` /
+`add_gc_flags` are the only writes there, so the destination's garbage is
+INHERITED, not manufactured -- which is what pushes the question upstream of
+evacuation entirely.
+
+`note_root_object_plausibility` is worth naming here because it looked like the
+answer and is not: a CSet root that fails the object screen is counted and
+**evacuated anyway** (`NON_OBJECT_ROOT_COPIED` exists precisely to log that).
+Measured on the same run: `CSet ROOT is not an object` **0**, `a NON-OBJECT root
+was COPIED` **0**. Roots are not the source on this workload.
+
+#### A trap this page should not step in twice
+
+The first source-side screen refused every `class_id >= 1 << 24` -- sound for
+LOADED classes, wrong for this VM. `AUTOBOX_CLASS_ID` is `u32::MAX` and lambda
+proxies are numbered by `SharedVm::alloc_lambda_proxy_id`, a bare counter from
+`0x8000_0000`. It reported 18 implausible headers in one run and **all eighteen
+were autobox wrappers or lambda proxies** -- a screen firing on correct,
+unchanged behaviour, which is worse than no screen because it invites a
+conclusion. The screen now refuses only the BAND between `1 << 24` and
+`0x8000_0000`, plus class 0 carrying thousands of slots.
+
+#### What is open
+
+Who writes a header, at the start of an object the evacuator then copies into a
+Survivor region, with the kind bit clear. Ruled out so far: the evacuation copy
+itself (`copy_shape_drift=0`), non-object roots (0/0), and -- for this
+workload -- G1's out-of-line allocator, whose window is real and now closed but
+whose closure did not remove the shape. The next instrument is the same
+source-side screen, corrected, run with `CRATONVM_G1_DBG_REACH=1` so the report
+names the CARVE that handed out the span; and the A-vs-B kill-switch comparison
+on a host quiet enough for it to mean something.
+
 ## Status
 
-**OPEN. The OOM face is FIXED (2026-08-30) but the FAILURE MODE MOVED to SIGSEGV -- read the addendum above, section 3, before treating that as an improvement. The 48 617 dangling references are 6 holders, not a rate. Split out 2026-08-29** from
+**OPEN. The OOM face is FIXED (2026-08-30) and held on 2026-09-02 (section 4c: 0 real `OutOfMemoryError` on both G1 arms, and the default-collector control PASSES in 811 s the same day, so the cap is a failure and not a slow host). A real allocation-publication defect was fixed on 2026-09-02 (section 4b) and did NOT close the class -- section 4a's holder shape survives it. The FAILURE MODE MOVED to SIGSEGV in 2026-08-30's arm -- read section 3 before treating that as an improvement. The 48 617 dangling references are 6 holders, not a rate. Split out 2026-08-29** from
 `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`, whose ZGC
 defect is closed and which never owned this row. The class **passes under the
 default collector**; only the explicit `-XX:+UseG1GC` arm fails.
