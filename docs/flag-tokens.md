@@ -836,7 +836,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-90 tokens.
+91 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -869,6 +869,7 @@ export inherited from a parent shell.
 | `g1-mark-lock-yield` | `CRATONVM_G1_MARK_LOCK_YIELD` |
 | `g1-shared-alloc` | `CRATONVM_G1_SHARED_ALLOC` |
 | `g1-eden-stripes` | `CRATONVM_G1_EDEN_STRIPES` |
+| `g1-parallel-mark` | `CRATONVM_G1_PARALLEL_MARK` |
 | `g1-workers` | `CRATONVM_G1_WORKERS` |
 | `g1-rset-source-cap` | `CRATONVM_G1_RSET_SOURCE_CAP` |
 | `g1-verify-budget` | `CRATONVM_G1_VERIFY_BUDGET` |

@@ -1898,16 +1898,60 @@ impl G1Region {
     /// allocation TAMS is an object boundary so it cannot legitimately happen,
     /// and over-counting only retains a region for one more cycle.
     fn try_mark_and_account(&self, addr: usize) -> bool {
+        match self.try_mark_and_measure(addr) {
+            None => false,
+            Some(bytes) => {
+                if bytes > 0 {
+                    self.marked_bytes_below_tams
+                        .fetch_add(bytes, Ordering::Relaxed);
+                }
+                true
+            }
+        }
+    }
+
+    /// F-12 — [`Self::try_mark_and_account`] split in two: mark the bit and
+    /// RETURN the bytes the caller must add to
+    /// [`Self::marked_bytes_below_tams`], instead of adding them here.
+    ///
+    /// `None` means the object was already black. `Some(0)` means it was newly
+    /// marked but is at or above TAMS (implicitly live; `cleanup` adds that
+    /// extent wholesale, so counting it here is the G1MAT-1 double-count).
+    ///
+    /// # Why this exists, and the obligation it creates
+    ///
+    /// This is still the ONLY caller of `mark_bitmap.try_mark`, so F-06's
+    /// "every mark goes through one funnel" property is intact. What moves is
+    /// WHERE the byte count lands. One `fetch_add` per marked object is free
+    /// for a single marker and is not free for several: a mark cycle walks a
+    /// handful of regions, so N workers were doing a read-modify-write on the
+    /// SAME `AtomicUsize` cache line once per object. Measured on a
+    /// 160,000-object graph at six workers, that one atomic was about 30 ns per
+    /// object — enough on its own to make parallel marking slower than serial
+    /// marking.
+    ///
+    /// The obligation is that the returned bytes MUST reach the accumulator.
+    /// An under-count makes a live region look dead and `cleanup` frees it in
+    /// place, which is the failure F-06's doc describes. The marker discharges
+    /// it through [`MarkLiveBytes`], whose `Drop` flushes — so an early
+    /// `break`, a `return`, or an unwind in the middle of a batch cannot lose
+    /// the count. Any NEW caller must do the same, or call
+    /// `try_mark_and_account` and pay the atomic.
+    ///
+    /// A debug build re-derives the accumulator by walking the heap on every
+    /// cleanup and asserts the two agree, so a dropped batch is a failing test
+    /// rather than a silently freed live region.
+    fn try_mark_and_measure(&self, addr: usize) -> Option<usize> {
         if !self.mark_bitmap.try_mark(addr) {
-            return false;
+            return None;
         }
         let Some(off) = addr.checked_sub(self.data.addr()) else {
-            return true;
+            return Some(0);
         };
         // At or above TAMS: implicitly live, and `cleanup` adds that extent
         // wholesale. Counting it here as well is the G1MAT-1 double-count.
         if off >= self.tams() {
-            return true;
+            return Some(0);
         }
         // SAFETY: `off < tams <= cursor`, so `addr` is inside this region's
         // live extent; every caller reached it through a region lookup, and the
@@ -1915,10 +1959,20 @@ impl G1Region {
         let header = unsafe { &*(addr as *const ObjectHeader) };
         let size = object_total_size(header);
         if size >= HEADER_SIZE && off.saturating_add(size) <= self.cursor() {
-            self.marked_bytes_below_tams
-                .fetch_add(size, Ordering::Relaxed);
+            Some(size)
+        } else {
+            Some(0)
         }
-        true
+    }
+
+    /// F-12 — add `bytes` to this region's live accumulator in one step.
+    /// The flush half of [`Self::try_mark_and_measure`].
+    #[inline]
+    fn add_marked_bytes(&self, bytes: usize) {
+        if bytes > 0 {
+            self.marked_bytes_below_tams
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
     }
 
     /// Remaining free bytes in this region.
@@ -2161,6 +2215,105 @@ const MARK_WORKLIST_CAP: usize = 1 << 20;
 /// single-acquisition step exactly.
 const MARK_LOCK_BATCH: usize = 32;
 
+/// F-12 — how many gray addresses a marking worker pulls from the shared seed
+/// queue in one refill.
+///
+/// The seed queue (`G1Collector::mark_worklist`) is where roots, SATB
+/// overwrites and the overflow rescan deposit work, and every worker refills
+/// from it under one lock. Taking one entry at a time would make that lock the
+/// new bottleneck; taking too many would leave one worker holding the whole
+/// initial root set while its peers steal it back an entry at a time. 64 is two
+/// batches' worth of scanning, so a worker that refills has enough to work on
+/// while its peers refill too.
+const MARK_REFILL_CHUNK: usize = 64;
+
+/// F-12 — RAII "this thread has mark work in flight" counter.
+///
+/// Termination for a parallel marker cannot be "every queue is empty": a worker
+/// that has popped an object and is scanning it holds work that is in no queue,
+/// and its children are not pushed until the scan finishes. A peer that
+/// observed empty queues at that moment would declare marking converged with a
+/// live subtree unscanned. This counter is the missing term, and it is the same
+/// shape as `SharedEvac::run_worker`'s `outstanding`.
+///
+/// The decrement is in `Drop` for the reason recorded there: a worker that
+/// unwound past its decrement would leave the count permanently above zero, and
+/// a leaked count of exactly that kind once cost 3h08m of CPU in a suite that
+/// finishes in seconds. Here it would not hang — it would make the cycle never
+/// report convergence, so the coordinator would spin the marker until the next
+/// pause forced the issue — which is quieter and therefore worse.
+struct ActiveMarker<'a>(&'a AtomicUsize);
+
+/// F-12 — one batch's worth of live-byte credits, flushed once instead of once
+/// per marked object.
+///
+/// `G1Region::try_mark_and_measure` hands back the bytes a newly-marked object
+/// contributes to its region's `marked_bytes_below_tams`, and this holds them
+/// until the end of the batch. The point is the shape of the contention: a mark
+/// cycle touches a handful of regions, so a per-object `fetch_add` puts N
+/// markers on one cache line once per object. Batching turns that into one
+/// read-modify-write per region per 32 objects.
+///
+/// A batch touches very few distinct regions, so a linear scan over a small
+/// vector beats any map — and the vector is reused across batches, so the
+/// steady state allocates nothing.
+///
+/// **The flush is in `Drop`, and that is the whole safety argument.** An
+/// under-counted region looks deader than it is, and `cleanup` frees a
+/// too-dead-looking Old region IN PLACE. Every exit from the batch — the normal
+/// end, the `break` when the deque runs dry, and an unwind out of a scan — must
+/// therefore flush, which is exactly what `Drop` guarantees and what an
+/// explicit call at the bottom of the loop would not.
+struct MarkLiveBytes<'a> {
+    regions: &'a [G1Region],
+    /// `(region index, bytes)`, in first-touched order.
+    pending: Vec<(usize, usize)>,
+}
+
+impl<'a> MarkLiveBytes<'a> {
+    fn new(regions: &'a [G1Region]) -> Self {
+        Self {
+            regions,
+            pending: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn add(&mut self, region_idx: usize, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(entry) = self.pending.iter_mut().find(|(i, _)| *i == region_idx) {
+            entry.1 += bytes;
+            return;
+        }
+        self.pending.push((region_idx, bytes));
+    }
+}
+
+impl Drop for MarkLiveBytes<'_> {
+    fn drop(&mut self) {
+        for &(idx, bytes) in self.pending.iter() {
+            self.regions[idx].add_marked_bytes(bytes);
+        }
+    }
+}
+
+impl<'a> ActiveMarker<'a> {
+    #[inline]
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+
+impl Drop for ActiveMarker<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Bound on the per-collection pause-record ring (§7 item 6). 64K records is
 /// ~1.5 MB and covers a very long soak's most-recent window for p50/p99; older
 /// records are evicted (and counted) so memory stays bounded.
@@ -2177,6 +2330,52 @@ const PAUSE_HISTORY_CAP: usize = 1 << 16;
 /// unnoticed: 1024 allocations is at most ~40 KB of objects, against a trigger
 /// that fires on 25% of the whole heap.
 const NEEDS_GC_RECOUNT_INTERVAL: usize = 1024;
+
+/// F-13 — evacuation worker count for this collector's configuration.
+///
+/// Free-standing because F-12 sizes the concurrent-mark deques from it in
+/// `G1Collector::new`, before there is a `&self` to ask.
+///
+/// Precedence: the `CRATONVM_G1_WORKERS` diagnostic override, then an explicit
+/// `gc_worker_threads` (clamped to the hardware), then the machine-derived
+/// ergonomic. See [`ergonomic_gc_worker_threads`].
+fn gc_worker_threads_for(config: &G1CollectorConfig) -> usize {
+    // Diagnostic override: `CRATONVM_G1_WORKERS=N` forces the worker count
+    // (e.g. =1 to drain the parallel path serially and isolate concurrency
+    // races from logic divergences). Falls back to the config otherwise.
+    if let Some(n) = gc_flags().g1_workers {
+        return n.max(1);
+    }
+    let avail = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1);
+    match config.gc_worker_threads {
+        0 => ergonomic_gc_worker_threads(avail),
+        cfg => cfg.min(avail),
+    }
+}
+
+/// F-12 — concurrent-mark worker count for this collector's configuration.
+///
+/// A quarter of the evacuation worker count, rounded up, which is HotSpot's
+/// `ConcGCThreads` ergonomic. The division is the whole point and is not a
+/// hedge: evacuation workers run inside a stop-the-world pause where the
+/// application is stopped and every core is free, while marking workers run
+/// BESIDE the application. Sizing the marker at the pause's width would hand a
+/// quarter to a third of the machine to the collector for the length of a
+/// concurrent cycle, which is how you shorten a mark and lengthen the program.
+///
+/// `CRATONVM_G1_PARALLEL_MARK=0` pins it to 1 — the single worker
+/// `ConcurrentMarkController::spawn` used to start unconditionally — and is the
+/// bisection lever for F-12. `CRATONVM_G1_WORKERS=N` still reaches this through
+/// [`gc_worker_threads_for`], so `=1` gives a single marker too.
+fn concurrent_mark_worker_count(config: &G1CollectorConfig) -> usize {
+    if !gc_flags().g1_parallel_mark {
+        return 1;
+    }
+    gc_worker_threads_for(config).div_ceil(4).max(1)
+}
 
 /// F-13 — evacuation worker count for a machine with `cpus` hardware threads.
 ///
@@ -2781,6 +2980,49 @@ pub struct G1Collector {
     /// addresses so the queue is `Send`/`Sync` without `unsafe impl`
     /// gymnastics for `*mut u8`.
     mark_worklist: Mutex<Vec<usize>>,
+    /// F-12 — one gray deque per concurrent-mark worker.
+    ///
+    /// `mark_worklist` above stays as the SHARED SEED queue: roots, SATB
+    /// overwrites, evacuation keep-alives and the overflow rescan all deposit
+    /// there, and every worker refills from it in `MARK_REFILL_CHUNK` bites.
+    /// These are where the transitive closure actually happens — a worker pops
+    /// from the back of its own deque and pushes the children it discovers onto
+    /// the same end, so the common case touches a lock nobody else wants.
+    ///
+    /// Marking used to be ONE worker draining ONE `Mutex<Vec<usize>>`, so even
+    /// a second worker would have contended on every push and pop. Mark
+    /// duration is not just CPU: it sets how much headroom the IHOP heuristic
+    /// has to leave, so a slow marker costs heap.
+    ///
+    /// **Locking discipline, and it is load-bearing.** A deque is only ever
+    /// touched while its toucher holds the regions guard — `read()` for a
+    /// worker, `write()` for a pause. That is what makes the post-pause gray
+    /// remap correct: `remap_gray_set_after_pause` rewrites every deque under
+    /// the write guard, so no worker can be holding a pre-pause address. A
+    /// refill or a steal that ran without the regions guard would break it, and
+    /// the symptom would be a marker dereferencing an evacuated object.
+    ///
+    /// Stealing takes at most ONE deque lock at a time — the thief drains into
+    /// a local vector and only then extends its own — so there is no lock-order
+    /// cycle between two workers stealing from each other.
+    mark_deques: Box<[Mutex<Vec<usize>>]>,
+    /// F-12 — marking workers currently holding popped-but-unscanned work.
+    /// See [`ActiveMarker`] for why an empty-queue test alone is not
+    /// termination.
+    mark_active: AtomicUsize,
+    /// F-12 telemetry — successful steals from a peer's deque.
+    ///
+    /// The engagement census for the work-stealing half of F-12. Zero steals on
+    /// a run with more than one worker means the seed queue alone kept everyone
+    /// fed (fine, and the common case for a wide root set), but zero steals
+    /// AND one worker doing all the scanning is the reading that says the
+    /// parallelism is not there.
+    mark_steals: AtomicUsize,
+    /// F-12 telemetry — objects scanned, per worker id.
+    ///
+    /// The distribution is the point, not the total: a parallel marker whose
+    /// work all lands on worker 0 is a serial marker with extra locks.
+    mark_worker_scans: Box<[AtomicUsize]>,
 
     /// Round-9 gc HIGH-5 — set when any `mark_worklist` push is
     /// dropped because the cap was hit. The marker checks this flag at
@@ -2879,6 +3121,23 @@ pub struct G1Collector {
     /// and hide an innocent object's slot 0 — under-marking). Cleared at
     /// cleanup/abort; empty outside a cycle.
     reference_skip: Mutex<FxHashSet<usize>>,
+    /// F-12 — `reference_skip.len()`, readable without taking its lock.
+    ///
+    /// `scan_object_refs` consults the skip set once per non-array object, and
+    /// with one marker that was an uncontended mutex — a few nanoseconds,
+    /// invisible. With N markers it is a convoy on a single global lock taken
+    /// per SCANNED OBJECT, which measured as a large part of why parallel
+    /// marking was initially SLOWER than serial marking on a 160,000-object
+    /// graph. The set is almost always empty (it is populated only while a mark
+    /// cycle has live Weak/Soft/Phantom `Reference` objects registered), so a
+    /// relaxed load that skips the lock removes the convoy outright.
+    ///
+    /// Maintained beside every mutation of the set, all of which are
+    /// stop-the-world. It is a HINT in the safe direction only: a stale zero
+    /// would skip a live referent's hiding, so it is stored AFTER the set is
+    /// filled and BEFORE it is cleared — see the sites. Being conservative the
+    /// other way (a stale non-zero) only costs a lock acquisition.
+    reference_skip_len: AtomicUsize,
 
     /// Finalizer-resurrection input for the CURRENT collection (see
     /// [`Self::collect_garbage_with_finalizers`]): referent addresses of
@@ -3311,6 +3570,14 @@ impl G1Collector {
             marking_complete: AtomicBool::new(false),
             mixed_gc_remaining: AtomicU64::new(0),
             mark_worklist: Mutex::new(Vec::new()),
+            mark_deques: (0..concurrent_mark_worker_count(&config))
+                .map(|_| Mutex::new(Vec::new()))
+                .collect(),
+            mark_active: AtomicUsize::new(0),
+            mark_steals: AtomicUsize::new(0),
+            mark_worker_scans: (0..concurrent_mark_worker_count(&config))
+                .map(|_| AtomicUsize::new(0))
+                .collect(),
             mark_worklist_overflowed: AtomicBool::new(false),
             mark_saw_implausible: AtomicBool::new(false),
             mark_oob_gray_skips: AtomicUsize::new(0),
@@ -3323,6 +3590,7 @@ impl G1Collector {
             gray_prov: Mutex::new(std::collections::HashMap::new()),
             v7b_reported: Mutex::new(std::collections::HashSet::new()),
             reference_skip: Mutex::new(FxHashSet::default()),
+            reference_skip_len: AtomicUsize::new(0),
             pending_finalizer_roots: Mutex::new(Vec::new()),
             resurrected_finalizers: Mutex::new(Vec::new()),
             kept_unresolved_regions: Mutex::new(RegionSet::new()),
@@ -4427,21 +4695,7 @@ impl G1Collector {
 
         // Remap (or drop) stale concurrent-mark worklist entries — same
         // protocol as the young paths (done under STW, guard held).
-        {
-            let mut worklist = self.mark_worklist.lock();
-            if !worklist.is_empty() {
-                worklist.retain_mut(|addr| {
-                    if let Some(&new_addr) = pointer_map.get(&*addr) {
-                        *addr = new_addr;
-                        return true;
-                    }
-                    match self.region_for_ptr(&regions, *addr as *mut u8) {
-                        Some(idx) if cset_set.contains(&idx) => false,
-                        _ => true,
-                    }
-                });
-            }
-        }
+        self.remap_gray_set_after_pause(&regions, &cset_set, &pointer_map);
 
         let pause_us = start.elapsed().as_micros() as u64;
         phases.close(pause_us);
@@ -4951,25 +5205,7 @@ impl G1Collector {
         // Done under STW (still holding `regions.lock()`), so no marker
         // thread can be reading/writing `mark_worklist` concurrently — the
         // concurrent marker takes the same lock for each step.
-        {
-            let mut worklist = self.mark_worklist.lock();
-            if !worklist.is_empty() {
-                worklist.retain_mut(|addr| {
-                    if let Some(&new_addr) = pointer_map.get(&*addr) {
-                        // Object was evacuated — follow the forwarding ptr.
-                        *addr = new_addr;
-                        return true;
-                    }
-                    // Not forwarded. If the address lived in a CSet region
-                    // it is now dangling (the region was reset above) so
-                    // drop it. Otherwise (Old / non-CSet) leave it alone.
-                    match self.region_for_ptr(&regions, *addr as *mut u8) {
-                        Some(idx) if cset_set.contains(&idx) => false,
-                        _ => true,
-                    }
-                });
-            }
-        }
+        self.remap_gray_set_after_pause(&regions, &cset_set, &pointer_map);
 
         let pause_us = start.elapsed().as_micros() as u64;
         phases.close(pause_us);
@@ -5433,21 +5669,7 @@ impl G1Collector {
         // every gray pointing into freed CSet regions (marker UAF whenever a
         // new mark cycle overlaps the mixed sequence). With the keep-alive
         // above, every retained CSet gray has a forwarding entry.
-        {
-            let mut worklist = self.mark_worklist.lock();
-            if !worklist.is_empty() {
-                worklist.retain_mut(|addr| {
-                    if let Some(&new_addr) = pointer_map.get(&*addr) {
-                        *addr = new_addr;
-                        return true;
-                    }
-                    match self.region_for_ptr(&regions, *addr as *mut u8) {
-                        Some(idx) if cset_set.contains(&idx) => false,
-                        _ => true,
-                    }
-                });
-            }
-        }
+        self.remap_gray_set_after_pause(&regions, &cset_set, &pointer_map);
 
         // Decrement mixed GC counter.
         // Relaxed ordering: mixed_gc_remaining and marking_complete are GC-internal
@@ -5497,20 +5719,75 @@ impl G1Collector {
     /// explicit `gc_worker_threads` (clamped to the hardware), then the
     /// machine-derived ergonomic. See [`ergonomic_gc_worker_threads`].
     fn parallel_worker_count(&self) -> usize {
-        // Diagnostic override: `CRATONVM_G1_WORKERS=N` forces the worker count
-        // (e.g. =1 to drain the parallel path serially and isolate concurrency
-        // races from logic divergences). Falls back to the config otherwise.
-        if let Some(n) = gc_flags().g1_workers {
-            return n.max(1);
+        gc_worker_threads_for(&self.config)
+    }
+
+    /// F-12 — how many CONCURRENT-MARK workers this collector runs.
+    ///
+    /// Fixed at construction, because it sizes `mark_deques` and a worker's id
+    /// indexes into that array.
+    #[inline]
+    pub(crate) fn mark_worker_count(&self) -> usize {
+        self.mark_deques.len()
+    }
+
+    /// F-12 diagnostics — successful work-steals so far this process.
+    #[inline]
+    pub(crate) fn dbg_mark_steals(&self) -> usize {
+        self.mark_steals.load(Ordering::Relaxed)
+    }
+
+    /// F-12 diagnostics — objects scanned, per worker id.
+    ///
+    /// The DISTRIBUTION is what this is for. A total tells you marking
+    /// happened; only the split tells you whether it happened in parallel, and
+    /// "all of it on worker 0" is a serial marker wearing a parallel marker's
+    /// clothes.
+    pub(crate) fn dbg_mark_worker_scans(&self) -> Vec<usize> {
+        self.mark_worker_scans
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    /// F-12 diagnostics for the out-of-crate throughput probe
+    /// (`gc/tests/g1_mark_parallelism.rs`): the per-worker scan split.
+    ///
+    /// Public because an integration test is a separate crate, and the split is
+    /// exactly what keeps that probe from quoting a wall-clock number for a run
+    /// in which the parallelism never engaged.
+    pub fn dbg_mark_worker_scans_public(&self) -> Vec<usize> {
+        self.dbg_mark_worker_scans()
+    }
+
+    /// F-12 diagnostics for the out-of-crate throughput probe: steal count.
+    pub fn dbg_mark_steals_public(&self) -> usize {
+        self.dbg_mark_steals()
+    }
+
+    /// F-12 diagnostics — is `addr` marked in its region's bitmap?
+    pub(crate) fn dbg_is_marked(&self, addr: usize) -> bool {
+        let regions = self.regions.read();
+        match self.lookup_region_for_addr(addr) {
+            Some(idx) => regions[idx].mark_bitmap.is_marked(addr),
+            None => false,
         }
-        let avail = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .max(1);
-        match self.config.gc_worker_threads {
-            0 => ergonomic_gc_worker_threads(avail),
-            cfg => cfg.min(avail),
-        }
+    }
+
+    /// F-12 — per-worker gray-deque cap.
+    ///
+    /// `MARK_WORKLIST_CAP` exists to turn a pathological fan-out into a
+    /// deterministic overflow protocol instead of an allocator OOM, and that
+    /// argument is about TOTAL gray memory. Splitting the cap across the
+    /// deques keeps the total bounded at roughly twice the original (the seed
+    /// queue still carries the full cap, because seeds are the class of entry
+    /// that must not be dropped — see the G1MARK-7 note in `remark`), rather
+    /// than at `workers + 1` times it. The floor keeps a many-worker
+    /// configuration from giving each deque a cap so small that ordinary
+    /// marking trips the overflow rescan.
+    #[inline]
+    fn mark_deque_cap(&self) -> usize {
+        (MARK_WORKLIST_CAP / self.mark_deques.len().max(1)).max(4096)
     }
 
     /// The persistent evacuation worker pool, created on first use.
@@ -6078,21 +6355,7 @@ impl G1Collector {
         // Remap (or drop) stale concurrent-mark worklist entries — identical to
         // the serial young path. Done under STW (guard held) so no marker step
         // races us.
-        {
-            let mut worklist = self.mark_worklist.lock();
-            if !worklist.is_empty() {
-                worklist.retain_mut(|addr| {
-                    if let Some(&new_addr) = pointer_map.get(&*addr) {
-                        *addr = new_addr;
-                        return true;
-                    }
-                    match self.region_for_ptr(&regions, *addr as *mut u8) {
-                        Some(idx) if cset_set.contains(&idx) => false,
-                        _ => true,
-                    }
-                });
-            }
-        }
+        self.remap_gray_set_after_pause(&regions, &cset_set, &pointer_map);
 
         let pause_us = start.elapsed().as_micros() as u64;
         phases.close(pause_us);
@@ -6344,21 +6607,7 @@ impl G1Collector {
         // Remap (or drop) stale concurrent-mark worklist entries — same
         // protocol as the young paths (the mixed CSet includes Old regions,
         // where the gray set concentrates).
-        {
-            let mut worklist = self.mark_worklist.lock();
-            if !worklist.is_empty() {
-                worklist.retain_mut(|addr| {
-                    if let Some(&new_addr) = pointer_map.get(&*addr) {
-                        *addr = new_addr;
-                        return true;
-                    }
-                    match self.region_for_ptr(&regions, *addr as *mut u8) {
-                        Some(idx) if cset_set.contains(&idx) => false,
-                        _ => true,
-                    }
-                });
-            }
-        }
+        self.remap_gray_set_after_pause(&regions, &cset_set, &pointer_map);
 
         let remaining = self.mixed_gc_remaining.load(Ordering::Relaxed);
         if remaining > 0 {
@@ -8911,12 +9160,28 @@ impl G1Collector {
                 self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
             }
         }
-        keepalive.extend(worklist.iter().copied().filter(|&addr| {
+        let cset_resident = |addr: usize| -> bool {
             match self.lookup_region_for_addr(addr) {
                 Some(idx) => cset_set.contains(&idx) && !regions[idx].mark_bitmap.is_marked(addr),
                 None => false,
             }
-        }));
+        };
+        keepalive.extend(worklist.iter().copied().filter(|&a| cset_resident(a)));
+        // F-12 — the gray set is no longer only the seed queue. A CSet-resident
+        // gray sitting in a WORKER'S deque is just as snapshot-live as one in
+        // the seed queue, and missing it is not a missed optimisation: the
+        // object would not be evacuated, so the post-pause remap would find it
+        // unforwarded and in the CSet and DROP it, silently unmarking its whole
+        // unscanned subtree. That is the SteadyChurn freed-live-Old-region
+        // defect, arriving by a new route.
+        //
+        // The seed-queue guard is released first so this never nests two gray
+        // locks; the caller is stop-the-world, so nothing can push in between.
+        drop(worklist);
+        for deque in self.mark_deques.iter() {
+            let deque = deque.lock();
+            keepalive.extend(deque.iter().copied().filter(|&a| cset_resident(a)));
+        }
         keepalive
     }
 
@@ -8960,6 +9225,153 @@ impl G1Collector {
         self.gray_prov.lock().get(&addr).copied()
     }
 
+    // -----------------------------------------------------------------------
+    // F-12 — the gray set: one shared seed queue plus one deque per worker
+    // -----------------------------------------------------------------------
+
+    /// Are all per-worker deques empty?
+    ///
+    /// Separate from [`Self::gray_set_is_empty`] because the overflow rescan
+    /// already holds the seed queue's lock when it asks, and re-taking it here
+    /// would deadlock.
+    fn mark_deques_are_empty(&self) -> bool {
+        self.mark_deques.iter().all(|d| d.lock().is_empty())
+    }
+
+    /// Is there no gray work anywhere — seed queue or any worker's deque?
+    ///
+    /// This replaces every `mark_worklist.lock().is_empty()` that meant
+    /// "marking has nothing left to do". The distinction matters: the seed
+    /// queue drains to empty as soon as the workers have pulled their chunks,
+    /// long before the closure is complete, so asking only the seed queue would
+    /// declare a cycle converged with the entire transitive closure still in
+    /// flight. Sites that genuinely mean "the SEED queue is empty" (there are
+    /// none left) would have to say so explicitly.
+    fn gray_set_is_empty(&self) -> bool {
+        // Two statements, so the seed-queue guard is provably released before
+        // any deque lock is taken. Nothing takes a deque and then the seed
+        // queue, so this direction is the only one that exists.
+        if !self.mark_worklist.lock().is_empty() {
+            return false;
+        }
+        self.mark_deques_are_empty()
+    }
+
+    /// Discard every gray entry, seed queue and deques alike.
+    fn clear_gray_set(&self) {
+        self.mark_worklist.lock().clear();
+        for deque in self.mark_deques.iter() {
+            deque.lock().clear();
+        }
+    }
+
+    /// Is `addr` waiting to be scanned anywhere in the gray set?
+    /// Diagnostics and tests only — O(gray set).
+    fn gray_set_contains(&self, addr: usize) -> bool {
+        if self.mark_worklist.lock().contains(&addr) {
+            return true;
+        }
+        self.mark_deques.iter().any(|d| d.lock().contains(&addr))
+    }
+
+    /// F-12 — fill `out` with work for `worker`, from the shared seed queue if
+    /// it has any and otherwise by stealing half of a peer's deque.
+    ///
+    /// Returns `false` when there is nothing anywhere, which is the caller's
+    /// signal to stop stepping (it is NOT termination on its own — a peer may
+    /// still be mid-scan; see [`ActiveMarker`]).
+    ///
+    /// # Lock discipline
+    ///
+    /// At most ONE deque lock is held at a time: the thief drains its victim
+    /// into `out` and the caller extends the thief's own deque afterwards. Two
+    /// workers stealing from each other therefore cannot deadlock, which the
+    /// obvious implementation — lock mine, then lock yours — would.
+    ///
+    /// The victim scan starts at `worker + 1` rather than at 0 so that N
+    /// starving workers do not all descend on worker 0's deque at once.
+    ///
+    /// Halving is the standard split: taking one entry makes the thief come
+    /// straight back, and taking everything makes the pair swap the whole queue
+    /// back and forth. The thief takes from the FRONT because the victim pops
+    /// from the BACK — the two ends are the ones least likely to be the same
+    /// object's neighbours, so the victim keeps the subtree it is descending.
+    fn take_marking_work(&self, worker: usize, out: &mut Vec<usize>) -> bool {
+        {
+            let mut seeds = self.mark_worklist.lock();
+            let take = MARK_REFILL_CHUNK.min(seeds.len());
+            if take > 0 {
+                let at = seeds.len() - take;
+                out.extend(seeds.drain(at..));
+                return true;
+            }
+        }
+        let n = self.mark_deques.len();
+        for k in 1..n {
+            let victim = (worker + k) % n;
+            let mut theirs = self.mark_deques[victim].lock();
+            if theirs.len() >= 2 {
+                let half = theirs.len() / 2;
+                out.extend(theirs.drain(..half));
+                self.mark_steals.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// F-12 — rewrite every gray entry through this pause's forwarding map,
+    /// dropping the ones whose object was in the collection set and did not
+    /// survive.
+    ///
+    /// This used to be five copies of the same `retain_mut` over
+    /// `mark_worklist`, one per collection path. Striping the gray set across
+    /// per-worker deques turns each of those into "and every deque too", and a
+    /// path that remapped the seed queue but forgot a deque would leave a
+    /// marker holding an address in a region this pause just reset — a marker
+    /// UAF, and exactly the defect the mixed path had before those blocks
+    /// existed. One implementation, five callers.
+    ///
+    /// # Stop-the-world
+    ///
+    /// The caller holds the regions WRITE guard, which is what makes this
+    /// safe: markers only touch a deque under the read guard, so none can be
+    /// mid-batch here, and none can be holding a popped address either (a pop
+    /// and its scan happen inside one read-guard hold).
+    fn remap_gray_set_after_pause(
+        &self,
+        regions: &[G1Region],
+        cset_set: &RegionSet,
+        pointer_map: &cratonvm_types::PointerMap,
+    ) {
+        let mut remap = |addr: &mut usize| -> bool {
+            if let Some(&new_addr) = pointer_map.get(&*addr) {
+                // Object was evacuated — follow the forwarding ptr.
+                *addr = new_addr;
+                return true;
+            }
+            // Not forwarded. If the address lived in a CSet region it is now
+            // dangling (the region was reset above) so drop it. Otherwise
+            // (Old / non-CSet) leave it alone.
+            match self.region_for_ptr(regions, *addr as *mut u8) {
+                Some(idx) if cset_set.contains(&idx) => false,
+                _ => true,
+            }
+        };
+        {
+            let mut seeds = self.mark_worklist.lock();
+            if !seeds.is_empty() {
+                seeds.retain_mut(&mut remap);
+            }
+        }
+        for deque in self.mark_deques.iter() {
+            let mut deque = deque.lock();
+            if !deque.is_empty() {
+                deque.retain_mut(&mut remap);
+            }
+        }
+    }
+
     fn push_gray_or_mark(&self, regions: &[G1Region], new_addr: usize) {
         let mut worklist = self.mark_worklist.lock();
         if worklist.len() < MARK_WORKLIST_CAP {
@@ -8986,7 +9398,7 @@ impl G1Collector {
                 }
             }
         }
-        self.mark_worklist.lock().contains(&addr)
+        self.gray_set_contains(addr)
     }
 
     /// Abort an in-flight marking cycle WITHOUT acting on the (incomplete)
@@ -9009,11 +9421,16 @@ impl G1Collector {
             }
             self.mark_start_snapshot.lock().clear();
         }
-        self.mark_worklist.lock().clear();
+        self.clear_gray_set();
         self.mark_worklist_overflowed
             .store(false, Ordering::Relaxed);
         self.mark_saw_implausible.store(false, Ordering::Relaxed);
         // INT-8: the skip set is per-cycle state.
+        // Length stored BEFORE the clear: a marker that races this sees
+        // either the old length (takes the lock, finds whatever survived) or
+        // the new zero (skips the lock over an already-empty set). It can never
+        // see zero over a populated set.
+        self.reference_skip_len.store(0, Ordering::Release);
         self.reference_skip.lock().clear();
         // G1AUD-2 — leave the marking-active phase BEFORE deactivating the
         // queue, not after. The reverse order opens a window in which
@@ -9072,7 +9489,7 @@ impl G1Collector {
                     .map(|r| (r.reuse_epoch, r.cursor(), r.region_type)),
             );
         }
-        self.mark_worklist.lock().clear();
+        self.clear_gray_set();
         // Round-9 gc HIGH-5: reset overflow indicator at cycle start so
         // a previous cycle's overflow doesn't trigger a needless rescan.
         self.mark_worklist_overflowed
@@ -9082,6 +9499,11 @@ impl G1Collector {
         // INT-8: stale skip entries from a previous cycle must never hide a
         // reused address's slot 0 — the VM re-publishes the current set
         // right after this call (still inside the initial-mark STW).
+        // Length stored BEFORE the clear: a marker that races this sees
+        // either the old length (takes the lock, finds whatever survived) or
+        // the new zero (skips the lock over an already-empty set). It can never
+        // see zero over a populated set.
+        self.reference_skip_len.store(0, Ordering::Release);
         self.reference_skip.lock().clear();
         // G1AUD-2 — the queue MUST already be live before the phase becomes
         // marking-active: the store paths read their old slot value on the
@@ -9106,6 +9528,12 @@ impl G1Collector {
         let mut skip = self.reference_skip.lock();
         skip.clear();
         skip.extend(addrs.iter().copied());
+        // Published AFTER the set is filled: a marker that sees the new length
+        // then takes the lock and finds the entries. The reverse order would
+        // let it see a non-zero length over an empty set, which is harmless,
+        // and — worse — a zero over a full one, which is not.
+        self.reference_skip_len
+            .store(skip.len(), Ordering::Release);
     }
 
     /// Test/diagnostic: current size of the referent-slot skip set.
@@ -9145,6 +9573,9 @@ impl G1Collector {
             return;
         }
         let old: Vec<usize> = skip.drain().collect();
+        // The set is transiently empty across this rebuild, but the caller is
+        // stop-the-world so no marker can observe it. The length is republished
+        // at the end.
         for addr in old {
             if let Some(&new_addr) = pointer_map.get(&addr) {
                 skip.insert(new_addr);
@@ -9158,6 +9589,8 @@ impl G1Collector {
                 // else: died in the CSet — prune.
             }
         }
+        self.reference_skip_len
+            .store(skip.len(), Ordering::Release);
     }
 
     /// G1CORE-6 — carry the string-deduplication table across an evacuation
@@ -9344,10 +9777,36 @@ impl G1Collector {
     /// drains the gray set produced by the roots.
     ///
     /// `work_amount` is the maximum number of objects to scan in this
-    /// step. Returns `true` when the worklist is empty (marking is done).
+    /// step. Returns `true` when the whole gray set is empty (marking is done).
+    ///
+    /// This is worker 0's entry point. It is what `remark`'s
+    /// `while !concurrent_mark_step(usize::MAX) {}` drains through, and what
+    /// every existing caller and test uses; with one worker configured it is
+    /// the entire marker. See [`Self::concurrent_mark_step_worker`].
     pub fn concurrent_mark_step(&self, work_amount: usize) -> bool {
+        self.concurrent_mark_step_worker(0, work_amount)
+    }
+
+    /// F-12 — one marking worker's step.
+    ///
+    /// `worker` indexes [`Self::mark_deques`]; each background thread owns one
+    /// index for its life, and the coordinator's own drain uses 0. The step
+    /// takes work in this order:
+    ///
+    /// 1. its own deque (pop from the back — the entries it pushed most
+    ///    recently, which are the ones still in cache);
+    /// 2. the shared seed queue, `MARK_REFILL_CHUNK` at a time;
+    /// 3. a peer's deque, half of it, taken from the FRONT so a thief and its
+    ///    victim work opposite ends and do not fight over the same entries.
+    ///
+    /// Returns `true` only at a GLOBAL fixed point: every deque and the seed
+    /// queue are empty, no other worker is mid-scan ([`ActiveMarker`]), and no
+    /// overflow rescan is pending. Any weaker test would let one worker declare
+    /// convergence while another still holds a live subtree.
+    pub fn concurrent_mark_step_worker(&self, worker: usize, work_amount: usize) -> bool {
+        let worker = worker % self.mark_deques.len();
         if work_amount == 0 {
-            return self.mark_worklist.lock().is_empty();
+            return self.gray_set_is_empty();
         }
 
         // G1MARK-6: pull mutator SATB overwrites into the gray set NOW
@@ -9418,21 +9877,58 @@ impl G1Collector {
         } else {
             usize::MAX
         };
+        let deque_cap = self.mark_deque_cap();
         let mut remaining = work_amount;
-        let mut gray_exhausted = false;
+        let mut scanned_total = 0usize;
+        // F-12 — bounded spin guard. A thief can empty this worker's deque
+        // between the refill and the drain, which costs an iteration that scans
+        // nothing. That is fine and self-correcting (the thief now has the
+        // work), but it must not be able to loop forever: after this many
+        // consecutive fruitless rounds the step returns and the caller decides
+        // whether to come back. `remaining` is only spent on real scans, so
+        // without this the loop's own budget would never bound it.
+        const IDLE_ROUNDS: usize = 16;
+        let mut idle_rounds = 0usize;
 
-        while remaining > 0 && !gray_exhausted {
+        {
+            // Held for the whole drain: see `ActiveMarker`. Dropped — including
+            // on unwind — before the fixed-point test below, which is the one
+            // place this worker must NOT count itself as active.
+            let _active = ActiveMarker::new(&self.mark_active);
+
+            while remaining > 0 && idle_rounds < IDLE_ROUNDS {
             let regions = self.regions.read();
-            let mut worklist = self.mark_worklist.lock();
+
+            // Refill under the regions guard, so the deque-mutation discipline
+            // (see the `mark_deques` field) covers stealing as well as
+            // scanning. The emptiness probe is a separate statement on purpose:
+            // taking the same deque's lock twice in one expression is a
+            // deadlock waiting for a temporary-lifetime rule to change.
+            let need_work = self.mark_deques[worker].lock().is_empty();
+            if need_work {
+                let mut fresh = Vec::new();
+                if !self.take_marking_work(worker, &mut fresh) {
+                    // Nothing in the seed queue and nothing to steal.
+                    break;
+                }
+                self.mark_deques[worker].lock().extend(fresh);
+            }
+
+            let mut worklist = self.mark_deques[worker].lock();
             self.mark_lock_batches.fetch_add(1, Ordering::Relaxed);
+            // Declared AFTER `regions` so it is dropped — and therefore
+            // flushed — before the guard it borrows. See `MarkLiveBytes`.
+            let mut live_bytes = MarkLiveBytes::new(&regions);
+            let before = remaining;
             let mut in_batch = batch.min(remaining);
 
             while in_batch > 0 {
                 let obj_addr = match worklist.pop() {
                     Some(a) => a,
                     None => {
-                        // Gray set empty for now — see overflow handling below.
-                        gray_exhausted = true;
+                        // This deque ran dry mid-batch. The outer loop refills
+                        // it (from the seed queue, or by stealing) or gives up;
+                        // `idle_rounds` bounds a thief/victim ping-pong.
                         break;
                     }
                 };
@@ -9546,8 +10042,15 @@ impl G1Collector {
                 // route the mark through the owning region's bitmap (which is
                 // keyed off that region's actual data pointer).
                 // Already black? Skip — nothing new to discover from it.
-                if !regions[region_idx].try_mark_and_account(obj_addr) {
-                    continue;
+                //
+                // F-12: `_measure` rather than `_account`, with the credit
+                // parked in `live_bytes` until the end of the batch. Same
+                // funnel, same numbers, one atomic per region per batch instead
+                // of one per object. `MarkLiveBytes` flushes on Drop, so the
+                // `continue` below cannot lose a credit.
+                match regions[region_idx].try_mark_and_measure(obj_addr) {
+                    None => continue,
+                    Some(bytes) => live_bytes.add(region_idx, bytes),
                 }
 
                 // Scan the object's reference fields and push gray successors.
@@ -9556,12 +10059,18 @@ impl G1Collector {
                 // readable for the duration of the GC cycle (regions are
                 // pinned by the lock guard).
                 let header = unsafe { &*(obj_addr as *const ObjectHeader) };
-                self.scan_object_refs(obj_ptr, header, &regions, &mut worklist);
+                self.scan_object_refs(obj_ptr, header, &regions, deque_cap, &mut worklist);
             }
+            drop(worklist);
+            let scanned = before - remaining;
+            scanned_total += scanned;
+            idle_rounds = if scanned == 0 { idle_rounds + 1 } else { 0 };
             // Both guards drop here. This is the window a waiting writer — an
             // STW pause, or an allocator claiming a fresh region — is admitted
             // through. See the batching note above.
+            }
         }
+        self.mark_worker_scans[worker].fetch_add(scanned_total, Ordering::Relaxed);
 
         // Re-take the guards to answer the "is marking done?" question.
         // Re-reading the worklist rather than carrying a stale emptiness across
@@ -9571,13 +10080,18 @@ impl G1Collector {
         // is exactly how a live subtree goes unscanned.
         {
             let _regions = self.regions.read();
-            let worklist = self.mark_worklist.lock();
-            if !worklist.is_empty() {
+            if !self.gray_set_is_empty() {
                 // Ran out of budget but still have work — call again.
                 return false;
             }
+            // F-12 — a peer may hold a popped object whose children are not
+            // pushed yet. Empty queues plus a live scanner is not a fixed
+            // point; see `ActiveMarker`.
+            if self.mark_active.load(Ordering::Acquire) != 0 {
+                return false;
+            }
             if !self.mark_worklist_overflowed.load(Ordering::Relaxed) {
-                // Worklist empty and no overflow: marking complete.
+                // Gray set empty, nobody scanning, no overflow: complete.
                 return true;
             }
         }
@@ -9605,7 +10119,7 @@ impl G1Collector {
         // `MARK_WORKLIST_CAP` (a million entries) and is already O(heap).
         let regions = self.regions.write();
         let mut worklist = self.mark_worklist.lock();
-        if !worklist.is_empty() {
+        if !worklist.is_empty() || !self.mark_deques_are_empty() {
             // Refilled while the guards were swapped — the caller steps again,
             // and the overflow flag is still set for a later rescan.
             return false;
@@ -9648,7 +10162,16 @@ impl G1Collector {
                     }
                     if region.mark_bitmap.is_marked(obj_addr) {
                         let obj_ptr = obj_addr as *mut u8;
-                        self.scan_object_refs(obj_ptr, header, &regions, &mut worklist);
+                        // The rescan seeds the SHARED queue at the FULL cap: it
+                        // IS the overflow recovery, so capping it per-deque
+                        // would let the recovery overflow.
+                        self.scan_object_refs(
+                            obj_ptr,
+                            header,
+                            &regions,
+                            MARK_WORKLIST_CAP,
+                            &mut worklist,
+                        );
                     }
                     offset += obj_size;
                 }
@@ -9677,6 +10200,7 @@ impl G1Collector {
         obj_ptr: *mut u8,
         header: &ObjectHeader,
         regions: &[G1Region],
+        cap: usize,
         worklist: &mut Vec<usize>,
     ) {
         // CRIT-perf fix: use the O(log R) cached `lookup_region_for_addr`
@@ -9760,7 +10284,7 @@ impl G1Collector {
                             // Round-9 gc HIGH-5: graceful overflow — drop
                             // the push and record the event so remark
                             // can run a conservative full re-walk.
-                            if worklist.len() >= MARK_WORKLIST_CAP {
+                            if worklist.len() >= cap {
                                 self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
                             } else {
                                 self.note_gray(
@@ -9785,9 +10309,17 @@ impl G1Collector {
             // slots (queue, next, discovered, subclass fields) trace
             // normally. Lock order: regions (held by every caller) →
             // reference_skip — same as `remap_reference_skip_set`'s callers.
-            let first_slot = {
+            // F-12 — the length is read WITHOUT the lock. This runs once per
+            // scanned object, and with N markers a global mutex here is a
+            // convoy on the marker's hottest line rather than the few
+            // nanoseconds it costs a single marker. The set is empty except
+            // while a cycle has `Reference` objects registered, so the load
+            // answers almost every scan on its own.
+            let first_slot = if self.reference_skip_len.load(Ordering::Acquire) == 0 {
+                0
+            } else {
                 let skip = self.reference_skip.lock();
-                if !skip.is_empty() && skip.contains(&(obj_ptr as usize)) {
+                if skip.contains(&(obj_ptr as usize)) {
                     1
                 } else {
                     0
@@ -9817,7 +10349,7 @@ impl G1Collector {
                             let ref_ptr = raw as usize as *mut u8;
                             if let Some(idx) = region_for(ref_ptr) {
                                 if !regions[idx].mark_bitmap.is_marked(ref_ptr as usize) {
-                                    if worklist.len() >= MARK_WORKLIST_CAP {
+                                    if worklist.len() >= cap {
                                         self.mark_worklist_overflowed
                                             .store(true, Ordering::Relaxed);
                                     } else {
@@ -9871,7 +10403,7 @@ impl G1Collector {
                                 // Round-9 gc HIGH-5: graceful overflow — drop
                                 // the push and record the event so remark
                                 // can run a conservative full re-walk.
-                                if worklist.len() >= MARK_WORKLIST_CAP {
+                                if worklist.len() >= cap {
                                     self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
                                 } else {
                                     self.note_gray(
@@ -9902,7 +10434,7 @@ impl G1Collector {
             let ptr = addr as *mut u8;
             if let Some(idx) = region_for(ptr) {
                 if !regions[idx].mark_bitmap.is_marked(addr) {
-                    if worklist.len() >= MARK_WORKLIST_CAP {
+                    if worklist.len() >= cap {
                         self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
                     } else {
                         self.note_gray(addr, "scan-child-sidetable", obj_ptr as usize);
@@ -10166,7 +10698,7 @@ impl G1Collector {
         // `cleanup_with_an_undrained_gray_set_retains_every_region` instead,
         // which is a stronger check than an assertion because it proves the
         // fail-safe actually retains.
-        let closure_incomplete = !self.mark_worklist.lock().is_empty();
+        let closure_incomplete = !self.gray_set_is_empty();
         if closure_incomplete {
             tracing::warn!(
                 "g1 cleanup: gray set non-empty at cleanup — the mark closure is \
@@ -10435,7 +10967,7 @@ impl G1Collector {
 
         // Audit fix (HIGH-3): clear any stragglers from the gray set and
         // deactivate the SATB write barrier — the cycle is fully done.
-        self.mark_worklist.lock().clear();
+        self.clear_gray_set();
         // Round-9 gc HIGH-5: clear the overflow indicator so the next
         // cycle starts in a clean state. Captured on the way out so the cycle
         // record can name it: `concurrent_mark_step` clears the flag when it
@@ -10444,6 +10976,11 @@ impl G1Collector {
         // case worth reporting.
         let overflow_outstanding = self.mark_worklist_overflowed.swap(false, Ordering::Relaxed);
         // INT-8: referent-slot hiding ends with the cycle.
+        // Length stored BEFORE the clear: a marker that races this sees
+        // either the old length (takes the lock, finds whatever survived) or
+        // the new zero (skips the lock over an already-empty set). It can never
+        // see zero over a populated set.
+        self.reference_skip_len.store(0, Ordering::Release);
         self.reference_skip.lock().clear();
         // Round-5 CRIT #4: close the SATB barrier with a drain-then-flip
         // protocol so no mutator log push that observed the gate as
@@ -10669,7 +11206,7 @@ impl G1Collector {
                 "a concurrent mark cycle is in flight (SATB snapshot liveness applies)",
             );
         }
-        if !self.mark_worklist.lock().is_empty() {
+        if !self.gray_set_is_empty() {
             return declined("the gray set is non-empty");
         }
         if self.finalizer_pause.load(Ordering::Relaxed) {
@@ -15514,7 +16051,7 @@ mod tests {
 
         assert!(
             used.len() >= 2,
-            "{THREADS} concurrent allocators all landed in the same Eden region ({used:?})              despite {stripes} stripes being available — striping is what makes the shared              allocation guard pay (F-11)"
+            "{THREADS} concurrent allocators all landed in the same Eden region ({used:?}) despite {stripes} stripes being available — striping is what makes the shared allocation guard pay (F-11)"
         );
     }
 

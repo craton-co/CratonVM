@@ -958,6 +958,28 @@ pub struct GcFlags {
     /// the bisection lever; a larger `n` than the default is a deliberate
     /// trade of footprint for allocation parallelism.
     pub g1_eden_stripes: Option<usize>,
+    /// `CRATONVM_G1_PARALLEL_MARK` — F-12. Run G1's concurrent mark phase on
+    /// several workers with per-worker gray deques and work stealing. Default
+    /// **ON** ([`parse::on_unless_zero`]); `=0` pins it to the single worker
+    /// `ConcurrentMarkController::spawn` used to start unconditionally.
+    ///
+    /// Marking was one thread draining one `Mutex<Vec<usize>>` gray set, so
+    /// even a second worker would have contended on every push and pop. Mark
+    /// duration is not only a CPU cost: it sets how much headroom the IHOP
+    /// heuristic has to leave before starting a cycle, so a slow marker is paid
+    /// for in heap.
+    ///
+    /// The worker count is a quarter of the evacuation worker count, rounded up
+    /// — HotSpot's `ConcGCThreads` ergonomic, and deliberately not the pause's
+    /// width, because these workers run BESIDE the application rather than
+    /// inside a pause where every core is idle. `CRATONVM_G1_WORKERS=N` still
+    /// reaches it through the evacuation count.
+    ///
+    /// `=0` is the bisection lever: the marking algorithm is identical at one
+    /// worker (the deque is the worklist, no steal can succeed, the termination
+    /// counter can only be this thread), so a defect that survives `=0` is not
+    /// a parallel-marking race.
+    pub g1_parallel_mark: bool,
     /// `CRATONVM_G1_DBG_RSET` — after every G1 evacuation pause, verify that
     /// every cross-region reference into a COLLECTABLE region is named in that
     /// region's remembered set. Opt-in diagnostic; whole-heap and O(live
@@ -1234,6 +1256,7 @@ impl GcFlags {
             g1_mark_lock_yield: on_unless_zero(src, "CRATONVM_G1_MARK_LOCK_YIELD"),
             g1_shared_alloc: on_unless_zero(src, "CRATONVM_G1_SHARED_ALLOC"),
             g1_eden_stripes: usize_min1(src, "CRATONVM_G1_EDEN_STRIPES"),
+            g1_parallel_mark: on_unless_zero(src, "CRATONVM_G1_PARALLEL_MARK"),
             identity_hash_evict: on_unless_zero(src, "CRATONVM_IDENTITY_HASH_EVICT"),
             g1_dbg_rset: present(src, "CRATONVM_G1_DBG_RSET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
