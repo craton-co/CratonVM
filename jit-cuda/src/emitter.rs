@@ -5,9 +5,15 @@
 //!
 //! This module owns the **target side** of the lowering: given an
 //! intermediate representation of a kernel body (whatever the
-//! `lowering` module produces), it emits a valid PTX 7.5 module
-//! string. Nothing in this file looks at JVM bytecode directly —
-//! that's `lowering`'s job.
+//! `lowering` module produces), it emits a valid PTX module string.
+//! Nothing in this file looks at JVM bytecode directly — that's
+//! `lowering`'s job.
+//!
+//! The `.version` that module declares is derived from its `.target`,
+//! not fixed. This paragraph said "a valid PTX 7.5 module" while
+//! [`PtxModule::render`] wrote exactly that literal, which is how the
+//! header came to name targets no such version admits — see
+//! [`crate::target`].
 //!
 //! The first cut is intentionally restricted; see [`PtxKernel`] for
 //! what we can express today. Any IR node that doesn't have a
@@ -88,11 +94,22 @@ pub struct PtxModule {
 }
 
 impl PtxModule {
+    /// The PTX ISA version this module's header declares: the lowest
+    /// one that admits its own `.target`.
+    ///
+    /// Derived, never hardcoded. See [`crate::target`] for the account
+    /// of the `.version 7.5` literal this replaces and why it made GPU
+    /// offload a silent no-op on every device newer than Ampere.
+    pub fn isa_version(&self) -> crate::target::IsaVersion {
+        crate::target::isa_for_target(self.sm_major, self.sm_minor)
+    }
+
     /// Render the module as a single PTX text blob suitable for
     /// `DeviceModule::from_ptx`.
     pub fn render(&self) -> String {
         let mut out = String::new();
-        out.push_str(".version 7.5\n");
+        let (isa_major, isa_minor) = self.isa_version();
+        out.push_str(&format!(".version {isa_major}.{isa_minor}\n"));
         out.push_str(&format!(".target sm_{}{}\n", self.sm_major, self.sm_minor));
         out.push_str(".address_size 64\n\n");
         for k in &self.kernels {

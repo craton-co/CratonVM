@@ -5,29 +5,34 @@ import java.net.StandardSocketOptions;
 import java.nio.channels.ServerSocketChannel;
 
 /**
- * Decides whether CratonVM's wildcard→loopback rewrite in
- * `advertised_listener_host` is fixing a real problem or masking a different
- * one.
+ * Asks HotSpot what a wildcard-bound listener should REPORT, at two layers.
  *
- * `ssc_local_address` deliberately reports `127.0.0.1` for a wildcard-bound
- * `ServerSocketChannel`. The stated reason is that
- * `sun.net.httpserver.ServerImpl` binds a `ServerSocketChannel`, answers
- * `HttpServer.getAddress()` from it, and a caller that reconnects to a literal
- * `0.0.0.0` fails on Windows with WSAEADDRNOTAVAIL — the named casualty being
- * `RestClientBuilderIntegTests`.
+ * HISTORY, because the answer already changed the code once. CratonVM used to
+ * rewrite a wildcard local address to loopback (`0.0.0.0` -> `127.0.0.1`,
+ * `::` -> `::1`) in `advertised_listener_host`, on the premise that Windows
+ * rejects a connect to an unspecified address with WSAEADDRNOTAVAIL and that
+ * `sun.net.httpserver.ServerImpl.getAddress()` therefore had to publish
+ * something reconnectable. THIS PROBE REFUTED BOTH HALVES on 2026-08-10:
+ * HotSpot itself answers the wildcard with `isAnyLocalAddress() == true`, and
+ * connecting to `0.0.0.0` works on both VMs. The rewrite was REMOVED; the
+ * measurement is quoted in `native-io/src/socket_channel.rs` above
+ * `advertised_listener_host`, which is now the identity function.
  *
- * That reasoning only holds if HotSpot does something different here. So ask
- * HotSpot directly:
+ * So this probe no longer asks whether the rewrite is justified -- there is no
+ * rewrite. It is now the REGRESSION for its absence, plus the open question
+ * that removal did not settle: HotSpot binds the wildcard as a dual-stack
+ * IPv6 socket and reports `[0:0:0:0:0:0:0:0]`, while CratonVM's HttpServer
+ * layer reports the v4 `0.0.0.0`. Both satisfy `isAnyLocalAddress()`, but a
+ * caller that connects to `::` reaches a v4-only listener on one and a
+ * dual-stack one on the other.
  *
- *   * if HotSpot's `getAddress()` also answers the wildcard, then real-world
- *     callers already cope with it, the rewrite is masking a *different*
- *     CratonVM defect in the reconnect path, and the accessor should tell the
- *     truth like HotSpot does;
- *   * if HotSpot answers a concrete address, the rewrite is emulating
- *     something real and must stay (or move to wherever HotSpot does it).
+ * The raw `ServerSocketChannel` row is printed alongside the `HttpServer` rows
+ * so the two layers can be compared in one run -- `HttpServer` is a consumer
+ * of exactly that API, and on the real-JDK arms the two DISAGREE: the channel
+ * matches HotSpot and the HttpServer above it does not.
  *
- * The raw `ServerSocketChannel` row is printed alongside so the two layers can
- * be compared in one run — `HttpServer` is a consumer of exactly that API.
+ * EVERY address row goes through {@link #norm}: see its comment for why this
+ * probe could not be scored at all before 2026-09-02.
  */
 public class HttpServerWildcardAddressProbe {
 
@@ -36,7 +41,7 @@ public class HttpServerWildcardAddressProbe {
         try (ServerSocketChannel ch = ServerSocketChannel.open()) {
             ch.setOption(StandardSocketOptions.SO_REUSEADDR, true);
             ch.bind(new InetSocketAddress("0.0.0.0", 0), 16);
-            System.out.println("channel getLocalAddress()   = " + ch.getLocalAddress());
+            System.out.println("channel getLocalAddress()   = " + norm(ch.getLocalAddress()));
             System.out.println("channel SO_REUSEADDR        = "
                     + ch.getOption(StandardSocketOptions.SO_REUSEADDR));
         }
@@ -48,11 +53,12 @@ public class HttpServerWildcardAddressProbe {
         try {
             server.start();
             InetSocketAddress addr = server.getAddress();
-            System.out.println("HttpServer getAddress()     = " + addr);
+            System.out.println("HttpServer getAddress()     = " + norm(addr));
             System.out.println("  .getAddress().isAnyLocal   = "
                     + (addr.getAddress() != null && addr.getAddress().isAnyLocalAddress()));
             System.out.println("  .getHostString()           = " + addr.getHostString());
-            System.out.println("  .getPort()                 = " + addr.getPort());
+            // The NUMBER is noise; that a port was bound at all is not.
+            System.out.println("  .getPort() bound           = " + (addr.getPort() > 0));
         } finally {
             server.stop(0);
         }
@@ -63,9 +69,43 @@ public class HttpServerWildcardAddressProbe {
         HttpServer explicit = HttpServer.create(new InetSocketAddress("0.0.0.0", 0), 0);
         try {
             explicit.start();
-            System.out.println("HttpServer explicit 0.0.0.0 = " + explicit.getAddress());
+            System.out.println("HttpServer explicit 0.0.0.0 = " + norm(explicit.getAddress()));
         } finally {
             explicit.stop(0);
         }
+    }
+
+    /**
+     * Erases the ephemeral port from an address rendering, and NOTHING else.
+     *
+     * Every bind in this probe asks for port 0, so the kernel picks a
+     * different number on every run of either VM. A raw diff of this probe's
+     * output therefore reports differing rows on two runs of the SAME binary,
+     * which is how a probe comes to count noise as signal — the state that
+     * left `W7-24` unscoreable until now.
+     *
+     * Only the trailing `:<digits>` goes, so the address itself survives
+     * intact. That matters here: HotSpot answers the IPv6 wildcard
+     * `/[0:0:0:0:0:0:0:0]:PORT`, whose ADDRESS contains colon-digit pairs a
+     * careless rewrite would eat, destroying exactly the family difference
+     * this probe exists to see.
+     *
+     * The fact that a port was bound at all is signal and is preserved
+     * separately, as a `bound` boolean — a probe that hid a failure to bind
+     * behind its own normalisation would be worse than the unscoreable one.
+     */
+    static String norm(Object o) {
+        String s = String.valueOf(o);
+        int c = s.lastIndexOf(':');
+        if (c < 0 || c == s.length() - 1) {
+            return s;
+        }
+        String tail = s.substring(c + 1);
+        for (int i = 0; i < tail.length(); i++) {
+            if (!Character.isDigit(tail.charAt(i))) {
+                return s;
+            }
+        }
+        return s.substring(0, c + 1) + "<ephemeral>";
     }
 }

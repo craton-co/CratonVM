@@ -3232,6 +3232,90 @@ pub fn execute(
                     } else {
                         0
                     };
+                    // -- The String-intrinsic pin, ASKED at this door -- D1, 2026-09-01
+                    //
+                    // The third door. The measurement that found the pin
+                    // installed at ONE of three, and why the answer is inert at
+                    // the two that reach the single-pass backend directly, is
+                    // written out at the OSR door (`jit_bridge.rs`, at
+                    // `osr_string_pin_declines`); the topology is in
+                    // `compile_gate`'s "installed at ONE door" section.
+                    //
+                    // This door passes `string_layout: None` below -- "String
+                    // intrinsics land in a later wave" -- so the pin's honest
+                    // verdict here is `BlindNoLayout`: a site declared on a
+                    // String-family receiver, no layout resolved at this door,
+                    // and the rule FAILS OPEN (`false`, do not pin). That is
+                    // not a shortcut. Without a layout the single-pass backend
+                    // emits no intrinsic either, so pinning would cost the
+                    // method a C2 body and buy nothing back. The `None` is
+                    // passed deliberately rather than papered over: the whole
+                    // gain is that `blind-no-layout` becomes a MEASURED number
+                    // for this door instead of an invisible absence.
+                    //
+                    // Consequence, so nobody reads more into the counter than
+                    // it carries: with `layout == None` the pin can only answer
+                    // `false` here. `NoSite` and `BlindNoLayout` are `false` by
+                    // rule, and the `BlindNoResolver` fail-closed arm requires
+                    // `layout.is_some()`. So this ask changes no machine code
+                    // today; it is a census entry, not a decision. It becomes a
+                    // real decision the moment the `string_layout: None`
+                    // argument below becomes a resolved layout -- the `if` is
+                    // the tripwire for exactly that.
+                    //
+                    // A resolver IS supplied even though the layout is not,
+                    // because without one the verdict would be
+                    // `BlindNoResolver` -- the STRONGER blindness, which says
+                    // nothing about whether a layout would have mattered -- and
+                    // the narrower fact is the whole reason to ask here.
+                    //
+                    // COST: once per eager first-call compile, off any loop.
+                    // The resolver takes the `class_manager` read lock per site,
+                    // matching `c_invoke_resolver` in `jit_bridge.rs` and the
+                    // field-op loop above, which already takes it per field op;
+                    // `string_intrinsic_pin_verdict` asks nothing at all for a
+                    // method with no `invokevirtual`/`invokeinterface` site and
+                    // stops at the first String-family receiver otherwise. No
+                    // lock is held here -- the `early_is_static` probe above
+                    // took and released its own.
+                    let eager_pin_invoke_resolver =
+                        |cp_idx: u16| -> Option<(String, String, String)> {
+                            let cm = shared.classes.class_manager.read();
+                            let class = cm.get_class(class_id)?;
+                            let (class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
+                                Some(ConstantPoolEntry::MethodReference {
+                                    class_index,
+                                    name_and_type_index,
+                                    ..
+                                }) => (*class_index, *name_and_type_index),
+                                Some(ConstantPoolEntry::InterfaceMethodReference {
+                                    class_index,
+                                    name_and_type_index,
+                                    ..
+                                }) => (*class_index, *name_and_type_index),
+                                _ => return None,
+                            };
+                            let target_class = class.constant_pool.get_class_name(class_idx)?;
+                            let (mn, desc) = class.constant_pool.get_name_and_type(nat_idx)?;
+                            Some((target_class.to_string(), mn.to_string(), desc.to_string()))
+                        };
+                    let eager_string_pin_declines = admission.string_intrinsic_pin_declines(
+                        &scan.invoke_ops,
+                        Some(&eager_pin_invoke_resolver),
+                        // The SAME value handed to `compile_with_param_slots`
+                        // below as its `string_layout` argument. Asking about a
+                        // layout this compile does not use would make the
+                        // census describe a compile that did not happen.
+                        None,
+                    );
+                    if eager_string_pin_declines && crate::runtime::env_cache::dbg_jitc() {
+                        eprintln!(
+                            "[cratonvm-jitc] eager-first-call String-intrinsic pin declines the \
+                             optimizing tier for {class_name_arc}.{method_name_arc}{descriptor_arc} \
+                             -- unreachable while this door passes `string_layout: None`. If this \
+                             ever fires, the later wave landed and this ask is now a decision.",
+                        );
+                    }
                     let mut cm = crate::jit::x64::compile_with_param_slots(
                         &admission,
                         &padded,
@@ -3597,6 +3681,7 @@ pub fn execute(
                                         is_synchronized,
                                         is_static,
                                         force_native_cache: std::sync::OnceLock::new(),
+                                        descriptor_facts_cache: std::sync::OnceLock::new(),
                                         intercept_shape_cache: std::sync::OnceLock::new(),
                                         native_callback_cache: std::sync::OnceLock::new(),
                                         invoc_key: std::sync::OnceLock::new(),
@@ -3677,7 +3762,7 @@ pub fn execute(
                                     ) {
                                         MethodCallFailed::ExceptionThrown(exc) => {
                                             crate::runtime::exceptions::attach_snapshotted_npe_frames(
-                                                shared, exc, snapshot,
+                                                shared, &thread.frames, exc, snapshot,
                                             );
                                             jit_early_exception = Some(exc);
                                             true
@@ -3930,6 +4015,7 @@ pub fn execute(
                                             is_synchronized,
                                             is_static,
                                             force_native_cache: std::sync::OnceLock::new(),
+                                            descriptor_facts_cache: std::sync::OnceLock::new(),
                                             intercept_shape_cache: std::sync::OnceLock::new(),
                                             native_callback_cache: std::sync::OnceLock::new(),
                                             invoc_key: std::sync::OnceLock::new(),
@@ -5246,6 +5332,75 @@ fn execute_frame_from_index(
     // arm's admission test to a register compare. Arming it mid-method is
     // observed on the next call/return, the accepted pgo-style tradeoff.
     let acmp_identity_trace = crate::runtime::env_cache::active_profiles_identity_trace();
+    // ── Back-edge poll word (2026-09-02) ─────────────────────────────────
+    //
+    // Every backward branch used to call `safepoint_check` UNCONDITIONALLY and
+    // then `continue` — straight into the loop-top poll thirty lines below,
+    // which asks `stw_requested` first and only calls `safepoint_check` if it
+    // is set. So the back-edge call was redundant with the very next thing the
+    // loop does, *except* for its tail: the async-exception drain, which is
+    // the only work at a back edge that the loop top does not repeat.
+    //
+    // That tail was not cheap. `take_async_exception` goes through
+    // `self_async_slot`: a thread-local `RefCell` borrow, an `Arc::clone`, a
+    // `swap(0, AcqRel)` and an `Arc` drop — three locked read-modify-writes
+    // per loop iteration, inside a function too large to inline (it carries
+    // the memwatch and blocked-access debug hooks). Measured with
+    // `probes/BackEdge.java` (two loops with identical total body-bytecode
+    // counts and an 8x difference in back-edge count, so the per-back-edge
+    // cost falls out of the difference): one interpreted backward branch cost
+    // 33-37 ns against HotSpot's template interpreter at 4.9 ns.
+    //
+    // Hoisting the slot handle turns the back-edge question into two relaxed
+    // loads and a predicted branch. See
+    // `ThreadRegistry::self_async_slot_handle` for why observing registration
+    // once per `execute_frame` entry is sound (same pgo-style tradeoff as
+    // `pgo_enabled` and `single_step_active` above).
+    let async_exception_slot = shared
+        .threads
+        .thread_registry
+        .self_async_slot_handle(thread.thread_id);
+    // The condition every back edge now tests before paying for
+    // `safepoint_check`. Written as a macro rather than a closure because the
+    // four call sites sit inside `&mut thread` borrows and a closure capturing
+    // `shared`/`async_exception_slot` would still have to be called in a
+    // position where `thread` is reborrowed.
+    //
+    // `CRATONVM_JIT_NO_BACKEDGE_POLL_GATE=1` (or `CRATONVM_JIT=-backedge-poll-
+    // gate`) makes the macro answer `true` unconditionally, restoring the
+    // unconditional call so the two arms can be priced inside one binary.
+    //
+    // ── The two diagnostics that must keep their sampling rate ──────────
+    //
+    // Skipping `safepoint_check` is equivalent to calling it only when the
+    // call would have been a no-op, and there are exactly two ways it is not:
+    // `memwatch::poll` and `blocked_access_debug`, both of which fire from
+    // inside it and neither of which the loop-top poll reaches. A memwatch is
+    // a *sampling* instrument — its own doc promises it "catches the
+    // corrupting write within one safepoint window" — so silently cutting its
+    // rate would weaken a diagnostic rather than speed anything up, and would
+    // do it invisibly.
+    //
+    // Both are startup-static gates, so folding them in costs one more `or`
+    // in the hoisted `bool` and nothing per back edge. An armed run keeps
+    // exactly the old poll frequency; the universal unarmed run keeps the two
+    // relaxed loads.
+    let backedge_poll_gate_off = crate::runtime::env_cache::no_backedge_poll_gate()
+        || crate::runtime::memwatch::is_watching()
+        || cratonvm_gc::blocked_access_debug::enabled();
+    macro_rules! backedge_poll_needed {
+        () => {
+            backedge_poll_gate_off
+                || shared
+                    .mem
+                    .gc_barrier
+                    .stw_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
+                || async_exception_slot
+                    .as_ref()
+                    .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed) != 0)
+        };
+    }
     // When a fast-path bytecode needs to throw a RuntimeError (AIOOBE, NPE, etc.),
     // it sets this to Some(...) and breaks out of the fast-path match instead of
     // returning directly. The main loop then converts it to a catchable Java exception.
@@ -5380,7 +5535,9 @@ fn execute_frame_from_index(
                         }
                         OsrBackoffOutcome::Skip => {}
                     }
-                    safepoint_check(shared, thread);
+                    if backedge_poll_needed!() {
+                        safepoint_check(shared, thread);
+                    }
                 }
             } else {
                 $frame.pc = $saved_pc + 3;
@@ -5695,7 +5852,9 @@ fn execute_frame_from_index(
                                             }
                                             OsrBackoffOutcome::Skip => {}
                                         }
-                                        safepoint_check(shared, thread);
+                                        if backedge_poll_needed!() {
+                                            safepoint_check(shared, thread);
+                                        }
                                     }
                                 } else {
                                     frame.pc = saved_pc + 5; // skip iload_X + iload_Y + if_icmplt(3)
@@ -6033,7 +6192,9 @@ fn execute_frame_from_index(
                             }
                             OsrBackoffOutcome::Skip => {}
                         }
-                        safepoint_check(shared, thread);
+                        if backedge_poll_needed!() {
+                            safepoint_check(shared, thread);
+                        }
                     }
                     continue;
                 }
@@ -6141,7 +6302,7 @@ fn execute_frame_from_index(
                     // lreturn (0xad): a KIND_LONG slot is read bit-exact so a
                     // collision-shaped long return keeps its high bits.
                     let value = if opcode == 0xb0 {
-                        let ret = crate::jit::return_type(frame.method_descriptor());
+                        let ret = frame.return_tag();
                         coerce_value_for_return_validated(shared, cv.to_value(), ret)
                     } else {
                         decode_arg_kind_aware(cv, kind, desc_byte)
@@ -7337,19 +7498,34 @@ fn execute_frame_from_index(
                     // adapter before it allocates either wrapper in interpreter mode.
                     // The helper verifies both the lambda metadata and its concrete
                     // getter bytecode; a miss preserves the ordinary invoke path.
-                    let tdigest_kernel = frame.class_name() == "org/elasticsearch/tdigest/Dist"
-                        && matches!(frame.method_name(), "quantile" | "cdf")
-                        && frame.method_descriptor() == "(DILjava/util/function/Function;)D";
+                    //
+                    // ORDER MATTERS (2026-09-02). This recognizer is
+                    // workload-specific and this arm is EVERY `invokestatic` in
+                    // the VM. It used to open with
+                    // `frame.class_name() == "org/elasticsearch/tdigest/Dist"`,
+                    // so every static call in every program paid a `FrameInner`
+                    // match, an `Arc<str>` deref and a length compare before
+                    // reaching the dispatch it actually wanted.
+                    //
+                    // The operands are all pure, so `&&` may be reordered
+                    // freely, and the BYTECODE-SHAPE half is both cheaper and
+                    // far more selective: three byte loads from `code_ptr`,
+                    // which the preamble has already pulled into L1, against a
+                    // four-opcode window (`invokestatic; invokeinterface; …
+                    // checkcast; … invokevirtual`) that essentially no other
+                    // call site matches. The name tests now run only for a call
+                    // site that already looks exactly like the kernel.
+                    //
                     // SAFETY: `code_ptr` addresses this frame's bytecode and the
-                    // preceding length check proves every inspected offset is in bounds.
-                    if tdigest_kernel
-                        && saved_pc + 14 <= code_len
+                    // `saved_pc + 14 <= code_len` test proves offsets +3/+8/+11
+                    // are in bounds of the padded buffer.
+                    if saved_pc + 14 <= code_len
                         && unsafe { *code_ptr.add(saved_pc + 3) } == 0xb9
                         && unsafe { *code_ptr.add(saved_pc + 8) } == 0xc0
-                        // SAFETY: `saved_pc + 14 <= code_len` was checked
-                        // above, so offsets +3/+8/+11 are all in bounds of the
-                        // frame's padded bytecode buffer.
                         && unsafe { *code_ptr.add(saved_pc + 11) } == 0xb6
+                        && frame.class_name() == "org/elasticsearch/tdigest/Dist"
+                        && matches!(frame.method_name(), "quantile" | "cdf")
+                        && frame.method_descriptor() == "(DILjava/util/function/Function;)D"
                     {
                         let index = frame.stack.pop_unchecked();
                         let lambda = frame.stack.pop_unchecked();
@@ -8209,7 +8385,9 @@ fn execute_frame_from_index(
                         }
                         OsrBackoffOutcome::Skip => {}
                     }
-                    safepoint_check(shared, thread);
+                    if backedge_poll_needed!() {
+                        safepoint_check(shared, thread);
+                    }
                 }
                 continue;
             }
@@ -8221,7 +8399,7 @@ fn execute_frame_from_index(
             Ok(InstructionResult::Return(value)) => {
                 // Slow-path return — check for stackless frames
                 if frame_idx > initial_frame_idx {
-                    let ret = crate::jit::return_type(thread.frames[frame_idx].method_descriptor());
+                    let ret = thread.frames[frame_idx].return_tag();
                     let value = value.map(|v| {
                         if ret == b'V' {
                             v
@@ -8507,7 +8685,8 @@ pub use field_access::*;
 pub mod invoke_phases;
 pub mod site_cache;
 pub use site_cache::{
-    CastSiteCache, ClassSiteCache, FieldSiteCache, MethodSiteCache, MethodSiteInfo, ResolvedNewSite,
+    CastSiteCache, ClassSiteCache, FieldSiteCache, IfaceSelectSiteCache, MethodSiteCache,
+    MethodSiteInfo, ResolvedNewSite,
 };
 // ---------------------------------------------------------------------------
 // Helper: Method invocation

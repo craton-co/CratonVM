@@ -90,24 +90,43 @@ cratonvm-types`:
 
 | | count |
 |---|---|
-| distinct `CRATONVM_*` identifiers appearing anywhere in Rust source | 1,056 |
-| exact string literals (i.e. actually named by code, not prose) | 993 |
-| **declared** in `flag_groups::INVENTORY` + scalars + group variables | **989** |
+| distinct `CRATONVM_*` identifiers appearing anywhere in Rust source | 1,117 |
+| exact string literals (i.e. actually named by code, not prose) | 1,050 |
+| **declared** in `flag_groups::INVENTORY` + scalars + group variables | **1044** |
 | declared before this pass | 576 |
 | declared by this pass | **71** |
 | allowlisted as intentionally undeclared | 11 |
 | user-facing names an operator has to learn | 15 |
 
-The first two rows are **not** generated and no test enforces them, which is
-why they read 692 / 658 from 2026-08-06 until 2026-09-01 while the true figures
-were 1,056 / 993 — a gap large enough to make the declared count (986) look
-like it *exceeded* the number of flags in the source, which is not possible.
-Re-derive them before quoting; the recipe is the one in [How to
-regenerate](#how-to-regenerate):
+The first two rows are generated too, as of 2026-09-02 — and that is a change,
+because the drift they used to show is the reason this section exists. They read
+692 / 658 from 2026-08-06 until 2026-09-01 while the true figures were
+1,056 / 993, a gap large enough to make the declared count (986) look like it
+*exceeded* the number of flags in the source, which is not possible. Re-derived
+on 2026-09-01 they had already moved to 1,065 / 1,001 on the same day, moved
+twice more that afternoon while eight new flags were registered, and went stale
+again on four separate days afterwards — each time because an unrelated branch
+added a flag.
+
+`flag_inventory_surface_counts_are_current` was added to catch that, and it did:
+it just turned every flag anyone added anywhere into a red build for whoever ran
+`cargo test` next. A number only a human can refresh, inside a file a generator
+rewrites, is a red build waiting for the next commit. So
+`tools/flag-census/render-inventory.sh` now writes these two rows as well, and
+the test keeps enforcing them — the generator and the test scan the tree with
+separate code, and the point is that they agree.
+
+To check one by hand, the recipes are below. They carry the same exclusions the
+test's own walk applies (`target/`, `vendor/`, `node_modules/`, dotted
+directories). The one exclusion the recipes cannot express is the internal
+docs tree, which `collect_rust` also skips; it holds no `*.rs` today, so the
+two agree anyway:
 
 ```bash
 # row 1 — identifiers anywhere in Rust source
-grep -rhoE 'CRATONVM_[A-Z0-9_]+' --include='*.rs' . | sort -u | wc -l
+grep -rhoE 'CRATONVM_[A-Z0-9_]+' --include='*.rs' \
+  --exclude-dir=target --exclude-dir=vendor --exclude-dir=node_modules \
+  --exclude-dir='.*' . | sort -u | wc -l
 # row 2 — exact string literals under <crate>/src
 for d in $(sed -n 's/^members = \[//p' Cargo.toml | tr -d '"[],'); do
   [ -d "$d/src" ] && grep -rhoE '"CRATONVM_[A-Z0-9_]+"' "$d/src"
@@ -115,14 +134,25 @@ done | tr -d '"' | sort -u | wc -l
 ```
 
 **What the three rows together say about the surface.** Grouping was a renaming,
-not a retirement: 986 declared knobs reached through 15 variables is still 986
-knobs. Of the names in `flag-surface.txt`, **491** are named nowhere outside
-`docs/internal` — i.e. neither operator-facing nor referenced by CI — and **65**
-of those have at most one Rust read site outside the declaration table. That
-set, not the 15, is the honest retirement backlog. Reproduce both with the
-`ext2`/`rs2` counting in `tools/flag-census/`-style greps: a name's read count
-is its `--include='*.rs'` hits across the member crates minus its hits in
-`types/src/flag_groups.rs` (which is a declaration, not a read).
+not a retirement: 995 declared knobs reached through 15 variables is still 995
+knobs. Of the names in `flag-surface.txt`, **488** are named nowhere outside
+`types/`, the generated documents and `docs/internal` — i.e. neither
+operator-facing nor referenced by CI — and **63** of those have at most one Rust
+read site outside the declaration table. That set, not the 15, is the honest
+retirement backlog, and it is now written down one row at a time in
+[flag-retirement-candidates-20260901.md](flag-retirement-candidates-20260901.md),
+which states the commands that produce all three numbers. The counting rule that
+matters: a name's read count is its `--include='*.rs'` hits across the member
+crates minus its hits in `types/src/flag_groups.rs`, because the registry names
+every variable and that is a declaration, not a read.
+
+Every `INVENTORY` row now also carries a `since:` date, taken from `git log`
+rather than guessed, and `flag_groups.rs`'s own `mod tests` enforces a
+retirement horizon on it: a `DBG` knob declared on or after **2026-08-01** has
+to be referenced somewhere outside `types/` and the generated documents.
+Rows older than the horizon are grandfathered — they are exactly the backlog
+above — so the policy is green today and starts biting on the next flag anyone
+adds.
 
 Read-path split, over `<crate>/src` only:
 
@@ -620,7 +650,7 @@ applies to `flag_env_mutation_guard.rs`.
 
 ## Full inventory
 
-1000 rows: 989 declared, 11 allowlisted. Generated by
+1055 rows: 1044 declared, 11 allowlisted. Generated by
 `tools/flag-census/render-inventory.py` — see
 [How to regenerate](#how-to-regenerate).
 
@@ -662,6 +692,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_A2` | DBG | `CRATONVM_DBG=a2` | opt-in | off | diag | snapshot | types, vm |
 | `CRATONVM_DBG_A5_CENSUS` | DBG | `CRATONVM_DBG=a5-census` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_A5_ENGAGEMENT` | DBG | `CRATONVM_DBG=a5-engagement` | opt-in | off | diag | snapshot | vm |
+| `CRATONVM_DBG_AASTORE_BARRIER_GATE` | DBG | `CRATONVM_DBG=aastore-barrier-gate-sites` | opt-in | off | diag | snapshot | jit |
 | `CRATONVM_DBG_ACCESS` | DBG | `CRATONVM_DBG=access` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_AIO` | DBG | `CRATONVM_DBG=aio` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_AIOOBE` | DBG | `CRATONVM_DBG=aioobe` | opt-in | off | diag | snapshot | types, vm |
@@ -711,7 +742,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_CLINIT_ORDER` | DBG | `CRATONVM_DBG=clinit-order` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_CLONE` | DBG | `CRATONVM_DBG=clone` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_COERCE` | DBG | `CRATONVM_DBG=coerce` | opt-in | off | diag | snapshot | types |
-| `CRATONVM_DBG_COERCION` | DBG | `CRATONVM_DBG=coercion` | opt-in | off | diag | snapshot | gc |
+| `CRATONVM_DBG_COERCION` | DBG | `CRATONVM_DBG=coercion` | opt-in | off | diag | snapshot | gc, types |
 | `CRATONVM_DBG_COLL_REFRESH` | DBG | `CRATONVM_DBG=coll-refresh` | opt-in | off | diag | snapshot | native-collections |
 | `CRATONVM_DBG_COMPACTVALUE` | DBG | `CRATONVM_DBG=compactvalue` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_COMPACT_INLINE` | DBG | `CRATONVM_DBG=compact-inline` | opt-in | off | diag | snapshot | jit, vm |
@@ -817,6 +848,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_IR_LONG` | DBG | `CRATONVM_DBG=ir-long` | opt-in | off | diag | snapshot | jit |
 | `CRATONVM_DBG_IR_RELOC` | DBG | `CRATONVM_DBG=ir-reloc` | opt-in | off | diag | snapshot | jit |
 | `CRATONVM_DBG_IR_SLOTS` | DBG | `CRATONVM_DBG=ir-slots` | opt-in | off | diag | snapshot | jit |
+| `CRATONVM_DBG_IR_STRING` | DBG | `CRATONVM_DBG=ir-string` | opt-in | off | diag | snapshot | jit |
 | `CRATONVM_DBG_ISINSTANCE` | DBG | `CRATONVM_DBG=isinstance` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_ISOLATED_CNF` | DBG | `CRATONVM_DBG=isolated-cnf` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_JAR` | DBG | `CRATONVM_DBG=jar` | opt-in | off | diag | snapshot | types |
@@ -843,6 +875,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_JIT_NAMES` | DBG | `CRATONVM_DBG=jit-names` | opt-in | off | diag | snapshot | jit, vm |
 | `CRATONVM_DBG_JIT_PIN` | DBG | `CRATONVM_DBG=jit-pin` | opt-in | off | diag | snapshot | jit |
 | `CRATONVM_DBG_JIT_PUTFIELD` | DBG | `CRATONVM_DBG=jit-putfield` | opt-in | off | diag | snapshot | vm |
+| `CRATONVM_DBG_JIT_REF_LOADS` | DBG | `CRATONVM_DBG=jit-ref-loads` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_JIT_ROOTSCAN` | DBG | `CRATONVM_DBG=jit-rootscan` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_JIT_SAFEPOINTS` | DBG | `CRATONVM_DBG=jit-safepoints` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_JIT_SCAN_PROF` | DBG | `CRATONVM_DBG=jit-scan-prof` | opt-in | off | diag | snapshot | vm |
@@ -937,7 +970,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_OSR_META` | DBG | `CRATONVM_DBG=osr-meta` | opt-in | off | diag | snapshot | jit |
 | `CRATONVM_DBG_OSR_SEED_COLLISION` | DBG | `CRATONVM_DBG=osr-seed-collision` | opt-in | off | diag | snapshot | jit |
 | `CRATONVM_DBG_OSR_SLOTS` | DBG | `CRATONVM_DBG=osr-slots` | opt-in | off | diag | snapshot | jit |
-| `CRATONVM_DBG_OVERLAY` | DBG | `CRATONVM_DBG=overlay` | opt-in | off | diag | snapshot | classloading, native-builtins, vm |
+| `CRATONVM_DBG_OVERLAY` | DBG | `CRATONVM_DBG=overlay` | opt-in | off | diag | snapshot | classloading, gc, native-builtins, types, vm |
 | `CRATONVM_DBG_OVERLAY_ALL` | DBG | `CRATONVM_DBG=overlay-all` | opt-in | off | diag | snapshot | classloading, vm |
 | `CRATONVM_DBG_OVERLAY_BT` | DBG | `CRATONVM_DBG=overlay-bt` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_OVERLAY_GATE` | DBG | `CRATONVM_DBG=overlay-gate` | opt-in | off | diag | snapshot | vm |
@@ -1103,6 +1136,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DIFF_HOTSPOT` | — | n/a (undeclared) | live | unset | harness/ABI | live getenv | vm/tests differential harness |
 | `CRATONVM_DISABLE_AALOAD_LICM` | JIT | `CRATONVM_JIT=aaload-licm` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_DISABLE_ARITH_LICM` | JIT | `CRATONVM_JIT=arith-licm` | opt-out | on | behaviour | snapshot | jit |
+| `CRATONVM_DISABLE_ARRAYLEN_LICM` | JIT | `CRATONVM_JIT=arraylen-licm` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_DISABLE_DEFAULT_WATCHDOG` | THREADS | `CRATONVM_THREADS=default-watchdog` | opt-out | on | behaviour | snapshot | vm-cli |
 | `CRATONVM_DISABLE_INTRINSICS` | JIT | `CRATONVM_JIT=intrinsics` | opt-out | on | behaviour | snapshot | difftest, vm, vm-cli |
 | `CRATONVM_DISABLE_JAR_MMAP` | LOADER | `CRATONVM_LOADER=jar-mmap` | opt-out | on | behaviour | snapshot | types |
@@ -1127,6 +1161,10 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_FRAME_TRACE` | DBG | `CRATONVM_DBG=frame-trace` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_FUZZ_BOOTCP` | — | n/a (undeclared) | live | unset | harness/ABI | live getenv | cargo-fuzz target |
 | `CRATONVM_FWD_RESOLVE_STRICT` | LOADER | `CRATONVM_LOADER=fwd-resolve-strict` | opt-in | off | behaviour | snapshot | types |
+| `CRATONVM_G1_ADAPTIVE_IHOP` | GC | `CRATONVM_GC=g1-adaptive-ihop` | default-on | on | behaviour | snapshot | types |
+| `CRATONVM_G1_ADAPTIVE_TENURING` | GC | `CRATONVM_GC=g1-adaptive-tenuring` | default-on | on | behaviour | snapshot | types |
+| `CRATONVM_G1_CARD_RSET` | GC | `CRATONVM_GC=g1-card-rset` | default-on | on | behaviour | snapshot | types |
+| `CRATONVM_G1_CLEANUP_WALK` | GC | `CRATONVM_GC=g1-cleanup-walk` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_G1_COVERAGE_PIN` | GC | `CRATONVM_GC=g1-coverage-pin` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_G1_DBG_GRAY_PROV` | DBG | `CRATONVM_DBG=g1-dbg-gray-prov` | opt-in | off | diag | snapshot | gc |
 | `CRATONVM_G1_DBG_HEADERS` | DBG | `CRATONVM_DBG=g1-dbg-headers` | opt-in | off | diag | snapshot | types |
@@ -1136,21 +1174,30 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_G1_DBG_RSET` | DBG | `CRATONVM_DBG=g1-dbg-rset` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_G1_DBG_ZERO` | DBG | `CRATONVM_DBG=g1-dbg-zero` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_G1_EAGER_HUMONGOUS` | GC | `CRATONVM_GC=g1-eager-humongous` | default-on | on | behaviour | snapshot | types |
+| `CRATONVM_G1_EDEN_STRIPES` | GC | `CRATONVM_GC=g1-eden-stripes` | opt-in | off | behaviour | snapshot | types |
+| `CRATONVM_G1_INLINE_BARRIER` | GC | `CRATONVM_GC=g1-inline-barrier` | opt-in | off | behaviour | snapshot | types |
+| `CRATONVM_G1_MARK_LOCK_YIELD` | GC | `CRATONVM_GC=g1-mark-lock-yield` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_G1_MARK_OOB_FAILSAFE` | GC | `CRATONVM_GC=g1-mark-oob-failsafe` | opt-in | off | behaviour | snapshot | gc |
 | `CRATONVM_G1_NARROW_FIXUP` | GC | `CRATONVM_GC=g1-narrow-fixup` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_G1_NO_EVAC_RETRY` | GC | `CRATONVM_GC=g1-evac-retry` | opt-out | on | behaviour | snapshot | types |
 | `CRATONVM_G1_NO_LIVE_REGION_MEMO` | GC | `CRATONVM_GC=g1-live-region-memo` | opt-out | on | behaviour | snapshot | gc |
 | `CRATONVM_G1_PARALLEL_EVAC` | GC | `CRATONVM_GC=g1-parallel-evac` | default-on | on | behaviour | snapshot | types |
+| `CRATONVM_G1_PARALLEL_EVAC_IN_JIT` | GC | `CRATONVM_GC=g1-parallel-evac-in-jit` | default-on | on | behaviour | snapshot | types |
+| `CRATONVM_G1_PARALLEL_MARK` | GC | `CRATONVM_GC=g1-parallel-mark` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_G1_PIN_EMPTY_PUBLICATION` | GC | `CRATONVM_GC=g1-pin-empty-publication` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_G1_PRECISE_ONLY_ROOTS` | GC | `CRATONVM_GC=g1-precise-only-roots` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_G1_RESERVE_HEAP` | GC | `CRATONVM_GC=g1-reserve-heap` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_G1_RSET_SOURCE_CAP` | GC | `CRATONVM_GC=g1-rset-source-cap` | opt-in | off | behaviour | snapshot | gc |
 | `CRATONVM_G1_SCRUB_FREE` | GC | `CRATONVM_GC=g1-scrub-free` | opt-in | off | behaviour | snapshot | gc, types |
+| `CRATONVM_G1_SHARED_ALLOC` | GC | `CRATONVM_GC=g1-shared-alloc` | default-on | on | behaviour | snapshot | types |
+| `CRATONVM_G1_UNCOMMIT` | GC | `CRATONVM_GC=g1-uncommit` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_G1_VERIFY_BUDGET` | GC | `CRATONVM_GC=g1-verify-budget` | opt-in | off | behaviour | snapshot | gc |
 | `CRATONVM_G1_WORKERS` | GC | `CRATONVM_GC=g1-workers` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_G1_YOUNG_PAUSE_TARGET` | GC | `CRATONVM_GC=g1-young-pause-target` | opt-in | off | behaviour | snapshot | gc, types |
 | `CRATONVM_GC` | GC | `CRATONVM_GC=…` | group | unset | — | snapshot | types |
 | `CRATONVM_GC_ARRAY_GUARD_BT` | DBG | `CRATONVM_DBG=gc-array-guard-bt` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_GC_CARD_METRICS` | GC | `CRATONVM_GC=card-metrics` | opt-in | off | behaviour | snapshot | gc, types |
+| `CRATONVM_GC_FULL_RSET_SCAN` | GC | `CRATONVM_GC=full-rset-scan` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN` | GC | `CRATONVM_GC=noflag-deposit-skip-jit-scan` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_GC_NO_BAND_MAP_LIVENESS` | GC | `CRATONVM_GC=band-map-liveness` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_GC_NO_CALLEE_RESOLVE` | GC | `CRATONVM_GC=innermost-callee-resolve` | opt-out | on | behaviour | snapshot | vm |
@@ -1162,21 +1209,27 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_GC_PAR_MIN_BYTES` | GC | `CRATONVM_GC=par-min-bytes` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_GC_PAR_THREADS` | GC | `CRATONVM_GC=par-threads` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_GC_PRECISE_ONLY_ROOTS` | GC | `CRATONVM_GC=precise-only-roots` | opt-in | off | behaviour | snapshot | vm |
-| `CRATONVM_GC_STATS` | DBG | `CRATONVM_DBG=gc-stats` | opt-in | off | diag | snapshot | vm-cli |
+| `CRATONVM_GC_RESERVE` | GC | `CRATONVM_GC=gc-reserve` | default-on | on | behaviour | snapshot | gc |
+| `CRATONVM_GC_STATS` | DBG | `CRATONVM_DBG=gc-stats` | opt-in | off | diag | snapshot | native-builtins, vm-cli |
 | `CRATONVM_GC_STREAM_REFRESH_EACH` | GC | `CRATONVM_GC=stream-refresh-each` | opt-in | off | behaviour | snapshot | native-collections |
 | `CRATONVM_GC_STRESS` | GC | `CRATONVM_GC=stress` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_GC_SWEEP_ANCHOR_STRIDE` | GC | `CRATONVM_GC=sweep-anchor-stride` | opt-in | off | behaviour | snapshot | types |
+| `CRATONVM_GC_VERIFY_RSET` | GC | `CRATONVM_GC=verify-rset` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_GC_VERIFY_STALE` | DBG | `CRATONVM_DBG=gc-verify-stale` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_GC_YOUNG_PAUSE_MS` | GC | `CRATONVM_GC=young-pause-goal-ms` | default-on | on | behaviour | snapshot | gc |
+| `CRATONVM_GC_YOUNG_TRIGGER_PERCENT` | GC | `CRATONVM_GC=young-trigger-percent` | opt-in | off | behaviour | snapshot | gc |
+| `CRATONVM_GETRESOURCE_FIRST_HIT` | COMPAT | `CRATONVM_COMPAT=getresource-first-hit` | default-on | on | behaviour | snapshot | native-builtins |
 | `CRATONVM_GPU_APPROX_MATH` | JIT | `CRATONVM_JIT=gpu-approx-math` | opt-in | off | behaviour | snapshot | jit-cuda |
 | `CRATONVM_GPU_CHUNKS` | GC | `CRATONVM_GC=gpu-chunks` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_GPU_CHUNK_STREAMS` | GC | `CRATONVM_GC=gpu-chunk-streams` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_GPU_CRITICAL_LEASE_MS` | GC | `CRATONVM_GC=gpu-critical-lease-ms` | opt-in | off | behaviour | snapshot | cuda-bridge |
 | `CRATONVM_GPU_CRITICAL_WAIT_MS` | GC | `CRATONVM_GC=gpu-critical-wait-ms` | opt-in | off | behaviour | snapshot | cuda-bridge |
 | `CRATONVM_GPU_DISPATCH_MEMO` | JIT | `CRATONVM_JIT=gpu-dispatch-memo` | default-on | on | behaviour | snapshot | vm |
+| `CRATONVM_GPU_DISPATCH_STREAMS` | GC | `CRATONVM_GC=gpu-dispatch-streams` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_GPU_DUMP_PTX` | DBG | `CRATONVM_DBG=gpu-dump-ptx` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_GPU_IF_CONVERT` | JIT | `CRATONVM_JIT=gpu-if-convert` | opt-in | off | behaviour | snapshot | jit-cuda |
 | `CRATONVM_GPU_IF_CONVERT_MAX_OPS` | JIT | `CRATONVM_JIT=gpu-if-convert-max-ops` | opt-in | off | behaviour | snapshot | jit-cuda |
+| `CRATONVM_GPU_JIT_ARRAY_WRITERS` | GC | `CRATONVM_GC=gpu-jit-array-writers` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_GPU_NO_ZEROCOPY` | GC | `CRATONVM_GC=gpu-zerocopy` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_GPU_TIME_DISPATCH` | DBG | `CRATONVM_DBG=gpu-time-dispatch` | opt-in | off | diag | snapshot | native-builtins |
 | `CRATONVM_GPU_TRACE_BYTES` | DBG | `CRATONVM_DBG=gpu-trace-bytes` | opt-in | off | diag | snapshot | vm |
@@ -1197,14 +1250,16 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_IO` | IO | `CRATONVM_IO=…` | group | unset | — | snapshot | — |
 | `CRATONVM_IR_DEOPT_RESUME` | JIT | `CRATONVM_JIT=ir-deopt-resume` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_ITR_BYTECODE` | REAL | `CRATONVM_REAL=itr-bytecode` | default-on | on | behaviour | snapshot | native-collections |
-| `CRATONVM_JAVA_HOME` | — | `CRATONVM_JAVA_HOME` | scalar | unset | behaviour | snapshot | libcratonvm, native-builtins, types, vm |
+| `CRATONVM_JAVA_HOME` | — | `CRATONVM_JAVA_HOME` | scalar | unset | behaviour | snapshot | libcratonvm, native-builtins, types, vm, vm-cli |
 | `CRATONVM_JBOSS_BOOT_LOG_FILE` | COMPAT | `CRATONVM_COMPAT=jboss-boot-log-file` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_JBOSS_BRUTE_FORCE_JARS` | COMPAT | `CRATONVM_COMPAT=jboss-brute-force-jars` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_JBOSS_LOGGER_BASE_EMIT` | COMPAT | `CRATONVM_COMPAT=jboss-logger-base-emit` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_JBOSS_LOGGER_LEVEL_FILTER` | COMPAT | `CRATONVM_COMPAT=jboss-logger-level-filter` | default-on | on | behaviour | snapshot | native-builtins |
+| `CRATONVM_JBOSS_LOG_CONTEXT_INITIALIZER` | COMPAT | `CRATONVM_COMPAT=jboss-log-context-initializer` | default-on | on | behaviour | snapshot | native-builtins |
 | `CRATONVM_JBOSS_MP_ROOT` | COMPAT | `CRATONVM_COMPAT=jboss-mp-root` | opt-in | off | behaviour | snapshot | native-builtins |
 | `CRATONVM_JCA_LENIENT_GETINSTANCE` | SECURITY | `CRATONVM_SECURITY=jca-lenient-getinstance` | opt-in | off | behaviour | snapshot | native-builtins |
 | `CRATONVM_JDK_RANDOM` | COMPAT | `CRATONVM_COMPAT=jdk-random` | opt-in | off | behaviour | snapshot | native-builtins, native-collections |
+| `CRATONVM_JFR_ENABLE_EVENTS` | — | `CRATONVM_JFR_ENABLE_EVENTS` | scalar | unset | behaviour | snapshot | vm |
 | `CRATONVM_JIT` | JIT | `CRATONVM_JIT=…` | group | unset | — | snapshot | types |
 | `CRATONVM_JIT_ACTIVATION_GLOBAL_MUTEX` | JIT | `CRATONVM_JIT=activation-global-mutex` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_JIT_BISECT_ONLY` | DBG | `CRATONVM_DBG=jit-bisect-only` | opt-in | off | diag | snapshot | jit |
@@ -1241,6 +1296,8 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST` | JIT | `CRATONVM_JIT=fjp-subclass-blocklist` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_FORCE_C2` | JIT | `CRATONVM_JIT=force-c2` | opt-in | off | behaviour | snapshot | difftest, jit |
 | `CRATONVM_JIT_FULL_SELF_CALL_SPILL` | JIT | `CRATONVM_JIT=full-self-call-spill` | opt-in | off | behaviour | snapshot | jit |
+| `CRATONVM_JIT_FUSED_BOUNDS_LOAD` | JIT | `CRATONVM_JIT=fused-bounds-load` | default-on | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_GATED_REF_STORE` | JIT | `CRATONVM_JIT=gated-ref-store` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_GATE_PASS_MEMO` | JIT | `CRATONVM_JIT=gate-pass-memo` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_GC_INERT_SELFREC` | JIT | `CRATONVM_JIT=gc-inert-selfrec` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_GETFIELD_HELPER` | JIT | `CRATONVM_JIT=getfield-helper` | opt-in | off | behaviour | snapshot | jit |
@@ -1257,6 +1314,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_IR_CALL` | JIT | `CRATONVM_JIT=ir-call` | opt-in | off | behaviour | snapshot | difftest, vm |
 | `CRATONVM_JIT_IR_CALL_SPECIAL` | JIT | `CRATONVM_JIT=ir-call-special` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_IR_CALL_VIRTUAL` | JIT | `CRATONVM_JIT=ir-call-virtual` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_JIT_IR_COLD_ARG_STAGE` | JIT | `CRATONVM_JIT=ir-cold-arg-stage` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_DIRECT_CALL` | JIT | `CRATONVM_JIT=ir-direct-call` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_FP` | JIT | `CRATONVM_JIT=ir-fp` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_IR_GC_POINT_MAPS` | JIT | `CRATONVM_JIT=ir-gc-point-maps` | default-on | on | behaviour | snapshot | jit |
@@ -1270,6 +1328,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_IR_OVER_INTRINSIC` | JIT | `CRATONVM_JIT=ir-over-intrinsic` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_RELOC_EMIT` | JIT | `CRATONVM_JIT=ir-reloc-emit` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_SELFREC_DIRECT` | JIT | `CRATONVM_JIT=ir-selfrec-direct` | opt-in | off | behaviour | snapshot | jit |
+| `CRATONVM_JIT_IR_STRING_INTRINSICS` | JIT | `CRATONVM_JIT=ir-string-intrinsics` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD` | JIT | `CRATONVM_JIT=ir-unresumable-trap-guard` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_KERNEL_REG_LOCALS` | JIT | `CRATONVM_JIT=kernel-reg-locals` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_KERNEL_REG_OSR` | JIT | `CRATONVM_JIT=kernel-reg-osr` | opt-in | off | behaviour | snapshot | jit |
@@ -1299,13 +1358,18 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_NATIVE_SHADOW_INTERFACE_BLIND` | JIT | `CRATONVM_JIT=native-shadow-interface-blind` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NEVER_FREE_CODE` | JIT | `CRATONVM_JIT=never-free-code` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NIO_BYTE_DIRECT_HELPERS` | JIT | `CRATONVM_JIT=nio-byte-direct-helpers` | default-on | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_NO_AASTORE_BARRIER_GATE` | JIT | `CRATONVM_JIT=aastore-barrier-gate` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_ALLOC_SPILL_SINK` | JIT | `CRATONVM_JIT=alloc-spill-sink` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_ATOMIC_INTRINSIC` | JIT | `CRATONVM_JIT=atomic-intrinsic` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC` | JIT | `CRATONVM_JIT=atomic-long-intrinsic` | opt-out | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_NO_BACKEDGE_POLL_GATE` | JIT | `CRATONVM_JIT=backedge-poll-gate` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_BCE` | JIT | `CRATONVM_JIT=bce` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH` | JIT | `CRATONVM_JIT=callee-oop-flush` | opt-out | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_NO_CALL_FRAME_DEDUPE` | JIT | `CRATONVM_JIT=call-frame-dedupe` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_CAST_SITE_CACHE` | JIT | `CRATONVM_JIT=cast-site-cache` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_CODE_PTR_MEMO` | JIT | `CRATONVM_JIT=code-ptr-memo` | opt-out | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_NO_COMPILED_FRAME_LINES` | JIT | `CRATONVM_JIT=compiled-frame-lines` | opt-out | on | behaviour | snapshot | vm |
+| `CRATONVM_JIT_NO_DESCRIPTOR_FACTS` | JIT | `CRATONVM_JIT=descriptor-facts` | opt-out | on | behaviour | snapshot | jit-api |
 | `CRATONVM_JIT_NO_DUP2_X2` | JIT | `CRATONVM_JIT=dup2-x2` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_DUPX` | JIT | `CRATONVM_JIT=dupx` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_DUP_X1` | JIT | `CRATONVM_JIT=dup-x1` | opt-out | on | behaviour | snapshot | jit |
@@ -1314,7 +1378,14 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_NO_FFM_INTRINSIC` | JIT | `CRATONVM_JIT=ffm-intrinsic` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_FRAME_BANDS` | JIT | `CRATONVM_JIT=frame-bands` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_IC_FRAME_REPUBLISH` | JIT | `CRATONVM_JIT=ic-frame-republish` | opt-out | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_NO_IFACE_SELECT_MEMO` | JIT | `CRATONVM_JIT=iface-select-memo` | opt-out | on | behaviour | snapshot | vm |
+| `CRATONVM_JIT_NO_INLINE_CALLER_FRAMES` | JIT | `CRATONVM_JIT=inline-caller-frames` | opt-out | on | behaviour | snapshot | vm |
+| `CRATONVM_JIT_NO_INLINE_CALL_MAP_AT_RETURN` | JIT | `CRATONVM_JIT=inline-call-map-at-return` | opt-out | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_NO_INLINE_FRAME_MAP` | JIT | `CRATONVM_JIT=inline-frame-map` | opt-out | on | behaviour | snapshot | jit, vm |
 | `CRATONVM_JIT_NO_INLINE_LIVE_SLOT_CLAMP` | JIT | `CRATONVM_JIT=inline-live-slot-clamp` | opt-out | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_NO_INLINE_MISS_EDGE_POISON` | JIT | `CRATONVM_JIT=inline-miss-edge-poison` | opt-out | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_NO_IR_FRAME_LINES` | JIT | `CRATONVM_JIT=ir-frame-lines` | opt-out | on | behaviour | snapshot | vm |
+| `CRATONVM_JIT_NO_IR_STRING_ACCESS_ADMIT` | JIT | `CRATONVM_JIT=ir-string-access-admit` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_LDC_CONST_CACHE` | JIT | `CRATONVM_JIT=ldc-const-cache` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_LONG_INTRINSICS` | JIT | `CRATONVM_JIT=long-intrinsics` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE` | JIT | `CRATONVM_JIT=mic-rust-entry-cache` | opt-out | on | behaviour | snapshot | vm |
@@ -1323,8 +1394,10 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_NO_NEW_CLASS_INIT_MEMO` | JIT | `CRATONVM_JIT=new-class-init-memo` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_NEW_SITE_CACHE` | JIT | `CRATONVM_JIT=new-site-cache` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT` | JIT | `CRATONVM_JIT=npe-frame-snapshot` | opt-out | on | behaviour | snapshot | vm |
+| `CRATONVM_JIT_NO_NPE_TRAP_LINES` | JIT | `CRATONVM_JIT=npe-trap-lines` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD` | JIT | `CRATONVM_JIT=osr-ambiguous-dead` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_OSR_FRAME_DEDUPE` | JIT | `CRATONVM_JIT=osr-frame-dedupe` | opt-out | on | behaviour | snapshot | vm |
+| `CRATONVM_JIT_NO_OSR_PC_REFRESH` | JIT | `CRATONVM_JIT=osr-pc-refresh` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_OSR_REFINED_REF` | JIT | `CRATONVM_JIT=osr-refined-ref` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_PARAM_TAG_SCAN` | JIT | `CRATONVM_JIT=param-tag-scan` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` | JIT | `CRATONVM_JIT=precise-alloc-athrow` | opt-out | on | behaviour | snapshot | jit |
@@ -1338,8 +1411,10 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_NO_STACK_BANG` | JIT | `CRATONVM_JIT=stack-bang` | both | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_STAGED_ARG_SHADOW` | JIT | `CRATONVM_JIT=staged-arg-shadow` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_STRING_INTRINSIC_PIN` | JIT | `CRATONVM_JIT=string-intrinsic-pin` | opt-out | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_NO_STRING_PIN_FAIL_CLOSED` | JIT | `CRATONVM_JIT=string-pin-fail-closed` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_TRUSTED_OOP_GETFIELD` | JIT | `CRATONVM_JIT=trusted-oop-getfield` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_OOPMAP_COVERAGE_PRESENCE_ONLY` | JIT | `CRATONVM_JIT=oopmap-coverage-presence-only` | opt-in | off | behaviour | snapshot | jit |
+| `CRATONVM_JIT_OPERAND_CACHE` | JIT | `CRATONVM_JIT=operand-cache` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_OSR` | JIT | `CRATONVM_JIT=osr` | opt-in | off | behaviour | snapshot | difftest, vm |
 | `CRATONVM_JIT_OSR_ATHROW` | JIT | `CRATONVM_JIT=osr-athrow` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_OSR_DEAD_LOCALS` | JIT | `CRATONVM_JIT=osr-dead-locals` | default-on | on | behaviour | snapshot | jit |
@@ -1355,6 +1430,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_REASSOC` | JIT | `CRATONVM_JIT=reassoc` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_RECEIVER_DESPEC` | JIT | `CRATONVM_JIT=receiver-despec` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE` | JIT | `CRATONVM_JIT=reloc-gate-map-incomplete` | default-on | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_RIP_SAFEPOINT_POLL` | JIT | `CRATONVM_JIT=rip-safepoint-poll` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_SAFEPOINT_POLLS` | JIT | `CRATONVM_JIT=safepoint-polls` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_SAFEPOINT_REG_SPILL` | JIT | `CRATONVM_JIT=safepoint-reg-spill` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_SCALAR_NEW` | JIT | `CRATONVM_JIT=scalar-new` | opt-in | off | behaviour | snapshot | vm |
@@ -1404,6 +1480,8 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_LHM_ROOT_ALL` | GC | `CRATONVM_GC=lhm-root-all` | opt-in | off | behaviour | snapshot | native-collections |
 | `CRATONVM_LOADER` | LOADER | `CRATONVM_LOADER=…` | group | unset | — | snapshot | — |
 | `CRATONVM_LOADER_AWARE_RESOLUTION` | LOADER | `CRATONVM_LOADER=aware-resolution` | opt-in | off | behaviour | snapshot | types |
+| `CRATONVM_LOADER_NO_ANN_PROXY_LATCH` | LOADER | `CRATONVM_LOADER=ann-proxy-latch` | opt-out | on | behaviour | snapshot | vm |
+| `CRATONVM_LOADER_NO_DUP_NAME_FIELD_GATE` | LOADER | `CRATONVM_LOADER=dup-name-field-gate` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_LOADER_PARENT_CHAIN` | LOADER | `CRATONVM_LOADER=parent-chain` | default-on | on | behaviour | snapshot | classloading |
 | `CRATONVM_LOADER_UNLOAD` | LOADER | `CRATONVM_LOADER=unload` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_LOCK_ORDER_CHECK` | THREADS | `CRATONVM_THREADS=lock-order-check` | opt-in | off | behaviour | snapshot | types |
@@ -1424,7 +1502,9 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_MOVING_YOUNG_NO_JIT` | GC | `CRATONVM_GC=moving-young-jit-frames` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_MOVING_YOUNG_VERIFY` | DBG | `CRATONVM_DBG=moving-young-verify` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_MSC_REAL_START` | REAL | `CRATONVM_REAL=msc-real-start` | default-on | on | behaviour | snapshot | types |
+| `CRATONVM_NATIVE_CF_COMPLETE` | JIT | `CRATONVM_JIT=native-cf-complete` | default-on | on | behaviour | snapshot | native-collections |
 | `CRATONVM_NATIVE_EC_MULTIPLY` | JIT | `CRATONVM_JIT=native-ec-multiply` | opt-in | off | behaviour | snapshot | types |
+| `CRATONVM_NATIVE_ENCODING` | — | `CRATONVM_NATIVE_ENCODING` | scalar | unset | behaviour | snapshot | native-api, vm |
 | `CRATONVM_NATIVE_MATCHER_FIND` | JIT | `CRATONVM_JIT=native-matcher-find` | default-on | on | behaviour | snapshot | types, vm |
 | `CRATONVM_NATIVE_PBE_KEYFACTORY` | JIT | `CRATONVM_JIT=native-pbe-keyfactory` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_NATIVE_SHADOW_SINK_CAP` | DBG | `CRATONVM_DBG=native-shadow-sink-cap` | opt-in | off | diag | snapshot | jit, types, vm |
@@ -1532,6 +1612,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_SP_STATS` | DBG | `CRATONVM_DBG=sp-stats` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_SP_TRACE` | DBG | `CRATONVM_DBG=sp-trace` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_SP_VERIFY` | DBG | `CRATONVM_DBG=sp-verify` | opt-in | off | diag | snapshot | types |
+| `CRATONVM_STDOUT_ENCODING` | — | `CRATONVM_STDOUT_ENCODING` | scalar | unset | behaviour | snapshot | native-api |
 | `CRATONVM_STRESS_THREAD_STATES` | THREADS | `CRATONVM_THREADS=stress-thread-states` | default-on | on | behaviour | snapshot | types, vm |
 | `CRATONVM_STRICT_JIT_ROOTS` | JIT | `CRATONVM_JIT=strict-jit-roots` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_STRICT_SWALLOWS` | COMPAT | `CRATONVM_COMPAT=strict-swallows` | opt-in | off | behaviour | snapshot | vm |
@@ -1613,9 +1694,13 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_ZGC_GEN_NURSERY_PERCENT` | GC | `CRATONVM_GC=zgc-gen-nursery-percent` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_GEN_PROMOTION_AGE` | GC | `CRATONVM_GC=zgc-gen-promotion-age` | opt-in | off | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_HIGH_COMPACTION` | GC | `CRATONVM_GC=zgc-high-compaction` | default-on | on | behaviour | snapshot | gc |
+| `CRATONVM_ZGC_MARKBITS` | GC | `CRATONVM_GC=zgc-markbits` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_MARK_CTX_DIRECT` | GC | `CRATONVM_GC=zgc-mark-ctx-direct` | default-on | on | behaviour | snapshot | gc |
+| `CRATONVM_ZGC_NO_JIT_LOAD_BARRIER` | GC | `CRATONVM_GC=zgc-jit-load-barrier` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_ZGC_NO_JIT_READ_BOUNDS` | GC | `CRATONVM_GC=zgc-jit-read-bounds` | opt-out | on | behaviour | snapshot | gc |
+| `CRATONVM_ZGC_PAGE_PINNED_RELOCATE` | GC | `CRATONVM_GC=zgc-page-pinned-relocate` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_PARMARK` | GC | `CRATONVM_GC=zgc-parmark` | default-on | on | behaviour | snapshot | gc |
+| `CRATONVM_ZGC_PARSWEEP` | GC | `CRATONVM_GC=zgc-parsweep` | opt-in | off | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_PUBLISH_VACATED` | GC | `CRATONVM_GC=zgc-publish-vacated` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_RELOCATE` | GC | `CRATONVM_GC=zgc-relocate` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT` | GC | `CRATONVM_GC=zgc-relocate-proven-jit` | default-on | on | behaviour | snapshot | gc |

@@ -311,6 +311,7 @@ fn cached_entry(class: &str, method: &str, descriptor: &str) -> CachedBytecodeMe
         is_synchronized: false,
         is_static: false,
         force_native_cache: std::sync::OnceLock::new(),
+        descriptor_facts_cache: std::sync::OnceLock::new(),
         intercept_shape_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),

@@ -2019,6 +2019,17 @@ pub trait NativeClassAccess {
         false
     }
 
+    /// [`Self::any_loaded_class_in_package`], narrowed to the classes ONE
+    /// loader defined. `loader_id` is the flat `ClassLoaderId` numbering
+    /// [`Self::loader_id_of_class`] reports.
+    ///
+    /// Same `false` default, for the same reason: an implementation that has
+    /// not overridden this declines rather than fabricating.
+    fn any_loaded_class_in_package_for_loader(&self, package_slash: &str, loader_id: u32) -> bool {
+        let _ = (package_slash, loader_id);
+        false
+    }
+
     /// Mark a class as hidden (JEP 371). Hidden classes are not discoverable via
     /// `Class.forName` or `ClassLoader.findLoadedClass`.
     fn set_class_hidden(&mut self, class_id: ClassId) {

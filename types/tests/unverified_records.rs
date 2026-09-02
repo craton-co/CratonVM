@@ -53,14 +53,38 @@
 
 use std::path::{Path, PathBuf};
 
-/// Phrases a record uses to say "this has not met a binary".
+/// Phrases a record uses to say "this has not met a binary", matched
+/// **case-insensitively as substrings** of a status line.
+///
+/// This list was six exact phrases until 2026-09-02, and that was the defect.
+/// It enumerated the PHRASINGS this campaign's records happened to use, and the
+/// campaign uses many more: `FIXED-UNVERIFIED`, `FIXED-UNVERIFIED-BY-CARGO`,
+/// `FIXED-UNVERIFIED-ON-CRATONVM`, `CODE LANDED, BEHAVIOUR UNVERIFIED`,
+/// `FIXED IN SOURCE, NOT VERIFIED BY AN ARM`, and plain prose like *"no binary
+/// exists that contains the code below"*. The test saw **5** records; the real
+/// population was **61**. Fifty-six pages said, in their own status block, that
+/// nobody had ever run the fix, and the gate was green over all of them.
+///
+/// That is the failure this repo has seen before: a literal table sitting in
+/// front of a question, agreeing with itself. `MIN_PAGES_SCANNED` guards the
+/// WALK and was working perfectly — 526 pages — while the MATCH saw almost
+/// nothing. A floor on the denominator says nothing about the numerator.
+///
+/// Keep these SHORT and generic. A marker that names a lane, a date or a file
+/// is a marker that will miss the next record.
 const UNVERIFIED_MARKERS: &[&str] = &[
-    "NOT yet verified against a binary",
-    "UNVERIFIED against a VM",
-    "NOT REBUILT",
-    "not been observed on a CratonVM binary",
-    "could not build or run Rust",
-    "unverified against a binary",
+    "unverified",
+    "not verified",
+    "not rebuilt",
+    "never been built",
+    "never been run",
+    "not been built",
+    "not been run",
+    "built or run",
+    "no binary",
+    "has not run",
+    "never met a binary",
+    "could not build or run rust",
 ];
 
 /// Phrases that discharge the debt. A page carrying one of these has met a
@@ -72,34 +96,220 @@ const DISCHARGE_MARKERS: &[&str] = &[
     "Verified against a binary",
 ];
 
-/// The debt as it stood when this test was written: records whose own status
-/// block says they have never met a binary.
+/// Records whose own status block says they have never met a binary.
 ///
-/// **All five have now been RUN** (2026-09-02) and none comes back clean, so
-/// they stay here — a run is not a discharge, and the note each entry carries
-/// is what the run found rather than a verdict on the record. Row-by-row
-/// adjudication against each record's own expectation table belongs to its
-/// owner; see
-/// `docs/known-issues/jdk-only/the-five-owed-records-run-at-last-20260902.md`.
+/// **This list was five entries until 2026-09-02. The real population was 61.**
+/// The other 56 were invisible because `UNVERIFIED_MARKERS` enumerated
+/// phrasings rather than asking the question; see the comment there. They are
+/// enumerated here now, each with the status line that put it in the list, so
+/// the debt is a worklist instead of a rumour.
 ///
-/// One thing that run established the hard way, worth knowing before repeating
-/// it: **all three probes are arm-specific.** Their sites are registered only
-/// under `--synthetic-jdk`, each record says so, and running the default build
-/// first produced numbers that measured the real path and looked like evidence.
+/// **These are OWED, not EXCUSED.** An entry is a promise someone still has to
+/// keep. The right way to remove one is to run the handle the record names and
+/// add its `VERIFIED AGAINST A BINARY` note — and once you do, the staleness
+/// check at the bottom of this test REQUIRES the entry to go, so the list can
+/// only shrink.
 ///
-/// **These are OWED, not EXCUSED.** An entry here is a promise someone still has
-/// to keep, and the right way to remove one is to run the handle the record
-/// names and add its `VERIFIED AGAINST A BINARY` note — not to leave it sitting
-/// because the list already tolerates it.
+/// Two entries have been paid, and both are worth reading before you pick one:
 ///
-/// The four this test was born from — `W7-63`, `W7-41`, `W7-19`, `W7-71` — are
-/// deliberately absent: they were verified on 2026-09-01 and all four passed,
-/// 0-diff against HotSpot in both modes. That is the outcome this list exists to
-/// make ordinary, and it is the evidence that working the list down is cheap.
+/// * `W7-63`, `W7-41`, `W7-19`, `W7-71` (2026-09-01) — never in this list,
+///   because they were fixed before it existed. All four passed, 0-diff against
+///   HotSpot in both modes, after sitting unverified for eighteen days.
+/// * `W7-24` (2026-09-02) — the first debt this list itself retired. Its door
+///   defect was fixed and unrun for 22 days, and the fix was right. Getting
+///   there also cost a repair to the PROBE, which printed ephemeral port
+///   numbers and so reported four differing rows on two runs of the same
+///   binary: an unscoreable probe is why a debt stays owed.
+///
+/// The pattern in both: **the fixes are usually right.** What is missing is the
+/// run, and a record nobody can act on is worth much less than the work in it.
+///
+/// One thing the 2026-09-02 run established the hard way: some probes are
+/// arm-specific. `W7-57`/`W7-58`/`W7-70`/`W7-81` name sites registered only
+/// under `--synthetic-jdk`, and a default build produces numbers that measure
+/// the real path and look like evidence. `W7-24` is the opposite — its own
+/// reproduce line is `--jdk-only`. Read the record for its arm; do not assume
+/// the neighbour's.
 const ALLOWED: &[(&str, &str)] = &[
     (
-        "docs/known-issues/jdk-only/W7-24-httpserverloop-and-strict-fallbacks.md",
-        "RUN 2026-09-02 on --synthetic-jdk (its sites are unreachable by default): the wildcard family differs, IPv4 where HotSpot gives IPv6, but HttpServerWildcardAddressProbe also prints ephemeral ports and must be normalised before it can be scored",
+        "docs/known-issues/jdk-only/E12-1-the-null-session-and-the-fabricated-cipher.md",
+        "status block says: **Status: FIXED-UNVERIFIED (this lane's file); NOMINATED (the rest).**",
+    ),
+    (
+        "docs/known-issues/jdk-only/E22-1-the-null-session-in-the-registrar-that-actually-answers.md",
+        "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`, this lane's file); NOMINATED (the rest).**",
+    ),
+    (
+        "docs/known-issues/jdk-only/E25-R11-GUARD-POPULATION-SWEEP-20260813.md",
+        "status block says: **Status:** FIXED-UNVERIFIED (registration + two guards in the owned file);",
+    ),
+    (
+        "docs/known-issues/jdk-only/E3-1-the-cipher-name-helper-and-its-real-denominator.md",
+        "status block says: **Status: FIXED-UNVERIFIED.** **Prov: HotSpot column MEAS (this host); CratonVM",
+    ),
+    (
+        "docs/known-issues/jdk-only/E31-1-the-unregistered-door-and-the-slot-that-resurrects-a-fabrication.md",
+        "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`, `native-builtins/src/tls.rs`, this lane's files); NOMINATED (the rest).**",
+    ),
+    (
+        "docs/known-issues/jdk-only/E33-R11-FOUR-UNFALSIFIABLE-GUARDS-20260813.md",
+        "status block says: **Status:** FIXED-UNVERIFIED-BY-CARGO. Every repair is mutation-checked by",
+    ),
+    (
+        "docs/known-issues/jdk-only/E42-1-the-slot-that-was-never-there-and-the-predicate-that-was-its-own-negation.md",
+        "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/phases_late/ssl_security.rs`, this lane's file); NOMINATED (the rest).**",
+    ),
+    (
+        "docs/known-issues/jdk-only/F10-1-the-two-minters-that-told-a-completed-handshake-it-never-happened.md",
+        "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/http_url_connection.rs`, `native-builtins/src/net_phase_e.rs` — this lane's files); NOMINATED (t",
+    ),
+    (
+        "docs/known-issues/jdk-only/F18-1-four-session-doors-with-no-registration-and-the-twin-that-read-another-table-20260813.md",
+        "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`, `native-builtins/src/tls.rs`, `native-builtins/src/phases_late/ssl_security.rs` — t",
+    ),
+    (
+        "docs/known-issues/jdk-only/F29-1-the-wrapper-class-comes-from-the-call-site-not-the-methodtype-20260813.md",
+        "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/lang_invoke.rs`,",
+    ),
+    (
+        "docs/known-issues/jdk-only/F30-1-the-registrar-call-graph-and-the-drifted-arm-20260813.md",
+        "status block says: **Status:** FIXED-UNVERIFIED-BY-CARGO. This lane did **not** run `cargo`",
+    ),
+    (
+        "docs/known-issues/jdk-only/F6-1-the-arm-that-had-to-move-and-the-two-minters-it-keeps-wrong.md",
+        "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`, `native-builtins/src/tls.rs` — this lane's files); NOMINATED (the rest).**",
+    ),
+    (
+        "docs/known-issues/jdk-only/G10-1-the-bignum-surface-measured-and-the-shipping-twin-20260816.md",
+        "status block says: **Status: CODE LANDED, BEHAVIOUR UNVERIFIED ON CRATONVM.** 2026-08-16, lane",
+    ),
+    (
+        "docs/known-issues/jdk-only/G14-1-the-uri-value-surface-and-how-far-RJdkBridge1-got-20260817.md",
+        "status block says: so no binary exists that contains the code below. Every 'after' here is",
+    ),
+    (
+        "docs/known-issues/jdk-only/G29-1-the-fabricated-http-request-and-its-missing-accessors-20260817.md",
+        "status block says: oracle. The fix is written and formatted but **has not been built**, so its",
+    ),
+    (
+        "docs/known-issues/jdk-only/G31-1-astype-and-the-verifier-that-was-never-asked-20260817.md",
+        "status block says: --tests` clean), but **no binary carrying them has ever executed**. This lane",
+    ),
+    (
+        "docs/known-issues/jdk-only/G35-1-the-registry-demotion-and-the-session-that-was-minted-twice-20260817.md",
+        "status block says: `cargo check` and `cargo test`, so no binary exists containing the code below.",
+    ),
+    (
+        "docs/known-issues/jdk-only/G44-1-the-session-the-verifier-was-handed-20260817.md",
+        "status block says: predates `aed6a3b73`, so no binary containing either this lane's changes or the",
+    ),
+    (
+        "docs/known-issues/jdk-only/G45-1-the-instrument-that-could-not-name-what-it-saw-20260817.md",
+        "status block says: so no binary contains the fix yet and every 'after' below is **PREDICTED** —",
+    ),
+    (
+        "docs/known-issues/jdk-only/G7-1-the-sslsession-surface-measured-and-the-merge-questions-settled-20260816.md",
+        "status block says: **Status:** FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`,",
+    ),
+    (
+        "docs/known-issues/jdk-only/G9-1-the-intrinsic-semantics-census-settled-20260816.md",
+        "status block says: **Status:** FIXED-UNVERIFIED-ON-CRATONVM. Four defects fixed, all four measured",
+    ),
+    (
+        "docs/known-issues/jdk-only/H0-1-the-jmx-pin-and-a-jdk-that-was-not-there-20260820.md",
+        "status block says: **Status: FIXED-UNVERIFIED.** Three source/doc changes landed in the tree. **No",
+    ),
+    (
+        "docs/known-issues/jdk-only/H1-1-the-sink-that-capped-every-count-20260820.md",
+        "status block says: **Status:** **FIXED-UNVERIFIED** — no binary carrying these changes has been",
+    ),
+    (
+        "docs/known-issues/jdk-only/H10-1-three-instruments-and-a-parse-verdict-of-its-own-20260820.md",
+        "status block says: **Status: FIXED-UNVERIFIED against CratonVM.** Three commits, all in the",
+    ),
+    (
+        "docs/known-issues/jdk-only/H11-3-four-rows-retired-and-a-unit-test-that-blocks-the-next-two-20260820.md",
+        "status block says: **Status: FIXED-UNVERIFIED — no binary carrying these changes has been built or",
+    ),
+    (
+        "docs/known-issues/jdk-only/H12-1-the-osr-door-binds-five-bridge-natives-the-method-entry-door-refuses-20260820.md",
+        "status block says: **Status: MEASURED (the defect) / FIXED-UNVERIFIED (the fix).** The divergence",
+    ),
+    (
+        "docs/known-issues/jdk-only/H13-2-all-four-assigned-defects-were-closed-and-the-probe-found-two-more-20260820.md",
+        "status block says: are **MEASURED** defects with **FIXED-UNVERIFIED** repairs: no binary carrying",
+    ),
+    (
+        "docs/known-issues/jdk-only/H2-1-the-filetime-epoch-and-the-queue-lock-20260820.md",
+        "status block says: **Status** `FIXED-UNVERIFIED` — **no binary carrying these changes has been",
+    ),
+    (
+        "docs/known-issues/jdk-only/H20-1-the-direct-call-plan-is-a-second-thing-every-door-builds-20260821.md",
+        "status block says: still not been run.",
+    ),
+    (
+        "docs/known-issues/jdk-only/H24-1-the-module-source-door-and-the-two-modules-a-boot-layer-probe-could-not-see-20260821.md",
+        "status block says: **Status: FIXED IN SOURCE, NOT VERIFIED BY AN ARM.** Lane H24, 2026-08-21.",
+    ),
+    (
+        "docs/known-issues/jdk-only/H4-1-the-cluster-that-is-not-a-tag-20260820.md",
+        "status block says: **Status: FIXED-UNVERIFIED — no binary carrying these changes has been built or",
+    ),
+    (
+        "docs/known-issues/jdk-only/H6-1-the-canonical-name-slot-holds-a-different-string-20260820.md",
+        "status block says: **Status: FIXED-UNVERIFIED — no binary carrying these changes has been built or",
+    ),
+    (
+        "docs/known-issues/jdk-only/H7-1-the-second-door-into-the-map-and-the-guard-that-named-the-wrong-class-20260820.md",
+        "status block says: **Status: FIXED-UNVERIFIED — no binary carrying these changes has been built or",
+    ),
+    (
+        "docs/known-issues/jdk-only/H8-1-three-declines-that-were-not-declines-20260820.md",
+        "status block says: **Status: FIXED-UNVERIFIED — no binary carrying these changes has been built or",
+    ),
+    (
+        "docs/known-issues/jdk-only/H9-1-hashset-owns-no-state-20260820.md",
+        "status block says: **Status: FIXED-UNVERIFIED — no binary carrying these changes has been built or",
+    ),
+    (
+        "docs/known-issues/jdk-only/W5-1-loadlibrary-allowlist-too-wide.md",
+        "status block says: nothing here was built or run):**",
+    ),
+    (
+        "docs/known-issues/jdk-only/W6-6-nativelibraries-load-fabricated-success.md",
+        "status block says: nothing here was built or run):**",
+    ),
+    (
+        "docs/known-issues/jdk-only/W7-14-fjp-common-factory-bound-by-name.md",
+        "status block says: call.** Not rebuilt in this lane: no claim is made that the change compiles or",
+    ),
+    (
+        "docs/known-issues/jdk-only/W7-30-stub-ratchet-boot-path-scope.md",
+        "status block says: the whole time**: §9. Nothing was built or run on 2026-08-12; every claim",
+    ),
+    (
+        "docs/known-issues/jdk-only/W7-36-differential-view-families.md",
+        "status block says: REBUILT, NOT VERIFIED. 1 recorded and deliberately not attempted.**",
+    ),
+    (
+        "docs/known-issues/jdk-only/W7-42-differential-instrument-holes.md",
+        "status block says: `native-builtins` change is a claim about source; it is not rebuilt here.",
+    ),
+    (
+        "docs/known-issues/jdk-only/W7-46-process-cluster.md",
+        "status block says: **Status:** SOURCE-ONLY. **No CratonVM binary was built or run.** Lane W7-46,",
+    ),
+    (
+        "docs/known-issues/jdk-only/W7-49-slot-index-recensus.md",
+        "status block says: Branch `fix/w44-slot-index-sweep-20260812`. Nothing here is built or run. Every",
+    ),
+    (
+        "docs/known-issues/jdk-only/W7-5-registrars-that-never-shipped.md",
+        "status block says: Wave 7, lane W7-5. Nothing was built or run on 2026-08-12.",
+    ),
+    (
+        "docs/known-issues/jdk-only/W7-55-record-reconciliation.md",
+        "status block says: Nothing was built or run for this pass. Every verdict below is git and source",
     ),
     (
         "docs/known-issues/jdk-only/W7-57-close-flush-swallow-sweep.md",
@@ -110,12 +320,32 @@ const ALLOWED: &[(&str, &str)] = &[
         "RUN 2026-09-02 on --synthetic-jdk: 264 rows vs HotSpot 285 (21 UNTESTED, not passing), 39 differing; the getIntLE/putIntLE reds are this record's own documented residuals",
     ),
     (
+        "docs/known-issues/jdk-only/W7-66-live-over-allocations.md",
+        "status block says: **Nothing here was built or run as CratonVM**; the probe transcript quoted below",
+    ),
+    (
         "docs/known-issues/jdk-only/W7-70-printstream-close-noop.md",
         "RUN 2026-09-02 via CloseFlushSwallowProbe on --synthetic-jdk (the probe both records name); shares W7-57's result",
     ),
     (
+        "docs/known-issues/jdk-only/W7-72-ssc-socket-and-filechannel.md",
+        "status block says: **Nothing here was built or run as CratonVM.** Every JDK field layout is",
+    ),
+    (
+        "docs/known-issues/jdk-only/W7-74-short-object-repairs.md",
+        "status block says: Branch `fix/short-thread-objects-20260812`. **Nothing here was built or run",
+    ),
+    (
         "docs/known-issues/jdk-only/W7-81-write-route-three-way.md",
         "RUN 2026-09-02 via CloseFlushSwallowProbe on --synthetic-jdk (the probe both records name); shares W7-57's result",
+    ),
+    (
+        "docs/known-issues/jdk-only/W7-9-minted-interface-abstract-methods.md",
+        "status block says: **Nothing here has been built or run.** Every claim is either `javap` output from",
+    ),
+    (
+        "docs/known-issues/jdk-only/the-five-owed-records-run-at-last-20260902.md",
+        "status block says: **Status: MEASURED 2026-09-02.** The `unverified_records` ratchet holds five",
     ),
 ];
 
@@ -158,6 +388,39 @@ fn pages(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
     }
 }
 
+/// The marker a page's OWN status block carries, if any.
+///
+/// Three things are deliberately NOT offences, each checked against the tree
+/// rather than guessed:
+///   * a BLOCKQUOTE (`>`) -- every record repaired on 2026-09-01 quotes its old
+///     status so a reader can see what changed;
+///   * a HEADING (`#`) -- `jdk-only/README.md` INDEXES records in this state,
+///     which is the opposite of hiding them;
+///   * anything past the status block -- `G39-1` describes ANOTHER record's
+///     banner in its prose, and that is a citation, not a claim.
+fn unverified_marker(text: &str) -> Option<&'static str> {
+    text.lines()
+        .take(STATUS_BLOCK_LINES)
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.starts_with('>') && !t.starts_with('#')
+        })
+        .find_map(|l| {
+            let lower = l.to_ascii_lowercase();
+            UNVERIFIED_MARKERS.iter().copied().find(|m| lower.contains(*m))
+        })
+}
+
+/// Whether the page says somewhere that the debt was paid. Deliberately an
+/// EXACT phrase, unlike the markers above: a discharge is a claim someone must
+/// make on purpose, and a loose match here forgives records that never ran. A
+/// draft of this test matched `verification note` and duly declared `W7-24` and
+/// `W7-57` discharged -- both of which are in `ALLOWED` precisely because they
+/// are not.
+fn is_discharged(text: &str) -> bool {
+    DISCHARGE_MARKERS.iter().any(|d| text.contains(*d))
+}
+
 #[test]
 fn a_record_does_not_claim_a_fix_it_never_ran() {
     let root = workspace_root();
@@ -186,18 +449,10 @@ fn a_record_does_not_claim_a_fix_it_never_ran() {
         //     state, which is the opposite of hiding them;
         //   * anything past the status block -- `G39-1` describes ANOTHER
         //     record's banner in its prose, and that is a citation, not a claim.
-        let Some(marker) = text
-            .lines()
-            .take(STATUS_BLOCK_LINES)
-            .filter(|l| {
-                let t = l.trim_start();
-                !t.starts_with('>') && !t.starts_with('#')
-            })
-            .find_map(|l| UNVERIFIED_MARKERS.iter().find(|m| l.contains(**m)))
-        else {
+        let Some(marker) = unverified_marker(text) else {
             continue;
         };
-        if DISCHARGE_MARKERS.iter().any(|d| text.contains(*d)) {
+        if is_discharged(text) {
             continue;
         }
         offenders.push(format!("  {rel}\n      says: {marker}"));
@@ -218,5 +473,39 @@ fn a_record_does_not_claim_a_fix_it_never_ran() {
          moment anyone ran them.",
         offenders.len(),
         offenders.join("\n")
+    );
+
+    // An allow-list rots the moment a record is repaired: the entry stays,
+    // quietly excusing a page that no longer needs excusing, and a reader can
+    // no longer tell the live debts from the paid ones. With 61 entries that
+    // rot is a certainty rather than a risk, so every entry must still name a
+    // page that EXISTS and still trips the detector. Paying a debt is then
+    // required to remove its entry, and the list can only shrink.
+    let mut stale: Vec<String> = Vec::new();
+    for (path, _) in ALLOWED {
+        match found.iter().find(|(rel, _)| rel == path) {
+            None => stale.push(format!(
+                "  {path}\n      names no such page — it was moved, renamed or deleted"
+            )),
+            Some((_, text)) => {
+                if unverified_marker(text).is_none() || is_discharged(text) {
+                    stale.push(format!(
+                        "  {path}\n      no longer claims an unrun fix — the debt was \
+                         paid and the entry outlived it"
+                    ));
+                }
+            }
+        }
+    }
+    stale.sort();
+
+    assert!(
+        stale.is_empty(),
+        "{} ALLOWED entr(ies) no longer describe the tree:\n\n{}\n\nDELETE them. \
+         An allowance for a record that is already verified is not harmless: it \
+         is the mechanism by which a list of 61 real debts decays into a list \
+         nobody trusts, and then into one nobody reads.",
+        stale.len(),
+        stale.join("\n")
     );
 }

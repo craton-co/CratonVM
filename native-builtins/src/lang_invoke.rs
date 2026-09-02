@@ -2885,6 +2885,45 @@ fn vh_has_synthetic_layout(ctx: &mut dyn NativeContext, vh: ObjectRef) -> bool {
 /// `.unwrap_or(0)`, which is not "unresolved" — it is slot 0, a real field — so
 /// the by-name fallback could never run and every access silently hit the
 /// receiver's first field instead.
+///
+/// # JVMS 6.5 census: `VarHandle` is abstract too
+///
+/// Everything the `MethodHandle` block on [`alloc_method_handle`] records
+/// applies here, with the same verdict (leave it, keep the WARN) and one extra
+/// hazard of its own. AUDITED 2026-09-01.
+///
+/// `java.lang.invoke.VarHandle` is `ACC_ABSTRACT`; on a stock `cratonvm Hello`
+/// the census names `alloc_static_var_handle` below simply because a static
+/// field handle is the first of this file's four `VarHandle` mints that boot
+/// reaches. The objects are real receivers -- returned from
+/// `Lookup.findVarHandle` / `findStaticVarHandle`, held in `static final
+/// VarHandle` fields of real JDK classes (`AtomicBoolean`, `AtomicReference`,
+/// `ObjectInputFilter$Config`), and used as the receiver of every
+/// signature-polymorphic `get` / `set` / `compareAndSet` / `getAndAdd` variant.
+///
+/// **(a) a concrete JDK subclass is worse here than for `MethodHandle`.** The
+/// candidates (`IndirectVarHandle`, the generated `VarHandle*s$Field*` species)
+/// all declare their own instance fields, and [`vh_has_synthetic_layout`] asks
+/// `declared_fields(class_id)` for a field literally named `vform` -- a name
+/// that lives on `VarHandle` itself, not on a subclass. A subclass receiver
+/// would therefore be judged to have OUR layout and the six slot writes below
+/// would run over the subclass's real fields. That predicate is in this file
+/// and could be widened to walk the superclass chain, but the rest of the
+/// price -- `vm_exec.rs`'s
+/// `is_var_handle_signature_polymorphic_receiver`, a `typecheck.rs` cast arm,
+/// and initialising the JDK's `java.lang.invoke` machinery on first use -- is
+/// not.
+///
+/// **(b)** a `cratonvm/internal/...` stand-in loses `instanceof VarHandle` and
+/// `checkcast VarHandle`, which currently answer correctly precisely because
+/// the class is the abstract type. Same trade as the `MethodHandle` site, same
+/// refusal.
+///
+/// **(c)** and the WARN cannot be silenced from this file even if both were
+/// done: `java/lang/invoke/VarHandle` is minted at nine further sites in
+/// `native-builtins/src/phases_late/foreign_ffm.rs` and
+/// `native-builtins/src/phases_late/reflect_invoke.rs`, and the per-class dedupe
+/// would just re-point `requester=` at one of them.
 pub(crate) fn alloc_instance_var_handle(
     ctx: &mut dyn NativeContext,
     class_name: &str,
@@ -2925,6 +2964,10 @@ pub(crate) fn alloc_instance_var_handle(
 }
 
 /// Allocate a VarHandle for a static field.
+///
+/// The JVMS 6.5 audit of this abstract-class mint is on
+/// [`alloc_instance_var_handle`]; this is the site the boot WARN happens to
+/// name, and the verdict there covers it unchanged.
 pub(crate) fn alloc_static_var_handle(
     ctx: &mut dyn NativeContext,
     class_name: &str,
@@ -10162,6 +10205,75 @@ fn method_is_variable_arity(
     false
 }
 
+/// # JVMS 6.5 census: this is the `MethodHandle` mint the boot WARN names
+///
+/// `java.lang.invoke.MethodHandle` is `ACC_ABSTRACT`, so no `new` in any image
+/// could have produced this object.
+/// `cratonvm_native_api::instantiable::observe_uninstantiable_receiver` reports
+/// that once per class per boot, and on a stock `cratonvm Hello` the
+/// `requester=` it prints is the allocation below -- not because this site is
+/// special, but because it is the first of this file's four `MethodHandle`
+/// mints the run reaches. AUDITED 2026-09-01: the violation is real, both
+/// repairs were assessed, and both are wrong HERE. The allocation is left
+/// exactly as it is and the WARN is left firing on purpose.
+///
+/// ## What the object is, before deciding what to do about it
+///
+/// A 22-slot carrier (`MH_VARARGS + 1`) whose slots 16.. hold CratonVM's own
+/// description of the handle -- class, name, descriptor, `MH_KIND`, the
+/// `MH_BOUND` combinator state, the varargs-collector bit -- and whose low
+/// slots are deliberately left to the real JDK layout so
+/// `set_field_by_name(mh, "type", ..)` still lands on `MethodHandle.type`
+/// (`MH_BASE`'s note). It is not an opaque token: it is returned to Java from
+/// every `Lookup.find*` / `unreflect*`, stored in fields declared
+/// `MethodHandle`, `checkcast`-ed to `java/lang/invoke/MethodHandle`, and used
+/// as the receiver of signature-polymorphic `invoke` / `invokeExact` /
+/// `invokeBasic`.
+///
+/// ## (a) mint a concrete JDK subclass -- rejected
+///
+/// The workspace has already run this experiment in the opposite direction.
+///
+/// `panama::DOWNCALL_CARRIER_CLASS` used to be a bespoke CONCRETE class,
+/// `java/lang/foreign/DowncallHandle`. Moving it TO this same abstract
+/// `java/lang/invoke/MethodHandle` is recorded there as "the whole of the
+/// `--jdk-only` fix", and it names the price of a carrier that is not literally
+/// `MethodHandle`: `vm/src/vm/vm_exec.rs`'s
+/// `is_method_handle_signature_polymorphic_receiver` has to name the class or
+/// `invokeExact` stops linking signature-polymorphically;
+/// `vm/src/runtime/interpreter/typecheck.rs` has to hard-code that the class is
+/// castable to `MethodHandle` or every `checkcast` on a returned handle throws;
+/// and `asType` has to stop writing the `type` field. Stamping
+/// `java/lang/invoke/DirectMethodHandle` here re-incurs all three, and adds an
+/// `ensure_class_initialized` of the JDK's own `java.lang.invoke` bootstrap to
+/// the first `findStatic` of every run. Two of those three files are outside
+/// this audit's write scope.
+///
+/// ## (b) mint a `cratonvm/internal/...` stand-in -- rejected
+///
+/// For those same three reasons, plus one the naming convention cannot fix.
+///
+/// Today's fiction fails in the harmless direction: because the class IS the
+/// abstract type, `instanceof MethodHandle` and `checkcast MethodHandle` both
+/// answer correctly and only `getClass()` lies -- and nothing in the corpus
+/// reads `getClass()` on a handle. Renaming without a matching arm in
+/// `typecheck.rs`'s `synthetic_implements` converts a wrong `getClass()` that
+/// nothing reads into a wrong `checkcast` that lambda linkage and
+/// `invokedynamic` reach on every call. That is a strictly worse trade, so it
+/// is not made.
+///
+/// ## (c) why this cannot be closed from this file at all
+///
+/// The census dedupes by CLASS NAME. Repairing all four `MethodHandle` mints in
+/// this file would not delete the WARN line: `java/lang/invoke/MethodHandle` is
+/// also minted by `native-builtins/src/panama.rs` (`alloc_downcall_handle`, on
+/// the documented reasoning above) and by
+/// `native-builtins/src/classloader.rs`, and the report would simply re-point
+/// `requester=` at whichever of those ran first. Closing this species is a
+/// coordinated change across those two files and the two VM files named above,
+/// not a local edit -- which is why nothing here is behind a kill switch:
+/// nothing about how these handles are minted changed, so there is nothing to
+/// A/B.
 pub(crate) fn alloc_method_handle(
     ctx: &mut dyn NativeContext,
     class: &str,

@@ -434,22 +434,128 @@ fn derive_host_locale() -> HostLocale {
         return host;
     }
 
+    HostLocale {
+        display: parse_locale_name(&posix_locale_category("LC_MESSAGES")),
+        format: parse_locale_name(&posix_locale_category("LC_CTYPE")),
+    }
+}
+
+/// Resolve ONE POSIX locale category the way `setlocale(<category>, "")` does:
+/// `LC_ALL` ▸ the category's own variable ▸ `LANG`.
+///
+/// Lifted out of `derive_host_locale` with the precedence unchanged — it was
+/// an inline `pick` closure there — when [`derive_native_encoding`] needed the same precedence
+/// for `LC_CTYPE`. A second copy is precisely how the locale answer and the
+/// encoding answer would drift apart on a host that sets only `LC_CTYPE`, or
+/// only `LC_ALL`: the two shapes this precedence exists to get right.
+///
+/// Returns the RAW locale name, `.codeset` suffix and `@modifier` included.
+/// `parse_locale_name` discards both because a language tag has neither.
+///
+/// It had a second caller for one day: a `native_encoding_from_locale_name`
+/// that read the codeset out of this string. That was replaced on 2026-09-01 by
+/// `cratonvm_native_api::os_encoding`, which asks libc instead — a locale NAME
+/// cannot tell an installed locale from a merely requested one, and HotSpot
+/// reports what `setlocale` actually gave it.
+fn posix_locale_category(category: &str) -> String {
     let env = |name: &str| cratonvm_types::flags::runtime_var(name).unwrap_or_default();
     let lc_all = env("LC_ALL");
-    let lang = env("LANG");
-    let pick = |category: String| {
-        if !lc_all.trim().is_empty() {
-            lc_all.clone()
-        } else if !category.trim().is_empty() {
-            category
-        } else {
-            lang.clone()
-        }
-    };
-    HostLocale {
-        display: parse_locale_name(&pick(env("LC_MESSAGES"))),
-        format: parse_locale_name(&pick(env("LC_CTYPE"))),
+    if !lc_all.trim().is_empty() {
+        return lc_all;
     }
+    let own = env(category);
+    if !own.trim().is_empty() {
+        return own;
+    }
+    env("LANG")
+}
+
+/// The charset the host announces, for the `native.encoding` property.
+///
+/// # Why this is derived and not a constant
+///
+/// Until 2026-09-01 both of CratonVM's property tables answered the literal
+/// `"UTF-8"` under a comment reading "Encodings — JDK 18+ pinned to UTF-8 for
+/// stdout/stderr/file/native". **That premise was false.** Read from the JDK
+/// 25 sources on the audit host (`lib/src.zip`), not from memory:
+/// `jdk/internal/util/SystemProps` *assigns* `file.encoding = "UTF-8"` — that
+/// is JEP 400's pin, and it is the only one — and then does an unconditional
+/// `put` of `native.encoding` from the value the platform native code
+/// computed. `java.lang.System`'s own property table specifies
+/// `native.encoding` as derived from the host environment and says setting it
+/// on the command line has no effect. A constant satisfies neither clause, so
+/// this key — unlike `stdout.encoding`, which is a compatibility judgement —
+/// was simply non-conforming. See
+/// docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-20260901.md.
+///
+/// # What this deliberately does NOT do
+///
+/// * **It does not move `stdout.encoding`, `stderr.encoding`,
+///   `stdin.encoding`, `file.encoding` or `sun.jnu.encoding`**, nor the
+///   charset stamped on `System.out`. In real-JDK mode that is not an accident
+///   of ordering: `SystemProps.initProperties` reaches for `native.encoding`
+///   only as a `putIfAbsent` FALLBACK for the three stream keys, and all three
+///   are already present in `native-builtins/src/system_bootstrap.rs`'s
+///   `vmProperties()` table, so this change cannot reach them. Whether
+///   `System.out` should follow the console is the judgement the page above
+///   declines to make; `sun.jnu.encoding` is riskier still, because it decides
+///   how FILE NAMES are encoded and moving it would change class loading
+///   rather than printing.
+/// * **It does not move `sun.jnu.encoding`.** That key decides how FILE NAMES
+///   are encoded, so moving it changes class loading rather than printing —
+///   a different blast radius, and still deferred.
+///
+/// Two bullets that stood here for one day are gone, both closed by
+/// `cratonvm_native_api::os_encoding` on 2026-09-01: this DOES read a Windows
+/// code page now (`GetACP`, and the attached console's code page for a stream
+/// that has one), and it DOES call `setlocale`/`nl_langinfo` rather than
+/// parsing the locale NAME — for `LC_CTYPE` only, on one thread, restoring the
+/// previous locale, which leaves the process-global state `derive_host_locale`
+/// declines to touch exactly as it was found. The name-parse it replaced could
+/// not tell an installed locale from a requested one: measured on the audit
+/// host, `LANG=en_US.ISO-8859-1` makes HotSpot answer `ANSI_X3.4-1968`
+/// (`setlocale` failed, so the process stayed in `C`) where the parse answered
+/// `ISO-8859-1`.
+fn derive_native_encoding() -> String {
+    // The A/B for this change, in one binary, on every platform:
+    // `CRATONVM_NATIVE_ENCODING=UTF-8` restores the pre-2026-09-01 constant
+    // exactly. Any other value is used verbatim. The default is derivation
+    // rather than the constant because, unlike `stdout.encoding`, the
+    // specification for this key is not ambiguous.
+    if let Some(pin) = cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_ENCODING")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        return pin;
+    }
+    platform_native_encoding()
+}
+
+/// The host-derived half of [`derive_native_encoding`], split out so the flag
+/// check above reads as the one-line override it is.
+///
+/// `cfg!` rather than `#[cfg]` on purpose: both arms then type-check on both
+/// platforms, so a Unix-side edit cannot silently break the Windows build that
+/// nobody working on this can run.
+fn platform_native_encoding() -> String {
+    // Delegated to `cratonvm_native_api::os_encoding`, which asks libc
+    // (`setlocale(LC_CTYPE, "")` then `nl_langinfo(CODESET)`) on Unix and
+    // `GetACP` on Windows, since 2026-09-01.
+    //
+    // It replaces a locale-NAME parse that lived here for one day and whose own
+    // doc named both of its gaps: a name cannot tell a locale that is INSTALLED
+    // from one that is merely requested (measured: `LANG=en_US.ISO-8859-1`
+    // makes HotSpot answer `ANSI_X3.4-1968`, because `setlocale` failed and the
+    // process stayed in `C`, where the parse answers `ISO-8859-1`), and the
+    // Windows leg answered a constant `UTF-8` because no code page was read
+    // anywhere in this tree. Both are closed there.
+    //
+    // The `setlocale` this was written to avoid is called once, on one thread,
+    // for `LC_CTYPE` only, and the previous locale is restored — so the
+    // process-global state `derive_host_locale` declines to touch is left
+    // exactly as it was found.
+    cratonvm_native_api::os_encoding::native_encoding().to_string()
 }
 
 /// The host's locales from a platform API, or `None` where there is no such
@@ -1826,6 +1932,8 @@ impl SharedVm {
             ihop_percent: config.g1_ihop_percent,
             max_gc_pause_ms: config.g1_max_gc_pause_ms,
             string_dedup: config.g1_string_dedup,
+            parallel_gc_threads: config.g1_parallel_gc_threads,
+            initial_heap_size: Some(config.initial_heap_size),
         };
         let mut heap = VmHeap::new_with_overrides(gc_backend, config.max_heap_size, g1_overrides);
         // Bind the heap to THIS VM's compact-layout domain, here rather than
@@ -3553,12 +3661,68 @@ impl SharedVm {
         // class-file major version for JDK 25 = 69 (45 + feature 24? → JDK 25 = 69).
         sys_props.insert("java.class.version".to_string(), "69.0".to_string());
 
-        // Encodings — JDK 18+ pinned to UTF-8 for stdout/stderr/file/native.
+        // Encodings. **Read the next three paragraphs before adding a key here.**
+        //
+        // The comment this replaces read "Encodings — JDK 18+ pinned to UTF-8
+        // for stdout/stderr/file/native", and it was FALSE for three of the
+        // four keys it named. JEP 400 pinned `file.encoding` and nothing else:
+        // `jdk/internal/util/SystemProps` (JDK 25 `lib/src.zip`, read on the
+        // audit host) ASSIGNS `file.encoding = "UTF-8"`, then DERIVES
+        // `native.encoding` from the platform and the three stream keys from
+        // `native.encoding`. A written-down premise that is wrong is how this
+        // survived unexamined; see
+        // docs/known-issues/stdout-encoding-differs-from-hotspot-on-windows-20260901.md.
+        //
+        // THE OTHER TABLES — there are three, not two.
+        // `native-builtins/src/system_bootstrap.rs` holds a second copy of
+        // these six keys in `vmProperties()` and a third, partial copy in
+        // `platformProperties()`. Which one wins depends on the mode:
+        //   * built-in (no real JDK) — THIS table is the only one; the other
+        //     two are never called.
+        //   * real-JDK — `SystemProps.initProperties` seeds from
+        //     `vmProperties()`, then `put`s `native.encoding` and
+        //     `sun.jnu.encoding` unconditionally from `platformProperties()`.
+        //     So for those two the PLATFORM table wins outright, and for the
+        //     remaining four the `vmProperties()` copy wins by being present
+        //     before the `putIfAbsent`s that would otherwise derive them.
+        // Both of `system_bootstrap.rs`'s copies read this map back through
+        // `NativeContext::get_system_property`, so the derivation below is the
+        // single source of truth in every mode and the three tables cannot
+        // disagree.
+        //
+        // THE STREAM KEYS ARE DERIVED HERE TOO, since 2026-09-01. That is the
+        // half the page above staged separately and recommended (§9, option A
+        // with C as its kill switch): `stdout.encoding` decides the `Charset`
+        // `install_charset` stamps on `System.out`, and therefore the BYTES —
+        // under `LANG=C` HotSpot writes `?` for a character US-ASCII cannot
+        // map and this VM wrote the UTF-8 sequence, ten rows of a 273-assertion
+        // differential. `CRATONVM_STDOUT_ENCODING=UTF-8` restores the old
+        // behaviour in one binary.
+        //
+        // `sun.jnu.encoding` is NOT derived, deliberately: it decides how FILE
+        // NAMES are encoded, so moving it changes class loading rather than
+        // printing. Different blast radius, different change.
+        //
+        // `file.encoding` is the one key the old comment got right: JEP 400
+        // does pin it, unconditionally, and `COMPAT` is the only escape.
+        let native_encoding = derive_native_encoding();
         sys_props.insert("file.encoding".to_string(), "UTF-8".to_string());
-        sys_props.insert("native.encoding".to_string(), "UTF-8".to_string());
+        sys_props.insert("native.encoding".to_string(), native_encoding.clone());
         sys_props.insert("sun.jnu.encoding".to_string(), "UTF-8".to_string());
-        sys_props.insert("stdout.encoding".to_string(), "UTF-8".to_string());
-        sys_props.insert("stderr.encoding".to_string(), "UTF-8".to_string());
+        sys_props.insert(
+            "stdout.encoding".to_string(),
+            cratonvm_native_api::os_encoding::stream_encoding(
+                cratonvm_native_api::os_encoding::StdStream::Out,
+            )
+            .to_string(),
+        );
+        sys_props.insert(
+            "stderr.encoding".to_string(),
+            cratonvm_native_api::os_encoding::stream_encoding(
+                cratonvm_native_api::os_encoding::StdStream::Err,
+            )
+            .to_string(),
+        );
         // Session 108 (Cluster D v2 — Console.<clinit> companion fix):
         // `java/io/Console.<clinit>` calls
         // `Charset.forName(System.getProperty("stdin.encoding"), UTF_8)`. The
@@ -3567,9 +3731,17 @@ impl SharedVm {
         // `Charset.lookup(null)` throws — so a null property here trips the
         // Console.<clinit> swallow we observed in Session 108. The
         // `stdin.encoding` key was missing from the bootstrap seed (only
-        // `stdout.encoding` / `stderr.encoding` were pinned). Mirror what
-        // HotSpot's launcher native code does: pin to UTF-8 unconditionally.
-        sys_props.insert("stdin.encoding".to_string(), "UTF-8".to_string());
+        // `stdout.encoding` / `stderr.encoding` were pinned). It must stay
+        // non-null; it need not be UTF-8, and on HotSpot it is the console's
+        // own code page — `cp866` on the 1251 Windows host measured above,
+        // where `stdout.encoding` was the redirected `Cp1251`.
+        sys_props.insert(
+            "stdin.encoding".to_string(),
+            cratonvm_native_api::os_encoding::stream_encoding(
+                cratonvm_native_api::os_encoding::StdStream::In,
+            )
+            .to_string(),
+        );
 
         // Force BufferedInputStream/etc. to use synchronized blocks instead
         // of InternalLock/ReentrantLock. This avoids potential issues with
@@ -3879,6 +4051,23 @@ impl SharedVm {
         for (k, v) in &config.system_properties {
             sys_props.insert(k.clone(), v.clone());
         }
+
+        // … with exactly ONE exception, and it is specified rather than
+        // chosen. `java.lang.System`'s property table says of
+        // `native.encoding`: "setting this system property on the command line
+        // has no effect". The JDK enforces that by `put`ting the platform value
+        // AFTER the command-line map has been built
+        // (`SystemProps.initProperties`), which is what this line mirrors. It
+        // is also what real-JDK mode already did here, because
+        // `platformProperties()` overrides the `-D` map there — so re-asserting
+        // it is what makes the two modes agree instead of disagreeing only
+        // when someone passes a flag the spec says is inert.
+        //
+        // Note this re-asserts the DERIVED value, not a constant: a
+        // `CRATONVM_NATIVE_ENCODING=…` pin is applied inside
+        // `derive_native_encoding` and therefore survives this line, which is
+        // what keeps the kill switch usable.
+        sys_props.insert("native.encoding".to_string(), native_encoding);
 
         // Wire GC logging from config
         if config.verbose_gc {
@@ -7580,6 +7769,10 @@ impl SharedVm {
 
     /// Drain the cleaner queue and return the addresses of cleaner actions
     /// to execute.  The caller is responsible for actually running them.
+    // Test-only: the sole caller is `m19_cleaner_actions_drained`. The
+    // scanner could not see that until the region splitter stopped counting
+    // braces inside string literals (2026-09-02).
+    #[cfg(test)]
     pub fn drain_cleaners(&self) -> Vec<usize> {
         self.mem.cleaner_thread.drain_actions()
     }
@@ -9208,6 +9401,73 @@ impl Vm {
         // idempotent, last-writer-wins shape as the two hooks just above.
         crate::runtime::jvmti::install_real_agent_env_bridge(&shared);
 
+        // JFR `cratonvm.JitCompileDecision` — install the producer's delivery
+        // sink.
+        //
+        // `cratonvm-jit` has no route to a `FlightRecorder`: the recorder is
+        // `SharedVm::debug.flight_recorder`, and a `jit -> vm` dependency edge
+        // would cycle. So `cratonvm_jfr::jit_decision` holds a `OnceLock` sink
+        // and the VM fills it in here — the same boot-time installer shape as
+        // `cratonvm_gc::install_gc_start_hook` and
+        // `install_real_agent_env_bridge` just above, except that this one is a
+        // BOXED CLOSURE rather than a bare `fn` because it has to CAPTURE the
+        // recorder handle, which is the entire point of the indirection.
+        //
+        // `Weak`, like the two hooks above, so a sink that outlives its VM (the
+        // cell is process-global and first-installation-wins) cannot keep the
+        // VM alive.
+        //
+        // Installed BEFORE the `-XX:StartFlightRecording` block below so that a
+        // recording naming the event on the command line arms the producer gate
+        // the moment `start_recording` refreshes it. Order is not strictly load
+        // bearing — `install_jit_decision_sink` re-arms from both flags itself —
+        // but this way there is no window in which a started recording wants the
+        // event and the producer is still dark.
+        {
+            // How many `try_lock` attempts the decision sink makes before it
+            // gives the event up. See the comment on the loop below.
+            const JIT_DECISION_LOCK_ATTEMPTS: u32 = 64;
+
+            let weak = Arc::downgrade(&shared);
+            cratonvm_jfr::jit_decision::install_jit_decision_sink(Box::new(move |decision| {
+                let Some(vm) = weak.upgrade() else {
+                    return;
+                };
+                // TRY-LOCK, DELIBERATELY, AND NOT `lock()`.
+                //
+                // `flight_recorder` is a non-reentrant `parking_lot::Mutex`, and
+                // this closure runs on whatever thread is compiling — a
+                // background compile worker, or a mutator part-way through
+                // executing Java. Every critical section that takes this lock
+                // today is `acquire -> one emit_* -> drop`, with no Java
+                // re-entry and no compile inside it, so a self-deadlock is not
+                // reachable as the code stands (checked across every
+                // `flight_recorder.lock()` site in `vm/` and `vm-cli/` when this
+                // was written).
+                //
+                // But this sink is the first thing that can call INTO the
+                // recorder from the middle of a compile, and it turns "some
+                // future path emits a JFR event with the recorder held and then
+                // runs Java" from a harmless mistake into a hung VM. That is not
+                // a trade a diagnostic gets to make: a lost decision event is a
+                // hole in a dump, a deadlock is a hung process.
+                //
+                // BOUNDED SPIN rather than a single attempt, so that ordinary
+                // contention — several compile workers each holding the lock for
+                // one formatted event — does not silently thin the census out
+                // and make a `jfr print` undercount. A genuine self-deadlock
+                // costs this many yields per compile and then continues, which
+                // is slow and visible rather than silent and fatal.
+                for _ in 0..JIT_DECISION_LOCK_ATTEMPTS {
+                    if let Some(mut jfr) = vm.debug.flight_recorder.try_lock() {
+                        cratonvm_jfr::builtin::emit_jit_compile_decision_event(&mut jfr, decision);
+                        return;
+                    }
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
         // obsaudit D15 (2026-07-26) — open the real attach-API socket and
         // register the *live* (real-VM-state-backed) jcmd command set. See
         // the LIVENESS block and `AttachListener`'s doc comment in
@@ -9232,6 +9492,177 @@ impl Vm {
             settings.max_size = jfr_cfg.max_events;
             settings.duration = jfr_cfg.duration;
             settings.dump_on_exit = jfr_cfg.dump_on_exit;
+
+            // ---- the event-name filter: the command-line half of
+            // ---- `jdk.jfr.Recording.enable(...)`
+            //
+            // 2026-09-01. Before this, `RecordingSettings::new` left
+            // `enabled_event_names: None` and nothing on the boot path ever
+            // overwrote it, so a `-XX:StartFlightRecording` recording could
+            // not name an event at all. That is not merely a missing
+            // convenience: `cratonvm.JitCompileDecision` arms its producer
+            // ONLY when a running recording names it explicitly (see
+            // `jfr/src/jit_decision.rs` and
+            // `FlightRecorder::any_running_recording_names_event`, which is
+            // deliberately stricter than the drain filter), so the event was
+            // unreachable from any command line. The only route was an
+            // in-process `jdk.jfr.Recording`, i.e. editing the application --
+            // exactly what an operator holding a production incident cannot
+            // do, and exactly the gap the event was added to close.
+            //
+            // TWO DOORS, deliberately, converging on this one place:
+            //
+            //  * `-XX:StartFlightRecording:+<Event>#enabled=true` -- HotSpot's
+            //    own spelling, parsed by `config::apply_jfr_event_setting`
+            //    into `VmConfig::jfr_enabled_events`.
+            //  * `CRATONVM_JFR_ENABLE_EVENTS=<name>[,<name>...]` -- a plain
+            //    comma-separated list, and obviously CratonVM-specific
+            //    because it is not HotSpot syntax and cannot be mistaken for
+            //    it. It exists because `Vm::new` is also reached by embedders
+            //    (`libcratonvm`, the in-process test binary, the JNI
+            //    invocation API) that never pass argv through `vm-cli`'s
+            //    option parser, and because it lets an already-deployed
+            //    launch script arm the event without editing its flags.
+            //
+            // They UNION rather than shadow each other. Two doors where the
+            // later silently overrides the earlier is how a flag ends up
+            // looking wired and doing nothing, which is the whole complaint
+            // this change answers.
+            let requested_events: Option<Vec<String>> = {
+                let mut names: Vec<String> = Vec::new();
+                let mut asked = false;
+                if let Some(from_flag) = shared.config.jfr_enabled_events.as_ref() {
+                    asked = true;
+                    for name in from_flag {
+                        if !names.iter().any(|n| n == name) {
+                            names.push(name.clone());
+                        }
+                    }
+                }
+                if let Ok(raw) =
+                    cratonvm_types::flags::runtime_var("CRATONVM_JFR_ENABLE_EVENTS")
+                {
+                    // Setting the variable at all counts as asking, even to an
+                    // empty value: that installs an EMPTY whitelist, so the
+                    // dump is empty and the startup line below says the filter
+                    // is empty. The alternative -- treating an empty value as
+                    // "no filter" -- would silently produce a full recording
+                    // from a command that asked for a narrow one, which is the
+                    // same class of lie as the unknown-name case handled just
+                    // below.
+                    asked = true;
+                    for name in raw.split(',') {
+                        let name = name.trim();
+                        if !name.is_empty() && !names.iter().any(|n| n == name) {
+                            names.push(name.to_string());
+                        }
+                    }
+                }
+                asked.then_some(names)
+            };
+            if let Some(requested) = requested_events {
+                // Validate every requested name against the recorder's OWN
+                // type registry, and refuse to boot on one it does not define.
+                //
+                // A typo here is otherwise indistinguishable from the exact
+                // ambiguity this event exists to remove: the recording starts,
+                // the workload runs, the dump is empty, and "the event never
+                // fired" and "the name was misspelt" look identical. The
+                // incident window is gone by the time anyone can tell them
+                // apart, so this has to fail before the workload starts.
+                //
+                // `create_flight_recorder` registers every built-in event type
+                // at recorder construction (see `jfr/src/lib.rs`), which
+                // happens in `SharedVm::new` well before this block, so the
+                // registry is authoritative for every name a command line can
+                // legitimately use. A `jdk.jfr.Event` subclass DEFINED IN JAVA
+                // registers later, at its first commit -- such a name cannot
+                // be spelled here and is an in-process-only route by
+                // construction, which is why "unknown" can be a hard error
+                // rather than a warning.
+                let rejection = {
+                    let fr = shared.debug.flight_recorder.lock();
+                    let unknown: Vec<String> = requested
+                        .iter()
+                        .filter(|name| fr.type_registry.find_by_name(name.as_str()).is_none())
+                        .cloned()
+                        .collect();
+                    if unknown.is_empty() {
+                        None
+                    } else {
+                        let mut known: Vec<String> = fr
+                            .type_registry
+                            .iter()
+                            .map(|(_, ty)| ty.name.clone())
+                            .collect();
+                        known.sort();
+                        Some((unknown, known))
+                    }
+                };
+                if let Some((unknown, known)) = rejection {
+                    // PANIC, and not `tracing::error!` plus carry on.
+                    //
+                    // Carrying on is the failure being designed out: it hands
+                    // the operator a running VM whose recording can never
+                    // contain what they asked for.
+                    //
+                    // `std::process::exit` would be the launcher-shaped
+                    // response and is what a bad `-XX:` flag deserves, but it
+                    // is wrong HERE: `Vm::new` is a library entry point, and
+                    // the `cratonvm-vm` test binary builds one `SharedVm` per
+                    // test. An `exit` would take the whole test binary down
+                    // over one test's configuration, and nothing else in
+                    // `vm/src` calls it (checked). A panic is just as
+                    // impossible to ignore, unwinds only this VM, and still
+                    // exits a real launcher non-zero.
+                    panic!(
+                        "-XX:StartFlightRecording / CRATONVM_JFR_ENABLE_EVENTS names {} event(s) \
+                         this VM does not define: {}\n\
+                         No recording can ever capture them, so refusing to start rather than \
+                         handing back an empty dump.\n\
+                         Known event names:\n  {}",
+                        unknown.len(),
+                        unknown.join(", "),
+                        known.join("\n  "),
+                    );
+                }
+                // Unconditional `eprintln!`, not `tracing::info!`: this line
+                // only prints when the operator explicitly asked for a JFR
+                // recording AND named events in it, so it is never noise, and
+                // it must not depend on a `tracing` subscriber being installed
+                // and filtered to `info`. It is the receipt that says which
+                // events this dump can possibly contain -- the one fact that
+                // makes a thin dump readable instead of ambiguous.
+                eprintln!(
+                    "[JFR] recording `cratonvm` restricted to {} named event(s): {}",
+                    requested.len(),
+                    requested.join(", ")
+                );
+                settings.enabled_event_names = Some(requested.iter().cloned().collect());
+            }
+
+            // The producer gate does NOT need its own `sync_jit_decision_gate`
+            // call here, and this was verified rather than assumed -- it is
+            // the same argument-order bug that was just fixed on the Java side
+            // in `vm_exec::jfr_configure_java_recording`, where `r.start()`
+            // before `r.enable(...)` left the producer permanently dark.
+            //
+            // The reason the two paths differ: there, `Recording.enable(...)`
+            // mutates a recording that is ALREADY RUNNING and changes no
+            // recording state, so nothing re-derives the gate. Here the names
+            // are written into `settings` BEFORE `new_recording`, so the
+            // recording is born with its filter and the state transition is
+            // what happens last. `FlightRecorder::start_recording` calls
+            // `refresh_running_ids`, whose tail calls
+            // `jit_decision::sync_jit_decision_gate(self)` -- so the gate is
+            // recomputed from a recorder that already names the event.
+            //
+            // The sink is installed further up in this function, before this
+            // block, and `install_jit_decision_sink` re-arms from both flags
+            // itself, so neither order can leave the producer dark. Adding a
+            // redundant `sync_jit_decision_gate` call after `start_recording`
+            // was considered and rejected: it would be dead the day it was
+            // written and would decay into looking load-bearing.
             let recording_id = {
                 let mut fr = shared.debug.flight_recorder.lock();
                 let id = fr.new_recording(settings);
@@ -10090,6 +10521,82 @@ impl Drop for Vm {
 // VmDiagnosticState implementation for SharedVm
 // ---------------------------------------------------------------------------
 
+/// Split a `jcmd JFR.dump` / `JFR.stop` argument list into `name=` and
+/// `filename=`.
+///
+/// Every other token is a hard error naming what is accepted, rather than a
+/// token quietly dropped on the floor. An operator who mistypes `filenam=x`
+/// and is told "OK" has been handed the same lie the JFR stubs used to tell:
+/// a success line and no file.
+fn jcmd_jfr_parse_target(
+    args: &[String],
+    command: &str,
+) -> Result<(Option<String>, Option<String>), String> {
+    let mut name: Option<String> = None;
+    let mut filename: Option<String> = None;
+    for token in args {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = token.split_once('=') else {
+            return Err(format!(
+                "{command}: option `{token}` is missing `=value` \
+                 (accepted: name=<recording>, filename=<path>)"
+            ));
+        };
+        match key {
+            "name" => name = Some(value.to_string()),
+            "filename" => filename = Some(value.to_string()),
+            other => {
+                return Err(format!(
+                    "{command}: unrecognized option `{other}` \
+                     (accepted: name=<recording>, filename=<path>)"
+                ))
+            }
+        }
+    }
+    Ok((name, filename))
+}
+
+/// Resolve a `jcmd` `name=` argument to the id of a **running** recording.
+///
+/// Only running recordings can be addressed, and that is a limitation of the
+/// data available here rather than a policy: `FlightRecorder` exposes
+/// `running_recording_ids` plus lookup by id, and nothing that enumerates
+/// stopped ones, so a recording that has already been stopped cannot be found
+/// by name from outside the crate. The workflow that matters is unaffected --
+/// HotSpot's own sequence is `JFR.start`, then `JFR.dump` while it runs, then
+/// `JFR.stop` -- and refusing clearly beats searching a set that cannot
+/// contain the answer.
+///
+/// With no `name=`, a single running recording is used and two or more are a
+/// refusal. Picking "the first" out of several would make which recording an
+/// operator dumped depend on hash-map iteration order.
+fn jcmd_jfr_running_recording(
+    fr: &cratonvm_jfr::FlightRecorder,
+    name: Option<&str>,
+) -> Result<u64, String> {
+    let running = fr.running_recording_ids();
+    match name {
+        Some(wanted) => running
+            .iter()
+            .copied()
+            .find(|id| {
+                fr.get_recording(*id)
+                    .is_some_and(|rec| rec.settings.name == wanted)
+            })
+            .ok_or_else(|| format!("no running recording is named `{wanted}`")),
+        None => match running.len() {
+            0 => Err("no recording is running".to_string()),
+            1 => Ok(running[0]),
+            n => Err(format!(
+                "{n} recordings are running; name one with `name=<recording>`"
+            )),
+        },
+    }
+}
+
 impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
     fn thread_snapshots(&self) -> Vec<crate::runtime::serviceability::ThreadSnapshot> {
         use crate::runtime::serviceability::{ThreadSnapshot, ThreadState};
@@ -10372,6 +10879,189 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
             .map_err(|e| format!("Failed to write heap dump to {}: {}", path, e))?;
 
         Ok(hprof_data.len() as u64)
+    }
+
+    // --- JFR, reached from `jcmd <pid> JFR.*` -------------------------------
+    //
+    // 2026-09-01. See the trait's own note in `runtime/serviceability.rs` for
+    // why these are trait methods and not an `Arc<SharedVm>` on the processor.
+    //
+    // What is deliberately NOT accepted by `JFR.start`, and why it is refused
+    // rather than ignored: `filename=`, `dumponexit=`, `duration=`, `maxage=`,
+    // `settings=` and `disk=`.
+    //
+    //  * `filename=` / `dumponexit=` would need somewhere to remember the path
+    //    for a recording this processor started. The only slot that exists,
+    //    `SharedVm::debug.jfr_dump_on_exit`, belongs to the
+    //    `-XX:StartFlightRecording` boot path, and a jcmd command silently
+    //    retargeting the boot recording's exit dump is a way to lose the file
+    //    an operator's launch script was counting on. Pass `filename=` to
+    //    `JFR.dump` / `JFR.stop` instead, where it is used immediately.
+    //  * `duration=` / `maxage=` need the HotSpot duration grammar (`30s`,
+    //    `5m`, `1h`), whose only parser lives in `vm-cli`'s option parser and
+    //    is private to it. A second, subtly different copy of a units parser
+    //    is worse than a clear refusal.
+    //  * `settings=` names a `.jfc` profile; see `config::apply_jfr_event_setting`
+    //    for why a `.jfc` name is refused rather than approximated.
+    fn jfr_start(&self, args: &[String]) -> Result<String, String> {
+        let mut name = "jcmd".to_string();
+        let mut max_events: Option<usize> = None;
+        let mut enabled_events: Option<Vec<String>> = None;
+
+        for token in args {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = token.split_once('=') else {
+                return Err(format!(
+                    "JFR.start: option `{token}` is missing `=value` (expected \
+                     `key=value` or `+<Event>#enabled=true`)"
+                ));
+            };
+            if key.starts_with('+') {
+                // Same token grammar, same parser, same error text as the
+                // `-XX:StartFlightRecording` command line. Two spellings for
+                // one concept is how an operator ends up unable to transfer
+                // what they learned from one surface to the other.
+                crate::config::apply_jfr_event_setting(&mut enabled_events, key, value)?;
+                continue;
+            }
+            match key {
+                "name" => name = value.to_string(),
+                "maxevents" => {
+                    max_events = Some(value.parse::<usize>().map_err(|_| {
+                        format!("JFR.start: maxevents=`{value}` is not a number")
+                    })?);
+                }
+                other => {
+                    return Err(format!(
+                        "JFR.start: unrecognized option `{other}`. Accepted: name, \
+                         maxevents, and `+<Event>#enabled=<bool>`. filename, \
+                         dumponexit, duration, maxage, settings and disk are refused \
+                         here rather than accepted and ignored; pass filename= to \
+                         JFR.dump or JFR.stop."
+                    ))
+                }
+            }
+        }
+
+        let mut settings = cratonvm_jfr::RecordingSettings::new(&name);
+        settings.max_size = max_events;
+
+        let mut fr = self.debug.flight_recorder.lock();
+        if let Some(requested) = enabled_events {
+            // Refuse an unknown name BEFORE the recording exists. Unlike the
+            // boot path this cannot panic -- a mistyped jcmd argument must not
+            // take down a running production VM -- but it must not start a
+            // recording that can never contain what was asked for either, so
+            // the answer is an error and no recording.
+            let unknown: Vec<String> = requested
+                .iter()
+                .filter(|n| fr.type_registry.find_by_name(n.as_str()).is_none())
+                .cloned()
+                .collect();
+            if !unknown.is_empty() {
+                return Err(format!(
+                    "JFR.start: this VM defines no event named: {}. Nothing was \
+                     started.",
+                    unknown.join(", ")
+                ));
+            }
+            settings.enabled_event_names = Some(requested.iter().cloned().collect());
+        }
+
+        // `start_recording` calls `refresh_running_ids`, whose tail calls
+        // `jit_decision::sync_jit_decision_gate`, so a recording that names
+        // `cratonvm.JitCompileDecision` arms that producer here with no extra
+        // call -- exactly as on the `-XX:StartFlightRecording` boot path, and
+        // for the same reason: the name filter is written into `settings`
+        // BEFORE the recording is created, so the state transition is last.
+        let id = fr.new_recording(settings);
+        fr.start_recording(id);
+        let filter = fr
+            .get_recording(id)
+            .and_then(|rec| rec.settings.enabled_event_names.as_ref())
+            .map(|names| {
+                let mut v: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+                v.sort_unstable();
+                v.join(", ")
+            });
+        drop(fr);
+
+        match filter {
+            Some(events) if events.is_empty() => Ok(format!(
+                "Started recording `{name}` (id {id}) with an EMPTY event filter: it \
+                 will contain nothing. Dump it with `JFR.dump name={name} \
+                 filename=<path>`."
+            )),
+            Some(events) => Ok(format!(
+                "Started recording `{name}` (id {id}), restricted to: {events}. Dump \
+                 it with `JFR.dump name={name} filename=<path>`."
+            )),
+            None => Ok(format!(
+                "Started recording `{name}` (id {id}), all events. Dump it with \
+                 `JFR.dump name={name} filename=<path>`."
+            )),
+        }
+    }
+
+    fn jfr_dump(&self, args: &[String]) -> Result<String, String> {
+        let (name, filename) = jcmd_jfr_parse_target(args, "JFR.dump")?;
+        let filename = filename.ok_or_else(|| {
+            "JFR.dump: filename=<path> is required -- there is nowhere else for the \
+             bytes to go, and a dump command that writes no file is the defect this \
+             one replaced"
+                .to_string()
+        })?;
+        let mut fr = self.debug.flight_recorder.lock();
+        let id =
+            jcmd_jfr_running_recording(&fr, name.as_deref()).map_err(|e| format!("JFR.dump: {e}"))?;
+        let bytes = fr
+            .dump_recording(id, std::path::Path::new(&filename))
+            .map_err(|e| format!("JFR.dump: writing `{filename}` failed: {e}"))?;
+        Ok(format!(
+            "Dumped recording (id {id}) to {filename} ({bytes} bytes). The recording \
+             is still running."
+        ))
+    }
+
+    fn jfr_stop(&self, args: &[String]) -> Result<String, String> {
+        let (name, filename) = jcmd_jfr_parse_target(args, "JFR.stop")?;
+        let mut fr = self.debug.flight_recorder.lock();
+        let id =
+            jcmd_jfr_running_recording(&fr, name.as_deref()).map_err(|e| format!("JFR.stop: {e}"))?;
+
+        // DUMP FIRST, STOP SECOND, and the order is load-bearing. Events sit
+        // on bounded per-thread rings until something drains them, and
+        // `drain_per_thread_into_repository` fans out only to recordings in
+        // `Running` state. `stop_recording` drains before it transitions for
+        // exactly that reason (see its comment), so stopping first is not
+        // lossy -- but a dump taken after the stop would still be the second
+        // drain of a ring the first one emptied, and every ordering question
+        // in this area has historically been answered wrong. Dumping while the
+        // recording is still `Running` is supported by `dump_recording` and
+        // needs no such argument.
+        let written = match filename.as_ref() {
+            Some(path) => Some((
+                path.clone(),
+                fr.dump_recording(id, std::path::Path::new(path))
+                    .map_err(|e| format!("JFR.stop: writing `{path}` failed: {e}"))?,
+            )),
+            None => None,
+        };
+        fr.stop_recording(id);
+        drop(fr);
+
+        match written {
+            Some((path, bytes)) => Ok(format!(
+                "Stopped recording (id {id}) and wrote {path} ({bytes} bytes)."
+            )),
+            None => Ok(format!(
+                "Stopped recording (id {id}). Nothing was written: pass \
+                 `filename=<path>` to write it out, or dump it before stopping."
+            )),
+        }
     }
 }
 

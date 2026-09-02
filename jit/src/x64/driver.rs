@@ -101,6 +101,73 @@ pub fn set_pending_local_handler_table(
     PENDING_LOCAL_HANDLER_CLASS.with(|c| c.set(declaring_class_id));
 }
 
+/// RAII scope for one compile's PC -> inline-chain recording session.
+///
+/// # Why a guard and not a paired call
+///
+/// `compile_with_param_slots` has on the order of forty `return None` bail
+/// paths — an unsupported opcode, a refused scan, a code buffer that overran,
+/// a lowering that ran past its budget — and a session left open on one of
+/// them is not merely a leak. `x64::inlining`'s rows are THREAD-LOCAL and
+/// keyed by a native code OFFSET, so the next compile scheduled on this
+/// worker thread would inherit rows naming offsets in a buffer that no longer
+/// exists and publish them on ITS artifact. A stack walk would then expand a
+/// frame into callees belonging to a method that was never compiled.
+///
+/// That is the same ABA hazard A18 refused a process-global registry keyed by
+/// the executable buffer's base address over (`.agent-requests/A18-jit-lib.txt`),
+/// arriving through a different door: an abandoned compile rather than a freed
+/// and remapped buffer. Auditing forty returns by hand and keeping them
+/// audited is exactly the discipline this codebase has repeatedly failed at —
+/// `compile_gate.rs` exists because a fourth compile door was added without
+/// one — so the close is delegated to `Drop`, which runs on every one of them
+/// including a panic unwind, and no bail path has to know the session exists.
+///
+/// # Why the success path may close it directly
+///
+/// `finish_inline_frame_recording` is IDEMPOTENT: it `replace(false)`s the
+/// recording flag and `mem::take`s the rows, so a second call sees no session,
+/// touches nothing and returns an empty map. The success path therefore
+/// assigns `cm.inline_frame_map` from a direct call and simply lets this guard
+/// drop afterwards; there is no arming/disarming bool to get wrong, and no
+/// state a double close could corrupt.
+///
+/// # Not reentrant, and does not need to be
+///
+/// The staging thread-locals at the top of this file already document
+/// "same-thread, synchronous compile, no nesting", and no path out of codegen
+/// re-enters `compile_with_param_slots` — the splice emitter walks the
+/// callee's bytecode inside THIS compile rather than starting another one. A
+/// nested compile would silently close the outer session; if one is ever
+/// added, this guard is where it has to be handled.
+struct InlineFrameSession;
+
+impl InlineFrameSession {
+    /// Discard whatever an abandoned compile left on this thread and open a
+    /// fresh session. One thread-local write, plus a cached flag read; with
+    /// `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` the session opens closed and every
+    /// hook in `x64::inlining` bails on its first read.
+    fn open() -> Self {
+        crate::x64::begin_inline_frame_recording();
+        // The NPE trap table rides the same session: it is described from the
+        // same splice-scope stack, and a table left over from an abandoned
+        // compile names sites in a DIFFERENT code buffer.
+        crate::x64::begin_npe_trap_recording();
+        InlineFrameSession
+    }
+}
+
+impl Drop for InlineFrameSession {
+    fn drop(&mut self) {
+        // A discarding close. `code_len = 0` truncates every row, which is the
+        // right answer for a bail: there is no artifact, so no row describes
+        // live machine code. On the success path this is the second call and
+        // does nothing.
+        let _ = crate::x64::finish_inline_frame_recording(0);
+        let _ = crate::x64::finish_npe_trap_recording();
+    }
+}
+
 /// Compile a JVM bytecode method to x86-64 machine code.
 ///
 /// When `needs_heap` is true, the compiled code expects a heap pointer as the
@@ -546,6 +613,18 @@ pub fn compile_with_param_slots(
     // A handler-local request is one-shot too, so a compile bailout cannot
     // accidentally arm the next unrelated method on this worker thread.
     let precise_exception_frames = PRECISE_EXCEPTION_FRAME_REQUEST.with(|c| c.take());
+    // Open the PC -> inline-chain recording session for this compile, with the
+    // one-shot `take`s above and for the same reason they are here: everything
+    // staged on this thread is claimed BEFORE any bail can leak it into the
+    // next method compiled on this worker. `open()` additionally discards
+    // anything an abandoned earlier compile left behind, so it is safe
+    // unconditionally and costs one thread-local write. Nothing above this
+    // point emits a byte of code, and nothing above it returns.
+    //
+    // The close is `InlineFrameSession`'s `Drop`, not a call at the end — see
+    // that type for why the ~40 bail paths below must not each be responsible
+    // for it.
+    let _inline_frame_session = InlineFrameSession::open();
     if crate::rbc6_emit_dbg() {
         eprintln!(
             "[rbc6-emit] driver took precise_exception_frames={precise_exception_frames}              exception_ranges={} protected_ranges_pending={}",
@@ -871,8 +950,86 @@ pub fn compile_with_param_slots(
         .chain(extra_guard_bodies())
         .map(|s| spliced_bytecode_len(s).saturating_mul(64))
         .sum();
+    // TWO per-bytecode coefficients, not one.
+    //
+    // 96 is calibrated on ordinary control-flow-heavy code, and it works there
+    // BECAUSE the `invoke_info.len() * 1024` term carries most of the weight:
+    // every method in the 2026-08-01 table above is invoke-dense, and in all of
+    // them the invoke term dominates. A method with almost no invokes gets
+    // nothing from that term, so 96 becomes the WHOLE estimate — and 96 is not
+    // enough for the one shape that emits the most machine code per bytecode:
+    // the large table initialiser.
+    //
+    // The witness is `java/lang/CharacterData00.<clinit>:()V`, which overran on
+    // every boot of every process (a stock `Hello` reproduces it). Its shape,
+    // read off `javap -c -p`: 4096 bytes of bytecode holding 2906 instructions,
+    // of which 635 `dup`, 324 `castore`, 313 `iconst_0`, 311 `iconst_1`, 309
+    // `aastore`, 290 `sipush`, 207 `newarray`, 206 `iconst_2`, 124 `bipush`,
+    // 104 `anewarray` — and SEVEN invokes in the entire method. Nothing but
+    // constant-push and array-store, at 1.41 bytecode BYTES per instruction
+    // where branchy code sits nearer 3; each of those one-byte opcodes still
+    // lowers to a spill/reload pair, and each store to a null check plus a
+    // bounds check. So the machine code per bytecode BYTE is far above what the
+    // 96 was fitted to, and no term in the old estimate noticed.
+    //
+    // Derivation, from that one measurement (`capacity=408576 wanted=473627`,
+    // which also pins `invoke_info.len() == 7` and `inline_extra == 0`:
+    // 4096*96 + 8192 + 7*1024 is exactly 408576):
+    //
+    //     needed per bytecode byte = (473627 - 8192 - 7*1024) / 4096 = 111.9
+    //
+    // 144 (= 1.5 * 96) covers that with 29% margin. The margin is deliberately
+    // modest rather than generous: `ExecutableBuffer::new` charges the WHOLE
+    // capacity to `COMMITTED_JIT_CODE_BYTES`, which is the quantity the
+    // code-cache cap bounds, so every byte over-estimated here is a byte the
+    // cap will not spend on some other method.
+    //
+    // TRUST THIS EXACTLY AS FAR AS ONE MEASUREMENT GOES. 111.9 is a single
+    // number from a single method. The only cross-check available without
+    // running the VM is `java/lang/CharacterDataLatin1.<clinit>`, the same
+    // shape — 3097 instructions in ~4718 bytes, ONE invoke. Scaling the
+    // witness's 163 machine bytes per bytecode INSTRUCTION (473627/2906) predicts
+    // ~107 bytes per bytecode byte for it: under 144, and also over 96, i.e. a
+    // second method the old coefficient was short for. That is a PREDICTION,
+    // not a measurement. If a third shape overruns at 144, re-derive from its
+    // own `wanted` instead of nudging this number.
+    //
+    // The predicate is deliberately cheap and honest — no bytecode walk, only
+    // `code_len` and the invoke list the caller already built. LARGE, because a
+    // small method's shortfall is cheap and the hint below self-corrects it in
+    // one retry; LOW INVOKE DENSITY, because that is precisely the condition
+    // under which the 1024-per-invoke term stops covering for 96. One invoke
+    // per 512 bytecode bytes puts the witness (7 invokes over 4096 bytes)
+    // inside and every method in the table above outside.
+    const BYTES_PER_BYTECODE: usize = 96;
+    const BYTES_PER_BYTECODE_TABLE_INIT: usize = 144;
+    const TABLE_INIT_MIN_CODE_LEN: usize = 2048;
+    const TABLE_INIT_BYTECODES_PER_INVOKE: usize = 512;
+    let table_init_shaped = code_len >= TABLE_INIT_MIN_CODE_LEN
+        && invoke_info
+            .len()
+            .saturating_mul(TABLE_INIT_BYTECODES_PER_INVOKE)
+            < code_len;
+    // ENGAGEMENT, not just a number: without this there is no way to tell a run
+    // where the second coefficient prevented an overflow from a run where the
+    // predicate never matched anything. Cheap — the env read is behind the
+    // shape test, so an ordinary method never performs it.
+    if table_init_shaped && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+        eprintln!(
+            "[cratonvm-jitc] code-buffer estimate: table-init shape \
+             method={} code_len={} invokes={} bytes_per_bytecode={}",
+            method_key,
+            code_len,
+            invoke_info.len(),
+            BYTES_PER_BYTECODE_TABLE_INIT
+        );
+    }
     let estimated_size = code_len
-        .saturating_mul(96)
+        .saturating_mul(if table_init_shaped {
+            BYTES_PER_BYTECODE_TABLE_INIT
+        } else {
+            BYTES_PER_BYTECODE
+        })
         .saturating_add(8192)
         .saturating_add(invoke_info.len().saturating_mul(1024))
         .saturating_add(inline_extra);
@@ -970,6 +1127,49 @@ pub fn compile_with_param_slots(
         .into_iter()
         .filter(|h| !bypassable_headers.contains(&h.loop_header))
         .collect();
+
+    // LICM: hoist the loop-invariant `arraylength` out of a counted loop's
+    // header. `CRATONVM_DISABLE_ARRAYLEN_LICM=1` is the kill switch — the
+    // hoist changes the emitted body of essentially every loop over an array
+    // in the VM, so it needs one, and the bisect it serves must reach the
+    // level the change is at (the emission, not the analysis).
+    let array_len_hoist_info = if cratonvm_types::flags::runtime_var_os(
+        "CRATONVM_DISABLE_ARRAYLEN_LICM",
+    )
+    .is_some()
+    {
+        Vec::new()
+    } else {
+        find_array_len_hoists(code, code_len, &loops)
+    };
+    // One filter, not the aaload hoist's two. There is no per-bci de-spec to
+    // apply because this pre-header speculates on nothing: it throws the NPE
+    // the body would have thrown rather than deopting, so there is no failed
+    // guard for a de-spec threshold to count.
+    //
+    // The bypassable-header veto DOES apply, and is the load-bearing one. A
+    // header reachable without running its own pre-header — a `goto` from
+    // outside into the loop, or an exception handler landing in the body —
+    // leaves the slot cold, and a cold slot here is a garbage LENGTH that a
+    // `bounds_safe_pcs` access then trusts, i.e. an unchecked out-of-bounds
+    // read rather than a wrong answer. Must run BEFORE `Compiler::new` pairs
+    // the offsets with the info by index.
+    let array_len_hoist_info: Vec<ArrayLenHoist> = array_len_hoist_info
+        .into_iter()
+        .filter(|h| !bypassable_headers.contains(&h.loop_header))
+        .collect();
+    if !array_len_hoist_info.is_empty()
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+    {
+        eprintln!(
+            "[JIT_GEN] arraylength-LICM hoists={} sites={:?}",
+            array_len_hoist_info.len(),
+            array_len_hoist_info
+                .iter()
+                .map(|h| (h.loop_header, h.array_local, h.sites.len()))
+                .collect::<Vec<_>>(),
+        );
+    }
 
     // LICM: find loop-invariant integer-arithmetic runs to hoist into the
     // loop pre-header. These are pure, non-faulting ALU expressions on
@@ -1496,6 +1696,7 @@ pub fn compile_with_param_slots(
         static_field_info,
         hoist_info,
         arith_hoist_info,
+        array_len_hoist_info,
         alloc_result,
         !matrix_dot_loops.is_empty(),
         *helpers,
@@ -2096,13 +2297,10 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
         // unnoticed (`resolvabletype-equals-jit-...`): the only
         // visible symptom was a flood of anonymous `try_patch_*: offset out of
         // bounds` warnings with no method attached to any of them.
-        tracing::warn!(
-            method = method_key,
-            code_len = code_len,
-            capacity = compiler.buf.capacity(),
-            wanted = compiler.buf.wanted(),
-            "JIT compile bailed: code buffer estimate too small; retrying at the measured size"
-        );
+        // The line itself is emitted BELOW, after the shortfall is recorded,
+        // because its LEVEL depends on whether this attempt just spent the last
+        // retry and `note_code_buffer_shortfall` is what bumps that count.
+        //
         // Remember the shortfall so the NEXT attempt at this method sizes its
         // buffer from a measurement instead of the heuristic.
         //
@@ -2124,6 +2322,49 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
             // and the retry was a bit-identical repeat — forever.
             compiler.buf.capacity(),
         );
+        // Level split: DEBUG while the bail is RECOVERABLE, WARN once it is not.
+        //
+        // This line used to be `warn!` unconditionally, and it fired on every
+        // boot of every process — `java/lang/CharacterData00.<clinit>:()V` on a
+        // stock `Hello` — for a condition the VM handles by itself on the next
+        // compile request. A warning that is always present is a warning nobody
+        // reads, and it sat directly next to the `codegen_failure_reason()` arm
+        // above, which is the one that really is permanent; keeping both at the
+        // same level is what made the two indistinguishable in a log before the
+        // reasons were split at all.
+        //
+        // Demoting is only safe because the bail stays COUNTED rather than
+        // becoming silent, which is the failure this site's original comment
+        // guards against: `note_jit_bail_site` below records it under
+        // `CODE_BUFFER_TOO_SMALL_SITE` (reported per method by
+        // `jit_bail_reason_for`), and `note_code_buffer_bail_cost` feeds the
+        // `code_buffer_bails=N (discarded_compile_ms=M)` fields of
+        // `tiered::dump_method_stats_to_stderr`. Nothing outside `docs/` parses
+        // the message text (checked across `ci/`, `scripts/`, `tools/`,
+        // `apps/`), so the wording of the recoverable arm is left alone for
+        // those write-ups to keep matching.
+        //
+        // The exhausted arm is a genuinely new fact and stays at `warn!`: after
+        // `MAX_CODE_BUFFER_RETRIES` doublings `try_compile` stops exempting this
+        // site from the permanent bail list, so the method is now interpreted
+        // for the life of the process and no later line will say so.
+        if crate::code_buffer_retries_exhausted(method_key) {
+            tracing::warn!(
+                method = method_key,
+                code_len = code_len,
+                capacity = compiler.buf.capacity(),
+                wanted = compiler.buf.wanted(),
+                "JIT compile bailed: retry budget spent on a short code buffer; stays interpreted"
+            );
+        } else {
+            tracing::debug!(
+                method = method_key,
+                code_len = code_len,
+                capacity = compiler.buf.capacity(),
+                wanted = compiler.buf.wanted(),
+                "JIT compile bailed: code buffer estimate too small; retrying at the measured size"
+            );
+        }
         crate::note_jit_bail_site(crate::CODE_BUFFER_TOO_SMALL_SITE);
         crate::note_code_buffer_bail_cost(compile_started.elapsed());
         return None;
@@ -2626,6 +2867,26 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     // with it on tier-up or invalidation. Empty on every compile that armed no
     // local handlers.
     cm._jit_local_handler_sites = compiler.local_handler_sites;
+
+    // Close the recording session and hand the finished map to the artifact,
+    // beside the other compile-local state being published onto it above.
+    //
+    // `code_len()` is load-bearing, not decorative: `InlineFrameMap::from_rows`
+    // drops every row at an offset past the artifact's final code length, which
+    // is how a row recorded into a stretch the emitter later rewound is
+    // discarded instead of published against machine code that is no longer
+    // there. Read into a local first so the immutable borrow of `cm` is over
+    // before the field assignment, rather than relying on evaluation order.
+    //
+    // `_inline_frame_session`'s `Drop` still runs on the way out of this
+    // function; that second close is a no-op (see `InlineFrameSession`).
+    let inline_frame_code_len = cm.code_len();
+    cm.inline_frame_map = crate::x64::finish_inline_frame_recording(inline_frame_code_len);
+    // No `code_len` screen for the trap table, and it needs none: its keys are
+    // monotonic ids rather than code offsets, so a row a rewind orphaned is
+    // simply unreachable -- no surviving trampoline carries its key. See
+    // `x64::inlining::record_npe_trap_site`.
+    cm.npe_trap_map = crate::x64::finish_npe_trap_recording();
 
     Some(cm)
 }
