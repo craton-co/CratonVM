@@ -284,20 +284,25 @@ enum StackSlot {
     /// round-trip when a register-mapped local is loaded and then immediately
     /// used by an arithmetic or branch operation.
     CalleeSaved(u8),
-    /// Value is in a caller-saved scratch register (R8/R9), paired with the
-    /// frame word its push already reserved for it. Used as a deferred-spill
-    /// cache: `push_from_rax` moves the result into a scratch register instead
-    /// of storing to the frame, avoiding the store+load round-trip when the
-    /// value is consumed by the very next operation.
+    /// Value is in a caller-saved scratch register (R8/R9). Used as a
+    /// deferred-spill cache: `push_from_rax` moves the result into a scratch
+    /// register instead of storing to the frame, avoiding the store+load
+    /// round-trip when the value is consumed by the very next operation.
+    /// Scratch slots MUST be flushed before any call, backward branch, or return.
     ///
-    /// Scratch slots MUST be flushed before any call, backward branch or
-    /// return, and the flush stores into **this** home rather than reserving
-    /// another. Carrying the home in the slot is what bounds the spill region:
-    /// without it a straight-line stretch with several calls reserved a fresh
-    /// word at every flush and grew the frame until the range was exhausted,
-    /// which is the "call-heavy regression" that had confined this whole
-    /// mechanism to methods containing no calls at all.
-    Scratch(u8, i32),
+    /// **A home offset was carried here for one day and reverted.** The idea
+    /// was to bound the spill region -- `flush_scratch_registers` reserves a
+    /// fresh word per flushed value, so a stretch with several calls grows it
+    /// once per call. Reserving the home at PUSH time instead made
+    /// `push_from_rax` advance the spill cursor where it previously did not,
+    /// and that shipped a nondeterministic heap corruption:
+    /// `RMapGcStress` went from PASS to "duplicate insert" / an
+    /// `ArrayIndexOutOfBoundsException` inside `String.equals`, and
+    /// `CRATONVM_JIT_KERNEL_REG_LOCALS=0` -- which makes this whole path inert
+    /// -- was what made it pass again. The frame-growth defect is real and
+    /// still open; whatever fixes it must not move this cursor, because the
+    /// OSR entry's local homes are derived from the same layout.
+    Scratch(u8),
     /// Value is in an XMM register (XMM0-XMM15). Used for FP locals loaded via
     /// dload/fload from XMM-allocated locals. Avoids the XMM→RAX→frame round-trip
     /// when the value is immediately consumed by a double/float arithmetic op.

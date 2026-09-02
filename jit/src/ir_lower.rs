@@ -1661,6 +1661,21 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// `CRATONVM_JIT_IR_COLD_ARG_STAGE=0` — stage a call's outgoing arguments
+    /// EAGERLY, before the call, as this backend did until 2026-09-02.
+    ///
+    /// Default on, meaning the staging happens on each reader's own cold side.
+    /// The switch exists because the eager version was removed without one, and
+    /// a change to what a frame holds across a call is exactly the kind that
+    /// has to be A/B-able in ONE binary when a GC-stress test starts failing.
+    /// Not having it cost a rebuild per hypothesis.
+    fn cold_arg_stage_enabled() -> bool {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_COLD_ARG_STAGE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    }
+
     // ── Moving-young relocation contract ─────────────────────────────────
     //
     // What `conservative_roots` demands of a compiled frame before a young
@@ -3791,7 +3806,21 @@ impl<'a> Lowerer<'a> {
         // The staging now happens inside that cold block, out of those same
         // slots, which still hold the same values there because nothing
         // between the marshal and the sentinel test writes them.
-        if has_receiver && num_args > 0 {
+        if !Self::cold_arg_stage_enabled() {
+            // The pre-2026-09-02 shape, kept behind the switch: stage every
+            // argument eagerly, with the receiver null check folded into the
+            // first iteration exactly as it was.
+            for i in 0..num_args {
+                let arg = inputs[2 + i];
+                self.gp_load_value(RAX, arg);
+                if i == 0 && has_receiver {
+                    self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+                    self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
+                }
+                // Cast: an argument index is bounded by the callee's parameter count.
+                self.store_rax(self.args_stage_top_off - (i as i32) * 8);
+            }
+        } else if has_receiver && num_args > 0 {
             self.gp_load_value(RAX, inputs[2]);
             self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
             self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
@@ -3892,12 +3921,15 @@ impl<'a> Lowerer<'a> {
         self.buf.emit(&[0, 0, 0, 0]);
         // ── cold from here ──────────────────────────────────────────────
         // RAX holds the sentinel, so it is free as the transfer scratch.
-        for i in 0..num_args {
-            let arg = inputs[2 + i];
-            self.gp_load_value(RAX, arg);
-            // Cast: an argument index is bounded by the callee's parameter
-            // count, so `i * 8` cannot overflow an x86-64 displacement.
-            self.store_rax(self.args_stage_top_off - (i as i32) * 8);
+        // Skipped under the eager shape: the call site already staged.
+        if Self::cold_arg_stage_enabled() {
+            for i in 0..num_args {
+                let arg = inputs[2 + i];
+                self.gp_load_value(RAX, arg);
+                // Cast: an argument index is bounded by the callee's parameter
+                // count, so `i * 8` cannot overflow an x86-64 displacement.
+                self.store_rax(self.args_stage_top_off - (i as i32) * 8);
+            }
         }
         self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
         self.emit_mov_reg_imm64(CALL_ARG_REGS[1], info_ptr as u64);
@@ -3975,6 +4007,64 @@ impl<'a> Lowerer<'a> {
             let arg = inputs[2 + i];
             self.gp_load_value(ENTRY_ABI_REGS[base + i], arg);
         }
+    }
+
+    /// Marshal the Java arguments into the **no-context** register layout once,
+    /// ahead of the whole inline-cache cascade.
+    ///
+    /// # Why this may sit before the guards
+    ///
+    /// The cascade's guards touch RAX (the receiver and its class id), R10 (the
+    /// cache-slot base) and R11 (the call target), and **nothing else** — no
+    /// `ENTRY_ABI_REGS` member appears in `emit_cmp_eax_r10_disp`,
+    /// `emit_cmp_byte_r10_disp_zero`, `emit_cmp_qword_r10_disp_zero`, or the
+    /// receiver null and kind checks. A layout established here therefore
+    /// survives every arm of the cascade to its `CALL`.
+    ///
+    /// # What it replaces
+    ///
+    /// `needs_context` is a property of the *cached entry*, not of the site, so
+    /// the marshalling was emitted twice per cache entry — ten copies at a site
+    /// with one MIC and a four-entry PIC, each of them `num_args` frame loads.
+    /// The no-context layout is now built once, and a context-needing arm
+    /// converts it with [`Self::emit_ic_shift_for_context`], which is
+    /// register-to-register.
+    ///
+    /// The alternative — one uniform entry ABI — would delete the question
+    /// entirely, and is deliberately not taken here: `needs_context` is an
+    /// output of optimization, so changing it changes how *every* compiled
+    /// method receives its arguments. That is not a change to fold into this
+    /// one.
+    fn emit_ic_premarshal_no_context(&mut self, inputs: &[NodeId], num_args: usize) {
+        for i in 0..num_args {
+            let arg = inputs[2 + i];
+            self.gp_load_value(ENTRY_ABI_REGS[i], arg);
+        }
+    }
+
+    /// Convert the pre-marshalled no-context layout into the context one: shift
+    /// every argument up one register and load the context into
+    /// `ENTRY_ABI_REGS[0]`.
+    ///
+    /// **Descending order is load-bearing.** Moving `[0] -> [1]` first would
+    /// overwrite argument 1 before it is read; from the top down, every
+    /// destination holds a value that has already been moved.
+    ///
+    /// Always legal: `emit_inline_cache_call`'s admission requires
+    /// `num_args + 1 <= ENTRY_ABI_REGS.len()`
+    /// (`ic_declines_when_args_overflow_the_abi_register_file` pins it), so the
+    /// top destination `ENTRY_ABI_REGS[num_args]` is always inside the file.
+    fn emit_ic_shift_for_context(&mut self, num_args: usize) {
+        debug_assert!(
+            num_args + 1 <= ENTRY_ABI_REGS.len(),
+            "the context shift needs {} registers and the file has {}",
+            num_args + 1,
+            ENTRY_ABI_REGS.len(),
+        );
+        for i in (0..num_args).rev() {
+            self.emit_mov_reg_reg64(ENTRY_ABI_REGS[i + 1], ENTRY_ABI_REGS[i]);
+        }
+        self.load_reg_from_frame(ENTRY_ABI_REGS[0], self.context_slot_off);
     }
 
     /// `CMP EAX, dword [R10 + disp]` — an inline-cache class-id guard.
@@ -4166,7 +4256,27 @@ impl<'a> Lowerer<'a> {
         // All three read the same frame slots, and nothing between this point
         // and any of them writes those slots.
 
+        // Marshal the Java arguments ONCE, in the no-context layout, before the
+        // guards. Each cache arm then either calls straight through or shifts
+        // the layout up one register — see `emit_ic_premarshal_no_context` for
+        // why a layout established here survives the cascade (its guards touch
+        // only RAX, R10 and R11).
+        // Under the eager shape the whole pre-marshal/shift scheme is off and
+        // each arm marshals for itself, exactly as before 2026-09-02.
+        let premarshal = Self::cold_arg_stage_enabled();
+        if premarshal {
+            self.emit_ic_premarshal_no_context(inputs, num_args);
+        } else {
+            for i in 0..num_args {
+                let arg = inputs[2 + i];
+                self.gp_load_value(RAX, arg);
+                self.store_rax(self.args_stage_top_off - (i as i32) * 8);
+            }
+        }
+
         // Receiver = arg0. Load it and its class id ONCE for the whole cascade.
+        // RAX is not an `ENTRY_ABI_REGS` member on either ABI, so this does not
+        // disturb the layout just built.
         self.gp_load_value(RAX, inputs[2]);
         self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
         slow_patches.push(self.emit_jcc_rel32(0x84)); // JZ .slow
@@ -4192,12 +4302,22 @@ impl<'a> Lowerer<'a> {
         self.emit_cmp_qword_r10_disp_zero(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8);
         slow_patches.push(self.emit_jcc_rel32(0x84)); // JE .slow
         self.emit_cmp_byte_r10_disp_zero(JitMICSlot::CACHED_NEEDS_CONTEXT_OFFSET as u8);
-        let mic_noctx = self.emit_jcc_rel32(0x84); // JE .mic_noctx
-        self.emit_ic_abi_marshal(inputs, num_args, true);
-        let mic_call = self.emit_jmp_rel32();
-        self.patch_rel32_to_here(mic_noctx);
-        self.emit_ic_abi_marshal(inputs, num_args, false);
-        self.patch_rel32_to_here(mic_call);
+        // Falls THROUGH on the context case and jumps on the no-context one,
+        // because the no-context layout is already in place: the fall-through
+        // shifts it, the jump does nothing at all. That inverts the old sense of
+        // this branch, which is why the target is named for what it skips.
+        if premarshal {
+            let mic_noctx = self.emit_jcc_rel32(0x84); // JE .mic_ready (no shift)
+            self.emit_ic_shift_for_context(num_args);
+            self.patch_rel32_to_here(mic_noctx);
+        } else {
+            let mic_noctx = self.emit_jcc_rel32(0x84); // JE .mic_noctx
+            self.emit_ic_abi_marshal(inputs, num_args, true);
+            let mic_call = self.emit_jmp_rel32();
+            self.patch_rel32_to_here(mic_noctx);
+            self.emit_ic_abi_marshal(inputs, num_args, false);
+            self.patch_rel32_to_here(mic_call);
+        }
         self.emit_call_cached_entry(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8);
         self.emit_inline_callee_deopt_service(info_ptr, num_args, inputs);
         done_patches.push(self.emit_jmp_rel32());
@@ -4221,12 +4341,19 @@ impl<'a> Lowerer<'a> {
             self.emit_cmp_qword_r10_disp_zero(JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8);
             slow_patches.push(self.emit_jcc_rel32(0x84)); // JE .slow
             self.emit_cmp_byte_r10_disp_zero(JitPICSlot::NEEDS_CONTEXT_OFFSETS[i] as u8);
-            let noctx = self.emit_jcc_rel32(0x84); // JE .entry_noctx
-            self.emit_ic_abi_marshal(inputs, num_args, true);
-            let call = self.emit_jmp_rel32();
-            self.patch_rel32_to_here(noctx);
-            self.emit_ic_abi_marshal(inputs, num_args, false);
-            self.patch_rel32_to_here(call);
+            // Same inversion as the MIC arm above.
+            if premarshal {
+                let noctx = self.emit_jcc_rel32(0x84); // JE .entry_ready (no shift)
+                self.emit_ic_shift_for_context(num_args);
+                self.patch_rel32_to_here(noctx);
+            } else {
+                let noctx = self.emit_jcc_rel32(0x84); // JE .entry_noctx
+                self.emit_ic_abi_marshal(inputs, num_args, true);
+                let call = self.emit_jmp_rel32();
+                self.patch_rel32_to_here(noctx);
+                self.emit_ic_abi_marshal(inputs, num_args, false);
+                self.patch_rel32_to_here(call);
+            }
             self.emit_call_cached_entry(JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8);
             self.emit_inline_callee_deopt_service(info_ptr, num_args, inputs);
             done_patches.push(self.emit_jmp_rel32());
@@ -13046,6 +13173,147 @@ mod tests {
         assert_eq!(ENTRY_ABI_REGS.len(), 6);
         // The shared planner bound must agree with the lowerer's.
         assert_eq!(crate::ir_entry_abi_reg_count(), ENTRY_ABI_REGS.len());
+    }
+
+    /// The context shift moves arguments in DESCENDING order, so no argument is
+    /// overwritten before it has been read.
+    ///
+    /// `emit_ic_premarshal_no_context` builds the no-context layout once, ahead
+    /// of the whole inline-cache cascade, and a context-needing arm converts it
+    /// by shifting every argument up one register. Ascending order would write
+    /// `ENTRY_ABI_REGS[1]` from `[0]` before reading `[1]`, so argument 1 would
+    /// become a second copy of argument 0 and every argument above it the same
+    /// — silently, and only for callees that need the context pointer.
+    ///
+    /// Asserted on the decoded `(dst, src)` pairs rather than on literal bytes,
+    /// because `ENTRY_ABI_REGS` differs between Win64 and System V and a
+    /// byte-literal test would pin one platform's answer as the property.
+    #[test]
+    fn the_context_shift_moves_arguments_from_the_top_down() {
+        for num_args in 1..=(ENTRY_ABI_REGS.len() - 1) {
+            let mut lo = lowerer_with_resident_xmm(4096, None);
+            let at = lo.buf.pos();
+            lo.emit_ic_shift_for_context(num_args);
+            let code = lo.buf.as_slice()[at..].to_vec();
+
+            // `MOV r64, r64` is `REX.W(+R+B) 89 ModRM(mod=11)`. Decode every one
+            // in order; the trailing context load is `8B` and is skipped.
+            let mut moves: Vec<(u8, u8)> = Vec::new();
+            let mut i = 0usize;
+            while i + 2 < code.len() {
+                if (0x48..=0x4F).contains(&code[i]) && code[i + 1] == 0x89 && code[i + 2] >= 0xC0 {
+                    let rex = code[i];
+                    let modrm = code[i + 2];
+                    let src = ((modrm >> 3) & 7) | (((rex >> 2) & 1) << 3);
+                    let dst = (modrm & 7) | ((rex & 1) << 3);
+                    moves.push((dst, src));
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+
+            let want: Vec<(u8, u8)> = (0..num_args)
+                .rev()
+                .map(|k| (ENTRY_ABI_REGS[k + 1], ENTRY_ABI_REGS[k]))
+                .collect();
+            assert_eq!(
+                moves, want,
+                "num_args={num_args}: the shift must run from the top down, so \
+                 every destination holds a value that has already been moved",
+            );
+
+            // …and the context lands in ABI[0], after the shift has vacated it.
+            // `MOV r64, [rbp - disp]` is `REX.W 8B ModRM`, and ABI[0]'s encoding
+            // appears in the ModRM `reg` field.
+            let ctx = ENTRY_ABI_REGS[0];
+            let ctx_loaded = code.windows(3).any(|w| {
+                (0x48..=0x4F).contains(&w[0])
+                    && w[1] == 0x8B
+                    && ((w[2] >> 3) & 7) == (ctx & 7)
+                    && (w[2] & 0xC0) != 0xC0
+            });
+            assert!(
+                ctx_loaded,
+                "num_args={num_args}: the context pointer must be loaded into \
+                 ABI[0] once the shift has vacated it",
+            );
+        }
+    }
+
+    /// The optimizing tier may not be opened to allocation-bearing methods
+    /// while it still lowers `Op::New` through the out-of-line stub.
+    ///
+    /// # The coupling this enforces
+    ///
+    /// `emit_new_object_stub` is three register loads and a `CALL` into
+    /// `jit_new_object`. The single-pass backend has
+    /// `x64::objects::emit_inline_tlab_new` and pays no call on the common
+    /// path. So an escaping allocation compiles WORSE at the optimizing tier
+    /// than at the baseline tier — which is one of the two independent causes
+    /// of the July 2026 Binary Trees 4x regression, and the reason
+    /// `IR_MAX_ALLOCATIONS` is pinned at 16 while every neighbouring cap is 64.
+    ///
+    /// It costs nothing today only because `c2_alloc_upgrade_enabled()` is
+    /// opt-in, so no method containing a `new` is ever promoted to this tier.
+    /// That was a sentence in a comment. It is a test now, because the edit
+    /// that breaks it — flipping the gate on, in `lib.rs`, to widen the
+    /// optimizing tier's population — does not look like it touches allocation
+    /// at all, and its symptom is a throughput regression on exactly the
+    /// workloads nobody re-measures after a policy change.
+    ///
+    /// # What discharges it
+    ///
+    /// Giving this tier an inline TLAB bump. That is not a copy of the
+    /// single-pass sequence: `jit_post_tlab_init` derives `shape` and the
+    /// object's total size from `class_layout(class_id)` **itself**, so a
+    /// caller that sizes the allocation as `HEADER_SIZE + num_fields *
+    /// SLOT_SIZE` while the class carries a registered compact layout hands the
+    /// helper a size mismatch and corrupts the heap. A correct implementation
+    /// needs the compact snapshot AND the runtime layout-version guard the
+    /// single-pass emitter carries for a layout that is REPLACED between
+    /// compile and execution. One shared sequence is the right answer; the
+    /// obstacle is that the header-write contract is policed by source scans of
+    /// `emit_inline_tlab_new`'s own body, so moving it means rewriting the
+    /// oracle in the same change as the code it polices.
+    ///
+    /// When that lands, delete this test — do not weaken it.
+    #[test]
+    fn the_optimizing_tier_stays_shut_to_allocation_while_it_has_no_inline_tlab() {
+        let ir_src = include_str!("ir_lower.rs");
+        // The `Op::New` arm's lowering, as it stands.
+        let uses_stub = ir_src.contains("runtime_lowering::emit_new_object_stub");
+        let has_inline_bump = ir_src.contains("emit_inline_tlab");
+        assert!(
+            uses_stub || has_inline_bump,
+            "the `Op::New` arm lowers through neither the stub nor an inline \
+             bump — this test can no longer see what it is guarding"
+        );
+        if has_inline_bump {
+            // The gap is closed; the coupling below has nothing to protect.
+            return;
+        }
+
+        // Still stub-only. Then the gate must be OPT-IN: `runtime_var_os(..)
+        // .is_some()` is off unless the variable is set, whereas a
+        // `map_or(true, ..)` or a `!matches!(.., Ok("0"))` would be default-on.
+        let lib_src = include_str!("lib.rs");
+        let body = lib_src
+            .split("fn c2_alloc_upgrade_enabled() -> bool {")
+            .nth(1)
+            .expect("c2_alloc_upgrade_enabled is in lib.rs")
+            .split("\n}")
+            .next()
+            .expect("the function ends");
+        assert!(
+            body.contains("is_some()"),
+            "`c2_alloc_upgrade_enabled` is no longer opt-in, but the optimizing \
+             tier still lowers `Op::New` through `emit_new_object_stub` — every \
+             promoted allocation now pays a CALL where the single-pass backend \
+             pays an inline TLAB bump. Give this tier the bump first (see this \
+             test's doc comment for why it is not a copy-paste), or leave the \
+             gate shut.\n\nbody was:\n{body}"
+        );
     }
 
     // ── wire-tiered-manager Step 4: PGO branch-bias in the IR (C2) path ──
