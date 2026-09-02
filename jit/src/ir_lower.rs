@@ -673,6 +673,16 @@ struct Lowerer<'a> {
     /// `JIT_REGION_BOUNDS` empty (`audits/g1-audit.md` 8.1) -- has no site
     /// here to ask it.
     read_bounds_addr: usize,
+    /// The three collector-published barrier gate bytes and the collector's own
+    /// `write_barrier`, for the inline reference STORE fast path this tier
+    /// gained on 2026-09-02 (`emit_gated_compact_ref_store`). All zero when the
+    /// collector publishes no plan, in which case every reference store is the
+    /// `jit_putfield_object` call it always was. Same contract, same helper ABI
+    /// slots, same census as `x64::objects::emit_gated_compact_ref_putfield`.
+    ref_store_pre_gate: usize,
+    ref_store_post_gate: usize,
+    ref_store_post_young_floor: usize,
+    write_barrier: usize,
     /// Emitted shadow push / reload sequence counts.
     ///
     /// Every push must have exactly one reload: a push advances the thread's
@@ -1214,6 +1224,10 @@ impl<'a> Lowerer<'a> {
             shadow_pushed_any: false,
             compact_fields: compact_fields.clone(),
             read_bounds_addr: helpers.read_bounds_addr,
+            ref_store_pre_gate: helpers.ref_store_pre_gate,
+            ref_store_post_gate: helpers.ref_store_post_gate,
+            ref_store_post_young_floor: helpers.ref_store_post_young_floor,
+            write_barrier: helpers.write_barrier,
             shadow_pushes: 0,
             shadow_reloads: 0,
             locals_size,
@@ -2356,6 +2370,17 @@ impl<'a> Lowerer<'a> {
     /// Byte-identical to the single-pass backend's `emit_mov_tls_disp32_rbp`;
     /// both must write the SAME slot, since `inline_rbp_tls_disp()` is the one
     /// source of truth the VM-side mirror accessor reads back.
+    /// `MOV RAX, gs:[disp32]` (`fs:` on Linux): the one-instruction thread
+    /// fetch through the `JIT_THREAD` mirror (`x64::jit_thread_tls_disp`).
+    fn emit_mov_rax_tls_disp32(&mut self, disp32: u32) {
+        self.buf
+            .emit_byte(crate::x64::inline_rbp_tls_segment_prefix());
+        self.buf.emit_byte(0x48); // REX.W
+        self.buf.emit_byte(0x8B); // MOV r64, r/m64
+        self.buf.emit_byte(0x04); // ModRM: reg=RAX, r/m=SIB
+        self.buf.emit_byte(0x25); // SIB: [disp32] absolute
+        self.buf.emit(&disp32.to_le_bytes());
+    }
     fn emit_mov_tls_disp32_rbp(&mut self, disp32: u32) {
         self.buf
             .emit_byte(crate::x64::inline_rbp_tls_segment_prefix());
@@ -2403,8 +2428,16 @@ impl<'a> Lowerer<'a> {
             return;
         }
         let start = self.buf.pos();
-        self.emit_mov_reg_imm64(RAX, self.get_current_thread as u64);
-        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        // 2026-09-02: one `mov rax, gs:[disp]` through the `JIT_THREAD`
+        // mirror where the VM publishes it; the helper call otherwise. Both
+        // stay inside the erasable span.
+        let tls_disp = crate::x64::jit_thread_tls_disp();
+        if tls_disp != 0 {
+            self.emit_mov_rax_tls_disp32(tls_disp as u32);
+        } else {
+            self.emit_mov_reg_imm64(RAX, self.get_current_thread as u64);
+            self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        }
         self.store_rax(self.shadow_thread_slot_off);
         // Capture the entry watermark, inside the erasable span: a method that
         // publishes nothing has no push to unwind, so the capture goes away
@@ -3933,8 +3966,22 @@ impl<'a> Lowerer<'a> {
         if total_sub > 0 {
             self.emit_add_rsp_imm32(total_sub);
         }
-        self.emit_inline_callee_deopt_service(info_ptr, num_args, inputs);
-        self.emit_call_return_check(slot, ty);
+        if crate::x64::merged_call_sentinel_enabled() {
+            // 2026-09-02: one sentinel compare on the hot path. The frame
+            // republish and shadow reload come FIRST so the cold side (which
+            // can run the interpreter and collect) sees this frame's own
+            // identity rather than the callee's dead one.
+            self.emit_post_call_frame_record();
+            self.emit_shadow_reload();
+            let keep = self.emit_call_sentinel_fast_skip();
+            self.emit_inline_callee_deopt_service(info_ptr, num_args, inputs);
+            self.emit_call_return_sentinel_tail(ty);
+            self.patch_rel32_to_here(keep);
+            self.store_rax(slot);
+        } else {
+            self.emit_inline_callee_deopt_service(info_ptr, num_args, inputs);
+            self.emit_call_return_check(slot, ty);
+        }
     }
 
     /// `SUB RSP, imm32` — reserve a call's outgoing stack-argument block.
@@ -4529,6 +4576,16 @@ impl<'a> Lowerer<'a> {
         // resolve this frame's maps against a dead frame's base.
         self.emit_post_call_frame_record();
         self.emit_shadow_reload();
+        self.emit_call_return_sentinel_tail(ty);
+        self.store_rax(slot);
+    }
+
+    /// The `i64::MIN` sentinel half of [`Self::emit_call_return_check`],
+    /// without the frame republish, the shadow reload or the result store:
+    /// what a call site emits on the COLD side of
+    /// [`Self::emit_call_sentinel_fast_skip`], where the common non-sentinel
+    /// return has already branched past it.
+    fn emit_call_return_sentinel_tail(&mut self, ty: IrType) {
         self.emit_mov_reg_imm64(R10, i64::MIN as u64);
         self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
         if matches!(ty, IrType::Long | IrType::Double | IrType::Float) {
@@ -4564,7 +4621,18 @@ impl<'a> Lowerer<'a> {
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
             self.push_call_exc_patch(patch);
         }
-        self.store_rax(slot);
+    }
+
+    /// The hot half of a merged post-call sentinel check: `RAX != i64::MIN`
+    /// branches past BOTH the callee-deopt service and the exception tail in
+    /// one compare, where the two used to each materialise the 10-byte
+    /// immediate and compare again. Returns the rel32 patch the caller lands
+    /// on `.keep`. The cold side keeps its own compares -- they run only when
+    /// the callee actually returned the sentinel.
+    fn emit_call_sentinel_fast_skip(&mut self) -> usize {
+        self.emit_mov_reg_imm64(R10, i64::MIN as u64);
+        self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
+        self.emit_jcc_rel32(0x85) // JNE .keep
     }
 
     /// COV-03 — the `i64::MIN` sentinel check for a *helper* that returns a
@@ -4916,6 +4984,157 @@ impl<'a> Lowerer<'a> {
             out.corrupt_last_byte();
         }
         Some(out)
+    }
+
+    /// Inline reference `putfield` behind the collector's three barrier gates,
+    /// for the optimizing tier. The port of
+    /// `x64::objects::emit_gated_compact_ref_putfield`, same contract:
+    ///
+    /// * the receiver in RAX has ALREADY been null-checked by the caller (the
+    ///   deopting check stays inline so a null receiver still raises);
+    /// * every inline test is a PREFIX of a barrier helper's own control flow
+    ///   (`pre_active == 0`, `flags_byte < young_floor`, `post_active == 0`),
+    ///   so a skipped call is one that would have returned having done
+    ///   nothing, and on any other answer the collector's own `write_barrier`
+    ///   runs;
+    /// * everything the fast path cannot prove -- an unmapped or misaligned
+    ///   receiver, a legacy-layout object, an out-of-range slot -- takes the
+    ///   `jit_putfield_object` helper, which is byte-for-byte the previous
+    ///   lowering.
+    ///
+    /// Returns `false` without emitting a byte when the site is not admitted;
+    /// the caller then emits the helper call alone.
+    ///
+    /// Why this tier needed it: `Node.<init>` in Binary Trees compiled to two
+    /// `jit_putfield_object` calls per constructed node under the default
+    /// collector, because the gates landed in the single-pass tier only
+    /// (`ref_store_pre_gate` had zero uses in this file).
+    fn emit_gated_compact_ref_store(
+        &mut self,
+        node_pc: Option<usize>,
+        base: NodeId,
+        value: NodeId,
+        field_index: i64,
+    ) -> bool {
+        if !ir_gated_ref_store_enabled()
+            || !crate::x64::gated_ref_store_enabled()
+            || !crate::x64::inline_putfield_enabled()
+            || crate::x64::narrow_oops_block_inline_fields()
+            || !cratonvm_types::compact_ref_fields_enabled()
+        {
+            return false;
+        }
+        let (pre, post, floor, barrier) = (
+            self.ref_store_pre_gate,
+            self.ref_store_post_gate,
+            self.ref_store_post_young_floor,
+            self.write_barrier,
+        );
+        if pre == 0 || post == 0 || floor == 0 || barrier == 0 || self.putfield_object == 0 {
+            return false;
+        }
+        if self.read_bounds_addr == 0 {
+            return false;
+        }
+        let Some(pc) = node_pc else {
+            return false;
+        };
+        let Some(&(c_off, c_is_ref, _type_tag)) = self.compact_fields.get(&pc) else {
+            return false;
+        };
+        if !c_is_ref {
+            return false;
+        }
+        let Ok(field_index_u32) = u32::try_from(field_index) else {
+            return false;
+        };
+        if cratonvm_types::GC_FLAGS_BYTE_OFFSET > 127
+            || cratonvm_types::NUM_SLOTS_OFFSET > 127
+        {
+            return false;
+        }
+        let cell_off = (HEADER_SIZE + c_off as usize) as i32;
+
+        // RAX = receiver, non-null. Every bail below lands on the helper call.
+        let mut bail: Vec<usize> = Vec::new();
+        // Alignment + published-bounds containment (the READ table: "is this
+        // address mapped"), same six compares the getfield fast path uses.
+        self.buf.emit(&[0x48, 0x89, 0xC1]); // MOV RCX, RAX
+        self.buf.emit(&[0x48, 0x83, 0xE1, 0x07]); // AND RCX, 7
+        bail.push(self.emit_jcc_rel32(0x85)); // JNZ
+        self.emit_mov_reg_imm64(RDX, self.read_bounds_addr as u64);
+        self.emit_cmp_rax_mem_rdx(0);
+        let below_b0 = self.emit_jcc_rel32(0x82);
+        self.emit_cmp_rax_mem_rdx(8);
+        let ok0 = self.emit_jcc_rel32(0x82);
+        self.patch_rel32_to_here(below_b0);
+        self.emit_cmp_rax_mem_rdx(16);
+        let below_b1 = self.emit_jcc_rel32(0x82);
+        self.emit_cmp_rax_mem_rdx(24);
+        let ok1 = self.emit_jcc_rel32(0x82);
+        self.patch_rel32_to_here(below_b1);
+        self.emit_cmp_rax_mem_rdx(32);
+        bail.push(self.emit_jcc_rel32(0x82));
+        self.emit_cmp_rax_mem_rdx(40);
+        bail.push(self.emit_jcc_rel32(0x83));
+        self.patch_rel32_to_here(ok0);
+        self.patch_rel32_to_here(ok1);
+
+        // pre_active == 0, else the SATB pre-barrier has work: helper.
+        self.emit_mov_reg_imm64(R11, pre as u64);
+        self.buf.emit(&[0x41, 0x80, 0x3B, 0x00]); // CMP BYTE [R11], 0
+        bail.push(self.emit_jcc_rel32(0x85)); // JNE
+
+        // ECX = the object's flags byte; must say COMPACT.
+        self.buf.emit(&[0x0F, 0xB6, 0x48, cratonvm_types::GC_FLAGS_BYTE_OFFSET as u8]); // MOVZX ECX, BYTE [RAX+disp8]
+        self.buf.emit(&[0xF6, 0xC1, cratonvm_types::GC_FLAG_COMPACT]); // TEST CL, imm8
+        bail.push(self.emit_jcc_rel32(0x84)); // JZ legacy layout
+
+        // Slot bound: field_index < num_slots, else the store is DROPPED (the
+        // helper's own verdict for an out-of-range slot).
+        self.buf.emit(&[0x44, 0x8B, 0x58, cratonvm_types::NUM_SLOTS_OFFSET as u8]); // MOV R11D, [RAX+disp8]
+        self.emit_mov_reg_imm64(R10, u64::from(field_index_u32));
+        self.buf.emit(&[0x45, 0x39, 0xDA]); // CMP R10D, R11D
+        let oob = self.emit_jcc_rel32(0x83); // JAE -> done (dropped)
+
+        // The store itself.
+        self.gp_load_value(RDX, value);
+        self.buf.emit(&[0x48, 0x89, 0x90]); // MOV [RAX+disp32], RDX
+        self.buf.emit(&cell_off.to_le_bytes());
+
+        let mut done: Vec<usize> = vec![oob];
+        // flags_byte < young_floor: a young receiver needs no post barrier.
+        self.emit_mov_reg_imm64(R11, floor as u64);
+        self.buf.emit(&[0x41, 0x3A, 0x0B]); // CMP CL, BYTE [R11]
+        done.push(self.emit_jcc_rel32(0x82)); // JB
+        // post_active == 0: no old objects, no card to dirty.
+        self.emit_mov_reg_imm64(R11, post as u64);
+        self.buf.emit(&[0x41, 0x80, 0x3B, 0x00]); // CMP BYTE [R11], 0
+        done.push(self.emit_jcc_rel32(0x84)); // JZ
+        // Otherwise the collector's own write_barrier(vm, obj, val). A leaf:
+        // no frame republish, exactly as the single-pass site emits it.
+        self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
+        self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
+        self.load_reg_from_frame(CALL_ARG_REGS[2], self.slot_of(value));
+        self.emit_mov_reg_imm64(RAX, barrier as u64);
+        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        done.push(self.emit_jmp_rel32());
+
+        // Slow path: the checked helper, unchanged.
+        for b in bail {
+            self.patch_rel32_to_here(b);
+        }
+        self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
+        self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
+        self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as i64 as u64);
+        self.load_reg_from_frame(CALL_ARG_REGS[3], self.slot_of(value));
+        self.emit_mov_reg_imm64(RAX, self.putfield_object as u64);
+        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        for d in done {
+            self.patch_rel32_to_here(d);
+        }
+        crate::x64::note_gated_ref_store();
+        true
     }
 
     fn lower_data_node(&mut self, id: NodeId) {
@@ -5777,6 +5996,16 @@ impl<'a> Lowerer<'a> {
                     self.gp_load_value(RAX, base);
                     self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
                     self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
+                    // 2026-09-02: the gated inline store the single-pass tier
+                    // has had since the same morning, with the helper below as
+                    // its slow path. Declines (returns false, emits nothing)
+                    // when the collector publishes no gate plan, the site has
+                    // no compact offset, or the switch is off -- and then the
+                    // helper call is exactly what it always was.
+                    if self.emit_gated_compact_ref_store(node.bytecode_pc, base, value, field_index)
+                    {
+                        return;
+                    }
                     // jit_putfield_object(vm_ptr, obj_ptr, field_index, val).
                     // Unlike every other putfield helper it takes the context
                     // pointer; `scan_frame_needs` reserves the slot for it.
@@ -11809,6 +12038,19 @@ pub(crate) fn lower_inner_with_scopes(
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
+
+/// Inline gated reference stores in the optimizing tier -- **default ON**,
+/// opt out with `CRATONVM_JIT_IR_GATED_REF_STORE=0`. Off restores the
+/// `jit_putfield_object` call at every reference `putfield`, which is what
+/// this tier emitted before 2026-09-02, so the two arms are A/B-able in one
+/// binary. The single-pass tier's own switch (`CRATONVM_JIT_GATED_REF_STORE`)
+/// still gates both tiers: `=0` there turns this off too.
+fn ir_gated_ref_store_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_GATED_REF_STORE") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
 
 /// Inline TLAB bump for the optimizing tier's `Op::New` — **default ON**, opt
 /// out with `CRATONVM_JIT_IR_INLINE_TLAB=0`.
