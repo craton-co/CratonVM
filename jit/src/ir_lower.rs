@@ -5110,7 +5110,10 @@ impl<'a> Lowerer<'a> {
         let Some(pc) = node_pc else {
             return false;
         };
-        let Some(&(c_off, c_is_ref, _type_tag)) = self.compact_fields.get(&pc) else {
+        // Keyed by `(pc, is_ref)` since dev re-keyed this map: a String-access
+        // expansion emits two `Op::Load`s at one pc. A reference STORE is a
+        // reference by construction, so the `true` half is this site's row.
+        let Some(&(c_off, c_is_ref, _type_tag)) = self.compact_fields.get(&(pc, true)) else {
             return false;
         };
         if !c_is_ref {
