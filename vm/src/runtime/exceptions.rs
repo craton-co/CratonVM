@@ -1856,6 +1856,53 @@ fn throwable_suppressed_sentinel(shared: &SharedVm) -> Option<Value> {
 /// Round-7 Fix 7: `#[cold]` — the whole throw machinery (allocation, init
 /// call, fillInStackTrace) is rare relative to non-throwing opcodes.
 #[cold]
+/// Attach the compiled frames snapshotted at a JIT-signalled implicit NPE to
+/// the throwable that was constructed for it.
+///
+/// The construction happens after the compiled activation has returned, so the
+/// trace `fillInStackTrace` just stored names none of the compiled code that
+/// raised the exception. `snapshot` is what those frames were, taken inside the
+/// helper while they were still live; this splices them back onto the front.
+///
+/// A `None` snapshot (the kill switch, or an NPE with no compiled frames under
+/// it) leaves the throwable exactly as it was.
+pub fn attach_snapshotted_npe_frames(
+    shared: &SharedVm,
+    throwable: ObjectRef,
+    snapshot: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
+) {
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    if snapshot.is_empty() {
+        return;
+    }
+    let hash = shared.mem.heap.identity_hash_code(throwable);
+    let Some(existing) = shared.throwable_stack_trace(hash) else {
+        // No trace was stored for this throwable (the boot path where the NPE
+        // class is not loaded yet). Nothing to splice onto.
+        return;
+    };
+    let cm = shared.classes.class_manager.read();
+    let merged = crate::runtime::stackwalker::append_snapshotted_compiled_frames(
+        &cm.class_store,
+        &snapshot,
+        existing,
+    );
+    drop(cm);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STTRACE").is_some() {
+        eprintln!(
+            "STTRACE_DBG_NPE_SNAPSHOT recovered={} trace_now={}",
+            snapshot.len(),
+            merged.len()
+        );
+        for f in &snapshot {
+            eprintln!("  STTRACE_DBG_NPE_SNAPSHOT[] {} bci={}", f.label, f.bci);
+        }
+    }
+    shared.store_throwable_stack_trace(throwable, merged);
+}
+
 pub fn throw_runtime_error(
     shared: &SharedVm,
     thread: &mut JvmThread,

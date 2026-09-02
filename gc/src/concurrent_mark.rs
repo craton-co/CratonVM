@@ -972,7 +972,7 @@ impl ConcurrentMarker {
             // slots past the extent `old_gen.contains` approved — which is the
             // "can a reader visit slot n of an object whose real slot count is
             // below n" question that
-            // `known-issues/hibernate/hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md`
+            // `internal/fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md`
             // §0.5 item 2 asks of exactly this code.
             //
             // Deriving the count from `total_size` closes the window by

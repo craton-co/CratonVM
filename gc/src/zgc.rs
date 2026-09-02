@@ -2410,6 +2410,16 @@ pub struct ZgcRealHeap {
     /// as it did before domains existed.
     layout_domain: std::sync::atomic::AtomicU32,
 
+    /// This heap's entry in the process-global live-heap registry.
+    ///
+    /// RAII only — see `gen_heap::RELOCATABLE_HEAPS_LIVE`. This collector
+    /// publishes its arena envelope into `MOVABLE_BOUNDS`, which is
+    /// single-tenant by slot-0 ownership, so a SECOND live heap leaves one of
+    /// the two unrepresented and the frame-band verifier's residency test then
+    /// answers `false` for every one of its addresses — a vacuous pass, not an
+    /// absence of movable words.
+    _bounds_registration: crate::gen_heap::RelocatableHeapRegistration,
+
     /// Backing storage for all objects.
     arena: Mutex<Arena>,
     /// Immutable arena envelope, captured at construction — see
@@ -3547,6 +3557,7 @@ impl ZgcRealHeap {
         crate::gen_heap::publish_movable_bounds(0, arena_base, arena_end);
         let heap = Self {
             layout_domain: std::sync::atomic::AtomicU32::new(cratonvm_types::FIRST_LAYOUT_DOMAIN),
+            _bounds_registration: crate::gen_heap::RelocatableHeapRegistration::new(),
             arena_base,
             arena_end,
             arena: Mutex::new(arena),
