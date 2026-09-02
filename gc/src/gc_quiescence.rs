@@ -711,11 +711,27 @@ pub mod incomplete_reason {
     /// This is the only reason code produced by *checking the answer* rather
     /// than by failing to establish a precondition.
     pub const COVERAGE_ORACLE_REFUTED: usize = 15;
+    /// The frame-band verifier could not run for the OPPOSITE reason to
+    /// [`YOUNG_BOUNDS_UNPUBLISHED`]: the tables it tests ARE published, and are
+    /// published about a different heap.
+    ///
+    /// `gen_heap::JIT_REGION_BOUNDS` and `gen_heap::MOVABLE_BOUNDS` are
+    /// process-global and discriminated by slot 0, so each describes exactly
+    /// one heap. With a second heap alive — a second embedded VM, an init-time
+    /// heap not yet dropped — whichever heap lost the slot has every one of its
+    /// addresses answer `false` to `gen_heap::addr_is_movable`, and the
+    /// verifier reports "nothing unpublished" over frames it never classified.
+    ///
+    /// Separated from [`YOUNG_BOUNDS_UNPUBLISHED`] because the operator action
+    /// differs: that one says a collector publishes nothing and is expected on
+    /// G1; this one says the process holds more heaps than the tables can
+    /// describe, which no production configuration does.
+    pub const BOUNDS_NOT_REPRESENTATIVE: usize = 16;
 
     /// One past the highest defined reason code. Sizes the per-reason counter
     /// array; a new variant must bump it (asserted by
     /// `every_incomplete_reason_has_a_label`).
-    pub const COUNT: usize = 16;
+    pub const COUNT: usize = 17;
 
     /// Human-readable label for a reason code (for the fallback diagnostic).
     pub fn label(code: usize) -> &'static str {
@@ -735,6 +751,7 @@ pub mod incomplete_reason {
             UNBOUNDED_FRAME_BAND => "compiled-frame-band-unbounded",
             FOREIGN_INNERMOST_RBP => "innermost-rbp-belongs-to-unguarded-callee",
             YOUNG_BOUNDS_UNPUBLISHED => "young-bounds-unpublished-verifier-vacuous",
+            BOUNDS_NOT_REPRESENTATIVE => "published-bounds-describe-another-heap",
             JIT_RELOCATION_UNSUPPORTED => "jit-relocation-contract-unproven",
             _ => "unknown",
         }
@@ -753,6 +770,7 @@ pub mod incomplete_reason {
 // reason as every other counter in this module.
 #[cfg(not(test))]
 static MOVING_YOUNG_REASON_COUNTS: [AtomicUsize; incomplete_reason::COUNT] = [
+    AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),

@@ -677,7 +677,8 @@ and **discard any arm whose control did not fail**.
    `performance/completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`
    and `performance/varhandle-writes-and-cas-have-no-fast-path-FIXED-20260827.md`.
    The residual is
-   [`../perf/juc-primitives-and-composition-after-the-compile-refusals-20260828.md`](../perf/juc-primitives-and-composition-after-the-compile-refusals-20260828.md).
+   `performance/juc-primitives-and-composition-after-the-compile-refusals-CLOSED-20260901.md` (internal), whose successor is
+   [`../perf/completablefuture-composition-is-20x-and-5-percent-compiled-20260901.md`](../perf/completablefuture-composition-is-20x-and-5-percent-compiled-20260901.md).
 2. **Test the variance hypothesis of §5.9 directly.** It predicts that
    anything reducing JIT timing variance reduces the failure, while anything
    reducing mean speed does not. `CRATONVM_BG_COMPILE=0` (synchronous

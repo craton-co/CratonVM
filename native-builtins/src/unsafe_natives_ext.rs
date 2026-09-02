@@ -1965,18 +1965,25 @@ fn ctx_caller_name(ctx: &mut dyn NativeContext) -> Option<String> {
     Some(out.join(" <- "))
 }
 
+/// Returns `true` when the offset is UNCLASSIFIED, i.e. the caller must refuse.
+///
+/// The three classified cases -- an arena-tagged handle, a synthetic offset, a
+/// registered static field -- return `false` and keep the private side store.
+/// Those are the paths that unblocked `ConcurrentHashMap.initTable` and the
+/// lazy-init hangs, and they are deliberately untouched.
 pub(crate) fn note_unsafe_side_store_offset(
     ctx: &mut dyn NativeContext,
     offset: usize,
     site: u32,
     nargs: usize,
-) {
+) -> bool {
     use std::sync::atomic::{AtomicU64, Ordering};
     if crate::unsafe_arena_addr_is_tagged(offset as i64)
         || crate::is_synthetic_offset(offset)
         || unsafe_static_field_target(offset).is_some()
     {
-        return;
+        // Classified: a legitimate user of the side store. Not a refusal.
+        return false;
     }
     static UNCLASSIFIED: AtomicU64 = AtomicU64::new(0);
     let n = UNCLASSIFIED.fetch_add(1, Ordering::Relaxed);
@@ -2005,6 +2012,7 @@ pub(crate) fn note_unsafe_side_store_offset(
             "UNCLASSIFIED-NULL-BASE: an Unsafe access with a null base whose              offset is neither an arena handle, nor a synthetic offset, nor a              registered static field. HotSpot reads this as an absolute address              and faults; here it lands in a private side store, so a CAS can              report success having written nowhere a reader can see. L1 R5."
         );
     }
+    true
 }
 
 fn unsafe_static_field_target(offset: usize) -> Option<(ClassId, usize)> {
@@ -2620,7 +2628,17 @@ pub(crate) fn native_unsafe_cas_int(
             if let Some(ok) = unsafe_static_cas(ctx, offset, expected, new_val) {
                 return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let cur = *map.entry(offset).or_insert(0);
             let ex = if let Value::Int(e) = expected { e } else { 0 };
@@ -2674,7 +2692,17 @@ pub(crate) fn native_unsafe_cas_long(
                 }
                 return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let cur = *map.entry(offset).or_insert(0);
             let ex = if let Value::Long(e) = expected { e } else { 0 };
@@ -2830,7 +2858,17 @@ pub(crate) fn native_unsafe_cas_object(
             if let Some(ok) = unsafe_static_cas(ctx, offset, expected, new_val) {
                 return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let mut map = lock_unsafe_shard_usize(static_obj_store(), offset);
             let cur = *map.entry(offset).or_insert(None);
             let ex = if let Value::Object(e) = expected {
@@ -2921,7 +2959,17 @@ pub(crate) fn native_unsafe_get_int_volatile(
                     _ => Value::Int(0),
                 }));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let map = lock_unsafe_shard_usize(static_int_store(), offset);
             return Ok(Some(Value::Int(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -2955,7 +3003,17 @@ pub(crate) fn native_unsafe_put_int_volatile(
             if unsafe_static_put(ctx, offset, Value::Int(v)) {
                 return Ok(None);
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             lock_unsafe_shard_usize(static_int_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -2990,7 +3048,17 @@ pub(crate) fn native_unsafe_get_long_volatile(
                     _ => Value::Long(0),
                 }));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let map = lock_unsafe_shard_usize(static_long_store(), offset);
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -3025,7 +3093,17 @@ pub(crate) fn native_unsafe_put_long_volatile(
             if unsafe_static_put(ctx, offset, Value::Long(v)) {
                 return Ok(None);
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -3056,7 +3134,17 @@ fn native_unsafe_get_object_volatile(
             if let Some(v) = unsafe_static_get(ctx, offset) {
                 return Ok(Some(recover_object_arg(v)));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let map = lock_unsafe_shard_usize(static_obj_store(), offset);
             return Ok(Some(Value::Object(
                 map.get(&offset).copied().unwrap_or(None),
@@ -3093,7 +3181,17 @@ fn native_unsafe_put_object_volatile(
             if unsafe_static_put(ctx, offset, Value::Object(v)) {
                 return Ok(None);
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             lock_unsafe_shard_usize(static_obj_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -3124,7 +3222,17 @@ pub(crate) fn native_unsafe_get_object(
             if let Some(v) = unsafe_static_get(ctx, offset) {
                 return Ok(Some(recover_object_arg(v)));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let map = lock_unsafe_shard_usize(static_obj_store(), offset);
             return Ok(Some(Value::Object(
                 map.get(&offset).copied().unwrap_or(None),
@@ -3159,7 +3267,17 @@ pub(crate) fn native_unsafe_put_object(
             if unsafe_static_put(ctx, offset, Value::Object(v)) {
                 return Ok(None);
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             lock_unsafe_shard_usize(static_obj_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -3479,7 +3597,17 @@ pub(crate) fn native_unsafe_get_int(
                     _ => Value::Int(0),
                 }));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let map = lock_unsafe_shard_usize(static_int_store(), offset);
             return Ok(Some(Value::Int(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -3513,7 +3641,17 @@ pub(crate) fn native_unsafe_put_int(
             if unsafe_static_put(ctx, offset, Value::Int(v)) {
                 return Ok(None);
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             lock_unsafe_shard_usize(static_int_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -3656,7 +3794,17 @@ pub(crate) fn native_unsafe_get_long(
                     _ => Value::Long(0),
                 }));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let map = lock_unsafe_shard_usize(static_long_store(), offset);
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -3698,7 +3846,17 @@ pub(crate) fn native_unsafe_put_long(
             if unsafe_static_put(ctx, offset, Value::Long(v)) {
                 return Ok(None);
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -3873,7 +4031,17 @@ pub(crate) fn native_unsafe_get_and_add_int(
             if let Some(old) = unsafe_static_get_and_add_int(ctx, offset, delta) {
                 return Ok(Some(Value::Int(old)));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let slot = map.entry(offset).or_insert(0);
             let old = *slot;
@@ -3940,7 +4108,17 @@ fn native_unsafe_get_and_set_int(ctx: &mut dyn NativeContext, args: &[Value]) ->
             if let Some(prev) = unsafe_static_get_and_set_int(ctx, offset, nv) {
                 return Ok(Some(Value::Int(prev)));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(0);
             return Ok(Some(Value::Int(prev)));
@@ -4314,7 +4492,17 @@ fn native_unsafe_get_and_add_long(ctx: &mut dyn NativeContext, args: &[Value]) -
             // Static-field semantics (null receiver). Maintain a per-offset
             // counter so callers like Thread$ThreadIdentifiers.next() get
             // monotonically-increasing values rather than a VM panic.
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let slot = map.entry(offset).or_insert(0);
             let old = *slot;
@@ -4379,7 +4567,17 @@ fn native_unsafe_get_and_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -
             if let Some(prev) = unsafe_static_get_and_set_long(ctx, offset, nv) {
                 return Ok(Some(Value::Long(prev)));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(0);
             return Ok(Some(Value::Long(prev)));
@@ -4429,7 +4627,17 @@ fn native_unsafe_get_and_set_object(
             if let Some(prev) = unsafe_static_get_and_set_object(ctx, offset, nv) {
                 return Ok(Some(Value::Object(prev)));
             }
-            note_unsafe_side_store_offset(ctx, offset, line!(), args.len());
+            if note_unsafe_side_store_offset(ctx, offset, line!(), args.len()) {
+                // §4.5's specified refusal, discharged by §21/§23's count.
+                // HotSpot SIGSEGVs here; the side store used to answer, and a
+                // CAS reported success having written nowhere.
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe access with a null base and an offset that is                          neither an arena handle, a synthetic offset, nor a                          registered static field: {offset:#x}"
+                    ),
+                }
+                .into());
+            }
             let mut map = lock_unsafe_shard_usize(static_obj_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(None);
             return Ok(Some(Value::Object(prev)));
@@ -4905,6 +5113,22 @@ mod unsafe_arena {
 
     struct Arena {
         bytes: Vec<u8>,
+        /// Bytes of HANDLE space this block owns, which is what `try_allocate`
+        /// bumped `next_addr` by -- not what the block currently holds.
+        ///
+        /// `locate` resolves an address to the greatest base at or below it, so
+        /// a block whose `bytes` grow past this would answer for handles
+        /// already issued to the blocks above it: two live blocks aliasing one
+        /// address range, with every access to the later one silently
+        /// redirected into the earlier. `reallocate` keeps
+        /// `bytes.len() <= reserved` and relocates rather than break it.
+        reserved: usize,
+    }
+
+    /// Handle space a block of `size` bytes owns. `next_addr` bumps by this,
+    /// and [`Arena::reserved`] records it.
+    fn reserved_for(size: usize) -> usize {
+        (size.max(1) + 15) & !15
     }
 
     pub(super) struct ArenaStore {
@@ -4922,6 +5146,14 @@ mod unsafe_arena {
         /// acquisition. Same caveat the JFR tables carry — if `inner` is ever
         /// given a level it must be a HIGHER one than this, never an equal.
         translated: cratonvm_types::lock_order::OrderedPlMutex<BTreeMap<i64, u64>>,
+        /// The backing buffer a `reallocate` displaced out from under an
+        /// OUTSTANDING real pointer, kept alive so that the pointer keeps
+        /// naming memory this process owns. See [`ArenaStore::reallocate`].
+        ///
+        /// LOCK LEVEL: `Scratch`, for the same reason `translated` is. Unlike
+        /// `translated` it is acquired with NO other arena lock held, so the
+        /// caveat there about the enclosing `inner.write()` does not apply.
+        retired: cratonvm_types::lock_order::OrderedPlMutex<BTreeMap<i64, Vec<u8>>>,
     }
 
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4938,6 +5170,13 @@ mod unsafe_arena {
     /// Frees of a block whose real pointer was already handed out. Same hazard:
     /// the `Vec` is dropped and its memory returned to the allocator.
     pub(super) static STALE_ON_FREE: AtomicU64 = AtomicU64::new(0);
+    /// Displaced buffers that [`ArenaStore::reallocate`] RETAINED rather than
+    /// dropped, because a real pointer into them was outstanding. This is the
+    /// count of times the dangling-pointer window above was closed.
+    pub(super) static RETAINED_ON_REALLOC: AtomicU64 = AtomicU64::new(0);
+    /// Translations refused by `unsafe_arena_real_ptr_bounded` because the
+    /// block could not cover the length being advertised with the pointer.
+    pub(super) static SHORT_TRANSLATIONS: AtomicU64 = AtomicU64::new(0);
 
     impl ArenaStore {
         fn new() -> Self {
@@ -4945,6 +5184,10 @@ mod unsafe_arena {
                 inner: RwLock::new(BTreeMap::new()),
                 next_addr: Mutex::new(ARENA_BASE),
                 translated: cratonvm_types::lock_order::OrderedPlMutex::new(
+                    BTreeMap::new(),
+                    cratonvm_types::lock_order::LockLevel::Scratch,
+                ),
+                retired: cratonvm_types::lock_order::OrderedPlMutex::new(
                     BTreeMap::new(),
                     cratonvm_types::lock_order::LockLevel::Scratch,
                 ),
@@ -4964,13 +5207,9 @@ mod unsafe_arena {
             let mut bytes: Vec<u8> = Vec::new();
             bytes.try_reserve_exact(size).ok()?;
             bytes.resize(size, 0u8);
-            let addr = {
-                let mut c = self.next_addr.lock();
-                let a = *c;
-                *c = c.saturating_add(((size.max(1) + 15) & !15) as i64);
-                a
-            };
-            self.inner.write().insert(addr, Arena { bytes });
+            let reserved = reserved_for(size);
+            let addr = self.bump(reserved);
+            self.inner.write().insert(addr, Arena { bytes, reserved });
             Some(addr)
         }
 
@@ -4978,51 +5217,211 @@ mod unsafe_arena {
             self.try_allocate(size).unwrap_or(0)
         }
 
+        /// Claim `reserved` bytes of handle space. Never reuses an address:
+        /// a freed block's handles stay dead so a use-after-free keeps
+        /// resolving to nothing instead of to somebody else's bytes.
+        ///
+        /// Takes no other lock, so it is safe to call while `inner` is held.
+        fn bump(&self, reserved: usize) -> i64 {
+            let mut c = self.next_addr.lock();
+            let a = *c;
+            *c = c.saturating_add(reserved as i64);
+            a
+        }
+
         #[cfg(test)]
         pub(super) fn block_is_translated(&self, addr: i64) -> bool {
             self.translated.lock().contains_key(&addr)
+        }
+
+        #[cfg(test)]
+        pub(super) fn block_is_retired(&self, addr: i64) -> bool {
+            self.retired.lock().contains_key(&addr)
         }
 
         /// `None` when the resize could not be allocated -- see
         /// [`Self::try_allocate`]. The block is left UNTOUCHED on failure,
         /// which is what `realloc(3)` guarantees and what the JDK's
         /// `reallocateMemory` contract relies on when it throws.
+        ///
+        /// `Some` carries the handle the block now lives at, which is NOT
+        /// necessarily the one passed in -- see [`Self::reallocate`].
         pub(super) fn try_reallocate(&self, addr: i64, new_size: usize) -> Option<i64> {
+            match self.reallocate(addr, new_size) {
+                0 => None,
+                a => Some(a),
+            }
+        }
+
+        /// Resize a block: 0 if the new size could not be allocated, otherwise
+        /// the handle the block now lives at, WHICH MAY DIFFER FROM `addr`.
+        ///
+        /// # Growing past the reserved handle space RELOCATES
+        ///
+        /// `try_allocate` bumps `next_addr` by the rounded request, so a block
+        /// owns exactly that much handle space, and `locate` resolves an
+        /// address to the greatest base at or below it. Growing `bytes` past
+        /// that made the block answer for every handle issued after it: two
+        /// live blocks aliasing one range, with reads and writes through the
+        /// LATER handle silently landing in the earlier block. A 64-byte block
+        /// grown to 4096 swallowed its successor whole.
+        ///
+        /// So a grow that will not fit is served from a fresh handle and the
+        /// old one dies, which is what `realloc(3)` does and what
+        /// `Unsafe.reallocateMemory` already documents -- its caller must use
+        /// the returned address, and `native_unsafe_reallocate_memory_consolidated`
+        /// passes this straight back to Java.
+        ///
+        /// # Keeping any buffer a real pointer still names
+        ///
+        /// `Vec::resize` reallocates when it must grow past its capacity, and a
+        /// reallocation MOVES the bytes; so does relocating. Every real pointer
+        /// [`Self::real_ptr`] handed out before that point would then name
+        /// memory the process allocator has taken back -- an unbounded
+        /// use-after-free from native code, which is the shape
+        /// `zgc-rewrite-pass-walks-off-a-reference-array-20260815.md` spent
+        /// seven passes hunting.
+        ///
+        /// So a block whose pointer is OUTSTANDING does not lose its old
+        /// buffer: the displaced `Vec` moves to `retired`, keyed by whatever
+        /// handle the block ends up at, and stays owned by this process until
+        /// that handle is freed. The stale pointer then reads stale-but-mapped
+        /// bytes instead of corrupting whatever the allocator handed out next.
+        /// That is a downgrade, not a cure -- the native is still using an
+        /// address the Java side has moved on from -- but it bounds the blast
+        /// radius to the block itself, and `STALE_ON_REALLOC` reports every
+        /// occurrence.
+        ///
+        /// Retention is at most ONE buffer per handle: a second displacement
+        /// drops the first, and `free` drops whatever is left. A resize that
+        /// does NOT move the buffer retains nothing and reports nothing, which
+        /// is why `STALE_ON_REALLOC` counts moves rather than resizes.
+        pub(super) fn reallocate(&self, addr: i64, new_size: usize) -> i64 {
+            // BEFORE anything moves, which is the only moment this is knowable.
+            let outstanding = self.translated.lock().get(&addr).copied();
             let mut inner = self.inner.write();
-            let cur_len = inner.get(&addr).map(|a| a.bytes.len()).unwrap_or(0);
-            if new_size > cur_len {
-                match inner.get_mut(&addr) {
-                    Some(a) => a.bytes.try_reserve_exact(new_size - cur_len).ok()?,
-                    None => {
-                        // No existing block: allocating a fresh one, so probe
-                        // the request before `reallocate` commits to it.
-                        let mut probe: Vec<u8> = Vec::new();
-                        probe.try_reserve_exact(new_size).ok()?;
+            let old = inner.remove(&addr);
+            let reserved = old.as_ref().map(|a| a.reserved).unwrap_or(0);
+            let mut bytes = old.map(|a| a.bytes).unwrap_or_default();
+
+            // A resize the block's own handle space cannot hold, or a resize of
+            // a handle that names no live block at all (`reallocate` must not
+            // conjure a block at an arbitrary address -- that is the aliasing
+            // above by another route). Both are served from a fresh handle.
+            if new_size > reserved {
+                let mut fresh: Vec<u8> = Vec::new();
+                if fresh.try_reserve_exact(new_size).is_err() {
+                    // `realloc(3)`'s contract on failure: the block is left
+                    // exactly as it was.
+                    if reserved != 0 {
+                        inner.insert(addr, Arena { bytes, reserved });
+                    }
+                    return 0;
+                }
+                fresh.extend_from_slice(&bytes[..new_size.min(bytes.len())]);
+                fresh.resize(new_size, 0u8);
+                let new_reserved = reserved_for(new_size);
+                let new_addr = self.bump(new_reserved);
+                inner.insert(
+                    new_addr,
+                    Arena {
+                        bytes: fresh,
+                        reserved: new_reserved,
+                    },
+                );
+                drop(inner);
+                self.displace(addr, new_addr, bytes, outstanding, new_size);
+                return new_addr;
+            }
+
+            // In place: the block keeps its handle. It can still MOVE in
+            // memory, because `reserved` bounds the handle space and
+            // `capacity` bounds the buffer, and those are different numbers --
+            // a 60-byte block reserves 64 and has capacity 60.
+            if outstanding.is_some() && new_size > bytes.capacity() {
+                let mut fresh: Vec<u8> = Vec::new();
+                if fresh.try_reserve_exact(new_size).is_err() {
+                    // Fail the resize rather than fall through and let
+                    // `Vec::resize` move the buffer with no way to retain the
+                    // old one. `realloc(3)` leaving the block untouched is a
+                    // contract the caller already handles; a silent dangle is
+                    // not.
+                    inner.insert(addr, Arena { bytes, reserved });
+                    return 0;
+                }
+                fresh.extend_from_slice(&bytes[..new_size.min(bytes.len())]);
+                fresh.resize(new_size, 0u8);
+                inner.insert(
+                    addr,
+                    Arena {
+                        bytes: fresh,
+                        reserved,
+                    },
+                );
+                drop(inner);
+                self.displace(addr, addr, bytes, outstanding, new_size);
+                return addr;
+            }
+            if new_size > bytes.len()
+                && bytes.try_reserve_exact(new_size - bytes.len()).is_err()
+            {
+                inner.insert(addr, Arena { bytes, reserved });
+                return 0;
+            }
+            bytes.resize(new_size, 0u8);
+            inner.insert(addr, Arena { bytes, reserved });
+            addr
+        }
+
+        /// Move the translation bookkeeping from `from` to `to` and retain the
+        /// buffer `displaced` if a real pointer into it is outstanding.
+        ///
+        /// The new block is deliberately NOT marked translated: nobody has been
+        /// given a pointer into it. The retained buffer is keyed by the block's
+        /// new handle so that freeing the block frees it too.
+        ///
+        /// Takes no arena lock but `translated`/`retired`, so callers must have
+        /// released `inner`.
+        fn displace(
+            &self,
+            from: i64,
+            to: i64,
+            displaced: Vec<u8>,
+            outstanding: Option<u64>,
+            new_size: usize,
+        ) {
+            let mut translated = self.translated.lock();
+            translated.remove(&from);
+            drop(translated);
+            let mut retired = self.retired.lock();
+            let carried = retired.remove(&from);
+            match outstanding {
+                Some(n) => {
+                    STALE_ON_REALLOC.fetch_add(1, Ordering::Relaxed);
+                    RETAINED_ON_REALLOC.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        target: "cratonvm::unsafe_arena",
+                        handle = format!("{from:#x}"),
+                        now_at = format!("{to:#x}"),
+                        translations = n,
+                        old_size = displaced.len(),
+                        new_size,
+                        "Unsafe-arena block MOVED while native code holds a real \
+                         pointer into it -- the displaced buffer is RETAINED so that \
+                         pointer keeps naming memory this process owns, and is \
+                         dropped when the handle is freed"
+                    );
+                    retired.insert(to, displaced);
+                }
+                None => {
+                    // Nothing is holding the displaced buffer, so it dies here.
+                    // Any buffer retained by an EARLIER displacement follows the
+                    // block to its new handle rather than being orphaned.
+                    if let Some(prev) = carried {
+                        retired.insert(to, prev);
                     }
                 }
             }
-            drop(inner);
-            Some(self.reallocate(addr, new_size))
-        }
-
-        pub(super) fn reallocate(&self, addr: i64, new_size: usize) -> i64 {
-            // BEFORE the resize, which is what may move the buffer.
-            if let Some(n) = self.translated.lock().get(&addr).copied() {
-                STALE_ON_REALLOC.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    target: "cratonvm::unsafe_arena",
-                    handle = format!("{addr:#x}"),
-                    translations = n,
-                    new_size,
-                    "Unsafe-arena block is being RESIZED while native code holds a                      real pointer into it -- `Vec::resize` may move the buffer,                      after which that pointer names memory the allocator has                      reclaimed"
-                );
-            }
-            let mut inner = self.inner.write();
-            let old = inner.remove(&addr);
-            let mut bytes = old.map(|a| a.bytes).unwrap_or_default();
-            bytes.resize(new_size, 0u8);
-            inner.insert(addr, Arena { bytes });
-            addr
         }
 
         pub(super) fn free(&self, addr: i64) {
@@ -5032,10 +5431,16 @@ mod unsafe_arena {
                     target: "cratonvm::unsafe_arena",
                     handle = format!("{addr:#x}"),
                     translations = n,
-                    "Unsafe-arena block is being FREED while native code holds a                      real pointer into it -- the `Vec` is dropped and its memory                      returned to the process allocator"
+                    "Unsafe-arena block is being FREED while native code holds a real pointer into it -- the `Vec` is dropped and its memory returned to the process allocator"
                 );
             }
             self.inner.write().remove(&addr);
+            // Whatever a resize retained for this handle dies with it. Freeing
+            // is the point at which the JNI/`Unsafe` contract says the pointer
+            // is dead on any VM, so there is nothing to preserve past it --
+            // and retaining past `free` would leak on an
+            // allocate/translate/free loop.
+            self.retired.lock().remove(&addr);
         }
 
         pub(super) fn get_byte(&self, addr: i64) -> u8 {
@@ -5307,7 +5712,16 @@ mod unsafe_arena {
     }
 }
 
-pub(crate) fn unsafe_arena_allocate(size: usize) -> i64 {
+/// Allocate an arena block and return its tagged handle.
+///
+/// `pub` alongside [`unsafe_arena_real_ptr`] and [`unsafe_arena_copy_in`]:
+/// production code reaches the arena through the `Unsafe` natives, but the JNI
+/// boundary in `cratonvm-vm` needs a live tagged handle to test that
+/// `GetDirectBufferAddress` really does bound the pointer it publishes by the
+/// capacity `GetDirectBufferCapacity` advertises. That guard is memory safety,
+/// and a guard whose wiring is only tested one crate away from where it is
+/// wired is a guard nobody has tested.
+pub fn unsafe_arena_allocate(size: usize) -> i64 {
     unsafe_arena::store().allocate(size)
 }
 
@@ -5373,50 +5787,155 @@ pub fn unsafe_arena_real_ptr(addr: i64) -> Option<(*mut u8, usize)> {
     unsafe_arena::store().real_ptr(addr)
 }
 
-/// `(translations, stale_on_realloc, stale_on_free)` — the lifetime audit for
-/// real pointers handed out of the Unsafe arena.
+/// Translate a live arena handle into a real pointer that is good for at least
+/// `want` bytes, or refuse.
+///
+/// [`unsafe_arena_real_ptr`] returns the bound and every caller used to throw it
+/// away. This is the same translation with the bound APPLIED: a JNI caller that
+/// is about to publish a pointer alongside an advertised length passes that
+/// length here, and a block that cannot cover it answers `None` instead of
+/// handing out a pointer the callee will legitimately run off the end of.
+///
+/// `None` is the right answer at the JNI boundary because the spec already
+/// reserves NULL for "not a direct buffer", so natives that check anything
+/// check for it — whereas a short pointer is checked by nobody.
+pub fn unsafe_arena_real_ptr_bounded(addr: i64, want: usize) -> Option<*mut u8> {
+    let (ptr, remaining) = unsafe_arena_real_ptr(addr)?;
+    if remaining < want {
+        unsafe_arena::SHORT_TRANSLATIONS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            target: "cratonvm::unsafe_arena",
+            handle = format!("{addr:#x}"),
+            remaining,
+            want,
+            "refusing to publish a real pointer for an Unsafe-arena block that is SHORTER than the length being advertised with it -- the callee would write past the block"
+        );
+        return None;
+    }
+    Some(ptr)
+}
+
+/// The lifetime audit for real pointers handed out of the Unsafe arena.
 ///
 /// # Why this exists
 ///
-/// `unsafe_arena_real_ptr` is the one place the arena's backing store is exposed
-/// rather than copied, and it has two production callers, both in `jni.rs`:
-/// `jni_long_arg_bits` (a tagged handle arriving as a JNI `jlong` argument —
-/// netty-tcnative's `SSL.bioWrite(long bio, long address, int len)` is the named
-/// case) and `direct_buffer_native_address`. **Both discard the `remaining`
-/// bound**, so the callee receives a bare pointer into a `Vec<u8>` with no
-/// length, and nothing checks what it writes.
+/// [`unsafe_arena_real_ptr`] is the one place the arena's backing store is
+/// exposed rather than copied, and it has two production callers, both in
+/// `jni.rs`: `jni_long_arg_bits` (a tagged handle arriving as a JNI `jlong`
+/// argument — netty-tcnative's `SSL.bioWrite(long bio, long address, int len)`
+/// is the named case) and `direct_buffer_native_address`. Both USED to discard
+/// the `remaining` bound, so the callee received a bare pointer into a
+/// `Vec<u8>` with no length and nothing checked what it wrote.
 ///
-/// Two ways that becomes a write into unrelated memory:
+/// Two ways that becomes a write into unrelated memory, and where each stands:
 ///
-/// * the callee writes past the block — nothing bounds it;
-/// * the block is `reallocate`d or `free`d while the pointer is outstanding.
-///   `reallocate` is `Vec::resize`, which may MOVE the buffer; `free` drops it.
-///   Either way the pointer then names memory the process allocator has taken
-///   back.
+/// * **the callee writes past the block.** `direct_buffer_native_address` now
+///   goes through [`unsafe_arena_real_ptr_bounded`] with the buffer's own
+///   advertised capacity, so a block that cannot cover it is refused and
+///   counted in `short_translations`. `jni_long_arg_bits` cannot be bounded —
+///   a `jlong` argument carries no length — and is counted in `translations`
+///   only;
+/// * **the block is `reallocate`d or `free`d while the pointer is
+///   outstanding.** `reallocate` no longer drops the displaced buffer when a
+///   pointer is outstanding: it RETAINS it, so the pointer keeps naming memory
+///   this process owns (`retained_on_realloc`). `free` still ends the
+///   pointer's life, which is what the contract says on any VM.
 ///
-/// `zgc-rewrite-pass-walks-off-a-reference-array-20260815.md` is looking for a
-/// writer that puts an **8-byte arena-pointer-shaped value onto a live object's
-/// header**, and has eliminated every managed store path, the allocator, the
-/// slide and `copy_to_native_memory`. This path was not in that table: its last
-/// row is a write *through* a tagged handle, which `ArenaStore::copy_in` bounds
-/// into the block's own `Vec` and which therefore cannot reach the Java heap at
-/// all. The hazard is the mirror image — the handle being TRANSLATED and the
-/// bound dropped.
+/// # Reading a zero
 ///
-/// **Nonzero `stale_on_*` means the mechanism is live on this workload.** Zero
-/// does not clear the path, because the unbounded-write half leaves no trace
-/// here.
+/// `translations` is the DENOMINATOR and is why this is printed rather than
+/// just warned about: without it, "the hazard never fired" and "no pointer was
+/// ever handed out on this workload" are the same run. `stale_on_*` and
+/// `short_translations` are only meaningful beside a non-zero `translations`.
+///
+/// # Provenance
+///
+/// `zgc-rewrite-pass-walks-off-a-reference-array-20260815.md` hunted a writer
+/// that puts an 8-byte arena-pointer-shaped value onto a live object's header,
+/// and eliminated every managed store path, the allocator, the slide and
+/// `copy_to_native_memory`. This path was its last untested row. The crash was
+/// later bisected to the collector's own reference processing (`aa4bc7922`),
+/// so this is not that writer — but the bound was genuinely being dropped, and
+/// that is fixed here rather than left as a probe.
+pub fn unsafe_arena_translation_stats() -> ArenaTranslationStats {
+    use std::sync::atomic::Ordering;
+    ArenaTranslationStats {
+        translations: unsafe_arena::TRANSLATIONS.load(Ordering::Relaxed),
+        stale_on_realloc: unsafe_arena::STALE_ON_REALLOC.load(Ordering::Relaxed),
+        stale_on_free: unsafe_arena::STALE_ON_FREE.load(Ordering::Relaxed),
+        retained_on_realloc: unsafe_arena::RETAINED_ON_REALLOC.load(Ordering::Relaxed),
+        short_translations: unsafe_arena::SHORT_TRANSLATIONS.load(Ordering::Relaxed),
+    }
+}
+
+/// The arena real-pointer audit, as one greppable line, at process exit.
+///
+/// HERE in `native-builtins` and not only in `vm-cli`, for the reason the
+/// corrupt-cell census records beside it on the same path: **a JUnit runner
+/// leaves through `System.exit` and never reaches `vm-cli`'s normal-return
+/// arm.** The netty class this counter was built for --
+/// `io.netty.util.ResourceLeakDetectorTest` under
+/// `zgc-rewrite-pass-walks-off-a-reference-array-20260815` -- is exactly such a
+/// runner, and it exits NON-ZERO on its one failing test. A line printed only
+/// on the normal-return path is therefore missing from precisely the runs
+/// anyone would look at, and reads as a clean zero.
+///
+/// Prints when there is something to report, or when GC statistics were asked
+/// for. `translations` is the DENOMINATOR: without it, "the hazard never
+/// fired" and "no pointer was ever handed out on this workload" are the same
+/// run, which is the whole reason the count exists.
+///
+/// A `Once` keeps the two exit paths from printing it twice. On the
+/// `System.exit` path only `CRATONVM_GC_STATS` is consulted -- `--verbose:gc`
+/// is a launcher flag and is not reachable from a native.
+pub fn arena_translation_exit_summary(always: bool) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let s = unsafe_arena_translation_stats();
+    let noteworthy =
+        s.stale_on_realloc != 0 || s.stale_on_free != 0 || s.short_translations != 0;
+    if !always && !noteworthy {
+        return;
+    }
+    ONCE.call_once(|| {
+        eprintln!(
+            "[VM] arena-ptr: translations={} short_translations={} stale_on_realloc={} retained_on_realloc={} stale_on_free={}",
+            s.translations,
+            s.short_translations,
+            s.stale_on_realloc,
+            s.retained_on_realloc,
+            s.stale_on_free,
+        );
+    });
+}
+
+/// See [`unsafe_arena_translation_stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ArenaTranslationStats {
+    /// Real pointers handed out of the arena. The denominator: every other
+    /// field is unreadable without it.
+    pub translations: u64,
+    /// Resizes that MOVED a block while a real pointer into it was
+    /// outstanding. Each one is also a `retained_on_realloc`.
+    pub stale_on_realloc: u64,
+    /// Frees of a block while a real pointer into it was outstanding.
+    pub stale_on_free: u64,
+    /// Displaced buffers kept alive rather than dropped, so a stale pointer
+    /// names memory this process still owns.
+    pub retained_on_realloc: u64,
+    /// Translations REFUSED because the block was shorter than the length
+    /// being advertised alongside the pointer.
+    pub short_translations: u64,
+}
+
 #[cfg(test)]
 pub(crate) fn unsafe_arena_block_is_translated(addr: i64) -> bool {
     unsafe_arena::store().block_is_translated(addr)
 }
 
-pub fn unsafe_arena_translation_stats() -> (u64, u64, u64) {
-    (
-        unsafe_arena::TRANSLATIONS.load(std::sync::atomic::Ordering::Relaxed),
-        unsafe_arena::STALE_ON_REALLOC.load(std::sync::atomic::Ordering::Relaxed),
-        unsafe_arena::STALE_ON_FREE.load(std::sync::atomic::Ordering::Relaxed),
-    )
+#[cfg(test)]
+pub(crate) fn unsafe_arena_block_is_retired(addr: i64) -> bool {
+    unsafe_arena::store().block_is_retired(addr)
 }
 
 /// Copy bytes out of the Unsafe arena (arena → `out`). Returns false if the
@@ -5435,7 +5954,8 @@ pub(crate) fn unsafe_arena_reallocate(addr: i64, new_size: usize) -> i64 {
     unsafe_arena::store().reallocate(addr, new_size)
 }
 
-pub(crate) fn unsafe_arena_free(addr: i64) {
+/// Free an arena block. `pub` for the same reason [`unsafe_arena_allocate`] is.
+pub fn unsafe_arena_free(addr: i64) {
     unsafe_arena::store().free(addr);
 }
 
@@ -5935,7 +6455,7 @@ mod unsafe_arena_real_ptr_tests {
             !unsafe_arena_block_is_translated(quiet),
             "an untranslated block must not be recorded"
         );
-        unsafe_arena_reallocate(quiet, 128);
+        let quiet = unsafe_arena_try_reallocate(quiet, 128).expect("resize succeeds");
         assert!(
             !unsafe_arena_block_is_translated(quiet),
             "and resizing it must not make it recorded"
@@ -5949,13 +6469,13 @@ mod unsafe_arena_real_ptr_tests {
         assert_eq!(remaining, 64, "the bound exists at the source");
         assert!(
             unsafe_arena_block_is_translated(held),
-            "handing a real pointer to native code must be recorded -- otherwise              `reallocate` cannot tell that it is about to move a buffer somebody              is holding"
+            "handing a real pointer to native code must be recorded -- otherwise `reallocate` cannot tell that it is about to move a buffer somebody is holding"
         );
 
         // Resizing it is the hazard: `Vec::resize` may move the buffer.
-        let (_t, r_before, _f) = unsafe_arena_translation_stats();
-        unsafe_arena_reallocate(held, 4096);
-        let (_t2, r_after, _f2) = unsafe_arena_translation_stats();
+        let r_before = unsafe_arena_translation_stats().stale_on_realloc;
+        let held = unsafe_arena_try_reallocate(held, 4096).expect("resize succeeds");
+        let r_after = unsafe_arena_translation_stats().stale_on_realloc;
         assert!(
             r_after > r_before,
             "resizing a block whose real pointer is outstanding must be reported"
@@ -5967,7 +6487,7 @@ mod unsafe_arena_real_ptr_tests {
         unsafe_arena_free(doomed);
         assert!(
             !unsafe_arena_block_is_translated(doomed),
-            "the record must be dropped with the block, or a later handle at the              same address inherits a warning that is not about it"
+            "the record must be dropped with the block, or a later handle at the same address inherits a warning that is not about it"
         );
 
         unsafe_arena_free(held);
@@ -6038,6 +6558,215 @@ mod unsafe_arena_real_ptr_tests {
         let live = unsafe_arena_allocate(8);
         assert!(unsafe_arena_real_ptr(live + 8).is_none());
         unsafe_arena_free(live);
+    }
+
+    /// **Growing a block past its reserved handle space must not swallow the
+    /// handles issued after it.**
+    ///
+    /// `try_allocate` bumps `next_addr` by the rounded request, so a block owns
+    /// exactly that much handle space, and `locate` resolves an address to the
+    /// greatest base at or below it. Growing `bytes` past that made the block
+    /// answer for its successors' handles: a 64-byte block grown to 4096
+    /// swallowed the next block whole, and every read and write through the
+    /// later handle landed silently in the earlier block. Two live
+    /// `Unsafe.allocateMemory` allocations, one address range.
+    ///
+    /// The write-through-both-and-read-back-both shape is deliberate: a test
+    /// that only checks the later block reads its own value passes while the
+    /// earlier block is being corrupted underneath it.
+    #[test]
+    fn growing_a_block_must_not_swallow_the_handles_issued_after_it() {
+        let a = unsafe_arena_allocate(64);
+        let b = unsafe_arena_allocate(64);
+        assert!(b > a, "handles bump upward");
+        // Sized from the ACTUAL gap rather than a constant: this arena is
+        // process-global and cargo runs tests in parallel, so a sibling's
+        // allocation lands between these two and a fixed 4096 stops spanning
+        // `b`. A precondition that a race can make vacuous is worse than none.
+        let span = (b - a) as usize + 128;
+
+        let grown = unsafe_arena_try_reallocate(a, span).expect("resize succeeds");
+        assert_ne!(
+            grown, a,
+            "a grow that its reserved handle space cannot hold must relocate"
+        );
+
+        assert!(unsafe_arena_put_byte(b + 1, 0x77));
+        assert!(unsafe_arena_put_byte(grown + 1, 0x11));
+        assert_eq!(unsafe_arena_get_byte(b + 1), 0x77, "b must keep its own bytes");
+        assert_eq!(
+            unsafe_arena_get_byte(grown + 1),
+            0x11,
+            "and the grown block must keep its own"
+        );
+
+        // The old handle is dead, which is `realloc(3)`'s contract and what
+        // keeps a use-after-realloc resolving to nothing rather than to
+        // whichever block now covers that address.
+        assert!(unsafe_arena_real_ptr(a).is_none());
+        assert!(!unsafe_arena_put_byte(a, 0xFF));
+
+        unsafe_arena_free(grown);
+        unsafe_arena_free(b);
+    }
+
+    /// **A grow that DOES fit the reserved handle space keeps its handle.** The
+    /// negative half: relocating every grow would be correct and would also
+    /// make the test above pass for the wrong reason, while needlessly
+    /// invalidating handles Java is entitled to keep using.
+    #[test]
+    fn a_grow_inside_the_reserved_handle_space_keeps_its_handle() {
+        // 60 bytes reserves 64 -- `next_addr` bumps by the 16-rounded request.
+        let handle = unsafe_arena_allocate(60);
+        assert!(unsafe_arena_put_byte(handle + 3, 0x2B));
+        let same = unsafe_arena_try_reallocate(handle, 64).expect("resize succeeds");
+        assert_eq!(same, handle, "a grow that fits must not move the handle");
+        assert_eq!(unsafe_arena_get_byte(handle + 3), 0x2B);
+        unsafe_arena_free(handle);
+    }
+
+    /// **A move under an outstanding real pointer keeps the displaced buffer
+    /// alive, and the outstanding pointer still reads it.**
+    ///
+    /// The assertion that matters is the read through the stale pointer AFTER
+    /// the move. Before the retention it named memory the process allocator had
+    /// taken back, so the read was undefined and a write through it was an
+    /// unbounded corruption of whatever landed there next; now it names a
+    /// buffer this process still owns, still holding the pre-move bytes.
+    ///
+    /// Run this one under Miri or ASan and the difference is the whole point:
+    /// the old code is a use-after-free here, this one is not.
+    ///
+    /// # Asserted PER BLOCK wherever possible
+    ///
+    /// The counters are process-global and cargo runs tests in parallel, so a
+    /// sibling moving its own block lands between any baseline and any
+    /// assertion. Counter checks are therefore `>=`, and the load-bearing
+    /// assertions are per-block queries, which are race-free. The module's
+    /// first attempt at exact deltas passed alone and failed in the suite.
+    #[test]
+    fn a_move_under_an_outstanding_pointer_retains_the_displaced_buffer() {
+        let handle = unsafe_arena_allocate(64);
+        assert!(unsafe_arena_put_byte(handle + 7, 0x5A));
+        let (ptr, remaining) = unsafe_arena_real_ptr(handle).expect("live handle translates");
+        assert_eq!(remaining, 64);
+
+        let retained_before = unsafe_arena_translation_stats().retained_on_realloc;
+        let moved = unsafe_arena_try_reallocate(handle, 1 << 20).expect("resize succeeds");
+        assert_ne!(moved, handle, "1 MiB cannot fit the 64 bytes of handle space");
+        assert!(
+            unsafe_arena_translation_stats().retained_on_realloc > retained_before,
+            "a move under an outstanding pointer must retain the displaced buffer"
+        );
+        assert!(
+            unsafe_arena_block_is_retired(moved),
+            "the retained buffer must be keyed by the handle the block ended up at, \
+             or `free` cannot drop it"
+        );
+        assert!(
+            !unsafe_arena_block_is_retired(handle),
+            "and not by the dead one, which nothing will ever free"
+        );
+
+        // The stale pointer still names owned memory holding the old bytes.
+        // SAFETY: this is exactly the dereference the retention makes sound --
+        // the displaced buffer is alive and at least 64 bytes long.
+        assert_eq!(unsafe { std::ptr::read(ptr.add(7)) }, 0x5A);
+
+        // The block itself moved on, and carried its contents.
+        assert_eq!(unsafe_arena_get_byte(moved + 7), 0x5A);
+
+        unsafe_arena_free(moved);
+        assert!(
+            !unsafe_arena_block_is_retired(moved),
+            "freeing the handle must drop the retained buffer -- otherwise an \
+             allocate/translate/resize/free loop leaks one buffer per iteration"
+        );
+    }
+
+    /// **A resize that cannot move the buffer retains nothing.** The negative
+    /// half: without it the retention fires on every resize of every translated
+    /// block, and the count says nothing about the hazard.
+    #[test]
+    fn a_resize_that_cannot_move_the_buffer_retains_nothing() {
+        let handle = unsafe_arena_allocate(4096);
+        let _ = unsafe_arena_real_ptr(handle).expect("translates");
+        // Shrinking never reallocates and fits the reserved space, so the block
+        // neither moves in memory nor changes handle.
+        let same = unsafe_arena_try_reallocate(handle, 16).expect("resize succeeds");
+        assert_eq!(same, handle);
+        assert!(
+            !unsafe_arena_block_is_retired(handle),
+            "a shrink displaces nothing, so there is nothing to retain"
+        );
+        unsafe_arena_free(handle);
+    }
+
+    /// **The resize path must not move a translated block before it can notice.**
+    ///
+    /// `try_reallocate`'s capacity probe used to run `try_reserve_exact` on the
+    /// LIVE `Vec`, which reallocates -- so the buffer moved during the probe,
+    /// and the detection downstream then read a capacity that had just been
+    /// satisfied and concluded nothing had moved. An instrument armed where it
+    /// could not fire. The probe is gone; this is what proves it stays gone.
+    #[test]
+    fn the_resize_path_does_not_move_a_translated_block_before_noticing() {
+        let handle = unsafe_arena_allocate(64);
+        let (ptr, _) = unsafe_arena_real_ptr(handle).expect("translates");
+        // SAFETY: 64 bytes are owned by this block.
+        unsafe { std::ptr::write(ptr.add(1), 0xC3) };
+
+        let before = unsafe_arena_translation_stats().retained_on_realloc;
+        let moved = unsafe_arena_try_reallocate(handle, 1 << 20).expect("resize succeeds");
+        assert!(
+            unsafe_arena_translation_stats().retained_on_realloc > before,
+            "the growth must be detected as a move, not hidden by a probe"
+        );
+        assert!(unsafe_arena_block_is_retired(moved));
+        // SAFETY: sound because the displaced buffer was retained.
+        assert_eq!(unsafe { std::ptr::read(ptr.add(1)) }, 0xC3);
+        unsafe_arena_free(moved);
+    }
+
+    /// **A bounded translation refuses a block that cannot cover the advertised
+    /// length, and accepts one that can.**
+    ///
+    /// Both halves are asserted: a guard that refuses everything is as useless
+    /// as one that refuses nothing, and `remaining == want` is the boundary the
+    /// JNI contract actually names -- a native may touch `capacity` bytes, not
+    /// `capacity + 1`.
+    #[test]
+    fn a_bounded_translation_refuses_only_a_block_that_is_too_short() {
+        let handle = unsafe_arena_allocate(64);
+        assert!(
+            unsafe_arena_real_ptr_bounded(handle, 64).is_some(),
+            "a block that exactly covers the advertised length must be published"
+        );
+        assert!(
+            unsafe_arena_real_ptr_bounded(handle, 0).is_some(),
+            "a zero-length buffer is legal and must not be refused"
+        );
+
+        let short_before = unsafe_arena_translation_stats().short_translations;
+        assert!(
+            unsafe_arena_real_ptr_bounded(handle, 65).is_none(),
+            "one byte past the block must be refused -- that byte is the bug"
+        );
+        assert!(
+            unsafe_arena_translation_stats().short_translations > short_before,
+            "and the refusal must be counted, or the guard is invisible"
+        );
+
+        // From an interior handle the bound counts from the offset, so the same
+        // block refuses a length it accepted from its base.
+        assert!(unsafe_arena_real_ptr_bounded(handle + 32, 32).is_some());
+        assert!(unsafe_arena_real_ptr_bounded(handle + 32, 33).is_none());
+
+        unsafe_arena_free(handle);
+        assert!(
+            unsafe_arena_real_ptr_bounded(handle, 1).is_none(),
+            "a dead handle refuses regardless of length"
+        );
     }
 }
 
@@ -6177,7 +6906,7 @@ mod unsafe_static_field_offset_tests {
         let offset = thread_next_tid_offset();
         // `&mut ctx`: this test OWNS its MockNativeContext, unlike the 21
         // production call sites which already hold a `&mut dyn NativeContext`.
-        note_unsafe_side_store_offset(&mut ctx, offset, line!(), 3);
+        let _ = note_unsafe_side_store_offset(&mut ctx, offset, line!(), 3);
         lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, 1);
 
         let first = native_unsafe_get_and_add_long(

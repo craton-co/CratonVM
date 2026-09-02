@@ -128,12 +128,55 @@ this lane started minting it, the dormant row won the slot (`owns=True inv=4`)
 over the registration that matched the shape actually produced, and killed
 `PqOptionalShadowSweep` at row 54.
 
-### What a fix looks like
+### What a fix looks like — the missing tool now exists
 
 Per row: find every producer of an object whose class name equals the registered
 class. If there is none, delete the registration. The `--jdk-only` census and
-`dump_synthetic_stubs` both enumerate registrations; neither enumerates
-producers, which is the missing tool and probably the first thing to build.
+`dump_synthetic_stubs` both enumerate registrations and neither enumerates
+producers; **`tools/dead-registration-census.py` does** (added 2026-08-30). It
+crosses two mechanical inputs — `javap` on the image for which names are
+abstract or interfaces, and a grep over the four allocation helpers for which
+names this VM mints — and reports the rows that can have no receiver.
+
+Its first run, over `java/util/*`:
+
+```text
+  rows on abstract/interface classes NOTHING mints:  199
+  rows on abstract/interface classes THIS VM mints:  284
+```
+
+The 284 are the exception this page is about: `Stream`, `IntStream`,
+`LongStream`, `DoubleStream`, `Collector` and `Spliterator` are all interfaces
+that CratonVM mints as concrete carriers, so registrations on those names are
+LIVE. The 199 span eighteen `java.util.function.*` interfaces, `BaseStream`,
+`ReferencePipeline`, two `java.util.logging` abstract classes, and the
+`java.util` set §2 already names.
+
+**Validated, and the blind spot measured.** `apps/probes/LambdaClassProbe` asks
+the one question that would overturn the function-interface verdict — is a
+lambda's runtime class its interface's name? It is not: lambdas and method
+references are `$$Lambda` hidden classes here exactly as on HotSpot, and
+anonymous and named implementations carry their own names. So those rows really
+have no receiver.
+
+The same probe records the trap that makes a naive check wrong.
+`getClass()` is NOT the name dispatch uses:
+`List.of("a").stream().getClass()` answers
+`java.util.stream.ReferencePipeline$Head` while the object's INTERNAL name is
+`java/util/stream/Stream`, because a reported-name mapping sits in front of it.
+A runtime `getClass()` reading would therefore have called the stream carriers
+un-minted and invited deleting 284 live rows.
+
+**Still not a delete list on its own.** The script is deliberately conservative
+in the safe direction — a false "minted" leaves a dead row in place, a false
+"not minted" would invite deleting a live one — and a candidate still wants the
+`DeadDoorProbe` confirmation in §2: call the method through every door, dump the
+registry, and check the count is still zero, with the static rows on the same
+class as the control.
+
+Deleting them moves `stub_ratchet`, `registrar_drift` and
+`registrar_reachability`, all paired ratchets that want the removed rows NAMED.
+The census output is that list.
 
 Deleting registrations moves `stub_ratchet`, `registrar_drift` and
 `registrar_reachability`, all of which are paired ratchets that want the removed

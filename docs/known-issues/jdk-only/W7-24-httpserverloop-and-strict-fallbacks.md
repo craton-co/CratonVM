@@ -8,6 +8,53 @@ that image's `javap` and `java`. **No claim is made that the source changes in
 this branch compile or work** — the binary predates them, and predates several
 fixes merged to `dev` today.
 
+
+> **VERIFIED AGAINST A BINARY 2026-09-02.** §1's door defect is FIXED and no
+> longer reproduces. `probes/HttpServerWildcardAddressProbe.java` on
+> `/data/l7dod-target/debug/cratonvm` (built 2026-09-02 00:43, tree
+> `94a887093`) under `--jdk-only`: **rc=0**, all seven rows printed, no
+> `NoClassDefFoundError: CratonVM$HttpServerLoop`. `--jdk-only` and `--real-jdk`
+> are **byte-identical**, which is the shape §1 predicted — the door was the
+> only thing strict mode was taking out.
+>
+> This record sat "APPLIED, NOT REBUILT" for **22 days**. The fix was right the
+> whole time.
+>
+> **The probe could not be scored until today, and that was its own fault.**
+> Every bind here asks for port 0, so the kernel picks a new number each run and
+> a raw diff reported four differing rows on two runs of the SAME binary. The
+> probe now normalises the trailing `:<port>` and keeps "a port was bound" as a
+> separate boolean; both VMs are self-stable across two runs, and the diff means
+> something. See its `norm()` comment for why the address itself must survive
+> the rewrite.
+>
+> **What still differs from HotSpot, and why it is not this record's defect.**
+> Four of seven rows, all one thing: HotSpot binds the wildcard as a dual-stack
+> IPv6 socket and reports `/[0:0:0:0:0:0:0:0]`, CratonVM reports `0.0.0.0`.
+> `isAnyLocalAddress()` is `true` on both, so a caller asking the behavioural
+> question gets the same answer. `native-io/src/socket_channel.rs` names this
+> divergence as knowingly left open above `advertised_listener_host`.
+>
+> **The probe's own header comment was stale and has been corrected.** It
+> described the `0.0.0.0` → `127.0.0.1` rewrite as current; that rewrite was
+> REMOVED on 2026-08-10 using this very probe, whose measurement is quoted in
+> the source. A probe that misdescribes the code it measures sends its next
+> reader looking for a fix that already landed.
+>
+> **A finding this run turned up that no record held.** In the registry dump,
+> `sun/net/httpserver/HttpServerImpl.getAddress` shows **2 invocations** and
+> `com/sun/net/httpserver/HttpServer.getAddress` shows **0** — the probe called
+> `getAddress()` exactly twice, so the abstract class's registration is not the
+> one that answers. `HttpServer` is abstract, every concrete subclass must
+> override, and the dispatch door asks the DECLARING class: nine instance-method
+> registrations on `com/sun/net/httpserver/HttpServer` are unreachable, with the
+> `HttpServerImpl` twins carrying the traffic. The static `create` overload is
+> the control — it is on the same class and shows 2 invocations, so the counter
+> works and the zeros are real. This is the family
+> `H5-1-the-abstract-registrations-are-fabricated-receivers-20260820.md` is
+> about; it is recorded here, not fixed here, because removing a dead
+> registration is a change to `net_phase_e.rs` that belongs to whoever owns it.
+
 Branch: `fix/jdk-only-httpserverloop-and-strict-fallbacks-20260811`.
 Files changed: `native-builtins/src/net_phase_e.rs` and this record.
 

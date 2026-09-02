@@ -2176,21 +2176,53 @@ fn native_fis_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // buffer at a sane chunk size to bound memory), so loop until `n`
     // bytes have been skipped or EOF is reached. Return the actual
     // number of bytes skipped, matching `java.io.FileInputStream.skip`.
-    // NOT REPAIRED HERE, AND THE REGISTRY SAYS WHY. HotSpot's `skip` past end
-    // of file answers the requested count (its `skip0` is one `lseek`), and
-    // this body answers 0. A seek was added here and MEASURED INERT: under
-    // `--jdk-only` the `skip(J)J` triple is not registered at all, and in the
-    // default mode it is registered with `invocations: 0`. So is `skip0(J)J`,
-    // in both. What actually answers is `java.io.InputStream.skip`'s
-    // read-and-discard default — the invocation counts prove it
-    // (`readBytes` +4 for two skips over a 2-byte file, `skip0` +0).
+    // NOT REPAIRED HERE, AND THE REASON HAS BEEN RE-MEASURED (2026-08-30).
+    // The conclusion below stands; both pieces of evidence the previous note
+    // gave for it were wrong, which is why they are replaced rather than kept.
     //
-    // That is a RESOLUTION finding, not a body one: `FileInputStream.skip`
-    // resolves to its superclass's method, so no change to either native here
-    // can move the answer. Recorded as a nomination rather than fixed with an
-    // edit that cannot fire. The answer is contract-legal in the meantime —
-    // `InputStream.skip` is specified to "skip over some smaller number of
-    // bytes, possibly zero".
+    // THE DEFECT IS THREE ROWS, NOT ONE. `FileInputStream.skip` is not
+    // `InputStream.skip`: its javadoc says it "may skip more bytes than what
+    // are remaining in the backing file ... the number of bytes skipped may
+    // include some number of bytes that were beyond the EOF", because HotSpot's
+    // `skip0` is one `lseek`. Read-and-discard can only answer what is there:
+    //
+    //   4-byte file at EOF   skip(4)    HotSpot 4     this VM 0
+    //   4-byte file, 1 left  skip(100)  HotSpot 100   this VM 1
+    //   at position 0        skip(-1)   HotSpot IOException   this VM 0
+    //
+    // WRONG EVIDENCE #1 — "the `skip(J)J` triple is not registered at all under
+    // `--jdk-only`, and `skip0(J)J` has `invocations: 0` in both". The registry
+    // now reads `skip 0 / skip0 5` for a five-`skip` program. That number is
+    // real and it is not entry: an `eprintln!` placed in THIS body printed
+    // nothing, in `--jdk-only` AND in the default mode. The counter counts a
+    // dispatch ATTEMPT; the body was never reached. (Same family as
+    // `a-zero-invocation-count-is-evidence-about-a-counter`, from the other
+    // side: a NON-zero count is evidence about a counter too.)
+    //
+    // WRONG EVIDENCE #2 — "`FileInputStream.skip` resolves to its superclass's
+    // method". It does not. Measured through reflection, identical to HotSpot:
+    //
+    //   FileInputStream.class.getMethod("skip", long.class).getDeclaringClass()
+    //     HotSpot   java.io.FileInputStream
+    //     this VM   java.io.FileInputStream
+    //
+    // and `getDeclaredMethods` lists `skip` AND `skip0` on the class, exactly
+    // as HotSpot does. RESOLUTION is correct; what differs is the body
+    // `invokevirtual` actually enters. The three answers above are precisely
+    // `InputStream.skip`'s read-and-discard default, so that is the bytecode
+    // running.
+    //
+    // So this is a DISPATCH finding — the superclass body is entered for a
+    // method the subclass declares and overrides — and no edit to either native
+    // in this file can move it. A seek-based body was written and measured
+    // inert twice, most recently on 2026-08-30; it is not carried here, because
+    // code that cannot run is worse than the absence of it. Nominated out of
+    // this lane.
+    //
+    // Contract-legal in the meantime only in the weak sense: `InputStream.skip`
+    // may "skip over some smaller number of bytes, possibly zero", but
+    // `FileInputStream` overrides that contract, and it is the override a
+    // caller holding a `FileInputStream` is entitled to.
     const CHUNK: usize = 8192;
     let mut remaining = n as u64;
     let mut total_skipped: u64 = 0;

@@ -594,6 +594,13 @@ pub fn run_shutdown_hooks(ctx: &mut dyn NativeContext, trigger: &str) {
     // would report it in zero logs.
     cratonvm_types::scalar_deopt_census::exit_summary();
     cratonvm_types::cell_census::exit_summary();
+    // Same exit path and the same argument: the netty runner this counter was
+    // built for exits through `System.exit` on its failing test, so a line
+    // printed only from `vm-cli`'s normal-return arm is absent from every run
+    // worth reading. See `arena_translation_exit_summary`.
+    crate::unsafe_natives_ext::arena_translation_exit_summary(
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_STATS").is_some(),
+    );
     // Same argument, same exit path: the post-remap stale-frame-word detector
     // splits its hits into words something RESUMES from and words nothing
     // reads, and `resumed_from=0 dead_region=N` is the REPAIRED state rather

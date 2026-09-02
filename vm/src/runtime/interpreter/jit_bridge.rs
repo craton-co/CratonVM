@@ -1667,8 +1667,7 @@ pub(super) fn compile_osr_artifact(
                                     entry,
                                     needs_context: true,
                                     num_params: 1,
-                                    return_type: cratonvm_jit::VARHANDLE_READ_RETURNS
-                                        [slot % cratonvm_jit::VARHANDLE_READ_RETURNS.len()],
+                                    return_type: cratonvm_jit::varhandle_read_slot_return(slot),
                                     guard_class_id: 0,
                                 },
                             ));
@@ -3301,6 +3300,9 @@ pub(super) fn try_osr(
         }
     }
     if crate::jit::helpers::take_jit_pending_npe() {
+        // Taken BEFORE the construction below re-captures a stack the compiled
+        // frames have already left — see `attach_snapshotted_npe_frames`.
+        let npe_snapshot = crate::jit::helpers::take_jit_pending_npe_compiled_frames();
         // Round-9/10 HIGH fix: route the NPE through the OSR'd method's own
         // exception table rather than losing it. The OSR target IS the method
         // whose code raised the NPE, so this frame's table is the one to
@@ -3322,6 +3324,11 @@ pub(super) fn try_osr(
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
+                crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                    shared,
+                    exc,
+                    npe_snapshot,
+                );
                 match route_osr_exception_out_of_artifact(
                     shared,
                     thread,
@@ -3345,7 +3352,10 @@ pub(super) fn try_osr(
             _ => {
                 // Couldn't construct a Java NPE object (e.g. rt.jar not
                 // loaded) — re-stash the raw flag as before so the next
-                // JIT drain still surfaces it.
+                // JIT drain still surfaces it. The frame snapshot is NOT
+                // re-stashed: it was taken for this raise, and by the time a
+                // later drain surfaced the flag it would describe frames that
+                // are long gone. A short trace beats a confidently wrong one.
                 crate::jit::helpers::stash_jit_pending_npe();
             }
         }
@@ -9918,7 +9928,7 @@ pub(super) fn execute_jit_call(
     // snapshot — semantics identical (everything was drained on every path
     // anyway; that unconditional draining IS the Round-8..11 leak-fix
     // discipline), minus the repeated TLS walks per call.
-    let (result, sig) = if !compiled.has_dispatch {
+    let (result, mut sig) = if !compiled.has_dispatch {
         // NEW-1.5 + T1.1.a: even on the fast path, a JIT call may
         // transitively trigger GC via a helper. Push the entry guard
         // so the root scanner can find spill slots in this frame;
@@ -10068,12 +10078,23 @@ pub(super) fn execute_jit_call(
         // and stops a later drain for the same method claiming it, since the
         // match compares method names only.
         let _ = cratonvm_jit::deopt::take_last_deopt();
+        // The compiled frames this NPE was raised in have already left the
+        // stack: the null-check stub called `jit_npe_with_action`, loaded the
+        // i64::MIN deopt sentinel and ran the epilogue, so construction here
+        // sees only what the interpreter still holds. `sig` carries the
+        // snapshot the helper took while they were live.
+        let npe_snapshot = sig.npe_compiled_frames.take();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
+                crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                    shared,
+                    exc,
+                    npe_snapshot,
+                );
                 let exc_locals = synchronized_args.as_deref().map_or_else(
                     || jit_saved_args_to_values(cached, &saved_args, np),
                     |args| args.to_vec(),
@@ -10464,7 +10485,7 @@ pub(super) fn execute_jit_call_decoded(
 
     // Run the compiled body. Mirrors execute_jit_call's run+exception logic
     // (including its one-shot signal drain — see the PERF note there).
-    let (result, sig) = if !compiled.has_dispatch {
+    let (result, mut sig) = if !compiled.has_dispatch {
         // SAFETY: compiled is a finalized JIT CompiledMethod with a validated entry; args match its JVM descriptor (receiver-aware).
         let fast_result: Result<i64, cratonvm_jit::CompileError> = {
             let _jit_root_guard =
@@ -10545,12 +10566,23 @@ pub(super) fn execute_jit_call_decoded(
     // Drain pending NPE / AIOOBE set by void-return store helpers (same as
     // execute_jit_call) — route through the JIT'd method's exception table.
     if sig.npe {
+        // The compiled frames this NPE was raised in have already left the
+        // stack: the null-check stub called `jit_npe_with_action`, loaded the
+        // i64::MIN deopt sentinel and ran the epilogue, so construction here
+        // sees only what the interpreter still holds. `sig` carries the
+        // snapshot the helper took while they were live.
+        let npe_snapshot = sig.npe_compiled_frames.take();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
+                crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                    shared,
+                    exc,
+                    npe_snapshot,
+                );
                 return route_jit_signal_exception(
                     shared,
                     thread,
@@ -10850,7 +10882,7 @@ pub(super) fn execute_jit_call_oneshot(
 
     // Run the compiled body. Mirrors `execute_jit_call_decoded`'s run+exception
     // logic (including its one-shot signal drain).
-    let (result, sig) = if !compiled.has_dispatch {
+    let (result, mut sig) = if !compiled.has_dispatch {
         // SAFETY: compiled is a finalized JIT CompiledMethod with a validated entry; args match its JVM descriptor (receiver-aware).
         let fast_result: Result<i64, cratonvm_jit::CompileError> = {
             let _jit_root_guard =
@@ -10927,12 +10959,23 @@ pub(super) fn execute_jit_call_oneshot(
     // helpers, routing each through the JIT'd method's own exception table
     // (same three sinks, same order, as `execute_jit_call_decoded`).
     if sig.npe {
+        // The compiled frames this NPE was raised in have already left the
+        // stack: the null-check stub called `jit_npe_with_action`, loaded the
+        // i64::MIN deopt sentinel and ran the epilogue, so construction here
+        // sees only what the interpreter still holds. `sig` carries the
+        // snapshot the helper took while they were live.
+        let npe_snapshot = sig.npe_compiled_frames.take();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
+                crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                    shared,
+                    exc,
+                    npe_snapshot,
+                );
                 return oneshot_route_exception(
                     shared,
                     thread,

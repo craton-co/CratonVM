@@ -1020,7 +1020,7 @@ pub fn collector_decision_report() -> String {
     if g1_pauses > 0 {
         s.push('\n');
         s.push_str(&format!(
-            "[GC] g1 root coverage: pauses={g1_pauses} incomplete={g1_incomplete}              ({:.2}%)",
+            "[GC] g1 root coverage: pauses={g1_pauses} incomplete={g1_incomplete} ({:.2}%)",
             100.0 * g1_incomplete as f64 / g1_pauses as f64,
         ));
         // The narrow sibling of the line above, and the one that can actually
