@@ -419,14 +419,43 @@ fn resolve_relative(dir: &str, target: &str) -> String {
 ///
 /// Nothing else belongs here. A citation that is merely awkward to reword is
 /// still a citation.
-const NOT_A_CITATION: &[(&str, &str, &str)] = &[(
-    "vm/tests/jck_conformance.rs",
-    "format!(\"{manifest_dir}/../docs/internal/gaps/jdk-regression-baseline.md\"),",
-    "`baseline_document()`'s FIRST candidate path, probed with `read_to_string` \
-     and falling back to the repo-root `gaps/` copy. It is what keeps the gate \
-     working while `docs/internal/` is removed from history, so the literal is \
-     a path being tolerated, not a link being offered.",
-)];
+const NOT_A_CITATION: &[(&str, &str, &str)] = &[
+    (
+        "vm/tests/jck_conformance.rs",
+        "format!(\"{manifest_dir}/../docs/internal/gaps/jdk-regression-baseline.md\"),",
+        "`baseline_document()`'s FIRST candidate path, probed with `read_to_string` and falling back to the repo-root `gaps/` copy. It is what keeps the gate working while `docs/internal/` is removed from history, so the literal is a path being tolerated, not a link being offered.",
+    ),
+    (
+        "CONTRIBUTING.md",
+        "somewhere outside `types/`, `docs/internal/` and the two generated flag",
+        "Prose naming the directory the numeric-claims guard does NOT scan. It offers no link and cites no record -- it tells a contributor where the guard stops.",
+    ),
+    (
+        "types/tests/doc_numeric_claims.rs",
+        "//! * **`docs/internal/`.** Those pages are history and legitimately record what",
+        "That guard's module docs, explaining which tree it exempts. A test that documents an exemption has to be able to name it.",
+    ),
+    (
+        "types/tests/doc_numeric_claims.rs",
+        "/// `docs/internal/` (relative to `root`).",
+        "Doc comment on that guard's own path-filter helper, naming the prefix it skips. The literal IS the behaviour being described.",
+    ),
+    (
+        "types/tests/doc_numeric_claims.rs",
+        "/// keeps `docs/internal/` — history, and allowed to describe a world that has",
+        "Same guard, explaining why history is kept rather than rewritten.",
+    ),
+    (
+        "types/tests/doc_numeric_claims.rs",
+        "//! * **`docs/internal/`.** Those pages are history and legitimately record what",
+        "That guard's own FAILURE MESSAGE, which must tell a reader which tree was skipped. Rewriting it to satisfy this guard would make the other guard's output wrong.",
+    ),
+    (
+        "types/tests/doc_numeric_claims.rs",
+        "`docs/internal/` is exempt and not scanned — those pages are history \\",
+        "That guard's own FAILURE MESSAGE, which has to tell a reader which tree it skipped. Rewriting it to satisfy this guard would make the other guard's output wrong -- the two guards are in genuine conflict here, and prose describing an exemption is not a link offered to a reader.",
+    ),
+];
 
 /// A `NOT_A_CITATION` row whose line is gone is permission nobody needs — the
 /// same defect the resolve-bypass allowlist's dead-row test names.
