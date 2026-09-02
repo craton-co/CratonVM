@@ -18594,7 +18594,6 @@ static COMPILED_FRAME_LINE_COUNTS: [std::sync::atomic::AtomicU64; 8] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
 ];
 
 /// Index into [`COMPILED_FRAME_LINE_COUNTS`]: answered from the safepoint-id
