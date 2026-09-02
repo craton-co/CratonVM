@@ -775,6 +775,12 @@ pub struct InlineFrameLevel {
     pub label: String,
     /// Bytecode index inside `label`'s method.
     pub bci: u32,
+    /// `ClassId` of the class `label` names, or `0` when the resolver supplied
+    /// none. Carried so a consumer that must answer in `ClassId` -- the JEP 403
+    /// deep-reflection gate, `Class.forName`'s caller loader -- can expand an
+    /// inlined level WITHOUT resolving a JIT label by name, which in a
+    /// security-relevant path would be a guess. See `InlineSite::class_id`.
+    pub class_id: u32,
 }
 
 /// One PC-keyed row: at `native_offset` (equivalently, under safepoint id
@@ -959,6 +965,9 @@ impl InlineFrameMap {
 struct InlineFrameScope {
     /// `"class/Name.method:descriptor"` of the callee being spliced.
     label: String,
+    /// `ClassId` of that callee's class, or `0`. See
+    /// [`InlineFrameLevel::class_id`].
+    class_id: u32,
     /// Where the invoke this splice replaces lives in the ENCLOSING bytecode --
     /// the compiling method's own code for a top-level splice, the enclosing
     /// callee's code for a nested one. Frozen at the push, which is why it can
@@ -1048,13 +1057,14 @@ fn inline_site_label(site: &crate::InlineSite) -> String {
     format!("{}.{}:{}", site.class_name, site.method_name, site.descriptor)
 }
 
-fn push_inline_frame_scope(label: String, entry_bci: usize) {
+fn push_inline_frame_scope(label: String, class_id: u32, entry_bci: usize) {
     if !inline_frame_recording() {
         return;
     }
     INLINE_FRAME_SCOPES.with(|s| {
         s.borrow_mut().push(InlineFrameScope {
             label,
+            class_id,
             entry_bci,
             cur_pc: usize::MAX,
         })
@@ -1136,6 +1146,7 @@ fn build_inline_frame_chain(scopes: &[InlineFrameScope]) -> Option<Vec<InlineFra
             label: scopes[i].label.clone(),
             // Cast: guarded above by the JVMS 4.9.1 bound.
             bci: bci as u32,
+            class_id: scopes[i].class_id,
         });
     }
     Some(chain)
@@ -1367,7 +1378,7 @@ impl Compiler {
         // compiling method's key on every level; this one records the
         // CALLEE's identity, which is what a stack trace has to name.
         let inline_frame_rows_checkpoint = inline_frame_rows_len();
-        push_inline_frame_scope(inline_site_label(site), pc);
+        push_inline_frame_scope(inline_site_label(site), site.class_id, pc);
         // The guarded-virtual MISS EDGE's poison row. In one line: a
         // receiver-guarded site emits guard, splice and miss edge under ONE
         // `cur_bc_pc`; the miss edge records no row of its own; without this
@@ -3798,7 +3809,7 @@ impl Compiler {
         // ENCLOSING callee's pc -- `inline_walk_at.0`, read HERE, before
         // `try_emit_inline_body` overwrites it and does not restore it.
         let inline_frame_rows_checkpoint = inline_frame_rows_len();
-        push_inline_frame_scope(inline_site_label(site), self.inline_walk_at.0);
+        push_inline_frame_scope(inline_site_label(site), site.class_id, self.inline_walk_at.0);
         let inline_ok = self.try_emit_inline_body(outer_pc, site);
         pop_inline_frame_scope();
         let published = self.deopt_stubs.len() > deopt_stubs_checkpoint

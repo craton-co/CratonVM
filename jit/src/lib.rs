@@ -6363,6 +6363,22 @@ pub struct InlineSite {
     pub needs_heap: bool,
     /// Class name of the inlined callee (for invalidation tracking).
     pub class_name: String,
+    /// `ClassId` of [`Self::class_name`], or `0` when the producer did not
+    /// supply one (every hand-built test fixture).
+    ///
+    /// The resolver knows this id -- it is what it looked the body up by -- and
+    /// used to drop it. That is why an inlined level in a stack walk carried
+    /// only a NAME, and why `stackwalker::frame_class_ids_with_compiled` could
+    /// not expand one: that walk answers in `ClassId`, takes no `ClassStore`,
+    /// and resolving a JIT label by name to answer the JEP 403 deep-reflection
+    /// gate would be a security-relevant GUESS. Carried here it is not a guess:
+    /// it is the same id the splice's own invalidation dependency is recorded
+    /// against.
+    ///
+    /// `0` is the "unknown" sentinel, matching
+    /// [`NestedInlineSite::guard_class_id`]'s use of it, and a consumer must
+    /// REFUSE on it rather than substitute anything.
+    pub class_id: u32,
     /// Method name of the inlined callee.
     pub method_name: String,
     /// Descriptor of the inlined callee.
@@ -7813,6 +7829,7 @@ mod profile_guided_inlining_tests {
             ldc2w_info: Vec::new(),
             needs_heap: false,
             class_name: class.to_string(),
+            class_id: 0,
             method_name: method.to_string(),
             descriptor: "()I".to_string(),
             elided_invoke_pcs: Vec::new(),
@@ -8598,6 +8615,7 @@ mod inline_selection_tests {
             ldc2w_info: Vec::new(),
             needs_heap,
             class_name: "InlineCost".to_string(),
+            class_id: 0,
             method_name: "leaf".to_string(),
             descriptor: "()V".to_string(),
             elided_invoke_pcs: Vec::new(),

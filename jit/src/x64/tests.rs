@@ -12353,6 +12353,7 @@ fn make_inline_site(
         ldc2w_info: Vec::new(),
         needs_heap: false,
         class_name: "Test".to_string(),
+        class_id: 0,
         method_name: "inlined".to_string(),
         descriptor,
         elided_invoke_pcs: Vec::new(),

@@ -8830,6 +8830,18 @@ fn resolve_inline_site_from(
     } else {
         callee_class.to_string()
     };
+    // ...and its id, chosen by the SAME branch so the two can never name
+    // different classes. A stack walk that has to answer in `ClassId` -- the
+    // JEP 403 deep-reflection gate, `Class.forName`'s caller loader -- can then
+    // see a spliced frame without resolving a JIT label by name, which would be
+    // a guess in a security-relevant path. `cp_class_id` is the id
+    // `callee_class` was looked up under; `declaring_id` is the class that
+    // declares the body a receiver resolution selected.
+    let inlined_body_class_id = if receiver_class_id.is_some() {
+        declaring_id.as_u32()
+    } else {
+        cp_class_id.as_u32()
+    };
 
     if method.is_synchronized() {
         no!("synchronized");
@@ -9793,6 +9805,7 @@ fn resolve_inline_site_from(
         ldc2w_info,
         needs_heap,
         class_name: inlined_body_class_name,
+        class_id: inlined_body_class_id,
         method_name: callee_method.to_string(),
         descriptor: callee_desc.to_string(),
         elided_invoke_pcs,

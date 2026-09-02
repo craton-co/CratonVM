@@ -4214,7 +4214,44 @@ pub struct ActiveCompiledFrame {
     /// for every refusal on the producer side, and an empty chain reproduces
     /// the historical one-entry-per-artifact answer exactly. See
     /// [`compiled_frame_inline_chain`].
-    pub inline_chain: Vec<(String, u32)>,
+    pub inline_chain: Vec<InlinedLevel>,
+    /// Was [`Self::inline_chain`] obtained from the EXACT key (this
+    /// activation's own return address), rather than the coarse safepoint-id
+    /// one?
+    ///
+    /// Display does not care -- both keys are fail-closed for it. A CALLER
+    /// ATTRIBUTION walk does: one `cur_bc_pc` covers a whole spliced region and
+    /// is shared with the inline cache's MISS EDGE, where the spliced body did
+    /// NOT run. A wrong frame in a trace is a wrong frame; a wrong frame in the
+    /// JEP 403 gate is a fail-OPEN caller. So
+    /// `stackwalker::frame_class_ids_with_compiled` expands only an exact
+    /// chain, and this is the bit that says which it has.
+    ///
+    /// `true` on an EMPTY chain is meaningless and never read: there is nothing
+    /// to expand.
+    pub chain_exact: bool,
+}
+
+/// One level of a compiled frame's inline chain, as a stack walk consumes it.
+///
+/// Replaces the `(label, bci)` pair the chain used to carry. The third field is
+/// the whole reason: `class_id` is recorded by the RESOLVER, at the moment it
+/// looked the spliced body up, so a walk that must answer in `ClassId` --
+/// `frame_class_ids_with_compiled`, feeding the JEP 403 deep-reflection gate
+/// and `Class.forName`'s caller loader -- can see an inlined method without
+/// resolving a JIT label BY NAME. That resolution is what made the blind spot
+/// deliberate: a by-name answer in a security gate is a guess, and this is not
+/// one.
+#[derive(Debug, Clone)]
+pub struct InlinedLevel {
+    /// `"class/Name.method:descriptor"`, the shape
+    /// [`ActiveCompiledFrame::label`] uses.
+    pub label: String,
+    /// Bytecode index in `label`'s own method.
+    pub bci: u32,
+    /// `ClassId` of the class `label` names, or `0` for "the producer supplied
+    /// none". A consumer must REFUSE on `0`, never substitute.
+    pub class_id: u32,
 }
 
 /// The bytecode index a live compiled activation is stopped at.
@@ -4391,12 +4428,22 @@ fn compiled_frame_inline_chain(
     cm: &cratonvm_jit::CompiledMethod,
     bci: i32,
     native_pc: Option<usize>,
-) -> Vec<(String, u32)> {
+) -> (Vec<InlinedLevel>, bool) {
+    fn levels(chain: &[cratonvm_jit::x64::InlineFrameLevel]) -> Vec<InlinedLevel> {
+        chain
+            .iter()
+            .map(|l| InlinedLevel {
+                label: l.label.clone(),
+                bci: l.bci,
+                class_id: l.class_id,
+            })
+            .collect()
+    }
     if cm.inline_frame_map.is_empty() {
         // The overwhelming majority: a method that splices nothing carries an
         // empty map and no allocation, and this is the whole cost it adds to a
         // throw.
-        return Vec::new();
+        return (Vec::new(), false);
     }
     // Key 1 — the exact return address, for every frame below the innermost.
     if let Some(pc) = native_pc {
@@ -4408,27 +4455,29 @@ fn compiled_frame_inline_chain(
             // Cast: bounded by `code_len()`, which is a JIT buffer position.
             let off = (pc - entry) as u32;
             if let Some(chain) = cm.inline_frame_map.chain_for_native_offset(off) {
-                return chain.iter().map(|l| (l.label.clone(), l.bci)).collect();
+                return (levels(chain), true);
             }
         }
-        // No fallback to key 2 here — see the doc above. An exact key that
+        // No fallback to key 2 here -- see the doc above. An exact key that
         // misses is evidence that this program point recorded no chain, not
         // permission to consult a coarser one.
-        return Vec::new();
+        return (Vec::new(), false);
     }
     // Key 2 — the safepoint id, the innermost frame's only evidence. `bci` is
     // what `activation_bci` recovered out of the frame's safepoint-id slot,
     // which is the same `cur_bc_pc` the emitter recorded the row under.
     if bci < 0 {
-        return Vec::new();
+        return (Vec::new(), false);
     }
     match cm.inline_frame_map.chain_for_safepoint_bci(bci as u32) {
-        Some(chain) => chain.iter().map(|l| (l.label.clone(), l.bci)).collect(),
+        // `false`: this is the COARSE key. Good enough to display, never good
+        // enough to attribute a caller -- see `ActiveCompiledFrame::chain_exact`.
+        Some(chain) => (levels(chain), false),
         // `None` is both "no row" and "two rows disagreed and the emitter
         // poisoned this bci". The caller cannot act differently on the two and
         // must not: an ambiguous chain and an absent one both mean no inlined
         // frame may be reported here.
-        None => Vec::new(),
+        None => (Vec::new(), false),
     }
 }
 
@@ -4493,8 +4542,17 @@ pub fn apply_npe_trap_site(frames: &mut [ActiveCompiledFrame], trap_key: u32) {
         top.inline_chain = site
             .chain
             .iter()
-            .map(|l| (l.label.clone(), l.bci))
+            .map(|l| InlinedLevel {
+                label: l.label.clone(),
+                bci: l.bci,
+                class_id: l.class_id,
+            })
             .collect();
+        // The trap site is an EXACT program point -- the emitter recorded it at
+        // the null check it is describing, not under a bci a whole spliced
+        // region shares. So this chain is as authoritative as a return-address
+        // one.
+        top.chain_exact = true;
     }
 }
 
@@ -4707,6 +4765,11 @@ pub fn active_compiled_frames() -> Vec<ActiveCompiledFrame> {
                         -1
                     }
                 };
+                let (inline_chain, chain_exact) = if want_chains {
+                    compiled_frame_inline_chain(cm, bci, *native_pc)
+                } else {
+                    (Vec::new(), false)
+                };
                 out.push(ActiveCompiledFrame {
                     interp_depth: e.interp_depth,
                     label: cm.method_label.clone(),
@@ -4719,13 +4782,10 @@ pub fn active_compiled_frames() -> Vec<ActiveCompiledFrame> {
                     bci,
                     // The callees this artifact spliced at that same program
                     // point. `Vec::new()` does not allocate, so a method that
-                    // inlines nothing — and the whole feature switched off —
+                    // inlines nothing -- and the whole feature switched off --
                     // costs one branch.
-                    inline_chain: if want_chains {
-                        compiled_frame_inline_chain(cm, bci, *native_pc)
-                    } else {
-                        Vec::new()
-                    },
+                    inline_chain,
+                    chain_exact,
                 });
             }
         }

@@ -1224,6 +1224,18 @@ pub const INVENTORY: &[E] = &[
     // of a trap inside a splice is only knowable from that session's scope
     // stack.
     E { group: Group::JIT, token: "npe-trap-lines", on_key: None, off_key: Some("CRATONVM_JIT_NO_NPE_TRAP_LINES"), off_word: None, since: "2026-09-02" },
+    // Default-ON. `stackwalker::frame_class_ids_with_compiled` -- the walk the
+    // JEP 403 deep-reflection gate and `Class.forName`'s caller loader read --
+    // reported ONE class per compiled artifact and so could not see a method
+    // the JIT had inlined. It answers in `ClassId` and resolving a JIT label by
+    // name would have been a guess in a security path; an inlined level now
+    // carries the id the RESOLVER used, and only a chain keyed on the exact
+    // return address is expanded (the coarse safepoint-id key is shared with
+    // the inline cache's miss edge, where the spliced body did not run).
+    // Separate from `inline-frame-map`, which kills the producer and takes the
+    // DISPLAY frames with it; this is the half a caller-attribution change has
+    // to be attributable to on its own.
+    E { group: Group::JIT, token: "inline-caller-frames", on_key: None, off_key: Some("CRATONVM_JIT_NO_INLINE_CALLER_FRAMES"), off_word: None, since: "2026-09-02" },
     // D2: a guarded-virtual site emits guard, splice AND miss edge under ONE
     // safepoint bci, and the miss edge records no inline-frame row -- so that
     // bci held exactly one chain, was never poisoned, and the innermost frame

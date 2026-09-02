@@ -62,7 +62,7 @@ use parking_lot::RwLock;
 use crate::classloading::{Class, ClassId, ClassStore};
 use crate::native::registry::StackTraceEntry;
 use crate::runtime::frame::Frame;
-use crate::jit::conservative_roots::ActiveCompiledFrame;
+use crate::jit::conservative_roots::{ActiveCompiledFrame, InlinedLevel};
 use crate::runtime::fx_collections::{fx_hashmap, FxHashMap};
 
 /// Sentinel "unknown line number" value — `-1` matches HotSpot's
@@ -478,7 +478,37 @@ pub fn capture_full_trace(class_store: &ClassStore, frames: &[Frame]) -> Vec<Sta
 /// Same ordering and same OSR de-duplication as [`capture_full_trace`]; the
 /// two must agree about what "the frames of this thread" are.
 ///
-/// # Why it does NOT expand inlined callees (2026-09-01)
+/// # It DOES expand inlined callees now, and on what evidence (2026-09-02)
+///
+/// The three reasons below were the state on 2026-09-01 and two of them have
+/// been removed rather than argued around:
+///
+///   * an inlined level now carries its own `ClassId`, recorded by the
+///     RESOLVER at the moment it looked the spliced body up
+///     (`InlineSite::class_id` -> `InlineFrameLevel::class_id` ->
+///     `InlinedLevel::class_id`). No name is resolved and no `ClassStore` is
+///     consulted, so the answer is not a guess and this function still takes no
+///     store;
+///   * the miss-edge hazard is closed by REFUSING the coarse key rather than by
+///     refusing the whole feature. Only a chain keyed on this activation's own
+///     return address (`ActiveCompiledFrame::chain_exact`) is expanded. The
+///     safepoint-id key shares one `cur_bc_pc` with the inline cache's miss
+///     edge, where the spliced body did not run -- a wrong frame in a trace,
+///     but a fail-OPEN caller in a gate, which is why display may use it and
+///     this may not.
+///
+/// A level with `class_id == 0` -- a producer that supplied none -- ends the
+/// expansion for that frame, and the levels BELOW it are dropped with it, the
+/// same `break`-not-`continue` rule `push_inlined_chain` follows: a hole in the
+/// chain re-parents everything under it.
+///
+/// The audit below still holds and is still worth keeping: it is the argument
+/// that this change is a hardening rather than a fix, because no consumer of
+/// this walk was ever standing on an inlined frame. What changed is that the
+/// claim no longer has to be re-derived every time a gate moves.
+/// `CRATONVM_JIT_NO_INLINE_CALLER_FRAMES=1` restores the flat answer.
+///
+/// # Why it did NOT expand inlined callees (2026-09-01)
 ///
 /// [`capture_full_trace`] turns one compiled entry into one entry per INLINED
 /// level as well (see [`ActiveCompiledFrame::inline_chain`]); this function
@@ -594,17 +624,61 @@ pub fn frame_class_ids_with_compiled(frames: &[Frame]) -> Vec<ClassId> {
     let mut next = 0usize;
     for (i, f) in frames.iter().enumerate() {
         while next < jit.len() && (jit[next].interp_depth as usize) <= i {
-            out.push(ClassId::new(jit[next].owner_class_id));
+            push_compiled_class_ids(&mut out, &jit[next]);
             next += 1;
         }
         out.push(f.class_id);
     }
     for slot in &jit[next..] {
-        out.push(ClassId::new(slot.owner_class_id));
+        push_compiled_class_ids(&mut out, slot);
     }
     // `frames` is outermost-first; every consumer wants innermost-first.
     out.reverse();
     out
+}
+
+/// Kill switch for the inlined levels in [`frame_class_ids_with_compiled`].
+///
+/// Default ON. `CRATONVM_JIT_NO_INLINE_CALLER_FRAMES=1` restores the flat
+/// one-entry-per-artifact answer this walk gave before 2026-09-02, so a
+/// caller-attribution verdict that changes after warm-up can be attributed to
+/// this expansion or to something else inside ONE binary. Separate from
+/// `CRATONVM_JIT_NO_INLINE_FRAME_MAP`, which kills the producer and so takes
+/// the DISPLAY frames with it: this is the security-relevant half and is the
+/// one worth being able to revert alone.
+fn inline_caller_frames_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_CALLER_FRAMES").is_none()
+    })
+}
+
+/// One compiled entry as one or more `ClassId`s: the artifact's own owner,
+/// then the classes of the callees it INLINED at this program point, outermost
+/// level first -- the same order and the same kept set
+/// [`push_compiled_frames`] produces for the display path.
+///
+/// Refuses in three places, each of which leaves the flat answer this walk gave
+/// before and never substitutes a guess:
+///
+///   * the switch is off;
+///   * the chain came from the coarse safepoint-id key
+///     (`!chain_exact`), which is shared with the inline cache's miss edge;
+///   * a level carries `class_id == 0`, i.e. no id was recorded. That ends the
+///     expansion INCLUDING the levels below it, because a hole re-parents
+///     everything deeper.
+fn push_compiled_class_ids(out: &mut Vec<ClassId>, slot: &ActiveCompiledFrame) {
+    out.push(ClassId::new(slot.owner_class_id));
+    if slot.inline_chain.is_empty() || !slot.chain_exact || !inline_caller_frames_enabled() {
+        return;
+    }
+    // The chain is innermost-first; `out` is outermost-first.
+    for level in slot.inline_chain.iter().rev() {
+        if level.class_id == 0 {
+            break;
+        }
+        out.push(ClassId::new(level.class_id));
+    }
 }
 
 /// Kill switch for [`drop_osr_continuations`]. Default ON;
@@ -877,7 +951,7 @@ fn drop_osr_continuations(
 /// Produced by [`drop_osr_continuations`] — see "The overrides" there for why
 /// this is passed to the trace assembler rather than written into
 /// `Frame::pc`.
-type OsrBciOverrides = std::collections::HashMap<usize, (i32, Vec<(String, u32)>)>;
+type OsrBciOverrides = std::collections::HashMap<usize, (i32, Vec<InlinedLevel>)>;
 
 /// Has this `(depth, label)` already had its one body entry removed by either
 /// rule of [`drop_osr_continuations`]?
@@ -1081,11 +1155,11 @@ fn push_compiled_frames(
 fn push_inlined_chain(
     out: &mut Vec<StackTraceEntry>,
     class_store: &ClassStore,
-    chain: &[(String, u32)],
+    chain: &[InlinedLevel],
 ) {
     // The chain is innermost-first; `out` is outermost-first.
-    for (label, bci) in chain.iter().rev() {
-        match inlined_frame_entry(class_store, label, *bci) {
+    for level in chain.iter().rev() {
+        match inlined_frame_entry(class_store, level) {
             Some(e) => out.push(e),
             None => break,
         }
@@ -1126,7 +1200,16 @@ fn push_inlined_chain(
 /// line — a confidently wrong line, which is the single worst outcome
 /// available in this file. One comparison buys immunity from it at a crate
 /// boundary this module cannot otherwise police.
-fn inlined_frame_entry(class_store: &ClassStore, label: &str, bci: u32) -> Option<StackTraceEntry> {
+fn inlined_frame_entry(
+    class_store: &ClassStore,
+    level: &InlinedLevel,
+) -> Option<StackTraceEntry> {
+    let InlinedLevel {
+        label,
+        bci,
+        class_id: recorded_class_id,
+    } = level;
+    let bci = *bci;
     // JVMS 4.9.1: `Code.code_length` must be less than 65536, so every genuine
     // bci is below it. Mirrors `conservative_roots::plausible_bci`.
     const MAX_CODE_LENGTH: u32 = 65_536;
@@ -1138,11 +1221,22 @@ fn inlined_frame_entry(class_store: &ClassStore, label: &str, bci: u32) -> Optio
     if class_name.is_empty() || method_name.is_empty() {
         return None;
     }
+    // The RESOLVER's own id first (2026-09-02). It is the id the splice was
+    // planned against, so it needs no name scan and cannot pick a different
+    // class of the same name under another loader -- the two failure modes of
+    // the by-name route. `0` means the producer supplied none (every hand-built
+    // fixture, and any artifact compiled before the field existed), and the
+    // memoized by-name resolution stays as the fallback for exactly that.
+    let by_id = (*recorded_class_id != 0)
+        .then(|| ClassId::new(*recorded_class_id))
+        .and_then(|id| class_store.get(id).map(|c| (id, c)));
     // `get` after the by-name resolution rather than trusting the id alone:
     // the memo's own verification already did this read, but the borrow cannot
     // escape it, and repeating it is one hash probe.
-    let resolved = find_class_id_by_name_memoized(class_store, class_name)
-        .and_then(|id| class_store.get(id).map(|c| (id, c)));
+    let resolved = by_id.or_else(|| {
+        find_class_id_by_name_memoized(class_store, class_name)
+            .and_then(|id| class_store.get(id).map(|c| (id, c)))
+    });
     let (class_name, source_file, class_id, method_index, line_number) = match resolved {
         Some((id, c)) => {
             let method_index = find_method_index_memoized(c, id, method_name, method_descriptor);
