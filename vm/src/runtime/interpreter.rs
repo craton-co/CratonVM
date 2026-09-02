@@ -5285,7 +5285,25 @@ fn execute_frame_from_index(
     // `CRATONVM_JIT_NO_BACKEDGE_POLL_GATE=1` (or `CRATONVM_JIT=-backedge-poll-
     // gate`) makes the macro answer `true` unconditionally, restoring the
     // unconditional call so the two arms can be priced inside one binary.
-    let backedge_poll_gate_off = crate::runtime::env_cache::no_backedge_poll_gate();
+    //
+    // ── The two diagnostics that must keep their sampling rate ──────────
+    //
+    // Skipping `safepoint_check` is equivalent to calling it only when the
+    // call would have been a no-op, and there are exactly two ways it is not:
+    // `memwatch::poll` and `blocked_access_debug`, both of which fire from
+    // inside it and neither of which the loop-top poll reaches. A memwatch is
+    // a *sampling* instrument — its own doc promises it "catches the
+    // corrupting write within one safepoint window" — so silently cutting its
+    // rate would weaken a diagnostic rather than speed anything up, and would
+    // do it invisibly.
+    //
+    // Both are startup-static gates, so folding them in costs one more `or`
+    // in the hoisted `bool` and nothing per back edge. An armed run keeps
+    // exactly the old poll frequency; the universal unarmed run keeps the two
+    // relaxed loads.
+    let backedge_poll_gate_off = crate::runtime::env_cache::no_backedge_poll_gate()
+        || crate::runtime::memwatch::is_watching()
+        || cratonvm_gc::blocked_access_debug::enabled();
     macro_rules! backedge_poll_needed {
         () => {
             backedge_poll_gate_off

@@ -1880,8 +1880,18 @@ pub(super) fn execute_invokevirtual_cached(
                     // `ClassId` (the resolution epoch, which the invalidate
                     // hook bumps and which nothing else on the invoke-cache
                     // path observes).
-                    if is_interface && actual_class_id != cached.declaring_class_id {
-                        let memo_hit = !iface_select_memo_disabled()
+                    //
+                    // The kill switch disables BOTH steps, not just the memo.
+                    // A switch that left the short-circuit in place would not
+                    // restore the pre-change path, so its "off" arm would not
+                    // be a control — and this is not hypothetical: the first
+                    // A/B of this change compared an arm the switch could not
+                    // reach and separated nothing.
+                    let iface_fast_off = iface_select_memo_disabled();
+                    if is_interface
+                        && (iface_fast_off || actual_class_id != cached.declaring_class_id)
+                    {
+                        let memo_hit = !iface_fast_off
                             && thread
                                 .iface_select_sites
                                 .get(caller_class_id, cp_index)
@@ -1910,7 +1920,7 @@ pub(super) fn execute_invokevirtual_cached(
                                     .evict(caller_class_id, cp_index, is_special);
                                 return Ok(CachedCallResult::CacheMiss);
                             }
-                            if !iface_select_memo_disabled() {
+                            if !iface_fast_off {
                                 site_stats::bump(site_stats::IFACE_SELECT_FILL);
                                 thread.iface_select_sites.put(
                                     caller_class_id,
