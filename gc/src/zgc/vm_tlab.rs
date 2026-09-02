@@ -334,6 +334,22 @@ mod tests {
         );
     }
 
+    /// The seam that keeps the JIT's inline allocator announcing what it
+    /// allocates. Without it every inline allocation is absent from the start
+    /// registry, and `is_object_address` — a mutator-path oracle here, not
+    /// just the sweep's — answers `None` for a perfectly live object.
+    #[test]
+    fn a_shared_heap_tells_the_jit_that_tlab_objects_must_be_announced() {
+        cratonvm_types::set_jit_tlab_registration_required(false);
+        let heap = ZgcRealHeap::new_shared(16 * 1024 * 1024);
+        assert!(
+            cratonvm_types::jit_tlab_registration_required(),
+            "a ZGC heap that hands out VM TLABs must require the announcing call"
+        );
+        drop(heap);
+        cratonvm_types::set_jit_tlab_registration_required(false);
+    }
+
     #[test]
     fn objects_laid_out_in_the_vm_tlab_are_registered_and_collected_like_any_other() {
         let heap = ZgcRealHeap::new_shared(16 * 1024 * 1024);

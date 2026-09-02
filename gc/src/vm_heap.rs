@@ -4304,6 +4304,47 @@ mod concurrent_mark_controller_tests {
     ///
     /// The exact edit that trips this: delete either
     /// `pointer_map.contains_key(&addr)` early return.
+    /// The `Zgc` arm of [`VmHeap::refill_tlab`] returned `None` until
+    /// 2026-09-02, which left the JIT's inline allocator dead on the default
+    /// collector: `thread.tlab` stayed empty, the inline bump missed every
+    /// time, and every compiled `new` took the helper. It carves a chunk now,
+    /// and retiring the buffer hands the unused tail back rather than leaving
+    /// a filler object this collector would never reclaim (it sweeps a
+    /// registry, not memory).
+    #[cfg(feature = "zgc")]
+    #[test]
+    fn the_zgc_arm_of_refill_tlab_carves_a_chunk_and_takes_its_tail_back() {
+        let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::new_shared(16 * 1024 * 1024));
+        let (ptr, size) = heap
+            .refill_tlab(64 * 1024)
+            .expect("ZGC must hand the VM thread's TLAB a chunk");
+        assert!(!ptr.is_null());
+        assert!(
+            size >= crate::tlab::min_tlab_size() && size <= 64 * 1024,
+            "chunk of {size} bytes is outside the requested bounds"
+        );
+        let mut tlab = unsafe { crate::Tlab::new(ptr, size) };
+        assert!(tlab.alloc(128, 8).is_some());
+        // The chunk is charged whole at refill; the retire credits the unused
+        // tail back, so `allocated` never counts bytes nobody can reach.
+        let allocated_before = heap.allocated_bytes();
+        tlab.retire();
+        assert!(tlab.is_retired());
+        assert_eq!(
+            allocated_before - heap.allocated_bytes(),
+            size - 128,
+            "the retired tail must be credited back to the heap"
+        );
+        let VmHeap::Zgc(z) = &heap else {
+            unreachable!("constructed as Zgc")
+        };
+        assert_eq!(
+            z.vm_tlab_engagement(),
+            (1, size, 1, size - 128),
+            "(refills, refill_bytes, tails_returned, tail_bytes_returned)"
+        );
+    }
+
     #[cfg(feature = "zgc")]
     #[test]
     fn the_pre_gc_address_predicates_are_correct_for_an_object_compaction_moved() {
