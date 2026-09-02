@@ -6,6 +6,30 @@ below was measured by running the already-built binary at
 25.0.3 (`Eclipse Adoptium jdk-25.0.3.9-hotspot`). Nothing here claims a source
 change works; it claims what was measured before it.
 
+> **VERIFIED AGAINST A BINARY 2026-09-01.** The status above was written by a
+> lane that could not build or run Rust, and it stood for roughly three weeks.
+> Run on a release binary of `dev`, against HotSpot 25.0.4+7 on the same host:
+>
+> ```text
+> RJdkHandles
+>   HotSpot          PASS RJdkHandles (331 checks, 40 steps)
+>   CratonVM compat  PASS RJdkHandles (331 checks, 40 steps)      0 differing lines
+>   CratonVM strict  PASS RJdkHandles (331 checks, 40 steps)      0 differing lines
+> ```
+>
+> Byte-identical output in BOTH modes, so the source work this record describes
+> does what it claimed on a real binary.
+>
+> `CK RJdkHandles steps=` and the step count on the `PASS` line -- both
+> introduced by this record's third pass -- are present and agree with HotSpot.
+>
+> **The predicted COUNT is superseded: this record expected `RJdkHandles` at 37 steps / 116 checks.** Other
+> lanes added to the shared vector across the three weeks. A count written as an
+> expectation ages into a falsehood the moment a shared vector grows -- what
+> survives verification is the ASSERTIONS, and those match. Do not re-derive a
+> defect from a count that merely moved.
+
+
 Branch: `fix/methodhandles-compatible-residuals-20260811`.
 Files changed: `native-builtins/src/lang_invoke.rs`,
 `regression-suite/src/RJdkHandles.java`, and this record. Nothing else.

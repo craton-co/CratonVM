@@ -959,7 +959,7 @@ pub fn get_or_create_app_loader(
     ctx.set_field_by_name(obj, "name", Value::Object(Some(name)));
     obj = ctx.read_native_pin(obj_pin, obj);
     platform = ctx.read_native_pin(platform_pin, platform);
-    ctx.set_field_by_name(obj, "parent", Value::Object(Some(platform)));
+    set_both_parent_fields(ctx, obj, platform);
     // Populate the REAL static `java.lang.ClassLoader.scl` so the real-JDK
     // `ClassLoader.getSystemClassLoader()` bytecode (reached when a call site
     // does not resolve to our native; observed in
@@ -972,6 +972,53 @@ pub fn get_or_create_app_loader(
     set_app_loader(vm, Some(obj));
     ctx.unpin_native_roots(platform_pin);
     Ok(obj)
+}
+
+/// Write the parent link into BOTH `parent` fields a built-in loader carries.
+///
+/// # There are two of them, and they are different fields
+///
+/// ```text
+///   java/lang/ClassLoader              private final ClassLoader        parent
+///   jdk/internal/loader/BuiltinClassLoader
+///                                      private final BuiltinClassLoader parent
+/// ```
+///
+/// A field is identified by its NAME AND DESCRIPTOR, and these two differ in
+/// both descriptor and declaring class. `set_field_by_name` resolves from the
+/// object's own class upwards, so on an `AppClassLoader` it finds
+/// `BuiltinClassLoader`'s and stops — leaving `java.lang.ClassLoader.parent`
+/// null forever.
+///
+/// That was invisible for as long as every reader was one of ours: the
+/// `getParent()` native resolves by name too, so it read the field that HAD
+/// been written and answered the platform loader. Real JDK bytecode does not:
+/// `ClassLoader.getPackage` is `getfield #108 // Field parent:Ljava/lang/ClassLoader;`,
+/// read the null, and took the `parent == null` branch to
+/// `BootLoader.getDefinedPackage` — so `Package.getPackage("java.sql")` walked
+/// past the platform loader that defines it and answered null, while
+/// `platform.getPackage("java.sql")` called directly answered correctly. The
+/// same field is read directly by `ClassLoader.loadClass`'s delegation and by
+/// `checkClassLoaderPermission`; this is not a `getPackage` quirk.
+///
+/// MEASURED with `Field.set(app, platform)` from Java: one write, and
+/// `app.getPackage("java.sql")` goes from `null` to `package java.sql` in the
+/// same run.
+///
+/// Only the built-in loaders need this. `URLClassLoader` and every ordinary
+/// user subclass inherit `ClassLoader.parent` with nothing shadowing it, so
+/// the by-name write there already lands on the field the JDK reads.
+fn set_both_parent_fields(ctx: &mut dyn NativeContext, loader: ObjectRef, parent: ObjectRef) {
+    // The derived one first, by name: this is the write that was already here,
+    // and the `getParent()`/`getName()` natives resolve the same way.
+    ctx.set_field_by_name(loader, "parent", Value::Object(Some(parent)));
+    // Then `java.lang.ClassLoader`'s own, addressed through the DECLARING
+    // class so the shadow cannot capture it. `resolve_field_index` starts its
+    // walk at the class it is given, and superclass fields keep their indices
+    // in a subclass instance.
+    if let Some(index) = ctx.resolve_field_index("java/lang/ClassLoader", "parent") {
+        ctx.set_field(loader, index, Value::Object(Some(parent)));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7837,7 +7884,7 @@ pub(crate) fn loader_is_builtin(ctx: &mut dyn NativeContext, loader: ObjectRef) 
 /// # 2026-08-22: step 1 used to be "built-in loaders ARE the global classpath"
 ///
 /// It is not true of the application loader, and `RLangPackages` failed its
-/// FIRST check on it (`WORKER-5-NOTE-8`), in BOTH modes:
+/// FIRST check on it, in BOTH modes:
 ///
 /// ```text
 ///   appLoader.getDefinedPackage("java.lang")   HotSpot null   CratonVM java.lang
@@ -7857,17 +7904,47 @@ pub(crate) fn loader_is_builtin(ctx: &mut dyn NativeContext, loader: ObjectRef) 
 pub(crate) fn package_class_files_visible_to_loader(
     ctx: &mut dyn NativeContext,
     loader: Option<ObjectRef>,
+    package_name: &str,
     class_glob: &str,
 ) -> bool {
     let Some(loader) = loader else {
+        // No receiver object at all: this IS the boot loader, so ask the boot
+        // loader's own definition question before falling back.
+        if let Some(answer) =
+            builtin_loader_defines_package(ctx, BuiltinLoaderKind::Boot, package_name)
+        {
+            return answer;
+        }
         return !ctx.find_all_resource_urls(class_glob).is_empty();
     };
     let loader_class = ctx.class_name_of_id(ctx.class_id_of_object(loader));
     if loader_is_builtin(ctx, loader) {
+        // The MODULE route first: for the boot and platform loaders it is the
+        // only route there is. A class-path segment probe cannot answer for
+        // them at all -- the boot image is a jimage, and a `java/sql/*.class`
+        // glob over it returns nothing, which is why `java.sql` read `null` on
+        // the platform loader and `java.lang` read `null` on the boot loader
+        // (taking `Package.getPackage` down with it) until this arm existed.
+        if let Some(kind) = builtin_loader_kind(loader_class.as_deref()) {
+            if let Some(answer) = builtin_loader_defines_package(ctx, kind, package_name) {
+                return answer;
+            }
+        }
         return match builtin_loader_segment(loader_class.as_deref()) {
-            Some(segment) => !ctx
-                .find_resource_urls_in_segment(class_glob, segment)
-                .is_empty(),
+            // The application loader's `-cp` segment, AND a loaded class. The
+            // segment probe alone answers the visibility question this whole
+            // function exists to stop answering: HotSpot's
+            // `app.getDefinedPackage("com.example.app")` is `null` until a
+            // class in it is defined and non-null after, and a class-file glob
+            // cannot tell those two instants apart. Spring's
+            // `BeanDefinitionLoader.findPackage` — the caller the app arm was
+            // written for — loads a class from the package before asking
+            // again, so it keeps working on the answer HotSpot gives it.
+            Some(segment) => {
+                !ctx.find_resource_urls_in_segment(class_glob, segment)
+                    .is_empty()
+                    && ctx.any_loaded_class_in_package(&package_name.replace('.', "/"))
+            }
             // The boot loader, or a built-in shape this VM does not recognise:
             // the historical global probe, unchanged.
             None => !ctx.find_all_resource_urls(class_glob).is_empty(),
@@ -7880,6 +7957,199 @@ pub(crate) fn package_class_files_visible_to_loader(
         return false;
     }
     !ctx.find_all_resource_urls(class_glob).is_empty()
+}
+
+/// Which of the three built-in loaders this is, by class name.
+///
+/// Separate from [`builtin_loader_segment`] on purpose: that one answers
+/// "which slice of the class path does this loader own", which is a question
+/// only the application and platform loaders have an answer to, and it is the
+/// WRONG question for a loader whose classes come out of a jimage.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BuiltinLoaderKind {
+    Boot,
+    Platform,
+    Application,
+}
+
+pub(crate) fn builtin_loader_kind(loader_class: Option<&str>) -> Option<BuiltinLoaderKind> {
+    match loader_class? {
+        "jdk/internal/loader/ClassLoaders$AppClassLoader" | "sun/misc/Launcher$AppClassLoader" => {
+            Some(BuiltinLoaderKind::Application)
+        }
+        "jdk/internal/loader/ClassLoaders$PlatformClassLoader"
+        | "sun/misc/Launcher$ExtClassLoader" => Some(BuiltinLoaderKind::Platform),
+        "jdk/internal/loader/ClassLoaders$BootClassLoader" => Some(BuiltinLoaderKind::Boot),
+        _ => None,
+    }
+}
+
+/// The JDK's own boot / platform module tables, read out of the running image.
+///
+/// `jdk.internal.module.ModuleLoaderMap$Modules.{bootModules,platformModules}`
+/// are the two `Set<String>` statics the JDK's own module system consults to
+/// decide which built-in loader defines a module's packages. Reading them beats
+/// keeping a hand-copied list in Rust: the answer then comes from the image the
+/// run actually loaded, and a JDK that moves a module between the two tables
+/// moves this VM with it.
+///
+/// Memoised on SUCCESS ONLY. A failure -- the class not yet initialisable this
+/// early in boot, a stripped or non-JDK image -- answers `None` and is retried
+/// on the next call, which selects the historical class-path probe. That is the
+/// pre-existing behaviour, never a silent "this loader defines nothing".
+struct BuiltinModuleSets {
+    boot: std::collections::HashSet<String>,
+    platform: std::collections::HashSet<String>,
+}
+
+const MODULE_LOADER_MAP_MODULES: &str = "jdk/internal/module/ModuleLoaderMap$Modules";
+
+thread_local! {
+    /// Re-entrancy guard for [`jdk_builtin_module_sets`].
+    ///
+    /// Reading the tables runs Java: a class initialisation and three
+    /// `invoke_virtual`s. If anything on that path reached
+    /// `getDefinedPackage` again the cache would still be cold and the read
+    /// would recurse without bound. The guard answers `None` on re-entry,
+    /// which selects the historical class-path probe for that one inner call —
+    /// the same fail-soft every other failure arm here takes.
+    static READING_MODULE_SETS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn jdk_builtin_module_sets(ctx: &mut dyn NativeContext) -> Option<Arc<BuiltinModuleSets>> {
+    static CACHE: OnceLock<Mutex<Option<Arc<BuiltinModuleSets>>>> = OnceLock::new();
+    let cell = CACHE.get_or_init(|| Mutex::new(None));
+    if let Some(hit) = cell.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return Some(hit);
+    }
+    if READING_MODULE_SETS.with(|f| f.replace(true)) {
+        return None;
+    }
+    let sets = jdk_builtin_module_sets_uncached(ctx);
+    READING_MODULE_SETS.with(|f| f.set(false));
+    let sets = sets?;
+    *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&sets));
+    Some(sets)
+}
+
+fn jdk_builtin_module_sets_uncached(ctx: &mut dyn NativeContext) -> Option<Arc<BuiltinModuleSets>> {
+    let cid = ctx
+        .ensure_class_initialized(MODULE_LOADER_MAP_MODULES)
+        .ok()
+        .or_else(|| ctx.class_id_by_name(MODULE_LOADER_MAP_MODULES))?;
+    let boot = read_static_string_set(ctx, cid, "bootModules")?;
+    let platform = read_static_string_set(ctx, cid, "platformModules")?;
+    Some(Arc::new(BuiltinModuleSets { boot, platform }))
+}
+
+/// One `static final Set<String>` field, walked into a Rust set.
+///
+/// The set and its iterator are held as GLOBAL ROOTS across the `invoke_virtual`
+/// calls rather than as raw `ObjectRef`s: `iterator()`/`next()` allocate, so a
+/// collection can move both between one call and the next, and a moved receiver
+/// is the shape that has cost this codebase whole sessions. Runs once per VM.
+fn read_static_string_set(
+    ctx: &mut dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+    field: &str,
+) -> Option<std::collections::HashSet<String>> {
+    let index = ctx.static_field_index_by_name(class_id, field)?;
+    let set = match ctx.get_static_field(class_id, index) {
+        Value::Object(Some(set)) => set,
+        _ => return None,
+    };
+    let set_root = ctx.add_global_root(set);
+    let out = read_string_set_rooted(ctx, set_root);
+    ctx.remove_global_root(set_root);
+    out
+}
+
+fn read_string_set_rooted(
+    ctx: &mut dyn NativeContext,
+    set_root: usize,
+) -> Option<std::collections::HashSet<String>> {
+    let set = ctx.resolve_global_root(set_root)?;
+    let iterator = match ctx.invoke_virtual(set, "iterator", "()Ljava/util/Iterator;", &[]) {
+        Ok(Some(Value::Object(Some(it)))) => it,
+        _ => return None,
+    };
+    let it_root = ctx.add_global_root(iterator);
+    let mut out = std::collections::HashSet::new();
+    // Bounded for the same reason `real_defined_package_names` is: a runaway
+    // iterator must not hang a boot-time lookup. The JDK's two tables hold
+    // ~50 names between them.
+    for _ in 0..4096 {
+        let Some(it) = ctx.resolve_global_root(it_root) else {
+            break;
+        };
+        match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(1))) => {}
+            _ => break,
+        }
+        let Some(it) = ctx.resolve_global_root(it_root) else {
+            break;
+        };
+        let Ok(Some(Value::Object(Some(name)))) =
+            ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[])
+        else {
+            break;
+        };
+        if let Some(name) = ctx.read_string(name) {
+            out.insert(name);
+        }
+    }
+    ctx.remove_global_root(it_root);
+    // An EMPTY table is a failed read, not an answer: the JDK never ships one.
+    // Reporting `None` keeps the caller on its historical probe instead of
+    // freezing "nothing is defined" into the memo.
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Does this built-in loader DEFINE `package_name` (dot form)?
+///
+/// `None` means "not answerable here" -- the module tables could not be read, or
+/// the application loader, whose packages come off the `-cp` segment and whose
+/// existing probe is right. The caller turns `None` back into that probe.
+///
+/// Two conjuncts, and both are load-bearing:
+///
+/// * the package's module is in the JDK's own table for THIS loader. Module
+///   membership alone is a capability, not a definition;
+/// * a class in that package is actually LOADED. HotSpot defines a package when
+///   a loader defines a class in it, so `plat.getDefinedPackage("java.sql")` is
+///   `null` until something loads a `java.sql` class and non-null after --
+///   which is what [`NativeContext::any_loaded_class_in_package`] answers.
+///
+/// A package in NO named module (the class path's unnamed module) is defined by
+/// neither the boot nor the platform loader, so those two answer a definite
+/// `false` rather than falling through to a global probe that would hand the
+/// boot loader every application package on the class path.
+fn builtin_loader_defines_package(
+    ctx: &mut dyn NativeContext,
+    kind: BuiltinLoaderKind,
+    package_name: &str,
+) -> Option<bool> {
+    if kind == BuiltinLoaderKind::Application {
+        return None;
+    }
+    let sets = jdk_builtin_module_sets(ctx)?;
+    let slash = package_name.replace('.', "/");
+    let table = match kind {
+        BuiltinLoaderKind::Boot => &sets.boot,
+        BuiltinLoaderKind::Platform => &sets.platform,
+        BuiltinLoaderKind::Application => unreachable!("returned above"),
+    };
+    let in_table = ctx
+        .module_for_package(&slash)
+        .is_some_and(|module| table.contains(&module));
+    if !in_table {
+        return Some(false);
+    }
+    Some(ctx.any_loaded_class_in_package(&slash))
 }
 
 /// Which class-path segment a built-in loader OWNS, or `None` for the boot
@@ -7898,14 +8168,17 @@ fn builtin_loader_segment(loader_class: Option<&str>) -> Option<u8> {
         "jdk/internal/loader/ClassLoaders$AppClassLoader" | "sun/misc/Launcher$AppClassLoader" => {
             Some(2)
         }
-        // The platform loader owns the extension segment. NOTE: this VM does
-        // not model the JDK's platform MODULE set, so a genuinely
-        // platform-defined package (`java.sql`) answers `null` here where
-        // HotSpot answers non-null. That is a KNOWN residual, recorded in
-        // `WORKER-5-NOTE-8`: it trades a fabricated `Package` for a missing
-        // one, in the direction `getDefinedPackage`'s contract prefers, and no
-        // corpus vector asks the question. Modelling the module set is the
-        // real fix and is a much larger job.
+        // The platform loader's extension segment, which is empty on a normal
+        // run. It is reached only when the module tables above could NOT be
+        // read: `builtin_loader_defines_package` answers for both the platform
+        // and the boot loader before this match, and a segment probe cannot
+        // answer for either of them anyway — the boot image is a jimage, and a
+        // `java/sql/*.class` glob over it returns nothing.
+        //
+        // That was the residual the 2026-08-22 narrowing knowingly shipped
+        // (`java.sql` read `null` on the platform loader), and it was wider
+        // than the one package it named. Closed 2026-09-01 by the module route;
+        // this arm is the fail-soft under it, not the answer.
         "jdk/internal/loader/ClassLoaders$PlatformClassLoader"
         | "sun/misc/Launcher$ExtClassLoader" => Some(1),
         _ => None,
