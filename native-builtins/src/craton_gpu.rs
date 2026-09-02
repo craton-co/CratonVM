@@ -3241,6 +3241,10 @@ pub mod dispatch_timing {
         // read as a clean run.
         cratonvm_types::gpu_event_census::exit_summary();
         cratonvm_types::gpu_dispatch_memo_census::exit_summary();
+        // The transparent (`--gpu`) door's phase table, for the same
+        // reason: it is self-gating and it counts the path `CALLS` cannot
+        // see. See `gpu_offload_phase_census`.
+        cratonvm_types::gpu_offload_phase_census::exit_summary();
         let calls = CALLS.load(Ordering::Relaxed);
         if calls == 0 {
             return;
