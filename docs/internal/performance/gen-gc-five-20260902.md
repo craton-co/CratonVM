@@ -301,6 +301,14 @@ old-gen buffer arm of §4 ran. `cas_losses=0` is expected on a tree, where each
 node is referenced once — the race path is covered by a test, not by this
 probe.
 
+**Re-confirmed on the merged-to-dev binary**, because the reconciliation
+replaced this branch's commit fix and region bound with the engine author's
+(same diagnosis, landed independently as `b024ca64b`): `cycles=29
+helper_scans=7267589 declined_for_slack=0 promotions=1060143`, pauses
+104–121 ms, `evac_drain` 76–83 ms, `map_merge` 18–26 ms at 1.27–1.31M copied.
+Same shape, a slightly noisier host. Regression suite **87/87** on that
+binary.
+
 ## Correctness
 
 * **1,782 gc unit tests and every gc integration target green — the first
