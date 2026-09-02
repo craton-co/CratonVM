@@ -622,7 +622,6 @@ fn test_helpers() -> JitRuntimeHelpers {
         // helper unset — `get_current_thread == 0` tells the JIT to
         // emit the pre-existing `new_object` call.
         tlab_cursor_offset_in_thread: 0,
-        tlab_registration_required: 0,
         tlab_end_offset_in_thread: 8,
         class_id_offset_in_obj: 0,
         get_current_thread: 0,

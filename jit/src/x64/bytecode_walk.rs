@@ -13144,23 +13144,25 @@ impl Compiler {
                         // belonged to the pre-redesign inline path; the
                         // current one completes the header before the cursor
                         // advance, which is what made default-on safe.)
-                        // ...and, under a collector that keeps an object-start
-                        // registry, NEVER: `tlab_post_init` is what registers
-                        // the object, and that registry is ZGC's only record
-                        // that it exists (the sweep visits registered bases,
-                        // `is_object_address` answers from it, the
-                        // conservative root scan screens with it). Skipping it
-                        // there leaves a live object invisible to all three.
-                        // Unreachable before mutators had a TLAB chunk on that
-                        // collector, which is what made this latent.
-                        let skip_helper = !has_prim_init
-                            && !has_finalizer
-                            && self.helpers.tlab_registration_required == 0;
+                        // Whether the post-init helper would have anything to
+                        // do: this is the INLINE-ELIGIBILITY question, and it
+                        // is about the class alone.
+                        let helper_is_noop = !has_prim_init && !has_finalizer;
+                        // Whether we may actually drop the call. A collector
+                        // whose sweep is driven by an allocation-base registry
+                        // rather than by walking the chunk (ZGC) has to be told
+                        // about every object, and this helper is the only place
+                        // an inline allocation can tell it -- an unannounced
+                        // object is not an object to `is_object_address`, and
+                        // its first use as a receiver decodes as `null`. So the
+                        // call stays, and only the bump is inlined.
+                        let skip_helper =
+                            helper_is_noop && !cratonvm_types::jit_tlab_registration_required();
                         let can_inline = cratonvm_types::flags::runtime_var_os(
                             "CRATONVM_JIT_DISABLE_INLINE_NEW",
                         )
                         .is_none()
-                            && (skip_helper
+                            && (helper_is_noop
                                 || cratonvm_types::flags::runtime_var_os(
                                     "CRATONVM_JIT_ENABLE_INLINE_NEW",
                                 )

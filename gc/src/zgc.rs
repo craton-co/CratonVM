@@ -104,15 +104,25 @@ mod starts;
 
 /// The sweep: the shard type both drivers fill, and the per-object body they
 /// share. Split out of this file on 2026-09-02.
+/// The per-object extra-root filter: the four global tables a marked
+/// object.s out-edges live in, reduced to two lock-free indexed loads.
+/// Added 2026-09-02.
+mod mark_roots;
+
 mod sweep;
 pub(crate) use sweep::{ZSweepCfg, ZSweepShard};
 
 /// The arena-backed thread-local allocation buffer -- not `zgc::tlab`, which
 /// buffers out of the page allocator. Split out of this file on 2026-09-02.
 mod arena_tlab;
-pub use arena_tlab::mutator_tlab_census;
 pub use arena_tlab::ZArenaTlabRetireSummary;
 pub(crate) use arena_tlab::{zgc_tlab_enabled_by_default, zgc_tlab_footprint, ZArenaTlabRegistry};
+
+/// The VM thread's own `Tlab` on this backend: the `Zgc` arm of
+/// `VmHeap::refill_tlab`, per-object registration, tail reclamation, and the
+/// skip-region contract with the compactor. Added 2026-09-02.
+mod vm_tlab;
+pub(crate) use vm_tlab::zgc_vm_tlab_enabled_by_default;
 
 pub(crate) use starts::{
     zgc_mark_bits_enabled, zgc_start_bits_enabled_by_default, ZObjectStartBits,
@@ -808,14 +818,6 @@ struct ZgcCounters {
     /// ...and the starved rung specifically. See
     /// [`Self::tlab_refill_recycled`].
     tlab_refill_starved: AtomicUsize,
-    /// Mutator-owned TLAB chunks (`refill_mutator_tlab`): chunks handed to a
-    /// `JvmThread::tlab`, bytes in them, objects registered from them and
-    /// tail bytes returned at retire. The engagement census for the inline
-    /// TLAB bump under this collector.
-    mutator_tlab_refills: AtomicU64,
-    mutator_tlab_refill_bytes: AtomicUsize,
-    mutator_tlab_objects: AtomicU64,
-    mutator_tlab_tail_bytes: AtomicUsize,
     /// Bytes the starved rung took off the free list.
     tlab_refill_starved_bytes: AtomicUsize,
     /// This heap's own `java.lang.ref` reference processor.
@@ -952,6 +954,9 @@ struct ZgcCounters {
     /// of two call chains ran is the kind of thing that is correct until someone
     /// adds a third. Plain atomics have no such argument to get wrong.
     mark_ref_skip_bloom: Box<[AtomicU64; Z_SKIP_BLOOM_WORDS]>,
+    /// Which objects and classes have edges the heap does not store in them.
+    /// Rebuilt per collection; read once per marked object. See `mark_roots`.
+    mark_root_filter: mark_roots::ZMarkRootFilter,
 
     /// One-shot latch for the "`visit_refs` ran with no skip-set snapshot"
     /// warning. Without it the warning is one line per object visited, which
@@ -1015,6 +1020,19 @@ struct ZgcCounters {
     /// Cycles that relocated the unpinned pages despite an incomplete coverage
     /// proof. See [`Self::coverage_incompleteness_is_page_pinnable`].
     relocation_on_page_pins: AtomicUsize,
+    /// `CRATONVM_ZGC_JIT_TLAB`: whether `refill_tlab` hands the VM thread's
+    /// buffer a chunk. See `zgc/vm_tlab.rs`.
+    vm_tlab_enabled: AtomicBool,
+    /// Reserved tails of VM TLABs whose owners could not retire before this
+    /// collection, published by the STW protocol and consumed by the slide.
+    jit_tlab_skip: Mutex<Vec<(usize, usize)>>,
+    /// Chunks handed to VM TLABs, and their bytes. The engagement counter for
+    /// the JIT's inline allocator on this backend.
+    vm_tlab_refills: AtomicUsize,
+    vm_tlab_refill_bytes: AtomicUsize,
+    /// Tails taken back from retiring VM TLABs through the sink, and their bytes.
+    vm_tlab_tails_returned: AtomicUsize,
+    vm_tlab_tail_bytes_returned: AtomicUsize,
 }
 
 pub struct ZgcRealHeap {
@@ -1888,10 +1906,6 @@ impl ZgcRealHeap {
                 compaction_targets_consumed: AtomicUsize::new(0),
                 tlab_refill_recycled: AtomicUsize::new(0),
                 tlab_refill_starved: AtomicUsize::new(0),
-                mutator_tlab_refills: AtomicU64::new(0),
-                mutator_tlab_refill_bytes: AtomicUsize::new(0),
-                mutator_tlab_objects: AtomicU64::new(0),
-                mutator_tlab_tail_bytes: AtomicUsize::new(0),
                 tlab_refill_starved_bytes: AtomicUsize::new(0),
                 ref_processor: Mutex::new(ReferenceProcessor::new()),
                 pending_finalizer_roots: Mutex::new(Vec::new()),
@@ -1899,6 +1913,7 @@ impl ZgcRealHeap {
                 slot_census: census::ZSlotCensus::new(),
                 mark_ref_skip: parking_lot::RwLock::new(None),
                 mark_ref_skip_bloom: Box::new(std::array::from_fn(|_| AtomicU64::new(0))),
+                mark_root_filter: mark_roots::ZMarkRootFilter::default(),
                 mark_ref_skip_warned: AtomicBool::new(false),
                 dead_scratch: Mutex::new(Vec::new()),
                 forwarding_words_stamped: AtomicUsize::new(0),
@@ -1907,6 +1922,12 @@ impl ZgcRealHeap {
                 conc_black_claims: AtomicUsize::new(0),
             tlab_retire_skipped_at_safepoint: AtomicUsize::new(0),
                 relocation_on_page_pins: AtomicUsize::new(0),
+                vm_tlab_enabled: AtomicBool::new(zgc_vm_tlab_enabled_by_default()),
+                jit_tlab_skip: Mutex::new(Vec::new()),
+                vm_tlab_refills: AtomicUsize::new(0),
+                vm_tlab_refill_bytes: AtomicUsize::new(0),
+                vm_tlab_tails_returned: AtomicUsize::new(0),
+                vm_tlab_tail_bytes_returned: AtomicUsize::new(0),
             }),
         };
         // G2c: seed the arena's allocation policy to match the mode the flag just
@@ -1991,14 +2012,18 @@ impl ZgcRealHeap {
         // Ignore the `Err`: `OnceLock::set` can only fail if this ran twice on
         // one heap, which this constructor makes impossible.
         let _ = heap.self_weak.set(std::sync::Arc::downgrade(&heap));
-        // Mutator-owned TLAB tails come back through `Tlab::retire`, which
-        // runs in VM code with no heap in hand; the hook holds a Weak so a
-        // torn-down heap answers "not mine" rather than dangling.
-        let weak = std::sync::Arc::downgrade(&heap);
-        crate::tlab::register_tail_return_hook(std::sync::Arc::new(move |start, end| {
-            weak.upgrade()
-                .is_some_and(|h| h.return_mutator_tail(start, end))
-        }));
+        // The VM thread's `Tlab::retire` hands its unused tail to whichever
+        // sink owns the address; this heap is that sink for its own arena.
+        // See `zgc/vm_tlab.rs`. A `Weak`, so a dropped heap stops answering.
+        let weak: std::sync::Weak<Self> = std::sync::Arc::downgrade(&heap);
+        let sink: std::sync::Weak<dyn crate::tlab::TlabTailSink> = weak;
+        crate::tlab::register_tlab_tail_sink(sink);
+        // This collector finds objects through its allocation-base registry,
+        // never by walking a TLAB chunk, so the JIT's inline allocator must
+        // keep calling the post-init helper that announces each one. Set
+        // before any method can be compiled: heap construction precedes the
+        // first compile. See `cratonvm_types::jit_tlab_registration_required`.
+        cratonvm_types::set_jit_tlab_registration_required(heap.vm_tlab_enabled());
         heap
     }
 
@@ -4966,12 +4991,12 @@ impl ZgcRealHeap {
         // the loop's spans miss every survivor is an argument about the
         // partition, not a check on the answer. Cheap beside the slide, and it
         // can only DROP spans — i.e. reclaim less.
-        let moved_to: FxHashMap<usize, usize> = pairs[first_pair..].iter().copied().collect();
+        let moved_to = relocate::ZForwardIndex::from_pairs(&pairs[first_pair..]);
         let mut survivor_now: Vec<usize> = live
             .iter()
             .copied()
             .filter(|b| *b >= high_lo && *b < high_hi)
-            .map(|b| moved_to.get(&b).copied().unwrap_or(b) - base)
+            .map(|b| moved_to.resolve(b) - base)
             .collect();
         survivor_now.sort_unstable();
         let spans_before = vacated.len();
@@ -5261,7 +5286,6 @@ impl ZgcRealHeap {
         // exists to be, and the two would drift on exactly the question that
         // matters: whether an identity entry is recorded for an object that
         // did not move. It is not; only real moves are recorded.
-        let record = relocate::ZRelocationRecord::new(true, live.len());
         let mut pairs: Vec<(usize, usize)> = Vec::new();
         let mut moved = 0usize;
         let mut reclaimed = 0usize;
@@ -5433,6 +5457,17 @@ impl ZgcRealHeap {
             // num_slots=0` signature.
             let mut pins = self.critical_pin_addrs();
             pins.extend(crate::gc_quiescence::pinned_jit_roots_snapshot());
+            // A VM TLAB whose owner could not retire (blocked in native, or
+            // frozen in compiled code) still bumps into its reserved tail
+            // when it resumes. The tail holds no registered base, so the sweep
+            // is blind to it by construction; the SLIDE is not, and a page it
+            // vacates is zeroed and re-issued. Pin both ends of every published
+            // tail so its pages leave the relocation set, and see
+            // `jit_tlab_skip_floor` below for the cursor. `zgc/vm_tlab.rs`.
+            for (tail_start, tail_end) in self.jit_tlab_skip_regions() {
+                pins.push(tail_start);
+                pins.push(tail_end - 1);
+            }
             if !pins.is_empty() {
                 let page_span = Self::Z_LOGICAL_PAGE_BYTES;
                 let mut dropped = 0usize;
@@ -5710,14 +5745,14 @@ impl ZgcRealHeap {
                 // RAISE the cursor -- i.e. reclaim less. Losing a cycle's reclaim
                 // is a cost; handing out occupied memory is heap corruption whose
                 // symptom surfaces cycles later in an unrelated subsystem.
-                let moved_to: FxHashMap<usize, usize> = pairs.iter().copied().collect();
+                let moved_to = relocate::ZForwardIndex::from_pairs(&pairs);
                 let mut stranded = 0usize;
                 let mut live_ceiling = base;
                 for &b in live {
                     if b < base || b >= low_end {
                         continue;
                     }
-                    let now = moved_to.get(&b).copied().unwrap_or(b);
+                    let now = moved_to.resolve(b);
                     // An unsizable header cannot be bounded, so it cannot be
                     // proven dead either. Refuse to reclaim past `low_end` rather
                     // than guess -- the same answer `highest_pinned_end` gives an
@@ -5730,7 +5765,12 @@ impl ZgcRealHeap {
                         live_ceiling = end;
                     }
                 }
-                let proposed = dest.max(highest_pinned_end);
+                // ...and never below the end of a published VM TLAB tail: the
+                // span between `new_cursor` and `low_end` is zeroed and handed
+                // back to the arena, which is exactly the memory its owner will
+                // bump into when it resumes. `zgc/vm_tlab.rs`.
+                let tail_floor = self.jit_tlab_skip_floor(base, low_end);
+                let proposed = dest.max(highest_pinned_end).max(tail_floor);
                 if live_ceiling > proposed {
                     stranded = live
                         .iter()
@@ -5799,7 +5839,7 @@ impl ZgcRealHeap {
                         .copied()
                         .filter(|b| *b >= base && *b < low_end)
                         .map(|b| {
-                            let now = moved_to.get(&b).copied().unwrap_or(b);
+                            let now = moved_to.resolve(b);
                             let end = match Self::alloc_size(self.header_ref(now as *mut u8)) {
                                 Some(sz) => now.saturating_add(sz).min(low_end),
                                 // Unsizable: bound it at the cursor rather than
@@ -5866,7 +5906,6 @@ impl ZgcRealHeap {
             // One batched publish after the slide, not one per object: the
             // record is read by the rewrite pass below, which must see the
             // WHOLE map or it resolves half the graph against a half-built one.
-            record.record_many(&pairs);
             // CRATONVM_DBG_ZGC_CORPSE -- remember what was at each vacated
             // address before the memset erases it. Read AFTER the move (the
             // header now lives at `to`) and before `compact_low_to` has
@@ -5901,11 +5940,15 @@ impl ZgcRealHeap {
         // AFTER the whole slide, not during it: a slot in an already-moved
         // object may point at an object that has not moved yet, so rewriting
         // as we go resolves half the graph against a half-built map.
-        let live_now: Vec<usize> = live.iter().map(|b| record.get(*b).unwrap_or(*b)).collect();
+        // ONE table for the three readers that used to have three: this, the
+        // rewrite loop below, and the walkability/verify pair. Built once, sorted,
+        // answered by a range check and a binary search -- see `ZForwardIndex`.
+        let fwd = relocate::ZForwardIndex::from_pairs(&pairs);
+        let live_now: Vec<usize> = live.iter().map(|b| fwd.resolve(*b)).collect();
         // Everything the rewrite is about to walk must still LOOK like the
         // object the slide thought it was moving.
         //
-        // `live_now` is `record.get(b).unwrap_or(b)` — it keeps the ORIGINAL
+        // `live_now` is `fwd.resolve(b)` — it keeps the ORIGINAL
         // address for any live object the relocation record does not list.
         // That is correct only while an unlisted object is one that genuinely
         // did not move AND whose memory nothing wrote over. If either half
@@ -5917,17 +5960,16 @@ impl ZgcRealHeap {
         // SIGSEGV INSIDE THE COLLECTOR — whose stack names only the collector,
         // so the crash site is worthless as evidence — into a list of
         // offenders with the one fact that discriminates: whether this base is
-        // an address the slide just vacated. `moved_from.contains(base)` says
+        // an address the slide just vacated. `fwd.contains_from(base)` says
         // the object was overwritten; `!contains` says the header was already
         // wrong before the slide, which is a different bug entirely.
         //
         // Unconditional, not behind a debug flag: the cost is one registry
         // probe and one `alloc_size` per survivor, against a walk of every one
         // of its slots, and the failure it prevents is memory corruption.
-        let moved_from: FxHashSet<usize> = pairs.iter().map(|(from, _)| *from).collect();
         let mut unwalkable = 0usize;
         for obj in &live_now {
-            if !self.rewrite_target_is_walkable(*obj, arena_lo, arena_hi, &moved_from) {
+            if !self.rewrite_target_is_walkable(*obj, arena_lo, arena_hi, &fwd) {
                 unwalkable += 1;
                 continue;
             }
@@ -5939,7 +5981,7 @@ impl ZgcRealHeap {
                     if raw == 0 {
                         return;
                     }
-                    if let Some(to) = record.get(raw) {
+                    if let Some(to) = fwd.get(raw) {
                         rewrites.push((slot.slot_addr, to as u64));
                     }
                 });
@@ -6094,10 +6136,12 @@ impl ZgcRealHeap {
                 sizes.insert(b, sz);
             }
         }
-        self.verify_no_dangling_slots_after_slide(&live_now, arena_lo, arena_hi, &moved_from);
+        self.verify_no_dangling_slots_after_slide(&live_now, arena_lo, arena_hi, &fwd);
 
-        let pointer_map: cratonvm_types::PointerMap =
-            record.into_pointer_map().into_iter().collect();
+        // The map is the cycle OUTPUT (monitors, the reference processor, the
+        // VM.s root write-back). Built from the pairs directly rather than
+        // cloned out of a second table nothing else reads any more.
+        let pointer_map: cratonvm_types::PointerMap = pairs.iter().copied().collect();
         (moved, reclaimed, pointer_map)
     }
 
@@ -6432,7 +6476,7 @@ impl ZgcRealHeap {
     /// `was_vacated` discriminates the causes: if THIS slide vacated the exact
     /// address, the object was overwritten by this cycle's bookkeeping.
     ///
-    /// **Read `was_vacated=false` narrowly.** `moved_from` covers one cycle, so
+    /// **Read `was_vacated=false` narrowly.** the index covers one cycle, so
     /// an address vacated nine collections ago also reports `false`. On the
     /// netty repro every offender reported `false` while its "header" decoded
     /// as ASCII — `class_id=0x41524150` is `"PARA"`, `num_slots=0x444f494e` is
@@ -6447,7 +6491,7 @@ impl ZgcRealHeap {
         base: usize,
         arena_lo: usize,
         arena_hi: usize,
-        moved_from: &FxHashSet<usize>,
+        fwd: &relocate::ZForwardIndex,
     ) -> bool {
         // Off-arena survivors are the high-address (large-object) end, which
         // this slide never touches, so there is nothing to check against.
@@ -6479,7 +6523,7 @@ impl ZgcRealHeap {
                 class_id = header.class_id.as_u32(),
                 num_slots = header.num_slots(),
                 array_length = header.array_length(),
-                was_vacated = moved_from.contains(&base),
+                was_vacated = fwd.contains_from(base),
                 arena_hi,
                 "zgc relocate: rewrite target is not walkable -- skipping it rather \
                  than striding a length this header cannot justify"
@@ -6516,7 +6560,7 @@ impl ZgcRealHeap {
         live_now: &[usize],
         arena_lo: usize,
         arena_hi: usize,
-        moved_from: &FxHashSet<usize>,
+        fwd: &relocate::ZForwardIndex,
     ) {
         if !zgc_verify_slide_enabled() {
             return;
@@ -6571,7 +6615,7 @@ impl ZgcRealHeap {
                 //    a reference (the W7-84 family, which this VM already warns
                 //    about separately) that happens to land inside the arena's
                 //    address range. Not the slide's doing, and not fixable here.
-                let missed_rewrite = moved_from.contains(&raw);
+                let missed_rewrite = fwd.contains_from(raw);
                 let aliases_survivor = !missed_rewrite && lands_inside_a_survivor(raw);
                 if missed_rewrite {
                     missed += 1;
@@ -10615,6 +10659,60 @@ impl barrier::ZBarrierContext for ZgcRealHeap {
     }
 }
 
+impl ZgcRealHeap {
+    /// The four edges an object has that are not stored in the object: its
+    /// class's pinned defining loader, and the mirrors and metadata a loader
+    /// owns. Written once and called by all three mark loops, so they cannot
+    /// disagree about what is reachable.
+    ///
+    /// Each of the three tables is a global `RwLock` over a hash map, and each
+    /// answer is overwhelmingly "nothing" -- so the filter is asked first, and
+    /// answers from a lock-free bitmap or bloom. See [`mark_roots`].
+    #[inline]
+    fn visit_pin_edges(&self, base: usize, class_id: u32, f: &mut dyn FnMut(usize)) {
+        let filter = &self.counters.mark_root_filter;
+        if filter.may_pin_loader(class_id) {
+            if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id) {
+                f(loader);
+            }
+        }
+        if !filter.may_own_extra_roots(base) {
+            return;
+        }
+        if let Some(mirrors) = cratonvm_types::mirror_pin::mirrors_for_loader(base) {
+            for m in mirrors {
+                f(m);
+            }
+        }
+        if let Some(metadata) = cratonvm_types::metadata_pin::roots_for_loader(base) {
+            for m in metadata {
+                f(m);
+            }
+        }
+    }
+
+    /// The native collection-overlay edge, behind the same filter.
+    ///
+    /// Split from [`Self::visit_pin_edges`] only because one caller
+    /// (`visit_refs`) carries a long comment about why this edge exists at all
+    /// and it belongs next to the call.
+    #[inline]
+    fn visit_overlay_edges(&self, base: usize, class_id: u32, f: &mut dyn FnMut(usize)) {
+        // The ONE table with no `NON_EMPTY` latch that ever fires:
+        // `native-collections` registers its provider at VM startup, so
+        // `PROVIDER_COUNT` is non-zero on every run and every marked object
+        // used to take the provider lock and that module's own mutex to be
+        // told it owns nothing. This test is what replaces both.
+        if !self.counters.mark_root_filter.may_own_overlay(base) {
+            return;
+        }
+        for overlay_ref in crate::external_roots::external_roots_for_owner(base, Some(class_id)) {
+            f(overlay_ref.as_ptr() as usize);
+        }
+    }
+
+}
+
 impl mark::ZMarkContext for ZgcRealHeap {
     /// [`vaddr::Z_REMAPPED`] — the quiescent good mask, unconditionally.
     ///
@@ -10791,19 +10889,7 @@ impl mark::ZMarkContext for ZgcRealHeap {
         // The pin edges, in `collect_garbage`'s order. `class_id` is read
         // through the shared header view, like every other read here.
         let class_id = self.header_ref(base as *mut u8).class_id.as_u32();
-        if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id) {
-            f(loader as u64);
-        }
-        if let Some(mirrors) = cratonvm_types::mirror_pin::mirrors_for_loader(base) {
-            for m in mirrors {
-                f(m as u64);
-            }
-        }
-        if let Some(metadata) = cratonvm_types::metadata_pin::roots_for_loader(base) {
-            for m in metadata {
-                f(m as u64);
-            }
-        }
+        self.visit_pin_edges(base, class_id, &mut |edge| f(edge as u64));
         // The native collection-overlay edges. `collect_garbage`'s serial loop
         // pushes these and this method did not, which would have been a
         // use-after-free the moment a coordinator drove a real collection
@@ -10815,9 +10901,7 @@ impl mark::ZMarkContext for ZgcRealHeap {
         // `native_roots.rs::scan_collection_overlays` explicitly defers to this
         // loop having run, and rooting every overlay regardless of reachability
         // is what that deferral exists to avoid.
-        for overlay_ref in crate::external_roots::external_roots_for_owner(base, Some(class_id)) {
-            f(overlay_ref.as_ptr() as u64);
-        }
+        self.visit_overlay_edges(base, class_id, &mut |edge| f(edge as u64));
     }
 
     /// The wild-pointer gate: is `addr` the base of a live allocation?
@@ -11743,6 +11827,15 @@ impl GarbageCollector for ZgcRealHeap {
         // below runs from scratch, which is the same fail-closed fallback
         // `mark_with_controller_stw` has always had.
         let mut clock = ZPhaseClock::new(gc_started.is_some());
+        // ARM THE EXTRA-ROOT FILTER, and only here. It answers "this object owns
+        // no mirrors, metadata or overlay" from a snapshot of those tables. key
+        // sets, which is a proof only while nothing can add to them -- true
+        // inside this pause and false during a CONCURRENT phase, where a
+        // mutator defining a class or building a native collection would
+        // register an owner the snapshot has never seen. A stale "no" there
+        // would drop a live edge, so the concurrent marker keeps asking the
+        // real tables: the filter is disarmed everywhere but here.
+        self.counters.mark_root_filter.rebuild();
         let concurrent_off_heap = self.finish_concurrent_mark(roots);
         let marked_concurrently = concurrent_off_heap.is_some();
         let markend_us = clock.lap();
@@ -12090,15 +12183,7 @@ impl GarbageCollector for ZgcRealHeap {
                 }
                 let class_id = header.class_id.as_u32();
                 self.enumerate_references(addr as *mut u8, &mut work, skip_for(addr));
-                if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id) {
-                    work.push(loader);
-                }
-                if let Some(mirrors) = cratonvm_types::mirror_pin::mirrors_for_loader(addr) {
-                    work.extend(mirrors);
-                }
-                if let Some(metadata) = cratonvm_types::metadata_pin::roots_for_loader(addr) {
-                    work.extend(metadata);
-                }
+                self.visit_pin_edges(addr, class_id, &mut |edge| work.push(edge));
                 // Same owner-based propagation Generational's non-moving young
                 // marker and old-gen BFS already do (`gen_heap.rs`): a native
                 // side-table entry is only reachable through the Java collection
@@ -12106,11 +12191,7 @@ impl GarbageCollector for ZgcRealHeap {
                 // owner, not rooted unconditionally for every overlay regardless
                 // of reachability. `native_roots.rs`'s `scan_collection_overlays`
                 // relies on this loop running before it defers to us.
-                for overlay_ref in
-                    crate::external_roots::external_roots_for_owner(addr, Some(class_id))
-                {
-                    work.push(overlay_ref.as_ptr() as usize);
-                }
+                self.visit_overlay_edges(addr, class_id, &mut |edge| work.push(edge));
             }
         }
         if wild_skipped > 0 {
@@ -12167,23 +12248,11 @@ impl GarbageCollector for ZgcRealHeap {
                     }
                     let class_id = h.class_id.as_u32();
                     self.enumerate_references(a as *mut u8, &mut work, skip_for(a));
-                    if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id) {
-                        work.push(loader);
-                    }
-                    if let Some(mirrors) = cratonvm_types::mirror_pin::mirrors_for_loader(a) {
-                        work.extend(mirrors);
-                    }
-                    if let Some(metadata) = cratonvm_types::metadata_pin::roots_for_loader(a) {
-                        work.extend(metadata);
-                    }
+                    self.visit_pin_edges(a, class_id, &mut |edge| work.push(edge));
                     // Same owner-based overlay propagation as the main mark
                     // loop above — a resurrected finalizable object's own
                     // side-table entries must survive with it.
-                    for overlay_ref in
-                        crate::external_roots::external_roots_for_owner(a, Some(class_id))
-                    {
-                        work.push(overlay_ref.as_ptr() as usize);
-                    }
+                    self.visit_overlay_edges(a, class_id, &mut |edge| work.push(edge));
                 }
             }
             if !resurrected.is_empty() {
@@ -12365,6 +12434,7 @@ impl GarbageCollector for ZgcRealHeap {
             ZSweepCfg {
                 arena_base: arena.base_ptr() as usize,
                 high_floor: arena.high_cursor(),
+                low_cursor: arena.used(),
                 zero_header_only: self.gen_header_zero_only.load(Ordering::Relaxed),
                 merge_dead_runs: self.gen_dead_runs_enabled.load(Ordering::Relaxed),
                 // Can the mark bits be cleared in bulk after the walk, rather
@@ -12377,11 +12447,23 @@ impl GarbageCollector for ZgcRealHeap {
             }
         };
 
+        // THE BITMAP SWEEP, when the cycle's shape allows it: whole-heap (a
+        // young cycle's floor makes the complement wrong -- it would reclaim
+        // the dead below the floor that a minor deliberately leaves for the
+        // next major), side mark bits, and the switch on. It returns the free
+        // list ALREADY BUILT, so the whole rebuild-and-sort tail below is
+        // skipped with it. See `sweep_bitmap`.
         let sweep_workers = self.sweep_workers(gen_on);
-        let mut swept_total = if sweep_workers > 1 {
-            self.sweep_parallel(&registered, sweep_floor, &cfg, sweep_workers)
-        } else {
-            self.sweep_serial(&registered, sweep_floor, &cfg)
+        let bitmap_swept = (sweep_floor == 0 && self.bitmap_sweep_enabled())
+            .then(|| self.sweep_bitmap(&registered, &cfg))
+            .flatten();
+        let (mut swept_total, complement) = match bitmap_swept {
+            Some((sh, spans, new_cursor)) => (sh, Some((spans, new_cursor))),
+            None if sweep_workers > 1 => (
+                self.sweep_parallel(&registered, sweep_floor, &cfg, sweep_workers),
+                None,
+            ),
+            None => (self.sweep_serial(&registered, sweep_floor, &cfg), None),
         };
         // THE SPILL SET, ALWAYS ON THIS THREAD. It belongs to no word range and
         // is not address-ordered, so it can neither be partitioned nor merged
@@ -12395,7 +12477,10 @@ impl GarbageCollector for ZgcRealHeap {
 
         let bytes_copied = swept_total.bytes_copied;
         let objects_copied = swept_total.objects_copied;
-        let bytes_freed = swept_total.bytes_freed;
+        // `mut`: the complement sweep learns what it reclaimed from the ARENA
+        // (how much the rebuilt free list gained, plus what the cursor gave
+        // back), which is only knowable inside the lock below.
+        let mut bytes_freed = swept_total.bytes_freed;
         let dead_count = swept_total.dead_count;
         let unsizable = swept_total.unsizable;
         let gen_promoted = swept_total.gen_promoted;
@@ -12417,8 +12502,30 @@ impl GarbageCollector for ZgcRealHeap {
             // see two spans as adjacent if they arrive in order. The bitmap scan
             // IS that order within a shard, and `ZSweepShard::absorb` preserves
             // it across shards -- joining the seam where two shards' runs touch.
-            for (off, len) in swept_total.spans.drain(..) {
-                arena.add_free_block(off, len);
+            match &complement {
+                // The bitmap sweep computed the whole LOW free list as the
+                // complement of the live set: address-ordered and merged
+                // already, so it is installed rather than accumulated, and
+                // neither the coalescer below nor the tail retraction has
+                // anything left to sort. `spans` still carries the
+                // large-object end's individual holes, which route by offset.
+                Some((spans, new_cursor)) => {
+                    let was_free = arena.rebuild_low_free_list(spans);
+                    let now_free: usize = spans.iter().map(|(_, len)| *len).sum();
+                    // What this cycle FREED, as opposed to what is free: the
+                    // complement includes the holes that were already on the
+                    // list when the sweep started.
+                    bytes_freed += now_free.saturating_sub(was_free);
+                    bytes_freed += arena.retract_cursor_to(*new_cursor);
+                    for (off, len) in swept_total.spans.drain(..) {
+                        arena.add_free_block(off, len);
+                    }
+                }
+                None => {
+                    for (off, len) in swept_total.spans.drain(..) {
+                        arena.add_free_block(off, len);
+                    }
+                }
             }
 
             // Coalesce the free list into maximal spans — same rationale as
@@ -12436,7 +12543,9 @@ impl GarbageCollector for ZgcRealHeap {
             // The merge itself now lives on `Arena` (`coalesce_free_list`), so
             // this sweep and the last-resort merge `Arena::alloc` runs before
             // it returns `None` cannot drift apart.
-            arena.coalesce_free_list();
+            if complement.is_none() {
+                arena.coalesce_free_list();
+            }
             // The same two steps for the LARGE-OBJECT end. They are separate
             // calls, not a wider version of the two above, because a merge
             // that straddled the point where the two cursors meet would be
@@ -13021,6 +13130,8 @@ impl GarbageCollector for ZgcRealHeap {
             }
         }
 
+        // Disarmed before any mutator runs again -- see the rebuild at the top.
+        self.counters.mark_root_filter.disarm();
         GcResult {
             stats: GcStats {
                 objects_copied,
@@ -14710,6 +14821,154 @@ pub(crate) mod tests {
     /// merge's "is there a previous span to join to?" branch is the one taken
     /// -- and the version that asked it with `it.next()` inside an `if let`
     /// tuple pattern consumed the span on the failing arm and dropped it.
+    /// The two sweeps must reclaim the same objects and leave the same amount
+    /// of low-arena space allocatable.
+    ///
+    /// Not the same free LIST: the complement sweep does not free-list the
+    /// span above the last survivor at all, it lowers the cursor onto it. So
+    /// the invariant is what a later allocation can actually get -- free-list
+    /// bytes plus bump headroom -- and that must not move.
+    ///
+    /// It is allowed to be BETTER, and the assertion says so in the direction
+    /// it can be: the complement reclaims the bytes of an object whose header
+    /// the per-object sweep refuses to size, which that sweep leaks.
+    /// THE MERGE'S OWN OBLIGATION, 2026-09-02.
+    ///
+    /// The complement sweep computes free space as everything no live object
+    /// covers. A VM TLAB's reserved tail is covered by no live object and is
+    /// not free: its owner is frozen in compiled code and will resume bumping
+    /// into it. Until the VM-TLAB arm existed this could not arise on this
+    /// backend, and `sweep_bitmap` carried a stub saying so; the two landed
+    /// together and this is what replaces the stub's promise.
+    ///
+    /// The slide has the same obligation and its own test
+    /// (`a_published_vm_tlab_tail_is_neither_slid_over_nor_reclaimed`). This
+    /// one is about the SWEEP, so relocation is off.
+    #[test]
+    fn the_complement_sweep_does_not_free_a_published_vm_tlab_tail() {
+        cratonvm_types::flags::with_thread_overrides(
+            &[
+                ("CRATONVM_ZGC_BITMAP_SWEEP", Some("1")),
+                ("CRATONVM_ZGC_RELOCATE", Some("0")),
+            ],
+            || {
+                let heap = ZgcRealHeap::new_shared(16 * 1024 * 1024);
+                heap.set_vm_tlab_enabled(true);
+                // Garbage, so the sweep has a complement worth computing.
+                for _ in 0..256 {
+                    heap.alloc_object(ClassId::new(3), 4);
+                }
+                let (ptr, size) = heap.refill_tlab(64 * 1024).expect("a chunk");
+                let used = 4096usize;
+                let tail = (ptr as usize + used, ptr as usize + size);
+                heap.set_jit_tlab_skip_regions(&[tail]);
+
+                let stw = unsafe { StopTheWorldToken::new_unchecked() };
+                let mut roots: Vec<ObjectRef> = Vec::new();
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+                heap.clear_jit_tlab_skip_regions();
+
+                // Nothing in the free list, and nothing above the cursor, may
+                // overlap the published tail: both are memory the allocator
+                // considers available.
+                let arena = heap.arena.lock();
+                let base = arena.base_ptr() as usize;
+                for (off, len) in arena.free_blocks_sorted() {
+                    let (lo, hi) = (base + off, base + off + len);
+                    assert!(
+                        hi <= tail.0 || lo >= tail.1,
+                        "free block {lo:#x}..{hi:#x} overlaps the published tail \
+                         {:#x}..{:#x}",
+                        tail.0,
+                        tail.1
+                    );
+                }
+                assert!(
+                    base + arena.used() >= tail.1,
+                    "the cursor dropped below the published tail's end"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn the_bitmap_sweep_reclaims_what_the_per_object_sweep_reclaims() {
+        fn outcome(bitmap: bool) -> (usize, usize, usize, usize) {
+            cratonvm_types::flags::with_thread_overrides(
+                &[
+                    (
+                        "CRATONVM_ZGC_BITMAP_SWEEP",
+                        Some(if bitmap { "1" } else { "0" }),
+                    ),
+                    // A slide would rearrange the arena underneath the
+                    // comparison; this test is about the sweep.
+                    ("CRATONVM_ZGC_RELOCATE", Some("0")),
+                ],
+                || {
+                    const LIVE_EVERY: usize = 23;
+                    const OBJECTS: usize = 4000;
+                    let heap = ZgcRealHeap::with_capacity(16 * 1024 * 1024);
+                    heap.set_tlab_enabled(false);
+                    let mut roots: Vec<ObjectRef> = Vec::new();
+                    for i in 0..OBJECTS {
+                        // Mixed shapes, so the holes are not uniform.
+                        let o = if i % 7 == 0 {
+                            heap.alloc_array(ClassId::new(1), ArrayElementType::Byte, 200)
+                        } else {
+                            heap.alloc_object(ClassId::new(11), 3)
+                        };
+                        if i % LIVE_EVERY == 0 {
+                            roots.push(o);
+                        }
+                    }
+                    // One dead and one live large object: the high end takes
+                    // the per-object path on both arms and must agree too.
+                    heap.alloc_array(ClassId::new(1), ArrayElementType::Byte, BIG);
+                    roots.push(heap.alloc_array(ClassId::new(1), ArrayElementType::Byte, BIG));
+                    let expect_live = roots.len();
+                    {
+                        let stw = unsafe { StopTheWorldToken::new() };
+                        heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+                    }
+                    let survivors = roots
+                        .iter()
+                        .filter(|r| heap.registry.contains(r.as_ptr() as usize))
+                        .count();
+                    let registered = heap.registry.snapshot().bases().len();
+                    let arena = heap.arena.lock();
+                    (
+                        expect_live,
+                        survivors,
+                        registered,
+                        arena.free_list_bytes() + arena.low_bump_headroom(),
+                    )
+                },
+            )
+        }
+
+        let per_object = outcome(false);
+        let bitmap = outcome(true);
+        assert_eq!(
+            per_object.0, per_object.1,
+            "the fixture is broken: a root did not survive its own collection"
+        );
+        assert_eq!(
+            (bitmap.0, bitmap.1, bitmap.2),
+            (per_object.0, per_object.1, per_object.2),
+            "the two sweeps disagree about which objects are live \
+             (roots, survivors, registered bases)"
+        );
+        assert!(
+            bitmap.3 >= per_object.3,
+            "the bitmap sweep left LESS allocatable than the per-object one: \
+             {} vs {}. The complement is the exact reclaimable set, so it may \
+             reclaim more (the bytes of an unsizable object, which the \
+             per-object sweep leaks) but never less.",
+            bitmap.3,
+            per_object.3,
+        );
+    }
+
     #[test]
     fn an_empty_leading_shard_does_not_swallow_the_next_shards_first_span() {
         let heap = ZgcRealHeap::with_capacity(4 * 1024 * 1024);
@@ -14724,6 +14983,7 @@ pub(crate) mod tests {
             ZSweepCfg {
                 arena_base: arena.base_ptr() as usize,
                 high_floor: arena.high_cursor(),
+                low_cursor: arena.used(),
                 zero_header_only: true,
                 merge_dead_runs: true,
                 bulk_clearable: heap.mark_bits.is_some(),
@@ -15755,11 +16015,27 @@ pub(crate) mod tests {
         );
     }
 
-    /// The sweep must RETAIN an object it cannot size rather than zero it and
-    /// hand its span to the arena. Retaining leaks one object; the alternative
-    /// is a 1 TiB `write_bytes` and a free block outside the arena.
+    /// The PER-OBJECT sweep must RETAIN an object it cannot size rather than
+    /// zero it and hand its span to the arena. Retaining leaks one object; the
+    /// alternative is a 1 TiB `write_bytes` and a free block outside the
+    /// arena.
+    ///
+    /// Pinned to that arm, because the property is a property of *deriving a
+    /// free span from a dead object's own header*. The complement sweep never
+    /// does that — it derives spans from the LIVE extents and treats
+    /// everything they do not cover as reclaimable — so the catastrophe this
+    /// guards against cannot arise there, and it reclaims the corrupt object
+    /// rather than leaking it. That difference is asserted by
+    /// `the_bitmap_sweep_reclaims_the_object_the_per_object_sweep_leaks`.
     #[test]
     fn the_sweep_retains_an_object_it_cannot_size() {
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_BITMAP_SWEEP", Some("0"))],
+            retains_an_object_it_cannot_size_body,
+        );
+    }
+
+    fn retains_an_object_it_cannot_size_body() {
         let heap = ZgcRealHeap::with_capacity(64 * 1024);
         let live = heap.alloc_object(ClassId::new(1), 2);
         let doomed = heap.alloc_object(ClassId::new(999_995), 4);
@@ -15794,6 +16070,65 @@ pub(crate) mod tests {
             heap.get_field(doomed, 0),
             Value::Int(0x5A5A_5A5A),
             "the body must not have been zeroed"
+        );
+    }
+
+    /// The other half of the arm split above: the complement sweep RECLAIMS
+    /// the object the per-object sweep leaks, and does so without ever reading
+    /// the corrupt size that made it unsizable.
+    ///
+    /// Both halves of the old catastrophe are still asserted here — no
+    /// oversized memset (the body sentinel survives, and only the header is
+    /// zeroed) and no free block outside the arena (the free list stays within
+    /// the cursor, which `rebuild_low_free_list` debug-asserts).
+    #[test]
+    fn the_bitmap_sweep_reclaims_the_object_the_per_object_sweep_leaks() {
+        cratonvm_types::flags::with_thread_overrides(
+            &[
+                ("CRATONVM_ZGC_BITMAP_SWEEP", Some("1")),
+                ("CRATONVM_ZGC_RELOCATE", Some("0")),
+            ],
+            || {
+                let heap = ZgcRealHeap::with_capacity(64 * 1024);
+                let live = heap.alloc_object(ClassId::new(1), 2);
+                let doomed = heap.alloc_object(ClassId::new(999_995), 4);
+                let doomed_addr = doomed.as_ptr() as usize;
+                heap.set_field(doomed, 0, Value::Int(0x5A5A_5A5A));
+                let header = unsafe { &*(doomed.as_ptr() as *const ObjectHeader) };
+                header.add_gc_flags(cratonvm_types::GC_FLAG_COMPACT);
+
+                // SAFETY: these unit tests run the heap single-threaded.
+                let stw = unsafe { StopTheWorldToken::new() };
+                let mut roots = [live];
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+                assert!(
+                    !heap.registry.contains(doomed_addr),
+                    "the complement reclaims an unreachable object whatever its \
+                     header says — nothing referenced it, or the mark would have \
+                     kept it"
+                );
+                // Read the body as RAW BYTES, not through `get_field`: the
+                // header has been zeroed, so the accessor sees `num_slots = 0`
+                // and refuses the index. That refusal is the point of zeroing
+                // a dead header, and it is why the sentinel has to be checked
+                // underneath it.
+                let body = unsafe {
+                    std::slice::from_raw_parts((doomed_addr + HEADER_SIZE) as *const u8, SLOT_SIZE)
+                };
+                assert!(
+                    body.iter().any(|b| *b != 0),
+                    "the body was zeroed: sizing a dead object is exactly what \
+                     this sweep declines to do, so it cannot have known how much \
+                     to clear"
+                );
+                let arena = heap.arena.lock();
+                assert!(
+                    arena.largest_free_block() <= arena.capacity(),
+                    "a free block larger than the arena means a corrupt size was \
+                     trusted after all"
+                );
+            },
         );
     }
 
@@ -17839,8 +18174,21 @@ pub(crate) mod tests {
     /// 265 ms — the restriction was applying a −30% to the small one. A default
     /// run performs only whole-heap cycles, so this is the arm that decides
     /// whether either feature is worth anything to anybody.
+    ///
+    /// Pinned to the PER-OBJECT sweep, whose two cost reductions these are:
+    /// both are ways of not paying for a dead object's size after having read
+    /// it. The complement sweep does not read one at all, so it has no
+    /// `zero_bytes_skipped` to report and merges every run by construction --
+    /// it supersedes both rather than sharing them.
     #[test]
     fn a_whole_heap_sweep_gets_the_cost_reductions_with_generational_off() {
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_BITMAP_SWEEP", Some("0"))],
+            whole_heap_sweep_cost_reductions_body,
+        );
+    }
+
+    fn whole_heap_sweep_cost_reductions_body() {
         let heap = ZgcRealHeap::new_shared(64 * 1024 * 1024);
         heap.set_tlab_enabled(false);
         heap.set_relocation_enabled(false);
@@ -20243,6 +20591,70 @@ pub(crate) mod tests {
             roots[1].as_ptr() as usize, pinned_addr,
             "a conservatively-rooted object moved; the root that named it cannot be              rewritten (it may be a long), so it now points at the zeroed vacated span"
         );
+    }
+
+    /// A blocked or frozen peer's un-retired VM TLAB is published as a skip
+    /// region. The slide must neither drop the bump cursor below its end nor
+    /// write into the buffer: `compact_low_to` would otherwise zero the span
+    /// and hand it out while the peer still bumps into it.
+    #[test]
+    fn a_published_vm_tlab_tail_is_neither_slid_over_nor_reclaimed() {
+        const FIELDS: usize = 500;
+        let heap = ZgcRealHeap::new_shared(64 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+        let per_page = ZgcRealHeap::Z_LOGICAL_PAGE_BYTES / (HEADER_SIZE + FIELDS * SLOT_SIZE);
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        for _page in 0..4 {
+            for i in 0..per_page {
+                let o = heap.alloc_object(ClassId::new(1), FIELDS);
+                if i % 12 == 0 {
+                    roots.push(o);
+                }
+            }
+        }
+        // The peer's buffer sits at the top of the bump region: carve it the
+        // way `refill_tlab` would, pretend the peer bumped 4 KiB into it, and
+        // publish the rest as its reserved tail.
+        heap.set_tlab_enabled(true);
+        heap.set_vm_tlab_enabled(true);
+        let (ptr, size) = heap.refill_tlab(64 * 1024).expect("a fresh chunk");
+        let used = 4096usize;
+        let tail = (ptr as usize + used, ptr as usize + size);
+        unsafe { std::ptr::write_bytes(ptr, 0xAB, used) };
+        heap.set_jit_tlab_skip_regions(&[tail]);
+        let pre: Vec<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+
+        let _serial = quiescence_test_guard();
+        crate::gc_quiescence::clear_pinned_jit_roots();
+        let stw = unsafe { StopTheWorldToken::new() };
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            },
+        );
+        heap.clear_jit_tlab_skip_regions();
+
+        assert!(
+            moved_of(&roots, &pre) > 0,
+            "the fixture must relocate SOMETHING, or a floor that holds proves nothing"
+        );
+        let cursor = {
+            let arena = heap.arena.lock();
+            arena.base_ptr() as usize + arena.used()
+        };
+        assert!(
+            cursor >= tail.1,
+            "cursor {cursor:#x} dropped below the published tail end {:#x}",
+            tail.1
+        );
+        let below = unsafe { std::slice::from_raw_parts(ptr, used) };
+        assert!(
+            below.iter().all(|b| *b == 0xAB),
+            "the slide wrote into the peer's buffer below its published tail"
+        );
+        let stale = unsafe { std::slice::from_raw_parts(tail.0 as *const u8, tail.1 - tail.0) };
+        assert!(stale.iter().all(|b| *b == 0), "the slide wrote into the published tail");
     }
 
     /// Nested critical sections on one array: the inner release must not

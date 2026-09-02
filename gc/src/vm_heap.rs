@@ -870,12 +870,18 @@ impl VmHeap {
     ///   peer root — the VM pins those via
     ///   [`crate::gc_quiescence::add_pinned_jit_root`]) are excluded from the
     ///   CSet, so nothing a frozen peer can address moves.
-    /// - ZGC (INT-3 residual): safe for the reason this protocol is actually
-    ///   about — [`Self::refill_tlab`] returns `None` on the `Zgc` arm, so ZGC
-    ///   mutators are never handed a TLAB and un-retired tails cannot exist —
-    ///   and the sweep walks the allocation-base REGISTRY, never linear
-    ///   memory. A frozen peer's conservative roots are ordinary
+    /// - ZGC: since 2026-09-02 [`Self::refill_tlab`] DOES hand ZGC mutators a
+    ///   chunk (`zgc/vm_tlab.rs`, kill switch `CRATONVM_ZGC_JIT_TLAB=0`), so
+    ///   un-retired tails exist there too. The sweep walks the allocation-base
+    ///   REGISTRY, never linear memory, so a tail (which holds no registered
+    ///   base) is invisible to it by construction; the SLIDE consumes the
+    ///   published list -- `relocate_stw` withholds every page a tail touches
+    ///   from the relocation set and never lowers the bump cursor below a
+    ///   tail's end. A frozen peer's conservative roots are ordinary
     ///   (pinned-by-design) mark roots.
+    ///   The pre-2026-09-02 argument ("`refill_tlab` returns `None` on the
+    ///   `Zgc` arm, so un-retired tails cannot exist") is GONE and must not be
+    ///   reasoned from.
     ///   Do NOT reuse the "non-moving STW mark-sweep" justification that stood
     ///   here until 2026-09-01: `ZgcRealHeap` COMPACTS by default
     ///   (`CRATONVM_ZGC_RELOCATE`, default-on since 2026-08-13). Whether a
@@ -892,15 +898,15 @@ impl VmHeap {
 
     /// BUG-03 / INT-3 — publish the reserved TLAB tails of forcibly-stopped
     /// in-JIT peers so the collection skips them (non-moving-sweep skip list
-    /// on Generational; region-walker skip + CSet exclusion on G1). No-op on
-    /// ZGC, whose mutators never hold TLABs (the published list is always
-    /// empty there — see [`Self::supports_jit_tlab_skip`]).
+    /// on Generational; region-walker skip + CSet exclusion on G1; page
+    /// withholding + bump-cursor floor for the slide on ZGC -- see
+    /// [`Self::supports_jit_tlab_skip`]).
     pub fn set_jit_tlab_skip_regions(&self, regions: &[(usize, usize)]) {
         match self {
             VmHeap::Generational(h) => h.set_jit_tlab_skip_regions(regions),
             VmHeap::G1(h) => h.set_jit_tlab_skip_regions(regions),
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(_) => {}
+            VmHeap::Zgc(h) => h.set_jit_tlab_skip_regions(regions),
         }
     }
 
@@ -910,7 +916,7 @@ impl VmHeap {
             VmHeap::Generational(h) => h.clear_jit_tlab_skip_regions(),
             VmHeap::G1(h) => h.clear_jit_tlab_skip_regions(),
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(_) => {}
+            VmHeap::Zgc(h) => h.clear_jit_tlab_skip_regions(),
         }
     }
 
@@ -3327,13 +3333,21 @@ impl VmHeap {
             // to fail against. Its switch shipped with no engagement counter,
             // which made "never reached" and "reached constantly" the same run.
             let (recycled_refills, starved_refills, starved_bytes) = h.tlab_recycle_engagement();
+            // The VM thread's own TLAB (the JIT inline allocator's buffer) on
+            // this backend. `vm_tlab_refills=0` on a run that allocated means
+            // the arm never engaged -- switch off, or every allocation took
+            // the helper -- and no throughput claim about it can stand.
+            let (vm_tlab_refills, vm_tlab_refill_bytes, vm_tlab_tails, vm_tlab_tail_bytes) =
+                h.vm_tlab_engagement();
             eprintln!(
                 "[GC] zgc-features: parallel_mark_cycles={par_cycles} \
                  driver_passes={driver_passes} mark_fallbacks={mark_fallbacks} \
                  compaction_cycles={compactions} objects_relocated={relocated} \
                  relocation_skipped_jit={skipped_jit} \
                  relocation_on_proven_jit={proven_jit} \
-                 tlab_retire_skipped={tlab_skipped} tlab_retire_skipped_at_safepoint={tlab_retire_skipped_at_safepoint}                  targeted_pages={targeted_pages}                  targets_recorded={targets_recorded} targets_consumed={targets_consumed}                  tlab_recycled_refills={recycled_refills} tlab_starved_refills={starved_refills}                  tlab_starved_bytes={starved_bytes}",
+                 tlab_retire_skipped={tlab_skipped} tlab_retire_skipped_at_safepoint={tlab_retire_skipped_at_safepoint}                  targeted_pages={targeted_pages}                  targets_recorded={targets_recorded} targets_consumed={targets_consumed}                  tlab_recycled_refills={recycled_refills} tlab_starved_refills={starved_refills}                  tlab_starved_bytes={starved_bytes} \
+                 vm_tlab_refills={vm_tlab_refills} vm_tlab_refill_bytes={vm_tlab_refill_bytes} \
+                 vm_tlab_tails_returned={vm_tlab_tails} vm_tlab_tail_bytes_returned={vm_tlab_tail_bytes}",
                 targeted_pages = crate::zgc::forwarding::targeted_pages_selected(),
                 tlab_retire_skipped_at_safepoint = h.tlab_retire_skipped_at_safepoint(),
                 targets_recorded = targets_recorded,
@@ -3814,47 +3828,40 @@ impl VmHeap {
         dispatch!(self, get_header(obj)).num_slots() as usize
     }
 
-    /// Carve out a TLAB from the young generation (generational) or Eden region (G1).
-    /// Returns `Some((ptr, size))` on success.
+    /// Carve out a TLAB from the young generation (generational), the Eden
+    /// region (G1), or the low arena (ZGC, since 2026-09-02 -- `zgc/vm_tlab.rs`,
+    /// kill switch `CRATONVM_ZGC_JIT_TLAB=0`). Returns `Some((ptr, size))` on
+    /// success; the chunk is zeroed.
+    ///
+    /// Every object the VM lays out in the chunk must be reported through
+    /// [`Self::note_tlab_object`] the moment its header is complete: on ZGC
+    /// that is how the object enters the start registry the sweep, the SATB
+    /// barrier and the conservative scans all consult.
     pub fn refill_tlab(&self, requested_size: usize) -> Option<(*mut u8, usize)> {
         match self {
             VmHeap::Generational(h) => h.refill_tlab(requested_size),
             VmHeap::G1(h) => h.refill_tlab(requested_size),
-            // 2026-09-02: a mutator-owned chunk carved like the heap's own
-            // TLAB chunks. Every object bumped from it must be registered
-            // through `note_thread_tlab_object` (this collector's object-start
-            // registry is a mutator-path oracle, not just a GC one).
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(h) => h.refill_mutator_tlab(requested_size),
-        }
-    }
-    /// Whether [`Self::note_thread_tlab_object`] does anything on this
-    /// collector — i.e. whether an object bump-allocated from a thread's own
-    /// TLAB must be registered before it is used.
-    ///
-    /// Read at compile time (through `JitRuntimeHelpers::
-    /// tlab_registration_required`) so the JIT's inline-`new` never takes the
-    /// fast path that skips the helper doing the registering.
-    #[inline]
-    pub fn tlab_objects_need_registration(&self) -> bool {
-        match self {
-            VmHeap::Generational(_) | VmHeap::G1(_) => false,
-            #[cfg(feature = "zgc")]
-            VmHeap::Zgc(_) => true,
+            VmHeap::Zgc(h) => h.refill_tlab(requested_size),
         }
     }
 
-    /// An object was bump-allocated from a thread's own TLAB and its header
-    /// is written: a collector that keeps an object-start registry records it
-    /// here. A no-op on the collectors whose heaps are parsed by header.
+    /// An object the VM just finished laying out at `ptr` inside a chunk from
+    /// [`Self::refill_tlab`]; `footprint` is what the buffer's cursor advanced
+    /// by. Registers it with the backend that needs to know (ZGC's start
+    /// registry, plus allocate-black and the young grain); a no-op on the
+    /// backends whose sweeps parse the chunk linearly.
     #[inline]
-    pub fn note_thread_tlab_object(&self, addr: usize, size: usize) {
+    pub fn note_tlab_object(&self, ptr: *mut u8, footprint: usize) {
         match self {
-            VmHeap::Generational(_) | VmHeap::G1(_) => {}
+            VmHeap::Generational(_) | VmHeap::G1(_) => {
+                let _ = (ptr, footprint);
+            }
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(h) => h.note_mutator_tlab_object(addr, size),
+            VmHeap::Zgc(h) => h.note_tlab_object(ptr, footprint),
         }
     }
+
 
     /// Check if a raw address is within a live (non-Free) region of the heap.
     /// For generational GC, always returns false (not applicable).
@@ -4588,6 +4595,50 @@ mod concurrent_mark_controller_tests {
     ///
     /// The exact edit that trips this: delete either
     /// `pointer_map.contains_key(&addr)` early return.
+    /// The `Zgc` arm of [`VmHeap::refill_tlab`] returned `None` until
+    /// 2026-09-02, which left the JIT's inline allocator dead on the default
+    /// collector: `thread.tlab` stayed empty, the inline bump missed every
+    /// time, and every compiled `new` took the helper. It carves a chunk now,
+    /// and retiring the buffer hands the unused tail back rather than leaving
+    /// a filler object this collector would never reclaim (it sweeps a
+    /// registry, not memory).
+    #[cfg(feature = "zgc")]
+    #[test]
+    fn the_zgc_arm_of_refill_tlab_carves_a_chunk_and_takes_its_tail_back() {
+        let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::new_shared(16 * 1024 * 1024));
+        if let VmHeap::Zgc(z) = &heap {
+            z.set_vm_tlab_enabled(true);
+        }
+        let (ptr, size) = heap
+            .refill_tlab(64 * 1024)
+            .expect("ZGC must hand the VM thread's TLAB a chunk");
+        assert!(!ptr.is_null());
+        assert!(
+            size >= crate::tlab::min_tlab_size() && size <= 64 * 1024,
+            "chunk of {size} bytes is outside the requested bounds"
+        );
+        let mut tlab = unsafe { crate::Tlab::new(ptr, size) };
+        assert!(tlab.alloc(128, 8).is_some());
+        // The chunk is charged whole at refill; the retire credits the unused
+        // tail back, so `allocated` never counts bytes nobody can reach.
+        let allocated_before = heap.allocated_bytes();
+        tlab.retire();
+        assert!(tlab.is_retired());
+        assert_eq!(
+            allocated_before - heap.allocated_bytes(),
+            size - 128,
+            "the retired tail must be credited back to the heap"
+        );
+        let VmHeap::Zgc(z) = &heap else {
+            unreachable!("constructed as Zgc")
+        };
+        assert_eq!(
+            z.vm_tlab_engagement(),
+            (1, size, 1, size - 128),
+            "(refills, refill_bytes, tails_returned, tail_bytes_returned)"
+        );
+    }
+
     #[cfg(feature = "zgc")]
     #[test]
     fn the_pre_gc_address_predicates_are_correct_for_an_object_compaction_moved() {

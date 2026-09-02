@@ -632,21 +632,23 @@ registry. Non-moving ⇒ the pointer map is always empty and
 no barriers are needed; reference semantics come entirely from the VM-level
 protocol.
 
-**Mutators DO have TLABs on this backend — two kinds since 2026-09-02.**
-`ZgcRealHeap::alloc_raw_tlab` (over `gc/src/zgc/tlab.rs`) is the funnel for
-every object and every array the heap allocates itself, it is **on by
-default**, and `CRATONVM_ZGC_TLAB=0` is the kill switch. Separately,
-`VmHeap::refill_tlab` on the `Zgc` arm now hands a mutator thread a chunk for
-its own `JvmThread::tlab` (`ZgcRealHeap::refill_mutator_tlab`) — the chunk
-both JIT tiers' inline TLAB bump and the interpreter's `alloc_initialized`
-fast path bump. Until then that arm returned `None`, so under the default
-collector every compiled `new` was a `jit_new_object` helper call. Objects
-bumped from a mutator chunk are registered eagerly, one at a time, through
-`VmHeap::note_thread_tlab_object` (registry, quiescence note, allocation
-account, black allocation under a live mark), and the unused tail returns to
-the arena through the `Tlab::retire` hook the heap registers in `new_shared`.
-`CRATONVM_ZGC_MUTATOR_TLAB=0` is the kill switch; the exit statistics print
-`ZGC mutator TLAB: refills=… objects_registered=…` as the engagement census. A TLAB chunk is *reserved* space that
+**Mutators have TLABs on this backend, and since 2026-09-02 the JIT's inline
+allocator can have one too -- OPT-IN.** `VmHeap::refill_tlab` on the `Zgc` arm
+hands the VM thread's own `Tlab` a zeroed chunk from the low arena
+(`gc/src/zgc/vm_tlab.rs`) when `CRATONVM_ZGC_JIT_TLAB=1`, so the interpreter's
+`new` and the compiled inline bump both hit; each object is registered in the start bitmap
+the moment its header is complete (`VmHeap::note_tlab_object`), the unused tail
+goes back to the arena free list when the thread retires the buffer
+(`Tlab::retire` → `TlabTailSink`), and a tail the STW protocol publishes for a
+blocked or frozen peer pins its pages against the slide. Before that date the
+arm returned `None`, every compiled allocation took the `jit_new_object` helper,
+and `tlab_hit_count` was zero here by construction. Below the VM buffer,
+`ZgcRealHeap::alloc_raw_tlab` (over `gc/src/zgc/arena_tlab.rs`) remains the
+funnel for the helper path and every native-side allocation; it is **on by
+default**, and `CRATONVM_ZGC_TLAB=0` is its kill switch (which also switches the
+VM buffer off, since both carve from the same source). The VM buffer is opt-in
+because it MEASURED SLOWER: see `zgc_vm_tlab_enabled_by_default` for the
+numbers and for the register-only helper the win needs. A TLAB chunk is *reserved* space that
 no collection can reclaim while its owning thread lives, so it is invisible to
 any trigger that counts live bytes; the reservation budget is bounded by the
 live buffer count (`ZGC_TLAB_RESERVATION_SHARE`) for exactly that reason.

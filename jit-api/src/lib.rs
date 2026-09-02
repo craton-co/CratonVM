@@ -1735,22 +1735,6 @@ pub struct JitRuntimeHelpers {
     /// `0` = not wired (hand-built test tables). Appended at the END of the
     /// struct so all prior golden offsets stay stable.
     pub ref_store_post_skip_mask: usize,
-    /// Non-zero when an object bump-allocated from a thread's own TLAB must be
-    /// REGISTERED with the collector before it is used.
-    ///
-    /// ZGC's object-start registry is that collector's only record that an
-    /// object exists: the sweep visits registered bases, `is_object_address`
-    /// answers from it, and the conservative JIT root scan screens candidate
-    /// words with it. An unregistered live object is therefore invisible to
-    /// all three. The single-pass inline-TLAB `new` has a fast path that skips
-    /// `tlab_post_init` for classes with no primitive defaults and no
-    /// finalizer, and that helper is what performs the registration — so under
-    /// a registry-keeping collector the fast path must not be taken.
-    ///
-    /// `0` = this collector parses its heap by header and needs no
-    /// registration (Generational, G1, and every hand-built test table), which
-    /// is the emission every backend had before this slot existed.
-    pub tlab_registration_required: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -1957,7 +1941,6 @@ helper_fields! {
     // A VALUE (a flags mask), not a pointer: `Constant` in the ABI table and
     // deliberately not range-checked as an address here.
     (ref_store_post_skip_mask,       FieldKind::Offset),
-    (tlab_registration_required,     FieldKind::Offset),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -1983,7 +1966,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 76,
+    JitRuntimeHelpers::NUM_FIELDS == 75,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -2390,7 +2373,6 @@ mod tests {
             g1_barrier_addr: 0x1208,
             g1_post_write_barrier: 0x1210,
             ref_store_post_skip_mask: 0x1,
-            tlab_registration_required: 1,
         }
     }
 
@@ -2638,7 +2620,6 @@ mod tests {
             g1_barrier_addr: 0,
             g1_post_write_barrier: 0,
             ref_store_post_skip_mask: 0,
-            tlab_registration_required: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -2819,8 +2800,7 @@ mod tests {
         // barrier gates; F-08 appended the two G1 inline-barrier words after
         // them; v12 appended the generational collector's post-barrier skip
         // mask, so every earlier golden offset below stays where it was.
-        // them, so both sets of golden offsets below stay where they were.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 76);
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 75);
     }
 
     #[test]
@@ -3193,11 +3173,6 @@ mod tests {
                 "ref_store_post_skip_mask",
                 std::mem::offset_of!(JitRuntimeHelpers, ref_store_post_skip_mask),
             ),
-            (
-                75,
-                "tlab_registration_required",
-                std::mem::offset_of!(JitRuntimeHelpers, tlab_registration_required),
-            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -3253,11 +3228,9 @@ mod tests {
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 43, "required-pointer count drifted");
         assert_eq!(opt, 17, "optional-pointer count drifted");
-        // v12's `ref_store_post_skip_mask` and v13's
-        // `tlab_registration_required` are both Offsets (baked VALUES, not
-        // call targets), which is why this moves twice and the two pointer
-        // counts do not move at all.
-        assert_eq!(off, 16, "offset-field count drifted");
+        // v12's `ref_store_post_skip_mask` is an Offset (a baked VALUE), which
+        // is why this moves and the two pointer counts do not.
+        assert_eq!(off, 15, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }
 

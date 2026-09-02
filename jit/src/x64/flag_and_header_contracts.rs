@@ -514,6 +514,54 @@ fn the_inline_allocator_writes_the_mark_word_unconditionally() {
     assert!(found, "the inline allocator must zero the mark word");
 }
 
+/// The decision to INLINE the bump and the decision to DROP the post-init
+/// helper call must stay two different questions.
+///
+/// They were one boolean until 2026-09-02, and collapsing them is only sound
+/// while every collector can find an object by walking the chunk it was
+/// allocated in. ZGC cannot: its sweep, its `is_object_address` oracle and
+/// its conservative scans are driven by an allocation-base registry, and the
+/// post-init helper is the only place an inline allocation can enter it. An
+/// object allocated without that call is invisible to the runtime — its first
+/// use as a receiver decodes as `null`, which is what miscompiled
+/// `probes/FjpProbe.java` (`NullPointerException: null object argument` inside
+/// `ForkJoinTask.fork`, no collection anywhere in the run).
+///
+/// A source scan for the same reason the test above is one: the flag is
+/// process-wide and published by the heap, so a byte-level test in this crate
+/// could only ever observe the unpublished default.
+#[test]
+fn dropping_the_post_init_helper_asks_the_collector_first() {
+    let src = include_str!("bytecode_walk.rs");
+    let start = src
+        .find("let skip_helper =")
+        .expect("the `new` arm must still decide whether to skip the post-init helper");
+    // The decision, up to the end of its statement.
+    let decision = &src[start..start + src[start..].find(';').expect("terminated statement")];
+    assert!(
+        decision.contains("jit_tlab_registration_required"),
+        "`skip_helper` no longer consults \
+         `cratonvm_types::jit_tlab_registration_required()`. On a collector \
+         that is TOLD about each allocation rather than walking the chunk \
+         (ZGC), dropping the post-init call leaves every inline-allocated \
+         object unregistered, and it decodes as `null` at its first native \
+         boundary. Found instead: {decision}"
+    );
+
+    let inline_gate_start = src
+        .find("let can_inline =")
+        .expect("the `new` arm must still gate inline allocation");
+    let inline_gate =
+        &src[inline_gate_start..inline_gate_start + src[inline_gate_start..].find(';').unwrap()];
+    assert!(
+        !inline_gate.contains("skip_helper"),
+        "inline ELIGIBILITY is reading `skip_helper`, so a collector that \
+         requires the announcing call would switch the inline bump off \
+         altogether rather than keep it and pay one call. It must read the \
+         class-only `helper_is_noop` term instead. Found: {inline_gate}"
+    );
+}
+
 /// The zeroing stores in `emit_inline_tlab_new` must cover exactly the
 /// header words that are not written with a real value, and every one of
 /// them must sit inside the header.

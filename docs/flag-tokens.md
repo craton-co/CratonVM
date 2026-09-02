@@ -886,7 +886,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-116 tokens.
+119 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -924,6 +924,10 @@ export inherited from a parent shell.
 | `zgc-markbits` | `CRATONVM_ZGC_MARKBITS` |
 | `zgc-page-pinned-relocate` | `CRATONVM_ZGC_PAGE_PINNED_RELOCATE` |
 | `zgc-parsweep` | `CRATONVM_ZGC_PARSWEEP` |
+| `zgc-bitmap-sweep` | `CRATONVM_ZGC_BITMAP_SWEEP` |
+| `zgc-mark-root-filter` | `CRATONVM_ZGC_MARK_ROOT_FILTER` |
+| `zgc-jit-tlab` | `CRATONVM_ZGC_JIT_TLAB` |
+| `zgc-tlab-tail-sink` | `CRATONVM_ZGC_TLAB_TAIL_SINK` |
 | `g1-reserve-heap` | `CRATONVM_G1_RESERVE_HEAP` |
 | `g1-uncommit` | `CRATONVM_G1_UNCOMMIT` |
 | `g1-card-rset` | `CRATONVM_G1_CARD_RSET` |
@@ -992,7 +996,6 @@ export inherited from a parent shell.
 | `zgc-conc-start` | `CRATONVM_ZGC_CONC_START` |
 | `zgc-conc-workers` | `CRATONVM_ZGC_CONC_WORKERS` |
 | `zgc-generational` | `CRATONVM_ZGC_GENERATIONAL` |
-| `zgc-mutator-tlab` | `CRATONVM_ZGC_MUTATOR_TLAB` |
 | `zgc-gen-promotion-age` | `CRATONVM_ZGC_GEN_PROMOTION_AGE` |
 | `zgc-gen-minors-per-major` | `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` |
 | `zgc-gen-nursery-percent` | `CRATONVM_ZGC_GEN_NURSERY_PERCENT` |

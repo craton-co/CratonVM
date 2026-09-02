@@ -4844,9 +4844,6 @@ pub unsafe extern "C" fn jit_post_tlab_init(
         } else {
             HEADER_SIZE + num_fields as usize * SLOT_SIZE
         };
-        // The header is complete: a registry-keeping collector (ZGC) records
-        // the object now, before the pointer escapes to Java code.
-        vm.mem.heap.note_thread_tlab_object(raw_ptr as usize, total);
         cratonvm_gc::a2dbg::record(
             raw_ptr as usize,
             class_id_raw as u32,
@@ -4856,6 +4853,18 @@ pub unsafe extern "C" fn jit_post_tlab_init(
             num_fields as u32,
             total,
         );
+    }
+
+    // The header is complete from here on. ZGC needs every TLAB object in its
+    // start registry before anything else can observe the address (the
+    // registry is a mutator-path oracle there, not only the sweep's), and
+    // this helper is the one call the inline allocator always makes -- so
+    // this is where an inline-allocated object is registered. A no-op on the
+    // backends whose sweeps parse the chunk linearly. `zgc/vm_tlab.rs`.
+    {
+        let footprint = HEADER_SIZE
+            + compact_body.map_or(num_fields as usize * SLOT_SIZE, |body| body as usize);
+        vm.mem.heap.note_tlab_object(raw_ptr, footprint);
     }
 
     // Reconstruct the typed handle and finish init.
@@ -25124,18 +25133,6 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         class_id_offset_in_obj: 0,
         get_current_thread: jit_get_current_thread as *const () as usize,
         tlab_post_init: jit_post_tlab_init as *const () as usize,
-        // Does this collector keep an object-start registry that a
-        // bump-allocated object must be entered into before use? If so the
-        // emitter must not take the inline-`new` fast path that skips
-        // `tlab_post_init`, because that helper is what enters it.
-        tlab_registration_required: usize::from(
-            vm_for_helpers
-                .map(|vm| vm.mem.heap.tlab_objects_need_registration())
-                // No VM in hand (the hand-built test tables): answer the
-                // FAIL-CLOSED direction. `1` costs the fast path; `0` would
-                // leave an object unregistered on a collector that needs it.
-                .unwrap_or(true),
-        ),
         // Stage 3 (precise oop maps) — only wire the frame-record helper when
         // the precise gate is on; otherwise leave it 0 so the prologue emits
         // nothing extra. The JIT also gates emission on its own cached flag,
@@ -25506,23 +25503,6 @@ pub unsafe extern "C" fn jit_safepoint_slow_path() {
 ///
 /// `extern "C"` with the single `rbp` argument in the platform's first
 /// integer-argument register, matching the JIT's `ARG_REGS[0]` load.
-/// The mutator-TLAB engagement census, on the `jit.method_stats` switch:
-/// `(refills, refill bytes, objects registered, tail bytes returned)` for the
-/// chunks `ZgcRealHeap::refill_mutator_tlab` handed to `JvmThread::tlab`. A
-/// zero refill count under the default collector says the inline TLAB bump
-/// both JIT tiers emit never had a chunk to bump -- the exact reading this
-/// census exists to make visible (see the 2026-09-02 note on
-/// `VmHeap::refill_tlab`'s Zgc arm).
-pub fn report_zgc_mutator_tlab_census_at_exit() {
-    #[cfg(feature = "zgc")]
-    {
-        let (refills, bytes, objects, tail) = cratonvm_gc::zgc::mutator_tlab_census();
-        eprintln!(
-            "[cratonvm] ZGC mutator TLAB: refills={refills} refill_bytes={bytes}              objects_registered={objects} tail_bytes_returned={tail}"
-        );
-    }
-}
-
 extern "C" fn jit_frame_record(rbp: usize) {
     crate::jit::conservative_roots::set_top_frame_base(rbp);
 }

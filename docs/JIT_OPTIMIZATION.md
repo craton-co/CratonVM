@@ -777,21 +777,27 @@ is a pure `int[][]` triple loop that the single-pass backend already
 vectorises and that allocates almost nothing — it should not move, and it does
 not.
 
-**A correctness bug this pass introduced and fixed, worth recording because
-the kill switch is what found it.** Giving ZGC mutators a TLAB made the
-single-pass inline-`new` fast path reachable for the first time on that
-collector, and that path skips `tlab_post_init` — the helper that enters the
-object in ZGC's object-start registry, which is that collector's only record
-that an object exists. 8 of 86 regression-suite vectors failed; the same
-binary with `CRATONVM_ZGC_MUTATOR_TLAB=0` passed 86 of 86, which located it in
-one run. See `JitRuntimeHelpers::tlab_registration_required` (helper ABI v12).
+**A correctness bug this pass found, worth recording because the kill switch
+is what located it.** Giving ZGC mutators a TLAB makes the single-pass
+inline-`new` fast path reachable for the first time on that collector, and
+that path skips `tlab_post_init` — the helper that enters the object in ZGC's
+object-start registry, which is that collector's only record that an object
+exists. 8 of 86 regression-suite vectors failed; the same binary with the
+mutator TLAB switched off passed 86 of 86, which located it in one run. Both
+branches hit it and both fixed it; the shipping fix is the `types`-level
+`jit_tlab_registration_required()` gate on `skip_helper`.
 
 **One finding is only half closed, and this says which half.** Finding 4 was
 "allocation and reference stores in the optimizing tier are helper calls". The
-reference stores are fixed (`emit_gated_compact_ref_store`), and compiled
-allocation under the default collector is fixed where it mattered most — the
-single-pass inline TLAB bump, which had been dead under ZGC because
-`VmHeap::refill_tlab` answered `None` there. The optimizing tier's OWN bump
+reference stores are fixed here (`emit_gated_compact_ref_store`). Compiled
+allocation under the default collector was fixed in parallel by
+`feat/zgc-jit-tlab-20260902`, which reached `dev` first and is the
+implementation that ships: `VmHeap::refill_tlab` had answered `None` on the
+Zgc arm, so a thread TLAB was always empty and the inline bump both tiers emit
+was dead code. This branch had built the same thing and it was dropped in
+favour of theirs on the merge — including its answer to the registration
+problem below, which they express as `cratonvm_types::
+jit_tlab_registration_required()` rather than as a helper-ABI slot. The optimizing tier's OWN bump
 (`emit_inline_tlab_new_ir`) stays opt-in: turning it on makes
 `regression-suite` vector `RJitMapTierDiff` SIGSEGV 4 runs in 10, inside VM
 code, on a reference read back as `0x2800`. What was ruled out: the header
@@ -860,7 +866,7 @@ downgrade that gate was shut for.
 | IR-tier inline TLAB bump for `Op::New` | off — the sequence has a defect `RJitMapTierDiff` reproduces 4/10; see `ir_inline_tlab_enabled` | `CRATONVM_JIT_IR_INLINE_TLAB=1` |
 | Thread pointer fetched from a TLS mirror (both tiers) | **ON** where the probe succeeds | `CRATONVM_JIT_TLS_THREAD_FETCH=0` |
 | One post-call sentinel compare (both tiers) | **ON** | `CRATONVM_JIT_MERGED_CALL_SENTINEL=0` |
-| ZGC mutator TLAB (the chunk the inline bump bumps) | **ON** | `CRATONVM_ZGC_MUTATOR_TLAB=0` |
+| ZGC VM-thread TLAB (the chunk the inline bump bumps) | off — `feat/zgc-jit-tlab-20260902`'s, kept opt-in because it measured slower there | `CRATONVM_ZGC_JIT_TLAB=1` |
 | Receiver-type + call-site profile recording | **ON** | `CRATONVM_TIER_PGO_RECEIVERS=0` (branch/back-edge recording stays behind `CRATONVM_TIER_PGO`) |
 | Guarded virtual inlining on receiver profiles | **ON** | `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE=0` |
 | Gated inline reference stores | **ON** where a collector publishes a plan | `CRATONVM_JIT_GATED_REF_STORE=0` |

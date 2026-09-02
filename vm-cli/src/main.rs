@@ -224,7 +224,6 @@ fn maybe_dump_shutdown_reports() {
 
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
-        cratonvm_vm::jit::helpers::report_zgc_mutator_tlab_census_at_exit();
         // The `getfield` fast-path ENGAGEMENT number, on the same switch. The
         // guarded inline `getfield` is emitted at dozens of sites and can still
         // never take its inline branch; only this counter distinguishes
