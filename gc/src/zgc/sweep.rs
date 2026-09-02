@@ -470,9 +470,21 @@ impl ZgcRealHeap {
             // it is reclaimed this cycle.
             prev_end = low_end;
         }
-        let new_cursor = prev_end.min(low_end);
+        let mut new_cursor = prev_end.min(low_end);
         if !skips.is_empty() {
             Self::withhold_skip_regions(&mut spans, &skips, base);
+            // ...AND THE CURSOR, not just the free list.
+            //
+            // Clipping the spans keeps a published tail off the free list, and
+            // that is only half of it: this pass also LOWERS the bump cursor
+            // onto the bytes above the last survivor, and a tail is above the
+            // last survivor by definition -- it holds no live object. Retracting
+            // through one hands its owner's next bump straight to the bump
+            // path as fresh space. The floor is the same one the slide applies
+            // (`jit_tlab_skip_floor`), for the same reason.
+            new_cursor = new_cursor
+                .max(self.jit_tlab_skip_floor(base, low_end))
+                .min(low_end);
         }
         // THE PRUNE, in one `fetch_and` per 512 arena bytes rather than one
         // `remove` per dead object. It has to run against the LIVE registry
@@ -484,25 +496,15 @@ impl ZgcRealHeap {
         Some((sh, spans, new_cursor - base))
     }
 
-    /// Spans below the low cursor that hold no live object and must still not
-    /// be reclaimed.
-    ///
-    /// Empty on this backend today, and the reason is worth stating rather
-    /// than assuming: `VmHeap::refill_tlab` returns `None` on the `Zgc` arm, so
-    /// ZGC mutators are never handed a TLAB and the stop-the-world protocol's
-    /// published reserved tails (`set_jit_tlab_skip_regions`) are always empty
-    /// here. The complement sweep is the FIRST consumer for which that would
-    /// stop being a curiosity and become a correctness dependency: a tail its
-    /// owner will resume bumping into holds no live object, so the complement
-    /// would hand those bytes to another thread.
-    ///
-    /// `feat/zgc-jit-tlab-20260902` is the branch that changes the premise. It
-    /// gives this backend VM TLABs and consumes the published list in the
-    /// slide; when the two meet, this body is what it has to fill in, and the
-    /// conflict here is the prompt.
-    fn jit_tlab_skip_regions(&self) -> Vec<(usize, usize)> {
-        Vec::new()
-    }
+    // `jit_tlab_skip_regions` USED TO BE STUBBED HERE, returning empty, with a
+    // note saying the VM-TLAB branch would have to fill it in when the two
+    // met. They met on 2026-09-02 and it did: the real one lives in
+    // `zgc/vm_tlab.rs` and returns the reserved tails the stop-the-world
+    // protocol published for peers frozen in compiled code. The complement
+    // sweep calls that one now, which is what `withhold_skip_regions` below
+    // exists to consume -- a tail its owner will resume bumping into holds no
+    // live object, so the complement would otherwise hand those bytes out
+    // from under it.
 
     /// Clip published TLAB tails out of the free spans. A frozen peer resumes
     /// bumping into its tail, so the complement must not offer those bytes to

@@ -386,9 +386,15 @@ pub(super) fn stw_take_over_and_wait(
     // Generational degrades to the non-moving sweep that consumes the JIT
     // TLAB skip regions; G1 (INT-3) skips the published tails in every region
     // walker and pins everything a frozen peer can address out of the CSet
-    // (see `pin_frozen_peer_roots_for_g1`); ZGC (INT-3 residual) is trivially
-    // safe — non-moving, registry-walked sweep, and its mutators never hold
-    // TLABs. The `supports_jit_tlab_skip` gate is retained for any future
+    // (see `pin_frozen_peer_roots_for_g1`); ZGC sweeps an allocation-base
+    // REGISTRY rather than memory, so an un-retired tail (which holds no
+    // registered base) is invisible to the sweep by construction, and its
+    // SLIDE consumes the published list — the pages a tail touches leave the
+    // relocation set and the bump cursor never drops below a tail's end
+    // (`zgc/vm_tlab.rs`). The "its mutators never hold TLABs" half of this
+    // argument was retired on 2026-09-02, when `VmHeap::refill_tlab` started
+    // serving that backend too; do not reason from it.
+    // The `supports_jit_tlab_skip` gate is retained for any future
     // backend that can't make one of those arguments.
     if !xt::enabled() || !shared.mem.heap.supports_jit_tlab_skip() {
         shared.mem.gc_barrier.wait_for_all();
@@ -3453,6 +3459,9 @@ pub(crate) fn tlab_alloc_byte_array(
         // the store. It is header-aligned, at least `size_of::<ObjectHeader>()`
         // bytes, and uninitialised — hence `ptr::write`, not an assignment.
         unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
+        // ZGC registers every TLAB object the moment its header is complete
+        // (`VmHeap::note_tlab_object`); a no-op on the linear-sweep backends.
+        shared.mem.heap.note_tlab_object(ptr, total_size);
     })?;
     use std::sync::atomic::Ordering;
     shared.mem.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
@@ -3843,6 +3852,16 @@ pub(super) fn tlab_alloc_object_inner(
     total_size: usize,
     refill_needs_young_room: bool,
 ) -> Option<ObjectRef> {
+    // LEGACY layout, on every backend, deliberately -- see
+    // `init_object_header`. A 2026-09-02 attempt to give ZGC's TLAB objects
+    // the compact shape its own `alloc_object` uses (so a TLAB object and a
+    // heap-allocated one of the same class would agree) MISCOMPILED
+    // `probes/FjpProbe.java`: wrong per-task sums, no collection involved.
+    // The interpreter fast path has never consulted the layout registry, and
+    // the tree has compiled and cached field access against that fact for
+    // long enough that changing it here is not a local decision. If the two
+    // shapes are ever unified it has to be done at every allocation site at
+    // once, with that probe in the gate.
     tlab_alloc_shaped_inner(
         thread,
         shared,
@@ -3872,6 +3891,9 @@ pub(super) fn tlab_alloc_shaped_inner(
         // SAFETY: `alloc_initialized` reserved `total_size` (>= HEADER_SIZE)
         // bytes at `ptr`, 8-byte aligned and privately owned until commit.
         unsafe { shape.init_header(ptr, class_id, hash) };
+        // ZGC registers every TLAB object the moment its header is complete
+        // (`VmHeap::note_tlab_object`); a no-op on the linear-sweep backends.
+        shared.mem.heap.note_tlab_object(ptr, total_size);
     }) {
         shared.mem.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
         // Truncation-checked: usize → u64 widening is loss-free on 64-bit
@@ -4059,6 +4081,7 @@ pub(super) fn tlab_alloc_shaped_inner(
             // SAFETY: same contract as the fast path — a freshly reserved,
             // 8-byte-aligned, privately-owned `total_size` region.
             unsafe { shape.init_header(ptr, class_id, hash) };
+            shared.mem.heap.note_tlab_object(ptr, total_size);
         }) {
             shared.mem.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
             shared
@@ -4204,6 +4227,7 @@ pub(super) fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: us
         cratonvm_gc::heap::HEADER_SIZE + num_fields * cratonvm_gc::heap::SLOT_SIZE,
     );
 }
+
 
 /// Shared-heap allocation path (with lock). Used for TLAB misses and large objects.
 pub(crate) fn alloc_object_shared(
