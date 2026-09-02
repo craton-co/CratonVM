@@ -2847,6 +2847,9 @@ mod tests {
                 method: "fake".into(),
                 descriptor: "(I)Ljava/lang/String;".into(),
                 registered_by: Some("native-builtins/src/lib.rs:1234".into()),
+                // The interesting arm: a refusal that did NOT retire its
+                // method, because an earlier registration still owns the slot.
+                survivor: Some("intrinsic@native-builtins/src/phases_early.rs:21878".into()),
             },
             JdkOnlyViolation::SyntheticNativeInvocation {
                 class: "com/example/Strict".into(),
@@ -3071,6 +3074,7 @@ mod tests {
             method: "fake".into(),
             descriptor: "(I)Ljava/lang/String;".into(),
             registered_by: Some("native-builtins/src/lib.rs:1234".into()),
+            survivor: None,
         };
         assert!(registered
             .render(Some(25), false)
