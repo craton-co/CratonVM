@@ -14146,9 +14146,16 @@ thread_local! {
     /// stub fires.
     static TEST_NPE_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// JEP 358 — the action code the firing null-check stub passed to
-    /// `jit_npe_with_action`. `-1` = no stub fired. Lets the null-NPE tests
-    /// assert the per-opcode action is threaded correctly.
+    /// `jit_npe_with_action`, DECODED out of the packed word. `-1` = no stub
+    /// fired. Lets the null-NPE tests assert the per-opcode action is threaded
+    /// correctly.
     static TEST_NPE_ACTION: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
+    /// The trap-site key from the same packed word: the id
+    /// `inlining::record_npe_trap_site` issued for THIS null check, which is
+    /// what lets the stack walk recover the bci of the frame that trapped.
+    /// `-1` = no stub fired, `0` = the site was not recorded (which is what
+    /// `CRATONVM_JIT_NO_NPE_TRAP_LINES=1` produces).
+    static TEST_NPE_TRAP_KEY: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
 }
 
 /// Test stand-in for `jit_throw_aioobe`: records the failure payload
@@ -14168,15 +14175,24 @@ unsafe extern "C" fn flagging_throw_aioobe(
 }
 
 /// Test stand-in for `jit_npe_with_action`: each inline null-check deopt
-/// stub calls `helpers.jit_npe_with_action(code)` to flag a pending NPE
-/// with its JEP-358 action code. Records the hit AND the code; the stub
-/// itself loads the `i64::MIN` sentinel.
+/// stub calls `helpers.jit_npe_with_action(packed)` to flag a pending NPE.
+/// Records the hit AND both halves of the packed word; the stub itself loads
+/// the `i64::MIN` sentinel.
+///
+/// The argument is NOT the bare action code. Since the trap-site side channel
+/// landed, each described null check gets its own ten-byte trampoline that
+/// passes `action | (trap_key << 8)`, so the walk that builds the trace can
+/// ask which check fired and recover the bci of the frame that trapped. A test
+/// that asserts on the raw word is asserting on the low byte AND the site id
+/// at once, and would move every time a new check is emitted ahead of it —
+/// so split it here, once, rather than in each test.
 ///
 /// SAFETY: plain `extern "C"` callback invoked by JIT code with one `i64`
 /// argument; touches only thread-locals.
-unsafe extern "C" fn flagging_npe_with_action(code: i64) {
+unsafe extern "C" fn flagging_npe_with_action(packed: i64) {
     TEST_NPE_HIT.with(|c| c.set(true));
-    TEST_NPE_ACTION.with(|c| c.set(code));
+    TEST_NPE_ACTION.with(|c| c.set(packed & 0xff));
+    TEST_NPE_TRAP_KEY.with(|c| c.set((packed >> 8) & 0x00ff_ffff));
 }
 
 /// `test_helpers()` with the `throw_aioobe` and `jit_npe_with_action`
@@ -14534,6 +14550,7 @@ fn test_inline_arraylength_null_throws_npe() {
 
     TEST_NPE_HIT.with(|c| c.set(false));
     TEST_NPE_ACTION.with(|c| c.set(-1));
+    TEST_NPE_TRAP_KEY.with(|c| c.set(-1));
     // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
     let result = unsafe { compiled.try_call(&[0]).expect("test JIT call") }; // null array
     assert_eq!(
@@ -14552,6 +14569,16 @@ fn test_inline_arraylength_null_throws_npe() {
         npe_action::ARRAY_LENGTH as i64,
         "null arraylength must report the ARRAY_LENGTH action"
     );
+    // The other half of the same word: the trap-site id. A zero here means the
+    // stub fired but named no site, which is exactly what the trace shows as
+    // `Method:-1` — the frame survives and its line does not.
+    if super::inlining::npe_trap_lines_enabled() {
+        assert!(
+            TEST_NPE_TRAP_KEY.with(|c| c.get()) > 0,
+            "the null-check trampoline must carry a recorded trap-site id              beside the action; got {}",
+            TEST_NPE_TRAP_KEY.with(|c| c.get())
+        );
+    }
 }
 
 #[test]
@@ -14568,6 +14595,7 @@ fn test_inline_iaload_null_throws_npe() {
 
     TEST_NPE_HIT.with(|c| c.set(false));
     TEST_NPE_ACTION.with(|c| c.set(-1));
+    TEST_NPE_TRAP_KEY.with(|c| c.set(-1));
     // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
     let result = unsafe { compiled.try_call(&[0, 0]).expect("test JIT call") }; // null array
     assert_eq!(result, i64::MIN, "null iaload must deopt with sentinel");
@@ -14604,6 +14632,7 @@ fn test_inline_castore_null_threads_char_action() {
 
     TEST_NPE_HIT.with(|c| c.set(false));
     TEST_NPE_ACTION.with(|c| c.set(-1));
+    TEST_NPE_TRAP_KEY.with(|c| c.set(-1));
     // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
     let result = unsafe { compiled.try_call(&[0]).expect("test JIT call") }; // null array
     assert_eq!(result, i64::MIN, "null castore must deopt with sentinel");
