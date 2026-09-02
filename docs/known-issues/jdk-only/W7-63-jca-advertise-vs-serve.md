@@ -927,10 +927,43 @@ distinguish them.
 
 ### Still open in `--synthetic-jdk`, and not this species
 
-* `Collections.emptyList()`/`emptySet()`/`emptyMap()` hand back a plain
-  `ArrayList`/`HashSet`/`HashMap`. Every type answer is right; the CLASS is
-  wrong (and so `Cloneable` is `true` where HotSpot says `false`). A
-  factory-return question, not a hierarchy one.
+* ~~`Collections.emptyList()`/`emptySet()`/`emptyMap()` hand back a plain
+  `ArrayList`/`HashSet`/`HashMap`.~~ **CLOSED 2026-09-02, and it was not a
+  cosmetic class-name difference.** The three per-call fallbacks never tried
+  `alloc_real_jdk`, unlike the `singletonList` sibling one screen below them —
+  which is why `singletonList` reported the right class in `--synthetic-jdk`
+  and `emptyList` reported `java.util.ArrayList`. They do now.
+
+  The class was the visible half. The one that mattered is that the objects
+  were MUTABLE: `Collections.emptyList().add("x")` **succeeded**, and
+  `ensure_collections_empty_singletons` records in its own comment what a
+  mutable empty singleton cost the last time one shipped — kotlin-reflect's
+  shaded protobuf tests `instanceof ArrayList` to decide whether to replace its
+  `emptyList()` placeholder, skipped the replacement, mutated the shared object,
+  and took down the Kotlin slice of the reactive suite. Here each call happens
+  to mint a fresh list, so the write was silently DISCARDED rather than shared —
+  the same class of wrong answer with a quieter failure.
+
+  `is_immutable_jdk_stand_in` now refuses structural mutation for the seven
+  classes minted under a JDK name with no `cratonvm/internal/Unmodifiable*`
+  stamp (`Collections$Empty{List,Set,Map}`, `$Singleton{List,Set,Map}`,
+  `Arrays$ArrayList`). `List.of`/`Set.of`/`Map.of`/`unmodifiable*` were already
+  correct in every mode — they carry the stamp, whose natives refuse.
+
+  Structural mutators ONLY, which is the part worth stating: `Arrays$ArrayList`
+  is fixed-SIZE, not immutable. `add`/`remove` throw on HotSpot and `set` writes
+  through, so the guard is consulted from `add` and `put` rather than from a
+  blanket write check — refusing `set` would break `Arrays.asList(a).set(0, x)`,
+  the idiomatic reason to call `asList`.
+
+  **11 of 13 rows of `apps/probes/EmptySingletonImmutable` now match HotSpot.**
+  The two that do not are `emptySet().add(..)` and `singleton(..).add(..)`,
+  which raise `NoSuchMethodError` where HotSpot raises
+  `UnsupportedOperationException`: `java/util/Set.add` is not
+  interface-registered, so nothing serves the call at all. That is a refusal
+  with the wrong exception TYPE, not a silent wrong answer, and registering
+  `Set.add` would change dispatch for every Set-typed receiver in the mode —
+  a bigger trade than the two rows are worth. Named here rather than fixed.
 * No `(Collection)` copy constructor for `Vector`, `CopyOnWriteArrayList`,
   `ConcurrentSkipListSet`, `ConcurrentSkipListMap`, `ArrayDeque` or
   `PriorityQueue`; no `Collections.unmodifiableSortedMap`; no
