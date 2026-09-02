@@ -675,6 +675,10 @@ mod imp {
         let mut band: Vec<u8> = Vec::with_capacity(256 * 1024);
         let mut candidates: Vec<ObjectRef> = Vec::new();
         let mut windows = 0usize;
+        let mut pinned_windows = 0usize;
+        let mut unpinned_windows = 0usize;
+        // Per-cycle, so reset before the pass rather than accumulated.
+        super::XT_HELPER_WINDOWS_UNPINNED_CYCLE.store(0, Ordering::Release);
         let mut found_total = 0usize;
         let mut e: ThreadEntry32 = unsafe { core::mem::zeroed() };
         e.dw_size = core::mem::size_of::<ThreadEntry32>() as u32;
@@ -727,6 +731,20 @@ mod imp {
                     if has_jit {
                         windows += 1;
                         found_total += candidates.len();
+                        // PIN, exactly as the Linux arm does. A window is only
+                        // COUNTED here when `snapshot_peer` returned `Some`,
+                        // and that means the whole GPR range and the whole
+                        // band `[rsp, committed_region_end)` were captured --
+                        // so a counted window is complete by construction and
+                        // needs no separate `complete` flag.
+                        if super::helper_window_pin_enabled() {
+                            let addrs: Vec<usize> =
+                                candidates.iter().map(|o| o.as_ptr() as usize).collect();
+                            cratonvm_gc::gc_quiescence::add_xt_cycle_pinned_jit_roots(&addrs);
+                            pinned_windows += 1;
+                        } else {
+                            unpinned_windows += 1;
+                        }
                         roots.append(&mut candidates);
                         if dbg() {
                             eprintln!(
@@ -742,10 +760,20 @@ mod imp {
         unsafe { CloseHandle(snap) };
         XT_HELPER_WINDOWS_SCANNED.fetch_add(windows as u64, Ordering::Relaxed);
         XT_HELPER_WINDOW_ROOTS.fetch_add(found_total as u64, Ordering::Relaxed);
-        if windows > 0 {
-            // Helper-window roots are a blocked peer's register file + raw
-            // stack: conservative and un-rewritable, exactly like the takeover
-            // pass. This collection must not relocate.
+        super::XT_HELPER_WINDOWS_PINNED.fetch_add(pinned_windows as u64, Ordering::Relaxed);
+        super::XT_HELPER_WINDOWS_REFUSED.fetch_add(unpinned_windows as u64, Ordering::Relaxed);
+        super::XT_HELPER_WINDOWS_UNPINNED_CYCLE.store(unpinned_windows as u64, Ordering::Release);
+        // Helper-window roots are a blocked peer's register file + raw stack:
+        // conservative and un-rewritable, so without a pin this collection must
+        // not relocate. WITH one -- and with the interior-resolving probe the
+        // discharge implies, so a derived pointer resolves to the base that
+        // must stay still -- the objects the peer can reach are held in place
+        // and the rest of the heap may move. See the Linux arm for the full
+        // argument and for why the pins alone are not sufficient without the
+        // second site in `interpreter::gc_and_alloc` agreeing.
+        if windows > 0
+            && !(super::helper_window_discharge_enabled() && unpinned_windows == 0)
+        {
             cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
                 cratonvm_gc::gc_quiescence::incomplete_reason::XT_HELPER_WINDOW,
             );
