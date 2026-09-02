@@ -43,6 +43,62 @@ an arm for, maintained by reading both. With one IR there is one
 acceptance predicate, and "can this node be lowered" is a match on
 `Op`.
 
+### Symptom 1b: a THIRD layer that must agree, and the one that bit
+
+The analyzer/emitter pair above is at least documented as a pair. There
+is a third participant nobody wrote down: the VM's marshaller.
+
+For a kernel to actually run on a device, three independent places must
+admit its parameter types:
+
+| layer | where | what it decides |
+|---|---|---|
+| analyzer | `jit-cuda/src/analyzer.rs`, `ParamKind::from_field` | is this method a kernel at all |
+| emitter | `jit-cuda/src/lowering/emit.rs` | can this body be lowered to PTX |
+| marshaller | `vm/src/runtime/offload.rs`, `marshal_array_arg` | can this array be pushed to a device |
+
+The analyzer/emitter disagreement is loud: it "wastes an analyze→lower
+round-trip and pollutes the per-method blacklist", and a lowering
+refusal is logged. **The analyzer/marshaller disagreement is silent,
+and it is silent in a way no differential test can detect.**
+
+When the marshaller refuses a type the analyzer admitted, the kernel is
+analyzed, lowered, compiled by `ptxas` and cached — and then the
+dispatch fails, the VM falls back to the interpreter, and the method
+returns the right answer. Every value matches HotSpot. Every value
+matches the `--nojit` control. The arm under test is comparing the
+interpreter with itself, and reports a pass.
+
+That is exactly what happened to `short[]` and `byte[]`. `ParamKind`
+had `I16Array`/`I8Array` from the start; `gpu_marshal` generated the
+complete `upload_obj_i16`/`download_obj_i16` pair from the same
+`direct_xfer!` macro as the other four, with `host_view_i16` /
+`write_back_i16` unit-tested against a real `SharedVm` heap and a
+comment arguing the zero-copy reinterpret is sound for them. The
+marshal loop's `match element_type` had four arms and a catch-all. Not
+one `short[]` or `byte[]` kernel ever reached a GPU, from the day that
+marshalling was written until 2026-09-02, and a test note in the tree
+asserted the opposite without ever exercising it.
+
+Two things close it:
+
+- `offload::is_marshallable_array_element` states the marshaller's set
+  as data, a `debug_assert!` in the catch-all ties it to the match it
+  describes, and `analyzer_and_marshaller_admit_the_same_arrays` pins it
+  equal to `ParamKind::from_field`. It needs no device and fails in
+  microseconds, naming the offending type.
+- `bench-gpu/marshal-stress.sh` counts H2D transfers **per kernel** and
+  fails when any of the six never dispatched.
+
+The general lesson, and the reason this sits in a document about
+lowering: **a correctness differential over a fallback path is vacuous
+by construction.** Wherever the system's response to "I cannot do this"
+is "do it correctly somewhere else", comparing outputs proves nothing
+and you must count engagement instead. One IR removes the
+analyzer/emitter half of this; it does not remove the marshaller half,
+because that lives in the VM and is about heap layout rather than about
+lowering. It needs its own guard either way.
+
 ### Symptom 2: pattern matching where analysis belongs
 
 `loop_recog` recognises exactly two shapes — a canonical counted loop
