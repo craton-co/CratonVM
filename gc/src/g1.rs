@@ -5922,7 +5922,7 @@ impl G1Collector {
         obj_ptr: *mut u8,
         header: &ObjectHeader,
         site: &'static str,
-    ) {
+    ) -> bool {
         // Two shapes, both of which `classify_candidate_header` accepts because
         // it only validates the TAG bytes and an upper bound on `shape`:
         //
@@ -5964,11 +5964,11 @@ impl G1Collector {
         let implausible = (cid >= MAX_LOADED_CLASS_ID && cid < LAMBDA_PROXY_CLASS_ID_BASE)
             || (cid == 0 && header.num_slots() >= IMPLAUSIBLE_CLASS0_SLOTS);
         if header.kind() != ObjectKind::Object || !implausible {
-            return;
+            return false;
         }
         let n = EVAC_IMPLAUSIBLE_CLASS0_COPY.fetch_add(1, Ordering::Relaxed) + 1;
         if n > 8 && !n.is_power_of_two() {
-            return;
+            return true;
         }
         let addr = obj_ptr as usize;
         let where_from = self
@@ -6006,6 +6006,7 @@ impl G1Collector {
             header.mark_word.load(Ordering::Relaxed),
             HEADER_SIZE + header.num_slots() as usize * SLOT_SIZE,
         );
+        true
     }
 
     /// Reject a candidate reference the evacuator is about to DEREFERENCE
@@ -6324,14 +6325,26 @@ impl G1Collector {
         }
     }
 
-    /// Count (and, for the first few, describe) a CSet-resident root that is not
-    /// the start of a live object. Returns whether it IS one, so the caller can
-    /// report what the evacuator then did with it.
+    /// Is this CSet-resident root the start of a live object? Counts and, for
+    /// the first few, describes the ones that are not.
     ///
-    /// Measurement only — the caller's behaviour is unchanged.
+    /// LOAD-BEARING since 2026-09-02; this doc said "measurement only — the
+    /// caller's behaviour is unchanged" for as long as the callers evacuated
+    /// the root either way. They now skip and pin on a `false`, so this
+    /// function decides whether a root is followed.
+    ///
+    /// TWO predicates, and only both together are the question. The tag screen
+    /// ([`Self::candidate_header_is_plausible`]) asks whether the two header
+    /// tag bytes decode and the address sits below its region's cursor — which
+    /// an INTERIOR address satisfies trivially, because the first eight bytes
+    /// of a reference slot are a heap pointer whose halves read as a class id
+    /// and a `num_slots`. The implausible-header screen is what rejects those.
+    /// Wiring the refusal to the tag screen alone measured `skipped=0` on a run
+    /// that was still fabricating objects out of array elements.
     fn note_root_object_plausibility(&self, regions: &[G1Region], addr: usize) -> bool {
         if self.candidate_header_is_plausible(regions, addr) {
-            // ACCEPTED -- and that is exactly what needs a second look. This
+            // ACCEPTED BY THE TAG SCREEN -- and that is exactly what needs a
+            // second look, and now a second VERDICT. This
             // screen answers "do the tag bytes decode and is the address below
             // its region's cursor", which an INTERIOR address satisfies
             // trivially: the first eight bytes of a reference slot are a heap
@@ -6346,8 +6359,15 @@ impl G1Collector {
             // SAFETY: `candidate_header_is_plausible` just validated the tag
             // bytes and placed the address inside a live region's span.
             let header = unsafe { &*(addr as *const ObjectHeader) };
-            self.note_implausible_legacy_header(regions, addr as *mut u8, header, "cset-root");
-            return true;
+            if !self.note_implausible_legacy_header(regions, addr as *mut u8, header, "cset-root") {
+                return true;
+            }
+            // Implausible: fall through to the refusal below, which is what
+            // the caller acts on. The FIRST version of this fix skipped only
+            // roots that failed the tag screen, and measured `skipped=0` while
+            // implausible headers kept appearing -- because the interior root
+            // that started this investigation PASSES the tag screen. Two
+            // predicates, and the guard was wired to the wrong one.
         }
         let n = NON_OBJECT_ROOT_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
         if n <= 8 || n.is_power_of_two() {
