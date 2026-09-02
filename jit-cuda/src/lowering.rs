@@ -170,21 +170,29 @@ fn lower_method_with_pool_impl(
             // `t + K`, so `bound` threads always cover the loop (`K` of
             // them redundantly, and `K` is 0 for every loop but the
             // constant-start form).
+            // What the bound IS decides both the guard's form and what
+            // it proves — see `Emitter::emit_loop_guard`. An array length
+            // and a non-negative literal are provably `>= 0`, so one
+            // unsigned compare retires an out-of-range thread AND
+            // establishes `tid >= 0` for the body. An `int` parameter is
+            // not: `for (i = 0; i < n; i++)` with a negative `n` runs
+            // zero times, and reading that bound as unsigned would run
+            // the body instead.
             match bound {
                 BoundSource::ParamLen(idx) => {
                     work_bound = crate::emitter::WorkBound::ParamLen(idx as u32);
                     let bound_reg = emitter.materialise_param_len(idx);
-                    emitter.emit_loop_guard(&bound_reg, &li);
+                    emitter.emit_loop_guard(&bound_reg, &li, Some(idx), true);
                 }
                 BoundSource::Literal(v) => {
                     work_bound = crate::emitter::WorkBound::Literal(v);
                     let bound_reg = emitter.materialise_literal_s32(v);
-                    emitter.emit_loop_guard(&bound_reg, &li);
+                    emitter.emit_loop_guard(&bound_reg, &li, None, v >= 0);
                 }
                 BoundSource::ParamScalar(idx) => {
                     work_bound = crate::emitter::WorkBound::ParamScalar(idx);
                     let bound_reg = emitter.materialise_param_scalar(idx as usize);
-                    emitter.emit_loop_guard(&bound_reg, &li);
+                    emitter.emit_loop_guard(&bound_reg, &li, None, false);
                 }
             }
             // Body — lower its forward CFG once.  The canonical back-edge
@@ -460,11 +468,25 @@ impl<'a> Emitter<'a> {
         self.hit_back_branch = false;
     }
 
-    /// Materialise `pN_len` into a fresh s32 register.
+    /// The register holding `pN_len`.
+    ///
+    /// AUDIT 2026-09-02: this used to issue its own `ld.param.s32`,
+    /// which was the second load of the same kernel parameter —
+    /// `bind_param_locals` already hoisted one for the bounds checks.
+    /// Reusing it also makes the loop bound and the bounds-check length
+    /// literally the same register, which is what lets
+    /// `Emitter::prove_index_within_param` recognise
+    /// `for (i = 0; i < a.length; i++) a[i]` as needing no check at all.
     pub(crate) fn materialise_param_len(&mut self, idx: usize) -> emit::Reg {
+        if let Some(r) = self.param_len_reg.get(idx).and_then(|r| r.clone()) {
+            return r;
+        }
         let r = self.regs.fresh_reg(RegKind::S32);
         use std::fmt::Write;
         writeln!(self.body, "    ld.param.s32 {}, [p{idx}_len];", r.name).unwrap();
+        if let Some(slot) = self.param_len_reg.get_mut(idx) {
+            *slot = Some(r.clone());
+        }
         r
     }
 
@@ -488,7 +510,29 @@ impl<'a> Emitter<'a> {
         r
     }
 
-    pub(crate) fn into_body(self) -> String {
+    /// The finished kernel body, with any per-array bounds precondition
+    /// moved back to a dominating position.
+    ///
+    /// The preconditions [`Emitter::prove_index_within_param`] emits are
+    /// discovered while walking the body — that is when it becomes known
+    /// which arrays are indexed by the induction variable — but they have
+    /// to EXECUTE before it. `prologue_splice_at` is the byte offset the
+    /// dispatch guard recorded, so they land immediately after it and
+    /// immediately before the first thing that depends on them.
+    ///
+    /// Splicing text rather than building an instruction list is what
+    /// this emitter does everywhere (see `try_emit_if_converted`, which
+    /// speculates by swapping the body `String` out and back). It is the
+    /// same trade, and the same reason: there is no IR to insert into.
+    pub(crate) fn into_body(mut self) -> String {
+        if self.bounds_prologue.is_empty() {
+            return self.body;
+        }
+        let at = self.prologue_splice_at.expect(
+            "a bounds precondition was emitted without a dispatch guard to \n             splice it after; only a guarded shape can prove an index, so \n             this is unreachable unless `prove_index_within_param` grew a \n             new caller",
+        );
+        let prologue = std::mem::take(&mut self.bounds_prologue);
+        self.body.insert_str(at, &prologue);
         self.body
     }
 
@@ -1125,6 +1169,216 @@ mod tests {
         }
     }
 
+    /// The element-wise loop body must contain no bounds check and no
+    /// multi-instruction address arithmetic.
+    ///
+    /// AUDIT 2026-09-02. `out[i] = a[i] + b[i]` used to lower to 31
+    /// instructions between the dispatch guard and the back edge, of
+    /// which 27 were overhead: six per access for a bounds check the
+    /// guard had already decided, and three per access to widen, scale
+    /// and offset an index. It is 7 now, plus four one-time
+    /// preconditions before the body starts.
+    ///
+    /// Asserted as an exact count rather than a bound, because both
+    /// directions are regressions worth catching: more means an
+    /// optimisation came undone, and fewer means something the kernel
+    /// needs went missing.
+    #[test]
+    fn elementwise_body_has_no_per_access_bounds_check_or_address_chain() {
+        let m = lower_fixture("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
+        let text = m.render();
+
+        // ── the address chain is one instruction ───────────────────────
+        assert_eq!(
+            text.matches("mad.wide.s32").count(),
+            3,
+            "one folded address per array access, three accesses\n{text}"
+        );
+        for gone in ["cvt.s64.s32", "mul.lo.s64", "add.u64"] {
+            assert!(
+                !text.contains(gone),
+                "`{gone}` is the old three-instruction address chain; \
+                 `mad.wide.s32` replaced it\n{text}"
+            );
+        }
+
+        // ── the length is loaded once per array, in the prologue ───────
+        for i in 0..3 {
+            assert_eq!(
+                text.matches(&format!("ld.param.s32 %r{i}, [p{i}_len]")).count(),
+                1,
+                "p{i}_len must be loaded exactly once, in the prologue\n{text}"
+            );
+        }
+        assert_eq!(
+            text.matches("_len]").count(),
+            3,
+            "three arrays, three length loads, no per-access reloads\n{text}"
+        );
+
+        // ── no per-access check survives ───────────────────────────────
+        assert!(
+            !text.contains("mov.s32 %r6, 0;") || !text.contains("setp.lt.s32 %r6"),
+            "the per-access zero constant should be gone\n{text}"
+        );
+        assert_eq!(
+            text.matches("setp.ge.u32").count(),
+            1,
+            "exactly one unsigned compare — the dispatch guard. A second \
+             would mean an access re-checked what the guard proved\n{text}"
+        );
+
+        // ── the guard's bound IS p0_len, so p0 needs no precondition ───
+        // and p1/p2 get exactly one apiece.
+        assert_eq!(
+            text.matches("bra L_bounds_fail").count(),
+            2,
+            "one precondition per array the guard says nothing about \
+             (p1, p2); p0 IS the bound and needs none\n{text}"
+        );
+        assert_eq!(
+            text.matches("setp.lt.s32").count(),
+            2,
+            "the preconditions are `pN_len < bound`, one per array\n{text}"
+        );
+
+        // ── and the whole body is 7 instructions ───────────────────────
+        let body: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .skip_while(|l| !l.starts_with("@%p0 bra L_done"))
+            .skip(1)
+            .take_while(|l| !l.starts_with("bra L_done"))
+            .filter(|l| !l.is_empty())
+            .collect();
+        // The four leading lines are the one-time preconditions.
+        let per_element: Vec<&&str> = body
+            .iter()
+            .filter(|l| !l.contains("L_bounds_fail") && !l.starts_with("setp.lt.s32"))
+            .collect();
+        assert_eq!(
+            per_element.len(),
+            7,
+            "expected 7 per-element instructions (3 addresses, 2 loads, \
+             1 add, 1 store), got {}:\n{:#?}\nfull kernel:\n{text}",
+            per_element.len(),
+            per_element
+        );
+    }
+
+    /// The bounds check is retired, not deleted: an array the guard says
+    /// nothing about still gets checked, once, before the body runs.
+    ///
+    /// This is the safety half of the optimisation above. Removing a
+    /// per-access check is only sound because something else proves the
+    /// same thing, and if that precondition ever stopped being emitted
+    /// the kernel would write past the end of a short array instead of
+    /// raising the failure flag. The test that counts instructions would
+    /// still pass — it would simply count fewer.
+    #[test]
+    fn a_shorter_secondary_array_still_reaches_the_failure_flag() {
+        let m = lower_fixture("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
+        let text = m.render();
+        let bound_reg = text
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("setp.ge.u32"))
+            .and_then(|l| l.split(',').nth(2))
+            .map(|r| r.trim().trim_end_matches(';').to_string())
+            .unwrap_or_else(|| panic!("no dispatch guard to read the bound from:\n{text}"));
+        // Both non-bound arrays are compared against that same register,
+        // and both jump to the deopt block.
+        let preconditions: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("setp.lt.s32") && l.ends_with(&format!("{bound_reg};")))
+            .collect();
+        assert_eq!(
+            preconditions.len(),
+            2,
+            "each array whose length the guard does not name must be \
+             proved at least as long as the bound:\n{text}"
+        );
+        assert!(
+            text.contains("L_bounds_fail:"),
+            "the failure block must still exist — the preconditions branch \
+             to it\n{text}"
+        );
+        assert!(
+            text.contains("st.global.u32 [") && text.contains("failure_flag"),
+            "the failure block must still raise the flag the host deopts \
+             on\n{text}"
+        );
+    }
+
+    /// An access behind a branch keeps its own check; one in front of
+    /// every branch does not.
+    ///
+    /// `onlyNegatives` is `for (i < in.length) if (in[i] < 0) out[i] =
+    /// -in[i];`, which has one of each:
+    ///
+    /// * `in[i]` is reached by every thread that passed the dispatch
+    ///   guard, and `in.length` IS the guard's bound — so there is
+    ///   nothing to check and nothing to hoist. Both reads of it lower
+    ///   to a bare address-and-load.
+    /// * `out[i]` sits inside the `if`. Its length is unrelated to the
+    ///   bound, so it needs a check — and that check must stay WHERE THE
+    ///   ACCESS IS. Hoisting `out.length >= bound` into the prologue
+    ///   would be sound in the "no wrong answers" sense and wrong in
+    ///   every other: a launch where `out` is short but no element is
+    ///   negative would deopt to the CPU on every call, having thrown
+    ///   nothing in Java. That is a silent performance cliff, and
+    ///   `Emitter::unconditional_since_guard` exists to prevent it.
+    ///
+    /// The conditional access is still cheaper than it was — one
+    /// unsigned compare rather than a materialised zero and two signed
+    /// ones — so the gate costs coverage, not the whole optimisation.
+    #[test]
+    fn a_conditional_access_keeps_its_check_instead_of_hoisting_a_precondition() {
+        let text = lower_fixture("EligibleBranchingLoop", "onlyNegatives", "([I[I)V").render();
+
+        // The guard, and exactly one more compare: `out[i]`'s own.
+        assert_eq!(
+            text.matches("setp.ge.u32").count(),
+            2,
+            "expected the dispatch guard plus one per-access check for the \
+             conditional store, and nothing else\n{text}"
+        );
+
+        // Nothing was hoisted: the prologue holds no `pN_len < bound`.
+        assert!(
+            !text.contains("setp.lt.s32"),
+            "a precondition was hoisted out of a conditional access — a \
+             launch that never takes the branch would now deopt\n{text}"
+        );
+
+        // The check that remains is in the branch's block, not before it.
+        let guard_line = text
+            .lines()
+            .position(|l| l.trim().starts_with("@%p0 bra L_done"))
+            .expect("no dispatch guard");
+        let branch_line = text
+            .lines()
+            .position(|l| l.trim().starts_with("@%p1 bra L_body_"))
+            .expect("no conditional branch");
+        let check_line = text
+            .lines()
+            .position(|l| l.trim().starts_with("@%p2 bra L_bounds_fail"))
+            .expect("the conditional store lost its bounds check");
+        assert!(
+            guard_line < branch_line && branch_line < check_line,
+            "the surviving check must sit after the branch that guards it, \
+             not between the dispatch guard and the branch\n{text}"
+        );
+
+        // The unconditional reads of the bound array kept nothing at all.
+        assert_eq!(
+            text.matches("mad.wide.s32").count(),
+            3,
+            "two reads of `in` and one write to `out`\n{text}"
+        );
+    }
+
     #[test]
     fn vector_add_lowers_to_real_ptx() {
         let m = lower_fixture("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
@@ -1138,8 +1392,11 @@ mod tests {
         assert!(text.contains("%ntid.x"));
         assert!(text.contains("%tid.x"));
         assert!(text.contains("mad.lo.u32"));
-        // Loop guard
-        assert!(text.contains("setp.ge.s32"));
+        // Loop guard. Unsigned since the bound is an array length: one
+        // compare retires an over-large index AND a negative one, which
+        // is what lets the per-access checks go. See
+        // `Emitter::emit_loop_guard`.
+        assert!(text.contains("setp.ge.u32"), "missing dispatch guard\n{text}");
         assert!(text.contains("L_done"));
         // Two int loads, one int store, one int add, all in global mem.
         let n_int_loads = text.matches("ld.global.s32").count();
@@ -1837,7 +2094,8 @@ mod tests {
         assert!(
             text.lines().any(|l| {
                 let l = l.trim_start();
-                l.starts_with("setp.ge.s32") && l.contains(&format!("{folded},"))
+                (l.starts_with("setp.ge.u32") || l.starts_with("setp.ge.s32"))
+                    && l.contains(&format!("{folded},"))
             }),
             "expected the loop guard to compare the folded tid+K register:\n{text}"
         );
@@ -1850,8 +2108,9 @@ mod tests {
         let m = lower_fixture("NonCanonicalLoops", "canonical", "([I[I[I)V");
         let text = m.render();
         assert!(text.contains(".visible .entry NonCanonicalLoops__canonical_"));
-        // Canonical guard: `tid >= bound` early-out.
-        assert!(text.contains("setp.ge.s32"));
+        // Canonical guard: `tid >= bound` early-out, unsigned so it
+        // also rejects a negative index (see `Emitter::emit_loop_guard`).
+        assert!(text.contains("setp.ge.u32"));
         // Two int loads + one int store + one add — the body lowered.
         assert!(text.matches("ld.global.s32").count() >= 2);
         assert!(text.contains("st.global.s32"));
@@ -2609,7 +2868,8 @@ mod tests {
         assert!(
             text.lines().any(|l| {
                 let l = l.trim_start();
-                l.starts_with("setp.ge.s32") && l.contains(&format!("{folded},"))
+                (l.starts_with("setp.ge.u32") || l.starts_with("setp.ge.s32"))
+                    && l.contains(&format!("{folded},"))
             }),
             "expected the loop guard to compare the folded tid+K register:\n{text}"
         );
