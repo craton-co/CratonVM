@@ -1036,6 +1036,7 @@ mod tests {
                 method: "bar".into(),
                 descriptor: "()V".into(),
                 registered_by: Some("native-builtins/src/lib.rs:1234".into()),
+                survivor: None,
             },
             JdkOnlyViolation::SyntheticNativeInvocation {
                 class: "java/lang/Foo".into(),
@@ -1376,6 +1377,7 @@ mod tests {
             method: "m".into(),
             descriptor: "()V".into(),
             registered_by: Some(secrets[2].into()),
+            survivor: None,
         });
         t.add_violation(&JdkOnlyViolation::MissingNative {
             class: secrets[4].into(),

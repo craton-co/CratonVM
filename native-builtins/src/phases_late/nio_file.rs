@@ -9751,12 +9751,27 @@ pub(crate) fn p57_alloc_path(
     // filesystem where a `byte[]` belongs -- two type-confused slots, invisible
     // for as long as our own natives read them back by the same indices.
     //
-    // A `set_field_by_name(obj, "stringValue", ..)` was added here and MEASURED
-    // INERT: the object is allocated against `java/nio/file/Path` -- the
-    // INTERFACE -- with two slots, so a `UnixPath` field name does not resolve
-    // and the write silently does nothing. `stringValue` read back NULL and the
-    // armed `java/nio/file/Path` scope did not move. Reverted rather than kept:
-    // code that cannot fire is worse than the absence of it.
+    // TWO WAYS OF FILLING `stringValue` WERE TRIED AND BOTH MEASURED INERT.
+    // Recorded together because the reason is the same and it is not the one
+    // the first attempt assumed.
+    //
+    //   set_field_by_name(obj, "stringValue", ..)                    no-op
+    //   resolve_field_index_by_class_id(class_id_of_object(obj), ..) no-op
+    //
+    // NOT a width problem: `try_alloc_concurrent_synthetic` allocates at
+    // `max(requested, real)` slots, so all five of `UnixPath`'s are there. It
+    // is an IDENTITY problem -- that allocator deliberately "keeps the
+    // requested identity" so field writes use the requested layout, so this
+    // object's `ClassId` is `java/nio/file/Path`, the INTERFACE, while Java's
+    // `getClass()` reports `sun.nio.fs.UnixPath`. Every name-based route
+    // resolves against the interface and misses.
+    //
+    // Which also means the reflection read that showed `stringValue = NULL` is
+    // not evidence of an empty slot: reflection resolves through the real
+    // class, which this object is not filed under. Two different mechanisms,
+    // one wrong conclusion available from each.
+    //
+    // Both reverted: code that cannot fire is worse than the absence of it.
     //
     // The real repair is to allocate as `sun/nio/fs/UnixPath` at its true width
     // and store into the named slots -- `fs` for the owning filesystem (which is
