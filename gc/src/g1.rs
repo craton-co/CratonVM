@@ -2638,6 +2638,9 @@ pub struct G1Collector {
     /// "bytes that have now survived `n` collections". Atomic because the
     /// parallel evacuator's workers fill it concurrently.
     survivor_age_bytes: [AtomicUsize; G1_MAX_TENURING_AGE],
+    /// F-18 — the previous pause's `survivor_age_bytes`, kept for diagnostics
+    /// because the live array is cleared at the end of every pause.
+    last_survivor_age_bytes: [AtomicUsize; G1_MAX_TENURING_AGE],
     /// F-18 — the age at which an object is promoted rather than copied to
     /// survivor space, re-derived after every evacuation pause.
     ///
@@ -3199,6 +3202,7 @@ impl G1Collector {
             ihop_headroom_percent: AtomicU64::new(100),
             ihop_late_events: AtomicU64::new(0),
             survivor_age_bytes: std::array::from_fn(|_| AtomicUsize::new(0)),
+            last_survivor_age_bytes: std::array::from_fn(|_| AtomicUsize::new(0)),
             tenuring_threshold: AtomicU64::new(config.promotion_age as u64),
             string_dedup_table: Mutex::new(FxHashMap::default()),
             gc_log_enabled: AtomicBool::new(false),
@@ -10785,16 +10789,27 @@ impl G1Collector {
         }
         self.tenuring_threshold
             .store(chosen as u64, Ordering::Relaxed);
-        for bucket in self.survivor_age_bytes.iter() {
+        for (age, bucket) in self.survivor_age_bytes.iter().enumerate() {
+            // Snapshot before clearing: this is the only moment the histogram
+            // exists, and a summary line read between pauses would otherwise
+            // always report zeros.
+            self.last_survivor_age_bytes[age].store(bucket.load(Ordering::Relaxed), Ordering::Relaxed);
             bucket.store(0, Ordering::Relaxed);
         }
     }
 
-    /// F-18 diagnostics: the current threshold and the age histogram.
+    /// F-18 diagnostics: the current threshold and the age histogram of the
+    /// most recent pause that had one.
+    ///
+    /// The LAST pause's, not the live counters: `update_tenuring_threshold`
+    /// consumes and clears the histogram at the end of every pause, so a read
+    /// taken between pauses — which is every read an operator or a summary line
+    /// can make — always finds it empty. A diagnostic that is structurally
+    /// always zero is worse than none, because a zero reads as an answer.
     pub fn tenuring_state(&self) -> (u8, [usize; G1_MAX_TENURING_AGE]) {
         (
             self.tenuring_threshold.load(Ordering::Relaxed) as u8,
-            std::array::from_fn(|i| self.survivor_age_bytes[i].load(Ordering::Relaxed)),
+            std::array::from_fn(|i| self.last_survivor_age_bytes[i].load(Ordering::Relaxed)),
         )
     }
 
@@ -11406,6 +11421,35 @@ impl G1Collector {
             flat_walks_refused_for_array(),
             kept_seeds_rejected(),
         );
+        // F-15 / F-16 / F-18 — the state the three adaptive policies ended the
+        // run in. Unconditional and before the early return, for the reason
+        // stated above: a policy whose state nothing prints cannot be cited,
+        // and each of these is a decision the collector made on its own that an
+        // operator would otherwise have to infer from the outcome.
+        eprintln!(
+            "[GC] g1 heap: reserved={} committed={} backing={}",
+            self.reserved_bytes(),
+            self.committed_bytes(),
+            if self.heap_is_reserved() {
+                "reserved-on-demand"
+            } else {
+                "fully-committed"
+            },
+        );
+        let (mark_ms, alloc_kib_per_ms, headroom_pct, late) = self.ihop_model_state();
+        eprintln!(
+            "[GC] g1 ihop: threshold={} ceiling={} mark_ms={mark_ms} old_growth_kib_per_ms={alloc_kib_per_ms} headroom_pct={headroom_pct} to_space_exhausted={late}",
+            self.marking_threshold_bytes(),
+            self.ihop_static_ceiling(),
+        );
+        let (tenuring, hist) = self.tenuring_state();
+        eprintln!(
+            "[GC] g1 tenuring: threshold={tenuring} configured={} survivor_target={} ages={:?}",
+            self.config.promotion_age,
+            self.survivor_target_bytes(),
+            hist,
+        );
+
         let Some(s) = self.pause_summary() else {
             return;
         };
@@ -17622,11 +17666,23 @@ mod tests {
         gc.update_tenuring_threshold();
         assert_eq!(gc.tenuring_threshold(), 1);
 
-        let (_, hist) = gc.tenuring_state();
+        // The LIVE array, not `tenuring_state()` — that returns the retained
+        // snapshot of the last pause, which is a different question.
         assert!(
-            hist.iter().all(|&b| b == 0),
+            gc.survivor_age_bytes
+                .iter()
+                .all(|b| b.load(Ordering::Relaxed) == 0),
             "a histogram that is filled but never cleared grows across pauses \
              and makes every later threshold wrong"
+        );
+        // ...and the snapshot kept for diagnostics must hold what was cleared.
+        // A diagnostic that is structurally always zero is worse than none,
+        // because a zero reads as an answer.
+        let (_, snapshot) = gc.tenuring_state();
+        assert_eq!(
+            snapshot[1],
+            target * 2,
+            "the retained snapshot is the histogram the pause actually had"
         );
 
         // A quiet pause therefore recovers the configured threshold rather than
