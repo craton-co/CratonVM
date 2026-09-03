@@ -8435,6 +8435,12 @@ impl Compiler {
                             // may allocate and trigger GC transitively.
                             self.emit_oop_map_for_safepoint();
                             self.emit_stack_arg_cleanup(total_sub);
+                            // 2026-09-02: one sentinel compare on the hot
+                            // path; the callee-deopt check and the exception
+                            // check below keep their own compares on the cold
+                            // side (`merged_call_sentinel_enabled`).
+                            let merged_keep = merged_call_sentinel_enabled()
+                                .then(|| self.emit_call_sentinel_fast_skip());
                             if let (Some(info), Some(args_base)) = (info_ptr, service_args_base) {
                                 self.emit_inline_callee_deopt_check(
                                     info as *const crate::JitInvokeInfo,
@@ -8462,6 +8468,9 @@ impl Compiler {
                             // the stashed exception through the exception
                             // table instead.
                             self.emit_post_invoke_exception_check(ret_type);
+                            if let Some(keep) = merged_keep {
+                                self.patch_rel32_to_here(keep);
+                            }
 
                             // Reclaim the spill cursor to the popped-args depth
                             // before the result is pushed, exactly as the
