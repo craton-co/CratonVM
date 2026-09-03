@@ -411,6 +411,21 @@ audit the shrink was planned from:
   the two shapes per OBJECT on `GC_FLAG_COMPACT`, exactly as the inline
   `getfield` read does, so a smaller header must move BOTH or the legacy shape
   writes the wrong cell.
+- `x64/objects.rs::emit_gated_compact_ref_putfield`, LEGACY shape (added
+  2026-09-02) — the single-pass twin of the entry above, added for the same
+  measured reason: a run-time path census found that arm taking its inline path
+  **0 times out of 16,380,000**, every execution bailing at the compactness
+  test. Same `HEADER_SIZE + field_index * SLOT_SIZE` plus the tag and
+  `FIELD_CELL_PAYLOAD64_OFFSET` biases, same disp32 encodings, same per-OBJECT
+  `GC_FLAG_COMPACT` branch — so a smaller header must move both shapes or the
+  legacy one writes the wrong cell.
+
+  **Neither automated tripwire sees this site.** `x64.rs`'s scans for the
+  `<CONST> as <ty>` cast form and this expression is not one; the
+  `layout_constant_inventory` in `jit/src/lib.rs` covers only `lib.rs` and
+  `ir_lower.rs`. It is listed here by hand, which is what this section is for,
+  and extending the inventory to `x64/objects.rs` is a worthwhile separate
+  change.
 - `ir_lower.rs::emit_inline_getstatic` (added 2026-08-03, cov-01) — the direct
   `getstatic` read: `field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD{32,64}_OFFSET`
   as a disp32, from the class's **statics block** base. It bakes the field-cell

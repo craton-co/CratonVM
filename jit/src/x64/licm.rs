@@ -1374,6 +1374,199 @@ pub fn inline_rbp_tls_disp() -> usize {
 /// This is shared with the OSR trampoline emitter in `lib.rs`; keeping the
 /// platform byte in one place prevents that independently emitted prologue
 /// from silently retaining the Windows `gs:` prefix on Linux.
+// ── JIT thread-pointer mirror ────────────────────────────────────────
+//
+// `jit_get_current_thread` is a helper CALL: `mov rax, imm64; call rax`, a
+// `note_jit_boundary` bump, a `thread_local!` access, `ret`. Both prologues
+// paid it -- the single-pass tier once per invocation for the shadow-stack
+// thread slot (plus a ten-instruction "inherit from the caller frame"
+// sequence for the TLAB thread cache), the optimizing tier once per
+// invocation unconditionally -- and `fib` paid it 1.4 billion times.
+//
+// The RBP mirror above already shows the cheaper shape: the VM keeps a raw
+// TLS word in lockstep with a Rust `thread_local!`, and compiled code reads
+// it with one segment-prefixed `mov`. This is the same shape for the thread
+// pointer. The VM publishes through `publish_jit_thread_mirror` at exactly
+// the sites that set `JIT_THREAD` (`set_jit_thread`, `restore_jit_thread`,
+// `clear_jit_thread`), so the mirror equals `JIT_THREAD` whenever compiled
+// code can run. Off (`CRATONVM_JIT_TLS_THREAD_FETCH=0`, or a failed probe)
+// every site falls back to the helper call byte for byte.
+
+/// Kill switch for the thread-pointer mirror: `CRATONVM_JIT_TLS_THREAD_FETCH=0`.
+fn tls_thread_fetch_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_TLS_THREAD_FETCH").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// TLS displacement of the `JIT_THREAD` mirror (`gs:` on Windows, `fs:` on
+/// Linux), or 0 when unavailable. Process-cached, thread-invariant.
+#[cfg(windows)]
+pub fn jit_thread_tls_disp() -> usize {
+    use std::sync::OnceLock;
+    static DISP: OnceLock<usize> = OnceLock::new();
+    *DISP.get_or_init(|| {
+        if !tls_thread_fetch_enabled() {
+            return 0;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn TlsAlloc() -> u32;
+            fn TlsSetValue(idx: u32, val: *mut core::ffi::c_void) -> i32;
+        }
+        const TLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
+        const TEB_TLS_SLOTS_OFF: usize = 0x1480;
+        unsafe {
+            let slot = TlsAlloc();
+            if slot == TLS_OUT_OF_INDEXES {
+                return 0;
+            }
+            let sentinel: usize = 0x4A54_5448_5244_0000 | (slot as usize & 0xFFFF);
+            if TlsSetValue(slot, sentinel as *mut core::ffi::c_void) == 0 {
+                return 0;
+            }
+            let candidate = TEB_TLS_SLOTS_OFF + (slot as usize) * 8;
+            let found = if read_gs_qword(candidate) == sentinel {
+                candidate
+            } else {
+                let mut d = TEB_TLS_SLOTS_OFF;
+                let end = TEB_TLS_SLOTS_OFF + 64 * 8;
+                let mut hit = 0;
+                while d < end {
+                    if read_gs_qword(d) == sentinel {
+                        hit = d;
+                        break;
+                    }
+                    d += 8;
+                }
+                hit
+            };
+            TlsSetValue(slot, core::ptr::null_mut());
+            found
+        }
+    })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+thread_local! {
+    pub(super) static LINUX_JIT_THREAD_MIRROR: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn jit_thread_tls_disp() -> usize {
+    use std::sync::OnceLock;
+    static DISP: OnceLock<usize> = OnceLock::new();
+    *DISP.get_or_init(|| {
+        if !tls_thread_fetch_enabled() {
+            return 0;
+        }
+        LINUX_JIT_THREAD_MIRROR.with(|cell| {
+            let fs_base = unsafe { read_fs_qword(0) };
+            let cell_addr = cell as *const std::cell::Cell<usize> as usize;
+            let delta = (cell_addr as i128) - (fs_base as i128);
+            let Ok(delta32) = i32::try_from(delta) else {
+                return 0;
+            };
+            if delta32 == 0 {
+                return 0;
+            }
+            let old = cell.replace(0x4A54_5448_5244_4C58);
+            let probed = unsafe { read_fs_qword(delta32 as isize) };
+            cell.set(old);
+            if probed == 0x4A54_5448_5244_4C58 {
+                (delta32 as u32) as usize
+            } else {
+                0
+            }
+        })
+    })
+}
+
+#[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
+pub fn jit_thread_tls_disp() -> usize {
+    0
+}
+
+/// VM side: keep the mirror equal to `JIT_THREAD`. A no-op when the mirror is
+/// unavailable, so the three callers need no gate of their own.
+pub fn publish_jit_thread_mirror(ptr: usize) {
+    #[cfg(windows)]
+    {
+        let disp = jit_thread_tls_disp();
+        if disp != 0 {
+            unsafe { write_gs_qword(disp, ptr) };
+        }
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        if jit_thread_tls_disp() != 0 {
+            LINUX_JIT_THREAD_MIRROR.with(|c| c.set(ptr));
+        }
+    }
+    #[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
+    {
+        let _ = ptr;
+    }
+}
+
+/// What compiled code would read right now; `None` when the mirror is off.
+pub fn jit_thread_mirror_read() -> Option<usize> {
+    let disp = jit_thread_tls_disp();
+    if disp == 0 {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        Some(unsafe { read_gs_qword(disp) })
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        Some(unsafe { read_fs_qword(disp as u32 as i32 as isize) })
+    }
+    #[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
+    {
+        None
+    }
+}
+
+#[cfg(windows)]
+#[inline]
+pub(super) unsafe fn write_gs_qword(disp: usize, val: usize) {
+    core::arch::asm!(
+        "mov qword ptr gs:[{addr}], {val}",
+        addr = in(reg) disp,
+        val = in(reg) val,
+        options(nostack, preserves_flags),
+    );
+}
+
+/// One post-call sentinel compare instead of two -- **default ON**, opt out
+/// with `CRATONVM_JIT_MERGED_CALL_SENTINEL=0`.
+///
+/// Every compiled call used to be followed by the callee-deopt check and the
+/// exception check, each materialising `i64::MIN` (a 10-byte `mov r, imm64`)
+/// and comparing RAX against it. Both ask the same question of the same
+/// register; the merged shape asks it once on the hot path and leaves the two
+/// original checks on the cold side, where they run only when the callee
+/// actually returned the sentinel. Off restores the previous two-check
+/// emission byte for byte, so the arms are A/B-able in one binary.
+pub fn merged_call_sentinel_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_MERGED_CALL_SENTINEL").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
 pub(crate) const fn inline_rbp_tls_segment_prefix() -> u8 {
     #[cfg(windows)]
     {
@@ -7879,6 +8072,17 @@ pub fn gated_ref_store_enabled() -> bool {
 /// matters: a sequence emitted at two sites whose compactness gate never passes
 /// is five extra instructions in front of the same helper call it always made.
 /// Costs a `LOCK INC` per store, so it is a diagnostic arm, never a timed one.
+/// `CRATONVM_DBG_SP_REF_STORE_TRACE=1` — the SINGLE-PASS twin of
+/// [`ir_ref_store_trace_enabled`]. Default off; costs a `LOCK INC` per store,
+/// so it is a diagnostic arm and never a timed one.
+pub fn sp_ref_store_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SP_REF_STORE_TRACE").is_some()
+    })
+}
+
 pub fn ir_ref_store_trace_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();

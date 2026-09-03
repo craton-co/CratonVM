@@ -8387,12 +8387,13 @@ pub const IR_MAX_FIELD_OPS: usize = 64;
 /// Maximum `getstatic`/`putstatic` sites. Was 5.
 pub const IR_MAX_STATIC_FIELD_OPS: usize = 64;
 
-/// Maximum `new` sites. Was 3. See the warning at the allocation check in
-/// [`ir_compatible`] — this one bounds both what escape analysis may attempt to
-/// eliminate AND how many surviving allocations may be lowered through the
-/// shared `emit_new_object_stub` (which costs the baseline tier's inline TLAB
-/// bump). It never applied to arrays, which are refused outright.
-pub const IR_MAX_ALLOCATIONS: usize = 16;
+/// Maximum `new` sites. Was 3, then 16 while a surviving allocation lowered
+/// through the shared `emit_new_object_stub` (a CALL where the single-pass
+/// backend bumps a TLAB inline). Since 2026-09-02 the optimizing tier has its
+/// own inline bump (`emit_inline_tlab_new_ir`) and the cap sits with every
+/// neighbouring cap at 64. It never applied to arrays, which are refused
+/// outright.
+pub const IR_MAX_ALLOCATIONS: usize = 64;
 
 /// cov-06: maximum `anewarray` sites. Same budget posture as
 /// [`IR_MAX_ALLOCATIONS`] — every admitted REFERENCE-array site is always
