@@ -1206,7 +1206,10 @@ struct Args {
     )]
     g1_region_size: Option<String>,
 
-    /// `-XX:MaxGCPauseMillis=<n>` → G1 pause target (honoured under G1).
+    /// `-XX:MaxGCPauseMillis=<n>` → pause target. G1 sizes its mixed
+    /// collection set from it; ZGC (the default collector) sizes its
+    /// allocation budget from it, since 2026-09-03. The generational
+    /// backend ignores it.
     #[arg(
         long = "XX:MaxGCPause",
         value_name = "MS",

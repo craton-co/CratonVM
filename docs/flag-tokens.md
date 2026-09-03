@@ -581,7 +581,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-328 tokens.
+329 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -917,7 +917,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-130 tokens.
+131 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1041,6 +1041,7 @@ export inherited from a parent shell.
 | `zgc-gen-minors-per-major` | `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` |
 | `zgc-gen-nursery-percent` | `CRATONVM_ZGC_GEN_NURSERY_PERCENT` |
 | `zgc-alloc-trigger` | `CRATONVM_ZGC_ALLOC_TRIGGER` |
+| `zgc-pause-target-ms` | `CRATONVM_ZGC_PAUSE_TARGET_MS` |
 | `zgc-sweep-header-zero` | `CRATONVM_ZGC_SWEEP_HEADER_ZERO` |
 | `zgc-sweep-dead-runs` | `CRATONVM_ZGC_SWEEP_DEAD_RUNS` |
 | `zgc-mark-ctx-direct` | `CRATONVM_ZGC_MARK_CTX_DIRECT` |
