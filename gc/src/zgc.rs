@@ -13314,12 +13314,23 @@ impl GarbageCollector for ZgcRealHeap {
         // RE-DERIVE THE ALLOCATION BUDGET from what this pause actually cost.
         // Before the logging block, and outside it, so the loop runs on a
         // quiet run too -- see `gc_started` above.
+        //
+        // FULL CYCLES ONLY. A young cycle's sweep skips everything below
+        // `sweep_floor`, so its `bytes_freed` describes the nursery while its
+        // `live_bytes` includes the old generation it never walked: the span
+        // reconstructed from the pair is far larger than the span the pause
+        // actually covered, and folding that in would teach the loop that a
+        // pause is cheaper per byte than it is. A young pause and a full pause
+        // are different cost functions; this models the one whose length is
+        // the problem.
         if let Some(started) = gc_started {
-            self.refresh_pause_target_budget(
-                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                live_bytes,
-                bytes_freed,
-            );
+            if !young_cycle {
+                self.refresh_pause_target_budget(
+                    started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    live_bytes,
+                    bytes_freed,
+                );
+            }
         }
         if let Some(started) = gc_started {
             let pause_us = started.elapsed().as_micros();
