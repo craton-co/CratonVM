@@ -100,9 +100,10 @@ pub use subsystem_config::{
 // `every_public_heap_constant_is_reachable` test below.
 pub use heap_types::{
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
-    element_type_tag_at, kind_tag_at, object_kind_from_tag, primitive_array_kind_tags_byte,
-    ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, ARRAY_LENGTH_OFFSET,
-    AUTOBOX_CLASS_ID, FIELD_CELL_PAYLOAD32_OFFSET, FIELD_CELL_PAYLOAD64_OFFSET,
+    element_type_tag_at, kind_tag_at, object_kind_from_tag, oob_index_code,
+    primitive_array_kind_tags_byte, ArrayElementType, ObjectHeader, ObjectKind,
+    ARRAY_DATA_OFFSET, ARRAY_LENGTH_OFFSET, ARRAY_STORE_OUT_OF_MEMORY, AUTOBOX_CLASS_ID,
+    FIELD_CELL_PAYLOAD32_OFFSET, FIELD_CELL_PAYLOAD64_OFFSET,
     FIELD_CELL_TAG_OBJECT, FIELD_CELL_TAG_OFFSET, FORWARDING_PTR_MASK, GC_FLAGS_BYTE_OFFSET,
     GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE, INFLATED_PTR_MASK,
     KIND_TAGS_BYTE_OFFSET, KIND_TAG_BYTE_MASK, MARK_FORWARDED, MARK_HASH_MASK, MARK_HASH_SHIFT,

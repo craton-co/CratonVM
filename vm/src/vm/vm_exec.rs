@@ -12960,7 +12960,29 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // and its contract is "no-op or VM error, never an out-of-bounds heap
         // write". The caller range-checks; `native-builtins`'s
         // `vh_array_index` is the worked example.
-        let _out_of_range = self.shared.mem.heap.set_array_element(obj, index, value);
+        //
+        // The ONE code that is not an index gets a report. Since 2026-09-03 a
+        // store that needs an auto-box wrapper on a full heap returns
+        // `ARRAY_STORE_OUT_OF_MEMORY` instead of `std::process::abort()`-ing
+        // (see that constant); the interpreter's `*astore` arms raise
+        // `OutOfMemoryError` from it, but this accessor has no error channel to
+        // raise through, so the store is dropped. Dropping it is still the
+        // right behaviour — the alternative was killing the VM — but it must
+        // not be SILENT, because a dropped element is exactly the shape of
+        // defect that takes a week to trace back to a heap that was full for
+        // one millisecond. Reported once per process: a full heap produces
+        // these in floods, and the first one is the one that matters.
+        if let Err(cratonvm_gc::heap::ARRAY_STORE_OUT_OF_MEMORY) =
+            self.shared.mem.heap.set_array_element(obj, index, value)
+        {
+            static REPORTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "OutOfMemoryError: Java heap space while auto-boxing a primitive into a                      reference array from native code (index {index}); the element was left                      unchanged. This accessor has no exception channel — see                      ARRAY_STORE_OUT_OF_MEMORY."
+                );
+            }
+        }
         // write_barrier fires automatically inside set_array_element for ref arrays
         //
         // Phase 10 #2: the host just wrote this array, so any device

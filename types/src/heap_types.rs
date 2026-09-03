@@ -266,6 +266,47 @@ pub const FIELD_CELL_PAYLOAD64_OFFSET: usize = 8;
 /// invariant for the upper bound of the dense id space.
 pub const AUTOBOX_CLASS_ID: ClassId = ClassId::new(u32::MAX);
 
+// ---------------------------------------------------------------------------
+// The `Result<(), i32>` array-store channel
+// ---------------------------------------------------------------------------
+
+/// The `Err` code every `set_array_element` / `get_array_element` returns when
+/// the index is out of range, or the receiver is not an array at all.
+///
+/// The channel is an `i32` while the index is a `usize`, and the four backends
+/// all wrote `Err(crate::heap::oob_index_code(index))`. That truncates: an index of `0x8000_0000`
+/// reports `i32::MIN`, and `RuntimeError::aioobe` then names a NEGATIVE index
+/// in the exception message for a store whose index was positive. Saturating
+/// instead is faithful for every index a real array can hold — `MAX_ARRAY_LENGTH`
+/// is `i32::MAX`, so `i32::MAX` is already out of range for every array this VM
+/// can build — and it is what keeps [`ARRAY_STORE_OUT_OF_MEMORY`] below
+/// unambiguous: no out-of-range index can ever produce that code.
+#[inline]
+pub const fn oob_index_code(index: usize) -> i32 {
+    if index >= i32::MAX as usize {
+        i32::MAX
+    } else {
+        index as i32
+    }
+}
+
+/// The `Err` code a `set_array_element` returns when the store needed an
+/// auto-box wrapper and the heap could not allocate one.
+///
+/// Storing a primitive `Value` into a reference array allocates a one-field
+/// `AUTOBOX_CLASS_ID` wrapper (see `cratonvm_gc::autobox`). All four backends did
+/// that through the INFALLIBLE `alloc_object`, which prints
+/// `FATAL: out of heap space` and calls `std::process::abort()` — so a Java
+/// program that filled the heap while a native was copying primitives into an
+/// `Object[]` died with no stack trace, no `OutOfMemoryError`, and no chance
+/// for a `catch (OutOfMemoryError)` to run. That is a *Java-level* condition
+/// with a *Java-level* answer, and this code carries it back out to the caller
+/// so the interpreter can raise `java.lang.OutOfMemoryError` instead.
+///
+/// [`oob_index_code`] guarantees this value cannot also mean "index
+/// `i32::MIN`": every out-of-range code is in `0..=i32::MAX`.
+pub const ARRAY_STORE_OUT_OF_MEMORY: i32 = i32::MIN;
+
 /// Exclusive upper bound on sequentially-assigned (dense, from-0) `ClassId`s.
 ///
 /// The class loader assigns ids `0, 1, 2, …`; this is the first value it must

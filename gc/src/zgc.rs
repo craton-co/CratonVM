@@ -11659,10 +11659,10 @@ impl GarbageCollector for ZgcRealHeap {
     fn get_array_element(&self, obj: ObjectRef, index: usize) -> Result<Value, i32> {
         let header = self.header(obj);
         if header.kind() != ObjectKind::Array {
-            return Err(index as i32);
+            return Err(crate::heap::oob_index_code(index));
         }
         if index >= header.array_length() as usize {
-            return Err(index as i32);
+            return Err(crate::heap::oob_index_code(index));
         }
         let element_type = header.element_type();
         // ---- THE LOAD BARRIER, on a real read path (Phase 4) -------------
@@ -11723,10 +11723,10 @@ impl GarbageCollector for ZgcRealHeap {
         self.audit_access_receiver(obj.as_ptr() as usize, index, "set_array_element");
         let header = self.header(obj);
         if header.kind() != ObjectKind::Array {
-            return Err(index as i32);
+            return Err(crate::heap::oob_index_code(index));
         }
         if index >= header.array_length() as usize {
-            return Err(index as i32);
+            return Err(crate::heap::oob_index_code(index));
         }
         let element_type = header.element_type();
         // ---- SATB, at the accessor rather than only at the call site ------
@@ -11765,7 +11765,22 @@ impl GarbageCollector for ZgcRealHeap {
                     other => {
                         // Auto-box non-Object values into a 1-field wrapper,
                         // matching `Heap::set_array_element`.
-                        let wrapper = self.alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1);
+                        //
+                        // FALLIBLE on purpose. `alloc_object` prints
+                        // `FATAL: ZGC(real): out of heap space` and calls
+                        // `std::process::abort()`, so a heap-full auto-box
+                        // killed the process where Java semantics call for an
+                        // `OutOfMemoryError` the program can catch — and the
+                        // store that triggers it is a native copying
+                        // primitives into an `Object[]`, which is the LAST
+                        // allocation before a heap fills, not the first. The
+                        // element keeps its old value on this arm; nothing is
+                        // half-written. See `ARRAY_STORE_OUT_OF_MEMORY`.
+                        let Some(wrapper) =
+                            self.try_alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1)
+                        else {
+                            return Err(crate::heap::ARRAY_STORE_OUT_OF_MEMORY);
+                        };
                         self.set_field(wrapper, 0, other);
                         // Arm the process-wide wrapper latch — see the matching
                         // note in `GenerationalHeap::set_array_element`.
