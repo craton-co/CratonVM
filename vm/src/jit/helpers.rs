@@ -5093,8 +5093,16 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     // over-sized object. In all cases the inline bump did not commit a
     // half-initialized object: the TLAB cursor in memory is the
     // last-allocated-object's end, so `retire()` here is safe.
-    let total_size = cratonvm_types::HEADER_SIZE
-        + (num_fields as usize).saturating_mul(cratonvm_types::SLOT_SIZE);
+    // The shape planner, not a bare legacy size. This site reserves the region
+    // that `tlab_alloc_object_guarded_refill` stamps a header onto, so a legacy
+    // reservation here with a compact header there is an object claiming a
+    // smaller size than it was given -- which every header-strided heap walk
+    // then misparses.
+    let (total_size, _, _) = crate::runtime::interpreter::plan_tlab_object_shape_at(
+        class_id,
+        num_fields as usize,
+        crate::runtime::interpreter::tlab_site::JIT_NEW,
+    );
     if heap.try_alloc_young_probe(total_size).is_none() {
         if let Some((thread, _guard)) = jit_thread_mut() {
             thread.tlab.retire();
@@ -17167,7 +17175,11 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
                 // site has to agree with the header its allocation will be
                 // stamped with. See `plan_tlab_object_shape`.
                 let (requested_size, _, _) =
-                    crate::runtime::interpreter::plan_tlab_object_shape(class_id, slots);
+                    crate::runtime::interpreter::plan_tlab_object_shape_at(
+                        class_id,
+                        slots,
+                        crate::runtime::interpreter::tlab_site::JIT_HELPER,
+                    );
                 let tlab_object = if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
                     crate::runtime::interpreter::tlab_alloc_object(
                         thread,
@@ -17187,14 +17199,35 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
                     // bytes `set_field_as(.., b'I')` would store, minus that
                     // path's per-call header read + layout dispatch. A
                     // primitive store takes no write barrier.
-                    // SAFETY: `object` is a live legacy-layout allocation
-                    // with >= 1 slot (`slots.max(1)` above); the cell is
-                    // exclusively ours until published below.
-                    unsafe {
-                        std::ptr::write(
-                            object.as_ptr().add(cratonvm_gc::heap::HEADER_SIZE) as *mut Value,
-                            Value::Int(value),
-                        );
+                    // ...but ONLY when it really is legacy. That premise was
+                    // an assumption about which allocator this site calls, not
+                    // a property of the object, and `CRATONVM_COMPACT_TLAB_ALLOC`
+                    // falsified it: with compact planning on, `java.lang.Integer`
+                    // gets a packed 4-byte `value` and this 16-byte `Value` cell
+                    // overwrote it and the bytes after it. `FjpProbe` summed
+                    // boxed integers and returned 215812748544 instead of
+                    // 499999500000 -- no collection involved, exactly as the
+                    // note on `tlab_alloc_object_inner` described. The cold arm
+                    // immediately below has always used the layout-aware store
+                    // and says why; this asks the object rather than assuming.
+                    // SAFETY: `object` was just allocated here, so its first
+                    // HEADER_SIZE bytes are a live, fully written `ObjectHeader`.
+                    let compact = cratonvm_types::is_compact_object(unsafe {
+                        &*(object.as_ptr() as *const cratonvm_types::ObjectHeader)
+                    });
+                    if compact {
+                        vm.mem.heap.set_field_as(object, 0, Value::Int(value), b'I');
+                    } else {
+                        // SAFETY: `object` is a live legacy-layout allocation
+                        // with >= 1 slot (`slots.max(1)` above) -- now CHECKED
+                        // immediately above, not assumed; the cell is
+                        // exclusively ours until published below.
+                        unsafe {
+                            std::ptr::write(
+                                object.as_ptr().add(cratonvm_gc::heap::HEADER_SIZE) as *mut Value,
+                                Value::Int(value),
+                            );
+                        }
                     }
                     // Object-return handoff root (see `call_integer_native_raw`).
                     thread.native_pending_return = Some(object);
@@ -17425,7 +17458,11 @@ pub unsafe extern "C" fn jit_long_value_of_direct(vm_ptr: i64, value: i64) -> i6
                 // site has to agree with the header its allocation will be
                 // stamped with. See `plan_tlab_object_shape`.
                 let (requested_size, _, _) =
-                    crate::runtime::interpreter::plan_tlab_object_shape(class_id, slots);
+                    crate::runtime::interpreter::plan_tlab_object_shape_at(
+                        class_id,
+                        slots,
+                        crate::runtime::interpreter::tlab_site::JIT_HELPER,
+                    );
                 let tlab_object = if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
                     crate::runtime::interpreter::tlab_alloc_object(
                         thread,
@@ -17444,14 +17481,26 @@ pub unsafe extern "C" fn jit_long_value_of_direct(vm_ptr: i64, value: i64) -> i6
                     // zeroed 16-byte `Value` cells), so field 0 is the `Value`
                     // cell at `HEADER_SIZE`. A primitive store takes no write
                     // barrier.
-                    // SAFETY: `object` is a live legacy-layout allocation with
-                    // >= 1 slot (`slots.max(1)` above); the cell is exclusively
-                    // ours until published below.
-                    unsafe {
-                        std::ptr::write(
-                            object.as_ptr().add(cratonvm_gc::heap::HEADER_SIZE) as *mut Value,
-                            Value::Long(value),
-                        );
+                    // ...but ONLY when it really is legacy -- see the
+                    // `Integer` twin for the miscompile that premise produced.
+                    // SAFETY: `object` was just allocated here, so its first
+                    // HEADER_SIZE bytes are a live, fully written `ObjectHeader`.
+                    let compact = cratonvm_types::is_compact_object(unsafe {
+                        &*(object.as_ptr() as *const cratonvm_types::ObjectHeader)
+                    });
+                    if compact {
+                        vm.mem.heap.set_field_as(object, 0, Value::Long(value), b'J');
+                    } else {
+                        // SAFETY: `object` is a live legacy-layout allocation
+                        // with >= 1 slot (`slots.max(1)` above) -- now CHECKED
+                        // immediately above, not assumed; the cell is
+                        // exclusively ours until published below.
+                        unsafe {
+                            std::ptr::write(
+                                object.as_ptr().add(cratonvm_gc::heap::HEADER_SIZE) as *mut Value,
+                                Value::Long(value),
+                            );
+                        }
                     }
                     thread.native_pending_return = Some(object);
                     return object.as_ptr() as i64;
