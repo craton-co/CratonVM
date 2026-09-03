@@ -5660,7 +5660,27 @@ impl Compiler {
                             (Vec::new(), Some(self.emit_jcc_rel32_patch(0x84))) // JE
                         } else if receiver_is_trusted_oop {
                             (
-                                self.emit_trusted_oop_receiver_check_at(code, pc, false),
+                                // Opts in exactly when the guard below emits
+                                // its `GC_FLAGS` read at `[RAX + 15]`, which is
+                                // the receiver dereference the implicit check
+                                // faults on. `raw_mode` is already false in this
+                                // branch -- it is the `if raw_mode` arm's
+                                // sibling -- so `!raw_mode && compact` reduces
+                                // to `compact` and the two conditions are the
+                                // same expression rather than two that have to
+                                // be kept in step.
+                                //
+                                // They are still verified independently:
+                                // `bind_implicit_null_recovery` decodes the
+                                // bytes actually emitted at the recorded offset
+                                // and fails the compile if they are not that
+                                // load. This predicate being wrong costs a
+                                // refused compile, not a missing null check.
+                                self.emit_trusted_oop_receiver_check_at(
+                                    code,
+                                    pc,
+                                    cratonvm_types::compact_ref_fields_enabled(),
+                                ),
                                 None,
                             )
                         } else {
@@ -5746,6 +5766,12 @@ impl Compiler {
                             for p in slow_patches {
                                 self.patch_rel32_to_here(p);
                             }
+                            // The implicit null check's recovery address, as in
+                            // the compact arm: this slow path reloads the
+                            // receiver from its frame slot rather than reusing
+                            // RAX, so a recovered fault needs no register
+                            // repair — only the instruction pointer moves.
+                            self.bind_implicit_null_recovery();
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.load_slot_to_reg(ARG_REGS[1], obj_slot);
                             self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag);

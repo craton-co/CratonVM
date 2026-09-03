@@ -584,17 +584,29 @@ mod receiver_elision_reach_tests {
     #[test]
     fn only_the_getfield_arms_consult_the_null_check_dataflow() {
         let src = include_str!("bytecode_walk.rs");
-        let consulting = src.matches("emit_trusted_oop_receiver_check_at(code, pc,").count();
-        let implicit_optin = src
-            .matches("emit_trusted_oop_receiver_check_at(code, pc, true)")
-            .count();
+        // Counted on the call NAME, not on an argument spelling: arm 2's call is
+        // wrapped across lines, and an earlier version of this test matched
+        // "(code, pc," and silently scored it as one site instead of two.
+        let consulting = src.matches("emit_trusted_oop_receiver_check_at(").count();
+        // Every arm that can elide the check MUST bind a recovery address,
+        // and the two numbers are checked against each other rather than
+        // against a constant. An arm that opts in without binding leaves the
+        // site pending; that is caught at runtime by
+        // `has_unbound_implicit_null_sites`, but as a refused compile on a
+        // live workload rather than here.
+        //
+        // Note the pairing is what is asserted, not the literal `true`. Arm 1
+        // opts in unconditionally; arm 2 opts in exactly when
+        // `compact_ref_fields_enabled()`, because that is when it emits the
+        // `GC_FLAGS` read the fault lands on. A future arm may well pass a
+        // third expression -- what it may not do is pass one without binding.
+        let binds = src.matches("self.bind_implicit_null_recovery()").count();
         assert_eq!(
-            implicit_optin, 1,
-            "exactly ONE arm may opt into the implicit null check, and it must \
-             be the one whose next emitted instruction is unconditionally a \
-             receiver dereference. The second getfield arm emits its GC_FLAGS \
-             read only under `compact_ref_fields_enabled()`, so it must pass \
-             `false`. Found {implicit_optin} opt-ins."
+            binds, consulting,
+            "{consulting} getfield arms consult the dataflow but {binds} bind a \
+             recovery address. Each arm that may elide the receiver check has \
+             to bind the slow path the fault recovers into, at the point that \
+             slow path begins."
         );
         assert_eq!(
             consulting, 2,
