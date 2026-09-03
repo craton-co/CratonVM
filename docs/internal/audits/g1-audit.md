@@ -1555,3 +1555,75 @@ reproduce: 0 crashes in 14 subsequent reps on that arm (8 without the oracle, 6
 with) and 0 in 14 on the unchanged arm. It is recorded rather than explained,
 and it matches the rare tight-heap crash class G1-11 already documents at
 roughly 1-in-32 on plain `dev`.
+
+## 19. The band test's object screen — and what it did NOT find (2026-09-03)
+
+*`fix/band-test-object-screen-20260903`. §18.3 named the object screen as the
+next step, once the envelope was bounded by the commit and a header read was
+safe. It is in. It does not move the number, and that is the result.*
+
+### 19.1 What was added
+
+`cratonvm_types::plausible_object_header_at` — the heap-free half of
+`G1Collector::is_object_address`. That function is a range check followed by
+exactly these header tests (kind tag decodes, element-type tag decodes, not a
+filler, plausible `num_slots`/`array_length`), and only the range half needs a
+collector. `band_word_is_an_object` applies it in
+`band_has_unpublished_word_with_map`, so the band test now asks "is there an
+unpublished OBJECT here" rather than "is there a word whose value lands in the
+heap's range" — the question every sibling instrument in that file already asks.
+
+Safe only because §18 bounded `MOVABLE_BOUNDS` to the committed prefix; under
+the previous reservation-wide envelope this dereference could touch a page that
+was never mapped.
+
+`CRATONVM_MOVING_YOUNG_NO_BAND_OBJECT_SCREEN=1` restores the range-only test,
+and that is the fail-OPEN direction — more words flagged, more cycles refusing
+to move — so it is the safe lever if a missed root is ever suspected here.
+
+**It is a filter, not a proof, and its test says so.** The kind and
+element-type tags are a few bits each, so some arbitrary words decode to a
+valid pair by chance; `the_object_header_screen_separates_headers_from_numbers`
+asserts a rejection RATE over a spread rather than a verdict on one hand-picked
+word, which would have been a coin toss dressed as a property.
+
+### 19.2 The measurement, which is a null result
+
+`org.h2.test.store.TestMVStoreTool` at `-Xmx64m`, precise-only switches and
+oracle on, four reps each:
+
+| screen | incomplete rate per rep | median |
+|---|---|---:|
+| off (range only) | 5.41, 3.80, 2.25, 25.00 % | 4.6 % |
+| on | 3.45, 45.83, 3.57, 2.50 % | 3.5 % |
+
+Both arms carry one outlier and the medians are inside the noise. **The screen
+does not reduce the residue.**
+
+That is worth having. After §18 the residual `compiled-frame-oop-not-published`
+reports are NOT non-header junk — they are words that pass a header screen. So
+the residue is either genuine unpublished roots, or dead slots still pointing at
+real objects, and telling those apart needs a liveness question rather than a
+shape one. The screen is landed because it makes the instrument ask the right
+question for whoever asks it next, not because it improved today's number.
+
+### 19.3 Where this leaves the shadow-stack question
+
+Four sections in, the honest state:
+
+* §14 — the coverage proof was vacuous under G1 (no movable envelope). Fixed.
+* §17 — a refutation latch fired on shape, reporting 100% incomplete on every
+  real workload for the wrong reason. Fixed; the reason census now names the
+  obligation.
+* §18 — most of the named obligation was the reservation-wide envelope that
+  §14 itself published. Fixed; median 28.7% → 3.7%.
+* §19 — the remaining few percent survive an object screen, so they are not
+  shape artefacts.
+
+What has NOT been established at any point is that the residue is a real
+missed root. Every instrument aimed at it so far has answered a question about
+shape, and every time the shape answer has turned out to be dominated by
+artefacts. The next step is the liveness question — the verifier type maps, as
+§16 used for `never_mapped` — applied to the band words, and it needs a
+workload whose coverage rate is stable enough to measure against, which
+`TestMVStoreTool` is not (§18.2).

@@ -102,6 +102,7 @@ pub use subsystem_config::{
 pub use heap_types::{
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
     element_type_tag_at, kind_tag_at, object_kind_from_tag, oob_index_code,
+    plausible_object_header_at,
     primitive_array_kind_tags_byte, ArrayElementType, ObjectHeader, ObjectKind,
     ARRAY_DATA_OFFSET, ARRAY_LENGTH_OFFSET, ARRAY_STORE_OUT_OF_MEMORY, AUTOBOX_CLASS_ID,
     FIELD_CELL_PAYLOAD32_OFFSET, FIELD_CELL_PAYLOAD64_OFFSET,

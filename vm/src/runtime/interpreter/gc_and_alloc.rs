@@ -3235,7 +3235,8 @@ pub(super) fn gc_alloc_object(
 
     // ONE shape decision for this allocation, used both to reserve the region
     // and to stamp the header. See `plan_tlab_object_shape`.
-    let (total_size, _body_size, _gc_flags) = plan_tlab_object_shape(class_id, num_fields);
+    let (total_size, _body_size, _gc_flags) =
+        plan_tlab_object_shape_at(class_id, num_fields, tlab_site::INTERPRETER);
     let _ = (HEADER_SIZE, SLOT_SIZE);
 
     // TLAB fast path: try thread-local bump allocation (no lock)
@@ -3432,15 +3433,7 @@ pub(crate) fn tlab_alloc_object(
     num_fields: usize,
     total_size: usize,
 ) -> Option<ObjectRef> {
-    // Re-planned here rather than taken as an argument: every caller computes
-    // `total_size` from the same planner, so this reads the same answer, and a
-    // wrapper that took the shape separately would let a caller pass a size
-    // and a shape that disagree.
-    let (planned_total, body_size, gc_flags) = plan_tlab_object_shape(class_id, num_fields);
-    debug_assert_eq!(
-        planned_total, total_size,
-        "a TLAB object's reserved size must be the one its shape plan asked for"
-    );
+    let (body_size, gc_flags) = shape_of_reserved(num_fields, total_size);
     tlab_alloc_object_inner(
         thread,
         shared,
@@ -3533,11 +3526,7 @@ pub(crate) fn tlab_alloc_object_guarded_refill(
     num_fields: usize,
     total_size: usize,
 ) -> Option<ObjectRef> {
-    let (planned_total, body_size, gc_flags) = plan_tlab_object_shape(class_id, num_fields);
-    debug_assert_eq!(
-        planned_total, total_size,
-        "a TLAB object's reserved size must be the one its shape plan asked for"
-    );
+    let (body_size, gc_flags) = shape_of_reserved(num_fields, total_size);
     tlab_alloc_object_inner(
         thread,
         shared,
@@ -3875,17 +3864,86 @@ pub fn tlab_object_shape_counts() -> (u64, u64, u64) {
 /// class's layout were replaced between them (the exact hazard the JIT's inline
 /// emitter carries a layout-replace guard for), and a body sized by one lookup
 /// with a header stamped by the other is heap corruption.
+/// Which TLAB object sites may plan the compact shape, as a bitmask —
+/// `CRATONVM_COMPACT_TLAB_SITES`, default all.
+///
+/// A bisection lever, not a tuning knob. `CRATONVM_COMPACT_TLAB_ALLOC=1`
+/// reproduces the `FjpProbe` miscompile in one run but says nothing about
+/// WHICH of the five sites is responsible, and each answer would otherwise cost
+/// a fifteen-minute rebuild. See [`TlabSite`].
+pub(crate) fn compact_tlab_site_mask() -> u32 {
+    static G: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_COMPACT_TLAB_SITES") {
+            Ok(v) => v.trim().parse::<u32>().unwrap_or(u32::MAX),
+            Err(_) => u32::MAX,
+        }
+    })
+}
+
+/// The TLAB object allocation sites, as mask bits for
+/// [`compact_tlab_site_mask`].
+pub(crate) mod tlab_site {
+    /// `gc_alloc_object` — the interpreter's own `new`.
+    pub const INTERPRETER: u32 = 1;
+    /// `jit_new_object`'s guarded-refill TLAB attempt.
+    pub const JIT_NEW: u32 = 2;
+    /// The two `tlab_alloc_object` sites inside the JIT helpers.
+    pub const JIT_HELPER: u32 = 4;
+    /// The native-call allocation site in `vm_exec`.
+    pub const NATIVE: u32 = 8;
+    /// The compact-`String` site in `vm_object`.
+    pub const STRING: u32 = 16;
+}
+
+/// One line per distinct class that gets the compact shape —
+/// `CRATONVM_DBG_COMPACT_TLAB=1`.
+fn note_compact_tlab_class(class_id: ClassId, num_fields: usize, site: u32) {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_TLAB").is_none() {
+        return;
+    }
+    use std::sync::atomic::Ordering;
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(u32, u32)>>> =
+        std::sync::Mutex::new(None);
+    static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let mut g = match SEEN.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let seen = g.get_or_insert_with(std::collections::HashSet::new);
+    if !seen.insert((class_id.as_u32(), site)) {
+        return;
+    }
+    // Bounded: a runaway class count would drown the run it is meant to
+    // explain.
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 200 {
+        return;
+    }
+    let name = cratonvm_gc::gc::resolve_class_info(class_id.as_u32())
+        .map(|(n, _)| n)
+        .unwrap_or_else(|| "<unresolved>".to_string());
+    eprintln!(
+        "[compact-tlab] site={site} class={name} id={} num_fields={num_fields}",
+        class_id.as_u32()
+    );
+}
+
 #[inline]
-pub(crate) fn plan_tlab_object_shape(class_id: ClassId, num_fields: usize) -> (usize, u32, u8) {
+pub(crate) fn plan_tlab_object_shape_at(
+    class_id: ClassId,
+    num_fields: usize,
+    site: u32,
+) -> (usize, u32, u8) {
     use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
     use std::sync::atomic::Ordering;
     let legacy_total = HEADER_SIZE + num_fields * SLOT_SIZE;
-    if compact_tlab_alloc_enabled() {
+    if compact_tlab_alloc_enabled() && (compact_tlab_site_mask() & site) != 0 {
         if let Some(body) = cratonvm_types::compact_tlab_body_size(class_id.as_u32(), num_fields) {
             if let (Some(total), Ok(body_u32)) =
                 (HEADER_SIZE.checked_add(body), u32::try_from(body))
             {
                 TLAB_COMPACT_OBJECTS.fetch_add(1, Ordering::Relaxed);
+                note_compact_tlab_class(class_id, num_fields, site);
                 TLAB_COMPACT_BYTES_SAVED
                     .fetch_add(legacy_total.saturating_sub(total) as u64, Ordering::Relaxed);
                 return (total, body_u32, cratonvm_types::GC_FLAG_COMPACT);
@@ -3894,6 +3952,44 @@ pub(crate) fn plan_tlab_object_shape(class_id: ClassId, num_fields: usize) -> (u
     }
     TLAB_LEGACY_OBJECTS.fetch_add(1, Ordering::Relaxed);
     (legacy_total, 0, 0)
+}
+
+/// The header shape implied by the size a caller actually RESERVED.
+///
+/// Derived, never re-planned. The wrappers used to call the planner a second
+/// time and `debug_assert` that the two agreed; they cannot be relied on to
+/// agree once the planner is site-screened (`CRATONVM_COMPACT_TLAB_SITES`),
+/// and a body sized by one answer with a header stamped from the other is heap
+/// corruption. Reading the shape back out of the reservation makes the two
+/// impossible to separate.
+///
+/// A compact body packs each field to its natural width (at most 8 bytes), so
+/// it is strictly smaller than the legacy `num_fields * SLOT_SIZE` for any
+/// non-empty object; equality means legacy. A zero-field object has no body at
+/// all and the shapes coincide, which is why it reads as legacy and why that
+/// costs nothing.
+#[inline]
+fn shape_of_reserved(num_fields: usize, total_size: usize) -> (u32, u8) {
+    use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+    let legacy_total = HEADER_SIZE + num_fields * SLOT_SIZE;
+    if total_size == legacy_total {
+        return (0, 0);
+    }
+    let body = total_size.saturating_sub(HEADER_SIZE);
+    match u32::try_from(body) {
+        Ok(body) => (body, cratonvm_types::GC_FLAG_COMPACT),
+        Err(_) => (0, 0),
+    }
+}
+
+/// [`plan_tlab_object_shape_at`] for a caller that does not name a site.
+///
+/// Used by the two TLAB wrappers, which re-plan only to check that the size
+/// they were handed is the one the shape asked for; the site screen is the
+/// original caller's and must not be applied twice.
+#[inline]
+pub(crate) fn plan_tlab_object_shape(class_id: ClassId, num_fields: usize) -> (usize, u32, u8) {
+    plan_tlab_object_shape_at(class_id, num_fields, u32::MAX)
 }
 
 /// Which header [`tlab_alloc_object_inner`] should stamp on the region it
