@@ -902,6 +902,20 @@ struct Lowerer<'a> {
     /// read-bounds compares): receivers already proven in the block being
     /// lowered. Cleared at every block entry (`ir_receiver_guard_cse_enabled`).
     guarded_receivers: Vec<NodeId>,
+    /// Receivers proven merely NON-NULL in the block being lowered — a weaker
+    /// fact than [`Self::guarded_receivers`], and kept apart from it for that
+    /// reason.
+    ///
+    /// A null test proves null-ness and nothing else. Folding it into the
+    /// mapped-receiver set would let a later site skip the alignment and
+    /// read-bounds compares on the strength of a test that never made them,
+    /// which is the one way this optimisation could go wrong quietly. So this
+    /// set suppresses only the `TEST`/`JZ`; the containment guard still keys
+    /// off `guarded_receivers` alone.
+    ///
+    /// Cleared at every block entry, then RE-SEEDED with the receiver — see
+    /// `seed_block_null_proofs`.
+    null_proven_receivers: Vec<NodeId>,
     /// Register → memory transitions this backend EMITTED for resident values
     /// (one per resident definition, because the wiring is write-through).
     /// Reported as `CompilationReport::spills`.
@@ -1302,6 +1316,7 @@ impl<'a> Lowerer<'a> {
             fused_cmp: Vec::new(),
             deopt_named: Vec::new(),
             guarded_receivers: Vec::new(),
+            null_proven_receivers: Vec::new(),
             ls_spills: 0,
             ls_reloads: 0,
             mir: None,
@@ -3236,10 +3251,19 @@ impl<'a> Lowerer<'a> {
         // address, which is still mapped. `itemCheck` proved `n` once per
         // field it read (`ir_receiver_guard_cse_enabled`).
         let receiver_proven = self.receiver_already_guarded(base);
-        if !receiver_proven {
+        // The null test is suppressed by the WEAKER fact as well: the seed, or
+        // a test already emitted in this block. The containment guard below
+        // still keys off `receiver_proven` alone, so a null-only proof never
+        // licenses skipping the alignment and read-bounds compares.
+        if self.receiver_already_non_null(base) {
+            crate::metrics::note_ir_receiver_null_check_elided();
+        } else {
             // 1. null → slow (the helper raises the NPE).
             self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
             slow.push(self.emit_jcc_rel32(0x84)); // JZ
+            crate::metrics::note_ir_receiver_null_check_emitted();
+            // Its fall-through is a proof for the rest of the block.
+            self.note_receiver_non_null(base);
         }
         if guarded && !raw_mode && !trusted_oop_receiver && !receiver_proven {
             self.note_receiver_guarded(base);
@@ -4031,6 +4055,8 @@ impl<'a> Lowerer<'a> {
         // A receiver proof is block-local: control can enter this block from a
         // predecessor that never proved it.
         self.guarded_receivers.clear();
+        self.null_proven_receivers.clear();
+        self.seed_block_null_proofs();
 
         let block = &self.schedule.blocks[block_idx];
 
@@ -5534,6 +5560,63 @@ impl<'a> Lowerer<'a> {
     /// being lowered (`ir_receiver_guard_cse_enabled`).
     fn receiver_already_guarded(&self, base: NodeId) -> bool {
         ir_receiver_guard_cse_enabled() && self.guarded_receivers.contains(&base)
+    }
+
+    /// Is `base` known non-null here — by the receiver seed, or by a null test
+    /// already emitted in this block?
+    fn receiver_already_non_null(&self, base: NodeId) -> bool {
+        self.receiver_already_guarded(base) || self.null_proven_receivers.contains(&base)
+    }
+
+    /// Record that a null test has just proven `base` on its fall-through.
+    fn note_receiver_non_null(&mut self, base: NodeId) {
+        if !self.null_proven_receivers.contains(&base) {
+            self.null_proven_receivers.push(base);
+        }
+    }
+
+    /// Seed this block's null proofs with `this`.
+    ///
+    /// # Why a seed, and not just the per-block CSE
+    ///
+    /// The CSE above proves a receiver once per block. That is worth nothing to
+    /// a loop whose body reads one field: the body is one block, its single
+    /// `getfield` is the first dereference in it, and so the test is emitted
+    /// once and executed on every iteration — forever, for a value the JVM
+    /// guarantees at the call site.
+    ///
+    /// This is the same hole the single-pass backend had, in the same shape
+    /// and for the same reason, and it was closed there by
+    /// `CRATONVM_JIT_THIS_NONNULL` seeding the null-check dataflow's entry
+    /// state. That fix was single-pass only: both arms it touches are in
+    /// `x64/bytecode_walk.rs`, so this tier kept emitting `TEST RAX, RAX; JZ`
+    /// at every `getfield` — and a 2026-09-03 measurement put the optimizing
+    /// tier at ~1.65x the baseline's time on exactly that loop.
+    ///
+    /// The seed is one fact: an instance method's parameter 0 is non-null,
+    /// because the JVM enters one only through a call site that has already
+    /// null-checked the receiver. `<init>` included — its receiver is
+    /// uninitialized, never null.
+    ///
+    /// **It is only ever the parameter NODE.** A local reassigned from
+    /// parameter 0 is a different node and gets nothing; there is no
+    /// bytecode-local pattern match here to mis-attribute, which is the class
+    /// of bug `preceding_aload_nonnull_local` carries a soundness fix for.
+    fn seed_block_null_proofs(&mut self) {
+        if !ir_this_nonnull_enabled() {
+            return;
+        }
+        let Some(recv) = self.graph.receiver_param else {
+            return;
+        };
+        for (id, node) in self.graph.nodes.iter().enumerate() {
+            if node.op == Op::Param(recv) {
+                // Cast: node ids index `graph.nodes`, which the builder bounds.
+                self.null_proven_receivers.push(id as NodeId);
+                crate::metrics::note_ir_receiver_seed();
+                break;
+            }
+        }
     }
 
     /// Record that the block being lowered has just proved `base`.
@@ -10710,6 +10793,47 @@ fn verify_mir_allocation(
 ///
 /// Declared in `types/src/flag_groups.rs` as `jit/ir-linear-scan`, so `-XX:`
 /// options and `flags::with_thread_overrides` reach it.
+/// Seed each block's null proofs with the receiver — **default OFF**, opt in
+/// with `CRATONVM_JIT_IR_THIS_NONNULL=1`.
+///
+/// # It is off because it measured SLOWER, which nobody expected
+///
+/// It is correct and it engages (`seeded=9 elided=2 emitted=0` against
+/// `0/0/2` with it off, same answer). On the loop it was built for — the one
+/// the 2026-09-03 tier comparison found inverted — it is **~20% slower with
+/// the check removed than with it emitted**: medians 1.78/1.93 on against
+/// 1.49/1.61 off, two replicate pairs, within-config spread 8%, same direction
+/// both times.
+///
+/// **The cost is not compile time.** At `reps=1`, where the loop barely runs,
+/// the two arms are 0.19 against 0.18 — so the per-block seed scan is ~0.01s
+/// and the 0.3s is in the emitted code.
+///
+/// Removing two instructions cannot make a loop 20% slower on its own, so what
+/// this really says is that the body is dominated by something layout- or
+/// branch-structure-sensitive, and deleting a never-taken forward `JZ` moved
+/// it. That is a lead worth pulling for the residual tier inversion itself,
+/// and it is the reason this switch stays available rather than being deleted:
+/// it is the smallest known perturbation that moves that loop by 20%.
+///
+/// If nobody finds the cause, withdraw it.
+///
+/// The optimizing-tier half of `CRATONVM_JIT_THIS_NONNULL`, which seeds the
+/// single-pass backend's null-check dataflow. Separate switch because the two
+/// tiers reach the fact by different routes — a bytecode dataflow there, the
+/// graph's `receiver_param` here — and a single flag would make a bisect
+/// unable to say which one moved.
+///
+/// Off restores the previous emission exactly: a `TEST`/`JZ` at every
+/// `getfield` whose receiver the per-block CSE has not already proven.
+fn ir_this_nonnull_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_THIS_NONNULL").is_some()
+    })
+}
+
 fn linear_scan_enabled() -> bool {
     #[cfg(test)]
     {
@@ -12769,6 +12893,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -12813,6 +12938,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -12858,6 +12984,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -12908,6 +13035,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -12958,6 +13086,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -12998,6 +13127,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -14820,6 +14950,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -14888,6 +15019,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let c0 = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -15012,6 +15144,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -15656,6 +15789,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -15948,6 +16082,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -15971,6 +16106,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -16050,6 +16186,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -16251,6 +16388,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         }
     }
 
@@ -17241,6 +17379,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -17531,6 +17670,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -17639,6 +17779,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -18841,6 +18982,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -18881,6 +19023,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;

@@ -5044,7 +5044,12 @@ fn h1_tlab_object_header_has_nonzero_hash_at_allocation() {
     let ptr = storage.as_mut_ptr() as *mut u8;
 
     // Path 1: the TLAB fast path no longer mints a hash at allocation.
-    super::init_object_header(ptr, ClassId::new(0), 0);
+    // `body_size` 0 and `gc_flags` 0: this test is about the TLAB fast path not
+    // minting a hash, and it asserts `class_id` and `num_slots` only. The two
+    // parameters added since carry the COMPACT body shape, which a zero-slot
+    // object does not have -- giving them anything else would be asserting a
+    // layout the test does not check.
+    super::init_object_header(ptr, ClassId::new(0), 0, 0, 0);
 
     // SAFETY: we just wrote a valid ObjectHeader into `ptr`.
     let header = unsafe { std::ptr::read(ptr as *const ObjectHeader) };
