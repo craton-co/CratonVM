@@ -7626,7 +7626,9 @@ impl Compiler {
                                 .invoke_info_idx
                                 .get(&pc)
                                 .map(|&i| self.invoke_info[i].1);
-                            match dispatch_info.map(|info| (info, self.reserve_spill_slots(5))) {
+                            match dispatch_info
+                                .map(|info| (info, self.reserve_spill_slots(5, SpillReason::HelperArgs)))
+                            {
                                 Some((info, Some(args_base))) => {
                                     let skip_dispatch = self.emit_jmp_rel32_patch();
                                     for &patch in &bail_patches {
@@ -9375,7 +9377,7 @@ impl Compiler {
                                     // edge's argument buffer so reclaiming that
                                     // buffer cannot free this.
                                     let out_base = if is_get {
-                                        match self.reserve_spill_slots(1) {
+                                        match self.reserve_spill_slots(1, SpillReason::HelperArgs) {
                                             Some(b) => Some(b),
                                             None => {
                                                 self.fail(
@@ -9428,7 +9430,7 @@ impl Compiler {
                                     // ---- decline edge: the unchanged dispatch
                                     self.patch_rel32_to_here(declined);
                                     let nargs = if is_get { 3 } else { 4 };
-                                    let args_base = match self.reserve_spill_slots(nargs) {
+                                    let args_base = match self.reserve_spill_slots(nargs, SpillReason::HelperArgs) {
                                         Some(b) => b,
                                         None => {
                                             self.fail(
@@ -13878,7 +13880,7 @@ impl Compiler {
                     let recv_offset = match recv_slot {
                         StackSlot::Frame(offset) => offset,
                         StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg, ..) => {
-                            let Some(offset) = self.reserve_spill_slots(1) else {
+                            let Some(offset) = self.reserve_spill_slots(1, SpillReason::HelperArgs) else {
                                 return false;
                             };
                             self.emit_store_local(offset, reg);

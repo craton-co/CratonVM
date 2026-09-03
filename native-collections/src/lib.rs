@@ -22722,6 +22722,15 @@ fn native_opt_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 // ===========================================================================
 
 fn native_arrays_sort_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `Arrays.sort(null)` reads `a.length` on its first line, so it is an NPE
+    // and not the silent no-op this body used to answer.
+    // MEASURED: `apps/probes/NullArgMsgProbe.java` row 56.
+    if matches!(args.first(), Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Cannot read the array length because \"a\" is null".to_string()),
+        }
+        .into());
+    }
     let arr = match args.first() {
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(None),
@@ -38310,6 +38319,22 @@ fn register_copy_constructor_natives(registry: &mut NativeMethodRegistry) {
 
 /// ArrayList.<init>(Collection) — copy elements from source collection into this list.
 fn native_al_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // RULE C. An explicit Java null is an NPE, not an empty list:
+    // `ArrayList(Collection)` and `Vector(Collection)` both open on
+    // `c.toArray()`, and `List.copyOf` -- the one internal caller -- opens on
+    // `Objects.requireNonNull`. `reject_null_collection` separates that from a
+    // MISSING argument, which the `None` arm below still handles leniently.
+    //
+    // MEASURED after `Vector(Collection)` was bound to this function on
+    // 2026-09-02: `apps/probes/HashtableVectorShadowSweep` row 108,
+    // `new Vector<String>((Collection<String>) null)` -- HotSpot NPE, here
+    // no-throw. COMPATIBLE MODE ONLY, and that is the interesting half: the
+    // registration's own comment says "real-JDK mode runs the class's own
+    // bytecode and never reaches here", which is true under `--jdk-only`, where
+    // the Vector family is `SyntheticStub` and dropped, and false in the
+    // DEFAULT mode, where `NativeKind::allowed_in` keeps it. Strict was 0-diff
+    // on that row throughout; only compat moved.
+    reject_null_collection(args.get(1))?;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -47243,6 +47268,43 @@ fn register_priority_queue_natives(r: &mut NativeMethodRegistry) {
 /// heapifies on HotSpot, and a queue built by copying source ORDER would
 /// `poll()` in the source's sequence rather than the comparator's. Same GC
 /// discipline as `native_ad_init_from_collection`.
+/// `obj instanceof <name>`, by class id, using the same idiom the rest of this
+/// file does for an assignability question.
+fn instance_of_named(ctx: &mut dyn NativeContext, obj: ObjectRef, name: &str) -> bool {
+    match ctx.class_id_by_name(name) {
+        Some(target) => {
+            let cid = ctx.class_id_of_object(obj);
+            cid == target || ctx.is_subclass(cid, target)
+        }
+        None => false,
+    }
+}
+
+/// The comparator a `PriorityQueue(Collection)` must adopt from its argument,
+/// or `None` for a source that imposes none.
+///
+/// The JDK's constructor branches on `SortedSet` and on `PriorityQueue`, and
+/// both carry a comparator that may be null (natural order). A null comparator
+/// on a `SortedSet` is therefore NOT the same as "not a SortedSet": both end in
+/// a natural-order heap here, so this collapses them, and the distinction would
+/// only matter if the two branches differed in some other way. They do not.
+///
+/// Asked through `invoke_virtual` rather than by reading a field, because the
+/// source can be any `SortedSet` -- a `TreeSet`, a `TreeMap` key-set view, a
+/// `Collections.synchronizedSortedSet` wrapper -- and only its own
+/// `comparator()` knows.
+fn sorted_source_comparator(ctx: &mut dyn NativeContext, source: ObjectRef) -> Option<Value> {
+    if !instance_of_named(ctx, source, "java/util/SortedSet")
+        && !instance_of_named(ctx, source, "java/util/PriorityQueue")
+    {
+        return None;
+    }
+    match ctx.invoke_virtual(source, "comparator", "()Ljava/util/Comparator;", &[]) {
+        Ok(Some(v @ Value::Object(Some(_)))) => Some(v),
+        _ => None,
+    }
+}
+
 fn native_pq_init_from_collection(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -47252,11 +47314,34 @@ fn native_pq_init_from_collection(
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    native_pq_init(ctx, args)?;
     let source = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(None),
+        _ => {
+            native_pq_init(ctx, args)?;
+            return Ok(None);
+        }
     };
+    // THE CHECK IS AT RUNTIME, on the object, not on the call site's descriptor.
+    // `PriorityQueue(Collection)` opens `if (c instanceof SortedSet<?> ss)` and
+    // adopts that set's comparator, so a `TreeSet` reaching this constructor
+    // through a `Collection`-typed reference still orders the queue its own way.
+    //
+    // MEASURED, `apps/probes/PqOptionalShadowSweep` row 34: a reverse-ordered
+    // `TreeSet` cast to `Collection` drained `[3, 2, 1]` on HotSpot and
+    // `[1, 2, 3]` here -- this constructor built a natural-order heap and threw
+    // the comparator away. BOTH MODES, because the sibling `(SortedSet)`
+    // overload is not registered at all and runs real bytecode, which is why
+    // the row above it (same set, `TreeSet`-typed) always passed: javac picks
+    // the more specific overload there, and only the cast reaches this one.
+    let comparator = sorted_source_comparator(ctx, source);
+    match comparator {
+        Some(c) => {
+            native_pq_init_comparator(ctx, &[Value::Object(Some(this)), c])?;
+        }
+        None => {
+            native_pq_init(ctx, args)?;
+        }
+    }
     let this_pin = ctx.pin_native_root(this);
     let elems = collect_collection_elements_or_real(ctx, source)?;
     let (_, handles) = pin_value_slice(ctx, &elems);
@@ -49159,6 +49244,19 @@ fn native_hs_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // `addAll(null)` reaches `AbstractCollection.addAll`, whose `for (E e : c)`
+    // dereferences immediately. Answering `false` told the caller the set was
+    // unchanged and hid the null. Only an explicitly-passed null throws; a
+    // missing argument stays the malformed-call no-op.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"java.util.Collection.iterator()\" because \"c\" is null"
+                    .to_string(),
+            ),
+        }
+        .into());
+    }
     let coll = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
@@ -49309,6 +49407,12 @@ fn native_hs_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // `retainAll(null)` throws too, but with NO message: the JDK reaches
+    // `Objects.requireNonNull(c)` here rather than a dereference, which is the
+    // distinction this file's two refusal helpers draw.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(bare_npe());
+    }
     let coll = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),

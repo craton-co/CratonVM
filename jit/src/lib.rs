@@ -18671,12 +18671,16 @@ pub fn compiled_frame_line_counts() -> [u64; 8] {
 /// | 3 | `exhausted` | compiles refused `spill-range-exhausted` |
 /// | 4 | `past-limit` | compiles refused `spill-cursor-past-limit` |
 /// | 5 | `peak-words` | high-water mark of live spill words in any one compile (a MAX, not a sum) |
-/// | 6 | `res-push` | words reserved by `push_stack` — the ordinary operand push |
-/// | 7 | `res-invalidate` | words reserved by `invalidate_callee_saved` |
-/// | 8 | `res-total` | every word reserved, so the two attributed columns read as a fraction of a whole |
+/// | 6 | `res-push` | the ordinary operand push |
+/// | 7 | `res-invalidate` | `invalidate_callee_saved` re-homing register-aliased entries |
+/// | 8 | `res-total` | every word reserved. NOT a counter: it is DERIVED at read time as the sum of the seven reason columns, so the partition is structural. Counting it separately and asserting the sum could not work — the columns are process-global atomics and seven loads plus an eighth are never a consistent snapshot while other threads compile |
 /// | 9 | `min-headroom` | the FEWEST words left between a reservation's end and `spill_limit_offset`, over every compile (a MIN; `u64::MAX` means nothing reserved) |
 /// | 10 | `inline-reserve-sum` | largest per-compile inline reserve as `spill_size` computes it today: a SUM over every site (a MAX over compiles) |
 /// | 11 | `inline-reserve-path` | what the same compile would need if the reserve were a MAX over top-level sites and over each site's deepest nested PATH (a MAX over compiles) |
+/// | 13 | `res-inline-locals` | an inlined callee's local frame |
+/// | 14 | `res-inline-merge` | an inlined body's branch-merge area |
+/// | 15 | `res-call-service` | the direct-call argument-service copy |
+/// | 16 | `res-helper-args` | a helper's argument buffer or out-parameter (intrinsic dispatch, FFM, the monitor receiver) |
 /// | 12 | `inline-reserve-spent` | what `spill_size` ACTUALLY added (a MAX over compiles). The engagement counter: it equals column 10 with the switch off and column 11 with it on, and inferring which without measuring it is how an inert change ships |
 ///
 /// Column 2 is retired and reads zero. It was the engagement counter for a
@@ -18691,7 +18695,7 @@ pub fn compiled_frame_line_counts() -> [u64; 8] {
 /// method, so 19 words is nearly the whole budget for one method and a rounding
 /// error for another. A refusal count of zero plus a large minimum headroom is
 /// a much stronger statement than the refusal count on its own.
-static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 13] = [
+static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 17] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -18702,6 +18706,10 @@ static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 13] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(u64::MAX),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -18723,8 +18731,19 @@ pub const SPILL_PEAK_WORDS: usize = 5;
 pub const SPILL_RES_PUSH: usize = 6;
 /// Words reserved by `invalidate_callee_saved`.
 pub const SPILL_RES_INVALIDATE: usize = 7;
-/// Every word reserved, by any caller.
+/// Every word reserved, by any caller. Derived, never stored — see the table.
 pub const SPILL_RES_TOTAL: usize = 8;
+
+/// The seven columns that partition [`SPILL_RES_TOTAL`], in `SpillReason` order.
+pub const SPILL_RES_REASON_COLUMNS: [usize; 7] = [
+    SPILL_RES_PUSH,
+    SPILL_FLUSH_RESERVED,
+    SPILL_RES_INVALIDATE,
+    SPILL_RES_INLINE_LOCALS,
+    SPILL_RES_INLINE_MERGE,
+    SPILL_RES_CALL_SERVICE,
+    SPILL_RES_HELPER_ARGS,
+];
 /// Fewest words ever left between a reservation and the spill limit.
 pub const SPILL_MIN_HEADROOM: usize = 9;
 /// Largest per-compile inline reserve, summed over sites as today.
@@ -18733,9 +18752,19 @@ pub const SPILL_INLINE_RESERVE_SUM: usize = 10;
 pub const SPILL_INLINE_RESERVE_PATH: usize = 11;
 /// What `spill_size` actually added for inlining.
 pub const SPILL_INLINE_RESERVE_SPENT: usize = 12;
+/// An inlined callee's local frame.
+pub const SPILL_RES_INLINE_LOCALS: usize = 13;
+/// An inlined body's branch-merge area.
+pub const SPILL_RES_INLINE_MERGE: usize = 14;
+/// The direct-call argument-service copy.
+pub const SPILL_RES_CALL_SERVICE: usize = 15;
+/// A helper's argument buffer or out-parameter.
+pub const SPILL_RES_HELPER_ARGS: usize = 16;
+/// Alias: the flush's own reservation column, named for `SpillReason::Flush`.
+pub const SPILL_RES_FLUSH: usize = SPILL_FLUSH_RESERVED;
 
 /// Human names, parallel to the slot indices.
-pub const SPILL_CURSOR_SLOT_NAMES: [&str; 13] = [
+pub const SPILL_CURSOR_SLOT_NAMES: [&str; 17] = [
     "flush-calls",
     "flush-reserved",
     "flush-canonical",
@@ -18749,6 +18778,10 @@ pub const SPILL_CURSOR_SLOT_NAMES: [&str; 13] = [
     "inline-reserve-sum",
     "inline-reserve-path",
     "inline-reserve-spent",
+    "res-inline-locals",
+    "res-inline-merge",
+    "res-call-service",
+    "res-helper-args",
 ];
 
 /// Add `n` to one column. `peak-words` must not go through here — it is a
@@ -18787,11 +18820,15 @@ pub fn note_spill_peak(words: u64, headroom: u64) {
 }
 
 /// Read the census. See [`SPILL_CURSOR_COUNTS`] for the columns.
-pub fn spill_cursor_counts() -> [u64; 13] {
-    let mut out = [0u64; 13];
+pub fn spill_cursor_counts() -> [u64; 17] {
+    let mut out = [0u64; 17];
     for (i, slot) in SPILL_CURSOR_COUNTS.iter().enumerate() {
         out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
     }
+    // `res-total` is derived, not counted. Every reservation bumps exactly one
+    // reason column, so the sum IS the total by construction and no reservation
+    // can reach the cursor without landing in it.
+    out[SPILL_RES_TOTAL] = SPILL_RES_REASON_COLUMNS.iter().map(|&c| out[c]).sum();
     out
 }
 
@@ -38370,7 +38407,39 @@ mod layout_constant_inventory {
         // the legacy cell address is `field_index * SLOT_SIZE`, a use of its
         // own and not a reuse of the compact arm's — which this comment claimed
         // until the inventory test refused the count and said so.
-        ("ir_lower.rs", [12, 4, 6, 0, 0, 0, 6, 4]),
+        //
+        // 2026-09-02 added the twelfth `HEADER_SIZE` and two more in tests
+        // (12 -> 14): the optimizing tier's GATED compact reference
+        // `putfield` (`emit_gated_ir_ref_putfield`) and the two test
+        // expectations that reconstruct the same address to assert the store
+        // is emitted at it. The emitter site is the mirror image of the
+        // inline `getfield` compact read directly above it — same
+        // `HEADER_SIZE + packed_body_offset`, same cell — and it is a disp32
+        // site (`48 89 90 disp32`), so it does not share the disp8
+        // backwards-addressing hazard the array sites have. Nothing else
+        // moves: the store reaches the compact cell base directly, with no
+        // `SLOT_SIZE` index and no payload bias, because a compact reference
+        // field IS the bare 8-byte pointer.
+        //
+        // Later the same day, the gated store grew its LEGACY shape and the
+        // counts moved again: `HEADER_SIZE` 14 -> 15, `SLOT_SIZE` 6 -> 7 and
+        // `FIELD_CELL_PAYLOAD64_OFFSET` 4 -> 5, all three from the one
+        // expression `HEADER_SIZE + field_index * SLOT_SIZE` plus the payload
+        // bias inside the 16-byte `Value` cell. It exists because the compact
+        // shape alone fired zero times out of 16,384,000 -- the TLAB fast path
+        // writes legacy headers unconditionally -- and it is the exact mirror
+        // of the inline `getfield`'s own legacy branch two entries above, which
+        // is where the offsets are transcribed from rather than re-derived.
+        // Both stores are disp32 (`48 89 90 disp32`, `4C 89 90 disp32`), so
+        // neither shares the disp8 backwards-addressing hazard; and since the
+        // arm now picks between the two shapes per OBJECT on the
+        // `GC_FLAG_COMPACT` bit, a header shrink must move BOTH or the legacy
+        // shape writes the wrong cell.
+        // Plus the two-shape test's own expectations (`HEADER_SIZE` 15 -> 17):
+        // it reconstructs both cell addresses to assert both stores are
+        // emitted, which is the assertion that would have caught the
+        // compact-only arm before a run-time census had to.
+        ("ir_lower.rs", [17, 4, 7, 0, 0, 0, 6, 6]),
     ];
 
     fn source(file: &str) -> &'static str {

@@ -197,11 +197,37 @@ fn dbg_precise_only_roots() -> bool {
 /// branch again, i.e. skip the conservative JIT scan on a pause whose oop-map
 /// coverage proof passed.
 ///
-/// This is the pre-fix behaviour and it is unsound under G1: the pin set that
-/// keeps a JIT-held object from being evacuated is built from the conservative
-/// scan's output, so skipping the scan leaves the pause with no protection at
-/// all rather than with a different one. Kept as an opt-in so the difference
-/// can be A/B'd in one binary.
+/// This is the pre-fix behaviour, and the reason it was called unsound has
+/// CHANGED — the sentence that stood here said "the pin set that keeps a
+/// JIT-held object from being evacuated is built from the conservative scan's
+/// output, so skipping the scan leaves the pause with no protection at all
+/// rather than with a different one". That is still a true description of the
+/// mechanism, but it was not the defect. The defect
+/// (`bug-g1-evacuates-live-jit-reference-20260819.md`) was that G1's coverage
+/// proof was VACUOUS: the frame-band verifier classifies a spill-band word with
+/// `gen_heap::addr_is_movable`, G1 published neither table it reads, so every
+/// word answered "not movable" and the verifier reported a frame clean without
+/// inspecting it. Suppression on a proof that inspected nothing is what left
+/// the pin set empty.
+///
+/// G1 publishes its arena envelope into `MOVABLE_BOUNDS` since 2026-09-02, so
+/// the proof is now earned rather than vacuous — `root coverage: incomplete`
+/// went from 100.00% of pauses to 0.00% on the probes. Measured with both
+/// switches on, G1's pin set goes to ZERO (`pin_addrs` 21 -> 0 on
+/// `HumongousChurn`, 0 on `G1CardChurn`/`G1ChurnPauseProbe`/`HumongousHold`)
+/// with `dangling=0` and HotSpot-identical checksums throughout.
+///
+/// It stays OPT-IN regardless, and the reason is now the MASTER switch's rather
+/// than G1's: `dbg_precise_only_roots`'s own doc records that the suppression
+/// rests on `CompiledMethod::fully_oop_covered`, a PRESENCE test rather than a
+/// completeness one, and that the runtime oracle which would settle it does not
+/// run on the cycles the bit is spent
+/// (`bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`). That
+/// is a JIT-wide question, not a collector one, and it is what a soak would
+/// have to answer before either default moves. Kept as an opt-in so the
+/// difference can be A/B'd in one binary — and note that this switch alone does
+/// nothing: `CRATONVM_GC_PRECISE_ONLY_ROOTS` gates it, and an arm that sets
+/// only this one measures nothing.
 fn dbg_g1_precise_only_roots() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {

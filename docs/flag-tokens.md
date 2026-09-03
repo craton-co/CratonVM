@@ -580,7 +580,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-310 tokens.
+314 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -693,6 +693,8 @@ export inherited from a parent shell.
 | `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
 | `gated-ref-store` | `CRATONVM_JIT_GATED_REF_STORE` |
+| `ir-ref-store` | `CRATONVM_JIT_IR_REF_STORE` |
+| `dbg-ir-ref-store-trace` | `CRATONVM_DBG_IR_REF_STORE_TRACE` |
 | `this-nonnull` | `CRATONVM_JIT_THIS_NONNULL` |
 | `receiver-null-elim` | `CRATONVM_JIT_RECEIVER_NULL_ELIM` |
 | `implicit-null-check` | `CRATONVM_JIT_IMPLICIT_NULL_CHECK` |
@@ -804,6 +806,7 @@ export inherited from a parent shell.
 | `field-fast-path` | `CRATONVM_JIT_NO_FIELD_FAST_PATH` |
 | `osr-inline-gate` | `CRATONVM_JIT_NO_OSR_INLINE_GATE` |
 | `invoke-fast-door` | `CRATONVM_JIT_NO_INVOKE_FAST_DOOR` |
+| `nonvirtual-fast-door` | `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` |
 | `iface-select-memo` | `CRATONVM_JIT_NO_IFACE_SELECT_MEMO` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
 | `ir-unresumable-trap-guard` | `CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD` |
@@ -894,6 +897,7 @@ export inherited from a parent shell.
 | `virtual-promote-java-util` | `CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL` |
 | `native-cf-postcomplete-skip` | `CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP` |
 | `native-cf-postcomplete-direct` | `CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT` |
+| `ffm-verdict-ways` | `CRATONVM_FFM_VERDICT_WAYS` |
 
 ## `CRATONVM_GC`
 

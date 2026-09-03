@@ -55,7 +55,7 @@ impl Compiler {
         if self.next_spill_offset < args_frame_top {
             self.next_spill_offset = args_frame_top;
         }
-        let base = self.reserve_spill_slots(arg_slots.len())?;
+        let base = self.reserve_spill_slots(arg_slots.len(), SpillReason::CallService)?;
         let end = base.checked_add((arg_slots.len() as i32).checked_mul(8)?)?;
         for slot in arg_slots {
             if let StackSlot::Frame(off) = slot {
