@@ -796,6 +796,28 @@ impl Compiler {
     ///   * `2C`       — ModRM mod=00 reg=RBP(5) r/m=100(SIB).
     ///   * `25`       — SIB scale=0 index=none(4) base=none(5) → [disp32].
     ///   * `disp32`   — displacement; effective address = segment base + disp.
+    /// RAX = the current `JvmThread*`: the `JIT_THREAD` mirror load where the
+    /// VM publishes it, the `get_current_thread` helper call otherwise. The two
+    /// return the same pointer by construction (`publish_jit_thread_mirror` is
+    /// called at every site that sets `JIT_THREAD`).
+    pub(super) fn emit_fetch_current_thread_into_rax(&mut self) {
+        let tls_disp = jit_thread_tls_disp();
+        if tls_disp != 0 {
+            self.emit_mov_rax_tls_disp32(tls_disp as u32);
+        } else {
+            self.emit_call_absolute(self.helpers.get_current_thread);
+        }
+    }
+    /// `MOV RAX, gs:[disp32]` (`fs:` on Linux): the one-instruction thread
+    /// fetch through the `JIT_THREAD` mirror (`jit_thread_tls_disp`).
+    pub(super) fn emit_mov_rax_tls_disp32(&mut self, disp32: u32) {
+        self.buf.emit_byte(inline_rbp_tls_segment_prefix());
+        self.buf.emit_byte(0x48); // REX.W
+        self.buf.emit_byte(0x8B); // MOV r64, r/m64
+        self.buf.emit_byte(0x04); // ModRM: reg=RAX, r/m=SIB
+        self.buf.emit_byte(0x25); // SIB: [disp32] absolute
+        self.buf.emit(&disp32.to_le_bytes());
+    }
     pub(super) fn emit_mov_tls_disp32_rbp(&mut self, disp32: u32) {
         self.buf.emit_byte(inline_rbp_tls_segment_prefix());
         self.buf.emit_byte(0x48); // REX.W

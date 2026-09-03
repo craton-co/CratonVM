@@ -255,7 +255,9 @@ pub(crate) use objects::note_ungated_ref_store;
 // other pays. `objects` is a private module, so the re-export is the seam.
 pub(crate) use objects::{ref_store_gates_of, ref_store_post_skip_mask_of};
 pub use objects::ref_store_site_counts;
+pub(crate) use objects::note_gated_ref_store;
 pub use null_check_elim::receiver_null_check_counts;
+pub use null_check_elim::receiver_null_check_implicit_by_arm;
 pub use null_check_elim::receiver_null_check_implicit_count;
 mod osr;
 mod simd;
@@ -277,6 +279,7 @@ mod emit;
 mod frames;
 mod operand_stack;
 pub use operand_stack::spill_slots_cap;
+pub(crate) use inlining::MAX_INLINE_MERGE_DEPTH;
 pub(crate) use operand_stack::SpillReason;
 pub mod safepoint;
 // ---------------------------------------------------------------------------

@@ -5,6 +5,41 @@ built or run. Nothing below is an "after" measurement, because there is none.
 Every forward-looking claim is labelled **PREDICTED** and carries what would
 falsify it.
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** The banner says "no binary carrying
+> these changes has been built or run" and that every forward-looking claim is
+> PREDICTED. A `--jdk-only-report` from a build of this tree now carries the
+> shape §1.3 predicted:
+>
+> ```json
+> "observation_sink": {
+>   "recorded": 61, "cap": 4096, "saturated": false,
+>   "truncated": false, "dropped": 0,
+>   "jit_fastpath": { "recorded": 0, "cap": 4096, "truncated": false, "dropped": 0 },
+>   "jit_compile":  { "recorded": 0, "cap": 256,  "truncated": false, "dropped": 0 }
+> }
+> ```
+>
+> `truncated`, `dropped` and `saturated` are all present, with both per-source
+> sub-objects. The `vm-cli` half is there too — a `--jdk-only` suite run prints
+> *"saturation: none — every bounded collection reported `truncated: false`, so
+> the counts above are totals, not floors."*
+>
+> **One field differs from the prediction, and the difference is the interesting
+> part.** §1.4 — "Why `jit_compile` is `null` and not `false`" — deliberately
+> reported `null` because that lane did not own `jit/src/lib.rs` and **"an
+> unmeasured thing must not render as a clean one"**. Today it reads `false` /
+> `0`. That is exactly the shape §1.4 was guarding against, so the VALUE alone
+> cannot say whether the guard was honoured or lost.
+>
+> The mechanism says it was honoured: §5's patch landed.
+> `record_jdk_only_direct_native_refusal` in `jit/src/lib.rs` now increments
+> `JDK_ONLY_VIOLATIONS_DROPPED` on the at-capacity branch, with a comment naming
+> the same reordering — dedup BEFORE the capacity test — that `helpers.rs` got on
+> 2026-08-20. The counter exists, so `false` / `0` is a measurement rather than a
+> default. **A changed value has to be checked against its mechanism, not
+> accepted**: had the `null` been replaced without the counter, the report would
+> read identically and would be lying in precisely the way §1.4 named.
+
 **Date** 2026-08-20 · **Lane** H1 · **Base** `26e4b5db4` on
 `claude/jdk-only-mode-handoff-09b48c`
 **Subject** `--jdk-only-report`'s observation sinks; `regression-suite/run.sh`;

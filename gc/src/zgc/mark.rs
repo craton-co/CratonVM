@@ -241,7 +241,7 @@ use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::zgc::barrier::is_bare_offset;
 use crate::zgc::vaddr::{ZColor, ZGoodMask, Z_MARKED0, Z_MARKED1, Z_OFFSET_MASK};
@@ -666,6 +666,36 @@ pub struct ZMarkStatsSnapshot {
 }
 
 impl ZMarkStats {
+    /// Zero every counter: what a POOL REUSED ACROSS CYCLES must do before
+    /// each one, because its readers ask "how much did THIS cycle do?".
+    ///
+    /// `off_heap_children` is the one that would bite silently:
+    /// `collect_garbage` reads it as that cycle.s `wild_skipped` and warns
+    /// when it is non-zero, so a cumulative count would report corrupt
+    /// reference slots on every cycle after the first one that saw any.
+    pub fn reset(&self) {
+        for counter in [
+            &self.objects_scanned,
+            &self.objects_marked,
+            &self.roots_marked,
+            &self.stripe_publishes,
+            &self.published_objects,
+            &self.steal_attempts,
+            &self.steals_succeeded,
+            &self.stolen_objects,
+            &self.own_stripe_refills,
+            &self.ingress_pushes,
+            &self.ingress_drains,
+            &self.ingress_objects,
+            &self.off_heap_children,
+            &self.domain_refusals,
+            &self.terminations,
+            &self.termination_aborts,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+
     /// Read every counter. Not atomic as a group; diagnostics only.
     pub fn snapshot(&self) -> ZMarkStatsSnapshot {
         ZMarkStatsSnapshot {
@@ -1685,6 +1715,13 @@ impl ZMarkTerminator {
         self.park_timeouts.load(Ordering::Relaxed)
     }
 
+    /// Zero the timeout count, for a terminator reused across cycles: the
+    /// heap folds this into a process counter once per cycle, and a
+    /// cumulative value would be re-added every time.
+    pub fn reset_park_timeouts(&self) {
+        self.park_timeouts.store(0, Ordering::Relaxed);
+    }
+
     /// Waits released by the termination edge itself. See the field.
     pub fn park_termination_wakes(&self) -> u64 {
         self.park_termination_wakes.load(Ordering::Relaxed)
@@ -1915,6 +1952,8 @@ impl ZMarkPauseControl {
 /// [`ZMarkCoordinator`]; never a `static`.
 pub struct ZMarkShared {
     ctx: Arc<dyn ZMarkContext>,
+    /// Per-cycle override of `ctx`. See `context_arc`.
+    cycle_ctx: RwLock<Option<Arc<dyn ZMarkContext>>>,
     stripes: ZMarkStripeSet,
     ingress: ZMarkIngress,
     terminator: ZMarkTerminator,
@@ -1944,7 +1983,34 @@ impl std::fmt::Debug for ZMarkShared {
 }
 
 impl ZMarkShared {
-    /// The heap-shape context.
+    /// The heap-shape context this cycle is marking through.
+    ///
+    /// `None` in the slot means "use the one this pool was constructed with",
+    /// which is every existing caller. The slot exists for a POOL THAT
+    /// OUTLIVES ITS CYCLES: such a pool is owned by the heap, and on this
+    /// backend the mark context IS the heap -- so a pool holding an `Arc` to
+    /// it would keep the heap alive, the heap would never drop, and its worker
+    /// threads would never be joined. Binding the context per cycle
+    /// ([`ZMarkCoordinator::begin_cycle_with`]) and dropping it at `end_cycle`
+    /// breaks that loop at the only point where it would otherwise close.
+    #[inline]
+    pub fn context_arc(&self) -> Arc<dyn ZMarkContext> {
+        match self.cycle_ctx.read().as_ref() {
+            Some(ctx) => Arc::clone(ctx),
+            None => Arc::clone(&self.ctx),
+        }
+    }
+
+    /// Bind (or clear) the context for one cycle.
+    fn set_cycle_context(&self, ctx: Option<Arc<dyn ZMarkContext>>) {
+        *self.cycle_ctx.write() = ctx;
+    }
+
+    /// The constructed context, borrowed.
+    ///
+    /// Does NOT see a per-cycle binding, so it is only for callers that know
+    /// the pool was built with the context they mean -- everything on the
+    /// per-cycle path uses [`Self::context_arc`].
     #[inline]
     pub fn context(&self) -> &dyn ZMarkContext {
         &*self.ctx
@@ -2048,7 +2114,7 @@ impl ZMarkHandle {
     /// The current good mask, forwarded from the context.
     #[inline]
     pub fn good_mask(&self) -> u64 {
-        self.shared.ctx.good_mask()
+        self.shared.context_arc().good_mask()
     }
 
     /// A [`ZMarkMutatorBuffer`] that **flushes itself into this pool on drop**.
@@ -2140,7 +2206,8 @@ impl ZMarkHandle {
         if addr == 0 {
             return false;
         }
-        let ctx = &*self.shared.ctx;
+        let ctx_arc = self.shared.context_arc();
+        let ctx = &*ctx_arc;
         if !ctx.is_in_heap(addr) {
             self.shared
                 .stats
@@ -2173,7 +2240,7 @@ impl ZMarkHandle {
     /// `None` if the context declares none. See [`ZMarkContext::heap_base`].
     #[inline]
     pub fn heap_base(&self) -> Option<u64> {
-        self.shared.ctx.heap_base()
+        self.shared.context_arc().heap_base()
     }
 
     /// The release-mode tripwire and the conversion, in one place.
@@ -2221,7 +2288,7 @@ impl ZMarkHandle {
             );
             return None;
         }
-        let Some(base) = self.shared.ctx.heap_base() else {
+        let Some(base) = self.shared.context_arc().heap_base() else {
             self.shared
                 .stats
                 .domain_refusals
@@ -2360,7 +2427,8 @@ impl ZMarkHandle {
         if addr == 0 {
             return false;
         }
-        let ctx = &*self.shared.ctx;
+        let ctx_arc = self.shared.context_arc();
+        let ctx = &*ctx_arc;
         if !ctx.is_in_heap(addr) {
             self.shared
                 .stats
@@ -2504,7 +2572,7 @@ impl ZMarkWorker {
     /// The thread body: join cycles, drain them, park between them.
     pub fn run(&mut self) {
         let shared = Arc::clone(&self.shared);
-        shared.ctx.on_worker_start(self.id);
+        shared.context_arc().on_worker_start(self.id);
         loop {
             if shared.should_stop.load(Ordering::Acquire) {
                 break;
@@ -2531,7 +2599,7 @@ impl ZMarkWorker {
 
             self.run_cycle(&shared, my_cycle);
         }
-        shared.ctx.on_worker_end(self.id);
+        shared.context_arc().on_worker_end(self.id);
     }
 
     /// Drain one cycle to its fixed point.
@@ -2577,7 +2645,8 @@ impl ZMarkWorker {
             return 0;
         }
         let shared = Arc::clone(&self.shared);
-        let ctx: &dyn ZMarkContext = &*shared.ctx;
+        let ctx_arc = shared.context_arc();
+        let ctx: &dyn ZMarkContext = &*ctx_arc;
         let stripes = &shared.stripes;
         let stats = &shared.stats;
         let pause = &shared.pause;
@@ -2854,6 +2923,32 @@ impl Drop for ZMarkPauseGuard<'_> {
 /// ```
 ///
 /// [`mark_to_completion`](Self::mark_to_completion) packages the inner loop.
+/// A context that marks nothing: what a POOL OUTLIVING ITS CYCLES is built
+/// with, so it holds no heap between them.
+///
+/// Every method is the refusing answer, and `is_in_heap` returning `false` is
+/// the load-bearing one -- a worker that somehow drained with no cycle bound
+/// discards its work rather than dereferencing an address on behalf of a heap
+/// that may no longer exist.
+#[derive(Debug, Default)]
+pub struct ZInertMarkContext;
+
+impl ZMarkContext for ZInertMarkContext {
+    fn good_mask(&self) -> u64 {
+        0
+    }
+    fn try_mark(&self, _addr: u64) -> bool {
+        false
+    }
+    fn is_marked(&self, _addr: u64) -> bool {
+        false
+    }
+    fn visit_refs(&self, _addr: u64, _f: &mut dyn FnMut(u64)) {}
+    fn is_in_heap(&self, _addr: u64) -> bool {
+        false
+    }
+}
+
 pub struct ZMarkCoordinator {
     shared: Arc<ZMarkShared>,
     handles: Vec<JoinHandle<()>>,
@@ -2878,6 +2973,7 @@ impl ZMarkCoordinator {
         let stripe_count = stripe_count_for(n);
         let shared = Arc::new(ZMarkShared {
             ctx,
+            cycle_ctx: RwLock::new(None),
             stripes: ZMarkStripeSet::new(stripe_count),
             ingress: ZMarkIngress::new(),
             terminator: ZMarkTerminator::new(n),
@@ -2969,8 +3065,8 @@ impl ZMarkCoordinator {
         self.shared.marking_active.store(true, Ordering::Release);
         tracing::debug!(
             target: "zgc",
-            good_mask = self.shared.ctx.good_mask(),
-            mark_color = ?mark_color_for(self.shared.ctx.good_mask()),
+            good_mask = self.shared.context_arc().good_mask(),
+            mark_color = ?mark_color_for(self.shared.context_arc().good_mask()),
             "ZGC mark cycle opened"
         );
     }
@@ -2979,6 +3075,24 @@ impl ZMarkCoordinator {
     /// [`ZMarkHandle::mark_live`] after this.
     pub fn end_cycle(&self) {
         self.shared.marking_active.store(false, Ordering::Release);
+        // Drop the cycle's context. A pool constructed with a real one falls
+        // back to that and is unaffected; a PERSISTENT pool stops referencing
+        // the heap it just marked here, which is what lets that heap drop.
+        self.shared.set_cycle_context(None);
+    }
+
+    /// [`Self::begin_cycle`], marking through `ctx` for this cycle only.
+    ///
+    /// What makes a pool reusable across cycles: the context is dropped again
+    /// by [`Self::end_cycle`], so between cycles the pool holds no reference
+    /// to any heap. See [`ZMarkShared::context_arc`] for why that matters.
+    pub fn begin_cycle_with(&self, ctx: Arc<dyn ZMarkContext>) {
+        // A reused pool carries the previous cycle.s counters, and every
+        // reader of them asks about THIS cycle -- see `ZMarkStats::reset`.
+        self.shared.stats.reset();
+        self.shared.terminator.reset_park_timeouts();
+        self.shared.set_cycle_context(Some(ctx));
+        self.begin_cycle();
     }
 
     /// Mark a root set and seed the stripes with it.
@@ -2989,7 +3103,8 @@ impl ZMarkCoordinator {
     ///
     /// Call at a safepoint, before [`start_marking`](Self::start_marking).
     pub fn push_roots(&self, roots: &[u64]) -> usize {
-        let ctx = &*self.shared.ctx;
+        let ctx_arc = self.shared.context_arc();
+        let ctx = &*ctx_arc;
         let mut batch: Vec<u64> = Vec::with_capacity(roots.len());
         for &root in roots {
             if root == 0 || !ctx.is_in_heap(root) {
@@ -3014,7 +3129,8 @@ impl ZMarkCoordinator {
     /// test can create an imbalance on purpose and observe work stealing fix
     /// it.
     pub fn dbg_push_roots_to_stripe(&self, stripe_key: usize, roots: &[u64]) -> usize {
-        let ctx = &*self.shared.ctx;
+        let ctx_arc = self.shared.context_arc();
+        let ctx = &*ctx_arc;
         let mut batch: Vec<u64> = Vec::with_capacity(roots.len());
         for &root in roots {
             if root == 0 || !ctx.is_in_heap(root) {
@@ -3208,7 +3324,8 @@ impl ZMarkCoordinator {
     /// reported `Complete` — the liveness answers the hook sees must be
     /// final.
     pub fn process_non_strong_refs(&self, hook: &dyn ZNonStrongRefHook) -> usize {
-        let ctx: &dyn ZMarkContext = &*self.shared.ctx;
+        let ctx_arc = self.shared.context_arc();
+        let ctx: &dyn ZMarkContext = &*ctx_arc;
         let mut keep: Vec<u64> = Vec::new();
         {
             let is_marked = |addr: u64| -> bool { ctx.is_marked(addr) };
@@ -4839,5 +4956,44 @@ mod tests {
         assert_eq!(ingress.drain_into(&mut out), Z_MARK_INGRESS_BUCKETS);
         assert_eq!(sorted(out).len(), Z_MARK_INGRESS_BUCKETS);
         assert!(!ingress.has_work());
+    }
+}
+
+#[cfg(test)]
+mod pool_cost {
+    use super::*;
+
+    /// How much of the parallel marker's per-cycle handicap is the POOL
+    /// ITSELF: spawning `n` OS threads at `begin`, and stopping and joining
+    /// them at `drop`.
+    ///
+    /// Asked before building a persistent pool, because the arithmetic decides
+    /// whether one is worth building. The 2026-09-02 re-measurement put the
+    /// parallel marker ~2 ms/cycle behind the serial loop at four workers and
+    /// ~6 ms behind at one; if construction is a small fraction of that, a
+    /// persistent pool cannot close it and the cost is in the coordination
+    /// protocol instead.
+    #[test]
+    #[ignore = "timing measurement; wants --release and a quiet box"]
+    fn measure_the_pool_construction_cost() {
+        const ROUNDS: usize = 20;
+        let mut graph = rustc_hash::FxHashMap::default();
+        graph.insert(1u64, vec![2u64]);
+        graph.insert(2u64, vec![]);
+        let ctx: Arc<dyn ZMarkContext> = Arc::new(TestMarkContext::new(graph));
+
+        for workers in [1usize, 2, 4, 8] {
+            let start = std::time::Instant::now();
+            for _ in 0..ROUNDS {
+                let pool = ZMarkCoordinator::new(Arc::clone(&ctx), workers);
+                pool.begin_cycle();
+                pool.end_cycle();
+                drop(pool);
+            }
+            let per = start.elapsed() / ROUNDS as u32;
+            eprintln!(
+                "[pool-cost] workers={workers} construct+begin+end+drop = {per:?} per cycle"
+            );
+        }
     }
 }

@@ -580,7 +580,11 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
+<<<<<<< HEAD
 308 tokens.
+=======
+314 tokens.
+>>>>>>> origin/dev
 
 | Token | Expands to |
 | --- | --- |
@@ -682,6 +686,14 @@ export inherited from a parent shell.
 | `precise-alloc-athrow` | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` |
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
 | `ir-inline-tlab` | `CRATONVM_JIT_IR_INLINE_TLAB` |
+| `ir-gated-ref-store` | `CRATONVM_JIT_IR_GATED_REF_STORE` |
+| `tls-thread-fetch` | `CRATONVM_JIT_TLS_THREAD_FETCH` |
+| `ir-receiver-guard-cse` | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE` |
+| `ir-residency-pays` | `CRATONVM_JIT_IR_RESIDENCY_PAYS` |
+| `ir-fused-branch` | `CRATONVM_JIT_IR_FUSED_BRANCH` |
+| `ir-const-imm` | `CRATONVM_JIT_IR_CONST_IMM` |
+| `ir-phi-residency` | `CRATONVM_JIT_IR_PHI_RESIDENCY` |
+| `merged-call-sentinel` | `CRATONVM_JIT_MERGED_CALL_SENTINEL` |
 | `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
 | `gated-ref-store` | `CRATONVM_JIT_GATED_REF_STORE` |
@@ -846,13 +858,14 @@ export inherited from a parent shell.
 | `elide-trivial-ctor` | `CRATONVM_JIT_ELIDE_TRIVIAL_CTOR` |
 | `site-cache-stubs` | `CRATONVM_JIT_SITE_CACHE_STUBS` |
 | `atomic-long-intrinsic` | `CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC` |
-| `box-unbox-intrinsic` | `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC` |
+| `box-unbox-intrinsic` | `CRATONVM_JIT_BOX_UNBOX_INTRINSIC / CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC` |
 | `tier-c1-threshold` | `CRATONVM_TIER_C1_THRESHOLD` |
 | `tier-c2-min-invocations` | `CRATONVM_TIER_C2_MIN_INVOCATIONS` |
 | `tier-c2-threshold` | `CRATONVM_TIER_C2_THRESHOLD` |
 | `tier-osr-backedge` | `CRATONVM_TIER_OSR_BACKEDGE` |
 | `tier-osr-threshold` | `CRATONVM_TIER_OSR_THRESHOLD` |
 | `tier-pgo` | `CRATONVM_TIER_PGO` |
+| `tier-pgo-receivers` | `CRATONVM_TIER_PGO_RECEIVERS` |
 | `tiered` | `CRATONVM_TIER_ENABLED` |
 | `tlab-zero-elision` | `CRATONVM_NO_JIT_TLAB_ZERO_ELISION` |
 | `trivial-getter` | `CRATONVM_TRIVIAL_GETTER` |
@@ -895,7 +908,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-120 tokens.
+121 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -937,6 +950,7 @@ export inherited from a parent shell.
 | `zgc-mark-root-filter` | `CRATONVM_ZGC_MARK_ROOT_FILTER` |
 | `zgc-jit-tlab` | `CRATONVM_ZGC_JIT_TLAB` |
 | `zgc-tlab-tail-sink` | `CRATONVM_ZGC_TLAB_TAIL_SINK` |
+| `zgc-mark-pool-persistent` | `CRATONVM_ZGC_MARK_POOL_PERSISTENT` |
 | `g1-reserve-heap` | `CRATONVM_G1_RESERVE_HEAP` |
 | `g1-uncommit` | `CRATONVM_G1_UNCOMMIT` |
 | `g1-card-rset` | `CRATONVM_G1_CARD_RSET` |
