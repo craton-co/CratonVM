@@ -553,7 +553,24 @@ impl VmHeap {
                 VmHeap::G1(G1State::new(config))
             }
             #[cfg(feature = "zgc")]
-            GcBackend::Zgc => VmHeap::Zgc(ZgcRealHeap::new_shared(total_bytes)),
+            GcBackend::Zgc => {
+                let heap = ZgcRealHeap::new_shared(total_bytes);
+                // `-XX:MaxGCPauseMillis` reached ONLY G1 before 2026-09-03.
+                // On the DEFAULT collector an operator who asked for a pause
+                // target got no answer and no diagnostic; ZGC now sizes its
+                // allocation budget from it (`refresh_pause_target_budget`).
+                // Applied after construction, so it wins over
+                // `CRATONVM_ZGC_PAUSE_TARGET_MS`, which seeded the field --
+                // an explicit flag must never be overridden by an A/B switch.
+                //
+                // `0` is refused by the CLI parser (`-XX:MaxGCPauseMillis=0`
+                // is warned about and dropped), so `Some(0)` cannot arrive
+                // here to mean "off"; that spelling belongs to the env var.
+                if let Some(ms) = overrides.max_gc_pause_ms {
+                    heap.set_pause_target_ms(ms.max(1));
+                }
+                VmHeap::Zgc(heap)
+            }
         }
     }
 
