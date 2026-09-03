@@ -1778,6 +1778,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "inline-oop-coverage", on_key: Some("CRATONVM_JIT_INLINE_OOP_COVERAGE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "local-mask-fail-closed", on_key: Some("CRATONVM_JIT_LOCAL_MASK_FAIL_CLOSED"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     E { group: Group::JIT, token: "wide-local-oop-maps", on_key: Some("CRATONVM_JIT_WIDE_LOCAL_OOP_MAPS"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
+    E { group: Group::JIT, token: "arm64-safepoints", on_key: Some("CRATONVM_JIT_ARM64_SAFEPOINTS"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     E { group: Group::JIT, token: "ir-gc-point-maps", on_key: Some("CRATONVM_JIT_IR_GC_POINT_MAPS"), off_key: None, off_word: Some("0"), since: "2026-08-30" },
     E { group: Group::JIT, token: "zero-spid", on_key: Some("CRATONVM_JIT_ZERO_SPID"), off_key: None, off_word: Some("0"), since: "2026-08-30" },
     E { group: Group::GC, token: "card-metrics", on_key: Some("CRATONVM_GC_CARD_METRICS"), off_key: None, off_word: None, since: "2026-07-31" },
@@ -2067,6 +2068,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "zgc-gen-minors-per-major", on_key: Some("CRATONVM_ZGC_GEN_MINORS_PER_MAJOR"), off_key: None, off_word: None, since: "2026-08-17" },
     E { group: Group::GC, token: "zgc-gen-nursery-percent", on_key: Some("CRATONVM_ZGC_GEN_NURSERY_PERCENT"), off_key: None, off_word: Some("0"), since: "2026-08-17" },
     E { group: Group::GC, token: "zgc-alloc-trigger", on_key: Some("CRATONVM_ZGC_ALLOC_TRIGGER"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
+    E { group: Group::GC, token: "zgc-pause-target-ms", on_key: Some("CRATONVM_ZGC_PAUSE_TARGET_MS"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     // G2e/G2f (2026-08-17, widened to every cycle 2026-08-18). Default-ON kill
     // switches over the sweep's two per-dead-object costs, in the shape `zgc-relocate` established:
     // `0` restores the previous behaviour byte for byte, so the A/B is a re-run

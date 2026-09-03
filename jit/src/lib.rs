@@ -22303,6 +22303,10 @@ fn try_compile_inner(
         *backend_attempted = true;
 
         let mut backend = aarch64_backend::Arm64Backend::new();
+        // Without this the backend's `safepoint_flag_addr` stays 0 and
+        // `emit_safepoint_poll` emits nothing — the same optional-helper
+        // contract x64 uses, so an unwired build is byte-identical.
+        backend.set_helpers(*helpers);
         let result = backend.compile_method_with_info(
             cached.max_locals as usize,
             num_params,

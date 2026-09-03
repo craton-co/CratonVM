@@ -905,6 +905,7 @@ export inherited from a parent shell.
 | `inline-oop-coverage` | `CRATONVM_JIT_INLINE_OOP_COVERAGE` |
 | `local-mask-fail-closed` | `CRATONVM_JIT_LOCAL_MASK_FAIL_CLOSED` |
 | `wide-local-oop-maps` | `CRATONVM_JIT_WIDE_LOCAL_OOP_MAPS` |
+| `arm64-safepoints` | `CRATONVM_JIT_ARM64_SAFEPOINTS` |
 | `ir-gc-point-maps` | `CRATONVM_JIT_IR_GC_POINT_MAPS` |
 | `zero-spid` | `CRATONVM_JIT_ZERO_SPID` |
 | `int-value-direct` | `CRATONVM_JIT_INT_VALUE_DIRECT` |
@@ -918,7 +919,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-130 tokens.
+131 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1042,6 +1043,7 @@ export inherited from a parent shell.
 | `zgc-gen-minors-per-major` | `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` |
 | `zgc-gen-nursery-percent` | `CRATONVM_ZGC_GEN_NURSERY_PERCENT` |
 | `zgc-alloc-trigger` | `CRATONVM_ZGC_ALLOC_TRIGGER` |
+| `zgc-pause-target-ms` | `CRATONVM_ZGC_PAUSE_TARGET_MS` |
 | `zgc-sweep-header-zero` | `CRATONVM_ZGC_SWEEP_HEADER_ZERO` |
 | `zgc-sweep-dead-runs` | `CRATONVM_ZGC_SWEEP_DEAD_RUNS` |
 | `zgc-mark-ctx-direct` | `CRATONVM_ZGC_MARK_CTX_DIRECT` |

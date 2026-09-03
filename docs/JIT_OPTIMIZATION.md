@@ -1154,6 +1154,72 @@ What has not been examined is the instruction-level shape of the loop body at
 each tier. That is where the next person should start, with
 `CRATONVM_DBG=jit-disasm CRATONVM_DBG_JIT_DISASM=TierProbe.fieldloop`.
 
+#### The disassembly, which settles it: neither candidate was the cause
+
+Both tiers' `fieldloop` bodies, extracted between the backedge and its target
+(`CRATONVM_DBG=jit-disasm CRATONVM_DBG_JIT_DISASM=TierProbe.fieldloop`).
+
+**The baseline tier** unrolls 4x and keeps every loop-carried value in a
+callee-saved register — `i` in `r12d`, `n` in `r14d`, `sum` in `r13`, `this`
+in `r15`:
+
+```text
+219: cmp r12d,r14d          ; counter and bound, both registers
+226: mov rax,r15            ; receiver, from a register
+229: mov ecx,[rax+0Fh]      ; GC_FLAGS — and the implicit null check
+239: movsxd rax,[rax+10h]   ; the field
+284: add eax,ecx            ; sum, in a register
+290: add r12d,1
+```
+
+Note what is absent: no `TEST RAX, RAX; JZ`. The receiver null check is
+already gone here, elided by the `this` seed, and `mov ecx,[rax+0Fh]` is the
+implicit check that replaced it.
+
+**The optimizing tier** does not unroll, and round-trips *every* loop-carried
+value through the frame on *every* iteration:
+
+```text
+1aa: mov rax,[rbp-58h]      ; receiver reloaded from the frame
+1ae: test rax,rax           ; the null check
+20d: mov [rbp-88h],rax      ; spill the loaded field
+217: mov rcx,[rbp-88h]      ; reload it
+220: mov [rbp-90h],rax      ; spill sum
+227: mov rbx,[rbp-78h]      ; reload sum
+235: mov [rbp-98h],rax      ; spill counter
+23c: mov r12,[rbp-80h]      ; reload counter
+243: mov rcx,[rbp-60h]      ; reload bound
+```
+
+That is roughly eight extra memory operations per iteration against a body
+whose real work is one load and one add. **The null check is a rounding error
+beside it**, which is why removing it moved nothing useful — and why the
+tiering inversion on this shape was never a null-check problem.
+
+**The allocator is not absent — it is losing.** With
+`CRATONVM_DBG_IR_LINEAR_SCAN=1` on this method:
+
+```text
+[ir-ls] nodes=23 positions=17 peak_live=11 scan_promoted=9
+        resident=3 (fp=0 gp=3) demoted=0 splits=4 scan_spills=1 scan_reloads=1
+```
+
+It runs, and it holds **three** of nine promoted candidates while **four are
+lost to live-range splits** — against a peak of eleven live values and a file
+of five GP registers (`IR_LOWER_LS_GPRS`). So the residual inversion has two
+named causes, in this order:
+
+1. **Split handling in `allocate_linear_scan`.** Four candidates in a
+   twenty-three-node graph were split out of a register. A split value keeping
+   a register for its dominant range is the difference between this loop's
+   values living in `rbx`/`r12` and living in `[rbp-90h]`.
+2. **The optimizing tier does not unroll.** The baseline's 4x unroll amortises
+   the counter compare, the backedge and the safepoint poll over four
+   iterations; the optimizing tier pays all three every iteration.
+
+Neither is the null check, and neither is code size — the optimizing tier emits
+*less* code for this method (1,030 bytes against 1,579).
+
 **The named candidate was tried, and it made things worse.** Porting the
 receiver null-check elision to the optimizing tier is built and switchable
 (`CRATONVM_JIT_IR_THIS_NONNULL=1`, default OFF). It is correct and it engages
