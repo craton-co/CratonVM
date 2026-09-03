@@ -13393,7 +13393,9 @@ impl GarbageCollector for ZgcRealHeap {
                 "[GC] zgc-pause: cycle={cycle} total_us={pause_us} \
                  markend_us={markend_us} tlab_us={tlab_us} snapshot_us={snapshot_us} \
                  mark_us={mark_us} resurrect_us={resurrect_us} refs_us={refs_us} \
-                 sweep_us={sweep_us} registered={} dead={}                  alloc_trigger={}/{} pause_target={}ms/{}/unreachable={}",
+                 sweep_us={sweep_us} registered={} dead={} \
+                 alloc_trigger={}/{} \
+                 pause_target={}ms/{}/unreachable={}",
                 registered_count,
                 dead_count,
                 // ENGAGEMENT for F1: fires/budget. `0/<n>` means every cycle
