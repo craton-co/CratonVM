@@ -910,10 +910,11 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-125 tokens.
+126 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `g1-late-header-write` | `CRATONVM_G1_LATE_HEADER_WRITE` |
 | `g1-mark-oob-failsafe` | `CRATONVM_G1_MARK_OOB_FAILSAFE` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |
