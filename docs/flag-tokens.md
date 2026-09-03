@@ -580,7 +580,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-305 tokens.
+306 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -879,6 +879,7 @@ export inherited from a parent shell.
 | `xt-peer-deadline-ms` | `CRATONVM_XT_PEER_DEADLINE_MS` |
 | `xt-peer-total-ms` | `CRATONVM_XT_PEER_TOTAL_MS` |
 | `direct-call-arg-maps` | `CRATONVM_JIT_DIRECT_CALL_ARG_MAPS` |
+| `self-call-arg-maps` | `CRATONVM_JIT_SELF_CALL_ARG_MAPS` |
 | `ir-gc-point-maps` | `CRATONVM_JIT_IR_GC_POINT_MAPS` |
 | `zero-spid` | `CRATONVM_JIT_ZERO_SPID` |
 | `int-value-direct` | `CRATONVM_JIT_INT_VALUE_DIRECT` |
