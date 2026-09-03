@@ -1058,6 +1058,26 @@ What has not been examined is the instruction-level shape of the loop body at
 each tier. That is where the next person should start, with
 `CRATONVM_DBG=jit-disasm CRATONVM_DBG_JIT_DISASM=TierProbe.fieldloop`.
 
+**The named candidate was tried, and it made things worse.** Porting the
+receiver null-check elision to the optimizing tier is built and switchable
+(`CRATONVM_JIT_IR_THIS_NONNULL=1`, default OFF). It is correct and it engages
+— `seeded=9 elided=2 emitted=0` against `0/0/2` with it off, same answer —
+and on the very loop above it is **~20% SLOWER with the check removed**:
+medians 1.78/1.93 on against 1.49/1.61 off, two replicate pairs, within-config
+spread 8%, same direction both times.
+
+At `reps=1`, where the loop barely runs, the arms are 0.19 against 0.18, so
+the per-block seed costs ~0.01s and the 0.3s is in the emitted code, not the
+compile.
+
+Deleting two instructions cannot slow a loop by 20% on its own. What that
+result actually says is that this loop body is dominated by something
+layout- or branch-structure-sensitive, and removing a never-taken forward
+`JZ` moved it. **That is now the most promising lead for the residual
+inversion**, and it is why the switch is kept rather than the change reverted:
+it is the smallest known perturbation that moves this loop by 20%, which makes
+it the cheapest handle on whatever the real cause is.
+
 One structural asymmetry is worth naming as a candidate: the receiver
 null-check elision described above — the `this` seed and
 `CRATONVM_JIT_RECEIVER_NULL_ELIM` — is **single-pass only**. Both arms it

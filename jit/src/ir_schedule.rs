@@ -2218,6 +2218,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let a = graph.add(Op::Const(1), IrType::Int, vec![], None); // 0
         let b = graph.add(Op::Const(2), IrType::Int, vec![], None); // 1
@@ -2240,6 +2241,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let base = graph.add(Op::Const(0), IrType::Int, vec![], None);
         let mut prev = base;
@@ -2269,6 +2271,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         }
     }
 
