@@ -580,7 +580,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-320 tokens.
+322 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -894,6 +894,8 @@ export inherited from a parent shell.
 | `self-call-arg-maps` | `CRATONVM_JIT_SELF_CALL_ARG_MAPS` |
 | `merge-marks-exact` | `CRATONVM_JIT_MERGE_MARKS_EXACT` |
 | `inline-oop-coverage` | `CRATONVM_JIT_INLINE_OOP_COVERAGE` |
+| `local-mask-fail-closed` | `CRATONVM_JIT_LOCAL_MASK_FAIL_CLOSED` |
+| `wide-local-oop-maps` | `CRATONVM_JIT_WIDE_LOCAL_OOP_MAPS` |
 | `ir-gc-point-maps` | `CRATONVM_JIT_IR_GC_POINT_MAPS` |
 | `zero-spid` | `CRATONVM_JIT_ZERO_SPID` |
 | `int-value-direct` | `CRATONVM_JIT_INT_VALUE_DIRECT` |
