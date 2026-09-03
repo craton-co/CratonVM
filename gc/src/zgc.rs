@@ -1366,6 +1366,24 @@ pub struct ZgcRealHeap {
     /// Seeded from [`zgc_pause_target_ms`]; `-XX:MaxGCPauseMillis` overwrites
     /// it through [`Self::set_pause_target_ms`] after construction.
     pause_target_ms: AtomicU64,
+    /// The span that produced the most recent OVERRUN, in bytes. `0` means
+    /// "no overrun is remembered".
+    ///
+    /// The relax path may not widen [`Self::pause_affordable_span`] past
+    /// seven-eighths of this. Without that memory the loop re-probes the
+    /// region it already knows overruns: it relaxes a quarter at a time, the
+    /// span climbs back to where the last long pause happened, the pause
+    /// overruns again, and it cuts. Measured on `G1ChurnPauseProbe 50 1800` at
+    /// `-Xmx2048m` with a 200 ms target, that cycle cost 13% of wall and left
+    /// the worst pause at 290 ms against an unconstrained 296 -- all of the
+    /// cost of a ceiling and none of the benefit. This is the `ssthresh` of a
+    /// multiplicative-decrease loop, and leaving it out is the same mistake.
+    ///
+    /// Forgotten when a pause comes in at or below a QUARTER of the target:
+    /// that is a span far cheaper than the remembered overrun implies, which
+    /// means the workload changed and the memory is now about a heap that no
+    /// longer exists.
+    pause_overrun_span: AtomicU64,
     /// The span, in BYTES, that a pause of [`Self::pause_target_ms`] can
     /// afford to walk -- the controller's state. `0` means "never measured",
     /// and nothing can be projected from it, which is why the first cycle of
@@ -1828,6 +1846,7 @@ impl ZgcRealHeap {
             },
             pause_target_ms: AtomicU64::new(zgc_pause_target_ms()),
             pause_affordable_span: AtomicU64::new(0),
+            pause_overrun_span: AtomicU64::new(0),
             gc_rearm: AtomicUsize::new(0),
             native_alloc_pressure: AtomicBool::new(false),
             hard_alloc_failure: AtomicBool::new(false),
@@ -2427,10 +2446,12 @@ impl ZgcRealHeap {
         let target_ns = target_ms.saturating_mul(1_000_000);
         let prior = self.pause_affordable_span.load(Ordering::Relaxed);
         let affordable = if pause_ns > target_ns {
-            // OVERRAN. Scale the span by how far over it went. `u128` so the
-            // product cannot wrap: span is bounded by the heap, but `target_ns`
-            // is a flag and `pause_ns` a clock reading, and neither is bounded
-            // by anything this file owns.
+            // OVERRAN. Remember the span that did it -- the relax path may not
+            // climb back into it -- and scale the span by how far over it
+            // went. `u128` so the product cannot wrap: span is bounded by the
+            // heap, but `target_ns` is a flag and `pause_ns` a clock reading,
+            // and neither is bounded by anything this file owns.
+            self.pause_overrun_span.store(span_bytes, Ordering::Relaxed);
             let sample = (u128::from(span_bytes) * u128::from(target_ns) / u128::from(pause_ns))
                 .min(u128::from(u64::MAX)) as u64;
             if prior == 0 {
@@ -2439,10 +2460,23 @@ impl ZgcRealHeap {
                 // Never widen on an overrun, and never cut by more than half.
                 sample.clamp(prior / 2, prior)
             }
+        } else if prior != 0 && pause_ns.saturating_mul(4) <= target_ns {
+            // FAR under -- a quarter of the target or less. The span this
+            // cycle walked is much cheaper than the remembered overrun says it
+            // should be, so the memory is about a heap that no longer exists:
+            // drop it and let the loop relax freely again.
+            self.pause_overrun_span.store(0, Ordering::Relaxed);
+            prior.saturating_add(prior / 4)
         } else if prior != 0 && pause_ns.saturating_mul(2) <= target_ns {
             // COMFORTABLY UNDER, and currently constrained: give a quarter
-            // back. Reaching capacity releases the constraint entirely, below.
-            prior.saturating_add(prior / 4)
+            // back, but NEVER past seven-eighths of the span that last
+            // overran. See `pause_overrun_span` for what re-probing that
+            // region costs.
+            let wider = prior.saturating_add(prior / 4);
+            match self.pause_overrun_span.load(Ordering::Relaxed) {
+                0 => wider,
+                overran => wider.min(overran / 8 * 7).max(prior),
+            }
         } else {
             // In the hysteresis band, or never constrained. Leave it.
             return;
@@ -20356,10 +20390,15 @@ pub(crate) mod tests {
         assert_eq!(unreachable, 0);
     }
 
-    /// A pause that OVERRAN tightens, proportionally, and a pause that comes
-    /// back comfortably under relaxes until the constraint is released.
+    /// A pause that OVERRAN tightens; a pause that comes back under relaxes,
+    /// but never back into the span that overran.
+    ///
+    /// The cap is the `ssthresh` of this loop. Without it the relax path walks
+    /// the span straight back to where the last long pause happened, overruns,
+    /// and cuts -- a cycle that on `G1ChurnPauseProbe 50 1800` at `-Xmx2048m`
+    /// cost 13% of wall and left the worst pause where it started.
     #[test]
-    fn an_overrun_tightens_and_a_short_pause_relaxes() {
+    fn an_overrun_tightens_and_a_short_pause_relaxes_but_not_back_into_it() {
         const MIB: usize = 1024 * 1024;
         let heap = ZgcRealHeap::with_capacity(4096 * MIB);
         heap.set_pause_target_ms(100);
@@ -20370,33 +20409,42 @@ pub(crate) mod tests {
         assert_eq!(affordable, (250 * MIB) as u64, "twice over means half the span");
         assert_eq!(budget, 150 * MIB, "budget is affordable - live");
 
-        // Still over, but only just: tighten a little more, never widen.
-        heap.refresh_pause_target_budget(110_000_000, 100 * MIB, 150 * MIB);
-        let narrower = heap.pause_target_state().1;
-        assert!(
-            narrower < affordable,
-            "a pause still over the target must not widen the span: {narrower} vs {affordable}"
-        );
-
         // Inside the hysteresis band (over half the target, under it): hold.
-        let held = narrower;
-        heap.refresh_pause_target_budget(70_000_000, 100 * MIB, 100 * MIB);
-        assert_eq!(
-            heap.pause_target_state().1, held,
-            "a pause in the band between half the target and the target holds"
-        );
-
-        // Comfortably under (at or below half): give a quarter back, each cycle,
-        // until the affordable span reaches capacity and the constraint is
-        // released altogether.
-        heap.refresh_pause_target_budget(40_000_000, 100 * MIB, 100 * MIB);
+        heap.refresh_pause_target_budget(70_000_000, 100 * MIB, 150 * MIB);
         assert_eq!(
             heap.pause_target_state().1,
-            held + held / 4,
-            "a comfortable pause relaxes by a quarter"
+            (250 * MIB) as u64,
+            "a pause between half the target and the target holds"
         );
+
+        // Comfortably under: relax by a quarter -- but the last overrun was a
+        // 500 MiB span, so the cap is seven-eighths of that, 437.5 MiB. A
+        // quarter on 250 is 312.5, which is under the cap, so it applies.
+        heap.refresh_pause_target_budget(45_000_000, 100 * MIB, 150 * MIB);
+        assert_eq!(
+            heap.pause_target_state().1,
+            (250 * MIB + 250 * MIB / 4) as u64,
+            "a comfortable pause relaxes by a quarter while under the cap"
+        );
+
+        // Keep relaxing: the cap binds before capacity does, and the span
+        // sticks at seven-eighths of the overrun span rather than climbing
+        // back to it.
+        for _ in 0..20 {
+            heap.refresh_pause_target_budget(45_000_000, 100 * MIB, 150 * MIB);
+        }
+        let capped = heap.pause_target_state().1;
+        assert_eq!(
+            capped,
+            (500 * MIB / 8 * 7) as u64,
+            "relaxation stops at seven-eighths of the span that overran"
+        );
+
+        // A pause at or below a QUARTER of the target says the workload
+        // changed: the memory is dropped and the loop relaxes freely again,
+        // all the way to releasing the constraint.
         for _ in 0..200 {
-            heap.refresh_pause_target_budget(40_000_000, 100 * MIB, 100 * MIB);
+            heap.refresh_pause_target_budget(20_000_000, 100 * MIB, 150 * MIB);
         }
         let (_, released, budget, _) = heap.pause_target_state();
         assert_eq!(released, 0, "relaxing to capacity releases the constraint");
