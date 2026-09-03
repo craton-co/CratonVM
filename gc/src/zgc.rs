@@ -2545,6 +2545,27 @@ impl ZgcRealHeap {
                 self.counters
                     .pause_target_unreachable
                     .fetch_add(1, Ordering::Relaxed);
+                // AND FORGET EVERYTHING. "I have no constraint" has to be the
+                // same state as "I have never constrained", or the loop can
+                // lock itself out permanently -- which it did.
+                //
+                // The tighten arm never widens (`sample.clamp(prior / 2,
+                // prior)`), and the relax arm is capped by
+                // `pause_overrun_span`. So a stale `prior` is a CEILING on
+                // everything the loop can ever believe again. Observed at
+                // `-Xmx4096m` with a 100 ms target: a startup cycle overran by
+                // 3% while walking a ~5 MiB span, pinning `affordable` at
+                // 4.8 MiB; that is below the live set, so the clause went
+                // inert; being inert means no constraint, so every following
+                // cycle ran unconstrained at 640-733 ms; and each of those
+                // could only ever clamp back down to the stale 4.8 MiB. The
+                // run never recovered.
+                //
+                // Cleared, the next overrun re-seeds from `prior == 0` with
+                // that cycle's own span, which is the freshest evidence there
+                // is.
+                self.pause_affordable_span.store(0, Ordering::Relaxed);
+                self.pause_overrun_span.store(0, Ordering::Relaxed);
                 self.alloc_trigger_percent_bytes
             }
         };
@@ -20537,6 +20558,51 @@ pub(crate) mod tests {
             heap.pause_target_state().1,
             settled / 2,
             "a 10x outlier must halve the span, not divide it by ten"
+        );
+    }
+
+    /// Going inert must RESET the loop, or one bad early cycle locks it out of
+    /// the run.
+    ///
+    /// The tighten arm never widens and the relax arm is capped by
+    /// `pause_overrun_span`, so a stale `pause_affordable_span` is a ceiling on
+    /// everything the loop can ever believe again. Observed at `-Xmx4096m`
+    /// with a 100 ms target: a startup cycle overran by 3% while walking a
+    /// ~5 MiB span, pinning the affordable span at 4.8 MiB; that is below the
+    /// live set, so the clause went inert; being inert means unconstrained; and
+    /// every following 733 ms cycle could only clamp back down to the stale
+    /// 4.8 MiB. The run never recovered.
+    #[test]
+    fn going_inert_resets_the_loop_so_a_bad_early_cycle_is_not_permanent() {
+        const MIB: usize = 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(4096 * MIB);
+        heap.set_pause_target_ms(100);
+
+        // A startup cycle: a tiny span, barely over the target. It seeds the
+        // affordable span at something far too small to be useful.
+        heap.refresh_pause_target_budget(103_000_000, 1 * MIB, 4 * MIB);
+        let seeded = heap.pause_target_state().1;
+        assert!(seeded > 0 && seeded < (6 * MIB) as u64, "a tiny seed: {seeded}");
+
+        // Now the real live set exists, and it is bigger than that seed, so
+        // the clause goes inert -- and must forget, not remember.
+        heap.refresh_pause_target_budget(60_000_000, 60 * MIB, 10 * MIB);
+        let (_, after_inert, budget, unreachable) = heap.pause_target_state();
+        assert_eq!(after_inert, 0, "going inert must clear the affordable span");
+        assert_eq!(budget, 0, "and hand the clause back to the percentage form");
+        assert!(unreachable > 0);
+
+        // The next overrun re-seeds from this cycle's own span rather than
+        // being clamped down to the stale 4.8 MiB it would have kept.
+        heap.refresh_pause_target_budget(700_000_000, 60 * MIB, 1200 * MIB);
+        let (_, reseeded, budget, _) = heap.pause_target_state();
+        assert!(
+            reseeded > (100 * MIB) as u64,
+            "a 1260 MiB span at 7x the target affords ~180 MiB, not 4.8: {reseeded}"
+        );
+        assert!(
+            budget > ZGC_ALLOC_TRIGGER_FLOOR,
+            "and the loop is controlling again rather than sitting inert"
         );
     }
 
