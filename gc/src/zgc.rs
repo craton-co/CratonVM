@@ -2467,11 +2467,25 @@ impl ZgcRealHeap {
             // drop it and let the loop relax freely again.
             self.pause_overrun_span.store(0, Ordering::Relaxed);
             prior.saturating_add(prior / 4)
-        } else if prior != 0 && pause_ns.saturating_mul(2) <= target_ns {
-            // COMFORTABLY UNDER, and currently constrained: give a quarter
-            // back, but NEVER past seven-eighths of the span that last
-            // overran. See `pause_overrun_span` for what re-probing that
-            // region costs.
+        } else if prior != 0 && pause_ns.saturating_mul(4) <= target_ns.saturating_mul(3) {
+            // UNDER THREE QUARTERS of the target, and currently constrained:
+            // give a quarter back, but NEVER past seven-eighths of the span
+            // that last overran. See `pause_overrun_span` for what re-probing
+            // that region costs.
+            //
+            // Three quarters and not a half. The band has to be narrow enough
+            // that a loop sitting just under the target still relaxes,
+            // otherwise it RATCHETS: pause length is noisy, so a settled loop
+            // overruns every few cycles and tightens, while a band of
+            // `[target/2, target]` means the cycles in between are never
+            // comfortable enough to give anything back. Measured on
+            // `G1ChurnPauseProbe 50 1800` at `-Xmx4096m` with a 100 ms target
+            // and a half-target band: pauses sat at 55-95 ms for a hundred
+            // consecutive cycles -- the loop was holding the target perfectly
+            // -- while the budget walked one way from 199 MiB down to 11 MiB
+            // and the run collected 139 times instead of 3. Noise alone drove
+            // it, because tightening had no dead zone and relaxing was
+            // unreachable.
             let wider = prior.saturating_add(prior / 4);
             match self.pause_overrun_span.load(Ordering::Relaxed) {
                 0 => wider,
@@ -20409,18 +20423,19 @@ pub(crate) mod tests {
         assert_eq!(affordable, (250 * MIB) as u64, "twice over means half the span");
         assert_eq!(budget, 150 * MIB, "budget is affordable - live");
 
-        // Inside the hysteresis band (over half the target, under it): hold.
-        heap.refresh_pause_target_budget(70_000_000, 100 * MIB, 150 * MIB);
+        // Inside the hysteresis band (over three quarters of the target,
+        // under it): hold.
+        heap.refresh_pause_target_budget(90_000_000, 100 * MIB, 150 * MIB);
         assert_eq!(
             heap.pause_target_state().1,
             (250 * MIB) as u64,
-            "a pause between half the target and the target holds"
+            "a pause between three quarters of the target and the target holds"
         );
 
-        // Comfortably under: relax by a quarter -- but the last overrun was a
-        // 500 MiB span, so the cap is seven-eighths of that, 437.5 MiB. A
+        // Under three quarters: relax by a quarter -- but the last overrun was
+        // a 500 MiB span, so the cap is seven-eighths of that, 437.5 MiB. A
         // quarter on 250 is 312.5, which is under the cap, so it applies.
-        heap.refresh_pause_target_budget(45_000_000, 100 * MIB, 150 * MIB);
+        heap.refresh_pause_target_budget(70_000_000, 100 * MIB, 150 * MIB);
         assert_eq!(
             heap.pause_target_state().1,
             (250 * MIB + 250 * MIB / 4) as u64,
@@ -20431,7 +20446,7 @@ pub(crate) mod tests {
         // sticks at seven-eighths of the overrun span rather than climbing
         // back to it.
         for _ in 0..20 {
-            heap.refresh_pause_target_budget(45_000_000, 100 * MIB, 150 * MIB);
+            heap.refresh_pause_target_budget(70_000_000, 100 * MIB, 150 * MIB);
         }
         let capped = heap.pause_target_state().1;
         assert_eq!(
