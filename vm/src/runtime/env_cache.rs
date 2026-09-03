@@ -1889,6 +1889,18 @@ cached_is_set!(no_osr_inline_gate, "CRATONVM_JIT_NO_OSR_INLINE_GATE");
 /// `CRATONVM_JIT=-invoke-fast-door`.
 cached_is_set!(no_invoke_fast_door, "CRATONVM_JIT_NO_INVOKE_FAST_DOOR");
 
+/// `CRATONVM_JIT_NO_DOOR_RECEIVER_RECORD=1` -- stop the monomorphic invoke
+/// fast door recording its receiver into `profile_store`, i.e. restore the
+/// behaviour that made it return wrong answers.
+///
+/// This exists so the fix has an A/B lever inside ONE binary. Set, the door
+/// serves warm monomorphic hits and records nothing, so the receiver profile is
+/// sampled only from the calls the door DECLINED -- and
+/// `org.h2.test.store.TestRandomMapOps --Xmx 256m` goes back to
+/// `AssertionError: (1810, null)` in 12-23 s. Clear, it records like the
+/// general path and the workload is clean.
+cached_is_set!(no_door_receiver_record, "CRATONVM_JIT_NO_DOOR_RECEIVER_RECORD");
+
 /// `CRATONVM_JIT_INVOKE_FAST_DOOR` -- OPT IN to the monomorphic invoke fast
 /// door, which is default-OFF since 2026-09-03 because it returns wrong
 /// answers.
@@ -2263,6 +2275,28 @@ pub fn jit_eager_callee_chain() -> bool {
     })
 }
 
+/// Skip the C1→C2 supersede-epoch bump when the publish cannot have
+/// invalidated anything. OFF by default, because it was measured to buy
+/// nothing.
+///
+/// The bump invalidates every `Jit` invoke-cache entry in every thread, which
+/// sounds expensive and is not: instrumenting the eviction it causes
+/// (`epoch_stale_evictions`) over CratonBench measured **9** evictions for the
+/// whole run, and over the regex workload **0** — each call site evicts once
+/// and refills. Two of the three publish outcomes provably cannot invalidate
+/// anything (`SupersedeOutcome`, `jit_bridge`), so skipping them is safe, but
+/// safe and worthless is not a reason to change a default. Set
+/// `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS=1` to skip them anyway; the
+/// engagement census under `CRATONVM_DBG=jitc` reports what was skipped.
+#[inline]
+pub fn supersede_epoch_skip_useless() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS")
+            .map_or(false, |v| v != "0" && v != "false")
+    })
+}
+
 pub fn c2_supersede() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {
@@ -2312,11 +2346,35 @@ pub fn jit_ir_call_virtual() -> bool {
 /// `"false"` value) opts in. See
 /// `docs/feature-designs/profile-guided-inlining.md`.
 #[inline]
+/// Guarded monomorphic virtual/interface inlining. **DEFAULT OFF**; opt in with
+/// `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE=1`.
+///
+/// It defaulted ON from `f697d618e`, a commit whose own subject calls it
+/// "wip(pgo-02): plumbing ... (checkpoint, no codegen yet)", while THREE places
+/// in `jit/src/lib.rs` describe this same flag as "default-off, unsoaked" and
+/// reason about correctness on that basis -- one of them explicitly relies on
+/// the speculation being "behavior-preserving when off". The documented
+/// contract and the code disagreed, and the code was the one nobody read.
+///
+/// It produces wrong answers. `probes/TreeTailIterProbe.java`: a compiled
+/// `for (e : treeMap.tailMap(k).entrySet())` iterates ZERO entries while
+/// `entrySet().size()` on the same object says 6, deterministically from
+/// iteration ~502. Handing the same iterator to another method drains nothing
+/// either, so the iterator really is empty -- the speculated `iterator()` body
+/// is spliced against a receiver whose `root` mirror it then reads as null.
+/// That is `org.h2.test.store.TestRandomMapOps` op:1033, which has been failing
+/// H2 in 11-22 s and blocking
+/// `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902`,
+/// whose SIGSEGV needs 25-183 s to appear.
+///
+/// Turning the default off restores exactly the state the surrounding code is
+/// written for. Re-enabling it needs the splice's receiver handling fixed
+/// first, and `probes/TreeTailIterProbe.java` is the check.
 pub fn jit_guarded_virtual_inline() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_GUARDED_VIRTUAL_INLINE")
-            .map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"))
     })
 }
 

@@ -233,7 +233,40 @@ sets it is unaffected.
 Correctness first: the measured speedup is recoverable the moment the sequence
 is made relocation-safe.
 
-## The repro is currently BLOCKED by an earlier failure (2026-09-02)
+## UNBLOCKED, and it reproduces (2026-09-03)
+
+The blocker below was `op:1033`, and it is fixed --
+`CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` had defaulted ON against a contract
+documented three times as "default-off, unsoaked"
+(`known-issues/jit/bug-compiled-treemap-submap-iteration-empty-20260903.md`).
+With that cleared, this page's own repro runs again on `dev@9f1accc2d`,
+`livedbg`, `--Xmx 256m`, host load ~5:
+
+| arm | result |
+|---|---|
+| shipped default (family OFF) | **SIGSEGV 0 of 4**, every run survived the full 400 s |
+| `CRATONVM_JIT=box-unbox-intrinsic` | **SIGSEGV 6 of 6**, at 24, 24, 32, 99, 209, 230 s |
+| that plus `CRATONVM_ZGC_RELOCATE=0` | **SIGSEGV 0 of 3**, every run survived the full 400 s |
+
+So "it takes BOTH relocation and this intrinsic" is re-measured on the current
+tip, not inherited from the original report.
+
+The control is the half worth noting: before `op:1033` was fixed, BOTH arms died
+of an `AssertionError` in 11-22 s and the differential said nothing. Now the
+default arm runs 400 s clean and the family arm crashes -- so the pairing this
+page rests on is re-established rather than inherited.
+
+The fault signature is unchanged from the original report:
+`SIGSEGV at pc=0x7f9fc9da16e2, addr=0x7f9fbbdf0000`, `rdi` equal to the fault
+address, the address a page boundary, and `fault pc is in NO live registered
+code buffer` -- i.e. a read through a reference into a page the collector has
+vacated, from inside libc.
+
+Nothing above this section is retracted: the STW argument and the two probes
+that do NOT reproduce still stand, and they still say the mechanism is not the
+one this page originally proposed.
+
+## The blocker, and how it was cleared (historical, 2026-09-02)
 
 Run on `dev@08a1711e5`, `livedbg`, quiet host, against H2 built at
 `apps/h2database/h2`. **It cannot reach the window this page measures in.**
@@ -300,5 +333,5 @@ lever this repo has been bitten by before.
 `CRATONVM_JIT_BOX_UNBOX_INTRINSIC=1` still works but now warns; the supported
 spelling is the token above.
 
-**As of 2026-09-02 this does not reach the SIGSEGV** -- see "The repro is
-currently BLOCKED by an earlier failure".
+As of 2026-09-03 this reaches the SIGSEGV again -- 6 of 6 -- see "UNBLOCKED,
+and it reproduces".

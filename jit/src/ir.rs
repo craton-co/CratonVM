@@ -1681,6 +1681,23 @@ pub struct Graph {
     /// Incremental def-use edges. A hand-built graph can leave this
     /// `UseLists::default()`: the lists are derived on first demand.
     pub uses: UseLists,
+    /// Which `Op::Param` holds the receiver, when this graph is an INSTANCE
+    /// method's. `None` means "static, or nobody said" — never "no receiver",
+    /// because a hand-built graph leaves it `None` and must not thereby claim
+    /// a fact about parameter 0.
+    ///
+    /// # Why the graph carries this and not the lowerer
+    ///
+    /// It is a property of the method, and the lowerer already holds `&Graph`.
+    /// The alternative was a fifteenth positional argument to `Lowerer::new`,
+    /// threaded through `lower` and `lower_inner`, to carry one bit that the
+    /// graph builder already had in hand.
+    ///
+    /// What it licenses is one fact, stated once: `this` is non-null. The JVM
+    /// enters an instance method only through a call site that has already
+    /// null-checked its receiver, `<init>` included — its receiver is
+    /// uninitialized but never null.
+    pub receiver_param: Option<u16>,
 }
 
 impl Graph {
@@ -4423,6 +4440,7 @@ impl IrBuilder {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: UseLists::new(),
+            receiver_param: None,
         };
         // The builder appends: every edge it writes goes through the tracked
         // mutators, so the def-use edges are maintained from an empty graph
@@ -9060,6 +9078,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: UseLists::new(),
+            receiver_param: None,
         };
         let a = graph.add(Op::Const(1), IrType::Int, vec![], None);
         let b = graph.add(Op::Const(2), IrType::Int, vec![], None);
@@ -9522,6 +9541,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: UseLists::new(),
+            receiver_param: None,
         }
     }
 

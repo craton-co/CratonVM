@@ -1017,6 +1017,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "frame-bands", on_key: None, off_key: Some("CRATONVM_JIT_NO_FRAME_BANDS"), off_word: None, since: "2026-08-20" },
     E { group: Group::JIT, token: "oopmap-coverage-presence-only", on_key: Some("CRATONVM_JIT_OOPMAP_COVERAGE_PRESENCE_ONLY"), off_key: None, off_word: None, since: "2026-08-20" },
     E { group: Group::GC, token: "moving-young-bounds-guard", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD"), off_word: None, since: "2026-08-20" },
+    E { group: Group::GC, token: "moving-young-band-object-screen", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_BAND_OBJECT_SCREEN"), off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "unreg-accept-residue", on_key: Some("CRATONVM_JIT_UNREG_ACCEPT_RESIDUE"), off_key: None, off_word: None, since: "2026-08-07" },
     // A/B opt-in restoring the pre-2026-07-31 single global `Mutex` in
     // `types::jit_activation`; presence-parsed (`runtime_var_os(..).is_some()`),
@@ -1251,6 +1252,10 @@ pub const INVENTORY: &[E] = &[
     // that one only adds the third consumer. One switch for both would have
     // made them indistinguishable in a bisect.
     E { group: Group::JIT, token: "this-nonnull", on_key: Some("CRATONVM_JIT_THIS_NONNULL"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // The optimizing tier's half of the same fact, reached by a different
+    // route (the graph's `receiver_param`, not a bytecode dataflow). Separate
+    // so a bisect can say which tier moved.
+    E { group: Group::JIT, token: "ir-this-nonnull", on_key: Some("CRATONVM_JIT_IR_THIS_NONNULL"), off_key: None, off_word: None, since: "2026-09-03" },
     // Drops the getfield receiver TEST/JZ where the dataflow proves it dead.
     E { group: Group::JIT, token: "receiver-null-elim", on_key: Some("CRATONVM_JIT_RECEIVER_NULL_ELIM"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     // DEFAULT-ON since its soak. Still the only switch in this backend whose
@@ -1384,6 +1389,7 @@ pub const INVENTORY: &[E] = &[
     // lever. Added a wave after the declaration sweep closed at zero
     // offenders, which is exactly how the count creeps back up.
     E { group: Group::JIT, token: "strict-install-epoch", on_key: Some("CRATONVM_JIT_STRICT_INSTALL_EPOCH"), off_key: None, off_word: Some("0"), since: "2026-08-01" },
+    E { group: Group::JIT, token: "supersede-epoch-skip-useless", on_key: Some("CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "kernel-reg-locals", on_key: Some("CRATONVM_JIT_KERNEL_REG_LOCALS"), off_key: None, off_word: None, since: "2026-07-14" },
     E { group: Group::JIT, token: "kernel-reg-osr", on_key: Some("CRATONVM_JIT_KERNEL_REG_OSR"), off_key: None, off_word: None, since: "2026-07-25" },
     E { group: Group::JIT, token: "leak-code", on_key: Some("CRATONVM_JIT_LEAK_CODE"), off_key: None, off_word: None, since: "2026-07-27" },
@@ -1581,6 +1587,7 @@ pub const INVENTORY: &[E] = &[
     // `invoke-fast-door` — off routes every monomorphic virtual cache hit
     // through the general `execute_invokevirtual_cached` dispatcher.
     E { group: Group::JIT, token: "invoke-fast-door", on_key: Some("CRATONVM_JIT_INVOKE_FAST_DOOR"), off_key: Some("CRATONVM_JIT_NO_INVOKE_FAST_DOOR"), off_word: None, since: "2026-09-02" },
+    E { group: Group::JIT, token: "door-receiver-record", on_key: None, off_key: Some("CRATONVM_JIT_NO_DOOR_RECEIVER_RECORD"), off_word: None, since: "2026-09-03" },
     // `nonvirtual-fast-door` — off routes every monomorphic `invokestatic`
     // and `invokespecial` cache hit through the general dispatcher.
     E { group: Group::JIT, token: "nonvirtual-fast-door", on_key: None, off_key: Some("CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR"), off_word: None, since: "2026-09-02" },
@@ -1943,6 +1950,11 @@ pub const INVENTORY: &[E] = &[
     // default because the single previous attempt at this unification
     // miscompiled `probes/FjpProbe.java`; see `compact_tlab_alloc_enabled`.
     E { group: Group::GC, token: "compact-tlab-alloc", on_key: Some("CRATONVM_COMPACT_TLAB_ALLOC"), off_key: None, off_word: None, since: "2026-09-03" },
+    // Bisection levers for the shape above: which sites may plan compact, and
+    // which classes actually did. Both exist because the first miscompile it
+    // exposed cost a rebuild per hypothesis until they did not.
+    E { group: Group::GC, token: "compact-tlab-sites", on_key: Some("CRATONVM_COMPACT_TLAB_SITES"), off_key: None, off_word: None, since: "2026-09-03" },
+    E { group: Group::GC, token: "dbg-compact-tlab", on_key: Some("CRATONVM_DBG_COMPACT_TLAB"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::GC, token: "promotion-guard", on_key: None, off_key: Some("CRATONVM_NO_GC_PROMOTION_GUARD"), off_word: None, since: "2026-06-21" },
     E { group: Group::GC, token: "promotion-oom-guard-broad", on_key: Some("CRATONVM_PROMOTION_OOM_GUARD_BROAD"), off_key: None, off_word: None, since: "2026-06-23" },
     E { group: Group::GC, token: "selective-promote", on_key: None, off_key: Some("CRATONVM_NO_SELECTIVE_PROMOTE"), off_word: None, since: "2026-06-05" },

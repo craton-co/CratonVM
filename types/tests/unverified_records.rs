@@ -132,24 +132,12 @@ const DISCHARGE_MARKERS: &[&str] = &[
 /// the neighbour's.
 const ALLOWED: &[(&str, &str)] = &[
     (
-        "docs/known-issues/jdk-only/E12-1-the-null-session-and-the-fabricated-cipher.md",
-        "status block says: **Status: FIXED-UNVERIFIED (this lane's file); NOMINATED (the rest).**",
-    ),
-    (
-        "docs/known-issues/jdk-only/E22-1-the-null-session-in-the-registrar-that-actually-answers.md",
-        "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`, this lane's file); NOMINATED (the rest).**",
-    ),
-    (
         "docs/known-issues/jdk-only/E25-R11-GUARD-POPULATION-SWEEP-20260813.md",
         "status block says: **Status:** FIXED-UNVERIFIED (registration + two guards in the owned file);",
     ),
     (
         "docs/known-issues/jdk-only/E3-1-the-cipher-name-helper-and-its-real-denominator.md",
         "status block says: **Status: FIXED-UNVERIFIED.** **Prov: HotSpot column MEAS (this host); CratonVM",
-    ),
-    (
-        "docs/known-issues/jdk-only/E31-1-the-unregistered-door-and-the-slot-that-resurrects-a-fabrication.md",
-        "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`, `native-builtins/src/tls.rs`, this lane's files); NOMINATED (the rest).**",
     ),
     (
         "docs/known-issues/jdk-only/E42-1-the-slot-that-was-never-there-and-the-predicate-that-was-its-own-negation.md",
@@ -216,10 +204,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status: FIXED-UNVERIFIED.** Three source/doc changes landed in the tree. **No",
     ),
     (
-        "docs/known-issues/jdk-only/H11-3-four-rows-retired-and-a-unit-test-that-blocks-the-next-two-20260820.md",
-        "status block says: **Status: FIXED-UNVERIFIED — no binary carrying these changes has been built or",
-    ),
-    (
         "docs/known-issues/jdk-only/H12-1-the-osr-door-binds-five-bridge-natives-the-method-entry-door-refuses-20260820.md",
         "status block says: **Status: MEASURED (the defect) / FIXED-UNVERIFIED (the fix).** The divergence",
     ),
@@ -246,14 +230,6 @@ const ALLOWED: &[(&str, &str)] = &[
     (
         "docs/known-issues/jdk-only/W7-14-fjp-common-factory-bound-by-name.md",
         "status block says: call.** Not rebuilt in this lane: no claim is made that the change compiles or",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-36-differential-view-families.md",
-        "status block says: REBUILT, NOT VERIFIED. 1 recorded and deliberately not attempted.**",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-42-differential-instrument-holes.md",
-        "status block says: `native-builtins` change is a claim about source; it is not rebuilt here.",
     ),
     (
         "docs/known-issues/jdk-only/W7-46-process-cluster.md",

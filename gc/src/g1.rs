@@ -4170,7 +4170,34 @@ impl G1Collector {
         // clean that was never inspected. The envelope also never changes,
         // where the committed prefix grows under `commit_through_region` and
         // the young set changes every pause.
-        crate::gen_heap::publish_movable_bounds(0, arena_base, arena_base + arena.reserved_len());
+        // The COMMITTED prefix, not the whole reservation — and republished as
+        // the prefix grows, exactly like `publish_jit_read_bounds` above.
+        //
+        // §14 published the reservation, arguing a superset is the safe
+        // direction. It is, for the classification this feeds: an address
+        // wrongly called immovable is a frame reported clean that was never
+        // inspected. But the committed prefix is ALSO a superset of what can
+        // hold an object — objects exist only in committed regions — so it is
+        // the same safe direction, tighter, and it buys two things the
+        // reservation does not.
+        //
+        // First, precision. `band_has_unpublished_word_with_map` classifies a
+        // stack word as an unpublished oop on `addr_is_movable(w)` alone, so
+        // every extra byte of range is extra stack words called oops by
+        // coincidence. Reserved-but-uncommitted address space cannot hold an
+        // object at all, so including it can only add false positives.
+        //
+        // Second, and the reason the range is not merely cosmetic: it is the
+        // one thing standing between that test and a header check. The test
+        // has no `is_object_address` screen — unlike every sibling instrument
+        // in `conservative_roots` — and cannot get one while the range covers
+        // pages that are not mapped, because reading a header there faults.
+        // Bounding it by the commit makes such a screen safe to add.
+        crate::gen_heap::publish_movable_bounds(
+            0,
+            arena_base,
+            arena_base + arena.committed_len(),
+        );
 
         // F-08 - publish G1's geometry for the JIT's inline post-write barrier.
         //
@@ -4473,6 +4500,14 @@ impl G1Collector {
             return false;
         }
         crate::gen_heap::publish_jit_read_bounds(
+            0,
+            self.arena_base,
+            self.arena_base + self.arena.committed_len(),
+        );
+        // ...and the movable envelope with it, for the reason given where it is
+        // first published: it is bounded by the commit, so it has to move when
+        // the commit does.
+        crate::gen_heap::publish_movable_bounds(
             0,
             self.arena_base,
             self.arena_base + self.arena.committed_len(),
