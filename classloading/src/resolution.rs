@@ -1385,9 +1385,32 @@ impl<JitMethod> CachedInvokeTarget<JitMethod> {
                 gate,
                 supersede_epoch,
                 ..
-            } => gate.is_stale() || *supersede_epoch != crate::class_manager::jit_supersede_epoch(),
+            } => {
+                if gate.is_stale() {
+                    return true;
+                }
+                if *supersede_epoch != crate::class_manager::jit_supersede_epoch() {
+                    // Counted, not merely returned: the supersede epoch is a
+                    // PROCESS-WIDE counter, so one C2 publish anywhere evicts
+                    // every `Jit` entry at every call site in every thread.
+                    // Whether that is worth avoiding is a question about how
+                    // many entries it actually throws away, and nothing was
+                    // measuring that. Relaxed, and only on the stale path.
+                    EPOCH_STALE_EVICTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return true;
+                }
+                false
+            }
         }
     }
+}
+
+/// Invoke-cache entries reported stale because the C1→C2 supersede epoch moved.
+static EPOCH_STALE_EVICTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many `Jit` invoke-cache entries the supersede epoch has invalidated.
+pub fn epoch_stale_evictions() -> u64 {
+    EPOCH_STALE_EVICTIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Cache key: (caller class, constant pool index, is_special).

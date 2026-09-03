@@ -8184,6 +8184,94 @@ pub(super) fn ensure_bg_compiler_started(shared: &SharedVm) {
 /// class/method/Code attribute is absent. The padded bytecode matches
 /// `Frame::code`'s layout (`padded_bytecode`, +2 zero tail) so the compiled
 /// artifact's PC mapping lines up with the interpreter frame at OSR entry.
+/// What a C1→C2 supersede publish actually did to the cached body.
+///
+/// The distinction exists because only one of the three can invalidate an
+/// invoke-cache entry, and the supersede epoch is a process-wide counter that
+/// every `Jit` entry in every thread is measured against.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum SupersedeOutcome {
+    /// No body was in the cache under this key before the publish, so nothing
+    /// was superseded. Reached by `promote_scalar_selfrec_to_ir`, which sends
+    /// the narrow scalar self-recursion shape straight to the optimizing tier
+    /// without a C1 body ever existing.
+    FirstPublish,
+    /// A body was replaced by one with identical code bytes — what a C2 task
+    /// that fell back to the single-pass backend produces.
+    Unchanged,
+    /// A body was replaced by different code.
+    Changed,
+}
+
+impl SupersedeOutcome {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            SupersedeOutcome::FirstPublish => "first-publish",
+            SupersedeOutcome::Unchanged => "unchanged",
+            SupersedeOutcome::Changed => "changed",
+        }
+    }
+}
+
+/// Classify a supersede from the artifact that was in the cache before the
+/// publish and the one in it afterwards.
+///
+/// A missing *replacement* is reported as `Changed`, not as one of the two
+/// cheap outcomes: the lookup failing is not evidence that nothing changed, and
+/// this decides whether to skip an invalidation, so the unknown case must fail
+/// towards the old unconditional behaviour.
+pub(super) fn classify_supersede(
+    before: Option<&[u8]>,
+    after: Option<&[u8]>,
+) -> SupersedeOutcome {
+    let Some(before) = before else {
+        return SupersedeOutcome::FirstPublish;
+    };
+    let Some(after) = after else {
+        return SupersedeOutcome::Changed;
+    };
+    // Pointer equality first: `put` may have refused the publish (install-epoch
+    // guard, code-cache cap), leaving the cache holding the very artifact that
+    // was there before. That is an unchanged body by definition and skips the
+    // byte compare entirely.
+    if std::ptr::eq(before.as_ptr(), after.as_ptr()) && before.len() == after.len() {
+        return SupersedeOutcome::Unchanged;
+    }
+    if before == after {
+        SupersedeOutcome::Unchanged
+    } else {
+        SupersedeOutcome::Changed
+    }
+}
+
+/// Engagement census for the three supersede outcomes.
+///
+/// A switch that suppresses work needs a count of what it suppressed, or a
+/// "no regression" reading cannot be told apart from "never fired".
+static SUPERSEDE_FIRST_PUBLISH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static SUPERSEDE_UNCHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUPERSEDE_CHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(super) fn note_supersede_outcome(outcome: SupersedeOutcome) {
+    let counter = match outcome {
+        SupersedeOutcome::FirstPublish => &SUPERSEDE_FIRST_PUBLISH,
+        SupersedeOutcome::Unchanged => &SUPERSEDE_UNCHANGED,
+        SupersedeOutcome::Changed => &SUPERSEDE_CHANGED,
+    };
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(first_publish, unchanged, changed)` supersede counts for this process.
+pub fn supersede_census() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        SUPERSEDE_FIRST_PUBLISH.load(Relaxed),
+        SUPERSEDE_UNCHANGED.load(Relaxed),
+        SUPERSEDE_CHANGED.load(Relaxed),
+    )
+}
+
 pub(super) fn fetch_osr_compile_inputs(
     shared: &SharedVm,
     class_name: &str,
@@ -8403,7 +8491,7 @@ pub(super) fn background_compile_task(
         };
     }
     let start = std::time::Instant::now();
-    // The body about to be REPLACED, measured before the publish overwrites it.
+    // The body about to be REPLACED, captured before the publish overwrites it.
     //
     // Nothing compares a C2 body against the C1 body it supersedes before
     // keeping it, and the open policy question that follows from that
@@ -8413,26 +8501,30 @@ pub(super) fn background_compile_task(
     // usually inlining or unrolling, and MORE call sites can be a callee's
     // calls after its frame was inlined away. What is missing is not a rule
     // but DATA, so this records the replacement instead of guessing at it.
-    let superseded_bytes: Option<usize> = (optimized
-        && crate::runtime::env_cache::dbg_jitc())
-    .then(|| {
-        let (class_id, _, _) = fetch_osr_compile_inputs(
-            &shared,
-            &task.method_key.class_name,
-            &task.method_key.method_name,
-            &task.method_key.descriptor,
-        )?;
-        let jit_cache = shared.jit.jit_cache.read();
-        jit_cache
-            .get(
+    //
+    // The capture is the whole artifact, not its length, and it is NOT gated on
+    // the diagnostic flag any more: the epoch bump below is now conditional on
+    // what this finds, so a debug-only capture would make the diagnostic change
+    // the behaviour it reports. `JitCache::get` returns an `Arc` clone, so
+    // holding it across the publish costs a refcount and keeps the superseded
+    // artifact alive against `defer_jit_owner`'s drop.
+    let superseded_body: Option<std::sync::Arc<cratonvm_jit::CompiledMethod>> = optimized
+        .then(|| {
+            let (class_id, _, _) = fetch_osr_compile_inputs(
+                &shared,
+                &task.method_key.class_name,
+                &task.method_key.method_name,
+                &task.method_key.descriptor,
+            )?;
+            let jit_cache = shared.jit.jit_cache.read();
+            jit_cache.get(
                 &task.method_key.class_name,
                 &task.method_key.method_name,
                 &task.method_key.descriptor,
                 class_id,
             )
-            .map(|cm| cm.code_bytes().len())
-    })
-    .flatten();
+        })
+        .flatten();
     // Real codegen + publish into the shared JIT cache. `try_jit_compile_callee`
     // is the by-name entry point shared with the JIT dispatch helpers; it stores
     // the compiled body under `(class, method, descriptor)` so the mutator's
@@ -8454,51 +8546,119 @@ pub(super) fn background_compile_task(
     )
     .is_some();
     // C1→C2 supersede, publish side: a freshly-published C2 body REPLACED the
-    // C1 entry in `jit_cache` (JitCache::put overwrites by key; the old
-    // artifact is retained forever — executable code is never freed). Bump
-    // the global supersede epoch so per-thread invoke-cache `Jit` entries
-    // (which snapshot the epoch at IC-fill time) report stale on their next
-    // hit, self-evict, and re-resolve to the C2 body. Without this, call
-    // sites that already flipped to the C1 artifact would run it forever.
+    // C1 entry in `jit_cache` (JitCache::put overwrites by key). Bump the
+    // global supersede epoch so per-thread invoke-cache `Jit` entries (which
+    // snapshot the epoch at IC-fill time) report stale on their next hit,
+    // self-evict, and re-resolve to the C2 body. Without this, call sites that
+    // already flipped to the C1 artifact would run it forever.
+    //
+    // That bump is GLOBAL: it invalidates every `Jit` invoke-cache entry, for
+    // every call site, in every thread — `CachedInvokeTarget::is_stale`
+    // compares one process-wide counter, and `InvokeCache::get` self-evicts on
+    // it. So it must be paid only when there is something to invalidate. The
+    // first reading off the `c1=`/`c2=` diagnostic said it usually is not:
+    // in one CratonBench run, 7 of 9 supersedes republished a body of exactly
+    // the same size, and a 8th (`fib`) had no predecessor at all.
+    //
+    // Two of the three outcomes below cannot invalidate anything:
+    //
+    //  * `FirstPublish` — no prior body, so no `Jit` entry can be holding a
+    //    replaced one. `fib` reaches C2 without a C1 body at all, because
+    //    `promote_scalar_selfrec_to_ir` sends the narrow scalar self-recursion
+    //    shape straight to the optimizing pipeline. The interpreter's negative
+    //    "no compiled body" memo is NOT this counter's job: `JitCache::put`
+    //    bumps `jit_cache_generation` on every publication precisely so a
+    //    first insertion is observed there.
+    //  * `Unchanged` — the published body is byte-identical to the one it
+    //    replaced, which is what a C2 task that fell back to the single-pass
+    //    backend produces (the IR admission gate declines, single-pass
+    //    recompiles the same bytecode deterministically). An IC entry still
+    //    holding the old artifact executes identical machine code, and it owns
+    //    an `Arc` to it, so the artifact stays alive.
+    //
+    // Identical code bytes also imply an identical ABI — `needs_heap` and
+    // `needs_context` are visible in the prologue — so an entry kept on the old
+    // artifact cannot be called the wrong way.
+    //
+    // Skipping those two is OFF by default: `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS=1`
+    // turns it on. The bump was measured, not assumed, to be nearly free — 9
+    // invoke-cache evictions over a whole CratonBench run and 0 over the regex
+    // workload — so the saving is real but worth nothing, and a default-on
+    // behaviour change that buys nothing is not worth its risk.
     if published && optimized {
-        crate::classloading::bump_jit_supersede_epoch();
-        if crate::runtime::env_cache::dbg_jitc() {
-            let replacement = {
-                let jit_cache = shared.jit.jit_cache.read();
-                fetch_osr_compile_inputs(
-                    &shared,
+        let replacement = {
+            let jit_cache = shared.jit.jit_cache.read();
+            fetch_osr_compile_inputs(
+                &shared,
+                &task.method_key.class_name,
+                &task.method_key.method_name,
+                &task.method_key.descriptor,
+            )
+            .and_then(|(class_id, _, _)| {
+                jit_cache.get(
                     &task.method_key.class_name,
                     &task.method_key.method_name,
                     &task.method_key.descriptor,
+                    class_id,
                 )
-                .and_then(|(class_id, _, _)| {
-                    jit_cache
-                        .get(
-                            &task.method_key.class_name,
-                            &task.method_key.method_name,
-                            &task.method_key.descriptor,
-                            class_id,
-                        )
-                        .map(|cm| cm.code_bytes().len())
-                })
-            };
+            })
+        };
+        let outcome = classify_supersede(
+            superseded_body.as_ref().map(|cm| cm.code_bytes()),
+            replacement.as_ref().map(|cm| cm.code_bytes()),
+        );
+        note_supersede_outcome(outcome);
+        let bumped = outcome == SupersedeOutcome::Changed
+            || !crate::runtime::env_cache::supersede_epoch_skip_useless();
+        if bumped {
+            crate::classloading::bump_jit_supersede_epoch();
+        }
+        if crate::runtime::env_cache::dbg_jitc() {
             // `c1=` is the body this one replaced, `c2=` the one that replaced
             // it. Both, always: the question this line exists for is whether
             // the optimizing tier is producing a BETTER body, and a size on
             // its own answers nothing without the size it displaced.
+            //
+            // `outcome=` is what separates the three cases a bare `c1=?` used
+            // to conflate — no predecessor, an identical republish, and a real
+            // replacement — and `epoch_bumped=` says whether this publish
+            // actually paid the process-wide invalidation.
             eprintln!(
-                "[cratonvm-jitc] c2-supersede published {}.{}{} (epoch={}) c1={} c2={}",
+                "[cratonvm-jitc] c2-supersede published {}.{}{} (epoch={}) c1={} c2={} outcome={} epoch_bumped={}",
                 task.method_key.class_name,
                 task.method_key.method_name,
                 task.method_key.descriptor,
                 crate::classloading::jit_supersede_epoch(),
-                superseded_bytes
-                    .map(|b| b.to_string())
-                    .unwrap_or_else(|| "?".to_string()),
+                superseded_body
+                    .as_ref()
+                    .map(|cm| cm.code_bytes().len().to_string())
+                    .unwrap_or_else(|| "none".to_string()),
                 replacement
-                    .map(|b| b.to_string())
+                    .as_ref()
+                    .map(|cm| cm.code_bytes().len().to_string())
                     .unwrap_or_else(|| "?".to_string()),
+                outcome.as_str(),
+                bumped,
             );
+            // When a replacement is the same LENGTH but not the same bytes,
+            // say how far apart it actually is. A handful of scattered bytes
+            // is a relocation (an embedded absolute address that moved),
+            // which is a body that could still be treated as unchanged; a
+            // large fraction is genuinely different code and cannot.
+            if let (Some(b), Some(a)) = (superseded_body.as_ref(), replacement.as_ref()) {
+                let (bb, ab) = (b.code_bytes(), a.code_bytes());
+                if bb.len() == ab.len() && bb != ab {
+                    let differing = bb.iter().zip(ab).filter(|(x, y)| x != y).count();
+                    let first = bb.iter().zip(ab).position(|(x, y)| x != y).unwrap_or(0);
+                    eprintln!(
+                        "[cratonvm-jitc]   …same length, {} of {} bytes differ ({:.3}%), first at +0x{:x}",
+                        differing,
+                        bb.len(),
+                        100.0 * differing as f64 / bb.len() as f64,
+                        first,
+                    );
+                }
+            }
         }
     }
     // C1→C2 supersede, trigger side: report whether this method would take
@@ -11796,5 +11956,74 @@ mod elidable_ctor_policy_tests {
                 "{mode:?}: an unregistered triple must not block elision"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod supersede_classification_tests {
+    use super::{classify_supersede, note_supersede_outcome, supersede_census, SupersedeOutcome};
+
+    /// The three outcomes a C2 publish can have, and which of them the epoch
+    /// bump is for.
+    #[test]
+    fn classify_supersede_separates_the_three_publish_outcomes() {
+        // No predecessor: `promote_scalar_selfrec_to_ir` reaches C2 without a
+        // C1 body ever existing, and the old diagnostic reported that as
+        // `c1=?` — indistinguishable from a failed lookup.
+        assert_eq!(
+            classify_supersede(None, Some(&[0x90, 0xc3])),
+            SupersedeOutcome::FirstPublish,
+        );
+        assert_eq!(
+            classify_supersede(Some(&[0x90, 0xc3]), Some(&[0x90, 0xc3])),
+            SupersedeOutcome::Unchanged,
+        );
+        assert_eq!(
+            classify_supersede(Some(&[0x90, 0xc3]), Some(&[0x31, 0xc0, 0xc3])),
+            SupersedeOutcome::Changed,
+        );
+    }
+
+    /// A missing replacement must NOT read as one of the two cheap outcomes.
+    /// This decides whether to skip an invalidation, so "I could not tell" has
+    /// to fail towards the historical unconditional bump.
+    #[test]
+    fn classify_supersede_fails_towards_bumping_when_the_replacement_is_unknown() {
+        assert_eq!(
+            classify_supersede(Some(&[0x90]), None),
+            SupersedeOutcome::Changed,
+        );
+    }
+
+    /// Same length is NOT the same body, and this is the case that refuted the
+    /// hypothesis this classifier was built for: a C2 task that falls back to
+    /// the single-pass backend recompiles the same bytecode, but each compile
+    /// embeds fresh `JitInvokeInfo` pointers as absolute immediates
+    /// (`emit_mov_imm64(ARG_REGS[1], info as *const _ as i64)`), so the bodies
+    /// differ in 0.1-1% of their bytes. Measured on CratonBench: 6 of 5193
+    /// bytes for `sieve`, 379 of 35686 for `Pattern.clazz`.
+    #[test]
+    fn classify_supersede_does_not_treat_equal_length_as_equal_code() {
+        let before = [0x48, 0xb8, 0x00, 0x10, 0x20, 0x30];
+        let after = [0x48, 0xb8, 0x00, 0x10, 0x99, 0x30];
+        assert_eq!(before.len(), after.len());
+        assert_eq!(
+            classify_supersede(Some(&before), Some(&after)),
+            SupersedeOutcome::Changed,
+            "a relocated absolute immediate is a different body as far as byte              equality is concerned; treating equal length as equal code would              skip an invalidation that IS needed when the code really changed",
+        );
+    }
+
+    /// The census must move, or a "no regression" reading cannot be told apart
+    /// from "the classifier never ran".
+    #[test]
+    fn supersede_census_counts_each_outcome() {
+        let (f0, u0, c0) = supersede_census();
+        note_supersede_outcome(SupersedeOutcome::FirstPublish);
+        note_supersede_outcome(SupersedeOutcome::Unchanged);
+        note_supersede_outcome(SupersedeOutcome::Changed);
+        note_supersede_outcome(SupersedeOutcome::Changed);
+        let (f1, u1, c1) = supersede_census();
+        assert_eq!((f1 - f0, u1 - u0, c1 - c0), (1, 1, 2));
     }
 }

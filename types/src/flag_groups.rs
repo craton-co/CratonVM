@@ -1372,6 +1372,7 @@ pub const INVENTORY: &[E] = &[
     // lever. Added a wave after the declaration sweep closed at zero
     // offenders, which is exactly how the count creeps back up.
     E { group: Group::JIT, token: "strict-install-epoch", on_key: Some("CRATONVM_JIT_STRICT_INSTALL_EPOCH"), off_key: None, off_word: Some("0"), since: "2026-08-01" },
+    E { group: Group::JIT, token: "supersede-epoch-skip-useless", on_key: Some("CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "kernel-reg-locals", on_key: Some("CRATONVM_JIT_KERNEL_REG_LOCALS"), off_key: None, off_word: None, since: "2026-07-14" },
     E { group: Group::JIT, token: "kernel-reg-osr", on_key: Some("CRATONVM_JIT_KERNEL_REG_OSR"), off_key: None, off_word: None, since: "2026-07-25" },
     E { group: Group::JIT, token: "leak-code", on_key: Some("CRATONVM_JIT_LEAK_CODE"), off_key: None, off_word: None, since: "2026-07-27" },

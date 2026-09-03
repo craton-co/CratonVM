@@ -2241,6 +2241,28 @@ pub fn jit_eager_callee_chain() -> bool {
     })
 }
 
+/// Skip the C1→C2 supersede-epoch bump when the publish cannot have
+/// invalidated anything. OFF by default, because it was measured to buy
+/// nothing.
+///
+/// The bump invalidates every `Jit` invoke-cache entry in every thread, which
+/// sounds expensive and is not: instrumenting the eviction it causes
+/// (`epoch_stale_evictions`) over CratonBench measured **9** evictions for the
+/// whole run, and over the regex workload **0** — each call site evicts once
+/// and refills. Two of the three publish outcomes provably cannot invalidate
+/// anything (`SupersedeOutcome`, `jit_bridge`), so skipping them is safe, but
+/// safe and worthless is not a reason to change a default. Set
+/// `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS=1` to skip them anyway; the
+/// engagement census under `CRATONVM_DBG=jitc` reports what was skipped.
+#[inline]
+pub fn supersede_epoch_skip_useless() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS")
+            .map_or(false, |v| v != "0" && v != "false")
+    })
+}
+
 pub fn c2_supersede() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {

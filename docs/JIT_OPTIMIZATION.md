@@ -980,9 +980,62 @@ downgrade that gate was shut for.
    `CRATONVM_DBG=jitc`, a supersede prints `c1=<bytes> c2=<bytes>`. What it
    also does is remove the causes that made a C2 body worse — the tier now has
    an inline TLAB bump, gated inline reference stores, and a register file.
+   **What that instrument then said is below.**
 4. **`Node` is still 48 bytes against HotSpot's 24.** Unchanged, structural,
    and a GC item: see
    `known-issues/perf/perf-bintrees-9x-gap-characterised.md`.
+
+### What the supersede diagnostic said, and the optimisation it refuted
+
+The `c1=`/`c2=` line above was built to gather data, and the first reading off
+it looked like a finding. CratonBench, nine supersedes: seven republished a
+body of **exactly the same size**, an eighth (`fib`) had `c1=?`, and only
+`itemCheck` changed size (1335 → 2355). Since every publish calls
+`bump_jit_supersede_epoch()`, and that epoch is a **process-wide** counter every
+`Jit` invoke-cache entry in every thread is measured against
+(`CachedInvokeTarget::is_stale`), seven of nine looked like pure waste.
+
+Three things came out of chasing it, two of them negative.
+
+**The `c1=?` was not a broken lookup.** `fib` is the narrow scalar
+self-recursion shape, and `promote_scalar_selfrec_to_ir` sends that straight to
+the optimizing tier on its first background compile — deliberately, because
+compiling it as C1 first strands recursive frames in the slower body. There was
+no C1 body to find. The defect was that the diagnostic printed `?` for both "no
+predecessor" and "lookup failed". It now classifies (`SupersedeOutcome`) and
+prints `outcome=first-publish|unchanged|changed` with `epoch_bumped=`.
+
+**Byte equality never fires, and cannot.** The seven same-size bodies differ in
+0.116%–1.06% of their bytes (6 of 5193 for `sieve`, 379 of 35686 for
+`Pattern.clazz`). They are the same code: a C2 task whose IR pipeline bails —
+`[ir] ir_lower::lower_inner returned None for Pattern.clazz(Z)…` — falls back
+to the single-pass backend and recompiles the same bytecode. But each compile
+allocates fresh `JitInvokeInfo` boxes and embeds their addresses as absolute
+immediates (`emit_mov_imm64(ARG_REGS[1], info as *const _ as i64)`), so the
+bodies are equal modulo relocations and unequal as bytes. Detecting "unchanged"
+would mean building a relocation table for a case that should not be created in
+the first place.
+
+**And the cost it was going to save is not there.** `epoch_stale_evictions()`
+counts the invoke-cache entries the epoch actually throws away. Over a whole
+CratonBench run: **9**. Over the regex workload: **0**. The invalidation is
+global in reach but each call site evicts once and refills, so the seven
+"wasted" bumps cost nine IC refills, not thousands.
+
+So the suppression is implemented, correct, and **off by default**
+(`CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS=1`). Two of the three outcomes
+provably cannot invalidate anything — `first-publish` has no predecessor, and
+the interpreter's negative "no compiled body" memo is driven by
+`jit_cache_generation`, which `JitCache::put` bumps on *every* publication — but
+safe and worthless is not a reason to move a default.
+
+The residual worth having is the one this uncovered by accident: **a C2 task
+that bails in `ir_lower` still runs the whole IR pipeline, recompiles via
+single-pass, republishes an equivalent body, and pays an invalidation.** The
+compile is the expensive part, not the epoch. Six of nine supersedes in
+CratonBench are that shape. Fixing it means not enqueuing (or not completing)
+a C2 task whose lowering will bail — which needs the bail to be predictable
+before the pipeline runs, and it currently is not.
 
 ### Summary table
 
@@ -1007,6 +1060,7 @@ downgrade that gate was shut for.
 | Precise JIT stack maps | **ON** | `CRATONVM_NO_PRECISE_JIT_MAPS` |
 | IR-tier register residency (GP + FP files) | **ON** since 2026-09-02, phis included | `CRATONVM_JIT_IR_LINEAR_SCAN=0`, `CRATONVM_JIT_IR_PHI_RESIDENCY=0` |
 | IR-tier constants as immediates | **ON** | `CRATONVM_JIT_IR_CONST_IMM=0` |
+| Skip the supersede-epoch bump when it cannot invalidate anything | off (measured worthless: 9 IC evictions/run) | `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS` |
 | IR-tier fused compare-and-branch, trampoline-free branches | **ON** | `CRATONVM_JIT_IR_FUSED_BRANCH=0` |
 | IR-tier receiver-guard CSE (once per receiver per block) | **ON** | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE=0` |
 | IR-tier gated inline reference stores | **ON** where a collector publishes a plan | `CRATONVM_JIT_IR_GATED_REF_STORE=0` |

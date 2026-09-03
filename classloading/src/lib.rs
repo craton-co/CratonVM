@@ -151,7 +151,7 @@ pub use class_path::{ClassPath, ManifestInfo};
 // can dedupe their per-call hierarchy walk. Invalidated in lockstep
 // with `ResolutionCache::invalidate_class` from the JVMTI
 // `RedefineClasses` path.
-pub use resolution::{LinkResolver, ResolvedMember};
+pub use resolution::{epoch_stale_evictions, LinkResolver, ResolvedMember};
 // Verification-derived per-method oop maps (see `type_maps`). Produced by the
 // same walk that verifies, on the default build path — no feature gate, no
 // env var. Re-exported here because the eventual consumers (GC root scan,
