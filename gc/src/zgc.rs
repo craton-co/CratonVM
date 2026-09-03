@@ -10418,7 +10418,6 @@ fn zgc_pause_target_ms() -> u64 {
     })
 }
 
-
 /// `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` -- young cycles allowed between
 /// whole-heap ones. Default [`generation::Z_DEFAULT_MINORS_PER_MAJOR`] (8).
 ///
