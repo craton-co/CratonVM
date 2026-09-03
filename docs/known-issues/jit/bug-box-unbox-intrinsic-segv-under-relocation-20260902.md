@@ -2,7 +2,9 @@
 
 ## Status
 
-**OPEN (root cause), MITIGATED (default flipped) 2026-09-02.**
+**OPEN (root cause), MITIGATED (default flipped) 2026-09-02.** The stated
+hypothesis was refuted on 2026-09-02 -- see below -- and the search is narrowed
+rather than closed.
 `CRATONVM_JIT_BOX_UNBOX_INTRINSIC` is now opt-in. The crash it causes is gone
 from the shipped default; the reason the inline sequence is unsafe under a
 moving collector is NOT yet established, and that is what stays open.
@@ -50,19 +52,58 @@ Its relocation files are byte-identical to parent 2, so nothing was
 hand-resolved there. The defect is the INTERACTION between
 `perf/box-random-intrinsics-20260902` and dev's relocation, not either alone.
 
-## The shape of the suspicion
+## The shape of the suspicion -- and why it cannot be right as stated
 
 `bytecode_walk.rs`, region `BOX_UNBOX`, inlines `Long.longValue()J` and
 `Integer.intValue()I`. It pops the receiver off the simulated operand stack and
 then dereferences it three times -- the class-id guard at `[RAX]`, the GC-flags
 byte, and the payload load -- with no call and therefore no safepoint between
-them. That is sound only while the receiver in hand cannot go stale. Under a
-moving collector it evidently can.
+them.
 
-**This is a hypothesis, not a finding.** What is measured is the pair of
-switches above and the bisect. The next step is to keep the receiver as a NAMED
-root across the sequence rather than only in `RAX`, and to re-enable the family
-behind its own switch to check whether that closes it.
+This page originally read: *"That is sound only while the receiver in hand
+cannot go stale. Under a moving collector it evidently can."* **That cannot be
+the mechanism.** Relocation here is stop-the-world -- `ZgcRealHeap::relocate_stw`
+-- so the mutator is parked at a safepoint while objects move. A receiver held
+in a register across a stretch containing NO safepoint is not the unsafe case;
+it is precisely the safe one. Nothing can move under that sequence.
+
+So the receiver must already be stale when it is LOADED. The question is not
+"what moves it while we hold it" but **"why was the slot it came from not
+healed at the last relocating safepoint"** -- which is a question about the oop
+map, not about the length of the inline sequence.
+
+That also retires the next step this page used to propose. Keeping the receiver
+as a named root ACROSS the sequence fixes nothing under STW relocation, because
+there is no safepoint inside the sequence for a root to matter at.
+
+## What a targeted probe rules out (2026-09-02)
+
+`probes/BoxUnboxReloc.java` -- a hot compiled unbox of long-lived boxed
+receivers, interleaved with garbage so their pages fragment and become
+compaction candidates. **8 runs per arm, intrinsic ON and OFF, zero crashes and
+zero wrong answers**, with all three ingredients measured as ENGAGED in the same
+run:
+
+| ingredient | how it was confirmed |
+|---|---|
+| the intrinsic | 3 sites claimed (`CRATONVM_DBG_ATOMIC_INTRINSIC=1`) |
+| relocation | `objects_relocated=34629`, `compaction_cycles=2` (`CRATONVM_GC_STATS=1`) |
+| the bail edge | `nullBails=19200` -- null receivers deopt through reason 6 |
+
+The bail edge is in there deliberately: it is the only CALL anywhere near this
+sequence, it is taken with the receiver already popped from the simulated
+operand stack, and it was the one remaining place a safepoint could open a
+window. It does not.
+
+**Read those counters before believing any result from this probe.** The first
+version of it ran clean 3/3 and meant nothing: it allocated the receivers in
+one dense block, so `objects_relocated` was 0 and the collector never had a
+reason to move them. A relocation defect cannot be exercised by a run that
+relocates nothing.
+
+So what the H2 workload has and this probe does not is the remaining lead.
+`TestRandomMapOps` is multi-threaded; this probe is not. That is the next thing
+to vary -- before any more edits to the emitter.
 
 ## The mitigation
 
