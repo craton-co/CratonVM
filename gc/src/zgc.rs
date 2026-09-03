@@ -2414,22 +2414,34 @@ impl ZgcRealHeap {
     /// * **Ceiling** (capacity). A budget above the heap can never be reached,
     ///   which is the same as being unconstrained -- so reaching it hands
     ///   control back to [`zgc_alloc_trigger_percent`]'s constant.
-    /// * **Below the floor, INCLUDING `affordable <= live`: the clause goes
-    ///   inert** and [`ZgcRealCounters::pause_target_unreachable`] counts the
-    ///   cycle.
+    /// * **Floor** ([`ZGC_ALLOC_TRIGGER_FLOOR`], 8 MiB) for a budget the loop
+    ///   wants SMALLER than that, against a live set the target can afford.
+    /// * **`affordable <= live`: the clause goes inert**, hands control back
+    ///   to [`zgc_alloc_trigger_percent`]'s constant, FORGETS its state, and
+    ///   [`ZgcRealCounters::pause_target_unreachable`] counts the cycle.
     ///
-    /// That second one is the safety argument, and the obvious implementation
-    /// is wrong. A budget of [`ZGC_ALLOC_TRIGGER_FLOOR`] looks like the
-    /// conservative choice -- "collect as often as we safely can and get as
-    /// close to the target as possible" -- and it is the opposite. When the
-    /// LIVE SET alone projects past the target, the pause length is set by the
-    /// live set and no budget changes it: collecting every 8 MiB against a
-    /// 1.5 GiB live set buys pauses of exactly the same length, hundreds of
-    /// times more often. The clause deliberately does not consult `gc_rearm`
-    /// (see `zgc_alloc_trigger_percent`), so nothing else would have stopped
-    /// it. A climbing `unreachable` is the diagnosis: the target is not
-    /// achievable at this live set, which is an answer, and a different one
-    /// from "the loop is holding the target".
+    /// The last two look alike and are opposite, and collapsing them was a
+    /// defect. When the LIVE SET alone projects past the target, the pause
+    /// length is set by the live set and no budget changes it: collecting
+    /// every 8 MiB against a 1.5 GiB live set buys pauses of exactly the same
+    /// length, hundreds of times more often, and the clause deliberately does
+    /// not consult `gc_rearm` (see `zgc_alloc_trigger_percent`) so nothing
+    /// else would have stopped it. But when the live set is CHEAP and the loop
+    /// merely wants a tight budget, going inert loses control completely --
+    /// measured at `-Xmx4096m`, a tightening step that crossed the floor
+    /// dropped the constraint and the next cycle ran unconstrained to 670 ms.
+    ///
+    /// Going inert also has to RESET the loop. The tighten arm never widens
+    /// and the relax arm is capped by [`Self::pause_overrun_span`], so a stale
+    /// affordable span is a ceiling on everything the controller can ever
+    /// believe again: a startup cycle that overran by 3% on a 5 MiB span
+    /// pinned it at 4.8 MiB, below the live set, and the run never recovered.
+    /// "I have no constraint" is the same state as "I have never
+    /// constrained".
+    ///
+    /// A climbing `unreachable` is the diagnosis: the target is not achievable
+    /// at this live set, which is an answer, and a different one from "the
+    /// loop is holding the target".
     ///
     /// # What the clock covers
     ///
