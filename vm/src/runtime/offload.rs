@@ -6709,6 +6709,19 @@ pub(crate) mod input_cache {
         let stats = crate::memory::addr_keyed::remap_and_sweep(table, pointer_map, &|addr| {
             heap.is_object_address(addr).is_some()
         });
+        // Counted BEFORE the early return, and counting the collections
+        // that changed nothing too. A run that reports `collections=25
+        // re-keyed=0` has been through 25 collections without one of
+        // them moving a cached array -- which is a different fact from
+        // `collections=0`, and telling them apart is the whole reason
+        // this is here. The `tracing::debug!` below cannot: `tracing`
+        // is built with `max_level_info`, so it is compiled out of
+        // every release binary.
+        cratonvm_types::gpu_residency_census::note_gc(
+            stats.moved as u64,
+            stats.retained as u64,
+            stats.dropped as u64,
+        );
         if stats.moved == 0 && stats.dropped == 0 {
             return;
         }
