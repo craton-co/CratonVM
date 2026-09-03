@@ -51,7 +51,8 @@
 //! cannot tell the two apart except through [`HeapStore::committed_bytes`],
 //! which is the point: nothing else in the crate has to know.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Commit granularity, in bytes.
 ///
@@ -290,6 +291,37 @@ impl HeapStore {
         }
     }
 
+    /// The per-granule commit bitmap, shareable without the arena lock.
+    ///
+    /// `None` on the [`HeapStore::Owned`] arm, which is wholly committed and
+    /// therefore has nothing to screen — read that as "every offset in
+    /// `[0, len())` is backed", NOT as "no information".
+    ///
+    /// # Why a reader needs this
+    ///
+    /// `-Xmx` buys ADDRESS SPACE; only the granules the allocator's cursor has
+    /// reached are mapped. A reader that knows only `[base, base + capacity)`
+    /// — which is what the generational heap's lock-free `region_bounds`
+    /// mirror publishes — will happily dereference an address in the reserved
+    /// middle and take a SIGSEGV. `is_object_address` did exactly that on
+    /// every conservative stack word that happened to look like a heap
+    /// pointer, which is how a third of the Spring Framework suite died under
+    /// `-XX:+UseGenerationalGC` while ZGC (whose validator consults a live-base
+    /// registry and never speculatively dereferences) passed all of it.
+    ///
+    /// The returned `Arc` keeps the words alive independently of the
+    /// reservation, so a `grow_to` that swaps the whole `Reservation` out
+    /// leaves a holder reading a stale-but-mapped bitmap rather than freed
+    /// memory. Stale in the safe direction, too: the old map's bits are a
+    /// SUBSET of the new one's for the range they share, so the worst case is
+    /// declining a granule that has since been committed.
+    pub fn commit_bits(&self) -> Option<Arc<[AtomicU64]>> {
+        match self {
+            HeapStore::Owned(_) => None,
+            HeapStore::Reserved(r) => Some(Arc::clone(&r.granules)),
+        }
+    }
+
     /// Is the granule holding `offset` committed, i.e. safe to READ?
     ///
     /// Lazy commit turns a speculative read of untouched heap space from
@@ -322,6 +354,36 @@ impl HeapStore {
     }
 }
 
+/// Is granule `g` marked committed in a bitmap obtained from
+/// [`HeapStore::commit_bits`]?
+///
+/// `false` for an index past the end of the map: a granule the reservation
+/// does not have cannot be backed. The load is `Acquire` so it pairs with the
+/// `Release` in `Reservation::set_committed` — observing the bit implies
+/// observing the commit syscall that made the granule readable.
+#[inline]
+pub fn granule_committed(bits: &[AtomicU64], g: usize) -> bool {
+    bits.get(g >> 6)
+        .is_some_and(|w| w.load(Ordering::Acquire) & (1u64 << (g & 63)) != 0)
+}
+
+/// Are all the granules spanned by `[offset, offset + len)` committed?
+///
+/// The question a reader actually has: a 16-byte object header two words
+/// short of a granule boundary straddles two granules, and finding the first
+/// backed says nothing about the second.
+#[inline]
+pub fn range_committed(bits: &[AtomicU64], offset: usize, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let last = match offset.checked_add(len - 1) {
+        Some(e) => e / GRANULE,
+        None => return false,
+    };
+    (offset / GRANULE..=last).all(|g| granule_committed(bits, g))
+}
+
 /// Reserved address space with per-granule commit tracking.
 pub struct Reservation {
     base: *mut u8,
@@ -333,7 +395,17 @@ pub struct Reservation {
     /// Reserved address space, rounded up to a whole number of granules.
     reserved_len: usize,
     /// One bit per granule; set means committed.
-    granules: Vec<u64>,
+    ///
+    /// `AtomicU64` behind an `Arc` rather than a plain `Vec<u64>` so a READER
+    /// can consult the map without taking the `Mutex<Arena>` that owns this
+    /// reservation. That is what [`HeapStore::commit_bits`] exists for: the
+    /// generational heap's conservative-root validator has to know whether a
+    /// candidate address is backed before it dereferences it, and it runs on
+    /// the mutator's own hot path where the arena lock is not available. The
+    /// `Arc` keeps the words alive across a `grow_to` that replaces the whole
+    /// reservation, so a reader holding the previous map sees stale bits
+    /// rather than freed memory.
+    granules: Arc<[AtomicU64]>,
     committed: usize,
 }
 
@@ -353,7 +425,9 @@ impl Reservation {
             base,
             len: capacity,
             reserved_len,
-            granules: vec![0u64; granule_count.div_ceil(64)],
+            granules: (0..granule_count.div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
             committed: 0,
         })
     }
@@ -413,18 +487,20 @@ impl Reservation {
 
     #[inline]
     fn is_committed(&self, g: usize) -> bool {
-        self.granules
-            .get(g >> 6)
-            .is_some_and(|w| w & (1u64 << (g & 63)) != 0)
+        granule_committed(&self.granules, g)
     }
 
     #[inline]
     fn set_committed(&mut self, g: usize, on: bool) {
-        if let Some(w) = self.granules.get_mut(g >> 6) {
+        if let Some(w) = self.granules.get(g >> 6) {
+            // `Release` on the SET so a reader that observes the bit also
+            // observes the `mprotect`/`VirtualAlloc` that made the granule
+            // readable (the syscall is ordered before this store on this
+            // thread, and the reader's `Acquire` load pairs with it).
             if on {
-                *w |= 1u64 << (g & 63);
+                w.fetch_or(1u64 << (g & 63), Ordering::Release);
             } else {
-                *w &= !(1u64 << (g & 63));
+                w.fetch_and(!(1u64 << (g & 63)), Ordering::Release);
             }
         }
     }
@@ -546,18 +622,36 @@ impl Reservation {
             return 0;
         }
         let bytes = count * GRANULE;
-        // SAFETY: bounded by the caller, as `commit_granules`.
-        if !unsafe { platform_decommit(self.base.add(first * GRANULE), bytes) } {
-            // A REFUSED DECOMMIT IS NOT AN ERROR. The bytes stay committed and
-            // usable; the only cost is that they stay resident. Reporting zero
-            // keeps the accounting honest.
-            return 0;
-        }
+        // CLEAR THE BITS BEFORE THE SYSCALL, not after.
+        //
+        // The bitmap is read lock-free (`HeapStore::commit_bits`, consulted by
+        // the generational heap's conservative-root validator on the mutator's
+        // own path). Unmapping first and clearing after leaves a window in
+        // which a reader is told a granule is backed when it has already been
+        // handed to the OS -- which is a SIGSEGV in the reader, not a wrong
+        // answer. Clearing first makes the window fail-SAFE instead: a reader
+        // declines a granule that is still mapped, and declining costs nothing
+        // but a conservative root this pass will re-find on the next one.
+        let mut cleared: Vec<usize> = Vec::new();
         for g in first..first + count {
             if self.is_committed(g) {
                 self.set_committed(g, false);
                 self.committed -= 1;
+                cleared.push(g);
             }
+        }
+        // SAFETY: bounded by the caller, as `commit_granules`.
+        if !unsafe { platform_decommit(self.base.add(first * GRANULE), bytes) } {
+            // A REFUSED DECOMMIT IS NOT AN ERROR. The bytes stay committed and
+            // usable; the only cost is that they stay resident. Reporting zero
+            // keeps the accounting honest -- and the bits speculatively cleared
+            // above have to go back, or the store would believe it owns less
+            // than it does and re-commit a granule it never released.
+            for g in cleared {
+                self.set_committed(g, true);
+                self.committed += 1;
+            }
+            return 0;
         }
         COMMITTED_BYTES.fetch_sub(bytes, Ordering::Relaxed);
         bytes

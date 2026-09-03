@@ -2907,6 +2907,16 @@ impl Arena {
         self.data.is_committed_at(offset)
     }
 
+    /// This arena's per-granule commit bitmap, readable without the arena
+    /// lock. `None` on the wholly-committed fallback store.
+    ///
+    /// See [`crate::reservation::HeapStore::commit_bits`] for what a reader is
+    /// buying: the right to ask "is this address backed?" before dereferencing
+    /// it, which `[base, base + capacity)` alone cannot answer.
+    pub fn commit_bits(&self) -> Option<std::sync::Arc<[std::sync::atomic::AtomicU64]>> {
+        self.data.commit_bits()
+    }
+
     /// Bytes of this arena's capacity that are actually committed.
     ///
     /// Equal to `capacity()` on the wholly-committed fallback store; below it,
