@@ -1272,7 +1272,7 @@ fn record_merge_state(
 /// (`iconst_1; goto L; iconst_0; L: ireturn`) both merge exactly one value.
 /// Four leaves room for nested conditionals without letting an unusual body
 /// reserve an unbounded region.
-const MAX_INLINE_MERGE_DEPTH: usize = 4;
+pub(super) const MAX_INLINE_MERGE_DEPTH: usize = 4;
 
 impl Compiler {
     // -----------------------------------------------------------------------
