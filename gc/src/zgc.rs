@@ -625,14 +625,6 @@ struct ZgcCounters {
     /// [`Self::conc_phase_nanos`] can be closed out at mark end. `0` when no
     /// cycle is open.
     conc_mark_started_at: AtomicU64,
-    /// Phase 4: `from_offset -> to_offset` for objects this cycle has moved.
-    ///
-    /// A plain map rather than `zgc::forwarding::ZForwardingTable` on purpose:
-    /// that table is per-page and this collector has one arena and no pages,
-    /// so its page-id keying would carry no information here. The table
-    /// becomes the right structure when `zgc::page` is adopted, which is the
-    /// step after this one.
-    forwarding: Mutex<FxHashMap<u64, u64>>,
     /// Barrier counters — slow-path entries, heals, forward lookups.
     barrier_stats: barrier::ZBarrierStats,
     /// Per-logical-page age, indexed by page id. A page's age is the number of
@@ -640,20 +632,6 @@ struct ZgcCounters {
     /// young-or-old. Grown on demand, never shrunk -- a page id is an index
     /// into the arena's logical grid and the arena does not shrink either.
     page_ages: Mutex<Vec<u32>>,
-    /// Page ids the last relocating cycle classified as old, and the input to
-    /// [`generation::ZGenerationScope`].
-    ///
-    /// **Page-level accounting, and no longer what decides a young cycle.**
-    /// Phase G splits the generations by OBJECT age
-    /// ([`ObjectHeader::gc_age`]), for a reason the logical grid cannot get
-    /// around: a page's age only ever rises, the bump cursor sits inside a page
-    /// that has therefore usually already aged past the promotion age, and the
-    /// allocator serves most steady-state requests out of free-list holes
-    /// scattered over every page. So a freshly allocated object -- exactly the
-    /// object a young cycle exists to collect -- is born into an old page and
-    /// read as old, and the phase reclaims nothing. An object's own age has none
-    /// of that: it is 0 at allocation wherever the bytes came from.
-    old_page_ids: Mutex<Vec<u64>>,
     /// Young collections the nursery-size trigger asked for.
     ///
     /// The engagement counter for G2d: this at zero on a generational run means
@@ -1879,10 +1857,8 @@ impl ZgcRealHeap {
                 conc_ingress_replayed: AtomicUsize::new(0),
                 conc_phase_nanos: AtomicU64::new(0),
                 conc_mark_started_at: AtomicU64::new(0),
-                forwarding: Mutex::new(FxHashMap::default()),
                 barrier_stats: barrier::ZBarrierStats::default(),
                 page_ages: Mutex::new(Vec::new()),
-                old_page_ids: Mutex::new(Vec::new()),
                 gen_nursery_triggers: AtomicUsize::new(0),
                 mark_park_timeouts: AtomicUsize::new(0),
                 gen_nursery_overshoot_max: AtomicUsize::new(0),
@@ -3701,7 +3677,18 @@ impl ZgcRealHeap {
             let idx = (*addr - base) / Self::Z_LOGICAL_PAGE_BYTES;
             live_bytes[idx] += Self::alloc_size(self.header_ref(*addr as *mut u8)).unwrap_or(0);
         }
-        let ages = self.counters.page_ages.lock();
+        // NO `page.set_age(..)` HERE.
+        //
+        // Until 2026-09-03 this took `counters.page_ages.lock()` and stamped
+        // each view's age from it. Nothing downstream read that word: the only
+        // consumers of these views are `adapters::page_candidates` -- whose
+        // `forwarding::PageCandidate` carries `page_id`, `live_bytes`,
+        // `capacity_bytes` and `size_class_index`, and no age -- and the
+        // young/old split, which reads `counters.page_ages` DIRECTLY in
+        // `age_pages_and_split`. (`relocate.rs`'s `gen_hint = page.age()` reads
+        // pages out of `ZPageAllocator`, not these views.) So the stamp bought
+        // a mutex acquire per cycle and a number that could only ever mislead
+        // a reader into thinking a view's age meant something.
         (0..pages)
             .map(|i| {
                 let page_base = base + i * Self::Z_LOGICAL_PAGE_BYTES;
@@ -3719,7 +3706,6 @@ impl ZgcRealHeap {
                     used,
                     live_bytes[i],
                 );
-                p.set_age(ages.get(i).copied().unwrap_or(0));
                 std::sync::Arc::new(p)
             })
             .collect()
@@ -5456,38 +5442,39 @@ impl ZgcRealHeap {
             // from real `page::ZPageReal` VIEWS over the arena grid -- see
             // `logical_pages` for why a view is not a page.
             //
-            // The scope is advisory for now: this cycle still evacuates from
-            // whichever pages the relocation-set selector picks, young or old.
-            // What it buys today is the accounting and the ages; scoping the
-            // MARK to young is what needs the remembered set to be complete,
-            // and completeness is a property of every store site, not of this
-            // function.
+            // NO `ZGenerationScope` IS BUILT HERE, and no `old_page_ids` is
+            // published.
+            //
+            // Both were removed on 2026-09-03 because nothing read either one.
+            // The scope was described as "advisory for now" -- this cycle
+            // evacuates from whichever pages the relocation-set selector picks,
+            // young or old -- and in the year since, its only consumer was the
+            // `scope_pages` field of the `tracing::debug!` below it. A
+            // `ZGenerationScope` that no marker is ever handed does not scope
+            // anything; it filters a page list into a second page list and
+            // drops it, and a reader who finds it here reasonably concludes the
+            // STW slide is generation-aware, which it is not. The real minor
+            // cycle builds its own scope over its own young page set --
+            // `generation::ZGenerationalHeap::minor_cycle` -- and that one is
+            // handed to a marker. `counters.old_page_ids` had no reader at all;
+            // even the card barrier's gate stopped asking it (see
+            // `has_old_objects`).
+            //
+            // What survives is the part with an effect: the page ages
+            // themselves, and the remembered set every old page gets.
             let views = self.logical_pages(live, base, low_end);
             let promo = generation::ZPromotionPolicy::default();
             let (young_ids, old_ids) = self.age_pages_and_split(views.len(), &promo);
-            let young_views: Vec<_> = views
-                .iter()
-                .filter(|p| young_ids.contains(&p.id()))
-                .cloned()
-                .collect();
-            let scope = generation::ZGenerationScope::from_pages(
-                generation::ZGeneration::Young,
-                self.gc_count.load(Ordering::Relaxed) as u64,
-                &young_views,
-                young_ids.len() == views.len(),
-            );
             // Every old page gets a remembered set, so the store barrier has
             // somewhere to record an old-to-young edge before the next cycle.
             for id in &old_ids {
                 self.remembered
                     .register_old_page(*id, Self::Z_LOGICAL_PAGE_BYTES);
             }
-            self.counters.old_page_ids.lock().clone_from(&old_ids);
             tracing::debug!(
                 target: "zgc",
                 young = young_ids.len(),
                 old = old_ids.len(),
-                scope_pages = scope.page_count(),
                 "zgc generational split over the logical grid"
             );
 
@@ -10714,7 +10701,28 @@ impl barrier::ZBarrierContext for ZgcRealHeap {
         if !self.relocate_active.load(Ordering::Relaxed) {
             return Some(addr);
         }
-        Some(self.counters.forwarding.lock().get(&addr).copied().unwrap_or(addr))
+        // THE SAME TABLE the slide writes and `load_and_forward` reads
+        // ([`Self::note_relocation`] / [`Self::counters::relocations`]), not a
+        // second one.
+        //
+        // Until 2026-09-03 this read a `counters.forwarding:
+        // Mutex<FxHashMap<u64, u64>>` that NOTHING in the collector ever
+        // inserted into -- the only writer in the tree was the one unit test
+        // below that arms the barrier by hand. So the barrier's forward step
+        // was structurally incapable of answering: had `relocate_active` ever
+        // been set by a real slide, every lookup would have missed and every
+        // stale reference would have been "healed" back to the address the
+        // object had just been moved off. It was a duplicate of `relocations`
+        // that had been left empty, keyed in offsets where `relocations` is
+        // keyed in addresses, and the difference between the two was the only
+        // reason it looked like a different table.
+        let base = self.arena.lock().base_ptr() as u64;
+        let from = base.checked_add(addr)? as usize;
+        let to = self.counters.relocations.lock().get(&from).copied();
+        match to {
+            Some(to) => Some((to as u64).checked_sub(base)?),
+            None => Some(addr),
+        }
     }
 
     /// Publish `addr` (an offset) to the concurrent marker.
@@ -11771,7 +11779,7 @@ impl GarbageCollector for ZgcRealHeap {
                         // `std::process::abort()`, so a heap-full auto-box
                         // killed the process where Java semantics call for an
                         // `OutOfMemoryError` the program can catch — and the
-                        // store that triggers it is a native copying
+                        // store that triggered it is a native copying
                         // primitives into an `Object[]`, which is the LAST
                         // allocation before a heap fills, not the first. The
                         // element keeps its old value on this arm; nothing is
@@ -19848,7 +19856,10 @@ pub(crate) mod tests {
         unsafe { std::ptr::write(slot as *mut u64, stale) };
 
         // Publish the move and arm the barrier.
-        heap.counters.forwarding.lock().insert(from_off, to_off);
+        heap.counters
+            .relocations
+            .lock()
+            .insert((base + from_off) as usize, (base + to_off) as usize);
         heap.relocate_active.store(true, Ordering::Relaxed);
         heap.set_barrier_color(Some(vaddr::ZColor::Remapped));
 
@@ -19858,7 +19869,7 @@ pub(crate) mod tests {
         let healed = unsafe { std::ptr::read(slot as *const u64) };
         heap.set_barrier_color(None);
         heap.relocate_active.store(false, Ordering::Relaxed);
-        heap.counters.forwarding.lock().clear();
+        heap.counters.relocations.lock().clear();
 
         assert_eq!(
             got,
