@@ -1032,8 +1032,22 @@ pub fn collector_decision_report() -> String {
     if g1_pauses > 0 {
         s.push('\n');
         s.push_str(&format!(
-            "[GC] g1 root coverage: pauses={g1_pauses} incomplete={g1_incomplete} ({:.2}%)",
-            100.0 * g1_incomplete as f64 / g1_pauses as f64,
+            "[GC] g1 root coverage: pauses={g1_pauses} incomplete={g1_incomplete} ({pct:.2}%){reasons}",
+            pct = 100.0 * g1_incomplete as f64 / g1_pauses as f64,
+            // The reason, appended rather than on its own line so a reader
+            // cannot see the rate without it.
+            reasons = {
+                let rows = g1_coverage_reason_counts();
+                if rows.is_empty() {
+                    String::new()
+                } else {
+                    let mut s = String::from(" reasons:");
+                    for (label, n) in rows {
+                        s.push_str(&format!(" {label}={n}"));
+                    }
+                    s
+                }
+            },
         ));
         // The narrow sibling of the line above, and the one that can actually
         // select: how often a pause ran with a compiled frame live and NOTHING
@@ -1328,12 +1342,52 @@ fn with_g1_cycle<R>(f: impl FnOnce(&G1CycleSlot) -> R) -> R {
 static G1_PAUSES: AtomicU64 = AtomicU64::new(0);
 static G1_PAUSES_COVERAGE_INCOMPLETE: AtomicU64 = AtomicU64::new(0);
 
-/// Count one G1 STW collection and whether its root set was incomplete.
-pub fn record_g1_pause_coverage(incomplete: bool) {
+/// Per-reason census for the pauses counted above, indexed by
+/// [`crate::gc_quiescence::incomplete_reason`] code.
+///
+/// The rate alone cannot be acted on. `G1Collector::root_coverage_incomplete_reason`
+/// computes WHICH obligation failed and this counter used to be handed only
+/// `is_some()`, so the reason was discarded at the one place it was known —
+/// and a reader of `incomplete=58 (100.00%)` had no way to tell an
+/// unregistered JIT frame from an unpublished bounds table from an OSR shadow.
+/// Measured on H2 (`org.h2.test.store.TestMVStoreTool`, 612 compiled frames),
+/// G1 reports 100% incomplete where the probes report 0%, and the reason is
+/// exactly what that difference needed naming.
+static G1_COVERAGE_REASONS: [AtomicU64; crate::gc_quiescence::incomplete_reason::COUNT] =
+    [const { AtomicU64::new(0) }; crate::gc_quiescence::incomplete_reason::COUNT];
+
+/// Count one G1 STW collection and, when its root set was incomplete, which
+/// obligation failed. `None` is a complete root set.
+pub fn record_g1_pause_coverage_reason(reason: Option<usize>) {
     G1_PAUSES.fetch_add(1, Ordering::Relaxed);
-    if incomplete {
+    if let Some(code) = reason {
         G1_PAUSES_COVERAGE_INCOMPLETE.fetch_add(1, Ordering::Relaxed);
+        if let Some(slot) = G1_COVERAGE_REASONS.get(code) {
+            slot.fetch_add(1, Ordering::Relaxed);
+        }
     }
+}
+
+/// Count one G1 STW collection and whether its root set was incomplete.
+///
+/// Kept for callers that have only the boolean; prefer
+/// [`record_g1_pause_coverage_reason`], which does not throw the reason away.
+pub fn record_g1_pause_coverage(incomplete: bool) {
+    record_g1_pause_coverage_reason(incomplete.then_some(
+        crate::gc_quiescence::incomplete_reason::NONE,
+    ));
+}
+
+/// The non-zero rows of the per-reason census, as `(label, count)`.
+pub fn g1_coverage_reason_counts() -> Vec<(&'static str, u64)> {
+    G1_COVERAGE_REASONS
+        .iter()
+        .enumerate()
+        .filter_map(|(code, c)| {
+            let n = c.load(Ordering::Relaxed);
+            (n > 0).then(|| (crate::gc_quiescence::incomplete_reason::label(code), n))
+        })
+        .collect()
 }
 
 /// `(total G1 pauses, pauses with an incomplete root set)`.

@@ -17234,7 +17234,7 @@ impl GarbageCollector for G1Collector {
         // empty-CSet fail-safe costs.
         let coverage_incomplete = Self::root_coverage_incomplete_reason();
         // Counted in BOTH arms — see `root_coverage_incomplete_reason`.
-        crate::gc_metrics::record_g1_pause_coverage(coverage_incomplete.is_some());
+        crate::gc_metrics::record_g1_pause_coverage_reason(coverage_incomplete);
         // Only the REFUSAL is gated, and it is OFF by default — see
         // `root_coverage_incomplete_reason` for the measurement that says why.
         let refuse = Self::refuse_evacuation(coverage_incomplete, gc_flags().g1_coverage_pin);

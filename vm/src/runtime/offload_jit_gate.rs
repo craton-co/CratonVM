@@ -284,7 +284,13 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
     // down. Both are correct; they cost different things.
     if method_writes_primitive_array(&code_attr.code) {
         match array_writer_policy() {
-            ArrayWriterPolicy::KeepCache => return true,
+            ArrayWriterPolicy::KeepCache => {
+                cratonvm_types::gpu_jit_gate_census::note_blocked_name(
+                    format!("{}.{}{}", class.name, method.name, method.descriptor),
+                    cratonvm_types::gpu_jit_gate_census::BlockReason::WritesPrimitiveArray,
+                );
+                return true;
+            }
             ArrayWriterPolicy::AllowJit => {
                 crate::runtime::offload::input_cache::disable_for_jit_array_writer();
                 // Fall through to the invokestatic scan: this method may
@@ -334,6 +340,18 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
             jit_cuda::analyzer::analyze(target_method),
             jit_cuda::OffloadVerdict::Eligible(_)
         ) {
+            cratonvm_types::gpu_jit_gate_census::note_blocked_name(
+                format!(
+                    "{}.{}{} -> calls {}.{}{}",
+                    class.name,
+                    method.name,
+                    method.descriptor,
+                    target_class_name,
+                    target_method_name,
+                    target_descriptor
+                ),
+                cratonvm_types::gpu_jit_gate_census::BlockReason::CallsEligibleKernel,
+            );
             return true;
         }
     }

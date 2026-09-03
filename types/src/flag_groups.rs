@@ -1935,6 +1935,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "par-threads", on_key: Some("CRATONVM_GC_PAR_THREADS"), off_key: None, off_word: None, since: "2026-07-25" },
     E { group: Group::GC, token: "sync-young-wipe", on_key: Some("CRATONVM_GC_SYNC_YOUNG_WIPE"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "jit-ref-store-gates", on_key: Some("CRATONVM_GC_JIT_REF_STORE_GATES"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // Opt-IN: the interpreter's TLAB fast path plans the COMPACT body shape,
+    // the one the JIT's inline `new` and the TLAB-miss path already use. Off by
+    // default because the single previous attempt at this unification
+    // miscompiled `probes/FjpProbe.java`; see `compact_tlab_alloc_enabled`.
+    E { group: Group::GC, token: "compact-tlab-alloc", on_key: Some("CRATONVM_COMPACT_TLAB_ALLOC"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::GC, token: "promotion-guard", on_key: None, off_key: Some("CRATONVM_NO_GC_PROMOTION_GUARD"), off_word: None, since: "2026-06-21" },
     E { group: Group::GC, token: "promotion-oom-guard-broad", on_key: Some("CRATONVM_PROMOTION_OOM_GUARD_BROAD"), off_key: None, off_word: None, since: "2026-06-23" },
     E { group: Group::GC, token: "selective-promote", on_key: None, off_key: Some("CRATONVM_NO_SELECTIVE_PROMOTE"), off_word: None, since: "2026-06-05" },

@@ -17163,8 +17163,11 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
                     cache.set(Some((vm_key, class_id.as_u32(), resolved as u32)));
                     resolved
                 });
-                use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
-                let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+                // The shape planner, not a bare legacy size: every TLAB object
+                // site has to agree with the header its allocation will be
+                // stamped with. See `plan_tlab_object_shape`.
+                let (requested_size, _, _) =
+                    crate::runtime::interpreter::plan_tlab_object_shape(class_id, slots);
                 let tlab_object = if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
                     crate::runtime::interpreter::tlab_alloc_object(
                         thread,
@@ -17418,8 +17421,11 @@ pub unsafe extern "C" fn jit_long_value_of_direct(vm_ptr: i64, value: i64) -> i6
                     cache.set(Some((vm_key, class_id.as_u32(), resolved as u32)));
                     resolved
                 });
-                use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
-                let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+                // The shape planner, not a bare legacy size: every TLAB object
+                // site has to agree with the header its allocation will be
+                // stamped with. See `plan_tlab_object_shape`.
+                let (requested_size, _, _) =
+                    crate::runtime::interpreter::plan_tlab_object_shape(class_id, slots);
                 let tlab_object = if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
                     crate::runtime::interpreter::tlab_alloc_object(
                         thread,
