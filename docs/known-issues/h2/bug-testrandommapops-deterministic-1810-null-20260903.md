@@ -2,11 +2,40 @@
 
 ## Status
 
-**MITIGATED 2026-09-03 (the door is default-OFF); root cause still OPEN.**
-Narrowed from 92 commits to ONE feature switch: the monomorphic invoke fast
-door. Not yet narrowed to a line. This is a NEW
-regression, distinct from every other failure on this workload, and it is the
-easiest of them to work on because it is **deterministic**.
+**FIXED 2026-09-03.** Root-caused and repaired; the door is default-ON again.
+The fix is one `if` in `execute_invokevirtual_fast_door`: it now records the
+receiver into `profile_store`, which it never did.
+
+**Root cause.** The monomorphic invoke fast door serves the WARM MONOMORPHIC
+hit — nearly every hit — and recorded no receiver, while the general path
+(`execute_invokevirtual_cached`, Step 5) always did. So `profile_store` was
+sampled only from the calls the door DECLINED: a sample biased by construction,
+and biased away from exactly the receivers the door is best at.
+`classify_receiver_shape` and `CallSiteEvidence` read that sample, and the
+single-pass backend pre-populates virtual-call MICs from it — so a site whose
+common receiver never appears in the profile can be devirtualised on a rare one,
+and the callee returns someone else's answer.
+
+That is why it took BOTH ingredients, which is what named it: the door (to
+bypass the recording) and `CRATONVM_TIER_PGO_RECEIVERS` (default-ON since
+2026-09-02, to consume the biased profile). Switching either off made it clean,
+and neither alone is a defect.
+
+**Proven in one binary**, with the fix behind its own kill switch so the arms
+differ by one `if` and nothing else:
+
+| arm | result |
+|---|---|
+| fix on (default) | clean to the cap |
+| `CRATONVM_JIT_NO_DOOR_RECEIVER_RECORD=1` | `AssertionError: (1810, null)` |
+
+Regression suite: **88 of 88 passed, 0 failed.**
+
+**The general lesson.** A fast door that skips the bookkeeping its slow path
+owes is not a fast path, it is a different answer. The door's module comment
+carefully enumerates what it DECLINES so the general path keeps owning those
+cases; it said nothing about what it still owes on the cases it ACCEPTS, and
+the receiver profile was the thing it owed.
 
 ## The repro
 
