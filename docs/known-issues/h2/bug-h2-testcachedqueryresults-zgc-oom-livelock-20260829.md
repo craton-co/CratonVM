@@ -1181,7 +1181,43 @@ Both real, both fixed, neither shown to BE the crash:
 - `publish_self_jit_depth` used `with`, which PANICS on a destroyed
   thread-local, and `pop_jit_entry` can run during teardown — now `try_with`.
 
-### CONCLUSION: the refusal is correct; pinning cannot discharge a blocked peer
+### RETRACTED 2026-09-03 -- every crash binary predates dev's box/unbox fix
+
+The conclusion below is withdrawn. It is not known to be wrong; it is not
+supported by the evidence that was offered for it.
+
+`known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`
+landed on dev the same day: the box/unbox intrinsic SIGSEGVs under a relocating
+collector, **11 of 11 runs, 25-183 s**, and it takes BOTH relocation and that
+intrinsic -- neither alone. Dev flipped the intrinsic to opt-in as the
+mitigation.
+
+Every binary crashed on this page was built before that flip, so it carried the
+intrinsic default-ON. And the ONLY effect of the pinned-peer credit is to let
+relocation happen on cycles that previously refused. So "relocation crashes this
+workload" was already true on dev, independently of the credit, and the
+`PUBLISH_ONLY` control cannot separate the two: suppressing the decision
+suppresses relocation, which suppresses the known defect too. Same for
+`CRATONVM_ZGC_RELOCATE=0`.
+
+What survives the retraction:
+
+* the relocation DECISION is what crashes -- still true, and still what the
+  arms show;
+* the plumbing is innocent (`PUBLISH_ONLY` 0/3, scan-only 0/2);
+* the shadow stack is a genuinely uncovered channel, 2090 refs on a 216 s run
+  -- an independent measurement that owes nothing to the crash;
+* the three implementation defects found by auditing the scan.
+
+What does not survive: any claim about whether a blocked peer CAN be discharged
+by pinning. Re-running on merged dev with the intrinsic default-off.
+
+The lesson is the cheap one: before concluding that a crash under your feature
+indicts your feature, ask what else on dev crashes under exactly the condition
+your feature creates. `git log origin/dev -- docs/known-issues/` would have
+found it in seconds.
+
+### SUPERSEDED CONCLUSION (read the retraction above first)
 
 Settled by measurement. Every arm below is the same binary with flags as the
 only difference.
