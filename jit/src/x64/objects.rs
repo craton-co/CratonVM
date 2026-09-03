@@ -568,6 +568,7 @@ impl Compiler {
         code: &[u8],
         bc_pc: usize,
         implicit_ok: bool,
+        arm: usize,
     ) -> Vec<usize> {
         if super::null_check_elim::receiver_null_elim_enabled() {
             if let Some(local) = super::null_check_elim::preceding_aload_nonnull_local(code, bc_pc)
@@ -595,7 +596,7 @@ impl Compiler {
         // as a decision made here.
         if implicit_ok && crate::implicit_null::enabled() {
             self.implicit_null_pending.push((self.buf.pos(), bc_pc));
-            super::null_check_elim::note_receiver_null_check_implicit();
+            super::null_check_elim::note_receiver_null_check_implicit(arm);
             return Vec::new();
         }
         super::null_check_elim::note_receiver_null_check_emitted();

@@ -466,11 +466,27 @@ pub(super) fn note_receiver_null_check_emitted() {
     RECEIVER_NULL_CHECKS_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-static RECEIVER_NULL_CHECKS_IMPLICIT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+/// Implicit sites, split by which `getfield` arm emitted them.
+///
+/// Split because the two arms are not the same bet. The compact arm is the
+/// common path; the legacy-cell arm is rare (13 sites against 1,705 on an H2
+/// workload) and was widened into this feature on the argument that it *could*
+/// carry sites the proof cannot reach, not on a measurement that it does.
+///
+/// A single total would have made that unanswerable, which is the shape this
+/// codebase keeps getting caught by: a widening that never fires looks
+/// identical to one that fires usefully. If `arm2` stays 0 across real
+/// workloads, the widening is dead code and should be withdrawn — the counter
+/// exists so that is a reading rather than an argument.
+static RECEIVER_NULL_CHECKS_IMPLICIT: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
-pub(super) fn note_receiver_null_check_implicit() {
-    RECEIVER_NULL_CHECKS_IMPLICIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+pub(super) fn note_receiver_null_check_implicit(arm: usize) {
+    if let Some(c) = RECEIVER_NULL_CHECKS_IMPLICIT.get(arm) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Sites that dropped the check in favour of the fault.
@@ -481,7 +497,19 @@ pub(super) fn note_receiver_null_check_implicit() {
 /// is a liability, and a single counter covering both would hide which of them
 /// a workload is actually running on.
 pub fn receiver_null_check_implicit_count() -> u64 {
-    RECEIVER_NULL_CHECKS_IMPLICIT.load(std::sync::atomic::Ordering::Relaxed)
+    RECEIVER_NULL_CHECKS_IMPLICIT
+        .iter()
+        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        .sum()
+}
+
+/// `(compact_arm, legacy_arm)` implicit sites. See the static's doc for why
+/// the split is the point.
+pub fn receiver_null_check_implicit_by_arm() -> (u64, u64) {
+    (
+        RECEIVER_NULL_CHECKS_IMPLICIT[0].load(std::sync::atomic::Ordering::Relaxed),
+        RECEIVER_NULL_CHECKS_IMPLICIT[1].load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// `(elided, emitted)` getfield receiver null checks, process-wide.

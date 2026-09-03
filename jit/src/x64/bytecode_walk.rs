@@ -5427,7 +5427,7 @@ impl Compiler {
                             (Vec::new(), Some(self.emit_jcc_rel32_patch(0x84))) // JE
                         } else if receiver_is_trusted_oop {
                             (
-                                self.emit_trusted_oop_receiver_check_at(code, pc, true),
+                                self.emit_trusted_oop_receiver_check_at(code, pc, true, 0),
                                 None,
                             )
                         } else {
@@ -5680,6 +5680,7 @@ impl Compiler {
                                     code,
                                     pc,
                                     cratonvm_types::compact_ref_fields_enabled(),
+                                    1,
                                 ),
                                 None,
                             )
