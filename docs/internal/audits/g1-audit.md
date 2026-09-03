@@ -1483,3 +1483,75 @@ report unreadable even when it was right. §16.4 said a counter that flags a
 possible defect is not evidence of one; §17 adds the converse — an instrument
 that reports a real obligation under a wrong label hides the one finding worth
 having.
+
+## 18. The shadow-stack gap was mostly my own envelope (2026-09-03)
+
+*`fix/moving-young-band-object-screen-20260903`. §17.4 named
+`compiled-frame-oop-not-published` at 81% as what is actually blocking precise
+root coverage on real code. Most of it was an artefact of the change §14 made.*
+
+### 18.1 The detector has no object screen, and could not have one
+
+`band_has_unpublished_word_with_map` decides a stack word is an unpublished oop
+on one test:
+
+```rust
+if is_relocatable(w) && !published.contains(&w) { return true; }
+```
+
+`is_relocatable` is `gen_heap::addr_is_movable` — an **address-range check**.
+No `is_object_address`, no header validation, unlike every sibling instrument
+in this file, all of which require `heap.is_object_address(qword).is_some()`
+before believing a word.
+
+It cannot simply be given one: there is no heap handle in
+`refresh_moving_young_coverage_for_current_thread`, and — the harder half —
+the range it tests covered G1's whole **reservation**, where reading a header
+faults on pages that were never committed.
+
+§14 published that reservation, on the argument that a superset is the safe
+direction. It is, for this classification. But it is also the reason this test
+lit up for G1 at all: every reserved-but-uncommitted byte is address space that
+cannot hold an object and can only turn coincidental stack words into
+"unpublished oops".
+
+### 18.2 The fix, and what it is worth
+
+G1 now publishes the **committed prefix** into `MOVABLE_BOUNDS`, republished as
+the prefix grows — exactly as `publish_jit_read_bounds` beside it already does.
+Still a superset of what can hold an object, so §14's safety argument is intact,
+and now tight enough that a header screen would be safe to add later.
+
+`org.h2.test.store.TestMVStoreTool` at `-Xmx64m`, precise-only switches and the
+oracle on, six reps each:
+
+| | incomplete rate per rep | median |
+|---|---|---:|
+| reservation (§14) | 2.94, 3.85, 16.95, 40.38, 72.41, 83.62 % | **28.7 %** |
+| committed prefix | 2.78, 2.78, 3.39, 4.08, 4.27, 21.43 % | **3.7 %** |
+
+The absolute counts fall the same way: 1–97 incomplete pauses become 1–5.
+
+**Read those spreads before the medians.** This workload is extremely unstable —
+the same binary and configuration produced 34 and 243 pauses on consecutive
+runs, and rates from 2.9% to 83.6% on the unchanged arm. Six reps are enough to
+say the arms differ by roughly an order of magnitude and not enough to put a
+figure on it. §12.3's lesson applies here too, and the instability is itself the
+finding that blocks a real soak of this metric: nobody can drive
+`compiled-frame-oop-not-published` down until the measurement is stable enough
+to tell progress from variance.
+
+### 18.3 What is left, honestly
+
+A residue survives the fix — 1 to 5 pauses per run still report
+`compiled-frame-oop-not-published`, and a second reason,
+`innermost-rbp-belongs-to-unguarded-callee`, appears alongside it. Those are
+the ones that may be real, and the object screen §18.1 describes is what would
+tell: with the range now bounded by the commit, a header check is safe to add,
+and it is the next step rather than a further narrowing of the bounds.
+
+**One segfault**, on the fixed arm, during the spread runs above. It did not
+reproduce: 0 crashes in 14 subsequent reps on that arm (8 without the oracle, 6
+with) and 0 in 14 on the unchanged arm. It is recorded rather than explained,
+and it matches the rare tight-heap crash class G1-11 already documents at
+roughly 1-in-32 on plain `dev`.
