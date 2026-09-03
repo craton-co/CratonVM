@@ -304,9 +304,11 @@ fn maybe_dump_shutdown_reports() {
             // Those look identical as a percentage and want opposite fixes.
             let (nn_elided, nn_emitted) = cratonvm_jit::x64::receiver_null_check_counts();
             let nn_implicit = cratonvm_jit::x64::receiver_null_check_implicit_count();
+            let (nn_i1, nn_i2) = cratonvm_jit::x64::receiver_null_check_implicit_by_arm();
             eprintln!(
                 "[cratonvm] getfield receiver null checks: elided={nn_elided} \
-                 implicit={nn_implicit} emitted={nn_emitted}"
+                 implicit={nn_implicit} (compact-arm={nn_i1} legacy-arm={nn_i2}) \
+                 emitted={nn_emitted}"
             );
             // Implicit null-check table. All four, because no one of them is a
             // verdict: `registered` alone cannot separate "off" from "on and

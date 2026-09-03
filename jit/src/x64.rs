@@ -257,6 +257,7 @@ pub(crate) use objects::{ref_store_gates_of, ref_store_post_skip_mask_of};
 pub use objects::ref_store_site_counts;
 pub(crate) use objects::note_gated_ref_store;
 pub use null_check_elim::receiver_null_check_counts;
+pub use null_check_elim::receiver_null_check_implicit_by_arm;
 pub use null_check_elim::receiver_null_check_implicit_count;
 mod osr;
 mod simd;
