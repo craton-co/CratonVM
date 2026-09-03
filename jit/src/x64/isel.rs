@@ -6526,6 +6526,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         }
     }
 

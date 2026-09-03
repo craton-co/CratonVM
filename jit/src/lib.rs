@@ -22817,6 +22817,11 @@ fn try_compile_inner(
         let mut ir_compact_fields: std::collections::HashMap<(usize, bool), (u32, bool, u8)> =
             std::collections::HashMap::new();
         let mut builder = ir::IrBuilder::new(num_params, cached.max_locals as usize);
+        // The one fact the optimizing tier cannot derive for itself: whether
+        // parameter 0 is a receiver. `num_params` above already counts the
+        // implicit `this`, so the flag is the only missing half, and it is
+        // right here.
+        builder.graph.receiver_param = if cached.is_static { None } else { Some(0) };
         builder.tdigest_scalar_kernel = cached.class_name.as_ref()
             == "org/elasticsearch/tdigest/Dist"
             && matches!(
@@ -31059,6 +31064,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31120,6 +31126,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31169,6 +31176,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31252,6 +31260,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31522,6 +31531,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31657,6 +31667,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31755,6 +31766,7 @@ mod tests {
                 exit: NO_NODE,
                 safepoints: Vec::new(),
                 uses: Default::default(),
+                receiver_param: None,
             };
             let start = g.add(Op::Start, IrType::Control, vec![], None);
             let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31846,6 +31858,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -37200,6 +37213,7 @@ mod tests {
             exit: 0,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(ir::Op::Start, ir::IrType::Void, vec![], None);
         let c = g.add(ir::Op::Const(42), ir::IrType::Int, vec![], None);
@@ -37230,6 +37244,7 @@ mod tests {
             exit: 0,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(ir::Op::Start, ir::IrType::Void, vec![], None);
         let alloc = g.add(

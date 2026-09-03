@@ -3149,6 +3149,42 @@ pub fn note_ir_getfield_decline(reason: usize) {
 }
 
 /// `(name, count)` for every refusal reason that fired.
+static IR_RECEIVER_SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IR_RECV_NULL_ELIDED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static IR_RECV_NULL_EMITTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// A block seeded with the receiver as non-null.
+pub fn note_ir_receiver_seed() {
+    IR_RECEIVER_SEED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn note_ir_receiver_null_check_elided() {
+    IR_RECV_NULL_ELIDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn note_ir_receiver_null_check_emitted() {
+    IR_RECV_NULL_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(seeded_blocks, elided, emitted)` for the optimizing tier's `getfield`
+/// receiver null check.
+///
+/// Three numbers because two of them are ambiguous alone. `elided=0` with
+/// `emitted=0` means this tier compiled no inline `getfield` at all — which is
+/// what the single-pass census reads on a workload too short to reach the
+/// tier, and is a different finding from "it compiled some and proved none".
+/// `seeded` separates "the graph carried no `receiver_param`" (static methods,
+/// or a hand-built graph) from "it did and nothing used it".
+pub fn ir_receiver_null_check_counts() -> (u64, u64, u64) {
+    (
+        IR_RECEIVER_SEED.load(std::sync::atomic::Ordering::Relaxed),
+        IR_RECV_NULL_ELIDED.load(std::sync::atomic::Ordering::Relaxed),
+        IR_RECV_NULL_EMITTED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 pub fn ir_getfield_declines() -> Vec<(&'static str, u64)> {
     IR_GETFIELD_DECLINE_NAMES
         .iter()

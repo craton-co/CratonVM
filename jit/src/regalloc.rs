@@ -6465,6 +6465,7 @@ mod linear_scan_tests {
                     exit: NO_NODE,
                     safepoints: Vec::new(),
                     uses: Default::default(),
+                    receiver_param: None,
                 },
                 live: LiveModel {
                     pos_of: Vec::new(),
