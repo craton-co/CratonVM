@@ -1181,7 +1181,55 @@ Both real, both fixed, neither shown to BE the crash:
 - `publish_self_jit_depth` used `with`, which PANICS on a destroyed
   thread-local, and `pop_jit_entry` can run during teardown — now `try_with`.
 
-### Under test
+### CONCLUSION: the refusal is correct; pinning cannot discharge a blocked peer
+
+Settled by measurement. Every arm below is the same binary with flags as the
+only difference.
+
+| arm | crashes |
+|---|---|
+| credit ON, no shadow scan | 3/4, then 3/3, then 2/2 across two binaries |
+| credit ON, shadow scan ON (engaged, 2090 roots recovered) | 3/3 |
+| credit ON but `PUBLISH_ONLY` -- all plumbing, no decision | **0/3** |
+| shadow scan only, no credit | **0/2** |
+| plain control (discharge only) | 0/3, including one 3600 s run |
+
+The plumbing is innocent: the TLS `Arc`, the per-tid registry, the deposits and
+the shadow scan all run clean for 600 s when the DECISION is suppressed. What
+crashes is crediting a pinned blocked peer and letting relocation proceed.
+
+Three channels are now covered -- register file, `[rsp, stack_base)`, and the
+shadow stack -- and it still crashes. There is at least a fourth
+(`apply_pending_blocked_fixups` also skips `remap_register_image_words` and
+`remap_active_jit_frames`), but the pattern is the point: the architecture makes
+a peer's JIT state consistent BY THE PEER ITSELF -- park, publish, remap on
+resume -- and a blocked peer sits outside that by design. Retrofitting
+immobility means enumerating every channel the design never required anyone else
+to know about, and being wrong once is a SIGSEGV.
+
+**So `cross-thread-jit-peer` stays.** Discharging it needs REWRITABILITY, not
+immobility: make a blocked peer remap its own JIT frames, register image and
+shadow stack when it wakes, which is a substantial change to the blocked-wake
+path and should be scoped as its own piece of work.
+
+### Independent finding: a blocked peer's shadow stack is never scanned for ROOTS
+
+Worth separating from the failed credit. `helper_window_pass` contributes a
+blocked peer's registers and stack to the root set on every cycle it runs, but
+never its shadow stack -- and `collect_roots` scans only the initiator's while a
+parked peer publishes its own. On a 216 s `TestMultiThread` run the new scan
+found `sh_windows=61 sh_slots=2376 sh_roots=2090`: 2090 heap references in
+blocked peers' shadow stacks that nothing else was scanning.
+
+Whether any of those 2090 is reachable ONLY through the shadow stack is NOT
+established here -- the same values usually also sit in a stack slot or
+register. But precise publication exists precisely because they sometimes do
+not, so this is a real hole to close on its own merits.
+`CRATONVM_XT_PEER_SHADOW_SCAN=1` closes it and measured clean (0/2 crashes,
+0 NPE, 0 OOM on `TestMultiThread`). It stays default-OFF pending a run that
+either demonstrates the loss or rules it out.
+
+### The route that was tried and rejected
 
 `CRATONVM_XT_PEER_SHADOW_SCAN=1` gives the owner-published route to the missing
 coverage: each thread publishes its own `ShadowStack` ADDRESS (authoritative,
