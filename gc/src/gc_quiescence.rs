@@ -483,6 +483,7 @@ pub fn reset_peer_proven_jit_depth() {
     peer_proven_depth_reset_inner();
     // The helper-window pins describe peers frozen during THIS cycle only.
     clear_xt_cycle_pinned_jit_roots();
+    clear_xt_cycle_pinned_jit_depth();
 }
 
 /// A cooperatively-parking peer deposits `depth` JIT entries it has just PROVEN
@@ -855,6 +856,7 @@ pub fn begin_moving_young_coverage_cycle() {
     // `reset_peer_proven_jit_depth`, because this entry point does not go
     // through it and a pause that reaches only one of the two is still cleared.
     clear_xt_cycle_pinned_jit_roots();
+    clear_xt_cycle_pinned_jit_depth();
 }
 
 /// Whether this cycle's root scan touched state belonging to a peer thread that
@@ -2594,4 +2596,358 @@ pub fn was_vacated(addr: usize) -> Option<usize> {
         return None;
     }
     from.get(&addr).copied()
+}
+
+// ---------------------------------------------------------------------------
+// Per-OS-thread published JIT depth, and the pinned-peer depth ledger.
+// ---------------------------------------------------------------------------
+//
+// `refresh_moving_young_coverage_for_collection` accounts for cross-thread JIT
+// coverage with a DEPTH comparison (`proven >= peer`), because
+// `GLOBAL_JIT_DEPTH` is the only process-wide view of compiled frames and it is
+// a depth, not a set of threads. That works for a cooperatively-parked peer,
+// which deposits its own depth into `peer_proven_jit_depth` at its park.
+//
+// A BLOCKED peer never reaches that park, so it deposits nothing -- and until
+// now the resulting shortfall refused the cycle. That is the
+// `cross-thread-jit-peer` term, 448 of the 877 relocation refusals on
+// `TestCachedQueryResults`.
+//
+// Since 2026-09-02 `helper_window_pass` PINS such a peer: it freezes the
+// thread, scans its whole register file and its whole `[rsp, stack_base)` band
+// conservatively, and pins every heap address it finds for the rest of the
+// cycle. A pinned peer's objects cannot move, so its frames need no
+// rewritability proof -- the obligation is discharged by immobility instead of
+// by proof.
+//
+// Turning that into an accounting entry needs the peer's DEPTH, and the depth
+// lives in a thread-local (`JIT_ENTRY_CHAIN`) the initiator cannot read. Hence
+// this registry: each thread publishes its own depth into a slot keyed by OS
+// tid, and the initiator reads the slot of a peer it has just frozen.
+//
+// Why publish from the JIT push/pop and not from the blocked-region
+// transition, which is far colder: `in_blocked_region` is raised at several
+// sites (`mark_native_thread_blocked`, the `BlockedGuard`, the JNI paths), and
+// a site that raised it without publishing would leave a STALE depth behind.
+// Stale-too-small merely under-credits and refuses a cycle it could have run;
+// stale-too-LARGE credits depth that nothing pinned, which is the unsound
+// direction -- it would let the collector move an object a peer's unscanned
+// frame still names. Publishing on every chain mutation cannot go stale.
+
+static PER_TID_JIT_DEPTH: std::sync::OnceLock<
+    std::sync::RwLock<
+        std::collections::HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    >,
+> = std::sync::OnceLock::new();
+
+fn per_tid_jit_depth()
+-> &'static std::sync::RwLock<
+    std::collections::HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+> {
+    PER_TID_JIT_DEPTH.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+/// Hand the calling thread the slot it should publish its JIT depth into.
+///
+/// Called once per thread (the caller caches the `Arc` in TLS and stores
+/// through it on every chain mutation), so the map lock is never taken on the
+/// hot path -- only here, and by [`jit_depth_of_tid`] while a peer is frozen.
+///
+/// Re-registering the same `os_tid` returns the EXISTING slot rather than
+/// replacing it: OS tids are recycled after a thread exits, and handing the
+/// recycled thread a fresh slot while some cycle still holds the old `Arc`
+/// would split one tid's depth across two cells.
+pub fn register_self_jit_depth_slot(os_tid: u32) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    let mut map = match per_tid_jit_depth().write() {
+        Ok(m) => m,
+        // A poisoned registry means some thread panicked mid-publish. Hand back
+        // a detached slot: the owner's stores go nowhere the initiator can read,
+        // so that thread simply never gets credited and its cycles keep
+        // refusing. Degrading to the old behaviour is the safe direction.
+        Err(_) => return std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    let slot = std::sync::Arc::clone(
+        map.entry(os_tid)
+            .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+    );
+    // Reset on (re-)registration. An entry can survive its owner: OS tids are
+    // recycled, and a thread that died without running its TLS destructor
+    // leaves its last depth behind. Handing the recycled thread that value
+    // would credit depth NOBODY holds -- the over-credit direction. The caller
+    // stores its real depth immediately after this returns.
+    slot.store(0, std::sync::atomic::Ordering::Release);
+    slot
+}
+
+/// Address of each thread's own `ShadowStack`, published by its owner.
+///
+/// A JIT frame's oops live in the shadow stack, which is a per-thread heap
+/// `Box<[usize]>` and NOT the machine stack -- so `helper_window_pass`, which
+/// scans registers plus `[rsp, stack_base)`, cannot see them. For the initiator
+/// and for a cooperatively parked peer that is fine (`collect_roots` scans its
+/// own; a parked peer publishes its own and remaps on resume). A BLOCKED peer
+/// does neither, and `apply_pending_blocked_fixups` never remaps a shadow
+/// stack, so its shadow-stack oops are unpinned and unremapped.
+///
+/// The initiator cannot recover the window from the peer's frames the way
+/// `shadow_window_from_frame` does: that helper only trusts a frame whose
+/// cached `JvmThread` is the CURRENT thread's, and attributing a
+/// `CompiledMethod` to a conservatively-found frame is the mis-attribution that
+/// has already SIGSEGV'd the band verifier. So the owner publishes the address
+/// instead -- authoritative, no attribution -- and the initiator reads `base`
+/// and `top` out of it while the peer is blocked and therefore stable.
+static PER_TID_SHADOW_ADDR: std::sync::OnceLock<
+    std::sync::RwLock<std::collections::HashMap<u32, (usize, usize, usize)>>,
+> = std::sync::OnceLock::new();
+
+fn per_tid_shadow_addr()
+-> &'static std::sync::RwLock<std::collections::HashMap<u32, (usize, usize, usize)>> {
+    PER_TID_SHADOW_ADDR.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+/// Publish the calling thread's `ShadowStack` address together with the `base`
+/// and `end` of its backing buffer.
+///
+/// Why all three. The live extent of the window is `[base, top)`, and `top` is
+/// mutated INLINE by compiled code -- no Rust runs on a push -- so the only
+/// current value lives in the struct, and reading it needs the struct's
+/// address. But `ShadowStack`'s own contract says `base`/`end` "remain valid
+/// even if the `ShadowStack` struct itself is moved", i.e. the struct address
+/// is NOT guaranteed stable in general.
+///
+/// It is stable in the case that matters: the JIT caches `*mut JvmThread` in
+/// every compiled frame and reaches the shadow stack as
+/// `thread + shadow_off_in_thread`, so the thread cannot move while any
+/// compiled frame is live -- and a blocked peer worth scanning has live
+/// compiled frames. The gap is the narrow case where a thread enters JIT
+/// (publishing), returns from every JIT frame, moves, and then blocks with a
+/// FALSE-POSITIVE `has_jit`: the reader would dereference a stale address.
+///
+/// `base`/`end` close it. They point into the heap `Box`, never change after
+/// `ensure_allocated`, and the reader requires the struct's own `base`/`end` to
+/// equal these before trusting `top`. A moved or freed struct matching both
+/// exactly is not a case that arises.
+pub fn publish_self_shadow_addr(os_tid: u32, addr: usize, base: usize, end: usize) {
+    if addr == 0 || base == 0 || end <= base {
+        return;
+    }
+    if let Ok(mut map) = per_tid_shadow_addr().write() {
+        map.insert(os_tid, (addr, base, end));
+    }
+}
+
+/// The `(addr, base, end)` triple `os_tid` published, if any.
+pub fn shadow_window_of_tid(os_tid: u32) -> Option<(usize, usize, usize)> {
+    let map = per_tid_shadow_addr().read().ok()?;
+    map.get(&os_tid).copied()
+}
+
+/// Drop `os_tid`'s slot when its owning thread exits.
+///
+/// Without this a dead thread's last depth stays readable under a tid the OS
+/// will hand to someone else, and a recycled thread that never enters JIT never
+/// overwrites it -- so the initiator would credit phantom depth for a peer with
+/// no compiled frames at all.
+pub fn unregister_jit_depth_slot(os_tid: u32) {
+    if let Ok(mut map) = per_tid_jit_depth().write() {
+        map.remove(&os_tid);
+    }
+    // The shadow address dies with the thread too: its `JvmThread` (and the
+    // `Box` the window points into) goes with it, so a leftover entry is a
+    // dangling pointer under a tid the OS will recycle.
+    if let Ok(mut map) = per_tid_shadow_addr().write() {
+        map.remove(&os_tid);
+    }
+}
+
+/// The JIT depth `os_tid` last published, or `None` if it never registered.
+///
+/// `None` and `Some(0)` are NOT interchangeable for the caller: a thread that
+/// never registered has an UNKNOWN depth, and crediting zero for it would claim
+/// its frames are accounted for. See [`add_xt_cycle_pinned_jit_depth`].
+pub fn jit_depth_of_tid(os_tid: u32) -> Option<usize> {
+    let map = per_tid_jit_depth().read().ok()?;
+    map.get(&os_tid)
+        .map(|slot| slot.load(std::sync::atomic::Ordering::Acquire))
+}
+
+/// Peer JIT depth this cycle discharged by PINNING rather than by proof, and
+/// whether every frozen peer could be attributed a published depth.
+///
+/// One peer whose depth is unknown poisons the whole ledger: the accounting is
+/// a single process-wide subtraction, so it cannot say "credit these threads
+/// and keep refusing for that one".
+///
+/// Production-global / `cfg(test)`-thread-local, for the same reason
+/// `MOVING_YOUNG_COVERAGE_INCOMPLETE` is: gc unit tests run in parallel threads
+/// of one process, and a shared ledger would let one test's deliberate credit
+/// satisfy another test's deliberate shortfall.
+#[cfg(not(test))]
+static XT_CYCLE_PINNED_JIT_DEPTH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(not(test))]
+static XT_CYCLE_PINNED_DEPTH_EXACT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+#[cfg(test)]
+thread_local! {
+    static XT_CYCLE_PINNED_JIT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static XT_CYCLE_PINNED_DEPTH_EXACT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+#[cfg(not(test))]
+fn pinned_depth_add(d: usize) {
+    XT_CYCLE_PINNED_JIT_DEPTH.fetch_add(d, std::sync::atomic::Ordering::AcqRel);
+}
+#[cfg(not(test))]
+fn pinned_depth_get() -> usize {
+    XT_CYCLE_PINNED_JIT_DEPTH.load(std::sync::atomic::Ordering::Acquire)
+}
+#[cfg(not(test))]
+fn pinned_depth_reset() {
+    XT_CYCLE_PINNED_JIT_DEPTH.store(0, std::sync::atomic::Ordering::Release);
+}
+#[cfg(not(test))]
+fn pinned_exact_set(v: bool) {
+    XT_CYCLE_PINNED_DEPTH_EXACT.store(v, std::sync::atomic::Ordering::Release);
+}
+#[cfg(not(test))]
+fn pinned_exact_get() -> bool {
+    XT_CYCLE_PINNED_DEPTH_EXACT.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(test)]
+fn pinned_depth_add(d: usize) {
+    XT_CYCLE_PINNED_JIT_DEPTH.with(|c| c.set(c.get().saturating_add(d)));
+}
+#[cfg(test)]
+fn pinned_depth_get() -> usize {
+    XT_CYCLE_PINNED_JIT_DEPTH.with(std::cell::Cell::get)
+}
+#[cfg(test)]
+fn pinned_depth_reset() {
+    XT_CYCLE_PINNED_JIT_DEPTH.with(|c| c.set(0));
+}
+#[cfg(test)]
+fn pinned_exact_set(v: bool) {
+    XT_CYCLE_PINNED_DEPTH_EXACT.with(|c| c.set(v));
+}
+#[cfg(test)]
+fn pinned_exact_get() -> bool {
+    XT_CYCLE_PINNED_DEPTH_EXACT.with(std::cell::Cell::get)
+}
+
+/// Credit `depth` JIT entries belonging to a peer whose ENTIRE stack this cycle
+/// pinned.
+///
+/// `depth == None` means the peer froze without ever having registered a slot,
+/// so its depth is unknown; that marks the ledger inexact and
+/// [`xt_cycle_pinned_jit_depth`] then refuses to credit anything at all.
+pub fn add_xt_cycle_pinned_jit_depth(depth: Option<usize>) {
+    match depth {
+        Some(d) => pinned_depth_add(d),
+        None => pinned_exact_set(false),
+    }
+}
+
+/// Depth discharged by pinning this cycle, or 0 when the ledger is inexact.
+pub fn xt_cycle_pinned_jit_depth() -> usize {
+    if !pinned_exact_get() {
+        return 0;
+    }
+    pinned_depth_get()
+}
+
+/// Reset the pinned-depth ledger. Shares the lifecycle of
+/// [`clear_xt_cycle_pinned_jit_roots`] -- the pins and the depth they discharge
+/// must appear and disappear together.
+pub fn clear_xt_cycle_pinned_jit_depth() {
+    pinned_depth_reset();
+    pinned_exact_set(true);
+}
+
+#[cfg(test)]
+mod pinned_peer_depth_tests {
+    use super::*;
+
+    /// The ledger sums the depths of peers whose stacks were pinned.
+    #[test]
+    fn pinned_depths_accumulate() {
+        clear_xt_cycle_pinned_jit_depth();
+        add_xt_cycle_pinned_jit_depth(Some(3));
+        add_xt_cycle_pinned_jit_depth(Some(4));
+        assert_eq!(xt_cycle_pinned_jit_depth(), 7);
+    }
+
+    /// THE safety property: one peer of unknown depth voids the whole credit,
+    /// rather than being counted as zero.
+    ///
+    /// Counting it as zero is the unsound direction -- it would claim a peer's
+    /// frames are accounted for when nothing pinned or proved them, and the
+    /// collector would then relocate an object that peer's frame still names.
+    #[test]
+    fn one_unknown_depth_voids_the_whole_credit() {
+        clear_xt_cycle_pinned_jit_depth();
+        add_xt_cycle_pinned_jit_depth(Some(5));
+        add_xt_cycle_pinned_jit_depth(None);
+        add_xt_cycle_pinned_jit_depth(Some(6));
+        assert_eq!(
+            xt_cycle_pinned_jit_depth(),
+            0,
+            "an unattributable peer must void the credit, not contribute 0 to it"
+        );
+    }
+
+    /// The poison does not outlive the cycle that set it.
+    #[test]
+    fn clearing_lifts_the_poison() {
+        clear_xt_cycle_pinned_jit_depth();
+        add_xt_cycle_pinned_jit_depth(None);
+        assert_eq!(xt_cycle_pinned_jit_depth(), 0);
+        clear_xt_cycle_pinned_jit_depth();
+        add_xt_cycle_pinned_jit_depth(Some(2));
+        assert_eq!(xt_cycle_pinned_jit_depth(), 2);
+    }
+
+    /// A registered thread reads back what it published; an unregistered tid is
+    /// `None`, which is what makes the distinction above expressible.
+    #[test]
+    fn depth_slot_round_trips_and_unknown_tid_is_none() {
+        let tid = 0xFEED_0001;
+        let slot = register_self_jit_depth_slot(tid);
+        slot.store(9, Ordering::Release);
+        assert_eq!(jit_depth_of_tid(tid), Some(9));
+        assert_eq!(jit_depth_of_tid(0xFEED_0002), None);
+    }
+
+    /// Re-registering a recycled OS tid hands back the SAME cell -- one tid's
+    /// depth must never be split across two of them -- but RESET, because the
+    /// previous owner may be dead and its leftover depth is held by nobody.
+    #[test]
+    fn re_registering_a_tid_returns_the_same_slot_reset_to_zero() {
+        let tid = 0xFEED_0003;
+        let a = register_self_jit_depth_slot(tid);
+        a.store(4, Ordering::Release);
+        let b = register_self_jit_depth_slot(tid);
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "one tid, one cell");
+        assert_eq!(
+            b.load(Ordering::Acquire),
+            0,
+            "a recycled tid must not inherit the dead thread's depth"
+        );
+    }
+
+    /// A departed thread leaves nothing readable behind.
+    #[test]
+    fn unregistering_removes_the_slot() {
+        let tid = 0xFEED_0004;
+        register_self_jit_depth_slot(tid).store(7, Ordering::Release);
+        assert_eq!(jit_depth_of_tid(tid), Some(7));
+        unregister_jit_depth_slot(tid);
+        assert_eq!(
+            jit_depth_of_tid(tid),
+            None,
+            "a dead thread's depth must read as UNKNOWN, not as a stale number"
+        );
+    }
 }

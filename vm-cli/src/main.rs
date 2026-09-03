@@ -5953,6 +5953,17 @@ fn run() -> Result<()> {
                  resignals={resig} classified_after_retry={saved} enabled={}",
                 cratonvm_vm::jit::xt_root_scan::enabled(),
             );
+            // Engagement census for the blocked-peer SHADOW-STACK scan. A
+            // clean run with `sh_windows=0` means the scan never ran, and any
+            // conclusion drawn from it is vacuous.
+            let sh_w = cratonvm_vm::jit::xt_root_scan::XT_PEER_SHADOW_WINDOWS.load(O::Relaxed);
+            let sh_s = cratonvm_vm::jit::xt_root_scan::XT_PEER_SHADOW_SLOTS.load(O::Relaxed);
+            let sh_r = cratonvm_vm::jit::xt_root_scan::XT_PEER_SHADOW_ROOTS.load(O::Relaxed);
+            let sh_u = cratonvm_vm::jit::xt_root_scan::XT_PEER_SHADOW_UNTRUSTED.load(O::Relaxed);
+            eprintln!(
+                "[GC] xt_peer_shadow: sh_windows={sh_w} sh_slots={sh_s} sh_roots={sh_r}                  sh_untrusted={sh_u} enabled={}",
+                cratonvm_vm::jit::conservative_roots::xt_peer_shadow_scan_enabled(),
+            );
             // H2-CID0 (2026-08-05): the unregistered-JIT-frame memo's audit.
             // `suppressed` counts times the memo answered "clean" while a scan
             // of the same range found a frame — i.e. oops that went unmarked

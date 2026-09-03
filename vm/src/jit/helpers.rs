@@ -886,6 +886,19 @@ pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
         // abnormal JIT exit (exception/deopt skipping a method epilogue) left
         // unbalanced. Captured after `ensure_allocated` so `top` is valid.
         saved_shadow_top = Some(thread.shadow_stack.top);
+        // Publish this thread's shadow-stack ADDRESS, plus the `base`/`end` of
+        // its backing buffer, so a GC initiator that freezes this thread can
+        // scan the window it cannot otherwise reach -- and can verify the
+        // address still describes THIS buffer before trusting `top`.
+        // Once per thread. See
+        // `cratonvm_gc::gc_quiescence::publish_self_shadow_addr`.
+        if crate::jit::conservative_roots::xt_peer_shadow_scan_enabled() {
+            crate::jit::conservative_roots::publish_self_shadow_addr_once(
+                &thread.shadow_stack as *const _ as usize,
+                thread.shadow_stack.base,
+                thread.shadow_stack.end,
+            );
+        }
         if if crate::runtime::env_cache::hot_lookup_cache() {
             crate::runtime::env_cache::dbg_shadow()
         } else {
