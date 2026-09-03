@@ -830,6 +830,24 @@ impl ScanEntry {
 /// has no cliff: the working set is bounded by the classes in the heap, not by
 /// a constant chosen in 2026.
 ///
+/// # And the end-to-end arm CAN resolve it
+///
+/// A component measurement usually cannot be seen end to end; this one can.
+/// `G1ChurnPauseProbe 50 600` at `-Xmx2048m`, release, one binary,
+/// `CRATONVM_GC_LAYOUT_SCAN_CACHE` the only thing moved, three interleaved
+/// pairs so an arm order cannot manufacture the result:
+///
+/// | rep | off | on |
+/// |---|---|---|
+/// | 1 | 3490 ms | 3346 ms |
+/// | 2 | 3398 ms | 3111 ms |
+/// | 3 | 3453 ms | 3120 ms |
+///
+/// Every pair moves the same way, mean 3447 → 3192 ms (**-7.4%** wall), with
+/// per-cycle `sweep_us` 106.3 → 100.9 ms and `mark_us` 9.81 → 9.46 ms. Both
+/// GC phases call this once per object, which is why the effect shows in the
+/// wall of a workload that spends a third of it collecting.
+///
 /// # Invalidation
 ///
 /// The whole table is dropped when [`layout_generation`] moves, which a
