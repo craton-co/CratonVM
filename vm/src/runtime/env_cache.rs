@@ -1896,6 +1896,13 @@ cached_is_set!(no_invoke_fast_door, "CRATONVM_JIT_NO_INVOKE_FAST_DOOR");
 /// lock). Off routes every cache hit through the general dispatcher.
 /// Token: `CRATONVM_JIT=-nonvirtual-fast-door`.
 cached_is_set!(no_nonvirtual_fast_door, "CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR");
+
+/// `CRATONVM_JIT_NO_FRAME_SLOT_REUSE` -- return a frame's buffers to the
+/// thread pools on every return and build the next callee's frame from
+/// them, instead of retiring the frame in place and rebuilding the next
+/// call in the buffers it left behind. Token:
+/// `CRATONVM_JIT=-frame-slot-reuse`.
+cached_is_set!(no_frame_slot_reuse, "CRATONVM_JIT_NO_FRAME_SLOT_REUSE");
 /// `CRATONVM_DBG_BYTECODE_DUMP` -- temporary raw-bytecode + mnemonic
 /// disassembly dump (2026-07-15, JRubyScriptTemplateTests round 3): see
 /// `push_frame_and_fire_entry`'s own doc comment for the full story --

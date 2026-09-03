@@ -225,16 +225,33 @@ pub(super) fn fire_jvmti_single_step(
 /// be derived from `thread` or `frame` — see the VM-scoping note at the top of
 /// this helper block.
 #[inline]
-pub(crate) fn push_frame_and_fire_entry(vm: usize, thread: &mut JvmThread, frame: Frame) {
-    thread.frames.push(frame);
+/// Fire `MethodEntry` for the frame on top of the stack.
+///
+/// Split out of [`push_frame_and_fire_entry`] for the fast doors, which
+/// install a callee by rebuilding a retired `FrameStack` slot in place and so
+/// never hand a `Frame` to that function. Only the JVMTI event is shared: the
+/// Spring trace and the bytecode dump beside it are diagnostics of the
+/// by-value push and stay there.
+#[inline]
+pub(crate) fn fire_method_entry_after_push(vm: usize, thread: &mut JvmThread) {
     if crate::runtime::jvmti::any_method_entry_listener_active() {
-        // Safe: we just pushed.
         let last = thread.frames.len() - 1;
         let frame_ref = &thread.frames[last];
         let method_id = synth_method_id(frame_ref);
         let tid = thread.thread_id.0;
         crate::runtime::jvmti::fire_method_entry_for_vm(vm, tid, method_id);
     }
+}
+
+pub(crate) fn push_frame_and_fire_entry(vm: usize, thread: &mut JvmThread, frame: Frame) {
+    // A retired slot at this depth is about to be overwritten by the frame
+    // just built. Harvest its buffers into the thread pools first, so the
+    // pooled constructors keep the recycling they have always relied on —
+    // without this, a workload whose calls do not go through a fast door
+    // would free a set of buffers and allocate a fresh one every call.
+    thread.harvest_retired_slot();
+    thread.frames.push(frame);
+    fire_method_entry_after_push(vm, thread);
     if crate::runtime::env_cache::trace_sb_filter() {
         let last = thread.frames.len() - 1;
         let frame_ref = &thread.frames[last];

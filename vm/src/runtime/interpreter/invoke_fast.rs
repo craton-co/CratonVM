@@ -147,6 +147,30 @@ pub(super) fn push_frame_verbatim(
     total_args: usize,
 ) -> CachedCallResult {
     thread.frames[frame_idx].stack.discard_top(total_args);
+    // The frame this call returns into was retired in place, not destroyed, so
+    // its four buffers are still in the slot at this depth. Rebuilding in them
+    // skips the whole pool round trip: no `(Vec, Vec)` tuple popped and pushed
+    // back, no four `Vec` headers taken and reinstalled, and no ~220-byte
+    // `Frame` constructed and moved into the stack. Measured 2026-09-02, that
+    // churn is what `frame_build` and `ret_recycle` are mostly made of --
+    // together 40% of an interpreted `invokestatic` -- and unlike the buffer
+    // FILL it needs nothing from precise oop maps.
+    //
+    // The first call at any depth finds no retired slot and takes the ordinary
+    // path below, which is also what `CRATONVM_JIT_NO_FRAME_SLOT_REUSE`
+    // restores for every call.
+    // `has_retired_slot` first: it is two loads, and it keeps the `Arc::clone`
+    // below off the path that has no slot to reuse (the first call at a depth,
+    // and every call when the switch is set).
+    if !crate::runtime::env_cache::no_frame_slot_reuse()
+        && thread.frames.has_retired_slot()
+        && thread
+            .frames
+            .push_cached_compact_reusing(Arc::clone(&cached), &slots[..total_args])
+    {
+        fire_method_entry_after_push(shared.vm_identity, thread);
+        return CachedCallResult::FramePushed;
+    }
     thread.refill_pools_from_shared(
         &shared.mem.operand_stack_pool,
         &shared.mem.tag_pool,
