@@ -1931,10 +1931,17 @@ mod tests {
         };
 
         // invokespecial entry: points at the interface default method itself.
+        // One `pc` for both entries on purpose: this test is about `is_special`
+        // disambiguating two entries at the SAME site, and `pc` became a key
+        // dimension in `6e392453f`. Varying it here would make them differ for a
+        // reason the test is not about, and the assertions below would then hold
+        // whether or not `is_special` was doing anything.
+        const SITE_PC: u32 = 0;
         cache.put(
             caller,
             cp_index,
             true,
+            SITE_PC,
             CachedInvokeTarget::Bytecode {
                 cached: make_cached("scala/collection/IterableOnceOps"),
                 gate: RedefineGate::never_stale(),
@@ -1946,6 +1953,7 @@ mod tests {
             caller,
             cp_index,
             false,
+            SITE_PC,
             CachedInvokeTarget::VirtualBytecode {
                 receiver_class_id: ClassId::new(42),
                 cached: make_cached("scala/collection/AbstractIterable"),
@@ -1954,14 +1962,18 @@ mod tests {
         );
 
         // The two entries must NOT alias each other.
-        let special = cache.get(caller, cp_index, true).expect("special entry");
+        let special = cache
+            .get(caller, cp_index, true, SITE_PC)
+            .expect("special entry");
         match special {
             CachedInvokeTarget::Bytecode { cached: m, .. } => {
                 assert_eq!(&*m.class_name, "scala/collection/IterableOnceOps");
             }
             other => panic!("expected Bytecode for invokespecial, got {other:?}"),
         }
-        let virt = cache.get(caller, cp_index, false).expect("virtual entry");
+        let virt = cache
+            .get(caller, cp_index, false, SITE_PC)
+            .expect("virtual entry");
         match virt {
             CachedInvokeTarget::VirtualBytecode { cached, .. } => {
                 assert_eq!(&*cached.class_name, "scala/collection/AbstractIterable");
@@ -2008,17 +2020,17 @@ mod tests {
             cached,
             gate: RedefineGate::snapshot(Arc::clone(&counter)),
         };
-        cache.put(caller, cp_index, false, entry);
+        cache.put(caller, cp_index, false, 0, entry);
 
         // First hit — counter unchanged, must return Some.
-        assert!(cache.get(caller, cp_index, false).is_some());
+        assert!(cache.get(caller, cp_index, false, 0).is_some());
 
         // Simulate `redefine_class` step 7 — bump the live counter.
         counter.fetch_add(1, Ordering::Release);
 
         // Next hit — entry is stale, getter must auto-evict and return None.
         assert!(
-            cache.get(caller, cp_index, false).is_none(),
+            cache.get(caller, cp_index, false, 0).is_none(),
             "stale entry must be evicted after redefine bump"
         );
 
@@ -2049,12 +2061,15 @@ mod tests {
             caller,
             cp_index,
             false,
+            0,
             CachedInvokeTarget::Bytecode {
                 cached: new_cached,
                 gate: RedefineGate::snapshot(Arc::clone(&counter)),
             },
         );
-        let hit = cache.get(caller, cp_index, false).expect("fresh entry hit");
+        let hit = cache
+            .get(caller, cp_index, false, 0)
+            .expect("fresh entry hit");
         match hit {
             CachedInvokeTarget::Bytecode { cached, .. } => {
                 // The bipush byte for 99 (0x63) confirms we got the new body.
