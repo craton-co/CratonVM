@@ -690,9 +690,32 @@ lives several hundred lines away in the arm that called it. An edit that broke
 the coupling would not produce a red test, it would produce a crash on a null
 receiver in production.
 
-Only the compact arm opts in. The second `getfield` arm emits its `GC_FLAGS`
-read only under `compact_ref_fields_enabled()`, so it passes `false` rather
-than make the guarantee conditional.
+#### Both arms opt in now, and the second one has bought nothing yet
+
+The legacy-cell `getfield` arm passed `false` at first, because it emits its
+`GC_FLAGS` read only under `compact_ref_fields_enabled()`. It can now make the
+guarantee exactly: `raw_mode` is already false in that branch, so the guard's
+`!raw_mode && compact` reduces to `compact`, and the opt-in is the *same*
+expression rather than a second one that has to be kept in step. The arm binds
+its recovery address where its guarded slow path begins, and that slow path
+reloads the receiver from its frame slot, so a recovered fault needs no
+register repair.
+
+**It changed no number.** On the H2 workload the census reads
+`implicit=285 (compact-arm=285 legacy-arm=0)`; on a purpose-built megamorphic
+probe reading a public field off a JDK class, `compact-arm=8 legacy-arm=0`. The
+legacy arm is 13 sites against the compact arm's 1,705 on H2, and all 13 had
+receivers the dataflow already proved.
+
+So the widening rests on "it could carry sites no proof reaches", not on a
+measurement that it does. That is recorded rather than smoothed over, and the
+census is split by arm precisely so the claim is falsifiable: **if `legacy-arm`
+stays 0 across real workloads, this widening is dead and should be withdrawn.**
+
+It is not the same as unreachable code — the arm does fire, 13 times on H2.
+What is unproven is that it ever fires with a receiver no proof covers, and
+that is a property of workloads rather than of the code, which is why it gets a
+counter instead of an argument.
 
 #### Measured
 
