@@ -264,6 +264,24 @@ fn maybe_dump_shutdown_reports() {
             eprintln!(
                 "[cratonvm] compiled reference stores: gated={gated} declined={declined}"
             );
+            // The DYNAMIC split for that pair, only under
+            // CRATONVM_DBG_SP_REF_STORE_TRACE=1. `gated=N` above counts emitted
+            // sequences; this counts executions, and on the optimizing tier the
+            // two turned out to differ by everything -- `gated=2` sitting on
+            // `inline=0` out of 16.4M. `barrier` is a SUBSET of `inline`: those
+            // stores happened inline and then still called the collector's own
+            // write barrier.
+            let (sp_inline, sp_barrier, sp_helper) =
+                cratonvm_jit::metrics::sp_ref_store_path_counts();
+            if sp_inline != 0 || sp_helper != 0 {
+                eprintln!(
+                    "[cratonvm]   ref-store executions: inline={sp_inline} \
+(of which barriered={sp_barrier}) helper={sp_helper}"
+                );
+                for (name, count) in cratonvm_jit::metrics::sp_ref_store_bails() {
+                    eprintln!("[cratonvm]     ref-store bail {name}: {count}");
+                }
+            }
             // The OPTIMIZING tier's own pair, never folded into the one above.
             // Until 2026-09-02 that tier lowered every reference store to the
             // helper unconditionally, so it reported neither number -- and a

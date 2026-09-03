@@ -7879,6 +7879,17 @@ pub fn gated_ref_store_enabled() -> bool {
 /// matters: a sequence emitted at two sites whose compactness gate never passes
 /// is five extra instructions in front of the same helper call it always made.
 /// Costs a `LOCK INC` per store, so it is a diagnostic arm, never a timed one.
+/// `CRATONVM_DBG_SP_REF_STORE_TRACE=1` — the SINGLE-PASS twin of
+/// [`ir_ref_store_trace_enabled`]. Default off; costs a `LOCK INC` per store,
+/// so it is a diagnostic arm and never a timed one.
+pub fn sp_ref_store_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SP_REF_STORE_TRACE").is_some()
+    })
+}
+
 pub fn ir_ref_store_trace_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();

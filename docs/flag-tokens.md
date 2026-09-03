@@ -580,7 +580,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-305 tokens.
+306 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -687,6 +687,7 @@ export inherited from a parent shell.
 | `gated-ref-store` | `CRATONVM_JIT_GATED_REF_STORE` |
 | `ir-ref-store` | `CRATONVM_JIT_IR_REF_STORE` |
 | `dbg-ir-ref-store-trace` | `CRATONVM_DBG_IR_REF_STORE_TRACE` |
+| `dbg-sp-ref-store-trace` | `CRATONVM_DBG_SP_REF_STORE_TRACE` |
 | `this-nonnull` | `CRATONVM_JIT_THIS_NONNULL` |
 | `receiver-null-elim` | `CRATONVM_JIT_RECEIVER_NULL_ELIM` |
 | `implicit-null-check` | `CRATONVM_JIT_IMPLICIT_NULL_CHECK` |
