@@ -732,6 +732,50 @@ pub mod gpu_jit_gate_census {
         }
     }
 
+    /// Why a method was blocked. The two reasons are very different in
+    /// reach, and the count alone cannot tell them apart.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum BlockReason {
+        /// The method writes a primitive array, so compiling it would
+        /// invalidate the input-residency cache with no hook to notice.
+        /// This is the BROAD reason: it catches any numeric kernel that
+        /// stores to an `int[]`/`long[]`/`float[]`/`double[]`, whether or
+        /// not it has anything to do with offload.
+        /// `CRATONVM_GPU_JIT_ARRAY_WRITERS=allow` trades the cache for the
+        /// compilation instead.
+        WritesPrimitiveArray,
+        /// The method calls an offload-eligible `invokestatic`, so
+        /// compiling it would hide that site from the interpreter hook.
+        /// This is the NARROW reason, and the one the gate is named for.
+        CallsEligibleKernel,
+    }
+
+    /// Names of the methods this gate denied, with the reason.
+    ///
+    /// A count says how MANY; only the names say whether the ones blocked
+    /// are the ones a workload spends its time in. kfusion blocks 7 of 301
+    /// methods -- 2.3%, which sounds negligible and would be the whole
+    /// story if those 7 are its integration loop.
+    ///
+    /// Bounded: a program with thousands of blocked methods has a
+    /// different problem, and the list is a diagnostic rather than a log.
+    static BLOCKED_NAMES: std::sync::Mutex<Vec<(String, &'static str)>> =
+        std::sync::Mutex::new(Vec::new());
+    const MAX_NAMED: usize = 64;
+
+    /// Record one blocked method by name. Called only on a first verdict.
+    pub fn note_blocked_name(name: String, reason: BlockReason) {
+        let mut v = BLOCKED_NAMES.lock().unwrap_or_else(|p| p.into_inner());
+        if v.len() >= MAX_NAMED {
+            return;
+        }
+        let tag = match reason {
+            BlockReason::WritesPrimitiveArray => "writes-primitive-array",
+            BlockReason::CallsEligibleKernel => "calls-eligible-kernel",
+        };
+        v.push((name, tag));
+    }
+
     pub fn exit_summary() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         let blocked = BLOCKED.load(Ordering::Relaxed);
@@ -745,6 +789,16 @@ pub mod gpu_jit_gate_census {
                 blocked + admitted,
                 100.0 * blocked as f64 / (blocked + admitted) as f64,
             );
+            let names = BLOCKED_NAMES.lock().unwrap_or_else(|p| p.into_inner());
+            for (name, reason) in names.iter() {
+                eprintln!("[cratonvm] gpu jit gate:   blocked {name}  ({reason})");
+            }
+            if blocked as usize > names.len() {
+                eprintln!(
+                    "[cratonvm] gpu jit gate:   ... and {} more not listed",
+                    blocked as usize - names.len()
+                );
+            }
         });
     }
 }
