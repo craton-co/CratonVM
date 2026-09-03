@@ -5991,6 +5991,16 @@ fn run() -> Result<()> {
                 "[GC] unnamed_frame_ref_pins: frames={urp_f} pinned={urp_p}                  duplicate_of_mapped={urp_d} enabled={}",
                 cratonvm_vm::jit::conservative_roots::pin_unnamed_frame_refs_enabled(),
             );
+            // Unmapped-duplicate remap: words no oop map named that still held
+            // a moved address after the precise remap. FRAMES is the denominator.
+            let udr_f = cratonvm_vm::jit::conservative_roots::unmapped_dupe_remap::FRAMES
+                .load(O::Relaxed);
+            let udr_r = cratonvm_vm::jit::conservative_roots::unmapped_dupe_remap::REWRITTEN
+                .load(O::Relaxed);
+            eprintln!(
+                "[GC] unmapped_dupe_remap: frames={udr_f} rewritten={udr_r} enabled={}",
+                cratonvm_vm::jit::conservative_roots::remap_unmapped_dupes_enabled(),
+            );
             // H2-CID0 (2026-08-05): the unregistered-JIT-frame memo's audit.
             // `suppressed` counts times the memo answered "clean" while a scan
             // of the same range found a frame — i.e. oops that went unmarked

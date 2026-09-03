@@ -1745,6 +1745,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "xt-peer-shadow-scan", on_key: Some("CRATONVM_XT_PEER_SHADOW_SCAN"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "dbg-stale-frame-words", on_key: Some("CRATONVM_DBG_STALE_FRAME_WORDS"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "pin-unnamed-frame-refs", on_key: Some("CRATONVM_JIT_PIN_UNNAMED_FRAME_REFS"), off_key: None, off_word: None, since: "2026-09-03" },
+    E { group: Group::JIT, token: "remap-unmapped-dupes", on_key: Some("CRATONVM_JIT_REMAP_UNMAPPED_DUPES"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "xt-helper-window-interior", on_key: Some("CRATONVM_XT_HELPER_WINDOW_INTERIOR"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "xt-helper-window-pin", on_key: Some("CRATONVM_XT_HELPER_WINDOW_PIN"), off_key: None, off_word: None, since: "2026-09-01" },
     E { group: Group::JIT, token: "xt-helper-window-scan", on_key: Some("CRATONVM_XT_HELPER_WINDOW_SCAN"), off_key: None, off_word: None, since: "2026-07-02" },

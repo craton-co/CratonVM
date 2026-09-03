@@ -6071,7 +6071,90 @@ fn remap_one_jit_frame(
             coverage_complete,
         );
     }
+    if remap_unmapped_dupes_enabled() {
+        remap_unmapped_frame_dupes(rbp, cm, pointer_map, &seen[..seen_len]);
+    }
     (true, examined, rewritten)
+}
+
+/// `CRATONVM_JIT_REMAP_UNMAPPED_DUPES=1` -- after the precise remap, rewrite any
+/// word in the frame that STILL holds an address this collection moved.
+///
+/// The defect, measured 2026-09-03 with `CRATONVM_DBG_STALE_FRAME_WORDS=1`: the
+/// register allocator keeps a reference in several frame slots at once and the
+/// oop map names only the canonical home. `TestCachedQueryResults.queryCounter`
+/// held one object at four slots -- a GPR safepoint spill, an operand spill and
+/// two below the locals boundary -- and the remap rewrote one. The rest keep
+/// pointing into the vacated page, which is the page-aligned SIGSEGV of
+/// `bug-box-unbox-intrinsic-segv-under-relocation-20260902`. Confirmed at
+/// scale: `duplicate_of_mapped=47946355`.
+///
+/// PINNING those objects was tried first and does not work: pins only withhold
+/// PAGES in the low compaction region (`relocate_stw`'s
+/// `addr >= base && addr < low_end`), so an object the general slide moves is
+/// unprotected. 2 of 3 runs still SIGSEGV with 96 M pins published.
+///
+/// So rewrite instead. The conservative-write hazard is real but narrow, and it
+/// is the hazard this path's PREDECESSOR already accepted -- see
+/// `remap_one_jit_frame`'s own comment: the sweep it replaced "did [this] to
+/// every such word in the frame". A word is only rewritten when its value is a
+/// KEY of the pointer map, i.e. exactly the base of an object this collection
+/// actually moved; a primitive holding that precise bit pattern is possible and
+/// is the residual risk, recorded rather than hidden.
+pub fn remap_unmapped_dupes_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_REMAP_UNMAPPED_DUPES").is_some()
+    })
+}
+
+pub mod unmapped_dupe_remap {
+    use std::sync::atomic::AtomicU64;
+    /// Frames swept. The denominator.
+    pub static FRAMES: AtomicU64 = AtomicU64::new(0);
+    /// Words rewritten that no map named.
+    pub static REWRITTEN: AtomicU64 = AtomicU64::new(0);
+}
+
+fn remap_unmapped_frame_dupes(
+    rbp: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+    pointer_map: &cratonvm_types::PointerMap,
+    named: &[i16],
+) {
+    use std::sync::atomic::Ordering as AOrd;
+    let frame_size = cm.osr_frame_size;
+    if frame_size <= 0 {
+        return;
+    }
+    let frame_size = frame_size as usize;
+    const MAX_COMPILED_FRAME_BYTES: usize = 1024 * 1024;
+    if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
+        return;
+    }
+    unmapped_dupe_remap::FRAMES.fetch_add(1, AOrd::Relaxed);
+    let lo = rbp - frame_size;
+    let mut a = (lo + 7) & !7usize;
+    while a <= rbp {
+        let off = (rbp - a) as i64;
+        // Slots the precise loop already handled are skipped: it rewrote them,
+        // so their value is now a to-space address, and a second lookup would
+        // miss anyway -- but skipping keeps the intent explicit.
+        let is_named =
+            off > 0 && off <= i16::MAX as i64 && named.contains(&(off as i16));
+        if !is_named {
+            // SAFETY: aligned word inside this thread's live compiled frame,
+            // bounded by the frame size recorded at compile time.
+            let v = unsafe { (a as *const usize).read() };
+            if let Some(&new) = pointer_map.get(&v) {
+                // SAFETY: same aligned in-frame slot, rewriting a reference to
+                // an object this collection relocated.
+                unsafe { (a as *mut usize).write(new) };
+                unmapped_dupe_remap::REWRITTEN.fetch_add(1, AOrd::Relaxed);
+            }
+        }
+        a += 8;
+    }
 }
 
 /// `CRATONVM_DBG=remap-residue` -- after a frame's oop map has been applied,

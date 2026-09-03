@@ -221,6 +221,66 @@ oracle corroborates either (`verifier_oop=0`). Whatever names the stale
 reference, it is not a Java local above the 64 mark and not something the class
 file's type maps call a reference.
 
+### 2026-09-03: the unnamed root IDENTIFIED, and three fixes that do not work
+
+A detector that asks the failing question directly --
+`CRATONVM_DBG_STALE_FRAME_WORDS=1`, which audits each frame AFTER
+`remap_one_jit_frame` has rewritten every slot the maps name and reports any
+word still holding an address this collection moved. On
+`TestCachedQueryResults`: `frames_audited=375 stale=390`, and the shape is the
+finding:
+
+```
+queryCounter [rbp-0x178] gpr-safepoint-spill stale=0x1fef6b70878 should_be=0x1fee1865758
+queryCounter [rbp-0x58]  operand-spill       stale=0x1fef6b70878 should_be=0x1fee1865758
+queryCounter [rbp-0x28]  java-local          stale=0x1fef6b70878 should_be=0x1fee1865758
+queryCounter [rbp-0x18]  java-local          stale=0x1fef6b70878 should_be=0x1fee1865758
+```
+
+ONE object, FOUR slots, four storage classes, `maps=7 covered=true`. The
+register allocator keeps several copies of a reference and the map names the
+canonical home. Confirmed at scale by a second pass:
+`duplicate_of_mapped=47946355`.
+
+That also explains why `CRATONVM_DBG_VERIFY_OOP_MAPS` never found it: that
+oracle asks whether the CLASS FILE calls a slot a reference and answers
+`verifier_oop=0` over 2.8 M candidates. These are compiler-introduced copies the
+class file's model does not mention, so it is structurally blind to them.
+
+**Eliminated, each by measurement:**
+
+| candidate | how it was ruled out |
+|---|---|
+| map SELECTION | `NO_MAP_FOR_SP_ID=0`, `NO_SP_ID_SLOT=0` |
+| precise oop maps for >64 locals | that fix in, 2/3 still SIGSEGV |
+| the box/unbox intrinsic | disabled in every run here |
+| the register image | `CRATONVM_DBG_JIT_STALE_AFTER_REMAP=1` reports ZERO |
+| pins not reaching the high end | `compact_high_region` takes the same `pins` and marks overlaps `immovable` |
+
+**Three fixes tried, none works, each failing informatively:**
+
+1. `CRATONVM_JIT_PIN_UNNAMED_FRAME_REFS=1` -- pin every object a frame names in
+   an unmapped slot. `frames=10357698 pinned=96587490`, and 2 of 3 still
+   SIGSEGV. Pins ARE honoured by both relocation paths, so the object that kills
+   it was never in the pin set.
+2. `CRATONVM_JIT_REMAP_UNMAPPED_DUPES=1` -- rewrite them instead. Only
+   `frames=285 rewritten=68`: the remap runs on relocating cycles over frame
+   BANDS, three orders of magnitude less reach than the scan-time pass, and 3 of
+   4 still SIGSEGV.
+3. Both together with the shadow-stack scan -- unchanged.
+
+**What that leaves.** The duplicates are real, enormous and NOT sufficient to
+explain the crash. The killing reference is in none of: a named map slot, an
+unnamed frame slot, the register image, the shadow stack, or the conservative
+stack scan. `relocate_stw`'s own comment names the remaining possibility -- "a
+pointer that never left a register is not in it" -- and this workload's failing
+allocation is a 524304-byte reference array, i.e. the large-object end.
+
+The next step is NOT another slot-scanning variant. It is either making the oop
+maps name every home the register allocator creates (codegen), or having ZGC
+consult the guard `gen_heap` and `g1` both consult and this collector, by its
+own comment here, "read ZERO times".
+
 ## The mitigation
 
 `box_unbox_intrinsic_disabled()` now defaults to disabled. Set
