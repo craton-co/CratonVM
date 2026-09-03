@@ -4401,6 +4401,9 @@ impl SharedVm {
         if crate::runtime::env_cache::tier_pgo() {
             crate::jit::profile::enable_profiling(true);
         }
+        crate::jit::profile::enable_receiver_profiling(
+            crate::runtime::env_cache::tier_pgo_receivers(),
+        );
 
         // Post-construction: pre-initialize critical static fields for core
         // classes when running with real JDK bytecode.  This must happen after

@@ -114,15 +114,70 @@ struct Validated {
     write: bool,
 }
 
+/// Verdict slots per thread. See [`VALIDATED`].
+const VERDICT_WAYS: usize = 4;
+
+/// `CRATONVM_FFM_VERDICT_WAYS` clamps how many of [`VERDICT_WAYS`] are used.
+///
+/// `1` restores the single-slot behaviour this cache replaced, which is the
+/// control arm for pricing the change on one binary. Anything outside
+/// `1..=VERDICT_WAYS` is clamped into it.
+fn effective_ways() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_FFM_VERDICT_WAYS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(VERDICT_WAYS)
+            .clamp(1, VERDICT_WAYS)
+    })
+}
+
 thread_local! {
-    /// The last carrier a full checked access succeeded on, on this thread.
+    /// Carriers a full checked access has succeeded on, on this thread.
     ///
-    /// One entry, not a map: the workloads this exists for sweep ONE segment in
-    /// a loop (a TSDF volume, a tensor, a pooled buffer), so a single slot has
-    /// the same hit rate as a map and costs a compare instead of a hash. A
-    /// second interleaved segment simply keeps missing, which is the ordinary
-    /// native path and therefore correct, only not faster.
-    static LAST_VALIDATED: Cell<Option<Validated>> = const { Cell::new(None) };
+    /// # This was ONE slot, and the workload it was written for thrashed it
+    ///
+    /// AUDIT 2026-09-02. The original comment here read: "One entry, not a
+    /// map: the workloads this exists for sweep ONE segment in a loop (a TSDF
+    /// volume, a tensor, a pooled buffer), so a single slot has the same hit
+    /// rate as a map... A second interleaved segment simply keeps missing,
+    /// which is the ordinary native path and therefore correct, only not
+    /// faster."
+    ///
+    /// The TSDF volume is kfusion, and kfusion is the app this whole fast
+    /// path was built for. Measured there once the engagement census had a
+    /// reporter (three frames of `kfusion.java.Benchmark`):
+    ///
+    /// ```text
+    ///   consults=129,445,168  hits=92,226,077 (71.2%)  misses=37,219,091
+    ///   native verdicts published=38,306,106
+    /// ```
+    ///
+    /// 38.3M publishes against 129M consults — better than one full native
+    /// verdict for every four elements. The same bench that sweeps a SINGLE
+    /// segment publishes once for 10.5M consults, so this is not the fast
+    /// path failing, it is the single slot being evicted by the second
+    /// carrier and rebuilt, forever. Integration alternates the volume with
+    /// the images it reads, and "only not faster" turned out to mean "pays
+    /// the expensive path 28.8% of the time".
+    ///
+    /// Four ways, checked in order, most-recently-published first. A hit is
+    /// at most four `u64` compares against a `Cell` copy, which is still far
+    /// cheaper than the native round-trip it avoids, and a workload that
+    /// really does sweep one segment still hits on the first compare.
+    ///
+    /// An empty slot is `carrier == 0`, which [`note_validated`] refuses to
+    /// store, so no real carrier can collide with it.
+    static VALIDATED: [Cell<Validated>; VERDICT_WAYS] = const {
+        [const {
+            Cell::new(Validated { carrier: 0, epoch: 0, read: false, write: false })
+        }; VERDICT_WAYS]
+    };
+    /// Next way to evict, round-robin. Round-robin rather than
+    /// least-recently-used: LRU needs a per-access write to record the use,
+    /// and this path is per ELEMENT.
+    static VICTIM: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Record that a FULL, checked access to `carrier` just succeeded.
@@ -138,17 +193,44 @@ pub fn note_validated(carrier: u64, write: bool) {
         return;
     }
     let now = epoch();
-    LAST_VALIDATED.with(|slot| {
-        let merged_write = match slot.get() {
-            Some(prev) if prev.carrier == carrier && prev.epoch == now => prev.write || write,
-            _ => write,
-        };
-        slot.set(Some(Validated {
+    let ways = effective_ways();
+    VALIDATED.with(|slots| {
+        // Refresh this carrier's own way if it has one, so a read-then-write
+        // loop merges into one entry instead of consuming two ways.
+        for slot in slots.iter().take(ways) {
+            let prev = slot.get();
+            if prev.carrier == carrier && prev.epoch == now {
+                slot.set(Validated {
+                    carrier,
+                    epoch: now,
+                    read: true,
+                    write: prev.write || write,
+                });
+                return;
+            }
+        }
+        // Otherwise take a free way, preferring one that is empty or stale
+        // before evicting a live verdict.
+        let victim = slots
+            .iter()
+            .take(ways)
+            .position(|s| {
+                let v = s.get();
+                v.carrier == 0 || v.epoch != now
+            })
+            .unwrap_or_else(|| {
+                VICTIM.with(|v| {
+                    let i = v.get() % ways;
+                    v.set((i + 1) % ways);
+                    i
+                })
+            });
+        slots[victim].set(Validated {
             carrier,
             epoch: now,
             read: true,
-            write: merged_write,
-        }));
+            write,
+        });
     });
 }
 
@@ -162,16 +244,33 @@ pub fn is_validated(carrier: u64, want_write: bool) -> bool {
     if carrier == 0 {
         return false;
     }
-    LAST_VALIDATED.with(|slot| match slot.get() {
-        Some(v) => v.carrier == carrier && v.epoch == epoch() && v.read && (!want_write || v.write),
-        None => false,
+    let now = epoch();
+    let ways = effective_ways();
+    VALIDATED.with(|slots| {
+        for slot in slots.iter().take(ways) {
+            let v = slot.get();
+            if v.carrier == carrier && v.epoch == now && v.read && (!want_write || v.write) {
+                return true;
+            }
+        }
+        false
     })
 }
 
 /// Drop this thread's verdict. For tests, and for any embedder that needs a
 /// hard reset without waiting for an epoch bump.
 pub fn forget_validated() {
-    LAST_VALIDATED.with(|slot| slot.set(None));
+    VALIDATED.with(|slots| {
+        for slot in slots.iter() {
+            slot.set(Validated {
+                carrier: 0,
+                epoch: 0,
+                read: false,
+                write: false,
+            });
+        }
+    });
+    VICTIM.with(|v| v.set(0));
 }
 
 // ---------------------------------------------------------------------------
@@ -225,13 +324,71 @@ pub fn fast_path_counts() -> (u64, u64) {
     )
 }
 
+/// One line at exit, when this process touched an FFM segment at all.
+///
+/// # This existed as three counters that nothing printed
+///
+/// AUDIT 2026-09-02. The header of this module says it plainly -- "a fast
+/// path that is structurally present but never taken looks exactly like a
+/// fast path that works, right up until someone prices it" -- and then
+/// `fast_path_counts` and `publish_count` had no caller anywhere in the
+/// workspace. The counters were correct and invisible, which is the same
+/// state as not having them.
+///
+/// How to read it:
+///
+/// * `publishes` is the denominator: verdicts the NATIVE published. High
+///   publishes with zero consults means compiled code never asked, i.e.
+///   the intrinsic is registered in a door this workload does not use, or
+///   the hot code is not compiled at all.
+/// * `hits` vs `misses` is whether the fast path, once asked, was
+///   ALLOWED. Misses are the declines: a heap carrier, a closed scope, an
+///   index the bounds check refused.
+///
+/// Silent when nothing published and nothing consulted, so a run that
+/// never touches FFM does not grow a line.
+pub fn exit_summary() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let (hits, misses) = fast_path_counts();
+    let publishes = publish_count();
+    if hits + misses + publishes == 0 {
+        return;
+    }
+    ONCE.call_once(|| {
+        let consults = hits + misses;
+        eprintln!(
+            "[cratonvm] ffm element fast path: consults={consults} hits={hits} \
+             misses={misses} ({:.1}% of consults hit); native verdicts \
+             published={publishes}",
+            100.0 * hits as f64 / consults.max(1) as f64,
+        );
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Serialises the tests in this module.
+    ///
+    /// The verdict table is per-THREAD but the epoch is a process-global,
+    /// and `a_verdict_is_scoped_to_its_carrier_and_epoch` bumps it. Without
+    /// this, that bump lands in the middle of a sibling running on another
+    /// thread and invalidates verdicts it just published — which is exactly
+    /// how the two carrier tests below failed in the suite and passed when
+    /// run alone.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the lock and start from an empty table.
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        let g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        forget_validated();
+        g
+    }
+
     #[test]
     fn a_verdict_is_scoped_to_its_carrier_and_epoch() {
-        forget_validated();
+        let _g = guard();
         note_validated(0x1000, false);
         assert!(is_validated(0x1000, false), "the published carrier hits");
         assert!(
@@ -253,7 +410,7 @@ mod tests {
 
     #[test]
     fn a_write_verdict_merges_rather_than_replacing_the_read_one() {
-        forget_validated();
+        let _g = guard();
         note_validated(0x1000, false);
         note_validated(0x1000, true);
         assert!(is_validated(0x1000, false));
@@ -267,9 +424,52 @@ mod tests {
         assert!(!is_validated(0x3000, true));
     }
 
+    /// The defect the census found: two carriers used alternately, which is
+    /// what kfusion's integration stage does (the TSDF volume and the images
+    /// it reads). With one slot each switch evicted the other and republished.
+    ///
+    /// Verified able to fail: with `CRATONVM_FFM_VERDICT_WAYS=1` — the
+    /// single-slot behaviour this replaced — the second assertion fails on
+    /// the first alternation.
+    #[test]
+    fn two_carriers_used_alternately_both_stay_validated() {
+        let _g = guard();
+        let a = 0x1_0000u64;
+        let b = 0x2_0000u64;
+        note_validated(a, false);
+        note_validated(b, false);
+        for _ in 0..8 {
+            assert!(is_validated(a, false), "carrier A was evicted by B");
+            assert!(is_validated(b, false), "carrier B was evicted by A");
+        }
+    }
+
+    /// Four is the width, so a fifth carrier must cost one of the others —
+    /// but only one, and the survivors must stay valid. A cache that dropped
+    /// everything on an overflow would be the single slot again with extra
+    /// steps.
+    #[test]
+    fn a_fifth_carrier_evicts_one_way_not_the_table() {
+        let _g = guard();
+        for i in 1..=(VERDICT_WAYS as u64 + 1) {
+            note_validated(i * 0x1000, false);
+        }
+        let live = (1..=(VERDICT_WAYS as u64 + 1))
+            .filter(|i| is_validated(i * 0x1000, false))
+            .count();
+        assert_eq!(
+            live, VERDICT_WAYS,
+            "expected exactly {VERDICT_WAYS} carriers to survive, got {live}"
+        );
+        assert!(
+            is_validated((VERDICT_WAYS as u64 + 1) * 0x1000, false),
+            "the most recent carrier must always be the one that is kept"
+        );
+    }
+
     #[test]
     fn a_zero_carrier_is_never_validated() {
-        forget_validated();
+        let _g = guard();
         note_validated(0, true);
         assert!(!is_validated(0, false), "null must not be fast-pathed");
     }

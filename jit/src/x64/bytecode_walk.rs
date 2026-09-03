@@ -647,13 +647,48 @@ impl Compiler {
                     // depth-recording call site records marks alongside —
                     // but degrades to the pre-existing, already-reviewed-safe
                     // behavior rather than panicking or guessing).
-                    self.stack_oop_marks = self
+                    //
+                    // ...AND SAY SO. The line below used to read
+                    // `self.stack_oop_marks_exact = expected_depth == 0`, which
+                    // is the answer for the all-`false` FALLBACK the paragraph
+                    // above replaced: a reconstruction that guessed could not
+                    // claim exactness at any nonzero depth. When the recorded
+                    // marks are present AND their length matches, nothing was
+                    // guessed -- they are the marks a predecessor actually had
+                    // here -- and the flag was still reporting otherwise.
+                    //
+                    // It is not a cosmetic disagreement. `record_oop_map` seeds
+                    // `map_incomplete` from this flag
+                    // (`map_incomplete_cause::MARKS_INEXACT`), so every
+                    // safepoint in the revived block loses its relocation claim
+                    // and, through `fully_shadow_covered`, so does the whole
+                    // method. MEASURED: on `RTreeRangeGc` and `RPriorityQueueGc`
+                    // this was the ONLY remaining cause -- `checkMap` 6,
+                    // `checkSet` 9, `singleThreaded` 3 -- and every failing pc
+                    // is the arm or the merge of one `?:` feeding a string
+                    // concat, the shape javac emits constantly.
+                    //
+                    // Sound for the same reason the recorded marks are usable at
+                    // all: a merge point's predecessors must agree about which
+                    // stack slots hold references, because JVMS 4.10.1 admits no
+                    // merge of a reference with a primitive. Whichever
+                    // predecessor `record_branch_target_depth` captured first
+                    // therefore speaks for all of them. The fallback still fails
+                    // closed -- it genuinely did guess.
+                    let recorded_marks = self
                         .branch_target_stack_oop_marks
                         .get(&pc)
                         .filter(|marks| marks.len() == expected_depth)
-                        .cloned()
-                        .unwrap_or_else(|| vec![false; expected_depth]);
-                    self.stack_oop_marks_exact = expected_depth == 0;
+                        .cloned();
+                    // The kill switch gates only the CLAIM. The marks
+                    // themselves are the earlier fix and are used either way,
+                    // so `CRATONVM_JIT_MERGE_MARKS_EXACT=0` restores exactly
+                    // the previous flag without reintroducing the mis-marking
+                    // that fix was for.
+                    self.stack_oop_marks_exact = expected_depth == 0
+                        || (recorded_marks.is_some() && merge_marks_exact_enabled());
+                    self.stack_oop_marks =
+                        recorded_marks.unwrap_or_else(|| vec![false; expected_depth]);
                 } else {
                     self.pc_to_native[pc] = -1;
                     pc += bytecode_len_at(code, pc);
@@ -5427,7 +5462,7 @@ impl Compiler {
                             (Vec::new(), Some(self.emit_jcc_rel32_patch(0x84))) // JE
                         } else if receiver_is_trusted_oop {
                             (
-                                self.emit_trusted_oop_receiver_check_at(code, pc, true),
+                                self.emit_trusted_oop_receiver_check_at(code, pc, true, 0),
                                 None,
                             )
                         } else {
@@ -5660,7 +5695,28 @@ impl Compiler {
                             (Vec::new(), Some(self.emit_jcc_rel32_patch(0x84))) // JE
                         } else if receiver_is_trusted_oop {
                             (
-                                self.emit_trusted_oop_receiver_check_at(code, pc, false),
+                                // Opts in exactly when the guard below emits
+                                // its `GC_FLAGS` read at `[RAX + 15]`, which is
+                                // the receiver dereference the implicit check
+                                // faults on. `raw_mode` is already false in this
+                                // branch -- it is the `if raw_mode` arm's
+                                // sibling -- so `!raw_mode && compact` reduces
+                                // to `compact` and the two conditions are the
+                                // same expression rather than two that have to
+                                // be kept in step.
+                                //
+                                // They are still verified independently:
+                                // `bind_implicit_null_recovery` decodes the
+                                // bytes actually emitted at the recorded offset
+                                // and fails the compile if they are not that
+                                // load. This predicate being wrong costs a
+                                // refused compile, not a missing null check.
+                                self.emit_trusted_oop_receiver_check_at(
+                                    code,
+                                    pc,
+                                    cratonvm_types::compact_ref_fields_enabled(),
+                                    1,
+                                ),
                                 None,
                             )
                         } else {
@@ -5746,6 +5802,12 @@ impl Compiler {
                             for p in slow_patches {
                                 self.patch_rel32_to_here(p);
                             }
+                            // The implicit null check's recovery address, as in
+                            // the compact arm: this slow path reloads the
+                            // receiver from its frame slot rather than reusing
+                            // RAX, so a recovered fault needs no register
+                            // repair — only the instruction pointer moves.
+                            self.bind_implicit_null_recovery();
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.load_slot_to_reg(ARG_REGS[1], obj_slot);
                             self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag);
@@ -7315,6 +7377,14 @@ impl Compiler {
                                 }
                             }
                             if !self.spill_range_fits(scratch_base, 5) {
+                                // Named here rather than inside the probe: this
+                                // is the arraycopy intrinsic's five scratch
+                                // homes, and a bail site of
+                                // `spill-range-exhausted` said only that some
+                                // range somewhere did not fit.
+                                self.fail(
+                                    "singlepass-codegen/arraycopy-scratch-spill-exhausted",
+                                );
                                 return false;
                             }
                             let s_src = scratch_base;
@@ -7626,7 +7696,9 @@ impl Compiler {
                                 .invoke_info_idx
                                 .get(&pc)
                                 .map(|&i| self.invoke_info[i].1);
-                            match dispatch_info.map(|info| (info, self.reserve_spill_slots(5))) {
+                            match dispatch_info
+                                .map(|info| (info, self.reserve_spill_slots(5, SpillReason::HelperArgs)))
+                            {
                                 Some((info, Some(args_base))) => {
                                     let skip_dispatch = self.emit_jmp_rel32_patch();
                                     for &patch in &bail_patches {
@@ -8425,6 +8497,12 @@ impl Compiler {
                             // may allocate and trigger GC transitively.
                             self.emit_oop_map_for_safepoint();
                             self.emit_stack_arg_cleanup(total_sub);
+                            // 2026-09-02: one sentinel compare on the hot
+                            // path; the callee-deopt check and the exception
+                            // check below keep their own compares on the cold
+                            // side (`merged_call_sentinel_enabled`).
+                            let merged_keep = merged_call_sentinel_enabled()
+                                .then(|| self.emit_call_sentinel_fast_skip());
                             if let (Some(info), Some(args_base)) = (info_ptr, service_args_base) {
                                 self.emit_inline_callee_deopt_check(
                                     info as *const crate::JitInvokeInfo,
@@ -8452,6 +8530,9 @@ impl Compiler {
                             // the stashed exception through the exception
                             // table instead.
                             self.emit_post_invoke_exception_check(ret_type);
+                            if let Some(keep) = merged_keep {
+                                self.patch_rel32_to_here(keep);
+                            }
 
                             // Reclaim the spill cursor to the popped-args depth
                             // before the result is pushed, exactly as the
@@ -8683,12 +8764,47 @@ impl Compiler {
                             );
                         }
                         let (arg_slots, arg_oops) = self.pop_invoke_args(n);
-                        // A reference staged into an area no oop map can name (the
-                        // native-ABI outgoing-argument area, the direct-call service
-                        // slots, or an inlined callee's parameter locals). The
-                        // conservative scan covers those and the precise map cannot,
-                        // so this method must not claim precise coverage here.
-                        if arg_oops.iter().any(|&o| o) {
+                        // THE SAME CHANNEL THE TWO DIRECT-CALL SITES USE, for the one
+                        // invoke arm `CRATONVM_JIT_DIRECT_CALL_ARG_MAPS` did not reach.
+                        //
+                        // This arm used to raise `pending_staged_args_unmapped` for any
+                        // reference argument, on the stated grounds that the value had
+                        // been staged "into an area no oop map can name". At the
+                        // safepoint that consumes the flag it has not: `pop_invoke_args`
+                        // hands back the arguments' FRAME slots, the non-tail form's
+                        // stack-guard safepoint and recursive CALL are emitted below
+                        // this point, and `emit_stack_arg_setup` — the step that does
+                        // move them into the un-nameable outgoing-ABI area — runs later
+                        // still. So the slots are live, frame-resident and nameable
+                        // exactly where the refusal was being raised.
+                        //
+                        // Naming them is also what PUBLISHES them:
+                        // `collect_live_oop_homes` reads `pending_staged_arg_oops`, so
+                        // the shadow stack carries them and the band verifier stops
+                        // finding a movable word nothing published. See
+                        // `self_call_arg_maps_enabled` for the measurement.
+                        //
+                        // An argument whose home is NOT a frame slot still fails
+                        // closed: a register/scratch/xmm-resident reference is precisely
+                        // what a frame-slot map cannot describe.
+                        let staged_self_args_mark = self.pending_staged_arg_oops.len();
+                        if self_call_arg_maps_enabled() {
+                            let mut unnameable = false;
+                            for (i, slot) in arg_slots.iter().enumerate() {
+                                if !arg_oops.get(i).copied().unwrap_or(false) {
+                                    continue;
+                                }
+                                match slot {
+                                    StackSlot::Frame(off) => {
+                                        self.pending_staged_arg_oops.push(*off);
+                                    }
+                                    _ => unnameable = true,
+                                }
+                            }
+                            if unnameable {
+                                self.pending_staged_args_unmapped = true;
+                            }
+                        } else if arg_oops.iter().any(|&o| o) {
                             self.pending_staged_args_unmapped = true;
                         }
 
@@ -8715,6 +8831,19 @@ impl Compiler {
                             let pos = self.buf.pos();
                             self.buf.try_patch_i32(jmp_offset, rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                             let _ = pos;
+
+                            // THE TAIL FORM EMITS NO SAFEPOINT. The arguments were
+                            // just loaded into this method's own parameter locals,
+                            // which `local_oop_masks` names from here on, and
+                            // `reset_spills` below hands their old slots straight back
+                            // to the spill allocator. Anything left pending would be
+                            // consumed by a LATER, unrelated safepoint and would name a
+                            // slot the cursor has already given to something else —
+                            // the mirror of the defect this staging fixes. Truncating
+                            // to the mark drops exactly what this site pushed; no
+                            // safepoint can have run in between to take them.
+                            self.pending_staged_arg_oops
+                                .truncate(staged_self_args_mark);
 
                             // Skip the following xreturn — we already jumped
                             pc += 3; // invokestatic
@@ -9366,7 +9495,7 @@ impl Compiler {
                                     // edge's argument buffer so reclaiming that
                                     // buffer cannot free this.
                                     let out_base = if is_get {
-                                        match self.reserve_spill_slots(1) {
+                                        match self.reserve_spill_slots(1, SpillReason::HelperArgs) {
                                             Some(b) => Some(b),
                                             None => {
                                                 self.fail(
@@ -9419,7 +9548,7 @@ impl Compiler {
                                     // ---- decline edge: the unchanged dispatch
                                     self.patch_rel32_to_here(declined);
                                     let nargs = if is_get { 3 } else { 4 };
-                                    let args_base = match self.reserve_spill_slots(nargs) {
+                                    let args_base = match self.reserve_spill_slots(nargs, SpillReason::HelperArgs) {
                                         Some(b) => b,
                                         None => {
                                             self.fail(
@@ -11134,7 +11263,11 @@ impl Compiler {
                                 // the next bytecode re-allocates spill slots
                                 // from the same base.
                                 let scratch_slots = if is_byte_form { 2 } else { 4 };
-                                if !self.spill_range_fits(self.next_spill_offset, scratch_slots) {
+                                if !self.spill_range_fits(self.next_spill_offset, scratch_slots)
+                                {
+                                    self.fail(
+                                        "singlepass-codegen/intrinsic-pin-spill-exhausted",
+                                    );
                                     return false;
                                 }
                                 let s_recv = self.next_spill_offset;
@@ -13135,12 +13268,25 @@ impl Compiler {
                         // belonged to the pre-redesign inline path; the
                         // current one completes the header before the cursor
                         // advance, which is what made default-on safe.)
-                        let skip_helper = !has_prim_init && !has_finalizer;
+                        // Whether the post-init helper would have anything to
+                        // do: this is the INLINE-ELIGIBILITY question, and it
+                        // is about the class alone.
+                        let helper_is_noop = !has_prim_init && !has_finalizer;
+                        // Whether we may actually drop the call. A collector
+                        // whose sweep is driven by an allocation-base registry
+                        // rather than by walking the chunk (ZGC) has to be told
+                        // about every object, and this helper is the only place
+                        // an inline allocation can tell it -- an unannounced
+                        // object is not an object to `is_object_address`, and
+                        // its first use as a receiver decodes as `null`. So the
+                        // call stays, and only the bump is inlined.
+                        let skip_helper =
+                            helper_is_noop && !cratonvm_types::jit_tlab_registration_required();
                         let can_inline = cratonvm_types::flags::runtime_var_os(
                             "CRATONVM_JIT_DISABLE_INLINE_NEW",
                         )
                         .is_none()
-                            && (skip_helper
+                            && (helper_is_noop
                                 || cratonvm_types::flags::runtime_var_os(
                                     "CRATONVM_JIT_ENABLE_INLINE_NEW",
                                 )
@@ -13856,7 +14002,7 @@ impl Compiler {
                     let recv_offset = match recv_slot {
                         StackSlot::Frame(offset) => offset,
                         StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg, ..) => {
-                            let Some(offset) = self.reserve_spill_slots(1) else {
+                            let Some(offset) = self.reserve_spill_slots(1, SpillReason::HelperArgs) else {
                                 return false;
                             };
                             self.emit_store_local(offset, reg);

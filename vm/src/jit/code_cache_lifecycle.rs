@@ -191,11 +191,17 @@
 //! 3. **A named fail-safe.** A retention that cannot be proven safe is a
 //!    first-class, counted outcome rather than an early `return`.
 //!
-//! The two are not yet joined: `jit/src/lib.rs` and
-//! `vm/src/runtime/jit_integration.rs` are outside this change's file
+//! The two are not yet joined: `jit/src/lib.rs` is outside this change's file
 //! ownership, so the install/retire call sites there still have to be routed
 //! into this module. `docs/jit/code-cache-lifecycle.md` lists them with the
 //! exact edit each one needs.
+//!
+//! This list named `vm/src/runtime/jit_integration.rs` as a second such place
+//! until 2026-09-02. It had no call sites to route: that module was a PARALLEL,
+//! never-referenced model of this whole layer -- its own counters, code cache,
+//! OSR manager, deopt manager and inline caches -- dead since the initial
+//! commit, and it has been deleted. The real install and retire sites are the
+//! ones in `jit/src/lib.rs`, and they are the whole list.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

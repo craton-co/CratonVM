@@ -113,9 +113,9 @@ Measured 2026-09-02 with the command above, one directory at a time.
 | Crate | LoC | Crate | LoC |
 |-------|----:|-------|----:|
 | `native-builtins` | 742,000 | `native-awt` | 18,000 |
-| `vm` | 453,000 | `types` | 39,000 |
-| `jit` | 237,000 | `native-api` | 36,000 |
-| `gc` | 166,000 | `reader` | 17,000 |
+| `vm` | 453,000 | `types` | 41,000 |
+| `jit` | 249,000 | `native-api` | 36,000 |
+| `gc` | 175,000 | `reader` | 17,000 |
 | `native-collections` | 86,000 | `jfr` | 20,000 |
 | `native-io` | 82,000 | `jit-cuda` | 14,000 |
 | `classloading` | 74,000 | remaining 9 | < 13,000 each |

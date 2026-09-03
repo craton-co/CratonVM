@@ -1804,15 +1804,51 @@ pub(super) fn compile_osr_artifact(
                     // (`while (nextIndex.getAndIncrement() < MAX)`) this
                     // intrinsic exists to speed up.
                     //
-                    // The class-manager guard is read and dropped inside the
-                    // `let` so no lock is held across the matcher call.
+                    // The class id comes off `cm_lock`, the guard this loop
+                    // ALREADY holds, and not from a fresh `.read()`.
+                    //
+                    // This comment used to say "the class-manager guard is read
+                    // and dropped inside the `let` so no lock is held across the
+                    // matcher call". That was true and it was the wrong half of
+                    // the question: the matcher never held one, and the LOOP
+                    // did — `cm_lock` at the top of this `if
+                    // !scan.invoke_ops.is_empty()` block is live for every
+                    // iteration, because `class` is borrowed out of it. A second
+                    // `.read()` here is therefore recursive.
+                    //
+                    // `parking_lot`'s `RwLock` read is not reentrant. A writer
+                    // that arrives between the outer acquisition and the inner
+                    // one parks the inner read BEHIND itself (readers do not
+                    // barge past a queued writer), and the guard that writer is
+                    // waiting for is the outer one this thread is holding. A
+                    // background compile racing any class load is the whole
+                    // window, and the `cratonvm-jit-co` thread is where it was
+                    // caught: `vm-cli/tests/jit_compile_gate_doors.rs` failed
+                    // with `lock order violation: attempted to acquire
+                    // ClassManager (level 10) while holding ClassManager (level
+                    // 10)` — the L10 `OrderedPlRwLock` reporting the deadlock
+                    // one step before it could happen.
+                    //
+                    // Three regions in this loop had it (`AtomicInteger`,
+                    // `AtomicLong`, and the box/unbox pair); all three now read
+                    // through `cm_lock`, which is also strictly cheaper.
+                    //
+                    // The rule is not new here. `dispatch_virtual.rs`'s proxy
+                    // walk states it in full — "walk the chain using the
+                    // ALREADY-HELD `cm` guard rather than calling
+                    // `class_chain_reaches_proxy_instance` (which takes its own
+                    // read) -- a nested second read acquisition on the same
+                    // thread self-deadlocks under parking_lot's writer-preferring
+                    // fairness once any writer is queued" — and these three
+                    // arms were written without it. `vm-cli/tests/
+                    // jit_compile_gate_doors.rs::
+                    // the_osr_door_takes_no_recursive_class_manager_lock` is the
+                    // guard that now names the families rather than waiting for
+                    // one to turn up in an unrelated probe.
                     if invoke_kind == 0
                         && target_class == "java/util/concurrent/atomic/AtomicInteger"
                     {
-                        let atomic_cid = shared
-                            .classes
-                            .class_manager
-                            .read()
+                        let atomic_cid = cm_lock
                             .find_bootstrap_class_by_name(
                                 "java/util/concurrent/atomic/AtomicInteger",
                             )
@@ -1856,10 +1892,9 @@ pub(super) fn compile_osr_artifact(
                     // scheduled timeout and decremented once per expiry.
                     if invoke_kind == 0 && target_class == "java/util/concurrent/atomic/AtomicLong"
                     {
-                        let atomic_long_cid = shared
-                            .classes
-                            .class_manager
-                            .read()
+                        // Through `cm_lock` — see the AtomicInteger arm above for
+                        // why a fresh `.read()` here is a recursive acquisition.
+                        let atomic_long_cid = cm_lock
                             .find_bootstrap_class_by_name("java/util/concurrent/atomic/AtomicLong")
                             .map(|id| id.as_u32());
                         if let Some((entry, num_params, ret, guard_class_id)) = atomic_long_cid
@@ -1910,10 +1945,9 @@ pub(super) fn compile_osr_artifact(
                     if invoke_kind == 0
                         && (target_class == "java/lang/Long" || target_class == "java/lang/Integer")
                     {
-                        let box_cid = shared
-                            .classes
-                            .class_manager
-                            .read()
+                        // Through `cm_lock` — see the AtomicInteger arm above for
+                        // why a fresh `.read()` here is a recursive acquisition.
+                        let box_cid = cm_lock
                             .find_bootstrap_class_by_name(&target_class)
                             .map(|id| id.as_u32());
                         if let Some((entry, num_params, ret, guard_class_id)) =
@@ -1952,6 +1986,7 @@ pub(super) fn compile_osr_artifact(
                     {
                         let entry =
                             crate::jit::helpers::jit_integer_int_value_direct as *const () as usize;
+                        cratonvm_jit::note_integer_int_value_direct_site();
                         direct_calls2.push((
                             pc,
                             crate::jit::JitDirectCall {
@@ -8368,6 +8403,36 @@ pub(super) fn background_compile_task(
         };
     }
     let start = std::time::Instant::now();
+    // The body about to be REPLACED, measured before the publish overwrites it.
+    //
+    // Nothing compares a C2 body against the C1 body it supersedes before
+    // keeping it, and the open policy question that follows from that
+    // (`perf-01-sieve-ir-body-slower-than-c1`) is deliberately not answered
+    // here: the metrics a static comparison could use are all proxies, and the
+    // two that look obvious both misjudge the good cases — a bigger body is
+    // usually inlining or unrolling, and MORE call sites can be a callee's
+    // calls after its frame was inlined away. What is missing is not a rule
+    // but DATA, so this records the replacement instead of guessing at it.
+    let superseded_bytes: Option<usize> = (optimized
+        && crate::runtime::env_cache::dbg_jitc())
+    .then(|| {
+        let (class_id, _, _) = fetch_osr_compile_inputs(
+            &shared,
+            &task.method_key.class_name,
+            &task.method_key.method_name,
+            &task.method_key.descriptor,
+        )?;
+        let jit_cache = shared.jit.jit_cache.read();
+        jit_cache
+            .get(
+                &task.method_key.class_name,
+                &task.method_key.method_name,
+                &task.method_key.descriptor,
+                class_id,
+            )
+            .map(|cm| cm.code_bytes().len())
+    })
+    .flatten();
     // Real codegen + publish into the shared JIT cache. `try_jit_compile_callee`
     // is the by-name entry point shared with the JIT dispatch helpers; it stores
     // the compiled body under `(class, method, descriptor)` so the mutator's
@@ -8398,12 +8463,41 @@ pub(super) fn background_compile_task(
     if published && optimized {
         crate::classloading::bump_jit_supersede_epoch();
         if crate::runtime::env_cache::dbg_jitc() {
+            let replacement = {
+                let jit_cache = shared.jit.jit_cache.read();
+                fetch_osr_compile_inputs(
+                    &shared,
+                    &task.method_key.class_name,
+                    &task.method_key.method_name,
+                    &task.method_key.descriptor,
+                )
+                .and_then(|(class_id, _, _)| {
+                    jit_cache
+                        .get(
+                            &task.method_key.class_name,
+                            &task.method_key.method_name,
+                            &task.method_key.descriptor,
+                            class_id,
+                        )
+                        .map(|cm| cm.code_bytes().len())
+                })
+            };
+            // `c1=` is the body this one replaced, `c2=` the one that replaced
+            // it. Both, always: the question this line exists for is whether
+            // the optimizing tier is producing a BETTER body, and a size on
+            // its own answers nothing without the size it displaced.
             eprintln!(
-                "[cratonvm-jitc] c2-supersede published {}.{}{} (epoch={})",
+                "[cratonvm-jitc] c2-supersede published {}.{}{} (epoch={}) c1={} c2={}",
                 task.method_key.class_name,
                 task.method_key.method_name,
                 task.method_key.descriptor,
                 crate::classloading::jit_supersede_epoch(),
+                superseded_bytes
+                    .map(|b| b.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+                replacement
+                    .map(|b| b.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
             );
         }
     }

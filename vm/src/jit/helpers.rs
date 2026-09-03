@@ -886,10 +886,12 @@ pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
         // abnormal JIT exit (exception/deopt skipping a method epilogue) left
         // unbalanced. Captured after `ensure_allocated` so `top` is valid.
         saved_shadow_top = Some(thread.shadow_stack.top);
-        // Publish this thread's shadow-stack ADDRESS so a GC initiator that
-        // freezes this thread can scan the window it cannot otherwise reach.
-        // Once per thread: the address is stable for the thread's lifetime.
-        // See `cratonvm_gc::gc_quiescence::publish_self_shadow_addr`.
+        // Publish this thread's shadow-stack ADDRESS, plus the `base`/`end` of
+        // its backing buffer, so a GC initiator that freezes this thread can
+        // scan the window it cannot otherwise reach -- and can verify the
+        // address still describes THIS buffer before trusting `top`.
+        // Once per thread. See
+        // `cratonvm_gc::gc_quiescence::publish_self_shadow_addr`.
         if crate::jit::conservative_roots::xt_peer_shadow_scan_enabled() {
             crate::jit::conservative_roots::publish_self_shadow_addr_once(
                 &thread.shadow_stack as *const _ as usize,
@@ -897,7 +899,11 @@ pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
                 thread.shadow_stack.end,
             );
         }
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW").is_some() {
+        if if crate::runtime::env_cache::hot_lookup_cache() {
+            crate::runtime::env_cache::dbg_shadow()
+        } else {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW").is_some()
+        } {
             use std::sync::atomic::{AtomicBool, Ordering};
             static ONCE: AtomicBool = AtomicBool::new(false);
             if !ONCE.swap(true, Ordering::Relaxed) {
@@ -917,6 +923,7 @@ pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
         t.set(thread as *mut JvmThread);
         old
     });
+    cratonvm_jit::x64::publish_jit_thread_mirror(thread as *mut JvmThread as usize);
     // Suspend any borrow held by an outer JIT level: the nested JIT call about
     // to run is a child reborrow of `thread`, not an aliasing sibling, so it
     // must start its own borrow level. The outer borrow is frozen on the call
@@ -973,6 +980,7 @@ pub fn restore_jit_thread(scope: JitThreadScope) {
         report_shadow_overflow_once();
     }
     JIT_THREAD.with(|t| t.set(scope.prev_ptr));
+    cratonvm_jit::x64::publish_jit_thread_mirror(scope.prev_ptr as usize);
     #[cfg(debug_assertions)]
     restore_jit_borrow(scope.prev_borrow);
 }
@@ -1014,6 +1022,7 @@ fn report_shadow_overflow_once() {
 /// Clear the JIT thread pointer after JIT execution completes.
 pub fn clear_jit_thread() {
     JIT_THREAD.with(|t| t.set(std::ptr::null_mut()));
+    cratonvm_jit::x64::publish_jit_thread_mirror(0);
 }
 
 /// The consolidated out-of-band JIT→interpreter signal block — see the
@@ -4863,6 +4872,18 @@ pub unsafe extern "C" fn jit_post_tlab_init(
         );
     }
 
+    // The header is complete from here on. ZGC needs every TLAB object in its
+    // start registry before anything else can observe the address (the
+    // registry is a mutator-path oracle there, not only the sweep's), and
+    // this helper is the one call the inline allocator always makes -- so
+    // this is where an inline-allocated object is registered. A no-op on the
+    // backends whose sweeps parse the chunk linearly. `zgc/vm_tlab.rs`.
+    {
+        let footprint = HEADER_SIZE
+            + compact_body.map_or(num_fields as usize * SLOT_SIZE, |body| body as usize);
+        vm.mem.heap.note_tlab_object(raw_ptr, footprint);
+    }
+
     // Reconstruct the typed handle and finish init.
     let obj_ref = cratonvm_types::ObjectRef::from_raw(raw_ptr);
 
@@ -6163,6 +6184,13 @@ pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize);
     *elem_ptr = val as u8;
+    // The host just wrote this array, so a GPU input-cache entry
+    // mirroring it is stale. `jit_iastore` has carried this since Phase
+    // 10 #2; this helper did not, because `byte[]` could not be
+    // marshalled and so was never cached. It became cacheable on
+    // 2026-09-02 and this line landed with the same change.
+    #[cfg(feature = "gpu-offload")]
+    crate::runtime::offload::input_cache::invalidate(cratonvm_types::ObjectRef::from_raw(ptr));
 }
 
 // SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap
@@ -17251,6 +17279,7 @@ static INTEGER_INT_VALUE_INFO: JitInvokeInfo = JitInvokeInfo {
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
+    let census = crate::runtime::interp_census::direct_binds_enabled();
     let raw = receiver as u64;
     if raw == 0 {
         set_jit_pending_npe();
@@ -17267,6 +17296,9 @@ pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64
         // costs ~0 here (see the hashmap-half-gap closeout doc: restoring all
         // three probes measured inside run-to-run noise).
         if let Some(object) = vm.mem.heap.is_object_address(raw as usize) {
+            if census {
+                crate::runtime::interp_census::note_int_value_direct(false);
+            }
             return match vm.mem.heap.get_field(object, 0) {
                 Value::Int(value) => value as i64,
                 _ => 0,
@@ -17275,6 +17307,9 @@ pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64
     }
     // Defensive fallback: hand the call to the generic dispatcher (same
     // machinery the non-direct site would have used).
+    if census {
+        crate::runtime::interp_census::note_int_value_direct(true);
+    }
     let args = [receiver];
     jit_invoke_dispatch(
         vm_ptr,
@@ -17484,6 +17519,7 @@ pub unsafe extern "C" fn jit_long_value_of_direct(vm_ptr: i64, value: i64) -> i6
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_long_long_value_direct(vm_ptr: i64, receiver: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
+    let census = crate::runtime::interp_census::direct_binds_enabled();
     let raw = receiver as u64;
     if raw == 0 {
         set_jit_pending_npe();
@@ -17498,8 +17534,18 @@ pub unsafe extern "C" fn jit_long_long_value_direct(vm_ptr: i64, receiver: i64) 
         // `get_field` dereference.
         if let Some(object) = vm.mem.heap.is_object_address(raw as usize) {
             match vm.mem.heap.get_field(object, 0) {
-                Value::Long(value) => return value,
-                Value::Int(value) => return i64::from(value),
+                Value::Long(value) => {
+                    if census {
+                        crate::runtime::interp_census::note_long_value_direct(false);
+                    }
+                    return value;
+                }
+                Value::Int(value) => {
+                    if census {
+                        crate::runtime::interp_census::note_long_value_direct(false);
+                    }
+                    return i64::from(value);
+                }
                 // Anything else is a shape the registered native answers 0 for;
                 // hand it to the generic dispatcher rather than guessing, so the
                 // two paths cannot disagree.
@@ -17509,6 +17555,9 @@ pub unsafe extern "C" fn jit_long_long_value_direct(vm_ptr: i64, receiver: i64) 
     }
     // Defensive fallback: hand the call to the generic dispatcher (same
     // machinery the non-direct site would have used).
+    if census {
+        crate::runtime::interp_census::note_long_value_direct(true);
+    }
     let args = [receiver];
     jit_invoke_dispatch(
         vm_ptr,

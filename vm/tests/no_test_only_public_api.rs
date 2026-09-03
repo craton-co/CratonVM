@@ -119,7 +119,45 @@ use std::path::{Path, PathBuf};
 ///
 /// Zero slack, matching `stub_ratchet`'s contract: this is the observed count,
 /// not a rounded-up allowance.
-const BASELINE_OFFENDERS: usize = 318;
+///
+/// # 318 -> 319 on 2026-09-02: `offload::release_submission`
+///
+/// **This is the `admit_direct_native_entry` case again, and it is recorded
+/// the same way: named, reasoned, and with the condition that takes it back
+/// down.** The instruction above is not to raise this number to make a
+/// failure go away; it is not a bar on carrying an item whose reason is
+/// written out.
+///
+/// Identified by diffing the offender LISTS, not the counts — one prebuilt
+/// binary scored `vm/src` at HEAD and at `1410653b1` (the commit that last
+/// settled this number), and `comm` gave exactly one newcomer and nothing
+/// gone:
+///
+/// ```text
+/// fn release_submission prod=1 test=19 vm/src/runtime/offload.rs
+/// ```
+///
+/// `prod=1` is its own declaration. `b6133b92d` (the same day) rewrote the
+/// synchronous JIT-caller path onto `dispatch_method_sync`, which — by
+/// design, and correctly — never registers a submission, so it no longer has
+/// anything to release. That deleted the last production call.
+///
+/// **It must not be gated or deleted to buy this point back.**
+/// `submissions().write().remove(&handle)` inside it is the ONLY remove from
+/// the GPU submission registry, against exactly one insert in
+/// `register_submission` — so with no caller, nothing drains that map at all
+/// and every async submission leaks its entry, its CUDA stream and its event
+/// for the life of the process. Deleting the drain would cement the leak;
+/// `#[cfg(test)]`-ing it would assert "test-only by design", which is false.
+/// See
+/// `docs/known-issues/gpu/submission-registry-has-no-drain-20260902.md`.
+///
+/// **Back to 318 when** either `GpuExecutor.releaseSubmission` gets a native
+/// (the API the registry's own overflow warning tells callers to use, and
+/// which `bench-gpu/GpuAsyncChainBench.java` already calls) or an
+/// executor-close path drains the map. Either gives this item a production
+/// caller, and the number comes down in that change.
+const BASELINE_OFFENDERS: usize = 301;
 
 /// Minimum number of declarations the scan must find before its result means
 /// anything.

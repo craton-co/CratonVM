@@ -116,7 +116,7 @@ probes/L5ModuleInvokeSweep   125 rows, 1 differing (unchanged)
 probes/P1RemainingSweep       29 rows, 0 differing
 ```
 
-## 6. Found on the way, not fixed here
+## 6. Found on the way — FIXED separately 2026-08-30
 
 `Lookup.defineHiddenClass` argument validation, both modes:
 
@@ -125,8 +125,14 @@ defineHiddenClass(new byte[]{1,2,3,4})  HotSpot ClassFormatError        CVM Ille
 defineHiddenClass(null, true)           HotSpot NullPointerException    CVM IllegalArgumentException
 ```
 
-Ordinary defects, not mode defects, and not on the Groovy path. Recorded rather
-than folded into this fix.
+Ordinary defects, not mode defects, and not on the Groovy path — recorded here
+rather than folded into this fix.
+
+Taking them on turned out to be worth more than the two rows suggested. The two
+became **eleven** across **three** doors once the probe was extended to all of
+them, and the obvious fix landed on a registration that
+`--dump-native-registry` shows can never be dispatched. See
+[the fix that changed nothing](the-fix-that-changed-nothing-a-shadowed-registrar-on-the-lookup-define-doors-20260830.md).
 
 ## Reproduce
 

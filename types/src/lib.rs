@@ -100,9 +100,10 @@ pub use subsystem_config::{
 // `every_public_heap_constant_is_reachable` test below.
 pub use heap_types::{
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
-    element_type_tag_at, kind_tag_at, object_kind_from_tag, primitive_array_kind_tags_byte,
-    ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, ARRAY_LENGTH_OFFSET,
-    AUTOBOX_CLASS_ID, FIELD_CELL_PAYLOAD32_OFFSET, FIELD_CELL_PAYLOAD64_OFFSET,
+    element_type_tag_at, kind_tag_at, object_kind_from_tag, oob_index_code,
+    primitive_array_kind_tags_byte, ArrayElementType, ObjectHeader, ObjectKind,
+    ARRAY_DATA_OFFSET, ARRAY_LENGTH_OFFSET, ARRAY_STORE_OUT_OF_MEMORY, AUTOBOX_CLASS_ID,
+    FIELD_CELL_PAYLOAD32_OFFSET, FIELD_CELL_PAYLOAD64_OFFSET,
     FIELD_CELL_TAG_OBJECT, FIELD_CELL_TAG_OFFSET, FORWARDING_PTR_MASK, GC_FLAGS_BYTE_OFFSET,
     GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE, INFLATED_PTR_MASK,
     KIND_TAGS_BYTE_OFFSET, KIND_TAG_BYTE_MASK, MARK_FORWARDED, MARK_HASH_MASK, MARK_HASH_SHIFT,
@@ -440,6 +441,39 @@ pub fn set_zgc_read_barrier_armed(armed: bool) {
 static ZGC_READ_BARRIER_ARMED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Whether the collector must be TOLD about each object a thread
+/// bump-allocates out of its TLAB, rather than discovering it by walking the
+/// chunk.
+///
+/// The two linear-sweep collectors (Generational, G1) parse a TLAB chunk as
+/// memory, so an object that merely appears in one needs no announcement.
+/// ZGC's sweep, its `is_object_address` oracle and its conservative scans are
+/// driven by an allocation-base REGISTRY instead, so an object it was never
+/// told about does not exist as far as the runtime is concerned — a receiver
+/// allocated that way decodes as `null` at the next native boundary.
+///
+/// The JIT's inline allocator normally SKIPS its post-allocation helper when
+/// the class needs no primitive initialisation and has no finalizer
+/// (`skip_post_init_helper` in `x64::objects::emit_inline_tlab_new`), because
+/// on those backends the helper would have nothing left to do. That helper is
+/// also the only place an inline-allocated object can be announced, so this
+/// flag forces the call back on. Published by `ZgcRealHeap` when it hands VM
+/// TLABs out; read at JIT compile time, so it must be set before the first
+/// compile — heap construction is, and that is where it is set.
+#[inline]
+pub fn jit_tlab_registration_required() -> bool {
+    JIT_TLAB_REGISTRATION_REQUIRED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Publish the value [`jit_tlab_registration_required`] reports.
+#[inline]
+pub fn set_jit_tlab_registration_required(required: bool) {
+    JIT_TLAB_REGISTRATION_REQUIRED.store(required, std::sync::atomic::Ordering::Release);
+}
+
+static JIT_TLAB_REGISTRATION_REQUIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Corrupt-`Value`-cell census, shared by the three crates that need it.
 ///
 /// It lives HERE rather than in the collector or the VM because the only exit
@@ -624,6 +658,273 @@ pub mod scalar_deopt_census {
 /// A `resolutions_missed` that keeps climbing after warm-up is the finding:
 /// it means call sites are not repeating, and the memo is pure overhead for
 /// that workload.
+/// Where the time in one TRANSPARENT (`--gpu`) offload dispatch goes.
+///
+/// # Why this is not `craton_gpu::dispatch_timing`
+///
+/// That module measures `submitMethod` — the explicit `GpuExecutor` API —
+/// and its `CALLS` counter only moves there. The `--gpu` auto-offload
+/// path never goes through it, so every transparent run printed no phase
+/// table at all, and the per-dispatch floor that dominates every small
+/// kernel (~48 us on an RTX 2060) had never been broken down. Two rounds
+/// of plausible guessing at that floor bought 117 us -> 100 us, which is
+/// what guessing usually buys. This is the same instrument for the other
+/// door.
+///
+/// Off unless `CRATONVM_GPU_TIME_DISPATCH=1` (the same switch, because it
+/// is the same question); the counters are plain relaxed atomics and the
+/// report prints at exit beside the other censuses.
+///
+/// `total` is the whole of `try_dispatch` and CONTAINS every other phase.
+/// Read the parts against it: what it holds beyond their sum is dispatch
+/// overhead none of them names, which is the thing worth finding.
+/// Where the time goes in a transparent dispatch that REFUSES.
+///
+/// # Why the dispatch table cannot answer this
+///
+/// [`gpu_offload_phase_census`] counts a call only once it is committed to
+/// the device (`note_call` sits at the point of no return), so every
+/// fall-through is invisible to it. Fall-throughs are the common case and,
+/// on a CPU-bound workload, the expensive one: `GpuHookOverheadBench`
+/// measures a cached `invokestatic` at 279 ns and the same site with the
+/// hook refusing at 10,122 ns -- a 9.8 us refusal, 36x the call it
+/// decorates. kfusion's CPU path runs 8x slower under `--gpu` for exactly
+/// this reason, offloading nothing.
+///
+/// A site whose target is ELIGIBLE is deliberately kept out of the
+/// per-call-site invoke cache so a later call with bigger arrays can still
+/// offload, so it re-enters the hook forever. That is the design; paying
+/// 9.8 us for it is not.
+///
+/// Off unless `CRATONVM_GPU_TIME_DISPATCH=1`, the same switch as its twin.
+pub mod gpu_refusal_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Phases, in the order `try_dispatch` runs them. `total` is the whole
+    /// refusal and CONTAINS the rest.
+    pub const PHASES: [&str; 5] = [
+        // The class-manager read lock, the class-name hash, and the LINEAR
+        // scan over the class's methods comparing two strings each.
+        "resolve_method",
+        // `OffloadCache::lookup_or_compile`.
+        "lookup_kernel",
+        // Descriptor shape, then `largest_primitive_array_len` against the
+        // real arguments -- the only part that genuinely must run per call,
+        // because the arrays can grow.
+        "gates",
+        // NESTED: the whole refusal.
+        "total",
+        // The caller's own guard in `dispatch_static`, which runs before
+        // `try_dispatch` on every call at a hooked site.
+        "hook_guard",
+    ];
+    pub const TOTAL: usize = 3;
+
+    /// Why a refusal refused, in the order the checks run.
+    pub const REASONS: [&str; 5] = [
+        "class_not_loaded",
+        "method_not_found",
+        "not_offloadable",
+        "descriptor_shape",
+        "below_min_work",
+    ];
+
+    static NANOS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            crate::flags::runtime_var("CRATONVM_GPU_TIME_DISPATCH")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        })
+    }
+
+    #[inline]
+    pub fn add(phase: usize, nanos: u64) {
+        if phase < NANOS.len() {
+            NANOS[phase].fetch_add(nanos, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn note_refusal(reason: usize) {
+        if reason < COUNTS.len() {
+            COUNTS[reason].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let refusals: u64 = COUNTS.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        if refusals == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            let total = NANOS[TOTAL].load(Ordering::Relaxed);
+            eprintln!(
+                "[cratonvm] gpu offload refusals: n={refusals} total={:.3} us/refusal",
+                total as f64 / refusals as f64 / 1000.0
+            );
+            for (i, name) in REASONS.iter().enumerate() {
+                let c = COUNTS[i].load(Ordering::Relaxed);
+                if c == 0 {
+                    continue;
+                }
+                eprintln!(
+                    "[cratonvm] gpu offload refusals:   {name:<18} {c:>12} ({:.1}%)",
+                    100.0 * c as f64 / refusals as f64
+                );
+            }
+            let mut named = 0u64;
+            for (i, name) in PHASES.iter().enumerate() {
+                if i == TOTAL {
+                    continue;
+                }
+                let n = NANOS[i].load(Ordering::Relaxed);
+                named = named.saturating_add(n);
+                eprintln!(
+                    "[cratonvm] gpu offload refusals:   {name:<18} {:>8.3} us/refusal ({:.1}%)",
+                    n as f64 / refusals as f64 / 1000.0,
+                    100.0 * n as f64 / total.max(1) as f64
+                );
+            }
+            eprintln!(
+                "[cratonvm] gpu offload refusals:   {:<18} {:>8.3} us/refusal ({:.1}%)",
+                "unaccounted",
+                total.saturating_sub(named) as f64 / refusals as f64 / 1000.0,
+                100.0 * total.saturating_sub(named) as f64 / total.max(1) as f64
+            );
+        });
+    }
+}
+
+pub mod gpu_offload_phase_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Index into [`NANOS`]. `total` last so the parts read first.
+    pub const PHASES: [&str; 11] = [
+        // `try_dispatch`: class-manager lookup of the class and method.
+        "resolve_method",
+        // `OffloadCache::lookup_or_compile` — a hit after the first call.
+        "lookup_kernel",
+        // Descriptor shape + `--gpu-min-work` against the real array len.
+        "gates",
+        // `dispatch_method_inner` steps 4-5: device context and stream.
+        "ctx_and_stream",
+        // Steps 6-7: the GC-critical marshal window and the H2D uploads.
+        "marshal_args",
+        // Step 8: `launch_on_stream`.
+        "launch",
+        // Steps 1-3: the cache handle, the SECOND class+method resolve,
+        // and the dispatch memo that exists to make it cheap.
+        "dispatch_prologue",
+        // Step 9 onward: building and registering the submission.
+        "dispatch_epilogue",
+        // `finalize_submission`'s `event.synchronize()` — the host
+        // waiting for the DEVICE. Not overhead: a synchronous API owes
+        // its caller a finished kernel. Read it as the floor the async
+        // path exists to hide.
+        "finalize_wait",
+        // The rest of `finalize_submission`: the writeback window, the
+        // D2H copies, the scalar download.
+        "finalize_writeback",
+        // NESTED: the whole of `try_dispatch`. Contains all of the above.
+        "total",
+    ];
+
+    pub const TOTAL: usize = 10;
+
+    /// Dispatches whose phases are NOT recorded.
+    ///
+    /// The first call through a method compiles it — analyze, lower,
+    /// `ptxas`, module load — which is tens of milliseconds, and averaged
+    /// over a run it lands entirely on `lookup_kernel`. At 2000
+    /// dispatches that read 27.01 us/call and looked like a hash lookup
+    /// gone wrong; at 20000 it read 0.35, which is what a hash lookup
+    /// costs. The table is about the STEADY state, so the compile is
+    /// excluded rather than smeared over it.
+    const WARMUP_CALLS: u64 = 1;
+
+    static NANOS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            crate::flags::runtime_var("CRATONVM_GPU_TIME_DISPATCH")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        })
+    }
+
+    #[inline]
+    pub fn add(phase: usize, nanos: u64) {
+        // `note_call` has already counted this dispatch, so the first one
+        // sees `CALLS == 1`. See [`WARMUP_CALLS`].
+        if CALLS.load(Ordering::Relaxed) <= WARMUP_CALLS {
+            return;
+        }
+        if phase < NANOS.len() {
+            NANOS[phase].fetch_add(nanos, Ordering::Relaxed);
+        }
+    }
+
+    /// One dispatch that reached the device. Counted at the point of no
+    /// return, NOT at entry: `try_dispatch` is called for every eligible
+    /// invokestatic and falls through on a cache miss, a wrong-shaped
+    /// descriptor or a too-small array, and averaging the real dispatches
+    /// over those would report a floor far below the real one.
+    pub fn note_call() {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let all = CALLS.load(Ordering::Relaxed);
+        let calls = all.saturating_sub(WARMUP_CALLS);
+        if calls == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            let total = NANOS[TOTAL].load(Ordering::Relaxed);
+            eprintln!(
+                "[cratonvm] gpu offload dispatch: calls={calls} (of {all}, \
+                 first {WARMUP_CALLS} excluded as compile) total={:.2} us/call",
+                total as f64 / calls as f64 / 1000.0
+            );
+            let mut named = 0u64;
+            for (i, name) in PHASES.iter().enumerate() {
+                if i == TOTAL {
+                    continue;
+                }
+                let n = NANOS[i].load(Ordering::Relaxed);
+                named = named.saturating_add(n);
+                if n == 0 {
+                    continue;
+                }
+                eprintln!(
+                    "[cratonvm] gpu offload dispatch:   {name:<15} {:>8.2} us/call \
+                     ({:.1}%)",
+                    n as f64 / calls as f64 / 1000.0,
+                    100.0 * n as f64 / total.max(1) as f64,
+                );
+            }
+            // The gap is the point of the table: it is the dispatch cost
+            // that none of the phases above names, and it is where the
+            // next change should be aimed.
+            let gap = total.saturating_sub(named);
+            eprintln!(
+                "[cratonvm] gpu offload dispatch:   {:<15} {:>8.2} us/call ({:.1}%)",
+                "unaccounted",
+                gap as f64 / calls as f64 / 1000.0,
+                100.0 * gap as f64 / total.max(1) as f64,
+            );
+        });
+    }
+}
+
 pub mod gpu_dispatch_memo_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -672,6 +973,133 @@ pub mod gpu_dispatch_memo_census {
                  ({:.1}% memoised); GpuArray type probes={probes}, each one \
                  integer compare",
                 100.0 * hit as f64 / (hit + miss).max(1) as f64,
+            );
+        });
+    }
+}
+
+/// What the GPU input-residency cache did across garbage collections.
+///
+/// The cache is keyed by `ObjectRef` -- a raw heap address -- so every
+/// collection has to re-key the entries whose arrays moved and drop the
+/// ones whose arrays died. Until 2026-09-02 the ONLY account of that was
+/// a `tracing::debug!` inside `input_cache::remap_and_sweep`, and
+/// `tracing` is built here with `max_level_info`: the statement is
+/// compiled out of every release build, so the path was unobservable in
+/// any binary anyone actually runs. A test that tried to confirm the
+/// remap carried the new `short[]`/`byte[]` entries read zero from it
+/// and could not tell "nothing moved" from "nothing can be reported".
+///
+/// `gcs` counts collections seen by the cache including the ones where
+/// it had nothing to do, so a zero in `rekeyed` can be read: no
+/// collections at all, versus collections that never moved a cached
+/// array.
+/// What the GPU submission registry did over the run.
+///
+/// `offload::SUBMISSIONS` had exactly one insert and one remove, and the
+/// remove had no production caller: every async submission stayed
+/// registered for the life of the process. The only account of that was
+/// a `tracing::warn!` fired once per doubling past 1024 live, which tells
+/// you a threshold was crossed and never how many leaked, nor whether a
+/// drain you just wired actually drains.
+///
+/// `live` at exit is the number that matters: on a program that releases
+/// every handle it takes, it should be zero.
+pub mod gpu_submission_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static REGISTERED: AtomicU64 = AtomicU64::new(0);
+    static RELEASED: AtomicU64 = AtomicU64::new(0);
+    static PEAK: AtomicU64 = AtomicU64::new(0);
+
+    /// One submission entered the registry; `live` is the table size
+    /// after the insert.
+    #[inline]
+    pub fn note_register(live: u64) {
+        REGISTERED.fetch_add(1, Ordering::Relaxed);
+        PEAK.fetch_max(live, Ordering::Relaxed);
+    }
+
+    /// One entry was actually removed. Not counted for a release call
+    /// naming a handle that was already gone -- the point is to measure
+    /// drains that happened, not drains that were attempted.
+    #[inline]
+    pub fn note_release() {
+        RELEASED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(registered, released, peak_live)`.
+    #[must_use]
+    pub fn totals() -> (u64, u64, u64) {
+        (
+            REGISTERED.load(Ordering::Relaxed),
+            RELEASED.load(Ordering::Relaxed),
+            PEAK.load(Ordering::Relaxed),
+        )
+    }
+
+    /// One line on the exit path, when this process registered anything.
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let (registered, released, peak) = totals();
+        if registered == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            let live = registered.saturating_sub(released);
+            eprintln!(
+                "[cratonvm] gpu submissions: registered={registered} released={released} \
+                 live_at_exit={live} peak_live={peak}"
+            );
+        });
+    }
+}
+
+pub mod gpu_residency_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static GCS: AtomicU64 = AtomicU64::new(0);
+    static REKEYED: AtomicU64 = AtomicU64::new(0);
+    static RETAINED: AtomicU64 = AtomicU64::new(0);
+    static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+    /// One collection's worth of remap accounting.
+    #[inline]
+    pub fn note_gc(rekeyed: u64, retained: u64, dropped: u64) {
+        GCS.fetch_add(1, Ordering::Relaxed);
+        if rekeyed != 0 {
+            REKEYED.fetch_add(rekeyed, Ordering::Relaxed);
+        }
+        if retained != 0 {
+            RETAINED.fetch_add(retained, Ordering::Relaxed);
+        }
+        if dropped != 0 {
+            DROPPED.fetch_add(dropped, Ordering::Relaxed);
+        }
+    }
+
+    /// `(collections, re-keyed, retained, dropped)`.
+    #[must_use]
+    pub fn totals() -> (u64, u64, u64, u64) {
+        (
+            GCS.load(Ordering::Relaxed),
+            REKEYED.load(Ordering::Relaxed),
+            RETAINED.load(Ordering::Relaxed),
+            DROPPED.load(Ordering::Relaxed),
+        )
+    }
+
+    /// One line on the exit path, when the cache saw any collection.
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let (gcs, rekeyed, retained, dropped) = totals();
+        if gcs == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            eprintln!(
+                "[cratonvm] gpu residency across GC: collections={gcs} \
+                 entries re-keyed={rekeyed} retained={retained} dropped={dropped}"
             );
         });
     }

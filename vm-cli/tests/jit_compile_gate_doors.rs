@@ -190,6 +190,94 @@ fn jdk_home() -> Option<PathBuf> {
 /// Compile the probe. Returns `None` only when javac is genuinely unavailable;
 /// a probe that fails to COMPILE panics, because "skipped" and "passed" look
 /// identical in a suite summary and a broken probe would read as a clean run.
+/// The second probe: ONE hot loop, one call from every family whose OSR-door
+/// planning region resolves a bootstrap class id per site.
+///
+/// `compile_osr_artifact`'s invoke-planning loop holds the `ClassManager` read
+/// guard for its whole body — it has to, because `class` is borrowed out of it
+/// — and three intrinsic regions inside that loop each took a SECOND
+/// `class_manager.read()` to turn a class NAME into an id. `parking_lot`'s
+/// `RwLock` read is not reentrant: a writer arriving between the two parks the
+/// inner read behind itself, and the guard that writer waits for is the outer
+/// one this thread holds. A background compile racing any class load is the
+/// entire window.
+///
+/// The three landed 20 days, 6 days and 0 days before this test was written
+/// (`AtomicInteger` 2026-08-13, `AtomicLong` 2026-08-27, the box/unbox pair
+/// 2026-09-02) and only the last one was ever reached by a test — because
+/// `CompileGateDoorsProbe` happens to box an `Integer`, and nothing in the
+/// suite put an `AtomicLong` inside an OSR-compiled loop. That is what this
+/// probe fixes: it names the families rather than waiting for one to turn up.
+///
+/// Add a call here whenever a new family gets a per-site class-id resolution in
+/// that loop.
+const OSR_INTRINSIC_PROBE_SRC: &str = r#"
+public class OsrIntrinsicDoorProbe {
+    static long spin(int n) {
+        java.util.concurrent.atomic.AtomicInteger ai =
+                new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicLong al =
+                new java.util.concurrent.atomic.AtomicLong();
+        Integer boxedInt = Integer.valueOf(1234567);
+        Long boxedLong = Long.valueOf(89012345678L);
+        String s = "abcdefghij";
+        long acc = 0;
+        for (int i = 0; i < n; i++) {
+            acc += ai.getAndIncrement();
+            acc += al.getAndIncrement();
+            acc += boxedInt.intValue();
+            acc += boxedLong.longValue();
+            acc += s.charAt(i % 10);
+        }
+        return acc;
+    }
+
+    public static void main(String[] args) {
+        System.out.println("spin=" + spin(400000));
+        System.out.println("OK");
+    }
+}
+"#;
+
+/// [`compile_probe`] for a named source. Same rules: a probe that fails to
+/// COMPILE panics rather than skipping.
+fn compile_named_probe(javac: &Path, class_name: &str, src_text: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("cratonvm-{class_name}-probe"));
+    let _ = std::fs::create_dir_all(&dir);
+    let src = dir.join(format!("{class_name}.java"));
+    let _ = std::fs::remove_file(dir.join(format!("{class_name}.class")));
+    std::fs::write(&src, src_text).expect("write probe source");
+    let out = match Command::new(javac)
+        .args(["--release", "21", "-d"])
+        .arg(&dir)
+        .arg(&src)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("[jit_compile_gate_doors] javac could not be executed: {e}; skipping");
+            return None;
+        }
+    };
+    if !out.status.success() {
+        let stderr_probe = String::from_utf8_lossy(&out.stderr);
+        if stderr_probe.contains("release version") && stderr_probe.contains("not supported") {
+            eprintln!(
+                "[jit_compile_gate_doors] javac cannot target --release 21; skipping. \
+                 Point JAVA_HOME or CRATONVM_TEST_JDK at a JDK 21+ install."
+            );
+            return None;
+        }
+    }
+    assert!(
+        out.status.success() && dir.join(format!("{class_name}.class")).exists(),
+        "[jit_compile_gate_doors] the embedded {class_name} probe failed to compile. \
+         javac stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(dir)
+}
+
 fn compile_probe(javac: &Path) -> Option<PathBuf> {
     let dir = std::env::temp_dir().join("cratonvm-jit-compile-gate-doors-probe");
     let _ = std::fs::create_dir_all(&dir);
@@ -445,5 +533,95 @@ fn every_backend_door_goes_through_the_admission_gate() {
         "[jit_compile_gate_doors] the eager first-call door admitted nothing even with          `bg-compile=0`. Before concluding the path is gone, check that the probe still          reaches `interpreter::execute()` at all: that is the only route to this door,          and it is reflection / JNI / native-invoke only, never a bytecode invoke.          `reflectedOnly` is what supplies it.
 stderr:
 {stderr}"
+    );
+}
+
+/// The OSR door plans every invoke in a hot loop while holding the
+/// `ClassManager` read guard; nothing inside that loop may take a second one.
+///
+/// # Why the assertion is on STDERR and not on the exit status
+///
+/// The violation panics on the `cratonvm-jit-co` background compile thread. The
+/// VM keeps running, the probe prints its checksum, and the process exits **0**.
+/// Measured on the unfixed tree: `rc=0`, `spin=` correct, `OK` printed — and two
+/// `lock order violation` lines on stderr. An exit-status assertion here would
+/// be a mute instrument, which is the failure mode this repository has already
+/// paid for more than once.
+///
+/// # Why it is a deadlock and not a lint
+///
+/// `parking_lot`'s `RwLock` does not let a reader barge past a queued writer, so
+/// the inner acquisition parks behind a writer that is itself waiting for the
+/// outer guard this thread holds. `OrderedPlRwLock` at `LockLevel::ClassManager`
+/// reports it one step before it can happen; that report is what this test
+/// reads.
+///
+/// # Proven able to fail
+///
+/// Reverted the fix, rebuilt, re-ran: two violations. Restored: none. A
+/// regression test whose failure has not been observed is a guess about a guard.
+#[test]
+fn the_osr_door_takes_no_recursive_class_manager_lock() {
+    let Some(bin) = cratonvm_binary() else {
+        eprintln!(
+            "[jit_compile_gate_doors] cratonvm binary not found; build it with \
+             `cargo build -p cratonvm-cli` (or set CRATONVM_BIN). skipping."
+        );
+        return;
+    };
+    let Some(jdk) = jdk_home() else {
+        eprintln!(
+            "[jit_compile_gate_doors] no usable JDK found (set CRATONVM_TEST_JDK or \
+             JAVA_HOME). skipping."
+        );
+        return;
+    };
+    let javac = jdk.join(if cfg!(windows) {
+        "bin/javac.exe"
+    } else {
+        "bin/javac"
+    });
+    let Some(classes) = compile_named_probe(&javac, "OsrIntrinsicDoorProbe", OSR_INTRINSIC_PROBE_SRC)
+    else {
+        return;
+    };
+
+    let mut cmd = Command::new(&bin);
+    cmd.arg("--java-home")
+        .arg(&jdk)
+        .env("CRATONVM_DBG", "jit-method-stats")
+        .arg("-c")
+        .arg(&classes)
+        .arg("OsrIntrinsicDoorProbe")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = cmd.output().expect("run OsrIntrinsicDoorProbe");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert!(
+        !stderr.contains("lock order violation"),
+        "[jit_compile_gate_doors] a lock-order violation on an OSR compile. The invoke \
+         loop in `compile_osr_artifact` holds the ClassManager read guard for its whole \
+         body, so a per-site `class_manager.read()` inside it is recursive — resolve the \
+         class id through the guard the loop already has.\nstderr:\n{stderr}"
+    );
+
+    // Anti-vacuity, in two parts. Without the first the probe could have failed
+    // to run at all; without the second it could have run entirely interpreted,
+    // and the loop the regions live in would never have been planned.
+    assert!(
+        stdout.contains("spin=35605592138200000") && stdout.contains("OK"),
+        "[jit_compile_gate_doors] OsrIntrinsicDoorProbe did not produce its checksum. \
+         The value is HotSpot's (`java -cp . OsrIntrinsicDoorProbe`), not this VM's.\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let fields = gate_line(&stderr);
+    assert!(
+        nth(&fields, "admitted", DOOR_OSR) > 0,
+        "[jit_compile_gate_doors] the OSR door admitted nothing, so this probe proves \
+         nothing about it — the single hot loop must drive an OSR compile.\n\
+         stderr:\n{stderr}"
     );
 }

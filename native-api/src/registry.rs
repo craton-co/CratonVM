@@ -939,6 +939,46 @@ pub trait NativeClassAccess {
     /// Check if child_class is a subclass of parent_class.
     fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool;
 
+    /// Is an instance of `class_id` assignable to `target_class_name`, asked
+    /// the LOADER-BLIND way the bytecode asks it?
+    ///
+    /// This is the third door onto one rule, and it exists for the reason
+    /// [`synthetic_implements_declared`] and [`aastore_element_assignable`]
+    /// exist: the walk was written once, for `checkcast`/`aastore`, and every
+    /// reflective caller that asks a SECOND, narrower question is how two doors
+    /// come to disagree about one object.
+    ///
+    /// [`is_subclass`] is not that question. It compares `ClassId`s, so under a
+    /// forked loader it refuses a value whose class chain names the target
+    /// under a different id — and while it does walk the interface DAG, it
+    /// walks the one recorded on the value's own class, which for a
+    /// `@CompileWithForkedClassLoader` copy can name the OTHER loader's
+    /// interface. `ClassManager::is_assignable_to_name` compares NAMES over
+    /// supers and interfaces transitively, is cycle-safe and depth-capped, and
+    /// is what `typecheck::aastore_element_assignable` already uses for exactly
+    /// this case.
+    ///
+    /// # `None` is the honest answer, and callers must treat it as "allow"
+    ///
+    /// `None` means this context cannot answer — the default for a host with no
+    /// VM hierarchy behind it (mocks, the fabricated-class harnesses). A caller
+    /// that turns a `false` into a refusal must leave `None` alone, or a test
+    /// mock starts throwing `ClassCastException` at correct code.
+    ///
+    /// **This does NOT carry the proxy hatches.** A `java.lang.reflect.Proxy`
+    /// instance and a lambda proxy acquire their interfaces at RUNTIME,
+    /// invisibly to any static walk, and `aastore_element_assignable` has a
+    /// separate block for each. A caller that refuses on `Some(false)` must
+    /// apply those itself.
+    ///
+    /// [`synthetic_implements_declared`]: Self::synthetic_implements_declared
+    /// [`aastore_element_assignable`]: Self::aastore_element_assignable
+    /// [`is_subclass`]: Self::is_subclass
+    fn class_assignable_to_name(&self, class_id: ClassId, target_class_name: &str) -> Option<bool> {
+        let _ = (class_id, target_class_name);
+        None
+    }
+
     /// Does the VM's `checkcast`/`instanceof` admit an instance of `class_id`
     /// as a `target_class_name` on a relationship that is **declared** rather
     /// than present in the loaded class hierarchy?
@@ -4540,6 +4580,22 @@ pub trait NativeGpuAccess: NativeInvokeAccess {
     ///
     /// Default impl is a no-op (no GPU offload). The VM override
     /// calls `runtime::offload::device_cache::release(handle)`.
+    /// Drop the offload runtime's registry entry for one async
+    /// submission handle.
+    ///
+    /// The handle is the same one `gpu_future_synchronize` /
+    /// `gpu_future_await` take: the Java "future handle" IS the offload
+    /// submission handle. Default no-op so a host without the offload
+    /// runtime (or a `gpu-offload`-less build) needs no arm.
+    ///
+    /// Added 2026-09-02. `offload::SUBMISSIONS` had one insert and one
+    /// remove, and the remove had no production caller -- no Java
+    /// program, however correctly written, could drain the registry,
+    /// because `Native.releaseFuture` only removed from
+    /// `native-builtins`' own `state::futures` map. This is the missing
+    /// half of that path.
+    fn gpu_release_submission(&mut self, _handle: u64) {}
+
     fn gpu_release_array_cache(&mut self, _handle: u64) {}
 
     /// Phase 10 #1 — wipe the explicit-submit input-residency cache.

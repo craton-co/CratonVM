@@ -2674,6 +2674,7 @@ pub fn execute(
                                 let entry = crate::jit::helpers::jit_integer_int_value_direct
                                     as *const ()
                                     as usize;
+                                cratonvm_jit::note_integer_int_value_direct_site();
                                 direct_calls_early.push((
                                     pc,
                                     crate::jit::JitDirectCall {
@@ -5417,6 +5418,11 @@ fn execute_frame_from_index(
         && !crate::runtime::env_cache::dbg_gse()
         && !crate::runtime::env_cache::dbg_pbstart()
         && !matches!(thread.kind, crate::threading::ThreadKind::Virtual);
+    // The same admission for the two non-virtual doors (`invokestatic`,
+    // `invokespecial`); they share every reason the virtual one stays off
+    // and add their own kill switch. See `interpreter::invoke_fast`.
+    let nonvirtual_fast_door_on =
+        invoke_fast_door_on && !crate::runtime::env_cache::no_nonvirtual_fast_door();
     // ── OSR call floor (2026-09-02) ─────────────────────────────────────
     // `try_osr_with_backoff` cannot do anything until `Frame::backward_count`
     // reaches the smallest threshold `Frame::should_try_osr` accepts (the
@@ -7514,6 +7520,31 @@ fn execute_frame_from_index(
                             None => {}
                         }
                     }
+                    if nonvirtual_fast_door_on {
+                        match invoke_fast::execute_nonvirtual_fast_door(
+                            shared, thread, frame_idx, cp_index, false,
+                        ) {
+                            Some(Ok(CachedCallResult::FramePushed)) => {
+                                frame_idx = thread.frames.len() - 1;
+                                continue;
+                            }
+                            Some(Ok(_)) => {
+                                continue;
+                            }
+                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e) {
+                                FastPathInvokeError::Runtime(re) => {
+                                    pending_runtime_error = Some((re, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Java(exc) => {
+                                    pending_java_exception = Some((exc, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Fatal(e) => return Err(e),
+                            },
+                            None => {}
+                        }
+                    }
                     // PERF: consult the cheap thread-local inline cache FIRST.
                     // A warm monomorphic site hits here and dispatches with one
                     // class-id compare + arg decode + frame push — no locks, no
@@ -7600,6 +7631,31 @@ fn execute_frame_from_index(
                     let cp_index = ((b1 as u16) << 8) | (b2 as u16); // Cast: bytecode operand decoding
                     let _ = frame;
                     thread.frames[frame_idx].pc = saved_pc + 3;
+                    if nonvirtual_fast_door_on {
+                        match invoke_fast::execute_nonvirtual_fast_door(
+                            shared, thread, frame_idx, cp_index, true,
+                        ) {
+                            Some(Ok(CachedCallResult::FramePushed)) => {
+                                frame_idx = thread.frames.len() - 1;
+                                continue;
+                            }
+                            Some(Ok(_)) => {
+                                continue;
+                            }
+                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e) {
+                                FastPathInvokeError::Runtime(re) => {
+                                    pending_runtime_error = Some((re, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Java(exc) => {
+                                    pending_java_exception = Some((exc, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Fatal(e) => return Err(e),
+                            },
+                            None => {}
+                        }
+                    }
                     let cached_result = execute_invokevirtual_cached(
                         shared, thread, frame_idx, cp_index, saved_pc, true, false,
                     );
@@ -7696,6 +7752,31 @@ fn execute_frame_from_index(
                     let cp_index = ((b1 as u16) << 8) | (b2 as u16); // Cast: bytecode operand decoding
                     let _ = frame;
                     thread.frames[frame_idx].pc = saved_pc + 3;
+                    if nonvirtual_fast_door_on {
+                        match invoke_fast::execute_invokestatic_fast_door(
+                            shared, thread, frame_idx, cp_index,
+                        ) {
+                            Some(Ok(CachedCallResult::FramePushed)) => {
+                                frame_idx = thread.frames.len() - 1;
+                                continue;
+                            }
+                            Some(Ok(_)) => {
+                                continue;
+                            }
+                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e) {
+                                FastPathInvokeError::Runtime(re) => {
+                                    pending_runtime_error = Some((re, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Java(exc) => {
+                                    pending_java_exception = Some((exc, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Fatal(e) => return Err(e),
+                            },
+                            None => {}
+                        }
+                    }
                     let cached_result =
                         execute_invokestatic_cached(shared, thread, frame_idx, cp_index, saved_pc);
                     match cached_result {
@@ -8910,6 +8991,7 @@ pub use constants::*;
 pub(crate) mod field_access;
 pub use field_access::*;
 mod field_fast;
+mod invoke_fast;
 // The interpreter's resolved constant pool: per-thread, lock-free site caches
 // for field and method constant-pool references. `pub` so `vm-cli` can print
 // the `CRATONVM_DBG=field-site` tally at exit.
@@ -9797,7 +9879,7 @@ fn alloc_multi_array(
                 .heap
                 .set_array_element(arr, i, Value::Object(Some(sub_array)))
                 .map_err(|idx| {
-                    RuntimeError::aioobe(idx, shared.mem.heap.array_length(arr) as i32)
+                    RuntimeError::array_store_fault(idx, shared.mem.heap.array_length(arr) as i32)
                 })?;
         }
         Ok(arr)

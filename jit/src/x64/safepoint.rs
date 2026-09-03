@@ -1756,6 +1756,12 @@ impl Compiler {
         // presence-only accounting so the difference is an A/B in one binary.
         let push_map = !slots.is_empty() || self.precise_maps;
         if push_map {
+            // The unmaskable half of the same accounting. See
+            // `Compiler::incomplete_oop_maps` for why the pc-keyed set below
+            // cannot answer this on its own.
+            if map_incomplete {
+                self.incomplete_oop_maps += 1;
+            }
             if self.precise_maps && (!map_incomplete || Self::oopmap_presence_only()) {
                 // Cast: bytecode/native offset to u32 (non-negative, fits)
                 self.mapped_safepoint_pcs.insert(self.cur_bc_pc as u32);
@@ -2101,6 +2107,121 @@ mod tests {
             "the non-moving path must not publish staged args; homes={homes:?}"
         );
         crate::x64::set_moving_young_override(None);
+    }
+
+    /// The SELF-RECURSIVE call arm must name its reference arguments rather
+    /// than refuse the safepoint.
+    ///
+    /// `CRATONVM_JIT_DIRECT_CALL_ARG_MAPS` gave the two direct-call arms a
+    /// nameable service range and stopped them raising
+    /// `pending_staged_args_unmapped`; the 0xb8 self-recursive arm kept
+    /// raising it for any reference argument, which makes `map_incomplete`
+    /// true at the next safepoint and so takes `fully_shadow_covered` false
+    /// for the whole method. Measured on `probes/OopMapSelfCall.java`: its two
+    /// self-recursive methods were the ONLY two uncovered methods in the run.
+    ///
+    /// This is the source-level half of that repair — that the arm reaches the
+    /// staging channel at all, and that it fails closed on a home a frame-slot
+    /// map genuinely cannot describe.
+    #[test]
+    fn the_self_recursive_arm_stages_its_reference_arguments() {
+        let src = include_str!("bytecode_walk.rs");
+        let at = src
+            .find("let staged_self_args_mark = self.pending_staged_arg_oops.len();")
+            .expect("the self-recursive arm must mark the staged-arg buffer");
+        let body = &src[at..at + 1400];
+        assert!(
+            body.contains("self_call_arg_maps_enabled()"),
+            "the repair must be behind its kill switch"
+        );
+        assert!(
+            body.contains("StackSlot::Frame(off) => {"),
+            "a frame-resident argument oop must be pushed to the staging buffer"
+        );
+        assert!(
+            body.contains("_ => unnameable = true,"),
+            "an argument with a non-frame home must still fail the safepoint closed"
+        );
+        // The legacy arm has to survive verbatim, or the kill switch does not
+        // bisect anything.
+        assert!(
+            body.contains("} else if arg_oops.iter().any(|&o| o) {"),
+            "`=0` must restore the unconditional refusal"
+        );
+    }
+
+    /// The TAIL form of that arm must un-stage what it staged.
+    ///
+    /// It emits no safepoint before the `JMP`, and `reset_spills` hands the
+    /// argument slots straight back to the spill allocator — so a staged
+    /// offset left pending there is taken by a later, unrelated safepoint and
+    /// names a slot something else now owns. That is the mirror of the defect
+    /// the staging fixes, and it is the reason the mark exists rather than a
+    /// bare `push`.
+    #[test]
+    fn the_tail_self_call_form_unstages_before_it_jumps() {
+        let src = include_str!("bytecode_walk.rs");
+        let at = src
+            .find("let staged_self_args_mark = self.pending_staged_arg_oops.len();")
+            .expect("the self-recursive arm must mark the staged-arg buffer");
+        let rest = &src[at..];
+        let trunc = rest
+            .find(".truncate(staged_self_args_mark);")
+            .expect("the tail form must truncate the staged-arg buffer back to the mark");
+        // The truncate belongs to the tail form: it must come before the
+        // `reset_spills()` that path ends with, and inside the same site.
+        let window = &rest[..trunc];
+        assert!(
+            window.contains("JMP rel32 back to body entry"),
+            "the truncate must sit on the TAIL path, after its JMP is emitted"
+        );
+    }
+
+    /// An incomplete map must be counted where a pc SET cannot mask it.
+    ///
+    /// `mapped_safepoint_pcs` is keyed by bytecode pc, and a pc is not a
+    /// safepoint: a splice emits one safepoint per `invoke*` in the callee
+    /// under one enclosing bci, and the self-recursive arm emits its
+    /// stack-guard safepoint and its recursive CALL under one bci too. A
+    /// COMPLETE map at that bci inserts the pc, and the subset test then reads
+    /// true with an incomplete map sitting beside it -- the same mistake
+    /// `remap_one_jit_frame` made using `find` on `bytecode_pc` where every
+    /// other reader used `filter`.
+    ///
+    /// The count is what `fully_oop_covered` tests, so it has to be maintained
+    /// beside the set and not derived from it.
+    #[test]
+    fn an_incomplete_map_is_counted_not_just_withheld_from_the_pc_set() {
+        let src = include_str!("safepoint.rs");
+        let at = src
+            .find("let push_map = !slots.is_empty() || self.precise_maps;")
+            .expect("the map push must be findable");
+        let body = &src[at..at + 700];
+        let count_at = body
+            .find("self.incomplete_oop_maps += 1;")
+            .expect("an incomplete map must bump the unmaskable count");
+        let set_at = body
+            .find("self.mapped_safepoint_pcs.insert(")
+            .expect("the pc set must still be maintained");
+        assert!(
+            count_at < set_at,
+            "the count is guarded by `if map_incomplete`, the set by its negation;              they must be separate statements, not one branch"
+        );
+
+        // ...and the predicate must actually spend it.
+        let driver = include_str!("driver.rs");
+        let at = driver
+            .find("cm.fully_oop_covered = compiler.precise_maps")
+            .expect("the coverage predicate must be findable");
+        let pred = &driver[at..at + 400];
+        assert!(
+            pred.contains("compiler.incomplete_oop_maps == 0"),
+            "the coverage predicate must test the unmaskable count; found: {pred:?}"
+        );
+        assert!(
+            pred.contains("inline_sites.is_empty()"),
+            "`CRATONVM_JIT_INLINE_OOP_COVERAGE=0` must restore the previous term              verbatim, or the pair cannot be bisected"
+        );
     }
 
     /// A bare `Compiler` with no locals, no operand stack and no register

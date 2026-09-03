@@ -6151,6 +6151,13 @@ fn call_site_is_hot(
 fn c2_alloc_upgrade_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
+        // Still OPT-IN, and the reason moved rather than went away. The tier
+        // does now have an inline TLAB bump and gated inline reference stores,
+        // so the ORIGINAL reason (a promoted allocation compiling worse than
+        // its single-pass body) is answerable — but the bump has a defect that
+        // `RJitMapTierDiff` reproduces 4 runs in 10, and with the bump off the
+        // old reason applies again unchanged. See `ir_inline_tlab_enabled`
+        // for the repro and for what was ruled out.
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_C2_ALLOC_UPGRADE").is_some()
     })
 }
@@ -10739,6 +10746,53 @@ pub fn collection_direct_helper_sites() -> (u64, u64, u64) {
     )
 }
 
+/// `CRATONVM_JIT_INT_VALUE_DIRECT` — default-ON, `=0` opts out. The kill switch
+/// for the `Integer.intValue` / `Long.longValue` binds at BOTH doors; see
+/// [`INTEGER_INT_VALUE_DIRECT_SITES`].
+pub fn int_value_direct_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_INT_VALUE_DIRECT") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
+/// Compile-time engagement counter for the `Integer.intValue` bind — how many
+/// call sites any of the three doors actually bound. Read by
+/// `CRATONVM_DBG_DIRECT_BINDS=1`; see `vm::runtime::interp_census`.
+pub static INTEGER_INT_VALUE_DIRECT_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `Long.longValue()` sibling of [`INTEGER_INT_VALUE_DIRECT_SITES`].
+///
+/// Separate because the two binds answer separate questions and one counter
+/// covering both cannot be read: the composition workload binds two `intValue`
+/// sites and one `longValue` site, and a single `sites_bound=3` says which of
+/// the two recognitions fired only if you already know.
+pub static LONG_LONG_VALUE_DIRECT_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read [`INTEGER_INT_VALUE_DIRECT_SITES`].
+pub fn integer_int_value_direct_sites() -> u64 {
+    INTEGER_INT_VALUE_DIRECT_SITES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Read [`LONG_LONG_VALUE_DIRECT_SITES`].
+pub fn long_long_value_direct_sites() -> u64 {
+    LONG_LONG_VALUE_DIRECT_SITES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Count one bound `Integer.intValue` site. Called by the two doors in the
+/// `vm` crate, which cannot name the static across the dependency edge in a
+/// `static` initialiser but can call this.
+pub fn note_integer_int_value_direct_site() {
+    INTEGER_INT_VALUE_DIRECT_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one bound `Long.longValue` site.
+pub fn note_long_long_value_direct_site() {
+    LONG_LONG_VALUE_DIRECT_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Register the `Integer.intValue` thin direct-call helper (called once from
 /// the VM's `build_helpers`).
 pub fn set_integer_int_value_direct_fn(addr: usize) {
@@ -12510,10 +12564,61 @@ pub fn box_unbox_intrinsic_sites() -> (usize, usize) {
 /// on ONE binary, which is the only kind of A/B this tree accepts for a perf
 /// claim — a control built from a different commit has manufactured a
 /// double-digit "regression" on phases containing neither call.
+/// # DEFAULT-OFF since 2026-09-02: it SIGSEGVs under a relocating collector
+///
+/// `org.h2.test.store.TestRandomMapOps --Xmx 256m` on the shipped default dies
+/// of `SIGSEGV` in 25-183 s, **11 runs out of 11**, at a fault address that is
+/// always a page boundary -- the shape of a read through a reference into a
+/// page the collector has already vacated. Two switches each remove it, 3 runs
+/// of 1200 s clean apiece:
+///
+/// * `CRATONVM_ZGC_RELOCATE=0` -- no relocation, no crash;
+/// * `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` -- this family off, no crash.
+///
+/// A `git bisect` over the 200 commits between the last known-good tip and the
+/// crashing one (both endpoints re-verified in the SAME build profile, and only
+/// `SIGSEGV` counted as bad, because the `NullPointerException` and the
+/// fragmentation `OutOfMemoryError` on this workload both PRE-DATE the range)
+/// lands on `a910b7d9c` -- a MERGE whose two parents are both good, and whose
+/// relocation files are byte-identical to one of them. So the defect is the
+/// INTERACTION between this intrinsic and dev's relocation, not either alone.
+///
+/// The inline sequence pops the receiver off the simulated operand stack and
+/// then dereferences it three times -- the class-id guard at `[RAX]`, the
+/// GC-flags byte, and the payload load -- with no call and therefore no
+/// safepoint in between. That is sound only while the receiver in hand cannot
+/// go stale; under a moving collector it evidently can. Root-causing that is
+/// the follow-up, and it wants the receiver kept as a NAMED root across the
+/// sequence rather than held only in `RAX`.
+///
+/// Correctness first: the family is now opt-in, and the perf win it was
+/// measured for is recoverable the moment the sequence is made relocation-safe.
+/// Set `CRATONVM_JIT_BOX_UNBOX_INTRINSIC=1` to turn it back on for that work.
+///
+/// `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` still forces it off, so a script
+/// that already sets it keeps working and keeps meaning the same thing.
 fn box_unbox_intrinsic_disabled() -> bool {
+    // Test-only force, consulted BEFORE the cache. The family is opt-in since
+    // it was found to SIGSEGV under relocation, so the matcher's own tests --
+    // which assert the POSITIVE case and say outright that every negative
+    // below it is vacuous without it -- cannot reach it through the
+    // environment: `OnceLock` fixes the answer at the first read, whichever
+    // test in the binary got there first. This is the same shape
+    // `ir_lower::ls_forced` uses, and it is thread-local so parallel tests
+    // cannot see each other's setting.
+    #[cfg(test)]
+    {
+        if let Some(forced) = box_unbox_forced() {
+            return !forced;
+        }
+    }
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some()
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some() {
+            return true;
+        }
+        // Default OFF: enabled only when explicitly asked for.
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_BOX_UNBOX_INTRINSIC").is_none()
     })
 }
 
@@ -12538,6 +12643,37 @@ fn box_unbox_intrinsic_disabled() -> bool {
 /// `AtomicIntFieldLayout::new(0, ..)` return `None` unless slot 0's compact
 /// storage is exactly 8 / 4 bytes wide, so a layout this load could not address
 /// never reaches codegen.
+#[cfg(test)]
+thread_local! {
+    /// `Some(true)` = force the box/unbox family ON for this thread's test,
+    /// `Some(false)` = force it OFF, `None` = ask the flags.
+    static BOX_UNBOX_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn box_unbox_forced() -> Option<bool> {
+    BOX_UNBOX_FORCE.with(|c| c.get())
+}
+
+/// RAII: force the box/unbox family ON for the current thread.
+#[cfg(test)]
+struct BoxUnboxForceOn;
+
+#[cfg(test)]
+impl BoxUnboxForceOn {
+    fn new() -> Self {
+        BOX_UNBOX_FORCE.with(|c| c.set(Some(true)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for BoxUnboxForceOn {
+    fn drop(&mut self) {
+        BOX_UNBOX_FORCE.with(|c| c.set(None));
+    }
+}
+
 pub fn try_resolve_box_unbox_intrinsic(
     class: &str,
     name: &str,
@@ -12547,6 +12683,30 @@ pub fn try_resolve_box_unbox_intrinsic(
     if box_unbox_intrinsic_disabled() {
         return None;
     }
+    box_unbox_intrinsic_shape(class, name, descriptor, guard_class_id)
+}
+
+/// Which triple maps to which intrinsic, and with what operand width —
+/// WITHOUT the enable gate.
+///
+/// Split out on 2026-09-02, when flipping the family's default to opt-in turned
+/// three matcher tests red: they assert that `Long.longValue()J` matches and
+/// that a dozen near-miss triples do not, and with the gate inside the matcher
+/// every one of those answers became `None`, so the positive case failed and
+/// every negative became vacuous.
+///
+/// Whether the family is ENABLED and whether a triple is one of the two it
+/// serves are separate questions, and only the second is what those tests are
+/// about. Keeping them separate means the tests go on guarding the match when
+/// the default flips back — which is the plan, once the relocation defect in
+/// `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`
+/// is closed.
+pub(crate) fn box_unbox_intrinsic_shape(
+    class: &str,
+    name: &str,
+    descriptor: &str,
+    guard_class_id: u32,
+) -> Option<(usize, usize, u8, u32)> {
     // ===== INTRINSIC REGION BEGIN: BOX_UNBOX =====
     match (class, name, descriptor) {
         ("java/lang/Long", "longValue", "()J") => {
@@ -12693,16 +12853,19 @@ mod atomic_accessor_intrinsic_tests {
     /// load for a method that is not a field read.
     #[test]
     fn box_unbox_matcher_is_exactly_two_triples() {
+        // The family is opt-in since it was found to SIGSEGV under relocation;
+        // force it on so these assertions test the matcher and not the gate.
+        let _on = BoxUnboxForceOn::new();
         // A real class id is needed: `AtomicLongFieldLayout::new` refuses 0, so
         // passing 0 would make every case below "None" for the wrong reason and
         // the test would pass without testing anything.
         const CID: u32 = 12345;
         assert!(
-            try_resolve_box_unbox_intrinsic("java/lang/Long", "longValue", "()J", CID).is_some(),
+            box_unbox_intrinsic_shape("java/lang/Long", "longValue", "()J", CID).is_some(),
             "the positive case must match, or every negative below is vacuous"
         );
         assert!(
-            try_resolve_box_unbox_intrinsic("java/lang/Integer", "intValue", "()I", CID).is_some()
+            box_unbox_intrinsic_shape("java/lang/Integer", "intValue", "()I", CID).is_some()
         );
         for (c, n, d) in [
             // Right class, wrong method — `Long.hashCode` is also a field read
@@ -12721,7 +12884,7 @@ mod atomic_accessor_intrinsic_tests {
             ("java/util/concurrent/atomic/AtomicLong", "longValue", "()J"),
         ] {
             assert!(
-                try_resolve_box_unbox_intrinsic(c, n, d, CID).is_none(),
+                box_unbox_intrinsic_shape(c, n, d, CID).is_none(),
                 "BOX_UNBOX matched {c}.{n}{d}, which it must not"
             );
         }
@@ -12733,9 +12896,9 @@ mod atomic_accessor_intrinsic_tests {
     /// leaving a `CALL` to a non-address.
     #[test]
     fn box_unbox_declines_an_unresolved_class_id() {
-        assert!(try_resolve_box_unbox_intrinsic("java/lang/Long", "longValue", "()J", 0).is_none());
+        assert!(box_unbox_intrinsic_shape("java/lang/Long", "longValue", "()J", 0).is_none());
         assert!(
-            try_resolve_box_unbox_intrinsic("java/lang/Integer", "intValue", "()I", 0).is_none()
+            box_unbox_intrinsic_shape("java/lang/Integer", "intValue", "()I", 0).is_none()
         );
     }
 
@@ -12747,11 +12910,14 @@ mod atomic_accessor_intrinsic_tests {
     /// `0x0123456789ABCDEF`.
     #[test]
     fn box_unbox_uses_the_matching_payload_width() {
+        // The family is opt-in since it was found to SIGSEGV under relocation;
+        // force it on so these assertions test the matcher and not the gate.
+        let _on = BoxUnboxForceOn::new();
         const CID: u32 = 12345;
         let (_, _, long_ret, _) =
-            try_resolve_box_unbox_intrinsic("java/lang/Long", "longValue", "()J", CID).unwrap();
+            box_unbox_intrinsic_shape("java/lang/Long", "longValue", "()J", CID).unwrap();
         let (_, _, int_ret, _) =
-            try_resolve_box_unbox_intrinsic("java/lang/Integer", "intValue", "()I", CID).unwrap();
+            box_unbox_intrinsic_shape("java/lang/Integer", "intValue", "()I", CID).unwrap();
         assert_eq!(long_ret, b'J');
         assert_eq!(int_ret, b'I');
         let l = AtomicLongFieldLayout::new(0, CID).unwrap();
@@ -12767,15 +12933,47 @@ mod atomic_accessor_intrinsic_tests {
     /// stack unbalanced.
     #[test]
     fn box_unbox_takes_no_arguments() {
+        // The family is opt-in since it was found to SIGSEGV under relocation;
+        // force it on so these assertions test the matcher and not the gate.
+        let _on = BoxUnboxForceOn::new();
         const CID: u32 = 12345;
         for (c, n, d) in [
             ("java/lang/Long", "longValue", "()J"),
             ("java/lang/Integer", "intValue", "()I"),
         ] {
-            let (_, num_params, _, guard) = try_resolve_box_unbox_intrinsic(c, n, d, CID).unwrap();
+            let (_, num_params, _, guard) = box_unbox_intrinsic_shape(c, n, d, CID).unwrap();
             assert_eq!(num_params, 0, "{c}.{n}{d}");
             assert_eq!(guard, CID, "{c}.{n}{d} must guard on the resolved class id");
         }
+    }
+
+    /// The family is OPT-IN, and the production entry point is what enforces
+    /// it.
+    ///
+    /// The matcher tests above deliberately call `box_unbox_intrinsic_shape`,
+    /// which has no gate — so without this, flipping the default back would
+    /// change nothing any test can see, and so would flipping it back by
+    /// accident. This is the one place the DEFAULT is asserted.
+    ///
+    /// It will need inverting when
+    /// `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`
+    /// is closed and the family goes default-on again. That is the point: the
+    /// flip should have to be deliberate.
+    #[test]
+    fn box_unbox_is_opt_in_until_the_relocation_defect_is_closed() {
+        const CID: u32 = 12345;
+        assert!(
+            box_unbox_intrinsic_shape("java/lang/Long", "longValue", "()J", CID).is_some(),
+            "the shape must match, or this test cannot tell the gate from a              matcher that stopped matching"
+        );
+        if std::env::var_os("CRATONVM_JIT_BOX_UNBOX_INTRINSIC").is_some() {
+            // Someone is running the root-cause work with the family on.
+            return;
+        }
+        assert!(
+            try_resolve_box_unbox_intrinsic("java/lang/Long", "longValue", "()J", CID).is_none(),
+            "the BOX_UNBOX family must stay opt-in while it SIGSEGVs under a              relocating collector (11/11 on H2 TestRandomMapOps)"
+        );
     }
 
     // ===== INTRINSIC REGION END: BOX_UNBOX =====
@@ -18617,10 +18815,18 @@ pub fn compiled_frame_line_counts() -> [u64; 8] {
 /// | 3 | `exhausted` | compiles refused `spill-range-exhausted` |
 /// | 4 | `past-limit` | compiles refused `spill-cursor-past-limit` |
 /// | 5 | `peak-words` | high-water mark of live spill words in any one compile (a MAX, not a sum) |
-/// | 6 | `res-push` | words reserved by `push_stack` — the ordinary operand push |
-/// | 7 | `res-invalidate` | words reserved by `invalidate_callee_saved` |
-/// | 8 | `res-total` | every word reserved, so the two attributed columns read as a fraction of a whole |
+/// | 6 | `res-push` | the ordinary operand push |
+/// | 7 | `res-invalidate` | `invalidate_callee_saved` re-homing register-aliased entries |
+/// | 8 | `res-total` | every word reserved. NOT a counter: it is DERIVED at read time as the sum of the seven reason columns, so the partition is structural. Counting it separately and asserting the sum could not work — the columns are process-global atomics and seven loads plus an eighth are never a consistent snapshot while other threads compile |
 /// | 9 | `min-headroom` | the FEWEST words left between a reservation's end and `spill_limit_offset`, over every compile (a MIN; `u64::MAX` means nothing reserved) |
+/// | 10 | `inline-reserve-sum` | largest per-compile inline reserve as `spill_size` computes it today: a SUM over every site (a MAX over compiles) |
+/// | 11 | `inline-reserve-path` | what the same compile would need if the reserve were a MAX over top-level sites and over each site's deepest nested PATH (a MAX over compiles) |
+/// | 13 | `res-inline-locals` | an inlined callee's local frame |
+/// | 14 | `res-inline-merge` | an inlined body's branch-merge area |
+/// | 15 | `res-call-service` | the direct-call argument-service copy |
+/// | 17 | `range-probe-declined` | a `spill_range_fits` PROBE answered no. Separate from `exhausted`, which counts only ranges that were actually being taken — the two used to be the same number, because the probe and the reservation shared one function |
+/// | 16 | `res-helper-args` | a helper's argument buffer or out-parameter (intrinsic dispatch, FFM, the monitor receiver) |
+/// | 12 | `inline-reserve-spent` | what `spill_size` ACTUALLY added (a MAX over compiles). The engagement counter: it equals column 10 with the switch off and column 11 with it on, and inferring which without measuring it is how an inert change ships |
 ///
 /// Column 2 is retired and reads zero. It was the engagement counter for a
 /// canonical-home flush — store to `base + i*8`, reclaim a dead word below the
@@ -18634,7 +18840,7 @@ pub fn compiled_frame_line_counts() -> [u64; 8] {
 /// method, so 19 words is nearly the whole budget for one method and a rounding
 /// error for another. A refusal count of zero plus a large minimum headroom is
 /// a much stronger statement than the refusal count on its own.
-static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 10] = [
+static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 18] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -18645,6 +18851,14 @@ static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 10] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(u64::MAX),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
 ];
 
 /// `flush_scratch_registers` invocations.
@@ -18663,13 +18877,43 @@ pub const SPILL_PEAK_WORDS: usize = 5;
 pub const SPILL_RES_PUSH: usize = 6;
 /// Words reserved by `invalidate_callee_saved`.
 pub const SPILL_RES_INVALIDATE: usize = 7;
-/// Every word reserved, by any caller.
+/// Every word reserved, by any caller. Derived, never stored — see the table.
 pub const SPILL_RES_TOTAL: usize = 8;
+
+/// The seven columns that partition [`SPILL_RES_TOTAL`], in `SpillReason` order.
+pub const SPILL_RES_REASON_COLUMNS: [usize; 7] = [
+    SPILL_RES_PUSH,
+    SPILL_FLUSH_RESERVED,
+    SPILL_RES_INVALIDATE,
+    SPILL_RES_INLINE_LOCALS,
+    SPILL_RES_INLINE_MERGE,
+    SPILL_RES_CALL_SERVICE,
+    SPILL_RES_HELPER_ARGS,
+];
 /// Fewest words ever left between a reservation and the spill limit.
 pub const SPILL_MIN_HEADROOM: usize = 9;
+/// Largest per-compile inline reserve, summed over sites as today.
+pub const SPILL_INLINE_RESERVE_SUM: usize = 10;
+/// The same compile's requirement if the reserve were a max over sites/paths.
+pub const SPILL_INLINE_RESERVE_PATH: usize = 11;
+/// What `spill_size` actually added for inlining.
+pub const SPILL_INLINE_RESERVE_SPENT: usize = 12;
+/// An inlined callee's local frame.
+pub const SPILL_RES_INLINE_LOCALS: usize = 13;
+/// An inlined body's branch-merge area.
+pub const SPILL_RES_INLINE_MERGE: usize = 14;
+/// The direct-call argument-service copy.
+pub const SPILL_RES_CALL_SERVICE: usize = 15;
+/// A helper's argument buffer or out-parameter.
+pub const SPILL_RES_HELPER_ARGS: usize = 16;
+/// A `spill_range_fits` probe answered no. Not a reservation, not in the
+/// partition — a question, counted so making it answerable did not lose it.
+pub const SPILL_RANGE_PROBE_DECLINED: usize = 17;
+/// Alias: the flush's own reservation column, named for `SpillReason::Flush`.
+pub const SPILL_RES_FLUSH: usize = SPILL_FLUSH_RESERVED;
 
 /// Human names, parallel to the slot indices.
-pub const SPILL_CURSOR_SLOT_NAMES: [&str; 10] = [
+pub const SPILL_CURSOR_SLOT_NAMES: [&str; 18] = [
     "flush-calls",
     "flush-reserved",
     "flush-canonical",
@@ -18680,6 +18924,14 @@ pub const SPILL_CURSOR_SLOT_NAMES: [&str; 10] = [
     "res-invalidate",
     "res-total",
     "min-headroom",
+    "inline-reserve-sum",
+    "inline-reserve-path",
+    "inline-reserve-spent",
+    "res-inline-locals",
+    "res-inline-merge",
+    "res-call-service",
+    "res-helper-args",
+    "range-probe-declined",
 ];
 
 /// Add `n` to one column. `peak-words` must not go through here — it is a
@@ -18698,6 +18950,19 @@ pub fn note_spill_cursor(slot: usize, n: u64) {
 /// Raise the peak-words high-water mark to `words` if it is higher, and lower
 /// the headroom low-water mark to `headroom` if it is smaller. One call, so a
 /// reservation cannot record one and forget the other.
+/// Record one compile's inline reserve, as computed today and as a
+/// max-over-paths alternative would compute it. Both are maxima over compiles:
+/// the question is how big the worst frame gets, not how many frames there are.
+#[inline]
+pub fn note_inline_reserve(sum_words: u64, path_words: u64, spent_words: u64) {
+    SPILL_CURSOR_COUNTS[SPILL_INLINE_RESERVE_SUM]
+        .fetch_max(sum_words, std::sync::atomic::Ordering::Relaxed);
+    SPILL_CURSOR_COUNTS[SPILL_INLINE_RESERVE_PATH]
+        .fetch_max(path_words, std::sync::atomic::Ordering::Relaxed);
+    SPILL_CURSOR_COUNTS[SPILL_INLINE_RESERVE_SPENT]
+        .fetch_max(spent_words, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[inline]
 pub fn note_spill_peak(words: u64, headroom: u64) {
     SPILL_CURSOR_COUNTS[SPILL_PEAK_WORDS].fetch_max(words, std::sync::atomic::Ordering::Relaxed);
@@ -18705,11 +18970,15 @@ pub fn note_spill_peak(words: u64, headroom: u64) {
 }
 
 /// Read the census. See [`SPILL_CURSOR_COUNTS`] for the columns.
-pub fn spill_cursor_counts() -> [u64; 10] {
-    let mut out = [0u64; 10];
+pub fn spill_cursor_counts() -> [u64; 18] {
+    let mut out = [0u64; 18];
     for (i, slot) in SPILL_CURSOR_COUNTS.iter().enumerate() {
         out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
     }
+    // `res-total` is derived, not counted. Every reservation bumps exactly one
+    // reason column, so the sum IS the total by construction and no reservation
+    // can reach the cursor without landing in it.
+    out[SPILL_RES_TOTAL] = SPILL_RES_REASON_COLUMNS.iter().map(|&c| out[c]).sum();
     out
 }
 
@@ -23684,6 +23953,63 @@ fn try_compile_inner(
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                             }
+                            // `Integer.intValue()` / `Long.longValue()` at the
+                            // OPTIMIZING door.
+                            //
+                            // The scope note above says these are
+                            // "single-pass-only" because they are
+                            // `invokevirtual` and this door is gated
+                            // `is_static || is_special`. That was true when it
+                            // was written and is not true now:
+                            // `invokevirtual_site_final_owner` pins an
+                            // unoverridable `invokevirtual` as statically
+                            // bound, and BOTH wrapper classes are `final`, so
+                            // `private_virtual_owner` is `Some` and the site
+                            // arrives here as `is_special` with `direct_class`
+                            // already the declaring class. The door the note
+                            // says these sites cannot reach is the door they
+                            // now come through.
+                            //
+                            // `needs_ctx = true` puts `vm_ptr` in ARG_REGS[0]
+                            // ahead of the receiver, which is the helpers' own
+                            // `(vm_ptr, receiver)` signature — the same
+                            // convention `Thread.currentThread` uses above.
+                            //
+                            // `Long.longValue` is NOT bound here, and the
+                            // reason is a measurement rather than an argument.
+                            // The argument applies unchanged -- `java/lang/Long`
+                            // is `final` too, so its sites arrive here pinned
+                            // exactly as `Integer`'s do -- but the arm was
+                            // written, built and measured, and
+                            // `CRATONVM_DBG_DIRECT_BINDS=1` reported
+                            // `Long.longValue: sites_bound=0` against
+                            // `Integer.intValue: sites_bound=4 served=159 199`
+                            // on the same run. Nothing on the workload this
+                            // change is measured against reaches it, so it
+                            // ships as a follow-up rather than as unexercised
+                            // code: re-add the `Long` half and watch
+                            // `sites_bound` move before believing it.
+                            if direct_target.is_none()
+                                && int_value_direct_enabled()
+                                && !is_static
+                                && direct_class == "java/lang/Integer"
+                                && mn == "intValue"
+                                && desc == "()I"
+                            {
+                                let entry = direct_native_helper(
+                                    &INTEGER_INT_VALUE_DIRECT_FN,
+                                    jdk_only,
+                                    intrinsic_resolver,
+                                    direct_class,
+                                    &mn,
+                                    &desc,
+                                );
+                                if entry != 0 {
+                                    direct_target = Some((entry, true));
+                                    direct_target_is_thin_helper = true;
+                                    note_integer_int_value_direct_site();
+                                }
+                            }
                             if direct_target.is_none()
                                 && !closes_cycle
                                 && !jit_direct_call_requires_dispatch(direct_class, &mn, &desc)
@@ -25480,6 +25806,50 @@ fn try_compile_inner(
             // is an acceptable trade for not running unaudited machinery on
             // every unrelated JIT compile.
             let virtual_interface_inline_admitted = class_id_name_resolver.is_some();
+            // `Integer.intValue()` at a site `invokevirtual_site_final_owner`
+            // pinned as statically bound (`invoke_kind == 1`). The arm further
+            // down still owns `invoke_kind == 0`; this one exists because that
+            // arm can no longer see these sites at all, and widening ITS
+            // condition would hand every other recogniser inside the
+            // `(0 | 2)` block a shape none of them was written for.
+            //
+            // `class_name` is already the pin's substituted DECLARING class,
+            // which for `intValue` is `java/lang/Integer` itself. The opcode is
+            // still `0xb6`, so the x64 ladder adds the receiver back exactly as
+            // it does for the unpinned shape. See
+            // [`INTEGER_INT_VALUE_DIRECT_SITES`].
+            if !is_recursive_call
+                && invoke_kind == 1
+                && direct_jit_callee_calls_enabled
+                && int_value_direct_enabled()
+                && class_name == "java/lang/Integer"
+                && method_name == "intValue"
+                && descriptor == "()I"
+            {
+                let entry = direct_native_helper(
+                    &INTEGER_INT_VALUE_DIRECT_FN,
+                    jdk_only,
+                    intrinsic_resolver,
+                    &class_name,
+                    &method_name,
+                    &descriptor,
+                );
+                if entry != 0 {
+                    needs_heap = true;
+                    note_integer_int_value_direct_site();
+                    direct_calls.push((
+                        pc,
+                        JitDirectCall {
+                            entry,
+                            needs_context: true,
+                            num_params: 0,
+                            return_type: b'I',
+                            guard_class_id: 0,
+                        },
+                    ));
+                    continue;
+                }
+            }
             if !is_recursive_call
                 && (invoke_kind == 3
                     || invoke_kind == 1
@@ -26367,6 +26737,7 @@ fn try_compile_inner(
                 // plain guard-free virtual direct-call path is sound, and
                 // the helper handles the null-receiver NPE itself.
                 if direct_jit_callee_calls_enabled
+                    && int_value_direct_enabled()
                     && invoke_kind == 0
                     && class_name == "java/lang/Integer"
                     && method_name == "intValue"
@@ -26384,6 +26755,7 @@ fn try_compile_inner(
                     );
                     if entry != 0 {
                         needs_heap = true;
+                        note_integer_int_value_direct_site();
                         direct_calls.push((
                             pc,
                             JitDirectCall {
@@ -38185,7 +38557,39 @@ mod layout_constant_inventory {
         // the legacy cell address is `field_index * SLOT_SIZE`, a use of its
         // own and not a reuse of the compact arm's — which this comment claimed
         // until the inventory test refused the count and said so.
-        ("ir_lower.rs", [11, 4, 6, 0, 0, 0, 6, 4]),
+        //
+        // 2026-09-02 added the twelfth `HEADER_SIZE` and two more in tests
+        // (12 -> 14): the optimizing tier's GATED compact reference
+        // `putfield` (`emit_gated_ir_ref_putfield`) and the two test
+        // expectations that reconstruct the same address to assert the store
+        // is emitted at it. The emitter site is the mirror image of the
+        // inline `getfield` compact read directly above it — same
+        // `HEADER_SIZE + packed_body_offset`, same cell — and it is a disp32
+        // site (`48 89 90 disp32`), so it does not share the disp8
+        // backwards-addressing hazard the array sites have. Nothing else
+        // moves: the store reaches the compact cell base directly, with no
+        // `SLOT_SIZE` index and no payload bias, because a compact reference
+        // field IS the bare 8-byte pointer.
+        //
+        // Later the same day, the gated store grew its LEGACY shape and the
+        // counts moved again: `HEADER_SIZE` 14 -> 15, `SLOT_SIZE` 6 -> 7 and
+        // `FIELD_CELL_PAYLOAD64_OFFSET` 4 -> 5, all three from the one
+        // expression `HEADER_SIZE + field_index * SLOT_SIZE` plus the payload
+        // bias inside the 16-byte `Value` cell. It exists because the compact
+        // shape alone fired zero times out of 16,384,000 -- the TLAB fast path
+        // writes legacy headers unconditionally -- and it is the exact mirror
+        // of the inline `getfield`'s own legacy branch two entries above, which
+        // is where the offsets are transcribed from rather than re-derived.
+        // Both stores are disp32 (`48 89 90 disp32`, `4C 89 90 disp32`), so
+        // neither shares the disp8 backwards-addressing hazard; and since the
+        // arm now picks between the two shapes per OBJECT on the
+        // `GC_FLAG_COMPACT` bit, a header shrink must move BOTH or the legacy
+        // shape writes the wrong cell.
+        // Plus the two-shape test's own expectations (`HEADER_SIZE` 15 -> 17):
+        // it reconstructs both cell addresses to assert both stores are
+        // emitted, which is the assertion that would have caught the
+        // compact-only arm before a run-time census had to.
+        ("ir_lower.rs", [17, 4, 7, 0, 0, 0, 6, 6]),
     ];
 
     fn source(file: &str) -> &'static str {

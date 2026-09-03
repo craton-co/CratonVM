@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-511 tokens.
+514 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -573,11 +573,14 @@ export inherited from a parent shell.
 | `zero-ranges` | `CRATONVM_DBG_ZERO_RANGES` |
 | `ir-string` | `CRATONVM_DBG_IR_STRING` |
 | `invoke-phases` | `CRATONVM_DBG_INVOKE_PHASES` |
+| `interp-frames` | `CRATONVM_DBG_INTERP_FRAMES` |
+| `tierup-decline` | `CRATONVM_DBG_TIERUP_DECLINE` |
+| `direct-binds` | `CRATONVM_DBG_DIRECT_BINDS` |
 | `g1-dbg-rset` | `CRATONVM_G1_DBG_RSET` |
 
 ## `CRATONVM_JIT`
 
-293 tokens.
+320 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -617,6 +620,7 @@ export inherited from a parent shell.
 | `c2-supersede` | `CRATONVM_C2_SUPERSEDE` |
 | `callee-oop-flush` | `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH` |
 | `spill-slots-cap` | `CRATONVM_JIT_SPILL_SLOTS_CAP` |
+| `inline-reserve-path` | `CRATONVM_JIT_NO_INLINE_RESERVE_PATH` |
 | `code-cache-max-mb` | `CRATONVM_JIT_CODE_CACHE_MAX_MB` |
 | `conservative-locals` | `CRATONVM_NO_CONSERVATIVE_LOCALS` |
 | `ctor-direct-call` | `CRATONVM_NO_CTOR_DIRECT_CALL` |
@@ -678,9 +682,20 @@ export inherited from a parent shell.
 | `precise-alloc-athrow` | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` |
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
 | `ir-inline-tlab` | `CRATONVM_JIT_IR_INLINE_TLAB` |
+| `ir-gated-ref-store` | `CRATONVM_JIT_IR_GATED_REF_STORE` |
+| `tls-thread-fetch` | `CRATONVM_JIT_TLS_THREAD_FETCH` |
+| `ir-receiver-guard-cse` | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE` |
+| `ir-residency-pays` | `CRATONVM_JIT_IR_RESIDENCY_PAYS` |
+| `ir-fused-branch` | `CRATONVM_JIT_IR_FUSED_BRANCH` |
+| `ir-const-imm` | `CRATONVM_JIT_IR_CONST_IMM` |
+| `ir-phi-residency` | `CRATONVM_JIT_IR_PHI_RESIDENCY` |
+| `merged-call-sentinel` | `CRATONVM_JIT_MERGED_CALL_SENTINEL` |
 | `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
 | `gated-ref-store` | `CRATONVM_JIT_GATED_REF_STORE` |
+| `ir-ref-store` | `CRATONVM_JIT_IR_REF_STORE` |
+| `dbg-ir-ref-store-trace` | `CRATONVM_DBG_IR_REF_STORE_TRACE` |
+| `dbg-sp-ref-store-trace` | `CRATONVM_DBG_SP_REF_STORE_TRACE` |
 | `this-nonnull` | `CRATONVM_JIT_THIS_NONNULL` |
 | `receiver-null-elim` | `CRATONVM_JIT_RECEIVER_NULL_ELIM` |
 | `implicit-null-check` | `CRATONVM_JIT_IMPLICIT_NULL_CHECK` |
@@ -792,6 +807,9 @@ export inherited from a parent shell.
 | `field-fast-path` | `CRATONVM_JIT_NO_FIELD_FAST_PATH` |
 | `osr-inline-gate` | `CRATONVM_JIT_NO_OSR_INLINE_GATE` |
 | `invoke-fast-door` | `CRATONVM_JIT_NO_INVOKE_FAST_DOOR` |
+| `nonvirtual-fast-door` | `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` |
+| `frame-slot-reuse` | `CRATONVM_JIT_NO_FRAME_SLOT_REUSE` |
+| `frame-slot-reuse` | `CRATONVM_JIT_NO_FRAME_SLOT_REUSE` |
 | `iface-select-memo` | `CRATONVM_JIT_NO_IFACE_SELECT_MEMO` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
 | `ir-unresumable-trap-guard` | `CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD` |
@@ -839,13 +857,14 @@ export inherited from a parent shell.
 | `elide-trivial-ctor` | `CRATONVM_JIT_ELIDE_TRIVIAL_CTOR` |
 | `site-cache-stubs` | `CRATONVM_JIT_SITE_CACHE_STUBS` |
 | `atomic-long-intrinsic` | `CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC` |
-| `box-unbox-intrinsic` | `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC` |
+| `box-unbox-intrinsic` | `CRATONVM_JIT_BOX_UNBOX_INTRINSIC / CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC` |
 | `tier-c1-threshold` | `CRATONVM_TIER_C1_THRESHOLD` |
 | `tier-c2-min-invocations` | `CRATONVM_TIER_C2_MIN_INVOCATIONS` |
 | `tier-c2-threshold` | `CRATONVM_TIER_C2_THRESHOLD` |
 | `tier-osr-backedge` | `CRATONVM_TIER_OSR_BACKEDGE` |
 | `tier-osr-threshold` | `CRATONVM_TIER_OSR_THRESHOLD` |
 | `tier-pgo` | `CRATONVM_TIER_PGO` |
+| `tier-pgo-receivers` | `CRATONVM_TIER_PGO_RECEIVERS` |
 | `tiered` | `CRATONVM_TIER_ENABLED` |
 | `tlab-zero-elision` | `CRATONVM_NO_JIT_TLAB_ZERO_ELISION` |
 | `trivial-getter` | `CRATONVM_TRIVIAL_GETTER` |
@@ -872,12 +891,23 @@ export inherited from a parent shell.
 | `xt-peer-deadline-ms` | `CRATONVM_XT_PEER_DEADLINE_MS` |
 | `xt-peer-total-ms` | `CRATONVM_XT_PEER_TOTAL_MS` |
 | `direct-call-arg-maps` | `CRATONVM_JIT_DIRECT_CALL_ARG_MAPS` |
+| `self-call-arg-maps` | `CRATONVM_JIT_SELF_CALL_ARG_MAPS` |
+| `merge-marks-exact` | `CRATONVM_JIT_MERGE_MARKS_EXACT` |
+| `inline-oop-coverage` | `CRATONVM_JIT_INLINE_OOP_COVERAGE` |
 | `ir-gc-point-maps` | `CRATONVM_JIT_IR_GC_POINT_MAPS` |
 | `zero-spid` | `CRATONVM_JIT_ZERO_SPID` |
+| `int-value-direct` | `CRATONVM_JIT_INT_VALUE_DIRECT` |
+| `indy-lambda-fast` | `CRATONVM_JIT_INDY_LAMBDA_FAST` |
+| `hot-lookup-cache` | `CRATONVM_JIT_HOT_LOOKUP_CACHE` |
+| `virtual-nominate-always` | `CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS` |
+| `virtual-promote-java-util` | `CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL` |
+| `native-cf-postcomplete-skip` | `CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP` |
+| `native-cf-postcomplete-direct` | `CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT` |
+| `ffm-verdict-ways` | `CRATONVM_FFM_VERDICT_WAYS` |
 
 ## `CRATONVM_GC`
 
-115 tokens.
+124 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -890,6 +920,7 @@ export inherited from a parent shell.
 | `verify-rset` | `CRATONVM_GC_VERIFY_RSET` |
 | `compact-ref-fields` | `CRATONVM_COMPACT_REF_FIELDS` |
 | `pack-fields-by-width` | `CRATONVM_PACK_FIELDS_BY_WIDTH` |
+| `layout-scan-cache` | `CRATONVM_GC_LAYOUT_SCAN_CACHE` |
 | `compressed-oops` | `CRATONVM_COMPRESSED_OOPS` |
 | `default-heap-ergonomics` | `CRATONVM_DEFAULT_HEAP_ERGONOMICS` |
 | `default-heap-max-mb` | `CRATONVM_DEFAULT_HEAP_MAX_MB` |
@@ -915,10 +946,16 @@ export inherited from a parent shell.
 | `zgc-markbits` | `CRATONVM_ZGC_MARKBITS` |
 | `zgc-page-pinned-relocate` | `CRATONVM_ZGC_PAGE_PINNED_RELOCATE` |
 | `zgc-parsweep` | `CRATONVM_ZGC_PARSWEEP` |
+| `zgc-bitmap-sweep` | `CRATONVM_ZGC_BITMAP_SWEEP` |
+| `zgc-mark-root-filter` | `CRATONVM_ZGC_MARK_ROOT_FILTER` |
+| `zgc-jit-tlab` | `CRATONVM_ZGC_JIT_TLAB` |
+| `zgc-tlab-tail-sink` | `CRATONVM_ZGC_TLAB_TAIL_SINK` |
+| `zgc-mark-pool-persistent` | `CRATONVM_ZGC_MARK_POOL_PERSISTENT` |
 | `g1-reserve-heap` | `CRATONVM_G1_RESERVE_HEAP` |
 | `g1-uncommit` | `CRATONVM_G1_UNCOMMIT` |
 | `g1-card-rset` | `CRATONVM_G1_CARD_RSET` |
 | `g1-card-clean` | `CRATONVM_G1_CARD_CLEAN` |
+| `g1-card-screen-jit-pinned` | `CRATONVM_G1_CARD_SCREEN_JIT_PINNED` |
 | `g1-inline-barrier` | `CRATONVM_G1_INLINE_BARRIER` |
 | `g1-mark-lock-yield` | `CRATONVM_G1_MARK_LOCK_YIELD` |
 | `g1-shared-alloc` | `CRATONVM_G1_SHARED_ALLOC` |
@@ -937,6 +974,7 @@ export inherited from a parent shell.
 | `gpu-device-pool` | `CRATONVM_GPU_DEVICE_POOL` |
 | `gpu-wait-latch` | `CRATONVM_GPU_WAIT_LATCH` |
 | `gpu-zerocopy` | `CRATONVM_GPU_NO_ZEROCOPY` |
+| `gpu-submission-drain` | `CRATONVM_GPU_NO_SUBMISSION_DRAIN` |
 | `lhm-root-all` | `CRATONVM_LHM_ROOT_ALL` |
 | `max-inflated-bytes` | `CRATONVM_MAX_INFLATED_BYTES` |
 | `mirror-pin-young-defer` | `CRATONVM_NO_MIRROR_PIN_YOUNG_DEFER` |
@@ -986,6 +1024,7 @@ export inherited from a parent shell.
 | `zgc-gen-promotion-age` | `CRATONVM_ZGC_GEN_PROMOTION_AGE` |
 | `zgc-gen-minors-per-major` | `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` |
 | `zgc-gen-nursery-percent` | `CRATONVM_ZGC_GEN_NURSERY_PERCENT` |
+| `zgc-alloc-trigger` | `CRATONVM_ZGC_ALLOC_TRIGGER` |
 | `zgc-sweep-header-zero` | `CRATONVM_ZGC_SWEEP_HEADER_ZERO` |
 | `zgc-sweep-dead-runs` | `CRATONVM_ZGC_SWEEP_DEAD_RUNS` |
 | `zgc-mark-ctx-direct` | `CRATONVM_ZGC_MARK_CTX_DIRECT` |
@@ -1124,7 +1163,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-24 tokens.
+25 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1146,6 +1185,7 @@ export inherited from a parent shell.
 | `mockito-legacy-selectors` | `CRATONVM_MOCKITO_LEGACY_SELECTORS` |
 | `stackwalker-jdk-walk` | `CRATONVM_SW_JDK_WALK` |
 | `jdk-random` | `CRATONVM_JDK_RANDOM` |
+| `jdk-scanner` | `CRATONVM_JDK_SCANNER` |
 | `strict-swallows` | `CRATONVM_STRICT_SWALLOWS` |
 | `tomcat-mapper-natives` | `CRATONVM_TOMCAT_MAPPER_NATIVES` |
 | `vh-strict-reference-return` | `CRATONVM_VH_STRICT_REFERENCE_RETURN` |

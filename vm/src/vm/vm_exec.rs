@@ -8954,6 +8954,20 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         false
     }
 
+    fn class_assignable_to_name(&self, class_id: ClassId, target_class_name: &str) -> Option<bool> {
+        // The SAME walk `typecheck::aastore_element_assignable` reaches for when
+        // its ClassId-comparing checks have run out — see the boundary's doc for
+        // why a reflective caller must not ask a narrower question than the
+        // bytecode does.
+        Some(
+            self.shared
+                .classes
+                .class_manager
+                .read()
+                .is_assignable_to_name(class_id, target_class_name),
+        )
+    }
+
     fn synthetic_implements_declared(&self, class_id: ClassId, target_class_name: &str) -> bool {
         // Via the `pub use typecheck::*` re-export in `interpreter.rs`, exactly
         // as `aastore_element_assignable` below reaches its predicate: one
@@ -10819,10 +10833,7 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
             receiver_class_id = self.shared.mem.heap.class_id_of(receiver);
         }
         // Check if the receiver is a lambda proxy.
-        let call_site = {
-            let proxies = self.shared.classes.lambda_proxies.read();
-            proxies.get(&receiver_class_id).cloned()
-        };
+        let call_site = self.shared.classes.lambda_call_site_for(receiver_class_id);
         if crate::runtime::env_cache::invoke_virtual_entry_trace()
             && method_name == "aotContributedInitializerStartsManagementContext"
         {
@@ -11507,9 +11518,18 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
                         .read()
                         .get_loaded_class_id(&class_name)
                         != Some(receiver_class_id));
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_NEEDS_EXACT_TRACE").is_some()
-                && method_name == "aotContributedInitializerStartsManagementContext"
-            {
+            // Name first, then the (now cached) gate: the name compare fails
+            // on its length for every other method, so the trace costs one
+            // `usize` compare on the path every native->Java callback takes.
+            // `CRATONVM_JIT_HOT_LOOKUP_CACHE=0` restores the original order and
+            // the uncached read.
+            if if crate::runtime::env_cache::hot_lookup_cache() {
+                method_name == "aotContributedInitializerStartsManagementContext"
+                    && crate::runtime::env_cache::needs_exact_trace()
+            } else {
+                cratonvm_types::flags::runtime_var_os("CRATONVM_NEEDS_EXACT_TRACE").is_some()
+                    && method_name == "aotContributedInitializerStartsManagementContext"
+            } {
                 let global_id = self
                     .shared
                     .classes
@@ -12940,7 +12960,29 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // and its contract is "no-op or VM error, never an out-of-bounds heap
         // write". The caller range-checks; `native-builtins`'s
         // `vh_array_index` is the worked example.
-        let _out_of_range = self.shared.mem.heap.set_array_element(obj, index, value);
+        //
+        // The ONE code that is not an index gets a report. Since 2026-09-03 a
+        // store that needs an auto-box wrapper on a full heap returns
+        // `ARRAY_STORE_OUT_OF_MEMORY` instead of `std::process::abort()`-ing
+        // (see that constant); the interpreter's `*astore` arms raise
+        // `OutOfMemoryError` from it, but this accessor has no error channel to
+        // raise through, so the store is dropped. Dropping it is still the
+        // right behaviour — the alternative was killing the VM — but it must
+        // not be SILENT, because a dropped element is exactly the shape of
+        // defect that takes a week to trace back to a heap that was full for
+        // one millisecond. Reported once per process: a full heap produces
+        // these in floods, and the first one is the one that matters.
+        if let Err(cratonvm_gc::heap::ARRAY_STORE_OUT_OF_MEMORY) =
+            self.shared.mem.heap.set_array_element(obj, index, value)
+        {
+            static REPORTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "OutOfMemoryError: Java heap space while auto-boxing a primitive into a                      reference array from native code (index {index}); the element was left                      unchanged. This accessor has no exception channel — see                      ARRAY_STORE_OUT_OF_MEMORY."
+                );
+            }
+        }
         // write_barrier fires automatically inside set_array_element for ref arrays
         //
         // Phase 10 #2: the host just wrote this array, so any device
@@ -16927,6 +16969,27 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
     /// cache. Called from `Native.releaseExecutor` so device
     /// buffers cached for plain JVM primitive arrays are freed when
     /// the Java `GpuExecutor` is closed.
+    fn gpu_release_submission(&mut self, handle: u64) {
+        #[cfg(feature = "gpu-offload")]
+        {
+            // Kill switch: the drain is new and default-on, and its
+            // absence is what the old behaviour was. See
+            // `CRATONVM_GPU_NO_SUBMISSION_DRAIN`.
+            use std::sync::OnceLock;
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            let on = *ENABLED.get_or_init(|| {
+                cratonvm_types::flags::runtime_var_os("CRATONVM_GPU_NO_SUBMISSION_DRAIN").is_none()
+            });
+            if on {
+                crate::runtime::offload::release_submission(handle);
+            }
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+        }
+    }
+
     fn gpu_clear_input_cache(&mut self) {
         #[cfg(feature = "gpu-offload")]
         {

@@ -677,7 +677,24 @@ struct Lowerer<'a> {
     /// cannot fault". The store question -- which G1/ZGC answer by leaving
     /// `JIT_REGION_BOUNDS` empty (`audits/g1-audit.md` 8.1) -- has no site
     /// here to ask it.
+    ///
+    /// **Since 2026-09-02 there is such a site** — `emit_gated_ir_ref_putfield`
+    /// below — and it asks the same READ question for the same reason: its
+    /// barrier decision comes from the collector's published PLAN, not from a
+    /// region table. `JIT_REGION_BOUNDS` is still never consulted here, so the
+    /// G1/ZGC interlock that leaves it empty is untouched.
     read_bounds_addr: usize,
+    /// `(pre, post, young_floor)` — the collector's published reference-store
+    /// barrier plan, resolved once at construction. `None` ⇒ no plan, and every
+    /// reference store keeps the unconditional `jit_putfield_object` call.
+    ///
+    /// Read through the SAME `x64::objects` predicate the single-pass backend
+    /// uses. Two tiers deciding independently what a published plan means is
+    /// how one of them ends up skipping a barrier the other pays.
+    ref_store_gates: Option<(usize, usize, usize)>,
+    /// The published post-barrier skip mask, when the plan uses that shape
+    /// rather than the unsigned age floor.
+    ref_store_post_skip_mask: Option<u8>,
     /// Emitted shadow push / reload sequence counts.
     ///
     /// Every push must have exactly one reload: a push advances the thread's
@@ -871,6 +888,20 @@ struct Lowerer<'a> {
     /// definition arm costs an optimization and can never produce a read of a
     /// register nothing wrote.
     gp_reg_live: Vec<bool>,
+    /// Number of input references to each node, over every input of every
+    /// node. Filled by `prepare_fusion_tables` before the first block lowers.
+    use_count: Vec<u32>,
+    /// `Op::Cmp` nodes whose only use is the `Op::If` terminator consuming
+    /// them, lowered as one fused compare-and-branch by that terminator; the
+    /// compare's own arm emits nothing (`ir_fused_branch_enabled`).
+    fused_cmp: Vec<bool>,
+    /// Nodes named by some safepoint snapshot. Their home word must hold the
+    /// value at that bci, so such a compare is never fused away.
+    deopt_named: Vec<bool>,
+    /// Per-block CSE of the mapped-receiver guard (null, alignment, the six
+    /// read-bounds compares): receivers already proven in the block being
+    /// lowered. Cleared at every block entry (`ir_receiver_guard_cse_enabled`).
+    guarded_receivers: Vec<NodeId>,
     /// Register → memory transitions this backend EMITTED for resident values
     /// (one per resident definition, because the wiring is write-through).
     /// Reported as `CompilationReport::spills`.
@@ -1219,6 +1250,8 @@ impl<'a> Lowerer<'a> {
             shadow_pushed_any: false,
             compact_fields: compact_fields.clone(),
             read_bounds_addr: helpers.read_bounds_addr,
+            ref_store_gates: crate::x64::ref_store_gates_of(helpers),
+            ref_store_post_skip_mask: crate::x64::ref_store_post_skip_mask_of(helpers),
             shadow_pushes: 0,
             shadow_reloads: 0,
             locals_size,
@@ -1265,6 +1298,10 @@ impl<'a> Lowerer<'a> {
             reg_live: Vec::new(),
             gp_reg_of: Vec::new(),
             gp_reg_live: Vec::new(),
+            use_count: Vec::new(),
+            fused_cmp: Vec::new(),
+            deopt_named: Vec::new(),
+            guarded_receivers: Vec::new(),
             ls_spills: 0,
             ls_reloads: 0,
             mir: None,
@@ -1433,6 +1470,20 @@ impl<'a> Lowerer<'a> {
     /// which is a missed optimization and never wrong code: the home word is
     /// written unconditionally.
     fn gp_load_value(&mut self, dst: u8, id: NodeId) {
+        // 2026-09-02: a constant is an IMMEDIATE, not a frame word. The
+        // `Op::Const` arm still writes its home (a deopt frame may name it,
+        // and some sites still read slots directly), but no reader of a
+        // constant has to wait on that store any more: `fib` materialised
+        // `1` and `2` into frame words and reloaded them on every call.
+        if ir_const_imm_enabled() {
+            if let Some(node) = self.graph.nodes.get(id as usize) {
+                if let Op::Const(val) = &node.op {
+                    let val = *val;
+                    self.emit_mov_reg_imm_smart(dst, val);
+                    return;
+                }
+            }
+        }
         match self.resident_gpr(id) {
             Some(src) => self.emit_mov_reg_reg64(dst, src),
             None => {
@@ -1954,34 +2005,8 @@ impl<'a> Lowerer<'a> {
 
         // Gather (phi_slot, value_id) pairs first to avoid borrowing `self`
         // immutably while emitting (which borrows `self` mutably).
-        let mut copies: Vec<(i32, i32)> = Vec::new();
-        for id in 0..self.graph.nodes.len() {
-            let node = &self.graph.nodes[id];
-            if !matches!(node.op, Op::Phi) {
-                continue;
-            }
-            // Only value phis materialise a frame slot; memory/control phis
-            // are bookkeeping tokens with no machine value to copy.
-            if matches!(node.ty, IrType::Memory | IrType::Control | IrType::Void) {
-                continue;
-            }
-            // phi.inputs = [merge, val_0, val_1, …]
-            if node.inputs.first().copied() != Some(merge_ctrl) {
-                continue;
-            }
-            // merge.inputs[k] is the control token for phi value k (= input k+1).
-            let merge_node = &self.graph.nodes[merge_ctrl as usize];
-            for (k, &ctrl_in) in merge_node.inputs.iter().enumerate() {
-                if self.block_of_ctrl(ctrl_in) != Some(pred_block) {
-                    continue;
-                }
-                if let Some(&val_id) = node.inputs.get(k + 1) {
-                    if val_id != NO_NODE {
-                        copies.push((self.slot_of(id as NodeId), self.slot_of(val_id)));
-                    }
-                }
-            }
-        }
+        let gathered = self.gather_phi_copies(pred_block, succ_block);
+        let copies: Vec<(i32, i32)> = gathered.iter().map(|&(_, dst, src)| (dst, src)).collect();
 
         // Phi copies are a PARALLEL assignment, not a sequence.
         //
@@ -2024,6 +2049,24 @@ impl<'a> Lowerer<'a> {
             if let Err(bailout) = self.emit_copy_op(op) {
                 self.latch_bailout(bailout);
                 return;
+            }
+        }
+        // 2026-09-02: a register-resident phi is PUBLISHED here, at every
+        // incoming edge, from the home word the copies just wrote. This is the
+        // definition site a phi never had, and it is what lets a loop counter
+        // or accumulator -- a phi at every loop header -- be read from a
+        // register inside the loop (`ir_phi_residency_enabled`). Reads before
+        // the first published edge (in emission order) still take the home
+        // word; every edge publishes, so the register is valid on entry to the
+        // block whichever predecessor ran.
+        if ir_phi_residency_enabled() {
+            for &(phi, dst, _) in &gathered {
+                if self.assigned_gpr(phi).is_some() {
+                    self.publish_gp_from_slot(phi, dst);
+                } else if self.assigned_xmm(phi).is_some() {
+                    let is_double = self.graph.nodes[phi as usize].ty == IrType::Double;
+                    self.publish_fp_from_slot(phi, dst, is_double);
+                }
             }
         }
     }
@@ -2361,6 +2404,17 @@ impl<'a> Lowerer<'a> {
     /// Byte-identical to the single-pass backend's `emit_mov_tls_disp32_rbp`;
     /// both must write the SAME slot, since `inline_rbp_tls_disp()` is the one
     /// source of truth the VM-side mirror accessor reads back.
+    /// `MOV RAX, gs:[disp32]` (`fs:` on Linux): the one-instruction thread
+    /// fetch through the `JIT_THREAD` mirror (`x64::jit_thread_tls_disp`).
+    fn emit_mov_rax_tls_disp32(&mut self, disp32: u32) {
+        self.buf
+            .emit_byte(crate::x64::inline_rbp_tls_segment_prefix());
+        self.buf.emit_byte(0x48); // REX.W
+        self.buf.emit_byte(0x8B); // MOV r64, r/m64
+        self.buf.emit_byte(0x04); // ModRM: reg=RAX, r/m=SIB
+        self.buf.emit_byte(0x25); // SIB: [disp32] absolute
+        self.buf.emit(&disp32.to_le_bytes());
+    }
     fn emit_mov_tls_disp32_rbp(&mut self, disp32: u32) {
         self.buf
             .emit_byte(crate::x64::inline_rbp_tls_segment_prefix());
@@ -2408,8 +2462,16 @@ impl<'a> Lowerer<'a> {
             return;
         }
         let start = self.buf.pos();
-        self.emit_mov_reg_imm64(RAX, self.get_current_thread as u64);
-        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        // 2026-09-02: one `mov rax, gs:[disp]` through the `JIT_THREAD`
+        // mirror where the VM publishes it; the helper call otherwise. Both
+        // stay inside the erasable span.
+        let tls_disp = crate::x64::jit_thread_tls_disp();
+        if tls_disp != 0 {
+            self.emit_mov_rax_tls_disp32(tls_disp as u32);
+        } else {
+            self.emit_mov_reg_imm64(RAX, self.get_current_thread as u64);
+            self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        }
         self.store_rax(self.shadow_thread_slot_off);
         // Capture the entry watermark, inside the erasable span: a method that
         // publishes nothing has no push to unwind, so the capture goes away
@@ -2695,6 +2757,326 @@ impl<'a> Lowerer<'a> {
         true
     }
 
+    /// Receiver alignment + containment in one of the three published
+    /// `JIT_READ_BOUNDS` regions, with RAX holding the receiver. Failures push
+    /// their patch offsets onto `slow`.
+    ///
+    /// Shared by the inline `getfield` read and the gated reference `putfield`
+    /// below, deliberately: both answer the same question — "is this address
+    /// one this heap handed out, so the header reads cannot fault" — and a
+    /// second transcription of six compares against a six-word table is a place
+    /// for the two to disagree about a region index.
+    ///
+    /// Clobbers RCX and RDX. A caller that needs the flags byte in CL must read
+    /// it AFTER this.
+    fn emit_receiver_align_and_containment(&mut self, slow: &mut Vec<usize>) {
+        // alignment: the low three bits must be clear.
+        self.buf.emit(&[0x48, 0x89, 0xC1]); // MOV RCX, RAX
+        self.buf.emit(&[0x48, 0x83, 0xE1, 0x07]); // AND RCX, 7
+        slow.push(self.emit_jcc_rel32(0x85)); // JNZ
+                                              // containment in one of the three published regions.
+                                              // RDX = &JIT_READ_BOUNDS = [b0, e0, b1, e1, b2, e2].
+        self.emit_mov_reg_imm64(RDX, self.read_bounds_addr as u64);
+        self.emit_cmp_rax_mem_rdx(0);
+        let below_b0 = self.emit_jcc_rel32(0x82); // JB -> try region 1
+        self.emit_cmp_rax_mem_rdx(8);
+        let ok0 = self.emit_jcc_rel32(0x82); // JB -> inside region 0
+        self.patch_rel32_to_here(below_b0);
+        self.emit_cmp_rax_mem_rdx(16);
+        let below_b1 = self.emit_jcc_rel32(0x82); // JB -> try region 2
+        self.emit_cmp_rax_mem_rdx(24);
+        let ok1 = self.emit_jcc_rel32(0x82); // JB -> inside region 1
+        self.patch_rel32_to_here(below_b1);
+        self.emit_cmp_rax_mem_rdx(32);
+        slow.push(self.emit_jcc_rel32(0x82)); // JB -> slow
+        self.emit_cmp_rax_mem_rdx(40);
+        slow.push(self.emit_jcc_rel32(0x83)); // JAE -> slow
+        self.patch_rel32_to_here(ok0);
+        self.patch_rel32_to_here(ok1);
+    }
+
+    /// `LOCK INC qword [counter]` when the reference-store path trace is on,
+    /// and nothing at all otherwise.
+    ///
+    /// Uses R11, which is free at both call sites, and clobbers flags — which
+    /// is why it is only ever emitted where the next instruction does not read
+    /// them (immediately before the value load on the inline path, and before
+    /// the argument marshal on the helper path).
+    fn emit_ref_store_path_trace(&mut self, counter: &'static std::sync::atomic::AtomicU64) {
+        if !crate::x64::ir_ref_store_trace_enabled() {
+            return;
+        }
+        self.emit_mov_reg_imm64(R11, counter as *const _ as u64);
+        self.buf.emit(&[0xF0, 0x49, 0xFF, 0x03]); // LOCK INC qword [R11]
+    }
+
+    /// COV-03 — the optimizing tier's **gated** compact reference `putfield`.
+    ///
+    /// The caller has already loaded the receiver into RAX and emitted the
+    /// inline null check that DEOPTS, so this sequence starts from a non-null
+    /// receiver and never has to reproduce the NullPointerException semantics.
+    /// Returns `false` without emitting anything when the site is not admitted,
+    /// leaving the caller's unconditional `jit_putfield_object` call in place.
+    ///
+    /// # Why this exists
+    ///
+    /// The single-pass backend got a gated reference store on 2026-09-02 and
+    /// this tier did not, so the barrier plan the generational collector
+    /// publishes was inert exactly where hot loops are compiled. A probe of
+    /// nothing but reference stores in a counted loop reported `gated=0
+    /// declined=0` on that tier's counter while the method's own admission line
+    /// said `admitted to the optimizing pipeline`: not refused — never asked.
+    ///
+    /// # What makes this sound
+    ///
+    /// The gates are `x64::objects::emit_gated_compact_ref_putfield`'s, read
+    /// through the same predicate, and each names a PREFIX of the barrier
+    /// helper's own control flow — a skipped call is a call that would have
+    /// returned having done nothing. The one structural difference is where the
+    /// store sits relative to the post-barrier decision:
+    ///
+    /// * the single-pass arm stores INLINE, then decides, and on "barrier
+    ///   needed" calls the collector's own `write_barrier`;
+    /// * this arm decides FIRST, and on "barrier needed" takes the full
+    ///   `jit_putfield_object`, which performs the store itself.
+    ///
+    /// That is not a shortcut, it is the absence of one: this tier has no heap
+    /// pointer in its frame (`write_barrier`'s first argument), and inventing a
+    /// second route to a collector's remembered set is the mistake
+    /// `inline_card_mark_available` was hard-`false`d to stop. Deciding first
+    /// costs one forward branch on the barriered path and keeps ONE piece of
+    /// code — the helper — responsible for every store that needs a barrier.
+    ///
+    /// Declining is always safe, and is the only thing a missing plan, an
+    /// unresolved compact slot or a disagreeing descriptor can produce.
+    fn emit_gated_ir_ref_putfield(
+        &mut self,
+        node_pc: Option<usize>,
+        base: NodeId,
+        value: NodeId,
+        field_index: i64,
+    ) -> bool {
+        // Both switches, because both mean "do not store a reference field
+        // inline". `CRATONVM_NO_JIT_INLINE_PUTFIELD` is the older, broader one
+        // and the single-pass gated arm honours it; an emitter that ignored it
+        // would leave someone who set it to chase a lost store still getting
+        // inline stores, from the tier they were least likely to look at.
+        if !crate::x64::ir_gated_ref_store_enabled() || !crate::x64::inline_putfield_enabled() {
+            crate::metrics::note_ir_ref_store_decline(0);
+            return false;
+        }
+        let Some(pc) = node_pc else {
+            crate::metrics::note_ir_ref_store_decline(1);
+            return false;
+        };
+        // The resolved compact offset for THIS site. Without it there is no
+        // inline address to store to — `HEADER_SIZE + field_index * SLOT_SIZE`
+        // is the legacy cell displacement and a compact object does not obey
+        // it. This is the plumbing COV-03 named as the blocker.
+        // Keyed by `(pc, is_reference)` since 2026-09-02 — the IR String-access
+        // expansion emits two accesses at one pc, one Int and one Ref, so a
+        // pc-only key could name at most one of them. A reference STORE is
+        // always the `true` half.
+        let Some(&(c_off, c_is_ref, type_tag)) = self.compact_fields.get(&(pc, true)) else {
+            crate::metrics::note_ir_ref_store_decline(2);
+            return false;
+        };
+        // Narrow oops would make the stored word an encoded 32-bit reference
+        // rather than the bare pointer this emits; legacy layout would make
+        // `c_off` the wrong displacement even when one is resolved.
+        if crate::x64::narrow_oops_block_inline_fields()
+            || !cratonvm_types::compact_ref_fields_enabled()
+        {
+            crate::metrics::note_ir_ref_store_decline(3);
+            return false;
+        }
+        // No published plan ⇒ no way to rule either barrier out — and the
+        // collectors that publish none (G1, ZGC) are exactly the ones whose
+        // empty region table is load-bearing. This is where they decline.
+        let Some((pre, post, floor)) = self.ref_store_gates else {
+            crate::metrics::note_ir_ref_store_decline(4);
+            return false;
+        };
+        // Descriptor agreement — the same defence the inline `getfield` arm
+        // applies and for the same reason: a resolver that fabricated a compact
+        // slot (the WildFly Host Controller SIGSEGV) must not steer a store,
+        // where it would write a full pointer over a primitive cell.
+        if !c_is_ref || !matches!(type_tag, b'L' | b'[') {
+            crate::metrics::note_ir_ref_store_decline(5);
+            return false;
+        }
+        // Receiver validity. A base node typed `IrType::Ref` is the IR's own
+        // proof that this is an oop — at least as strong as the single-pass
+        // `stack_oop_marks` argument its trusted-oop arm rests on — and the
+        // caller's null check has already run. Anything else needs the
+        // published READ bounds; without them there is no proof to be had, and
+        // the site declines rather than dereference an unvalidated address.
+        let trusted_oop_receiver = crate::x64::trusted_oop_receiver_getfield_enabled()
+            && self.graph.nodes[base as usize].ty == IrType::Ref;
+        if !trusted_oop_receiver && self.read_bounds_addr == 0 {
+            crate::metrics::note_ir_ref_store_decline(6);
+            return false;
+        }
+
+        // RAX holds the non-null receiver on entry. The bail sets are kept
+        // APART rather than in one vector so the run-time trace can say which
+        // gate refused — see `IR_REF_STORE_BAIL`. Without the trace they are
+        // concatenated and every one of them lands on the same helper label,
+        // which is what they did before this split and what they cost.
+        let mut bail_recv: Vec<usize> = Vec::new();
+        let mut bail_pre: Vec<usize> = Vec::new();
+        let mut bail_barrier: Vec<usize> = Vec::new();
+        if !trusted_oop_receiver {
+            self.emit_receiver_align_and_containment(&mut bail_recv);
+        }
+
+        // -- SATB pre-barrier gate --------------------------------------
+        // Marking armed ⇒ the overwritten reference has to reach the snapshot,
+        // which is the helper's job. Armed only during a concurrent mark phase.
+        self.emit_mov_reg_imm64(R11, pre as u64);
+        self.buf.emit(&[0x41, 0x80, 0x3B, 0x00]); // CMP byte [R11], 0
+        bail_pre.push(self.emit_jcc_rel32(0x85)); // JNE -> helper
+
+        // -- the receiver flags byte, read ONCE --------------------------
+        // `GC_FLAGS_BYTE_OFFSET` carries the GC flags in bits 0..3 and `gc_age`
+        // in bits 4..7, so this single byte answers both the young-receiver
+        // question the post gate asks and the per-object layout question the
+        // store shape below asks.
+        self.buf.emit(&[0x0F, 0xB6, 0x88]); // MOVZX ECX, byte [RAX + disp32]
+        self.buf
+            .emit(&(cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32).to_le_bytes());
+
+        // -- slot bounds ------------------------------------------------
+        // `field_index < num_slots`, which for a compact object is the FIELD
+        // COUNT (see `heap.rs` on the two meanings that word carries). A
+        // failure DROPS the store, matching `jit_putfield_object`'s own
+        // out-of-bounds behaviour, so it targets its own label rather than the
+        // helper.
+        self.buf.emit(&[0x44, 0x8B, 0x98]); // MOV R11D, dword [RAX + disp32]
+        self.buf
+            .emit(&(cratonvm_types::NUM_SLOTS_OFFSET as i32).to_le_bytes());
+        self.emit_mov_reg_imm64(R10, field_index as u64);
+        self.buf.emit(&[0x45, 0x3B, 0xD3]); // CMP R10D, R11D
+        let oob = self.emit_jcc_rel32(0x83); // JAE -> drop
+
+        // -- post-barrier gates ------------------------------------------
+        // CL still holds the receiver's flags byte. Two shapes can rule the
+        // post barrier out, and a publisher supplies exactly one of them
+        // (`ref_store_gates_of` enforces that).
+        let mut inline_store: Vec<usize> = Vec::new();
+        if let Some(mask) = self.ref_store_post_skip_mask {
+            // MASK — "the receiver carries none of the bits that could make a
+            // post barrier necessary". The generational shape: `GC_FLAG_OLD_GEN`
+            // clear means young, and a young receiver needs no card. Baked as an
+            // immediate, because which collector is running cannot change after
+            // start-up.
+            self.buf.emit(&[0xF6, 0xC1, mask]); // TEST CL, mask
+            inline_store.push(self.emit_jcc_rel32(0x84)); // JZ -> young receiver
+        } else {
+            // FLOOR — `age << 4 | flags` compared unsigned against
+            // `promotion_floor << 4` is an EXACT test of `gc_age <
+            // promotion_floor`, because the flags nibble is at most 15 and
+            // cannot carry `a << 4` up to `(a + 1) << 4`.
+            self.emit_mov_reg_imm64(R11, floor as u64);
+            self.buf.emit(&[0x41, 0x3A, 0x0B]); // CMP CL, byte [R11]
+            inline_store.push(self.emit_jcc_rel32(0x82)); // JB -> young receiver
+        }
+        self.emit_mov_reg_imm64(R11, post as u64);
+        self.buf.emit(&[0x41, 0x80, 0x3B, 0x00]); // CMP byte [R11], 0
+        inline_store.push(self.emit_jcc_rel32(0x84)); // JZ -> no old objects
+                                                      // Neither gate ruled the barrier out: the helper does the store.
+        bail_barrier.push(self.emit_jmp_rel32());
+
+        // -- the barrier-free store, in whichever shape this OBJECT has --
+        //
+        // Both layouts store inline. A compact-only arm would be an arm that
+        // almost never fires: `init_object_header`, the TLAB fast path that
+        // serves nearly every allocation for the interpreter and
+        // `jit_new_object` alike, writes a LEGACY header unconditionally --
+        // `array_length = 0`, no `GC_FLAG_COMPACT` -- regardless of whether the
+        // class has a registered compact layout, because it never consults
+        // `plan_object_alloc`. The run-time census says so exactly: with only
+        // the compact shape emitted, `RefStoreLoopProbe` took this arm 0 times
+        // out of 16,384,000 and bailed at the compactness test every time, on
+        // Generational and ZGC alike. It is the same trap the inline `getfield`
+        // read fell into and climbed out of on 2026-08-18, and the fix is the
+        // same: emit both shapes and pick per OBJECT, exactly as that arm and
+        // `jit_putfield_object` itself do.
+        for patch in inline_store {
+            self.patch_rel32_to_here(patch);
+        }
+        self.emit_ref_store_path_trace(&crate::metrics::IR_REF_STORE_INLINE_TAKEN);
+        self.gp_load_value(RDX, value);
+        self.buf.emit(&[0xF6, 0xC1, cratonvm_types::GC_FLAG_COMPACT]); // TEST CL, imm8
+        let legacy_shape = self.emit_jcc_rel32(0x84); // JZ -> the 16-byte cell
+        // COMPACT: a reference field is the bare 8-byte pointer at the cell
+        // base, which is exactly what the inline `getfield` arm reads back.
+        //
+        // Cast: a compact field offset plus the header is bounded by the
+        // object size.
+        let cell_off = (HEADER_SIZE + c_off as usize) as i32;
+        self.buf.emit(&[0x48, 0x89, 0x90]); // MOV [RAX + disp32], RDX
+        self.buf.emit(&cell_off.to_le_bytes());
+        let stored = self.emit_jmp_rel32();
+
+        // LEGACY: the uniform 16-byte `Value` cell -- tag dword (with its pad)
+        // then the pointer payload. Transcribed from the single-pass backend's
+        // own legacy inline reference store, so the two cannot disagree about
+        // which half of the cell holds what; the bounds check above is what
+        // makes `field_index * SLOT_SIZE` addressable, since for a legacy
+        // object `num_slots` counts exactly these cells.
+        self.patch_rel32_to_here(legacy_shape);
+        let legacy_off = (HEADER_SIZE + field_index as usize * SLOT_SIZE) as i32;
+        self.emit_mov_reg_imm64(R10, u64::from(cratonvm_types::FIELD_CELL_TAG_OBJECT));
+        self.buf.emit(&[0x4C, 0x89, 0x90]); // MOV [RAX + disp32], R10
+        self.buf
+            .emit(&(legacy_off + cratonvm_types::FIELD_CELL_TAG_OFFSET as i32).to_le_bytes());
+        self.buf.emit(&[0x48, 0x89, 0x90]); // MOV [RAX + disp32], RDX
+        self.buf
+            .emit(&(legacy_off + FIELD_CELL_PAYLOAD64_OFFSET as i32).to_le_bytes());
+        let stored_legacy = self.emit_jmp_rel32();
+
+        // -- helper fallback: the full SATB + store + post barrier --------
+        //
+        // With the trace on, each bail set gets a one-instruction stub that
+        // names it before joining the helper; without it they all land here
+        // directly and cost nothing.
+        let bail_groups = [(bail_recv, 0usize), (bail_pre, 1), (bail_barrier, 3)];
+        let mut to_helper: Vec<usize> = Vec::new();
+        if crate::x64::ir_ref_store_trace_enabled() {
+            for (patches, reason) in bail_groups {
+                if patches.is_empty() {
+                    continue;
+                }
+                for patch in patches {
+                    self.patch_rel32_to_here(patch);
+                }
+                self.emit_ref_store_path_trace(&crate::metrics::IR_REF_STORE_BAIL[reason]);
+                to_helper.push(self.emit_jmp_rel32());
+            }
+        } else {
+            for (patches, _) in bail_groups {
+                to_helper.extend(patches);
+            }
+        }
+        for patch in to_helper {
+            self.patch_rel32_to_here(patch);
+        }
+        self.emit_ref_store_path_trace(&crate::metrics::IR_REF_STORE_HELPER_TAKEN);
+        self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
+        self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
+        self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as i64 as u64);
+        self.load_reg_from_frame(CALL_ARG_REGS[3], self.slot_of(value));
+        self.emit_mov_reg_imm64(RAX, self.putfield_object as u64);
+        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+
+        self.patch_rel32_to_here(oob);
+        self.patch_rel32_to_here(stored);
+        self.patch_rel32_to_here(stored_legacy);
+        crate::metrics::note_ir_ref_store_gated();
+        true
+    }
+
     /// Guarded inline read of a compact instance field, with the checked
     /// `jit_getfield` helper as the slow path. Returns `false` when the site is
     /// not eligible, leaving the caller's helper-only lowering in place.
@@ -2847,33 +3229,21 @@ impl<'a> Lowerer<'a> {
         let mut slow: Vec<usize> = Vec::new();
 
         self.gp_load_value(RAX, base);
-        // 1. null → slow (the helper raises the NPE).
-        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
-        slow.push(self.emit_jcc_rel32(0x84)); // JZ
-        if guarded && !raw_mode && !trusted_oop_receiver {
-            // 2. alignment: the low three bits must be clear.
-            self.buf.emit(&[0x48, 0x89, 0xC1]); // MOV RCX, RAX
-            self.buf.emit(&[0x48, 0x83, 0xE1, 0x07]); // AND RCX, 7
-            slow.push(self.emit_jcc_rel32(0x85)); // JNZ
-                                                  // 3. containment in one of the three published regions.
-                                                  //    RDX = &JIT_READ_BOUNDS = [b0, e0, b1, e1, b2, e2].
-            self.emit_mov_reg_imm64(RDX, self.read_bounds_addr as u64);
-            self.emit_cmp_rax_mem_rdx(0);
-            let below_b0 = self.emit_jcc_rel32(0x82); // JB → try region 1
-            self.emit_cmp_rax_mem_rdx(8);
-            let ok0 = self.emit_jcc_rel32(0x82); // JB → inside region 0
-            self.patch_rel32_to_here(below_b0);
-            self.emit_cmp_rax_mem_rdx(16);
-            let below_b1 = self.emit_jcc_rel32(0x82); // JB → try region 2
-            self.emit_cmp_rax_mem_rdx(24);
-            let ok1 = self.emit_jcc_rel32(0x82); // JB → inside region 1
-            self.patch_rel32_to_here(below_b1);
-            self.emit_cmp_rax_mem_rdx(32);
-            slow.push(self.emit_jcc_rel32(0x82)); // JB → slow
-            self.emit_cmp_rax_mem_rdx(40);
-            slow.push(self.emit_jcc_rel32(0x83)); // JAE → slow
-            self.patch_rel32_to_here(ok0);
-            self.patch_rel32_to_here(ok1);
+        // 2026-09-02: a receiver this block already proved (null-tested and,
+        // where the guard applies, mapped) is not re-proved. Same SSA value,
+        // same block, and no way for it to become null or unmapped in between:
+        // a relocating collector rewrites the home word to the object's new
+        // address, which is still mapped. `itemCheck` proved `n` once per
+        // field it read (`ir_receiver_guard_cse_enabled`).
+        let receiver_proven = self.receiver_already_guarded(base);
+        if !receiver_proven {
+            // 1. null → slow (the helper raises the NPE).
+            self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+            slow.push(self.emit_jcc_rel32(0x84)); // JZ
+        }
+        if guarded && !raw_mode && !trusted_oop_receiver && !receiver_proven {
+            self.note_receiver_guarded(base);
+            self.emit_receiver_align_and_containment(&mut slow);
         }
         // 4. per-OBJECT compactness. A class with a registered compact layout
         //    can still have legacy 16-byte-cell instances — and in practice
@@ -3033,7 +3403,7 @@ impl<'a> Lowerer<'a> {
         let arg2 =
             cratonvm_jit_api::getfield_index_arg(field_index as u32, ref_node, base_is_proven_oop);
         self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
-        self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
+        self.gp_load_value(CALL_ARG_REGS[1], base);
         self.emit_mov_reg_imm64(CALL_ARG_REGS[2], arg2);
         self.emit_mov_reg_imm64(RAX, self.getfield as u64);
         self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
@@ -3443,6 +3813,25 @@ impl<'a> Lowerer<'a> {
         self.buf.emit(bytes.as_slice());
     }
 
+    /// `MOV qword [RBP - offset], imm32` (sign-extended), or `false` when the
+    /// value needs all 64 bits and the caller must go through a register.
+    ///
+    /// A constant's home word is still written — a deopt frame may name it,
+    /// and a handful of sites read home slots directly — but since every
+    /// READER materialises a constant as an immediate
+    /// (`ir_const_imm_enabled`), nothing needs it in RAX on the way there.
+    /// One instruction instead of two, at every `Op::Const` in every method.
+    fn emit_store_frame_imm32(&mut self, offset: i32, val: i64) -> bool {
+        let Ok(imm) = i32::try_from(val) else {
+            return false;
+        };
+        self.buf.emit_byte(0x48); // REX.W
+        self.buf.emit_byte(0xC7); // MOV r/m64, imm32 (/0)
+        self.emit_rbp_modrm_disp(0, offset);
+        self.buf.emit(&imm.to_le_bytes());
+        true
+    }
+
     /// MOV RAX, imm64
     fn emit_mov_rax_imm64(&mut self, val: i64) {
         if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
@@ -3639,6 +4028,9 @@ impl<'a> Lowerer<'a> {
 
     fn lower_block(&mut self, block_idx: usize) {
         self.block_offsets[block_idx] = self.buf.pos();
+        // A receiver proof is block-local: control can enter this block from a
+        // predecessor that never proved it.
+        self.guarded_receivers.clear();
 
         let block = &self.schedule.blocks[block_idx];
 
@@ -3748,7 +4140,7 @@ impl<'a> Lowerer<'a> {
         self.load_reg_from_frame(abi[0], self.context_slot_off); // vm_ptr
         for i in 0..num_args {
             let arg = inputs[2 + i];
-            self.load_reg_from_frame(abi[1 + i], self.slot_of(arg)); // Java arg i
+            self.gp_load_value(abi[1 + i], arg); // Java arg i
         }
         // Direct CALL rel32 to entry (code offset 0), patched at finalize.
         self.buf.emit(&[0xE8]);
@@ -3948,8 +4340,22 @@ impl<'a> Lowerer<'a> {
         if total_sub > 0 {
             self.emit_add_rsp_imm32(total_sub);
         }
-        self.emit_inline_callee_deopt_service(info_ptr, num_args, inputs);
-        self.emit_call_return_check(slot, ty);
+        if crate::x64::merged_call_sentinel_enabled() {
+            // 2026-09-02: one sentinel compare on the hot path. The frame
+            // republish and shadow reload come FIRST so the cold side (which
+            // can run the interpreter and collect) sees this frame's own
+            // identity rather than the callee's dead one.
+            self.emit_post_call_frame_record();
+            self.emit_shadow_reload();
+            let keep = self.emit_call_sentinel_fast_skip();
+            self.emit_inline_callee_deopt_service(info_ptr, num_args, inputs);
+            self.emit_call_return_sentinel_tail(ty);
+            self.patch_rel32_to_here(keep);
+            self.store_rax(slot);
+        } else {
+            self.emit_inline_callee_deopt_service(info_ptr, num_args, inputs);
+            self.emit_call_return_check(slot, ty);
+        }
     }
 
     /// `SUB RSP, imm32` — reserve a call's outgoing stack-argument block.
@@ -4544,6 +4950,16 @@ impl<'a> Lowerer<'a> {
         // resolve this frame's maps against a dead frame's base.
         self.emit_post_call_frame_record();
         self.emit_shadow_reload();
+        self.emit_call_return_sentinel_tail(ty);
+        self.store_rax(slot);
+    }
+
+    /// The `i64::MIN` sentinel half of [`Self::emit_call_return_check`],
+    /// without the frame republish, the shadow reload or the result store:
+    /// what a call site emits on the COLD side of
+    /// [`Self::emit_call_sentinel_fast_skip`], where the common non-sentinel
+    /// return has already branched past it.
+    fn emit_call_return_sentinel_tail(&mut self, ty: IrType) {
         self.emit_mov_reg_imm64(R10, i64::MIN as u64);
         self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
         if matches!(ty, IrType::Long | IrType::Double | IrType::Float) {
@@ -4579,7 +4995,18 @@ impl<'a> Lowerer<'a> {
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
             self.push_call_exc_patch(patch);
         }
-        self.store_rax(slot);
+    }
+
+    /// The hot half of a merged post-call sentinel check: `RAX != i64::MIN`
+    /// branches past BOTH the callee-deopt service and the exception tail in
+    /// one compare, where the two used to each materialise the 10-byte
+    /// immediate and compare again. Returns the rel32 patch the caller lands
+    /// on `.keep`. The cold side keeps its own compares -- they run only when
+    /// the callee actually returned the sentinel.
+    fn emit_call_sentinel_fast_skip(&mut self) -> usize {
+        self.emit_mov_reg_imm64(R10, i64::MIN as u64);
+        self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
+        self.emit_jcc_rel32(0x85) // JNE .keep
     }
 
     /// COV-03 — the `i64::MIN` sentinel check for a *helper* that returns a
@@ -4933,6 +5360,189 @@ impl<'a> Lowerer<'a> {
         Some(out)
     }
 
+    /// The `(phi, dst_slot, src_slot)` copies the edge `pred_block ->
+    /// succ_block` carries: one per value phi of the successor's merge whose
+    /// input for this edge is a real node. Pure; `emit_phi_copies` emits
+    /// exactly these and `edge_has_phi_copies` asks whether there are any.
+    fn gather_phi_copies(&self, pred_block: usize, succ_block: usize) -> Vec<(NodeId, i32, i32)> {
+        let merge_ctrl = self.schedule.blocks[succ_block].ctrl;
+        if !matches!(
+            self.graph.nodes[merge_ctrl as usize].op,
+            Op::Merge | Op::Region
+        ) {
+            return Vec::new();
+        }
+        let mut out: Vec<(NodeId, i32, i32)> = Vec::new();
+        for id in 0..self.graph.nodes.len() {
+            let node = &self.graph.nodes[id];
+            if !matches!(node.op, Op::Phi) {
+                continue;
+            }
+            // Only value phis materialise a frame slot; memory/control phis
+            // are bookkeeping tokens with no machine value to copy.
+            if matches!(node.ty, IrType::Memory | IrType::Control | IrType::Void) {
+                continue;
+            }
+            // phi.inputs = [merge, val_0, val_1, …]
+            if node.inputs.first().copied() != Some(merge_ctrl) {
+                continue;
+            }
+            // merge.inputs[k] is the control token for phi value k (= input k+1).
+            let merge_node = &self.graph.nodes[merge_ctrl as usize];
+            for (k, &ctrl_in) in merge_node.inputs.iter().enumerate() {
+                if self.block_of_ctrl(ctrl_in) != Some(pred_block) {
+                    continue;
+                }
+                if let Some(&val_id) = node.inputs.get(k + 1) {
+                    if val_id != NO_NODE {
+                        out.push((id as NodeId, self.slot_of(id as NodeId), self.slot_of(val_id)));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether the edge `pred_block -> succ_block` carries any phi copy.
+    fn edge_has_phi_copies(&self, pred_block: usize, succ_block: usize) -> bool {
+        !self.gather_phi_copies(pred_block, succ_block).is_empty()
+    }
+
+    /// Fill `use_count`, `deopt_named` and `fused_cmp` before the first block
+    /// lowers. A compare is fused into its `If` when that `If` is its ONLY
+    /// use, no safepoint snapshot names it, and the switch is on.
+    fn prepare_fusion_tables(&mut self) {
+        let n = self.graph.nodes.len();
+        let mut use_count = vec![0u32; n];
+        for node in &self.graph.nodes {
+            for &input in &node.inputs {
+                if input != NO_NODE {
+                    if let Some(c) = use_count.get_mut(input as usize) {
+                        *c = c.saturating_add(1);
+                    }
+                }
+            }
+        }
+        let mut deopt_named = vec![false; n];
+        for sp in &self.graph.safepoints {
+            for &v in sp.locals.iter().chain(sp.stack.iter()) {
+                if v != NO_NODE {
+                    if let Some(cell) = deopt_named.get_mut(v as usize) {
+                        *cell = true;
+                    }
+                }
+            }
+        }
+        let mut fused_cmp = vec![false; n];
+        if ir_fused_branch_enabled() {
+            // Fusing moves the reads of the compare's inputs from the
+            // compare's own position to the terminator's, so it is legal
+            // exactly while nothing scheduled in between can overwrite where
+            // those inputs live. Two things can:
+            //
+            // * a value sharing an input's HOME COLOUR — `plan_slots` packs
+            //   values into shared frame words by live range, and the
+            //   allocator's model ends an input's range at the compare;
+            // * a value promoted into an input's REGISTER, for the same
+            //   reason. `test_lower_ternary_lt_phi` caught exactly that: `a`
+            //   and the constant `1` were handed the same RBX.
+            //
+            // Both are checked against the plans this lowering was handed,
+            // rather than approximated by requiring the compare to be the last
+            // scheduled node — which is what the first cut did, and it
+            // declined `fib`, whose two subtractions sit between its compare
+            // and its branch.
+            let color_of = |plan: &SlotPlan, id: NodeId| -> Option<u32> {
+                plan.node_color.get(id as usize).copied().flatten()
+            };
+            for block in &self.schedule.blocks {
+                let Some(term) = block.terminator else {
+                    continue;
+                };
+                let Some(if_node) = self.graph.nodes.get(term as usize) else {
+                    continue;
+                };
+                if !matches!(if_node.op, Op::If) {
+                    continue;
+                }
+                let Some(&cond) = if_node.inputs.get(1) else {
+                    continue;
+                };
+                if cond == NO_NODE {
+                    continue;
+                }
+                let Some(pos) = block.nodes.iter().position(|&id| id == cond) else {
+                    continue;
+                };
+                let Some(cmp) = self.graph.nodes.get(cond as usize) else {
+                    continue;
+                };
+                if !matches!(cmp.op, Op::Cmp(_)) || cmp.inputs.len() < 2 {
+                    continue;
+                }
+                if use_count[cond as usize] != 1 || deopt_named[cond as usize] {
+                    continue;
+                }
+                let (a, b) = (cmp.inputs[0], cmp.inputs[1]);
+                let in_colors = [color_of(&self.slot_plan, a), color_of(&self.slot_plan, b)];
+                // Through the sanctioned accessors, never `reg_of` directly:
+                // `the_register_read_path_is_gated_on_publication` is what
+                // keeps "assigned" and "published" from drifting apart.
+                let in_gp = [self.assigned_gpr(a), self.assigned_gpr(b)];
+                let in_fp = [self.assigned_xmm(a), self.assigned_xmm(b)];
+                let clobbered = block.nodes[pos + 1..].iter().any(|&later| {
+                    let c = color_of(&self.slot_plan, later);
+                    let g = self.assigned_gpr(later);
+                    let f = self.assigned_xmm(later);
+                    (c.is_some() && in_colors.contains(&c))
+                        || (g.is_some() && in_gp.contains(&g))
+                        || (f.is_some() && in_fp.contains(&f))
+                });
+                if clobbered {
+                    continue;
+                }
+                fused_cmp[cond as usize] = true;
+            }
+        }
+        self.use_count = use_count;
+        self.deopt_named = deopt_named;
+        self.fused_cmp = fused_cmp;
+    }
+
+    /// `MOV reg, imm` in the shortest encoding that reproduces `val` in all 64
+    /// bits: `mov r32, imm32` (zero-extends) for 0..=u32::MAX, `mov r64,
+    /// simm32` for the rest of the i32 range, `mov r64, imm64` otherwise.
+    fn emit_mov_reg_imm_smart(&mut self, reg: u8, val: i64) {
+        if (0..=i64::from(u32::MAX)).contains(&val) {
+            if reg >= 8 {
+                self.buf.emit_byte(0x41); // REX.B
+            }
+            self.buf.emit_byte(0xB8 + (reg & 7));
+            self.buf.emit(&(val as u32).to_le_bytes());
+        } else if i32::try_from(val).is_ok() {
+            let rex = 0x48 | if reg >= 8 { 0x01 } else { 0 };
+            self.buf.emit_byte(rex);
+            self.buf.emit_byte(0xC7); // MOV r/m64, simm32
+            self.buf.emit_byte(0xC0 | (reg & 7));
+            self.buf.emit(&(val as i32).to_le_bytes());
+        } else {
+            self.emit_mov_reg_imm64(reg, val as u64);
+        }
+    }
+
+    /// Whether `base` was already null-tested and mapped-proved in the block
+    /// being lowered (`ir_receiver_guard_cse_enabled`).
+    fn receiver_already_guarded(&self, base: NodeId) -> bool {
+        ir_receiver_guard_cse_enabled() && self.guarded_receivers.contains(&base)
+    }
+
+    /// Record that the block being lowered has just proved `base`.
+    fn note_receiver_guarded(&mut self, base: NodeId) {
+        if ir_receiver_guard_cse_enabled() && !self.guarded_receivers.contains(&base) {
+            self.guarded_receivers.push(base);
+        }
+    }
+
     fn lower_data_node(&mut self, id: NodeId) {
         // real-frame-deopt: anchor the node's bytecode pc to the earliest
         // native offset emitted for it, so safepoint snapshots can be keyed
@@ -4954,9 +5564,12 @@ impl<'a> Lowerer<'a> {
         let node = &self.graph.nodes[id as usize];
         match &node.op {
             Op::Const(val) => {
+                let val = *val;
                 let slot = self.alloc_slot(id);
-                self.emit_mov_rax_imm64(*val);
-                self.store_rax(slot);
+                if !ir_const_imm_enabled() || !self.emit_store_frame_imm32(slot, val) {
+                    self.emit_mov_rax_imm64(val);
+                    self.store_rax(slot);
+                }
             }
             Op::Param(idx) => {
                 let slot = self.alloc_slot(id);
@@ -5456,6 +6069,11 @@ impl<'a> Lowerer<'a> {
                 self.store_rax(slot);
             }
             Op::Cmp(cc) => {
+                // Fused into its consuming `Op::If` (see `lower_terminator`):
+                // nothing to materialise here.
+                if self.fused_cmp.get(id as usize).copied().unwrap_or(false) {
+                    return;
+                }
                 let slot = self.alloc_slot(id);
                 self.gp_load_value(RAX, node.inputs[0]);
                 self.gp_load_value(RCX, node.inputs[1]);
@@ -5684,7 +6302,7 @@ impl<'a> Lowerer<'a> {
                 if self.getfield != 0 {
                     crate::metrics::note_getfield_arm(5);
                     self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
-                    self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
+                    self.gp_load_value(CALL_ARG_REGS[1], base);
                     // Reference loads must carry `GETFIELD_EXPECT_REFERENCE` at
                     // EVERY arm, not just the one that crashed — this is the
                     // inline-compact fallback arm. No receiver proof is claimed
@@ -5792,13 +6410,27 @@ impl<'a> Lowerer<'a> {
                     self.gp_load_value(RAX, base);
                     self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
                     self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
+                    // GATED reference store — tried first, and complete when it
+                    // takes: the barrier-free store, both gate sequences, the
+                    // helper fallback and the out-of-bounds drop all converge
+                    // at its end. `false` means "not admitted", and the
+                    // unconditional helper call below then runs exactly as it
+                    // did before. See `emit_gated_ir_ref_putfield`.
+                    if self.emit_gated_ir_ref_putfield(
+                        node.bytecode_pc,
+                        base,
+                        value,
+                        field_index,
+                    ) {
+                        return;
+                    }
                     // jit_putfield_object(vm_ptr, obj_ptr, field_index, val).
                     // Unlike every other putfield helper it takes the context
                     // pointer; `scan_frame_needs` reserves the slot for it.
                     self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
-                    self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
+                    self.gp_load_value(CALL_ARG_REGS[1], base);
                     self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as i64 as u64);
-                    self.load_reg_from_frame(CALL_ARG_REGS[3], self.slot_of(value));
+                    self.gp_load_value(CALL_ARG_REGS[3], value);
                     self.emit_mov_reg_imm64(RAX, self.putfield_object as u64);
                     self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
                     return;
@@ -5819,9 +6451,9 @@ impl<'a> Lowerer<'a> {
                     self.gp_load_value(RAX, base);
                     self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
                     self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
-                    self.load_reg_from_frame(CALL_ARG_REGS[0], self.slot_of(base));
+                    self.gp_load_value(CALL_ARG_REGS[0], base);
                     self.emit_mov_reg_imm64(CALL_ARG_REGS[1], field_index as i64 as u64);
-                    self.load_reg_from_frame(CALL_ARG_REGS[2], self.slot_of(value));
+                    self.gp_load_value(CALL_ARG_REGS[2], value);
                     self.emit_mov_reg_imm64(RAX, helper as u64);
                     self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
                     return;
@@ -5845,9 +6477,9 @@ impl<'a> Lowerer<'a> {
                     // Receiver first: `load_reg_from_frame` into arg0 would be
                     // clobbered by nothing here, but keep the order arg0..arg2
                     // so a future stack-arg spill sees a conventional sequence.
-                    self.load_reg_from_frame(CALL_ARG_REGS[0], self.slot_of(base));
+                    self.gp_load_value(CALL_ARG_REGS[0], base);
                     self.emit_mov_reg_imm64(CALL_ARG_REGS[1], field_index as i64 as u64);
-                    self.load_reg_from_frame(CALL_ARG_REGS[2], self.slot_of(value));
+                    self.gp_load_value(CALL_ARG_REGS[2], value);
                     self.emit_mov_reg_imm64(RAX, self.putfield_int as u64);
                     self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
                     return;
@@ -5947,7 +6579,7 @@ impl<'a> Lowerer<'a> {
                         ));
                         return;
                     }
-                    self.load_reg_from_frame(RDX, self.slot_of(node.inputs[4])); // value → RDX
+                    self.gp_load_value(RDX, node.inputs[4]); // value → RDX
                     self.gp_load_value(RAX, node.inputs[2]); // array → RAX
                     self.gp_load_value(RCX, node.inputs[3]); // index → RCX
                     self.emit_array_null_bounds_guards(bci);
@@ -6008,8 +6640,8 @@ impl<'a> Lowerer<'a> {
             Op::LambdaIntToDouble => {
                 let slot = self.alloc_slot(id);
                 self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
-                self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(node.inputs[2]));
-                self.load_reg_from_frame(CALL_ARG_REGS[2], self.slot_of(node.inputs[3]));
+                self.gp_load_value(CALL_ARG_REGS[1], node.inputs[2]);
+                self.gp_load_value(CALL_ARG_REGS[2], node.inputs[3]);
                 self.emit_mov_reg_imm64(RAX, self.lambda_int_to_double as u64);
                 self.buf.emit(&[0xFF, 0xD0]);
                 self.store_rax(slot);
@@ -6335,7 +6967,7 @@ impl<'a> Lowerer<'a> {
                 if let Some(tag) = prim_array_tag {
                     crate::CHECKCAST_INLINE_SITES_PRIM_ARRAY
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    self.load_reg_from_frame(RAX, self.slot_of(obj));
+                    self.gp_load_value(RAX, obj);
                     self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
                     let null_slow = self.emit_jcc_rel32(0x84); // JZ → helper
                                                                // CMP BYTE [RAX+KIND_TAGS_BYTE_OFFSET], tag (80 /7 ib).
@@ -6353,7 +6985,7 @@ impl<'a> Lowerer<'a> {
                 } else if let Some(cid) = target_class_id {
                     crate::CHECKCAST_INLINE_SITES_IR
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    self.load_reg_from_frame(RAX, self.slot_of(obj));
+                    self.gp_load_value(RAX, obj);
                     self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
                     let null_slow = self.emit_jcc_rel32(0x84); // JZ → helper
                                                                // ARRAY RECEIVERS MUST NOT REACH THE COMPARE — see the
@@ -6398,7 +7030,7 @@ impl<'a> Lowerer<'a> {
 
                 self.emit_safepoint_map(sp_live_hi);
                 self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off); // vm_ptr
-                self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(obj)); // obj_ptr
+                self.gp_load_value(CALL_ARG_REGS[1], obj); // obj_ptr
                 self.emit_mov_reg_imm64(CALL_ARG_REGS[2], name_ptr as u64); // name_ptr
                 self.emit_mov_reg_imm64(CALL_ARG_REGS[3], name_len as u64); // name_len
                 self.emit_mov_reg_imm64(RAX, self.checkcast as u64);
@@ -6431,7 +7063,7 @@ impl<'a> Lowerer<'a> {
                 self.emit_safepoint_map(sp_live_hi);
                 let slot = self.alloc_slot(id);
                 self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off); // vm_ptr
-                self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(obj)); // obj_ptr
+                self.gp_load_value(CALL_ARG_REGS[1], obj); // obj_ptr
                 self.emit_mov_reg_imm64(CALL_ARG_REGS[2], name_ptr as u64); // name_ptr
                 self.emit_mov_reg_imm64(CALL_ARG_REGS[3], name_len as u64); // name_len
                 self.emit_mov_reg_imm64(RAX, self.instanceof_check as u64);
@@ -6760,7 +7392,7 @@ impl<'a> Lowerer<'a> {
             // a no-op for this arm and keeps the stub's contract uniform.
             Op::Throw => {
                 let exc = node.inputs[2];
-                self.load_reg_from_frame(CALL_ARG_REGS[0], self.slot_of(exc));
+                self.gp_load_value(CALL_ARG_REGS[0], exc);
                 // `athrow` is refused inside a spliced body today; translating
                 // anyway keeps the rule "a bci handed to the interpreter goes
                 // through `resume_bci`" without an exception to remember.
@@ -6811,11 +7443,43 @@ impl<'a> Lowerer<'a> {
                 self.emit_epilogue();
             }
             Op::If => {
-                // Load condition into RAX
                 let cond_id = node.inputs[1];
-                self.gp_load_value(RAX, cond_id);
-                // TEST EAX, EAX  (does not disturb RAX; sets ZF)
-                self.buf.emit(&[0x85, 0xC0]);
+                // 2026-09-02: a compare whose only consumer is this `If` is
+                // lowered HERE as `cmp; jcc` instead of `setcc; movzx; store;
+                // reload; test; jcc`. `fused_cc` is the Jcc condition byte
+                // under which the branch is TAKEN (the `Op::Cmp` result is
+                // nonzero); `None` keeps the boolean-in-RAX shape.
+                let fused_cc: Option<u8> = match self.graph.nodes.get(cond_id as usize) {
+                    Some(cmp_node)
+                        if self.fused_cmp.get(cond_id as usize).copied().unwrap_or(false) =>
+                    {
+                        match cmp_node.op {
+                            Op::Cmp(cc) => {
+                                let a = cmp_node.inputs[0];
+                                let b = cmp_node.inputs[1];
+                                let ref_cmp =
+                                    matches!(self.graph.nodes[a as usize].ty, IrType::Ref)
+                                        || matches!(self.graph.nodes[b as usize].ty, IrType::Ref);
+                                self.gp_load_value(RAX, a);
+                                self.gp_load_value(RCX, b);
+                                if ref_cmp {
+                                    self.buf.emit(&[0x48, 0x39, 0xC8]); // CMP RAX, RCX
+                                } else {
+                                    self.buf.emit(&[0x39, 0xC8]); // CMP EAX, ECX
+                                }
+                                Some(cc.x64_cc())
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if fused_cc.is_none() {
+                    // Load condition into RAX
+                    self.gp_load_value(RAX, cond_id);
+                    // TEST EAX, EAX  (does not disturb RAX; sets ZF)
+                    self.buf.emit(&[0x85, 0xC0]);
+                }
 
                 // Snapshot successor block indices (immutable borrow ends
                 // here so `emit_phi_copies` can borrow `self` mutably).
@@ -6823,7 +7487,50 @@ impl<'a> Lowerer<'a> {
                 let succ1 = self.schedule.blocks[block_idx].successors.get(1).copied();
 
                 match (succ0, succ1) {
+                    (Some(true_block), Some(false_block))
+                        if ir_fused_branch_enabled()
+                            && !self.edge_has_phi_copies(block_idx, true_block)
+                            && !self.edge_has_phi_copies(block_idx, false_block) =>
+                    {
+                        // 2026-09-02: neither edge carries phi copies, so the
+                        // branch needs no trampolines at all -- one Jcc to
+                        // the far edge, and the near edge either falls
+                        // through into the next emitted block or takes one
+                        // JMP. Same polarity rule as the general layout below:
+                        // the taken (true) edge is the near one unless the
+                        // profile says this branch is usually not taken.
+                        let favor_false = node
+                            .bytecode_pc
+                            .and_then(|pc| self.branch_hints.get(&pc).copied())
+                            == Some(false);
+                        // Jcc byte under which control goes to the FAR edge.
+                        let (jcc_far, near_block, far_block) = match fused_cc {
+                            Some(cc) if favor_false => (cc, false_block, true_block),
+                            Some(cc) => (cc ^ 1, true_block, false_block),
+                            None if favor_false => (0x85u8, false_block, true_block), // JNE
+                            None => (0x84u8, true_block, false_block),               // JE
+                        };
+                        self.buf.emit(&[0x0F, jcc_far]);
+                        let far_patch = self.buf.pos();
+                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                        self.branch_patches.push((far_patch, far_block));
+                        if near_block != block_idx + 1 {
+                            self.buf.emit_byte(0xE9); // JMP near_block
+                            let near_patch = self.buf.pos();
+                            self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                            self.branch_patches.push((near_patch, near_block));
+                        }
+                    }
                     (Some(true_block), Some(false_block)) => {
+                        // A fused compare leaves the flags for `cc`; the
+                        // general layout below wants "ZF set ⇔ condition
+                        // false" (a TEST on the boolean). Rebuild that
+                        // contract from the flags with one SETcc + TEST so
+                        // the phi-copy trampolines stay exactly as they were.
+                        if let Some(cc) = fused_cc {
+                            self.buf.emit(&[0x0F, cc + 0x10, 0xC0]); // SETcc AL
+                            self.buf.emit(&[0x84, 0xC0]); // TEST AL, AL
+                        }
                         // BUG FIX [jit-irlower #2]: phi copies must execute on
                         // the edge actually taken, so the conditional branch
                         // splits the critical edges. Default layout:
@@ -10000,9 +10707,13 @@ fn linear_scan_enabled() -> bool {
             return forced;
         }
     }
-    matches!(
+    // 2026-09-02: DEFAULT ON. The enumeration disagreement that declined the
+    // file on every array-touching method was reconciled the same day, phis
+    // are admitted (`ir_phi_residency_enabled`), and the census below says
+    // where the file engages. `=0` is the kill switch.
+    !matches!(
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_LINEAR_SCAN").as_deref(),
-        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
     )
 }
 
@@ -10208,6 +10919,10 @@ fn plan_register_residency(
     // — which this file must not read, and does not: every home offset comes
     // from `plan_slots`, which keeps every pin, through `alloc_slot_checked`.
     let released = live.release_deopt_pins(graph);
+    // Phis too, when their edges publish them (see `emit_phi_copies`).
+    if ir_phi_residency_enabled() {
+        live.release_phi_pins(graph);
+    }
 
     // ── Agreement check: two liveness models, one program ────────────
     //
@@ -10329,10 +11044,54 @@ fn plan_register_residency(
     // and `skip_phi` in particular is the one that decides whether this file
     // can ever reach a LOOP COUNTER -- which is a phi, at every loop header.
     let (mut skip_split, mut skip_bank, mut skip_home, mut skip_phi) = (0usize, 0, 0, 0);
+    // 2026-09-02, measured: promotion is not free, and two populations pay for
+    // it without ever collecting.
+    //
+    // A register costs a PROLOGUE SAVE and a restore at every exit (the file is
+    // callee-saved by construction), plus one publish load at the definition.
+    // It repays that at each READ it turns into a register move. So a value
+    // read once breaks even at best, and on a small call-heavy method the
+    // saves dominate: `FibProbe.fib` promoted five registers, was measured
+    // 145-149 ms against 110-133 ms for the same binary with the file off, and
+    // the disassembly showed why -- four of the five registers were published
+    // and never read.
+    //
+    // A CONSTANT is worse than break-even: since `ir_const_imm_enabled` every
+    // reader materialises it as an immediate, so its register can never be
+    // read at all.
+    let mut use_count = vec![0u32; n];
+    for node in &graph.nodes {
+        for &input in &node.inputs {
+            if input != NO_NODE {
+                if let Some(c) = use_count.get_mut(input as usize) {
+                    *c = c.saturating_add(1);
+                }
+            }
+        }
+    }
+    let (mut skip_const, mut skip_single_use) = (0usize, 0usize);
     for id in 0..n {
         let Some(segs) = alloc.segments.get(id) else {
             continue;
         };
+        if ir_residency_pays_enabled() {
+            match graph.nodes.get(id).map(|node| &node.op) {
+                Some(Op::Const(_)) => {
+                    skip_const += 1;
+                    continue;
+                }
+                // A phi is exempt: its reads are inside the loop it carries a
+                // value around, which is the whole population this file exists
+                // for, and its "definition" is an edge copy that is already
+                // paying the store.
+                Some(Op::Phi) => {}
+                _ if use_count.get(id).copied().unwrap_or(0) < 2 => {
+                    skip_single_use += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
         // ONE segment, and it holds a register. Anything else — a split, a
         // spill, a reload, a home-slot stretch in the middle — is refused
         // rather than emitted: this wiring has no reload machinery, so a value
@@ -10401,7 +11160,12 @@ fn plan_register_residency(
             .nodes
             .get(id)
             .is_some_and(|node| matches!(node.op, Op::Phi));
-        if is_phi {
+        // 2026-09-02: with `ir_phi_residency_enabled`, `emit_phi_copies` IS
+        // the publishing site (every incoming edge reloads the register from
+        // the home word it just wrote), so a phi is admitted like any other
+        // value; the allocator's structural pin was released by
+        // `release_phi_pins` above on the same condition.
+        if is_phi && !ir_phi_residency_enabled() {
             skip_phi += 1;
             continue;
         }
@@ -10504,7 +11268,8 @@ fn plan_register_residency(
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
         eprintln!(
             "[ir-ls] skipped: split_or_spilled={skip_split} \
-             wrong_bank_or_type={skip_bank} no_home={skip_home} phi={skip_phi}"
+             wrong_bank_or_type={skip_bank} no_home={skip_home} phi={skip_phi} \
+             const={skip_const} single_use={skip_single_use}"
         );
     }
     if promoted == 0 {
@@ -11382,6 +12147,7 @@ pub(crate) fn lower_inner_with_scopes(
     lowerer.emit_safepoint_poll();
 
     // Emit blocks in order
+    lowerer.prepare_fusion_tables();
     for block_idx in 0..schedule.blocks.len() {
         lowerer.lower_block(block_idx);
     }
@@ -11826,6 +12592,57 @@ pub(crate) fn lower_inner_with_scopes(
 
 // ── Tests ────────────────────────────────────────────────────────────
 
+/// Loop-carried values (phis) may be register-resident -- **default ON**, opt
+/// out with `CRATONVM_JIT_IR_PHI_RESIDENCY=0`. `emit_phi_copies` publishes a
+/// promoted phi's register at every incoming edge; off, phis stay home-bound
+/// as they were before 2026-09-02 and the residency census reports them
+/// under `phi=`.
+fn ir_phi_residency_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PHI_RESIDENCY") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
+/// Promote only where a register can repay its prologue save -- **default
+/// ON**, opt out with `CRATONVM_JIT_IR_RESIDENCY_PAYS=0` to promote every
+/// candidate the allocator hands back, which is what this file did before
+/// 2026-09-02 and what made `FibProbe.fib` slower with the file on than off.
+fn ir_residency_pays_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_RESIDENCY_PAYS") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
+/// A constant is read as an immediate rather than from its home word --
+/// **default ON**, opt out with `CRATONVM_JIT_IR_CONST_IMM=0`.
+fn ir_const_imm_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CONST_IMM") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
+/// A compare whose only use is its `If` lowers as one `cmp; jcc`, and a
+/// branch with no phi copies on either edge emits no trampolines -- **default
+/// ON**, opt out with `CRATONVM_JIT_IR_FUSED_BRANCH=0`.
+fn ir_fused_branch_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_FUSED_BRANCH") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
+/// The null + mapped receiver guard is emitted once per receiver per block --
+/// **default ON**, opt out with `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE=0`.
+fn ir_receiver_guard_cse_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_RECEIVER_GUARD_CSE") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
 /// Inline TLAB bump for the optimizing tier's `Op::New` — **default ON**, opt
 /// out with `CRATONVM_JIT_IR_INLINE_TLAB=0`.
 ///
@@ -11842,10 +12659,35 @@ pub(crate) fn lower_inner_with_scopes(
 /// which now passes because the bump exists rather than because the gate is
 /// shut.
 fn ir_inline_tlab_enabled() -> bool {
-    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_INLINE_TLAB") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    }
+    // 2026-09-02, the eight-finding pass: BACK TO OPT-IN, with a repro.
+    //
+    // This bump had never executed. Its own gate was shut, and underneath that
+    // `VmHeap::refill_tlab` answered `None` on the default collector, so
+    // `thread.tlab` was always empty and the limit compare always failed.
+    // Giving ZGC mutators a chunk made it live for the first time, and
+    // `regression-suite` vector `RJitMapTierDiff` then SIGSEGVs 4 runs in 10,
+    // inside VM code, on a reference read back as a small integer (`0x2800`)
+    // — i.e. an object whose contents are not what its allocator promised.
+    //
+    // Three switches each take the crash rate to zero, and they are the three
+    // that gate this sequence executing at all: `CRATONVM_ZGC_MUTATOR_TLAB=0`
+    // (no chunk to bump), this flag (the stub instead), and
+    // `CRATONVM_JIT_C2_ALLOC_UPGRADE=0` (no allocating method reaches this
+    // tier). It is NOT the `Op::New` header writes, which were read out of a
+    // disassembly and match the single-pass sequence field for field, and it
+    // is NOT relocation (4/4 with `CRATONVM_ZGC_RELOCATE=0`). One real defect
+    // WAS found and fixed on the way (`IN_OWN_TLAB_RETIRE`, a double free of
+    // the reserved tail); it is not this one.
+    //
+    // So: the capability stays, behind its switch, with the repro written
+    // down — and `c2_alloc_upgrade_enabled` stays opt-in with it, because a
+    // promoted allocation lowering through `emit_new_object_stub` is a CALL
+    // where the single-pass body bumps inline, which is the downgrade that
+    // gate was shut for in the first place.
+    matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_INLINE_TLAB").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
 }
 
 #[cfg(test)]
@@ -12422,6 +13264,305 @@ mod tests {
         assert!(
             cm.needs_context(),
             "a reference putfield must make the artifact `needs_context`"
+        );
+    }
+
+    /// Lower `void set(Corpus o, X v) { o.f = v; }` with a resolved compact
+    /// slot for the store site, and return the emitted bytes.
+    ///
+    /// `plan` publishes the collector's reference-store barrier gates; without
+    /// it the helpers describe a collector that published none, which is the
+    /// control arm for every assertion below.
+    const COMPACT_REF_PUTFIELD_HELPER: usize = 0x1111_2222_3333_4450;
+
+    fn lower_compact_ref_putfield(plan: bool, c_off: u32) -> Vec<u8> {
+        // Static gate bytes and a read-bounds table. Real addresses of real
+        // storage: the emitter bakes them as imm64 and the assertions read the
+        // same values back, so a wrong one shows up as a missing sequence
+        // rather than as a fault (nothing executes this code).
+        static PRE_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        static POST_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+        static READ_BOUNDS: [u64; 6] = [0; 6];
+
+        let graph = ref_or_wide_putfield_graph(b'L', 0x19, IrType::Ref);
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.putfield_object = COMPACT_REF_PUTFIELD_HELPER;
+        helpers.putfield_int = COMPACT_REF_PUTFIELD_HELPER ^ 0xF;
+        helpers.read_bounds_addr = std::ptr::addr_of!(READ_BOUNDS) as usize;
+        if plan {
+            helpers.ref_store_pre_gate = std::ptr::addr_of!(PRE_GATE) as usize;
+            helpers.ref_store_post_gate = std::ptr::addr_of!(POST_GATE) as usize;
+            helpers.ref_store_post_skip_mask = cratonvm_types::GC_FLAG_OLD_GEN as usize;
+        }
+
+        // The builder puts the `putfield` at pc 3 (`aload_0; aload_1;
+        // putfield`), which is the key `set_field_info` uses above.
+        let mut compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
+        compact.insert((3usize, true), (c_off, true, b'L'));
+        let empty_hints: HashMap<usize, bool> = HashMap::new();
+        let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        lower_inner(
+            &graph,
+            &schedule,
+            2,
+            4,
+            &helpers,
+            &empty_hints,
+            &[],
+            None,
+            &no_direct,
+            &no_ic,
+            &compact,
+        )
+        .expect("a reference putfield with its helper wired must compile")
+        .code_bytes()
+        .to_vec()
+    }
+
+    /// The optimizing tier emits the BARRIER-FREE store only when a collector
+    /// published a barrier plan — and emits none without one.
+    ///
+    /// This is the pair, not the positive alone. Until 2026-09-02 this tier
+    /// lowered every reference store to `jit_putfield_object` unconditionally,
+    /// so a test that only asserted "the helper address is baked" passed both
+    /// before and after the arm existed and could not tell them apart. The
+    /// control arm here is a helper table with no plan, which is what G1 and
+    /// ZGC actually present, and it must produce no inline store at all.
+    #[test]
+    fn the_optimizing_tier_stores_inline_only_behind_a_published_barrier_plan() {
+        let c_off = 8u32;
+        // MOV [RAX + disp32], RDX — the barrier-free compact reference store.
+        let mut store_seq: Vec<u8> = vec![0x48, 0x89, 0x90];
+        store_seq.extend_from_slice(&((HEADER_SIZE + c_off as usize) as i32).to_le_bytes());
+
+        let without = lower_compact_ref_putfield(false, c_off);
+        assert!(
+            !contains_seq(&without, &store_seq),
+            "with NO published barrier plan the optimizing tier must emit no \
+             inline reference store — a store whose barrier nothing ruled out \
+             is a lost card, invisible until the next collection"
+        );
+
+        let with = lower_compact_ref_putfield(true, c_off);
+        assert!(
+            contains_seq(&with, &store_seq),
+            "with a published plan the optimizing tier must emit the inline \
+             compact store at the RESOLVED offset — that offset is the whole \
+             plumbing this arm needed, and the uniform slot displacement the \
+             fallback derives is one a compact object does not obey"
+        );
+        // The helper is still the fallback. Every gate that cannot rule a
+        // barrier out branches to it, so its address must remain baked: an arm
+        // that inlined the store and dropped the fallback would be exactly the
+        // missing-barrier defect this whole sequence is built to avoid.
+        assert!(
+            contains_seq(&with, &(COMPACT_REF_PUTFIELD_HELPER as u64).to_le_bytes()),
+            "the gated arm must keep `jit_putfield_object` as its fallback"
+        );
+    }
+
+    /// The gated arm emits BOTH store shapes and picks between them per object.
+    ///
+    /// A compact-only arm is an arm that almost never fires. `init_object_header`
+    /// — the TLAB fast path serving nearly every allocation for the interpreter
+    /// and `jit_new_object` alike — writes a LEGACY header unconditionally, no
+    /// `GC_FLAG_COMPACT`, whatever layout the class has registered. Measured on
+    /// `RefStoreLoopProbe` with only the compact shape emitted: 16,384,000
+    /// executions, `inline=0`, every one bailing at the compactness test, on
+    /// Generational and ZGC alike. This asserts the shape that fixed it.
+    #[test]
+    fn the_gated_arm_emits_the_legacy_cell_store_as_well_as_the_compact_one() {
+        let code = lower_compact_ref_putfield(true, 8);
+        // The legacy 16-byte `Value` cell for field 0: tag qword then the
+        // pointer payload, both at `HEADER_SIZE + 0 * SLOT_SIZE`.
+        // `i32::try_from`, not the bare cast: the audit in
+        // `flag_and_header_contracts` counts that cast form as an EMISSION
+        // site, and a test expectation is not one -- including in this comment,
+        // which is why it does not spell the form out.
+        let legacy_off = i32::try_from(HEADER_SIZE).expect("the header fits an i32");
+        let mut tag_store: Vec<u8> = vec![0x4C, 0x89, 0x90]; // MOV [RAX+disp32], R10
+        tag_store.extend_from_slice(
+            &(legacy_off + cratonvm_types::FIELD_CELL_TAG_OFFSET as i32).to_le_bytes(),
+        );
+        assert!(
+            contains_seq(&code, &tag_store),
+            "the legacy shape must write the cell's TAG — a payload written \
+             without it leaves a cell whose discriminant still says whatever \
+             the field held before, and the reader believes the discriminant"
+        );
+        let mut pay_store: Vec<u8> = vec![0x48, 0x89, 0x90]; // MOV [RAX+disp32], RDX
+        pay_store.extend_from_slice(
+            &(legacy_off + FIELD_CELL_PAYLOAD64_OFFSET as i32).to_le_bytes(),
+        );
+        assert!(
+            contains_seq(&code, &pay_store),
+            "the legacy shape must write the 64-bit pointer payload"
+        );
+        // And the compact shape is still there — this is a two-shape arm, not a
+        // replacement of one dead shape by another.
+        let mut compact_store: Vec<u8> = vec![0x48, 0x89, 0x90];
+        compact_store.extend_from_slice(&((HEADER_SIZE + 8usize) as i32).to_le_bytes());
+        assert!(
+            contains_seq(&code, &compact_store),
+            "the compact shape must survive: the receiver's own header decides, \
+             and a genuinely compact object stores the bare pointer"
+        );
+    }
+
+    /// The gated arm reads the receiver's flags byte ONCE and asks both
+    /// questions of it: compactness, then the post-barrier skip mask.
+    ///
+    /// Both are `TEST CL, imm8` against a bit in `GC_FLAGS_BYTE_OFFSET`, which
+    /// packs `gc_age` in bits 4..7 and the GC flags in bits 0..3. The mask
+    /// shape exists because the floor shape cannot express the generational
+    /// question: an old-gen object allocated at `gc_age == 0` has flags byte
+    /// `0x01` and sorts BELOW a young object that survived three collections
+    /// (`0x30`), so an unsigned floor would skip the card the first one needs.
+    #[test]
+    fn the_gated_arm_tests_the_flags_byte_for_compactness_and_for_the_skip_mask() {
+        let code = lower_compact_ref_putfield(true, 8);
+        assert!(
+            contains_seq(
+                &code,
+                &[0xF6, 0xC1, cratonvm_types::GC_FLAG_COMPACT]
+            ),
+            "the arm must test GC_FLAG_COMPACT — a class with a registered \
+             compact layout can still have legacy-cell instances, and storing \
+             a pointer at the packed offset into one of those corrupts a \
+             neighbouring field"
+        );
+        assert!(
+            contains_seq(
+                &code,
+                &[0xF6, 0xC1, cratonvm_types::GC_FLAG_OLD_GEN]
+            ),
+            "the arm must test the published skip mask to rule the post \
+             barrier out"
+        );
+        // MOVZX ECX, byte [RAX + GC_FLAGS_BYTE_OFFSET] — read once, asked
+        // twice. A second read would be a second chance for the two answers to
+        // come from different bytes.
+        let mut read_seq: Vec<u8> = vec![0x0F, 0xB6, 0x88];
+        read_seq
+            .extend_from_slice(&(cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32).to_le_bytes());
+        assert!(
+            contains_seq(&code, &read_seq),
+            "the flags byte must be read as a BYTE at its own offset, not as \
+             the dword the older arms use — that dword starts 15 bytes into a \
+             16-byte header and takes three of its four bytes from the first \
+             instance field"
+        );
+    }
+
+    /// A site with no resolved compact slot keeps the unconditional helper.
+    ///
+    /// The refusal that matters most: `HEADER_SIZE + field_index * SLOT_SIZE`
+    /// is the legacy cell displacement, and emitting a store there for a
+    /// compact object would write a pointer over an unrelated field. The
+    /// snapshot being absent is the ordinary case for an unresolved site, not
+    /// an error.
+    #[test]
+    fn a_reference_store_with_no_resolved_compact_slot_keeps_the_helper() {
+        static PRE_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        static POST_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+        static READ_BOUNDS: [u64; 6] = [0; 6];
+        unsafe extern "C" fn fake_putfield_object(_vm: i64, _obj: i64, _idx: i64, _val: i64) {}
+
+        let graph = ref_or_wide_putfield_graph(b'L', 0x19, IrType::Ref);
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.putfield_object = fake_putfield_object as *const () as usize;
+        helpers.putfield_int = fake_putfield_object as *const () as usize;
+        helpers.read_bounds_addr = std::ptr::addr_of!(READ_BOUNDS) as usize;
+        helpers.ref_store_pre_gate = std::ptr::addr_of!(PRE_GATE) as usize;
+        helpers.ref_store_post_gate = std::ptr::addr_of!(POST_GATE) as usize;
+        helpers.ref_store_post_skip_mask = cratonvm_types::GC_FLAG_OLD_GEN as usize;
+
+        let empty_hints: HashMap<usize, bool> = HashMap::new();
+        let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        let no_compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
+        let code = lower_inner(
+            &graph,
+            &schedule,
+            2,
+            4,
+            &helpers,
+            &empty_hints,
+            &[],
+            None,
+            &no_direct,
+            &no_ic,
+            &no_compact,
+        )
+        .expect("the store must still compile through the helper")
+        .code_bytes()
+        .to_vec();
+        assert!(
+            !contains_seq(&code, &[0xF6, 0xC1, cratonvm_types::GC_FLAG_COMPACT]),
+            "with no resolved compact slot the gated arm must not be emitted \
+             at all, published plan or not"
+        );
+        assert!(
+            contains_seq(
+                &code,
+                &(fake_putfield_object as *const () as u64).to_le_bytes()
+            ),
+            "the unconditional `jit_putfield_object` lowering must remain"
+        );
+    }
+
+    /// A plan is all three gates or none, and the optimizing tier reads that
+    /// through the SAME predicate the single-pass backend uses.
+    ///
+    /// The shared reader is the point. A pre-gate with a dead post-gate would
+    /// let compiled code skip the post barrier on the strength of a word nobody
+    /// maintains, and two tiers deciding that independently is how one of them
+    /// ends up skipping a barrier the other pays.
+    #[test]
+    fn a_half_published_plan_leaves_the_optimizing_tier_on_the_helper() {
+        static PRE_GATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        static READ_BOUNDS: [u64; 6] = [0; 6];
+        unsafe extern "C" fn fake_putfield_object(_vm: i64, _obj: i64, _idx: i64, _val: i64) {}
+
+        let graph = ref_or_wide_putfield_graph(b'L', 0x19, IrType::Ref);
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.putfield_object = fake_putfield_object as *const () as usize;
+        helpers.putfield_int = fake_putfield_object as *const () as usize;
+        helpers.read_bounds_addr = std::ptr::addr_of!(READ_BOUNDS) as usize;
+        // Pre-gate only: no post-gate, no post shape.
+        helpers.ref_store_pre_gate = std::ptr::addr_of!(PRE_GATE) as usize;
+
+        let mut compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
+        compact.insert((3usize, true), (8u32, true, b'L'));
+        let empty_hints: HashMap<usize, bool> = HashMap::new();
+        let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        let code = lower_inner(
+            &graph,
+            &schedule,
+            2,
+            4,
+            &helpers,
+            &empty_hints,
+            &[],
+            None,
+            &no_direct,
+            &no_ic,
+            &compact,
+        )
+        .expect("the store must still compile through the helper")
+        .code_bytes()
+        .to_vec();
+        let mut store_seq: Vec<u8> = vec![0x48, 0x89, 0x90];
+        store_seq.extend_from_slice(&((HEADER_SIZE + 8usize) as i32).to_le_bytes());
+        assert!(
+            !contains_seq(&code, &store_seq),
+            "a plan missing its post-barrier gate must decline the whole fast \
+             path, not emit a store gated only on the half that was published"
         );
     }
 
@@ -13532,10 +14673,23 @@ mod tests {
             .expect("lower baseline")
             .code_bytes()
             .to_vec();
-        assert!(
-            contains_seq(&base_code, &[0x0F, 0x84]),
-            "baseline IR branch should emit JE (0F 84)"
-        );
+        // 2026-09-02: with the compare FUSED into the branch, the emitted
+        // condition is the compare's own inverse rather than `TEST` on a
+        // materialised boolean, so the concrete byte for this `ifeq` shape is
+        // `JNE` (0F 85) where it used to be `JE` (0F 84). What this test is
+        // for -- the hint INVERTS the branch, and only the hint does -- is
+        // unchanged, and is asserted as the property below rather than as one
+        // of the two bytes. Both polarities must appear across the arms, or
+        // the "inversion" being checked is vacuous.
+        let base_polarity = if contains_seq(&base_code, &[0x0F, 0x84]) {
+            0x84u8
+        } else {
+            assert!(
+                contains_seq(&base_code, &[0x0F, 0x85]),
+                "the baseline IR branch emitted neither JE nor JNE"
+            );
+            0x85u8
+        };
 
         // "usually not taken" at the ifeq PC (1): inverted to `JNE` (0F 85),
         // and a different code buffer.
@@ -13547,15 +14701,15 @@ mod tests {
             .code_bytes()
             .to_vec();
         assert!(
-            contains_seq(&hint_code, &[0x0F, 0x85]),
-            "usually-not-taken hint should invert the IR branch to JNE (0F 85)"
+            contains_seq(&hint_code, &[0x0F, base_polarity ^ 1]),
+            "a not-taken hint must invert the branch polarity"
         );
         assert_ne!(
             base_code, hint_code,
             "branch-bias hint must change the emitted code"
         );
 
-        // "usually taken" keeps the default JE layout (byte-identical).
+        // "usually taken" keeps the default layout (byte-identical).
         let mut taken_hints = HashMap::new();
         taken_hints.insert(1usize, true);
         let (g2, s2) = build();
@@ -13565,7 +14719,7 @@ mod tests {
             .to_vec();
         assert_eq!(
             base_code, taken_code,
-            "usually-taken hint must reproduce the default JE layout byte-for-byte"
+            "usually-taken hint must reproduce the default layout byte-for-byte"
         );
     }
 
@@ -15595,8 +16749,10 @@ mod tests {
             "frame bytes only fell from {before} to {after} on a 512-link chain",
         );
         // The residual is the fixed part of the frame — bookkeeping slots, the
-        // stack-arg reserve and the ABI shadow space — not spill.
-        assert!(after <= 160, "{after} bytes for a 4-slot working set");
+        // stack-arg reserve, the ABI shadow space and, since the register file
+        // went default-on (2026-09-02), the estimate's reservation for the
+        // callee-saved GP save area — not spill.
+        assert!(after <= 192, "{after} bytes for a 4-slot working set");
     }
 
     /// The node ceiling the frame bound implies, before and after.
@@ -16504,11 +17660,18 @@ mod tests {
             residency.reg_of[idx as usize], None,
             "an int took a register, but this file's register set is XMM-only"
         );
+        // `elem`, not `doubled`: since `ir_residency_pays_enabled` a value read
+        // ONCE is not promoted (its register cannot repay the prologue save it
+        // costs), and `doubled` is read once, by the return. `elem` is read
+        // twice — it is both inputs of the `Add` — so it is the FP value this
+        // graph can promote, and asserting on it keeps the two checks above
+        // non-vacuous for the reason they were written.
         assert!(
-            residency.reg_of[doubled as usize].is_some(),
+            residency.reg_of[elem as usize].is_some(),
             "the FP value must be promoted, or the two assertions above are \
              vacuous"
         );
+        let _ = doubled;
     }
 
     /// A value live across a helper call must not keep a caller-saved register.
@@ -18289,8 +19452,12 @@ mod tests {
     /// nothing can hand out is a regression with no upside, and `frame_size`
     /// feeds `DEFAULT_MAX_FRAME_BYTES`, so it would also decline methods that
     /// used to compile.
+    ///
+    /// 2026-09-02: the file is default-ON now, so this pins the OFF arm
+    /// (`CRATONVM_JIT_IR_LINEAR_SCAN=0`) rather than the process default.
     #[test]
     fn the_default_configuration_reserves_no_save_area() {
+        let _off = LsForce::off();
         assert_eq!(
             ir_saved_xmm_bytes(),
             0,
@@ -18503,4 +19670,5 @@ pub static IC_FRAME_REPUBLISH_SITES: std::sync::atomic::AtomicUsize =
 pub fn ic_frame_republish_sites() -> usize {
     IC_FRAME_REPUBLISH_SITES.load(std::sync::atomic::Ordering::Relaxed)
 }
+
 

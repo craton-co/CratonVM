@@ -1374,6 +1374,199 @@ pub fn inline_rbp_tls_disp() -> usize {
 /// This is shared with the OSR trampoline emitter in `lib.rs`; keeping the
 /// platform byte in one place prevents that independently emitted prologue
 /// from silently retaining the Windows `gs:` prefix on Linux.
+// ── JIT thread-pointer mirror ────────────────────────────────────────
+//
+// `jit_get_current_thread` is a helper CALL: `mov rax, imm64; call rax`, a
+// `note_jit_boundary` bump, a `thread_local!` access, `ret`. Both prologues
+// paid it -- the single-pass tier once per invocation for the shadow-stack
+// thread slot (plus a ten-instruction "inherit from the caller frame"
+// sequence for the TLAB thread cache), the optimizing tier once per
+// invocation unconditionally -- and `fib` paid it 1.4 billion times.
+//
+// The RBP mirror above already shows the cheaper shape: the VM keeps a raw
+// TLS word in lockstep with a Rust `thread_local!`, and compiled code reads
+// it with one segment-prefixed `mov`. This is the same shape for the thread
+// pointer. The VM publishes through `publish_jit_thread_mirror` at exactly
+// the sites that set `JIT_THREAD` (`set_jit_thread`, `restore_jit_thread`,
+// `clear_jit_thread`), so the mirror equals `JIT_THREAD` whenever compiled
+// code can run. Off (`CRATONVM_JIT_TLS_THREAD_FETCH=0`, or a failed probe)
+// every site falls back to the helper call byte for byte.
+
+/// Kill switch for the thread-pointer mirror: `CRATONVM_JIT_TLS_THREAD_FETCH=0`.
+fn tls_thread_fetch_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_TLS_THREAD_FETCH").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// TLS displacement of the `JIT_THREAD` mirror (`gs:` on Windows, `fs:` on
+/// Linux), or 0 when unavailable. Process-cached, thread-invariant.
+#[cfg(windows)]
+pub fn jit_thread_tls_disp() -> usize {
+    use std::sync::OnceLock;
+    static DISP: OnceLock<usize> = OnceLock::new();
+    *DISP.get_or_init(|| {
+        if !tls_thread_fetch_enabled() {
+            return 0;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn TlsAlloc() -> u32;
+            fn TlsSetValue(idx: u32, val: *mut core::ffi::c_void) -> i32;
+        }
+        const TLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
+        const TEB_TLS_SLOTS_OFF: usize = 0x1480;
+        unsafe {
+            let slot = TlsAlloc();
+            if slot == TLS_OUT_OF_INDEXES {
+                return 0;
+            }
+            let sentinel: usize = 0x4A54_5448_5244_0000 | (slot as usize & 0xFFFF);
+            if TlsSetValue(slot, sentinel as *mut core::ffi::c_void) == 0 {
+                return 0;
+            }
+            let candidate = TEB_TLS_SLOTS_OFF + (slot as usize) * 8;
+            let found = if read_gs_qword(candidate) == sentinel {
+                candidate
+            } else {
+                let mut d = TEB_TLS_SLOTS_OFF;
+                let end = TEB_TLS_SLOTS_OFF + 64 * 8;
+                let mut hit = 0;
+                while d < end {
+                    if read_gs_qword(d) == sentinel {
+                        hit = d;
+                        break;
+                    }
+                    d += 8;
+                }
+                hit
+            };
+            TlsSetValue(slot, core::ptr::null_mut());
+            found
+        }
+    })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+thread_local! {
+    pub(super) static LINUX_JIT_THREAD_MIRROR: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn jit_thread_tls_disp() -> usize {
+    use std::sync::OnceLock;
+    static DISP: OnceLock<usize> = OnceLock::new();
+    *DISP.get_or_init(|| {
+        if !tls_thread_fetch_enabled() {
+            return 0;
+        }
+        LINUX_JIT_THREAD_MIRROR.with(|cell| {
+            let fs_base = unsafe { read_fs_qword(0) };
+            let cell_addr = cell as *const std::cell::Cell<usize> as usize;
+            let delta = (cell_addr as i128) - (fs_base as i128);
+            let Ok(delta32) = i32::try_from(delta) else {
+                return 0;
+            };
+            if delta32 == 0 {
+                return 0;
+            }
+            let old = cell.replace(0x4A54_5448_5244_4C58);
+            let probed = unsafe { read_fs_qword(delta32 as isize) };
+            cell.set(old);
+            if probed == 0x4A54_5448_5244_4C58 {
+                (delta32 as u32) as usize
+            } else {
+                0
+            }
+        })
+    })
+}
+
+#[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
+pub fn jit_thread_tls_disp() -> usize {
+    0
+}
+
+/// VM side: keep the mirror equal to `JIT_THREAD`. A no-op when the mirror is
+/// unavailable, so the three callers need no gate of their own.
+pub fn publish_jit_thread_mirror(ptr: usize) {
+    #[cfg(windows)]
+    {
+        let disp = jit_thread_tls_disp();
+        if disp != 0 {
+            unsafe { write_gs_qword(disp, ptr) };
+        }
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        if jit_thread_tls_disp() != 0 {
+            LINUX_JIT_THREAD_MIRROR.with(|c| c.set(ptr));
+        }
+    }
+    #[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
+    {
+        let _ = ptr;
+    }
+}
+
+/// What compiled code would read right now; `None` when the mirror is off.
+pub fn jit_thread_mirror_read() -> Option<usize> {
+    let disp = jit_thread_tls_disp();
+    if disp == 0 {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        Some(unsafe { read_gs_qword(disp) })
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        Some(unsafe { read_fs_qword(disp as u32 as i32 as isize) })
+    }
+    #[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
+    {
+        None
+    }
+}
+
+#[cfg(windows)]
+#[inline]
+pub(super) unsafe fn write_gs_qword(disp: usize, val: usize) {
+    core::arch::asm!(
+        "mov qword ptr gs:[{addr}], {val}",
+        addr = in(reg) disp,
+        val = in(reg) val,
+        options(nostack, preserves_flags),
+    );
+}
+
+/// One post-call sentinel compare instead of two -- **default ON**, opt out
+/// with `CRATONVM_JIT_MERGED_CALL_SENTINEL=0`.
+///
+/// Every compiled call used to be followed by the callee-deopt check and the
+/// exception check, each materialising `i64::MIN` (a 10-byte `mov r, imm64`)
+/// and comparing RAX against it. Both ask the same question of the same
+/// register; the merged shape asks it once on the hot path and leaves the two
+/// original checks on the cold side, where they run only when the callee
+/// actually returned the sentinel. Off restores the previous two-check
+/// emission byte for byte, so the arms are A/B-able in one binary.
+pub fn merged_call_sentinel_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_MERGED_CALL_SENTINEL").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
 pub(crate) const fn inline_rbp_tls_segment_prefix() -> u8 {
     #[cfg(windows)]
     {
@@ -2435,6 +2628,118 @@ pub(super) fn direct_call_arg_maps_enabled() -> bool {
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
         match cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_CALL_ARG_MAPS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
+/// Name a SELF-RECURSIVE call's reference arguments in its safepoint map
+/// (`CRATONVM_JIT_SELF_CALL_ARG_MAPS`, **default-ON; `=0` restores the pre-fix
+/// arrangement**).
+///
+/// The sibling of [`direct_call_arg_maps_enabled`], for the one invoke arm that
+/// change did not reach. The 0xb8 self-recursive site pops its arguments and,
+/// if any of them is a reference, raises `pending_staged_args_unmapped` — which
+/// makes `map_incomplete` true at the next safepoint, takes that safepoint's
+/// `moving_young_coverage_complete` false through
+/// `relocation_coverage_complete`, and so takes `fully_shadow_covered` false
+/// for the WHOLE method.
+///
+/// It did not have to. The arguments this arm stages are still in ordinary
+/// frame slots at the safepoint that consumes the flag: the non-tail form emits
+/// its stack-guard safepoint (and then the recursive `CALL`) only AFTER
+/// `pop_invoke_args`, and `emit_stack_arg_setup` — the step that moves them
+/// into the un-nameable outgoing-ABI area — runs later still. A frame slot is
+/// exactly what `pending_staged_arg_oops` exists to name, so the honest answer
+/// at that safepoint is the slot, not a refusal.
+///
+/// MEASURED on `probes/OopMapSelfCall.java`: the two self-recursive methods are
+/// the ONLY two methods in the whole run whose coverage claim is false
+/// (`shadow=false shadow_missing_pcs=[45]` / `[23]`, both the self-call bci),
+/// and every one of the eight `scauses` reads zero — the refusal arrives
+/// through `map_incomplete`, whose own census names it `staged_unmappable`.
+///
+/// An argument whose home is NOT a frame slot still fails the safepoint closed:
+/// a register- or xmm-resident value is precisely what a frame-slot map cannot
+/// describe, and that is the case the flag was right about.
+/// May a REVIVED merge block claim its reconstructed operand-stack oop marks
+/// are exact (`CRATONVM_JIT_MERGE_MARKS_EXACT`, **default-ON; `=0` restores the
+/// pre-fix flag**)?
+///
+/// When the walk arrives at a branch target dead (the block before it ended in
+/// a `goto`/`return`/`athrow`), the operand stack is reconstructed from
+/// `branch_target_stack_depth` and the marks from
+/// `branch_target_stack_oop_marks`. The marks half was fixed once already: a
+/// blanket `vec![false; depth]` there permanently mis-marked any reference
+/// carried across the branch from before it.
+///
+/// The EXACTNESS flag was not fixed with it. It kept reading
+/// `expected_depth == 0` -- the honest answer for the blanket fallback, and the
+/// wrong one once the real marks are in hand. `record_oop_map` seeds
+/// `map_incomplete` from that flag, so every safepoint in the revived block
+/// lost its relocation claim, and `fully_shadow_covered` ANDs it over the
+/// method.
+///
+/// MEASURED: on `RTreeRangeGc` and `RPriorityQueueGc` it was the ONLY remaining
+/// cause after the self-call repair -- `checkMap` 6, `checkSet` 9,
+/// `singleThreaded` 3 -- and every failing pc is an arm or the merge of one
+/// `?:` feeding a string concat.
+///
+/// Sound for the same reason the recorded marks are usable at all: JVMS 4.10.1
+/// admits no merge of a reference with a primitive, so a merge point's
+/// predecessors must agree about which slots hold references and whichever one
+/// was captured first speaks for all of them. The fallback -- no recorded marks,
+/// or a length that does not match the depth -- still fails closed, because
+/// there it genuinely did guess.
+/// May a method containing an INLINE SPLICE claim `fully_oop_covered`
+/// (`CRATONVM_JIT_INLINE_OOP_COVERAGE`, **default-ON; `=0` restores the
+/// previous predicate verbatim**)?
+///
+/// On: the term is `incomplete_oop_maps == 0` -- no safepoint of this
+/// compilation published a short map. Off: the historical
+/// `inline_sites.is_empty()` -- no splice at all, whatever the maps say.
+///
+/// The two changes are one change. Retiring the blanket term is only sound
+/// because the count replacing it is unmaskable, and the count is only worth
+/// having because the blanket term was what incidentally covered the mask. See
+/// `Compiler::incomplete_oop_maps` and the comment at the assignment.
+pub(super) fn inline_oop_coverage_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_OOP_COVERAGE") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
+pub(super) fn merge_marks_exact_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MERGE_MARKS_EXACT") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
+pub(super) fn self_call_arg_maps_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SELF_CALL_ARG_MAPS") {
             Ok(v) => !matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "0" | "false" | "off" | "no"
@@ -7847,6 +8152,63 @@ pub fn gated_ref_store_enabled() -> bool {
     *G.get_or_init(|| {
         !matches!(
             cratonvm_types::flags::runtime_var("CRATONVM_JIT_GATED_REF_STORE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// The gated inline reference store on the **optimizing (IR) tier** — default
+/// ON, opt out with `CRATONVM_JIT_IR_REF_STORE=0`.
+///
+/// A separate switch from [`gated_ref_store_enabled`] above, and it has to be:
+/// the two tiers emit different code from the same barrier plan, so one lever
+/// covering both could not tell "the plan is wrong" from "the new emitter is
+/// wrong". The single-pass switch stays the lever for the plan itself; this one
+/// is the lever for THIS emitter.
+///
+/// Why the optimizing tier needed its own arm at all: it lowered every
+/// reference store to `jit_putfield_object` unconditionally, so the barrier
+/// plan published on 2026-09-02 was inert exactly where hot loops are compiled.
+/// A probe of nothing but reference stores in a counted loop reported
+/// `gated=0 declined=0` — not "declined", but never asked, because this tier
+/// had no arm to ask with.
+///
+/// Off ⇒ the unconditional helper call this tier emitted before, which is a
+/// supported configuration and the first thing to set if a compiled reference
+/// store is suspected of losing a card or an SATB entry.
+/// `CRATONVM_DBG_IR_REF_STORE_TRACE=1` — count, at RUN time, how many gated
+/// reference stores took the inline path and how many fell through to the
+/// helper. Default off.
+///
+/// The compile-time `gated=N` census cannot answer this, and the difference
+/// matters: a sequence emitted at two sites whose compactness gate never passes
+/// is five extra instructions in front of the same helper call it always made.
+/// Costs a `LOCK INC` per store, so it is a diagnostic arm, never a timed one.
+/// `CRATONVM_DBG_SP_REF_STORE_TRACE=1` — the SINGLE-PASS twin of
+/// [`ir_ref_store_trace_enabled`]. Default off; costs a `LOCK INC` per store,
+/// so it is a diagnostic arm and never a timed one.
+pub fn sp_ref_store_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SP_REF_STORE_TRACE").is_some()
+    })
+}
+
+pub fn ir_ref_store_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_REF_STORE_TRACE").is_some()
+    })
+}
+
+pub fn ir_gated_ref_store_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_REF_STORE").as_deref(),
             Ok("0") | Ok("false") | Ok("off") | Ok("no")
         )
     })

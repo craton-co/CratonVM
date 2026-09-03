@@ -222,6 +222,10 @@ fn maybe_dump_shutdown_reports() {
     // the switch having been off.
     cratonvm_vm::threading::monitor::report_monitor_notify_census_at_exit();
 
+    // The two composition censuses (`CRATONVM_DBG_INTERP_FRAMES`,
+    // `CRATONVM_DBG_TIERUP_DECLINE`). Each prints nothing when unarmed.
+    cratonvm_vm::runtime::interp_census::report_at_exit();
+
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
         // The `getfield` fast-path ENGAGEMENT number, on the same switch. The
@@ -260,6 +264,51 @@ fn maybe_dump_shutdown_reports() {
             eprintln!(
                 "[cratonvm] compiled reference stores: gated={gated} declined={declined}"
             );
+            // The DYNAMIC split for that pair, only under
+            // CRATONVM_DBG_SP_REF_STORE_TRACE=1. `gated=N` above counts emitted
+            // sequences; this counts executions, and on the optimizing tier the
+            // two turned out to differ by everything -- `gated=2` sitting on
+            // `inline=0` out of 16.4M. `barrier` is a SUBSET of `inline`: those
+            // stores happened inline and then still called the collector's own
+            // write barrier.
+            let (sp_inline, sp_barrier, sp_helper) =
+                cratonvm_jit::metrics::sp_ref_store_path_counts();
+            if sp_inline != 0 || sp_helper != 0 {
+                eprintln!(
+                    "[cratonvm]   ref-store executions: inline={sp_inline} \
+(of which barriered={sp_barrier}) helper={sp_helper}"
+                );
+                for (name, count) in cratonvm_jit::metrics::sp_ref_store_bails() {
+                    eprintln!("[cratonvm]     ref-store bail {name}: {count}");
+                }
+            }
+            // The OPTIMIZING tier's own pair, never folded into the one above.
+            // Until 2026-09-02 that tier lowered every reference store to the
+            // helper unconditionally, so it reported neither number -- and a
+            // hot loop is compiled there, which is why a healthy single-pass
+            // count said nothing about where the time went. Zero on BOTH sides
+            // here means the tier compiled no reference store at all; a
+            // declined count with the reasons below means it asked and refused.
+            let (ir_gated, ir_declined) = cratonvm_jit::metrics::ir_ref_store_site_counts();
+            eprintln!(
+                "[cratonvm] optimizing-tier reference stores: gated={ir_gated} declined={ir_declined}"
+            );
+            for (name, count) in cratonvm_jit::metrics::ir_ref_store_declines() {
+                eprintln!("[cratonvm]   ir ref-store declined {name}: {count}");
+            }
+            // The DYNAMIC split, only under CRATONVM_DBG_IR_REF_STORE_TRACE=1.
+            // `gated=N` above is a count of emitted sequences; this is a count
+            // of executions, and a sequence whose compactness gate never
+            // passes has the first without the second.
+            let (inline_taken, helper_taken) = cratonvm_jit::metrics::ir_ref_store_path_counts();
+            if inline_taken != 0 || helper_taken != 0 {
+                eprintln!(
+                    "[cratonvm]   ir ref-store executions: inline={inline_taken} helper={helper_taken}"
+                );
+                for (name, count) in cratonvm_jit::metrics::ir_ref_store_bails() {
+                    eprintln!("[cratonvm]     ir ref-store bail {name}: {count}");
+                }
+            }
             // Optimizing-tier allocation. A zero on the left is the EXPECTED
             // reading under a default configuration -- `c2_alloc_upgrade` is
             // opt-in, so no method containing a `new` reaches that tier -- and
@@ -273,9 +322,11 @@ fn maybe_dump_shutdown_reports() {
             // Those look identical as a percentage and want opposite fixes.
             let (nn_elided, nn_emitted) = cratonvm_jit::x64::receiver_null_check_counts();
             let nn_implicit = cratonvm_jit::x64::receiver_null_check_implicit_count();
+            let (nn_i1, nn_i2) = cratonvm_jit::x64::receiver_null_check_implicit_by_arm();
             eprintln!(
                 "[cratonvm] getfield receiver null checks: elided={nn_elided} \
-                 implicit={nn_implicit} emitted={nn_emitted}"
+                 implicit={nn_implicit} (compact-arm={nn_i1} legacy-arm={nn_i2}) \
+                 emitted={nn_emitted}"
             );
             // Implicit null-check table. All four, because no one of them is a
             // verdict: `registered` alone cannot separate "off" from "on and

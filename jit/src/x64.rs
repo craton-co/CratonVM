@@ -249,8 +249,15 @@ mod arrays;
 mod deopt_stubs;
 mod objects;
 pub(crate) use objects::note_ungated_ref_store;
+// The barrier-plan readers are shared with the OPTIMIZING tier
+// (`ir_lower`), deliberately: two tiers deciding independently what a
+// published plan means is how one of them ends up skipping a barrier the
+// other pays. `objects` is a private module, so the re-export is the seam.
+pub(crate) use objects::{ref_store_gates_of, ref_store_post_skip_mask_of};
 pub use objects::ref_store_site_counts;
+pub(crate) use objects::note_gated_ref_store;
 pub use null_check_elim::receiver_null_check_counts;
+pub use null_check_elim::receiver_null_check_implicit_by_arm;
 pub use null_check_elim::receiver_null_check_implicit_count;
 mod osr;
 mod simd;
@@ -272,6 +279,8 @@ mod emit;
 mod frames;
 mod operand_stack;
 pub use operand_stack::spill_slots_cap;
+pub(crate) use inlining::MAX_INLINE_MERGE_DEPTH;
+pub(crate) use operand_stack::SpillReason;
 pub mod safepoint;
 // ---------------------------------------------------------------------------
 // Compile bytecode to x86-64
@@ -295,18 +304,45 @@ enum StackSlot {
     /// round-trip when the value is consumed by the very next operation.
     /// Scratch slots MUST be flushed before any call, backward branch, or return.
     ///
-    /// **A home offset was carried here for one day and reverted.** The idea
-    /// was to bound the spill region -- `flush_scratch_registers` reserves a
-    /// fresh word per flushed value, so a stretch with several calls grows it
-    /// once per call. Reserving the home at PUSH time instead made
-    /// `push_from_rax` advance the spill cursor where it previously did not,
-    /// and that shipped a nondeterministic heap corruption:
-    /// `RMapGcStress` went from PASS to "duplicate insert" / an
+    /// **A home offset was carried here for one day and reverted.** Reserving
+    /// the home at PUSH time made `push_from_rax` advance the spill cursor
+    /// where it previously did not, and that shipped a nondeterministic heap
+    /// corruption: `RMapGcStress` went from PASS to "duplicate insert" / an
     /// `ArrayIndexOutOfBoundsException` inside `String.equals`, and
     /// `CRATONVM_JIT_KERNEL_REG_LOCALS=0` -- which makes this whole path inert
-    /// -- was what made it pass again. The frame-growth defect is real and
-    /// still open; whatever fixes it must not move this cursor, because the
-    /// OSR entry's local homes are derived from the same layout.
+    /// -- was what made it pass again. A second, independent symptom is on
+    /// `scratch-slot-home-broke-sixteen-charsets-FIXED-20260902.md`.
+    ///
+    /// **The constraint that revert established still holds**: whatever touches
+    /// this must not move the spill cursor, because the OSR entry's local homes
+    /// are derived from the same layout. That is the durable lesson and it is
+    /// not in question.
+    ///
+    /// **What IS no longer true is the motivation.** This comment used to end
+    /// "the frame-growth defect is real and still open", on the reasoning that
+    /// `flush_scratch_registers` reserves a fresh word per flushed value so a
+    /// stretch with several calls grows the spill region once per call. The
+    /// spill census says otherwise, and it was re-measured on 2026-09-02 on
+    /// exactly the shape that sentence describes -- one method, 64 sequential
+    /// calls, all 64 results live across every later one:
+    ///
+    /// ```text
+    /// flush-calls=144 flush-reserved=1 peak-words=8 res-push=451 exhausted=0
+    /// ```
+    ///
+    /// 144 flushes reserved **one word between them**, and the region peaked at
+    /// 8 words rather than 64. Identical under `CRATONVM_JIT_SPILL_SLOTS_CAP`
+    /// at 16 and at 8. The reason is visible from `SCRATCH_REGS` two lines
+    /// below: there are only two scratch registers, so at most two values are
+    /// ever register-resident and needing a word, and `flush_home`'s own
+    /// inequality shows the word it takes is never above the position's
+    /// canonical home. A canonical-home variant was built anyway, shipped
+    /// behind a kill switch, and withdrawn with its engagement counter reading
+    /// ZERO in every arm at every budget.
+    ///
+    /// So there is nothing here to re-land and nothing to fix. Read
+    /// `spill_cursor_counts()` before believing otherwise -- this residual has
+    /// now been taken on twice on the strength of a comment.
     Scratch(u8),
     /// Value is in an XMM register (XMM0-XMM15). Used for FP locals loaded via
     /// dload/fload from XMM-allocated locals. Avoids the XMM→RAX→frame round-trip
@@ -1036,6 +1072,25 @@ struct Compiler {
     /// coverage. Fail-closed: it makes the safepoint incomplete rather than
     /// silently narrowing what the map describes.
     pending_staged_args_unmapped: bool,
+    /// How many safepoints this compilation published with an INCOMPLETE map.
+    ///
+    /// `mapped_safepoint_pcs` records the same fact keyed by BYTECODE PC, and a
+    /// pc is not a safepoint: an inline splice emits one safepoint per `invoke*`
+    /// in the callee under ONE enclosing bci, and the self-recursive arm emits
+    /// its stack-guard safepoint and its recursive CALL under one bci too. Two
+    /// maps, one key — so a COMPLETE map at that bci puts the pc in the set and
+    /// `safepoint_pcs.is_subset(&mapped_safepoint_pcs)` then reads TRUE with an
+    /// incomplete map sitting right beside it. That is the masking half of the
+    /// same mistake `remap_one_jit_frame` made when it used `find` on
+    /// `bytecode_pc` where every other reader used `filter`.
+    ///
+    /// A count cannot be masked. It is what `fully_oop_covered` tests, and it is
+    /// what makes retiring the blanket `inline_sites.is_empty()` term safe: that
+    /// term existed because a splice was "a construct the current mapping cannot
+    /// describe", and Stage 3b now describes it — pushing each live spliced-callee
+    /// local into the map's own `frame_slot_offsets` and failing the safepoint
+    /// closed (`INLINE_LOCAL_UNMAPPABLE`) when it cannot.
+    incomplete_oop_maps: usize,
     /// T1.1.a — collected oop maps, indexed by native PC offset of the
     /// instruction *after* the safepoint call. Transferred to
     /// `CompiledMethod::oop_maps` at finalize time.
@@ -2718,6 +2773,7 @@ impl Compiler {
             stack_oop_marks_exact: true,
             pending_staged_arg_oops: Vec::new(),
             pending_staged_args_unmapped: false,
+            incomplete_oop_maps: 0,
             oop_maps: Vec::new(),
             local_oop_masks: Vec::new(),
             local_kinds: Vec::new(),

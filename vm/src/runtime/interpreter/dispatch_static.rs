@@ -34,7 +34,7 @@ pub(super) fn execute_invokestatic(
     // resolution succeeds; this is the slow path, only reached on a cache
     // miss from execute_invokestatic_cached, so the instruction is
     // definitely executing by this point).
-    if crate::jit::profile::is_profiling_enabled() {
+    if crate::jit::profile::is_receiver_profiling_enabled() {
         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
         shared
             .jit
@@ -402,12 +402,23 @@ pub(super) fn execute_invokestatic(
     let mut suppress_invoke_cache = loader_specific_dispatch || has_user_defining_loader;
     #[cfg(feature = "gpu-offload")]
     {
-        if shared.config.gpu_offload_enabled
+        // The guard is timed: it runs on EVERY call at a hooked site, ahead
+        // of `try_dispatch`, and `get_or_create` is not obviously free.
+        // Charged to `gpu_refusal_census` as `hook_guard` so the bench's
+        // per-call overhead can be attributed instead of assumed -- which is
+        // how it was established that the hook is 4% of it and the lost
+        // invoke cache is the other 96%.
+        let hook_timed = cratonvm_types::gpu_refusal_census::enabled();
+        let hook_entered = std::time::Instant::now();
+        let hook_open = shared.config.gpu_offload_enabled
             && shared
                 .offload_registry
                 .get_or_create(shared.config.gpu_device_ordinal, &shared.config)
-                .has_device()
-        {
+                .has_device();
+        if hook_timed {
+            cratonvm_types::gpu_refusal_census::add(4, hook_entered.elapsed().as_nanos() as u64);
+        }
+        if hook_open {
             match crate::runtime::offload::try_dispatch(
                 shared,
                 thread,
@@ -1363,7 +1374,7 @@ pub(super) fn execute_invokestatic_cached(
     // dispatch match below — every remaining path through this match
     // actually dispatches (Handled/FramePushed), so this is "the call site
     // fired," not "we merely consulted the cache."
-    if crate::jit::profile::is_profiling_enabled() {
+    if crate::jit::profile::is_receiver_profiling_enabled() {
         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
         shared
             .jit

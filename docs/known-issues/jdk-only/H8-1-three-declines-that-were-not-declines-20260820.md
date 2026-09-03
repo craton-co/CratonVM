@@ -458,6 +458,45 @@ and `javap`. No correction to `H5-1` is needed.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** §5 opened "Nothing below has been
+> run." §5.1's three rows were checked against `--dump-native-registry` on both
+> arms, from a build of this tree. **Two hold; the third was superseded by a
+> later, deliberate retirement — not falsified.**
+>
+> ```text
+>                                        --real-jdk and --jdk-only, identical
+> sun/nio/ch/UnixDispatcher.close0       kind=bridge  native-io/src/net.rs:4274
+> java/io/RandomAccessFile.getFilePointer kind=bridge  native-io/src/random_access_file.rs:624
+> java/io/Closeable.close                ABSENT
+> java/lang/AutoCloseable.close          ABSENT
+> ```
+>
+> * **H8-A's falsifier did not fire.** The surviving `close0` row names
+>   `net.rs`/`net_close`, exactly as §1.1's ordering argument requires, and the
+>   superseded `lib.rs` entry is gone. That was "the whole visible effect of
+>   H8-A".
+> * **H8-B's falsifier did not fire.** `getFilePointer` is PRESENT in the default
+>   arm. §5.1 says its absence would mean `real_raf_enabled()` is inverted and
+>   "revert immediately, that would break real-JDK RAF entirely". It is present.
+> * **The `Closeable` / `AutoCloseable` rows are absent, and §5.1 predicted
+>   "present, unchanged".** This is NOT a regression against H8-C: the two
+>   registrations were **RETIRED on 2026-08-21 by WORKER 4**, the day after this
+>   record, and the deleted lines are preserved verbatim in a comment at
+>   `native-io/src/lib.rs:8902`. The reason given is this campaign's
+>   interface-registration family: dispatch keys on the RECEIVER, so an interface
+>   instance-method row is shut out at step 1 of `execute_invoke_kind`, and again
+>   at step 6's interface-default gate. They served nobody. `H11-3` N1 had
+>   written the deletion out verbatim and could not make it because `vm/` was out
+>   of that lane's bounds.
+>
+> So the third row is stale by a documented, intentional change with a named
+> owner and a preserved diff — the distinction worth drawing, because "predicted
+> present, measured absent" reads as a falsifier until you look at why.
+>
+> **NOT verified, and §5.3 says so itself:** H8-B's behaviour change lives only
+> in the `CRATONVM_SYNTHETIC_RAF=1` arm, which no regression vector sets. A green
+> suite is explicitly not evidence for it, and this note did not set that flag.
+
 ## 5. VERIFICATION PLAN
 
 Nothing below has been run. Build the three arms and diff.

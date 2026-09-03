@@ -1324,7 +1324,15 @@ pub fn dump_method_stats_to_stderr() {
             crate::x64::inline_call_map_at_return_counts(),
             crate::x64::inline_miss_edge_poison_counts(),
         );
-        // What the operand-spill cursor did. `exhausted` is a REFUSED COMPILE:
+        // What the operand-spill cursor did, and WHERE every word went:
+        // `res-push` + `flush-reserved` + `res-invalidate` + `res-inline-locals`
+        // + `res-inline-merge` + `res-call-service` + `res-helper-args` sum to
+        // `res-total` by construction, because `SpillReason` is a parameter of
+        // `reserve_spill_slots`. The first cut of this census named three sites
+        // by hand and left 22-30% in an unnamed remainder, which is the same
+        // shape as the defect it was built to find.
+        //
+        // `exhausted` is a REFUSED COMPILE:
         // the method keeps running interpreted and the only thing that ever
         // said so was a single-slot "last bail site" with no count, so "does
         // this happen, and on what?" had no answer at all. A non-zero

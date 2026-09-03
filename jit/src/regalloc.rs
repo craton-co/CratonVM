@@ -4849,6 +4849,31 @@ impl LiveModel {
         }
         released
     }
+    /// Release the STRUCTURAL pin on every phi, for a consumer that publishes
+    /// a promoted phi's register itself at every incoming edge (`ir_lower`'s
+    /// `emit_phi_copies` does, behind `CRATONVM_JIT_IR_PHI_RESIDENCY`). The
+    /// pin exists because no definition arm ever writes a phi; a consumer
+    /// that supplies that write at the edges has discharged the reason.
+    ///
+    /// Same caveat as [`Self::release_deopt_pins`]: the home layout must
+    /// still come from a colouring that keeps every phi in its own word,
+    /// which `ir_lower::plan_slots` does. A no-op on an unconverged model.
+    pub fn release_phi_pins(&mut self, graph: &Graph) -> usize {
+        if !self.converged {
+            return 0;
+        }
+        let mut released = 0usize;
+        for (id, node) in graph.nodes.iter().enumerate() {
+            if !matches!(node.op, Op::Phi) {
+                continue;
+            }
+            if self.pinned.get(id).copied().unwrap_or(false) {
+                self.pinned[id] = false;
+                released += 1;
+            }
+        }
+        released
+    }
 }
 
 impl MachineModel {

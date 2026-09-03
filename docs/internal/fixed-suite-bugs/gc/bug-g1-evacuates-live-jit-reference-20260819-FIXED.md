@@ -373,8 +373,12 @@ The oracle was fixed — it walks the RBP chain exactly as
 `scan_compiled_frame_bands` does, checks each frame against ITS OWN method's
 maps at ITS OWN rbp over its own band only, and splits the hits into
 `never_mapped` / `wrong_map` / `below_jit`. Nobody had run it. Here is the
-number: one binary, `PolynomialTest`, `--Xmx 1g`,
-`CRATONVM_DBG_JIT_ROOTSCAN=1 CRATONVM_DBG_VERIFY_OOP_MAPS=1`.
+number: `PolynomialTest`, `--Xmx 1g`,
+`CRATONVM_DBG_JIT_ROOTSCAN=1 CRATONVM_DBG_VERIFY_OOP_MAPS=1`. The three
+single-collector rows are one binary; the second G1 row is the build one commit
+earlier, whose only difference is an unrelated stderr print — stated rather than
+elided, because a cross-binary row is not an A/B row and this page has been
+burnt by one before.
 
 | collector | colls | `ybounds` | `reason` | frames | verifiable words | `never_mapped` | `while_covered` | result |
 |---|---:|---|---|---:|---:|---:|---:|---|
@@ -386,7 +390,7 @@ number: one binary, `PolynomialTest`, `--Xmx 1g`,
 Three things to read off it, and one of them answers the other half of the
 residual.
 
-**The count is 0, 6, 0, 2 across four runs of one binary.** A codegen gap does
+**The count is 0, 6, 0, 2 across four runs.** A codegen gap does
 not come and go: `String.trim`'s compiled body either names a slot in its maps
 or it does not, and it runs thousands of times per run. A count that is zero on
 one G1 run and six on the next is measuring whether an address-shaped word

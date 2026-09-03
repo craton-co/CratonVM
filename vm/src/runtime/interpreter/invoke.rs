@@ -564,7 +564,7 @@ pub(super) fn execute_invoke_kind(
     // concurrency contract: this is a heuristic hotness signal for the
     // inliner, not a correctness input, so the small over/under-count this
     // early-return placement can produce on a resolution error is acceptable.
-    if is_special && crate::jit::profile::is_profiling_enabled() {
+    if is_special && crate::jit::profile::is_receiver_profiling_enabled() {
         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
         shared
             .jit

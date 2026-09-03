@@ -247,7 +247,7 @@ pub(super) fn execute_instruction(
                             "AIOOBE-LOAD class={cls} method={mth} pc={pc} idx={i} len={alen}"
                         );
                     }
-                    RuntimeError::aioobe(i, shared.mem.heap.array_length(array_ref) as i32)
+                    RuntimeError::array_store_fault(i, shared.mem.heap.array_length(array_ref) as i32)
                 })?;
             if remap_trace_on() && matches!(instruction, Instruction::Aaload) {
                 if let Value::Object(Some(o)) = &value {
@@ -436,7 +436,7 @@ pub(super) fn execute_instruction(
                             .unwrap_or_else(|| "?".to_string());
                         eprintln!("AIOOBE-AASTORE class={_diag_class} method={npe_mname} pc={_diag_pc} idx={i} len={alen}");
                     }
-                    RuntimeError::aioobe(i, shared.mem.heap.array_length(array_ref) as i32)
+                    RuntimeError::array_store_fault(i, shared.mem.heap.array_length(array_ref) as i32)
                 })?;
             // write_barrier fires automatically inside set_array_element
         }
@@ -515,7 +515,7 @@ pub(super) fn execute_instruction(
                             .unwrap_or_else(|| "?".to_string());
                         eprintln!("AIOOBE-XASTORE class={_diag_class} method={npe_mname} pc={_diag_pc} idx={i} len={alen}");
                     }
-                    RuntimeError::aioobe(i, shared.mem.heap.array_length(array_ref) as i32)
+                    RuntimeError::array_store_fault(i, shared.mem.heap.array_length(array_ref) as i32)
                 })?;
             // Phase 10 #2: the host just wrote this array, so any device
             // buffer mirroring it is stale.
@@ -588,7 +588,7 @@ pub(super) fn execute_instruction(
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 .set_array_element(array_ref, index as usize, Value::Long(v))
                 .map_err(|i| {
-                    RuntimeError::aioobe(i, shared.mem.heap.array_length(array_ref) as i32)
+                    RuntimeError::array_store_fault(i, shared.mem.heap.array_length(array_ref) as i32)
                 })?;
             // Phase 10 #2 — see the `Iastore` arm.
             #[cfg(feature = "gpu-offload")]
@@ -644,7 +644,7 @@ pub(super) fn execute_instruction(
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 .set_array_element(array_ref, index as usize, Value::Double(d))
                 .map_err(|i| {
-                    RuntimeError::aioobe(i, shared.mem.heap.array_length(array_ref) as i32)
+                    RuntimeError::array_store_fault(i, shared.mem.heap.array_length(array_ref) as i32)
                 })?;
             // Phase 10 #2 — see the `Iastore` arm.
             #[cfg(feature = "gpu-offload")]

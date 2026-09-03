@@ -384,17 +384,71 @@ pub(super) fn spliced_bytecode_len(site: &crate::InlineSite) -> usize {
 /// for the body's own frame, plus `callee_code_len` to bound its operand depth.
 /// A nested body gets its own locals and its own operand stack on top of the
 /// body that splices it, so the reserves add.
+/// DEFAULT ON. Opt out with `CRATONVM_JIT_NO_INLINE_RESERVE_PATH=1`, which
+/// puts the inline spill reserve back on a SUM over every site.
+///
+/// The arm exists because this changes the frame layout of every method that
+/// inlines anything, and the previous change to a frame layout in this
+/// subsystem -- reserving the scratch home at push time, 2026-09-02 -- shipped
+/// a nondeterministic heap corruption that cost a rebuild per hypothesis to
+/// bisect because no flag could separate it in one binary.
+pub(super) fn inline_reserve_path_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_RESERVE_PATH").is_none()
+    })
+}
+
+/// What ONE splice takes: its callee's locals, its branch-merge area, and a
+/// bound on its own operand depth.
+///
+/// `callee_code_len` is the operand bound — every push costs at least one
+/// bytecode byte — and `MAX_INLINE_MERGE_DEPTH` is the merge area
+/// `try_emit_inline` reserves whether or not the body branches.
+///
+/// The merge area was missing here until 2026-09-02, which under-budgeted every
+/// site by four words: `iconst_0; ireturn` is a two-byte callee that budgets
+/// two words against a spend of six. It did not bite because the reserve was a
+/// SUM over every site, so slack from the others covered it. Making the reserve
+/// a max over concurrently-live splices removes that mask, so the four words
+/// have to be named — and they are cheap next to the 273 the max saves.
+fn spliced_site_own(site: &crate::InlineSite, param_span: usize) -> usize {
+    site.callee_max_locals
+        .max(param_span)
+        .saturating_add(site.callee_code_len)
+        .saturating_add(super::inlining::MAX_INLINE_MERGE_DEPTH)
+}
+
 pub(super) fn spliced_stack_reserve(site: &crate::InlineSite) -> usize {
     let (_, param_span) = crate::compute_param_jvm_slots(&site.descriptor, site.callee_is_static);
     site.nested_sites
         .iter()
         .map(|n| spliced_stack_reserve(&n.site))
-        .fold(
-            site.callee_max_locals
-                .max(param_span)
-                .saturating_add(site.callee_code_len),
-            |a, b| a.saturating_add(b),
-        )
+        .fold(spliced_site_own(site, param_span), |a, b| {
+            a.saturating_add(b)
+        })
+}
+
+/// What one site would need if concurrently-live splices were counted rather
+/// than all of them: its own frame plus the DEEPEST nested path under it,
+/// instead of the sum over every descendant.
+///
+/// Measurement only for now. A splice's epilogue rewinds `next_spill_offset`
+/// to `caller_post_pop_spill` on both the value-returning and the void return
+/// arm, and the outer walk runs `reset_spills()` at every instruction boundary
+/// on top of that -- so sibling splices demonstrably reuse the same words, and
+/// only a root-to-leaf chain is ever live at once. `spliced_stack_reserve` sums
+/// siblings anyway, which is what this exists to price.
+pub(super) fn spliced_stack_reserve_path(site: &crate::InlineSite) -> usize {
+    let (_, param_span) = crate::compute_param_jvm_slots(&site.descriptor, site.callee_is_static);
+    let own = spliced_site_own(site, param_span);
+    let deepest = site
+        .nested_sites
+        .iter()
+        .map(|n| spliced_stack_reserve_path(&n.site))
+        .max()
+        .unwrap_or(0);
+    own.saturating_add(deepest)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1068,20 +1122,65 @@ pub fn compile_with_param_slots(
         .max()
         .unwrap_or(0);
     // Inlining allocates extra spill slots for each inlined callee's locals
-    // and operand stack ON TOP of the caller's `max_stack` (and, since the
-    // inline epilogue keeps the return value rather than reclaiming the callee
-    // locals, sequential inlines accumulate). `spill_size` is derived purely
-    // from `max_stack`, so without this reserve the inlined code writes past
-    // the spill region into the callee-saved / shadow area — corrupting live
-    // values (observed as a `ClassCastException: …$TaskOption not an enum` when
-    // a clobbered slot fed an enum-typed field). Reserve, per site,
-    // `callee_max_locals + callee_code_len` (the latter bounds the callee's own
-    // operand depth); the total is bounded by `MAX_INLINE_BUDGET`.
-    let inline_stack_reserve: usize = inline_sites
+    // and operand stack ON TOP of the caller's `max_stack`. `spill_size` is
+    // derived purely from `max_stack`, so without this reserve the inlined code
+    // writes past the spill region into the callee-saved / shadow area —
+    // corrupting live values (observed as a `ClassCastException: …$TaskOption
+    // not an enum` when a clobbered slot fed an enum-typed field). Reserve, per
+    // site, `callee_max_locals + callee_code_len` (the latter bounds the
+    // callee's own operand depth).
+    //
+    // This used to read "...and, since the inline epilogue keeps the return
+    // value rather than reclaiming the callee locals, sequential inlines
+    // accumulate", and summed the per-site figures on that basis. The epilogue
+    // reclaims now — see `inline_reserve_path_enabled` below for the evidence
+    // and for what replaced the sum.
+    let inline_stack_reserve_sum: usize = inline_sites
         .values()
         .chain(extra_guard_bodies())
         .map(spliced_stack_reserve)
         .sum();
+    let inline_stack_reserve_path: usize = inline_sites
+        .values()
+        .chain(extra_guard_bodies())
+        .map(spliced_stack_reserve_path)
+        .max()
+        .unwrap_or(0);
+    // Spend the concurrently-live figure, not the sum. DEFAULT ON; opt out
+    // with `CRATONVM_JIT_NO_INLINE_RESERVE_PATH=1`.
+    //
+    // The sum is what the comment above asks for, and it was right when it was
+    // written: the splicer used to keep the return value and leave the callee
+    // locals where they were. It does not any more. Both of the inline
+    // epilogue's return arms end with
+    // `self.next_spill_offset = caller_post_pop_spill`, and the outer walk
+    // calls `reset_spills()` at every instruction boundary on top of that, so
+    // sibling splices provably reuse the same words -- the void arm's own
+    // comment says the reclaim is load-bearing precisely for the NESTED case,
+    // where the mini-walk has no per-instruction reset. Only a root-to-leaf
+    // chain is ever live at once, which is what `spliced_stack_reserve_path`
+    // measures.
+    //
+    // Measured before the change: 280 words reserved against 7 needed on a
+    // 40-argument stress, 265 against 41 on CratonBench -- 2 KB of frame per
+    // compiled method to hold one 56-byte splice.
+    //
+    // Under-reserving here FAILS CLOSED. `callee_local_base`, the merge area
+    // and every callee operand push all go through `reserve_spill_slots`, which
+    // bounds against `spill_limit_offset` and bails the compile rather than
+    // writing past the region; the `exhausted` census column counts exactly
+    // that. So the worst case of this being wrong is inlining declined and a
+    // method left interpreted, visible in the census -- not a clobbered frame.
+    let inline_stack_reserve = if inline_reserve_path_enabled() {
+        inline_stack_reserve_path
+    } else {
+        inline_stack_reserve_sum
+    };
+    crate::note_inline_reserve(
+        inline_stack_reserve_sum as u64,
+        inline_stack_reserve_path as u64,
+        inline_stack_reserve as u64,
+    );
     let max_stack = max_stack
         .saturating_add(max_invoke_args)
         .saturating_add(inline_stack_reserve);
@@ -2566,6 +2665,22 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     cm.has_dispatch = has_dispatch;
     if !implicit_null_sites.is_empty() {
         let base = cm.entry as usize;
+        // The entry MUST be the buffer base, because `CompiledMethod::drop`
+        // retires `[entry, entry + buffer.pos())` while this registers at
+        // `entry + fault_off`. Today they agree (`entry_offset = 0` above, and
+        // the OSR-trampoline purge in that same `Drop` already leans on it).
+        // If a future prologue moves the entry, every site below it silently
+        // stops being retired -- a stale entry pointing into a reused buffer,
+        // which is the exact hazard this design exists to prevent, arriving
+        // through the one door nobody would think to check.
+        //
+        // So it is checked, and a mismatch registers NOTHING: the sites keep
+        // their elided checks and the faults they would have caught go to the
+        // crash reporter. That is a real loss of NPEs and it is the safe
+        // direction -- a crash is diagnosable, a stale recovery is not.
+        if base != cm.code_bytes().as_ptr() as usize {
+            crate::note_jit_bail_site_at("implicit-null-entry-not-base", 0, 0);
+        } else {
         for (fault_off, recover_off) in implicit_null_sites {
             // A full table DECLINES. The site keeps its elided check, and the
             // fault it would have caught then arrives as a crash instead of an
@@ -2573,6 +2688,7 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
             // and that is why `implicit_null::counts` prints it rather than
             // swallowing it.
             let _ = crate::implicit_null::register(base + fault_off, base + recover_off);
+        }
         }
     }
 
@@ -2781,9 +2897,39 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     // backstop suppression before the moving path relies on it. Always `false`
     // on the default path (`sp_id_slot_off == 0`), so it is inert until the gate
     // is on AND Stage B lands.
+    //
+    // THE INLINE TERM IS RETIRED, AND THE MASK IT HID BEHIND IS CLOSED
+    // (2026-09-02). `compiler.inline_sites.is_empty()` was the "no construct the
+    // current mapping cannot describe" clause, written when a splice was exactly
+    // that: its callee's locals lived in the caller's spill area and nothing
+    // named them. Stage 3b names them now -- each live spliced-callee local goes
+    // into this safepoint's own `frame_slot_offsets`, and a scope whose dataflow
+    // cannot classify the callee pc fails the safepoint closed
+    // (`INLINE_LOCAL_UNMAPPABLE`). The blanket term was refusing methods the
+    // sharper per-safepoint machinery had already cleared: `RMapGcStress.key`
+    // reads `shadow=true`, every one of the eight `causes` zero, `unmapped_pcs=[]`
+    // -- and `frameslot=false` for no reason but this clause.
+    //
+    // Retiring it alone would NOT have been safe, which is why the count below
+    // lands with it. `safepoint_pcs.is_subset(&mapped_safepoint_pcs)` is keyed by
+    // BYTECODE PC, and a splice emits one safepoint per `invoke*` in the callee
+    // under ONE enclosing bci -- so a complete map at that bci inserts the pc and
+    // the subset test then reads TRUE with an incomplete map beside it. The
+    // blanket term was incidentally covering that hole for exactly the shape that
+    // opens it. `incomplete_oop_maps` counts safepoints, not pcs, and cannot be
+    // masked; it is strictly stronger than the subset test for this purpose, and
+    // the subset test is kept because it also catches a safepoint that pushed no
+    // map at all.
+    //
+    // `CRATONVM_JIT_INLINE_OOP_COVERAGE=0` restores the previous predicate
+    // verbatim, so the pair is one A/B in one binary.
     cm.fully_oop_covered = compiler.precise_maps
         && compiler.sp_id_slot_off != 0
-        && compiler.inline_sites.is_empty()
+        && (if inline_oop_coverage_enabled() {
+            compiler.incomplete_oop_maps == 0
+        } else {
+            compiler.inline_sites.is_empty()
+        })
         && compiler
             .safepoint_pcs
             .is_subset(&compiler.mapped_safepoint_pcs);

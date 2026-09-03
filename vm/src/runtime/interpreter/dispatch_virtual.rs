@@ -915,7 +915,7 @@ pub(super) fn execute_invokevirtual_vtable_fast(
         )));
     }
 
-    if crate::jit::profile::is_profiling_enabled() {
+    if crate::jit::profile::is_receiver_profiling_enabled() {
         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
         shared.jit.profile_store.record_receiver_borrowed(
             cid,
@@ -1723,7 +1723,7 @@ pub(super) fn execute_invokevirtual_cached(
     // Bytecode/Native" elsewhere in this function). Same placement rationale
     // as execute_invokestatic_cached: after every early CacheMiss eviction
     // above, right before the dispatch match.
-    if is_special && crate::jit::profile::is_profiling_enabled() {
+    if is_special && crate::jit::profile::is_receiver_profiling_enabled() {
         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
         shared
             .jit
@@ -1764,7 +1764,7 @@ pub(super) fn execute_invokevirtual_cached(
                         return Ok(CachedCallResult::CacheMiss);
                     }
                     let actual_class_id = shared.mem.heap.class_id_of(obj_ref);
-                    if crate::jit::profile::is_profiling_enabled() {
+                    if crate::jit::profile::is_receiver_profiling_enabled() {
                         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
                         shared.jit.profile_store.record_receiver_borrowed(
                             cid,
@@ -2222,6 +2222,46 @@ pub(super) fn execute_invokevirtual_cached(
                             })
                             .unwrap_or(true)
                     };
+                    // `CRATONVM_DBG_TIERUP_DECLINE=1` — name the FIRST
+                    // condition below that refuses this site, per method. The
+                    // chain gates the invocation COUNTER as well as the
+                    // promotion, so a method refused here is a method
+                    // `jit-method-stats` cannot see and `CRATONVM_JIT_THRESHOLD`
+                    // cannot reach. Mirrors the `&&` order exactly.
+                    if crate::runtime::interp_census::tierup_decline_enabled() {
+                        let reason = if is_special {
+                            "is_special"
+                        } else if matches!(thread.kind, crate::threading::ThreadKind::Virtual) {
+                            "virtual_thread"
+                        } else if cached.is_synchronized {
+                            "synchronized"
+                        } else if entry_gate.generation != 0 {
+                            "entry_gate_generation"
+                        } else if crate::runtime::env_cache::disable_jit() {
+                            "nojit"
+                        } else if has_registered_native() {
+                            "registered_native"
+                        } else if receiver_is_java_util() {
+                            "receiver_is_java_util"
+                        } else if !cached.exception_table.is_empty() {
+                            "callee_exception_table"
+                        } else if !crate::runtime::env_cache::jit_virtual_tierup() {
+                            "virtual_tierup_off"
+                        } else {
+                            "admitted"
+                        };
+                        crate::runtime::interp_census::record_tierup_decline(
+                            reason,
+                            &cached.class_name,
+                            &cached.method_name,
+                            &cached.method_descriptor,
+                        );
+                    }
+                    // Set by the last `&&` operand below, and read inside the
+                    // block: which of the two PROMOTION hazards, if either,
+                    // applies to this site. See
+                    // `env_cache::jit_virtual_nominate_always`.
+                    let mut promotion_barred = false;
                     if !is_special
                         && !matches!(thread.kind, crate::threading::ThreadKind::Virtual)
                         && !cached.is_synchronized
@@ -2233,15 +2273,6 @@ pub(super) fn execute_invokevirtual_cached(
                         // and this one costs a `NativeMethodRegistry` resolve.
                         // Under `--nojit` it is now never evaluated at all.
                         && !has_registered_native()
-                        // The generic-conversion regression reaches a hot
-                        // java.util graph while Spring creates annotation and
-                        // conversion metadata. Its instance-method tier-ups
-                        // are independently JIT-safe at direct/static sites,
-                        // but this cached virtual route can publish a stale
-                        // receiver-specific entry and then spin. Keep only
-                        // this virtual promotion out of java.util; static
-                        // compilation and ordinary direct dispatch remain on.
-                        && !receiver_is_java_util()
                         // A handler-bearing callee must never be entered by a
                         // DIRECT compiled call. `execute_jit_call_decoded`
                         // below has no interpreter boundary at which the
@@ -2264,8 +2295,39 @@ pub(super) fn execute_invokevirtual_cached(
                         // wholesale. `exception_table` is carried on the
                         // callee's own cache entry, so this costs one field
                         // read, not a class-manager lookup.
-                        && cached.exception_table.is_empty()
                         && crate::runtime::env_cache::jit_virtual_tierup()
+                        // The two promotion hazards, evaluated ONCE, and the
+                        // ONLY place either is evaluated.
+                        //
+                        // `receiver_is_java_util` used to be an operand of this
+                        // chain in its own right (its comment, kept below on
+                        // `promotion_barred`'s first line, is the
+                        // generic-conversion regression it was added for). It
+                        // is a PROMOTION hazard, so it belongs where the
+                        // exception-table test now is; leaving it in the chain
+                        // as well is what made the first cut of this change
+                        // inert.
+                        //
+                        // Written as a block so the `&&` chain above still
+                        // short-circuits past its class-manager `try_read`
+                        // under `--nojit` and for a synchronized or
+                        // native-shadowed callee, exactly as before.
+                        //
+                        // With `jit_virtual_nominate_always` (default-ON) the
+                        // chain no longer STOPS here: it enters the block with
+                        // `promotion_barred` set, which suppresses the
+                        // `jit_cache` probe and the inline upgrade but lets the
+                        // invocation counter and the tiered nomination run.
+                        && {
+                            // `receiver_is_java_util` is evaluated only when it
+                            // can still change the answer, so the promotion arm
+                            // does not pay its class-manager `try_read` either.
+                            promotion_barred = !cached.exception_table.is_empty()
+                                || (!crate::runtime::env_cache::jit_virtual_promote_java_util()
+                                    && receiver_is_java_util());
+                            crate::runtime::env_cache::jit_virtual_nominate_always()
+                                || !promotion_barred
+                        }
                     {
                         // Fast path: already compiled (by this counter or OSR)?
                         //
@@ -2278,7 +2340,9 @@ pub(super) fn execute_invokevirtual_cached(
                         // racing publication can only cause a redundant re-probe,
                         // never a missed one.
                         let jit_generation = cratonvm_jit::jit_cache_generation();
-                        let compiled_opt = if cached.jit_probe_is_current(jit_generation) {
+                        let compiled_opt = if promotion_barred
+                            || cached.jit_probe_is_current(jit_generation)
+                        {
                             None
                         } else {
                             let found = shared.jit.jit_cache.read().get(
@@ -2326,10 +2390,16 @@ pub(super) fn execute_invokevirtual_cached(
                                         .jit
                                         .tiered_manager
                                         .on_method_invocation_observed(&tiered_key, cnt as u64);
-                                } else if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
-                                    try_jit_upgrade_with_gate(shared, &cached, entry_gate.clone())
-                                {
-                                    return Some(compiled);
+                                } else if !promotion_barred {
+                                    if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
+                                        try_jit_upgrade_with_gate(
+                                            shared,
+                                            &cached,
+                                            entry_gate.clone(),
+                                        )
+                                    {
+                                        return Some(compiled);
+                                    }
                                 }
                             }
                             None
@@ -2451,7 +2521,7 @@ pub(super) fn execute_invokevirtual_cached(
                         return Ok(CachedCallResult::CacheMiss);
                     }
                     let actual_class_id = shared.mem.heap.class_id_of(obj_ref);
-                    if crate::jit::profile::is_profiling_enabled() {
+                    if crate::jit::profile::is_receiver_profiling_enabled() {
                         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
                         shared.jit.profile_store.record_receiver_borrowed(
                             cid,
@@ -2620,7 +2690,7 @@ pub(super) fn execute_invokevirtual_cached(
                             return Ok(CachedCallResult::CacheMiss);
                         }
                         let actual_class_id = shared.mem.heap.class_id_of(obj_ref);
-                        if crate::jit::profile::is_profiling_enabled() {
+                        if crate::jit::profile::is_receiver_profiling_enabled() {
                             let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
                             shared.jit.profile_store.record_receiver_borrowed(
                                 cid,
@@ -4354,19 +4424,17 @@ pub(super) fn execute_invokevirtual_fast_door(
             slots[i] = (cv, tag);
         }
     }
-    thread.frames[frame_idx].stack.discard_top(total_args);
-    thread.refill_pools_from_shared(
-        &shared.mem.operand_stack_pool,
-        &shared.mem.tag_pool,
-        cached.max_locals as usize,
-        (cached.max_stack as usize).max(16) + 8,
-    );
-    let frame = Frame::new_pooled_cached_compact(
+    // One push for all three doors (see `invoke_fast::push_frame_verbatim`),
+    // which is also what lets a virtual call reuse the retired frame slot the
+    // return left behind. This tail used to be a second copy of the same
+    // sequence, and the copy is exactly why the slot-reuse change reached the
+    // static doors first and left `virtual1` flat.
+    Some(Ok(invoke_fast::push_frame_verbatim(
+        shared,
+        thread,
+        frame_idx,
         cached,
-        &slots[..total_args],
-        &mut thread.locals_pool,
-        &mut thread.stacks_pool,
-    );
-    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
-    Some(Ok(CachedCallResult::FramePushed))
+        &slots,
+        total_args,
+    )))
 }

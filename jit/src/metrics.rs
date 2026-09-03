@@ -3157,3 +3157,205 @@ pub fn ir_getfield_declines() -> Vec<(&'static str, u64)> {
         .filter(|(_, v)| *v > 0)
         .collect()
 }
+
+/// Optimizing-tier reference-STORE sites that got the gated inline sequence.
+///
+/// Counted separately from the single-pass tally
+/// (`x64::ref_store_site_counts`) because the two answer different questions
+/// and were, before 2026-09-02, answered by the same zero. A hot loop compiles
+/// on THIS tier, so "the barrier plan is engaged" measured on the single-pass
+/// counter says nothing about where the time goes.
+pub static IR_REF_STORE_GATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Optimizing-tier reference-store sites that asked and kept the full helper.
+pub static IR_REF_STORE_DECLINED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Why an optimizing-tier reference store declined the gated sequence.
+///
+/// A bare declined count cannot be acted on: "no collector published a plan"
+/// and "the plan is live but this site has no resolved compact slot" call for
+/// opposite next steps, and the first is a configuration while the second is a
+/// missing snapshot entry.
+pub static IR_REF_STORE_DECLINE: [std::sync::atomic::AtomicU64; 7] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Names for [`IR_REF_STORE_DECLINE`], index-parallel.
+pub const IR_REF_STORE_DECLINE_NAMES: [&str; 7] = [
+    "switch-off",
+    "no-bytecode-pc",
+    "no-compact-slot-for-pc",
+    "narrow-oops-or-legacy-layout",
+    "no-published-barrier-plan",
+    "descriptor-disagrees",
+    "receiver-unproven-no-read-bounds",
+];
+
+/// Record an optimizing-tier gated reference store.
+#[inline]
+pub fn note_ir_ref_store_gated() {
+    IR_REF_STORE_GATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record an optimizing-tier reference store that kept the full helper.
+#[inline]
+pub fn note_ir_ref_store_decline(reason: usize) {
+    IR_REF_STORE_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(c) = IR_REF_STORE_DECLINE.get(reason) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `(gated, declined)` optimizing-tier reference-store site counts.
+pub fn ir_ref_store_site_counts() -> (u64, u64) {
+    (
+        IR_REF_STORE_GATED.load(std::sync::atomic::Ordering::Relaxed),
+        IR_REF_STORE_DECLINED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Dynamic engagement for the optimizing tier's gated reference store —
+/// **opt-in**, `CRATONVM_DBG_IR_REF_STORE_TRACE=1`, and off it these stay zero
+/// because nothing increments them.
+///
+/// The site counts above are COMPILE-TIME: `gated=2` says the sequence was
+/// emitted at two sites, not that either one ever takes its fast path. Those
+/// are different facts and the gap between them is a whole class of wrong
+/// conclusion — an instrument armed where it cannot fire. The compactness gate
+/// is the specific reason to doubt: a class with a registered compact layout
+/// can still have legacy-cell instances, and if the allocator hands out legacy
+/// headers then every store pays five extra instructions and takes the helper
+/// anyway.
+///
+/// Emitted as a `LOCK INC` on each path, so the pair is exact under threads.
+/// It costs a locked memory operation per store and is therefore never on in a
+/// timed arm: run it to learn the split, then measure without it.
+pub static IR_REF_STORE_INLINE_TAKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Dynamic count of gated sites that fell through to `jit_putfield_object`.
+/// See [`IR_REF_STORE_INLINE_TAKEN`].
+pub static IR_REF_STORE_HELPER_TAKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Which gate sent a gated reference store to the helper, at RUN time.
+/// Trace-only, index-parallel with [`IR_REF_STORE_BAIL_NAMES`].
+///
+/// The reason a total is not enough: "the receiver was not compact" and "a
+/// barrier was genuinely needed" are the difference between a gate that can
+/// never pass on this workload and one doing its job.
+pub static IR_REF_STORE_BAIL: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Names for [`IR_REF_STORE_BAIL`], index-parallel.
+pub const IR_REF_STORE_BAIL_NAMES: [&str; 4] = [
+    "receiver-unproven",
+    "satb-marking-armed",
+    // Retired 2026-09-02: the arm emits BOTH store shapes and picks per
+    // object, so a legacy receiver is no longer a reason to leave it. The slot
+    // stays so the indices of the reasons around it do not move.
+    "receiver-not-compact-RETIRED",
+    "post-barrier-needed",
+];
+
+/// `(name, count)` for every dynamic bail reason that fired.
+pub fn ir_ref_store_bails() -> Vec<(&'static str, u64)> {
+    IR_REF_STORE_BAIL_NAMES
+        .iter()
+        .zip(IR_REF_STORE_BAIL.iter())
+        .map(|(n, c)| (*n, c.load(std::sync::atomic::Ordering::Relaxed)))
+        .filter(|(_, v)| *v > 0)
+        .collect()
+}
+
+/// The SINGLE-PASS gated reference store's dynamic paths — **opt-in**,
+/// `CRATONVM_DBG_SP_REF_STORE_TRACE=1`.
+///
+/// The optimizing tier got this instrument first, and it immediately showed
+/// that tier's `gated=2 declined=0` sitting on top of `inline=0` out of
+/// 16,384,000 executions. The single-pass arm has the same compile-time census
+/// and had no run-time one, so the same question about it was open rather than
+/// answered.
+///
+/// `INLINE` counts stores this arm performed itself; `BARRIER` counts how many
+/// of those still had to call the collector's `write_barrier` afterwards (a
+/// subset of `INLINE`, not a separate path); `HELPER` counts the ones that
+/// left for `jit_putfield_object` before storing anything.
+pub static SP_REF_STORE_INLINE_TAKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Inline stores that still needed the collector's own post barrier.
+/// See [`SP_REF_STORE_INLINE_TAKEN`].
+pub static SP_REF_STORE_BARRIER_TAKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Gated sites that left for the full helper. See [`SP_REF_STORE_INLINE_TAKEN`].
+pub static SP_REF_STORE_HELPER_TAKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Which gate sent a single-pass gated reference store to the helper.
+/// Index-parallel with [`SP_REF_STORE_BAIL_NAMES`].
+pub static SP_REF_STORE_BAIL: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Names for [`SP_REF_STORE_BAIL`], index-parallel.
+pub const SP_REF_STORE_BAIL_NAMES: [&str; 3] = [
+    "receiver-unproven",
+    "satb-marking-armed",
+    // Retired the same day it was first measured: the arm emits BOTH store
+    // shapes and picks per object, so a legacy receiver is no longer a reason
+    // to leave it. The slot stays so the indices around it do not move.
+    "receiver-not-compact-RETIRED",
+];
+
+/// `(inline, barrier, helper)` dynamic path counts for the single-pass arm.
+/// All zero means the trace was off.
+pub fn sp_ref_store_path_counts() -> (u64, u64, u64) {
+    (
+        SP_REF_STORE_INLINE_TAKEN.load(std::sync::atomic::Ordering::Relaxed),
+        SP_REF_STORE_BARRIER_TAKEN.load(std::sync::atomic::Ordering::Relaxed),
+        SP_REF_STORE_HELPER_TAKEN.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// `(name, count)` for every single-pass dynamic bail reason that fired.
+pub fn sp_ref_store_bails() -> Vec<(&'static str, u64)> {
+    SP_REF_STORE_BAIL_NAMES
+        .iter()
+        .zip(SP_REF_STORE_BAIL.iter())
+        .map(|(n, c)| (*n, c.load(std::sync::atomic::Ordering::Relaxed)))
+        .filter(|(_, v)| *v > 0)
+        .collect()
+}
+
+/// `(inline, helper)` dynamic path counts. `(0, 0)` means the trace was off.
+pub fn ir_ref_store_path_counts() -> (u64, u64) {
+    (
+        IR_REF_STORE_INLINE_TAKEN.load(std::sync::atomic::Ordering::Relaxed),
+        IR_REF_STORE_HELPER_TAKEN.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// `(name, count)` for every optimizing-tier refusal reason that fired.
+pub fn ir_ref_store_declines() -> Vec<(&'static str, u64)> {
+    IR_REF_STORE_DECLINE_NAMES
+        .iter()
+        .zip(IR_REF_STORE_DECLINE.iter())
+        .map(|(n, c)| (*n, c.load(std::sync::atomic::Ordering::Relaxed)))
+        .filter(|(_, v)| *v > 0)
+        .collect()
+}
