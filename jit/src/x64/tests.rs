@@ -16996,6 +16996,189 @@ fn the_containment_compare_narrows_its_displacement_and_knows_the_two_base_cases
     );
 }
 
+/// The gated reference store writes the RIGHT CELL for a legacy receiver, and
+/// takes no helper call to do it.
+///
+/// Executed, not inspected: the compiled body runs against a fake object and
+/// the assertions read the bytes it wrote.
+///
+/// This arm used to send every non-compact receiver to `jit_putfield_object`,
+/// which made it an arm that essentially never fired — `init_object_header`,
+/// the TLAB fast path serving nearly every allocation, writes a LEGACY header
+/// unconditionally whatever layout the class has registered. A run-time path
+/// census on `RefStoreLoopProbe` measured `inline=0` out of 16,380,000, all of
+/// them bailing at the compactness test, while the compile-time census said
+/// `gated=2 declined=0` and looked healthy.
+///
+/// Both halves are asserted. A test that only checked the legacy receiver
+/// would pass on an arm that had simply swapped one dead shape for another.
+#[test]
+fn the_gated_ref_store_writes_both_cell_shapes_without_a_helper_call() {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    static HELPER_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static BARRIER_CALLS: AtomicUsize = AtomicUsize::new(0);
+    /// Records the full-barrier path and deliberately does NOT store, so an
+    /// inline store and a helper store are trivially distinguishable.
+    unsafe extern "C" fn marker_putfield_object(_vm: i64, _obj: i64, _idx: i64, _val: i64) {
+        HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+    unsafe extern "C" fn marker_write_barrier(_heap: i64, _obj: i64, _val: i64) {
+        BARRIER_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    // The published plan: SATB disarmed, old objects present, and the
+    // generational MASK shape. `post_active` is deliberately 1 so the mask is
+    // what rules the barrier out and not a global "nothing is old" shortcut.
+    static PRE_GATE: AtomicU64 = AtomicU64::new(0);
+    static POST_GATE: AtomicU64 = AtomicU64::new(1);
+    static READ_BOUNDS: [AtomicUsize; 6] = [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ];
+
+    // void setRef(Object this, Object v) { this.f = v; }
+    let code: Vec<u8> = vec![0x2a, 0x2b, 0xb5, 0x00, 0x01, 0xb1, 0, 0];
+    let field_info = vec![(2usize, 0usize, b'L')];
+    let mut helpers = test_helpers();
+    helpers.putfield_object = marker_putfield_object as *const () as usize; // Cast: fn → slot
+    helpers.write_barrier = marker_write_barrier as *const () as usize; // Cast: fn → slot
+    helpers.read_bounds_addr = READ_BOUNDS.as_ptr() as usize; // Cast: static address
+    helpers.ref_store_pre_gate = std::ptr::addr_of!(PRE_GATE) as usize; // Cast: static address
+    helpers.ref_store_post_gate = std::ptr::addr_of!(POST_GATE) as usize; // Cast: static address
+    helpers.ref_store_post_young_floor = 0;
+    helpers.ref_store_post_skip_mask = cratonvm_types::GC_FLAG_OLD_GEN as usize;
+
+    set_pending_compact_field_info(vec![(2, 0, true)]);
+    let compiled = compile(
+        &code,
+        6,
+        2,
+        2,
+        true, // needs_heap — the barrier helper takes it
+        Vec::new(),
+        field_info,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(), // pic_slots
+        Vec::new(), // ldc_info
+        Vec::new(), // ldc2w_info
+        HashMap::new(),
+        HashMap::new(),
+        &helpers,
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None, // string_layout
+    )
+    .expect("reference putfield must compile");
+
+    let val = Box::new([0u64; 8]);
+    let val_addr = val.as_ptr() as usize; // Cast: stored reference
+
+    // ---- LEGACY receiver: no GC_FLAG_COMPACT, the 16-byte `Value` cell ----
+    let mut obj = Box::new([0u64; 8]);
+    // SAFETY: `obj` is 64 bytes and 8-byte aligned; both writes land inside it.
+    unsafe {
+        let p = obj.as_mut_ptr() as *mut u8; // Cast: array base → byte cursor
+        *p.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) = 0; // young, LEGACY
+        std::ptr::write_unaligned(
+            p.add(cratonvm_types::NUM_SLOTS_OFFSET) as *mut u32, // Cast: header field
+            4u32,
+        );
+    }
+    let obj_addr = obj.as_mut_ptr() as usize; // Cast: receiver address
+    let page = obj_addr & !0xFFF;
+    READ_BOUNDS[0].store(page, Ordering::Release);
+    READ_BOUNDS[1].store(page + 0x10000, Ordering::Release);
+
+    HELPER_CALLS.store(0, Ordering::SeqCst);
+    BARRIER_CALLS.store(0, Ordering::SeqCst);
+    // SAFETY: JIT-compiled code from valid bytecode in an executable mmap; the
+    // receiver is a live 64-byte buffer shaped like an object header and
+    // neither marker helper stores anything.
+    unsafe {
+        compiled.call_with_heap(0, &[obj_addr as i64, val_addr as i64]); // Cast: JIT ABI
+    }
+    assert_eq!(
+        (
+            HELPER_CALLS.load(Ordering::SeqCst),
+            BARRIER_CALLS.load(Ordering::SeqCst)
+        ),
+        (0, 0),
+        "a young LEGACY receiver must store inline and call NOTHING — before \
+         the two-shape store it took the helper on every single execution"
+    );
+    let word = cratonvm_types::HEADER_SIZE / 8;
+    assert_eq!(
+        obj[word] as u32,
+        cratonvm_types::FIELD_CELL_TAG_OBJECT,
+        "the legacy shape must write the cell's TAG; a payload written without \
+         it leaves a discriminant saying whatever the field held before, and \
+         the reader believes the discriminant"
+    );
+    assert_eq!(
+        obj[word + 1] as usize, // Cast: raw stored pointer word
+        val_addr,
+        "the legacy shape must write the 64-bit pointer payload"
+    );
+
+    // ---- COMPACT receiver: the bare 8-byte pointer at the cell base ----
+    let mut c_obj = fake_compact_young_object();
+    let c_addr = c_obj.as_mut_ptr() as usize; // Cast: receiver address
+    let c_page = c_addr & !0xFFF;
+    READ_BOUNDS[0].store(c_page, Ordering::Release);
+    READ_BOUNDS[1].store(c_page + 0x10000, Ordering::Release);
+    HELPER_CALLS.store(0, Ordering::SeqCst);
+    BARRIER_CALLS.store(0, Ordering::SeqCst);
+    // SAFETY: as above.
+    unsafe {
+        compiled.call_with_heap(0, &[c_addr as i64, val_addr as i64]); // Cast: JIT ABI
+    }
+    assert_eq!(
+        (
+            HELPER_CALLS.load(Ordering::SeqCst),
+            BARRIER_CALLS.load(Ordering::SeqCst)
+        ),
+        (0, 0),
+        "a young COMPACT receiver must still store inline and call nothing"
+    );
+    assert_eq!(
+        fake_object_ref_cell(&c_obj),
+        val_addr,
+        "the compact shape must survive the addition of the legacy one — the \
+         receiver's own header decides, and a genuinely compact object stores \
+         the bare pointer"
+    );
+
+    // ---- an OLD receiver still reaches the collector's write barrier ----
+    // SAFETY: `c_obj` is the buffer built above; this sets its flags byte.
+    unsafe {
+        let p = c_obj.as_mut_ptr() as *mut u8; // Cast: array base → byte cursor
+        *p.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) =
+            cratonvm_types::GC_FLAG_COMPACT | cratonvm_types::GC_FLAG_OLD_GEN;
+    }
+    BARRIER_CALLS.store(0, Ordering::SeqCst);
+    // SAFETY: as above.
+    unsafe {
+        compiled.call_with_heap(0, &[c_addr as i64, val_addr as i64]); // Cast: JIT ABI
+    }
+    assert_eq!(
+        BARRIER_CALLS.load(Ordering::SeqCst),
+        1,
+        "an OLD receiver is the case the mask exists to catch: the store is \
+         still inline, but the collector's own write barrier must run"
+    );
+}
+
 /// The two post-barrier gate shapes are mutually exclusive, and a plan that
 /// supplies neither (or both) is declined.
 ///

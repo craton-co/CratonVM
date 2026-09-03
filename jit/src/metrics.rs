@@ -3279,6 +3279,69 @@ pub fn ir_ref_store_bails() -> Vec<(&'static str, u64)> {
         .collect()
 }
 
+/// The SINGLE-PASS gated reference store's dynamic paths — **opt-in**,
+/// `CRATONVM_DBG_SP_REF_STORE_TRACE=1`.
+///
+/// The optimizing tier got this instrument first, and it immediately showed
+/// that tier's `gated=2 declined=0` sitting on top of `inline=0` out of
+/// 16,384,000 executions. The single-pass arm has the same compile-time census
+/// and had no run-time one, so the same question about it was open rather than
+/// answered.
+///
+/// `INLINE` counts stores this arm performed itself; `BARRIER` counts how many
+/// of those still had to call the collector's `write_barrier` afterwards (a
+/// subset of `INLINE`, not a separate path); `HELPER` counts the ones that
+/// left for `jit_putfield_object` before storing anything.
+pub static SP_REF_STORE_INLINE_TAKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Inline stores that still needed the collector's own post barrier.
+/// See [`SP_REF_STORE_INLINE_TAKEN`].
+pub static SP_REF_STORE_BARRIER_TAKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Gated sites that left for the full helper. See [`SP_REF_STORE_INLINE_TAKEN`].
+pub static SP_REF_STORE_HELPER_TAKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Which gate sent a single-pass gated reference store to the helper.
+/// Index-parallel with [`SP_REF_STORE_BAIL_NAMES`].
+pub static SP_REF_STORE_BAIL: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Names for [`SP_REF_STORE_BAIL`], index-parallel.
+pub const SP_REF_STORE_BAIL_NAMES: [&str; 3] = [
+    "receiver-unproven",
+    "satb-marking-armed",
+    // Retired the same day it was first measured: the arm emits BOTH store
+    // shapes and picks per object, so a legacy receiver is no longer a reason
+    // to leave it. The slot stays so the indices around it do not move.
+    "receiver-not-compact-RETIRED",
+];
+
+/// `(inline, barrier, helper)` dynamic path counts for the single-pass arm.
+/// All zero means the trace was off.
+pub fn sp_ref_store_path_counts() -> (u64, u64, u64) {
+    (
+        SP_REF_STORE_INLINE_TAKEN.load(std::sync::atomic::Ordering::Relaxed),
+        SP_REF_STORE_BARRIER_TAKEN.load(std::sync::atomic::Ordering::Relaxed),
+        SP_REF_STORE_HELPER_TAKEN.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// `(name, count)` for every single-pass dynamic bail reason that fired.
+pub fn sp_ref_store_bails() -> Vec<(&'static str, u64)> {
+    SP_REF_STORE_BAIL_NAMES
+        .iter()
+        .zip(SP_REF_STORE_BAIL.iter())
+        .map(|(n, c)| (*n, c.load(std::sync::atomic::Ordering::Relaxed)))
+        .filter(|(_, v)| *v > 0)
+        .collect()
+}
+
 /// `(inline, helper)` dynamic path counts. `(0, 0)` means the trace was off.
 pub fn ir_ref_store_path_counts() -> (u64, u64) {
     (

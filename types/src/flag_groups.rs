@@ -1229,6 +1229,9 @@ pub const INVENTORY: &[E] = &[
     // and its helper fallback. The compile-time census counts emitted
     // sequences, which is not the same fact.
     E { group: Group::JIT, token: "dbg-ir-ref-store-trace", on_key: Some("CRATONVM_DBG_IR_REF_STORE_TRACE"), off_key: None, off_word: None, since: "2026-09-02" },
+    // The single-pass twin. Two switches rather than one so a run can trace one
+    // tier at a time when both arms are engaged.
+    E { group: Group::JIT, token: "dbg-sp-ref-store-trace", on_key: Some("CRATONVM_DBG_SP_REF_STORE_TRACE"), off_key: None, off_word: None, since: "2026-09-02" },
     // Seeds `this` non-null at method entry. Kept separate from
     // `receiver-null-elim` below because the blast radii differ: this one
     // widens a fact THREE consumers already read (array null-check elision,

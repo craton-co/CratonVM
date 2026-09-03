@@ -1608,6 +1608,23 @@ impl Compiler {
         ref_store_post_skip_mask_of(&self.helpers)
     }
 
+    /// `LOCK INC qword [counter]` when the single-pass reference-store path
+    /// trace is on, and nothing at all otherwise.
+    ///
+    /// Uses R11, which is scratch at every call site here, and clobbers flags
+    /// — so it is only ever emitted where the next instruction sets them again
+    /// or does not read them.
+    fn emit_ref_store_path_trace(&mut self, counter: &'static std::sync::atomic::AtomicU64) {
+        if !crate::x64::sp_ref_store_trace_enabled() {
+            return;
+        }
+        self.emit_mov_imm64_full(R11, counter as *const _ as i64);
+        self.buf.emit_byte(0xF0); // LOCK
+        self.buf.emit_byte(0x49); // REX.W + REX.B
+        self.buf.emit_byte(0xFF); // INC r/m64 (/0)
+        self.buf.emit_byte(0x03); // ModRM mod=00 reg=000 rm=011 (R11)
+    }
+
     /// Emit a compact reference `putfield` whose barriers are **gated inline**
     /// rather than paid as a call.
     ///
@@ -1664,7 +1681,12 @@ impl Compiler {
         // The value has to survive to the store and, on the barriered path, to
         // the helper call — both of which read it out of its frame slot, so no
         // register constraint travels across the guards.
-        let mut bail: Vec<usize> = Vec::new();
+        // The bail sets are kept APART rather than in one vector so the
+        // run-time trace can say which gate refused — see `SP_REF_STORE_BAIL`.
+        // Without the trace they are concatenated and all land on the same
+        // helper label, which is exactly what they did before this split.
+        let mut bail_recv: Vec<usize> = Vec::new();
+        let mut bail_pre: Vec<usize> = Vec::new();
         self.load_slot_to_reg(RAX, obj_slot);
 
         // ── receiver validity ───────────────────────────────────────────
@@ -1674,7 +1696,7 @@ impl Compiler {
         // the header reads below cannot fault" — the barrier question is the
         // gates' job now, and conflating the two is what left this arm dead
         // under every non-publishing collector.
-        bail.extend(if receiver_is_trusted_oop {
+        bail_recv.extend(if receiver_is_trusted_oop {
             self.emit_trusted_oop_receiver_check()
         } else {
             self.emit_guarded_getfield_receiver_check(self.helpers.read_bounds_addr)
@@ -1686,18 +1708,16 @@ impl Compiler {
         // mark phase.
         self.emit_mov_imm64_full(R11, pre as i64);
         self.emit_cmp_mem8_imm8(R11, 0, 0);
-        bail.push(self.emit_jcc_rel32_patch(0x85)); // JNE → helper
+        bail_pre.push(self.emit_jcc_rel32_patch(0x85)); // JNE → helper
 
-        // ── layout guard, out of ONE header byte ────────────────────────
+        // ── the receiver flags byte, read ONCE ──────────────────────────
         // `GC_FLAGS_BYTE_OFFSET` carries the flags in bits 0..3 and `gc_age` in
-        // bits 4..7, so this single byte answers both the compactness question
-        // here and the young-receiver question after the store. Read as a byte
-        // rather than as the dword the older arms use: that dword starts 15
-        // bytes into a 16-byte header and takes three of its four bytes from
-        // the first instance field.
+        // bits 4..7, so this single byte answers both the young-receiver
+        // question the post gate asks and the per-object layout question the
+        // store shape below asks. Read as a byte rather than as the dword the
+        // older arms use: that dword starts 15 bytes into a 16-byte header and
+        // takes three of its four bytes from the first instance field.
         self.emit_movzx_r32_mem8(RCX, RAX, cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32);
-        self.emit_test_r8_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT);
-        bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ → helper (legacy cell layout)
 
         // ── slot bounds ─────────────────────────────────────────────────
         // `field_index < num_slots`. A failure DROPS the store, matching
@@ -1708,9 +1728,53 @@ impl Compiler {
         self.emit_cmp_r32_r32(R10, R11);
         let oob = self.emit_jcc_rel32_patch(0x83); // JAE → drop
 
-        // ── the store ───────────────────────────────────────────────────
+        // ── the store, in whichever shape this OBJECT has ───────────────
+        //
+        // Both layouts store inline, and the reason is measured rather than
+        // assumed. This arm used to send a non-compact receiver to the helper,
+        // which made it an arm that essentially never fired:
+        // `init_object_header` — the TLAB fast path serving nearly every
+        // allocation for the interpreter and `jit_new_object` alike — writes a
+        // LEGACY header unconditionally (`array_length = 0`, no
+        // `GC_FLAG_COMPACT`) whatever layout the class has registered, because
+        // it never consults `plan_object_alloc`. A run-time path census on
+        // `RefStoreLoopProbe` put a number on it: `inline=0` out of
+        // **16,380,000**, every one bailing at the compactness test, while the
+        // compile-time census reported `gated=2 declined=0` and looked healthy.
+        //
+        // It is the same trap the inline `getfield` read fell into and climbed
+        // out of on 2026-08-18, and the optimizing tier's twin of this arm on
+        // 2026-09-02. The fix is theirs: emit both shapes and pick per OBJECT
+        // on the header bit, exactly as `jit_putfield_object` does.
         self.load_slot_to_reg(RDX, val_slot);
+        self.emit_test_r8_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT);
+        let legacy_shape = self.emit_jcc_rel32_patch(0x84); // JZ → the 16-byte cell
+        // COMPACT: a reference field is the bare 8-byte pointer at the cell
+        // base, which is what the guarded inline `getfield` reads back.
         self.emit_mov_mem_disp32_r64(RAX, RDX, cell_off);
+        let shaped = self.emit_jmp_rel32_patch();
+        // LEGACY: the uniform 16-byte `Value` cell — tag qword (the dword tag
+        // plus its pad) then the pointer payload. `field_index < num_slots` was
+        // checked above, and for a legacy object `num_slots` counts exactly
+        // these cells, which is what makes this stride addressable.
+        self.patch_rel32_to_here(legacy_shape);
+        let legacy_off = (HEADER_SIZE + field_index * SLOT_SIZE) as i32; // Cast: disp32
+        self.emit_mov_imm64(R10, i64::from(cratonvm_types::FIELD_CELL_TAG_OBJECT));
+        self.emit_mov_mem_disp32_r64(
+            RAX,
+            R10,
+            legacy_off + cratonvm_types::FIELD_CELL_TAG_OFFSET as i32,
+        );
+        self.emit_mov_mem_disp32_r64(
+            RAX,
+            RDX,
+            legacy_off + cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET as i32,
+        );
+        self.patch_rel32_to_here(shaped);
+        // Counted here rather than at the top: everything above can still
+        // leave for the helper, and "reached the store" is the fact the
+        // compile-time census cannot supply.
+        self.emit_ref_store_path_trace(&crate::metrics::SP_REF_STORE_INLINE_TAKEN);
 
         // ── post-barrier gates ──────────────────────────────────────────
         // CL still holds the receiver's flags byte, which carries `gc_age` in
@@ -1742,6 +1806,7 @@ impl Compiler {
         done.push(self.emit_jcc_rel32_patch(0x84)); // JZ → no old objects, no card
 
         // Neither gate could rule the barrier out: run the collector's own.
+        self.emit_ref_store_path_trace(&crate::metrics::SP_REF_STORE_BARRIER_TAKEN);
         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
         self.load_slot_to_reg(ARG_REGS[2], val_slot);
@@ -1749,9 +1814,32 @@ impl Compiler {
         done.push(self.emit_jmp_rel32_patch());
 
         // ── helper fallback: the full SATB + post barrier + store ───────
-        for b in bail {
+        //
+        // With the trace on, each bail set gets a one-instruction stub naming
+        // it before joining the helper; without it they all land here directly
+        // and cost nothing.
+        let bail_groups = [(bail_recv, 0usize), (bail_pre, 1)];
+        let mut to_helper: Vec<usize> = Vec::new();
+        if crate::x64::sp_ref_store_trace_enabled() {
+            for (patches, reason) in bail_groups {
+                if patches.is_empty() {
+                    continue;
+                }
+                for b in patches {
+                    self.patch_rel32_to_here(b);
+                }
+                self.emit_ref_store_path_trace(&crate::metrics::SP_REF_STORE_BAIL[reason]);
+                to_helper.push(self.emit_jmp_rel32_patch());
+            }
+        } else {
+            for (patches, _) in bail_groups {
+                to_helper.extend(patches);
+            }
+        }
+        for b in to_helper {
             self.patch_rel32_to_here(b);
         }
+        self.emit_ref_store_path_trace(&crate::metrics::SP_REF_STORE_HELPER_TAKEN);
         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
         self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 imm32
