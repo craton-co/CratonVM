@@ -22181,12 +22181,13 @@ fn try_compile_inner(
             method_info,
         );
         if result.success {
-            if let Some(machine_code) = aarch64_backend::emit_machine_code(&result) {
-                if let Some(mut buf) = ExecutableBuffer::new(machine_code.len().max(4096)) {
-                    buf.set_tag("aarch64-backend");
-                    buf.emit(&machine_code);
-                    return Some(CompiledMethod::new(buf));
-                }
+            // One line on purpose: everything this used to do inline lives in
+            // `publish_compiled_method`, which has no `cfg` on it and so is
+            // type-checked and unit-tested on every host. This block is not
+            // compiled on x86-64, which is how it came to build its
+            // `CompiledMethod` without ever transferring `oop_maps`.
+            if let Some(cm) = aarch64_backend::publish_compiled_method(&result) {
+                return Some(cm);
             }
         }
         return None;
