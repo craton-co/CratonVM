@@ -51,9 +51,18 @@ The data is intact. The compiled loop is wrong.
 
 `CRATONVM_JIT_DENY=TreeTailIterProbe.iterTail` makes it clean, and denying the
 caller (`main`) does not. So the defect is in that one method's compiled body.
-It also fails exactly ONCE per method, on the first entry to the freshly
-compiled body, and is correct forever after; with tier-up switches flipped the
-failure moves between `iterTail` and `iterHead`, which is the same statement.
+With tier-up switches flipped the failure moves between `iterTail` and
+`iterHead`, which says the same thing about whichever one compiles at that
+moment.
+
+**How many iterations fail depends on the probe, and the difference is worth
+knowing before you read a count.** Without the `EMPTY-ITER` diagnostic the
+method fails exactly ONCE, on the first entry to the freshly compiled body, and
+is right forever after -- which is what first suggested a compile transition.
+The committed probe carries the diagnostic, and then fails persistently
+(`badTail=2496` of 3000 from iteration 503): the extra code in the cold path
+changes the method enough that whatever repaired it no longer happens. Same
+first failure, different recovery. Do not read the count as severity.
 
 `subCls=java.util.TreeMap`, not a `NavigableSubMap`: the native `tailMap`
 returns a natively-managed TreeMap. `native-collections/src/lib.rs` records why
