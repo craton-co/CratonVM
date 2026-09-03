@@ -2,7 +2,9 @@
 
 ## Status
 
-**OPEN (root cause), MITIGATED (default flipped) 2026-09-02.**
+**OPEN (root cause), MITIGATED (default flipped) 2026-09-02.** The stated
+hypothesis was refuted on 2026-09-02 -- see below -- and the search is narrowed
+rather than closed.
 `CRATONVM_JIT_BOX_UNBOX_INTRINSIC` is now opt-in. The crash it causes is gone
 from the shipped default; the reason the inline sequence is unsafe under a
 moving collector is NOT yet established, and that is what stays open.
@@ -50,25 +52,124 @@ Its relocation files are byte-identical to parent 2, so nothing was
 hand-resolved there. The defect is the INTERACTION between
 `perf/box-random-intrinsics-20260902` and dev's relocation, not either alone.
 
-## The shape of the suspicion
+## Narrowed 2026-09-02 (later): it is relocation UNDER LIVE JIT FRAMES
+
+Four more arms on the pre-fix binary (intrinsic default-ON), 1200 s cap, quiet
+host, each with the default arm re-run in the SAME batch as a positive control
+so a quiet batch cannot be mistaken for a fix:
+
+| arm | SIGSEGV |
+|---|---|
+| default (positive control) | **2 / 2** (34 s, 121 s) |
+| `CRATONVM_COMPACT_REF_FIELDS=0` | **3 / 3** — hypothesis REFUTED |
+| `CRATONVM_ZGC_RELOCATE=0` | 0 / 3 |
+| `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` | **0 / 3** |
+
+**Refuted: the compact/legacy offset fallback.** `AtomicLongFieldLayout::new`
+falls back to `compact = legacy` when `compact_field_storage` has no entry, and
+the emitted code still branches on `GC_FLAG_COMPACT` and uses `compact` for a
+compact instance — so a compact object read at a legacy offset can land past
+its end, which would fault exactly like this. It is a real smell and it is NOT
+this defect: with compact fields off entirely, all three runs still SIGSEGV.
+Written down because it looked convincing and cost one run to rule out.
+
+**Confirmed: the narrow switch is enough.** `RELOCATE_UNDER_PROVEN_JIT=0` keeps
+compaction on everywhere EXCEPT under live compiled frames, and that alone
+removes the crash. So the stale value is a reference held in a LIVE JIT FRAME
+that relocation moved without rewriting — a root the safepoint's oop map does
+not name.
+
+That is the same family as
+`known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`,
+which has been hunting an unnamed root in a compiled frame for days and whose
+oracle reports `local_oop=0`. This is a fresh, cheap, 100%-reproducible
+instance of that shape — and unlike that page's witness, this one has a switch
+that turns it on and off in one binary.
+
+## The shape of the suspicion -- and why it cannot be right as stated
 
 `bytecode_walk.rs`, region `BOX_UNBOX`, inlines `Long.longValue()J` and
 `Integer.intValue()I`. It pops the receiver off the simulated operand stack and
 then dereferences it three times -- the class-id guard at `[RAX]`, the GC-flags
 byte, and the payload load -- with no call and therefore no safepoint between
-them. That is sound only while the receiver in hand cannot go stale. Under a
-moving collector it evidently can.
+them.
 
-**This is a hypothesis, not a finding.** What is measured is the pair of
-switches above and the bisect. The next step is to keep the receiver as a NAMED
-root across the sequence rather than only in `RAX`, and to re-enable the family
-behind its own switch to check whether that closes it.
+This page originally read: *"That is sound only while the receiver in hand
+cannot go stale. Under a moving collector it evidently can."* **That cannot be
+the mechanism.** Relocation here is stop-the-world -- `ZgcRealHeap::relocate_stw`
+-- so the mutator is parked at a safepoint while objects move. A receiver held
+in a register across a stretch containing NO safepoint is not the unsafe case;
+it is precisely the safe one. Nothing can move under that sequence.
+
+So the receiver must already be stale when it is LOADED. The question is not
+"what moves it while we hold it" but **"why was the slot it came from not
+healed at the last relocating safepoint"** -- which is a question about the oop
+map, not about the length of the inline sequence.
+
+That also retires the next step this page used to propose. Keeping the receiver
+as a named root ACROSS the sequence fixes nothing under STW relocation, because
+there is no safepoint inside the sequence for a root to matter at.
+
+## What a targeted probe rules out (2026-09-02)
+
+`probes/BoxUnboxReloc.java` -- a hot compiled unbox of long-lived boxed
+receivers, interleaved with garbage so their pages fragment and become
+compaction candidates. **8 runs per arm, intrinsic ON and OFF, zero crashes and
+zero wrong answers**, with all three ingredients measured as ENGAGED in the same
+run:
+
+| ingredient | how it was confirmed |
+|---|---|
+| the intrinsic | 3 sites claimed (`CRATONVM_DBG_ATOMIC_INTRINSIC=1`) |
+| relocation | `objects_relocated=34629`, `compaction_cycles=2` (`CRATONVM_GC_STATS=1`) |
+| the bail edge | `nullBails=19200` -- null receivers deopt through reason 6 |
+
+The bail edge is in there deliberately: it is the only CALL anywhere near this
+sequence, it is taken with the receiver already popped from the simulated
+operand stack, and it was the one remaining place a safepoint could open a
+window. It does not.
+
+**Read those counters before believing any result from this probe.** The first
+version of it ran clean 3/3 and meant nothing: it allocated the receivers in
+one dense block, so `objects_relocated` was 0 and the collector never had a
+reason to move them. A relocation defect cannot be exercised by a run that
+relocates nothing.
+
+`probes/BoxUnboxRelocMT.java` varies the one thing left -- thread count. Four
+mutator threads unboxing the same tables while a fifth fragments them, 30 s per
+run, **3 runs per arm, no crash and no wrong answer in any of them**:
+
+| arm | compaction cycles | objects relocated | null bails |
+|---|---|---|---|
+| intrinsic ON | 173 / 204 / 211 | 3.2M / 3.7M / 3.9M | ~300k |
+| intrinsic OFF | 150 / 226 / 281 | 2.7M / 4.1M / 5.0M | ~480k |
+
+Five million relocations with the family enabled, and nothing. So whatever H2
+does, it is not simply "unbox a relocating receiver on several threads".
+
+Two extraction traps this cost, both worth avoiding on the next attempt.
+`objects_relocated=` appears on more than one line, and grepping the whole log
+for the LAST one reports 0 while the summary line says 3.2M -- restrict to
+`zgc-features:` first. And at 6 threads the workload stops compacting
+altogether (`objects_relocated=0` in every run), so a thread count chosen for
+"more pressure" can quietly remove the very ingredient being tested.
+
+The lead that remains is what `TestRandomMapOps` does that this does not:
+receivers that are not `Long`/`Integer` from `valueOf`, a deopt from somewhere
+other than the null check, or an interaction with the map's own structure.
+
+Note what the sequence does to the receiver's SLOT: `pop_stack()` releases it,
+and `push_from_rax()` can hand the same spill slot straight back for the
+primitive result. Between those two the reference lives only in `RAX`. Any
+safepoint that observes the frame in that window sees a slot the map no longer
+names — or, worse, names as holding the primitive that replaced it.
 
 ## The mitigation
 
 `box_unbox_intrinsic_disabled()` now defaults to disabled. Set
 `CRATONVM_JIT_BOX_UNBOX_INTRINSIC=1` to turn the family back on -- which is how
-the root-cause work should run it. `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1`
+the root-cause work should run it. The fix arm was verified at **3 of 3 runs
+clean to the 1200 s cap** on the workload that crashed 11 out of 11. `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1`
 still forces it off and still means the same thing, so any script that already
 sets it is unaffected.
 

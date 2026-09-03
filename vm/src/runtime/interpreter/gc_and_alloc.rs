@@ -4083,7 +4083,7 @@ pub(super) fn tlab_alloc_shaped_inner(
             unsafe { shape.init_header(ptr, class_id, hash) };
             shared.mem.heap.note_tlab_object(ptr, total_size);
         }) {
-            shared.mem.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
+                shared.mem.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
             shared
                 .mem
                 .bytes_allocated_total

@@ -907,6 +907,20 @@ impl Compiler {
         // this function advance the spill cursor and the OSR entry's local
         // homes are derived from the same layout — a nondeterministic heap
         // corruption. Nothing here may touch the cursor.
+        //
+        // 2026-09-02, the eight-finding pass: re-examined as that pass's
+        // finding 6, and the recommendation is AGAINST widening this. The
+        // ARG_REGS collision is fixable — a dynamic pool of the callee-saved
+        // registers `alloc_used_regs` did not hand out contains no argument
+        // register, and callee-saved means a call preserves the value by the
+        // ABI rather than by a flush the emitter has to remember. What changed
+        // is the size of the prize: `slot_mirror` already elides the RELOAD
+        // half of the round-trip (the step-7 row of
+        // `known-issues/perf/array-element-load-baseline-codegen-20260901.md`),
+        // so a widened cache still buys one STORE per push. Set that against
+        // the constraint above — the adjacent change shipped a nondeterministic
+        // heap corruption and was reverted the same day — and the expected
+        // value is negative. Left as it is, deliberately.
         if self.kernel_operand_cache || operand_cache_enabled() {
             let free = SCRATCH_REGS.iter().copied().find(|&candidate| {
                 !self
