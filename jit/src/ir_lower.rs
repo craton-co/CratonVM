@@ -10653,9 +10653,9 @@ fn verify_mir_allocation(
 }
 
 /// Run the linear-scan allocator and use its result as a register read cache.
-/// `CRATONVM_JIT_IR_LINEAR_SCAN=1`, **default OFF**.
+/// **Default ON** since 2026-09-02; `CRATONVM_JIT_IR_LINEAR_SCAN=0` opts out.
 ///
-/// # What this file gained, and why the default did not move with it
+/// # What this file gained, and how the default moved
 ///
 /// It shipped OFF while the file was XMM-only, and while it was XMM-only that
 /// was the right default: the wiring's own comment said *"this wiring is still
@@ -10670,9 +10670,9 @@ fn verify_mir_allocation(
 /// slower** on Windows and **~3.2x** slower on a quieter Linux host, on every
 /// kernel whose cost was not already dominated by an out-of-line helper call.
 ///
-/// **The default stays off because the fix does not yet reach those kernels,
-/// and the census says so rather than a guess.** With
-/// `CRATONVM_DBG_IR_LINEAR_SCAN=1`:
+/// **The default stayed off at first because the fix did not reach those
+/// kernels, and the census said so rather than a guess.** With
+/// `CRATONVM_DBG_IR_LINEAR_SCAN=1`, at that time:
 ///
 /// * on `BinTrees.itemCheck` the file works —
 ///   `resident=7 (fp=0 gp=7) demoted=0`, `phi=0`, with 13 candidates lost to
@@ -10689,11 +10689,21 @@ fn verify_mir_allocation(
 /// op, so reconciling the two is a one-line fix with a test rather than a
 /// search through fifty variants.
 ///
-/// So: the capability is built, verified and safe, and flipping this default is
-/// a decision that wants a wall-clock measurement on a quiet host — which the
-/// host this landed on could not supply (load 30–63 throughout). Reconcile the
-/// enumerations first; the flip is worth little until the kernels that showed
-/// the inversion can actually reach the allocator.
+/// **Both prerequisites landed on 2026-09-02 and the default moved with them.**
+/// The enumeration disagreement was the one `ir_op_defines_value` had over
+/// `Op::ArrayLength` and `Op::NewArray` — it declined the file on every method
+/// containing an `arraylength`, which is every counted `for` loop over an
+/// array. Phis are admitted separately (`ir_phi_residency_enabled`). The
+/// regression suite is green with the file on (88/88).
+///
+/// **What the flip did NOT settle** is the tiering inversion this paragraph
+/// was written about. Re-measured 2026-09-03 on a RELEASE binary, arms
+/// interleaved, with a second arm of each configuration to establish the noise
+/// floor: four of five loop shapes are indistinguishable between tiers, and the
+/// field-read loop is still **~1.65x slower at the optimizing tier**
+/// (C1 0.86/0.83 against C2 1.39/1.41, fifteen reps, controls agreeing to 3.5%
+/// and 1.4%). So this file closed the part of the gap it was built for and the
+/// remaining case is elsewhere — see `docs/JIT_OPTIMIZATION.md`.
 ///
 /// Off is exactly the pre-change emission: no register is handed out, no save
 /// area is reserved, every read goes to its home word.
