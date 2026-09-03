@@ -168,20 +168,12 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status: CODE LANDED, BEHAVIOUR UNVERIFIED ON CRATONVM.** 2026-08-16, lane",
     ),
     (
-        "docs/known-issues/jdk-only/G14-1-the-uri-value-surface-and-how-far-RJdkBridge1-got-20260817.md",
-        "status block says: so no binary exists that contains the code below. Every 'after' here is",
-    ),
-    (
         "docs/known-issues/jdk-only/G29-1-the-fabricated-http-request-and-its-missing-accessors-20260817.md",
         "status block says: oracle. The fix is written and formatted but **has not been built**, so its",
     ),
     (
         "docs/known-issues/jdk-only/G31-1-astype-and-the-verifier-that-was-never-asked-20260817.md",
         "status block says: --tests` clean), but **no binary carrying them has ever executed**. This lane",
-    ),
-    (
-        "docs/known-issues/jdk-only/G35-1-the-registry-demotion-and-the-session-that-was-minted-twice-20260817.md",
-        "status block says: `cargo check` and `cargo test`, so no binary exists containing the code below.",
     ),
     (
         "docs/known-issues/jdk-only/G44-1-the-session-the-verifier-was-handed-20260817.md",
