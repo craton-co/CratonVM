@@ -9879,7 +9879,7 @@ fn alloc_multi_array(
                 .heap
                 .set_array_element(arr, i, Value::Object(Some(sub_array)))
                 .map_err(|idx| {
-                    RuntimeError::aioobe(idx, shared.mem.heap.array_length(arr) as i32)
+                    RuntimeError::array_store_fault(idx, shared.mem.heap.array_length(arr) as i32)
                 })?;
         }
         Ok(arr)

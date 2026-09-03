@@ -5361,7 +5361,7 @@ impl GenerationalHeap {
         let header = self.get_header(obj_ref);
         debug_assert_eq!(header.kind(), ObjectKind::Array);
         if index >= header.array_length() as usize {
-            return Err(index as i32);
+            return Err(crate::heap::oob_index_code(index));
         }
         // SAFETY: Bounds check above guarantees `index < array_length`. The array
         // was allocated with sufficient data space for all elements after the header.
@@ -5382,7 +5382,7 @@ impl GenerationalHeap {
         let header = self.get_header(obj_ref);
         debug_assert_eq!(header.kind(), ObjectKind::Array);
         if index >= header.array_length() as usize {
-            return Err(index as i32);
+            return Err(crate::heap::oob_index_code(index));
         }
         // SAFETY: Bounds check above guarantees `index < array_length`. The array
         // data region is within the allocation.
@@ -5480,7 +5480,7 @@ impl GenerationalHeap {
             );
         }
         if index >= header.array_length() as usize {
-            return Err(index as i32);
+            return Err(crate::heap::oob_index_code(index));
         }
         // SAFETY: Bounds check above guarantees `index < array_length`. The array
         // data region is within the allocation. `write_prim_element` writes at the
@@ -5499,7 +5499,12 @@ impl GenerationalHeap {
                         self.write_barrier(obj_ref, value);
                     }
                     _ => {
-                        let wrapper = self.alloc_object(AUTOBOX_CLASS_ID, 1);
+                        // Fallible: `alloc_object` aborts the process when the
+                        // heap is full, and a heap-full auto-box is an
+                        // `OutOfMemoryError` (`ARRAY_STORE_OUT_OF_MEMORY`).
+                        let Some(wrapper) = self.try_alloc_object(AUTOBOX_CLASS_ID, 1) else {
+                            return Err(crate::heap::ARRAY_STORE_OUT_OF_MEMORY);
+                        };
                         self.set_field(wrapper, 0, value);
                         // Arm the process-wide wrapper latch: `Heap::
                         // get_array_element` does NOT unbox, so a wrapper can

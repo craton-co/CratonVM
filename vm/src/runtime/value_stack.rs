@@ -345,6 +345,27 @@ impl ValueStack {
     /// `numberOfTrailingZeros` tail call). Only ever GROWS (a no-op when
     /// already large enough), so it can never shrink a live stack or drop
     /// in-use slots; newly added slots are zero / `KIND_UNKNOWN`.
+    /// Re-arm this stack for a new frame of `max_size` slots, reusing the
+    /// allocation it already has.
+    ///
+    /// The same contract as [`Self::from_pooled`], which this replaces on the
+    /// frame-slot-reuse path: a slot buffer that is already long enough is
+    /// kept as it is (nothing above `len` is ever read, and every push writes
+    /// its slot before `len` admits it), while `kinds` is cleared because a
+    /// stale `KIND_LONG` mark is the one direction that is not safe — it would
+    /// tell `scan_object_refs` to skip a slot that holds a reference.
+    pub fn reset_in_place(&mut self, max_size: usize) {
+        if self.slots.len() < max_size {
+            self.slots.resize(max_size, CompactValue::zero());
+        } else {
+            self.slots.truncate(max_size);
+        }
+        self.kinds.clear();
+        self.kinds.resize(max_size, KIND_UNKNOWN);
+        self.len = 0;
+        self.max_size = max_size;
+    }
+
     pub fn ensure_max_size(&mut self, new_max: usize) -> bool {
         if new_max > self.max_size {
             self.slots.resize(new_max, CompactValue::zero());

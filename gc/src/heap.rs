@@ -150,6 +150,11 @@ const DEFAULT_SEMI_SPACE_SIZE: usize = 32 * 1024 * 1024;
 /// Matches HotSpot's practical limit.
 const MAX_ARRAY_LENGTH: usize = i32::MAX as usize; // 2^31 - 1
 
+/// The array-store error channel — see [`cratonvm_types::oob_index_code`] and
+/// [`cratonvm_types::ARRAY_STORE_OUT_OF_MEMORY`]. Re-exported here because
+/// every backend in this crate reaches for them through `crate::heap::`.
+pub use cratonvm_types::{oob_index_code, ARRAY_STORE_OUT_OF_MEMORY};
+
 /// GC threshold: trigger collection when from-space usage exceeds 75% capacity.
 const GC_THRESHOLD_PERCENT: usize = 75;
 
@@ -969,7 +974,7 @@ impl Heap {
         let header = self.get_header(obj_ref);
         assert_eq!(header.kind(), ObjectKind::Array, "not an array");
         if index >= header.array_length() as usize {
-            return Err(index as i32);
+            return Err(crate::heap::oob_index_code(index));
         }
         // SAFETY: bounds check passed above (`index < array_length`).
         // `obj_ref + HEADER_SIZE` is the start of the data area.
@@ -998,7 +1003,7 @@ impl Heap {
         let header = self.get_header(obj_ref);
         assert_eq!(header.kind(), ObjectKind::Array, "not an array");
         if index >= header.array_length() as usize {
-            return Err(index as i32);
+            return Err(crate::heap::oob_index_code(index));
         }
         // SAFETY: bounds check passed above. Same invariant as `get_array_element`.
         let value = unsafe {
@@ -1085,7 +1090,7 @@ impl Heap {
         let header = self.get_header(obj_ref);
         assert_eq!(header.kind(), ObjectKind::Array, "not an array");
         if index >= header.array_length() as usize {
-            return Err(index as i32);
+            return Err(crate::heap::oob_index_code(index));
         }
         // SAFETY: bounds check passed above. Same invariant as `get_array_element`.
         // For reference arrays, non-Object values are auto-boxed into wrapper
@@ -1101,7 +1106,12 @@ impl Heap {
                         write_prim_element(base, index, header.element_type(), value);
                     }
                     _ => {
-                        let wrapper = self.alloc_object(AUTOBOX_CLASS_ID, 1);
+                        // Fallible: `alloc_object` aborts the process when the
+                        // heap is full, and a heap-full auto-box is an
+                        // `OutOfMemoryError` (`ARRAY_STORE_OUT_OF_MEMORY`).
+                        let Some(wrapper) = self.try_alloc_object(AUTOBOX_CLASS_ID, 1) else {
+                            return Err(ARRAY_STORE_OUT_OF_MEMORY);
+                        };
                         self.set_field(wrapper, 0, value);
                         // Arm the process-wide wrapper latch — see the matching
                         // note in `GenerationalHeap::set_array_element` and
