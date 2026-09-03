@@ -652,7 +652,11 @@ artefact — collecting six times as often pays the live-set-proportional half
 of a cycle (the mark, the registry snapshot) six times as often. It is off by
 default for that reason; what would earn a non-zero default is a budget
 derived from a pause TARGET rather than a percentage. `[GC] zgc-pause:` prints
-`alloc_trigger=<fires>/<budget bytes>` as its engagement counter. The sweep prunes
+`alloc_trigger=<fires>/<budget bytes>` as its engagement counter. The
+regression suite is 88/88 both with the clause off (the shipped default) and
+with `CRATONVM_ZGC_ALLOC_TRIGGER=12`, so the switch is safe to turn on — what
+it has NOT had is suite time on the larger corpora, which is what a default
+change would need. The sweep prunes
 dead bases in place and feeds the exact dead list to the monitor
 registry. Non-moving ⇒ the pointer map is always empty and
 no barriers are needed; reference semantics come entirely from the VM-level
