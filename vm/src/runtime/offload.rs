@@ -239,6 +239,9 @@ pub struct OffloadCache {
     /// `kernels` already has, since it is keyed on `(class_id, method_index)`
     /// and a redefinition would reuse neither.
     dispatch_memo: RwLock<FxHashMap<u64, ResolvedDispatch>>,
+    /// Consecutive `below_min_work` refusals per CALL SITE, keyed by
+    /// `(caller class id, bytecode pc)`. See [`min_work_giveup_after`].
+    min_work_streak: RwLock<FxHashMap<u64, u32>>,
     /// The open graph capture, if any.
     ///
     /// While this is `Some`, `dispatch_method_from_native_on_stream` takes
@@ -443,6 +446,38 @@ static NEXT_GRAPH_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 /// Hash of a call site's name triple, the memo's key.
 #[cfg(feature = "gpu-offload")]
+/// Consecutive `below_min_work` refusals after which a CALL SITE is allowed
+/// into the invoke cache. `0` never gives up.
+///
+/// # Why this needs a pc-keyed invoke cache
+///
+/// A site whose target is offload-eligible is deliberately kept out of the
+/// per-call-site invoke cache so a later call with bigger arrays can still
+/// offload. The hook that does the keeping is cheap -- 0.48 us per refusal,
+/// caller guard included -- but the site then pays the UNCACHED
+/// `invokestatic` path on every call, 10.3 us against 0.35 us cached. 96% of
+/// the measured "hook overhead" is that, not the hook.
+///
+/// Giving up on a site therefore pays, but only if a SITE is a thing the
+/// cache can name. Under the old `(class, cp index, is_special)` key it was
+/// not: two call sites invoking the same method share a constant-pool entry
+/// and one cache entry, so promoting the small-array site also promoted the
+/// big-array one and it silently stopped offloading -- measured at 1.47 ms
+/// against 81.7 us on `GpuHookOverheadBench`, an 18x regression, which is
+/// why the first attempt at this was reverted.
+///
+/// So this is gated on `CRATONVM_INVOKE_CACHE_PC_KEY`. With pc-keying off
+/// the promotion never fires, because it would be the same defect again.
+fn min_work_giveup_after() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_GPU_MIN_WORK_GIVEUP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(256)
+    })
+}
+
 fn dispatch_memo_key(class_name: &str, method_name: &str, descriptor: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = rustc_hash::FxHasher::default();
@@ -582,6 +617,7 @@ impl OffloadCache {
             chunk_stage_f32: RwLock::new(None),
             chunk_stage_f64: RwLock::new(None),
             dispatch_memo: RwLock::new(FxHashMap::default()),
+            min_work_streak: RwLock::new(FxHashMap::default()),
             gpu_array_class_id: RwLock::new(None),
             capture: RwLock::new(None),
             replay_bind: RwLock::new(None),
@@ -628,6 +664,39 @@ impl OffloadCache {
 
     /// Remember one call site's resolution.
     #[cfg(feature = "gpu-offload")]
+    /// Count one `below_min_work` refusal at `site` and say whether the site
+    /// should be PROMOTED into the invoke cache.
+    ///
+    /// Always `false` unless the invoke cache is pc-keyed: without that a
+    /// "site" is a method reference, and promoting one caller silently
+    /// deoptimises every other caller of the same kernel. See
+    /// [`min_work_giveup_after`].
+    pub(crate) fn note_site_below_min_work(&self, site: u64) -> bool {
+        let limit = min_work_giveup_after();
+        if limit == 0 || !cratonvm_classloading::resolution::pc_key_enabled() {
+            return false;
+        }
+        let mut streaks = self.min_work_streak.write();
+        let n = streaks.entry(site).or_insert(0);
+        *n = n.saturating_add(1);
+        *n > limit
+    }
+
+    /// Clear `site`'s streak: it just offloaded, so a later small call must
+    /// not inherit a count from before.
+    pub(crate) fn clear_site_below_min_work(&self, site: u64) {
+        if min_work_giveup_after() == 0 || !cratonvm_classloading::resolution::pc_key_enabled() {
+            return;
+        }
+        // A read first: the common case is an empty streak, and taking the
+        // write lock on every offloaded dispatch would be a cost on the path
+        // this whole feature exists to make fast.
+        if self.min_work_streak.read().get(&site).is_none_or(|n| *n == 0) {
+            return;
+        }
+        self.min_work_streak.write().insert(site, 0);
+    }
+
     fn dispatch_memo_put(
         &self,
         class_name: &str,
@@ -1191,7 +1260,13 @@ impl OffloadCache {
         // opted out, so we record the verdict and don't even hand the
         // method to the analyzer.
         if let Some(exclude) = &method_annotations.gpu_exclude {
-            tracing::debug!(
+            // `info!`, not `debug!`: docs/gpu/annotations.md tells users to
+            // read this line with `RUST_LOG=gpu.offload=...`, and under
+            // `release_max_level_info` a `debug!` is compiled out of every
+            // release build, so no RUST_LOG value could ever surface it.
+            // Bounded by the number of @GpuExclude-annotated methods, and
+            // still below the default WARN filter.
+            tracing::info!(
                 target: "gpu.offload",
                 class = %class_name,
                 method = method_index,
@@ -1525,14 +1600,30 @@ pub fn try_dispatch(
     let timed = cratonvm_types::gpu_offload_phase_census::enabled();
     let entered = std::time::Instant::now();
     let mut mark = entered;
+    // A refusal is charged to `gpu_refusal_census`, which is the only
+    // instrument that can see it: the dispatch table's `note_call` sits at
+    // the point of no return, so every fall-through below is invisible
+    // there. `refuse!` stamps the reason and the elapsed total.
+    macro_rules! refuse {
+        ($reason:expr, $outcome:expr) => {{
+            if timed {
+                cratonvm_types::gpu_refusal_census::note_refusal($reason);
+                cratonvm_types::gpu_refusal_census::add(
+                    cratonvm_types::gpu_refusal_census::TOTAL,
+                    entered.elapsed().as_nanos() as u64,
+                );
+            }
+            return Ok($outcome);
+        }};
+    }
     let cm = shared.classes.class_manager.read();
     let class_id = match cm.get_loaded_class_id(class_name) {
         Some(id) => id,
-        None => return Ok(DispatchOutcome::FallThrough),
+        None => refuse!(0, DispatchOutcome::FallThrough),
     };
     let class = match cm.get_class(class_id) {
         Some(c) => c,
-        None => return Ok(DispatchOutcome::FallThrough),
+        None => refuse!(0, DispatchOutcome::FallThrough),
     };
     let method_index = match class
         .methods
@@ -1540,10 +1631,12 @@ pub fn try_dispatch(
         .position(|m| &*m.name == method_name && &*m.descriptor == method_descriptor)
     {
         Some(i) => i as u16,
-        None => return Ok(DispatchOutcome::FallThrough),
+        None => refuse!(1, DispatchOutcome::FallThrough),
     };
     if timed {
-        cratonvm_types::gpu_offload_phase_census::add(0, mark.elapsed().as_nanos() as u64);
+        let n = mark.elapsed().as_nanos() as u64;
+        cratonvm_types::gpu_offload_phase_census::add(0, n);
+        cratonvm_types::gpu_refusal_census::add(0, n);
         mark = std::time::Instant::now();
     }
     // Hold the class-manager read lock for the full lookup_or_compile
@@ -1565,7 +1658,9 @@ pub fn try_dispatch(
     );
     drop(cm);
     if timed {
-        cratonvm_types::gpu_offload_phase_census::add(1, mark.elapsed().as_nanos() as u64);
+        let n = mark.elapsed().as_nanos() as u64;
+        cratonvm_types::gpu_offload_phase_census::add(1, n);
+        cratonvm_types::gpu_refusal_census::add(1, n);
         mark = std::time::Instant::now();
     }
 
@@ -1594,7 +1689,13 @@ pub fn try_dispatch(
             let is_long_reduction =
                 kernel.signature.is_reduction && method_descriptor.ends_with(")J");
             if !is_void && !is_int_reduction && !is_long_reduction {
-                return Ok(DispatchOutcome::FallThrough);
+                if timed {
+                    cratonvm_types::gpu_refusal_census::add(
+                        2,
+                        mark.elapsed().as_nanos() as u64,
+                    );
+                }
+                refuse!(3, DispatchOutcome::FallThrough);
             }
             // 2. Real per-element work must clear `--gpu-min-work`. The
             //    analyzer's `estimated_work` is a fixed 1<<20 placeholder
@@ -1608,10 +1709,16 @@ pub fn try_dispatch(
             //    de-offload.
             let runtime_work = largest_primitive_array_len(shared, args);
             if (runtime_work as u32) < shared.config.gpu_min_work {
+                if timed {
+                    cratonvm_types::gpu_refusal_census::add(
+                        2,
+                        mark.elapsed().as_nanos() as u64,
+                    );
+                }
                 // Per-call gate, not a property of the method: the next
                 // call at this site may pass a larger array, so the site
                 // must stay on the slow path where this hook can see it.
-                return Ok(DispatchOutcome::FallThroughKeepHooked);
+                refuse!(4, DispatchOutcome::FallThroughKeepHooked);
             }
             // Marshal args → device, launch the kernel, synchronize, and
             // write kernel-written arrays back into the Java heap (void)
@@ -1723,7 +1830,9 @@ pub fn try_dispatch(
                 }
             }
         }
-        LookupOutcome::Skip | LookupOutcome::Blacklisted => Ok(DispatchOutcome::FallThrough),
+        LookupOutcome::Skip | LookupOutcome::Blacklisted => {
+            refuse!(2, DispatchOutcome::FallThrough)
+        }
     }
 }
 
@@ -3855,6 +3964,7 @@ pub fn register_submission(sub: std::sync::Arc<StreamSubmission>) -> u64 {
         table.insert(h, sub);
         table.len()
     };
+    cratonvm_types::gpu_submission_census::note_register(live as u64);
     if live >= SUBMISSION_WARN_THRESHOLD && live.is_power_of_two() {
         tracing::warn!(
             live_submissions = live,
@@ -3922,7 +4032,9 @@ pub fn lookup_submission(handle: u64) -> Option<std::sync::Arc<StreamSubmission>
 /// resulting +1 rather than hiding it.
 #[cfg(feature = "gpu-offload")]
 pub fn release_submission(handle: u64) {
-    submissions().write().remove(&handle);
+    if submissions().write().remove(&handle).is_some() {
+        cratonvm_types::gpu_submission_census::note_release();
+    }
 }
 
 // ── Known-issues followups #3: spontaneous completion reaper ─────────

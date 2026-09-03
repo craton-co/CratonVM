@@ -1315,3 +1315,171 @@ What would have to change before this is asked again, in order:
 Only when both read zero across a soak of this shape does the question become
 "should the defaults move", and even then the answer is a longer soak, not this
 one.
+
+## 16. §15 was wrong: there is no map-selection gap, and there was no coverage gap either (2026-09-03)
+
+*`fix/jit-oop-map-selection-20260902`. §15 read two raw counters as refutations
+of the precise-only suppression. The class file's own type maps say both
+populations are dead storage. This section corrects the record and fixes the
+instrument that produced it.*
+
+### 16.1 The correction
+
+`NEVER_MAPPED` and `WRONG_MAP` count in-band words **that look like heap
+addresses**. Looking like one is not being one: an old pointer left in a
+reusable local or spill slot after its value died still passes
+`heap.is_object_address`, and the precise map is *right* to omit it — that is
+the whole advantage a precise map has over a conservative scan, which keeps
+such garbage alive.
+
+The tree already had the independent answer and `NEVER_MAPPED` was already
+split by it: `verifier_local_verdict` asks the CLASS FILE's own type maps
+whether that local holds a reference at that bci. Read with that column, §15's
+table says the opposite of what §15 concluded:
+
+| workload | `never_mapped` | `verifier_oop` | `verifier_not_oop` | `wrong_map` | `wrong_map` `verifier_oop` |
+|---|---:|---:|---:|---:|---:|
+| `HumongousChurn 48 6000` | 16 | **0** | 16 | 22 | **0** |
+| `HumongousChurn 48 20000` | 52 | **0** | 52 | 58 | **0** |
+| `HumongousWide 64 400` | 6 | **0** | 6 | 12 | **0** |
+
+`verifier_unknown=0` throughout, so the oracle answered rather than declined.
+**Every flagged word in both populations is dead storage.** There is no
+map-selection gap on these workloads, and no coverage gap either.
+
+The stale-after-remap evidence §15.2 leaned on falls the same way. Under the
+suppression `HumongousChurn` leaves 15 `region=java-local verifiable=true`
+words stale against 0 without it — but a *dead* slot left stale is harmless,
+and what that experiment actually measured is the conservative scan needlessly
+retaining and rewriting dead values. It is a cost of the backstop, not a
+hazard of removing it.
+
+### 16.2 What that made the gate do
+
+§15 landed a change making `verify_active_coverage_into` refute on any
+`WRONG_MAP` increment. On this evidence that gate would have refused the
+suppression **forever**, on every workload, over words the class file says are
+not references. A gate keyed to a counter that cannot tell a live oop from dead
+storage is not a safety property; it is an off switch with a justification
+attached.
+
+`WRONG_MAP` is now split — `WRONG_MAP_VERIFIER_OOP` and
+`WRONG_MAP_VERIFIER_OTHER`, the same oracle `NEVER_MAPPED` has always used —
+and the gate reads the confirmed subset. The raw counters remain, reported
+beside their split, because the *ratio* is the interesting number: a large
+`wrong_map` with a zero `verifier_oop` is precisely the measurement of how much
+dead storage the conservative backstop is retaining.
+
+### 16.3 Where this leaves the defaults
+
+Still opt-in, but the reason has changed and is weaker than §15's.
+
+§15 said "the soak refutes the suppression". It does not; that reading was an
+artefact of an instrument that could not subtract dead slots. What can honestly
+be said now is only that **no refutation was found** on six probes covering 14
+compiled frames — a sample far too small to license a default, and much smaller
+than the `CRATONVM_GC_STRESS` populations the master switch's own doc cites.
+
+So the open question is no longer "is the coverage bit sound" — nothing here
+impugns it — but "has it been exercised over enough compiled code to trust",
+which is a soak of a different size than this one, on real applications rather
+than probes. `WRONG_MAP_VERIFIER_OOP` and the `while_covered` verifier column
+are the two numbers that soak should read, and neither should be read without
+the other.
+
+### 16.4 The lesson, since it cost two sections
+
+A counter that flags a *possible* defect is not evidence of one, and this file
+now has an instance in each direction: §12.3 recorded a single run that looked
+like a 82%-vs-45% win and was noise, and §15 recorded a counter that looked like
+a refutation and was dead storage. Both were caught by asking for a second,
+independent reading — reps in the first case, the verifier's own type maps in
+the second. The instruments that can answer were already in the tree both times.
+
+## 17. The real-application soak: a false-positive latch, and the obligation that is actually blocking (2026-09-03)
+
+*`fix/g1-coverage-reason-census-20260903`. §16.3 said the open question was
+sample size and that a real soak needs applications rather than probes. This is
+that soak, on H2 and its own test suite. It found two things the probes could
+not, and the second one only became visible after the first was fixed.*
+
+### 17.1 §16 holds at scale
+
+`org.h2.test.store.TestMVStoreTool` at `-Xmx64m`, oracle armed — **612
+compiled frames and 14 798 in-band words**, against 14 frames on the probes:
+
+| counter | raw | verifier-confirmed |
+|---|---:|---:|
+| `never_mapped` | 400 | **0** (`not_oop=302`, `unknown=98`) |
+| `wrong_map` | 1 874 | **0** |
+
+Forty-four times the frame sample and still not one confirmed refutation. §16's
+conclusion — the raw counters measure dead pointers in reusable slots, which a
+precise map is right to omit — is not a small-sample artefact.
+
+### 17.2 A latch that fired on shape, on every real workload
+
+With the precise-only switches and the oracle on, H2 reported
+`root coverage: incomplete` on **100.00%** of pauses. The same class with the
+switches off reports **0.00%**. Enabling the suppression was *causing* the
+incompleteness.
+
+The cause is one ungated latch. At the audit site two refutation latches sit
+side by side:
+
+* the `fully_shadow_covered` one is gated on `verdict == Oop`, and its comment
+  gives the reason — "latching on the raw counter would have suppressed every
+  collection on every workload measured, since 5-6% of in-band words trip it";
+* the `fully_oop_covered` one, three lines above, was **not gated**. It latched
+  on the raw counter.
+
+`note_coverage_oracle_refutation` is process-wide, so 400 raw hits on H2 — all
+`verifier_oop=0` — latched the refutation for the rest of the run and every
+subsequent pause reported incomplete. The argument the tree had already written
+for the second latch applies verbatim to the first; it now has it.
+
+### 17.3 The reason was computed and thrown away
+
+`root_coverage_incomplete_reason()` returns WHICH obligation failed, and
+`record_g1_pause_coverage` was handed only `is_some()`. So a reader of
+`incomplete=58 (100.00%)` could not tell an unregistered JIT frame from an
+unpublished bounds table from an OSR shadow — which is why §14 read 0% on
+probes and §17 read 100% on H2 with no way to see that the two were different
+obligations.
+
+The `[GC] g1 root coverage:` line now carries the per-reason census, appended
+rather than on its own line so the rate cannot be read without it.
+
+### 17.4 What is actually blocking, named
+
+With the latch fixed, the same H2 run says:
+
+```
+g1 root coverage: pauses=243 incomplete=197 (81.07%)
+                  reasons: compiled-frame-oop-not-published=197
+```
+
+`UNPUBLISHED_FRAME_OOP`: a live compiled frame's own spill band holds a
+young-heap address the shadow stack never published, so nothing can rewrite
+that slot after a relocation. Not the coverage bit, not map selection, not the
+bounds table — a *shadow-stack publication* gap, and the one obligation
+`arch-2026-07-26/moving-young-corruption-rootcause.md` is named after.
+
+The pause count rising 33 → 243 in the same wall time is the other half of the
+same story: the old latch was refusing evacuation, so the run made less
+progress per pause.
+
+That is where precise root coverage actually stands on real code, and it is a
+more specific answer than §14, §15 or §16 could give. The defaults stay
+opt-in; `compiled-frame-oop-not-published` at 81% is the number the next
+attempt should drive down, and it is a shadow-stack question rather than a
+codegen or collector one.
+
+### 17.5 Two instruments, both of which had to be fixed to see this
+
+Neither result was visible before this section: the latch made every real
+workload report the same wrong reason, and the discarded reason code made the
+report unreadable even when it was right. §16.4 said a counter that flags a
+possible defect is not evidence of one; §17 adds the converse — an instrument
+that reports a real obligation under a wrong label hides the one finding worth
+having.

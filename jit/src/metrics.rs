@@ -3322,6 +3322,79 @@ pub const SP_REF_STORE_BAIL_NAMES: [&str; 3] = [
     "receiver-not-compact-RETIRED",
 ];
 
+/// Executions of the two OTHER single-pass inline reference-store arms —
+/// **opt-in**, `CRATONVM_DBG_SP_REF_STORE_TRACE=1`.
+///
+/// These are the arms the gated one falls through to, and until now neither
+/// appeared in any census. That is how `bt18` under the generational collector
+/// came to read `gated=2` with no executions at all and look like a hole: its
+/// four hot inlined stores were being served, inline and barrier-free, by the
+/// fresh-constructor arm — which counted nothing, at compile time or at run
+/// time.
+///
+/// `FRESH_CTOR` is `emit_inline_fresh_ctor_compact_ref_putfield`, taken when a
+/// `new`-produced receiver makes every barrier unnecessary; `BODY` is
+/// `emit_inline_body_compact_ref_putfield`, the general arm that additionally
+/// requires the field's old value to be null. Each has its own guards and
+/// falls back to the full helper on them.
+pub static SP_REF_STORE_FRESH_CTOR_TAKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Executions of the general inline body arm. See
+/// [`SP_REF_STORE_FRESH_CTOR_TAKEN`].
+pub static SP_REF_STORE_BODY_TAKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// G1's inline post-write barrier: sites emitted, and what those sites did at
+/// run time.
+///
+/// The arm has existed since F-08 behind `CRATONVM_G1_INLINE_BARRIER`, guarded
+/// by three conjoined conditions, and its only engagement signal was a single
+/// `tracing::info!` line saying it had been emitted at least once. That says
+/// the arm exists; it does not say how many sites got it, and it says nothing
+/// at all about how often the filter actually spared the call — which is the
+/// entire question, because G1's `post_write_barrier_rset` returns immediately
+/// on a null value or a same-region edge and the filter is a copy of exactly
+/// those two tests.
+///
+/// `SKIPPED` counts executions the filter answered "nothing to remember" for;
+/// `CALLED` counts those that reached `jit_g1_post_write_barrier`. The run-time
+/// pair is opt-in under `CRATONVM_DBG_SP_REF_STORE_TRACE=1`, same as its
+/// siblings, and costs a `LOCK INC` apiece.
+pub static G1_INLINE_BARRIER_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Filter executions that spared the call. See [`G1_INLINE_BARRIER_SITES`].
+pub static G1_INLINE_BARRIER_SKIPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Filter executions that took the call. See [`G1_INLINE_BARRIER_SITES`].
+pub static G1_INLINE_BARRIER_CALLED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Record an emitted G1 inline post-write barrier site.
+#[inline]
+pub fn note_g1_inline_barrier_site() {
+    G1_INLINE_BARRIER_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(sites, skipped, called)` for G1's inline post-write barrier.
+pub fn g1_inline_barrier_counts() -> (u64, u64, u64) {
+    (
+        G1_INLINE_BARRIER_SITES.load(std::sync::atomic::Ordering::Relaxed),
+        G1_INLINE_BARRIER_SKIPPED.load(std::sync::atomic::Ordering::Relaxed),
+        G1_INLINE_BARRIER_CALLED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// `(fresh_ctor, body)` executions of the two non-gated inline arms.
+pub fn sp_ref_store_other_arm_counts() -> (u64, u64) {
+    (
+        SP_REF_STORE_FRESH_CTOR_TAKEN.load(std::sync::atomic::Ordering::Relaxed),
+        SP_REF_STORE_BODY_TAKEN.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// `(inline, barrier, helper)` dynamic path counts for the single-pass arm.
 /// All zero means the trace was off.
 pub fn sp_ref_store_path_counts() -> (u64, u64, u64) {

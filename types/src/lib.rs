@@ -68,6 +68,7 @@ pub use field_layout::clear_class_layouts;
 pub use field_layout::{
     class_layout, class_layout_for_fields, compact_field_slot, compact_field_storage,
     compact_object_body_size, compact_object_field_storage, compact_ref_fields_enabled,
+    compact_tlab_body_size, single_layout_domain,
     foreign_layout_refusals, is_compact_object, layout_generation, layout_replace_guard,
     next_layout_domain, object_body_size, pack_fields_by_width_enabled, read_compact_field,
     register_class_layout, set_compact_ref_fields_enabled, set_pack_fields_by_width_enabled,
@@ -100,9 +101,10 @@ pub use subsystem_config::{
 // `every_public_heap_constant_is_reachable` test below.
 pub use heap_types::{
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
-    element_type_tag_at, kind_tag_at, object_kind_from_tag, primitive_array_kind_tags_byte,
-    ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, ARRAY_LENGTH_OFFSET,
-    AUTOBOX_CLASS_ID, FIELD_CELL_PAYLOAD32_OFFSET, FIELD_CELL_PAYLOAD64_OFFSET,
+    element_type_tag_at, kind_tag_at, object_kind_from_tag, oob_index_code,
+    primitive_array_kind_tags_byte, ArrayElementType, ObjectHeader, ObjectKind,
+    ARRAY_DATA_OFFSET, ARRAY_LENGTH_OFFSET, ARRAY_STORE_OUT_OF_MEMORY, AUTOBOX_CLASS_ID,
+    FIELD_CELL_PAYLOAD32_OFFSET, FIELD_CELL_PAYLOAD64_OFFSET,
     FIELD_CELL_TAG_OBJECT, FIELD_CELL_TAG_OFFSET, FORWARDING_PTR_MASK, GC_FLAGS_BYTE_OFFSET,
     GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE, INFLATED_PTR_MASK,
     KIND_TAGS_BYTE_OFFSET, KIND_TAG_BYTE_MASK, MARK_FORWARDED, MARK_HASH_MASK, MARK_HASH_SHIFT,
@@ -677,6 +679,234 @@ pub mod scalar_deopt_census {
 /// `total` is the whole of `try_dispatch` and CONTAINS every other phase.
 /// Read the parts against it: what it holds beyond their sum is dispatch
 /// overhead none of them names, which is the thing worth finding.
+/// Where the time goes in a transparent dispatch that REFUSES.
+///
+/// # Why the dispatch table cannot answer this
+///
+/// [`gpu_offload_phase_census`] counts a call only once it is committed to
+/// the device (`note_call` sits at the point of no return), so every
+/// fall-through is invisible to it. Fall-throughs are the common case and,
+/// on a CPU-bound workload, the expensive one: `GpuHookOverheadBench`
+/// measures a cached `invokestatic` at 279 ns and the same site with the
+/// hook refusing at 10,122 ns -- a 9.8 us refusal, 36x the call it
+/// decorates. kfusion's CPU path runs 8x slower under `--gpu` for exactly
+/// this reason, offloading nothing.
+///
+/// A site whose target is ELIGIBLE is deliberately kept out of the
+/// per-call-site invoke cache so a later call with bigger arrays can still
+/// offload, so it re-enters the hook forever. That is the design; paying
+/// 9.8 us for it is not.
+///
+/// Off unless `CRATONVM_GPU_TIME_DISPATCH=1`, the same switch as its twin.
+/// How many methods `--gpu` denied JIT admission.
+///
+/// AUDIT 2026-09-03. `vm::runtime::offload_jit_gate` refuses JIT and OSR
+/// admission to any method whose body contains an offload-eligible
+/// `invokestatic`, so the interpreter hook can still see that site. The
+/// consequence is that the WHOLE caller runs interpreted -- its loops, its
+/// arithmetic, everything -- and that is the largest cost `--gpu` imposes on
+/// a CPU-bound program. Measured on `GpuHookOverheadBench`, the same method:
+///
+/// ```text
+///   no --gpu (JIT admitted)                            10 ns/call
+///   --gpu, site promoted, hook reached only 514 times  6,139 ns/call
+/// ```
+///
+/// 600x, against 0.48 us for the hook itself and 0.75 for the lost invoke
+/// cache. Nothing counted it until this census existed.
+pub mod gpu_jit_gate_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static BLOCKED: AtomicU64 = AtomicU64::new(0);
+    static ADMITTED: AtomicU64 = AtomicU64::new(0);
+
+    /// One verdict, counted per DISTINCT method: the gate caches its
+    /// verdicts, so this counts first judgements rather than consultations,
+    /// which is the number that says how much of the program moved off the
+    /// JIT.
+    #[inline]
+    pub fn note_verdict(blocked: bool) {
+        if blocked {
+            BLOCKED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            ADMITTED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Why a method was blocked. The two reasons are very different in
+    /// reach, and the count alone cannot tell them apart.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum BlockReason {
+        /// The method writes a primitive array, so compiling it would
+        /// invalidate the input-residency cache with no hook to notice.
+        /// This is the BROAD reason: it catches any numeric kernel that
+        /// stores to an `int[]`/`long[]`/`float[]`/`double[]`, whether or
+        /// not it has anything to do with offload.
+        /// `CRATONVM_GPU_JIT_ARRAY_WRITERS=allow` trades the cache for the
+        /// compilation instead.
+        WritesPrimitiveArray,
+        /// The method calls an offload-eligible `invokestatic`, so
+        /// compiling it would hide that site from the interpreter hook.
+        /// This is the NARROW reason, and the one the gate is named for.
+        CallsEligibleKernel,
+    }
+
+    /// Names of the methods this gate denied, with the reason.
+    ///
+    /// A count says how MANY; only the names say whether the ones blocked
+    /// are the ones a workload spends its time in. kfusion blocks 7 of 301
+    /// methods -- 2.3%, which sounds negligible and would be the whole
+    /// story if those 7 are its integration loop.
+    ///
+    /// Bounded: a program with thousands of blocked methods has a
+    /// different problem, and the list is a diagnostic rather than a log.
+    static BLOCKED_NAMES: std::sync::Mutex<Vec<(String, &'static str)>> =
+        std::sync::Mutex::new(Vec::new());
+    const MAX_NAMED: usize = 64;
+
+    /// Record one blocked method by name. Called only on a first verdict.
+    pub fn note_blocked_name(name: String, reason: BlockReason) {
+        let mut v = BLOCKED_NAMES.lock().unwrap_or_else(|p| p.into_inner());
+        if v.len() >= MAX_NAMED {
+            return;
+        }
+        let tag = match reason {
+            BlockReason::WritesPrimitiveArray => "writes-primitive-array",
+            BlockReason::CallsEligibleKernel => "calls-eligible-kernel",
+        };
+        v.push((name, tag));
+    }
+
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let blocked = BLOCKED.load(Ordering::Relaxed);
+        let admitted = ADMITTED.load(Ordering::Relaxed);
+        if blocked + admitted == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            eprintln!(
+                "[cratonvm] gpu jit gate: methods judged={} blocked_from_jit={blocked}                  admitted={admitted} ({:.1}% denied JIT, so the whole caller runs                  interpreted and its offload sites stay visible to the hook)",
+                blocked + admitted,
+                100.0 * blocked as f64 / (blocked + admitted) as f64,
+            );
+            let names = BLOCKED_NAMES.lock().unwrap_or_else(|p| p.into_inner());
+            for (name, reason) in names.iter() {
+                eprintln!("[cratonvm] gpu jit gate:   blocked {name}  ({reason})");
+            }
+            if blocked as usize > names.len() {
+                eprintln!(
+                    "[cratonvm] gpu jit gate:   ... and {} more not listed",
+                    blocked as usize - names.len()
+                );
+            }
+        });
+    }
+}
+
+pub mod gpu_refusal_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Phases, in the order `try_dispatch` runs them. `total` is the whole
+    /// refusal and CONTAINS the rest.
+    pub const PHASES: [&str; 5] = [
+        // The class-manager read lock, the class-name hash, and the LINEAR
+        // scan over the class's methods comparing two strings each.
+        "resolve_method",
+        // `OffloadCache::lookup_or_compile`.
+        "lookup_kernel",
+        // Descriptor shape, then `largest_primitive_array_len` against the
+        // real arguments -- the only part that genuinely must run per call,
+        // because the arrays can grow.
+        "gates",
+        // NESTED: the whole refusal.
+        "total",
+        // The caller's own guard in `dispatch_static`, which runs before
+        // `try_dispatch` on every call at a hooked site.
+        "hook_guard",
+    ];
+    pub const TOTAL: usize = 3;
+
+    /// Why a refusal refused, in the order the checks run.
+    pub const REASONS: [&str; 5] = [
+        "class_not_loaded",
+        "method_not_found",
+        "not_offloadable",
+        "descriptor_shape",
+        "below_min_work",
+    ];
+
+    static NANOS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            crate::flags::runtime_var("CRATONVM_GPU_TIME_DISPATCH")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        })
+    }
+
+    #[inline]
+    pub fn add(phase: usize, nanos: u64) {
+        if phase < NANOS.len() {
+            NANOS[phase].fetch_add(nanos, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn note_refusal(reason: usize) {
+        if reason < COUNTS.len() {
+            COUNTS[reason].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let refusals: u64 = COUNTS.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        if refusals == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            let total = NANOS[TOTAL].load(Ordering::Relaxed);
+            eprintln!(
+                "[cratonvm] gpu offload refusals: n={refusals} total={:.3} us/refusal",
+                total as f64 / refusals as f64 / 1000.0
+            );
+            for (i, name) in REASONS.iter().enumerate() {
+                let c = COUNTS[i].load(Ordering::Relaxed);
+                if c == 0 {
+                    continue;
+                }
+                eprintln!(
+                    "[cratonvm] gpu offload refusals:   {name:<18} {c:>12} ({:.1}%)",
+                    100.0 * c as f64 / refusals as f64
+                );
+            }
+            let mut named = 0u64;
+            for (i, name) in PHASES.iter().enumerate() {
+                if i == TOTAL {
+                    continue;
+                }
+                let n = NANOS[i].load(Ordering::Relaxed);
+                named = named.saturating_add(n);
+                eprintln!(
+                    "[cratonvm] gpu offload refusals:   {name:<18} {:>8.3} us/refusal ({:.1}%)",
+                    n as f64 / refusals as f64 / 1000.0,
+                    100.0 * n as f64 / total.max(1) as f64
+                );
+            }
+            eprintln!(
+                "[cratonvm] gpu offload refusals:   {:<18} {:>8.3} us/refusal ({:.1}%)",
+                "unaccounted",
+                total.saturating_sub(named) as f64 / refusals as f64 / 1000.0,
+                100.0 * total.saturating_sub(named) as f64 / total.max(1) as f64
+            );
+        });
+    }
+}
+
 pub mod gpu_offload_phase_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -871,6 +1101,67 @@ pub mod gpu_dispatch_memo_census {
 /// it had nothing to do, so a zero in `rekeyed` can be read: no
 /// collections at all, versus collections that never moved a cached
 /// array.
+/// What the GPU submission registry did over the run.
+///
+/// `offload::SUBMISSIONS` had exactly one insert and one remove, and the
+/// remove had no production caller: every async submission stayed
+/// registered for the life of the process. The only account of that was
+/// a `tracing::warn!` fired once per doubling past 1024 live, which tells
+/// you a threshold was crossed and never how many leaked, nor whether a
+/// drain you just wired actually drains.
+///
+/// `live` at exit is the number that matters: on a program that releases
+/// every handle it takes, it should be zero.
+pub mod gpu_submission_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static REGISTERED: AtomicU64 = AtomicU64::new(0);
+    static RELEASED: AtomicU64 = AtomicU64::new(0);
+    static PEAK: AtomicU64 = AtomicU64::new(0);
+
+    /// One submission entered the registry; `live` is the table size
+    /// after the insert.
+    #[inline]
+    pub fn note_register(live: u64) {
+        REGISTERED.fetch_add(1, Ordering::Relaxed);
+        PEAK.fetch_max(live, Ordering::Relaxed);
+    }
+
+    /// One entry was actually removed. Not counted for a release call
+    /// naming a handle that was already gone -- the point is to measure
+    /// drains that happened, not drains that were attempted.
+    #[inline]
+    pub fn note_release() {
+        RELEASED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(registered, released, peak_live)`.
+    #[must_use]
+    pub fn totals() -> (u64, u64, u64) {
+        (
+            REGISTERED.load(Ordering::Relaxed),
+            RELEASED.load(Ordering::Relaxed),
+            PEAK.load(Ordering::Relaxed),
+        )
+    }
+
+    /// One line on the exit path, when this process registered anything.
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let (registered, released, peak) = totals();
+        if registered == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            let live = registered.saturating_sub(released);
+            eprintln!(
+                "[cratonvm] gpu submissions: registered={registered} released={released} \
+                 live_at_exit={live} peak_live={peak}"
+            );
+        });
+    }
+}
+
 pub mod gpu_residency_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 

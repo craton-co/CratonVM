@@ -63,11 +63,18 @@ A gate wired into one door is a gate for one door.
 
 The gated arm is now tried at this door too, and every fall-through is counted.
 
-## Fix 3 — a specialization that is dead on the default collector
+## Fix 3 — a specialization that is dead on ZGC
 
-The fresh-constructor arm was ordered ahead of the gated one, which is right:
-a `new`-produced object needs no barrier at all, so it emits no gates. Except
-that arm opens with
+**Corrected 2026-09-02, after this page first shipped saying the opposite.**
+The original text claimed the fresh-constructor arm was dead on the *default*
+collector because "only G1 and ZGC call `publish_movable_bounds`". That is the
+wrong table. `publish_movable_bounds` writes `MOVABLE_BOUNDS`;
+`region_bounds_are_live` reads `JIT_REGION_BOUNDS`, and the only writer of
+`JIT_REGION_BOUNDS` is `GenerationalHeap::publish_region_bounds` — as
+`gen_heap.rs` says in as many words: *"the two tables only diverge on G1
+(read-only publish) and ZGC (neither)"*.
+
+So it is the other way round. The fresh-constructor arm opens with
 
 ```rust
 if !g1 && !region_bounds_are_live(self.helpers.region_bounds_addr) {
@@ -76,15 +83,22 @@ if !g1 && !region_bounds_are_live(self.helpers.region_bounds_addr) {
 }
 ```
 
-and **only G1 and ZGC call `publish_movable_bounds`** — the generational
-collector never publishes that table. So under the default collector the
-specialization degrades to a full helper call on every constructor field store,
-which is precisely what bt18 is made of.
+and those bounds are live **only** under the generational collector. Under ZGC
+the specialization degrades to a full helper call on every constructor field
+store, which is precisely what bt18 is made of — and that, not anything about
+the default collector, is what the 10-of-10 measurement below is measuring.
 
 The ordering is now conditional on the arm being able to run:
 `fresh_ctor_first_store && region_bounds_are_live(...)`. Where the
-specialization is live it still wins; where it is not, the gated arm takes the
-store instead of a helper call taking it.
+specialization is live — the generational collector — it still wins; where it
+is not, the gated arm takes the store instead of a helper call taking it.
+
+Two independent confirmations, since a claim this page got backwards once
+deserves them: the source above, and the emitted code. `bottomUpTree`
+disassembled under `-XX:+UseGenerationalGC` contains the fresh-constructor
+arm's `test byte [rax+0Fh], 4` (a direct memory-operand test), while the same
+method under ZGC contains the gated arm's `movzx ecx, byte [rax+0Fh]` /
+`test cl, 4`.
 
 ## Engagement
 
@@ -120,27 +134,62 @@ spends most of its time allocating and recursing, and the barrier was never the
 majority of it. The 136.6 million eliminated calls are the fact; the 5% is what
 they are worth in this workload.
 
-## Residual — the Generational reading
+## The Generational reading — resolved, and it was not a defect
 
-Under `-XX:+UseGenerationalGC`, bt18 reads `gated=2 declined=0` and executes
-neither site, while ZGC on the same binary and workload reads `gated=6` and
-136.6M executions. Inlining statistics are identical between the two
-(`inline-reserve-*` match exactly), so the four inlined sites are compiled in
-both cases; why they are neither gated nor declined under Generational is **not
-established here**, and guessing at it would be the mistake this whole line of
-work has been about. It wants its own census — the decline reasons at that door
-are counted now, which is the instrument the next person needs and did not have.
+When this page first shipped it left an open residual: under
+`-XX:+UseGenerationalGC`, bt18 read `gated=2 declined=0` and executed neither
+site, while ZGC on the same binary read `gated=6` and 136.6M executions.
 
-That also means the throughput result above is a ZGC result. The default
-collector's bt18 has not been shown to move.
+It is not a hole. Chased with the instruments rather than guessed at:
+
+1. `CRATONVM_DBG=jit-field-sites` shows **identical site sets** on both
+   collectors — four `putfield/inlined` in `bottomUpTree`, two `putfield` in
+   `Node.<init>`. Inlining is the same.
+2. The disassembly places the two gated sequences under Generational inside
+   `Node.<init>`, not `bottomUpTree`. `Node.<init>` is compiled as a standalone
+   body and then never called, because every call to it is inlined — hence
+   `gated=2` with zero executions.
+3. `bottomUpTree`'s four hot stores under Generational take the
+   **fresh-constructor arm**, which is live there and only there (see Fix 3).
+   That arm stores inline with no barrier and no helper call at all.
+
+So under the default collector those stores were already on the cheapest path
+available. What was missing was not codegen but a census: neither the
+fresh-constructor arm nor the general body arm counted anything, at compile
+time or at run time, so a workload served entirely by them read as `gated=2`
+and nothing else — indistinguishable from a hole.
+
+Both arms are now traced under `CRATONVM_DBG_SP_REF_STORE_TRACE=1`, and the
+reading resolves:
+
+`bt16`, one binary, one workload:
+
+| collector | gated sites | gated executions | fresh-ctor executions |
+|---|---|---|---|
+| Generational | 2 (never called) | 0 | **29,966,944** |
+| ZGC | 6 | **29,969,414** | 0 (arm not live) |
+| G1 | 0 (6 declined) | — | 0 |
+
+The same stores, within 0.01% of each other, served by a different arm on each
+collector. That agreement is the cross-check: two independent counters on two
+configurations arriving at the same workload-determined number is much harder
+to fake than either one alone.
+
+The throughput result above remains a ZGC result, and now for a stated reason:
+under Generational the stores this change would have moved were not on the
+helper to begin with.
 
 ## Levers
 
 - `CRATONVM_JIT_GATED_REF_STORE=0` — the single-pass gated arm off, at every
   door, back to the pre-existing arms.
 - `CRATONVM_DBG_SP_REF_STORE_TRACE=1` — the run-time path census: inline (and
-  how many of those still barriered), helper, and which gate refused. A
-  `LOCK INC` per store, so a diagnostic arm and never a timed one.
+  how many of those still barriered), helper, which gate refused, and the
+  executions of the two non-gated inline arms. A `LOCK INC` per store, so a
+  diagnostic arm and never a timed one.
+- `CRATONVM_DBG=jit-field-sites` with `CRATONVM_DBG_JIT_FIELD_SITES=<filter>` —
+  which field sites a method compiled, and whether each is `putfield` or
+  `putfield/inlined`. This is what settled the Generational question above.
 
 ## Gates
 

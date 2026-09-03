@@ -1034,13 +1034,19 @@ fn native_dsrc_driver(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 ///
 /// INTENTIONAL COMPATIBILITY SHIM — see `register_application_lifecycle` for
 /// the full rationale. The real Quarkus replay plan is not executed here; we
-/// only return normally so bootstrap dispatch does not abort. The
-/// debug-gated trace makes the elision visible (set
-/// `RUST_LOG=cratonvm_native_builtins=debug` or filter on this target) so a
-/// run that depends on these hooks is never silently mistaken for a fully
-/// started application.
+/// only return normally so bootstrap dispatch does not abort. The trace
+/// makes the elision visible so a run that depends on these hooks is never
+/// silently mistaken for a fully started application.
+///
+/// AUDIT 2026-09-03: this was `debug!`, and the sentence above was
+/// therefore false in every shipped binary. The workspace pins `tracing`
+/// with `release_max_level_info`, so `debug!` and `trace!` expand to
+/// no-ops in a release build -- the safeguard existed only in a debug
+/// build, which is not where anyone runs Quarkus. `info!` because the
+/// hook fires a handful of times per run (start/stop/awaitShutdown), not
+/// in any loop.
 fn native_app_lifecycle_no_op(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    tracing::debug!(
+    tracing::info!(
         target: "cratonvm_native_builtins::quarkus",
         "io.quarkus.runtime.Application lifecycle hook elided (compatibility \
          shim: real Quarkus replay plan not executed)"

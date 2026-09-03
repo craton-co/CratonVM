@@ -1889,6 +1889,21 @@ cached_is_set!(no_osr_inline_gate, "CRATONVM_JIT_NO_OSR_INLINE_GATE");
 /// `CRATONVM_JIT=-invoke-fast-door`.
 cached_is_set!(no_invoke_fast_door, "CRATONVM_JIT_NO_INVOKE_FAST_DOOR");
 
+/// `CRATONVM_JIT_INVOKE_FAST_DOOR` -- OPT IN to the monomorphic invoke fast
+/// door, which is default-OFF since 2026-09-03 because it returns wrong
+/// answers.
+///
+/// `org.h2.test.store.TestRandomMapOps --Xmx 256m` fails in 12-23 s, every
+/// run, at a fixed seed and a fixed op, with a map `get` returning `null`
+/// where a value was stored (`AssertionError: (1810, null)`). Disabling this
+/// one door -- and nothing else -- runs it clean to a 200 s cap. It is not the
+/// collector: the same failure reproduces with `CRATONVM_ZGC_RELOCATE=0`.
+///
+/// The line-level defect is NOT yet identified, which is why this is a default
+/// flip and not a repair. See
+/// `known-issues/h2/bug-testrandommapops-deterministic-1810-null-20260903.md`.
+cached_is_set!(invoke_fast_door_opt_in, "CRATONVM_JIT_INVOKE_FAST_DOOR");
+
 /// `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` -- disable the monomorphic
 /// `invokestatic` / `invokespecial` fast doors (borrowed cache entry,
 /// verbatim `CompactValue` argument transfer, and for `invokestatic` a
@@ -1896,6 +1911,20 @@ cached_is_set!(no_invoke_fast_door, "CRATONVM_JIT_NO_INVOKE_FAST_DOOR");
 /// lock). Off routes every cache hit through the general dispatcher.
 /// Token: `CRATONVM_JIT=-nonvirtual-fast-door`.
 cached_is_set!(no_nonvirtual_fast_door, "CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR");
+
+/// `CRATONVM_JIT_NO_FRAME_SLOT_REUSE` -- return a frame's buffers to the
+/// thread pools on every return and build the next callee's frame from
+/// them, instead of retiring the frame in place and rebuilding the next
+/// call in the buffers it left behind. Token:
+/// `CRATONVM_JIT=-frame-slot-reuse`.
+cached_is_set!(no_frame_slot_reuse, "CRATONVM_JIT_NO_FRAME_SLOT_REUSE");
+
+/// `CRATONVM_JIT_NO_FRAME_EMPLACE` -- build the callee's `Frame` on the Rust
+/// stack and move it into the frame stack, instead of constructing it in the
+/// slot. Only reachable when no slot is retired: the first call at a depth,
+/// and every call under `CRATONVM_JIT_NO_FRAME_SLOT_REUSE`. Token:
+/// `CRATONVM_JIT=-frame-emplace`.
+cached_is_set!(no_frame_emplace, "CRATONVM_JIT_NO_FRAME_EMPLACE");
 /// `CRATONVM_DBG_BYTECODE_DUMP` -- temporary raw-bytecode + mnemonic
 /// disassembly dump (2026-07-15, JRubyScriptTemplateTests round 3): see
 /// `push_frame_and_fire_entry`'s own doc comment for the full story --

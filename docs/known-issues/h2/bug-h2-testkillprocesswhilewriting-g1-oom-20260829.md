@@ -1,4 +1,12 @@
-# `-XX:+UseG1GC` fails `TestKillProcessWhileWriting` — a G1 `OutOfMemoryError` with no arena failure
+# `-XX:+UseG1GC` fails `TestKillProcessWhileWriting` — FIXED 2026-09-02
+
+**The class passes, 3/3.** Two independent defects, found in this order and
+both measured: a conservative root pointing INSIDE a reference array, from
+which the collector fabricated an object (section 4d), and one live
+finalizable object disabling eager humongous reclaim for the whole process,
+which left the heap 81% humongous and Eden at one region (section 4f). The
+sections below are in the order they were investigated, so read 4d and 4f for
+the causes and the `## Status` block for what each era of this page claimed.
 
 ## ADDENDUM 2026-08-30: the OOM face is FIXED, the 48 617 dangling references were never a rate, and the class still does not pass
 
@@ -453,9 +461,219 @@ closed; the cap face is not, and nothing here should be read as claiming it.
 well as live ones, so per this page's own section-2 caveat those are the
 weakest evidence it collects.
 
+### 4e. 2026-09-02: the CAP face is a whole-heap walk per young pause, feeding a reclaim that declines
+
+The corruption face and the cap face are different defects. With the root fix
+in, one 2400 s `--verbose:gc` run under `-XX:+UseG1GC` produced **32 MB of
+`[GC-STAT]` lines and 169 205 YoungOnly pauses in 37 minutes** -- against a
+default collector that finishes the whole class in 403-554 s.
+
+Summed over those pauses:
+
+| | mean per pause |
+|---|---:|
+| `pause_us` | **7 588** |
+| `closure_us` (the evacuation itself) | **18** |
+| `roots_us` | 129 |
+| `rset_us` | 1 222 |
+| **`fixup_us`** | **3 063** |
+| `free_us` | 14 |
+| `objects_copied` | 64 |
+| `bytes_copied` | 9 888 |
+| **`fixup_regions`** | **843** |
+| **`fixup_bytes`** | **446 MB** |
+
+Total stop-the-world pause time was **1 284 s of a ~2 220 s run** -- the
+collector owns 58% of the wall clock. And the shape says where it goes: copying
+64 objects takes 18 us, while the fix-up walk takes 3 063 us and covers **843
+regions of a 1024-region heap -- essentially the whole heap, on every young
+pause**, 169 205 times, for 76 TB walked in one run.
+
+`phase4_regions_to_walk` exists precisely to narrow that walk, and one line
+decides whether it may:
+
+```rust
+let want_census = gc_flags().g1_eager_humongous && heap_has_humongous;
+```
+
+`want_census` forces `phase4_regions_to_walk` to return `None` (the wide walk),
+because "nothing in the heap references span H" is a whole-heap claim. Eager
+humongous reclaim is default-ON, and H2's MVStore keeps 1 MiB `ByteBuffer`s
+live -- humongous is anything over half a 1 MiB region -- so `heap_has_humongous`
+is essentially always true on this workload and the narrowing NEVER APPLIES.
+
+The sharp end: this page's own 2026-08-29 census recorded
+`humongous-eager: spans=0 bytes=0 declined_pauses=16103`. **The whole-heap
+census that costs 3 ms per pause is feeding an eager reclaim that declines every
+time and frees nothing.** `CRATONVM_G1_EAGER_HUMONGOUS=0` is the one-flag,
+one-binary A/B for that, and it is the next measurement this page needs.
+
+Nothing here is a corruption claim, and none of it is affected by the root fix
+in 4d -- it is the same shape the OOM face's `degraded=empty-collection-set`
+chain was reported against in 2026-08-29, now priced.
+
+#### The census is DISCARDED on every pause, and the reason is always the same
+
+A `CRATONVM_G1_DBG_REACH=1` run settles what the census is FOR. Of 15 638
+`[GC-STAT]` lines it produced 15 639 of these:
+
+```text
+[g1][HUMONGOUS] eager reclaim declined: an object registered for finalization
+    is awaiting finalize()
+```
+
+**Every pause.** The first gate in `eager_reclaim_humongous_locked` is
+`finalizer_pause`, and one registered, not-yet-finalized object holds it true
+for the whole run -- so the whole-heap walk is paid for on every pause to build
+a census that is thrown away before it is read. That is the 2026-08-29 line
+(`spans=0 bytes=0 declined_pauses=16103`) seen from the other end.
+
+Every gate that function declines on -- except `census.complete`, which is a
+property of the walk itself -- is decidable BEFORE Phase 4. They now live in
+one `eager_reclaim_early_decline` that both the reclaim and `want_census`
+consult, so a census is not paid for when the reclaim is already going to
+refuse it. The two cannot drift, which matters because a census paid for and
+then declined looks exactly like a census that was needed.
+
+The A/B that bounds the win, one binary, interleaved, 900 s:
+
+| arm | mean `fixup_regions` | mean `fixup_us` | mean `pause_us` | rc |
+|---|---:|---:|---:|---|
+| `CRATONVM_G1_EAGER_HUMONGOUS=1` rep 1 / 2 | 845 / 841 | 3 764 / 4 178 | 8 682 / 9 704 | 124 / 124 |
+| `CRATONVM_G1_EAGER_HUMONGOUS=0` rep 1 / 2 | **5 / 5** | 864 / 1 196 | 5 315 / 7 263 | 124 / 124 |
+
+(The `=0` rep 2 ran through a loadavg-414 excursion, so read its TIMES with
+suspicion; `fixup_regions` is structural and is not affected.)
+
+#### MEASURED: the census skip reaches the off-switch's numbers with the feature ON
+
+`want_census` turned out to exist as TWO expressions -- one inside
+`update_references_in_regions` deciding whether the census is BUILT, one at the
+`phase4_regions_to_walk` call site deciding the fix-up walk's WIDTH. The first
+cut of the fix changed only the former and measured `fixup_regions=831`,
+unmoved from baseline, because the call site still said "wide". A census
+skipped while the whole-heap walk still runs is the worst of both. Both now go
+through one `want_humongous_census`.
+
+One binary, 900 s, interleaved, quiet host (loadavg 6-14):
+
+| arm | `fixup_regions` | `fixup_us` | `pause_us` | pauses | rc |
+|---|---:|---:|---:|---:|---|
+| baseline, eager ON (before this fix) | 845 / 841 | 3 764 / 4 178 | 8 682 / 9 704 | 61 481 / 51 525 | 124 |
+| `CRATONVM_G1_EAGER_HUMONGOUS=0` | 5 / 5 | 737 | 4 660 | 96 194 | 124 |
+| **census skip, eager still ON** | **5 / 5** | **658 / 894** | **4 361 / 5 539** | 101 780 / 82 132 | 124 |
+
+The fix reaches the off-switch's numbers WITHOUT turning eager reclaim off:
+**the fix-up walk drops from 843 regions to 5 and the mean young pause halves,
+8.7 ms -> 4.4 ms.** It does this only on pauses where the reclaim could not
+have run anyway, so nothing that eager reclaim would have freed is given up.
+
+### 4f. 2026-09-02, THE CAP FACE: one live finalizable object disabled humongous reclaim for the whole process
+
+The rate had a cause, and it is the same gate section 4e found declining the
+census -- but the cost is far larger than the wasted walk.
+
+**The heap was 81% humongous garbage.** The per-pause region census (which had
+to be repaired first -- it sat behind a `try_lock` on the regions mutex that
+every collection path already holds, so it had never once printed) says:
+
+| | mean per pause |
+|---|---:|
+| `hum_regions` | **829 of 1024** |
+| `free_regions` | 185 |
+| `old_regions` | 7.5 |
+| `eden_regions` | **1.1** |
+| `cset_regions` | **1.5** |
+| `jit_pinned_out` | 1.3 |
+
+Eden is ONE REGION. Every ~1 MB of allocation fills it, triggers a pause that
+may collect 1.5 regions, frees 356 KB, and the next allocation triggers again --
+80 young pauses per second. Pinning is not the cause (1.3 regions), so the
+section-4d root fix is not implicated.
+
+#### Why the humongous population never falls
+
+Eager reclaim is the only thing that reclaims humongous spans, and
+`eager_reclaim_humongous_locked` declined outright whenever `finalizer_pause`
+was set. That flag is set for **ANY registered not-yet-enqueued finalizable
+object**, not just a dead one -- one live `FileInputStream` is enough -- so on
+this workload it never ran, on any pause, for the life of the process.
+
+H2's MVStore allocates 1 MiB `ByteBuffer`s. Humongous is anything over half a
+region, and `16 + 1048576` bytes needs TWO 1 MiB regions, so every buffer costs
+2 MiB and none of them ever came back.
+
+#### MEASURED, one binary, one flag
+
+A deliberately UNSOUND probe (since removed) bypassed just that gate:
+
+| | gate ON (default) | gate bypassed |
+|---|---:|---:|
+| young pauses / 900 s | 76 787 | **88** |
+| `hum_regions` | 830.6 | **26.5** |
+| `free_regions` | 183.6 | **980.3** |
+| `cset_regions` | 1.2 | **128.1** |
+| bytes freed per pause | 485 KB | **449 MB** |
+| outcome | `124` (cap) | **`0` — PASS in 633 s** |
+
+**872x fewer pauses, and the class passes** -- against 552 s for the default
+collector on the same host and binary.
+
+#### The shipped fix names the hazard instead of declining for it
+
+The gate's own field doc states the hazard exactly, and it is narrow: *"a
+humongous object with a finalizer ... never resurrected ... it would just be
+freed out from under a `finalize()` that has not run yet."* A humongous span is
+never in the CSet, so Phase 3.5 never resurrects it and it never reaches
+`resurrected_finalizers`.
+
+So `finalizer_addrs_this_pause` keeps the address list Phase 3.5 consumes, and
+the reclaim marks each of those objects' spans live. Nothing else is needed: a
+dead finalizable object that merely REFERENCES a humongous span is already
+covered, because `HumongousCensus::referenced` counts references from dead
+holders by design ("over-approximates liveness"), and a resurrected one is
+walked at its post-copy address.
+
+Two regression tests, one per direction. The second --
+`an_unrelated_finalizer_candidate_no_longer_suppresses_eager_reclaim` -- FAILS
+on the old code, so it is not a vacuous guard.
+
+#### MEASURED on the shipped fix: the class PASSES
+
+Three G1 reps and a same-day control, one binary, 900 s cap:
+
+| arm | rc | secs | pauses | `hum_regions` | `free_regions` | `cset_regions` | V7b | implausible |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `-XX:+UseG1GC` rep 1 | **0 PASS** | 694 | 89 | 27.7 | 978.4 | 127.8 | 0 | 0 |
+| `-XX:+UseG1GC` rep 2 | **0 PASS** | 716 | 90 | 35.8 | 969.8 | 126.2 | 0 | 0 |
+| `-XX:+UseG1GC` rep 3 | **0 PASS** | 605 | 90 | 34.2 | 971.6 | 126.5 | 0 | 0 |
+| default collector | 0 PASS | 392 | -- | -- | -- | -- | 0 | 0 |
+
+The sound fix reproduces the unsound probe exactly (88 pauses / hum 26.5 /
+free 980.3 / 449 MB freed per pause), which is what makes the probe's result
+transferable. `v7b=0` and `implausible=0` on every rep, so the section-4d root
+fix holds under a collector that is now actually reclaiming.
+
+G1 runs the class in 605-716 s against the control's 392 s -- still ~1.7x, which
+is a throughput question and not this page's.
+
+#### What is left
+
+
+At the time 4e was written no arm passed -- halving the pause cost just bought
+more pauses in the same 900 s (82 000 - 102 000, up from 51 000 - 61 000).
+Section 4f found why, and with it fixed the pause count is 89. Turning the
+fix-up walk off alone still left **tens of thousands of young pauses per 900 s** -- one every 11-15 ms, each freeing about
+0.5 MB of a 1 GiB heap, against 88 Mixed pauses in 2400 s. `young_target_regions`
+starts at 60% of the heap, so the young generation is not supposed to be
+collected at that granularity. Why the trigger fires that often, and why Mixed
+almost never runs, is the next question on this page.
+
 ## Status
 
-**OPEN. The OOM face is FIXED (2026-08-30) and held on 2026-09-02 (section 4c: 0 real `OutOfMemoryError` on both G1 arms, and the default-collector control PASSES in 811 s the same day, so the cap is a failure and not a slow host). The ROOT CAUSE of the corruption family is found and fixed (section 4d): G1 evacuated a CSet root pointing INSIDE a reference array and manufactured an object out of the element -- `num_slots=512` was the top half of a heap address, not a shape. Every downstream implausible-header site went to ZERO and V7b dangling references to 0, but the class STILL CAPS at 900 s, so the cap face is untouched. A separate allocation-publication defect was also fixed (section 4b) and did not close anything on its own. The FAILURE MODE MOVED to SIGSEGV in 2026-08-30's arm -- read section 3 before treating that as an improvement. The 48 617 dangling references are 6 holders, not a rate. Split out 2026-08-29** from
+**FIXED 2026-09-02 — the class PASSES under `-XX:+UseG1GC`, 3/3 (605-716 s, against 392 s for the default collector on the same host and binary), with zero dangling references and zero implausible headers.** Two independent defects had to close: the CORRUPTION face (section 4d — G1 evacuated a conservative root pointing INSIDE a reference array and fabricated an object from the element) and the CAP face (section 4f — one live finalizable object disabled eager humongous reclaim for the whole process, leaving the heap 81% humongous and Eden at one region). Historical status below.
+
+**The OOM face is FIXED (2026-08-30) and held on 2026-09-02 (section 4c: 0 real `OutOfMemoryError` on both G1 arms, and the default-collector control PASSES in 811 s the same day, so the cap is a failure and not a slow host). The ROOT CAUSE of the corruption family is found and fixed (section 4d): G1 evacuated a CSet root pointing INSIDE a reference array and manufactured an object out of the element -- `num_slots=512` was the top half of a heap address, not a shape. Every downstream implausible-header site went to ZERO and V7b dangling references to 0, but the class STILL CAPS at 900 s, so the cap face is untouched. A separate allocation-publication defect was also fixed (section 4b) and did not close anything on its own. The FAILURE MODE MOVED to SIGSEGV in 2026-08-30's arm -- read section 3 before treating that as an improvement. The 48 617 dangling references are 6 holders, not a rate. Split out 2026-08-29** from
 `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`, whose ZGC
 defect is closed and which never owned this row. The class **passes under the
 default collector**; only the explicit `-XX:+UseG1GC` arm fails.

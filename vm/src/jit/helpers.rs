@@ -886,6 +886,19 @@ pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
         // abnormal JIT exit (exception/deopt skipping a method epilogue) left
         // unbalanced. Captured after `ensure_allocated` so `top` is valid.
         saved_shadow_top = Some(thread.shadow_stack.top);
+        // Publish this thread's shadow-stack ADDRESS, plus the `base`/`end` of
+        // its backing buffer, so a GC initiator that freezes this thread can
+        // scan the window it cannot otherwise reach -- and can verify the
+        // address still describes THIS buffer before trusting `top`.
+        // Once per thread. See
+        // `cratonvm_gc::gc_quiescence::publish_self_shadow_addr`.
+        if crate::jit::conservative_roots::xt_peer_shadow_scan_enabled() {
+            crate::jit::conservative_roots::publish_self_shadow_addr_once(
+                &thread.shadow_stack as *const _ as usize,
+                thread.shadow_stack.base,
+                thread.shadow_stack.end,
+            );
+        }
         if if crate::runtime::env_cache::hot_lookup_cache() {
             crate::runtime::env_cache::dbg_shadow()
         } else {
@@ -17150,8 +17163,11 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
                     cache.set(Some((vm_key, class_id.as_u32(), resolved as u32)));
                     resolved
                 });
-                use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
-                let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+                // The shape planner, not a bare legacy size: every TLAB object
+                // site has to agree with the header its allocation will be
+                // stamped with. See `plan_tlab_object_shape`.
+                let (requested_size, _, _) =
+                    crate::runtime::interpreter::plan_tlab_object_shape(class_id, slots);
                 let tlab_object = if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
                     crate::runtime::interpreter::tlab_alloc_object(
                         thread,
@@ -17405,8 +17421,11 @@ pub unsafe extern "C" fn jit_long_value_of_direct(vm_ptr: i64, value: i64) -> i6
                     cache.set(Some((vm_key, class_id.as_u32(), resolved as u32)));
                     resolved
                 });
-                use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
-                let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+                // The shape planner, not a bare legacy size: every TLAB object
+                // site has to agree with the header its allocation will be
+                // stamped with. See `plan_tlab_object_shape`.
+                let (requested_size, _, _) =
+                    crate::runtime::interpreter::plan_tlab_object_shape(class_id, slots);
                 let tlab_object = if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
                     crate::runtime::interpreter::tlab_alloc_object(
                         thread,

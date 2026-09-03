@@ -2243,10 +2243,16 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     // default (non-moving) path: `conservative_roots::scan_one_frame_precise`
     // already sweeps the whole frame region, so the extra precise entries are
     // redundant there and re-validated via `heap.is_object_address`.
-    let (lo_masks, lo_reached) =
-        compute_local_oop_masks(code, code_len, max_locals, param_oop_mask);
+    let (lo_masks, lo_reached, lo_windows) =
+        compute_local_oop_masks_windowed(code, code_len, max_locals, param_oop_mask);
     compiler.local_oop_masks = lo_masks;
     compiler.local_oop_reached = lo_reached;
+    // The layout the windowed readers need. `lo_windows == 0` is the REFUSAL
+    // (`max_locals` past `MAX_WINDOWED_LOCALS`, or the switch off above 64),
+    // and leaves `local_oop_masks` empty, which is what
+    // `map_incomplete_cause::LOCAL_MASK_UNSUPPORTED` fails closed on.
+    compiler.local_oop_windows = lo_windows;
+    compiler.local_oop_stride = code_len;
     // The entry state, kept alongside the per-pc vectors: the method-entry
     // safepoint poll is at no bytecode pc, so it has nothing to look up.
     // See `Compiler::local_oop_mask_at_current_pc`.
@@ -2897,9 +2903,39 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     // backstop suppression before the moving path relies on it. Always `false`
     // on the default path (`sp_id_slot_off == 0`), so it is inert until the gate
     // is on AND Stage B lands.
+    //
+    // THE INLINE TERM IS RETIRED, AND THE MASK IT HID BEHIND IS CLOSED
+    // (2026-09-02). `compiler.inline_sites.is_empty()` was the "no construct the
+    // current mapping cannot describe" clause, written when a splice was exactly
+    // that: its callee's locals lived in the caller's spill area and nothing
+    // named them. Stage 3b names them now -- each live spliced-callee local goes
+    // into this safepoint's own `frame_slot_offsets`, and a scope whose dataflow
+    // cannot classify the callee pc fails the safepoint closed
+    // (`INLINE_LOCAL_UNMAPPABLE`). The blanket term was refusing methods the
+    // sharper per-safepoint machinery had already cleared: `RMapGcStress.key`
+    // reads `shadow=true`, every one of the eight `causes` zero, `unmapped_pcs=[]`
+    // -- and `frameslot=false` for no reason but this clause.
+    //
+    // Retiring it alone would NOT have been safe, which is why the count below
+    // lands with it. `safepoint_pcs.is_subset(&mapped_safepoint_pcs)` is keyed by
+    // BYTECODE PC, and a splice emits one safepoint per `invoke*` in the callee
+    // under ONE enclosing bci -- so a complete map at that bci inserts the pc and
+    // the subset test then reads TRUE with an incomplete map beside it. The
+    // blanket term was incidentally covering that hole for exactly the shape that
+    // opens it. `incomplete_oop_maps` counts safepoints, not pcs, and cannot be
+    // masked; it is strictly stronger than the subset test for this purpose, and
+    // the subset test is kept because it also catches a safepoint that pushed no
+    // map at all.
+    //
+    // `CRATONVM_JIT_INLINE_OOP_COVERAGE=0` restores the previous predicate
+    // verbatim, so the pair is one A/B in one binary.
     cm.fully_oop_covered = compiler.precise_maps
         && compiler.sp_id_slot_off != 0
-        && compiler.inline_sites.is_empty()
+        && (if inline_oop_coverage_enabled() {
+            compiler.incomplete_oop_maps == 0
+        } else {
+            compiler.inline_sites.is_empty()
+        })
         && compiler
             .safepoint_pcs
             .is_subset(&compiler.mapped_safepoint_pcs);
@@ -2950,7 +2986,7 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
         // report "no cause" for a real one. Adding a variant without adding a
         // column is now a compile error rather than a silent column.
         const _: () = assert!(
-            crate::x64::safepoint::map_incomplete_cause::COUNT == 8,
+            crate::x64::safepoint::map_incomplete_cause::COUNT == 9,
             "map_incomplete_cause gained a variant: add a column to the              frameslot-detail line below, then bump this"
         );
         eprintln!(
@@ -2972,7 +3008,7 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
         eprintln!(
             "[oopcov]   frameslot-detail method={} precise_maps={} sp_id_slot_off={} inline_sites={} \
              safepoints={} mapped={} unmapped_pcs={:?} \
-             causes(marks_inexact={} oop_in_reg={} stack_deep={} local_deep={} staged_deep={}              staged_unmappable={} inline_local_unmappable={} local_mask_unreached={})",
+             causes(marks_inexact={} oop_in_reg={} stack_deep={} local_deep={} staged_deep={}              staged_unmappable={} inline_local_unmappable={} local_mask_unreached={}              local_mask_unsupported={})",
             compiler.method_key,
             compiler.precise_maps,
             compiler.sp_id_slot_off,
@@ -2995,6 +3031,13 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
             // cause, `staged_unmappable`" was made from this line.
             causes[6],
             causes[7],
+            // The NINTH cause. A method whose local count exceeds what
+            // `compute_local_oop_masks` supports got no mask at all, so Stage 2
+            // contributed nothing and bumped nothing -- and the map shipped
+            // claiming coverage of locals it had not named. Added as a column in
+            // the same commit as the cause, which is what the `COUNT` assertion
+            // above exists to force.
+            causes[8],
         );
     }
     // Shadow-stack — frame offsets + thread-struct offset, so the OSR trampoline

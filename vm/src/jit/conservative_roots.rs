@@ -419,6 +419,157 @@ unsafe fn write_gs_qword(disp: usize, val: usize) {
 static GLOBAL_JIT_DEPTH: cratonvm_types::striped_counter::StripedCounter =
     cratonvm_types::striped_counter::StripedCounter::new();
 
+/// `CRATONVM_XT_PINNED_PEER_DEPTH=1` -- credit a frozen peer's JIT depth to the
+/// cross-thread coverage account when this cycle PINNED that peer's entire
+/// stack, instead of refusing the cycle because the peer never parked to prove
+/// its own frames rewritable.
+///
+/// Default OFF, so the two behaviours are one binary apart and the comparison
+/// is an A/B rather than a rebuild. See
+/// [`refresh_moving_young_coverage_for_collection`] for the argument, and
+/// `cratonvm_gc::gc_quiescence::add_xt_cycle_pinned_jit_depth` for why the
+/// per-thread depth is published from here rather than from the (much colder)
+/// blocked-region transition.
+pub fn xt_pinned_peer_depth_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_XT_PINNED_PEER_DEPTH").is_some()
+    })
+}
+
+/// `CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY=1` -- publish per-thread depths and
+/// deposit them, but credit NOTHING to the coverage account.
+///
+/// The bisect lever for the segfault this feature produced on
+/// `TestCachedQueryResults`: with one flag gating both the publisher (a TLS
+/// `Arc` written on every JIT chain mutation) and the decision (relocating on
+/// cycles that used to refuse), a crash cannot be attributed to either. This
+/// arm runs the whole mechanism EXCEPT the decision, so a crash here indicts
+/// the publisher and a crash only without it indicts the relocation.
+pub fn xt_pinned_peer_publish_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY").is_some()
+    })
+}
+
+/// `CRATONVM_XT_PEER_SHADOW_SCAN=1` -- scan and pin a frozen blocked peer's
+/// SHADOW STACK, not just its registers and machine stack.
+///
+/// A JIT frame's oops live in the shadow stack, a per-thread heap allocation
+/// the helper-window scan cannot see. Without this the pinned-peer depth credit
+/// claims coverage it does not have, and the class SIGSEGVs.
+pub fn xt_peer_shadow_scan_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_XT_PEER_SHADOW_SCAN").is_some()
+    })
+}
+
+thread_local! {
+    static SHADOW_ADDR_PUBLISHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Publish this thread's shadow-stack address once. Called from
+/// `set_jit_thread`, which runs on every interpreter->JIT entry, so the
+/// repeat path is one TLS bool.
+pub fn publish_self_shadow_addr_once(addr: usize, base: usize, end: usize) {
+    // `base == 0` means `ensure_allocated` has not run yet; publishing that
+    // would register a window with no buffer. Stay unpublished (the reader
+    // treats absent as UNKNOWN and refuses) and try again on the next entry.
+    if base == 0 {
+        return;
+    }
+    let _ = SHADOW_ADDR_PUBLISHED.try_with(|c| {
+        if c.get() {
+            return;
+        }
+        cratonvm_gc::gc_quiescence::publish_self_shadow_addr(self_os_tid(), addr, base, end);
+        c.set(true);
+    });
+}
+
+/// This thread's OS tid, in the same namespace `blocked_os_tids` reports and
+/// `helper_window_pass` enumerates -- the key the initiator will look this
+/// thread's depth up by.
+#[cfg(windows)]
+fn self_os_tid() -> u32 {
+    unsafe extern "system" {
+        fn GetCurrentThreadId() -> u32;
+    }
+    unsafe { GetCurrentThreadId() }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn self_os_tid() -> u32 {
+    // SAFETY: `SYS_gettid` takes no arguments and cannot fail.
+    unsafe { libc::syscall(libc::SYS_gettid) as u32 }
+}
+
+#[cfg(not(any(windows, all(unix, target_os = "linux"))))]
+fn self_os_tid() -> u32 {
+    // No helper-window scanner on this platform, so nothing ever reads the
+    // slot; 0 keeps every thread on the never-registered path.
+    0
+}
+
+/// Owns this thread's registry entry so it is REMOVED when the thread exits.
+///
+/// A leftover entry is readable under a tid the OS will recycle, and a recycled
+/// thread that never enters JIT never overwrites it -- so the initiator would
+/// credit depth nobody holds. `register_self_jit_depth_slot` also resets on
+/// re-registration, which covers the threads whose destructors never run.
+struct JitDepthSlot {
+    os_tid: u32,
+    cell: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for JitDepthSlot {
+    fn drop(&mut self) {
+        cratonvm_gc::gc_quiescence::unregister_jit_depth_slot(self.os_tid);
+    }
+}
+
+thread_local! {
+    /// This thread's published JIT-depth cell, resolved once. `None` until the
+    /// first chain mutation with the credit enabled.
+    static SELF_JIT_DEPTH_SLOT: std::cell::RefCell<Option<JitDepthSlot>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Publish this thread's current `JIT_ENTRY_CHAIN` length so a GC initiator
+/// that freezes this thread can attribute a depth to it.
+///
+/// One TLS read and one relaxed store on a path that already does both; the
+/// registry lock is taken only on this thread's FIRST call. Gated so the
+/// default arm pays a single cached-bool branch.
+#[inline]
+fn publish_self_jit_depth(depth: usize) {
+    if !xt_pinned_peer_depth_enabled() {
+        return;
+    }
+    // `try_with`, not `with`: `pop_jit_entry` can run while this thread is
+    // tearing down, and `with` on an already-destroyed thread-local PANICS.
+    // A skipped publish only under-credits.
+    let _ = SELF_JIT_DEPTH_SLOT.try_with(|c| {
+        // `try_borrow_mut`: this runs on the JIT entry/exit path, which a panic
+        // unwind can re-enter. Skipping a publish is safe (the initiator then
+        // reads a stale-SMALLER depth and under-credits, refusing a cycle it
+        // could have run); a double-borrow panic here would not be.
+        let Ok(mut slot) = c.try_borrow_mut() else {
+            return;
+        };
+        let held = slot.get_or_insert_with(|| {
+            let os_tid = self_os_tid();
+            JitDepthSlot {
+                os_tid,
+                cell: cratonvm_gc::gc_quiescence::register_self_jit_depth_slot(os_tid),
+            }
+        });
+        held.cell.store(depth, std::sync::atomic::Ordering::Release);
+    });
+}
+
 /// Re-export the GC-side quiescence flag so VM call sites have a single
 /// canonical entry point. The flag itself lives in the gc crate (see
 /// `gc::gc_quiescence`) because the GC must consult it from inside its own
@@ -895,6 +1046,7 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         n
     });
     GLOBAL_JIT_DEPTH.inc();
+    publish_self_jit_depth(depth);
     // P1 shadow record (`docs/threading/thread-transition-states.md` §7.2):
     // this is the ONLY point at which a thread becomes
     // `CompiledUninterruptible`. A nested entry re-records the same state,
@@ -972,6 +1124,7 @@ pub fn pop_jit_entry() -> Option<usize> {
     });
     if let Some(entry) = popped {
         GLOBAL_JIT_DEPTH.dec();
+        publish_self_jit_depth(remaining);
         thread_state::record_transition(
             leaving_compiled_state(remaining),
             "jit::conservative_roots::pop_jit_entry",
@@ -1074,6 +1227,9 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
         GLOBAL_JIT_DEPTH.dec();
         cratonvm_gc::gc_quiescence::leave();
         cratonvm_jit::jit_execution_leave();
+    }
+    if pruned > 0 {
+        publish_self_jit_depth(remaining);
     }
     if pruned > 0 {
         tracing::debug!(
@@ -3889,12 +4045,33 @@ pub fn refresh_moving_young_coverage_for_collection() -> bool {
     let peer_depth = peer_jit_depth();
     if peer_depth > 0 {
         let proven = cratonvm_gc::gc_quiescence::peer_proven_jit_depth();
+        // Depth belonging to peers this cycle discharged by PINNING instead of
+        // by proof (see `add_xt_cycle_pinned_jit_depth`). Two conditions, and
+        // both are load-bearing:
+        //
+        //  - the credit is enabled, so the old behaviour is one flag away; and
+        //  - EVERY helper window this cycle was pinned. A single unpinned
+        //    window means some frozen peer's stack is neither proven nor
+        //    immobile, and since the account is one process-wide subtraction it
+        //    cannot exclude just that peer -- so it credits nothing at all.
+        //
+        // `xt_cycle_pinned_jit_depth` applies the third condition itself: it
+        // returns 0 if any pinned peer's depth was unknown.
+        let pinned = if xt_pinned_peer_depth_enabled()
+            && !xt_pinned_peer_publish_only()
+            && crate::jit::xt_root_scan::helper_windows_all_pinned_this_cycle()
+        {
+            cratonvm_gc::gc_quiescence::xt_cycle_pinned_jit_depth()
+        } else {
+            0
+        };
+        let covered = proven.saturating_add(pinned);
         let accounted = xt_jit_coverage_handshake_enabled()
-            && (peer_coverage_accounted(peer_depth, proven) || xt_jit_coverage_assume());
+            && (peer_coverage_accounted(peer_depth, covered) || xt_jit_coverage_assume());
         cratonvm_gc::gc_quiescence::note_peer_coverage_verdict(accounted);
         if xt_coverage_dbg() {
             eprintln!(
-                "[xt-coverage] peer_depth={peer_depth} proven={proven} accounted={accounted}"
+                "[xt-coverage] peer_depth={peer_depth} proven={proven} pinned={pinned} accounted={accounted}"
             );
         }
         if !accounted {
@@ -6498,7 +6675,7 @@ pub fn verify_active_coverage_into(heap: &VmHeap, roots: &mut Vec<ObjectRef>) ->
     // whose `while_covered` is zero, so a gate reading only the coverage
     // counters returns "proof holds" over frames it has just been shown hold
     // unreachable-by-the-scan oops.
-    let before_wrong_map = oop_map_audit::WRONG_MAP.load(Ordering::Relaxed);
+    let before_wrong_map = oop_map_audit::WRONG_MAP_VERIFIER_OOP.load(Ordering::Relaxed);
     scan_active_jit_frames(heap, roots);
     if oracle_force_refute() {
         note_coverage_oracle_refutation();
@@ -6506,7 +6683,7 @@ pub fn verify_active_coverage_into(heap: &VmHeap, roots: &mut Vec<ObjectRef>) ->
     }
     oop_map_audit::NEVER_MAPPED_WHILE_COVERED.load(Ordering::Relaxed) > before
         || oop_map_audit::NEVER_MAPPED_WHILE_SHADOW_COVERED.load(Ordering::Relaxed) > before_shadow
-        || oop_map_audit::WRONG_MAP.load(Ordering::Relaxed) > before_wrong_map
+        || oop_map_audit::WRONG_MAP_VERIFIER_OOP.load(Ordering::Relaxed) > before_wrong_map
 }
 
 /// Whether the pre-suppression verification should run: only when the oracle is
@@ -6697,7 +6874,29 @@ pub mod oop_map_audit {
     /// In-band object addresses named by SOME map of the owning frame but not
     /// by the one its safepoint id selects. Not a codegen coverage gap — a
     /// map-selection gap, which strands the oop just as effectively.
+    ///
+    /// **Raw, and it over-reports.** A slot whose value merely LOOKS like a
+    /// heap address is counted here even when it is dead storage — an old
+    /// pointer left in a reusable local or spill slot after the value died,
+    /// which the precise map is right to omit and the conservative scan keeps
+    /// alive for nothing. Read [`WRONG_MAP_VERIFIER_OOP`] for the population
+    /// that is actually evidence.
     pub static WRONG_MAP: AtomicU64 = AtomicU64::new(0);
+    /// The subset of [`WRONG_MAP`] that the CLASS FILE's own type maps confirm
+    /// holds a reference at that bci — the same independent oracle
+    /// `NEVER_MAPPED` is split by, applied to the map-selection population that
+    /// had no verdict at all.
+    ///
+    /// This is the number a refutation may be built on. A non-zero reading is a
+    /// live reference the selected map omits; a zero reading over a large
+    /// `WRONG_MAP` says the raw counter was measuring dead slots.
+    pub static WRONG_MAP_VERIFIER_OOP: AtomicU64 = AtomicU64::new(0);
+    /// The rest of [`WRONG_MAP`]: the verifier says NOT a reference, or cannot
+    /// answer (an inlined frame, a slot outside the java-locals band, no type
+    /// maps for the method). Kept apart so a zero in
+    /// [`WRONG_MAP_VERIFIER_OOP`] beside a large count here is legible as
+    /// "asked and answered no", not "never asked".
+    pub static WRONG_MAP_VERIFIER_OTHER: AtomicU64 = AtomicU64::new(0);
     /// Object addresses BELOW the innermost compiled frame — interpreter,
     /// native and Rust frames the compiled method called into. Not the oop
     /// map's responsibility; counted so it can be subtracted rather than
@@ -6842,7 +7041,7 @@ pub mod oop_map_audit {
         eprintln!(
             "[cratonvm] oop-map audit: frames={} unreadable_frames={} words={} \
              never_mapped={} (while_covered={} of {} claiming; \
-             while_shadow_covered={} of {} claiming) wrong_map={} below_jit={}",
+             while_shadow_covered={} of {} claiming) wrong_map={}              (verifier_oop={} other={}) below_jit={}",
             FRAMES.load(Ordering::Relaxed),
             UNREADABLE_FRAMES.load(Ordering::Relaxed),
             WORDS.load(Ordering::Relaxed),
@@ -6852,6 +7051,8 @@ pub mod oop_map_audit {
             NEVER_MAPPED_WHILE_SHADOW_COVERED.load(Ordering::Relaxed),
             FRAMES_CLAIMING_SHADOW_COVERAGE.load(Ordering::Relaxed),
             WRONG_MAP.load(Ordering::Relaxed),
+            WRONG_MAP_VERIFIER_OOP.load(Ordering::Relaxed),
+            WRONG_MAP_VERIFIER_OTHER.load(Ordering::Relaxed),
             BELOW_JIT.load(Ordering::Relaxed),
         );
         // THE LINE TO READ FIRST. Everything above counts words that LOOK like
@@ -7067,6 +7268,17 @@ fn verify_precise_covers_conservative(
                         // covered by the map the collector will actually scan
                     } else if any.contains(&off16) {
                         audit::WRONG_MAP.fetch_add(1, AOrd::Relaxed);
+                        // Split it the way NEVER_MAPPED is split. Without this
+                        // the map-selection population has no verdict at all,
+                        // and a raw non-zero reading cannot distinguish a live
+                        // reference the selected map omits from an old pointer
+                        // lying dead in a reusable slot.
+                        match verifier_local_verdict(frame_cm, off, active_sp_id) {
+                            VerifierSlotVerdict::Oop => {
+                                audit::WRONG_MAP_VERIFIER_OOP.fetch_add(1, AOrd::Relaxed)
+                            }
+                            _ => audit::WRONG_MAP_VERIFIER_OTHER.fetch_add(1, AOrd::Relaxed),
+                        };
                     } else {
                         audit::NEVER_MAPPED.fetch_add(1, AOrd::Relaxed);
                         let class = classify_frame_slot(off, &frame_cm.frame_layout);
@@ -7107,9 +7319,29 @@ fn verify_precise_covers_conservative(
                         if frame_cm.fully_oop_covered {
                             audit::NEVER_MAPPED_WHILE_COVERED.fetch_add(1, AOrd::Relaxed);
                             // The bit has been caught claiming coverage it does
-                            // not have. Latch it: `collect_roots` consults this
+                            // not have -- but only if the word really is an oop.
+                            // Latched, and `collect_roots` consults the latch
                             // before skipping the conservative backstop.
-                            note_coverage_oracle_refutation();
+                            //
+                            // GATED ON THE VERIFIER, for exactly the reason the
+                            // shadow latch below already gives: the raw counter
+                            // flags any in-band word that LOOKS like a heap
+                            // address, and an old pointer left in a reusable
+                            // slot after its value died looks exactly like one.
+                            // The two latches sat side by side with only the
+                            // second one gated, and the first one's cost was
+                            // measured on 2026-09-03: H2
+                            // (`org.h2.test.store.TestMVStoreTool`, 612
+                            // compiled frames) trips it 400 times with
+                            // `verifier_oop=0` on every one, and because the
+                            // latch is process-wide the run then reports
+                            // `root coverage: incomplete` on 100% of pauses --
+                            // where the same class without the oracle reports
+                            // 0.00%. A refusal that fires on shape rather than
+                            // evidence, and it fired on every real workload.
+                            if verdict == VerifierSlotVerdict::Oop {
+                                note_coverage_oracle_refutation();
+                            }
                         }
                         // ...and the same latch on the claim the MOVING path
                         // actually spends, but ONLY on a corroborated hit.
@@ -7700,6 +7932,14 @@ mod coverage_oracle_gate_tests {
     /// were BOTH zero over frames holding 160 oops the precise walk cannot
     /// reach.
     ///
+    /// It must read the VERIFIER-CONFIRMED subset, not the raw counter. The raw
+    /// one over-reports: a slot whose value merely looks like a heap address is
+    /// counted even when it is dead storage, which the precise map is right to
+    /// omit. Measured 2026-09-02, the class file's own type maps returned
+    /// `verifier_oop=0` over every never-mapped word on these workloads, so a
+    /// gate keyed on the raw count would refuse the suppression forever on
+    /// evidence that is not evidence.
+    ///
     /// A source-level assertion because the gate needs live compiled frames to
     /// run: what is pinned here is that the counter appears in the decision at
     /// all, which is the thing that was missing.
@@ -7716,7 +7956,7 @@ mod coverage_oracle_gate_tests {
         for counter in [
             "NEVER_MAPPED_WHILE_COVERED",
             "NEVER_MAPPED_WHILE_SHADOW_COVERED",
-            "WRONG_MAP",
+            "WRONG_MAP_VERIFIER_OOP",
         ] {
             assert!(
                 body.contains(counter),

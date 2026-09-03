@@ -769,6 +769,192 @@ thread_local! {
         const { std::cell::RefCell::new(VersionCache::new()) };
 }
 
+// ---------------------------------------------------------------------------
+// The GC scan cache — dense by `class_id`
+// ---------------------------------------------------------------------------
+
+/// How far the scan cache will index by `class_id` before giving up and going
+/// to the registry.
+///
+/// The bound is a MEMORY bound, not a correctness one: the table is per thread
+/// and grown on demand to the highest `class_id` that thread has looked up, at
+/// [`ScanEntry`]'s 16 bytes a slot, so 32 768 caps a scanning thread at 512 KiB.
+/// A VM with more compact-laid-out classes than this keeps working — the excess
+/// ids fall through to [`registry_layout_for_fields`], which is where every id
+/// went before this cache existed.
+const SCAN_CACHE_MAX: usize = 32_768;
+
+/// One slot of [`ScanCache`]. `field_count == EMPTY` means "never resolved".
+///
+/// Not `Option<(u32, Option<Arc<..>>)>`: the sentinel keeps the slot at 16
+/// bytes, and the table is sized in slots per thread.
+#[derive(Clone)]
+struct ScanEntry {
+    field_count: u32,
+    resolved: Option<Arc<CompactLayout>>,
+}
+
+impl ScanEntry {
+    const EMPTY: u32 = u32::MAX;
+    const fn empty() -> Self {
+        Self {
+            field_count: Self::EMPTY,
+            resolved: None,
+        }
+    }
+}
+
+/// The collectors' per-object layout lookup, cached DENSELY by `class_id`.
+///
+/// # Why this is not the 8-entry [`VersionCache`]
+///
+/// `with_class_layout` is called once per scanned object by the mark and sweep
+/// loops of all four collectors (it is called from nowhere else in the tree —
+/// `gc/src/{gc,g1,gen_heap,zgc,concurrent_mark}.rs` are the only callers), and
+/// it was served by an 8-entry MRU array. The argument for eight was "the GC
+/// scans long runs of same-class objects", and a microbenchmark of a tree of
+/// one node type agrees. A real heap does not: the collector's working set is
+/// every class with a live instance, and it visits them in ADDRESS order, which
+/// is allocation order, which interleaves them. Past eight distinct classes the
+/// MRU array misses on essentially every object and each miss pays a
+/// `parking_lot` reader acquire plus an FxHash probe plus an install.
+///
+/// Measured by `measure_the_layout_lookup_at_working_set` (in this file,
+/// `--release`, 2M lookups per row):
+///
+/// | distinct classes | 1 | 4 | 8 | 16 | 64 | 256 | 1024 |
+/// |---|---|---|---|---|---|---|---|
+/// | ns/lookup, 8-entry MRU | 6.2 | 8.8 | 9.3 | 36.5 | 33.4 | 33.6 | 37.2 |
+///
+/// The cliff is exactly at the cache size, and it is 4x. Indexing by `class_id`
+/// has no cliff: the working set is bounded by the classes in the heap, not by
+/// a constant chosen in 2026.
+///
+/// # And the end-to-end arm CAN resolve it
+///
+/// A component measurement usually cannot be seen end to end; this one can.
+/// `G1ChurnPauseProbe 50 600` at `-Xmx2048m`, release, one binary,
+/// `CRATONVM_GC_LAYOUT_SCAN_CACHE` the only thing moved, three interleaved
+/// pairs so an arm order cannot manufacture the result:
+///
+/// | rep | off | on |
+/// |---|---|---|
+/// | 1 | 3490 ms | 3346 ms |
+/// | 2 | 3398 ms | 3111 ms |
+/// | 3 | 3453 ms | 3120 ms |
+///
+/// Every pair moves the same way, mean 3447 → 3192 ms (**-7.4%** wall), with
+/// per-cycle `sweep_us` 106.3 → 100.9 ms and `mark_us` 9.81 → 9.46 ms. Both
+/// GC phases call this once per object, which is why the effect shows in the
+/// wall of a workload that spends a third of it collecting.
+///
+/// # Invalidation
+///
+/// The whole table is dropped when [`layout_generation`] moves, which a
+/// registration or a redefine does. That is the same rule [`VersionCache`]
+/// uses, and it is why a hit can never serve a stale layout.
+///
+/// # One field count per class
+///
+/// A slot holds ONE `field_count`. A class registered at two counts (the
+/// append-only synthetic-class upgrade path) flaps its slot and degrades to a
+/// registry probe per lookup — which is what every class did before this
+/// cache, so it is a lost optimisation and not a regression.
+struct ScanCache {
+    /// The [`layout_generation`] `entries` was resolved at. `u64::MAX` when the
+    /// table has never been filled, which no real generation can be.
+    generation: std::cell::Cell<u64>,
+    /// Indexed by `class_id`. Grown on demand, never past [`SCAN_CACHE_MAX`].
+    entries: Vec<ScanEntry>,
+}
+
+impl ScanCache {
+    const fn new() -> Self {
+        Self {
+            generation: std::cell::Cell::new(u64::MAX),
+            entries: Vec::new(),
+        }
+    }
+
+    /// The resolved layout for `(class_id, field_count)` at `generation`, or
+    /// `None` for a miss. `Some(&entry)` may still carry `resolved: None` — a
+    /// cached negative, which is the point.
+    ///
+    /// `&self`, so the whole lookup path runs under a SHARED `RefCell` borrow
+    /// and `with_class_layout` can hold it across the caller's closure. See
+    /// [`VersionCache::find`] for the re-entrancy argument, which is the same
+    /// one.
+    #[inline]
+    fn find(&self, class_id: u32, field_count: u32, generation: u64) -> Option<&ScanEntry> {
+        if self.generation.get() != generation {
+            return None;
+        }
+        match self.entries.get(class_id as usize) {
+            Some(e) if e.field_count == field_count => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Install `resolved` and return the slot, or `None` when `class_id` is
+    /// past [`SCAN_CACHE_MAX`] and the caller must not cache it.
+    #[inline]
+    fn install(
+        &mut self,
+        class_id: u32,
+        field_count: u32,
+        generation: u64,
+        resolved: Option<Arc<CompactLayout>>,
+    ) -> Option<usize> {
+        let idx = class_id as usize;
+        if idx >= SCAN_CACHE_MAX {
+            return None;
+        }
+        if self.generation.get() != generation {
+            self.entries.clear();
+            self.generation.set(generation);
+        }
+        if idx >= self.entries.len() {
+            self.entries.resize(idx + 1, ScanEntry::empty());
+        }
+        self.entries[idx] = ScanEntry {
+            field_count,
+            resolved,
+        };
+        Some(idx)
+    }
+}
+
+thread_local! {
+    static SCAN_CACHE: std::cell::RefCell<ScanCache> =
+        const { std::cell::RefCell::new(ScanCache::new()) };
+}
+
+static SCAN_CACHE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Whether [`with_class_layout`] uses the dense [`ScanCache`].
+///
+/// On by default. `CRATONVM_GC_LAYOUT_SCAN_CACHE=0` restores the 8-entry
+/// [`VersionCache`] path this function used before 2026-09-03, which is the
+/// A/B arm for the measurement in [`ScanCache`]'s doc — the two paths resolve
+/// through the same registry and must return the same layout for every
+/// `(class_id, field_count)`, so a behavioural difference between the arms is
+/// a bug in the cache and not a tuning question.
+#[inline]
+fn scan_cache_enabled() -> bool {
+    *SCAN_CACHE_ENABLED.get_or_init(|| {
+        match crate::flags::runtime_var("CRATONVM_GC_LAYOUT_SCAN_CACHE") {
+            Ok(value) => {
+                let value = value.trim();
+                !matches!(
+                    value,
+                    "0" | "false" | "False" | "FALSE" | "off" | "Off" | "OFF" | "no" | "No" | "NO"
+                )
+            }
+            Err(_) => true,
+        }
+    })
+}
+
 /// The uncached registry probe both accessors fall back to: an `RwLock` reader
 /// acquire plus a SipHash probe. Everything above exists to avoid this.
 #[inline]
@@ -893,6 +1079,66 @@ pub fn with_class_layout<R>(
     f: impl FnOnce(&CompactLayout) -> R,
 ) -> Option<R> {
     let generation = layout_generation();
+    if scan_cache_enabled() {
+        return with_class_layout_scan_cached(class_id, field_count, generation, f);
+    }
+    with_class_layout_mru(class_id, field_count, generation, f)
+}
+
+/// [`with_class_layout`] over the dense [`ScanCache`]. See that type for the
+/// measurement and the invalidation rule.
+#[inline]
+fn with_class_layout_scan_cached<R>(
+    class_id: u32,
+    field_count: u32,
+    generation: u64,
+    f: impl FnOnce(&CompactLayout) -> R,
+) -> Option<R> {
+    SCAN_CACHE.with(|cell| {
+        match cell.try_borrow() {
+            Ok(cache) => {
+                if let Some(entry) = cache.find(class_id, field_count, generation) {
+                    // Hit (possibly a cached negative). `f` runs with the
+                    // shared borrow live, so a nested `with_class_layout` from
+                    // inside it still hits.
+                    return entry.resolved.as_deref().map(f);
+                }
+            }
+            // An `install` is on this thread's stack. One uncached probe.
+            Err(_) => return registry_layout_for_fields(class_id, field_count).map(|a| f(&a)),
+        }
+        let resolved = registry_layout_for_fields(class_id, field_count);
+        // Install under a SHORT exclusive borrow that never spans user code,
+        // then re-borrow shared to run `f` against the entry. `install`
+        // declines ids past `SCAN_CACHE_MAX`; those run `f` against the handle
+        // we already hold.
+        let installed = match cell.try_borrow_mut() {
+            Ok(mut cache) => cache.install(class_id, field_count, generation, resolved.clone()),
+            Err(_) => None,
+        };
+        match installed {
+            Some(idx) => match cell.try_borrow() {
+                Ok(cache) => cache.entries[idx].resolved.as_deref().map(f),
+                // Nothing can hold a borrow here, but this is a GC path where a
+                // panic aborts the collection, so re-resolve rather than rely
+                // on that reasoning.
+                Err(_) => resolved.map(|a| f(&a)),
+            },
+            None => resolved.map(|a| f(&a)),
+        }
+    })
+}
+
+/// [`with_class_layout`] over the 8-entry [`VersionCache`] — the arm
+/// `CRATONVM_GC_LAYOUT_SCAN_CACHE=0` selects, kept verbatim so the A/B is a
+/// re-run and not a rebuild.
+#[inline]
+fn with_class_layout_mru<R>(
+    class_id: u32,
+    field_count: u32,
+    generation: u64,
+    f: impl FnOnce(&CompactLayout) -> R,
+) -> Option<R> {
     VERSION_CACHE.with(|cell| {
         match cell.try_borrow() {
             Ok(cache) => {
@@ -1033,6 +1279,49 @@ pub fn compact_field_storage_in(
 /// this one predicate, so an object can never be marked compact with a partial
 /// or stale class recipe.
 #[inline]
+/// Has this process ever had more than one `ClassStore`?
+///
+/// `false` is the state every production embedding is in, and the state in
+/// which a domain screen cannot change any answer: `layout_owner` returns
+/// `None` for every `class_id`, so `layout_domain_owns` is vacuously true
+/// whatever domain is passed. Callers that cannot cheaply obtain the owning
+/// heap's domain use this to decide whether they may plan a compact layout at
+/// all — see [`compact_tlab_body_size`].
+#[inline]
+pub fn single_layout_domain() -> bool {
+    NEXT_LAYOUT_DOMAIN.load(std::sync::atomic::Ordering::Relaxed) <= 1
+}
+
+/// The compact body size for a TLAB-allocated object, or `None` for "allocate
+/// the uniform 16-byte-cell layout".
+///
+/// # Why this is a separate entry point
+///
+/// The interpreter's TLAB fast path has no cheap route to the owning heap's
+/// layout domain — it reaches the heap through a trait object on a path where
+/// a registry lock would be the dominant cost — so it cannot call
+/// [`compact_object_body_size`]. Rather than pass a domain it has not got,
+/// this refuses outright unless the process has a single `ClassStore`, which is
+/// exactly the condition under which the domain screen is vacuous. A
+/// multi-`ClassStore` process therefore keeps the legacy TLAB shape, which is
+/// the pre-2026-09-03 behaviour and always sound.
+///
+/// The remaining predicate is deliberately the SAME one the JIT's inline
+/// `new` emitter uses (`x64::objects::emit_inline_tlab_new`): a registered
+/// layout whose `field_count` matches this allocation exactly. That emitter
+/// has been allocating compact bodies inline since long before this function
+/// existed, so a class allocated by compiled code and the same class allocated
+/// by the interpreter now agree by construction — which is the property that
+/// matters, and the one they did not have.
+pub fn compact_tlab_body_size(class_id: u32, field_count: usize) -> Option<usize> {
+    if !compact_ref_fields_enabled() || !single_layout_domain() {
+        return None;
+    }
+    class_layout(class_id)
+        .filter(|l| l.field_count() == field_count)
+        .map(|l| l.body_size as usize)
+}
+
 pub fn compact_object_body_size(domain: u32, class_id: u32, field_count: usize) -> Option<usize> {
     if !compact_ref_fields_enabled() {
         return None;
@@ -2101,6 +2390,113 @@ mod tests {
             compact_object_field_storage_in(foreign_domain, &header, 0).is_none(),
             "a foreign domain must degrade to the guard, not to wrong offsets"
         );
+        clear_class_layouts();
+    }
+
+    /// The two `with_class_layout` arms must be indistinguishable.
+    ///
+    /// They resolve through the same registry, so a difference is a bug in the
+    /// dense cache and never a tuning question — which is what makes
+    /// `CRATONVM_GC_LAYOUT_SCAN_CACHE=0` a usable A/B arm. Covers the four
+    /// cases the dense table adds: a hit, a cached NEGATIVE, a class whose
+    /// `field_count` does not match the cached slot, and a `class_id` past
+    /// `SCAN_CACHE_MAX` (which the table declines to index and must therefore
+    /// still answer correctly).
+    #[test]
+    fn both_with_class_layout_arms_agree() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        for cid in [3u32, 4, 5, 900] {
+            register_class_layout(FIRST_LAYOUT_DOMAIN, cid, one_ref_layout(cid * 8 + 8));
+        }
+        let probe = |cid: u32, fc: u32| {
+            let gen = layout_generation();
+            let mru = with_class_layout_mru(cid, fc, gen, |l| l.body_size);
+            let dense = with_class_layout_scan_cached(cid, fc, gen, |l| l.body_size);
+            assert_eq!(mru, dense, "arms disagree for (class_id {cid}, field_count {fc})");
+            // Twice, so the second call is served from each arm's cache.
+            let mru2 = with_class_layout_mru(cid, fc, gen, |l| l.body_size);
+            let dense2 = with_class_layout_scan_cached(cid, fc, gen, |l| l.body_size);
+            assert_eq!(mru2, dense2, "cached arms disagree for ({cid}, {fc})");
+            assert_eq!(mru, mru2, "a cached hit differs from the first resolve");
+            dense
+        };
+        for cid in [3u32, 4, 5, 900] {
+            assert_eq!(probe(cid, 1), Some(cid * 8 + 8), "registered class {cid}");
+        }
+        // Cached negatives: never registered, and registered-but-wrong-count.
+        assert_eq!(probe(6, 1), None, "an unregistered class has no layout");
+        assert_eq!(probe(3, 2), None, "field_count is part of the key");
+        // Re-probe the original count: the slot for class 3 was just overwritten
+        // by the (3, 2) negative, so this exercises the flap path.
+        assert_eq!(probe(3, 1), Some(32), "a flapped slot must re-resolve, not go stale");
+        // Past the dense table's index bound. `register_class_layout` refuses
+        // ids at or above MAX_DENSE_CLASS_LAYOUTS, so the answer is None on
+        // both arms — but it must come back, not hang on a 4-billion resize.
+        assert!(SCAN_CACHE_MAX < MAX_DENSE_CLASS_LAYOUTS);
+        assert_eq!(probe(SCAN_CACHE_MAX as u32, 1), None, "past the dense bound");
+        assert_eq!(probe(u32::MAX, 1), None, "AUTOBOX_CLASS_ID has no layout");
+        // A registration bumps the generation and must invalidate the table.
+        register_class_layout(FIRST_LAYOUT_DOMAIN, 3, one_ref_layout(4096));
+        assert_eq!(probe(3, 1), Some(4096), "a redefine must not serve the old layout");
+        clear_class_layouts();
+    }
+
+    /// COMPONENT MEASUREMENT for the collector's per-object layout lookup.
+    ///
+    /// `with_class_layout` is called once per scanned object by every
+    /// collector's mark and sweep loops. It is served by an 8-entry
+    /// thread-local MRU cache; the argument for that size is "the GC scans
+    /// long runs of same-class objects". A tree of one node type does. A real
+    /// heap does not: the collector's working set is every class with a live
+    /// instance, which is hundreds. Past 8 the cache thrashes and every lookup
+    /// pays `registry_layout_for_fields` -- an `RwLock` reader acquire and a
+    /// SipHash probe -- plus an install.
+    ///
+    /// This times the lookup alone, at working sets either side of the cache,
+    /// so the cost can be compared against a real cycle's object count BEFORE
+    /// anything is rebuilt. Ignored: wants `--release` and a quiet box.
+    ///
+    ///   cargo test -p cratonvm-types --release --lib -- --ignored --nocapture     ///     measure_the_layout_lookup_at_working_set
+    #[test]
+    #[ignore = "timing measurement; wants --release and a quiet box"]
+    fn measure_the_layout_lookup_at_working_set() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        const CLASSES: u32 = 8192;
+        for cid in 0..CLASSES {
+            register_class_layout(FIRST_LAYOUT_DOMAIN, cid, one_ref_layout(cid * 8 + 8));
+        }
+        // Warm the registry's own lock/hash path once.
+        for cid in 0..CLASSES {
+            let _ = class_layout_for_fields(cid, 1);
+        }
+        // Both arms in ONE process, called directly rather than through the
+        // `OnceLock` switch, so the comparison cannot be a cross-binary one.
+        const LOOKUPS: u32 = 2_000_000;
+        println!("working_set   8-entry MRU ns   dense scan ns    speedup");
+        for &ws in &[1u32, 4, 8, 16, 64, 256, 1024, 8192] {
+            let gen = layout_generation();
+            let mut run = |dense: bool| -> f64 {
+                let t = std::time::Instant::now();
+                let mut acc = 0usize;
+                for i in 0..LOOKUPS {
+                    let cid = i % ws;
+                    let got = if dense {
+                        with_class_layout_scan_cached(cid, 1, gen, |l| l.body_size as usize)
+                    } else {
+                        with_class_layout_mru(cid, 1, gen, |l| l.body_size as usize)
+                    };
+                    acc += got.unwrap_or(0);
+                }
+                let el = t.elapsed();
+                assert!(acc > 0, "the loop must not be optimised away");
+                el.as_nanos() as f64 / LOOKUPS as f64
+            };
+            let mru = run(false);
+            let dense = run(true);
+            println!("{ws:>11}   {mru:>13.2}   {dense:>13.2}   {:>8.2}x", mru / dense);
+        }
         clear_class_layouts();
     }
 }

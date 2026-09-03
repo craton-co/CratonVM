@@ -402,12 +402,25 @@ pub(super) fn execute_invokestatic(
     let mut suppress_invoke_cache = loader_specific_dispatch || has_user_defining_loader;
     #[cfg(feature = "gpu-offload")]
     {
-        if shared.config.gpu_offload_enabled
-            && shared
-                .offload_registry
-                .get_or_create(shared.config.gpu_device_ordinal, &shared.config)
-                .has_device()
-        {
+        // The guard is timed: it runs on EVERY call at a hooked site, ahead
+        // of `try_dispatch`, and `get_or_create` is not obviously free.
+        // Charged to `gpu_refusal_census` as `hook_guard` so the bench's
+        // per-call overhead can be attributed instead of assumed -- which is
+        // how it was established that the hook is 4% of it and the lost
+        // invoke cache is the other 96%.
+        let hook_timed = cratonvm_types::gpu_refusal_census::enabled();
+        let hook_entered = std::time::Instant::now();
+        let offload_cache = shared
+            .offload_registry
+            .get_or_create(shared.config.gpu_device_ordinal, &shared.config);
+        let hook_open = shared.config.gpu_offload_enabled && offload_cache.has_device();
+        // The call site, keyed as the pc-keyed invoke cache keys it. See the
+        // `FallThroughKeepHooked` arm below.
+        let offload_site = ((current_class_id.as_u32() as u64) << 32) | pc as u64;
+        if hook_timed {
+            cratonvm_types::gpu_refusal_census::add(4, hook_entered.elapsed().as_nanos() as u64);
+        }
+        if hook_open {
             match crate::runtime::offload::try_dispatch(
                 shared,
                 thread,
@@ -418,6 +431,9 @@ pub(super) fn execute_invokestatic(
                 &args,
             )? {
                 crate::runtime::offload::DispatchOutcome::Handled => {
+                    // This site just offloaded, so it is not a
+                    // small-arrays-forever case; forget any refusal streak.
+                    offload_cache.clear_site_below_min_work(offload_site);
                     // Deliberately NOT populating the invoke cache —
                     // see the block comment above.
                     return Ok(CachedCallResult::Handled);
@@ -433,6 +449,7 @@ pub(super) fn execute_invokestatic(
                     // moot for Int/Long today, but this is the one push
                     // sequence and it must stay identical for either
                     // caller).
+                    offload_cache.clear_site_below_min_work(offload_site);
                     let ret = crate::jit::return_type(&method_descriptor);
                     let value = coerce_value_for_return(value, ret);
                     push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
@@ -446,7 +463,20 @@ pub(super) fn execute_invokestatic(
                     // --gpu-min-work) declined this particular call.
                     // Run the CPU path but keep the site un-promoted
                     // so a future call can still offload.
-                    suppress_invoke_cache = true;
+                    //
+                    // Until it has declined too many times in a row. Denying
+                    // the site the invoke cache costs 10.3 us per call
+                    // against 0.35 us cached, while the hook doing the
+                    // denying costs 0.48 -- so this line, not the hook, is
+                    // 96% of the measured overhead. After
+                    // `CRATONVM_GPU_MIN_WORK_GIVEUP` consecutive refusals the
+                    // site is promoted and the hook is never consulted there
+                    // again. Requires `CRATONVM_INVOKE_CACHE_PC_KEY`, without
+                    // which a "site" is a method reference and promoting one
+                    // caller deoptimises its siblings.
+                    if !offload_cache.note_site_below_min_work(offload_site) {
+                        suppress_invoke_cache = true;
+                    }
                 }
                 crate::runtime::offload::DispatchOutcome::FallThrough => {
                     // Method is ineligible / blacklisted / launch
@@ -473,13 +503,13 @@ pub(super) fn execute_invokestatic(
     )? {
         CachedCallResult::FramePushed => {
             if !suppress_invoke_cache {
-                populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+                populate_invoke_cache(thread, shared, current_class_id, cp_index, false, pc);
             }
             return Ok(CachedCallResult::FramePushed);
         }
         CachedCallResult::Handled => {
             if !suppress_invoke_cache {
-                populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+                populate_invoke_cache(thread, shared, current_class_id, cp_index, false, pc);
             }
             return Ok(CachedCallResult::Handled);
         }
@@ -529,7 +559,7 @@ pub(super) fn execute_invokestatic(
 
     // Populate invoke cache for future fast-path hits
     if !suppress_invoke_cache {
-        populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+        populate_invoke_cache(thread, shared, current_class_id, cp_index, false, pc);
     }
 
     Ok(CachedCallResult::Handled)
@@ -764,11 +794,16 @@ pub(super) fn populate_invoke_cache(
     caller_class_id: ClassId,
     cp_index: u16,
     is_special: bool,
+    // The bytecode offset of the invoke being cached. Part of the cache key
+    // under `CRATONVM_INVOKE_CACHE_PC_KEY`; ignored otherwise. It must be the
+    // offset of the INVOKE ITSELF, not the pc the interpreter has already
+    // advanced past it -- a `put` and a `get` that disagree key one site two
+    // ways and it misses forever. See `resolution::pc_key_enabled`.
+    site_pc: usize,
 ) {
     // Check if already cached
     if let Some(existing) = thread
-        .invoke_cache
-        .get(caller_class_id, cp_index, is_special)
+        .invoke_cache.get(caller_class_id, cp_index, is_special, site_pc as u32)
     {
         if crate::runtime::env_cache::dbg_loader_trace() {
             let dbg_relevant = matches!(
@@ -888,6 +923,7 @@ pub(super) fn populate_invoke_cache(
             caller_class_id,
             cp_index,
             is_special,
+            site_pc as u32,
             CachedInvokeTarget::Intrinsic {
                 kind,
                 callback: cratonvm_native_builtins::intrinsics::callback_for(kind),
@@ -937,7 +973,7 @@ pub(super) fn populate_invoke_cache(
         {
             thread
                 .invoke_cache
-                .put(caller_class_id, cp_index, is_special, target);
+                .put(caller_class_id, cp_index, is_special, site_pc as u32, target);
             return;
         }
     }
@@ -1076,7 +1112,7 @@ pub(super) fn populate_invoke_cache(
                     .insert_promoted_invoke(promoted_key, target.clone());
                 thread
                     .invoke_cache
-                    .put(caller_class_id, cp_index, is_special, target);
+                    .put(caller_class_id, cp_index, is_special, site_pc as u32, target);
                 return;
             }
         }
@@ -1093,7 +1129,7 @@ pub(super) fn populate_invoke_cache(
             .insert_promoted_invoke(promoted_key, target.clone());
         thread
             .invoke_cache
-            .put(caller_class_id, cp_index, is_special, target);
+            .put(caller_class_id, cp_index, is_special, site_pc as u32, target);
         return;
     }
 
@@ -1197,7 +1233,7 @@ pub(super) fn populate_invoke_cache(
                     .insert_promoted_invoke(promoted_key, target.clone());
                 thread
                     .invoke_cache
-                    .put(caller_class_id, cp_index, is_special, target);
+                    .put(caller_class_id, cp_index, is_special, site_pc as u32, target);
                 return;
             }
         }
@@ -1226,7 +1262,7 @@ pub(super) fn populate_invoke_cache(
                 .insert_promoted_invoke(promoted_key, target.clone());
             thread
                 .invoke_cache
-                .put(caller_class_id, cp_index, is_special, target);
+                .put(caller_class_id, cp_index, is_special, site_pc as u32, target);
         }
         return;
     }
@@ -1279,7 +1315,7 @@ pub(super) fn populate_invoke_cache(
         .insert_promoted_invoke(promoted_key, target.clone());
     thread
         .invoke_cache
-        .put(caller_class_id, cp_index, is_special, target);
+        .put(caller_class_id, cp_index, is_special, site_pc as u32, target);
 }
 
 #[inline]
@@ -1316,7 +1352,7 @@ pub(super) fn execute_invokestatic_cached(
     // is_special=false since static calls never collide cp_index with
     // invokespecial in the same class (different CP entries semantically).
     let ph_t0 = crate::runtime::interpreter::invoke_phases::now();
-    let target = match thread.invoke_cache.get(caller_class_id, cp_index, false) {
+    let target = match thread.invoke_cache.get(caller_class_id, cp_index, false, pc as u32) {
         Some(t) => t.clone(),
         None => return Ok(CachedCallResult::CacheMiss),
     };
@@ -1590,7 +1626,7 @@ pub(super) fn execute_invokestatic_cached(
                     };
                     thread
                         .invoke_cache
-                        .put(caller_class_id, cp_index, false, jit_target.clone());
+                        .put(caller_class_id, cp_index, false, pc as u32, jit_target.clone());
                     if let CachedInvokeTarget::Jit {
                         compiled,
                         num_params,
@@ -1756,6 +1792,7 @@ pub(super) fn execute_invokestatic_cached(
                             caller_class_id,
                             cp_index,
                             false,
+                            pc as u32,
                             jit_target.clone(),
                         );
                         // Execute via JIT right now

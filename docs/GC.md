@@ -626,7 +626,37 @@ missing). What is still owed is a suite-scale soak.
 
 **ZgcRealHeap.** One arena + free list (post-sweep coalesced) + hash-set
 registry of allocation bases. `needs_gc` triggers at 75 % occupancy with
-a post-sweep re-arm so a large live set cannot storm. The sweep prunes
+a post-sweep re-arm so a large live set cannot storm. That clause makes pause
+work scale with the heap FLAG rather than with the garbage: at `-Xmx2g` with
+50 MiB live it fires when `allocated` reaches 1.5 GiB, so every cycle lets
+~1.45 GiB accumulate and the registry, the mark bitmap and the sweep all cover
+the span the bump cursor ran over — doubling `-Xmx` doubles every pause on a
+workload whose live set did not change.
+
+`CRATONVM_ZGC_ALLOC_TRIGGER=<percent>` (**default 0, off**, added 2026-09-03)
+adds a second clause that collects once that percent of capacity has been
+allocated since the last cycle, capping the span a pause walks at
+`budget + live`. It is a pause-versus-throughput DIAL, measured on
+`G1ChurnPauseProbe 50 600` at `-Xmx2048m` (release, three runs a row, one
+binary, only this switch moved):
+
+| percent | wall ms | cycles/run | mean pause | max pause | registered at the worst pause |
+|---|---|---|---|---|---|
+| 0 (off) | 2891 | 2 | 116 ms | **202 ms** | 10,597,520 |
+| 50 | 3234 (+12 %) | 3 | 113 ms | 174 ms | 7,485,260 |
+| 25 | 3463 (+20 %) | 6 | 80 ms | 122 ms | 3,953,214 |
+| 12 | 3767 (+30 %) | 12 | 57 ms | **79 ms** | 2,116,551 |
+
+The worst pause falls 2.6× for a 30 % wall cost, and the cost is not an
+artefact — collecting six times as often pays the live-set-proportional half
+of a cycle (the mark, the registry snapshot) six times as often. It is off by
+default for that reason; what would earn a non-zero default is a budget
+derived from a pause TARGET rather than a percentage. `[GC] zgc-pause:` prints
+`alloc_trigger=<fires>/<budget bytes>` as its engagement counter. The
+regression suite is 88/88 both with the clause off (the shipped default) and
+with `CRATONVM_ZGC_ALLOC_TRIGGER=12`, so the switch is safe to turn on — what
+it has NOT had is suite time on the larger corpora, which is what a default
+change would need. The sweep prunes
 dead bases in place and feeds the exact dead list to the monitor
 registry. Non-moving ⇒ the pointer map is always empty and
 no barriers are needed; reference semantics come entirely from the VM-level

@@ -164,6 +164,63 @@ primitive result. Between those two the reference lives only in `RAX`. Any
 safepoint that observes the frame in that window sees a slot the map no longer
 names — or, worse, names as holding the primitive that replaced it.
 
+## 2026-09-03: a second trigger, with this intrinsic DISABLED
+
+`org.h2.test.jdbc.TestCachedQueryResults` SIGSEGVs 2 of 3 runs (185 s, 100 s) on
+merged dev with the box/unbox intrinsic at its new default -- OFF. The enable
+flag appears nowhere in those logs. Details and arms:
+`known-issues/h2/bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829.md`.
+
+What makes that workload crash is an experimental change
+(`CRATONVM_XT_PINNED_PEER_DEPTH=1` + `CRATONVM_XT_PEER_SHADOW_SCAN=1`) whose
+only effect is to let relocation proceed while compiled frames are live:
+`relocation_on_proven_jit` 2 -> 22, `relocation_skipped_jit` 877 -> 3,
+`objects_relocated=519932`.
+
+So the two ingredients this page names are not both necessary. Relocation under
+live compiled frames is sufficient on its own; the intrinsic is one way to reach
+the bad root, not the only one. That is evidence FOR this page's own narrowed
+conclusion -- "a reference held in a LIVE JIT FRAME that relocation moved
+without rewriting, a root the safepoint's oop map does not name" -- and against
+any remaining account in which the inline unbox sequence is itself the
+mechanism.
+
+It also gives the root-cause hunt a second reproducer on a different workload,
+which the surviving run shows is otherwise well-behaved (99978/100000, zero
+OOM, zero NPE, 22 compaction cycles).
+
+### The second trigger behaves like this one on every switch, and the oracle is blind to both
+
+`CRATONVM_ZGC_RELOCATE=0` removes it: **0 / 3**, matching this page's own 0/3.
+The fault `rdi` is page-aligned in every crash (`0x232ECD30000`,
+`0x28DEA7B0000`, `0x1CA01BB0000`) -- this page's signature exactly.
+
+`CRATONVM_DBG_VERIFY_OOP_MAPS=1` does NOT find the root. It refutes
+`fully_oop_covered` immediately on both workloads, but reports
+`verifier_oop=0 verifier_not_oop=1222475 verifier_unknown=1582066` against a
+populated `name_index=(1237 names)`. Every one of 2.8 M never-mapped words is
+either confirmed not-a-reference or unknown; none is corroborated. So the
+unnamed root is not something this oracle can see as an oop -- which is itself a
+constraint on what it can be.
+
+Note for anyone running it: the per-hit lines are capped at 64
+(`STEP3_LOG_CAP`), and both audit summary lines print only at normal exit, so a
+crashing arm produces no verdict.
+
+### Ruled out 2026-09-03: precise oop maps for >64 locals do NOT fix it
+
+`fix/jit-precise-oop-maps-wide-locals-20260903` ("methods above 64 locals had no
+precise oop maps at all") is the closest thing to an unnamed root in a compiled
+frame that has landed, and it is NOT this defect. Rebuilt on dev with that fix
+in (`2632fb2c1` confirmed an ancestor), the second trigger still SIGSEGVs
+**2 of 3** (103 s, 119 s), same page-aligned fault `rdi`.
+
+So the surviving candidates are unchanged: this page's own prediction of
+scalar-replacement, LICM-hoist or GPR-spill slots -- none of which the runtime
+oracle corroborates either (`verifier_oop=0`). Whatever names the stale
+reference, it is not a Java local above the 64 mark and not something the class
+file's type maps call a reference.
+
 ## The mitigation
 
 `box_unbox_intrinsic_disabled()` now defaults to disabled. Set
@@ -176,13 +233,72 @@ sets it is unaffected.
 Correctness first: the measured speedup is recoverable the moment the sequence
 is made relocation-safe.
 
+## The repro is currently BLOCKED by an earlier failure (2026-09-02)
+
+Run on `dev@08a1711e5`, `livedbg`, quiet host, against H2 built at
+`apps/h2database/h2`. **It cannot reach the window this page measures in.**
+
+`TestRandomMapOps` dies of `seed:0 op:1033 java.lang.AssertionError: (1810,
+null)` after 11-22 s, having completed ZERO passes -- where HotSpot 25 on the
+same classpath completes at least nine. The SIGSEGV this page records appears at
+25-183 s. The run is over before that window opens.
+
+It is not this intrinsic. Five runs per arm at `--Xmx 256m`, three per arm at
+384m / 512m / 1g:
+
+| arm | outcome |
+|---|---|
+| `CRATONVM_JIT=box-unbox-intrinsic` (family ON) | AssertionError, 0 SIGSEGV |
+| shipped default (family OFF) | AssertionError, 0 SIGSEGV |
+| `CRATONVM_ZGC_RELOCATE=0` | AssertionError, unchanged |
+| `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` | AssertionError, unchanged |
+
+Same op, same values, every arm. And it is **deterministic**: `seed:0 op:1033
+(1810, null)` byte-identical across four consecutive runs.
+
+That contradicts two things this page and its sibling rest on. This page says
+the failures pre-dating the bisect range are a `NullPointerException` and a
+fragmentation `OutOfMemoryError`; the blocker is neither, so a bisect scored the
+way this page describes would now score every commit BAD for the wrong reason.
+And `h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md` says `--Xmx
+1g` and `4g` are "clean over 1500 s each" -- at 1g this fails in 13-15 s. That
+page also calls its defect one with "no reproducer worth bisecting yet". It has
+one now, and it is 13 seconds long.
+
+**Whoever takes this page next has to clear that first**, or bisect the SIGSEGV
+on a tree where `op:1033` does not fire.
+
+Not established, and measured to be unavailable rather than assumed away:
+**whether the blocker is JIT-dependent.** A `--nojit` arm ran the full 1500 s
+with no AssertionError -- and completed ZERO passes, where HotSpot completes one
+about every 15 s. `TestRandomMapOps` prints an `op:` line only when it FAILS, so
+a run that has not failed offers no evidence it ever reached op 1033. "1500 s
+clean under `--nojit`" is therefore not a result; it is a run that may simply
+be slower than the defect is deep. Scoring it as an arm would be the same
+mistake as the `objects_relocated=0` probe above.
+
+Making that arm answerable needs a progress signal the test does not currently
+emit -- a per-op counter, or a seeded run bounded to a few thousand ops.
+
 ## Reproducing
 
 ```
 cargo build --profile livedbg -p cratonvm-cli
-CRATONVM_JIT_BOX_UNBOX_INTRINSIC=1 cratonvm --java-home $JDK25 --Xmx 256m \
-  -c "$H2_CP" org.h2.test.store.TestRandomMapOps
+
+# The classpath file omits H2's own output dirs; both are needed.
+H=apps/h2database/h2
+CP="$H/target/test-classes:$H/target/classes:$(cat $H/craton-testcp.txt)"
+
+# Run from a scratch cwd: the test writes its database files beside you.
+CRATONVM_JIT=box-unbox-intrinsic cratonvm --java-home $JDK25 --Xmx 256m \
+  -cp "$CP" org.h2.test.store.TestRandomMapOps
 ```
 
 Under three minutes on a quiet host. A CONTENDED host hides it -- the same
 lever this repo has been bitten by before.
+
+`CRATONVM_JIT_BOX_UNBOX_INTRINSIC=1` still works but now warns; the supported
+spelling is the token above.
+
+**As of 2026-09-02 this does not reach the SIGSEGV** -- see "The repro is
+currently BLOCKED by an earlier failure".

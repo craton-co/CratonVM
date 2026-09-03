@@ -2637,6 +2637,142 @@ pub(super) fn direct_call_arg_maps_enabled() -> bool {
     })
 }
 
+/// Name a SELF-RECURSIVE call's reference arguments in its safepoint map
+/// (`CRATONVM_JIT_SELF_CALL_ARG_MAPS`, **default-ON; `=0` restores the pre-fix
+/// arrangement**).
+///
+/// The sibling of [`direct_call_arg_maps_enabled`], for the one invoke arm that
+/// change did not reach. The 0xb8 self-recursive site pops its arguments and,
+/// if any of them is a reference, raises `pending_staged_args_unmapped` — which
+/// makes `map_incomplete` true at the next safepoint, takes that safepoint's
+/// `moving_young_coverage_complete` false through
+/// `relocation_coverage_complete`, and so takes `fully_shadow_covered` false
+/// for the WHOLE method.
+///
+/// It did not have to. The arguments this arm stages are still in ordinary
+/// frame slots at the safepoint that consumes the flag: the non-tail form emits
+/// its stack-guard safepoint (and then the recursive `CALL`) only AFTER
+/// `pop_invoke_args`, and `emit_stack_arg_setup` — the step that moves them
+/// into the un-nameable outgoing-ABI area — runs later still. A frame slot is
+/// exactly what `pending_staged_arg_oops` exists to name, so the honest answer
+/// at that safepoint is the slot, not a refusal.
+///
+/// MEASURED on `probes/OopMapSelfCall.java`: the two self-recursive methods are
+/// the ONLY two methods in the whole run whose coverage claim is false
+/// (`shadow=false shadow_missing_pcs=[45]` / `[23]`, both the self-call bci),
+/// and every one of the eight `scauses` reads zero — the refusal arrives
+/// through `map_incomplete`, whose own census names it `staged_unmappable`.
+///
+/// An argument whose home is NOT a frame slot still fails the safepoint closed:
+/// a register- or xmm-resident value is precisely what a frame-slot map cannot
+/// describe, and that is the case the flag was right about.
+/// May a REVIVED merge block claim its reconstructed operand-stack oop marks
+/// are exact (`CRATONVM_JIT_MERGE_MARKS_EXACT`, **default-ON; `=0` restores the
+/// pre-fix flag**)?
+///
+/// When the walk arrives at a branch target dead (the block before it ended in
+/// a `goto`/`return`/`athrow`), the operand stack is reconstructed from
+/// `branch_target_stack_depth` and the marks from
+/// `branch_target_stack_oop_marks`. The marks half was fixed once already: a
+/// blanket `vec![false; depth]` there permanently mis-marked any reference
+/// carried across the branch from before it.
+///
+/// The EXACTNESS flag was not fixed with it. It kept reading
+/// `expected_depth == 0` -- the honest answer for the blanket fallback, and the
+/// wrong one once the real marks are in hand. `record_oop_map` seeds
+/// `map_incomplete` from that flag, so every safepoint in the revived block
+/// lost its relocation claim, and `fully_shadow_covered` ANDs it over the
+/// method.
+///
+/// MEASURED: on `RTreeRangeGc` and `RPriorityQueueGc` it was the ONLY remaining
+/// cause after the self-call repair -- `checkMap` 6, `checkSet` 9,
+/// `singleThreaded` 3 -- and every failing pc is an arm or the merge of one
+/// `?:` feeding a string concat.
+///
+/// Sound for the same reason the recorded marks are usable at all: JVMS 4.10.1
+/// admits no merge of a reference with a primitive, so a merge point's
+/// predecessors must agree about which slots hold references and whichever one
+/// was captured first speaks for all of them. The fallback -- no recorded marks,
+/// or a length that does not match the depth -- still fails closed, because
+/// there it genuinely did guess.
+/// May a method containing an INLINE SPLICE claim `fully_oop_covered`
+/// (`CRATONVM_JIT_INLINE_OOP_COVERAGE`, **default-ON; `=0` restores the
+/// previous predicate verbatim**)?
+///
+/// On: the term is `incomplete_oop_maps == 0` -- no safepoint of this
+/// compilation published a short map. Off: the historical
+/// `inline_sites.is_empty()` -- no splice at all, whatever the maps say.
+///
+/// The two changes are one change. Retiring the blanket term is only sound
+/// because the count replacing it is unmaskable, and the count is only worth
+/// having because the blanket term was what incidentally covered the mask. See
+/// `Compiler::incomplete_oop_maps` and the comment at the assignment.
+pub(super) fn inline_oop_coverage_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_OOP_COVERAGE") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
+/// Does a method whose locals the oop dataflow cannot describe AT ALL fail its
+/// safepoints closed (`CRATONVM_JIT_LOCAL_MASK_FAIL_CLOSED`, **default-ON;
+/// `=0` restores the silent claim**)?
+///
+/// `compute_local_oop_masks` returns empty vectors above its supported local
+/// count. Stage 2 is wrapped in `if !self.local_oop_masks.is_empty()`, so such
+/// a method contributed no slots, bumped no cause and left `map_incomplete`
+/// alone -- publishing a map that named none of its reference locals while
+/// `fully_oop_covered` read TRUE. See
+/// `map_incomplete_cause::LOCAL_MASK_UNSUPPORTED` for the measurement.
+pub(super) fn local_mask_fail_closed_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_LOCAL_MASK_FAIL_CLOSED") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
+pub(super) fn merge_marks_exact_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MERGE_MARKS_EXACT") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
+pub(super) fn self_call_arg_maps_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SELF_CALL_ARG_MAPS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
 pub(super) fn spill_args_published_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -3259,19 +3395,34 @@ pub(super) fn oop_dataflow_successors(code: &[u8], code_len: usize, pc: usize) -
 /// definitely-oop; primitive stores (`istore`/`lstore`/`fstore`/`dstore`/
 /// `iinc`) make it definitely-non-oop; long/double stores also clear the
 /// category-2 high half. All other opcodes leave the local types unchanged.
-pub(super) fn oop_dataflow_transfer(code: &[u8], pc: usize, mask: u64, max_locals: usize) -> u64 {
+pub(super) fn oop_dataflow_transfer(
+    code: &[u8],
+    pc: usize,
+    mask: u64,
+    max_locals: usize,
+    base: usize,
+) -> u64 {
+    // `base` is the first JVM local slot this 64-bit word describes, so bit `b`
+    // means local `base + b`. These two closures are the ONLY places a local
+    // index becomes a bit position -- which is why widening the analysis past
+    // 64 locals leaves all twenty opcode arms below untouched. `base == 0`
+    // reproduces the pre-window behaviour exactly.
     let set_oop = |m: u64, k: usize| -> u64 {
-        if k < 64 && k < max_locals {
-            m | (1u64 << k)
-        } else {
-            m
+        if k >= max_locals {
+            return m;
+        }
+        match k.checked_sub(base) {
+            Some(b) if b < 64 => m | (1u64 << b),
+            _ => m,
         }
     };
     let clr = |m: u64, k: usize, span: usize| -> u64 {
         let mut m = m;
         for j in k..k + span {
-            if j < 64 {
-                m &= !(1u64 << j);
+            if let Some(b) = j.checked_sub(base) {
+                if b < 64 {
+                    m &= !(1u64 << b);
+                }
             }
         }
         m
@@ -3344,6 +3495,104 @@ pub(super) fn oop_dataflow_transfer(code: &[u8], pc: usize, mask: u64, max_local
 /// last false-negative that blocked fully-covered status for reference-param
 /// methods. The caller passes `0` when the precise gate is off, so the default
 /// path is byte-identical (entry state empty, exactly as before).
+/// The most JVM local slots the windowed analysis will describe: four words.
+///
+/// The JVMS allows 65535. A method past this stays on the conservative path and
+/// now SAYS so (`map_incomplete_cause::LOCAL_MASK_UNSUPPORTED`) instead of
+/// publishing a map that names none of its locals.
+pub(super) const MAX_WINDOWED_LOCALS: usize = 256;
+
+/// Widen the "must be oop" local dataflow past 64 locals
+/// (`CRATONVM_JIT_WIDE_LOCAL_OOP_MAPS`, **default-ON; `=0` restores the 64-slot
+/// cliff**).
+///
+/// Above 64 locals the analysis returned EMPTY vectors, so such a method had no
+/// precise local coverage at all -- the oop map named none of its reference
+/// locals and every safepoint fell back to the conservative sweep. Measured on
+/// `probes/OopMapWideLocals.java` (83 locals, 80 of them live references across
+/// allocations that collect): 409 of 409 safepoints, none of them naming a
+/// local. `BOBYQAOptimizer.trsbox` (90+ locals) is the shape it was first
+/// noticed on.
+///
+/// The analysis itself is unchanged. It is run once per 64-local window, with
+/// `oop_dataflow_transfer`'s `base` selecting which slots a word describes. A
+/// slot outside the window simply has no bit; the same worklist runs over the
+/// same CFG each time, so this is a wider answer, not a weaker one.
+///
+/// THE DEOPT SNAPSHOT IS THE COUPLING TO KNOW ABOUT.
+/// `build_and_record_deopt_point`'s `is_oop` reads bits `< 64`, so a >64-local
+/// method now has a SECOND source where `classify_local_kinds` was the only one
+/// -- the same refinement already shipped below the cliff, and strictly more
+/// precise, since a set bit means "astore'd on every reaching path".
+pub(super) fn wide_local_oop_maps_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_WIDE_LOCAL_OOP_MAPS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
+/// How many 64-local windows a method needs, or `None` when it is past what the
+/// analysis will describe. One window is the historical case.
+pub(super) fn local_oop_window_count(max_locals: usize) -> Option<usize> {
+    if max_locals == 0 {
+        return None;
+    }
+    if !wide_local_oop_maps_enabled() {
+        return if max_locals <= 64 { Some(1) } else { None };
+    }
+    if max_locals > MAX_WINDOWED_LOCALS {
+        return None;
+    }
+    Some(max_locals.div_ceil(64))
+}
+
+/// The windowed form: `masks[w * code_len + pc]` describes locals
+/// `w*64 .. w*64+64` at `pc`. An empty result is a REFUSAL.
+pub(super) fn compute_local_oop_masks_windowed(
+    code: &[u8],
+    code_len: usize,
+    max_locals: usize,
+    param_oop_mask: u64,
+) -> (Vec<u64>, Vec<bool>, usize) {
+    let Some(windows) = local_oop_window_count(max_locals) else {
+        return (Vec::new(), Vec::new(), 0);
+    };
+    if code_len == 0 {
+        return (Vec::new(), Vec::new(), 0);
+    }
+    let mut all: Vec<u64> = Vec::with_capacity(windows * code_len);
+    let mut reached_all: Vec<bool> = Vec::new();
+    for w in 0..windows {
+        // `param_oop_mask` describes slots 0..63, so only the first window is
+        // seeded from it. A reference parameter above slot 63 needs 64 slots of
+        // parameters ahead of it; it seeds conservatively (not-oop) and its
+        // first `astore` corrects it.
+        let seed = if w == 0 { param_oop_mask } else { 0 };
+        let (m, r) = compute_local_oop_masks_window(code, code_len, max_locals, seed, w * 64);
+        if m.is_empty() {
+            return (Vec::new(), Vec::new(), 0);
+        }
+        // The CFG walk is identical across windows, so `reached` is too.
+        if w == 0 {
+            reached_all = r;
+        }
+        all.extend_from_slice(&m);
+    }
+    (all, reached_all, windows)
+}
+
+/// The historical entry point: window 0 only, empty above 64 locals.
+///
+/// Kept for the INLINE-SPLICE path, whose `InlineOopScope` is a single `u64` by
+/// construction -- a spliced callee above 64 locals still fails its safepoints
+/// closed through `mask_at_cur() == None`, which is what that type documents.
 pub(super) fn compute_local_oop_masks(
     code: &[u8],
     code_len: usize,
@@ -3351,6 +3600,19 @@ pub(super) fn compute_local_oop_masks(
     param_oop_mask: u64,
 ) -> (Vec<u64>, Vec<bool>) {
     if max_locals == 0 || max_locals > 64 || code_len == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    compute_local_oop_masks_window(code, code_len, max_locals, param_oop_mask, 0)
+}
+
+fn compute_local_oop_masks_window(
+    code: &[u8],
+    code_len: usize,
+    max_locals: usize,
+    param_oop_mask: u64,
+    base: usize,
+) -> (Vec<u64>, Vec<bool>) {
+    if max_locals == 0 || code_len == 0 || base >= max_locals {
         return (Vec::new(), Vec::new());
     }
     const TOP: u64 = u64::MAX;
@@ -3372,7 +3634,7 @@ pub(super) fn compute_local_oop_masks(
         if guard == 0 {
             break;
         }
-        let out = oop_dataflow_transfer(code, pc, in_mask[pc], max_locals);
+        let out = oop_dataflow_transfer(code, pc, in_mask[pc], max_locals, base);
         for succ in oop_dataflow_successors(code, code_len, pc) {
             if succ >= code_len {
                 continue;
@@ -3392,10 +3654,12 @@ pub(super) fn compute_local_oop_masks(
     }
     // Mask off bits beyond max_locals (TOP-init residue on any unreached PC is
     // irrelevant — callers gate on `reached`).
-    let valid_bits = if max_locals >= 64 {
+    // Bits past this window's share of `max_locals` are TOP-init residue.
+    let in_window = max_locals.saturating_sub(base);
+    let valid_bits = if in_window >= 64 {
         u64::MAX
     } else {
-        (1u64 << max_locals) - 1
+        (1u64 << in_window) - 1
     };
     for m in in_mask.iter_mut() {
         *m &= valid_bits;

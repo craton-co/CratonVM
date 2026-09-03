@@ -82,7 +82,7 @@ independently to inspect `.class` files.
 
 ## vm — Virtual Machine
 
-The VM is the core of the project (~2,020,000 Rust LoC across the 22 workspace
+The VM is the core of the project (~2,080,000 Rust LoC across the 22 workspace
 member crates, plus the separate `fuzz` harness workspace).
 It contains six major subsystems (several now extracted into their own
 crates).
@@ -99,7 +99,7 @@ find <the 22 member dirs> -name '*.rs' -type f \
   | xargs -0 cat | wc -l
 ```
 
-which reports roughly 2,020,000 lines (2,018,468 on 2026-09-01) across about
+which reports roughly 2,080,000 lines (2,080,876 on 2026-09-03) across about
 920 files. Re-measure before quoting it: this figure and the table below stood
 at 1,350,000 for long enough to be wrong by 49%, because nothing regenerates
 them. If you change this paragraph, change the table too — they are derived
@@ -113,7 +113,7 @@ Measured 2026-09-02 with the command above, one directory at a time.
 | Crate | LoC | Crate | LoC |
 |-------|----:|-------|----:|
 | `native-builtins` | 742,000 | `native-awt` | 18,000 |
-| `vm` | 453,000 | `types` | 39,000 |
+| `vm` | 453,000 | `types` | 41,000 |
 | `jit` | 249,000 | `native-api` | 36,000 |
 | `gc` | 175,000 | `reader` | 17,000 |
 | `native-collections` | 86,000 | `jfr` | 20,000 |
