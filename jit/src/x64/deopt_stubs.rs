@@ -445,12 +445,23 @@ impl Compiler {
         // Locals: oop-ness from the intersection-dataflow mask (only when the
         // forward dataflow reached this PC; otherwise treat as non-oop).
         //
-        // In a method with MORE THAN 64 LOCALS this mask is not merely truncated
-        // at bit 63 — `compute_local_oop_masks` returns EMPTY vectors for
-        // `max_locals > 64`, so `oop_reached` is `false`, `oop_mask` is `0`, and
-        // `is_oop` below reads FALSE FOR EVERY LOCAL, slot 0 included. Measured
-        // on an 84-local probe: `oop_reached=false oop_mask=0x0` while three
-        // reference locals were live.
+        // In a method with MORE THAN 64 LOCALS this mask used to be not merely
+        // truncated at bit 63: `compute_local_oop_masks` returned EMPTY vectors
+        // for `max_locals > 64`, so `oop_reached` was `false`, `oop_mask` was
+        // `0`, and `is_oop` below read FALSE FOR EVERY LOCAL, slot 0 included.
+        // Measured on an 84-local probe: `oop_reached=false oop_mask=0x0` while
+        // three reference locals were live.
+        //
+        // CHANGED 2026-09-03 (`CRATONVM_JIT_WIDE_LOCAL_OOP_MAPS`, default-on).
+        // The method path now runs the same analysis once per 64-local window,
+        // so such a method DOES have a mask and `is_oop` answers truthfully for
+        // slots 0..63. Above slot 63 nothing changes here -- this reads one
+        // `u64`, so point 1 below still holds verbatim and
+        // `classify_local_kinds` is still the reference authority up there. What
+        // is gone is the sharp edge where slot 0 of an 84-local method read
+        // non-oop for no reason but its neighbours' count.
+        //
+        // `=0` restores the empty vectors and every sentence above it.
         //
         // This comment used to say that was "sound only because
         // `can_deopt_resume` (later) gates such methods off". That is not what
