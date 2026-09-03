@@ -2371,15 +2371,24 @@ impl ZgcRealHeap {
     /// * **A pause that overran the target TIGHTENS.**
     ///   `affordable = span * target / pause`, floored at half the previous
     ///   value so one anomalous pause cannot collapse the budget.
-    /// * **A pause comfortably under it (at or below half) RELAXES**, by a
-    ///   quarter, and hands back control entirely once the affordable span
-    ///   reaches capacity. Without this a single transient spike would
-    ///   constrain the heap for the rest of the run.
+    /// * **A pause under THREE QUARTERS of the target RELAXES**, by a quarter,
+    ///   never past seven-eighths of the span that last overran
+    ///   ([`Self::pause_overrun_span`]), and hands back control entirely once
+    ///   the affordable span reaches capacity. Without a relax path a single
+    ///   transient spike would constrain the heap for the rest of the run.
     /// * **Anything in between leaves the budget alone** -- the hysteresis
-    ///   band that stops the loop hunting. This is the same shape, and the
-    ///   same reasoning, as `CRATONVM_G1_YOUNG_PAUSE_TARGET` in `g1.rs`:
-    ///   tighten after an overrun, relax while pauses stay under half the
-    ///   goal.
+    ///   band `[0.75, 1.0] x target` that stops the loop hunting. Three
+    ///   quarters and not a half: pause length is noisy, so a loop that has
+    ///   settled just under the target overruns every few cycles and tightens,
+    ///   and a band that wide means the cycles in between never give anything
+    ///   back. It RATCHETS. Measured at `-Xmx4096m` against a 100 ms target
+    ///   with a half-target band: pauses held at 55-95 ms for a hundred
+    ///   consecutive cycles while the budget walked one way from 199 MiB to
+    ///   11 MiB and the run collected 139 times instead of 3.
+    ///
+    /// The shape is `CRATONVM_G1_YOUNG_PAUSE_TARGET`'s in `g1.rs` -- tighten
+    /// after an overrun, relax while pauses stay comfortably under the goal --
+    /// with the band narrowed for the reason above.
     ///
     /// The consequence that matters: on a workload whose pauses never reach
     /// the target the clause NEVER ENGAGES, and costs one relaxed load per
