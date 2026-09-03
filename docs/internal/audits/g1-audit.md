@@ -1627,3 +1627,65 @@ artefacts. The next step is the liveness question — the verifier type maps, as
 §16 used for `never_mapped` — applied to the band words, and it needs a
 workload whose coverage rate is stable enough to measure against, which
 `TestMVStoreTool` is not (§18.2).
+
+## 20. The liveness screen — and the crash §19 shipped (2026-09-03)
+
+*`fix/band-test-liveness-screen-20260903`. §19.3 named the liveness question as
+the next step. Adding it surfaced a defect §19 had already merged.*
+
+### 20.1 First: §19 shipped a segfault, and this is how
+
+§19's object screen dereferences a band word to read its header:
+
+```rust
+if is_relocatable(w) && !published.contains(&w) && band_word_is_an_object(w) {
+```
+
+Its safety comment argued the word is inside the published movable range, which
+§18 bounds by the committed prefix. **That argument holds for one of the two
+callers.** `band_has_unpublished_word_with_map` takes
+`is_relocatable: impl Fn(usize) -> bool` as a PARAMETER; production passes
+`gen_heap::addr_is_movable`, but the map-less wrapper takes whatever the caller
+supplies, and every unit test in this file supplies a closure over synthetic
+values like `0xbeef_0000`. Reading a header from one of those is a segfault, and
+`frame_band_scan_rejects_a_relocatable_word_the_shadow_stack_never_published`
+duly crashed the whole `cratonvm-vm` test binary.
+
+**How it reached `dev`**: §19 was gated on the types and gc suites and
+`cargo check --workspace --all-targets`. A `check` compiles tests without
+running them, and the crashing test lives in `cratonvm-vm`, whose test suite was
+not run. The lesson is narrow and worth stating: a change to a function in
+`vm/src/` is not gated by the gc suite, and `check` is not `test`.
+
+The fix is a `readable: bool` parameter — only the caller knows whether the
+words its predicate accepts may be dereferenced. `true` for the
+`addr_is_movable` caller, `false` for the generic one, which reverts to §18's
+behaviour there. The four band tests pass again and the full 2613-test
+`cratonvm-vm` suite is green.
+
+### 20.2 The liveness screen
+
+§19 established the survivors of the object screen are header-shaped, so shape
+cannot separate a real missed root from a dead slot still pointing at a live
+object. The class file's own type maps can, for the java-locals band —
+`verifier_local_verdict`, the same oracle §16 used.
+
+**One direction only, and that is the whole safety argument.** Reporting an
+unpublished oop makes the cycle refuse to move, so DISCARDING a report is the
+direction that permits movement. A word is discarded only on a positive
+`NotOop` — the verifier saying this local definitely holds no reference at this
+bci. `Unknown` (an inlined frame, a slot outside the locals band, no type maps
+for the method) KEEPS the report, because "could not ask" must never read as
+"answered no".
+
+That is §16's asymmetry pointed the other way, and deliberately so: there the
+consequence of being wrong was a missed refutation, here it is a missed root.
+
+### 20.3 Status
+
+The screen is in and sound by construction; it is not yet measured. §18.2's
+finding stands in the way — `TestMVStoreTool`'s coverage rate swings from 2.9%
+to 83.6% on an unchanged arm, so a residue of a few percent cannot be shown to
+move against it. Whoever measures this needs a workload with a stable rate
+first; that is now the blocking item for the whole §14-§20 line of work, ahead
+of any further screening.
