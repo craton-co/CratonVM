@@ -892,7 +892,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-121 tokens.
+122 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -905,6 +905,7 @@ export inherited from a parent shell.
 | `verify-rset` | `CRATONVM_GC_VERIFY_RSET` |
 | `compact-ref-fields` | `CRATONVM_COMPACT_REF_FIELDS` |
 | `pack-fields-by-width` | `CRATONVM_PACK_FIELDS_BY_WIDTH` |
+| `layout-scan-cache` | `CRATONVM_GC_LAYOUT_SCAN_CACHE` |
 | `compressed-oops` | `CRATONVM_COMPRESSED_OOPS` |
 | `default-heap-ergonomics` | `CRATONVM_DEFAULT_HEAP_ERGONOMICS` |
 | `default-heap-max-mb` | `CRATONVM_DEFAULT_HEAP_MAX_MB` |
