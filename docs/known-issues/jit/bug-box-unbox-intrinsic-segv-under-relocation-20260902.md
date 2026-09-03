@@ -281,6 +281,19 @@ maps name every home the register allocator creates (codegen), or having ZGC
 consult the guard `gen_heap` and `g1` both consult and this collector, by its
 own comment here, "read ZERO times".
 
+### The blanket guard removes this crash -- at a price that rules it out
+
+`CRATONVM_ZGC_JIT_BLANKET_REFUSAL=1` (new) applies `gen_heap`'s and `g1`'s rule
+here: a live compiled frame refuses relocation, proof or no proof. On the
+`TestCachedQueryResults` trigger it is **0 SIGSEGV in 4 runs**, against a
+same-binary control that crashed.
+
+That is a useful confirmation -- it means this defect really is confined to
+relocation under live compiled frames, with no residue elsewhere -- and it is
+not a fix anyone can ship: the same 4 runs log 8-9 k fragmentation
+`OutOfMemoryError`s and never complete, where the unguarded arm finishes in
+462 s with ZERO. Full numbers on the H2 page.
+
 ## The mitigation
 
 `box_unbox_intrinsic_disabled()` now defaults to disabled. Set

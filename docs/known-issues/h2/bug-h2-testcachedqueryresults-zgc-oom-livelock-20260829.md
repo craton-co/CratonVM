@@ -1246,6 +1246,39 @@ Third independent binary, same two facts: the credit clears the fragmentation
 published candidate for the unnamed root, and fixing it changes nothing here.
 Ruled out, and recorded on that page too.
 
+### 2026-09-03: the guard PRICED -- it removes the crash by restoring the OOM
+
+`CRATONVM_ZGC_JIT_BLANKET_REFUSAL=1` makes a live compiled frame refuse
+relocation on its own, without consulting the coverage proof -- the rule
+`gen_heap` and `g1` both apply and this collector replaced on 2026-08-21.
+`relocate_stw` already computed the term (`compiled_frames_live`); it simply was
+not a refusal.
+
+One binary, the flag the only difference, 1500 s cap:
+
+| arm | SIGSEGV | ref-array OOM | `actual` | outcome |
+|---|---|---|---|---|
+| guard ON | **0 / 4** | 8344, 9382 | — | did not complete |
+| guard OFF | 1 / 2 | **0** | **99966** | completed in 462 s |
+
+So the guard WORKS as a crash fix, and it is not shippable: it trades the
+SIGSEGV for the exact `OutOfMemoryError` this page exists to remove. For scale,
+the same-dev discharge-only control logs 14040 OOMs and also does not complete,
+so the guard is better than having no credit at all and an order of magnitude
+worse than the credit running unguarded.
+
+That prices the trade and closes the question. The three-way choice is now
+explicit:
+
+1. **credit, unguarded** -- 99966-99978, ZERO OOM, completes in ~460 s, and
+   SIGSEGVs about 2 runs in 3 on the open codegen defect;
+2. **credit + guard** -- no crash, ~8-9 k OOMs, never completes;
+3. **neither** -- no crash, 14 k OOMs, never completes.
+
+None ships. (1) is the only one that solves the page, and it is blocked on
+naming every home the register allocator creates -- see the box/unbox page for
+the identification, the three failed repairs, and what remains.
+
 ### Attribution closed 2026-09-03: it is dev's relocation defect, and the oracle does not see it
 
 | arm | SIGSEGV |
