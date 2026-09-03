@@ -12557,10 +12557,47 @@ pub fn box_unbox_intrinsic_sites() -> (usize, usize) {
 /// on ONE binary, which is the only kind of A/B this tree accepts for a perf
 /// claim — a control built from a different commit has manufactured a
 /// double-digit "regression" on phases containing neither call.
+/// # DEFAULT-OFF since 2026-09-02: it SIGSEGVs under a relocating collector
+///
+/// `org.h2.test.store.TestRandomMapOps --Xmx 256m` on the shipped default dies
+/// of `SIGSEGV` in 25-183 s, **11 runs out of 11**, at a fault address that is
+/// always a page boundary -- the shape of a read through a reference into a
+/// page the collector has already vacated. Two switches each remove it, 3 runs
+/// of 1200 s clean apiece:
+///
+/// * `CRATONVM_ZGC_RELOCATE=0` -- no relocation, no crash;
+/// * `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` -- this family off, no crash.
+///
+/// A `git bisect` over the 200 commits between the last known-good tip and the
+/// crashing one (both endpoints re-verified in the SAME build profile, and only
+/// `SIGSEGV` counted as bad, because the `NullPointerException` and the
+/// fragmentation `OutOfMemoryError` on this workload both PRE-DATE the range)
+/// lands on `a910b7d9c` -- a MERGE whose two parents are both good, and whose
+/// relocation files are byte-identical to one of them. So the defect is the
+/// INTERACTION between this intrinsic and dev's relocation, not either alone.
+///
+/// The inline sequence pops the receiver off the simulated operand stack and
+/// then dereferences it three times -- the class-id guard at `[RAX]`, the
+/// GC-flags byte, and the payload load -- with no call and therefore no
+/// safepoint in between. That is sound only while the receiver in hand cannot
+/// go stale; under a moving collector it evidently can. Root-causing that is
+/// the follow-up, and it wants the receiver kept as a NAMED root across the
+/// sequence rather than held only in `RAX`.
+///
+/// Correctness first: the family is now opt-in, and the perf win it was
+/// measured for is recoverable the moment the sequence is made relocation-safe.
+/// Set `CRATONVM_JIT_BOX_UNBOX_INTRINSIC=1` to turn it back on for that work.
+///
+/// `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` still forces it off, so a script
+/// that already sets it keeps working and keeps meaning the same thing.
 fn box_unbox_intrinsic_disabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some()
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some() {
+            return true;
+        }
+        // Default OFF: enabled only when explicitly asked for.
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_BOX_UNBOX_INTRINSIC").is_none()
     })
 }
 
