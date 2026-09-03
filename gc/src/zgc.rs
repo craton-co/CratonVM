@@ -2337,23 +2337,33 @@ impl ZgcRealHeap {
     /// It is folded into [`Self::pause_ns_per_byte_scaled`] rather than used
     /// raw, for the reason on that field.
     ///
-    /// # Three clamps, and what each is for
+    /// # The clamps, and why an unmeetable target means DO NOTHING
     ///
-    /// * **Floor** ([`ZGC_ALLOC_TRIGGER_FLOOR`], 8 MiB). A budget below this
-    ///   is a collection storm, and the clause deliberately does not consult
-    ///   `gc_rearm` (see `zgc_alloc_trigger_percent`), so the floor is the only
-    ///   thing between an unreachable target and a cycle per allocation.
     /// * **Ceiling** (capacity). A budget above the heap can never be reached,
     ///   which is the same behaviour as the clause being off -- but writing the
     ///   real number rather than `0` keeps `[GC] zgc-pause:`'s report honest
     ///   about what the loop believes.
-    /// * **Unreachable** (`target / k <= live`). The LIVE SET alone already
-    ///   projects past the target: no budget, not even zero, makes this pause
-    ///   fit. The budget goes to the floor and
-    ///   [`ZgcRealCounters::pause_target_unreachable`] counts the cycle,
-    ///   because "the dial is working" and "the dial cannot deliver and is now
-    ///   just collecting as often as the floor allows" are very different
-    ///   states that produce identical short budgets.
+    /// * **Below the floor, INCLUDING `target / k <= live`: the clause goes
+    ///   inert** (budget = capacity) and
+    ///   [`ZgcRealCounters::pause_target_unreachable`] counts the cycle.
+    ///
+    /// That second one is the whole safety argument for having this on by
+    /// default, and the obvious implementation is wrong. A budget of
+    /// [`ZGC_ALLOC_TRIGGER_FLOOR`] looks like the conservative choice --
+    /// "collect as often as we safely can and get as close to the target as
+    /// possible" -- and it is the opposite. When the LIVE SET alone projects
+    /// past the target, the pause length is set by the live set and no budget
+    /// changes it: collecting every 8 MiB against a 1.5 GiB live set buys
+    /// pauses of exactly the same length, hundreds of times more often. The
+    /// clause deliberately does not consult `gc_rearm` (see
+    /// `zgc_alloc_trigger_percent`), so nothing else would have stopped it.
+    ///
+    /// So the worst thing an unmeetable target can do is nothing, and the
+    /// occupancy clauses keep running the collector as they did before. The
+    /// counter is what turns that silence into a diagnosis: a run whose
+    /// `unreachable` climbs is a run whose pause target is not achievable at
+    /// this live set, which is an answer, and it is a different answer from
+    /// "the loop is holding the target".
     ///
     /// # What the clock covers
     ///
@@ -2406,16 +2416,16 @@ impl ZgcRealHeap {
         let affordable_span = target_ns.saturating_mul(1 << ZGC_PAUSE_COST_SHIFT) / next;
         let cap = self.heap_capacity();
         let budget = match affordable_span.checked_sub(live_bytes as u64) {
-            Some(b) if b as usize > ZGC_ALLOC_TRIGGER_FLOOR => (b as usize).min(cap),
-            // Either the live set alone overruns the target, or what is left
-            // after it is below the floor. Both are the same operational
-            // situation and both get the floor; the counter is what tells them
-            // apart from a healthy small budget.
+            Some(b) if b as usize >= ZGC_ALLOC_TRIGGER_FLOOR => (b as usize).min(cap),
+            // The target is not achievable at this live set -- either the live
+            // set alone overruns it, or what it leaves is too small to be
+            // worth a cycle. Go INERT, not tight: see the doc above for why
+            // the floor is the wrong answer here and would be a storm.
             _ => {
                 self.counters
                     .pause_target_unreachable
                     .fetch_add(1, Ordering::Relaxed);
-                ZGC_ALLOC_TRIGGER_FLOOR
+                cap
             }
         };
         self.alloc_trigger_bytes.store(budget, Ordering::Relaxed);
@@ -20326,11 +20336,15 @@ pub(crate) mod tests {
         // so the loop must fall to the floor AND say so.
         heap.set_pause_target_ms(1);
         heap.refresh_pause_target_budget(200_000_000, 900 * MIB, GIB - 900 * MIB);
-        let (_, _, floored, gave_up) = heap.pause_target_state();
-        assert_eq!(floored, ZGC_ALLOC_TRIGGER_FLOOR, "an unreachable target floors");
+        let (_, _, inert, gave_up) = heap.pause_target_state();
+        assert_eq!(
+            inert,
+            heap.heap_capacity(),
+            "an unachievable target must go INERT, not tight: the pause length              is set by the live set, so a small budget buys pauses of the same              length hundreds of times more often"
+        );
         assert!(
             gave_up > 0,
-            "and it must be COUNTED -- a floored budget that is working and one              that has given up produce the same alloc_trigger= line otherwise"
+            "and it must be COUNTED -- a loop holding the target and a loop              that has given up are different answers"
         );
     }
 
@@ -20387,8 +20401,9 @@ pub(crate) mod tests {
         heap.refresh_pause_target_budget(u64::MAX / 2, 8 * MIB, 8 * MIB);
         let (_, _, budget, unreachable) = heap.pause_target_state();
         assert_eq!(
-            budget, ZGC_ALLOC_TRIGGER_FLOOR,
-            "an absurdly expensive pause floors the budget rather than wrapping"
+            budget,
+            heap.heap_capacity(),
+            "an absurdly expensive pause goes inert rather than wrapping"
         );
         assert!(unreachable > 0, "and reports that it could not meet the target");
     }
