@@ -1069,6 +1069,25 @@ struct Compiler {
     /// coverage. Fail-closed: it makes the safepoint incomplete rather than
     /// silently narrowing what the map describes.
     pending_staged_args_unmapped: bool,
+    /// How many safepoints this compilation published with an INCOMPLETE map.
+    ///
+    /// `mapped_safepoint_pcs` records the same fact keyed by BYTECODE PC, and a
+    /// pc is not a safepoint: an inline splice emits one safepoint per `invoke*`
+    /// in the callee under ONE enclosing bci, and the self-recursive arm emits
+    /// its stack-guard safepoint and its recursive CALL under one bci too. Two
+    /// maps, one key — so a COMPLETE map at that bci puts the pc in the set and
+    /// `safepoint_pcs.is_subset(&mapped_safepoint_pcs)` then reads TRUE with an
+    /// incomplete map sitting right beside it. That is the masking half of the
+    /// same mistake `remap_one_jit_frame` made when it used `find` on
+    /// `bytecode_pc` where every other reader used `filter`.
+    ///
+    /// A count cannot be masked. It is what `fully_oop_covered` tests, and it is
+    /// what makes retiring the blanket `inline_sites.is_empty()` term safe: that
+    /// term existed because a splice was "a construct the current mapping cannot
+    /// describe", and Stage 3b now describes it — pushing each live spliced-callee
+    /// local into the map's own `frame_slot_offsets` and failing the safepoint
+    /// closed (`INLINE_LOCAL_UNMAPPABLE`) when it cannot.
+    incomplete_oop_maps: usize,
     /// T1.1.a — collected oop maps, indexed by native PC offset of the
     /// instruction *after* the safepoint call. Transferred to
     /// `CompiledMethod::oop_maps` at finalize time.
@@ -2751,6 +2770,7 @@ impl Compiler {
             stack_oop_marks_exact: true,
             pending_staged_arg_oops: Vec::new(),
             pending_staged_args_unmapped: false,
+            incomplete_oop_maps: 0,
             oop_maps: Vec::new(),
             local_oop_masks: Vec::new(),
             local_kinds: Vec::new(),

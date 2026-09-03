@@ -1756,6 +1756,12 @@ impl Compiler {
         // presence-only accounting so the difference is an A/B in one binary.
         let push_map = !slots.is_empty() || self.precise_maps;
         if push_map {
+            // The unmaskable half of the same accounting. See
+            // `Compiler::incomplete_oop_maps` for why the pc-keyed set below
+            // cannot answer this on its own.
+            if map_incomplete {
+                self.incomplete_oop_maps += 1;
+            }
             if self.precise_maps && (!map_incomplete || Self::oopmap_presence_only()) {
                 // Cast: bytecode/native offset to u32 (non-negative, fits)
                 self.mapped_safepoint_pcs.insert(self.cur_bc_pc as u32);
@@ -2168,6 +2174,53 @@ mod tests {
         assert!(
             window.contains("JMP rel32 back to body entry"),
             "the truncate must sit on the TAIL path, after its JMP is emitted"
+        );
+    }
+
+    /// An incomplete map must be counted where a pc SET cannot mask it.
+    ///
+    /// `mapped_safepoint_pcs` is keyed by bytecode pc, and a pc is not a
+    /// safepoint: a splice emits one safepoint per `invoke*` in the callee
+    /// under one enclosing bci, and the self-recursive arm emits its
+    /// stack-guard safepoint and its recursive CALL under one bci too. A
+    /// COMPLETE map at that bci inserts the pc, and the subset test then reads
+    /// true with an incomplete map sitting beside it -- the same mistake
+    /// `remap_one_jit_frame` made using `find` on `bytecode_pc` where every
+    /// other reader used `filter`.
+    ///
+    /// The count is what `fully_oop_covered` tests, so it has to be maintained
+    /// beside the set and not derived from it.
+    #[test]
+    fn an_incomplete_map_is_counted_not_just_withheld_from_the_pc_set() {
+        let src = include_str!("safepoint.rs");
+        let at = src
+            .find("let push_map = !slots.is_empty() || self.precise_maps;")
+            .expect("the map push must be findable");
+        let body = &src[at..at + 700];
+        let count_at = body
+            .find("self.incomplete_oop_maps += 1;")
+            .expect("an incomplete map must bump the unmaskable count");
+        let set_at = body
+            .find("self.mapped_safepoint_pcs.insert(")
+            .expect("the pc set must still be maintained");
+        assert!(
+            count_at < set_at,
+            "the count is guarded by `if map_incomplete`, the set by its negation;              they must be separate statements, not one branch"
+        );
+
+        // ...and the predicate must actually spend it.
+        let driver = include_str!("driver.rs");
+        let at = driver
+            .find("cm.fully_oop_covered = compiler.precise_maps")
+            .expect("the coverage predicate must be findable");
+        let pred = &driver[at..at + 400];
+        assert!(
+            pred.contains("compiler.incomplete_oop_maps == 0"),
+            "the coverage predicate must test the unmaskable count; found: {pred:?}"
+        );
+        assert!(
+            pred.contains("inline_sites.is_empty()"),
+            "`CRATONVM_JIT_INLINE_OOP_COVERAGE=0` must restore the previous term              verbatim, or the pair cannot be bisected"
         );
     }
 
