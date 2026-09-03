@@ -2506,18 +2506,32 @@ impl ZgcRealHeap {
         }
         self.pause_affordable_span
             .store(affordable, Ordering::Relaxed);
+        // TWO DIFFERENT SITUATIONS, and collapsing them into one clamp was a
+        // defect worth its own paragraph.
+        //
+        //   * `affordable <= live` -- the LIVE SET alone projects past the
+        //     target. No budget makes this pause fit, so go INERT: the pause
+        //     length is set by the live set and a small budget would buy
+        //     pauses of exactly the same length, hundreds of times more often.
+        //     The clause deliberately skips `gc_rearm`, so nothing else would
+        //     have stopped it.
+        //   * `0 < affordable - live < FLOOR` -- the loop wants a SMALL budget
+        //     against a cheap live set. That is not the same thing at all, and
+        //     going inert there loses control completely: measured on
+        //     `G1ChurnPauseProbe 50 1800` at `-Xmx4096m` with a 100 ms target,
+        //     a tightening step that crossed the floor dropped the constraint,
+        //     the next cycle ran unconstrained to 670 ms, and the loop spent
+        //     the run oscillating between a tight budget and no budget. The
+        //     floor is the right answer here -- it is the tightest useful
+        //     budget, and against a live set the target can afford it is not a
+        //     storm.
         let budget = match affordable.checked_sub(live_bytes as u64) {
-            // Compared and converted in `u64`: `affordable` can legitimately
-            // exceed `usize::MAX` on a 32-bit host, where `as usize` would
-            // truncate a huge budget into a small one -- the one direction that
-            // turns an inert clause into a storm.
-            Some(b) if b >= ZGC_ALLOC_TRIGGER_FLOOR as u64 => {
-                usize::try_from(b).unwrap_or(usize::MAX).min(cap)
-            }
-            // The target is not achievable at this live set -- either the live
-            // set alone overruns it, or what it leaves is too small to be
-            // worth a cycle. Go INERT, not tight: see the doc above for why
-            // the floor is the wrong answer here and would be a storm.
+            // Converted in `u64`: `affordable` can legitimately exceed
+            // `usize::MAX` on a 32-bit host, where `as usize` would truncate a
+            // huge budget into a small one.
+            Some(b) if b > 0 => usize::try_from(b)
+                .unwrap_or(usize::MAX)
+                .clamp(ZGC_ALLOC_TRIGGER_FLOOR.min(cap), cap),
             _ => {
                 self.counters
                     .pause_target_unreachable
@@ -20514,6 +20528,42 @@ pub(crate) mod tests {
             heap.pause_target_state().1,
             settled / 2,
             "a 10x outlier must halve the span, not divide it by ten"
+        );
+    }
+
+    /// A budget the loop wants to make SMALL is floored, not abandoned.
+    ///
+    /// The two situations look alike and are opposite. When the live set alone
+    /// overruns the target, no budget helps and the clause must go inert (the
+    /// test below). When the live set is CHEAP and the loop simply wants a
+    /// tight budget, going inert loses control entirely -- measured on
+    /// `G1ChurnPauseProbe 50 1800` at `-Xmx4096m`, a tightening step that
+    /// crossed the floor dropped the constraint and the next cycle ran
+    /// unconstrained to 670 ms, against a 100 ms target it had been holding.
+    #[test]
+    fn a_budget_below_the_floor_is_floored_not_abandoned() {
+        const MIB: usize = 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(1024 * MIB);
+        heap.set_pause_target_ms(100);
+        // A 10 MiB live set, and a cycle four times over the target: the
+        // affordable span converges to a quarter of the 48 MiB span, i.e.
+        // 12 MiB -- barely more than the live set, so the budget the loop
+        // wants is 2 MiB.
+        for _ in 0..40 {
+            heap.refresh_pause_target_budget(400_000_000, 10 * MIB, 38 * MIB);
+        }
+        let (_, affordable, budget, unreachable) = heap.pause_target_state();
+        assert!(
+            affordable > (10 * MIB) as u64,
+            "the live set is cheap, so the target is still achievable: {affordable}"
+        );
+        assert_eq!(
+            budget, ZGC_ALLOC_TRIGGER_FLOOR,
+            "a budget the loop wants smaller than the floor is FLOORED --              abandoning the constraint here would hand the next cycle the whole              heap to walk"
+        );
+        assert_eq!(
+            unreachable, 0,
+            "and this is not the unachievable case -- that one is about the              LIVE SET overrunning the target, not about a tight budget"
         );
     }
 
