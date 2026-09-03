@@ -580,7 +580,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-322 tokens.
+321 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -808,7 +808,6 @@ export inherited from a parent shell.
 | `osr-inline-gate` | `CRATONVM_JIT_NO_OSR_INLINE_GATE` |
 | `invoke-fast-door` | `CRATONVM_JIT_NO_INVOKE_FAST_DOOR` |
 | `nonvirtual-fast-door` | `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` |
-| `frame-slot-reuse` | `CRATONVM_JIT_NO_FRAME_SLOT_REUSE` |
 | `frame-slot-reuse` | `CRATONVM_JIT_NO_FRAME_SLOT_REUSE` |
 | `iface-select-memo` | `CRATONVM_JIT_NO_IFACE_SELECT_MEMO` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
