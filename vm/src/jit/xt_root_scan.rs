@@ -128,6 +128,18 @@ pub fn helper_windows_all_pinned_this_cycle() -> bool {
 ///
 /// Turn it on with `CRATONVM_GC_STATS=1` and read `relocation_on_proven_jit`:
 /// a zero still voids the run.
+/// Engagement census for [`scan_peer_shadow_window`].
+///
+/// Without these a clean result cannot be told apart from a scan that never
+/// ran: a peer whose shadow stack is legitimately empty and a peer whose window
+/// was never read both contribute zero roots. `WINDOWS` is the denominator,
+/// `SLOTS` says whether the windows had anything in them, and `UNTRUSTED`
+/// counts the windows that refused the pin rather than claim coverage.
+pub static XT_PEER_SHADOW_WINDOWS: AtomicU64 = AtomicU64::new(0);
+pub static XT_PEER_SHADOW_SLOTS: AtomicU64 = AtomicU64::new(0);
+pub static XT_PEER_SHADOW_ROOTS: AtomicU64 = AtomicU64::new(0);
+pub static XT_PEER_SHADOW_UNTRUSTED: AtomicU64 = AtomicU64::new(0);
+
 /// Scan a frozen blocked peer's SHADOW STACK, appending every heap address it
 /// names to `out`.
 ///
@@ -145,38 +157,54 @@ pub fn scan_peer_shadow_window<F>(os_tid: u32, is_obj: &F, out: &mut Vec<ObjectR
 where
     F: Fn(usize) -> Option<ObjectRef>,
 {
-    let ss = cratonvm_gc::gc_quiescence::shadow_addr_of_tid(os_tid)?;
+    let Some((ss, pub_base, pub_end)) = cratonvm_gc::gc_quiescence::shadow_window_of_tid(os_tid)
+    else {
+        // The peer never published. That is UNKNOWN coverage, not empty
+        // coverage, so it must refuse.
+        XT_PEER_SHADOW_UNTRUSTED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
     if ss == 0 || ss & 0x7 != 0 {
+        XT_PEER_SHADOW_UNTRUSTED.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     // SAFETY: `ss` is the `#[repr(C)] ShadowStack` address the owning thread
-    // published; its backing `Box` is owned by that thread's `JvmThread`, the
-    // thread is blocked (hence alive and not mutating), and the entry is
-    // removed when the thread exits. Fields are `top`, `end`, `base` at 0, 8,
-    // 16 -- asserted by `layout_offsets_match_jit_contract`.
+    // published. The thread is in `blocked_os_tids` (alive), it is blocked so
+    // it is not mutating, its `JvmThread` cannot have moved while it holds live
+    // compiled frames (the JIT caches `*mut JvmThread` per frame and reaches
+    // the shadow stack through it), and the entry is removed when the thread
+    // exits. Fields are `top`, `end`, `base` at 0, 8, 16 -- asserted by
+    // `layout_offsets_match_jit_contract`.
+    //
+    // RESIDUAL, stated plainly: this read happens BEFORE the identity check
+    // below can reject a stale address, so a thread that died between the
+    // blocked-tid snapshot and here would be read after free. The window is
+    // narrow and the same shape the existing `shadow_window_from_frame` lives
+    // with; the identity check is what stops a stale read from being ACTED on.
     let (top, end, base) = unsafe {
         let p = ss as *const usize;
         (p.read(), p.add(1).read(), p.add(2).read())
     };
-    // An unallocated shadow stack is all zeros: a real, empty window.
-    if base == 0 && top == 0 && end == 0 {
-        return Some(0);
-    }
-    // The exact `#[repr(C)]` invariant. Anything else means the address did not
-    // describe a `ShadowStack` and nothing below may be dereferenced.
-    if base & 0x7 != 0 || top & 0x7 != 0 || end & 0x7 != 0 {
+    // IDENTITY CHECK, and the reason reading `ss` is defensible: the struct's
+    // own `base`/`end` must be exactly what this thread published. They point
+    // into the heap `Box` and never change after `ensure_allocated`, so a
+    // struct that moved (or was freed) does not match, and a stale address is
+    // rejected instead of dereferenced further.
+    if base != pub_base || end != pub_end {
+        XT_PEER_SHADOW_UNTRUSTED.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    if base == 0 || top < base || end < top {
+    // The `#[repr(C)]` invariant. `top` is the only field compiled code writes,
+    // so it is the only one that still needs checking.
+    if top & 0x7 != 0 || top < base || top > end {
+        XT_PEER_SHADOW_UNTRUSTED.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let span = top - base;
-    // `DEFAULT_SHADOW_SLOTS` is 256 Ki words; anything past that is not a
-    // window this VM allocates.
-    if span > cratonvm_gc::shadow_stack::DEFAULT_SHADOW_SLOTS * 8 * 16 {
-        return None;
-    }
     let slots = span / 8;
+    XT_PEER_SHADOW_WINDOWS.fetch_add(1, Ordering::Relaxed);
+    XT_PEER_SHADOW_SLOTS.fetch_add(slots as u64, Ordering::Relaxed);
+    let found_before = out.len();
     for i in 0..slots {
         // SAFETY: `[base, top)` is inside the validated window, which the
         // blocked peer is not mutating.
@@ -185,6 +213,7 @@ where
             out.push(o);
         }
     }
+    XT_PEER_SHADOW_ROOTS.fetch_add((out.len() - found_before) as u64, Ordering::Relaxed);
     Some(slots)
 }
 

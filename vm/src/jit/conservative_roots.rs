@@ -473,12 +473,18 @@ thread_local! {
 /// Publish this thread's shadow-stack address once. Called from
 /// `set_jit_thread`, which runs on every interpreter->JIT entry, so the
 /// repeat path is one TLS bool.
-pub fn publish_self_shadow_addr_once(addr: usize) {
+pub fn publish_self_shadow_addr_once(addr: usize, base: usize, end: usize) {
+    // `base == 0` means `ensure_allocated` has not run yet; publishing that
+    // would register a window with no buffer. Stay unpublished (the reader
+    // treats absent as UNKNOWN and refuses) and try again on the next entry.
+    if base == 0 {
+        return;
+    }
     let _ = SHADOW_ADDR_PUBLISHED.try_with(|c| {
         if c.get() {
             return;
         }
-        cratonvm_gc::gc_quiescence::publish_self_shadow_addr(self_os_tid(), addr);
+        cratonvm_gc::gc_quiescence::publish_self_shadow_addr(self_os_tid(), addr, base, end);
         c.set(true);
     });
 }

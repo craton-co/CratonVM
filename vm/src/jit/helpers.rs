@@ -893,6 +893,8 @@ pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
         if crate::jit::conservative_roots::xt_peer_shadow_scan_enabled() {
             crate::jit::conservative_roots::publish_self_shadow_addr_once(
                 &thread.shadow_stack as *const _ as usize,
+                thread.shadow_stack.base,
+                thread.shadow_stack.end,
             );
         }
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW").is_some() {

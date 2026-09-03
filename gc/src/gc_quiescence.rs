@@ -2697,28 +2697,47 @@ pub fn register_self_jit_depth_slot(os_tid: u32) -> std::sync::Arc<std::sync::at
 /// instead -- authoritative, no attribution -- and the initiator reads `base`
 /// and `top` out of it while the peer is blocked and therefore stable.
 static PER_TID_SHADOW_ADDR: std::sync::OnceLock<
-    std::sync::RwLock<std::collections::HashMap<u32, usize>>,
+    std::sync::RwLock<std::collections::HashMap<u32, (usize, usize, usize)>>,
 > = std::sync::OnceLock::new();
 
 fn per_tid_shadow_addr()
--> &'static std::sync::RwLock<std::collections::HashMap<u32, usize>> {
+-> &'static std::sync::RwLock<std::collections::HashMap<u32, (usize, usize, usize)>> {
     PER_TID_SHADOW_ADDR.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
 }
 
-/// Publish the calling thread's `ShadowStack` address. Idempotent; the address
-/// is stable for the thread's lifetime (the backing `Box` is owned by its
-/// `JvmThread`).
-pub fn publish_self_shadow_addr(os_tid: u32, addr: usize) {
-    if addr == 0 {
+/// Publish the calling thread's `ShadowStack` address together with the `base`
+/// and `end` of its backing buffer.
+///
+/// Why all three. The live extent of the window is `[base, top)`, and `top` is
+/// mutated INLINE by compiled code -- no Rust runs on a push -- so the only
+/// current value lives in the struct, and reading it needs the struct's
+/// address. But `ShadowStack`'s own contract says `base`/`end` "remain valid
+/// even if the `ShadowStack` struct itself is moved", i.e. the struct address
+/// is NOT guaranteed stable in general.
+///
+/// It is stable in the case that matters: the JIT caches `*mut JvmThread` in
+/// every compiled frame and reaches the shadow stack as
+/// `thread + shadow_off_in_thread`, so the thread cannot move while any
+/// compiled frame is live -- and a blocked peer worth scanning has live
+/// compiled frames. The gap is the narrow case where a thread enters JIT
+/// (publishing), returns from every JIT frame, moves, and then blocks with a
+/// FALSE-POSITIVE `has_jit`: the reader would dereference a stale address.
+///
+/// `base`/`end` close it. They point into the heap `Box`, never change after
+/// `ensure_allocated`, and the reader requires the struct's own `base`/`end` to
+/// equal these before trusting `top`. A moved or freed struct matching both
+/// exactly is not a case that arises.
+pub fn publish_self_shadow_addr(os_tid: u32, addr: usize, base: usize, end: usize) {
+    if addr == 0 || base == 0 || end <= base {
         return;
     }
     if let Ok(mut map) = per_tid_shadow_addr().write() {
-        map.insert(os_tid, addr);
+        map.insert(os_tid, (addr, base, end));
     }
 }
 
-/// The `ShadowStack` address `os_tid` published, if any.
-pub fn shadow_addr_of_tid(os_tid: u32) -> Option<usize> {
+/// The `(addr, base, end)` triple `os_tid` published, if any.
+pub fn shadow_window_of_tid(os_tid: u32) -> Option<(usize, usize, usize)> {
     let map = per_tid_shadow_addr().read().ok()?;
     map.get(&os_tid).copied()
 }
