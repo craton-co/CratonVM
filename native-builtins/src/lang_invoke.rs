@@ -4762,6 +4762,9 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 Some(Value::Object(Some(r))) => *r,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            if let Some(refusal) = vh_instance_refusal(ctx, meta.as_deref(), receiver, None) {
+                return Err(refusal);
+            }
             let td = match meta.as_deref() {
                 Some(m) => vh_type_desc_from_meta(m),
                 None => vh_type_desc(ctx, this),
@@ -4990,6 +4993,10 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 _ => return Ok(None),
             };
             let value = args.get(2).cloned().unwrap_or(Value::Int(0));
+            if let Some(refusal) = vh_instance_refusal(ctx, meta.as_deref(), receiver, Some(value))
+            {
+                return Err(refusal);
+            }
 
             if field_idx >= 0 {
                 ctx.set_field(receiver, field_idx as usize, value);
@@ -5100,6 +5107,12 @@ fn varhandle_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let expected = args.get(2).cloned().unwrap_or(Value::Int(0));
     let new_val = args.get(3).cloned().unwrap_or(Value::Int(0));
+    // The NEW value is the one that gets STORED, so it is the one judged. The
+    // expected value is only compared, and a wrong-typed expectation simply
+    // fails the comparison -- which is what the JDK does too.
+    if let Some(refusal) = vh_instance_refusal(ctx, meta.as_deref(), receiver, Some(new_val)) {
+        return Err(refusal);
+    }
 
     let idx = if field_idx >= 0 {
         field_idx as usize
@@ -5214,6 +5227,15 @@ fn varhandle_compare_and_exchange_raw(
     };
     let expected = args.get(2).cloned().unwrap_or(Value::Int(0));
     let new_val = args.get(3).cloned().unwrap_or(Value::Int(0));
+    // MEASURED on HotSpot 25.0.3+9 before wiring, `probes/ReflectArgTypeSweep.java`:
+    // `getAndSet`, `getAndAdd` and `compareAndExchange` all raise
+    // ClassCastException on a wrong receiver too, so all three doors get the
+    // same check as `set`/`get`/`compareAndSet`. They were left out of the
+    // first pass because only the latter three had been measured, and an
+    // unmeasured door is where a fix at the wrong level starts.
+    if let Some(refusal) = vh_instance_refusal(ctx, meta.as_deref(), receiver, Some(new_val)) {
+        return Err(refusal);
+    }
 
     let idx = if field_idx >= 0 {
         field_idx as usize
@@ -5323,6 +5345,15 @@ fn varhandle_get_and_set_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Ok(Some(Value::Object(None))),
     };
     let new_val = args.get(2).cloned().unwrap_or(Value::Int(0));
+    // MEASURED on HotSpot 25.0.3+9 before wiring, `probes/ReflectArgTypeSweep.java`:
+    // `getAndSet`, `getAndAdd` and `compareAndExchange` all raise
+    // ClassCastException on a wrong receiver too, so all three doors get the
+    // same check as `set`/`get`/`compareAndSet`. They were left out of the
+    // first pass because only the latter three had been measured, and an
+    // unmeasured door is where a fix at the wrong level starts.
+    if let Some(refusal) = vh_instance_refusal(ctx, meta.as_deref(), receiver, Some(new_val)) {
+        return Err(refusal);
+    }
 
     let idx = if field_idx >= 0 {
         field_idx as usize
@@ -5732,6 +5763,11 @@ fn varhandle_get_and_add_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 Some(Value::Object(Some(r))) => *r,
                 _ => return Ok(Some(Value::Int(0))),
             };
+            // Receiver only: the delta is numeric, so there is no reference to
+            // judge and `vh_instance_refusal` is passed `None` for the value.
+            if let Some(refusal) = vh_instance_refusal(ctx, meta.as_deref(), receiver, None) {
+                return Err(refusal);
+            }
             let delta = args.get(2).cloned().unwrap_or(Value::Int(0));
             let idx = if field_idx >= 0 {
                 field_idx as usize
@@ -5918,6 +5954,10 @@ fn varhandle_get_and_bitwise_raw(
                 Some(Value::Object(Some(r))) => *r,
                 _ => return Ok(Some(Value::Int(0))),
             };
+            // Receiver only -- the mask is numeric. See `getAndAdd` above.
+            if let Some(refusal) = vh_instance_refusal(ctx, meta.as_deref(), receiver, None) {
+                return Err(refusal);
+            }
             let mask = args.get(2).cloned().unwrap_or(Value::Int(0));
             let idx = if field_idx >= 0 {
                 field_idx as usize
@@ -13721,6 +13761,312 @@ fn primitive_widens(from: u8, to: u8) -> bool {
 /// the two descriptors are not describing the same call and every positional
 /// comparison below would be meaningless, so it returns `None` and leaves
 /// whatever handles arity to handle it.
+/// May `value` be passed where the parameter descriptor `target_desc` is
+/// declared -- as far as this VM is willing to ASSERT?
+///
+/// `None` means "cannot tell, do not refuse". `Some(false)` is a POSITIVE
+/// mismatch, and the only thing a caller may turn into a `ClassCastException`.
+///
+/// # Why every clause below is a refusal to answer
+///
+/// `MethodHandle.invoke` and `bindTo` both end in a `cast`, so both need this,
+/// and both sit on the Groovy-indy / SpEL-FunctionReference / log4j-provider
+/// path in this tree. A FALSE `ClassCastException` there refuses working code,
+/// which is strictly worse than the wrong answer it would replace -- so the
+/// predicate is built to fail towards "allow":
+///
+/// * a null is always passable, and a primitive is not this predicate's question;
+/// * `Ljava/lang/Object;` and array parameters accept anything we would reason
+///   about;
+/// * an UNRESOLVABLE target class means we know nothing;
+/// * a value that is itself a VM-minted stand-in is never judged, and
+///   `synthetic_implements_declared` is consulted for the relationships that
+///   live in the interpreter's table rather than in the loaded hierarchy;
+/// * a `java.lang.reflect.Proxy` instance and a lambda proxy acquire their
+///   interfaces at RUNTIME, invisibly to any static walk, so neither is judged.
+///   These are the two hatches `typecheck::aastore_element_assignable` carries
+///   for the same reason, and they are the whole cost of judging interfaces at
+///   all.
+///
+/// An INTERFACE target IS judged, but only through
+/// `class_assignable_to_name` -- the loader-blind by-name walk over supers and
+/// interfaces that the `checkcast`/`aastore` path already uses.
+/// `is_subclass` alone must never decide an interface: it compares `ClassId`s,
+/// and under a forked loader it refuses a value whose chain names the target
+/// under a different id.
+///
+/// W7-19 5.1 deferred the `bindTo` half of this for exactly the reasons above.
+/// What changed is not the risk but the predicates available to price it -- and
+/// that `probes/CodegenFrameworkSmoke.java` now boots Groovy, ByteBuddy,
+/// Mockito, ASM, Javassist and Objenesis as themselves, so the refusal has a
+/// lane that can catch it being wrong.
+fn reference_arg_admitted(
+    ctx: &mut dyn NativeContext,
+    value: Value,
+    target_desc: &str,
+) -> Option<bool> {
+    let Value::Object(Some(obj)) = value else {
+        return None;
+    };
+    if !target_desc.starts_with('L') || !target_desc.ends_with(';') {
+        return None;
+    }
+    let target = &target_desc[1..target_desc.len() - 1];
+    if target == "java/lang/Object" {
+        return None;
+    }
+    let target_cid = ctx.class_id_by_name(target)?;
+    let value_cid = ctx.class_id_of_object(obj);
+    // A lambda/method-reference proxy lives outside the loaded hierarchy
+    // entirely (`ClassId >= 0x8000_0000`), so no walk can vouch for it.
+    if value_cid.as_u32() >= 0x8000_0000 {
+        return None;
+    }
+    let value_name = ctx.class_name_of_id(value_cid)?;
+    if ctx.is_class_synthetic_stub(&value_name) {
+        return None;
+    }
+    // A `java.lang.reflect.Proxy` implements its interfaces at RUNTIME. The
+    // `aastore` path can be precise here because it has the RECORDED interface
+    // set to consult; this one does not, so it declines.
+    if value_name.contains("$Proxy") || value_name.ends_with("AnnotationProxy") {
+        return None;
+    }
+    let target_owned = target.to_string();
+    if value_cid == target_cid
+        || ctx.is_subclass(value_cid, target_cid)
+        || ctx.synthetic_implements_declared(value_cid, &target_owned)
+    {
+        return Some(true);
+    }
+    // Last, and the only clause that may say NO about an interface: the
+    // loader-blind by-name walk. `None` from the context (a mock, a harness
+    // with no VM hierarchy) means "cannot tell" and must stay an allow.
+    ctx.class_assignable_to_name(value_cid, &target_owned)
+}
+
+/// The `ClassCastException` for a positively-mismatched reference, worded the
+/// way HotSpot words it (`Cannot cast java.lang.Integer to java.lang.String`).
+fn reference_cast_failure(
+    ctx: &mut dyn NativeContext,
+    value: Value,
+    target_desc: &str,
+) -> MethodCallFailed {
+    let from = match value {
+        Value::Object(Some(o)) => {
+            let cid = ctx.class_id_of_object(o);
+            ctx.class_name_of_id(cid).unwrap_or_default()
+        }
+        _ => String::new(),
+    };
+    let to = target_desc
+        .strip_prefix('L')
+        .and_then(|t| t.strip_suffix(';'))
+        .unwrap_or(target_desc);
+    RuntimeError::ClassCastException {
+        message: format!(
+            "Cannot cast {} to {}",
+            from.replace('/', "."),
+            to.replace('/', ".")
+        ),
+    }
+    .into()
+}
+
+/// `MethodHandle.invoke` is `asType(callSiteType)` then an exact invocation, and
+/// `asType` CASTS every reference argument to the handle's declared parameter
+/// type. This VM passed them through untouched.
+///
+/// Measured, `probes/L5ModuleInvokeSweep.java` and a two-line reduction:
+///
+/// ```text
+/// cat  = findVirtual(String, "concat", (String)String)
+/// cat.invoke("ab", (Object) Integer.valueOf(3))
+///   HotSpot   ClassCastException: Cannot cast java.lang.Integer to java.lang.String
+///   CratonVM  NoSuchMethodError: 'boolean java.lang.Integer.isEmpty()'
+///
+/// len  = findVirtual(String, "length", ()int)
+/// len.invoke((Object) Integer.valueOf(3))
+///   HotSpot   ClassCastException: Cannot cast java.lang.Integer to java.lang.String
+///   CratonVM  NoSuchMethodError: 'int java.lang.Integer.length()'
+/// ```
+///
+/// The messages name the mechanism exactly: the `Integer` reached the callee and
+/// the callee's own body then dispatched `isEmpty()` / `length()` on it.
+/// **The RECEIVER is uncast too, not only the parameters.**
+///
+/// `NoSuchMethodError` is not a smaller version of the same behaviour. It
+/// extends `Error`, so a `catch (ClassCastException)` -- or any
+/// `catch (RuntimeException)` around a reflective dispatch -- does not see it,
+/// and the name it carries belongs to a method the caller never wrote.
+///
+/// `MH_DESC` omits the receiver for virtual/special handles (`needs_receiver`),
+/// so the receiver is judged against `MH_CLASS` and the rest 1:1 against the
+/// descriptor -- the same split `adapt_invoke_args` uses a few lines below.
+fn invoke_reference_cast_refusal(
+    ctx: &mut dyn NativeContext,
+    mh: ObjectRef,
+    kind: i32,
+    needs_receiver: bool,
+    has_bound: bool,
+    extra: &[Value],
+) -> Option<MethodCallFailed> {
+    // ONLY a handle whose `MH_DESC` is authoritative for its own arguments.
+    //
+    // An ADAPTER -- `filterArguments`, `insertArguments`, `foldArguments`, a
+    // spread/collect, the `__adapter__` a second `bindTo` mints -- keeps the
+    // LEAF member's descriptor in `MH_DESC` while presenting a different
+    // parameter list to its caller. `filterArguments(cat, 1, intToString)` has
+    // the same ARITY as `cat`, so the length guard below cannot see it, and
+    // comparing the caller's `Integer` against the leaf's
+    // `Ljava/lang/String;` would refuse a perfectly correct call.
+    //
+    // `kind_has_authoritative_type` is the same gate
+    // `invoke_narrowing_arg_refusal` uses, and for the same reason.
+    if !kind_has_authoritative_type(kind) {
+        return None;
+    }
+    let desc = mh_read_desc(ctx, mh)?;
+    let (params, _) = split_descriptor_params(&desc)?;
+    let receiver_taken = needs_receiver && !has_bound && !extra.is_empty();
+    if receiver_taken {
+        if let Some(class) = mh_read_class(ctx, mh) {
+            let target = format!("L{class};");
+            if reference_arg_admitted(ctx, extra[0], &target) == Some(false) {
+                return Some(reference_cast_failure(ctx, extra[0], &target));
+            }
+        }
+    }
+    let rest = if receiver_taken { &extra[1..] } else { extra };
+    // Only a 1:1 alignment is judged. A varargs collector, a spread/collect
+    // adapter or a partially bound handle can legitimately present a different
+    // arity here, and guessing the alignment is how a cast check starts refusing
+    // correct calls.
+    if rest.len() != params.len() {
+        return None;
+    }
+    for (v, pdesc) in rest.iter().zip(params.iter()) {
+        if reference_arg_admitted(ctx, *v, pdesc) == Some(false) {
+            return Some(reference_cast_failure(ctx, *v, pdesc));
+        }
+    }
+    None
+}
+
+/// [`invoke_reference_cast_refusal`] for the `invokeWithArguments` doors, which
+/// receive their arguments already unpacked and compute `needs_receiver` /
+/// `has_bound` for themselves.
+///
+/// Two registrations spell `invokeWithArguments` -- `([Ljava/lang/Object;)` and
+/// `(Ljava/util/List;)` -- and both bypass the `invoke` native entirely. Fixing
+/// `invoke` alone left `d.invokeWithArguments` differing, which is the
+/// several-independent-doors shape this file meets often enough to have a name
+/// for it.
+fn invoke_with_arguments_cast_refusal(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    unpacked: &[Value],
+) -> Option<MethodCallFailed> {
+    let kind = match ctx.get_field(this, MH_KIND) {
+        Value::Int(k) => k,
+        _ => MH_KIND_VIRTUAL,
+    };
+    let needs_receiver = kind == MH_KIND_VIRTUAL || kind == MH_KIND_SPECIAL;
+    let has_bound = matches!(ctx.get_field(this, MH_BOUND), Value::Object(Some(_)));
+    invoke_reference_cast_refusal(ctx, this, kind, needs_receiver, has_bound, unpacked)
+}
+
+/// Refuse a `VarHandle` INSTANCE access whose receiver is not an instance of the
+/// handle's coordinate class, or whose value does not fit the declared field.
+///
+/// # What this VM did instead
+///
+/// `varhandle_set`'s instance arm resolved `field_idx` from the VarHandle's OWN
+/// class and then applied it to whatever object arrived, with no arm between
+/// the two lines. Measured, `probes/ReflectArgTypeSweep.java`, BOTH modes:
+///
+/// ```text
+/// row                 HotSpot 25.0.3+9           CratonVM
+/// v.wrongRef          ClassCastException         3        <- Integer STORED in a String field
+/// v.wrongReceiver     ClassCastException         no-throw <- wrote through a String receiver
+/// v.primWrongRef      WrongMethodTypeException   no-throw <- "nine" STORED in an int field
+/// v.getWrongReceiver  ClassCastException         y        <- READ through a String receiver
+/// v.casWrongRef       ClassCastException         true     <- CAS succeeded
+/// ```
+///
+/// Two of those are worse than a wrong exception type. `v.wrongRef` leaves a
+/// `String`-declared field holding an `Integer` with nothing failing at the
+/// store, so the next ordinary read of that field is where it surfaces -- at a
+/// site that did nothing wrong. `v.getWrongReceiver` applied a `Box` field index
+/// to a `String` and returned what it found there.
+///
+/// # Why the ORDER of the checks is the whole design
+///
+/// These are the CAS-dominated paths this file has been tuned for twice: a
+/// thread-local plan memo took the global lock off the JIT's fast paths (a
+/// scaling probe went 0.07x -> 0.68x at 24 threads), and `vh_meta_get` returns
+/// an `Arc` precisely so a hot op pays a refcount bump instead of three `String`
+/// clones. A per-operation `class_id_by_name` + `is_subclass` would take a
+/// class-manager read lock on every `CompletableFuture` composition step and
+/// undo both.
+///
+/// So the receiver check is an INTEGER COMPARE against `meta.class_id`, which is
+/// already in hand. Only a mismatch -- a subclass receiver, or a genuinely wrong
+/// one -- pays `reference_arg_admitted`, and that predicate refuses only on a
+/// positive reading. A handle with no meta, or whose meta carries no class name,
+/// is not judged at all.
+fn vh_instance_refusal(
+    ctx: &mut dyn NativeContext,
+    meta: Option<&VarHandleMeta>,
+    receiver: ObjectRef,
+    value: Option<Value>,
+) -> Option<MethodCallFailed> {
+    let meta = meta?;
+    if meta.class_name.is_empty() {
+        return None;
+    }
+    // FAST PATH: the overwhelmingly common case is the exact class, and this
+    // arm costs one heap read and one integer compare.
+    let recv_cid = ctx.class_id_of_object(receiver);
+    if recv_cid.as_u32() != meta.class_id {
+        let target = format!("L{};", meta.class_name);
+        let recv = Value::Object(Some(receiver));
+        if reference_arg_admitted(ctx, recv, &target) == Some(false) {
+            return Some(reference_cast_failure(ctx, recv, &target));
+        }
+    }
+    let value = value?;
+    // A PRIMITIVE field given a reference that is not its wrapper is a
+    // `WrongMethodTypeException`, not a cast failure -- the JDK reports it as a
+    // signature mismatch because a `VarHandle` access is signature-polymorphic.
+    // No hierarchy walk is involved.
+    if matches!(
+        meta.field_desc.as_str(),
+        "I" | "J" | "F" | "D" | "Z" | "B" | "S" | "C"
+    ) {
+        if let Value::Object(Some(o)) = value {
+            let cid = ctx.class_id_of_object(o);
+            let name = ctx.class_name_of_id(cid).unwrap_or_default();
+            if crate::lang_class::wrapper_to_prim_desc(&name).is_none() {
+                return Some(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/lang/invoke/WrongMethodTypeException",
+                    &format!(
+                        "cannot convert {} to {}",
+                        name.replace('/', "."),
+                        meta.field_desc
+                    ),
+                ));
+            }
+        }
+        return None;
+    }
+    if reference_arg_admitted(ctx, value, &meta.field_desc) == Some(false) {
+        return Some(reference_cast_failure(ctx, value, &meta.field_desc));
+    }
+    None
+}
+
 fn invoke_narrowing_arg_refusal(
     ctx: &mut dyn NativeContext,
     mh: ObjectRef,
@@ -13934,6 +14280,14 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                     return Err(refusal);
                 }
             }
+            // Before `adapt_invoke_args`, which unboxes and can re-enter the
+            // interpreter: a wrong reference must fail as the cast `asType`
+            // performs, not as whatever the callee does with it.
+            if let Some(refusal) =
+                invoke_reference_cast_refusal(ctx, this, kind, needs_receiver, has_bound, extra)
+            {
+                return Err(refusal);
+            }
             let adapted = if needs_receiver && !has_bound && !extra.is_empty() {
                 let mut v = Vec::with_capacity(extra.len());
                 v.push(extra[0]);
@@ -14069,6 +14423,15 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             let unpacked: Vec<Value> = (0..len)
                 .map(|i| ctx.get_array_element(arr_ref, i))
                 .collect();
+            // `invokeWithArguments` is `asType(genericMethodType(n))` then an
+            // exact invocation, so it casts exactly as `invoke` does -- and it
+            // is a SEPARATE native, so the check on `invoke` does not reach it.
+            // Measured: `cat.invokeWithArguments("ab", Integer.valueOf(3))`
+            // answered `NoSuchMethodError` from inside `String.concat` after the
+            // `invoke` door was already fixed.
+            if let Some(refusal) = invoke_with_arguments_cast_refusal(ctx, this, &unpacked) {
+                return Err(refusal);
+            }
             // invokeWithArguments ALWAYS returns Object: a void target must yield
             // null (returning Ok(None) pushes NOTHING — the caller's areturn then
             // underflows the operand stack and killed the VM; Gradle's
@@ -14097,6 +14460,9 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             // Unpack the List via its own toArray() — layout-agnostic (the old
             // direct slot reads assumed the ArrayList layout and silently saw 0
             // args for any other List implementation).
+            // NOTE: the cast refusal for this overload is applied after the
+            // List is unpacked, below -- see the `Object[]` overload above for
+            // why `invokeWithArguments` needs its own.
             let unpacked: Vec<Value> = match args.get(1) {
                 Some(Value::Object(Some(l))) => {
                     match ctx.invoke_virtual(*l, "toArray", "()[Ljava/lang/Object;", &[])? {
@@ -14109,6 +14475,9 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                 }
                 _ => Vec::new(),
             };
+            if let Some(refusal) = invoke_with_arguments_cast_refusal(ctx, this, &unpacked) {
+                return Err(refusal);
+            }
             // Same Object-return contract as the Object[] overload above: box
             // primitives, void → null.
             let desc = mh_read_desc(ctx, this).unwrap_or_default();
@@ -14158,21 +14527,32 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             // is allowed through — a refusal is only ever raised on a positive
             // reading.
             //
-            // NOT done here, and W7-19 §5.1 carries the reason: the JDK's one-line
-            // body is `type.leadingReferenceParameter().cast(x)`, so it also
-            // raises `ClassCastException` for a wrong REFERENCE type
-            // (`(String,int)int`.bindTo(Integer.valueOf(1))). The test below is
-            // syntactic — is the first descriptor token `L…;`/`[…` — and cannot
-            // be wrong for a reason outside its own two lines. A `cast` check is
-            // an assignability question, and the only predicate `NativeContext`
-            // offers is `is_subclass`, which answers FALSE for a fabricated
-            // stand-in against a real JDK interface (a fabricated class declares
-            // no interfaces, so every type test against one fails). `bindTo` is
-            // on the Groovy-indy / SpEL-FunctionReference / log4j-provider path
-            // in this tree, all of which bind interfaces and subtypes, so that
-            // false negative would be a FALSE `ClassCastException` on a hot path
-            // — a refusal of working code, which is worse than the wrong answer
-            // it replaces. It wants a lane that can run those workloads.
+            // DONE 2026-08-30, narrowly — the `cast` half of the JDK's one-line
+            // body `type.leadingReferenceParameter().cast(x)`, which also raises
+            // `ClassCastException` for a wrong REFERENCE type. See the second
+            // check below.
+            //
+            // W7-19 §5.1 deferred it, and its reason still governs the SHAPE of
+            // the check: an assignability question asked with `is_subclass`
+            // alone answers FALSE for a fabricated stand-in against a real JDK
+            // interface (a fabricated class declares no interfaces, so every
+            // type test against one fails), and `bindTo` is on the Groovy-indy /
+            // SpEL-FunctionReference / log4j-provider path in this tree, all of
+            // which bind interfaces and subtypes. A false `ClassCastException`
+            // there refuses working code, which is worse than the wrong answer
+            // it replaces.
+            //
+            // What changed is not the risk but the available predicates: the
+            // check below never refuses an INTERFACE target (where the false
+            // negative lives), consults `synthetic_implements_declared` for the
+            // VM-minted stand-ins, and refuses only on a positive reading. The
+            // lane §5.1 asked for also exists now —
+            // `probes/CodegenFrameworkSmoke.java` boots Groovy, ByteBuddy,
+            // Mockito, ASM, Javassist and Objenesis as themselves.
+            //
+            // The test immediately below stays syntactic — is the first
+            // descriptor token `L…;`/`[…` — and cannot be wrong for a reason
+            // outside its own two lines.
             if let Value::Object(Some(mt)) = ctx.get_field_by_name(this, "type") {
                 if let Some(tdesc) = methodtype_to_descriptor(ctx, mt) {
                     if let Some((params, _)) = split_descriptor_params(&tdesc) {
@@ -14184,6 +14564,30 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                                 message: "no leading reference parameter".to_string(),
                             }
                             .into());
+                        }
+                        // The `cast` half of `type.leadingReferenceParameter()
+                        // .cast(x)`, deferred above until it could be written
+                        // WITHOUT the false positive that made it dangerous.
+                        //
+                        // Measured, `probes/L8InvokeLookupSweep.java`:
+                        //   findVirtual(String, "length", ()int)
+                        //     .bindTo(Integer.valueOf(1))
+                        //   HotSpot   ClassCastException
+                        //   CratonVM  accepted, answers a handle of type ()int
+                        // A missing check, and the wrong receiver is then live
+                        // in a handle that looks perfectly well-typed.
+                        //
+                        // `reference_arg_admitted` is the shared predicate --
+                        // `MethodHandle.invoke` needs the identical judgement on
+                        // its own arguments, and writing it twice is how the two
+                        // doors come to disagree about one object. It answers
+                        // `Some(false)` only on a positive mismatch; every
+                        // "cannot tell" case is an allow, and its doc comment
+                        // has the reason for each.
+                        if let Some(pdesc) = params.first().cloned() {
+                            if reference_arg_admitted(ctx, recv, &pdesc) == Some(false) {
+                                return Err(reference_cast_failure(ctx, recv, &pdesc));
+                            }
                         }
                     }
                 }

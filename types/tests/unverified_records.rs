@@ -220,10 +220,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status:** **FIXED-UNVERIFIED** — no binary carrying these changes has been",
     ),
     (
-        "docs/known-issues/jdk-only/H10-1-three-instruments-and-a-parse-verdict-of-its-own-20260820.md",
-        "status block says: **Status: FIXED-UNVERIFIED against CratonVM.** Three commits, all in the",
-    ),
-    (
         "docs/known-issues/jdk-only/H11-3-four-rows-retired-and-a-unit-test-that-blocks-the-next-two-20260820.md",
         "status block says: **Status: FIXED-UNVERIFIED — no binary carrying these changes has been built or",
     ),
@@ -246,10 +242,6 @@ const ALLOWED: &[(&str, &str)] = &[
     (
         "docs/known-issues/jdk-only/H24-1-the-module-source-door-and-the-two-modules-a-boot-layer-probe-could-not-see-20260821.md",
         "status block says: **Status: FIXED IN SOURCE, NOT VERIFIED BY AN ARM.** Lane H24, 2026-08-21.",
-    ),
-    (
-        "docs/known-issues/jdk-only/H4-1-the-cluster-that-is-not-a-tag-20260820.md",
-        "status block says: **Status: FIXED-UNVERIFIED — no binary carrying these changes has been built or",
     ),
     (
         "docs/known-issues/jdk-only/H6-1-the-canonical-name-slot-holds-a-different-string-20260820.md",
