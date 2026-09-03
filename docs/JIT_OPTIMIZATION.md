@@ -1030,12 +1030,53 @@ the interpreter's negative "no compiled body" memo is driven by
 safe and worthless is not a reason to move a default.
 
 The residual worth having is the one this uncovered by accident: **a C2 task
-that bails in `ir_lower` still runs the whole IR pipeline, recompiles via
-single-pass, republishes an equivalent body, and pays an invalidation.** The
-compile is the expensive part, not the epoch. Six of nine supersedes in
-CratonBench are that shape. Fixing it means not enqueuing (or not completing)
-a C2 task whose lowering will bail — which needs the bail to be predictable
-before the pipeline runs, and it currently is not.
+that declines after entering the IR pipeline still recompiles via single-pass,
+republishes an equivalent body, and pays an invalidation.** The compile is the
+expensive part, not the epoch — timed at 36 ms across 6 such tasks in one
+CratonBench run, against 2 ms for the 3 that produced an IR body. That residual
+is now fixed; see below.
+
+### The deferred-`new` retry was spent blind
+
+Naming the decline routes (`[ir] IrBuilder::build refused at ir.rs:N`,
+`[ir] ir_lower::lower_inner refused (<reason>)`) moved the diagnosis twice.
+
+The residual above was written as "bails in `ir_lower`". It mostly does not.
+Five of the six fall-throughs bail one stage earlier, in `IrBuilder::build`, at
+the `0xbb` arm — a `new` whose class had no `new_info` row. That is the
+documented `JitNewSite::Deferred` path: the resolver never runs a user
+`ClassLoader.loadClass` from inside a compile, so a `new` of a not-yet-loaded
+class defers, and the builder refuses the whole method.
+
+That refusal is transient by design, and there is a one-shot memo
+(`note_deferred_new_bail` / `take_deferred_new_retry`) to give such a method one
+more optimizing attempt once the class loads. **The grant never checked whether
+it had.** It flipped its `0` to `1` on the next supersede attempt regardless, so
+on CratonBench each of the five `java/util/regex/Pattern` methods bailed
+*twice* — once for real, once on a retry spent while the class was still
+unloaded — and then had no retry left for the moment it did load. The doc
+comment even described the failure ("a class that is still not loaded on the
+retry bails again") without treating it as one.
+
+The memo now records the deferred sites as `(holder_class_id, cp_idx)` and the
+grant asks the resolver whether they resolve *now*; if not it holds the retry
+rather than burning it. Measured on CratonBench:
+
+| | before | after |
+|---|---:|---:|
+| C2 tasks that fell through to single-pass | 6 (36 ms) | **1 (6 ms)** |
+| C2 tasks that produced an IR body | 3 (2 ms) | 3 (2 ms) |
+| supersede publishes with a changed body | 8 | **3** |
+| deferred-`new` retries held / spent | 0 / 6 | **5 / 1** |
+
+The gate discriminates rather than refusing everything — it held five and
+granted one — and `lowered=3` is unchanged, so no method lost its optimized
+body. All seven CratonBench checksums are identical.
+
+**This is not a throughput claim.** The saving is ~30 ms of *background compile*
+CPU per run; the benchmark wall times moved by more than that in both
+directions, which is run-to-run noise on this host, not a result.
+`CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND=1` restores the blind grant.
 
 ### Summary table
 
@@ -1061,6 +1102,7 @@ before the pipeline runs, and it currently is not.
 | IR-tier register residency (GP + FP files) | **ON** since 2026-09-02, phis included | `CRATONVM_JIT_IR_LINEAR_SCAN=0`, `CRATONVM_JIT_IR_PHI_RESIDENCY=0` |
 | IR-tier constants as immediates | **ON** | `CRATONVM_JIT_IR_CONST_IMM=0` |
 | Skip the supersede-epoch bump when it cannot invalidate anything | off (measured worthless: 9 IC evictions/run) | `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS` |
+| Deferred-`new` retry held until the class resolves | **ON** | `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND=1` |
 | IR-tier fused compare-and-branch, trampoline-free branches | **ON** | `CRATONVM_JIT_IR_FUSED_BRANCH=0` |
 | IR-tier receiver-guard CSE (once per receiver per block) | **ON** | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE=0` |
 | IR-tier gated inline reference stores | **ON** where a collector publishes a plan | `CRATONVM_JIT_IR_GATED_REF_STORE=0` |

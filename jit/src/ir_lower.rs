@@ -11695,6 +11695,35 @@ pub fn lower_with_scalar_deopt(
     )
 }
 
+thread_local! {
+/// The reason the most recent `lower_inner` on this thread refused.
+///
+/// A bail that names itself is the difference between "the optimizing tier
+/// declined" and a fact you can act on: the C2 task pays for an IR build,
+/// optimize and schedule before any of these fire, and whether that cost can be
+/// avoided up front depends entirely on WHICH of them fired.
+///
+/// Thread-local and overwritten per compile; read it immediately after the
+/// lowering call, on the same thread.
+static LOWER_BAIL_REASON: std::cell::Cell<Option<&'static str>> =
+    const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn note_lower_bail(reason: &'static str) {
+    LOWER_BAIL_REASON.with(|c| c.set(Some(reason)));
+}
+
+/// Clear the reason before a lowering attempt, so a stale one cannot be read
+/// as this attempt's.
+pub(crate) fn clear_lower_bail() {
+    LOWER_BAIL_REASON.with(|c| c.set(None));
+}
+
+/// The reason the last lowering attempt on this thread refused, if it did.
+pub fn last_lower_bail() -> Option<&'static str> {
+    LOWER_BAIL_REASON.with(|c| c.get())
+}
+
 /// Shared lowering body: profile-guided branch hints, the optional
 /// guard-surviving scalar-replacement map, and the two per-call-site lowering
 /// tables all flow in here. `pub(crate)` so the production compile path
@@ -11834,6 +11863,7 @@ pub(crate) fn lower_inner_with_scopes(
             .iter()
             .any(|node| matches!(node.op, Op::New { .. }))
     {
+        note_lower_bail("new-without-alloc-helper");
         return None;
     }
     // cov-06. Same reasoning, split per `Op::NewArray` shape: a PRIMITIVE
@@ -11846,6 +11876,7 @@ pub(crate) fn lower_inner_with_scopes(
         .any(|node| matches!(node.op, Op::NewArray { element_type, .. } if element_type != 0))
         && helpers.newarray == 0
     {
+        note_lower_bail("newarray-primitive-without-helper");
         return None;
     }
     if graph
@@ -11854,6 +11885,7 @@ pub(crate) fn lower_inner_with_scopes(
         .any(|node| matches!(node.op, Op::NewArray { element_type, .. } if element_type == 0))
         && helpers.anewarray_object == 0
     {
+        note_lower_bail("anewarray-without-helper");
         return None;
     }
     // cov-01. The same reasoning as the two guards above, for the three
@@ -11944,6 +11976,7 @@ pub(crate) fn lower_inner_with_scopes(
                 .iter()
                 .any(|n| matches!(n.op, Op::Store(MemKind::Int)));
         if needs_getfield_helper || needs_putfield_helper {
+            note_lower_bail("getfield-or-putfield-helper-required");
             return None;
         }
     }
@@ -11970,6 +12003,7 @@ pub(crate) fn lower_inner_with_scopes(
         )
     }) && helpers.getfield == 0
     {
+        note_lower_bail("wide-load-without-getfield-helper");
         return None;
     }
     if helpers.dispatch_threw == 0
@@ -11980,6 +12014,7 @@ pub(crate) fn lower_inner_with_scopes(
             )
         })
     {
+        note_lower_bail("wide-load-shape-unsupported");
         return None;
     }
     // COV-03 — every non-int field STORE is helper-only, and each width has its
@@ -11997,6 +12032,7 @@ pub(crate) fn lower_inner_with_scopes(
             _ => false,
         };
         if missing {
+            note_lower_bail("putfield-helper-missing-for-width");
             return None;
         }
     }
@@ -12026,6 +12062,7 @@ pub(crate) fn lower_inner_with_scopes(
                 .and_then(|&o| graph.nodes.get(o as usize))
                 .map_or(true, |o| !matches!(o.op, Op::Const(_)))
     }) {
+        note_lower_bail("non-const-store-operand");
         return None;
     }
 
@@ -12353,6 +12390,7 @@ pub(crate) fn lower_inner_with_scopes(
                 lowerer.shadow_pushes, lowerer.shadow_reloads
             );
         }
+        note_lower_bail("shadow-push-reload-imbalance");
         return None;
     }
 
