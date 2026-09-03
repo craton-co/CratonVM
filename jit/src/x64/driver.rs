@@ -2897,9 +2897,39 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     // backstop suppression before the moving path relies on it. Always `false`
     // on the default path (`sp_id_slot_off == 0`), so it is inert until the gate
     // is on AND Stage B lands.
+    //
+    // THE INLINE TERM IS RETIRED, AND THE MASK IT HID BEHIND IS CLOSED
+    // (2026-09-02). `compiler.inline_sites.is_empty()` was the "no construct the
+    // current mapping cannot describe" clause, written when a splice was exactly
+    // that: its callee's locals lived in the caller's spill area and nothing
+    // named them. Stage 3b names them now -- each live spliced-callee local goes
+    // into this safepoint's own `frame_slot_offsets`, and a scope whose dataflow
+    // cannot classify the callee pc fails the safepoint closed
+    // (`INLINE_LOCAL_UNMAPPABLE`). The blanket term was refusing methods the
+    // sharper per-safepoint machinery had already cleared: `RMapGcStress.key`
+    // reads `shadow=true`, every one of the eight `causes` zero, `unmapped_pcs=[]`
+    // -- and `frameslot=false` for no reason but this clause.
+    //
+    // Retiring it alone would NOT have been safe, which is why the count below
+    // lands with it. `safepoint_pcs.is_subset(&mapped_safepoint_pcs)` is keyed by
+    // BYTECODE PC, and a splice emits one safepoint per `invoke*` in the callee
+    // under ONE enclosing bci -- so a complete map at that bci inserts the pc and
+    // the subset test then reads TRUE with an incomplete map beside it. The
+    // blanket term was incidentally covering that hole for exactly the shape that
+    // opens it. `incomplete_oop_maps` counts safepoints, not pcs, and cannot be
+    // masked; it is strictly stronger than the subset test for this purpose, and
+    // the subset test is kept because it also catches a safepoint that pushed no
+    // map at all.
+    //
+    // `CRATONVM_JIT_INLINE_OOP_COVERAGE=0` restores the previous predicate
+    // verbatim, so the pair is one A/B in one binary.
     cm.fully_oop_covered = compiler.precise_maps
         && compiler.sp_id_slot_off != 0
-        && compiler.inline_sites.is_empty()
+        && (if inline_oop_coverage_enabled() {
+            compiler.incomplete_oop_maps == 0
+        } else {
+            compiler.inline_sites.is_empty()
+        })
         && compiler
             .safepoint_pcs
             .is_subset(&compiler.mapped_safepoint_pcs);

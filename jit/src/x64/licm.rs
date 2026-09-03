@@ -2637,6 +2637,118 @@ pub(super) fn direct_call_arg_maps_enabled() -> bool {
     })
 }
 
+/// Name a SELF-RECURSIVE call's reference arguments in its safepoint map
+/// (`CRATONVM_JIT_SELF_CALL_ARG_MAPS`, **default-ON; `=0` restores the pre-fix
+/// arrangement**).
+///
+/// The sibling of [`direct_call_arg_maps_enabled`], for the one invoke arm that
+/// change did not reach. The 0xb8 self-recursive site pops its arguments and,
+/// if any of them is a reference, raises `pending_staged_args_unmapped` — which
+/// makes `map_incomplete` true at the next safepoint, takes that safepoint's
+/// `moving_young_coverage_complete` false through
+/// `relocation_coverage_complete`, and so takes `fully_shadow_covered` false
+/// for the WHOLE method.
+///
+/// It did not have to. The arguments this arm stages are still in ordinary
+/// frame slots at the safepoint that consumes the flag: the non-tail form emits
+/// its stack-guard safepoint (and then the recursive `CALL`) only AFTER
+/// `pop_invoke_args`, and `emit_stack_arg_setup` — the step that moves them
+/// into the un-nameable outgoing-ABI area — runs later still. A frame slot is
+/// exactly what `pending_staged_arg_oops` exists to name, so the honest answer
+/// at that safepoint is the slot, not a refusal.
+///
+/// MEASURED on `probes/OopMapSelfCall.java`: the two self-recursive methods are
+/// the ONLY two methods in the whole run whose coverage claim is false
+/// (`shadow=false shadow_missing_pcs=[45]` / `[23]`, both the self-call bci),
+/// and every one of the eight `scauses` reads zero — the refusal arrives
+/// through `map_incomplete`, whose own census names it `staged_unmappable`.
+///
+/// An argument whose home is NOT a frame slot still fails the safepoint closed:
+/// a register- or xmm-resident value is precisely what a frame-slot map cannot
+/// describe, and that is the case the flag was right about.
+/// May a REVIVED merge block claim its reconstructed operand-stack oop marks
+/// are exact (`CRATONVM_JIT_MERGE_MARKS_EXACT`, **default-ON; `=0` restores the
+/// pre-fix flag**)?
+///
+/// When the walk arrives at a branch target dead (the block before it ended in
+/// a `goto`/`return`/`athrow`), the operand stack is reconstructed from
+/// `branch_target_stack_depth` and the marks from
+/// `branch_target_stack_oop_marks`. The marks half was fixed once already: a
+/// blanket `vec![false; depth]` there permanently mis-marked any reference
+/// carried across the branch from before it.
+///
+/// The EXACTNESS flag was not fixed with it. It kept reading
+/// `expected_depth == 0` -- the honest answer for the blanket fallback, and the
+/// wrong one once the real marks are in hand. `record_oop_map` seeds
+/// `map_incomplete` from that flag, so every safepoint in the revived block
+/// lost its relocation claim, and `fully_shadow_covered` ANDs it over the
+/// method.
+///
+/// MEASURED: on `RTreeRangeGc` and `RPriorityQueueGc` it was the ONLY remaining
+/// cause after the self-call repair -- `checkMap` 6, `checkSet` 9,
+/// `singleThreaded` 3 -- and every failing pc is an arm or the merge of one
+/// `?:` feeding a string concat.
+///
+/// Sound for the same reason the recorded marks are usable at all: JVMS 4.10.1
+/// admits no merge of a reference with a primitive, so a merge point's
+/// predecessors must agree about which slots hold references and whichever one
+/// was captured first speaks for all of them. The fallback -- no recorded marks,
+/// or a length that does not match the depth -- still fails closed, because
+/// there it genuinely did guess.
+/// May a method containing an INLINE SPLICE claim `fully_oop_covered`
+/// (`CRATONVM_JIT_INLINE_OOP_COVERAGE`, **default-ON; `=0` restores the
+/// previous predicate verbatim**)?
+///
+/// On: the term is `incomplete_oop_maps == 0` -- no safepoint of this
+/// compilation published a short map. Off: the historical
+/// `inline_sites.is_empty()` -- no splice at all, whatever the maps say.
+///
+/// The two changes are one change. Retiring the blanket term is only sound
+/// because the count replacing it is unmaskable, and the count is only worth
+/// having because the blanket term was what incidentally covered the mask. See
+/// `Compiler::incomplete_oop_maps` and the comment at the assignment.
+pub(super) fn inline_oop_coverage_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_OOP_COVERAGE") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
+pub(super) fn merge_marks_exact_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MERGE_MARKS_EXACT") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
+pub(super) fn self_call_arg_maps_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SELF_CALL_ARG_MAPS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
 pub(super) fn spill_args_published_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();

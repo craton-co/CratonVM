@@ -580,7 +580,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-317 tokens.
+320 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -891,6 +891,9 @@ export inherited from a parent shell.
 | `xt-peer-deadline-ms` | `CRATONVM_XT_PEER_DEADLINE_MS` |
 | `xt-peer-total-ms` | `CRATONVM_XT_PEER_TOTAL_MS` |
 | `direct-call-arg-maps` | `CRATONVM_JIT_DIRECT_CALL_ARG_MAPS` |
+| `self-call-arg-maps` | `CRATONVM_JIT_SELF_CALL_ARG_MAPS` |
+| `merge-marks-exact` | `CRATONVM_JIT_MERGE_MARKS_EXACT` |
+| `inline-oop-coverage` | `CRATONVM_JIT_INLINE_OOP_COVERAGE` |
 | `ir-gc-point-maps` | `CRATONVM_JIT_IR_GC_POINT_MAPS` |
 | `zero-spid` | `CRATONVM_JIT_ZERO_SPID` |
 | `int-value-direct` | `CRATONVM_JIT_INT_VALUE_DIRECT` |
@@ -904,7 +907,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-123 tokens.
+124 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -971,6 +974,7 @@ export inherited from a parent shell.
 | `gpu-device-pool` | `CRATONVM_GPU_DEVICE_POOL` |
 | `gpu-wait-latch` | `CRATONVM_GPU_WAIT_LATCH` |
 | `gpu-zerocopy` | `CRATONVM_GPU_NO_ZEROCOPY` |
+| `gpu-submission-drain` | `CRATONVM_GPU_NO_SUBMISSION_DRAIN` |
 | `lhm-root-all` | `CRATONVM_LHM_ROOT_ALL` |
 | `max-inflated-bytes` | `CRATONVM_MAX_INFLATED_BYTES` |
 | `mirror-pin-young-defer` | `CRATONVM_NO_MIRROR_PIN_YOUNG_DEFER` |
