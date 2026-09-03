@@ -37,7 +37,18 @@ thiserror = "2"
 # recovered).
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # Round-7 cross-cutting Fix 3: `release_max_level_info` causes `trace!` and
-# `debug!` macros to expand to no-ops in release builds. The VM has thousands
+# `debug!` macros to expand to no-ops in release builds.
+#
+# COROLLARY, and it has bitten repeatedly (audit 2026-09-03): a `debug!`
+# or `trace!` is NOT an instrument. It cannot be recovered with any
+# RUST_LOG value on a released binary, so it must never be the only
+# account of something a reader needs -- a counter, a data-loss event, a
+# fallback taken, a safety property a comment claims. If a zero is
+# meaningful, emit it at `info!`/`warn!` or give it an exit-summary
+# census (see `types::gpu_submission_census` for the shape). The sweep
+# that found this checked for three shapes: docs telling a user to set
+# `RUST_LOG=...=debug`, comments claiming a debug line makes something
+# visible, and counters whose only non-test reader was a `debug!`. The VM has thousands
 # of trace/debug sites in interpreter dispatch, GC scan loops, JIT entry, and
 # class-loading paths; even with subscriber filtering, the per-call
 # argument formatting / level check is non-zero. Compile-time elision wins it

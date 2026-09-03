@@ -17067,7 +17067,10 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
                     | MethodHandleKind::InvokeSpecial
             );
             if !kind_admitted {
-                tracing::debug!(
+                // See the sibling site in `runtime/offload.rs`: `debug!` is
+                // compiled out in release, so this decision was
+                // unreachable by any RUST_LOG directive.
+                tracing::info!(
                     target: "gpu.offload",
                     handle_kind = ?lcs.impl_handle.kind,
                     target_class = %lcs.impl_handle.class_name,

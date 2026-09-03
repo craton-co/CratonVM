@@ -1191,7 +1191,13 @@ impl OffloadCache {
         // opted out, so we record the verdict and don't even hand the
         // method to the analyzer.
         if let Some(exclude) = &method_annotations.gpu_exclude {
-            tracing::debug!(
+            // `info!`, not `debug!`: docs/gpu/annotations.md tells users to
+            // read this line with `RUST_LOG=gpu.offload=...`, and under
+            // `release_max_level_info` a `debug!` is compiled out of every
+            // release build, so no RUST_LOG value could ever surface it.
+            // Bounded by the number of @GpuExclude-annotated methods, and
+            // still below the default WARN filter.
+            tracing::info!(
                 target: "gpu.offload",
                 class = %class_name,
                 method = method_index,
