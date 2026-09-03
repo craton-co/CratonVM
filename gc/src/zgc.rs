@@ -1345,10 +1345,20 @@ pub struct ZgcRealHeap {
     /// cycle", which is a question a non-generational heap has too.
     ///
     /// Atomic because [`Self::refresh_pause_target_budget`] REWRITES it at the
-    /// end of every collection when a pause target is set -- that is the whole
-    /// of the pause-target mode's effect on the trigger -- and so a test can
-    /// flip the clause on a live heap and assert both arms of it.
+    /// end of every collection while a pause target is CONSTRAINING -- that is
+    /// the whole of the pause-target mode's effect on the trigger -- and so a
+    /// test can flip the clause on a live heap and assert both arms of it.
     alloc_trigger_bytes: AtomicUsize,
+    /// What [`zgc_alloc_trigger_percent`] alone asked for, fixed at
+    /// construction. `0` when the percentage form is off, which is the default.
+    ///
+    /// The pause-target loop is a CEILING and starts unconstrained; when it
+    /// releases its constraint -- pauses came back comfortably under the
+    /// target, or the target turned out to be unachievable -- it has to hand
+    /// [`Self::alloc_trigger_bytes`] back to something, and that something is
+    /// this. Without it, releasing would leave whatever the last constrained
+    /// cycle happened to compute.
+    alloc_trigger_percent_bytes: usize,
     /// The pause this collector tries to stay under, in MILLISECONDS. `0`
     /// means no target, and then [`Self::alloc_trigger_bytes`] keeps whatever
     /// [`zgc_alloc_trigger_percent`] gave it at construction.
@@ -1812,6 +1822,10 @@ impl ZgcRealHeap {
                 0 => 0,
                 pct => (cap / 100 * pct).max(ZGC_ALLOC_TRIGGER_FLOOR),
             }),
+            alloc_trigger_percent_bytes: match zgc_alloc_trigger_percent() {
+                0 => 0,
+                pct => (cap / 100 * pct).max(ZGC_ALLOC_TRIGGER_FLOOR),
+            },
             pause_target_ms: AtomicU64::new(zgc_pause_target_ms()),
             pause_affordable_span: AtomicU64::new(0),
             gc_rearm: AtomicUsize::new(0),
@@ -2315,82 +2329,86 @@ impl ZgcRealHeap {
     /// Re-derive the allocation budget from the PAUSE TARGET, using what this
     /// cycle just cost. Called once per collection, at the safepoint.
     ///
-    /// # The controller
+    /// # A target is a CEILING, not a setpoint
     ///
-    /// The trigger fires when `allocated - watermark >= budget`, and
-    /// `watermark` is the post-sweep `allocated`, i.e. the live bytes. So at
-    /// the moment the next cycle starts, the span its pause walks is
-    /// `live + budget` bytes -- **the controller and the trigger are in the
-    /// same units, which is the point of doing this in bytes.** Given a cycle
-    /// that walked `span` in `pause`, the span a target-length pause can
-    /// afford is
+    /// This is the whole design, and the first two versions of it got the
+    /// point wrong. The obvious controller solves `pause == target`:
     ///
     /// ```text
     ///     affordable = span * target / pause
     ///     budget     = affordable - live
     /// ```
     ///
-    /// which is MULTIPLICATIVE: each cycle scales the span by how far the last
-    /// pause was from the target. That matters more than it looks, because the
-    /// pause is not proportional to the span -- it is roughly
-    /// `fixed + k * span`, and on this collector the fixed part is large (a
+    /// whose fixed point is a pause exactly ON the target, from either side.
+    /// Measured on `G1ChurnPauseProbe 50 600` at `-Xmx2048m`, whose natural
+    /// worst pause is 175 ms: with a 200 ms target that controller fired seven
+    /// cycles, grew the budget until pauses reached 203 ms, and cost 17% of
+    /// wall. It did exactly what it was asked -- it held 200 ms -- by making
+    /// the pauses LONGER and paying for the privilege. Nobody who sets
+    /// `-XX:MaxGCPauseMillis=200` is asking for that.
+    ///
+    /// So the loop is one-sided, and it starts UNCONSTRAINED:
+    ///
+    /// * **A pause that overran the target TIGHTENS.**
+    ///   `affordable = span * target / pause`, floored at half the previous
+    ///   value so one anomalous pause cannot collapse the budget.
+    /// * **A pause comfortably under it (at or below half) RELAXES**, by a
+    ///   quarter, and hands back control entirely once the affordable span
+    ///   reaches capacity. Without this a single transient spike would
+    ///   constrain the heap for the rest of the run.
+    /// * **Anything in between leaves the budget alone** -- the hysteresis
+    ///   band that stops the loop hunting. This is the same shape, and the
+    ///   same reasoning, as `CRATONVM_G1_YOUNG_PAUSE_TARGET` in `g1.rs`:
+    ///   tighten after an overrun, relax while pauses stay under half the
+    ///   goal.
+    ///
+    /// The consequence that matters: on a workload whose pauses never reach
+    /// the target the clause NEVER ENGAGES, and costs one relaxed load per
+    /// collection. That is what makes a non-zero default defensible, where the
+    /// percentage form ([`zgc_alloc_trigger_percent`]) had to ship off.
+    ///
+    /// # Why the correction is multiplicative
+    ///
+    /// The pause is not proportional to the span. It is roughly
+    /// `fixed + k * span`, and on this collector the fixed part is large -- a
     /// measured 35 ms pause over a 5.7 MiB span next to a 48 ms pause over a
-    /// 167 MiB one puts it near 34 ms). A controller that fitted `k` as a
-    /// simple RATIO of pause to span would attribute all of that fixed cost to
-    /// the span and cut the budget accordingly. The multiplicative form does
-    /// not care: its fixed point is exactly `pause == target` whatever shape
-    /// the cost curve has, because that is the only place the correction factor
-    /// is 1. It never has to know `fixed` or `k`.
-    ///
-    /// # Rate limit instead of smoothing
-    ///
-    /// The correction is clamped to `[prior / 2, prior * 2]` per cycle and is
-    /// otherwise undamped. An EWMA was tried first and is the wrong instrument
-    /// here: the loop's own convergence is geometric (the factor
-    /// `target / pause` shrinks as the pause approaches the target, so it
-    /// cannot overshoot far), and averaging on top of that only slows the one
-    /// phase that needs to be fast. A 3:1 fold measured on `G1ChurnPauseProbe`
-    /// took about ten cycles to work off the first cycle's unrepresentative
-    /// sample, and spent all ten with the budget too TIGHT -- over-collecting
-    /// precisely while it knew least. Undamped it converges in about five, and
-    /// the rate limit is what bounds a single anomalous pause: a host hiccup
-    /// that quadruples one pause halves the next budget rather than quartering
-    /// it, and the cycle after corrects.
+    /// 167 MiB one puts it near 34 ms. A controller that fitted `k` as a plain
+    /// ratio of pause to span would attribute all of that fixed cost to the
+    /// span: the first version did, and it reported coefficients an order of
+    /// magnitude too high on the small early cycles, cutting the budget to
+    /// 8-27 MiB where the converged answer was over 140. Scaling the span by
+    /// `target / pause` never has to know `fixed` or `k`, because the only
+    /// place the correction factor is 1 is the place the pause equals the
+    /// target.
     ///
     /// # The clamps, and why an unmeetable target means DO NOTHING
     ///
     /// * **Ceiling** (capacity). A budget above the heap can never be reached,
-    ///   which is the same behaviour as the clause being off -- but writing the
-    ///   real number rather than `0` keeps `[GC] zgc-pause:`'s report honest
-    ///   about what the loop believes.
+    ///   which is the same as being unconstrained -- so reaching it hands
+    ///   control back to [`zgc_alloc_trigger_percent`]'s constant.
     /// * **Below the floor, INCLUDING `affordable <= live`: the clause goes
-    ///   inert** (budget = capacity) and
-    ///   [`ZgcRealCounters::pause_target_unreachable`] counts the cycle.
+    ///   inert** and [`ZgcRealCounters::pause_target_unreachable`] counts the
+    ///   cycle.
     ///
-    /// That second one is the whole safety argument for having this on by
-    /// default, and the obvious implementation is wrong. A budget of
-    /// [`ZGC_ALLOC_TRIGGER_FLOOR`] looks like the conservative choice --
-    /// "collect as often as we safely can and get as close to the target as
-    /// possible" -- and it is the opposite. When the LIVE SET alone projects
-    /// past the target, the pause length is set by the live set and no budget
-    /// changes it: collecting every 8 MiB against a 1.5 GiB live set buys
-    /// pauses of exactly the same length, hundreds of times more often. The
-    /// clause deliberately does not consult `gc_rearm` (see
-    /// `zgc_alloc_trigger_percent`), so nothing else would have stopped it.
-    ///
-    /// So the worst thing an unmeetable target can do is nothing, and the
-    /// occupancy clauses keep running the collector as they did before. The
-    /// counter is what turns that silence into a diagnosis: a run whose
-    /// `unreachable` climbs is a run whose pause target is not achievable at
-    /// this live set, which is an answer, and it is a different answer from
-    /// "the loop is holding the target".
+    /// That second one is the safety argument, and the obvious implementation
+    /// is wrong. A budget of [`ZGC_ALLOC_TRIGGER_FLOOR`] looks like the
+    /// conservative choice -- "collect as often as we safely can and get as
+    /// close to the target as possible" -- and it is the opposite. When the
+    /// LIVE SET alone projects past the target, the pause length is set by the
+    /// live set and no budget changes it: collecting every 8 MiB against a
+    /// 1.5 GiB live set buys pauses of exactly the same length, hundreds of
+    /// times more often. The clause deliberately does not consult `gc_rearm`
+    /// (see `zgc_alloc_trigger_percent`), so nothing else would have stopped
+    /// it. A climbing `unreachable` is the diagnosis: the target is not
+    /// achievable at this live set, which is an answer, and a different one
+    /// from "the loop is holding the target".
     ///
     /// # What the clock covers
     ///
     /// `pause_ns` is the same figure `[GC] zgc-pause:` reports, which is taken
     /// BEFORE the optional compaction slide (`CRATONVM_ZGC_RELOCATE=1`). Under
     /// that flag the real pause is longer than the one being modelled, so the
-    /// loop holds its target on a pause that is not the whole pause. Sizing
+    /// loop holds its ceiling on a pause that is not the whole pause. Sizing
     /// from a clock that stops early is still self-correcting for everything
     /// it does cover; it is simply blind to the part it does not.
     fn refresh_pause_target_budget(&self, pause_ns: u64, live_bytes: usize, bytes_freed: usize) {
@@ -2407,20 +2425,39 @@ impl ZgcRealHeap {
             return;
         }
         let target_ns = target_ms.saturating_mul(1_000_000);
-        // `span * target / pause`, in `u128` so the product cannot wrap: span
-        // is bounded by the heap, but `target_ns` is a flag and `pause_ns` a
-        // clock reading, and neither is bounded by anything this file owns.
-        let sample = (u128::from(span_bytes) * u128::from(target_ns) / u128::from(pause_ns))
-            .min(u128::from(u64::MAX)) as u64;
         let prior = self.pause_affordable_span.load(Ordering::Relaxed);
-        let affordable = if prior == 0 {
-            sample
+        let affordable = if pause_ns > target_ns {
+            // OVERRAN. Scale the span by how far over it went. `u128` so the
+            // product cannot wrap: span is bounded by the heap, but `target_ns`
+            // is a flag and `pause_ns` a clock reading, and neither is bounded
+            // by anything this file owns.
+            let sample = (u128::from(span_bytes) * u128::from(target_ns) / u128::from(pause_ns))
+                .min(u128::from(u64::MAX)) as u64;
+            if prior == 0 {
+                sample
+            } else {
+                // Never widen on an overrun, and never cut by more than half.
+                sample.clamp(prior / 2, prior)
+            }
+        } else if prior != 0 && pause_ns.saturating_mul(2) <= target_ns {
+            // COMFORTABLY UNDER, and currently constrained: give a quarter
+            // back. Reaching capacity releases the constraint entirely, below.
+            prior.saturating_add(prior / 4)
         } else {
-            sample.clamp(prior / 2, prior.saturating_mul(2))
+            // In the hysteresis band, or never constrained. Leave it.
+            return;
         };
+        let cap = self.heap_capacity();
+        if affordable >= cap as u64 {
+            // Unconstrained again: hand the clause back to the percentage
+            // form, which is `0` (off) unless an operator set one.
+            self.pause_affordable_span.store(0, Ordering::Relaxed);
+            self.alloc_trigger_bytes
+                .store(self.alloc_trigger_percent_bytes, Ordering::Relaxed);
+            return;
+        }
         self.pause_affordable_span
             .store(affordable, Ordering::Relaxed);
-        let cap = self.heap_capacity();
         let budget = match affordable.checked_sub(live_bytes as u64) {
             // Compared and converted in `u64`: `affordable` can legitimately
             // exceed `usize::MAX` on a 32-bit host, where `as usize` would
@@ -2437,7 +2474,7 @@ impl ZgcRealHeap {
                 self.counters
                     .pause_target_unreachable
                     .fetch_add(1, Ordering::Relaxed);
-                cap
+                self.alloc_trigger_percent_bytes
             }
         };
         self.alloc_trigger_bytes.store(budget, Ordering::Relaxed);
@@ -10255,11 +10292,15 @@ const ZGC_ALLOC_TRIGGER_FLOOR: usize = 8 * 1024 * 1024;
 /// `G1ChurnPauseProbe`; on a workload with a tenth of the live set the same
 /// 12% would buy a pause nobody needed to shorten, at the same cost.
 ///
-/// A target inverts that. The collector MEASURES what a pause costs per byte
-/// of the span it walked, and sizes the next budget so the projected pause
-/// lands on the target -- so it spends throughput only where a pause would
-/// otherwise overrun, and spends none at all where pauses are already short.
-/// See [`ZgcRealHeap::refresh_pause_target_budget`] for the control law.
+/// A target inverts that. It is a CEILING: the clause starts unconstrained and
+/// only engages once a pause has actually OVERRUN the target, tightening in
+/// proportion to the overrun and relaxing back to unconstrained once pauses
+/// return to comfortably under it. So it spends throughput only where a pause
+/// would otherwise overrun, and on a workload whose pauses never reach the
+/// target it costs one relaxed load per collection and nothing else -- which
+/// is what makes a non-zero default defensible here where the percentage form
+/// had to ship off. See [`ZgcRealHeap::refresh_pause_target_budget`], whose
+/// doc also records what the two earlier, wrong versions of this loop did.
 fn zgc_pause_target_ms() -> u64 {
     static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -20292,64 +20333,76 @@ pub(crate) mod tests {
         assert_eq!(heap.get_array_element(arr, 0), Ok(Value::Int(7)));
     }
 
-    /// The pause-target loop sizes the budget so the PROJECTED pause lands on
-    /// the target, and reports when it cannot.
+    /// A pause target is a CEILING: a pause under it must not move anything.
     ///
-    /// Drives `refresh_pause_target_budget` directly with synthetic cycles
-    /// rather than through a collection, because the property under test is
-    /// the controller and a real pause on a test heap is unmeasurably short
-    /// (which is its own arm below).
+    /// This is the property the first two versions of the controller did not
+    /// have, and the one that makes a non-zero default defensible. A loop that
+    /// solves `pause == target` reaches it from BELOW too -- it grows the
+    /// budget until pauses lengthen to meet the target -- which on
+    /// `G1ChurnPauseProbe` at `-Xmx2048m` turned a natural 175 ms worst pause
+    /// into 203 ms and charged 17% of wall for it.
     #[test]
-    fn the_pause_target_sizes_the_budget_from_what_a_pause_cost() {
-        const GIB: usize = 1024 * 1024 * 1024;
+    fn a_pause_under_the_target_does_not_engage_the_clause() {
         const MIB: usize = 1024 * 1024;
-        let heap = ZgcRealHeap::with_capacity(4 * GIB);
+        let heap = ZgcRealHeap::with_capacity(1024 * MIB);
+        heap.set_pause_target_ms(200);
+        // Ten cycles, every one comfortably inside the target.
+        for _ in 0..10 {
+            heap.refresh_pause_target_budget(150_000_000, 100 * MIB, 400 * MIB);
+        }
+        let (_, affordable, budget, unreachable) = heap.pause_target_state();
+        assert_eq!(affordable, 0, "nothing constrained the heap");
+        assert_eq!(budget, 0, "and the trigger clause is still off");
+        assert_eq!(unreachable, 0);
+    }
+
+    /// A pause that OVERRAN tightens, proportionally, and a pause that comes
+    /// back comfortably under relaxes until the constraint is released.
+    #[test]
+    fn an_overrun_tightens_and_a_short_pause_relaxes() {
+        const MIB: usize = 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(4096 * MIB);
         heap.set_pause_target_ms(100);
 
-        // A cycle that walked 1 GiB in 200 ms and left 100 MiB live. Twice the
-        // target, so half the span is affordable: 512 MiB, less the 100 MiB
-        // live => 412 MiB of budget.
-        heap.refresh_pause_target_budget(200_000_000, 100 * MIB, GIB - 100 * MIB);
-        let (target, affordable, budget, unreachable) = heap.pause_target_state();
-        assert_eq!(target, 100);
-        assert_eq!(
-            affordable,
-            (GIB / 2) as u64,
-            "twice the target means half the span is affordable"
-        );
-        assert_eq!(budget, GIB / 2 - 100 * MIB, "budget is affordable - live");
-        assert_eq!(unreachable, 0, "a 100 MiB live set does not overrun 100 ms");
+        // 200 ms over a 500 MiB span: twice the target, so half the span.
+        heap.refresh_pause_target_budget(200_000_000, 100 * MIB, 400 * MIB);
+        let (_, affordable, budget, _) = heap.pause_target_state();
+        assert_eq!(affordable, (250 * MIB) as u64, "twice over means half the span");
+        assert_eq!(budget, 150 * MIB, "budget is affordable - live");
 
-        // A cycle that landed exactly ON the target must not move anything --
-        // the correction factor is 1, which is what makes `pause == target`
-        // the fixed point.
-        heap.refresh_pause_target_budget(100_000_000, 100 * MIB, GIB / 2 - 100 * MIB);
+        // Still over, but only just: tighten a little more, never widen.
+        heap.refresh_pause_target_budget(110_000_000, 100 * MIB, 150 * MIB);
+        let narrower = heap.pause_target_state().1;
+        assert!(
+            narrower < affordable,
+            "a pause still over the target must not widen the span: {narrower} vs {affordable}"
+        );
+
+        // Inside the hysteresis band (over half the target, under it): hold.
+        let held = narrower;
+        heap.refresh_pause_target_budget(70_000_000, 100 * MIB, 100 * MIB);
+        assert_eq!(
+            heap.pause_target_state().1, held,
+            "a pause in the band between half the target and the target holds"
+        );
+
+        // Comfortably under (at or below half): give a quarter back, each cycle,
+        // until the affordable span reaches capacity and the constraint is
+        // released altogether.
+        heap.refresh_pause_target_budget(40_000_000, 100 * MIB, 100 * MIB);
         assert_eq!(
             heap.pause_target_state().1,
-            (GIB / 2) as u64,
-            "a pause on target is the fixed point"
+            held + held / 4,
+            "a comfortable pause relaxes by a quarter"
         );
-
-        // THE UNREACHABLE ARM. A 1 ms target against a live set that alone
-        // takes far longer than that to walk: no budget makes this pause fit,
-        // so the loop must go inert AND say so. Rate-limited, so it takes
-        // several cycles to get down there -- which is the point of the limit.
-        heap.set_pause_target_ms(1);
-        for _ in 0..24 {
-            heap.refresh_pause_target_budget(200_000_000, 900 * MIB, GIB - 900 * MIB);
+        for _ in 0..200 {
+            heap.refresh_pause_target_budget(40_000_000, 100 * MIB, 100 * MIB);
         }
-        let (_, _, inert, gave_up) = heap.pause_target_state();
+        let (_, released, budget, _) = heap.pause_target_state();
+        assert_eq!(released, 0, "relaxing to capacity releases the constraint");
         assert_eq!(
-            inert,
-            heap.heap_capacity(),
-            "an unachievable target must go INERT, not tight: the pause length \
-             is set by the live set, so a small budget buys pauses of the same \
-             length hundreds of times more often"
-        );
-        assert!(
-            gave_up > 0,
-            "and it must be COUNTED -- a loop holding the target and a loop \
-             that has given up are different answers"
+            budget, 0,
+            "and hands the clause back to the percentage form, which is off"
         );
     }
 
@@ -20360,18 +20413,18 @@ pub(crate) mod tests {
         let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
         heap.set_pause_target_ms(0);
         heap.alloc_trigger_bytes.store(12345, Ordering::Relaxed);
-        heap.refresh_pause_target_budget(50_000_000, 1024, 1024);
+        heap.refresh_pause_target_budget(500_000_000, 1024, 1024);
         assert_eq!(
             heap.alloc_trigger_bytes.load(Ordering::Relaxed),
             12345,
             "with no target the percent clause keeps the budget it was given"
         );
 
-        // A target, but a cycle that walked nothing: there is no correction
-        // factor to apply, and inventing one would size the next budget off a
+        // A target, and an overrun, but a cycle that walked nothing: there is
+        // no span to scale, and inventing one would size the next budget off a
         // cycle that did not happen.
         heap.set_pause_target_ms(100);
-        heap.refresh_pause_target_budget(50_000_000, 0, 0);
+        heap.refresh_pause_target_budget(500_000_000, 0, 0);
         assert_eq!(heap.alloc_trigger_bytes.load(Ordering::Relaxed), 12345);
         assert_eq!(heap.pause_target_state().1, 0, "and nothing was learned");
         // Likewise a pause the clock could not resolve -- it is the divisor.
@@ -20379,34 +20432,53 @@ pub(crate) mod tests {
         assert_eq!(heap.pause_target_state().1, 0);
     }
 
-    /// The correction is rate-limited to 2x per cycle, so one anomalous pause
-    /// cannot collapse the budget -- the property that makes this a controller
-    /// and not an oscillator.
+    /// The tightening is rate-limited to half per cycle, so one anomalous
+    /// pause cannot collapse the budget.
     #[test]
     fn one_anomalous_pause_cannot_collapse_the_budget() {
         const MIB: usize = 1024 * 1024;
-        let heap = ZgcRealHeap::with_capacity(1024 * MIB);
+        let heap = ZgcRealHeap::with_capacity(4096 * MIB);
         heap.set_pause_target_ms(100);
-        // Settle: a cycle that lands on the target leaves the span alone.
-        heap.refresh_pause_target_budget(100_000_000, 100 * MIB, 400 * MIB);
+        // Constrain to 250 MiB by overrunning once at 2x.
+        heap.refresh_pause_target_budget(200_000_000, 100 * MIB, 400 * MIB);
         let settled = heap.pause_target_state().1;
-        assert_eq!(settled, (500 * MIB) as u64);
+        assert_eq!(settled, (250 * MIB) as u64);
 
-        // One cycle that took FOUR TIMES as long over the same span. The raw
-        // correction would be a quarter; the limit makes it a half.
-        heap.refresh_pause_target_budget(400_000_000, 100 * MIB, 400 * MIB);
+        // A host hiccup: one pause TEN TIMES the target over the same span.
+        // The raw correction would be a tenth; the limit makes it a half.
+        heap.refresh_pause_target_budget(1_000_000_000, 100 * MIB, 400 * MIB);
         assert_eq!(
             heap.pause_target_state().1,
             settled / 2,
-            "a 4x outlier must halve the span, not quarter it"
+            "a 10x outlier must halve the span, not divide it by ten"
         );
-        // And a cycle four times FASTER is capped the other way.
-        let low = heap.pause_target_state().1;
-        heap.refresh_pause_target_budget(25_000_000, 100 * MIB, 400 * MIB);
+    }
+
+    /// The target being unachievable at this live set must leave the clause
+    /// inert, and say so.
+    #[test]
+    fn an_unachievable_target_goes_inert_and_is_counted() {
+        const MIB: usize = 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(1024 * MIB);
+        heap.set_pause_target_ms(1);
+        // A 900 MiB live set against a 1 ms target: no budget makes this fit.
+        // Rate-limited, so it takes several cycles to get down there -- which
+        // is the point of the limit.
+        for _ in 0..24 {
+            heap.refresh_pause_target_budget(200_000_000, 900 * MIB, 100 * MIB);
+        }
+        let (_, _, budget, gave_up) = heap.pause_target_state();
         assert_eq!(
-            heap.pause_target_state().1,
-            low * 2,
-            "and the limit binds in both directions"
+            budget, 0,
+            "an unachievable target must go INERT (here: the percentage form, \
+             which is off), not tight -- the pause length is set by the live \
+             set, so a small budget buys pauses of the same length hundreds of \
+             times more often"
+        );
+        assert!(
+            gave_up > 0,
+            "and it must be COUNTED -- a loop holding the target and a loop \
+             that has given up are different answers"
         );
     }
 
@@ -20420,23 +20492,20 @@ pub(crate) mod tests {
     fn an_absurd_pause_target_or_pause_cannot_overflow_the_budget() {
         const MIB: usize = 1024 * 1024;
         let heap = ZgcRealHeap::with_capacity(64 * MIB);
-        // ~584 years, in milliseconds.
+        // ~584 years, in milliseconds. No pause can overrun it, so the
+        // one-sided loop never engages.
         heap.set_pause_target_ms(u64::MAX / 2_000_000);
         heap.refresh_pause_target_budget(1_000_000, 8 * MIB, 8 * MIB);
-        let (_, _, budget, _) = heap.pause_target_state();
-        assert_eq!(
-            budget,
-            heap.heap_capacity(),
-            "an unreachable-large target clamps to capacity, which is inert"
-        );
-        // And the other operand: a pause the clock reports as ~292 years.
+        assert_eq!(heap.pause_target_state().1, 0);
+        assert_eq!(heap.pause_target_state().2, 0);
+        // And the other operand: a pause the clock reports as ~292 years,
+        // against an ordinary target.
         let heap = ZgcRealHeap::with_capacity(64 * MIB);
         heap.set_pause_target_ms(100);
         heap.refresh_pause_target_budget(u64::MAX / 2, 8 * MIB, 8 * MIB);
         let (_, _, budget, unreachable) = heap.pause_target_state();
         assert_eq!(
-            budget,
-            heap.heap_capacity(),
+            budget, 0,
             "an absurdly expensive pause goes inert rather than wrapping"
         );
         assert!(unreachable > 0, "and reports that it could not meet the target");
