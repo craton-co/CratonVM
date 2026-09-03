@@ -2679,6 +2679,50 @@ pub fn register_self_jit_depth_slot(os_tid: u32) -> std::sync::Arc<std::sync::at
     slot
 }
 
+/// Address of each thread's own `ShadowStack`, published by its owner.
+///
+/// A JIT frame's oops live in the shadow stack, which is a per-thread heap
+/// `Box<[usize]>` and NOT the machine stack -- so `helper_window_pass`, which
+/// scans registers plus `[rsp, stack_base)`, cannot see them. For the initiator
+/// and for a cooperatively parked peer that is fine (`collect_roots` scans its
+/// own; a parked peer publishes its own and remaps on resume). A BLOCKED peer
+/// does neither, and `apply_pending_blocked_fixups` never remaps a shadow
+/// stack, so its shadow-stack oops are unpinned and unremapped.
+///
+/// The initiator cannot recover the window from the peer's frames the way
+/// `shadow_window_from_frame` does: that helper only trusts a frame whose
+/// cached `JvmThread` is the CURRENT thread's, and attributing a
+/// `CompiledMethod` to a conservatively-found frame is the mis-attribution that
+/// has already SIGSEGV'd the band verifier. So the owner publishes the address
+/// instead -- authoritative, no attribution -- and the initiator reads `base`
+/// and `top` out of it while the peer is blocked and therefore stable.
+static PER_TID_SHADOW_ADDR: std::sync::OnceLock<
+    std::sync::RwLock<std::collections::HashMap<u32, usize>>,
+> = std::sync::OnceLock::new();
+
+fn per_tid_shadow_addr()
+-> &'static std::sync::RwLock<std::collections::HashMap<u32, usize>> {
+    PER_TID_SHADOW_ADDR.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+/// Publish the calling thread's `ShadowStack` address. Idempotent; the address
+/// is stable for the thread's lifetime (the backing `Box` is owned by its
+/// `JvmThread`).
+pub fn publish_self_shadow_addr(os_tid: u32, addr: usize) {
+    if addr == 0 {
+        return;
+    }
+    if let Ok(mut map) = per_tid_shadow_addr().write() {
+        map.insert(os_tid, addr);
+    }
+}
+
+/// The `ShadowStack` address `os_tid` published, if any.
+pub fn shadow_addr_of_tid(os_tid: u32) -> Option<usize> {
+    let map = per_tid_shadow_addr().read().ok()?;
+    map.get(&os_tid).copied()
+}
+
 /// Drop `os_tid`'s slot when its owning thread exits.
 ///
 /// Without this a dead thread's last depth stays readable under a tid the OS
@@ -2687,6 +2731,12 @@ pub fn register_self_jit_depth_slot(os_tid: u32) -> std::sync::Arc<std::sync::at
 /// no compiled frames at all.
 pub fn unregister_jit_depth_slot(os_tid: u32) {
     if let Ok(mut map) = per_tid_jit_depth().write() {
+        map.remove(&os_tid);
+    }
+    // The shadow address dies with the thread too: its `JvmThread` (and the
+    // `Box` the window points into) goes with it, so a leftover entry is a
+    // dangling pointer under a tid the OS will recycle.
+    if let Ok(mut map) = per_tid_shadow_addr().write() {
         map.remove(&os_tid);
     }
 }

@@ -128,6 +128,66 @@ pub fn helper_windows_all_pinned_this_cycle() -> bool {
 ///
 /// Turn it on with `CRATONVM_GC_STATS=1` and read `relocation_on_proven_jit`:
 /// a zero still voids the run.
+/// Scan a frozen blocked peer's SHADOW STACK, appending every heap address it
+/// names to `out`.
+///
+/// The window is `[base, top)` of the `ShadowStack` the peer published the
+/// address of (`gc_quiescence::publish_self_shadow_addr`). Reading it is sound
+/// only for a peer that cannot run: `mark_blocked_region_leave` waits out an
+/// active pause, so a blocked peer's `top` is stable for the whole STW.
+///
+/// Every field is validated before use. The address came from another thread
+/// and a stale or torn one would be dereferenced here -- the same shape of
+/// mistake that SIGSEGV'd the band verifier on a `base` of `0x5555_0000_0004`.
+/// Returns the number of slots scanned, or `None` if the window could not be
+/// trusted (which must keep the cycle refusing rather than claim coverage).
+pub fn scan_peer_shadow_window<F>(os_tid: u32, is_obj: &F, out: &mut Vec<ObjectRef>) -> Option<usize>
+where
+    F: Fn(usize) -> Option<ObjectRef>,
+{
+    let ss = cratonvm_gc::gc_quiescence::shadow_addr_of_tid(os_tid)?;
+    if ss == 0 || ss & 0x7 != 0 {
+        return None;
+    }
+    // SAFETY: `ss` is the `#[repr(C)] ShadowStack` address the owning thread
+    // published; its backing `Box` is owned by that thread's `JvmThread`, the
+    // thread is blocked (hence alive and not mutating), and the entry is
+    // removed when the thread exits. Fields are `top`, `end`, `base` at 0, 8,
+    // 16 -- asserted by `layout_offsets_match_jit_contract`.
+    let (top, end, base) = unsafe {
+        let p = ss as *const usize;
+        (p.read(), p.add(1).read(), p.add(2).read())
+    };
+    // An unallocated shadow stack is all zeros: a real, empty window.
+    if base == 0 && top == 0 && end == 0 {
+        return Some(0);
+    }
+    // The exact `#[repr(C)]` invariant. Anything else means the address did not
+    // describe a `ShadowStack` and nothing below may be dereferenced.
+    if base & 0x7 != 0 || top & 0x7 != 0 || end & 0x7 != 0 {
+        return None;
+    }
+    if base == 0 || top < base || end < top {
+        return None;
+    }
+    let span = top - base;
+    // `DEFAULT_SHADOW_SLOTS` is 256 Ki words; anything past that is not a
+    // window this VM allocates.
+    if span > cratonvm_gc::shadow_stack::DEFAULT_SHADOW_SLOTS * 8 * 16 {
+        return None;
+    }
+    let slots = span / 8;
+    for i in 0..slots {
+        // SAFETY: `[base, top)` is inside the validated window, which the
+        // blocked peer is not mutating.
+        let v = unsafe { ((base + i * 8) as *const usize).read() };
+        if let Some(o) = is_obj(v) {
+            out.push(o);
+        }
+    }
+    Some(slots)
+}
+
 pub fn helper_window_discharge_enabled() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_XT_HELPER_WINDOW_DISCHARGE").is_some()
 }
@@ -730,6 +790,18 @@ mod imp {
                         classify_helper_window_words(words, &ranges, is_obj, &mut candidates);
                     if has_jit {
                         windows += 1;
+                        // A JIT frame's oops live in the SHADOW STACK, which
+                        // is not the machine stack and so is invisible to
+                        // everything above. Scan it too, or the pin is
+                        // incomplete and any coverage credited on it is a lie.
+                        // An untrusted window refuses the pin rather than
+                        // claiming coverage it does not have.
+                        let shadow_ok = if crate::jit::conservative_roots::xt_peer_shadow_scan_enabled()
+                        {
+                            super::scan_peer_shadow_window(tid, is_obj, &mut candidates).is_some()
+                        } else {
+                            true
+                        };
                         found_total += candidates.len();
                         // PIN, exactly as the Linux arm does. A window is only
                         // COUNTED here when `snapshot_peer` returned `Some`,
@@ -737,7 +809,7 @@ mod imp {
                         // band `[rsp, committed_region_end)` were captured --
                         // so a counted window is complete by construction and
                         // needs no separate `complete` flag.
-                        if super::helper_window_pin_enabled() {
+                        if super::helper_window_pin_enabled() && shadow_ok {
                             let addrs: Vec<usize> =
                                 candidates.iter().map(|o| o.as_ptr() as usize).collect();
                             cratonvm_gc::gc_quiescence::add_xt_cycle_pinned_jit_roots(&addrs);
@@ -1541,6 +1613,18 @@ mod imp {
                     );
                     if has_jit {
                         windows += 1;
+                        // A JIT frame's oops live in the SHADOW STACK, which
+                        // is not the machine stack and so is invisible to
+                        // everything above. Scan it too, or the pin is
+                        // incomplete and any coverage credited on it is a lie.
+                        // An untrusted window refuses the pin rather than
+                        // claiming coverage it does not have.
+                        let shadow_ok = if crate::jit::conservative_roots::xt_peer_shadow_scan_enabled()
+                        {
+                            super::scan_peer_shadow_window(tid, is_obj, &mut candidates).is_some()
+                        } else {
+                            true
+                        };
                         found_total += candidates.len();
                         let roots_this_window = candidates.len();
                         // PIN, rather than refuse the whole cycle.
@@ -1562,7 +1646,7 @@ mod imp {
                         // The scan runs on the COLLECTOR's thread, so it cannot
                         // publish under the peer's `ThreadId` either; hence a
                         // per-cycle set.
-                        if complete && helper_window_pin_enabled() {
+                        if complete && shadow_ok && helper_window_pin_enabled() {
                             let addrs: Vec<usize> =
                                 candidates.iter().map(|o| o.as_ptr() as usize).collect();
                             cratonvm_gc::gc_quiescence::add_xt_cycle_pinned_jit_roots(&addrs);

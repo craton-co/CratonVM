@@ -453,6 +453,36 @@ pub fn xt_pinned_peer_publish_only() -> bool {
     })
 }
 
+/// `CRATONVM_XT_PEER_SHADOW_SCAN=1` -- scan and pin a frozen blocked peer's
+/// SHADOW STACK, not just its registers and machine stack.
+///
+/// A JIT frame's oops live in the shadow stack, a per-thread heap allocation
+/// the helper-window scan cannot see. Without this the pinned-peer depth credit
+/// claims coverage it does not have, and the class SIGSEGVs.
+pub fn xt_peer_shadow_scan_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_XT_PEER_SHADOW_SCAN").is_some()
+    })
+}
+
+thread_local! {
+    static SHADOW_ADDR_PUBLISHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Publish this thread's shadow-stack address once. Called from
+/// `set_jit_thread`, which runs on every interpreter->JIT entry, so the
+/// repeat path is one TLS bool.
+pub fn publish_self_shadow_addr_once(addr: usize) {
+    let _ = SHADOW_ADDR_PUBLISHED.try_with(|c| {
+        if c.get() {
+            return;
+        }
+        cratonvm_gc::gc_quiescence::publish_self_shadow_addr(self_os_tid(), addr);
+        c.set(true);
+    });
+}
+
 /// This thread's OS tid, in the same namespace `blocked_os_tids` reports and
 /// `helper_window_pass` enumerates -- the key the initiator will look this
 /// thread's depth up by.
