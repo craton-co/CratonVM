@@ -916,7 +916,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-127 tokens.
+130 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -925,6 +925,7 @@ export inherited from a parent shell.
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |
 | `moving-young-bounds-guard` | `CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD` |
+| `moving-young-band-object-screen` | `CRATONVM_MOVING_YOUNG_NO_BAND_OBJECT_SCREEN` |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
 | `card-table-only` | `CRATONVM_CARD_TABLE_ONLY` |
 | `full-rset-scan` | `CRATONVM_GC_FULL_RSET_SCAN` |
@@ -1009,6 +1010,8 @@ export inherited from a parent shell.
 | `sync-young-wipe` | `CRATONVM_GC_SYNC_YOUNG_WIPE` |
 | `jit-ref-store-gates` | `CRATONVM_GC_JIT_REF_STORE_GATES` |
 | `compact-tlab-alloc` | `CRATONVM_COMPACT_TLAB_ALLOC` |
+| `compact-tlab-sites` | `CRATONVM_COMPACT_TLAB_SITES` |
+| `dbg-compact-tlab` | `CRATONVM_DBG_COMPACT_TLAB` |
 | `promotion-guard` | `CRATONVM_NO_GC_PROMOTION_GUARD` |
 | `promotion-oom-guard-broad` | `CRATONVM_PROMOTION_OOM_GUARD_BROAD` |
 | `selective-promote` | `CRATONVM_NO_SELECTIVE_PROMOTE` |

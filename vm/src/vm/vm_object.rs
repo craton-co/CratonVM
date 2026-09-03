@@ -161,8 +161,11 @@ pub fn create_java_string_uninterned_gc_safe_threaded(
         let (class_id, fields) = java_string_allocation_layout(shared);
         // The shape planner, not a bare legacy size -- see
         // `plan_tlab_object_shape`.
-        let (object_size, _, _) =
-            crate::runtime::interpreter::plan_tlab_object_shape(class_id, fields);
+        let (object_size, _, _) = crate::runtime::interpreter::plan_tlab_object_shape_at(
+            class_id,
+            fields,
+            crate::runtime::interpreter::tlab_site::STRING,
+        );
         let str_obj = crate::runtime::interpreter::tlab_alloc_object(
             thread,
             shared,

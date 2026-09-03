@@ -232,14 +232,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: call.** Not rebuilt in this lane: no claim is made that the change compiles or",
     ),
     (
-        "docs/known-issues/jdk-only/W7-36-differential-view-families.md",
-        "status block says: REBUILT, NOT VERIFIED. 1 recorded and deliberately not attempted.**",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-42-differential-instrument-holes.md",
-        "status block says: `native-builtins` change is a claim about source; it is not rebuilt here.",
-    ),
-    (
         "docs/known-issues/jdk-only/W7-46-process-cluster.md",
         "status block says: **Status:** SOURCE-ONLY. **No CratonVM binary was built or run.** Lane W7-46,",
     ),
