@@ -735,6 +735,20 @@ impl Aarch64Emitter {
         self.emit_u32(inst);
     }
 
+    /// LDRB Wt, [Xn, #imm]  (unsigned offset, ZERO-EXTENDING BYTE load).
+    ///
+    /// `imm` is a byte count and is NOT scaled -- the byte form's `imm12` is in
+    /// units of 1. The width matters: the safepoint flag this exists for is a
+    /// Rust `AtomicBool`, i.e. exactly ONE byte, and the `GcBarrier` fields
+    /// that follow it in memory (`gc_generation: AtomicU64`, ...) are not zero.
+    /// Reading it with the 64-bit `ldr_imm` would fold those bytes into the
+    /// test and make a safepoint poll fire whenever the generation counter is
+    /// nonzero -- i.e. always, after the first collection.
+    pub fn ldrb_imm(&mut self, rt: Reg, rn: Reg, imm: u16) {
+        let inst = ldst_unsigned_imm(0b00, 0, 0b01, imm, rn, rt.enc());
+        self.emit_u32(inst);
+    }
+
     /// STR Xt, [Xn, Xm]  (register offset, 64-bit)
     pub fn str_reg(&mut self, rt: Reg, rn: Reg, rm: Reg) {
         let inst = ldst_reg_offset(0b11, 0, 0b00, rm, 0b011, 0, rn, rt.enc());
