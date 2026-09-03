@@ -378,6 +378,16 @@ fresh-ctor={fresh_ctor} body={body}"
             // receiver occurred" from "the entry was missing"; and a non-zero
             // `declined` is the reading that says the table filled up and the
             // feature has stopped applying to new compiles.
+            // The optimizing tier's own receiver null checks, never folded
+            // into the single-pass pair above: the two tiers prove the fact by
+            // different routes, and folding them would hide a tier that had
+            // stopped proving it at all.
+            let (ir_seed, ir_el, ir_em) =
+                cratonvm_jit::metrics::ir_receiver_null_check_counts();
+            eprintln!(
+                "[cratonvm] optimizing-tier receiver null checks: seeded={ir_seed} \
+                 elided={ir_el} emitted={ir_em}"
+            );
             let (in_reg, in_ret, in_rec, in_dec) = cratonvm_jit::implicit_null::counts();
             eprintln!(
                 "[cratonvm] implicit null checks: registered={in_reg} retired={in_ret} \
@@ -1196,7 +1206,10 @@ struct Args {
     )]
     g1_region_size: Option<String>,
 
-    /// `-XX:MaxGCPauseMillis=<n>` → G1 pause target (honoured under G1).
+    /// `-XX:MaxGCPauseMillis=<n>` → pause target. G1 sizes its mixed
+    /// collection set from it; ZGC (the default collector) sizes its
+    /// allocation budget from it, since 2026-09-03. The generational
+    /// backend ignores it.
     #[arg(
         long = "XX:MaxGCPause",
         value_name = "MS",

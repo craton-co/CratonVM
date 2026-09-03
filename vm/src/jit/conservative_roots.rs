@@ -3433,6 +3433,14 @@ fn band_has_unpublished_young_word(
     published: &std::collections::HashSet<usize>,
 ) -> bool {
     let map_slots = frame_active_map_slots(rbp, cm);
+    // The safepoint id is what makes the verifier's answer specific to THIS
+    // point in the method; without it there is no liveness question to ask.
+    let sp_id = active_safepoint_id(rbp, cm);
+    let ask = sp_id.map(|bci| move |off: i32| verifier_local_verdict(cm, off, bci));
+    let ask_ref: Option<&dyn Fn(i32) -> VerifierSlotVerdict> = match ask {
+        Some(ref f) => Some(f),
+        None => None,
+    };
     band_has_unpublished_word_with_map(
         rbp,
         frame_size,
@@ -3441,6 +3449,9 @@ fn band_has_unpublished_young_word(
         published,
         map_slots.as_ref(),
         cratonvm_gc::gen_heap::addr_is_movable,
+        // The production predicate, whose range is the committed prefix.
+        true,
+        ask_ref,
     )
 }
 
@@ -3581,12 +3592,57 @@ fn band_has_unpublished_word_with(
         published,
         None,
         is_relocatable,
+        // An arbitrary caller-supplied predicate: its words are not known to be
+        // dereferenceable, so no header screen.
+        false,
+        // No compiled method in scope, so no liveness question can be asked —
+        // and per the note in the word test, that keeps every report.
+        None,
     )
 }
 
 /// [`band_has_unpublished_word_with`] plus the active map's live slots. See
 /// [`band_slot_is_verifiable_with_map`].
 #[allow(clippy::too_many_arguments)]
+/// The object screen for the band test: is the word an actual object HEADER, or
+/// merely a number that lands in the heap's address range?
+///
+/// `is_relocatable` answers the second question and the band test used to stop
+/// there, so any stack word whose bit pattern fell inside the arena counted as
+/// an unpublished oop. Every sibling instrument in this file screens with
+/// `is_object_address` first; audit §16-§18 measured what skipping it costs
+/// (hundreds to thousands of flagged words, `verifier_oop=0` on all of them).
+///
+/// Safe to read the header only because §18 bounded `MOVABLE_BOUNDS` to the
+/// COMMITTED prefix — under the previous reservation-wide envelope this
+/// dereference could touch a page that was never mapped.
+///
+/// `CRATONVM_MOVING_YOUNG_NO_BAND_OBJECT_SCREEN=1` restores the range-only
+/// test. It is the fail-OPEN direction (more words flagged, more cycles
+/// refusing to move), so it is the safe lever to reach for if a missed root is
+/// ever suspected here.
+#[inline]
+fn band_word_is_an_object(w: usize) -> bool {
+    if band_object_screen_disabled() {
+        return true;
+    }
+    if w == 0 || w & 0x7 != 0 {
+        return false;
+    }
+    // SAFETY: the caller has already established `w` is inside the published
+    // movable range, which §18 bounds by the committed prefix, so the header
+    // words are mapped. Alignment is checked just above.
+    unsafe { cratonvm_types::plausible_object_header_at(w as *const u8) }
+}
+
+fn band_object_screen_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BAND_OBJECT_SCREEN")
+            .is_some()
+    })
+}
+
 fn band_has_unpublished_word_with_map(
     rbp: usize,
     frame_size: usize,
@@ -3595,6 +3651,21 @@ fn band_has_unpublished_word_with_map(
     published: &std::collections::HashSet<usize>,
     map_slots: Option<&std::collections::HashSet<i32>>,
     is_relocatable: impl Fn(usize) -> bool,
+    // Whether a word `is_relocatable` accepts may be DEREFERENCED.
+    //
+    // Only the caller knows. In production `is_relocatable` is
+    // `gen_heap::addr_is_movable`, whose range §18 bounds by the COMMITTED
+    // prefix, so the header words are mapped. But this function takes the
+    // predicate as a parameter, and callers that pass an arbitrary closure —
+    // every unit test here does — accept words that are not addresses at all.
+    // Reading a header from one of those is a segfault, which is exactly what
+    // the §19 object screen did until this flag existed: it inherited a safety
+    // argument that held for one of its two callers.
+    readable: bool,
+    // The liveness oracle for a JAVA-LOCAL slot, when the caller has the
+    // compiled method and safepoint id needed to consult it. `None` at a call
+    // site means "cannot ask", which is not the same as "asked and got no".
+    liveness: Option<&dyn Fn(i32) -> VerifierSlotVerdict>,
 ) -> bool {
     if frame_size == 0 || frame_size > rbp {
         return false;
@@ -3616,8 +3687,30 @@ fn band_has_unpublished_word_with_map(
         // SAFETY: aligned read inside the calling thread's own live compiled
         // frame, bounded by the frame size recorded at compile time.
         let w = unsafe { (addr as *const usize).read() };
-        if is_relocatable(w) && !published.contains(&w) {
-            return true;
+        if is_relocatable(w) && !published.contains(&w) && (!readable || band_word_is_an_object(w))
+        {
+            // The LIVENESS screen. §19 established the survivors of the object
+            // screen are header-shaped, so shape cannot separate a real missed
+            // root from a dead slot still pointing at a live object. The class
+            // file's own type maps can, for the java-locals band.
+            //
+            // ONE DIRECTION ONLY, and it is the whole safety argument here:
+            // reporting an unpublished oop makes the cycle refuse to move, so
+            // DISCARDING a report is the direction that permits movement. A
+            // word is therefore discarded only on a positive `NotOop` — the
+            // verifier saying this local definitely holds no reference at this
+            // bci. `Unknown` (an inlined frame, a slot outside the locals band,
+            // no type maps for the method) keeps the report, because "could not
+            // ask" must never read as "answered no". That is the same
+            // asymmetry §16 relies on, pointed the other way, because here the
+            // consequence of being wrong is a missed root rather than a missed
+            // refutation.
+            let dead_by_verifier = liveness
+                .map(|ask| ask(off) == VerifierSlotVerdict::NotOop)
+                .unwrap_or(false);
+            if !dead_by_verifier {
+                return true;
+            }
         }
         addr += 8;
     }

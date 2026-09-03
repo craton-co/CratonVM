@@ -4193,6 +4193,39 @@ pub(super) fn execute_invokevirtual_fast_door(
     {
         return None;
     }
+    // RECORD THE RECEIVER, exactly as `execute_invokevirtual_cached` does at
+    // its own Step 5.
+    //
+    // This door serves the WARM MONOMORPHIC hit -- which is nearly every hit.
+    // Without this it recorded nothing, so `profile_store` saw only the calls
+    // the door DECLINED: a sample biased by construction, and biased towards
+    // the receivers the door is worst at. `classify_receiver_shape` and
+    // `CallSiteEvidence` then read that sample, and the single-pass backend
+    // pre-populates virtual-call MICs from it, so a site whose common receiver
+    // never appears in the profile can be devirtualised on a rare one.
+    //
+    // Measured: `org.h2.test.store.TestRandomMapOps --Xmx 256m` returned the
+    // wrong answer (`AssertionError: (1810, null)`, seed 0, op 1033, every run
+    // in 12-23 s) with this door on. It needed BOTH ingredients -- the door,
+    // and `CRATONVM_TIER_PGO_RECEIVERS` (default ON since 2026-09-02) -- and
+    // switching either off made it clean, which is what named the interaction.
+    //
+    // The cost is the general path's cost: one `is_receiver_profiling_enabled`
+    // load, and on the profiled arm a borrowed record. A door that skips the
+    // bookkeeping its slow path owes is not a fast path, it is a different
+    // answer.
+    if crate::jit::profile::is_receiver_profiling_enabled()
+        && !crate::runtime::env_cache::no_door_receiver_record()
+    {
+        let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
+        shared.jit.profile_store.record_receiver_borrowed(
+            cid,
+            mn,
+            md,
+            site_pc,
+            actual_class_id.as_u32(),
+        );
+    }
     if is_interface && actual_class_id != cached.declaring_class_id {
         let memo_hit = !iface_select_memo_disabled()
             && thread

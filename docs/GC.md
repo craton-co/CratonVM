@@ -650,13 +650,69 @@ binary, only this switch moved):
 The worst pause falls 2.6× for a 30 % wall cost, and the cost is not an
 artefact — collecting six times as often pays the live-set-proportional half
 of a cycle (the mark, the registry snapshot) six times as often. It is off by
-default for that reason; what would earn a non-zero default is a budget
-derived from a pause TARGET rather than a percentage. `[GC] zgc-pause:` prints
+default for that reason: a percentage of capacity says nothing about how long
+the resulting pause will be, so it is a dial the operator has to tune per
+workload. The pause-target form below is what replaced it. `[GC] zgc-pause:` prints
 `alloc_trigger=<fires>/<budget bytes>` as its engagement counter. The
 regression suite is 88/88 both with the clause off (the shipped default) and
 with `CRATONVM_ZGC_ALLOC_TRIGGER=12`, so the switch is safe to turn on — what
 it has NOT had is suite time on the larger corpora, which is what a default
-change would need. The sweep prunes
+change would need.
+
+`-XX:MaxGCPauseMillis=<n>` (or `CRATONVM_ZGC_PAUSE_TARGET_MS`, **default 200**,
+added 2026-09-03) is the form that ships on. The flag reached only G1 before
+that date, so on the DEFAULT collector an operator who asked for a pause target
+got no answer and no diagnostic. It is a CEILING, not a setpoint: the clause
+starts unconstrained and engages only once a pause has actually overrun the
+target, then scales the span it will allow by `target / pause` — multiplicative,
+so it never has to model the pause cost curve, whose fixed part is large
+(~34 ms here). It tightens on an overrun, holds inside `[0.75, 1.0] × target`,
+and relaxes a quarter at a time but never back past ⅞ of the span that last
+overran. On a workload whose pauses never reach the target it never engages at
+all, which is what makes a non-zero default defensible where the percentage form
+had to ship off. `refresh_pause_target_budget` records the control law, the
+three earlier and wrong versions of it, and what each one measured.
+
+Measured on `G1ChurnPauseProbe 50 1800` at `-Xmx2048m`, whose unconstrained
+worst pause is 244 ms (release, three interleaved reps, one binary, only the
+target moved). "p50 after engagement" excludes the overruns the controller had
+to *observe* in order to react — no feedback loop can prevent those:
+
+| target | wall ms | cycles/run | p50 after engagement | worst |
+|---|---|---|---|---|
+| off | 8773 | 6 | — | 244 ms |
+| **200 ms (default)** | 9234 (+5.3 %) | 6.3 | 193 ms | 210 ms |
+| 100 ms | 11352 (+29 %) | 24 | **68 ms** | 196 ms |
+| 80 ms | 10210 (+16 %) | 26 | **57 ms** | 143 ms |
+| `ALLOC_TRIGGER=12` | 10525 (+20 %) | 36 | — | 93 ms |
+
+**Why the unit had to change.** Doubling `-Xmx` on a workload whose live set did
+not move nearly doubles the worst pause — and the *percentage* form doubles with
+it, because 12 % of a bigger heap is a bigger budget. Only a target holds:
+
+| `-Xmx` | off | `ALLOC_TRIGGER=12` | target 100 ms |
+|---|---|---|---|
+| 2048m | 313 ms worst | 85 ms worst, 246 MiB budget | p50 73.5 ms |
+| 4096m | 595 ms worst | **249 ms** worst, 492 MiB budget | p50 79.7 ms |
+
+**What it does NOT control, and why.** It holds the MEDIAN; the tail stays high.
+The pause floor on this collector is the arena's HIGH-WATER MARK, not the live
+set: the bitmap sweep covers `[base, low_cursor)` and the cursor does not
+retract, so once any cycle has run the bump cursor out to 1.3 GiB, every later
+pause pays a scan over that span whatever the allocation budget is. No
+allocation trigger can undo that — only compaction and a cursor retraction can
+(`CRATONVM_ZGC_RELOCATE`, `Arena::retract_cursor_to`). That is why a 100 ms
+target is reachable at `-Xmx2048m` on this probe and not at `-Xmx4096m`, and
+why the loop gives up after three unreachable verdicts rather than paying one
+unconstrained cycle per retry (measured: 56 cycles and +101 % wall for a p50 of
+103.8 ms — worse on both axes than never trying).
+
+`[GC] zgc-pause:` prints `alloc_trigger=<fires>/<budget bytes>` and
+`pause_target=<ms>/<affordable span>/unreachable=<n>` as the engagement
+counters. A climbing `unreachable` says the target is not achievable at this
+live set, which is a different answer from "the loop is holding the target" and
+produces an identical budget without it.
+ The sweep prunes
 dead bases in place and feeds the exact dead list to the monitor
 registry. Non-moving ⇒ the pointer map is always empty and
 no barriers are needed; reference semantics come entirely from the VM-level

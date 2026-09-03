@@ -1275,6 +1275,7 @@ mod tests {
             exit: 0,
             safepoints: Vec::new(),
             uses: UseLists::default(),
+            receiver_param: None,
         }
     }
 

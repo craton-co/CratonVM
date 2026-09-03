@@ -14018,8 +14018,11 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // orchestrated GC this method cannot (see `safe_native_call_impl`).
         // The shape planner, not a bare legacy size -- see
         // `plan_tlab_object_shape`.
-        let (requested_size, _, _) =
-            crate::runtime::interpreter::plan_tlab_object_shape(class_id, slots);
+        let (requested_size, _, _) = crate::runtime::interpreter::plan_tlab_object_shape_at(
+            class_id,
+            slots,
+            crate::runtime::interpreter::tlab_site::NATIVE,
+        );
         if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
             if let Some(obj) = crate::runtime::interpreter::tlab_alloc_object(
                 self.thread,

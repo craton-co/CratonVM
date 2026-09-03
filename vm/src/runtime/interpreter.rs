@@ -5410,12 +5410,11 @@ fn execute_frame_from_index(
     // call is armed: PGO (it records call sites and receivers), the invoke
     // traces, the frame trace, or a virtual thread. See
     // `execute_invokevirtual_fast_door`.
-    // DEFAULT-OFF since 2026-09-03: this door returns wrong answers.
-    // `TestRandomMapOps` fails deterministically with it on and is clean with
-    // it off; see `env_cache::invoke_fast_door_opt_in`. Correctness first --
-    // the door is recoverable the moment the defect is found.
-    let invoke_fast_door_on = crate::runtime::env_cache::invoke_fast_door_opt_in()
-        && !crate::runtime::env_cache::no_invoke_fast_door()
+    // Default-ON again as of 2026-09-03: the wrong answers this door produced
+    // were the receiver profile it was not recording, and it records it now.
+    // `CRATONVM_JIT_INVOKE_FAST_DOOR=1` remains accepted (it forced the door on
+    // while the default was off) and is now a no-op.
+    let invoke_fast_door_on = !crate::runtime::env_cache::no_invoke_fast_door()
         && !pgo_enabled
         && !crate::runtime::env_cache::frame_trace()
         && !crate::runtime::env_cache::dbg_h2trace()

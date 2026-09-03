@@ -1308,6 +1308,7 @@ mod tests {
             exit: 0,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -1327,6 +1328,7 @@ mod tests {
             exit: 0,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -1871,6 +1873,7 @@ mod tests {
                 stack: vec![1234],
             }],
             uses: Default::default(),
+            receiver_param: None,
         };
         g.add(Op::Phi, IrType::Int, vec![NO_NODE, 3], None);
         g.add(Op::Return, IrType::Void, vec![u32::MAX - 1], None);
@@ -1887,6 +1890,7 @@ mod tests {
             exit: 0,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         assert!(verify_graph(&g, "empty", VerifyOptions::all()).is_err());
     }
