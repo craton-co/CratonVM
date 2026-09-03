@@ -647,13 +647,48 @@ impl Compiler {
                     // depth-recording call site records marks alongside —
                     // but degrades to the pre-existing, already-reviewed-safe
                     // behavior rather than panicking or guessing).
-                    self.stack_oop_marks = self
+                    //
+                    // ...AND SAY SO. The line below used to read
+                    // `self.stack_oop_marks_exact = expected_depth == 0`, which
+                    // is the answer for the all-`false` FALLBACK the paragraph
+                    // above replaced: a reconstruction that guessed could not
+                    // claim exactness at any nonzero depth. When the recorded
+                    // marks are present AND their length matches, nothing was
+                    // guessed -- they are the marks a predecessor actually had
+                    // here -- and the flag was still reporting otherwise.
+                    //
+                    // It is not a cosmetic disagreement. `record_oop_map` seeds
+                    // `map_incomplete` from this flag
+                    // (`map_incomplete_cause::MARKS_INEXACT`), so every
+                    // safepoint in the revived block loses its relocation claim
+                    // and, through `fully_shadow_covered`, so does the whole
+                    // method. MEASURED: on `RTreeRangeGc` and `RPriorityQueueGc`
+                    // this was the ONLY remaining cause -- `checkMap` 6,
+                    // `checkSet` 9, `singleThreaded` 3 -- and every failing pc
+                    // is the arm or the merge of one `?:` feeding a string
+                    // concat, the shape javac emits constantly.
+                    //
+                    // Sound for the same reason the recorded marks are usable at
+                    // all: a merge point's predecessors must agree about which
+                    // stack slots hold references, because JVMS 4.10.1 admits no
+                    // merge of a reference with a primitive. Whichever
+                    // predecessor `record_branch_target_depth` captured first
+                    // therefore speaks for all of them. The fallback still fails
+                    // closed -- it genuinely did guess.
+                    let recorded_marks = self
                         .branch_target_stack_oop_marks
                         .get(&pc)
                         .filter(|marks| marks.len() == expected_depth)
-                        .cloned()
-                        .unwrap_or_else(|| vec![false; expected_depth]);
-                    self.stack_oop_marks_exact = expected_depth == 0;
+                        .cloned();
+                    // The kill switch gates only the CLAIM. The marks
+                    // themselves are the earlier fix and are used either way,
+                    // so `CRATONVM_JIT_MERGE_MARKS_EXACT=0` restores exactly
+                    // the previous flag without reintroducing the mis-marking
+                    // that fix was for.
+                    self.stack_oop_marks_exact = expected_depth == 0
+                        || (recorded_marks.is_some() && merge_marks_exact_enabled());
+                    self.stack_oop_marks =
+                        recorded_marks.unwrap_or_else(|| vec![false; expected_depth]);
                 } else {
                     self.pc_to_native[pc] = -1;
                     pc += bytecode_len_at(code, pc);

@@ -2473,6 +2473,49 @@ pub(super) fn direct_call_arg_maps_enabled() -> bool {
 /// An argument whose home is NOT a frame slot still fails the safepoint closed:
 /// a register- or xmm-resident value is precisely what a frame-slot map cannot
 /// describe, and that is the case the flag was right about.
+/// May a REVIVED merge block claim its reconstructed operand-stack oop marks
+/// are exact (`CRATONVM_JIT_MERGE_MARKS_EXACT`, **default-ON; `=0` restores the
+/// pre-fix flag**)?
+///
+/// When the walk arrives at a branch target dead (the block before it ended in
+/// a `goto`/`return`/`athrow`), the operand stack is reconstructed from
+/// `branch_target_stack_depth` and the marks from
+/// `branch_target_stack_oop_marks`. The marks half was fixed once already: a
+/// blanket `vec![false; depth]` there permanently mis-marked any reference
+/// carried across the branch from before it.
+///
+/// The EXACTNESS flag was not fixed with it. It kept reading
+/// `expected_depth == 0` -- the honest answer for the blanket fallback, and the
+/// wrong one once the real marks are in hand. `record_oop_map` seeds
+/// `map_incomplete` from that flag, so every safepoint in the revived block
+/// lost its relocation claim, and `fully_shadow_covered` ANDs it over the
+/// method.
+///
+/// MEASURED: on `RTreeRangeGc` and `RPriorityQueueGc` it was the ONLY remaining
+/// cause after the self-call repair -- `checkMap` 6, `checkSet` 9,
+/// `singleThreaded` 3 -- and every failing pc is an arm or the merge of one
+/// `?:` feeding a string concat.
+///
+/// Sound for the same reason the recorded marks are usable at all: JVMS 4.10.1
+/// admits no merge of a reference with a primitive, so a merge point's
+/// predecessors must agree about which slots hold references and whichever one
+/// was captured first speaks for all of them. The fallback -- no recorded marks,
+/// or a length that does not match the depth -- still fails closed, because
+/// there it genuinely did guess.
+pub(super) fn merge_marks_exact_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MERGE_MARKS_EXACT") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
 pub(super) fn self_call_arg_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
