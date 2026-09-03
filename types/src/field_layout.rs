@@ -1279,6 +1279,49 @@ pub fn compact_field_storage_in(
 /// this one predicate, so an object can never be marked compact with a partial
 /// or stale class recipe.
 #[inline]
+/// Has this process ever had more than one `ClassStore`?
+///
+/// `false` is the state every production embedding is in, and the state in
+/// which a domain screen cannot change any answer: `layout_owner` returns
+/// `None` for every `class_id`, so `layout_domain_owns` is vacuously true
+/// whatever domain is passed. Callers that cannot cheaply obtain the owning
+/// heap's domain use this to decide whether they may plan a compact layout at
+/// all — see [`compact_tlab_body_size`].
+#[inline]
+pub fn single_layout_domain() -> bool {
+    NEXT_LAYOUT_DOMAIN.load(std::sync::atomic::Ordering::Relaxed) <= 1
+}
+
+/// The compact body size for a TLAB-allocated object, or `None` for "allocate
+/// the uniform 16-byte-cell layout".
+///
+/// # Why this is a separate entry point
+///
+/// The interpreter's TLAB fast path has no cheap route to the owning heap's
+/// layout domain — it reaches the heap through a trait object on a path where
+/// a registry lock would be the dominant cost — so it cannot call
+/// [`compact_object_body_size`]. Rather than pass a domain it has not got,
+/// this refuses outright unless the process has a single `ClassStore`, which is
+/// exactly the condition under which the domain screen is vacuous. A
+/// multi-`ClassStore` process therefore keeps the legacy TLAB shape, which is
+/// the pre-2026-09-03 behaviour and always sound.
+///
+/// The remaining predicate is deliberately the SAME one the JIT's inline
+/// `new` emitter uses (`x64::objects::emit_inline_tlab_new`): a registered
+/// layout whose `field_count` matches this allocation exactly. That emitter
+/// has been allocating compact bodies inline since long before this function
+/// existed, so a class allocated by compiled code and the same class allocated
+/// by the interpreter now agree by construction — which is the property that
+/// matters, and the one they did not have.
+pub fn compact_tlab_body_size(class_id: u32, field_count: usize) -> Option<usize> {
+    if !compact_ref_fields_enabled() || !single_layout_domain() {
+        return None;
+    }
+    class_layout(class_id)
+        .filter(|l| l.field_count() == field_count)
+        .map(|l| l.body_size as usize)
+}
+
 pub fn compact_object_body_size(domain: u32, class_id: u32, field_count: usize) -> Option<usize> {
     if !compact_ref_fields_enabled() {
         return None;

@@ -3233,7 +3233,10 @@ pub(super) fn gc_alloc_object(
 ) -> Result<ObjectRef, MethodCallFailed> {
     use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
 
-    let total_size = HEADER_SIZE + num_fields * SLOT_SIZE;
+    // ONE shape decision for this allocation, used both to reserve the region
+    // and to stamp the header. See `plan_tlab_object_shape`.
+    let (total_size, _body_size, _gc_flags) = plan_tlab_object_shape(class_id, num_fields);
+    let _ = (HEADER_SIZE, SLOT_SIZE);
 
     // TLAB fast path: try thread-local bump allocation (no lock)
     let obj = if total_size <= cratonvm_gc::tlab::tlab_max_alloc() {
@@ -3429,7 +3432,25 @@ pub(crate) fn tlab_alloc_object(
     num_fields: usize,
     total_size: usize,
 ) -> Option<ObjectRef> {
-    tlab_alloc_object_inner(thread, shared, class_id, num_fields, total_size, false)
+    // Re-planned here rather than taken as an argument: every caller computes
+    // `total_size` from the same planner, so this reads the same answer, and a
+    // wrapper that took the shape separately would let a caller pass a size
+    // and a shape that disagree.
+    let (planned_total, body_size, gc_flags) = plan_tlab_object_shape(class_id, num_fields);
+    debug_assert_eq!(
+        planned_total, total_size,
+        "a TLAB object's reserved size must be the one its shape plan asked for"
+    );
+    tlab_alloc_object_inner(
+        thread,
+        shared,
+        class_id,
+        num_fields,
+        body_size,
+        gc_flags,
+        total_size,
+        false,
+    )
 }
 
 /// TLAB hit-only path for the tiny byte arrays backing compact dynamic Strings.
@@ -3512,7 +3533,21 @@ pub(crate) fn tlab_alloc_object_guarded_refill(
     num_fields: usize,
     total_size: usize,
 ) -> Option<ObjectRef> {
-    tlab_alloc_object_inner(thread, shared, class_id, num_fields, total_size, true)
+    let (planned_total, body_size, gc_flags) = plan_tlab_object_shape(class_id, num_fields);
+    debug_assert_eq!(
+        planned_total, total_size,
+        "a TLAB object's reserved size must be the one its shape plan asked for"
+    );
+    tlab_alloc_object_inner(
+        thread,
+        shared,
+        class_id,
+        num_fields,
+        body_size,
+        gc_flags,
+        total_size,
+        true,
+    )
 }
 
 /// The ARRAY twin of [`tlab_alloc_object_guarded_refill`], for the JIT's
@@ -3787,6 +3822,80 @@ pub(super) fn tlab_refill_wedge_break(thread: &mut JvmThread, shared: &SharedVm)
     true
 }
 
+/// `CRATONVM_COMPACT_TLAB_ALLOC=1` — let the interpreter's TLAB fast path
+/// allocate the COMPACT body shape for classes that have one, instead of the
+/// uniform 16-byte-cell layout it has always written.
+///
+/// **Default OFF.** Not because the shape is wrong — the JIT's inline `new` has
+/// emitted exactly this shape for months, and `gen_heap::alloc_object` (the
+/// TLAB-miss path) plans it too, so the same class already gets both shapes
+/// today depending on which allocator ran. It is off because the one previous
+/// attempt to change this path, on the ZGC arm on 2026-09-02, MISCOMPILED
+/// `probes/FjpProbe.java` — wrong per-task sums, no collection involved — and
+/// the comment it left says the unification has to happen at every allocation
+/// site at once with that probe in the gate. This lands the unification and the
+/// gate; the default is the measurement's to earn.
+pub(crate) fn compact_tlab_alloc_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_COMPACT_TLAB_ALLOC").is_some()
+    })
+}
+
+/// TLAB objects given the compact body shape, and those left legacy.
+///
+/// A count needs its complement to be readable: "compact=0" means either that
+/// the switch is off or that no allocated class has a registered layout, and
+/// those are different facts.
+static TLAB_COMPACT_OBJECTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TLAB_LEGACY_OBJECTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bytes the compact shape saved against what the legacy shape would have
+/// taken for the same allocations. The point of the change, in the only unit
+/// that matters.
+static TLAB_COMPACT_BYTES_SAVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(compact, legacy, bytes_saved)` for TLAB object allocations.
+pub fn tlab_object_shape_counts() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        TLAB_COMPACT_OBJECTS.load(Ordering::Relaxed),
+        TLAB_LEGACY_OBJECTS.load(Ordering::Relaxed),
+        TLAB_COMPACT_BYTES_SAVED.load(Ordering::Relaxed),
+    )
+}
+
+/// The shape a TLAB object allocation should take: `(total_size, body_size,
+/// gc_flags)`, where a `body_size` of 0 and no flags mean the legacy uniform
+/// 16-byte-cell layout.
+///
+/// ONE lookup per allocation, and the result is carried to the header stamp
+/// rather than recomputed there. Two independent lookups could disagree if the
+/// class's layout were replaced between them (the exact hazard the JIT's inline
+/// emitter carries a layout-replace guard for), and a body sized by one lookup
+/// with a header stamped by the other is heap corruption.
+#[inline]
+pub(crate) fn plan_tlab_object_shape(class_id: ClassId, num_fields: usize) -> (usize, u32, u8) {
+    use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+    use std::sync::atomic::Ordering;
+    let legacy_total = HEADER_SIZE + num_fields * SLOT_SIZE;
+    if compact_tlab_alloc_enabled() {
+        if let Some(body) = cratonvm_types::compact_tlab_body_size(class_id.as_u32(), num_fields) {
+            if let (Some(total), Ok(body_u32)) =
+                (HEADER_SIZE.checked_add(body), u32::try_from(body))
+            {
+                TLAB_COMPACT_OBJECTS.fetch_add(1, Ordering::Relaxed);
+                TLAB_COMPACT_BYTES_SAVED
+                    .fetch_add(legacy_total.saturating_sub(total) as u64, Ordering::Relaxed);
+                return (total, body_u32, cratonvm_types::GC_FLAG_COMPACT);
+            }
+        }
+    }
+    TLAB_LEGACY_OBJECTS.fetch_add(1, Ordering::Relaxed);
+    (legacy_total, 0, 0)
+}
+
 /// Which header [`tlab_alloc_object_inner`] should stamp on the region it
 /// reserves. Everything else about the allocation — the TLAB fast path, the
 /// refill gate, the wedge breakers, the retire-before-replace protocol — is
@@ -3795,7 +3904,15 @@ pub(super) fn tlab_refill_wedge_break(thread: &mut JvmThread, shared: &SharedVm)
 #[derive(Clone, Copy)]
 pub(super) enum TlabShape {
     /// `num_fields` object slots.
-    Object { num_fields: usize },
+    /// `body_size`/`gc_flags` carry the shape [`plan_tlab_object_shape`]
+    /// chose, so the header stamp and the size the caller reserved come from
+    /// ONE lookup. A zero `body_size` with no flags is the legacy uniform
+    /// 16-byte-cell layout.
+    Object {
+        num_fields: usize,
+        body_size: u32,
+        gc_flags: u8,
+    },
     /// `length` elements of `element_type`.
     Array {
         element_type: ArrayElementType,
@@ -3824,7 +3941,11 @@ impl TlabShape {
             // see `gc/src/g1.rs`'s zeroed-region closure. Minting eagerly is
             // not an option to get it back: a non-zero mark word loses the
             // thin-lock CAS, so every `synchronized` block would inflate.
-            TlabShape::Object { num_fields } => init_object_header(ptr, class_id, num_fields),
+            TlabShape::Object {
+                num_fields,
+                body_size,
+                gc_flags,
+            } => init_object_header(ptr, class_id, num_fields, body_size, gc_flags),
             TlabShape::Array {
                 element_type,
                 length_u32,
@@ -3844,11 +3965,14 @@ impl TlabShape {
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn tlab_alloc_object_inner(
     thread: &mut JvmThread,
     shared: &SharedVm,
     class_id: ClassId,
     num_fields: usize,
+    body_size: u32,
+    gc_flags: u8,
     total_size: usize,
     refill_needs_young_room: bool,
 ) -> Option<ObjectRef> {
@@ -3866,7 +3990,11 @@ pub(super) fn tlab_alloc_object_inner(
         thread,
         shared,
         class_id,
-        TlabShape::Object { num_fields },
+        TlabShape::Object {
+            num_fields,
+            body_size,
+            gc_flags,
+        },
         total_size,
         refill_needs_young_room,
     )
@@ -4192,13 +4320,22 @@ fn note_tlab_legacy_object(class_id: ClassId, num_fields: usize) {
 /// `gc::g1` have always assigned a fresh hash here; this brings the
 /// fast path into agreement with them.
 #[inline(always)]
-pub(super) fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: usize) {
+pub(super) fn init_object_header(
+    ptr: *mut u8,
+    class_id: ClassId,
+    num_fields: usize,
+    body_size: u32,
+    gc_flags: u8,
+) {
     use cratonvm_gc::heap::{ArrayElementType, ObjectHeader, ObjectKind};
     let header = ObjectHeader::new(
         class_id,
         ObjectKind::Object,
         ArrayElementType::Reference,
-        0,
+        // The COMPACT shape mirrors its packed body size here, exactly as
+        // `gen_heap::alloc_object` and the JIT's inline `new` both do; the
+        // legacy shape writes 0. See `plan_tlab_object_shape`.
+        body_size,
         // A class-file field table is u16-sized, so this is unreachable for a
         // verified Java class. Keep the allocation path panic-free if a corrupt
         // synthetic caller nevertheless violates that invariant.
@@ -4206,6 +4343,13 @@ pub(super) fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: us
     );
     // SAFETY: ptr points to freshly allocated, properly aligned memory for an ObjectHeader.
     unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
+    if gc_flags != 0 {
+        // SAFETY: the header was just written at `ptr`, so this reads a live,
+        // fully initialised `ObjectHeader`; `add_gc_flags` takes `&self` and
+        // drives the atomic mark word.
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        header.add_gc_flags(gc_flags);
+    }
     // Every header this function writes is LEGACY — `array_length = 0`, no
     // `GC_FLAG_COMPACT` — regardless of whether the class has a registered
     // compact layout, because this path never consults `plan_object_alloc`.

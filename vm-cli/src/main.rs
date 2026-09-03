@@ -276,6 +276,21 @@ fn maybe_dump_shutdown_reports() {
                     }
                 }
             }
+            // TLAB object SHAPES. The pair plus the bytes, because "compact=0"
+            // means either that `CRATONVM_COMPACT_TLAB_ALLOC` is off or that no
+            // allocated class has a registered layout, and those are different
+            // facts -- while the saving is the only number that says whether
+            // the change was worth making.
+            {
+                let (compact, legacy, saved) =
+                    cratonvm_vm::runtime::interpreter::tlab_object_shape_counts();
+                if compact != 0 || legacy != 0 {
+                    eprintln!(
+                        "[cratonvm] TLAB object shapes: compact={compact} legacy={legacy} \
+bytes-saved={saved}"
+                    );
+                }
+            }
             let (gated, declined) = cratonvm_jit::x64::ref_store_site_counts();
             eprintln!(
                 "[cratonvm] compiled reference stores: gated={gated} declined={declined}"
