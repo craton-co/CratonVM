@@ -580,7 +580,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-315 tokens.
+320 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -808,6 +808,8 @@ export inherited from a parent shell.
 | `osr-inline-gate` | `CRATONVM_JIT_NO_OSR_INLINE_GATE` |
 | `invoke-fast-door` | `CRATONVM_JIT_NO_INVOKE_FAST_DOOR` |
 | `nonvirtual-fast-door` | `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` |
+| `frame-slot-reuse` | `CRATONVM_JIT_NO_FRAME_SLOT_REUSE` |
+| `frame-slot-reuse` | `CRATONVM_JIT_NO_FRAME_SLOT_REUSE` |
 | `iface-select-memo` | `CRATONVM_JIT_NO_IFACE_SELECT_MEMO` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
 | `ir-unresumable-trap-guard` | `CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD` |
@@ -889,6 +891,9 @@ export inherited from a parent shell.
 | `xt-peer-deadline-ms` | `CRATONVM_XT_PEER_DEADLINE_MS` |
 | `xt-peer-total-ms` | `CRATONVM_XT_PEER_TOTAL_MS` |
 | `direct-call-arg-maps` | `CRATONVM_JIT_DIRECT_CALL_ARG_MAPS` |
+| `self-call-arg-maps` | `CRATONVM_JIT_SELF_CALL_ARG_MAPS` |
+| `merge-marks-exact` | `CRATONVM_JIT_MERGE_MARKS_EXACT` |
+| `inline-oop-coverage` | `CRATONVM_JIT_INLINE_OOP_COVERAGE` |
 | `ir-gc-point-maps` | `CRATONVM_JIT_IR_GC_POINT_MAPS` |
 | `zero-spid` | `CRATONVM_JIT_ZERO_SPID` |
 | `int-value-direct` | `CRATONVM_JIT_INT_VALUE_DIRECT` |
@@ -902,7 +907,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-121 tokens.
+124 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -915,6 +920,7 @@ export inherited from a parent shell.
 | `verify-rset` | `CRATONVM_GC_VERIFY_RSET` |
 | `compact-ref-fields` | `CRATONVM_COMPACT_REF_FIELDS` |
 | `pack-fields-by-width` | `CRATONVM_PACK_FIELDS_BY_WIDTH` |
+| `layout-scan-cache` | `CRATONVM_GC_LAYOUT_SCAN_CACHE` |
 | `compressed-oops` | `CRATONVM_COMPRESSED_OOPS` |
 | `default-heap-ergonomics` | `CRATONVM_DEFAULT_HEAP_ERGONOMICS` |
 | `default-heap-max-mb` | `CRATONVM_DEFAULT_HEAP_MAX_MB` |
@@ -968,6 +974,7 @@ export inherited from a parent shell.
 | `gpu-device-pool` | `CRATONVM_GPU_DEVICE_POOL` |
 | `gpu-wait-latch` | `CRATONVM_GPU_WAIT_LATCH` |
 | `gpu-zerocopy` | `CRATONVM_GPU_NO_ZEROCOPY` |
+| `gpu-submission-drain` | `CRATONVM_GPU_NO_SUBMISSION_DRAIN` |
 | `lhm-root-all` | `CRATONVM_LHM_ROOT_ALL` |
 | `max-inflated-bytes` | `CRATONVM_MAX_INFLATED_BYTES` |
 | `mirror-pin-young-defer` | `CRATONVM_NO_MIRROR_PIN_YOUNG_DEFER` |
@@ -1017,6 +1024,7 @@ export inherited from a parent shell.
 | `zgc-gen-promotion-age` | `CRATONVM_ZGC_GEN_PROMOTION_AGE` |
 | `zgc-gen-minors-per-major` | `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` |
 | `zgc-gen-nursery-percent` | `CRATONVM_ZGC_GEN_NURSERY_PERCENT` |
+| `zgc-alloc-trigger` | `CRATONVM_ZGC_ALLOC_TRIGGER` |
 | `zgc-sweep-header-zero` | `CRATONVM_ZGC_SWEEP_HEADER_ZERO` |
 | `zgc-sweep-dead-runs` | `CRATONVM_ZGC_SWEEP_DEAD_RUNS` |
 | `zgc-mark-ctx-direct` | `CRATONVM_ZGC_MARK_CTX_DIRECT` |

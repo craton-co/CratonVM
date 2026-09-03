@@ -1525,14 +1525,30 @@ pub fn try_dispatch(
     let timed = cratonvm_types::gpu_offload_phase_census::enabled();
     let entered = std::time::Instant::now();
     let mut mark = entered;
+    // A refusal is charged to `gpu_refusal_census`, which is the only
+    // instrument that can see it: the dispatch table's `note_call` sits at
+    // the point of no return, so every fall-through below is invisible
+    // there. `refuse!` stamps the reason and the elapsed total.
+    macro_rules! refuse {
+        ($reason:expr, $outcome:expr) => {{
+            if timed {
+                cratonvm_types::gpu_refusal_census::note_refusal($reason);
+                cratonvm_types::gpu_refusal_census::add(
+                    cratonvm_types::gpu_refusal_census::TOTAL,
+                    entered.elapsed().as_nanos() as u64,
+                );
+            }
+            return Ok($outcome);
+        }};
+    }
     let cm = shared.classes.class_manager.read();
     let class_id = match cm.get_loaded_class_id(class_name) {
         Some(id) => id,
-        None => return Ok(DispatchOutcome::FallThrough),
+        None => refuse!(0, DispatchOutcome::FallThrough),
     };
     let class = match cm.get_class(class_id) {
         Some(c) => c,
-        None => return Ok(DispatchOutcome::FallThrough),
+        None => refuse!(0, DispatchOutcome::FallThrough),
     };
     let method_index = match class
         .methods
@@ -1540,10 +1556,12 @@ pub fn try_dispatch(
         .position(|m| &*m.name == method_name && &*m.descriptor == method_descriptor)
     {
         Some(i) => i as u16,
-        None => return Ok(DispatchOutcome::FallThrough),
+        None => refuse!(1, DispatchOutcome::FallThrough),
     };
     if timed {
-        cratonvm_types::gpu_offload_phase_census::add(0, mark.elapsed().as_nanos() as u64);
+        let n = mark.elapsed().as_nanos() as u64;
+        cratonvm_types::gpu_offload_phase_census::add(0, n);
+        cratonvm_types::gpu_refusal_census::add(0, n);
         mark = std::time::Instant::now();
     }
     // Hold the class-manager read lock for the full lookup_or_compile
@@ -1565,7 +1583,9 @@ pub fn try_dispatch(
     );
     drop(cm);
     if timed {
-        cratonvm_types::gpu_offload_phase_census::add(1, mark.elapsed().as_nanos() as u64);
+        let n = mark.elapsed().as_nanos() as u64;
+        cratonvm_types::gpu_offload_phase_census::add(1, n);
+        cratonvm_types::gpu_refusal_census::add(1, n);
         mark = std::time::Instant::now();
     }
 
@@ -1594,7 +1614,13 @@ pub fn try_dispatch(
             let is_long_reduction =
                 kernel.signature.is_reduction && method_descriptor.ends_with(")J");
             if !is_void && !is_int_reduction && !is_long_reduction {
-                return Ok(DispatchOutcome::FallThrough);
+                if timed {
+                    cratonvm_types::gpu_refusal_census::add(
+                        2,
+                        mark.elapsed().as_nanos() as u64,
+                    );
+                }
+                refuse!(3, DispatchOutcome::FallThrough);
             }
             // 2. Real per-element work must clear `--gpu-min-work`. The
             //    analyzer's `estimated_work` is a fixed 1<<20 placeholder
@@ -1608,10 +1634,16 @@ pub fn try_dispatch(
             //    de-offload.
             let runtime_work = largest_primitive_array_len(shared, args);
             if (runtime_work as u32) < shared.config.gpu_min_work {
+                if timed {
+                    cratonvm_types::gpu_refusal_census::add(
+                        2,
+                        mark.elapsed().as_nanos() as u64,
+                    );
+                }
                 // Per-call gate, not a property of the method: the next
                 // call at this site may pass a larger array, so the site
                 // must stay on the slow path where this hook can see it.
-                return Ok(DispatchOutcome::FallThroughKeepHooked);
+                refuse!(4, DispatchOutcome::FallThroughKeepHooked);
             }
             // Marshal args → device, launch the kernel, synchronize, and
             // write kernel-written arrays back into the Java heap (void)
@@ -1723,7 +1755,9 @@ pub fn try_dispatch(
                 }
             }
         }
-        LookupOutcome::Skip | LookupOutcome::Blacklisted => Ok(DispatchOutcome::FallThrough),
+        LookupOutcome::Skip | LookupOutcome::Blacklisted => {
+            refuse!(2, DispatchOutcome::FallThrough)
+        }
     }
 }
 
@@ -3855,6 +3889,7 @@ pub fn register_submission(sub: std::sync::Arc<StreamSubmission>) -> u64 {
         table.insert(h, sub);
         table.len()
     };
+    cratonvm_types::gpu_submission_census::note_register(live as u64);
     if live >= SUBMISSION_WARN_THRESHOLD && live.is_power_of_two() {
         tracing::warn!(
             live_submissions = live,
@@ -3922,7 +3957,9 @@ pub fn lookup_submission(handle: u64) -> Option<std::sync::Arc<StreamSubmission>
 /// resulting +1 rather than hiding it.
 #[cfg(feature = "gpu-offload")]
 pub fn release_submission(handle: u64) {
-    submissions().write().remove(&handle);
+    if submissions().write().remove(&handle).is_some() {
+        cratonvm_types::gpu_submission_census::note_release();
+    }
 }
 
 // ── Known-issues followups #3: spontaneous completion reaper ─────────

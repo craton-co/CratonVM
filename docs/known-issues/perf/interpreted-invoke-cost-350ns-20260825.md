@@ -1183,6 +1183,9 @@ The two measurements a future attempt should take before writing any code:
    directly into the frame stack's slot (rather than constructing it and
    moving it in) targets the first; the pooled-buffer hand-off targets the
    second. Both are size-independent, both are worth more than the fill.
+   **The second is taken by the section below**, which retires frames instead
+   of destroying them: `ret_recycle` 19.6 cycles to 9.0, and 55-90 ns off
+   every interpreted call shape.
 2. The GC scan is what forces the locals buffer to be initialised at all
    (`scan_local_objects` walks the whole buffer and would otherwise root a
    previous frame's dead references). An arena has the same obligation, and
@@ -1191,6 +1194,87 @@ The two measurements a future attempt should take before writing any code:
    verifier's type maps are already in this VM and are described elsewhere in
    these notes as "the independent oracle"; that is the piece to build first,
    because it is what makes an arena legal, not merely fast.
+
+### The half of the arena that needs no oop maps: retire the frame, keep the slot
+
+The re-scoping above splits the frame cost in two, and only one half waits on
+precise oop maps:
+
+* the **fill** — initialising `locals` so the GC scan cannot see a previous
+  frame's dead references. 14 cycles. Needs oop maps to remove.
+* the **churn** — two pooled `(Vec, Vec)` tuples popped and pushed back, four
+  `Vec` headers taken and reinstalled, a `ValueStack` rebuilt, a ~220-byte
+  `Frame` constructed and moved into the frame stack, and the mirror image on
+  return. The other ~140 cycles. Needs nothing.
+
+This takes the churn.
+
+`FrameStack` now separates its **logical depth** from its allocation.
+`buf.len()` is a high-water mark; the slots above `depth` hold *retired*
+frames whose four buffers stay exactly where they are. A return retires the
+frame where it lies (`retire_top`), and the next call at that depth is rebuilt
+in its buffers by `Frame::reset_cached_compact` — no pool round trip, no `Vec`
+headers moved, no `Frame` moved.
+
+Nothing above `depth` is live. Every accessor on the type is bounded by it —
+`len`, `iter`, `last`, `get`, `as_slice`, `Deref`, `Index`, `IntoIterator` —
+so the GC root scan, the stack walker and every `frames[i]` see exactly the
+frames they saw before. A by-value push still harvests the retired slot into
+the thread pools first, so the pooled constructors keep the recycling they
+have always had.
+
+All three fast doors now share one push (`invoke_fast::push_frame_verbatim`).
+That is not tidying: the virtual door had carried its own copy of that tail
+since the second pass, and the copy is precisely why the first measurement of
+this change showed the static arms improving and `virtual1` flat.
+
+`probes/Dispatch.java` at 200k x 5, ns/iteration, **six** interleaved passes,
+two arms of one binary (`CRATONVM_JIT_NO_FRAME_SLOT_REUSE` off and on), Azure
+at load ~10:
+
+| arm | reuse ON | reuse OFF |
+|---|---|---|
+| `nocall` (control) | 47 36 30 29 29 29 | 52 30 44 29 29 29 |
+| `static0` | 153 162 146 132 129 109 | 220 190 181 218 200 145 |
+| `static1` | 144 188 149 169 144 117 | 241 224 192 239 213 151 |
+| `static4` | 181 240 158 179 172 133 | 247 227 280 294 224 170 |
+| `virtual1` | 147 158 202 147 168 125 | 248 244 209 218 216 160 |
+| `special1` | 193 162 146 140 154 126 | 226 200 239 253 225 161 |
+| `iface1` | 231 227 188 224 160 127 | 320 338 228 274 245 162 |
+| `ifaceInherited` | 144 173 141 199 205 125 | 288 212 265 246 247 164 |
+
+**Every call shape improves in all six passes, pairwise**, by 55-90 ns —
+roughly a third off an interpreted call — while `nocall`, which pushes no
+frame at all, is flat. `CRATONVM_DBG=invoke-phases` on the same binary puts
+the saving where the design says it is: `ret_recycle` 19.6 cycles → 9.0, and
+the whole call 467 → 413.
+
+#### Two bugs the tests and the control caught first
+
+Both are worth recording because neither would have shown up as a wrong
+answer, and one of them was invisible until the control arm was believed.
+
+1. **`MethodEntry` fired twice.** Splitting the event out of
+   `push_frame_and_fire_entry` so the reusing push could fire it too left the
+   original block in place. Three JVMTI unit tests failed immediately.
+2. **The switch-off arm poisoned the buffer pools.** On the pooled path the
+   husk's buffers have *already* been harvested, so
+   `harvest_retired_slot` handed the pools four **zero-capacity** `Vec`s;
+   every later frame build then popped an empty buffer and reallocated from
+   scratch. It measured as `ret_recycle` at **427 cycles against 17** and a
+   2-3x regression — in the arm that exists to be the control. A control that
+   is slower than the thing it controls is not a baseline, and the first A/B
+   run with it was discarded rather than reported.
+
+   The guard is one capacity test, and the lesson generalises: **when a change
+   moves *where* a resource is released, check every path that releases it,
+   including the one the kill switch turns back on.**
+
+#### What is left
+
+The fill, which is the oop-map half, and the `Frame` struct itself: a
+by-value push still moves ~220 bytes when no slot is retired (the first call
+at each depth). Emplacing it would take the remaining `frame_push` cycles.
 
 ## Exit criteria
 

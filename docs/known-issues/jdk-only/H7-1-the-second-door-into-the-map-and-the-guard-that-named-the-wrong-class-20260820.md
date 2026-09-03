@@ -418,6 +418,46 @@ compile.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** §6a.1's test has been compiled and
+> run — and §6a.1's own warning is the reason it needed doing properly:
+> "`cargo check -p X` builds the LIB only", so a test inside `jit/src/lib.rs`'s
+> `mod tests` is **not compiled at all** by the obvious command.
+>
+> ```text
+> cargo test -p cratonvm-jit --lib strict_mode_refuses_every_collection_direct_helper
+>   tests::strict_mode_refuses_every_collection_direct_helper ... ok
+>   1 passed, 0 failed, 2194 filtered out
+> ```
+>
+> Run by NAME, and the `2194 filtered out` is what says the name still resolves
+> rather than the filter matching nothing.
+>
+> **§6a.4 is NOT verified here, and the reason is §6b's own point.** The strict
+> report's `refusals` object exists and reads:
+>
+> ```json
+> {"jit_direct_native_binds": 0, "jit_inline_cache_natives": 0,
+>  "jit_fastpath_admissions": 5, "interpreter_bytecode_preferred": 35,
+>  "interpreter_shadow_unenforced": 47}
+> ```
+>
+> That report came from a small probe, not a strict ARM over the corpus, so a
+> zero here is a statement about the workload and not about the counter. **A
+> count of 0 from a workload that cannot reach the path is not a measurement** —
+> which is exactly what §6b established from the other direction: `RJitGc`
+> contains no map at all, no vector in `regression-suite/src/` declares a
+> `ConcurrentMap`-typed variable, and so
+> `CONCURRENT_HASHMAP_GET_DIRECT_SITES` reads 0 on every arm regardless.
+>
+> §6b's framing is the right one and stands unchanged: *"That is not a reason to
+> doubt them; it is the measurement of how much the suite can say."*
+>
+> **§6a.2 and §6a.3 have expired.** They pin `--jdk-only` 104/104, `SUITE=all`
+> 99/104, and the stub ratchet at 1615 / 12857 and 1626 / 13225. Today the suite
+> is 125–128 vectors and the ratchet reads 1634 / 13529 and 1645 / 13897, moved
+> by three weeks of other lanes — the same expiry as `H3-1` §5, `W7-30` §11 and
+> `H4-1` §7a.
+
 ## 6. VERIFICATION PLAN
 
 ### 6a. For what landed

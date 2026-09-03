@@ -1572,6 +1572,12 @@ pub const INVENTORY: &[E] = &[
     // `nonvirtual-fast-door` — off routes every monomorphic `invokestatic`
     // and `invokespecial` cache hit through the general dispatcher.
     E { group: Group::JIT, token: "nonvirtual-fast-door", on_key: None, off_key: Some("CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR"), off_word: None, since: "2026-09-02" },
+    // `frame-slot-reuse` — off routes every frame's buffers back through
+    // the thread pools on return instead of retiring the frame in place.
+    E { group: Group::JIT, token: "frame-slot-reuse", on_key: None, off_key: Some("CRATONVM_JIT_NO_FRAME_SLOT_REUSE"), off_word: None, since: "2026-09-02" },
+    // `frame-slot-reuse` — off routes every frame's buffers back through
+    // the thread pools on return instead of retiring the frame in place.
+    E { group: Group::JIT, token: "frame-slot-reuse", on_key: None, off_key: Some("CRATONVM_JIT_NO_FRAME_SLOT_REUSE"), off_word: None, since: "2026-09-02" },
     // `iface-select-memo` — off makes every `invokeinterface` cache hit
     // retake the class-manager read lock and rewalk the receiver hierarchy
     // to re-verify maximally-specific selection.
@@ -1744,6 +1750,9 @@ pub const INVENTORY: &[E] = &[
     // cooperative poll and `Op::New`), so `off_word` is exactly `"0"` -- the
     // same shape as `zero-spid` below.
     E { group: Group::JIT, token: "direct-call-arg-maps", on_key: Some("CRATONVM_JIT_DIRECT_CALL_ARG_MAPS"), off_key: None, off_word: Some("0"), since: "2026-08-30" },
+    E { group: Group::JIT, token: "self-call-arg-maps", on_key: Some("CRATONVM_JIT_SELF_CALL_ARG_MAPS"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::JIT, token: "merge-marks-exact", on_key: Some("CRATONVM_JIT_MERGE_MARKS_EXACT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::JIT, token: "inline-oop-coverage", on_key: Some("CRATONVM_JIT_INLINE_OOP_COVERAGE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "ir-gc-point-maps", on_key: Some("CRATONVM_JIT_IR_GC_POINT_MAPS"), off_key: None, off_word: Some("0"), since: "2026-08-30" },
     E { group: Group::JIT, token: "zero-spid", on_key: Some("CRATONVM_JIT_ZERO_SPID"), off_key: None, off_word: Some("0"), since: "2026-08-30" },
     E { group: Group::GC, token: "card-metrics", on_key: Some("CRATONVM_GC_CARD_METRICS"), off_key: None, off_word: None, since: "2026-07-31" },
@@ -1759,6 +1768,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "verify-rset", on_key: Some("CRATONVM_GC_VERIFY_RSET"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "compact-ref-fields", on_key: Some("CRATONVM_COMPACT_REF_FIELDS"), off_key: None, off_word: None, since: "2026-06-22" },
     E { group: Group::GC, token: "pack-fields-by-width", on_key: Some("CRATONVM_PACK_FIELDS_BY_WIDTH"), off_key: None, off_word: None, since: "2026-08-06" },
+    E { group: Group::GC, token: "layout-scan-cache", on_key: Some("CRATONVM_GC_LAYOUT_SCAN_CACHE"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::GC, token: "compressed-oops", on_key: Some("CRATONVM_COMPRESSED_OOPS"), off_key: None, off_word: None, since: "2026-07-25" },
     E { group: Group::GC, token: "default-heap-ergonomics", on_key: Some("CRATONVM_DEFAULT_HEAP_ERGONOMICS"), off_key: None, off_word: None, since: "2026-06-17" },
     E { group: Group::GC, token: "default-heap-max-mb", on_key: Some("CRATONVM_DEFAULT_HEAP_MAX_MB"), off_key: None, off_word: None, since: "2026-06-17" },
@@ -1868,6 +1878,7 @@ pub const INVENTORY: &[E] = &[
     // price it is one binary both ways.
     E { group: Group::GC, token: "gpu-wait-latch", on_key: Some("CRATONVM_GPU_WAIT_LATCH"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "gpu-zerocopy", on_key: None, off_key: Some("CRATONVM_GPU_NO_ZEROCOPY"), off_word: None, since: "2026-06-16" },
+    E { group: Group::GC, token: "gpu-submission-drain", on_key: None, off_key: Some("CRATONVM_GPU_NO_SUBMISSION_DRAIN"), off_word: None, since: "2026-09-02" },
     // Measurement lever: root every heap-backed LinkedHashMap overlay entry
     // again, restoring the unbounded young-gen pinning the skip-set removed.
     E { group: Group::GC, token: "lhm-root-all", on_key: Some("CRATONVM_LHM_ROOT_ALL"), off_key: None, off_word: None, since: "2026-08-01" },
@@ -2020,6 +2031,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "zgc-gen-promotion-age", on_key: Some("CRATONVM_ZGC_GEN_PROMOTION_AGE"), off_key: None, off_word: None, since: "2026-08-17" },
     E { group: Group::GC, token: "zgc-gen-minors-per-major", on_key: Some("CRATONVM_ZGC_GEN_MINORS_PER_MAJOR"), off_key: None, off_word: None, since: "2026-08-17" },
     E { group: Group::GC, token: "zgc-gen-nursery-percent", on_key: Some("CRATONVM_ZGC_GEN_NURSERY_PERCENT"), off_key: None, off_word: Some("0"), since: "2026-08-17" },
+    E { group: Group::GC, token: "zgc-alloc-trigger", on_key: Some("CRATONVM_ZGC_ALLOC_TRIGGER"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     // G2e/G2f (2026-08-17, widened to every cycle 2026-08-18). Default-ON kill
     // switches over the sweep's two per-dead-object costs, in the shape `zgc-relocate` established:
     // `0` restores the previous behaviour byte for byte, so the A/B is a re-run

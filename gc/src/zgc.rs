@@ -625,14 +625,6 @@ struct ZgcCounters {
     /// [`Self::conc_phase_nanos`] can be closed out at mark end. `0` when no
     /// cycle is open.
     conc_mark_started_at: AtomicU64,
-    /// Phase 4: `from_offset -> to_offset` for objects this cycle has moved.
-    ///
-    /// A plain map rather than `zgc::forwarding::ZForwardingTable` on purpose:
-    /// that table is per-page and this collector has one arena and no pages,
-    /// so its page-id keying would carry no information here. The table
-    /// becomes the right structure when `zgc::page` is adopted, which is the
-    /// step after this one.
-    forwarding: Mutex<FxHashMap<u64, u64>>,
     /// Barrier counters — slow-path entries, heals, forward lookups.
     barrier_stats: barrier::ZBarrierStats,
     /// Per-logical-page age, indexed by page id. A page's age is the number of
@@ -640,20 +632,6 @@ struct ZgcCounters {
     /// young-or-old. Grown on demand, never shrunk -- a page id is an index
     /// into the arena's logical grid and the arena does not shrink either.
     page_ages: Mutex<Vec<u32>>,
-    /// Page ids the last relocating cycle classified as old, and the input to
-    /// [`generation::ZGenerationScope`].
-    ///
-    /// **Page-level accounting, and no longer what decides a young cycle.**
-    /// Phase G splits the generations by OBJECT age
-    /// ([`ObjectHeader::gc_age`]), for a reason the logical grid cannot get
-    /// around: a page's age only ever rises, the bump cursor sits inside a page
-    /// that has therefore usually already aged past the promotion age, and the
-    /// allocator serves most steady-state requests out of free-list holes
-    /// scattered over every page. So a freshly allocated object -- exactly the
-    /// object a young cycle exists to collect -- is born into an old page and
-    /// read as old, and the phase reclaims nothing. An object's own age has none
-    /// of that: it is 0 at allocation wherever the bytes came from.
-    old_page_ids: Mutex<Vec<u64>>,
     /// Young collections the nursery-size trigger asked for.
     ///
     /// The engagement counter for G2d: this at zero on a generational run means
@@ -701,6 +679,16 @@ struct ZgcCounters {
     /// Reported beside the budget it is measured against, because "17 MB over" is
     /// meaningless without it.
     gen_nursery_overshoot_max: AtomicUsize,
+    /// Collections the ALLOCATION-RATE clause of `needs_gc` asked for
+    /// (`zgc_alloc_trigger_percent`).
+    ///
+    /// The engagement counter for F1: this at zero on a default run means every
+    /// collection still came from the 75%-of-`-Xmx` clause or from
+    /// `headroom_low`, i.e. the budget is above what the workload allocates
+    /// between the collections it was already having and the change measures
+    /// nothing. Counted at the POLL, not at the collection, so a trigger that
+    /// fires and is then overtaken by another clause still shows.
+    alloc_trigger_fires: AtomicUsize,
     /// Fixed-point waits the mark driver served by TIMING OUT rather than by
     /// being woken, summed across every cycle — see
     /// [`mark::ZMarkTerminator::park_timeouts`].
@@ -1337,13 +1325,30 @@ pub struct ZgcRealHeap {
     /// Bytes of fresh allocation that fill the nursery, precomputed from
     /// [`zgc_gen_nursery_percent`] so the allocation path never divides.
     gen_nursery_bytes: AtomicUsize,
-    /// `allocated` as of the end of the last collection — the nursery's zero.
+    /// Bytes of fresh allocation that trigger a collection on their own,
+    /// precomputed from [`zgc_alloc_trigger_percent`] so the allocation path
+    /// never divides. `0` disables the clause.
     ///
-    /// `allocated - gen_nursery_watermark` is bytes allocated since, which on a
-    /// bump-first heap (G2c) is the nursery's size. Exact, O(1), and it needs no
-    /// counter of its own: `allocated` is already incremented on the allocation
-    /// path for the live-bytes trigger, and already read by `needs_gc`.
-    gen_nursery_watermark: AtomicUsize,
+    /// Unlike [`Self::gen_nursery_bytes`] this is armed on EVERY run, not only
+    /// a generational one: it is the answer to "how much garbage is worth a
+    /// cycle", which is a question a non-generational heap has too.
+    ///
+    /// Atomic only so a test can flip the clause on a live heap and assert
+    /// both arms of it; nothing in the collector writes it after construction.
+    alloc_trigger_bytes: AtomicUsize,
+    /// `allocated` as of the end of the last collection.
+    ///
+    /// `allocated - cycle_alloc_watermark` is BYTES ALLOCATED SINCE THE LAST
+    /// COLLECTION. Exact, O(1), and it needs no counter of its own: `allocated`
+    /// is already incremented on the allocation path for the live-bytes
+    /// trigger, and already read by `needs_gc`.
+    ///
+    /// Two clauses of [`needs_gc`](GarbageCollector::needs_gc) read it: the
+    /// nursery-size trigger (generational only — there it is the nursery's
+    /// zero, and the difference IS the nursery's size on a bump-first heap),
+    /// and the allocation-rate trigger below it, which is on for every run.
+    /// It was called `cycle_alloc_watermark` while only the first existed.
+    cycle_alloc_watermark: AtomicUsize,
     /// Did the nursery-size clause of `needs_gc` fire? Consumed by the
     /// collection it asked for.
     ///
@@ -1772,6 +1777,10 @@ impl ZgcRealHeap {
             next_hash_code: AtomicI32::new(1),
             allocated: AtomicUsize::new(0),
             gc_threshold: cap * ZGC_REAL_GC_THRESHOLD_PERCENT / 100,
+            alloc_trigger_bytes: AtomicUsize::new(match zgc_alloc_trigger_percent() {
+                0 => 0,
+                pct => (cap / 100 * pct).max(ZGC_ALLOC_TRIGGER_FLOOR),
+            }),
             gc_rearm: AtomicUsize::new(0),
             native_alloc_pressure: AtomicBool::new(false),
             hard_alloc_failure: AtomicBool::new(false),
@@ -1801,7 +1810,7 @@ impl ZgcRealHeap {
             gen_minors_per_major: AtomicUsize::new(zgc_gen_minors_per_major()),
             gen_force_major_next: AtomicBool::new(false),
             gen_nursery_bytes: AtomicUsize::new(cap / 100 * zgc_gen_nursery_percent()),
-            gen_nursery_watermark: AtomicUsize::new(0),
+            cycle_alloc_watermark: AtomicUsize::new(0),
             gen_nursery_triggered: AtomicBool::new(false),
             gen_header_zero_only: AtomicBool::new(zgc_sweep_header_zero()),
             gen_dead_runs_enabled: AtomicBool::new(zgc_sweep_dead_runs()),
@@ -1879,13 +1888,12 @@ impl ZgcRealHeap {
                 conc_ingress_replayed: AtomicUsize::new(0),
                 conc_phase_nanos: AtomicU64::new(0),
                 conc_mark_started_at: AtomicU64::new(0),
-                forwarding: Mutex::new(FxHashMap::default()),
                 barrier_stats: barrier::ZBarrierStats::default(),
                 page_ages: Mutex::new(Vec::new()),
-                old_page_ids: Mutex::new(Vec::new()),
                 gen_nursery_triggers: AtomicUsize::new(0),
                 mark_park_timeouts: AtomicUsize::new(0),
                 gen_nursery_overshoot_max: AtomicUsize::new(0),
+                alloc_trigger_fires: AtomicUsize::new(0),
                 gen_zero_bytes_skipped: AtomicUsize::new(0),
                 gen_dead_runs: AtomicUsize::new(0),
                 gen_dead_objects: AtomicUsize::new(0),
@@ -3701,7 +3709,18 @@ impl ZgcRealHeap {
             let idx = (*addr - base) / Self::Z_LOGICAL_PAGE_BYTES;
             live_bytes[idx] += Self::alloc_size(self.header_ref(*addr as *mut u8)).unwrap_or(0);
         }
-        let ages = self.counters.page_ages.lock();
+        // NO `page.set_age(..)` HERE.
+        //
+        // Until 2026-09-03 this took `counters.page_ages.lock()` and stamped
+        // each view's age from it. Nothing downstream read that word: the only
+        // consumers of these views are `adapters::page_candidates` -- whose
+        // `forwarding::PageCandidate` carries `page_id`, `live_bytes`,
+        // `capacity_bytes` and `size_class_index`, and no age -- and the
+        // young/old split, which reads `counters.page_ages` DIRECTLY in
+        // `age_pages_and_split`. (`relocate.rs`'s `gen_hint = page.age()` reads
+        // pages out of `ZPageAllocator`, not these views.) So the stamp bought
+        // a mutex acquire per cycle and a number that could only ever mislead
+        // a reader into thinking a view's age meant something.
         (0..pages)
             .map(|i| {
                 let page_base = base + i * Self::Z_LOGICAL_PAGE_BYTES;
@@ -3719,7 +3738,6 @@ impl ZgcRealHeap {
                     used,
                     live_bytes[i],
                 );
-                p.set_age(ages.get(i).copied().unwrap_or(0));
                 std::sync::Arc::new(p)
             })
             .collect()
@@ -5456,38 +5474,39 @@ impl ZgcRealHeap {
             // from real `page::ZPageReal` VIEWS over the arena grid -- see
             // `logical_pages` for why a view is not a page.
             //
-            // The scope is advisory for now: this cycle still evacuates from
-            // whichever pages the relocation-set selector picks, young or old.
-            // What it buys today is the accounting and the ages; scoping the
-            // MARK to young is what needs the remembered set to be complete,
-            // and completeness is a property of every store site, not of this
-            // function.
+            // NO `ZGenerationScope` IS BUILT HERE, and no `old_page_ids` is
+            // published.
+            //
+            // Both were removed on 2026-09-03 because nothing read either one.
+            // The scope was described as "advisory for now" -- this cycle
+            // evacuates from whichever pages the relocation-set selector picks,
+            // young or old -- and in the year since, its only consumer was the
+            // `scope_pages` field of the `tracing::debug!` below it. A
+            // `ZGenerationScope` that no marker is ever handed does not scope
+            // anything; it filters a page list into a second page list and
+            // drops it, and a reader who finds it here reasonably concludes the
+            // STW slide is generation-aware, which it is not. The real minor
+            // cycle builds its own scope over its own young page set --
+            // `generation::ZGenerationalHeap::minor_cycle` -- and that one is
+            // handed to a marker. `counters.old_page_ids` had no reader at all;
+            // even the card barrier's gate stopped asking it (see
+            // `has_old_objects`).
+            //
+            // What survives is the part with an effect: the page ages
+            // themselves, and the remembered set every old page gets.
             let views = self.logical_pages(live, base, low_end);
             let promo = generation::ZPromotionPolicy::default();
             let (young_ids, old_ids) = self.age_pages_and_split(views.len(), &promo);
-            let young_views: Vec<_> = views
-                .iter()
-                .filter(|p| young_ids.contains(&p.id()))
-                .cloned()
-                .collect();
-            let scope = generation::ZGenerationScope::from_pages(
-                generation::ZGeneration::Young,
-                self.gc_count.load(Ordering::Relaxed) as u64,
-                &young_views,
-                young_ids.len() == views.len(),
-            );
             // Every old page gets a remembered set, so the store barrier has
             // somewhere to record an old-to-young edge before the next cycle.
             for id in &old_ids {
                 self.remembered
                     .register_old_page(*id, Self::Z_LOGICAL_PAGE_BYTES);
             }
-            self.counters.old_page_ids.lock().clone_from(&old_ids);
             tracing::debug!(
                 target: "zgc",
                 young = young_ids.len(),
                 old = old_ids.len(),
-                scope_pages = scope.page_count(),
                 "zgc generational split over the logical grid"
             );
 
@@ -9944,6 +9963,89 @@ fn zgc_gen_nursery_percent() -> usize {
     })
 }
 
+/// `CRATONVM_ZGC_ALLOC_TRIGGER` -- collect once this PERCENT OF CAPACITY has
+/// been allocated since the last collection. **Default 0, i.e. OFF**; the
+/// measurement below is why.
+///
+/// # What this fixes
+///
+/// Every other clause of [`needs_gc`](GarbageCollector::needs_gc) is a
+/// question about the WHOLE HEAP: `allocated >= gc_threshold` is 75% of
+/// `-Xmx`, and `headroom_low` is "the arena can no longer serve a request".
+/// Neither asks how much GARBAGE there is. At `-Xmx2g` with 50 MiB live, the
+/// first clause fires when `allocated` reaches 1.5 GiB -- so every cycle lets
+/// ~1.45 GiB of garbage accumulate before it runs, and the object-start
+/// registry, the mark bitmap and the sweep all cover that whole span because
+/// the arena's bump cursor has run over it.
+///
+/// **Pause work therefore scaled with the heap FLAG rather than with the
+/// garbage.** Doubling `-Xmx` on a workload whose live set did not change
+/// doubled every pause, which is the opposite of what a heap-size increase is
+/// supposed to buy. Triggering on allocation caps the span a pause has to walk
+/// at `budget + live` regardless of `-Xmx`.
+///
+/// # MEASURED, and why it is off by default
+///
+/// `G1ChurnPauseProbe 50 600` at `-Xmx2048m` -- 50 MiB retained, 2.4 GiB of
+/// garbage streamed past it -- release build, three runs a row, this binary
+/// with only this switch moved:
+///
+/// | percent | wall ms | cycles/run | mean pause | max pause | registered at the worst pause |
+/// |---|---|---|---|---|---|
+/// | 0 (off) | 2891 | 2 | 116 ms | **202 ms** | 10,597,520 |
+/// | 50 | 3234 (+12%) | 3 | 113 ms | 174 ms | 7,485,260 |
+/// | 25 | 3463 (+20%) | 6 | 80 ms | 122 ms | 3,953,214 |
+/// | 12 | 3767 (+30%) | 12 | 57 ms | **79 ms** | 2,116,551 |
+///
+/// The mechanism is exactly the predicted one: the span a pause walks tracks
+/// the budget, and the worst pause falls 2.6x for a 30% wall cost. But it IS a
+/// 30% wall cost, and it is not an artefact of measuring badly -- it is what
+/// collecting six times as often costs. Total sweep work across a run is not
+/// reduced (the same bytes are swept, in more and smaller pieces) and the
+/// per-cycle work that is proportional to the LIVE set -- the mark, the
+/// registry snapshot -- is paid six times as often instead of twice.
+///
+/// So this is a pause-versus-throughput DIAL and not a fix, and a dial does not
+/// get to pick its own default on an argument: this tree has shipped a ZGC
+/// marking feature default-on on an argument before and reverted it (see
+/// `CRATONVM_ZGC_PARSWEEP`'s note). What would earn a non-zero default is a
+/// budget derived from a PAUSE TARGET rather than from a percentage --
+/// project the span the next cycle would walk from the last cycle's
+/// microseconds per registered object, and collect when it would exceed
+/// `max_gc_pause_ms`. That is a different change and it needs the suite time
+/// this one has not had.
+///
+/// Off, the clause costs one relaxed load per `needs_gc`.
+///
+/// # Why it needs no `gc_rearm` floor
+///
+/// The same argument the nursery clause makes: [`Self::cycle_alloc_watermark`]
+/// is reset to the post-sweep `allocated` at the end of every collection, so
+/// firing again requires `budget` bytes of genuinely NEW allocation. A live
+/// set parked above the static threshold -- the shape `gc_rearm` exists to
+/// stop storming on -- cannot re-trigger this clause at all.
+fn zgc_alloc_trigger_percent() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_ZGC_ALLOC_TRIGGER")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            Some(p) => p.min(100),
+            None => 0,
+        }
+    })
+}
+
+/// The floor under [`zgc_alloc_trigger_percent`]'s budget.
+///
+/// A percentage of a small heap is a small number, and a budget below the
+/// re-arm floor would trade the storm `gc_rearm` prevents for one this clause
+/// causes. 8 MiB is the same figure [`zgc_headroom_margin`] floors at, for the
+/// same reason: it is the smallest allocation window in which a real workload
+/// does enough to be worth a cycle.
+const ZGC_ALLOC_TRIGGER_FLOOR: usize = 8 * 1024 * 1024;
+
 /// `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` -- young cycles allowed between
 /// whole-heap ones. Default [`generation::Z_DEFAULT_MINORS_PER_MAJOR`] (8).
 ///
@@ -10714,7 +10816,33 @@ impl barrier::ZBarrierContext for ZgcRealHeap {
         if !self.relocate_active.load(Ordering::Relaxed) {
             return Some(addr);
         }
-        Some(self.counters.forwarding.lock().get(&addr).copied().unwrap_or(addr))
+        // THE SAME TABLE the slide writes and `load_and_forward` reads
+        // ([`Self::note_relocation`] / [`Self::counters::relocations`]), not a
+        // second one.
+        //
+        // Until 2026-09-03 this read a `counters.forwarding:
+        // Mutex<FxHashMap<u64, u64>>` that NOTHING in the collector ever
+        // inserted into -- the only writer in the tree was the one unit test
+        // below that arms the barrier by hand. So the barrier's forward step
+        // was structurally incapable of answering: had `relocate_active` ever
+        // been set by a real slide, every lookup would have missed and every
+        // stale reference would have been "healed" back to the address the
+        // object had just been moved off. It was a duplicate of `relocations`
+        // that had been left empty, keyed in offsets where `relocations` is
+        // keyed in addresses, and the difference between the two was the only
+        // reason it looked like a different table.
+        // `self.arena_base`, not `self.arena.lock().base_ptr()`: this is a
+        // BARRIER slow path, reached from an ordinary field or element read,
+        // and a barrier that takes the allocator lock is a barrier that can
+        // deadlock against any caller holding it. The field is fixed at
+        // construction and documented as safe to read without the lock.
+        let base = self.arena_base as u64;
+        let from = base.checked_add(addr)? as usize;
+        let to = self.counters.relocations.lock().get(&from).copied();
+        match to {
+            Some(to) => Some((to as u64).checked_sub(base)?),
+            None => Some(addr),
+        }
     }
 
     /// Publish `addr` (an offset) to the concurrent marker.
@@ -11659,10 +11787,10 @@ impl GarbageCollector for ZgcRealHeap {
     fn get_array_element(&self, obj: ObjectRef, index: usize) -> Result<Value, i32> {
         let header = self.header(obj);
         if header.kind() != ObjectKind::Array {
-            return Err(index as i32);
+            return Err(crate::heap::oob_index_code(index));
         }
         if index >= header.array_length() as usize {
-            return Err(index as i32);
+            return Err(crate::heap::oob_index_code(index));
         }
         let element_type = header.element_type();
         // ---- THE LOAD BARRIER, on a real read path (Phase 4) -------------
@@ -11723,10 +11851,10 @@ impl GarbageCollector for ZgcRealHeap {
         self.audit_access_receiver(obj.as_ptr() as usize, index, "set_array_element");
         let header = self.header(obj);
         if header.kind() != ObjectKind::Array {
-            return Err(index as i32);
+            return Err(crate::heap::oob_index_code(index));
         }
         if index >= header.array_length() as usize {
-            return Err(index as i32);
+            return Err(crate::heap::oob_index_code(index));
         }
         let element_type = header.element_type();
         // ---- SATB, at the accessor rather than only at the call site ------
@@ -11765,7 +11893,22 @@ impl GarbageCollector for ZgcRealHeap {
                     other => {
                         // Auto-box non-Object values into a 1-field wrapper,
                         // matching `Heap::set_array_element`.
-                        let wrapper = self.alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1);
+                        //
+                        // FALLIBLE on purpose. `alloc_object` prints
+                        // `FATAL: ZGC(real): out of heap space` and calls
+                        // `std::process::abort()`, so a heap-full auto-box
+                        // killed the process where Java semantics call for an
+                        // `OutOfMemoryError` the program can catch — and the
+                        // store that triggered it is a native copying
+                        // primitives into an `Object[]`, which is the LAST
+                        // allocation before a heap fills, not the first. The
+                        // element keeps its old value on this arm; nothing is
+                        // half-written. See `ARRAY_STORE_OUT_OF_MEMORY`.
+                        let Some(wrapper) =
+                            self.try_alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1)
+                        else {
+                            return Err(crate::heap::ARRAY_STORE_OUT_OF_MEMORY);
+                        };
                         self.set_field(wrapper, 0, other);
                         // Arm the process-wide wrapper latch — see the matching
                         // note in `GenerationalHeap::set_array_element`.
@@ -11842,6 +11985,30 @@ impl GarbageCollector for ZgcRealHeap {
             return true;
         }
 
+        // ---- F1: ENOUGH HAS BEEN ALLOCATED SINCE THE LAST CYCLE ----------
+        //
+        // The clause above is 75% of `-Xmx` and the one beside it is "the arena
+        // cannot serve a request"; neither asks how much GARBAGE there is. At
+        // `-Xmx2g` with 50 MiB live the first fires at 1.5 GiB of `allocated`,
+        // so a cycle let ~1.45 GiB accumulate before running and then paid for
+        // it: the registry, the mark bitmap and the sweep all cover the span
+        // the bump cursor ran over. Pause work scaled with the heap FLAG, and
+        // doubling `-Xmx` doubled every pause on a workload whose live set had
+        // not changed.
+        //
+        // Two relaxed loads and a compare on the miss; `a` is already in hand.
+        // See `zgc_alloc_trigger_percent` for the budget, the switch, and why
+        // this clause needs no `gc_rearm` floor.
+        let alloc_budget = self.alloc_trigger_bytes.load(Ordering::Relaxed);
+        if alloc_budget > 0
+            && a.saturating_sub(self.cycle_alloc_watermark.load(Ordering::Relaxed)) >= alloc_budget
+        {
+            self.counters
+                .alloc_trigger_fires
+                .fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+
         // ---- G2d: THE NURSERY IS FULL ------------------------------------
         //
         // Both clauses above are about the WHOLE HEAP: `gc_threshold` is live
@@ -11873,7 +12040,7 @@ impl GarbageCollector for ZgcRealHeap {
         if budget == 0 {
             return false; // the kill switch, see `zgc_gen_nursery_percent`
         }
-        if a.saturating_sub(self.gen_nursery_watermark.load(Ordering::Relaxed)) >= budget {
+        if a.saturating_sub(self.cycle_alloc_watermark.load(Ordering::Relaxed)) >= budget {
             self.gen_nursery_triggered.store(true, Ordering::Relaxed);
             return true;
         }
@@ -12754,7 +12921,7 @@ impl GarbageCollector for ZgcRealHeap {
             let grew = self
                 .allocated
                 .load(Ordering::Relaxed)
-                .saturating_sub(self.gen_nursery_watermark.load(Ordering::Relaxed));
+                .saturating_sub(self.cycle_alloc_watermark.load(Ordering::Relaxed));
             let over = grew.saturating_sub(budget);
             self.counters.gen_nursery_overshoot_max
                 .fetch_max(over, Ordering::Relaxed);
@@ -12825,7 +12992,7 @@ impl GarbageCollector for ZgcRealHeap {
         // the same figure `allocated` was just given -- so "bytes allocated since
         // the last collection" is exact rather than an estimate, and the trigger
         // above cannot storm.
-        self.gen_nursery_watermark
+        self.cycle_alloc_watermark
             .store(live_bytes, Ordering::Relaxed);
         // Re-arm the trigger: require at least a quarter of the remaining
         // headroom (min 64 KiB) of NEW allocation before the next
@@ -12975,9 +13142,14 @@ impl GarbageCollector for ZgcRealHeap {
                 "[GC] zgc-pause: cycle={cycle} total_us={pause_us} \
                  markend_us={markend_us} tlab_us={tlab_us} snapshot_us={snapshot_us} \
                  mark_us={mark_us} resurrect_us={resurrect_us} refs_us={refs_us} \
-                 sweep_us={sweep_us} registered={} dead={}",
+                 sweep_us={sweep_us} registered={} dead={}                  alloc_trigger={}/{}",
                 registered_count,
                 dead_count,
+                // ENGAGEMENT for F1: fires/budget. `0/<n>` means every cycle
+                // still came from the 75%-of-`-Xmx` clause and the allocation
+                // trigger measured nothing; `<n>/0` means the switch is off.
+                self.counters.alloc_trigger_fires.load(Ordering::Relaxed),
+                self.alloc_trigger_bytes.load(Ordering::Relaxed),
             );
         }
 
@@ -19807,6 +19979,97 @@ pub(crate) mod tests {
         );
     }
 
+    /// A heap-full auto-box raises, it does not `std::process::abort()`.
+    ///
+    /// Storing a primitive into a REFERENCE array allocates a one-field
+    /// `AUTOBOX_CLASS_ID` wrapper. That allocation went through the infallible
+    /// `alloc_object`, whose failure arm is
+    /// `eprintln!("FATAL: ...."); std::process::abort()` -- so a heap that
+    /// filled while a native was copying primitives into an `Object[]` killed
+    /// the process with no stack trace and no catchable `OutOfMemoryError`.
+    ///
+    /// This fills the heap and then makes exactly that store. Before the fix
+    /// the test binary died; now the store is refused with
+    /// `ARRAY_STORE_OUT_OF_MEMORY`, which `RuntimeError::array_store_fault`
+    /// turns into `java.lang.OutOfMemoryError`. The element is unchanged, so
+    /// nothing is half-written.
+    #[test]
+    fn a_heap_full_autobox_reports_out_of_memory_rather_than_aborting() {
+        let heap = ZgcRealHeap::with_capacity(1024 * 1024);
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Reference, 4);
+        // A reference store still works while there is room.
+        assert!(heap.set_array_element(arr, 0, Value::Int(7)).is_ok());
+        assert_eq!(heap.get_array_element(arr, 0), Ok(Value::Int(7)));
+        // Fill the low end, in the SAME shape the auto-box wrapper is: a
+        // one-field object. Filling with 4 KiB arrays is not enough -- the
+        // wrapper still fits in a hole one of those was refused for, which is
+        // exactly the near-miss this test must not accept as a pass.
+        let mut guard = 0;
+        while heap.try_alloc_object(ClassId::new(0), 1).is_some() {
+            guard += 1;
+            assert!(guard < 1_000_000, "a 1 MiB heap cannot serve this many objects");
+        }
+        assert_eq!(
+            heap.set_array_element(arr, 1, Value::Int(9)),
+            Err(cratonvm_types::ARRAY_STORE_OUT_OF_MEMORY),
+            "a heap-full auto-box must report OOM, not abort the process"
+        );
+        assert_eq!(
+            heap.get_array_element(arr, 1),
+            Ok(Value::Object(None)),
+            "and it must leave the element alone -- nothing half-written"
+        );
+        // The element that DID get a wrapper is still readable: the refusal
+        // must not have disturbed the earlier store.
+        assert_eq!(heap.get_array_element(arr, 0), Ok(Value::Int(7)));
+    }
+
+    /// The allocation-rate clause of `needs_gc` fires on GARBAGE, well below
+    /// the occupancy clause -- and stops firing when it is switched off.
+    ///
+    /// The occupancy clause is 75% of capacity; on a 64 MiB heap that is
+    /// 48 MiB. This allocates 9 MiB, which is more than the 8 MiB budget floor
+    /// and a sixth of the occupancy threshold, and asserts that the collection
+    /// is asked for anyway, that the ENGAGEMENT counter attributes it to this
+    /// clause, and that `CRATONVM_ZGC_ALLOC_TRIGGER=0`'s effect (a zero budget)
+    /// restores the old answer on the same heap in the same state -- which is
+    /// what makes the switch a usable A/B arm rather than a rebuild.
+    #[test]
+    fn the_allocation_trigger_fires_below_the_occupancy_threshold() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+        heap.alloc_trigger_bytes
+            .store(ZGC_ALLOC_TRIGGER_FLOOR, Ordering::Relaxed);
+        assert!(!heap.needs_gc(), "an empty heap needs no collection");
+        // 32 KiB arrays: below `ZGC_LARGE_OBJECT_MIN`, so they bump the LOW
+        // end and count toward the same `allocated` both clauses read.
+        while heap.allocated.load(Ordering::Relaxed) < 9 * 1024 * 1024 {
+            heap.alloc_array(ClassId::new(0), ArrayElementType::Byte, 32 * 1024);
+        }
+        let a = heap.allocated.load(Ordering::Relaxed);
+        assert!(
+            a < heap.gc_threshold,
+            "the point of the test is that the OCCUPANCY clause is not what              fires: allocated {a} must stay under gc_threshold {}",
+            heap.gc_threshold
+        );
+        assert!(
+            !heap.headroom_low.load(Ordering::Relaxed),
+            "nor the headroom clause -- 55 MiB of a 64 MiB heap is free"
+        );
+        assert!(
+            heap.needs_gc(),
+            "9 MiB allocated against an 8 MiB budget must ask for a collection"
+        );
+        assert!(
+            heap.counters.alloc_trigger_fires.load(Ordering::Relaxed) > 0,
+            "and the engagement counter must attribute it to this clause"
+        );
+        heap.alloc_trigger_bytes.store(0, Ordering::Relaxed);
+        assert!(
+            !heap.needs_gc(),
+            "with the clause switched off the same heap in the same state must              answer exactly as it did before 2026-09-03"
+        );
+    }
+
     /// An armed barrier **forwards** a reference whose object relocation
     /// moved, and heals the slot so the next read takes the fast path.
     ///
@@ -19833,7 +20096,10 @@ pub(crate) mod tests {
         unsafe { std::ptr::write(slot as *mut u64, stale) };
 
         // Publish the move and arm the barrier.
-        heap.counters.forwarding.lock().insert(from_off, to_off);
+        heap.counters
+            .relocations
+            .lock()
+            .insert((base + from_off) as usize, (base + to_off) as usize);
         heap.relocate_active.store(true, Ordering::Relaxed);
         heap.set_barrier_color(Some(vaddr::ZColor::Remapped));
 
@@ -19843,7 +20109,7 @@ pub(crate) mod tests {
         let healed = unsafe { std::ptr::read(slot as *const u64) };
         heap.set_barrier_color(None);
         heap.relocate_active.store(false, Ordering::Relaxed);
-        heap.counters.forwarding.lock().clear();
+        heap.counters.relocations.lock().clear();
 
         assert_eq!(
             got,

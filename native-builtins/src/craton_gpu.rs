@@ -2086,13 +2086,24 @@ fn builtin_future_get_error_message(
 /// `Native.releaseFuture(long futureHandle)`
 #[cfg(feature = "gpu-offload")]
 fn builtin_release_future(
-    _ctx: &mut dyn cratonvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
     state::with(|s| {
         s.futures.remove(&handle);
     });
+    // AUDIT 2026-09-02: the line above drops THIS crate's record of the
+    // future. The offload runtime keeps a second, independent table --
+    // `offload::SUBMISSIONS` -- keyed by the same handle, and until now
+    // nothing removed from it: one insert, one remove, and the remove had
+    // no production caller. `GpuExecutor.releaseSubmission(h)` compiles
+    // to `Native.releaseFuture(h)`, so a program doing exactly what the
+    // registry's own overflow warning tells it to do still leaked every
+    // submission. Measured before this line: GpuAsyncChainBench, which
+    // awaits and releases all 2000 of its handles, still tripped the
+    // "1024 submissions are alive" warning.
+    ctx.gpu_release_submission(handle);
     Ok(None)
 }
 
@@ -3249,10 +3260,17 @@ pub mod dispatch_timing {
         // (silent unless the cache saw a GC) and, like the two above, it
         // reports a path `CALLS` cannot see. See `gpu_residency_census`.
         cratonvm_types::gpu_residency_census::exit_summary();
+        // Whether the submission registry drained. `live_at_exit` should
+        // be 0 for a program that releases what it takes.
+        cratonvm_types::gpu_submission_census::exit_summary();
         // The transparent (`--gpu`) door's phase table, for the same
         // reason: it is self-gating and it counts the path `CALLS` cannot
         // see. See `gpu_offload_phase_census`.
         cratonvm_types::gpu_offload_phase_census::exit_summary();
+        // The other half of the transparent door: the dispatches that
+        // REFUSED, which the table above cannot see. See
+        // `gpu_refusal_census`.
+        cratonvm_types::gpu_refusal_census::exit_summary();
         let calls = CALLS.load(Ordering::Relaxed);
         if calls == 0 {
             return;

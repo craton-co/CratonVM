@@ -240,14 +240,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status: FIXED IN SOURCE, NOT VERIFIED BY AN ARM.** Lane H24, 2026-08-21.",
     ),
     (
-        "docs/known-issues/jdk-only/H6-1-the-canonical-name-slot-holds-a-different-string-20260820.md",
-        "status block says: **Status: FIXED-UNVERIFIED — no binary carrying these changes has been built or",
-    ),
-    (
-        "docs/known-issues/jdk-only/H7-1-the-second-door-into-the-map-and-the-guard-that-named-the-wrong-class-20260820.md",
-        "status block says: **Status: FIXED-UNVERIFIED — no binary carrying these changes has been built or",
-    ),
-    (
         "docs/known-issues/jdk-only/W5-1-loadlibrary-allowlist-too-wide.md",
         "status block says: nothing here was built or run):**",
     ),
