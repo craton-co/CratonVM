@@ -3249,6 +3249,10 @@ pub mod dispatch_timing {
         // reason: it is self-gating and it counts the path `CALLS` cannot
         // see. See `gpu_offload_phase_census`.
         cratonvm_types::gpu_offload_phase_census::exit_summary();
+        // The other half of the transparent door: the dispatches that
+        // REFUSED, which the table above cannot see. See
+        // `gpu_refusal_census`.
+        cratonvm_types::gpu_refusal_census::exit_summary();
         let calls = CALLS.load(Ordering::Relaxed);
         if calls == 0 {
             return;
