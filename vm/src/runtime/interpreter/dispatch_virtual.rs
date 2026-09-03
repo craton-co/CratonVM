@@ -1070,12 +1070,13 @@ pub(super) fn execute_invokevirtual_vtable_fast(
         caller_class_id,
         cp_index,
         false,
+        site_pc as u32,
         receiver_class_id,
         target.clone(),
     );
     thread
         .invoke_cache
-        .put(caller_class_id, cp_index, false, target);
+        .put(caller_class_id, cp_index, false, site_pc as u32, target);
 
     Ok(CachedCallResult::FramePushed)
 }
@@ -1389,8 +1390,7 @@ pub(super) fn execute_invokevirtual_cached(
                     format!("{receiver:?}")
                 };
                 let cached = thread
-                    .invoke_cache
-                    .get(caller_class_id, cp_index, is_special);
+                    .invoke_cache.get(caller_class_id, cp_index, is_special, site_pc as u32);
                 let cached_info = cached.as_ref().map(|t| format!("{t:?}"));
                 drop(cm);
                 eprintln!(
@@ -1483,8 +1483,7 @@ pub(super) fn execute_invokevirtual_cached(
     }
 
     let target = match thread
-        .invoke_cache
-        .get(caller_class_id, cp_index, is_special)
+        .invoke_cache.get(caller_class_id, cp_index, is_special, site_pc as u32)
     {
         Some(t) => {
             dbg_invoke_stats_record(0);
@@ -1806,6 +1805,7 @@ pub(super) fn execute_invokevirtual_cached(
                             caller_class_id,
                             cp_index,
                             is_special,
+                            site_pc as u32,
                             actual_class_id,
                         );
                         match poly_result {
@@ -3106,6 +3106,9 @@ pub(super) fn populate_virtual_invoke_cache(
     cp_index: u16,
     receiver_class_id: ClassId,
     receiver_value: &Value,
+    // See `dispatch_static::populate_invoke_cache` for why this must be the
+    // invoke's own offset.
+    site_pc: usize,
 ) {
     // T10.4 fast path — the VM-wide `SharedResolutionState` may already
     // hold a fully-built `CachedInvokeTarget` that a sibling thread promoted
@@ -3123,12 +3126,13 @@ pub(super) fn populate_virtual_invoke_cache(
             caller_class_id,
             cp_index,
             false,
+            site_pc as u32,
             receiver_class_id,
             target.clone(),
         );
         thread
             .invoke_cache
-            .put(caller_class_id, cp_index, false, target);
+            .put(caller_class_id, cp_index, false, site_pc as u32, target);
         return;
     }
 
@@ -3358,12 +3362,13 @@ pub(super) fn populate_virtual_invoke_cache(
                     caller_class_id,
                     cp_index,
                     false,
+                    site_pc as u32,
                     receiver_class_id,
                     target.clone(),
                 );
                 thread
                     .invoke_cache
-                    .put(caller_class_id, cp_index, false, target);
+                    .put(caller_class_id, cp_index, false, site_pc as u32, target);
                 return;
             }
         }
@@ -3481,12 +3486,13 @@ pub(super) fn populate_virtual_invoke_cache(
                 caller_class_id,
                 cp_index,
                 false,
+                site_pc as u32,
                 receiver_class_id,
                 target.clone(),
             );
             thread
                 .invoke_cache
-                .put(caller_class_id, cp_index, false, target);
+                .put(caller_class_id, cp_index, false, site_pc as u32, target);
             return;
         }
         // FJP fix: walk the parent chain looking for natives registered on
@@ -3594,12 +3600,13 @@ pub(super) fn populate_virtual_invoke_cache(
                                 caller_class_id,
                                 cp_index,
                                 false,
+                                site_pc as u32,
                                 receiver_class_id,
                                 target.clone(),
                             );
                             thread
                                 .invoke_cache
-                                .put(caller_class_id, cp_index, false, target);
+                                .put(caller_class_id, cp_index, false, site_pc as u32, target);
                             return;
                         }
                         break;
@@ -3633,12 +3640,13 @@ pub(super) fn populate_virtual_invoke_cache(
                             caller_class_id,
                             cp_index,
                             false,
+                            site_pc as u32,
                             receiver_class_id,
                             target.clone(),
                         );
                         thread
                             .invoke_cache
-                            .put(caller_class_id, cp_index, false, target);
+                            .put(caller_class_id, cp_index, false, site_pc as u32, target);
                         return;
                     }
                 }
@@ -3684,12 +3692,13 @@ pub(super) fn populate_virtual_invoke_cache(
                 caller_class_id,
                 cp_index,
                 false,
+                site_pc as u32,
                 receiver_class_id,
                 target.clone(),
             );
             thread
                 .invoke_cache
-                .put(caller_class_id, cp_index, false, target);
+                .put(caller_class_id, cp_index, false, site_pc as u32, target);
         }
         return;
     }
@@ -3777,12 +3786,13 @@ pub(super) fn populate_virtual_invoke_cache(
                     caller_class_id,
                     cp_index,
                     false,
+                    site_pc as u32,
                     receiver_class_id,
                     target.clone(),
                 );
                 thread
                     .invoke_cache
-                    .put(caller_class_id, cp_index, false, target);
+                    .put(caller_class_id, cp_index, false, site_pc as u32, target);
                 return;
             }
         }
@@ -3824,12 +3834,13 @@ pub(super) fn populate_virtual_invoke_cache(
                     caller_class_id,
                     cp_index,
                     false,
+                    site_pc as u32,
                     receiver_class_id,
                     target.clone(),
                 );
                 thread
                     .invoke_cache
-                    .put(caller_class_id, cp_index, false, target);
+                    .put(caller_class_id, cp_index, false, site_pc as u32, target);
                 return;
             }
         }
@@ -3867,12 +3878,13 @@ pub(super) fn populate_virtual_invoke_cache(
                     caller_class_id,
                     cp_index,
                     false,
+                    site_pc as u32,
                     receiver_class_id,
                     target.clone(),
                 );
                 thread
                     .invoke_cache
-                    .put(caller_class_id, cp_index, false, target);
+                    .put(caller_class_id, cp_index, false, site_pc as u32, target);
                 return;
             }
         }
@@ -3914,12 +3926,13 @@ pub(super) fn populate_virtual_invoke_cache(
             caller_class_id,
             cp_index,
             false,
+            site_pc as u32,
             receiver_class_id,
             target.clone(),
         );
         thread
             .invoke_cache
-            .put(caller_class_id, cp_index, false, target);
+            .put(caller_class_id, cp_index, false, site_pc as u32, target);
         return;
     }
 
@@ -3975,12 +3988,13 @@ pub(super) fn populate_virtual_invoke_cache(
         caller_class_id,
         cp_index,
         false,
+        site_pc as u32,
         receiver_class_id,
         target.clone(),
     );
     thread
         .invoke_cache
-        .put(caller_class_id, cp_index, false, target);
+        .put(caller_class_id, cp_index, false, site_pc as u32, target);
 }
 
 /// Spring's `MergedAnnotation$Adapt.isIn` loader-split bridge (see the guard
@@ -4126,6 +4140,7 @@ pub(super) fn execute_invokevirtual_fast_door(
     cp_index: u16,
     is_interface: bool,
     fast_field: Option<&cratonvm_gc::zgc::ZgcRealHeap>,
+    site_pc: usize,
 ) -> Option<Result<CachedCallResult, MethodCallFailed>> {
     use std::sync::atomic::Ordering;
     if crate::classloading::any_class_redefined() {
@@ -4136,7 +4151,7 @@ pub(super) fn execute_invokevirtual_fast_door(
     }
     let caller_class_id = thread.frames[frame_idx].class_id;
     let (receiver_class_id, cached, gate_generation) =
-        match thread.invoke_cache.get(caller_class_id, cp_index, false) {
+        match thread.invoke_cache.get(caller_class_id, cp_index, false, site_pc as u32) {
             Some(CachedInvokeTarget::VirtualBytecode {
                 receiver_class_id,
                 cached,
@@ -4326,7 +4341,7 @@ pub(super) fn execute_invokevirtual_fast_door(
                                 .tiered_manager
                                 .on_method_invocation_observed(&tiered_key, cnt as u64);
                         } else {
-                            let gate = match thread.invoke_cache.get(caller_class_id, cp_index, false)
+                            let gate = match thread.invoke_cache.get(caller_class_id, cp_index, false, site_pc as u32)
                             {
                                 Some(CachedInvokeTarget::VirtualBytecode { gate, .. }) => {
                                     gate.clone()

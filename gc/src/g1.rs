@@ -375,6 +375,84 @@ pub fn evacuation_refs_rejected() -> usize {
     EVAC_REF_REJECTED.load(Ordering::Relaxed)
 }
 
+/// The subset of [`EVAC_REF_REJECTED`] whose refusal is evidence of
+/// CORRUPTION rather than of an ordinary dead referent.
+///
+/// The same split the marker's gate already carries as [`GrayRefusal`], and
+/// for the same reason: a candidate at or above its region's cursor, or in a
+/// `Free` region, was never a live object in that region's CURRENT
+/// incarnation, and a slot naming one is ROUTINE -- freed regions are
+/// deliberately not scrubbed (G1AUD-10) and the evacuation walks name dead
+/// objects' slots as well as live ones. A candidate INSIDE the allocated
+/// prefix whose header does not decode is the other thing entirely: something
+/// was placed there and its header does not describe it.
+///
+/// `EVAC_REF_REJECTED` counted both, which is one bit too few to act on. That
+/// is verbatim the defect the 2026-08-30 `plausible_mark_scan_target` split
+/// fixed on the MARKING side, where 2 226 of 2 249 refusals turned out to be
+/// the routine kind and the remaining 23 were the whole story.
+/// `TestKillProcessWhileWriting` reports this evacuation-side family in the
+/// MILLIONS (`#134217728`), and until this split nothing said which of the two
+/// populations that number was.
+pub static EVAC_REF_REJECTED_TORN: AtomicUsize = AtomicUsize::new(0);
+
+/// The value of [`EVAC_REF_REJECTED_TORN`].
+pub fn evacuation_refs_rejected_torn() -> usize {
+    EVAC_REF_REJECTED_TORN.load(Ordering::Relaxed)
+}
+
+/// How many times the evacuator copied a header claiming to be a LEGACY OBJECT
+/// of class 0 with an implausible field count.
+///
+/// `ClassId(0)` is the class every primitive array carries (`newarray` passes
+/// it verbatim) and the MIC/PIC empty-slot sentinel; the objects allocated
+/// under it have zero to a handful of fields. Nothing in this VM allocates a
+/// class-0 legacy object with thousands of slots, so such a header is not an
+/// object -- and a legacy slot count is a SIXTEEN-byte stride, so the walk it
+/// authorises is eight times the extent of the reference array whose torn
+/// header reads this way.
+///
+/// The report is the producer question this counter exists to answer: it names
+/// the SOURCE region, offset and reuse epoch, and -- under
+/// `CRATONVM_G1_DBG_REACH=1` -- the allocation site that carved that span, which
+/// is what separates "a TLAB handed this out" from "the out-of-line allocator
+/// did". Expected to be ZERO.
+pub static EVAC_IMPLAUSIBLE_CLASS0_COPY: AtomicUsize = AtomicUsize::new(0);
+
+/// The value of [`EVAC_IMPLAUSIBLE_CLASS0_COPY`].
+pub fn evacuation_implausible_class0_copies() -> usize {
+    EVAC_IMPLAUSIBLE_CLASS0_COPY.load(Ordering::Relaxed)
+}
+
+/// How many times an evacuation copy's DESTINATION carried a different class,
+/// shape or kind than its source.
+///
+/// The memcpy and the two quartet updates (`set_gc_age`, `add_gc_flags`) are
+/// the only writes `evacuate_object` performs, and none of them touches the
+/// class id, the shape word or the kind. A non-zero value therefore means the
+/// destination span was not exclusively this object's. Expected to be ZERO.
+pub static EVAC_COPY_SHAPE_DRIFT: AtomicUsize = AtomicUsize::new(0);
+
+/// The value of [`EVAC_COPY_SHAPE_DRIFT`].
+pub fn evacuation_copy_shape_drifts() -> usize {
+    EVAC_COPY_SHAPE_DRIFT.load(Ordering::Relaxed)
+}
+
+/// How many CSet roots were left unevacuated because they are not the start of
+/// a live object.
+///
+/// Replaces [`NON_OBJECT_ROOT_COPIED`]'s subject: the collector used to copy
+/// such a root and rewrite the root slot to the copy. Non-zero means a
+/// conservatively-scanned stack word named an interior or dead address, which
+/// is the condition conservative scanning exists to tolerate -- and which,
+/// until 2026-09-02, this collector turned into a fabricated object.
+pub static NON_OBJECT_ROOT_SKIPPED: AtomicUsize = AtomicUsize::new(0);
+
+/// The value of [`NON_OBJECT_ROOT_SKIPPED`].
+pub fn non_object_roots_skipped() -> usize {
+    NON_OBJECT_ROOT_SKIPPED.load(Ordering::Relaxed)
+}
+
 /// How many objects the evacuation ref-scan refused to WALK because their own
 /// header did not look like a live object. Expected to be ZERO.
 pub static EVAC_HOLDER_REJECTED: AtomicUsize = AtomicUsize::new(0);
@@ -487,6 +565,14 @@ pub static EMPTY_JIT_PUBLICATION_SEEN: AtomicUsize = AtomicUsize::new(0);
 /// address by `evacuate_object` — i.e. how many times the evacuator computed a
 /// size from garbage, memcpy'd that many bytes, installed a forwarding entry
 /// for the address, and rewrote the root to point at the copy.
+///
+/// STRUCTURALLY ZERO since 2026-09-02: the root loops now `continue` on a
+/// non-object root instead of evacuating it, so nothing can increment this.
+/// It is kept, still printed, and paired with [`NON_OBJECT_ROOT_SKIPPED`],
+/// because the pair is the readable form of the change — "seen, and NOT
+/// copied" — and because a counter that silently disappears takes its own
+/// regression guard with it: if a future edit reintroduces the copy, this goes
+/// non-zero in the same line that reports the skips.
 pub static NON_OBJECT_ROOT_COPIED: AtomicUsize = AtomicUsize::new(0);
 
 /// The values of [`NON_OBJECT_ROOT_SEEN`] and [`NON_OBJECT_ROOT_COPIED`].
@@ -2260,6 +2346,45 @@ impl G1Region {
         align: usize,
         site: &'static str,
     ) -> Option<(*mut u8, usize)> {
+        self.bump_alloc_initialized(size, align, site, |_| {})
+    }
+
+    /// [`Self::bump_alloc`], with `init` run over the fresh span before the
+    /// pointer is returned to the caller.
+    ///
+    /// # What this does and does NOT close
+    ///
+    /// It closes the half of the `cursor` field's documented publication window
+    /// that belongs to the OBJECT HEADER. That doc says the window "is not new
+    /// in kind -- the object HEADER has always been written by the caller after
+    /// the allocator released the lock"; with an initializer the header is
+    /// written inside the allocator instead, so the four call sites
+    /// (`try_alloc_object`, `try_alloc_array`, and the `GarbageCollector`
+    /// `alloc_object` / `alloc_array`) cannot individually forget to, and the
+    /// span carries a decodable header the moment the allocator returns.
+    ///
+    /// It does NOT close the F-11 window itself, and must not be read as
+    /// claiming to. Under F-11 the compare-exchange that claims the range IS
+    /// the publication, so nothing can run before it; `init` runs after the
+    /// claim and after the zeroing, exactly where the caller's header store
+    /// used to run, only sooner and unconditionally. What bounds that window is
+    /// the rule the `cursor` field states -- no concurrent reader walks
+    /// `[0, cursor)` -- and this changes nothing about that rule.
+    ///
+    /// An earlier version of this function moved zeroing and `init` ABOVE a
+    /// plain-`usize` cursor commit. That ordering does not survive F-11 and the
+    /// claim is not made here any more.
+    fn bump_alloc_initialized(
+        &self,
+        size: usize,
+        align: usize,
+        site: &'static str,
+        // `Fn`, not `FnOnce`: `alloc_in_region_initialized` has arms that may
+        // each attempt a bump, and only the arm that SUCCEEDS runs the
+        // initializer, so callers build their header inside the closure body
+        // and the closure stays re-callable.
+        init: impl Fn(*mut u8),
+    ) -> Option<(*mut u8, usize)> {
         let base = self.data.addr();
         // F-11 — claim the range with a compare-exchange rather than a
         // read-modify-write through `&mut`. The loop body is the identical
@@ -2317,6 +2442,11 @@ impl G1Region {
         unsafe {
             std::ptr::write_bytes(ptr, 0, size);
         }
+        // The header, before the pointer is handed out. See this function's
+        // doc for what this does and does not close: the claim above is the
+        // publication under F-11, so this is the caller's header store moved
+        // inside the allocator, not a reordering of it against the cursor.
+        init(ptr);
         Some((ptr, offset_in_region))
     }
 
@@ -2875,9 +3005,61 @@ pub struct G1PausePhases {
     /// card table removed.
     pub rset_bytes_scanned: u64,
     pub rset_bytes_skipped: u64,
+    /// The region census AFTER this pause: Free / Eden / Survivor / Old /
+    /// humongous.
+    ///
+    /// `needs_gc` triggers on the FREE FRACTION, so "how much did this pause
+    /// buy" is not answerable from `bytes_freed` alone -- it is answerable
+    /// from how many regions came back. A pause that frees bytes without
+    /// returning regions to the Free pool leaves the trigger latched and the
+    /// next pause starts immediately, which is the storm shape
+    /// `young_target_regions` documents as "a trigger the collector cannot
+    /// satisfy".
+    ///
+    /// Filled inside the pause, where the regions guard is already held. The
+    /// census this replaces was written as a `try_lock` inside the `[GC-STAT]`
+    /// emitter -- and every collection path calls that emitter while holding
+    /// the guard, so the `try_lock` ALWAYS failed and the counts were never
+    /// once printed. An instrument armed where it cannot fire.
+    pub free_regions: u32,
+    pub eden_regions: u32,
+    pub surv_regions: u32,
+    pub old_regions: u32,
+    pub hum_regions: u32,
+    /// How many regions this pause actually collected, and how many young
+    /// regions each pin vocabulary kept OUT of that set.
+    ///
+    /// `bytes_freed` cannot separate "there was little garbage" from "almost
+    /// nothing was collectable": measured on the H2 class, 19 268 young pauses
+    /// in 240 s freeing a mean of 356 KB each -- about a third of a region per
+    /// pause, on a heap whose trigger is a 25% free fraction. Either the
+    /// collection set is tiny or it is nearly all pinned out, and only these
+    /// three numbers say which.
+    pub cset_regions: u32,
+    pub jni_pinned_out: u32,
+    pub jit_pinned_out: u32,
 }
 
 impl G1PausePhases {
+    /// Fill the region census from a borrowed region table.
+    fn record_region_census(&mut self, regions: &[G1Region]) {
+        let (mut f, mut e, mut s, mut o, mut h) = (0u32, 0u32, 0u32, 0u32, 0u32);
+        for r in regions.iter() {
+            match r.region_type {
+                RegionType::Free => f += 1,
+                RegionType::Eden => e += 1,
+                RegionType::Survivor => s += 1,
+                RegionType::Old => o += 1,
+                _ => h += 1,
+            }
+        }
+        self.free_regions = f;
+        self.eden_regions = e;
+        self.surv_regions = s;
+        self.old_regions = o;
+        self.hum_regions = h;
+    }
+
     /// Sum of the six measured phases.
     #[inline]
     pub fn measured_us(&self) -> u64 {
@@ -3618,6 +3800,27 @@ pub struct G1Collector {
     /// out from under a `finalize()` that has not run yet.
     finalizer_pause: AtomicBool,
 
+    /// The addresses [`Self::collect_garbage_with_finalizers`] was handed this
+    /// pause, kept for [`Self::eager_reclaim_humongous_locked`].
+    ///
+    /// Separate from `pending_finalizer_roots` for the reason that field's doc
+    /// gives -- Phase 3.5 CONSUMES that list with `std::mem::take`, so by the
+    /// time eager reclaim runs it is empty on every path. This copy is not
+    /// consumed, so the reclaim can name the one shape `finalizer_pause` used
+    /// to decline the entire reclaim for: a HUMONGOUS object with a finalizer,
+    /// which is dead, is never in the CSet, is therefore never resurrected, and
+    /// so is invisible to the census.
+    ///
+    /// Naming those spans is strictly cheaper than the gate it replaces.
+    /// `finalizer_pause` is true for ANY registered not-yet-enqueued
+    /// finalizable object -- one live `FileInputStream` is enough -- so the gate
+    /// disabled eager humongous reclaim for the whole process. Measured on H2
+    /// `TestKillProcessWhileWriting` (2026-09-02), gate versus no gate:
+    /// 76 787 young pauses -> **88**, humongous regions 830 -> **26**, free
+    /// regions 184 -> **980**, collection set 1.2 -> **128** regions, and the
+    /// class goes from a 900 s cap to **passing in 633 s**.
+    finalizer_addrs_this_pause: Mutex<Vec<usize>>,
+
     /// Persistent parallel-evacuation worker threads (see [`crate::evac_pool`]).
     ///
     /// Created on the FIRST parallel pause rather than in [`G1Collector::new`],
@@ -4072,6 +4275,7 @@ impl G1Collector {
             reference_skip: Mutex::new(FxHashSet::default()),
             reference_skip_len: AtomicUsize::new(0),
             pending_finalizer_roots: Mutex::new(Vec::new()),
+            finalizer_addrs_this_pause: Mutex::new(Vec::new()),
             resurrected_finalizers: Mutex::new(Vec::new()),
             kept_unresolved_regions: Mutex::new(RegionSet::new()),
             kept_unresolved_live: Mutex::new(std::collections::HashSet::new()),
@@ -4710,6 +4914,51 @@ impl G1Collector {
     /// F-11. That arm is deliberately not a separate code path: it is the same
     /// slow path, entered without the fast probe.
     pub fn alloc_in_region(&self, size: usize) -> Option<(*mut u8, usize)> {
+        self.alloc_in_region_initialized(size, |_| {})
+    }
+
+    /// [`Self::alloc_in_region`], with `init` run over the fresh span while the
+    /// regions lock is still held.
+    ///
+    /// Every caller that writes an `ObjectHeader` should use this rather than
+    /// writing it after the plain form returns, so the header cannot be
+    /// forgotten at one of four call sites and the span is decodable the moment
+    /// the allocator hands it back. See
+    /// [`G1Region::bump_alloc_initialized`] for what this does and does not
+    /// close: under F-11 the claim IS the publication, so this moves the
+    /// caller's header store inside the allocator rather than reordering it
+    /// against the cursor.
+    pub fn alloc_in_region_initialized(
+        &self,
+        size: usize,
+        init: impl Fn(*mut u8),
+    ) -> Option<(*mut u8, usize)> {
+        // ONE-BINARY A/B. `CRATONVM_G1_LATE_HEADER_WRITE=1` restores the old
+        // arrangement -- the header written by the CALLER after the regions
+        // lock is dropped -- on the same binary, so the change can be bisected
+        // against a workload without a second build. Default OFF.
+        if g1_late_header_write() {
+            let result = self.alloc_in_region_locked(size, &|_| {});
+            if let Some((ptr, _)) = result {
+                init(ptr);
+            }
+            return result;
+        }
+        self.alloc_in_region_locked(size, &init)
+    }
+
+    /// The body of [`Self::alloc_in_region_initialized`]: takes the regions
+    /// lock and runs `init` over the fresh span before publishing it.
+    fn alloc_in_region_locked(
+        &self,
+        size: usize,
+        init: &dyn Fn(*mut u8),
+    ) -> Option<(*mut u8, usize)> {
+        // NO GUARD HERE. Each arm below takes the guard it needs -- the
+        // humongous claim exclusive then downgraded, the Eden fast path shared,
+        // the slow path exclusive. An outer guard held across them deadlocks:
+        // `parking_lot`'s RwLock is not reentrant, and this function held a
+        // write guard while dev's F-10/F-11 arms asked for their own.
         let region_size = self.config.region_size;
 
         // Humongous check. Retypes a run of Free regions: exclusive.
@@ -4735,6 +4984,12 @@ impl G1Collector {
                 // committed, and `size <= needed*region_size`.
                 std::ptr::write_bytes(start_addr as *mut u8, 0, size);
             }
+            // The header BEFORE the cursor. Here that ordering is real and
+            // dev's own claim protocol provides it: the span was typed with the
+            // start region's cursor still 0, so nothing under the shared guard
+            // can walk into it until `set_cursor` below. This is the one
+            // allocation path where "init before publication" is literally true.
+            init(start_addr as *mut u8);
             regions[start].set_cursor(size);
             // Humongous bytes count toward the IHOP occupancy statistic; the
             // next pause's recompute replaces this running total.
@@ -4753,7 +5008,7 @@ impl G1Collector {
                 && regions[cur].region_type == RegionType::Eden
                 && self.commit_through_region(cur)
             {
-                if let Some(result) = regions[cur].bump_alloc(size, 8, "obj:cur-eden") {
+                if let Some(result) = regions[cur].bump_alloc_initialized(size, 8, "obj:cur-eden", &init) {
                     self.alloc_shared_claims.fetch_add(1, Ordering::Relaxed);
                     return Some((result.0, cur));
                 }
@@ -4773,7 +5028,7 @@ impl G1Collector {
             && regions[cur].region_type == RegionType::Eden
             && self.commit_through_region(cur)
         {
-            if let Some(result) = regions[cur].bump_alloc(size, 8, "obj:cur-eden") {
+            if let Some(result) = regions[cur].bump_alloc_initialized(size, 8, "obj:cur-eden", &init) {
                 return Some((result.0, cur));
             }
         }
@@ -4785,7 +5040,7 @@ impl G1Collector {
             regions[idx].region_type = RegionType::Eden;
             self.eden_slots[slot].store(idx, Ordering::Relaxed);
             self.note_region_consumed_locked(&regions);
-            if let Some(result) = regions[idx].bump_alloc(size, 8, "obj:fresh-eden") {
+            if let Some(result) = regions[idx].bump_alloc_initialized(size, 8, "obj:fresh-eden", &init) {
                 return Some((result.0, idx));
             }
         }
@@ -5671,6 +5926,8 @@ impl G1Collector {
         // able to tell "nothing was garbage" from "everything was pinned".
         let (jni_pinned_out, jit_pinned_out) =
             count_young_regions_pinned_out(regions.as_slice(), &jit_pinned_regions);
+        // Carried to `phases` below, which is not in scope yet.
+        let cset_regions_selected = cset.len() as u32;
 
         if cset.is_empty() {
             let mut degraded = crate::gc_metrics::g1_degraded::EMPTY_COLLECTION_SET;
@@ -5728,6 +5985,11 @@ impl G1Collector {
         // already takes one; see `G1PausePhases` for why this is not
         // debug-gated.
         let mut phases = G1PausePhases::default();
+        // What this pause was ALLOWED to collect, and what the two pin
+        // vocabularies kept out of it -- see the field docs.
+        phases.cset_regions = cset_regions_selected;
+        phases.jni_pinned_out = jni_pinned_out as u32;
+        phases.jit_pinned_out = jit_pinned_out as u32;
         let mut phase_mark = std::time::Instant::now();
 
         // Process root references
@@ -5736,6 +5998,59 @@ impl G1Collector {
             if let Some(region_idx) = self.region_for_ptr(&regions, old_ptr) {
                 if cset_set.contains(&region_idx) {
                     let plausible = self.note_root_object_plausibility(&regions, old_ptr as usize);
+                    // A ROOT THAT IS NOT AN OBJECT START IS NOT EVACUATED.
+                    //
+                    // Measured on `TestKillProcessWhileWriting` (2026-09-02): a
+                    // CSet root landed 0x28 bytes INSIDE a live reference array
+                    // (`grid=INTERIOR of=0x108 delta=0x28 size=0x110 cid=185
+                    // kind=Array`, the extent independently confirmed by the
+                    // region's own carve trail). `evacuate_object` then read
+                    // that ELEMENT as a header: a heap pointer's low half became
+                    // the class id and its high half became `num_slots` --
+                    // 0x200, which is why every holder in that investigation
+                    // reported `num_slots=512` -- so the object was sized at
+                    // 0x2010, eight kilobytes were copied into a Survivor
+                    // region, and `*root` was rewritten to name the result.
+                    // Scanning that fake object as 512 legacy slots is the
+                    // source of the rejected candidates, the dangling references
+                    // and the segfault this class is filed for.
+                    //
+                    // Copying it was never right. `note_root_object_plausibility`
+                    // has reported the condition since it was written and
+                    // `NON_OBJECT_ROOT_COPIED` counted the copies -- the guard
+                    // was measurement-only, and what it measured was the
+                    // collector manufacturing an object out of an array element.
+                    //
+                    // Leaving the root alone cannot be worse. A conservative JIT
+                    // root is a stack word that merely LOOKS like a pointer, so
+                    // an interior or garbage one names nothing the mutator reads
+                    // through; and pinning its region keeps whatever it is
+                    // interior to from moving out from under it, which is the
+                    // treatment `pin_region_for_addr` already exists to give a
+                    // conservatively-discovered root.
+                    if !plausible {
+                        let n = NON_OBJECT_ROOT_SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 8 || n.is_power_of_two() {
+                            tracing::warn!(
+                                "[g1] a NON-OBJECT root was SKIPPED (#{n}): 0x{:x} — it is not the start of a live object, so evacuating it would have sized an object from bytes that are not a header. The root is left unchanged and its region pinned.",
+                                old_ptr as usize,
+                            );
+                        }
+                        // NO PIN HERE. `G1Region::pinned` is the JNI-critical
+                        // pin, cleared only by a matching `unpin_region` or by
+                        // `reset` -- and a pinned region is never collected, so
+                        // it is never reset. Setting it from this loop leaked
+                        // the region for the life of the process, and bought
+                        // nothing even for this pause: the CSet is already
+                        // chosen by the time a root is processed.
+                        //
+                        // `pinned_region_set_including_non_object_roots` is
+                        // where a non-object root's region is kept out of the
+                        // CSet, which is BEFORE selection and per-pause. This
+                        // arm is the backstop for anything that reaches here
+                        // anyway.
+                        continue;
+                    }
                     // Step 9: `fresh` is ignored here — the root loop keeps its
                     // existing unconditional push (a duplicate root re-scans
                     // idempotently). Gating it on `fresh` is deferred to the
@@ -5749,17 +6064,6 @@ impl G1Collector {
                         &mut bytes_copied,
                         &cset_set,
                     ) {
-                        if !plausible && new_ptr != old_ptr {
-                            let n = NON_OBJECT_ROOT_COPIED.fetch_add(1, Ordering::Relaxed) + 1;
-                            if n <= 8 || n.is_power_of_two() {
-                                tracing::warn!(
-                                    "[g1] a NON-OBJECT root was COPIED (#{n}, young): \
-                                     0x{:x} -> 0x{:x}",
-                                    old_ptr as usize,
-                                    new_ptr as usize,
-                                );
-                            }
-                        }
                         *root = unsafe { ObjectRef::from_raw(new_ptr) };
                         work_list.push(new_ptr);
                     }
@@ -5965,6 +6269,8 @@ impl G1Collector {
         // forwarding entry (incomplete remembered set => UAF). No-op on
         // the release/quiet path; aborts in debug.
         phases.free_us = phase_mark.elapsed().as_micros() as u64;
+        // The census, while the guard is still held -- see the field docs.
+        phases.record_region_census(&regions);
         phase_mark = std::time::Instant::now();
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
         self.dbg_verify_rset_completeness(&regions, "young-serial");
@@ -6296,6 +6602,59 @@ impl G1Collector {
             if let Some(region_idx) = self.region_for_ptr(&regions, old_ptr) {
                 if cset_set.contains(&region_idx) {
                     let plausible = self.note_root_object_plausibility(&regions, old_ptr as usize);
+                    // A ROOT THAT IS NOT AN OBJECT START IS NOT EVACUATED.
+                    //
+                    // Measured on `TestKillProcessWhileWriting` (2026-09-02): a
+                    // CSet root landed 0x28 bytes INSIDE a live reference array
+                    // (`grid=INTERIOR of=0x108 delta=0x28 size=0x110 cid=185
+                    // kind=Array`, the extent independently confirmed by the
+                    // region's own carve trail). `evacuate_object` then read
+                    // that ELEMENT as a header: a heap pointer's low half became
+                    // the class id and its high half became `num_slots` --
+                    // 0x200, which is why every holder in that investigation
+                    // reported `num_slots=512` -- so the object was sized at
+                    // 0x2010, eight kilobytes were copied into a Survivor
+                    // region, and `*root` was rewritten to name the result.
+                    // Scanning that fake object as 512 legacy slots is the
+                    // source of the rejected candidates, the dangling references
+                    // and the segfault this class is filed for.
+                    //
+                    // Copying it was never right. `note_root_object_plausibility`
+                    // has reported the condition since it was written and
+                    // `NON_OBJECT_ROOT_COPIED` counted the copies -- the guard
+                    // was measurement-only, and what it measured was the
+                    // collector manufacturing an object out of an array element.
+                    //
+                    // Leaving the root alone cannot be worse. A conservative JIT
+                    // root is a stack word that merely LOOKS like a pointer, so
+                    // an interior or garbage one names nothing the mutator reads
+                    // through; and pinning its region keeps whatever it is
+                    // interior to from moving out from under it, which is the
+                    // treatment `pin_region_for_addr` already exists to give a
+                    // conservatively-discovered root.
+                    if !plausible {
+                        let n = NON_OBJECT_ROOT_SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 8 || n.is_power_of_two() {
+                            tracing::warn!(
+                                "[g1] a NON-OBJECT root was SKIPPED (#{n}): 0x{:x} — it is not the start of a live object, so evacuating it would have sized an object from bytes that are not a header. The root is left unchanged and its region pinned.",
+                                old_ptr as usize,
+                            );
+                        }
+                        // NO PIN HERE. `G1Region::pinned` is the JNI-critical
+                        // pin, cleared only by a matching `unpin_region` or by
+                        // `reset` -- and a pinned region is never collected, so
+                        // it is never reset. Setting it from this loop leaked
+                        // the region for the life of the process, and bought
+                        // nothing even for this pause: the CSet is already
+                        // chosen by the time a root is processed.
+                        //
+                        // `pinned_region_set_including_non_object_roots` is
+                        // where a non-object root's region is kept out of the
+                        // CSet, which is BEFORE selection and per-pause. This
+                        // arm is the backstop for anything that reaches here
+                        // anyway.
+                        continue;
+                    }
                     // Step 9: `fresh` is ignored here — the root loop keeps its
                     // existing unconditional push (a duplicate root re-scans
                     // idempotently). Gating it on `fresh` is deferred to the
@@ -6309,17 +6668,6 @@ impl G1Collector {
                         &mut bytes_copied,
                         &cset_set,
                     ) {
-                        if !plausible && new_ptr != old_ptr {
-                            let n = NON_OBJECT_ROOT_COPIED.fetch_add(1, Ordering::Relaxed) + 1;
-                            if n <= 8 || n.is_power_of_two() {
-                                tracing::warn!(
-                                    "[g1] a NON-OBJECT root was COPIED (#{n}, mixed): \
-                                     0x{:x} -> 0x{:x}",
-                                    old_ptr as usize,
-                                    new_ptr as usize,
-                                );
-                            }
-                        }
                         *root = unsafe { ObjectRef::from_raw(new_ptr) };
                         work_list.push(new_ptr);
                     }
@@ -7596,6 +7944,9 @@ impl G1Collector {
         monitors: &dyn MonitorCleanup,
     ) -> (GcResult, Vec<usize>) {
         *self.pending_finalizer_roots.lock() = finalizer_addrs.to_vec();
+        // The copy Phase 3.5 does not consume — see
+        // `finalizer_addrs_this_pause`.
+        *self.finalizer_addrs_this_pause.lock() = finalizer_addrs.to_vec();
         self.resurrected_finalizers.lock().clear();
         self.finalizer_pause
             .store(!finalizer_addrs.is_empty(), Ordering::Relaxed);
@@ -7606,6 +7957,7 @@ impl G1Collector {
         // (e.g. an empty-CSet early return) so a later plain collection
         // never sees stale candidates.
         self.pending_finalizer_roots.lock().clear();
+        self.finalizer_addrs_this_pause.lock().clear();
         self.finalizer_pause.store(false, Ordering::Relaxed);
         let mut dead = std::mem::take(&mut *self.resurrected_finalizers.lock());
         // `retry_after_evacuation_failure` (run inside collect_garbage,
@@ -7799,6 +8151,8 @@ impl G1Collector {
             return None;
         }
 
+        self.note_implausible_legacy_header(regions, old_ptr, header, "evacuate-src");
+
         // Decide destination based on age. F-18: the threshold is re-derived
         // after every pause from the age histogram, so it may be below the
         // configured `promotion_age` when survivor space is under pressure.
@@ -7846,6 +8200,18 @@ impl G1Collector {
                 return Some((old_ptr, true));
             }
         };
+
+        // The SOURCE's shape, before anything is copied. Compared against the
+        // destination below: "the source was already not an object" and "the
+        // copy produced something that is not an object" are different defects
+        // with different producers, and every report this page has carried so
+        // far read the destination only -- after the evacuator had already
+        // written it -- so it could not tell them apart.
+        let src_shape = (
+            header.class_id.as_u32(),
+            header.num_slots(),
+            header.kind(),
+        );
 
         // Copy object data
         unsafe {
@@ -7909,6 +8275,28 @@ impl G1Collector {
             // F-18: this object is in survivor space at the age it now carries.
             self.note_survivor_age(new_header.gc_age(), obj_size);
         }
+        // The destination must carry the source's identity. `set_gc_age` and
+        // `add_gc_flags` touch only quartet bits; nothing here may change the
+        // class, the shape or the kind.
+        let dst_shape = (
+            new_header.class_id.as_u32(),
+            new_header.num_slots(),
+            new_header.kind(),
+        );
+        if dst_shape != src_shape {
+            let n = EVAC_COPY_SHAPE_DRIFT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                tracing::warn!(
+                    "[g1] evacuation COPY CHANGED an object's shape (#{n}): old={:#x} new={:#x} size={obj_size:#x} src=(class {}, slots {}, {:?}) dst=(class {}, slots {}, {:?}) -- the memcpy and the two quartet updates are the only writes here, so a difference means the destination span was not exclusively this object's.",
+                    old_addr,
+                    new_ptr as usize,
+                    src_shape.0, src_shape.1, src_shape.2,
+                    dst_shape.0, dst_shape.1, dst_shape.2,
+                );
+            }
+        }
+        self.note_implausible_legacy_header(regions, new_ptr, new_header, "evacuate-dest");
+
         // F-02: install the forward on the FROM-space header, after the
         // destination is fully written. Ordering matters for the same reason it
         // does in the parallel evacuator: the forward is what makes the copy
@@ -7950,6 +8338,109 @@ impl G1Collector {
     /// no such API), so the invariant is enforced by the type-level
     /// `&mut Vec<G1Region>` parameter (only the lock holder can produce
     /// it) plus this contract comment.
+    /// Report -- once per power of two -- a header that claims to be a legacy
+    /// object of class 0 with an implausible field count, and say WHERE the
+    /// bytes came from. See [`EVAC_IMPLAUSIBLE_CLASS0_COPY`].
+    ///
+    /// Measurement only: the caller's behaviour is unchanged. The point is the
+    /// SOURCE-side context, which no report on this page has ever carried --
+    /// every rejection so far named the holder after it had already been
+    /// copied into a Survivor region, so the carve that produced it was two
+    /// moves behind.
+    fn note_implausible_legacy_header(
+        &self,
+        regions: &[G1Region],
+        obj_ptr: *mut u8,
+        header: &ObjectHeader,
+        site: &'static str,
+    ) -> bool {
+        // Two shapes, both of which `classify_candidate_header` accepts because
+        // it only validates the TAG bytes and an upper bound on `shape`:
+        //
+        //  * a class id in the BAND no loader mints, and
+        //  * class 0 with a field count no class has. `ClassId(0)` is what
+        //    every primitive array carries (`newarray` passes it verbatim) and
+        //    the MIC/PIC empty-slot sentinel; its objects have zero to a
+        //    handful of fields. A reference array whose kind bit is unset reads
+        //    exactly this way.
+        //
+        // Both authorise a SIXTEEN-byte-stride walk over something that is not
+        // a legacy object.
+        //
+        // # The band, and why "large class id" alone was WRONG
+        //
+        // The first version of this screen refused every `class_id >= 1 << 24`,
+        // on the reasoning that a process with 16 million loaded classes has
+        // other problems. That reasoning is right about LOADED classes and
+        // wrong about this VM's class-id space, which has two synthetic
+        // regions above it:
+        //
+        //  * [`cratonvm_types::AUTOBOX_CLASS_ID`] is `u32::MAX`, and
+        //  * lambda proxies are numbered by `SharedVm::alloc_lambda_proxy_id`,
+        //    a bare counter from `0x8000_0000` (see `resolution.rs`, which
+        //    allocates `ClassId::new(0x8000_0000)`).
+        //
+        // Both are ordinary live objects. Measured: a 500 s
+        // `TestKillProcessWhileWriting` run reported 18 "implausible" headers
+        // and ALL EIGHTEEN were autobox wrappers (`class_id=4294967295`,
+        // `num_slots=1`) or lambda proxies (`class_id=2147483648..64`) -- a
+        // screen that fires on unchanged, correct behaviour, which is worse
+        // than no screen because it invites a conclusion.
+        //
+        // The band between them is what no id occupies.
+        const MAX_LOADED_CLASS_ID: u32 = 1 << 24;
+        const LAMBDA_PROXY_CLASS_ID_BASE: u32 = 0x8000_0000;
+        const IMPLAUSIBLE_CLASS0_SLOTS: u32 = 1024;
+        let cid = header.class_id.as_u32();
+        let implausible = (cid >= MAX_LOADED_CLASS_ID && cid < LAMBDA_PROXY_CLASS_ID_BASE)
+            || (cid == 0 && header.num_slots() >= IMPLAUSIBLE_CLASS0_SLOTS);
+        if header.kind() != ObjectKind::Object || !implausible {
+            return false;
+        }
+        let n = EVAC_IMPLAUSIBLE_CLASS0_COPY.fetch_add(1, Ordering::Relaxed) + 1;
+        if n > 8 && !n.is_power_of_two() {
+            return true;
+        }
+        let addr = obj_ptr as usize;
+        let where_from = self
+            .lookup_region_for_addr(addr)
+            .and_then(|i| regions.get(i).map(|r| (i, r)))
+            .map(|(i, r)| {
+                let base = r.data.as_ptr() as usize;
+                let off = addr.wrapping_sub(base);
+                format!(
+                    "r{i}/{:?}/off={off:#x}/cursor={:#x}/reuse_epoch={}/recycled_in_generation={} {} {} {}",
+                    r.region_type,
+                    r.cursor(),
+                    r.reuse_epoch,
+                    r.recycled_in_generation,
+                    // The carve that produced this span, when the trails are
+                    // recording. This is the whole point of the report.
+                    r.tlab_trail
+                        .lock()
+                        .describe_owner_or(&r.bump_trail.lock(), r.reuse_epoch, off),
+                    // Is this a REAL object boundary in the region's own grid,
+                    // or one a desynced walk invented? `grid=OBJECT-START` with
+                    // a sane `prev=` says an allocator put an object here and
+                    // its header is wrong; `grid=INTERIOR` says the address
+                    // came from somewhere that had no business naming it.
+                    self.locate_in_object_grid(r, addr),
+                    // ...and the bytes, so "shape written, mark word never
+                    // written" is readable rather than inferred.
+                    hexdump_around(r.data.as_ptr() as *mut u8, r.cursor(), off),
+                )
+            })
+            .unwrap_or_else(|| "r?".to_string());
+        tracing::warn!(
+            "[g1] IMPLAUSIBLE legacy header at {site} (#{n}): obj={addr:#x}              class_id={} kind=Object num_slots={} mark={:#018x} claims={:#x} bytes              source={where_from} -- no allocation in this VM produces a class-0 legacy              object with that many fields; a reference array whose kind bit is unset              reads exactly this way, and the walk it authorises is eight times the              array's extent.",
+            cid,
+            header.num_slots(),
+            header.mark_word.load(Ordering::Relaxed),
+            HEADER_SIZE + header.num_slots() as usize * SLOT_SIZE,
+        );
+        true
+    }
+
     /// Reject a candidate reference the evacuator is about to DEREFERENCE
     /// when it does not look like a live object header, and say so once.
     ///
@@ -7985,14 +8476,37 @@ impl G1Collector {
         slot: usize,
         raw: usize,
     ) -> bool {
-        if self.candidate_header_is_plausible(regions, raw) {
+        let (verdict, _) = self.classify_candidate_header(regions, raw);
+        if verdict == HeaderVerdict::Object {
+            // Same second look as `note_root_object_plausibility`'s, on the
+            // other supply route. A slot holding an INTERIOR address passes
+            // `classify_candidate_header` and is then evacuated as an object,
+            // which is how a 0x2010-byte "object" whose header is a heap
+            // pointer gets carved into a Survivor region.
+            // SAFETY: the verdict above validated the tag bytes and the
+            // address's containment below its region's cursor.
+            let cand = unsafe { &*(raw as *const ObjectHeader) };
+            self.note_implausible_legacy_header(regions, raw as *mut u8, cand, "ref-slot-candidate");
             return true;
         }
+        // WHICH refusal, not just THAT one. See [`EVAC_REF_REJECTED_TORN`]:
+        // "at/above the cursor" and "inside the allocated prefix but the tags
+        // do not decode" are different defects with different producers, and
+        // one counter over both is what made `#134217728` unactionable.
+        let torn = evac_refusal_is_torn(verdict);
         let n = EVAC_REF_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+        let torn_n = if torn {
+            EVAC_REF_REJECTED_TORN.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            EVAC_REF_REJECTED_TORN.load(Ordering::Relaxed)
+        };
         // Rate-limited like the other GC fail-safes: the first is always
         // visible, then powers of two, so a pathological cycle cannot flood a
-        // suite log while a single occurrence still cannot hide.
-        if n <= 8 || n.is_power_of_two() {
+        // suite log while a single occurrence still cannot hide. A TORN
+        // candidate gets its OWN budget: it is the rare population, and
+        // sharing a throttle with the routine one is how a handful of real
+        // events hide behind millions of ordinary ones.
+        if n <= 8 || n.is_power_of_two() || (torn && (torn_n <= 8 || torn_n.is_power_of_two())) {
             // SAFETY: `holder` is the object currently being scanned; the
             // evacuator owns it under the `regions` lock.
             // The holder's SHAPE, not just its class. A rejection says a word
@@ -8022,8 +8536,50 @@ impl G1Collector {
                     )
                 })
                 .unwrap_or_else(|| "r?".to_string());
+            // WHERE THE HOLDER SITS IN ITS OWN REGION'S OBJECT GRID. The
+            // 2026-08-30 census established that every rejection this site
+            // produces carries the same holder shape (`class_id=0
+            // kind=Object num_slots=8192 array_len=0`) and asked what such a
+            // thing is. That question has exactly two answers and this string
+            // separates them: `grid=OBJECT-START` means the bytes at a real
+            // object start decode to that shape, so the HEADER is lying and
+            // the producer is an allocator or a mark-word writer, while
+            // `grid=INTERIOR` / `grid=DESYNC-BEFORE-TARGET` / `grid=WALK-BROKE`
+            // means the holder address is not an object start at all and the
+            // producer is whatever put it on a worklist.
+            //
+            // The raw mark word is printed beside it because the shape's
+            // `kind` and `element_type` live in its top 16 bits: an all-zero
+            // quartet under a non-zero `shape` is what a PRIMITIVE ARRAY
+            // (which carries `class_id` 0 -- see `try_alloc_array`'s callers)
+            // looks like when its kind tags were never written or were
+            // overwritten, and that reads back as exactly the censused shape.
+            let holder_grid = self
+                .lookup_region_for_addr(holder as usize)
+                .map(|i| {
+                    let r = &regions[i];
+                    let off = (holder as usize).wrapping_sub(r.data.as_ptr() as usize);
+                    format!(
+                        "{} {}",
+                        self.locate_in_object_grid(r, holder as usize),
+                        // The RAW bytes. A `class_id` of 0x65676170 with
+                        // `num_slots` 115 is the ASCII `page` + `s` -- an H2
+                        // MVStore chunk header, i.e. byte-ARRAY PAYLOAD being
+                        // read as an object header. Decoding that from two
+                        // decimal fields is a trick a reader should not have
+                        // to repeat.
+                        hexdump_around(r.data.as_ptr() as *mut u8, r.cursor(), off),
+                    )
+                })
+                .unwrap_or_else(|| "grid=no-region".to_string());
+            // SAFETY: as above -- the evacuator owns the holder under the lock.
+            let holder_mark = unsafe {
+                (*(holder as *const ObjectHeader))
+                    .mark_word
+                    .load(Ordering::Relaxed)
+            };
             tracing::warn!(
-                "[g1] {site}: REJECTED a non-object candidate (#{n}): holder=0x{:x} class_id={holder_class} kind={holder_kind:?} num_slots={holder_slots} array_len={holder_len} holder_region={holder_region} slot={slot} candidate=0x{raw:x} — the word is inside the region span but is not a live object header, so evacuating it would have dereferenced it. The slot is left unchanged and the pause continues.",
+                "[g1] {site}: REJECTED a non-object candidate (#{n}, torn={torn} torn_total={torn_n} verdict={verdict:?}): holder=0x{:x} class_id={holder_class} kind={holder_kind:?} num_slots={holder_slots} array_len={holder_len} holder_mark=0x{holder_mark:016x} holder_region={holder_region} {holder_grid} slot={slot} candidate=0x{raw:x} — the word is inside the region span but is not a live object header, so evacuating it would have dereferenced it. The slot is left unchanged and the pause continues.",
                 holder as usize,
             );
         }
@@ -8082,7 +8638,7 @@ impl G1Collector {
         let n = EVAC_HOLDER_CLAMPED.fetch_add(1, Ordering::Relaxed) + 1;
         if n <= 8 || n.is_power_of_two() {
             tracing::warn!(
-                "[g1] evacuation ref-scan CLAMPED a holder's element walk (#{n}):                  obj=0x{addr:x} declared={declared} room={room} — the header claims more                  reference slots than its region holds, so the walk would have read past                  the region. Walking {room}.",
+                "[g1] evacuation ref-scan CLAMPED a holder's element walk (#{n}):                  obj=0x{addr:x} stride={stride} declared={declared} room={room} — the header claims more                  reference slots than its region holds, so the walk would have read past                  the region. Walking {room}.",
             );
         }
         room
@@ -8201,13 +8757,57 @@ impl G1Collector {
         }
     }
 
-    /// Count (and, for the first few, describe) a CSet-resident root that is not
-    /// the start of a live object. Returns whether it IS one, so the caller can
-    /// report what the evacuator then did with it.
+    /// Does `addr` name a live object the collector may FOLLOW -- evacuate,
+    /// scan, forward?
     ///
-    /// Measurement only — the caller's behaviour is unchanged.
+    /// Both screens, because either alone admits the other's defect:
+    ///
+    /// * [`Self::candidate_header_is_plausible`] validates the two header tag
+    ///   bytes and containment below the owning region's cursor. An INTERIOR
+    ///   address satisfies both trivially: the first eight bytes of a reference
+    ///   slot are a heap pointer whose low half reads as a class id and whose
+    ///   high half reads as `num_slots`.
+    /// * [`Self::note_implausible_legacy_header`] rejects exactly that -- a
+    ///   class id in the band no loader mints, or class 0 carrying thousands of
+    ///   slots.
+    ///
+    /// Measured 2026-09-02: gating on the first alone is what let a conservative
+    /// root pointing 0x28 bytes inside a live reference array reach
+    /// `evacuate_object`, which sized an object from the array ELEMENT and
+    /// copied eight kilobytes of it into a Survivor region.
+    fn addr_is_followable_object(
+        &self,
+        regions: &[G1Region],
+        addr: usize,
+        site: &'static str,
+    ) -> bool {
+        if !self.candidate_header_is_plausible(regions, addr) {
+            return false;
+        }
+        // SAFETY: the screen above validated the tag bytes and placed `addr`
+        // inside a live region's committed span.
+        let header = unsafe { &*(addr as *const ObjectHeader) };
+        !self.note_implausible_legacy_header(regions, addr as *mut u8, header, site)
+    }
+
+    /// Is this CSet-resident root the start of a live object? Counts and, for
+    /// the first few, describes the ones that are not.
+    ///
+    /// LOAD-BEARING since 2026-09-02; this doc said "measurement only — the
+    /// caller's behaviour is unchanged" for as long as the callers evacuated
+    /// the root either way. They now skip and pin on a `false`, so this
+    /// function decides whether a root is followed.
+    ///
+    /// TWO predicates, and only both together are the question. The tag screen
+    /// ([`Self::candidate_header_is_plausible`]) asks whether the two header
+    /// tag bytes decode and the address sits below its region's cursor — which
+    /// an INTERIOR address satisfies trivially, because the first eight bytes
+    /// of a reference slot are a heap pointer whose halves read as a class id
+    /// and a `num_slots`. The implausible-header screen is what rejects those.
+    /// Wiring the refusal to the tag screen alone measured `skipped=0` on a run
+    /// that was still fabricating objects out of array elements.
     fn note_root_object_plausibility(&self, regions: &[G1Region], addr: usize) -> bool {
-        if self.candidate_header_is_plausible(regions, addr) {
+        if self.addr_is_followable_object(regions, addr, "cset-root") {
             return true;
         }
         let n = NON_OBJECT_ROOT_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
@@ -8238,6 +8838,15 @@ impl G1Collector {
         let jit_skips = self.jit_tlab_skip_spans();
         let mut offset = 0usize;
         let mut objects = 0usize;
+        // The object the walk stepped over to arrive here, and the step it
+        // took. `grid=OBJECT-START` alone cannot distinguish "the grid is
+        // sound and this really is an object" from "the grid is walking at
+        // wrong boundaries and lands here by construction" -- and the second
+        // is what a header full of ASCII (`class_id=0x65676170`, the bytes
+        // `page`, from an H2 MVStore chunk header) means. The PREDECESSOR is
+        // the object whose size decided this boundary, so it is the one to
+        // name.
+        let mut prev = String::from("prev=none");
         while offset < region.cursor() {
             let obj_ptr = (base + offset) as *mut u8;
             if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_ptr as usize) {
@@ -8281,7 +8890,7 @@ impl G1Collector {
                 );
             }
             if target == offset {
-                return format!("grid=OBJECT-START idx={objects} size=0x{obj_size:x}");
+                return format!("grid=OBJECT-START idx={objects} size=0x{obj_size:x} {prev}");
             }
             if target < offset + obj_size {
                 return format!(
@@ -8292,10 +8901,19 @@ impl G1Collector {
                     header.kind(),
                 );
             }
+            prev = format!(
+                "prev=(off=0x{offset:x} cid={} kind={:?} elem={:?} alen={} slots={} size=0x{obj_size:x} mark={:#018x})",
+                header.class_id.as_u32(),
+                header.kind(),
+                header.element_type(),
+                header.array_length(),
+                header.num_slots(),
+                header.mark_word.load(Ordering::Relaxed),
+            );
             offset += obj_size;
             objects += 1;
         }
-        format!("grid=PAST-CURSOR walked={objects} objects to 0x{offset:x}")
+        format!("grid=PAST-CURSOR walked={objects} objects to 0x{offset:x} {prev}")
     }
 
     fn scan_and_evacuate_refs(
@@ -8313,6 +8931,14 @@ impl G1Collector {
         // from an rset source walk, and a wrong header here is what walks the
         // loops below out of the region entirely — see
         // `holder_walkable_slots`.
+        // The holder AT SCAN TIME. `evacuate_object` already screens both ends
+        // of every copy and reports `copy_shape_drift`; a worklist holder is a
+        // to-space copy that went through it. So if this fires while
+        // `evacuate-src` / `evacuate-dest` stayed silent for the same address,
+        // the header was sound when it was copied and is not sound now --
+        // i.e. something overwrote the copy WITHIN the pause, which is a
+        // different defect from anything the copy path can produce.
+        self.note_implausible_legacy_header(regions, obj_ptr, header, "worklist-holder");
         if !self.candidate_header_is_plausible(regions, obj_ptr as usize) {
             let n = EVAC_HOLDER_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 8 || n.is_power_of_two() {
@@ -8390,10 +9016,27 @@ impl G1Collector {
                 }
             }
         } else {
-            for_each_flat_object_reference_trusting_header(
+            // The flat walk gets the SAME region clamp the reference-array branch
+            // beside it already has, with the 16-byte `SLOT_SIZE` stride
+            // `holder_walkable_slots` grew for it. `candidate_header_is_plausible`
+            // validated the holder's tag bytes and its containment; it did not
+            // validate that `HEADER_SIZE + num_slots * SLOT_SIZE` lands inside the
+            // region, and a legacy slot leaves a region twice as fast as an array
+            // element does.
+            //
+            // `record_outgoing_rset_edges` already makes exactly this argument and
+            // applies exactly this clamp; it was the only one of the three flat
+            // walks that got it. The two that did not are the two that also WRITE:
+            // an unclamped walk here does not merely read past the holder, it
+            // rewrites `Value` cells past the holder with forwarded pointers, i.e.
+            // it corrupts whatever objects follow it in the region.
+            let walkable_slots =
+                self.holder_walkable_slots(regions, obj_ptr, header.num_slots() as usize, SLOT_SIZE);
+            for_each_flat_object_reference_capped(
                 obj_ptr,
                 header,
                 0,
+                walkable_slots,
                 |slot_ptr, raw, compact| {
                     // Item 4 — membership before plausibility; see the array
                     // arm above for why.
@@ -8592,6 +9235,12 @@ impl G1Collector {
                 break;
             }
             let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            // Same screen on the LINEAR walk. Note the standing caveat: this
+            // walk visits dead objects too (it walks the region, not the live
+            // set), so a hit here is weaker evidence than one at
+            // `worklist-holder` -- which is exactly why the two sites are
+            // named apart.
+            self.note_implausible_legacy_header(regions, obj_ptr, header, "rset-source-walk");
             // Round-9 gc CRIT-1: humongous continuation filler covers the
             // entire region; skip without trying to follow any oops.
             if is_humongous_filler(header) {
@@ -8757,10 +9406,27 @@ impl G1Collector {
                     }
                 }
             } else {
-                for_each_flat_object_reference_trusting_header(
+                // The flat walk gets the SAME region clamp the reference-array branch
+                // beside it already has, with the 16-byte `SLOT_SIZE` stride
+                // `holder_walkable_slots` grew for it. `candidate_header_is_plausible`
+                // validated the holder's tag bytes and its containment; it did not
+                // validate that `HEADER_SIZE + num_slots * SLOT_SIZE` lands inside the
+                // region, and a legacy slot leaves a region twice as fast as an array
+                // element does.
+                //
+                // `record_outgoing_rset_edges` already makes exactly this argument and
+                // applies exactly this clamp; it was the only one of the three flat
+                // walks that got it. The two that did not are the two that also WRITE:
+                // an unclamped walk here does not merely read past the holder, it
+                // rewrites `Value` cells past the holder with forwarded pointers, i.e.
+                // it corrupts whatever objects follow it in the region.
+                let walkable_slots =
+                    self.holder_walkable_slots(regions, obj_ptr, header.num_slots() as usize, SLOT_SIZE);
+                for_each_flat_object_reference_capped(
                     obj_ptr,
                     header,
                     0,
+                    walkable_slots,
                     |slot_ptr, raw, compact| {
                         // Item 4 — CSet membership from the address first; the
                         // header screen runs only for a CSet resident.
@@ -12443,6 +13109,86 @@ impl G1Collector {
     /// the census, frees a live H.
     ///
     /// Returns bytes reclaimed.
+    ///
+    /// Is the humongous census worth taking this pause?
+    ///
+    /// ONE home for a predicate that had two, which is what let them drift.
+    /// The copy at the `phase4_regions_to_walk` call site decides the fix-up
+    /// walk's WIDTH; the copy in `update_references_in_regions` decides whether
+    /// the census is built at all. Changing one and not the other produces a
+    /// whole-heap walk feeding a census nobody reads -- measured, when the
+    /// first cut of this fix moved only the second: `fixup_regions` stayed at
+    /// 831 against an 845/841 baseline.
+    fn want_humongous_census(
+        &self,
+        regions: &[G1Region],
+        pointer_map: &cratonvm_types::PointerMap,
+    ) -> bool {
+        gc_flags().g1_eager_humongous
+            && regions
+                .iter()
+                .any(|r| r.region_type == RegionType::HumongousStart)
+            && self.eager_reclaim_early_decline(pointer_map).is_none()
+    }
+
+    /// The reasons [`Self::eager_reclaim_humongous_locked`] will decline that
+    /// are already decidable BEFORE Phase 4 walks anything, or `None` if it
+    /// could still proceed.
+    ///
+    /// # Why this is not just tidiness
+    ///
+    /// The humongous census is the ONLY thing that forces Phase 4 to take its
+    /// whole-heap walk (`phase4_regions_to_walk` returns `None` when
+    /// `want_census`). Measured on `TestKillProcessWhileWriting`, 2026-09-02:
+    /// that walk covered **843 of 1024 regions and 446 MB per young pause**, at
+    /// 3 063 us of a 7 588 us mean pause -- against 18 us for the evacuation
+    /// closure that does all the copying.
+    ///
+    /// And on that workload it bought NOTHING. A `CRATONVM_G1_DBG_REACH=1` run
+    /// logged the decline on **every one of 15 639 pauses**, always with the
+    /// same reason: *"an object registered for finalization is awaiting
+    /// finalize()"*. The H2 page's 2026-08-29 census recorded the same thing
+    /// from the other end: `humongous-eager: spans=0 bytes=0
+    /// declined_pauses=16103`.
+    ///
+    /// # The finalizer gate is the one that matters, and it is not rare
+    ///
+    /// `finalizer_pause` is set from `collect_garbage_with_finalizers` when the
+    /// pause has ANY registered, not-yet-enqueued finalizable object -- not
+    /// just a dead one. A heap with one live finalizable object anywhere (a
+    /// `FileInputStream` will do) therefore holds this true for the whole
+    /// process, and eager humongous reclaim NEVER RUNS. Measured consequence on
+    /// H2, whose MVStore allocates 1 MiB `ByteBuffer`s that each become a
+    /// TWO-region humongous span at a 1 MiB region size: **829 of 1024 regions
+    /// humongous, Eden squeezed to 1.1 regions, a 1.5-region collection set,
+    /// and 80 young pauses per second.**
+    ///
+    /// `census.complete` is deliberately NOT here: it is a property of the walk
+    /// itself, so it cannot be known before the walk and stays at the call site.
+    fn eager_reclaim_early_decline(
+        &self,
+        pointer_map: &cratonvm_types::PointerMap,
+    ) -> Option<&'static str> {
+        if self.gc_state.phase() != ConcurrentGcPhase::Idle || self.satb_queue.is_active() {
+            return Some("a concurrent mark cycle is in flight (SATB snapshot liveness applies)");
+        }
+        if !self.mark_worklist.lock().is_empty() {
+            return Some("the gray set is non-empty");
+        }
+        // NO FINALIZER GATE. It used to decline the entire reclaim whenever
+        // `finalizer_pause` was set, and that flag is true for ANY registered
+        // not-yet-enqueued finalizable object -- one live `FileInputStream` is
+        // enough -- so eager humongous reclaim never ran for the life of the
+        // process. `eager_reclaim_humongous_locked` now names the exact shape
+        // the gate was protecting (a humongous object WITH a finalizer, which
+        // is never in the CSet and so is never resurrected) in its live set
+        // instead. See `finalizer_addrs_this_pause`.
+        if pointer_map.iter().any(|(old, new)| old == new) {
+            return Some("evacuation failure kept cset regions phase 4 never walked");
+        }
+        None
+    }
+
     fn eager_reclaim_humongous_locked(
         &self,
         regions: &mut Vec<G1Region>,
@@ -12492,12 +13238,17 @@ impl G1Collector {
         if !self.gray_set_is_empty() {
             return declined("the gray set is non-empty");
         }
-        if self.finalizer_pause.load(Ordering::Relaxed) {
-            // NOT `pending_finalizer_roots.is_empty()`: Phase 3.5 has already
-            // taken that list by the time this runs, so the obvious test passes
-            // unconditionally. See the `finalizer_pause` field.
-            return declined("an object registered for finalization is awaiting finalize()");
-        }
+        // NO FINALIZER GATE. It used to decline the ENTIRE reclaim whenever
+        // `finalizer_pause` was set, and that flag is true for ANY registered
+        // not-yet-enqueued finalizable object -- one live `FileInputStream` is
+        // enough -- so eager humongous reclaim never ran for the life of the
+        // process. Measured on H2 `TestKillProcessWhileWriting`: 830 of 1024
+        // regions humongous, Eden squeezed to 1.1 regions, 76 787 young pauses
+        // per 900 s each freeing 485 KB, against 88 pauses and a PASS without
+        // it. The exact shape the gate protected -- a humongous object WITH a
+        // finalizer, which is never in the CSet and so never resurrected -- is
+        // named in the live set below instead. See `finalizer_addrs_this_pause`
+        // and `a_humongous_span_awaiting_finalization_is_not_eagerly_reclaimed`.
         if pointer_map.iter().any(|(old, new)| old == new) {
             return declined("evacuation failure kept cset regions phase 4 never walked");
         }
@@ -12527,6 +13278,24 @@ impl G1Collector {
         };
         for root in roots {
             note_addr(&mut live, root.as_ptr() as usize);
+        }
+        // EVERY object registered for finalization this pause, at the address
+        // it had when the pause started. This is what replaced the wholesale
+        // `finalizer_pause` decline, and it is aimed at the one shape that
+        // decline existed for: a HUMONGOUS object with a finalizer. Such an
+        // object is unreachable (that is why it is being finalized), is never
+        // in the CSet (humongous spans are not evacuated), and therefore never
+        // reaches `resurrected_finalizers` — so nothing else in this function
+        // would name it live and the span would be freed out from under a
+        // `finalize()` that has not run.
+        //
+        // A dead finalizable object that merely REFERENCES a humongous span
+        // needs nothing extra: the census counts references from dead holders
+        // too (see `HumongousCensus::referenced`, "over-approximates
+        // liveness"), and a resurrected one is walked at its post-copy address
+        // by the loop below.
+        for &addr in self.finalizer_addrs_this_pause.lock().iter() {
+            note_addr(&mut live, addr);
         }
         // Post-copy addresses of objects resurrected for finalization this
         // pause: unreachable by definition, and exactly why they need naming.
@@ -13479,7 +14248,7 @@ impl G1Collector {
             String::new()
         } else {
             format!(
-                " roots_us={} rset_us={} closure_us={} fixup_us={} free_us={}                  verify_us={} other_us={} fixup_regions={} fixup_bytes={}                  rset_regions={}/{} rset_scanned={} rset_skipped={}",
+                " roots_us={} rset_us={} closure_us={} fixup_us={} free_us={}                  verify_us={} other_us={} fixup_regions={} fixup_bytes={}                  rset_regions={}/{} rset_scanned={} rset_skipped={} free_regions={} eden_regions={} surv_regions={} old_regions={} hum_regions={} cset_regions={} jni_pinned_out={} jit_pinned_out={}",
                 phases.roots_us,
                 phases.rset_us,
                 phases.closure_us,
@@ -13498,6 +14267,14 @@ impl G1Collector {
                 phases.rset_regions_offered,
                 phases.rset_bytes_scanned,
                 phases.rset_bytes_skipped,
+                phases.free_regions,
+                phases.eden_regions,
+                phases.surv_regions,
+                phases.old_regions,
+                phases.hum_regions,
+                phases.cset_regions,
+                phases.jni_pinned_out,
+                phases.jit_pinned_out,
             )
             .replace("                 ", "")
         };
@@ -13508,6 +14285,15 @@ impl G1Collector {
             stats.bytes_copied,
             stats.bytes_freed,
             if gc_flags().g1_dbg_reach {
+                // NOTE: this census still cannot fire for a COLLECTION. F-10
+                // made the guard an RwLock and this a `try_read`, so a caller
+                // holding a read guard now gets its counts -- but every
+                // collection path holds the WRITE guard, which is the case that
+                // matters, and dev's own comment says such a caller "still gets
+                // `None`". The per-pause census on `phase_note`
+                // (`G1PausePhases::free_regions`) is taken inside the pause and
+                // covers exactly that gap. Both are kept: they answer for
+                // different callers.
                 // try_read: the collection paths call this while still
                 // holding the regions guard as a WRITER (diagnostic-only; skip
                 // the counts then). Non-blocking either way, so F-10's RwLock
@@ -13602,7 +14388,8 @@ impl G1Collector {
         let rejected = evacuation_refs_rejected();
         let (holder_rejected, holder_clamped) = evacuation_holder_counts();
         eprintln!(
-            "[GC] g1 evac_ref_rejected={rejected} evac_holder_rejected={holder_rejected} evac_holder_clamped={holder_clamped} source_walk_desync={}",
+            "[GC] g1 evac_ref_rejected={rejected} (torn={}) evac_holder_rejected={holder_rejected} evac_holder_clamped={holder_clamped} source_walk_desync={}",
+            evacuation_refs_rejected_torn(),
             evacuation_source_walk_desyncs(),
         );
         // The remaining two "expected to be ZERO" guard counters, on the same
@@ -13610,6 +14397,15 @@ impl G1Collector {
         // consumer anywhere in the tree, which makes their zero unciteable: a
         // run cannot be quoted as evidence for a guard that nothing prints. See
         // `FLAT_WALK_REFUSED_ARRAY` and `KEPT_SEED_REJECTED`.
+        eprintln!(
+            "[GC] g1 non_object_roots_skipped={}",
+            non_object_roots_skipped(),
+        );
+        eprintln!(
+            "[GC] g1 implausible_legacy_headers={} copy_shape_drift={}",
+            evacuation_implausible_class0_copies(),
+            evacuation_copy_shape_drifts(),
+        );
         eprintln!(
             "[GC] g1 flat_walk_refused_array={} kept_seed_rejected={}",
             flat_walks_refused_for_array(),
@@ -13920,19 +14716,32 @@ impl G1Collector {
         // M6 (round-12 gc): checked `+ HEADER_SIZE` to match `try_alloc_array`
         // and gen_heap; a near-`usize::MAX` field count must not wrap.
         let total_size = HEADER_SIZE.checked_add(num_fields.checked_mul(SLOT_SIZE)?)?;
-        let (ptr, _region) = self.alloc_in_region(total_size)?;
-
-        let header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Object,
-            ArrayElementType::Reference,
-            0,
-            u32::try_from(num_fields).ok()?,
-        );
-        unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
-            Some(ObjectRef::from_raw(ptr))
-        }
+        let num_slots = u32::try_from(num_fields).ok()?;
+        // The header is written by the INITIALIZER, i.e. under the regions
+        // lock and before the allocation is published. Writing it after
+        // `alloc_in_region` returned left a window in which the region cursor
+        // already covered this address and the bytes there were the zeroed
+        // span, then a partly-retired 16-byte header store. See
+        // `G1Region::bump_alloc_initialized`.
+        let (ptr, _region) = self.alloc_in_region_initialized(total_size, |ptr| {
+            // SAFETY: `ptr` is the base of a span this allocation has just
+            // reserved and not yet published; it is 8-aligned and at least
+            // `HEADER_SIZE` bytes.
+            unsafe {
+                std::ptr::write(
+                    ptr as *mut ObjectHeader,
+                    ObjectHeader::new(
+                        class_id,
+                        ObjectKind::Object,
+                        ArrayElementType::Reference,
+                        0,
+                        num_slots,
+                    ),
+                );
+            }
+        })?;
+        // SAFETY: the initializer above wrote a well-formed header at `ptr`.
+        unsafe { Some(ObjectRef::from_raw(ptr)) }
     }
 
     /// Allocate and pre-initialize primitive-typed slots based on JVM
@@ -13984,25 +14793,44 @@ impl G1Collector {
     ) -> Option<ObjectRef> {
         let data_size = array_data_size(length, element_type).ok()?;
         let total_size = ARRAY_DATA_OFFSET.checked_add(data_size)?;
-        let (ptr, _region) = self.alloc_in_region(total_size)?;
-
-        // Mirror `length` into BOTH `array_length` and `num_slots`, matching
-        // `Heap::alloc_array` (heap.rs:367-370,403-410) and
-        // `GenerationalHeap::alloc_array` (gen_heap.rs:497-500). The shared
-        // header decoders in `vm_heap` / `walk_objects` (e.g.
-        // `VmHeap::num_fields(arr)`) consume `num_slots` and were silently
-        // returning 0 for any G1-allocated array prior to this fix.
-        let header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Array,
-            element_type,
-            u32::try_from(length).ok()?,
-            u32::try_from(length).expect("array length must fit u32 for G1 header num_slots"),
-        );
-        unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
-            Some(ObjectRef::from_raw(ptr))
-        }
+        let length_u32 = u32::try_from(length).ok()?;
+        // The header is written by the INITIALIZER, i.e. under the regions
+        // lock and before the allocation is published. Writing it after
+        // `alloc_in_region` returned left a window in which the region cursor
+        // already covered this address and the bytes there were the zeroed
+        // span, then a partly-retired 16-byte header store. See
+        // `G1Region::bump_alloc_initialized`.
+        //
+        // An ARRAY is the shape that made this window fatal rather than
+        // merely wrong: `kind` lives in the mark word, the SECOND half of the
+        // header, so the intermediate state of the store below is
+        // `class_id` + `shape = length` with `kind` still reading `Object`.
+        // A primitive array carries `class_id` 0, so that intermediate state
+        // is a legacy object claiming `length` SIXTEEN-byte slots -- eight
+        // times a `byte[]`'s real extent.
+        let (ptr, _region) = self.alloc_in_region_initialized(total_size, |ptr| {
+            // Mirror `length` into BOTH `array_length` and `num_slots`, matching
+            // `Heap::alloc_array` (heap.rs:367-370,403-410) and
+            // `GenerationalHeap::alloc_array` (gen_heap.rs:497-500). The shared
+            // header decoders in `vm_heap` / `walk_objects` (e.g.
+            // `VmHeap::num_fields(arr)`) consume `num_slots` and were silently
+            // returning 0 for any G1-allocated array prior to this fix.
+            // SAFETY: as in `try_alloc_object`.
+            unsafe {
+                std::ptr::write(
+                    ptr as *mut ObjectHeader,
+                    ObjectHeader::new(
+                        class_id,
+                        ObjectKind::Array,
+                        element_type,
+                        length_u32,
+                        length_u32,
+                    ),
+                );
+            }
+        })?;
+        // SAFETY: the initializer above wrote a well-formed header at `ptr`.
+        unsafe { Some(ObjectRef::from_raw(ptr)) }
     }
 
     /// Carve a TLAB from the current Eden region.
@@ -14915,7 +15743,17 @@ impl G1Collector {
             let Some(idx) = self.lookup_region_for_addr(addr) else {
                 continue;
             };
-            if set.contains(&idx) || self.candidate_header_is_plausible(regions, addr) {
+            // BOTH screens -- see `addr_is_followable_object`. Gating this on
+            // the tag screen alone is what put the containing region of an
+            // INTERIOR root into the CSet: the root passed, its region was not
+            // pinned out, and the root loop then evacuated the array element it
+            // pointed at as if it were an object. Pinning the region out here
+            // is the correct treatment and the cheap one -- the region simply
+            // does not join the CSet, so nothing in it moves and the interior
+            // root stays valid, which is what a conservatively-discovered root
+            // needs and what this set was built to give it.
+            if set.contains(&idx) || self.addr_is_followable_object(regions, addr, "root-pin-scan")
+            {
                 continue;
             }
             let n = NON_OBJECT_ROOT_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
@@ -15644,7 +16482,27 @@ impl GarbageCollector for G1Collector {
         );
         let body_size = compact_body.unwrap_or(num_fields * SLOT_SIZE);
         let total_size = HEADER_SIZE + body_size;
-        let (ptr, _region) = self.alloc_in_region(total_size).unwrap_or_else(|| {
+        let num_slots = u32::try_from(num_fields).expect("field count exceeds u32::MAX");
+        // The header is written by the INITIALIZER -- under the regions lock,
+        // before the allocation is published. See
+        // `G1Region::bump_alloc_initialized`.
+        let (ptr, _region) = self
+            .alloc_in_region_initialized(total_size, |ptr| {
+                let mut header = ObjectHeader::new(
+                    class_id,
+                    ObjectKind::Object,
+                    ArrayElementType::Reference,
+                    0,
+                    num_slots,
+                );
+                if let Some(body) = compact_body {
+                    header.set_compact_shape(num_slots, body);
+                }
+                // SAFETY: `ptr` is the base of a reserved, unpublished span,
+                // 8-aligned and at least `HEADER_SIZE` bytes.
+                unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
+            })
+            .unwrap_or_else(|| {
             if gc_flags().g1_dbg_diag {
                 let regions = self.regions.read();
                 let mut free = 0usize;
@@ -15684,21 +16542,8 @@ impl GarbageCollector for G1Collector {
             std::process::abort();
         });
 
-        let mut header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Object,
-            ArrayElementType::Reference,
-            0,
-            u32::try_from(num_fields).expect("field count exceeds u32::MAX"),
-        );
-        if let Some(body) = compact_body {
-            header.set_compact_shape(num_fields as u32, body);
-        }
-
-        unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
-            ObjectRef::from_raw(ptr)
-        }
+        // SAFETY: the initializer above wrote a well-formed header at `ptr`.
+        unsafe { ObjectRef::from_raw(ptr) }
     }
 
     fn alloc_array(
@@ -15710,7 +16555,36 @@ impl GarbageCollector for G1Collector {
         let data_size = array_data_size(length, element_type)
             .expect("array data size overflow in g1 alloc_array");
         let total_size = ARRAY_DATA_OFFSET + data_size;
-        let (ptr, _region) = self.alloc_in_region(total_size).unwrap_or_else(|| {
+        let length_u32 = u32::try_from(length).expect("array length exceeds u32::MAX");
+        // The header is written by the INITIALIZER -- under the regions lock,
+        // before the allocation is published. See
+        // `G1Region::bump_alloc_initialized`, and `try_alloc_array` for why an
+        // array header is the shape whose torn intermediate state reads back
+        // as a legacy object claiming `length` sixteen-byte slots.
+        //
+        // Mirror `length` into BOTH `array_length` and `num_slots`, matching
+        // `Heap::alloc_array` (heap.rs:367-370,403-410) and
+        // `GenerationalHeap::alloc_array` (gen_heap.rs:497-500). The shared
+        // header decoders in `vm_heap` / `walk_objects` (e.g.
+        // `VmHeap::num_fields(arr)`) consume `num_slots` and were silently
+        // returning 0 for any G1-allocated array prior to that fix.
+        let (ptr, _region) = self
+            .alloc_in_region_initialized(total_size, |ptr| {
+                // SAFETY: as in `alloc_object`.
+                unsafe {
+                    std::ptr::write(
+                        ptr as *mut ObjectHeader,
+                        ObjectHeader::new(
+                            class_id,
+                            ObjectKind::Array,
+                            element_type,
+                            length_u32,
+                            length_u32,
+                        ),
+                    );
+                }
+            })
+            .unwrap_or_else(|| {
             eprintln!(
                 "FATAL: G1: out of heap space for array allocation ({} bytes) \
                  -- see the object-allocation abort above for the invariant \
@@ -15720,24 +16594,8 @@ impl GarbageCollector for G1Collector {
             std::process::abort();
         });
 
-        // Mirror `length` into BOTH `array_length` and `num_slots`, matching
-        // `Heap::alloc_array` (heap.rs:367-370,403-410) and
-        // `GenerationalHeap::alloc_array` (gen_heap.rs:497-500). The shared
-        // header decoders in `vm_heap` / `walk_objects` (e.g.
-        // `VmHeap::num_fields(arr)`) consume `num_slots` and were silently
-        // returning 0 for any G1-allocated array prior to this fix.
-        let header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Array,
-            element_type,
-            u32::try_from(length).expect("array length exceeds u32::MAX"),
-            u32::try_from(length).expect("array length must fit u32 for G1 header num_slots"),
-        );
-
-        unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
-            ObjectRef::from_raw(ptr)
-        }
+        // SAFETY: the initializer above wrote a well-formed header at `ptr`.
+        unsafe { ObjectRef::from_raw(ptr) }
     }
 
     fn get_header(&self, obj: ObjectRef) -> &ObjectHeader {
@@ -17107,6 +17965,69 @@ enum GrayRefusal {
     TornHeader,
 }
 
+/// [`GrayRefusal`]'s question, asked of a [`HeaderVerdict`]: is this refusal
+/// evidence of CORRUPTION, or of an address that simply is not a live object?
+///
+/// `true` only for the verdicts that mean "something IS allocated here and its
+/// header does not describe it". Everything else -- unaligned, outside the
+/// arena, no such region, a `Free` region, at or above the cursor -- says the
+/// address was never an object start in this region's current incarnation,
+/// which is routine for the reasons [`GrayRefusal::NotAllocated`] spells out.
+///
+/// `HumongousFiller` counts as TORN here and does NOT on the marking side, and
+/// the difference is deliberate: the marker may legitimately be handed a
+/// continuation slice's base, whereas a *reference slot* pointing at one names
+/// an address no allocation ever returned.
+fn evac_refusal_is_torn(verdict: HeaderVerdict) -> bool {
+    match verdict {
+        HeaderVerdict::BadKindTag
+        | HeaderVerdict::BadElementTag
+        | HeaderVerdict::ImplausibleShape
+        | HeaderVerdict::HumongousFiller => true,
+        HeaderVerdict::Object
+        | HeaderVerdict::NullOrUnaligned
+        | HeaderVerdict::OutsideArena
+        | HeaderVerdict::NoRegionGeometry
+        | HeaderVerdict::NoSuchRegion
+        | HeaderVerdict::RegionFree
+        | HeaderVerdict::BelowRegionBase
+        | HeaderVerdict::AboveCursor => false,
+    }
+}
+
+/// `CRATONVM_G1_LATE_HEADER_WRITE=1` -- publish an out-of-line allocation
+/// BEFORE its header is written, i.e. the ordering G1 had until 2026-09-01.
+///
+/// The one-binary A/B for that fix. `alloc_in_region_initialized` normally runs
+/// the caller's header write over the fresh span while the regions lock is
+/// still held; with this set it publishes first and calls the initializer after
+/// the lock is dropped, reopening the window in which a heap walk reads an
+/// address the cursor covers and a header that is not there yet. See
+/// [`G1Region::bump_alloc_initialized`] for what a walker reads in that window
+/// and why an ARRAY is the shape that makes it fatal.
+///
+/// Default OFF. It exists because the fix UNBLOCKS a workload rather than
+/// moving a number, and a fix like that has no A/B unless the old behaviour is
+/// reachable on the same binary.
+/// Value-parsed, NOT `is_some()`. A kill switch whose OFF word turns it ON is
+/// a control arm that silently is not one: an operator bisecting with
+/// `CRATONVM_G1_LATE_HEADER_WRITE=0` would have been running the buggy
+/// ordering while believing they had disabled it. `truthy_word` is the same
+/// reading `CRATONVM_G1_PARALLEL_EVAC` gets -- empty, `0`, `false`, `off` and
+/// `no` are all OFF.
+fn g1_late_header_write() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_G1_LATE_HEADER_WRITE")
+            .and_then(|v| v.into_string().ok())
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// `CRATONVM_G1_MARK_OOB_FAILSAFE=1` -- treat [`GrayRefusal::NotAllocated`]
 /// as a torn header again, i.e. restore the single-bit gate.
 ///
@@ -18011,6 +18932,64 @@ mod tests {
 
     fn make_collector() -> G1Collector {
         G1Collector::new(small_config())
+    }
+
+    /// The header initializer runs under the regions guard, over a span that is
+    /// already zeroed, and before the allocator hands the pointer back.
+    ///
+    /// It does NOT assert "before the allocation is published", and must not:
+    /// under F-11 the compare-exchange that claims the range IS the
+    /// publication, so nothing can run before it. What this guards is the half
+    /// that is still true and still worth having -- the four header-writing
+    /// callers cannot individually forget, and the span carries a decodable
+    /// header the moment `alloc_in_region` returns rather than after the guard
+    /// is dropped. See `G1Region::bump_alloc_initialized`.
+    #[test]
+    fn the_allocation_initializer_runs_under_the_guard_over_a_zeroed_span() {
+        let gc = make_collector();
+        let ran = std::cell::Cell::new(false);
+        let got = gc.alloc_in_region_initialized(64, |p| {
+            assert!(
+                gc.regions.try_write().is_none(),
+                "the regions guard must still be held while the header is written"
+            );
+            // SAFETY: `p` is the base of the 64-byte span this allocation just
+            // claimed; the initializer owns it exclusively.
+            let bytes = unsafe { std::slice::from_raw_parts(p, 64) };
+            assert!(
+                bytes.iter().all(|b| *b == 0),
+                "the span must already be zeroed when the initializer runs"
+            );
+            ran.set(true);
+        });
+        assert!(got.is_some(), "the allocation must succeed on a fresh heap");
+        assert!(ran.get(), "the initializer must have run");
+    }
+
+    /// ...and the initializer is actually wired to the header write: an array
+    /// allocated out of line reads back through the same decoders the region
+    /// walk uses. `num_slots` mirroring `array_length` is the property that
+    /// makes a torn header indistinguishable from a legacy object, so both are
+    /// asserted.
+    #[test]
+    fn out_of_line_array_allocation_publishes_a_decodable_array_header() {
+        let gc = make_collector();
+        // Larger than `TLAB_MAX_ALLOC` (32 KiB) in the real VM: this entry
+        // point is the one every big array takes.
+        let arr = gc
+            .try_alloc_array(ClassId::new(0), ArrayElementType::Int, 8192)
+            .expect("fresh heap must serve one 32 KiB array");
+        // SAFETY: `try_alloc_array` returned a live object reference.
+        let header = unsafe { &*(arr.as_ptr() as *const ObjectHeader) };
+        assert_eq!(header.kind(), ObjectKind::Array);
+        assert_eq!(header.element_type(), ArrayElementType::Int);
+        assert_eq!(header.array_length(), 8192);
+        assert_eq!(header.num_slots(), 8192);
+        let regions = gc.regions.read();
+        assert!(
+            gc.candidate_header_is_plausible(&regions, arr.as_ptr() as usize),
+            "the published array must satisfy the same screen the evacuator applies"
+        );
     }
 
     /// Ten-findings item 5. The region table is walked linearly by every
@@ -19860,6 +20839,74 @@ mod tests {
             "an open mark cycle must suppress eager reclaim: SATB snapshot \
              liveness applies and the gray set holds addresses this pause \
              never walked"
+        );
+    }
+
+    /// A HUMONGOUS object WITH A FINALIZER must survive its own unreachability
+    /// until `finalize()` has run.
+    ///
+    /// This is the exact shape the wholesale `finalizer_pause` decline existed
+    /// for, and the reason removing that decline needed a replacement rather
+    /// than a deletion: the object is unreachable (that is why it is being
+    /// finalized), a humongous span is never in the CSet so Phase 3.5 never
+    /// resurrects it, and nothing else in `eager_reclaim_humongous_locked`
+    /// would name it live. Naming it from `finalizer_addrs_this_pause` is what
+    /// keeps it, and this test is what keeps that true.
+    ///
+    /// The gate it replaced was not free: `finalizer_pause` is set for ANY
+    /// registered not-yet-enqueued finalizable object, so a single live one
+    /// disabled eager humongous reclaim for the whole process — measured on H2
+    /// as 830 of 1024 regions humongous and 76 787 young pauses per 900 s,
+    /// against 26 and 88 without it.
+    #[test]
+    fn a_humongous_object_awaiting_finalization_is_never_eagerly_reclaimed() {
+        let gc = make_collector();
+        let doomed = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 100_000);
+        assert_eq!(gc.count_regions(RegionType::HumongousStart), 1);
+        let addr = doomed.as_ptr() as usize;
+        // Unreachable from any root, and registered for finalization: exactly
+        // the state the reference processor hands to the collector.
+        let _churn = gc.alloc_object(ClassId::new(1), 1);
+        let mut roots: Vec<ObjectRef> = vec![];
+        let (_result, _dead) =
+            gc.collect_garbage_with_finalizers(&stw(), &mut roots, &[addr], &NoopMonitors);
+
+        assert_eq!(
+            gc.count_regions(RegionType::HumongousStart),
+            1,
+            "a humongous object registered for finalization must not be reclaimed \
+             before finalize() runs: it is unreachable by construction, and a \
+             humongous span is never in the CSet, so nothing else names it live"
+        );
+    }
+
+    /// ...and the other half of that change: a humongous span that is merely
+    /// unreachable, on a pause that HAS finalizer candidates, is still
+    /// reclaimed. The old gate declined outright here, which is what disabled
+    /// the feature for any process holding one finalizable object.
+    #[test]
+    fn an_unrelated_finalizer_candidate_no_longer_suppresses_eager_reclaim() {
+        let gc = make_collector();
+        let keeper = gc.alloc_object(ClassId::new(1), 1);
+        let _dead_span = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 100_000);
+        assert_eq!(gc.count_regions(RegionType::HumongousStart), 1);
+
+        let _churn = gc.alloc_object(ClassId::new(1), 1);
+        let mut roots: Vec<ObjectRef> = vec![keeper];
+        // A finalizer candidate that is NOT the humongous span.
+        let (_result, _dead) = gc.collect_garbage_with_finalizers(
+            &stw(),
+            &mut roots,
+            &[keeper.as_ptr() as usize],
+            &NoopMonitors,
+        );
+
+        assert_eq!(
+            gc.count_regions(RegionType::HumongousStart),
+            0,
+            "an unreachable humongous span must still be reclaimed on a pause \
+             that merely HAS finalizer candidates -- declining here is what left \
+             830 of 1024 regions humongous on the H2 workload"
         );
     }
 

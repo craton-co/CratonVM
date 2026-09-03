@@ -196,8 +196,10 @@ pub fn caller_blocks_jit(shared: &SharedVm, class_id: ClassId, method_index: u16
     }
     let verdict = compute(shared, class_id, method_index);
     cache().write().insert(key, verdict);
+    cratonvm_types::gpu_jit_gate_census::note_verdict(verdict);
     verdict
 }
+
 
 /// Convenience wrapper for call sites that resolve their method by
 /// `(class_name, method_name, descriptor)` rather than by index — i.e.

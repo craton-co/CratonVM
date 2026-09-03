@@ -335,13 +335,14 @@ pub(super) fn execute_invokestatic_fast_door(
     thread: &mut JvmThread,
     frame_idx: usize,
     cp_index: u16,
+    site_pc: usize,
 ) -> Option<Result<CachedCallResult, MethodCallFailed>> {
     const MISS: usize = site_stats::DOOR_STATIC_MISS;
     if crate::classloading::any_class_redefined() {
         decline!("static", MISS, "a class was redefined");
     }
     let caller_class_id = thread.frames[frame_idx].class_id;
-    let cached = match thread.invoke_cache.get(caller_class_id, cp_index, false) {
+    let cached = match thread.invoke_cache.get(caller_class_id, cp_index, false, site_pc as u32) {
         Some(CachedInvokeTarget::Bytecode { cached, gate }) => {
             // A redefined target keeps the general path, which re-resolves.
             if gate.generation != 0 {
@@ -434,6 +435,7 @@ pub(super) fn execute_nonvirtual_fast_door(
     frame_idx: usize,
     cp_index: u16,
     is_special: bool,
+    site_pc: usize,
 ) -> Option<Result<CachedCallResult, MethodCallFailed>> {
     const MISS: usize = site_stats::DOOR_SPECIAL_MISS;
     if crate::classloading::any_class_redefined() {
@@ -441,7 +443,7 @@ pub(super) fn execute_nonvirtual_fast_door(
     }
     let caller_class_id = thread.frames[frame_idx].class_id;
     let (cached, expected_receiver) =
-        match thread.invoke_cache.get(caller_class_id, cp_index, is_special) {
+        match thread.invoke_cache.get(caller_class_id, cp_index, is_special, site_pc as u32) {
         Some(CachedInvokeTarget::Bytecode { cached, gate }) => {
             if gate.generation != 0 {
                 decline!("special", MISS, "the target class has been redefined");

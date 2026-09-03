@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-514 tokens.
+515 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -571,6 +571,7 @@ export inherited from a parent shell.
 | `youngscan` | `CRATONVM_DBG_YOUNGSCAN` |
 | `youngstate` | `CRATONVM_DBG_YOUNGSTATE` |
 | `zero-ranges` | `CRATONVM_DBG_ZERO_RANGES` |
+| `invoke-cache-stats` | `CRATONVM_INVOKE_CACHE_STATS` |
 | `ir-string` | `CRATONVM_DBG_IR_STRING` |
 | `invoke-phases` | `CRATONVM_DBG_INVOKE_PHASES` |
 | `interp-frames` | `CRATONVM_DBG_INTERP_FRAMES` |
@@ -580,13 +581,14 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-321 tokens.
+322 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `aaload-licm` | `CRATONVM_DISABLE_AALOAD_LICM` |
 | `gpu-approx-math` | `CRATONVM_GPU_APPROX_MATH` |
 | `gpu-dispatch-memo` | `CRATONVM_GPU_DISPATCH_MEMO` |
+| `invoke-cache-pc-key` | `CRATONVM_INVOKE_CACHE_PC_KEY` |
 | `gpu-if-convert` | `CRATONVM_GPU_IF_CONVERT` |
 | `gpu-if-convert-max-ops` | `CRATONVM_GPU_IF_CONVERT_MAX_OPS` |
 | `sp-ic-deny` | `CRATONVM_JIT_SP_IC_DENY` |
@@ -806,7 +808,7 @@ export inherited from a parent shell.
 | `backedge-poll-gate` | `CRATONVM_JIT_NO_BACKEDGE_POLL_GATE` |
 | `field-fast-path` | `CRATONVM_JIT_NO_FIELD_FAST_PATH` |
 | `osr-inline-gate` | `CRATONVM_JIT_NO_OSR_INLINE_GATE` |
-| `invoke-fast-door` | `CRATONVM_JIT_NO_INVOKE_FAST_DOOR` |
+| `invoke-fast-door` | `CRATONVM_JIT_INVOKE_FAST_DOOR / CRATONVM_JIT_NO_INVOKE_FAST_DOOR` |
 | `nonvirtual-fast-door` | `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` |
 | `frame-slot-reuse` | `CRATONVM_JIT_NO_FRAME_SLOT_REUSE` |
 | `iface-select-memo` | `CRATONVM_JIT_NO_IFACE_SELECT_MEMO` |
@@ -908,12 +910,14 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-124 tokens.
+126 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `g1-late-header-write` | `CRATONVM_G1_LATE_HEADER_WRITE` |
 | `g1-mark-oob-failsafe` | `CRATONVM_G1_MARK_OOB_FAILSAFE` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
+| `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |
 | `moving-young-bounds-guard` | `CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD` |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
 | `card-table-only` | `CRATONVM_CARD_TABLE_ONLY` |
