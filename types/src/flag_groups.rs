@@ -1254,7 +1254,7 @@ pub const INVENTORY: &[E] = &[
     // The optimizing tier's half of the same fact, reached by a different
     // route (the graph's `receiver_param`, not a bytecode dataflow). Separate
     // so a bisect can say which tier moved.
-    E { group: Group::JIT, token: "ir-this-nonnull", on_key: Some("CRATONVM_JIT_IR_THIS_NONNULL"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
+    E { group: Group::JIT, token: "ir-this-nonnull", on_key: Some("CRATONVM_JIT_IR_THIS_NONNULL"), off_key: None, off_word: None, since: "2026-09-03" },
     // Drops the getfield receiver TEST/JZ where the dataflow proves it dead.
     E { group: Group::JIT, token: "receiver-null-elim", on_key: Some("CRATONVM_JIT_RECEIVER_NULL_ELIM"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     // DEFAULT-ON since its soak. Still the only switch in this backend whose

@@ -10793,8 +10793,30 @@ fn verify_mir_allocation(
 ///
 /// Declared in `types/src/flag_groups.rs` as `jit/ir-linear-scan`, so `-XX:`
 /// options and `flags::with_thread_overrides` reach it.
-/// Seed each block's null proofs with the receiver — **default ON**, opt out
-/// with `CRATONVM_JIT_IR_THIS_NONNULL=0`.
+/// Seed each block's null proofs with the receiver — **default OFF**, opt in
+/// with `CRATONVM_JIT_IR_THIS_NONNULL=1`.
+///
+/// # It is off because it measured SLOWER, which nobody expected
+///
+/// It is correct and it engages (`seeded=9 elided=2 emitted=0` against
+/// `0/0/2` with it off, same answer). On the loop it was built for — the one
+/// the 2026-09-03 tier comparison found inverted — it is **~20% slower with
+/// the check removed than with it emitted**: medians 1.78/1.93 on against
+/// 1.49/1.61 off, two replicate pairs, within-config spread 8%, same direction
+/// both times.
+///
+/// **The cost is not compile time.** At `reps=1`, where the loop barely runs,
+/// the two arms are 0.19 against 0.18 — so the per-block seed scan is ~0.01s
+/// and the 0.3s is in the emitted code.
+///
+/// Removing two instructions cannot make a loop 20% slower on its own, so what
+/// this really says is that the body is dominated by something layout- or
+/// branch-structure-sensitive, and deleting a never-taken forward `JZ` moved
+/// it. That is a lead worth pulling for the residual tier inversion itself,
+/// and it is the reason this switch stays available rather than being deleted:
+/// it is the smallest known perturbation that moves that loop by 20%.
+///
+/// If nobody finds the cause, withdraw it.
 ///
 /// The optimizing-tier half of `CRATONVM_JIT_THIS_NONNULL`, which seeds the
 /// single-pass backend's null-check dataflow. Separate switch because the two
@@ -10808,10 +10830,7 @@ fn ir_this_nonnull_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        !matches!(
-            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_THIS_NONNULL").as_deref(),
-            Ok("0") | Ok("false") | Ok("off") | Ok("no")
-        )
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_THIS_NONNULL").is_some()
     })
 }
 
