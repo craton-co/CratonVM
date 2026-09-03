@@ -128,8 +128,32 @@ sweep the registry, and cannot: the map is global, so a close-time
 drain-all would free submissions belonging to another executor in the
 same process.
 
-The value-returning API (`submit`/`launch` -> `GpuFuture.get()`) is
-unaffected -- those paths do not register a handle you have to manage.
+The value-returning API (`submit`/`launch`/`submitV` -> `GpuFuture.get()`)
+registers a submission too, but you do not manage it by hand:
+`GpuFutureImpl` registers itself with `StreamCleaner` (a
+`java.lang.ref.Cleaner`), and the cleaning action calls `releaseFuture`
+once the future becomes unreachable. So those handles are released **when
+the future is collected**, and the registry's occupancy for that API is
+bounded by collection frequency rather than by the life of the process.
+
+Measured, 500 `submitV` + `get()` calls with the arrays hoisted out of
+the loop so the loop itself allocates almost nothing:
+
+```
+no collection forced   registered=500 released=0   live_at_exit=500 peak_live=500
+System.gc() every 50   registered=500 released=500 live_at_exit=0   peak_live=50
+```
+
+`peak_live` tracks the collection interval exactly. The first row is not
+a leak -- it is a program that never gave the collector a reason to run,
+which for a real workload is unusual. If you hold thousands of futures
+between collections and that matters, take the handle API instead and
+release explicitly.
+
+Both of these only work as described since 2026-09-02. Before that
+`releaseFuture` did not reach the offload registry, so **neither** path
+drained: forcing a collection every 50 iterations still left
+`released=0 live_at_exit=500`.
 
 **This was broken until 2026-09-02** and is worth knowing about if you
 are reading older code. `GpuExecutor.releaseSubmission(h)` compiles to
