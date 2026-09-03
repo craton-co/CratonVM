@@ -892,7 +892,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-120 tokens.
+121 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -934,6 +934,7 @@ export inherited from a parent shell.
 | `zgc-mark-root-filter` | `CRATONVM_ZGC_MARK_ROOT_FILTER` |
 | `zgc-jit-tlab` | `CRATONVM_ZGC_JIT_TLAB` |
 | `zgc-tlab-tail-sink` | `CRATONVM_ZGC_TLAB_TAIL_SINK` |
+| `zgc-mark-pool-persistent` | `CRATONVM_ZGC_MARK_POOL_PERSISTENT` |
 | `g1-reserve-heap` | `CRATONVM_G1_RESERVE_HEAP` |
 | `g1-uncommit` | `CRATONVM_G1_UNCOMMIT` |
 | `g1-card-rset` | `CRATONVM_G1_CARD_RSET` |

@@ -399,17 +399,34 @@ pub(super) fn inline_reserve_path_enabled() -> bool {
     })
 }
 
+/// What ONE splice takes: its callee's locals, its branch-merge area, and a
+/// bound on its own operand depth.
+///
+/// `callee_code_len` is the operand bound — every push costs at least one
+/// bytecode byte — and `MAX_INLINE_MERGE_DEPTH` is the merge area
+/// `try_emit_inline` reserves whether or not the body branches.
+///
+/// The merge area was missing here until 2026-09-02, which under-budgeted every
+/// site by four words: `iconst_0; ireturn` is a two-byte callee that budgets
+/// two words against a spend of six. It did not bite because the reserve was a
+/// SUM over every site, so slack from the others covered it. Making the reserve
+/// a max over concurrently-live splices removes that mask, so the four words
+/// have to be named — and they are cheap next to the 273 the max saves.
+fn spliced_site_own(site: &crate::InlineSite, param_span: usize) -> usize {
+    site.callee_max_locals
+        .max(param_span)
+        .saturating_add(site.callee_code_len)
+        .saturating_add(super::inlining::MAX_INLINE_MERGE_DEPTH)
+}
+
 pub(super) fn spliced_stack_reserve(site: &crate::InlineSite) -> usize {
     let (_, param_span) = crate::compute_param_jvm_slots(&site.descriptor, site.callee_is_static);
     site.nested_sites
         .iter()
         .map(|n| spliced_stack_reserve(&n.site))
-        .fold(
-            site.callee_max_locals
-                .max(param_span)
-                .saturating_add(site.callee_code_len),
-            |a, b| a.saturating_add(b),
-        )
+        .fold(spliced_site_own(site, param_span), |a, b| {
+            a.saturating_add(b)
+        })
 }
 
 /// What one site would need if concurrently-live splices were counted rather
@@ -424,10 +441,7 @@ pub(super) fn spliced_stack_reserve(site: &crate::InlineSite) -> usize {
 /// siblings anyway, which is what this exists to price.
 pub(super) fn spliced_stack_reserve_path(site: &crate::InlineSite) -> usize {
     let (_, param_span) = crate::compute_param_jvm_slots(&site.descriptor, site.callee_is_static);
-    let own = site
-        .callee_max_locals
-        .max(param_span)
-        .saturating_add(site.callee_code_len);
+    let own = spliced_site_own(site, param_span);
     let deepest = site
         .nested_sites
         .iter()
