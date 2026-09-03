@@ -1889,6 +1889,18 @@ cached_is_set!(no_osr_inline_gate, "CRATONVM_JIT_NO_OSR_INLINE_GATE");
 /// `CRATONVM_JIT=-invoke-fast-door`.
 cached_is_set!(no_invoke_fast_door, "CRATONVM_JIT_NO_INVOKE_FAST_DOOR");
 
+/// `CRATONVM_JIT_NO_DOOR_RECEIVER_RECORD=1` -- stop the monomorphic invoke
+/// fast door recording its receiver into `profile_store`, i.e. restore the
+/// behaviour that made it return wrong answers.
+///
+/// This exists so the fix has an A/B lever inside ONE binary. Set, the door
+/// serves warm monomorphic hits and records nothing, so the receiver profile is
+/// sampled only from the calls the door DECLINED -- and
+/// `org.h2.test.store.TestRandomMapOps --Xmx 256m` goes back to
+/// `AssertionError: (1810, null)` in 12-23 s. Clear, it records like the
+/// general path and the workload is clean.
+cached_is_set!(no_door_receiver_record, "CRATONVM_JIT_NO_DOOR_RECEIVER_RECORD");
+
 /// `CRATONVM_JIT_INVOKE_FAST_DOOR` -- OPT IN to the monomorphic invoke fast
 /// door, which is default-OFF since 2026-09-03 because it returns wrong
 /// answers.

@@ -581,7 +581,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-326 tokens.
+327 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -809,6 +809,7 @@ export inherited from a parent shell.
 | `field-fast-path` | `CRATONVM_JIT_NO_FIELD_FAST_PATH` |
 | `osr-inline-gate` | `CRATONVM_JIT_NO_OSR_INLINE_GATE` |
 | `invoke-fast-door` | `CRATONVM_JIT_INVOKE_FAST_DOOR / CRATONVM_JIT_NO_INVOKE_FAST_DOOR` |
+| `door-receiver-record` | `CRATONVM_JIT_NO_DOOR_RECEIVER_RECORD` |
 | `nonvirtual-fast-door` | `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` |
 | `frame-slot-reuse` | `CRATONVM_JIT_NO_FRAME_SLOT_REUSE` |
 | `frame-emplace` | `CRATONVM_JIT_NO_FRAME_EMPLACE` |
