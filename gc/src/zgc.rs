@@ -747,6 +747,25 @@ struct ZgcCounters {
     /// measurement is a vacuous green.**
     parallel_mark_cycles: AtomicUsize,
     compaction_cycles: AtomicUsize,
+    /// Why `needs_gc` said yes, one counter per branch.
+    ///
+    /// AUDIT 2026-09-03. `needs_gc` has four independent reasons and the
+    /// stats reported only the TOTAL, so "13 collections against 2" could
+    /// not be attributed. Measured on kfusion, one frame, same binary:
+    /// `--gpu` collects 13 times and without it twice, for 27% more
+    /// garbage -- a trigger difference, not an allocation difference, and
+    /// no way to tell which trigger without these.
+    trigger_stress: AtomicUsize,
+    trigger_threshold: AtomicUsize,
+    trigger_headroom: AtomicUsize,
+    trigger_alloc_budget: AtomicUsize,
+    /// Allocations the arena genuinely REFUSED, which latch
+    /// `hard_alloc_failure` and make the safepoint collect without ever
+    /// consulting `needs_gc`. Counted because the four `trigger_*` tallies
+    /// above came back ALL ZERO on a run that collected 13 times, leaving
+    /// this as the only remaining explanation -- and a conclusion by
+    /// elimination is worth exactly one counter.
+    trigger_hard_alloc_fail: AtomicUsize,
     objects_relocated: AtomicUsize,
     vacated_spans_published: AtomicUsize,
     vacated_bytes_published: AtomicUsize,
@@ -1906,6 +1925,11 @@ impl ZgcRealHeap {
                 gen_recards_after_relocation: AtomicUsize::new(0),
                 parallel_mark_cycles: AtomicUsize::new(0),
                 compaction_cycles: AtomicUsize::new(0),
+            trigger_stress: AtomicUsize::new(0),
+            trigger_threshold: AtomicUsize::new(0),
+            trigger_headroom: AtomicUsize::new(0),
+            trigger_alloc_budget: AtomicUsize::new(0),
+            trigger_hard_alloc_fail: AtomicUsize::new(0),
                 objects_relocated: AtomicUsize::new(0),
                 vacated_spans_published: AtomicUsize::new(0),
                 vacated_bytes_published: AtomicUsize::new(0),
@@ -2766,6 +2790,20 @@ impl ZgcRealHeap {
     }
 
     /// Number of collections performed so far.
+    /// `(stress, threshold, headroom, alloc_budget, hard_alloc_fail)` —
+    /// why a cycle happened. The first four are `needs_gc`'s branches; the
+    /// last is the arena refusing an allocation, which collects WITHOUT
+    /// consulting `needs_gc` at all. See the counters' declaration.
+    pub fn trigger_tallies(&self) -> (usize, usize, usize, usize, usize) {
+        (
+            self.counters.trigger_stress.load(Ordering::Relaxed),
+            self.counters.trigger_threshold.load(Ordering::Relaxed),
+            self.counters.trigger_headroom.load(Ordering::Relaxed),
+            self.counters.trigger_alloc_budget.load(Ordering::Relaxed),
+            self.counters.trigger_hard_alloc_fail.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn gc_count(&self) -> usize {
         self.gc_count.load(Ordering::Relaxed)
     }
@@ -7191,6 +7229,9 @@ impl ZgcRealHeap {
                     // the case it was written for: see the `hard_alloc_failure`
                     // field doc.
                     self.hard_alloc_failure.store(true, Ordering::Relaxed);
+                    self.counters
+                        .trigger_hard_alloc_fail
+                        .fetch_add(1, Ordering::Relaxed);
                     // ...and WHERE that collection should compact. The latch
                     // above has always asked for a cycle; this is the first
                     // thing that tells it where the request actually needs
@@ -12005,6 +12046,7 @@ impl GarbageCollector for ZgcRealHeap {
             if step > 0 {
                 let last = self.counters.gc_stress_mark.load(Ordering::Relaxed);
                 if a.saturating_sub(last) >= step {
+                    self.counters.trigger_stress.fetch_add(1, Ordering::Relaxed);
                     return true;
                 }
             }
@@ -12026,6 +12068,17 @@ impl GarbageCollector for ZgcRealHeap {
         if a >= self.gc_rearm.load(Ordering::Relaxed)
             && (a >= self.gc_threshold || self.headroom_low.load(Ordering::Relaxed))
         {
+            // Both halves are recorded, and deliberately not as an
+            // either/or: a cycle can satisfy the live-bytes threshold AND
+            // be short of contiguous headroom, and which one is driving a
+            // workload is the whole question when the collection COUNT is
+            // what differs between two arms.
+            if a >= self.gc_threshold {
+                self.counters.trigger_threshold.fetch_add(1, Ordering::Relaxed);
+            }
+            if self.headroom_low.load(Ordering::Relaxed) {
+                self.counters.trigger_headroom.fetch_add(1, Ordering::Relaxed);
+            }
             return true;
         }
 
@@ -12049,6 +12102,9 @@ impl GarbageCollector for ZgcRealHeap {
         {
             self.counters
                 .alloc_trigger_fires
+                .fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .trigger_alloc_budget
                 .fetch_add(1, Ordering::Relaxed);
             return true;
         }

@@ -3279,6 +3279,17 @@ impl VmHeap {
                 h.allocated_bytes(),
                 h.heap_capacity(),
             );
+            // WHY those collections happened. `needs_gc` has four
+            // independent reasons and the count alone cannot separate
+            // them, which is what made "13 collections against 2" on the
+            // same workload unattributable. A cycle can satisfy more than
+            // one, so these do not have to sum to `collections`.
+            {
+                let (stress, threshold, headroom, budget, hard) = h.trigger_tallies();
+                eprintln!(
+                    "[GC] zgc-trigger: stress={stress} live_bytes_threshold={threshold}                      headroom_low={headroom} alloc_budget={budget}                      hard_alloc_refusals={hard}"
+                );
+            }
             // Phase 2.2's tracked number, on its own line so a suite runner can
             // extract it per class with one grep.
             //
