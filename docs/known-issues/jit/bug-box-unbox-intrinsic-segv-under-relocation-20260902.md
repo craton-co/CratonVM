@@ -211,10 +211,17 @@ one now, and it is 13 seconds long.
 **Whoever takes this page next has to clear that first**, or bisect the SIGSEGV
 on a tree where `op:1033` does not fire.
 
-Not established: whether the blocker is JIT-dependent. The `--nojit` arm is far
-slower and had not reached `op:1033` at all within 300 s, so reading "no
-AssertionError" off it would be exactly the vacuous negative the probe section
-above warns about.
+Not established, and measured to be unavailable rather than assumed away:
+**whether the blocker is JIT-dependent.** A `--nojit` arm ran the full 1500 s
+with no AssertionError -- and completed ZERO passes, where HotSpot completes one
+about every 15 s. `TestRandomMapOps` prints an `op:` line only when it FAILS, so
+a run that has not failed offers no evidence it ever reached op 1033. "1500 s
+clean under `--nojit`" is therefore not a result; it is a run that may simply
+be slower than the defect is deep. Scoring it as an arm would be the same
+mistake as the `objects_relocated=0` probe above.
+
+Making that arm answerable needs a progress signal the test does not currently
+emit -- a per-op counter, or a seeded run bounded to a few thousand ops.
 
 ## Reproducing
 
