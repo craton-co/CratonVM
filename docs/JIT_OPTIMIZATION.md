@@ -756,24 +756,42 @@ not recovered are the ones taken before the method compiled. Every arm exited
 `rc=0`. CPU time was 962 s with the flag on against 1001 s off — read as
 identical on a shared host, not as a win.
 
-**Reach, which is the finding that matters.** The same census, pointed at real
-workloads, reads zero:
+**Reach — and the correction that matters.** This section first estimated the
+reach from short suite vectors and synthetic probes, and concluded it was "a
+real set, and a small one". **That was wrong, and it was wrong for a reason
+worth keeping:** the probes were too small to compile much, so they measured
+the JIT's warm-up threshold rather than the feature's reach.
 
-* `RMapGcStress`, `RJitGc`, `RStringOps`: `elided=0 implicit=0 emitted=0`, and
-  `CALL sites emitted by arm:` empty. The compact `getfield` arm was not merely
-  declining — it was **never reached**, because those vectors compile no
-  `getfield` in this tier at all.
-* The soak probe had to be built to provoke it: 32 classes behind an interface,
-  so the call site is megamorphic and the readers cannot be inlined. Even then
-  **8 sites** registered, not 32.
-* The common shape — `this.field` — is now *proved* non-null by
-  `CRATONVM_JIT_THIS_NONNULL`, so it is elided outright and never reaches the
-  implicit path at all.
+* `RMapGcStress`, `RJitGc`, `RStringOps` read `elided=0 implicit=0 emitted=0`
+  with `CALL sites emitted by arm:` **empty**. That empty field is the tell,
+  and it was in the output all along: the arm was not declining, the vectors
+  compile no `getfield` in this tier *at all*. A census of a workload that
+  compiles nothing measures nothing.
+* The soak probe had to be built megamorphic to provoke 8 sites, which said
+  more about the probe than about the feature.
 
-So the population is: single-pass-compiled, compact-layout `getfield`, on a
-trusted-oop receiver the dataflow cannot prove — in practice a field read off a
-*parameter* in a method hot enough to compile but not inlined. That is a real
-set, and a small one.
+Pointed at a **real application** — the H2 engine, 60,000 batched inserts and
+20 sorted full scans over a 3-column table — the same census reads:
+
+| Arm | elided | implicit | emitted |
+|---|---|---|---|
+| default (all on) | 1425 | 288 | **0** |
+| `CRATONVM_JIT_IMPLICIT_NULL_CHECK=0` | 1425 | 0 | 288 |
+| `CRATONVM_JIT_THIS_NONNULL=0` | 1000 | 713 | 4 |
+| all three off (the old behaviour) | 0 | 0 | **1715** |
+
+Every arm returns the identical answer, matching HotSpot.
+
+So the real numbers are: **1,715 receiver null checks on this workload before
+any of this work, and 0 after it.** The `this` seed accounts for 425 of the
+elisions on its own (1425 → 1000 when it is switched off). The implicit check
+covers 288 sites that no proof reaches — and the two are complementary rather
+than redundant: with the seed off, 713 sites fall through to the implicit path
+instead, and only 4 end up with neither.
+
+`recovered=0` on this run, because correct code does not dereference null. That
+is the expected steady state: the implicit check costs nothing until a null
+arrives, and then it costs a fault instead of a branch.
 
 **The default is ON**, since 2026-09-02. Opt out with
 `CRATONVM_JIT_IMPLICIT_NULL_CHECK=0`.
@@ -782,8 +800,13 @@ The engineering recommendation at the end of the soak was to leave it off, and
 it is worth recording that it was overruled deliberately rather than forgotten.
 The case for off was never correctness — the soak settles that — it was that
 none of the three things a default usually rests on were present: the
-throughput effect is unmeasurable, the reach is a handful of sites, and the
-failure mode is the only *silent* one in this backend. The case for on is that
+throughput effect is unmeasurable, the reach looked like a handful of sites,
+and the failure mode is the only *silent* one in this backend. **The middle
+term was wrong** — measured on the H2 engine rather than on probes, this work
+removes 1,715 receiver null checks and leaves zero, 288 of them reachable only
+by the implicit path (see the reach table above). The recommendation to leave
+it off was made on synthetic evidence and does not survive the real
+measurement; the decision to default it on does. The case for on is that
 the mechanism is the one thing covering the sites the proof-based elision
 cannot reach, it has soaked clean across three full suite passes and ~12,000
 translated faults, and a feature that is only ever exercised behind an opt-in
@@ -975,7 +998,7 @@ downgrade that gate was shut for.
 | Optimizing tier for allocation-bearing methods | off — the tier's own bump is off, so a promoted allocation would lower through the stub's CALL again | `CRATONVM_JIT_C2_ALLOC_UPGRADE=1` |
 | `this` seeded non-null at method entry | **ON** | `CRATONVM_JIT_THIS_NONNULL=0` |
 | `getfield` receiver null-check elision | **ON** | `CRATONVM_JIT_RECEIVER_NULL_ELIM=0` |
-| Implicit null check (fault + signal translation) | **ON** — soaked clean; the kill switch is the first move on any unexplained compiled-code crash | `CRATONVM_JIT_IMPLICIT_NULL_CHECK=0` |
+| Implicit null check (fault + signal translation) | **ON** — 288 sites on H2 that no proof reaches; kill switch is the first move on any unexplained compiled-code crash | `CRATONVM_JIT_IMPLICIT_NULL_CHECK=0` |
 
 ### Performance — current status
 
