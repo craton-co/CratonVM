@@ -216,10 +216,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status: FIXED-UNVERIFIED.** Three source/doc changes landed in the tree. **No",
     ),
     (
-        "docs/known-issues/jdk-only/H1-1-the-sink-that-capped-every-count-20260820.md",
-        "status block says: **Status:** **FIXED-UNVERIFIED** — no binary carrying these changes has been",
-    ),
-    (
         "docs/known-issues/jdk-only/H11-3-four-rows-retired-and-a-unit-test-that-blocks-the-next-two-20260820.md",
         "status block says: **Status: FIXED-UNVERIFIED — no binary carrying these changes has been built or",
     ),
@@ -249,10 +245,6 @@ const ALLOWED: &[(&str, &str)] = &[
     ),
     (
         "docs/known-issues/jdk-only/H7-1-the-second-door-into-the-map-and-the-guard-that-named-the-wrong-class-20260820.md",
-        "status block says: **Status: FIXED-UNVERIFIED — no binary carrying these changes has been built or",
-    ),
-    (
-        "docs/known-issues/jdk-only/H8-1-three-declines-that-were-not-declines-20260820.md",
         "status block says: **Status: FIXED-UNVERIFIED — no binary carrying these changes has been built or",
     ),
     (
