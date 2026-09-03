@@ -3345,6 +3345,48 @@ pub static SP_REF_STORE_FRESH_CTOR_TAKEN: std::sync::atomic::AtomicU64 =
 pub static SP_REF_STORE_BODY_TAKEN: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// G1's inline post-write barrier: sites emitted, and what those sites did at
+/// run time.
+///
+/// The arm has existed since F-08 behind `CRATONVM_G1_INLINE_BARRIER`, guarded
+/// by three conjoined conditions, and its only engagement signal was a single
+/// `tracing::info!` line saying it had been emitted at least once. That says
+/// the arm exists; it does not say how many sites got it, and it says nothing
+/// at all about how often the filter actually spared the call — which is the
+/// entire question, because G1's `post_write_barrier_rset` returns immediately
+/// on a null value or a same-region edge and the filter is a copy of exactly
+/// those two tests.
+///
+/// `SKIPPED` counts executions the filter answered "nothing to remember" for;
+/// `CALLED` counts those that reached `jit_g1_post_write_barrier`. The run-time
+/// pair is opt-in under `CRATONVM_DBG_SP_REF_STORE_TRACE=1`, same as its
+/// siblings, and costs a `LOCK INC` apiece.
+pub static G1_INLINE_BARRIER_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Filter executions that spared the call. See [`G1_INLINE_BARRIER_SITES`].
+pub static G1_INLINE_BARRIER_SKIPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Filter executions that took the call. See [`G1_INLINE_BARRIER_SITES`].
+pub static G1_INLINE_BARRIER_CALLED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Record an emitted G1 inline post-write barrier site.
+#[inline]
+pub fn note_g1_inline_barrier_site() {
+    G1_INLINE_BARRIER_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(sites, skipped, called)` for G1's inline post-write barrier.
+pub fn g1_inline_barrier_counts() -> (u64, u64, u64) {
+    (
+        G1_INLINE_BARRIER_SITES.load(std::sync::atomic::Ordering::Relaxed),
+        G1_INLINE_BARRIER_SKIPPED.load(std::sync::atomic::Ordering::Relaxed),
+        G1_INLINE_BARRIER_CALLED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// `(fresh_ctor, body)` executions of the two non-gated inline arms.
 pub fn sp_ref_store_other_arm_counts() -> (u64, u64) {
     (
