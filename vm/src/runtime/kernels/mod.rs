@@ -340,6 +340,22 @@ mod tests {
         }
     }
 
+    /// The `.target` was chosen for breadth. The `.version` has to be
+    /// checked with the same care, because nvcc picks it for you.
+    ///
+    /// AUDIT 2026-09-02: the committed artifact carried `.version 9.3` —
+    /// whatever toolkit last regenerated it (CUDA 13.3), not what the
+    /// code needs. A driver older than the CUDA 13 line cannot parse ISA
+    /// 9.3, so the module failed to load and every matmul fell back to
+    /// the CPU on a host whose GPU would have run the sm_75 body
+    /// perfectly. The `.target` bought Turing-through-Blackwell breadth
+    /// and the `.version` silently spent it.
+    ///
+    /// Asserted as a literal, not as "some version exists", so a
+    /// regeneration on a newer toolkit fails this test instead of
+    /// quietly raising the driver floor. See `gemm.cu`'s header for the
+    /// one-line rewrite that belongs beside the nvcc invocation, and for
+    /// why 6.3 is honest rather than merely low.
     #[test]
     fn ptx_targets_a_supported_architecture() {
         assert!(
@@ -347,8 +363,11 @@ mod tests {
             "gemm.ptx should target sm_75 (the CUDA 13 floor); found none"
         );
         assert!(
-            GEMM_PTX.contains(".version"),
-            "gemm.ptx has no .version directive — is it truncated?"
+            GEMM_PTX.contains(".version 6.3"),
+            "gemm.ptx must declare `.version 6.3`, the floor for sm_75.              nvcc stamps the toolkit's own version instead — rerun the              rewrite from gemm.cu's header. Found: {:?}",
+            GEMM_PTX
+                .lines()
+                .find(|l| l.trim_start().starts_with(".version"))
         );
     }
 

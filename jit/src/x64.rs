@@ -220,10 +220,38 @@ mod inlining;
 /// Engagement count for the splice cursor clamp, for `jit-method-stats`.
 /// A number beside a result is what says whether the guard ran at all.
 pub(crate) use inlining::inline_live_slot_clamps;
+/// The PC -> inline-chain map, and the per-compile session that records it.
+///
+/// NAMED rather than glob re-exported, unlike the ~15 `pub use foo::*;`
+/// siblings above. A glob would be capped at each item's own declared
+/// visibility and so would be sound, but `inlining` is not a lowering module
+/// with one entry point: it is the splice emitter, and most of what is `pub`
+/// in it is a hook the walk calls. These five items ARE its interface to the
+/// rest of the tree -- `jit/src/lib.rs` names `InlineFrameMap` for the
+/// `CompiledMethod` field, `x64/driver.rs` opens and closes the session
+/// around codegen, and `vm/src/jit/conservative_roots.rs` reads
+/// `InlineFrameLevel` out of the finished map to expand a compiled frame into
+/// the inlined callees it is standing inside.
+///
+/// Without this line none of them can name the types at all: the module was
+/// private and unexported, which is why the whole producer shipped inert and
+/// every item in it still carries `#[allow(dead_code)]`. `InlineFrameRow` is
+/// deliberately NOT exported -- it is the emission-order form, consumed by
+/// `finish_inline_frame_recording` and meaningless outside it.
+pub use inlining::{
+    begin_inline_frame_recording, begin_npe_trap_recording, finish_inline_frame_recording,
+    finish_npe_trap_recording, inline_call_map_at_return_counts, inline_frame_map_enabled,
+    inline_miss_edge_poison_counts, npe_trap_lines_enabled, InlineFrameLevel, InlineFrameMap,
+    NpeTrapMap, NpeTrapSite,
+};
 mod arith;
 mod arrays;
 mod deopt_stubs;
 mod objects;
+pub(crate) use objects::note_ungated_ref_store;
+pub use objects::ref_store_site_counts;
+pub use null_check_elim::receiver_null_check_counts;
+pub use null_check_elim::receiver_null_check_implicit_count;
 mod osr;
 mod simd;
 
@@ -243,6 +271,7 @@ thread_local! {
 mod emit;
 mod frames;
 mod operand_stack;
+pub use operand_stack::spill_slots_cap;
 pub mod safepoint;
 // ---------------------------------------------------------------------------
 // Compile bytecode to x86-64
@@ -265,6 +294,19 @@ enum StackSlot {
     /// register instead of storing to the frame, avoiding the store+load
     /// round-trip when the value is consumed by the very next operation.
     /// Scratch slots MUST be flushed before any call, backward branch, or return.
+    ///
+    /// **A home offset was carried here for one day and reverted.** The idea
+    /// was to bound the spill region -- `flush_scratch_registers` reserves a
+    /// fresh word per flushed value, so a stretch with several calls grows it
+    /// once per call. Reserving the home at PUSH time instead made
+    /// `push_from_rax` advance the spill cursor where it previously did not,
+    /// and that shipped a nondeterministic heap corruption:
+    /// `RMapGcStress` went from PASS to "duplicate insert" / an
+    /// `ArrayIndexOutOfBoundsException` inside `String.equals`, and
+    /// `CRATONVM_JIT_KERNEL_REG_LOCALS=0` -- which makes this whole path inert
+    /// -- was what made it pass again. The frame-growth defect is real and
+    /// still open; whatever fixes it must not move this cursor, because the
+    /// OSR entry's local homes are derived from the same layout.
     Scratch(u8),
     /// Value is in an XMM register (XMM0-XMM15). Used for FP locals loaded via
     /// dload/fload from XMM-allocated locals. Avoids the XMM→RAX→frame round-trip
@@ -585,6 +627,11 @@ struct Compiler {
     arith_hoist_offsets: Vec<i32>,
     /// LICM: frame offset of the first shared arith-LICM scratch slot.
     arith_scratch_base: i32,
+    /// LICM: loop-invariant `arraylength` hoisting info.
+    array_len_hoist_info: Vec<ArrayLenHoist>,
+    /// LICM: frame offsets for hoisted array lengths (one per
+    /// `array_len_hoist_info` entry, shared by all of that entry's sites).
+    array_len_hoist_offsets: Vec<i32>,
     /// Frame offset of the first callee-saved register slot (from RBP).
     callee_saved_base: i32,
     /// SIMD: vectorizable loops detected during analysis.
@@ -605,7 +652,7 @@ struct Compiler {
     /// `[NULL + ARRAY_LENGTH_OFFSET]`, hitting the signal-handler hs_err path
     /// that just re-raises and kills the VM.
     ///
-    /// Each entry is `(action, patch_offset)`: `action` is the JEP-358
+    /// Each entry is `(action, patch_offset, trap_key)`: `action` is the JEP-358
     /// [`cratonvm_jit_api::npe_action`] code for the trapping opcode (so the
     /// interpreter can attach "Cannot load from int array" etc. when
     /// `-XX:+ShowCodeDetailsInExceptionMessages` is on), and `patch_offset` is
@@ -617,7 +664,14 @@ struct Compiler {
     /// path drains the NPE flag and surfaces the (action-only) exception.
     /// (Previously a single shared stub called `jit_bastore(0)`, which set the
     /// byte-store action for *every* opcode regardless of element type.)
-    null_check_store_stubs: Vec<(u8, usize)>,
+    ///
+    /// `trap_key` is the id `x64::inlining::record_npe_trap_site` issued for
+    /// this site, or `0` for "not described". A non-zero key buys the site its
+    /// own ten-byte cold trampoline, which packs `action | key << 8` into the
+    /// helper's single argument so the NPE snapshot can put a LINE on the frame
+    /// that raised. `0` keeps the historical shape exactly: the `JZ` goes
+    /// straight to the shared per-action stub.
+    null_check_store_stubs: Vec<(u8, usize, u32)>,
     /// Post-invoke exception checks. After every JIT-dispatched invoke
     /// (`invoke_dispatch` / `invoke_virtual_mic`) whose callee can throw,
     /// the codegen emits a `CMP RAX, i64::MIN; JE rel32` guard. The
@@ -731,6 +785,22 @@ struct Compiler {
     /// already contains an absolute imm64 and is shift-safe by
     /// construction.
     helper_call_patches: Vec<usize>,
+    /// Native offsets of RIP-relative `disp32` fields that address a FIXED
+    /// ABSOLUTE address (today: the safepoint flag, see
+    /// [`emit_test_mem8_abs_imm8`]), paired with the number of instruction
+    /// bytes that follow the displacement.
+    ///
+    /// A RIP-relative displacement is measured from the address of the NEXT
+    /// instruction, so the trailing count matters: `TEST BYTE [rip+d32], imm8`
+    /// carries its `imm8` after the displacement and its reference point is
+    /// `disp32_offset + 4 + 1`, not `+ 4`.
+    ///
+    /// Serves the same purpose as [`Self::helper_call_patches`] and for the
+    /// same reason: the unroll duplicator copies body bytes verbatim, and a
+    /// displacement that was right at the original site addresses
+    /// `target + shift` from the copy. Each copy is re-resolved against the
+    /// reconstructed absolute target.
+    rip_abs_disp32_patches: Vec<(usize, usize)>,
     /// Task #60 — IC (inline cache) patch sites for per-clone slot allocation.
     ///
     /// Each entry is `(native_offset_of_imm64, kind, original_slot_ptr)` where
@@ -1268,6 +1338,17 @@ struct Compiler {
     /// emission passes to skip the `TEST reg, reg; JZ throw_npe`
     /// sequence when the receiver is already known non-null.
     null_check_info: crate::null_check_elim::NullCheckInfo,
+    /// Implicit null-check sites whose faulting instruction has been emitted
+    /// but whose recovery address is not yet known — `(fault_off, bc_pc)`.
+    /// Drained by `bind_implicit_null_recovery` when the slow path is bound;
+    /// a non-empty vector at the end of a compile means a site was elided
+    /// without a recovery address and fails the compile.
+    implicit_null_pending: Vec<(usize, usize)>,
+    /// Resolved `(fault_off, recover_off)` pairs, registered against the final
+    /// code address once the artifact exists. Offsets rather than addresses:
+    /// the buffer base is stable from allocation, but registration must not
+    /// happen until the compile is known to have succeeded.
+    implicit_null_sites: Vec<(usize, usize)>,
     /// T5.2.15 — SIMD element-wise loops detected via SuperWord.
     ///
     /// Each entry describes one vectorizable `out[i] = a[i] OP b[i]`
@@ -2114,6 +2195,7 @@ impl Compiler {
         static_field_info: Vec<(usize, u32, usize, u8, bool)>,
         hoist_info: Vec<LoopHoist>,
         arith_hoist_info: Vec<ArithLoopHoist>,
+        array_len_hoist_info: Vec<ArrayLenHoist>,
         alloc_result: super::regalloc::RegAllocResult,
         reserve_matrix_dot_scratch: bool,
         helpers: JitRuntimeHelpers,
@@ -2137,6 +2219,7 @@ impl Compiler {
         // If scalar replacement is active, reserve extra slots for replaced object fields.
         let num_hoists = hoist_info.len();
         let num_arith_hoists = arith_hoist_info.len();
+        let num_len_hoists = array_len_hoist_info.len();
         // LICM arithmetic: besides one result slot per hoist, reserve a small
         // shared scratch pool sized to the deepest hoisted expression. The
         // pool is shared because hoists execute serially (one per loop entry),
@@ -2237,6 +2320,7 @@ impl Compiler {
             + num_hoists
             + num_arith_hoists
             + arith_scratch_depth
+            + num_len_hoists
             + num_scalar_slots
             + (if precise_maps { 1 } else { 0 })
             + jit_thread_slots
@@ -2310,8 +2394,15 @@ impl Compiler {
                                                                                               // than `DIRECT_CALL_SERVICE_HEADROOM_SLOTS` arguments simply fails the
                                                                                               // reservation and falls back, exactly as an over-wide method does today.
         const DIRECT_CALL_SERVICE_HEADROOM_SLOTS: usize = 16;
-        let spill_slots =
-            max_stack.saturating_add(max_stack.min(DIRECT_CALL_SERVICE_HEADROOM_SLOTS));
+        let spill_slots = spill_slots_cap()
+            .map_or_else(
+                || max_stack.saturating_add(max_stack.min(DIRECT_CALL_SERVICE_HEADROOM_SLOTS)),
+                |cap| {
+                    max_stack
+                        .saturating_add(max_stack.min(DIRECT_CALL_SERVICE_HEADROOM_SLOTS))
+                        .min(cap)
+                },
+            );
         let spill_size = (spill_slots.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
         let shadow_space = 32i32; // Windows x64 shadow space for helper calls
                                   // Reserved bytes ABOVE the shadow region for in-frame stack args to
@@ -2496,6 +2587,15 @@ impl Compiler {
         let arith_scratch_local = arith_hoist_base + num_arith_hoists;
         let arith_scratch_base: i32 = ((arith_scratch_local as i32) + 1) * 8; // Cast: x86-64 immediate encoding
 
+        // LICM: array-length hoist slots follow the arith scratch pool, so
+        // none of the four regions alias. Each slot holds a zero-extended
+        // 32-bit length; nothing in it is ever a reference, so these slots are
+        // deliberately absent from every oop map.
+        let len_hoist_base = arith_scratch_local + arith_scratch_depth;
+        let array_len_hoist_offsets: Vec<i32> = (0..num_len_hoists)
+            .map(|k| ((len_hoist_base + k) as i32 + 1) * 8) // Cast: x86-64 immediate encoding
+            .collect();
+
         Self {
             method_label,
             buf,
@@ -2556,6 +2656,8 @@ impl Compiler {
             hoist_offsets,
             arith_hoist_info,
             arith_hoist_offsets,
+            array_len_hoist_info,
+            array_len_hoist_offsets,
             arith_scratch_base,
             callee_saved_base,
             simd_loops: Vec::new(),
@@ -2576,6 +2678,7 @@ impl Compiler {
             mic_slots: Vec::new(),
             pic_slots: Vec::new(),
             helper_call_patches: Vec::new(),
+            rip_abs_disp32_patches: Vec::new(),
             ic_patches: Vec::new(),
             cloned_mic_slots: Vec::new(),
             cloned_pic_slots: Vec::new(),
@@ -2660,6 +2763,8 @@ impl Compiler {
             shadow_pushed_any: false,
             induction_vars: Vec::new(),
             null_check_info: crate::null_check_elim::NullCheckInfo::default(),
+            implicit_null_pending: Vec::new(),
+            implicit_null_sites: Vec::new(),
             simd_element_wise_loops: Vec::new(),
             bulk_zero_byte_fill_loops: Vec::new(),
             bulk_set_byte_stride_loops: Vec::new(),
@@ -2825,6 +2930,80 @@ impl Compiler {
     /// inline null-check stubs at array store/load sites.
     pub(crate) fn is_local_nonnull(&self, pc: usize, local: usize) -> bool {
         self.null_check_info.is_nonnull(pc, local)
+    }
+
+    /// Any implicit null-check site still waiting for a recovery address?
+    ///
+    /// Checked once at the end of a compile. A `true` here means a receiver
+    /// check was elided and the slow path it should fault into was never
+    /// bound — the site would run unguarded and its NPE would arrive as a
+    /// SIGSEGV. The caller fails the compile.
+    pub(crate) fn has_unbound_implicit_null_sites(&self) -> bool {
+        !self.implicit_null_pending.is_empty()
+    }
+
+    /// Bind every pending implicit null-check site to the slow path that
+    /// starts at the current buffer position, **after verifying that the
+    /// instruction we declined to guard actually faults on a null receiver.**
+    ///
+    /// # Why the bytes are decoded rather than trusted
+    ///
+    /// `emit_trusted_oop_receiver_check_at` elides the check and records the
+    /// offset the NEXT instruction will occupy. Which instruction that is
+    /// belongs to the arm that called it, and an edit there — inserting a
+    /// register move, reordering a guard — would silently move the fault onto
+    /// an instruction that does not dereference the receiver, or does not
+    /// fault at all. The check would then simply be gone, with nothing to say
+    /// so.
+    ///
+    /// So the emitted bytes are decoded here and required to be
+    /// `MOV r32, [RAX + disp32]` with `disp32` inside the null page. That is
+    /// what the arm emits (the `GC_FLAGS` byte read at `[RAX + 15]`), and the
+    /// displacement bound is the same constant the signal handler screens on,
+    /// so the compiler and the handler agree by construction rather than by
+    /// two people remembering the same number.
+    ///
+    /// # Fail-closed
+    ///
+    /// A mismatch calls `self.fail`, which discards the artifact and sends the
+    /// method back to the interpreter. There is deliberately no path that
+    /// keeps the compile and re-emits the check: the fast path is already
+    /// encoded by now, and squeezing a check back in would move everything
+    /// after it.
+    pub(crate) fn bind_implicit_null_recovery(&mut self) {
+        if self.implicit_null_pending.is_empty() {
+            return;
+        }
+        let recover_off = self.buf.pos();
+        let pending = std::mem::take(&mut self.implicit_null_pending);
+        for (fault_off, bc_pc) in pending {
+            let mut head = [0u8; 6];
+            let ok = {
+                let bytes = self.buf.as_slice();
+                if fault_off + 6 <= bytes.len() {
+                    head.copy_from_slice(&bytes[fault_off..fault_off + 6]);
+                    true
+                } else {
+                    false
+                }
+            };
+            // `MOV r32, r/m32` (0x8B), ModRM mod=10 (disp32) r/m=000 (RAX),
+            // then a little-endian disp32. No REX prefix: both the destination
+            // and the base are low registers in the sequence that reaches
+            // here, so a REX byte means this is a different instruction.
+            let shaped = ok
+                && head[0] == 0x8B
+                && (head[1] & 0xC7) == 0x80
+                && (0..crate::implicit_null::NULL_PAGE_LIMIT as i32)
+                    .contains(&i32::from_le_bytes([head[2], head[3], head[4], head[5]]));
+            if !shaped {
+                self.dbg_last_pc = bc_pc;
+                self.fail("implicit-null-shape");
+                self.implicit_null_sites.clear();
+                return;
+            }
+            self.implicit_null_sites.push((fault_off, recover_off));
+        }
     }
 
     /// Raise the compile-wide failure flag, naming the site that raised it.

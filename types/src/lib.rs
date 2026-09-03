@@ -47,7 +47,11 @@ mod value;
 /// an `FxHashMap` for exactly that reason and then paid to convert it into a
 /// `HashMap` for this field: 43 ms of a 424 ms stop-the-world pause, to change
 /// a container type. Naming the hasher here is what removes that conversion.
-pub type PointerMap = rustc_hash::FxHashMap<usize, usize>;
+/// Since 2026-09-02 (gen-gc-five) this is a SHARDED map built in parallel
+/// by the evacuation workers rather than the flat `FxHashMap` alias; the
+/// reasoning above still holds for every shard. See [`pointer_map`].
+pub mod pointer_map;
+pub use pointer_map::PointerMap;
 
 pub use class_id::{ClassId, ClassLoaderId};
 pub use compact_value::{CompactTag, CompactValue, CompactValueError};
@@ -436,6 +440,39 @@ pub fn set_zgc_read_barrier_armed(armed: bool) {
 static ZGC_READ_BARRIER_ARMED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Whether the collector must be TOLD about each object a thread
+/// bump-allocates out of its TLAB, rather than discovering it by walking the
+/// chunk.
+///
+/// The two linear-sweep collectors (Generational, G1) parse a TLAB chunk as
+/// memory, so an object that merely appears in one needs no announcement.
+/// ZGC's sweep, its `is_object_address` oracle and its conservative scans are
+/// driven by an allocation-base REGISTRY instead, so an object it was never
+/// told about does not exist as far as the runtime is concerned — a receiver
+/// allocated that way decodes as `null` at the next native boundary.
+///
+/// The JIT's inline allocator normally SKIPS its post-allocation helper when
+/// the class needs no primitive initialisation and has no finalizer
+/// (`skip_post_init_helper` in `x64::objects::emit_inline_tlab_new`), because
+/// on those backends the helper would have nothing left to do. That helper is
+/// also the only place an inline-allocated object can be announced, so this
+/// flag forces the call back on. Published by `ZgcRealHeap` when it hands VM
+/// TLABs out; read at JIT compile time, so it must be set before the first
+/// compile — heap construction is, and that is where it is set.
+#[inline]
+pub fn jit_tlab_registration_required() -> bool {
+    JIT_TLAB_REGISTRATION_REQUIRED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Publish the value [`jit_tlab_registration_required`] reports.
+#[inline]
+pub fn set_jit_tlab_registration_required(required: bool) {
+    JIT_TLAB_REGISTRATION_REQUIRED.store(required, std::sync::atomic::Ordering::Release);
+}
+
+static JIT_TLAB_REGISTRATION_REQUIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Corrupt-`Value`-cell census, shared by the three crates that need it.
 ///
 /// It lives HERE rather than in the collector or the VM because the only exit
@@ -680,6 +717,38 @@ pub mod gpu_event_census {
     static RECYCLED: AtomicU64 = AtomicU64::new(0);
     static WAITS_ISSUED: AtomicU64 = AtomicU64::new(0);
     static WAITS_ELIDED: AtomicU64 = AtomicU64::new(0);
+    static WAITS_ELIDED_LATCHED: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_HIT: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_MISS: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_PARKED: AtomicU64 = AtomicU64::new(0);
+
+    /// One device allocation served from the bridge's allocation pool.
+    #[inline]
+    pub fn note_alloc_pool_hit() {
+        ALLOC_HIT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One device allocation that had to go to `cuMemAlloc`.
+    #[inline]
+    pub fn note_alloc_pool_miss() {
+        ALLOC_MISS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One freed device allocation parked in the pool instead of freed.
+    #[inline]
+    pub fn note_alloc_pool_parked() {
+        ALLOC_PARKED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(pool hits, cuMemAlloc calls, blocks parked)`.
+    #[must_use]
+    pub fn alloc_totals() -> (u64, u64, u64) {
+        (
+            ALLOC_HIT.load(Ordering::Relaxed),
+            ALLOC_MISS.load(Ordering::Relaxed),
+            ALLOC_PARKED.load(Ordering::Relaxed),
+        )
+    }
 
     /// One `cuEventCreate` the pool could not serve.
     #[inline]
@@ -705,6 +774,20 @@ pub mod gpu_event_census {
         WAITS_ELIDED.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One wait skipped because the event had ALREADY FIRED, rather than
+    /// because it was recorded on the waiting stream.
+    ///
+    /// Counted separately from [`note_wait_elided`] because the two
+    /// answer different questions. Same-stream elision says the caller
+    /// kept a chain on one stream; this one says the caller waited on
+    /// stale work — a resident buffer whose `last_write` nothing
+    /// rewrites — and it is the counter that says whether the latch is
+    /// earning its query.
+    pub fn note_wait_elided_latched() {
+        WAITS_ELIDED_LATCHED.fetch_add(1, Ordering::Relaxed);
+        WAITS_ELIDED.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// `(created, recycled, waits issued, waits elided)`.
     #[must_use]
     pub fn totals() -> (u64, u64, u64, u64) {
@@ -726,16 +809,20 @@ pub mod gpu_event_census {
     pub fn exit_summary() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         let (created, recycled, issued, elided) = totals();
-        if created + recycled + issued + elided == 0 {
+        let latched = WAITS_ELIDED_LATCHED.load(Ordering::Relaxed);
+        let (alloc_hit, alloc_miss, alloc_parked) = alloc_totals();
+        if created + recycled + issued + elided + alloc_hit + alloc_miss == 0 {
             return;
         }
         ONCE.call_once(|| {
             eprintln!(
                 "[cratonvm] gpu events: created={created} recycled={recycled} \
                  (pool served {:.1}%); stream waits issued={issued} \
-                 elided={elided} ({:.1}% elided)",
+                 elided={elided} ({:.1}% elided, {latched} already-fired);                  device allocs: cuMemAlloc={alloc_miss} \
+                 pooled={alloc_hit} ({:.1}% pooled) parked={alloc_parked}",
                 100.0 * recycled as f64 / (created + recycled).max(1) as f64,
                 100.0 * elided as f64 / (issued + elided).max(1) as f64,
+                100.0 * alloc_hit as f64 / (alloc_hit + alloc_miss).max(1) as f64,
             );
         });
     }

@@ -25,7 +25,7 @@
 //! * When enabled, a reference slot is 4 bytes holding `(addr - base) >> shift`,
 //!   with 0 reserved for null.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Narrow reference slot width in bytes when compression is active.
 pub const NARROW_REF_SIZE: usize = 4;
@@ -234,23 +234,135 @@ pub fn decode_with(base: u64, shift: usize, narrow: u32) -> u64 {
 // single chokepoint the compressed-oops wiring depends on: with compression off
 // they are byte-for-byte the previous raw 64-bit pointer access, and with it on
 // they are a 4-byte narrow load/store plus the base+shift transform.
+//
+// ATOMICITY: both are RELAXED ATOMIC accesses, not plain `read()` / `write()`.
+// =============================================================================
+//
+// WHY - THE RACE. ZGC is this VM's default collector, and its load barrier
+// SELF-HEALS the slot it reads:
+//
+//     gc/src/zgc/barrier.rs, load_barrier_slow:
+//         slot.compare_exchange(observed, healed, AcqRel, Acquire)
+//
+// where `slot` is an `&AtomicU64` view of exactly the address these two
+// functions access - `cratonvm_gc::vm_heap::VmHeap::zgc_load_ref_slot_barriered`
+// takes that view of the very same `*const u8` it would otherwise hand to
+// `read_ref_slot`. A NON-ATOMIC access racing an ATOMIC one on one location is
+// a data race, and a data race is undefined behaviour in the Rust abstract
+// machine no matter what x86-64 does with an aligned qword. The hazard is not
+// the instruction the backend emits today: it is that the compiler is entitled
+// to assume a plain access is unshared, and may therefore duplicate, widen,
+// sink, hoist or invent it. That entitlement is what has to go.
+//
+// WHY NOW, AND WHY THIS CHANGES NOTHING OBSERVABLE. Nothing arms that barrier
+// yet. `vm/src/vm/vm_init.rs` pins `const RELOCATION_REQUESTED: bool = false`,
+// `ZgcRealHeap::set_barrier_color` - the sole writer of the coloured state -
+// has no non-test caller, and `barrier_good_mask` never leaves `Z_REMAPPED`. No
+// coloured word is ever stored in a heap slot in any shipping configuration, so
+// this removes LATENT undefined behaviour rather than altering live behaviour.
+// It is step 1 of the ordered work list on
+// `cratonvm_gc::vm_heap::VmHeap::load_ref_slot_barriered`, whose step 7 is
+// "only then flip `RELOCATION_REQUESTED`"; the requirement is spelled out in
+// `.agent-requests/A16-vm-stores.txt`.
+//
+// WHY `Relaxed`, AND NOT SOMETHING STRONGER. Four separate reasons, because
+// "SeqCst to be safe" on the path every putfield and every aastore takes is an
+// assertion, not an argument:
+//
+//  a. THE DEFECT IS THE NON-ATOMICITY, NOT THE ORDERING. What makes the old
+//     code UB is mixing a plain access with an atomic one on one location.
+//     `Relaxed` is already an atomic access and already not a data race, so it
+//     closes the whole of the defect. No step of the race argument asks for a
+//     happens-before edge, so no step of it can justify buying one.
+//
+//  b. THE EDGE THAT MATTERS IS ALREADY ON THE OTHER SIDE. The heal's
+//     `AcqRel`/`Acquire` supplies both halves of the ordering the barrier
+//     needs: the release that publishes the corrected word, and the acquire
+//     that orders the marker publication ahead of it. A slot writer
+//     participates in neither - it is not the publication point for the
+//     referent's contents.
+//
+//  c. THESE ARE NOT THE JAVA PUBLICATION POINTS. A Java-visible ordering edge
+//     on a reference field comes from `volatile`/final semantics, and in this
+//     tree those are supplied by the CALLER, never by this writer:
+//     `set_field_volatile` (gc/src/zgc.rs, gc/src/heap.rs, gc/src/g1.rs) takes
+//     the volatile stripe lock and brackets its `set_field` with two explicit
+//     `fence(SeqCst)`s, and `crate::write_compact_field` takes an `Ordering`
+//     parameter from its caller. Strengthening this function would put a fence
+//     on every ORDINARY putfield to buy an edge the caller already has where it
+//     needs one. Note the bracketing fences get STRONGER here, not weaker: a
+//     `fence` orders ATOMIC accesses, so pairing one with a plain store was
+//     always formally vacuous, and pairing it with a Relaxed store is not.
+//
+//  d. WHAT `Relaxed` BUYS OVER PLAIN IS EXACTLY WHAT A CAS NEIGHBOUR NEEDS,
+//     and nothing else: no tearing, no invented reads, no invented writes, no
+//     duplication or widening of the access. Everything a plain access already
+//     had - free reordering against unrelated accesses, no added coherency
+//     traffic - it keeps.
+//
+// COST: nil on the shapes actually touched here, which are a naturally aligned
+// 8-byte word (wide arm) and a naturally aligned 4-byte word (narrow arm). On
+// x86-64 a Relaxed atomic load or store of such a word lowers to the same
+// single `mov` as the plain access; only a SeqCst STORE needs `xchg`/`mfence`,
+// and even Acquire loads and Release stores are free on this ISA. On aarch64
+// both are the same `ldr`/`str`; only Acquire/Release would need `ldar`/`stlr`.
+// There is therefore no benchmark this can move, which is also what makes it
+// safe to land AHEAD of the arming instead of with it.
+//
+// ALIGNMENT IS NOT A NEW PRECONDITION. A Relaxed atomic requires natural
+// alignment - and `(ptr as *const u64).read()` already did, because `ptr::read`
+// is UB on a misaligned pointer. The `# Safety` contract below is unchanged and
+// nothing that compiles today becomes unsound. The one caller that genuinely
+// cannot prove alignment has its own plain function; see
+// [`read_ref_slot_unaligned`], which deliberately does NOT follow this change.
+//
+// WHY THE NARROW ARM TOO, when the barrier can never CAS one. It cannot:
+// `VmHeap::zgc_load_ref_slot_barriered` asserts `!load_barrier_armed()` under
+// `narrow_oops_enabled()`, because a coloured word does not fit in 32 bits
+// (`Z_COLORED_TAG` is bit 63) and the two configurations are refused together.
+// The narrow arm is converted anyway, for a reason independent of ZGC:
+// `crate::write_compact_field`'s Reference arm stores the SAME compact
+// instance-field slots through `(&*(ptr as *const AtomicU32)).store(n, ord)`
+// and `crate::read_compact_field` loads them the same way, so a plain narrow
+// access here already mixes with an atomic one on one location on its own
+// account (both routes reach a compact reference field - see
+// `gc/src/gen_heap.rs`'s compact-object evacuation arm, which updates such a
+// slot through `write_ref_slot`). Converting one arm and not the other would
+// additionally leave the next reader to re-derive which half was safe, and the
+// two shapes are identical, so uniformity is free.
+//
+// SPELLING, RULED OUT: `AtomicU64::from_ptr` / `AtomicU32::from_ptr` are stable
+// since 1.75 and so are available under the workspace's 1.80 MSRV, and they are
+// the tidier form. The `&*(ptr as *const Atomic..)` cast is used instead purely
+// for consistency: it is what `read_compact_field` / `write_compact_field`
+// already use to take an atomic view of these exact slots, and having one
+// spelling means a future reader comparing the two files is comparing the
+// orderings rather than the casts.
 
 /// Read a heap reference slot as a raw 64-bit address (`0` = null).
+///
+/// A **relaxed atomic** load. See the atomicity note above this section for
+/// why it must be atomic at all, and why `Relaxed` is the right strength.
 ///
 /// # Safety
 /// `ptr` must point at a live reference slot of the current width
 /// ([`ref_field_size`]) inside an object allocated under the same
-/// configuration.
+/// configuration, naturally aligned for that width - the same requirement
+/// `ptr::read` imposed before this became an atomic load.
 #[inline(always)]
 pub unsafe fn read_ref_slot(ptr: *const u8) -> u64 {
     if narrow_oops_enabled() {
-        decode(unsafe { (ptr as *const u32).read() })
+        decode(unsafe { (&*(ptr as *const AtomicU32)).load(Ordering::Relaxed) })
     } else {
-        unsafe { (ptr as *const u64).read() }
+        unsafe { (&*(ptr as *const AtomicU64)).load(Ordering::Relaxed) }
     }
 }
 
 /// Write a raw 64-bit address into a heap reference slot (`0` = null).
+///
+/// A **relaxed atomic** store. See the atomicity note above this section.
+/// `probe(addr)` still runs first and is unchanged - one relaxed load of a flag
+/// when the span probe is off.
 ///
 /// # Safety
 /// Same contract as [`read_ref_slot`].
@@ -259,14 +371,34 @@ pub unsafe fn write_ref_slot(ptr: *mut u8, addr: u64) {
     probe(addr);
     if narrow_oops_enabled() {
         let n = encode(addr);
-        unsafe { (ptr as *mut u32).write(n) }
+        unsafe { (&*(ptr as *const AtomicU32)).store(n, Ordering::Relaxed) }
     } else {
-        unsafe { (ptr as *mut u64).write(addr) }
+        unsafe { (&*(ptr as *const AtomicU64)).store(addr, Ordering::Relaxed) }
     }
 }
 
 /// Unaligned [`read_ref_slot`], for diagnostic walkers that may land on a slot
 /// without proving its alignment first.
+///
+/// # This one stays PLAIN, and that is a constraint on its callers
+///
+/// [`read_ref_slot`] / [`write_ref_slot`] are relaxed atomics so that they may
+/// safely neighbour the ZGC load barrier's self-healing `compare_exchange`
+/// (see the section note above). This function cannot follow them, and the
+/// reason is not a preference: there is no unaligned atomic load in Rust, nor
+/// in the ISAs underneath it - an atomic access requires natural alignment by
+/// definition, which is exactly the precondition this function exists to not
+/// require. There is no weaker CAS to meet it with either, so the constraint
+/// cannot be pushed onto the barrier side.
+///
+/// The consequence is a rule rather than an omission: **any slot reachable
+/// through this function is a slot the load barrier must never CAS.** That
+/// holds today by construction - the callers are diagnostic heap walkers that
+/// scan conservatively and may land mid-object, so what they read is not
+/// necessarily a reference slot at all, while the barrier is only ever pointed
+/// at a slot named by a resolved layout. If a walker is ever taught to hand an
+/// address from here to a barriered read, the WALKER is the bug: prove the
+/// alignment and call [`read_ref_slot`] instead.
 ///
 /// # Safety
 /// `ptr` must be readable for [`ref_field_size`] bytes.

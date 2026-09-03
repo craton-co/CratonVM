@@ -479,7 +479,7 @@ impl CrashInfo {
             .location()
             .map(|loc| format!("{}:{}", loc.file(), loc.line()));
 
-        let thread_name = std::thread::current().name().map(String::from);
+        let thread_name = current_thread_name();
 
         Self {
             signal: 0,
@@ -502,7 +502,7 @@ impl CrashInfo {
             pid: get_pid(),
             tid: get_tid(),
             timestamp: SystemTime::now(),
-            thread_name: std::thread::current().name().map(String::from),
+            thread_name: current_thread_name(),
             panic_message: None,
             panic_location: None,
         }
@@ -956,6 +956,37 @@ mod windows_fault {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let code = (*rec).exception_code;
+
+        // ── Implicit null check ─────────────────────────────────────────
+        //
+        // First, before the watchpoint and crash paths, and for the same
+        // reason the Unix handler does it first: a recovered fault is a Java
+        // NullPointerException that compiled code detects by faulting rather
+        // than by branching, not a crash to report.
+        //
+        // For an access violation `ExceptionInformation[1]` is the address
+        // that faulted (`[0]` is the read/write/execute discriminator, which
+        // this does not care about — a null receiver faults the same way
+        // whichever it was). `NumberParameters` is checked because the record
+        // only promises those words when it says it has them.
+        //
+        // The remaining conditions — the address inside the null page, and an
+        // EXACT registered PC rather than merely one inside some compiled
+        // method — are enforced by `recover`. RIP lives at offset 0xF8 in
+        // CONTEXT, the same slot the watchpoint path below reads.
+        const EXCEPTION_CONTINUE_EXECUTION_IN: i32 = -1;
+        if code == EXCEPTION_ACCESS_VIOLATION && (*rec).number_parameters >= 2 {
+            let ctx = (*info).context_record as *mut u8;
+            if !ctx.is_null() {
+                let addr = (*rec).exception_information[1];
+                let rip = core::ptr::read_unaligned(ctx.add(0xF8) as *const u64) as usize;
+                if let Some(target) = cratonvm_jit::implicit_null::recover(rip, addr) {
+                    core::ptr::write_unaligned(ctx.add(0xF8) as *mut u64, target as u64);
+                    return EXCEPTION_CONTINUE_EXECUTION_IN;
+                }
+            }
+        }
+
         // spring-bug-10 watchpoint: a HW data breakpoint fires STATUS_SINGLE_STEP.
         // If DR6 shows one of DR0-3 tripped, this is OUR savebase watchpoint —
         // inspect the value just written; if it is the corrupt 0xFFFF…FFFE, report
@@ -1103,10 +1134,11 @@ mod windows_fault {
             captured as usize
         };
 
-        let tname = std::thread::current()
-            .name()
-            .map(String::from)
-            .unwrap_or_else(|| "<unnamed>".to_string());
+        // `super::`, because this is `mod windows_fault` and the function is at
+        // file scope. Unqualified it compiles on no platform — the module is
+        // `#[cfg(windows)]`, so a Linux build never type-checks this body and
+        // the break reaches Windows only.
+        let tname = super::current_thread_name().unwrap_or_else(|| "<unnamed>".to_string());
         let pid = std::process::id();
 
         let mut report = String::with_capacity(4096);
@@ -1668,7 +1700,7 @@ pub fn symbolize_rvas(_rvas: &[usize]) -> Vec<(usize, Option<String>)> {
 ///
 /// A register dump alone leaves this to the reader, and the reader does not do
 /// it: all eight crash logs behind
-/// `fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md`
+/// `internal/fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md`
 /// satisfy `fault == r10 + rax*4` — an unchecked jump-table load with a garbage
 /// index — and because nothing said so, two sessions read the wildly scattered
 /// fault addresses as random corruption and looked for an environmental cause.
@@ -1772,6 +1804,60 @@ mod indexed_load_decode_tests {
     }
 
     /// A zero index would make every base "explain" the address.
+    /// `current_thread_name` is called from panic hooks and signal handlers,
+    /// so it must stay callable on a thread whose thread-local data has
+    /// already been destroyed. `std::thread::current()` is not — it panics
+    /// there, and a panic from a TLS destructor aborts the whole process, so
+    /// a regression in this helper fails this test unmissably rather than
+    /// subtly.
+    ///
+    /// The ordering matters and is set up deliberately: destructors registered
+    /// through `__cxa_thread_atexit_impl` run in reverse registration order, so
+    /// the probe touches its own `thread_local!` FIRST and `std::thread::
+    /// current()` SECOND. That makes std's `CURRENT` handle the first thing
+    /// torn down and the probe's `Drop` the last — i.e. the probe runs in
+    /// exactly the state that produced `thread/current.rs:315:9`.
+    #[test]
+    fn current_thread_name_survives_tls_teardown() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::Mutex;
+
+        static RAN: AtomicBool = AtomicBool::new(false);
+        static SEEN: Mutex<Option<String>> = Mutex::new(None);
+
+        struct Probe;
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let name = super::current_thread_name();
+                *SEEN.lock().unwrap() = name;
+                RAN.store(true, AtomicOrdering::SeqCst);
+            }
+        }
+        thread_local! {
+            static PROBE: Probe = const { Probe };
+        }
+
+        std::thread::Builder::new()
+            // <= 15 bytes: Linux stores only TASK_COMM_LEN - 1, and this test
+            // asserts on the exact string.
+            .name("tlsprobe".to_string())
+            .spawn(|| {
+                PROBE.with(|_| ());
+                let _ = std::thread::current().name().map(String::from);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert!(RAN.load(AtomicOrdering::SeqCst), "the TLS destructor never ran");
+        #[cfg(any(unix, windows))]
+        assert_eq!(
+            SEEN.lock().unwrap().as_deref(),
+            Some("tlsprobe"),
+            "the OS thread name should still be readable after TLS teardown"
+        );
+    }
+
     #[test]
     fn zero_index_and_zero_base_are_not_explanations() {
         let regs = [("rax", 0u64), ("r10", 0x1000)];
@@ -2201,11 +2287,63 @@ fn install_signal_handlers() {
     // for the rules. Roughly: only libc syscalls, atomics, and stack-local
     // arithmetic are allowed. No allocations, no locks, no formatting
     // machinery, no `std::fs`, no `Backtrace::capture`.
+    /// Point the interrupted thread's instruction pointer at `target`.
+    ///
+    /// Async-signal-safe: a single store into the kernel-supplied signal
+    /// frame. Only x86-64 Linux, which is the only Unix target where the JIT
+    /// emits an implicit null-check site at all — the AArch64 backend
+    /// dereferences no Java object, so it registers nothing and this is never
+    /// reached there.
+    #[cfg(unix)]
+    fn set_pc_in_ucontext(ucontext: *mut std::ffi::c_void, target: usize) -> bool {
+        if ucontext.is_null() {
+            return false;
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        unsafe {
+            let uc = ucontext as *mut libc::ucontext_t;
+            (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] = target as libc::greg_t;
+            true
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            let _ = target;
+            false
+        }
+    }
+
     extern "C" fn crash_signal_handler(
         sig: std::ffi::c_int,
         info: *mut libc::siginfo_t,
         ucontext: *mut std::ffi::c_void,
     ) {
+        // ── Implicit null check ─────────────────────────────────────────
+        //
+        // BEFORE the re-entry guard, deliberately. A recovered fault is not a
+        // crash: it is a Java-level NullPointerException that compiled code
+        // chose to detect by faulting rather than by branching. Latching
+        // CRASH_IN_PROGRESS on the way past would make the next REAL crash
+        // take the re-raise path and lose its report.
+        //
+        // Four conditions, all of them necessary — see
+        // `cratonvm_jit::implicit_null` for why each one is load-bearing.
+        // The two enforced here are that the signal is a memory-access fault
+        // and that `si_code` says `si_addr` is an address at all rather than a
+        // union member left over from `kill -SEGV`; the null-page and
+        // exact-PC conditions are enforced by `recover`.
+        if sig == libc::SIGSEGV && !info.is_null() {
+            let code_is_real = si_code_means_a_faulting_address(unsafe { (*info).si_code });
+            if code_is_real {
+                let addr = unsafe { (*info).si_addr() } as usize;
+                let pc = fault_pc_from_ucontext(ucontext) as usize;
+                if let Some(target) = cratonvm_jit::implicit_null::recover(pc, addr) {
+                    if set_pc_in_ucontext(ucontext, target) {
+                        return;
+                    }
+                }
+            }
+        }
+
         // Re-entry guard. `compare_exchange` on an `AtomicBool` is lock-free
         // and async-signal-safe on every architecture we target.
         if CRASH_IN_PROGRESS
@@ -2803,7 +2941,7 @@ not an address\n",
 /// the faulting instruction and not only its base. The eight hibernate-orm
 /// JSON/XML crashes were decoded by testing `fault_address == r10 + rax*4` --
 /// which the Linux report could not have answered, because it never printed
-/// `rax` (fixed-bugs/
+/// `rax` (internal/fixed-bugs/
 /// hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md).
 #[cfg(unix)]
 const GREG_RAX: usize = 0;
@@ -3085,6 +3223,105 @@ pub fn hex_into_buf(buf: &mut [u8], n: u64) -> usize {
         buf[i] = scratch[len - 1 - i];
     }
     out_len
+}
+
+// ── Panic-safe thread naming ───────────────────────────────────────────────
+
+/// The calling thread's name, obtained **without** `std::thread::current()`.
+///
+/// `std::thread::current()` does not return `None` once the calling thread's
+/// thread-local data has been destroyed — it *panics*
+/// (`library/std/src/thread/current.rs`: "use of std::thread::current() is not
+/// possible after the thread's local data has been destroyed"). A thread
+/// running its own exit path is in exactly that state, and so is any code a
+/// TLS destructor reaches.
+///
+/// That matters here because every caller of this function is a panic hook or
+/// a signal handler. A panic raised **inside** a panic hook is a
+/// panic-while-panicking: Rust cannot unwind twice, so it prints
+/// `thread panicked while processing panic. aborting.` and calls `abort()`
+/// immediately — *before* the hook has printed the original panic. So one
+/// convenience call for a cosmetic name did two things at once: it turned
+/// every late-in-thread-lifetime panic into a SIGABRT, and it destroyed the
+/// evidence of what that panic actually was. Everything the log could still
+/// show was the *second* panic's fixed message, which is identical no matter
+/// what the first one was.
+///
+/// The OS thread name is TLS-free, so it is safe from a hook, a TLS
+/// destructor and a signal handler alike. Two measured caveats, both accepted
+/// deliberately (`/tmp/tn.rs`, glibc 2.39 / Linux 6.17):
+///
+/// * Linux stores only `TASK_COMM_LEN - 1` = 15 bytes, so
+///   `vert.x-eventloop-thread-3` reports as `vert.x-eventloo`.
+/// * A thread that was never named inherits its **parent's** `comm`, so an
+///   unnamed worker reports the name of the pool thread that spawned it
+///   rather than `<unnamed>`. That is still true provenance — an unnamed
+///   child of `vert.x-eventloo` is a vert.x thread — and the crash report
+///   carries the exact `tid` beside it.
+///
+/// Windows has neither caveat — `GetThreadDescription` returns the full name a
+/// `thread::Builder::name()` set, `main` for the main thread, and nothing at
+/// all for a thread that was never named (compile-checked and run on Win11 with
+/// the same 1.97.1 toolchain).
+///
+/// `std::thread::try_current()` would avoid the Linux caveats too, but is
+/// unstable as of the 1.97.1 toolchain this tree builds with.
+pub fn current_thread_name() -> Option<String> {
+    #[cfg(unix)]
+    {
+        // 64 is comfortably above Linux's 16-byte buffer and macOS's 64.
+        let mut buf = [0u8; 64];
+        // SAFETY: `buf` is a valid, writable buffer of `buf.len()` bytes, and
+        // `pthread_getname_np` is documented to NUL-terminate within it.
+        let rc =
+            unsafe { libc::pthread_getname_np(libc::pthread_self(), buf.as_mut_ptr().cast(), buf.len()) };
+        if rc != 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        if end == 0 {
+            return None;
+        }
+        return core::str::from_utf8(&buf[..end]).ok().map(str::to_owned);
+    }
+    #[cfg(windows)]
+    {
+        use core::ffi::c_void;
+        extern "system" {
+            // `isize`, not `*mut c_void`, and the crate has no choice about
+            // it: `jit::helpers` declares the same symbol that way — "this
+            // module treats handles as `isize`" — and
+            // `clashing_extern_declarations` is `--deny`ed, so two spellings
+            // of one import fail the build. Windows-only, which is why it
+            // reached this tree at all.
+            fn GetCurrentThread() -> isize;
+            fn GetThreadDescription(thread: isize, out: *mut *mut u16) -> i32;
+            fn LocalFree(mem: *mut c_void) -> *mut c_void;
+        }
+        let mut wide: *mut u16 = core::ptr::null_mut();
+        // SAFETY: `GetThreadDescription` writes a LocalAlloc'd, NUL-terminated
+        // UTF-16 buffer into `wide` on success; we free it below.
+        let hr = unsafe { GetThreadDescription(GetCurrentThread(), &mut wide) };
+        if hr < 0 || wide.is_null() {
+            return None;
+        }
+        // SAFETY: `wide` is a NUL-terminated UTF-16 string owned by us.
+        let mut len = 0usize;
+        while unsafe { *wide.add(len) } != 0 {
+            len += 1;
+        }
+        let slice = unsafe { core::slice::from_raw_parts(wide, len) };
+        let name = String::from_utf16_lossy(slice);
+        unsafe { LocalFree(wide.cast()) };
+        if name.is_empty() {
+            return None;
+        }
+        return Some(name);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
 }
 
 // ── Platform helpers ───────────────────────────────────────────────────────

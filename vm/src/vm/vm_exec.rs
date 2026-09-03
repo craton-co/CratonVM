@@ -9967,6 +9967,14 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .any_loaded_class_in_package(package_slash)
     }
 
+    fn any_loaded_class_in_package_for_loader(&self, package_slash: &str, loader_id: u32) -> bool {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .any_loaded_class_in_package_for_loader(package_slash, loader_id)
+    }
+
     fn set_class_hidden(&mut self, class_id: ClassId) {
         let mut cm = self.shared.classes.class_manager_write();
         if let Some(class) = cm.get_class_mut(class_id) {
@@ -10811,10 +10819,7 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
             receiver_class_id = self.shared.mem.heap.class_id_of(receiver);
         }
         // Check if the receiver is a lambda proxy.
-        let call_site = {
-            let proxies = self.shared.classes.lambda_proxies.read();
-            proxies.get(&receiver_class_id).cloned()
-        };
+        let call_site = self.shared.classes.lambda_call_site_for(receiver_class_id);
         if crate::runtime::env_cache::invoke_virtual_entry_trace()
             && method_name == "aotContributedInitializerStartsManagementContext"
         {
@@ -11499,9 +11504,18 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
                         .read()
                         .get_loaded_class_id(&class_name)
                         != Some(receiver_class_id));
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_NEEDS_EXACT_TRACE").is_some()
-                && method_name == "aotContributedInitializerStartsManagementContext"
-            {
+            // Name first, then the (now cached) gate: the name compare fails
+            // on its length for every other method, so the trace costs one
+            // `usize` compare on the path every native->Java callback takes.
+            // `CRATONVM_JIT_HOT_LOOKUP_CACHE=0` restores the original order and
+            // the uncached read.
+            if if crate::runtime::env_cache::hot_lookup_cache() {
+                method_name == "aotContributedInitializerStartsManagementContext"
+                    && crate::runtime::env_cache::needs_exact_trace()
+            } else {
+                cratonvm_types::flags::runtime_var_os("CRATONVM_NEEDS_EXACT_TRACE").is_some()
+                    && method_name == "aotContributedInitializerStartsManagementContext"
+            } {
                 let global_id = self
                     .shared
                     .classes
@@ -12934,6 +12948,19 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // `vh_array_index` is the worked example.
         let _out_of_range = self.shared.mem.heap.set_array_element(obj, index, value);
         // write_barrier fires automatically inside set_array_element for ref arrays
+        //
+        // Phase 10 #2: the host just wrote this array, so any device
+        // buffer mirroring it is stale.
+        //
+        // AUDIT 2026-09-02: native code writes arrays too, and none of it
+        // went through an interpreter `*astore` arm. `System.arraycopy`
+        // lands here for its per-element shapes, and every other native
+        // array writer that reaches `NativeHeapAccess` does as well. This
+        // is the chokepoint for all of them, which is why the fix is here
+        // rather than in `native-builtins` — that crate cannot see
+        // `input_cache`, and its `gpu-offload` feature is empty.
+        #[cfg(feature = "gpu-offload")]
+        crate::runtime::offload::input_cache::invalidate(obj);
     }
 
     // -- Bulk primitive-array intrinsics (perf override) --------------------
@@ -13395,6 +13422,21 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 }
             }
         }
+        // Phase 10 #2: `dst` has just been overwritten in bulk, so any
+        // device buffer mirroring it is stale.
+        //
+        // AUDIT 2026-09-02: this is the FAST path — `System.arraycopy`
+        // for same-type primitive arrays takes it and never touches
+        // `set_array_element`, so invalidating there alone left this hole
+        // open. `GpuRuntimeStress`'s `bulk_writes` scenario is the one
+        // that found it: a `System.arraycopy` into a kernel's input array
+        // between submits, after which the next submit computed from the
+        // device copy the host had replaced.
+        //
+        // `src` is not invalidated: a copy READS it and leaves it byte
+        // for byte as the device already has it.
+        #[cfg(feature = "gpu-offload")]
+        crate::runtime::offload::input_cache::invalidate(dst);
         true
     }
 
@@ -17688,15 +17730,28 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
             return;
         };
         let mut recorder = self.shared.debug.flight_recorder.lock();
-        let Some(recording) = recorder.get_recording_mut(id) else {
-            return;
-        };
-        recording.settings.enabled_event_names =
-            enabled_names.map(|names| names.iter().cloned().collect());
-        recording.settings.event_thresholds_by_name = thresholds
-            .iter()
-            .map(|(name, nanos)| (name.clone(), *nanos))
-            .collect();
+        {
+            let Some(recording) = recorder.get_recording_mut(id) else {
+                return;
+            };
+            recording.settings.enabled_event_names =
+                enabled_names.map(|names| names.iter().cloned().collect());
+            recording.settings.event_thresholds_by_name = thresholds
+                .iter()
+                .map(|(name, nanos)| (name.clone(), *nanos))
+                .collect();
+        }
+        // A14/A8 (2026-09-01): re-arm the `cratonvm.JitCompileDecision` producer
+        // gate. That event is armed only when a RUNNING recording names it, and
+        // the gate is otherwise refreshed by `refresh_running_ids` — which runs
+        // on start, not on a settings change. Every Java-side settings edit
+        // funnels through this function (`native-builtins/src/jfr.rs`), and
+        // `Recording.enable(...)` changes no recording STATE, so without this
+        // line `r.start()` followed by `r.enable(...)` leaves the producer
+        // permanently dark while the reverse order works — an argument-order
+        // dependence nothing would explain. The `recording` borrow is scoped
+        // above so `recorder` is free to be re-borrowed here.
+        cratonvm_jfr::jit_decision::sync_jit_decision_gate(&recorder);
     }
 
     fn jfr_set_java_output(&mut self, path: &str) {

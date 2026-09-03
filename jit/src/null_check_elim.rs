@@ -407,6 +407,93 @@ fn transfer(code: &[u8], pc: usize, in_mask: u64, prev_inst_pc: &[usize]) -> (u6
 /// (`NullCheckInfo::default()`) with a proper fixpoint forward
 /// dataflow using meet-over-paths (intersection at join points).
 pub fn analyze(code: &[u8], code_len: usize) -> NullCheckInfo {
+    analyze_with_receiver(code, code_len, false)
+}
+
+/// Is local 0 the `this` of an instance method?
+///
+/// `Some(true)` means it is, `Some(false)` that the method is static, and
+/// `None` that the two inputs did not agree and the question is therefore
+/// unanswered — which every caller must read as "assume nothing".
+///
+/// # Why this is derived rather than passed
+///
+/// `compile_with_param_slots` takes no `is_static`, and threading one through
+/// would be a cross-crate signature change to a function that already carries
+/// two dozen parameters. Both facts it needs are already there:
+///
+/// * `method_key` is `"<class>.<method>:<descriptor>"`, and
+/// * `num_params` is the ARGUMENT count — one per argument regardless of
+///   width, `this` included for an instance method (`prologue_param_slots` in
+///   `lib.rs`: `count_param_slots(descriptor) + if is_static { 0 } else { 1 }`).
+///
+/// So `num_params` must equal the descriptor's declared count or that count
+/// plus one, and which of the two it is *is* the answer. Note the width
+/// convention: `count_param_slots` counts `J`/`D` as ONE, so this must not be
+/// confused with `compute_param_jvm_slots`, which counts them as two. Reading
+/// the wrong one makes every method with a `long` or `double` parameter look
+/// like the other kind.
+///
+/// # The disagreement case is the load-bearing one
+///
+/// Returning `None` when the arithmetic comes out to neither is not
+/// defensiveness for its own sake — it is the only thing standing between a
+/// mis-paired `method_key` and a wrong `this` seed, and a wrong seed elides a
+/// null check that was doing real work. The legacy `compile()` wrapper passes
+/// `""`, which has no `(` and lands here too.
+pub fn receiver_in_local_zero(method_key: &str, num_params: usize) -> Option<bool> {
+    let desc_start = method_key.find('(')?;
+    let descriptor = &method_key[desc_start..];
+    descriptor.find(')')?;
+    let declared = crate::count_param_slots(descriptor);
+    if num_params == declared {
+        Some(false)
+    } else if num_params == declared + 1 {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// [`analyze`], plus the one fact no walk of the bytecode can derive for
+/// itself: whether local 0 holds a receiver.
+///
+/// # What the seed buys, and why the absence of it cost a loop
+///
+/// Entry IN was 0 — *nothing* proven on entry. The only way a local became
+/// known non-null was for an instruction to dereference it, so the first
+/// `this.field` in a method always paid a `TEST`/`JZ`, and — much worse — so
+/// did every later one inside a loop. The IN mask at a loop header is the meet
+/// of the entry path and the backedge; the backedge carries "local 0 non-null"
+/// (the body's own `getfield` proved it), the entry path does not, and the
+/// intersection is empty. A `for (…) sum += this.x;` therefore re-tested `this`
+/// on every iteration, forever, for a value the JVM guarantees.
+///
+/// `this` is non-null by construction: an instance method is only ever entered
+/// through a call site that has already null-checked its receiver, and that
+/// includes `<init>`, whose receiver is uninitialized but never null. Seeding
+/// bit 0 makes the meet come out non-empty and the whole loop stop asking.
+///
+/// # Why this is safe for the facts it feeds
+///
+/// The seed is one more fact of exactly the kind the analysis already
+/// produces, and it is killed by the same rule: `astore 0` clears bit 0 unless
+/// the stored value came from a proven producer. A method that reassigns local
+/// 0 loses the fact at the store, which is the correct and conservative
+/// direction. An `istore_0`/`fstore_0` over the receiver slot does not clear
+/// it, and does not need to: a later `aload_0` of a slot last written by an
+/// int store does not verify, so no consumer can reach the stale bit.
+///
+/// It is also correct under OSR. Entry IN was 0, so every fact this analysis
+/// produces is derived from instructions that actually executed on the path to
+/// the PC — properties that hold however control arrived, including an
+/// interpreter transition into the middle of the method. "Local 0 is non-null"
+/// is a property of the frame, not of the path, so it holds there too.
+pub fn analyze_with_receiver(
+    code: &[u8],
+    code_len: usize,
+    receiver_in_local_0: bool,
+) -> NullCheckInfo {
     let len = code_len.min(code.len());
     if len == 0 {
         return NullCheckInfo::default();
@@ -428,7 +515,9 @@ pub fn analyze(code: &[u8], code_len: usize) -> NullCheckInfo {
     // narrow. Entry IN is forced to 0 (nothing proven on entry).
     let top: u64 = !0;
     let mut in_masks = vec![top; len];
-    in_masks[0] = 0;
+    // Entry IN. `this` is the single fact the bytecode cannot prove about
+    // itself; everything else starts unproven. See the doc comment.
+    in_masks[0] = u64::from(receiver_in_local_0);
 
     // Track which PCs are valid instruction starts AND record each
     // instruction's *linear-predecessor* PC. The "linear predecessor"
@@ -654,5 +743,105 @@ mod tests {
         // it's STILL unproven (the meet over [entry: 0, back-edge:
         // {L0}] = 0). This is the correctness check.
         assert!(!info.is_nonnull(0, 0));
+    }
+}
+
+#[cfg(test)]
+mod receiver_seed_tests {
+    use super::{analyze_with_receiver, receiver_in_local_zero};
+
+    /// `this` is non-null, and the loop header is where that stops being free.
+    ///
+    /// The body below is `for (i = 0; i < 10; i++) { x = this.f; }`. The
+    /// `getfield` at bci 3 proves its own receiver non-null on fall-through,
+    /// so the BACKEDGE into the loop header carries the fact. The entry path
+    /// does not, and the meet is an intersection — so without a seed the fact
+    /// dies at the header on every iteration and the receiver is re-tested
+    /// forever, for a value the JVM guarantees at entry.
+    ///
+    /// Both arms are asserted in one test on purpose: the `false` arm IS the
+    /// pre-seed behaviour, so this test would have failed before the seed
+    /// existed and states exactly what changed.
+    #[test]
+    fn the_receiver_seed_is_what_survives_the_loop_header_meet() {
+        #[rustfmt::skip]
+        let code: Vec<u8> = vec![
+            0x03,               // 0:  iconst_0
+            0x3C,               // 1:  istore_1
+            0x2A,               // 2:  aload_0          <- loop header
+            0xB4, 0x00, 0x01,   // 3:  getfield #1
+            0x3D,               // 6:  istore_2
+            0x1B,               // 7:  iload_1
+            0x04,               // 8:  iconst_1
+            0x60,               // 9:  iadd
+            0x3C,               // 10: istore_1
+            0x1B,               // 11: iload_1
+            0x10, 0x0A,         // 12: bipush 10
+            0xA1, 0xFF, 0xF4,   // 14: if_icmplt 2      (14 - 12)
+            0x1B,               // 17: iload_1
+            0xAC,               // 18: ireturn
+        ];
+        let n = code.len();
+
+        let unseeded = analyze_with_receiver(&code, n, false);
+        assert!(
+            !unseeded.is_nonnull(3, 0),
+            "without the seed the entry path carries nothing, so the meet at \
+             the loop header must be empty -- if this passes, the header is no \
+             longer a join and the test has stopped measuring the thing it names"
+        );
+
+        let seeded = analyze_with_receiver(&code, n, true);
+        assert!(
+            seeded.is_nonnull(3, 0),
+            "with `this` seeded, both edges into the header carry local 0 and \
+             the getfield receiver check is dead"
+        );
+    }
+
+    /// A `getfield` on a local that is NOT the receiver keeps its check.
+    ///
+    /// Same shape, but the field is read out of local 1 -- a parameter, which
+    /// the seed says nothing about. The guard here is against a seed that
+    /// leaks across locals, which would elide a real null check on an argument
+    /// and turn an NPE into a SIGSEGV.
+    #[test]
+    fn the_seed_does_not_leak_to_a_parameter() {
+        #[rustfmt::skip]
+        let code: Vec<u8> = vec![
+            0x2B,               // 0: aload_1
+            0xB4, 0x00, 0x01,   // 1: getfield #1
+            0x57,               // 4: pop
+            0xB1,               // 5: return
+        ];
+        let seeded = analyze_with_receiver(&code, code.len(), true);
+        assert!(
+            !seeded.is_nonnull(1, 1),
+            "the seed proves local 0 and nothing else"
+        );
+    }
+
+    /// The derivation, including the width convention that would silently
+    /// misclassify every method with a `long` or `double` parameter.
+    #[test]
+    fn the_receiver_derivation_reads_an_argument_count_not_a_slot_count() {
+        // Instance: descriptor declares 2, `num_params` counts `this` too.
+        assert_eq!(receiver_in_local_zero("Foo.bar:(II)V", 3), Some(true));
+        // Static: the two agree exactly.
+        assert_eq!(receiver_in_local_zero("Foo.bar:(II)V", 2), Some(false));
+        // `J` and `D` are ONE argument each here. Counting them as two JVM
+        // slots (which `compute_param_jvm_slots` does, and this must not)
+        // would make declared = 4 and answer `None` for a plain instance
+        // method -- or, worse, `Some(false)` for the static one.
+        assert_eq!(receiver_in_local_zero("Foo.bar:(JD)V", 3), Some(true));
+        assert_eq!(receiver_in_local_zero("Foo.bar:(JD)V", 2), Some(false));
+        // No-arg forms are still distinguishable.
+        assert_eq!(receiver_in_local_zero("Foo.bar:()V", 1), Some(true));
+        assert_eq!(receiver_in_local_zero("Foo.bar:()V", 0), Some(false));
+        // Disagreement is unanswered, never guessed.
+        assert_eq!(receiver_in_local_zero("Foo.bar:(II)V", 7), None);
+        // The legacy `compile()` wrapper's empty key has no descriptor.
+        assert_eq!(receiver_in_local_zero("", 1), None);
+        assert_eq!(receiver_in_local_zero("Foo.bar:(II", 3), None);
     }
 }

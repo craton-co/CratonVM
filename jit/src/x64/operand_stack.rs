@@ -17,6 +17,31 @@
 
 use super::*;
 
+/// TEST-ONLY, opt-in: cap `spill_slots` at this many words, whatever
+/// `max_stack` asks for. Unset (the default) means no cap.
+///
+/// `spill-range-exhausted` is a refusal nothing in the tree could count until
+/// the spill census landed, and on every workload measured it fires ZERO times
+/// with 7 to 9 words of headroom to spare. A census column that never fires is
+/// indistinguishable from one armed where it cannot fire, and the way to tell
+/// those apart is to make the thing happen on purpose. Shrinking the budget
+/// does that without inventing a pathological method: the same emitter, the
+/// same workload and the same code path, with less room. At 48, 32, 24, 16, 12
+/// and 8 words it refuses 2, 56, 96, 137, 157 and 177 compiles, which is what
+/// establishes that the column is wired where it can fire.
+///
+/// It caps rather than replaces, so a small method is unaffected and the arm
+/// only bites where the budget was actually being used.
+pub fn spill_slots_cap() -> Option<usize> {
+    static G: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_SPILL_SLOTS_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    })
+}
+
 impl Compiler {
     pub(super) fn checked_spill_range_end(&mut self, start: i32, slots: usize) -> Option<i32> {
         let bytes = slots.checked_mul(8).and_then(|n| i32::try_from(n).ok());
@@ -29,13 +54,22 @@ impl Compiler {
             return None;
         };
         if start < self.base_spill_offset || end > self.spill_limit_offset {
+            crate::note_spill_cursor(crate::SPILL_REFUSED_EXHAUSTED, 1);
             self.fail("singlepass-codegen/spill-range-exhausted");
             return None;
         }
+        crate::note_spill_peak(
+            u64::try_from((end - self.base_spill_offset) / 8).unwrap_or(0),
+            u64::try_from((self.spill_limit_offset - end) / 8).unwrap_or(0),
+        );
         Some(end)
     }
 
     pub(super) fn reserve_spill_slots(&mut self, slots: usize) -> Option<i32> {
+        // Every reservation, so the three attributed columns can be read as a
+        // fraction of a whole rather than as three numbers with an unknown
+        // remainder beside them.
+        crate::note_spill_cursor(crate::SPILL_RES_TOTAL, slots as u64);
         let start = self.next_spill_offset;
         let end = self.checked_spill_range_end(start, slots)?;
         self.next_spill_offset = end;
@@ -65,6 +99,7 @@ impl Compiler {
         if self.stack.is_empty() && self.stack_oop_marks.is_empty() {
             self.stack_oop_marks_exact = true;
         }
+        crate::note_spill_cursor(crate::SPILL_RES_PUSH, 1);
         let offset = self.reserve_spill_slots(1)?;
         let slot = StackSlot::Frame(offset);
         self.stack.push(slot);
@@ -250,14 +285,16 @@ impl Compiler {
                 self.stack.push(top);
                 self.stack_oop_marks.push(top_is_oop);
             }
-            StackSlot::Scratch(reg) => {
+            StackSlot::Scratch(reg, ..) => {
                 let avail = SCRATCH_REGS.iter().copied().find(|&sr| {
                     sr != reg
                         && !self
                             .stack
                             .iter()
-                            .any(|s| matches!(s, StackSlot::Scratch(r) if *r == sr))
+                            .any(|s| matches!(s, StackSlot::Scratch(r, ..) if *r == sr))
                 });
+                // Its OWN home: two stack positions sharing one would have the
+                // second flush overwrite the first.
                 if let Some(sr) = avail {
                     self.emit_mov_reg_reg(sr, reg);
                     self.stack.push(StackSlot::Scratch(sr));
@@ -506,6 +543,7 @@ impl Compiler {
             }
         }
         if next > self.spill_limit_offset {
+            crate::note_spill_cursor(crate::SPILL_REFUSED_PAST_LIMIT, 1);
             self.fail("singlepass-codegen/spill-cursor-past-limit");
             return;
         }
@@ -725,7 +763,7 @@ impl Compiler {
         match slot {
             StackSlot::Frame(off) => self.emit_load_local(RAX, off),
             StackSlot::CalleeSaved(reg) => self.emit_mov_reg_reg(RAX, reg),
-            StackSlot::Scratch(reg) => self.emit_mov_reg_reg(RAX, reg),
+            StackSlot::Scratch(reg, ..) => self.emit_mov_reg_reg(RAX, reg),
             StackSlot::Xmm(xmm) => self.emit_movq_rax_from_xmm(xmm),
         }
     }
@@ -736,7 +774,7 @@ impl Compiler {
         match slot {
             StackSlot::Frame(off) => self.emit_load_local(RCX, off),
             StackSlot::CalleeSaved(reg) => self.emit_mov_reg_reg(RCX, reg),
-            StackSlot::Scratch(reg) => self.emit_mov_reg_reg(RCX, reg),
+            StackSlot::Scratch(reg, ..) => self.emit_mov_reg_reg(RCX, reg),
             StackSlot::Xmm(xmm) => self.emit_movq_gpr_from_xmm(RCX, xmm),
         }
     }
@@ -747,18 +785,44 @@ impl Compiler {
     /// instead of being stored to the frame, avoiding the memory round-trip when
     /// the next bytecode immediately consumes the value.
     pub(super) fn push_from_rax(&mut self) {
-        // The broad R8/R9 experiment regressed call-heavy methods because each
-        // call flushed live scratch values. Pure kernels contain no calls,
-        // allocation, fields, or other GC-capable operations; their counted
-        // loop back edges arrive with an empty operand stack. Restrict the
-        // deferred cache to that proven shape.
-        if self.kernel_operand_cache {
-            if let Some(reg) = SCRATCH_REGS.iter().copied().find(|&candidate| {
+        // ── Why this is pure-kernel-only ────────────────────────────────
+        //
+        // The comment here used to read *"the broad R8/R9 experiment regressed
+        // call-heavy methods because each call flushed live scratch values"*,
+        // which reads as a cost argument and is not one: a flush emits the
+        // store `push_stack` would have emitted anyway, only later.
+        //
+        // The real blocker is a REGISTER COLLISION. `SCRATCH_REGS` is
+        // `[R8, R9]` and `ARG_REGS` contains both on either ABI, so every
+        // helper call marshalling three or four arguments destroys a live
+        // scratch value unless a flush precedes it — and the emitter has many
+        // more `emit_call_absolute` sites than flush sites. `pure_kernel`
+        // excludes every one of them, which is why it works. See
+        // `operand_cache_enabled` for the full statement and for what widening
+        // it would actually take; the flag is opt-in so the two arms can be
+        // measured in one binary.
+        //
+        // The SECOND defect this comment used to carry — a stretch of calls
+        // growing the spill region once per flush until `spill-range-exhausted`
+        // failed the compile — DOES NOT REPRODUCE. The spill census
+        // (`spill_cursor_counts`) shows flush reservations are a small constant
+        // that does not move when the budget is cut to the point of refusing
+        // 177 compiles, and that peak usage tracks `max_stack` rather than the
+        // number of calls; `flush_home` carries the inequality that explains it.
+        //
+        // What remains true is the constraint: reserving the home at PUSH time
+        // was tried on 2026-09-02 and reverted the same day, because it made
+        // this function advance the spill cursor and the OSR entry's local
+        // homes are derived from the same layout — a nondeterministic heap
+        // corruption. Nothing here may touch the cursor.
+        if self.kernel_operand_cache || operand_cache_enabled() {
+            let free = SCRATCH_REGS.iter().copied().find(|&candidate| {
                 !self
                     .stack
                     .iter()
-                    .any(|slot| matches!(slot, StackSlot::Scratch(r) if *r == candidate))
-            }) {
+                    .any(|slot| matches!(slot, StackSlot::Scratch(r, ..) if *r == candidate))
+            });
+            if let Some(reg) = free {
                 self.emit_mov_reg_reg(reg, RAX);
                 self.stack_push(StackSlot::Scratch(reg), false);
                 return;
@@ -787,7 +851,7 @@ impl Compiler {
     /// returns `fallback`.
     pub(super) fn slot_to_gpr(&mut self, slot: StackSlot, fallback: u8) -> u8 {
         match slot {
-            StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg) => reg,
+            StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg, ..) => reg,
             StackSlot::Frame(off) => {
                 self.emit_load_local(fallback, off);
                 fallback
@@ -803,7 +867,7 @@ impl Compiler {
     pub(super) fn load_slot_to_reg(&mut self, dst: u8, slot: StackSlot) {
         match slot {
             StackSlot::Frame(off) => self.emit_load_local(dst, off),
-            StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg) => {
+            StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg, ..) => {
                 if dst != reg {
                     self.emit_mov_reg_reg(dst, reg);
                 }
@@ -815,9 +879,49 @@ impl Compiler {
         }
     }
 
+    /// Where the flush should put the value that currently sits at
+    /// operand-stack position `idx`.
+    ///
+    /// It takes the next word off the spill cursor, and that is not a
+    /// compromise — it is optimal. The value being flushed is register-resident
+    /// and owns no word; the positions below it own at most `idx` words between
+    /// them; so `next_spill_offset <= base_spill_offset + idx*8`, and the
+    /// reserved word is never above the position's own canonical home. There is
+    /// no cheaper answer to hand it.
+    ///
+    /// This function exists as a named site because the 2026-09-02 revert left a
+    /// note saying the opposite: that a fresh word per flushed value is what
+    /// made a call-heavy method grow its spill region until
+    /// `spill-range-exhausted` refused the compile. The spill census says that
+    /// is not what the cursor does. On a purpose-built 40-argument stress, a
+    /// `dup`/`astore` stress, CratonBench and the regression suite,
+    /// `flush-reserved` is a small constant (21 of 1067 reservations on the
+    /// stress; `res-push` dominates) and `peak-words` tracks the method's own
+    /// `max_stack`, not the number of calls it makes. Under
+    /// `CRATONVM_JIT_SPILL_SLOTS_CAP` at 48, 32, 24, 16, 12 and 8 words —
+    /// budgets tight enough to refuse 2 to 177 compiles — `flush-reserved`
+    /// does not move at all.
+    ///
+    /// A canonical-home variant of this function (store to `base + idx*8` and
+    /// reuse a dead word below the cursor) was written, shipped behind a kill
+    /// switch, and withdrawn: its engagement counter read ZERO in every arm at
+    /// every budget, for the reason the inequality above gives — at a flush
+    /// there is no dead word below the cursor to reclaim. Anyone reaching for
+    /// this again should read `spill_cursor_counts()` first.
+    fn flush_home(&mut self, _idx: usize) -> Option<i32> {
+        crate::note_spill_cursor(crate::SPILL_FLUSH_RESERVED, 1);
+        self.reserve_spill_slots(1)
+    }
+
     pub(super) fn flush_scratch_registers(&mut self) {
+        crate::note_spill_cursor(crate::SPILL_FLUSH_CALLS, 1);
         // Collect scratch slots first to avoid double-mutable-borrow of self
         // (iterating &mut self.stack while calling self.emit_store_local).
+        //
+        // Each flushed value goes to `flush_home`, which prefers the position's
+        // own canonical word over a fresh one — see there for why a fresh word
+        // per flush is what made a call-heavy method grow its spill region until
+        // the range was exhausted.
         let scratch_slots: Vec<(usize, u8)> = self
             .stack
             .iter()
@@ -831,7 +935,7 @@ impl Compiler {
             })
             .collect();
         for (idx, reg) in scratch_slots {
-            let Some(off) = self.reserve_spill_slots(1) else {
+            let Some(off) = self.flush_home(idx) else {
                 return;
             };
             self.emit_store_local(off, reg);
@@ -855,7 +959,7 @@ impl Compiler {
             })
             .collect();
         for (idx, xmm) in xmm_slots {
-            let Some(off) = self.reserve_spill_slots(1) else {
+            let Some(off) = self.flush_home(idx) else {
                 return;
             };
             // Direct MOVQ [rbp-off], XMM — saves the round-trip
@@ -901,7 +1005,7 @@ impl Compiler {
                 })
                 .collect();
             for (idx, reg) in callee_oop_slots {
-                let Some(off) = self.reserve_spill_slots(1) else {
+                let Some(off) = self.flush_home(idx) else {
                     return;
                 };
                 self.emit_store_local(off, reg);
@@ -974,11 +1078,12 @@ impl Compiler {
         let needs_spill = self
             .stack
             .iter()
-            .any(|s| matches!(s, StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) if *r == reg));
+            .any(|s| matches!(s, StackSlot::CalleeSaved(r) | StackSlot::Scratch(r, ..) if *r == reg));
         if !needs_spill {
             return;
         }
         // Spill the register value once
+        crate::note_spill_cursor(crate::SPILL_RES_INVALIDATE, 1);
         let Some(off) = self.reserve_spill_slots(1) else {
             return;
         };
@@ -986,7 +1091,7 @@ impl Compiler {
         // Update all CalleeSaved/Scratch entries for this register to the shared spill slot
         for slot in &mut self.stack {
             match *slot {
-                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) if r == reg => {
+                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r, ..) if r == reg => {
                     *slot = StackSlot::Frame(off);
                 }
                 _ => {}

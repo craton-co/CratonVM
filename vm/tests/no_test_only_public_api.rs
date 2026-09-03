@@ -269,10 +269,57 @@ fn code_part(line: &str) -> &str {
     }
 }
 
+/// The net BLOCK-brace count of a line: braces inside a string literal, a
+/// char literal or a line comment are not block delimiters.
+///
+/// Counting the raw line was the SECOND incarnation of the region-latch bug
+/// the `;` arm of [`split_regions`] fixed. `vm/src/vm/vm_exec.rs:31238` is
+/// a `format!` whose escaped `{{` is a literal brace in the OUTPUT, not an
+/// opened block; counted raw it left the `#[cfg(test)] mod tests` region at
+/// depth 2 forever, so 3 633 production lines of that file were filed as
+/// test. MEASURED 2026-09-02 across `vm/src`: five files, 5 131 production
+/// lines, and the visible symptom was `with_cas_lock` reported `prod=1`
+/// while `vm_exec.rs:33264` calls it in production. With this counting,
+/// every one of the 142 files closes its regions.
 fn brace_delta(line: &str) -> i32 {
-    let open = line.matches('{').count() as i32;
-    let close = line.matches('}').count() as i32;
-    open - close
+    let b = line.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    let mut in_str = false;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            // A line comment ends the code part of the line.
+            b'/' if i + 1 < b.len() && b[i + 1] == b'/' => break,
+            // A char literal holding a brace. Matched narrowly (three bytes,
+            // brace in the middle) so a lifetime such as `&'a T` is never
+            // mistaken for a quote that needs closing.
+            b'\'' if i + 2 < b.len()
+                && b[i + 2] == b'\''
+                && (b[i + 1] == b'{' || b[i + 1] == b'}') =>
+            {
+                i += 3;
+                continue;
+            }
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    depth
 }
 
 /// Extract the declared name from a `pub` item line, if it is one.

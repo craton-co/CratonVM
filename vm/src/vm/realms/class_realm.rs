@@ -39,6 +39,21 @@ pub const LAMBDA_PROXY_ID_BASE: u32 = 0x8000_0000;
 /// [`ClassRealm::is_annotation_proxy_class`] answer from a single `ClassId`
 /// instead of a name comparison under the class-manager lock.
 pub const ANNOTATION_PROXY_CLASS: &str = "java/lang/annotation/AnnotationProxy";
+
+/// Kill switch for the `any_annotation_proxy_defined()` fast path in
+/// [`ClassRealm::is_annotation_proxy_class`]
+/// (`CRATONVM_LOADER_NO_ANN_PROXY_LATCH=1`, or
+/// `CRATONVM_LOADER=-ann-proxy-latch`). Set, the gate falls through to the
+/// epoch-keyed resolver on every call, exactly as it did before the latch —
+/// which is what makes the two arms comparable inside one binary.
+#[inline]
+fn ann_proxy_latch_disabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_LOADER_NO_ANN_PROXY_LATCH").is_some()
+    })
+}
+
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
@@ -645,6 +660,26 @@ impl ClassRealm {
             && self.lambda_proxies.read().contains_key(&class_id)
     }
 
+    /// The lambda call site for `class_id`, or `None` for an ordinary class.
+    ///
+    /// The value-returning sibling of [`Self::is_lambda_proxy_class`], and it
+    /// exists for the same reason: `NativeContextImpl::invoke_virtual` took
+    /// `lambda_proxies.read()` and probed the map on EVERY native->Java
+    /// callback, to answer "no" for every ordinary receiver. The id-range test
+    /// in front is exact — see [`Self::is_lambda_proxy_class`] — so an ordinary
+    /// receiver now costs one `u32` compare instead of an `RwLock` acquisition
+    /// and a hash probe. On `HibfixComposeProbe2` that path is
+    /// `CompletableFuture.complete`'s `postComplete()` callback, 2.5 times per
+    /// composition chain.
+    #[inline]
+    pub fn lambda_call_site_for(&self, class_id: ClassId) -> Option<Arc<LambdaCallSite>> {
+        if class_id.as_u32() < LAMBDA_PROXY_ID_BASE && crate::runtime::env_cache::hot_lookup_cache()
+        {
+            return None;
+        }
+        self.lambda_proxies.read().get(&class_id).cloned()
+    }
+
     /// Is `class_id` the VM-internal [`ANNOTATION_PROXY_CLASS`]?
     ///
     /// Annotation proxies have no real bytecode for the `Annotation` contract
@@ -658,11 +693,47 @@ impl ClassRealm {
     /// comparison it replaces took the class-manager read lock, resolved the
     /// class, and compared an `Arc<str>` against a literal, once per virtual
     /// invoke.
+    ///
+    /// # The `u32::MAX` state is the common one, and it is not the fast one
+    ///
+    /// "Steady state" above meant *once the class exists*. `AnnotationProxy` is
+    /// a VM-internal synthetic class that most programs never mint, so the hint
+    /// stays `u32::MAX` for the whole process and every virtual invoke reaches
+    /// [`Self::resolve_annotation_proxy_cid`] — which is `#[cold]`, hence an
+    /// out-of-line call, and which does two atomic loads before it can answer.
+    /// That is what the advertised "one relaxed load and one `u32` compare"
+    /// actually costs in the overwhelmingly common case.
+    ///
+    /// **Stated precisely, because the first version of this note overstated
+    /// it.** The cold resolver *stamps* the epoch on its negative, so it is
+    /// **not** true that every virtual invoke took the class-manager read lock
+    /// while classes were loading: only the first invoke after each class
+    /// definition did. The lock traffic is therefore O(classes defined), not
+    /// O(invokes) — a real cost during a Spring or Tomcat start, but a much
+    /// smaller one than "per invoke", and the difference matters to anyone
+    /// budgeting against this line.
+    ///
+    /// `any_annotation_proxy_defined()` removes both halves: it is a
+    /// process-global one-way latch raised by `loaded_classes_insert` the first
+    /// time the name is defined *anywhere*, so it is immune to the epoch.
+    /// False ⇒ no realm has the class ⇒ no `class_id` can be it, in one relaxed
+    /// load with no call. It gates only the *lookup*, never the answer — the
+    /// per-realm `annotation_proxy_cid` still decides identity, because two VMs
+    /// in one process mint the class independently and must not share an id.
+    ///
+    /// Not separately measured: the effect is a few nanoseconds on a path whose
+    /// run-to-run spread on the development host is tens. It is kept because it
+    /// strictly removes work and adds one `bool`, not because a probe resolved
+    /// it. `CRATONVM_LOADER_NO_ANN_PROXY_LATCH=1` is there for whoever gets a
+    /// quiet host.
     #[inline]
     pub fn is_annotation_proxy_class(&self, class_id: ClassId) -> bool {
         let hint = self.annotation_proxy_cid.load(Ordering::Relaxed);
         if hint != u32::MAX {
             return class_id.as_u32() == hint;
+        }
+        if !ann_proxy_latch_disabled() && !crate::classloading::any_annotation_proxy_defined() {
+            return false;
         }
         self.resolve_annotation_proxy_cid() == Some(class_id)
     }

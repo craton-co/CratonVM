@@ -263,6 +263,14 @@ probes measured                              80
   vacuous (dial never asked)                  2
 ```
 
+**One probe was skipped and the count above does not include it.**
+`JdkInternalSweep` needs `--add-exports java.base/jdk.internal.{misc,access,loader,util}=ALL-UNNAMED`,
+the battery compiled with a plain `javac`, and it reported `JAVAC-FAILED` and
+moved on. So "80 probes" is what RAN, not the tree — a battery that skips on a
+compile error and prints one line about it is a battery whose coverage has to be
+read from its own log rather than assumed. Two more rows are marked vacuous for
+the same class of reason: the dial was never asked, so their zero says nothing.
+
 Worst first, and the `d(hs,base)=0` column is the one that matters — those
 families were **byte-identical to HotSpot before the retirement**:
 
@@ -397,14 +405,68 @@ shadowed method has bytecode; the table re-tags at REGISTRATION and
 table. It is not the table's result, and the `open` build is what that costs
 when it is treated as one.
 
+### Where the five leads stand — re-taken 2026-09-01, and only ONE is still a lead
+
+The five improving families were measured on the 2026-08-30 binary. Re-taken
+unarmed on the current one, three of them are already at zero — so their
+"improvement" was a code fix landing in the tree, not evidence for a
+retirement. **A lead measured against yesterday's binary is a lead about
+yesterday's binary**, which is the same trap as reusing a stale probe baseline,
+one level up.
+
+```text
+                         d(hs,base) 08-30   d(hs,base) 09-01
+AbstractReceiverSweep           12                 12    by design, see below
+L6MsgProbe                       8                  8    <- the one live lead
+L4Diag                           4                  0    closed by the retirement in this section
+DequeListShadowSweep             2                  0    closed in the tree by another lane
+PropsOrderSweep                  2                  0    closed in the tree
+```
+
+* **`AbstractReceiverSweep`'s 12 are not a defect to close.** They are the FFM
+  carrier's class NAME, and the contract decision above says that name is not
+  comparable. Retirement cannot deliver it either — that is what the `ArenaImpl`
+  rejection measured.
+* **`L6MsgProbe`'s 8 are the one live retirement lead this adjudication
+  produced.** They are `ConcurrentHashMap` constructor and argument-validation
+  messages — armed, the probe goes to 0. And `ConcurrentHashMap` is exactly the
+  class whose retirement empties `Properties.keySet()`, so this is only
+  reachable **per-triple**: the constructors and validation paths, not
+  `keySet`/`values`. `retired_shadow` is per-triple and can express that; the
+  dial cannot, which is why the lead could be found but not taken by the
+  instrument that found it. It sits in the collections/concurrency families, so
+  it is left here as a measured lead rather than claimed.
+
 ### One probe row that is not evidence
 
 `JdkOnlyPlatformProbe` reported +2 against the retirement. It is a
-virtual-thread `handoffs=` counter, and five runs of the CONTROL binary give
-55, 55, 58, 55, 58 — nondeterministic scheduling, not a regression. Every other
-field on that line is identical. **A differential probe with a nondeterministic
-row cannot be used as an oracle**, and this one was quietly contributing noise
-to the whole-set battery in §5 too.
+virtual-thread `handoffs=` counter: 64 threads handing off through a
+`SynchronousQueue`, and five runs of the CONTROL binary gave 55, 55, 58, 55, 58.
+Every other field on that line was identical, so the row was set aside as noise
+rather than a regression.
+
+**Re-measured 2026-09-01, and the first pass was not good enough to say that
+with.** Those five control runs were not interleaved with any HotSpot run — on
+this host a non-interleaved A/B is a load reading. Taken properly, ABBA, at load
+29 on 8 cores:
+
+```text
+HS 64   CV 64   CV 64   HS 64   HS 64   CV 64   CV 64   HS 64
+```
+
+Eight of eight, both VMs. And a purpose-built probe that separates the two sides
+of the handoff — `apps/probes/VtHandoffProbe.java`, which counts refused offers
+and timed-out polls rather than only successful ones, because the original row
+counts successes and ignores what `offer` returned — is **0-diff over 512
+handoffs in 8 rounds**, on both VMs.
+
+So the shortfall did not reproduce, and the conclusion "not a regression" holds
+for a better reason than the one first given: the row is load-fragile on BOTH
+VMs, and the 55/58 spread was a moment when several probe instances overlapped,
+not a property of this VM. **A differential probe with a load-fragile row cannot
+be used as an oracle** — it was contributing noise to the whole-set battery in
+§5 too — but "load-fragile" and "this VM is nondeterministic where HotSpot is
+not" are different claims, and only the first is measured.
 
 ---
 

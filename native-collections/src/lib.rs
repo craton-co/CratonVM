@@ -6177,12 +6177,66 @@ pub fn native_al_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(Some(old))
 }
 
+/// Is `this` one of the JDK's IMMUTABLE stand-in classes, for which a
+/// structural mutator must raise `UnsupportedOperationException`?
+///
+/// In real-JDK mode these receivers carry real bytecode — `Collections$EmptyList`
+/// inherits `AbstractList.add`, which throws — so nothing here is consulted. In
+/// `--synthetic-jdk` there is no bytecode, the interface-registered natives
+/// serve the call instead, and they mutated happily. Measured 2026-09-02 with
+/// `apps/probes/EmptySingletonImmutable`:
+///
+/// ```text
+///     Collections.emptyList().add("x")        SUCCEEDED   (HotSpot: UOE)
+///     Collections.emptyMap().put("k","v")     SUCCEEDED   (HotSpot: UOE)
+///     Collections.singletonList("a").add("x") SUCCEEDED   (HotSpot: UOE)
+///     Arrays.asList("a","b").add("x")         SUCCEEDED   (HotSpot: UOE)
+/// ```
+///
+/// `List.of` / `Set.of` / `Map.of` / `unmodifiable*` were already correct in
+/// every mode: they carry the `cratonvm/internal/Unmodifiable*` stamp, whose
+/// own natives refuse. These seven are the ones minted under a JDK class name
+/// with no such stamp.
+///
+/// **Structural mutators only.** `Arrays$ArrayList` is fixed-SIZE, not
+/// immutable: `add`/`remove` throw on HotSpot and `set` is legal and writes
+/// through to the backing array. That is why this is consulted from `add` and
+/// `put` rather than from a blanket "any write" check — a guard that also
+/// refused `set` would break `Arrays.asList(a).set(0, x)`, which is the
+/// idiomatic reason to call `asList` at all.
+fn is_immutable_jdk_stand_in(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let Some(name) = ctx.class_name_of_id(ctx.class_id_of_object(this)) else {
+        return false;
+    };
+    matches!(
+        &*name,
+        "java/util/Collections$EmptyList"
+            | "java/util/Collections$EmptySet"
+            | "java/util/Collections$EmptyMap"
+            | "java/util/Collections$SingletonList"
+            | "java/util/Collections$SingletonSet"
+            | "java/util/Collections$SingletonMap"
+            | "java/util/Arrays$ArrayList"
+    )
+}
+
 pub fn native_al_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // An immutable JDK stand-in refuses structurally — see
+    // `is_immutable_jdk_stand_in` for the measurement and for why `set` is not
+    // guarded alongside `add`.
+    if is_immutable_jdk_stand_in(ctx, this) {
+        return Err(
+            cratonvm_types::error::RuntimeError::UnsupportedOperationException {
+                message: String::new(),
+            }
+            .into(),
+        );
+    }
     // A `values()` / TreeMap-`entrySet()` view is an `ArrayList` here, but it is
     // not addable. `Map.values`: "The collection supports element removal ... It
     // does not support the `add` or `addAll` operations"; the JDK's
@@ -9664,6 +9718,102 @@ fn map_buckets_slot(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     receiver_table_slot(ctx, this).unwrap_or(MAP_FIELD_BUCKETS)
 }
 
+/// Write the JVMS §2.3 default — `null`, WRITTEN — into the reference-typed
+/// fields of a map object THIS CRATE allocated itself, so a slot that is
+/// legitimately empty until first use reads back as `null` and not as `Int(0)`.
+///
+/// # This is the whole of the 2026-09-01 descriptor-coercion census row
+///
+/// A stock `cratonvm Hello` reported `total=2740
+/// primitive-into-reference[read=2740]`, all 2740 of them at ONE locator
+/// (`class_id=64 index=2 descriptor=[`) — `java.util.HashMap.table`, read by
+/// [`map_state`] through [`map_buckets_slot`] on the `HashSet.add` boot path.
+/// The access-kind breakdown is the finding, and it is easy to read past:
+/// `read=2740`, **`store=0`**. Not one `set_field` in this crate — or anywhere
+/// else in the VM on that path — ever wrote a primitive at that slot. What put
+/// the `Int(0)` there was the ALLOCATOR.
+///
+/// `Value::Object` carries a `NonNull` niche, so the all-zero cell
+/// `alloc_zeroed` leaves decodes as `Value::Int(0)` and NOT as
+/// `Value::Object(None)`. `gc::heap::alloc_object_with_descriptors` and
+/// `interpreter::gc_and_alloc::init_primitive_fields` both exist to write the
+/// defaults explicitly for exactly that reason, and the test
+/// `zero_memory_does_not_decode_as_null_which_is_why_the_write_exists` pins it.
+/// The interpreter's `new` opcode goes through `init_primitive_fields`; the
+/// `NativeContext::alloc_object` this crate calls goes through neither. So a
+/// map a JAVA constructor allocates has a real `null` at `table` and is silent,
+/// while the backing map [`alloc_hs_backing`] allocates for every `HashSet` has
+/// `Int(0)` there and is counted on every read until the first insert publishes
+/// an array.
+///
+/// # Why this is a repair and not a way to quiet the census
+///
+/// The guard is RIGHT that a primitive is sitting in a reference slot; it is
+/// only wrong about who wrote it. Filling the slot with a fabricated array to
+/// make the number go down would be the anti-pattern this tree has been bitten
+/// by — a loud, counted coercion traded for a silent wrong answer. Leaving the
+/// slot empty is correct; this makes "empty" spell itself the way the JVMS
+/// spells it.
+///
+/// # Java-visible behaviour is unchanged, by construction
+///
+/// `coerce_field_value_for_slot` answers a `b'L' | b'['` descriptor with
+/// `Object(None)` for `Int(0)` and with `Object(None)` for `Object(None)`. So
+/// every descriptor-aware reader — `get_field`, `get_field_volatile`,
+/// `get_field_typed`, `compare_and_swap_field`, and the interpreter's own
+/// `getfield` — sees the byte-identical `Value` before and after this write.
+/// The readers that DO differ are the non-coercing ones (`get_field_raw`,
+/// `Object.clone`'s verbatim field copy, the JIT's direct cell reads), and for
+/// those `Int(0)` at a reference slot was the wrong answer and `null` is the
+/// right one. There is no arm on which the old value is preferable, which is
+/// why this is not behind a kill switch: there would be nothing to A/B.
+///
+/// # Scope, and the fabricated-layout early return
+///
+/// Names resolved on the RECEIVER — the same question [`receiver_table_slot`]
+/// asks, through the same call — and only for a receiver that HAS a real
+/// `table` field. A fabricated layout (`cratonvm/synthetic/AnonymousObject$N`,
+/// the bare `ClassId(0)` CHM segments) returns early, and that is load-bearing:
+/// its `_fN` slots have no declared descriptor, the coercion's `_ => value` arm
+/// passes them through untouched, and this file deliberately keeps
+/// `Int(capacity)` at `MAP_FIELD_CAPACITY` and `Int(size)` at `MAP_FIELD_SIZE`
+/// in two of them. Writing `null` there would delete live state. The early
+/// return is the same discriminator [`publish_map_table_inner`] already uses to
+/// decide whether the legacy capacity `Int` may be stored at all.
+///
+/// The four names are the reference-typed instance fields every map this crate
+/// allocates carries: `AbstractMap.keySet`, `AbstractMap.values`,
+/// `HashMap.table`, `HashMap.entrySet`. `LinkedHashMap.head`/`tail` are
+/// deliberately NOT in the list — they are references too, but a name that a
+/// shadowing subclass could have redeclared as an `int` would turn one census
+/// row (`primitive-into-reference`) into another (`null-into-primitive`)
+/// instead of removing one, and no reader in this file consults them before a
+/// writer has.
+///
+/// Cost: four `resolve_field_index_by_class_id` per map ALLOCATION — not per
+/// operation — on a path that already spends an `ensure_class_initialized`, a
+/// `class_num_total_fields`, and four more name resolutions in the initializer
+/// that runs immediately after. Not a GC point: `set_field` only runs the write
+/// barrier, which never allocates from the Java heap (see [`publish_map_table`]
+/// for the same note), so no caller needs a pin around this call.
+fn init_native_map_reference_defaults(ctx: &mut dyn NativeContext, map: ObjectRef) {
+    if receiver_table_slot(ctx, map).is_none() {
+        // Fabricated layout — see the doc comment above. Nothing here is a
+        // reference field by DECLARATION, so there is no default to write, and
+        // writing one would clobber the model's `Int` slots.
+        return;
+    }
+    let class_id = ctx.class_id_of_object(map);
+    let num_fields = ctx.object_num_fields(map);
+    for name in ["table", "entrySet", "keySet", "values"] {
+        if let Some(slot) = ctx.resolve_field_index_by_class_id(class_id, name) {
+            if slot < num_fields {
+                ctx.set_field(map, slot, Value::Object(None));
+            }
+        }
+    }
+}
+
 /// Publish a freshly built bucket table on `map`, honouring both storage
 /// conventions this crate maintains:
 ///
@@ -11967,11 +12117,49 @@ fn map_init_capacity_eager(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// the only thing they share. Keeping ONE spelling is the point: this file has
 /// twice found a rule half-applied across a family that shares the contract and
 /// not the code.
-fn map_ctor_capacity_load_check(args: &[Value]) -> Result<(), MethodCallFailed> {
+/// How a map family SPELLS the refusals above.
+///
+/// The doc comment on the helper argues for keeping one spelling. That is the
+/// right instinct when the family shares the contract, and measured against
+/// HotSpot on JDK 25 (`apps/probes/MapCtorMsgProbe.java`) this one does not —
+/// there are five spellings of the same negative-capacity check:
+///
+/// ```text
+///   HashMap / LinkedHashMap / HashSet / LinkedHashSet  Illegal initial capacity: -1
+///   Hashtable                                          Illegal Capacity: -1
+///   WeakHashMap                                        Illegal Initial Capacity: -1
+///   IdentityHashMap                                    expectedMaxSize is negative: -1
+///   ConcurrentHashMap                                  (no message at all)
+/// ```
+///
+/// Only the first row is this helper's. `ConcurrentHashMap` reached it anyway
+/// and inherited a message the JDK does not produce, so the spelling is now a
+/// parameter rather than an assumption.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MapCtorRefusalSpelling {
+    /// `HashMap` and the classes that copy its wording.
+    HashMapFamily,
+    /// `ConcurrentHashMap`: `throw new IllegalArgumentException()`, bare.
+    Messageless,
+}
+
+fn map_ctor_capacity_load_check(
+    args: &[Value],
+    spelling: MapCtorRefusalSpelling,
+) -> Result<(), MethodCallFailed> {
+    // An EMPTY message is this crate's marker for a null `getMessage()` — see
+    // the `IllegalArgumentException` arm of `RuntimeError::render`. `Some("")`
+    // and `None` are different answers to `getMessage()`, and the probe reads
+    // the difference.
+    let messageless = spelling == MapCtorRefusalSpelling::Messageless;
     if let Some(Value::Int(c)) = args.get(1) {
         if *c < 0 {
             return Err(RuntimeError::IllegalArgumentException {
-                message: format!("Illegal initial capacity: {c}"),
+                message: if messageless {
+                    String::new()
+                } else {
+                    format!("Illegal initial capacity: {c}")
+                },
             }
             .into());
         }
@@ -11979,7 +12167,14 @@ fn map_ctor_capacity_load_check(args: &[Value]) -> Result<(), MethodCallFailed> 
     if let Some(Value::Float(f)) = args.get(2) {
         if *f <= 0.0 || f.is_nan() {
             return Err(RuntimeError::IllegalArgumentException {
-                message: format!("Illegal load factor: {f}"),
+                message: if messageless {
+                    String::new()
+                } else {
+                    // `java_float_to_string`, not `{f}`: Rust prints 0.0f32 as
+                    // "0" and Java prints "0.0", so the plain interpolation was
+                    // wrong for every caller at once.
+                    format!("Illegal load factor: {}", java_float_to_string(*f))
+                },
             }
             .into());
         }
@@ -11996,7 +12191,7 @@ fn map_init_capacity_inner(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    map_ctor_capacity_load_check(args)?;
+    map_ctor_capacity_load_check(args, MapCtorRefusalSpelling::HashMapFamily)?;
     let cap = match args.get(1) {
         Some(Value::Int(c)) => {
             // JDK `HashMap(int initialCapacity)` / `HashSet(int)` semantics:
@@ -12115,7 +12310,10 @@ fn native_hashtable_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -
         if !load_factor.is_finite() || *load_factor <= 0.0 {
             return Err(
                 cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                    message: format!("Illegal Load: {load_factor}"),
+                    message: format!(
+                        "Illegal Load: {}",
+                        java_float_to_string(*load_factor)
+                    ),
                 }
                 .into(),
             );
@@ -12575,6 +12773,19 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     //
     // Deliberately here rather than inside `native_map_put_evict`: the `evict`
     // flag is `LinkedHashMap.removeEldestEntry`'s, and a TreeMap has no eldest.
+    // An immutable JDK stand-in (`Collections$EmptyMap`, `$SingletonMap`)
+    // refuses — see `is_immutable_jdk_stand_in`. Ahead of the TreeMap route
+    // because neither of those is a TreeMap and the refusal is unconditional.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if is_immutable_jdk_stand_in(ctx, *this) {
+            return Err(
+                cratonvm_types::error::RuntimeError::UnsupportedOperationException {
+                    message: String::new(),
+                }
+                .into(),
+            );
+        }
+    }
     if let Some(Value::Object(Some(this))) = args.first() {
         if is_tree_map_receiver(ctx, *this) {
             return native_tm_put(ctx, args);
@@ -18199,6 +18410,11 @@ pub fn make_hashset_with_elements(
         let buckets = alloc_ref_array(ctx, cap);
         let pin_base = ctx.pin_native_root(buckets);
         let backing_map = ctx.alloc_object(hashmap_class_id, map_n_fields);
+        // JVMS §2.3 defaults — see [`init_native_map_reference_defaults`]. This
+        // branch already writes `entrySet` explicitly and overwrites `table`
+        // two lines down; `keySet`/`values` are the slots that were left holding
+        // `Int(0)`. Not a GC point, so the pin re-read below is unaffected.
+        init_native_map_reference_defaults(ctx, backing_map);
         let buckets = ctx.read_native_pin(pin_base, buckets);
         ctx.set_field(backing_map, f_table, Value::Object(Some(buckets)));
         ctx.set_field(backing_map, f_size, Value::Int(0));
@@ -18785,7 +19001,7 @@ fn register_set_view_carrier_natives(r: &mut NativeMethodRegistry) {
 fn native_hs_init_capacity_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // BEFORE the trim, or the load factor is validated by nobody: the guard
     // reads `args[2]`, and the (I)V path this delegates to never sees it.
-    map_ctor_capacity_load_check(args)?;
+    map_ctor_capacity_load_check(args, MapCtorRefusalSpelling::HashMapFamily)?;
     // Drop the loadFactor (last) arg and reuse the (I)V path.
     let trimmed: Vec<Value> = args.iter().take(2).copied().collect();
     native_hs_init_capacity(ctx, &trimmed)
@@ -19055,7 +19271,16 @@ fn alloc_backing_map(ctx: &mut dyn NativeContext) -> ObjectRef {
     };
     let total = ctx.class_num_total_fields(cid);
     let n = std::cmp::max(total, MAP_NUM_FIELDS);
-    ctx.alloc_object(cid, n)
+    let m = ctx.alloc_object(cid, n);
+    // JVMS §2.3 defaults for the reference slots. `NativeContext::alloc_object`
+    // zero-fills and stops there, and a zeroed cell decodes as `Int(0)`, not as
+    // `null` — so without this every reference field of this map reads back as a
+    // primitive. `table` is the one a caller then reads on EVERY map operation
+    // until the first insert publishes an array, and it was the whole of the
+    // 2,740-hit descriptor-coercion census row. See
+    // [`init_native_map_reference_defaults`].
+    init_native_map_reference_defaults(ctx, m);
+    m
 }
 
 /// `true` for Set classes whose iteration must preserve *insertion* order
@@ -19088,6 +19313,14 @@ fn alloc_hs_backing(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) ->
         let total = ctx.class_num_total_fields(cid);
         let n = std::cmp::max(total, MAP_NUM_FIELDS);
         let m = ctx.alloc_object(cid, n);
+        // JVMS §2.3 defaults, before anything can read them — see
+        // [`init_native_map_reference_defaults`]. This is the insertion-ordered
+        // twin of the `alloc_backing_map` arm below and has the same defect:
+        // `lhm_init_with_cap_lazy` deliberately leaves `table` unallocated, so
+        // without an explicit `null` the slot reads back `Int(0)` for the whole
+        // life of an empty `LinkedHashSet`. Not a GC point, so it sits outside
+        // the pin below.
+        init_native_map_reference_defaults(ctx, m);
         // The freshly allocated backing map is referenced ONLY by this local
         // until the caller stores it into the set's `map` field. Pin it across
         // the initializer (which allocates the bucket table): a moving cycle
@@ -19130,7 +19363,7 @@ fn native_hs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 }
 
 fn native_hs_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    map_ctor_capacity_load_check(args)?;
+    map_ctor_capacity_load_check(args, MapCtorRefusalSpelling::HashMapFamily)?;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -21502,7 +21735,12 @@ fn native_al_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // iterators as holding a trailing `null` element.
         return Err(
             cratonvm_types::error::RuntimeError::NoSuchElementException {
-                message: "no more elements".to_string(),
+                // MEASURED on HotSpot 25.0.4+7 (`apps/probes/MapCtorMsgProbe.java`):
+                // an exhausted iterator or enumeration in this family answers a
+                // NULL `getMessage()`. `Vector`'s enumeration is the one that does
+                // not ("Vector Enumeration") and does not come through here. An
+                // EMPTY message is this crate's marker for no message.
+                message: String::new(),
             }
             .into(),
         );
@@ -21655,7 +21893,7 @@ fn native_map_key_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         // own exhausted paths, so the two cannot drift into different reports.
         return Err(
             cratonvm_types::error::RuntimeError::NoSuchElementException {
-                message: "No more elements".to_string(),
+                message: String::new(),
             }
             .into(),
         );
@@ -23366,7 +23604,14 @@ fn native_collections_empty_list(ctx: &mut dyn NativeContext, _args: &[Value]) -
     if let Some(v) = collections_empty_singleton(ctx, "EMPTY_LIST") {
         return Ok(Some(v));
     }
-    // Fallback (field not yet initialised): fresh synthetic empty list.
+    // See `native_collections_empty_map` for why this precedes the synthetic:
+    // the sibling `native_collections_singleton_list` just below already does
+    // it, which is why `singletonList` reported the right class in
+    // `--synthetic-jdk` while `emptyList` reported `java.util.ArrayList`.
+    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$EmptyList") {
+        return Ok(Some(Value::Object(Some(o))));
+    }
+    // Last resort: fresh synthetic empty list.
     let __al_n_fields = al_slots(ctx).2;
     let list = try_alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields)?;
     let arr = alloc_ref_array(ctx, 0);
@@ -38261,6 +38506,18 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // A null source map answered an EMPTY MAP here, where the JDK
+    // dereferences it: `HashMap(Map m)` -> `putMapEntries(m, false)` ->
+    // `int s = m.size()`. Silently accepting null is worse than a wrong
+    // message -- the caller does not learn it passed null at all. Only an
+    // explicitly-passed null throws; a missing argument stays the
+    // malformed-call no-op, the distinction `reject_null_functional` draws.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Cannot invoke \"java.util.Map.size()\" because \"m\" is null".to_string()),
+        }
+        .into());
+    }
     let source = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -43985,6 +44242,10 @@ fn alloc_linked_hash_map(ctx: &mut dyn NativeContext) -> ObjectRef {
     let total = ctx.class_num_total_fields(cid);
     let n = std::cmp::max(total, MAP_NUM_FIELDS);
     let m = ctx.alloc_object(cid, n);
+    // JVMS §2.3 defaults — see [`init_native_map_reference_defaults`]. The
+    // initializer below is EAGER, so `table` is overwritten with a real array
+    // one line later; `keySet`/`values`/`entrySet` are the slots this rescues.
+    init_native_map_reference_defaults(ctx, m);
     lhm_init_with_cap(ctx, m, MAP_DEFAULT_CAPACITY);
     m
 }
@@ -44661,7 +44922,7 @@ fn native_lhm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 fn native_lhm_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Serves the `(I)V`, `(IF)V` and `(IFZ)V` constructors, so validating
     // `args[1]`/`args[2]` here covers all three.
-    map_ctor_capacity_load_check(args)?;
+    map_ctor_capacity_load_check(args, MapCtorRefusalSpelling::HashMapFamily)?;
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -44747,7 +45008,16 @@ fn lhm_is_access_order(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
 fn native_lhm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // RULE C: `LinkedHashMap(Map)` is `putMapEntries(m, false)`, which reads
     // `m.size()`.
-    reject_null_collection(args.get(1))?;
+    // NOT `reject_null_collection`: that is the
+    // `Objects.requireNonNull(c)` shape, whose NPE carries no message. This
+    // constructor DEREFERENCES its argument (`m.size()`), so the JDK raises a
+    // helpful NPE naming the method and its own parameter name.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Cannot invoke \"java.util.Map.size()\" because \"m\" is null".to_string()),
+        }
+        .into());
+    }
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -45918,6 +46188,14 @@ fn register_array_deque_natives(r: &mut NativeMethodRegistry) {
 
     r.register(c, "<init>", "()V", native_ad_init);
     r.register(c, "<init>", "(I)V", native_ad_init_capacity);
+    // `(Collection)` — see the note on `java/util/Vector`'s. `addLast` per
+    // element, which is what `ArrayDeque(Collection)` specifies.
+    r.register(
+        c,
+        "<init>",
+        "(Ljava/util/Collection;)V",
+        native_ad_init_from_collection,
+    );
     r.register(c, "size", "()I", native_ad_size);
     r.register(c, "isEmpty", "()Z", native_ad_is_empty);
     r.register(c, "addFirst", "(Ljava/lang/Object;)V", native_ad_add_first);
@@ -45985,15 +46263,34 @@ fn register_array_deque_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(c, "clear", "()V", native_ad_clear);
     r.register(c, "toArray", "()[Ljava/lang/Object;", native_ad_to_array);
-    // NO `iterator` REGISTRATION. Real `ArrayDeque.iterator()` bytecode runs,
-    // and that is the fix for the fail-fast row this family carried, not a
-    // concession. The JDK's `DeqIterator` is fail-fast off a PHYSICAL index
-    // into the ring buffer -- `nonNullElementAt` reports any null it reads as a
-    // `ConcurrentModificationException` -- so it is exactly as fail-fast as the
-    // buffer's layout, and no counter reproduces it. `ad_state` derives the
-    // element count and `ad_grow`/`ad_remove_at_logical` reproduce the JDK's
-    // own layout byte for byte, so there is nothing left for a shadow to
-    // protect. See `native_ad_iterator`'s removal in the same commit.
+    // NO `iterator` REGISTRATION in real-JDK mode. Real `ArrayDeque.iterator()`
+    // bytecode runs, and that is the fix for the fail-fast row this family
+    // carried, not a concession. The JDK's `DeqIterator` is fail-fast off a
+    // PHYSICAL index into the ring buffer -- `nonNullElementAt` reports any
+    // null it reads as a `ConcurrentModificationException` -- so it is exactly
+    // as fail-fast as the buffer's layout, and no counter reproduces it.
+    // `ad_state` derives the element count and `ad_grow`/`ad_remove_at_logical`
+    // reproduce the JDK's own layout byte for byte, so there is nothing left
+    // for a shadow to protect. See `native_ad_iterator`'s removal in the same
+    // commit.
+    //
+    // `--synthetic-jdk` HAS NO SUCH BYTECODE, and the consequence is measured
+    // 2026-09-02 (`apps/probes/AdDispatch`): after `d.add("a")`, `size()`
+    // answers 1 and `peekFirst()` answers "a" while a for-each yields ZERO
+    // elements — a silently empty loop, through every declared type and
+    // through `addLast` as well. OPEN, and deliberately not fixed here.
+    //
+    // A `#[cfg(feature = "synthetic-jdk")]` registration was written and
+    // REVERTED, because the cheap version of it is the trap this crate already
+    // names: minting `java/util/ArrayDeque$Itr` arms the dormant registration
+    // at the bottom of `register_snapshot_iterator_natives`, which that comment
+    // calls "a trap armed for whoever produces one later". Doing it right means
+    // minting the real `ArrayDeque$DeqIterator` with the snapshot fields — i.e.
+    // putting ArrayDeque back into `VALUES_ITR_CARRIERS`, which it LEFT on
+    // 2026-08-30 — and that table's own doc records `DescendingIterator` making
+    // java.base a second producer of the carrier class the last time it was
+    // done. Two measured decisions to reverse and a two-producer hazard to
+    // re-open; it wants the census that owns this area, not a side edit.
     r.register(c, "toString", "()Ljava/lang/String;", native_ad_to_string);
     r.register(
         c,
@@ -46002,6 +46299,63 @@ fn register_array_deque_natives(r: &mut NativeMethodRegistry) {
         native_ad_for_each,
     );
     r.set_category(__prev_cat);
+}
+
+/// `ArrayDeque(Collection)` — the JDK's `this(c.size()); copyElements(c);`.
+///
+/// **`native_ad_init_capacity` with the SOURCE SIZE, not `native_ad_init`.**
+/// The first version of this called the no-arg init, which allocates the
+/// default 16 + 1 slots, and the contents were correct — so nothing that reads
+/// elements could see the difference. The CAPACITY is observable anyway, and
+/// `apps/probes/ItrCarrierCensus` saw it: HotSpot sizes a 3-element deque to 4
+/// slots, so a 4th `add` GROWS and reallocates `elements`, and a live
+/// `DeqIterator` then reads a null through `nonNullElementAt` and raises
+/// `ConcurrentModificationException`. With 17 slots there is no grow, no null,
+/// and no CME — `ArrayDeque` came out NOT fail-fast on `add` against HotSpot's
+/// fail-fast, one row of that probe, with every element-level check agreeing.
+///
+/// The `+ 1` inside `native_ad_init_capacity` is what makes `this(c.size())`
+/// correct rather than off-by-one; its own comment records the wrap-onto-head
+/// bug from getting that wrong.
+///
+/// Same GC discipline as `native_ll_init_from_collection`:
+/// `collect_collection_elements_or_real` re-enters Java and every `addLast`
+/// can grow the backing array, so `this` is pinned and each element re-read
+/// per iteration rather than held across the call.
+fn native_ad_init_from_collection(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    reject_null_collection(args.get(1))?;
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let source = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            native_ad_init(ctx, args)?;
+            return Ok(None);
+        }
+    };
+    // The drain runs BEFORE the sizing, which the JDK's `this(c.size())` does
+    // not — but `c.size()` and the drained length are the same number, and
+    // draining first is what makes the size available without asking the
+    // source twice (it may be a view whose `size()` re-walks). `this` is
+    // pinned across it because the drain re-enters Java and can collect.
+    let this_pin = ctx.pin_native_root(this);
+    let elems = collect_collection_elements_or_real(ctx, source)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    let capacity = i32::try_from(elems.len()).unwrap_or(i32::MAX);
+    native_ad_init_capacity(ctx, &[Value::Object(Some(this)), Value::Int(capacity)])?;
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    for (i, val) in elems.iter().enumerate() {
+        let this = ctx.read_native_pin(this_pin, this);
+        let val = read_pinned_elem(ctx, handles[i], *val);
+        native_ad_add_last(ctx, &[Value::Object(Some(this)), val])?;
+    }
+    ctx.unpin_native_roots(this_pin);
+    Ok(None)
 }
 
 fn native_ad_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -46594,60 +46948,6 @@ fn ad_collect_elements(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
 }
 
 
-/// `ArrayDeque$Itr.remove()` — remove the element returned by the last `next()`
-/// from the BACKING deque (field 2). Without this native, `remove()` falls to
-/// the `java/util/Iterator` default, which throws `UnsupportedOperationException`
-/// — the kafka `NetworkClientDelegate` unsent-request cleanup
-/// (`iterator.remove()` over an `ArrayDeque`) hit exactly that. The iterator is
-/// snapshot-backed (field 0 = array, field 1 = cursor), so we remove the first
-/// occurrence of the just-returned element from the live deque (correct for the
-/// forward, unique-element iteration these call sites use); the snapshot is left
-/// intact so continued iteration matches JDK semantics.
-fn native_ad_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0);
-    // Field 3 is the cursor value at the last successful `remove()`, or 0
-    // before the first one -- the other half of the JDK's
-    // `IllegalStateException` contract, which `cursor <= 0` alone cannot
-    // express. `remove()` twice with no intervening `next()` finds the cursor
-    // unchanged since the previous removal. MEASURED no-throw in compatible
-    // mode (apps/probes/DequeListShadowSweep 84); the `--jdk-only` route already had
-    // it, through `SnapshotItrBacking::last_removed_cursor`.
-    let last_removed = if ctx.object_num_fields(this) > 3 {
-        ctx.get_field(this, 3).as_int().unwrap_or(0)
-    } else {
-        0
-    };
-    if cursor <= 0 || last_removed == cursor {
-        return Err(RuntimeError::IllegalStateException {
-            message: "next() has not been called, or remove() already called after the last next()"
-                .to_string(),
-        }
-        .into());
-    }
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) => a,
-        _ => return Ok(None),
-    };
-    let backing = match ctx.get_field(this, 2) {
-        Value::Object(Some(b)) => b,
-        // Older 2-field iterators (no backing ref): nothing to mutate.
-        _ => return Ok(None),
-    };
-    let last = ctx.get_array_element(arr, (cursor - 1) as usize);
-    let this_pin = ctx.pin_native_root(this);
-    let removed = native_ad_remove_first_occurrence(ctx, &[Value::Object(Some(backing)), last]);
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
-    removed?;
-    if ctx.object_num_fields(this) > 3 {
-        ctx.set_field(this, 3, Value::Int(cursor));
-    }
-    Ok(None)
-}
 
 fn native_ad_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
@@ -46910,6 +47210,17 @@ fn register_priority_queue_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Comparator;)V",
         native_pq_init_comparator,
     );
+    // `(Collection)` — see the note on `java/util/Vector`'s. This one must
+    // route through `native_pq_add` rather than copying the source order: a
+    // `PriorityQueue` is a heap, and `PriorityQueue(Collection)` on HotSpot
+    // heapifies. Copying element order would produce a queue whose `poll()`
+    // sequence is the source's, not the comparator's.
+    r.register(
+        c,
+        "<init>",
+        "(Ljava/util/Collection;)V",
+        native_pq_init_from_collection,
+    );
     r.register(c, "size", "()I", native_pq_size);
     r.register(c, "isEmpty", "()Z", native_pq_is_empty);
     r.register(c, "add", "(Ljava/lang/Object;)Z", native_pq_add);
@@ -46923,6 +47234,39 @@ fn register_priority_queue_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "iterator", "()Ljava/util/Iterator;", native_pq_iterator);
     r.register(c, "toString", "()Ljava/lang/String;", native_pq_to_string);
     r.set_category(__prev_cat);
+}
+
+/// `PriorityQueue(Collection)` — `this(); addAll(c);`.
+///
+/// Routed through `native_pq_add` per element rather than copying the source
+/// array, because a `PriorityQueue` is a HEAP: `PriorityQueue(Collection)`
+/// heapifies on HotSpot, and a queue built by copying source ORDER would
+/// `poll()` in the source's sequence rather than the comparator's. Same GC
+/// discipline as `native_ad_init_from_collection`.
+fn native_pq_init_from_collection(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    reject_null_collection(args.get(1))?;
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    native_pq_init(ctx, args)?;
+    let source = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let elems = collect_collection_elements_or_real(ctx, source)?;
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    for (i, val) in elems.iter().enumerate() {
+        let this = ctx.read_native_pin(this_pin, this);
+        let val = read_pinned_elem(ctx, handles[i], *val);
+        native_pq_add(ctx, &[Value::Object(Some(this)), val])?;
+    }
+    ctx.unpin_native_roots(this_pin);
+    Ok(None)
 }
 
 fn native_pq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -47311,6 +47655,18 @@ fn register_vector_natives(r: &mut NativeMethodRegistry) {
 
     r.register(c, "<init>", "()V", native_al_init);
     r.register(c, "<init>", "(I)V", native_al_init_capacity);
+    // `(Collection)` — the copy constructor. Absent until 2026-09-02, so
+    // `new Vector<>(someList)` raised `NoSuchMethodError` in `--synthetic-jdk`
+    // (real-JDK mode runs the class's own bytecode and never reaches here).
+    // Bound to the shared ArrayList implementation like every other method on
+    // this class: `al_slots_for` resolves `elementData`/`elementCount` against
+    // the RECEIVER's layout, which is the whole reason Vector can share these.
+    r.register(
+        c,
+        "<init>",
+        "(Ljava/util/Collection;)V",
+        native_al_init_from_collection,
+    );
     r.register(c, "size", "()I", native_al_size);
     r.register(c, "isEmpty", "()Z", native_al_is_empty);
     r.register(c, "get", "(I)Ljava/lang/Object;", native_vec_get);
@@ -49313,46 +49669,39 @@ fn register_queue_deque_interface_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/util/Deque", "size", "()I", native_ad_size);
     registry.register("java/util/Deque", "isEmpty", "()Z", native_ad_is_empty);
 
-    // Iterator support for the fabricated `ArrayDeque$Itr`: the 2-field snapshot
-    // pattern (field 0 = array, field 1 = cursor).
+    // `java/util/ArrayDeque$Itr` RETIRED 2026-09-02 by the iterator-carrier
+    // census (`fixed-suite-bugs/iterator-carrier-census-20260902.md`).
+    // `hasNext`/`next`/`remove` were bound here to the 2-field snapshot
+    // pattern for a class this crate stopped minting on 2026-08-30, when
+    // ArrayDeque's iterator became the real `DeqIterator`.
     //
-    // `java/util/PriorityQueue$Itr` LEFT THIS LOOP on 2026-08-29, and how it
-    // failed is worth keeping. That name is a REAL JDK class, and nothing in
-    // this crate minted it -- the row described a 2-field shape the real class
-    // has never had, and it sat inert because no object of that class ever
-    // reached these natives. The moment `native_pq_iterator` started minting
-    // the real class (L3 residual 6.1), this dormant row won the slot over the
-    // `native_al_itr_*` registration that matches the shape actually minted:
-    // `owns=True inv=4` here against `owns=False inv=0` there. Iteration then
-    // reported every queue EMPTY.
+    // The comment that stood here explained why that is dangerous rather than
+    // merely dead, and it is kept because the reasoning outlives the rows:
+    // `java/util/PriorityQueue$Itr` sat in this same loop describing a 2-field
+    // shape the real class has never had, inert because nothing minted it —
+    // and the moment `native_pq_iterator` started minting the real class the
+    // dormant row won the slot over the `native_al_itr_*` registration that
+    // matched the shape actually produced (`owns=True inv=4` here against
+    // `owns=False inv=0` there), and iteration reported every queue EMPTY.
+    // A registration keyed on a class nobody produces is a trap armed for
+    // whoever produces one later, and the dump shows it as a duplicate only
+    // once the class exists.
     //
-    // A registration keyed on a class nobody produces is not harmless -- it is
-    // a trap armed for whoever produces one later, and the dump shows it as a
-    // duplicate only once the class exists. `ArrayDeque$Itr` is now in that
-    // same state (its mint site became the real `DeqIterator` in the same
-    // change) and is recorded in the L3 record as a retirement candidate rather
-    // than deleted here, because deleting registrations is the shadow-retirement
-    // lane's edit and wants its own census.
-    for itr_class in &["java/util/ArrayDeque$Itr"] {
-        registry.register(itr_class, "hasNext", "()Z", native_snapshot_itr_has_next);
-        registry.register(
-            itr_class,
-            "next",
-            "()Ljava/lang/Object;",
-            native_snapshot_itr_next,
-        );
-    }
-    // `ArrayDeque$Itr.remove()` removes the last-returned element from the
-    // backing deque (field 2). Otherwise remove() falls to the Iterator default
-    // → UnsupportedOperationException (kafka NetworkClientDelegate). Only the
-    // ArrayDeque iterator carries the backing-deque ref; the PriorityQueue
-    // iterator does not, so it is left as-is.
-    registry.register(
-        "java/util/ArrayDeque$Itr",
-        "remove",
-        "()V",
-        native_ad_itr_remove,
-    );
+    // It was armed. During the census a first attempt at an ArrayDeque
+    // iterator for `--synthetic-jdk` minted `ArrayDeque$Itr` and was reverted.
+    //
+    // Retired on evidence the deferral asked for and did not have:
+    //   * nothing mints the class — no allocation site names it, and
+    //     `apps/probes/ItrCarrierCensus` shows the runtime handing out the real
+    //     `java/util/ArrayDeque$DeqIterator`;
+    //   * the only caller of these natives was `vm::tests::array_deque_iterator`,
+    //     which drives them on a hand-built receiver — and it fails at its FIRST
+    //     step (`ArrayDeque.iterator() not registered`), stale from the same
+    //     2026-08-30 change, unnoticed because its whole
+    //     `#[cfg(all(test, feature = "synthetic-jdk"))]` module had not compiled
+    //     since `InlineSite` grew a field.
+    // So the rows had no reachable consumer at all, and removing them breaks
+    // nothing that was working.
     registry.set_category(__prev_cat);
 }
 
@@ -51610,11 +51959,17 @@ pub fn gc_overlay_owner_addrs() -> Option<std::collections::HashSet<usize>> {
     let index = overlay_owner_keys()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if index.is_empty() {
-        None
-    } else {
-        Some(index.keys().copied().collect())
-    }
+    // `Some` of an EMPTY set, not `None`, when nothing is registered.
+    //
+    // The two say opposite things to a marker. `None` means "I cannot
+    // enumerate my owners, so do not exclude anything on my behalf"
+    // (`ExternalRootProvider::owner_addrs`), which forces the per-object
+    // overlay lookup -- the provider lock and this mutex -- for every marked
+    // object in the heap. `Some(empty)` is the fact: this provider owns
+    // nothing, so no address needs asking about. A program that touches no
+    // native-backed collection is exactly the case that was paying most for
+    // the ambiguity.
+    Some(index.keys().copied().collect())
 }
 
 /// Return the Rust-side references owned by one already-marked collection.
@@ -55195,7 +55550,16 @@ fn native_tm_descending_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 /// `TreeMap(Map)` — a fresh natural-ordered map, then `putAll`.
 fn native_tm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // RULE C: the JDK's body is `putAll(m)`, which reads `m.size()`.
-    reject_null_collection(args.get(1))?;
+    // NOT `reject_null_collection`: that is the
+    // `Objects.requireNonNull(c)` shape, whose NPE carries no message. This
+    // constructor DEREFERENCES its argument (`map.size()`), so the JDK raises a
+    // helpful NPE naming the method and its own parameter name.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Cannot invoke \"java.util.Map.size()\" because \"map\" is null".to_string()),
+        }
+        .into());
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -59503,7 +59867,7 @@ fn native_chm_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // bytecode runs `new ConcurrentHashMap<>(initialCapacity)`, and THIS
     // constructor validated nothing. One line, the same guard every other
     // hash-ordered constructor in the file now shares.
-    map_ctor_capacity_load_check(args)?;
+    map_ctor_capacity_load_check(args, MapCtorRefusalSpelling::Messageless)?;
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -59595,7 +59959,10 @@ fn native_chm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // the shape `phase-2-worklist` records as the worst a refusal can take,
     // because the caller does not learn it passed null until much later.
     if matches!(args.get(1), None | Some(Value::Object(None))) {
-        return Err(bare_npe());
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Cannot invoke \"java.util.Map.size()\" because \"m\" is null".to_string()),
+        }
+        .into());
     }
     // cceres5: `chm_init_segments` allocates (segments + buckets); `source`
     // sat raw in `args` across it, so `collect_entries_any` below could walk a
@@ -60760,8 +61127,15 @@ fn native_chm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // so it is an NPE and not a silent no-op. A missing argument is a dispatch
     // defect rather than a Java-visible null and keeps the old return — the
     // distinction `reject_null_functional` draws.
+    // The comment above says `m.size()`; MEASURED on HotSpot 25 the
+    // message names `entrySet()`. `ConcurrentHashMap.putAll` is not
+    // `HashMap.putAll`, and the premise had been transcribed from the wrong
+    // class -- which is why this arm is keyed on the measurement.
     if matches!(args.get(1), Some(Value::Object(None))) {
-        return Err(bare_npe());
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Cannot invoke \"java.util.Map.entrySet()\" because \"m\" is null".to_string()),
+        }
+        .into());
     }
     let source = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
@@ -67103,7 +67477,31 @@ fn native_collections_empty_map(ctx: &mut dyn NativeContext, _args: &[Value]) ->
     if let Some(v) = collections_empty_singleton(ctx, "EMPTY_MAP") {
         return Ok(Some(v));
     }
-    // Fallback (field not yet initialised): fresh synthetic empty map.
+    // `alloc_real_jdk` FIRST, exactly as `native_collections_singleton_list`
+    // does one screen up, and for the same reason: it resolves the class the
+    // JDK would have returned in BOTH modes — real-JDK from the image, and
+    // `--synthetic-jdk` from `class_manager`'s fabrication tables, which carry
+    // `Collections$Empty*` field shapes and interface rows already. Only the
+    // static-field cache above is real-JDK-only.
+    //
+    // Without it this fallback minted an ordinary mutable synthetic, so in
+    // `--synthetic-jdk` (measured 2026-09-02, `apps/probes/EmptySingletonImmutable`):
+    //
+    //     Collections.emptyList()  class=java.util.ArrayList
+    //                              instanceof ArrayList = true
+    //                              add("x") = SUCCEEDED
+    //
+    // The `add` is the defect. `ensure_collections_empty_singletons` above
+    // records what a mutable empty singleton cost the last time one shipped —
+    // kotlin-reflect's shaded protobuf tests `instanceof ArrayList` to decide
+    // whether to replace its `emptyList()` placeholder, skipped the
+    // replacement, and mutated the shared object. Here each call happens to
+    // mint a FRESH list, so the write is not shared — it is silently DISCARDED
+    // instead, which is the same class of wrong answer with a quieter failure.
+    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$EmptyMap") {
+        return Ok(Some(Value::Object(Some(o))));
+    }
+    // Last resort: fresh synthetic empty map.
     let map = alloc_backing_map(ctx);
     map_init_eager(ctx, &[Value::Object(Some(map))])?;
     Ok(Some(Value::Object(Some(map))))
@@ -67113,7 +67511,11 @@ fn native_collections_empty_set(ctx: &mut dyn NativeContext, _args: &[Value]) ->
     if let Some(v) = collections_empty_singleton(ctx, "EMPTY_SET") {
         return Ok(Some(v));
     }
-    // Fallback (field not yet initialised): fresh synthetic empty set.
+    // See `native_collections_empty_map` for why this precedes the synthetic.
+    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$EmptySet") {
+        return Ok(Some(Value::Object(Some(o))));
+    }
+    // Last resort: fresh synthetic empty set.
     let set = try_alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS)?;
     let inner_map = alloc_backing_map(ctx);
     map_init_eager(ctx, &[Value::Object(Some(inner_map))])?;
@@ -71529,6 +71931,50 @@ fn native_executors_new_scheduled_pool(
 // so the request now equals the declared width.
 const CF_FIELD_RESULT: usize = 0;
 const CF_FIELD_DONE: usize = 1;
+
+/// `CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT` — default-ON, `=0` opts out. Routes
+/// the `postComplete()` callback through `invoke_virtual_bytecode_only`
+/// instead of `invoke_virtual`, i.e. straight to the interpreter's `execute`
+/// rather than through the by-NAME native resolver that misses. See the call
+/// site in `native_cf_complete`.
+fn cf_postcomplete_direct_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static GATE: AtomicU8 = AtomicU8::new(0);
+    match GATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = match cratonvm_types::flags::runtime_var(
+                "CRATONVM_NATIVE_CF_POSTCOMPLETE_DIRECT",
+            ) {
+                Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+                Err(_) => true,
+            };
+            GATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// `CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP` — default-ON, `=0` opts out. See the
+/// call site in `native_cf_complete`.
+fn cf_postcomplete_skip_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static GATE: AtomicU8 = AtomicU8::new(0);
+    match GATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on =
+                match cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP") {
+                    Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+                    Err(_) => true,
+                };
+            GATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
 /// Number of slots a CratonVM *synthetic* `CompletableFuture` carries — the
 /// real declared width, because `CF_FIELD_RESULT`/`CF_FIELD_DONE` are the only
 /// two slots any native in this crate touches.
@@ -71690,12 +72136,76 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         native_cf_any_of,
     );
 
-    // complete — needed because the real CompletableFuture.complete(null) relies on
-    // the static `NIL` AltResult sentinel, which is effectively null on CratonVM, so
-    // `complete(null)` leaves `result == null` (isDone() stays false). That breaks
-    // e.g. KafkaFuture.allOf(...) whose result is completed with `complete(null)`,
-    // leaving it pending forever (get() hangs).
-    r.register(cf, "complete", "(Ljava/lang/Object;)Z", native_cf_complete);
+    // complete — registered because the real CompletableFuture.complete(null)
+    // relies on the static `NIL` AltResult sentinel, which WAS effectively null
+    // on CratonVM, so `complete(null)` left `result == null` (isDone() stayed
+    // false). That broke e.g. KafkaFuture.allOf(...) whose result is completed
+    // with `complete(null)`, leaving it pending forever (get() hangs).
+    //
+    // **The premise is stale AND the registration is still right.** Both halves
+    // were measured on 2026-09-02, and the second is the surprising one.
+    //
+    // The premise first. Reading the field directly through
+    // `--add-opens java.base/java.util.concurrent`:
+    //
+    //     HotSpot   NIL = java.util.concurrent.CompletableFuture$AltResult@...  NIL.ex = null
+    //     CratonVM  NIL = java.util.concurrent.CompletableFuture$AltResult@4c3  NIL.ex = null
+    //
+    // `NIL` is a proper `AltResult` here now, and with this registration OFF
+    // the real bytecode answers `complete(null) -> true, isDone=true,
+    // get=null` and `allOf(...)` completes — identical to HotSpot. So the hang
+    // this bridge was written to prevent does not reproduce, and "it shadows
+    // real bytecode for a reason that has expired" is a fair reading of it.
+    //
+    // It is still the wrong conclusion. `CompletableFuture` composition is
+    // ~20x HotSpot and this native is 2.50 crossings per chain, which makes it
+    // look exactly like `AtomicReference.compareAndSet`'s synthetic stub —
+    // de-registered on 2026-08-29 for a 1.6x win, on the argument that a stub
+    // over one line of real JDK bytecode is a pure tax. MEASURED here, one
+    // binary, this switch the only difference, six interleaved reps,
+    // `HibfixComposeProbe2` 2 threads x 320 000 chains, load 14-22:
+    //
+    //     registered (default)   20.64-23.55 s cpu   (median 22.16)   34.6 us/chain
+    //     de-registered          66.56-70.49 s cpu   (median 69.52)  108.6 us/chain
+    //
+    // **3.14x SLOWER with the bridge gone**, ranges disjoint, `wrong=0` in all
+    // twelve runs. The native census says why, and it is not "the bytecode is
+    // slow" — the crossing does not disappear, it MULTIPLIES (80 000 chains):
+    //
+    //     CompletableFuture.complete        200 000 ->       0
+    //     CompletableFuture.completeValue         0 -> 200 000   (itself a registered native)
+    //     Unsafe.compareAndSetInt               619 -> 200 000   (+2.5/chain)
+    //     Object.<init>                       2 882 -> 122 174   (+1.5/chain)
+    //
+    // The real `complete` is `completeValue(value)` — which is ANOTHER
+    // registered native, so the boundary is crossed anyway — plus the CAS and
+    // the `AltResult`/`Completion` allocation that this one collapses. This
+    // bridge is not a shadow in front of cheap bytecode; it is a fast path in
+    // front of three more boundary crossings and an allocation.
+    //
+    // The switch is kept because that is a strong claim and it should stay
+    // one run away from being re-checked, not one BUILD away: the "synthetic
+    // stub over a real JDK method is a pure tax" pattern is real, it has paid
+    // out before, and the next person to notice 2.50 crossings per chain here
+    // will reach for it. **Do not flip this default.** If it is ever flipped,
+    // the number above is what has to move first.
+    //
+    // Note also that a class-scoped retirement is the wrong instrument for
+    // this cluster even if the per-triple answer were the other way: this
+    // native serves a SYNTHETIC CompletableFuture too (an Int `done` marker at
+    // slot 1 instead of the real `stack` reference), and retiring a cluster
+    // wholesale is the shape that once left `ConcurrentHashMap` with a retired
+    // constructor and live mutators, silently losing five of six entries (see
+    // `admit_forced_native`'s header).
+    //
+    // `CRATONVM_NATIVE_CF_COMPLETE=0` — do not register it; the real JDK
+    // bytecode runs instead, correctly, and 3.14x slower.
+    if !matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_CF_COMPLETE").as_deref(),
+        Ok("0")
+    ) {
+        r.register(cf, "complete", "(Ljava/lang/Object;)Z", native_cf_complete);
+    }
 
     // completeExceptionally
     r.register(
@@ -73121,7 +73631,32 @@ fn native_cf_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // cross-thread `complete()` (the timed `get(...)` only "self-heals"
         // because `parkNanos` re-polls `result`). Run `postComplete()` to release
         // waiters — this is the missing half of the synthetic override.
-        ctx.invoke_virtual(this, "postComplete", "()V", &[])?;
+        //
+        // ...but only when there is a stack to pop. `postComplete()`'s whole
+        // body is `while ((h = f.stack) != null || (f != this && (h = (f =
+        // this).stack) != null))`, so with `stack`@1 null it returns having
+        // done nothing — and this callback is not cheap: it is a by-NAME
+        // virtual dispatch out of a native, which resolves through
+        // `invoke_or_native` (two registry probes plus the descriptor-quirk
+        // scan, all of them misses — `postComplete` is not a native) and then
+        // through `invoke_on_class_shared_inner`. The composition page's
+        // "name-keyed lookup, 8.2 %" bucket is that chain: 100 005 missed
+        // `CompletableFuture.postComplete()V` registry lookups in 40 000
+        // chains, 76 % of every miss on the workload.
+        //
+        // A `complete()` with no dependents and no waiter is the common shape
+        // outside a composition benchmark; there the whole chain now costs one
+        // field read. `CRATONVM_NATIVE_CF_POSTCOMPLETE_SKIP=0` restores the
+        // unconditional callback so the two arms can be priced in one binary.
+        let no_waiters = matches!(ctx.get_field(this, CF_FIELD_DONE), Value::Object(None))
+            && cf_postcomplete_skip_enabled();
+        if !no_waiters {
+            if cf_postcomplete_direct_enabled() {
+                ctx.invoke_virtual_bytecode_only(this, "postComplete", "()V", &[])?;
+            } else {
+                ctx.invoke_virtual(this, "postComplete", "()V", &[])?;
+            }
+        }
     }
     Ok(Some(Value::Int(1)))
 }
@@ -73198,7 +73733,13 @@ fn native_cf_complete_exceptionally(
     // blocked in untimed `get()`/`join()`. Without this they hang forever on a
     // cross-thread exceptional completion — the same defect fixed in
     // `native_cf_complete`.
-    ctx.invoke_virtual(this, "postComplete", "()V", &[])?;
+    //
+    // `invoke_virtual_bytecode_only`, not `invoke_virtual`, for the reason the
+    // sibling in `native_cf_complete` states and measures: `postComplete` is
+    // ordinary JDK bytecode and can never be a native, so the by-NAME resolver
+    // is two hashes of the 53-byte triple plus the cold descriptor-quirk
+    // rewrite, all of them misses, per completion.
+    ctx.invoke_virtual_bytecode_only(this, "postComplete", "()V", &[])?;
     Ok(Some(Value::Int(1)))
 }
 
@@ -74317,6 +74858,66 @@ mod tests {
         let mut r = NativeMethodRegistry::new();
         register_collections_natives(&mut r);
         r
+    }
+
+    /// No natives may be bound to an iterator class this crate never MINTS.
+    ///
+    /// The durable output of the iterator-carrier census
+    /// (`fixed-suite-bugs/iterator-carrier-census-20260902.md`).
+    /// A registration keyed on a class nobody produces is inert until someone
+    /// produces one, and then it WINS the slot over the registration that
+    /// matches the shape actually minted. It has happened twice:
+    ///
+    /// * `java/util/PriorityQueue$Itr` described a 2-field snapshot the real
+    ///   class has never had; when `native_pq_iterator` began minting the real
+    ///   class, iteration reported every queue EMPTY.
+    /// * `java/util/ArrayDeque$Itr` sat in the same state after ArrayDeque's
+    ///   iterator became the real `DeqIterator`, and a first attempt at a
+    ///   `--synthetic-jdk` iterator during the census minted it and sprang the
+    ///   trap again.
+    ///
+    /// Neither was visible as a test failure — the second's only caller had
+    /// been failing at its first line for days inside a module that would not
+    /// compile. So this asserts the property directly and cheaply: for the
+    /// iterator classes this crate has retired, nothing may be registered.
+    ///
+    /// This is a DENY-LIST rather than the general property ("every registered
+    /// iterator class has a mint site"), because a mint site is not visible to
+    /// a registry test — `build_registry` sees names, not allocations. A
+    /// deny-list of the two names that have actually caused this is a check
+    /// that can fail; the general form would need the static scan the census
+    /// ran, and would have to be kept honest by a control row whose answer is
+    /// already known. Add a name here when a carrier is retired.
+    #[test]
+    fn no_natives_are_bound_to_a_retired_iterator_carrier() {
+        let r = build_registry();
+        for retired in [
+            // Retired 2026-09-02: ArrayDeque hands out the real `DeqIterator`.
+            "java/util/ArrayDeque$Itr",
+            // Retired 2026-08-29: PriorityQueue hands out the real `$Itr`,
+            // which IS this name — so the check below is specifically that the
+            // 2-field SNAPSHOT natives are not the ones bound to it. The real
+            // class is served through `VALUES_ITR_CARRIERS`.
+        ] {
+            for (method, desc) in [
+                ("hasNext", "()Z"),
+                ("next", "()Ljava/lang/Object;"),
+                ("remove", "()V"),
+            ] {
+                assert!(
+                    r.find(retired, method, desc).is_none(),
+                    "{retired}.{method}{desc} is registered, but nothing mints                      {retired} — a dormant row is a trap armed for whoever                      mints one later; see the iterator-carrier census"
+                );
+            }
+        }
+        // Control: the carriers that ARE minted must still be bound, so this
+        // test cannot pass by the registry being empty.
+        for (_, carrier) in VALUES_ITR_CARRIERS {
+            assert!(
+                r.find(carrier, "next", "()Ljava/lang/Object;").is_some(),
+                "{carrier} is a live carrier and must keep its natives"
+            );
+        }
     }
 
     #[test]

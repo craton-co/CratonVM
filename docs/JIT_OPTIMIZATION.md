@@ -225,6 +225,587 @@ receiver/type guard that deopts to the normal call path on mismatch:
   primitive arrays (insertion sort, inline)
 - `CRC32`/`CRC32C.update`
 
+### Register residency in the optimizing tier — built, verified, still opt-in
+
+`ir_lower` keeps **every** value in a frame word. Its GP tier is fixed
+(RAX/RCX/RDX for values, R10/R11 for safepoint and shadow-stack work, R8/R9 for
+call arguments), `frame_word_off` returns `Err` for `ValueLoc::Reg`, and the
+linear-scan allocator that exists and self-verifies
+(`regalloc::allocate_linear_scan` plus `verify_allocation`) was wired only as a
+**write-through read cache over XMM2–XMM7**, behind
+`CRATONVM_JIT_IR_LINEAR_SCAN`, default off. Its own doc comment stated the
+consequence: *"this wiring is still FP-only. An `int` loop counter gets nothing
+out of it."*
+
+The single-pass backend, meanwhile, colours Java locals into callee-saved GPRs
+(`LOCAL_REGS` = RBX/R12–R15, plus RSI/RDI on Windows) by default. So the
+baseline tier keeps loop counters and accumulators in registers and the
+optimizing tier that supersedes it does not.
+
+**That inversion is measured, in one binary.** `CRATONVM_JIT_IR_LONG=0` declines
+any method using `long`, which routes a `long`-accumulating kernel to the
+single-pass backend and changes nothing else. Five one-line kernels, 20.5M
+iterations each, identical checksums on every arm:
+
+| kernel (inner loop body) | C2 / IR | C1 / single-pass | C1 advantage |
+|---|---:|---:|---:|
+| `s += a[i]` over `int[]` | 84–90 ms | 25–28 ms | **3.2x** |
+| `N n = a[i]; if (n != null)` | 91–103 ms | 31–34 ms | **3.0x** |
+| `s += a[i].v` | 93–102 ms | 34–37 ms | **2.7x** |
+| `a[i].v = i` | 165–178 ms | 119–129 ms | 1.4x |
+| `a[i].next = a[i]` | 347–361 ms | 284–304 ms | ~1.2x |
+
+(Linux/EPYC, load 5–12, three rounds. An earlier Windows run at load ~0.6 put
+the first row at 1.6x; the direction is the same and the size is host-dependent.)
+The last two rows are the control that makes the rest readable: they are
+dominated by out-of-line barrier work, so register residency cannot move them,
+and it does not. `jit/src/x64/single_pass_only.rs` treats this inversion as a
+finite, enumerable list of single-pass specialisations to veto on. It is not
+finite.
+
+**What landed.** `regalloc::xmm_roles::IR_GP_LINEAR_SCAN` = RBX, R12–R15 — a
+general-purpose file beside the XMM one, on the same write-through contract.
+
+Every part of the register choice is forced. They are callee-saved on **both**
+ABIs, which this wiring needs because it has no reload machinery: a value's
+register must survive a call by the calling convention rather than by analysis,
+and that rules out even the otherwise-obvious System V candidates RSI/RDI. They
+are untouched by this emitter's own tiers. The prologue saves them and every
+exit restores them (`IR_GP_PROLOGUE_SAVED`), on the same footing as the XMM save
+area and just as dynamically — a method that promotes nothing emits no save.
+
+**The safepoint obligation is discharged by type, not by structure.** A GC root
+walk reads a frame it did not stop, through RBP, and `OopMapEntry` names frame
+slots only, so no reference may be register-resident at a safepoint. The XMM
+file discharged that by having no register a `Ref` could occupy; the GP file has
+to refuse the type, which `plan_register_residency`'s bank match does. Everything
+else is unchanged by construction: the home word is written at every definition,
+so `emit_safepoint_map`, `build_deopt_points` and `emit_phi_copies` read exactly
+what they always did.
+
+**The default did not move, and the census is why.** With
+`CRATONVM_DBG_IR_LINEAR_SCAN=1`:
+
+* on `BinTrees.itemCheck` the file works — `resident=7 (fp=0 gp=7) demoted=0`,
+  `phi=0`, 13 candidates lost to splits and 2 to type;
+* on all five probe kernels above it never runs at all: *"refused: liveness and
+  colourer disagree about which values want a home"*, 5 of 5.
+
+That refusal was a **pre-existing** gate, not something the GP file introduced.
+`regalloc::ir_op_defines_value` (through `wants_loc`) and `ir_lower`'s
+`op_defines_result_slot` (through `node_color`) are two enumerations of one
+question — the second and third of the three `the_three_ir_op_enumerations`
+names — and any disagreement declines the whole method. It was declining the XMM
+cache the same way and nobody could see it, because the flag printed only on
+success. Both halves of that are fixed: every refusal now carries a reason, the
+enumeration disagreement names the offending node and op, and a successful plan
+reports its per-cause skip census (`split_or_spilled`, `wrong_bank_or_type`,
+`no_home`, `phi`).
+
+**The disagreement itself is fixed too, and it was exactly two ops.**
+`op_defines_result_slot` lists `Op::ArrayLength` and `Op::NewArray`;
+`ir_op_defines_value` did not — while its own doc comment asserted lockstep and
+named those two as *"absent there and absent here"*. The comment written to
+prevent the drift was the drift. Every counted loop spelled
+`for (i = 0; i < a.length; i++)` contains an `arraylength`, which is why the
+five array-touching kernels declined and `BinTrees.itemCheck`, which touches no
+array, was the one that promoted. Nothing was ever miscompiled — the agreement
+check did its job and declined — but the optimization was unavailable wherever
+arrays are, which is most places.
+
+The lockstep claim is now enforced rather than asserted:
+`the_two_value_defining_enumerations_agree` parses both function bodies out of
+the two source files and compares the sets, so adding an arm to one list and
+forgetting the other fails a test instead of surfacing as an unexplained
+refusal months later.
+
+So the capability is built, tested, safe, and no longer structurally blocked.
+The flip is a separate decision that still wants a **measurement on a quiet
+host**, which is what this work could not supply: the box ran at load 30–352
+throughout, with the fat-LTO link of the verifying binary SIGKILLed by the OOM
+killer at load 352. **Do not flip it on the strength of the table above; that
+table is the problem statement, not a result.**
+
+Off is exactly the pre-change emission: no register handed out, no save area
+reserved, every read from its home word.
+
+Two couplings are worth knowing. Residency and the **level-2 selector** are
+mutually exclusive — `isel`'s encoder is anchored byte-for-byte against the
+per-opcode arms under the assumption that the frame-homed allocation *is* this
+backend's allocation, which residency makes false — so a MIR mode turns
+residency off. And the IR tier still publishes no OSR entry table; the assertion
+that would catch an OSR trampoline entering past a prologue that saves registers
+now covers the GP band too.
+
+**Known limit, named rather than guessed at:** a loop counter and a loop
+accumulator are `Op::Phi` at the loop header, and phis are excluded — the
+allocator refuses them, and their homes are written by `emit_phi_copies` at each
+incoming edge rather than by a definition arm, so there is no site that could
+publish one into a register. Reaching loop-carried values therefore needs the
+allocator to admit phis and `emit_phi_copies` to publish; the `phi=` field of
+the skip census is there to say how much that is worth on a given workload
+before anyone builds it.
+
+### Reference stores: barrier gates instead of a region table
+
+Under the default collector, **every reference `putfield` in compiled code was
+an out-of-line call**, and the inline fast path guarding it was dead code that
+still cost about twenty-five instructions.
+
+The fast path was gated on `region_bounds_are_live(region_bounds_addr)` — the
+*contents* of the process-global `JIT_REGION_BOUNDS` table. ZGC (the default
+since 2026-08-10) and G1 both deliberately never publish into it; `zgc.rs` says
+so outright: filling it "would re-enable an inline reference STORE fast path
+this collector must not have". Worse, the emitter's admission test was
+`helpers.region_bounds_addr != 0` — the *address* of a static, hence a constant
+`true` — so the whole sequence was emitted (null test, alignment test, six
+containment compares that could never pass, a compactness test, an old-gen test)
+and then fell through to `jit_putfield_object` anyway.
+
+The prediction that follows is falsifiable and was checked:
+`CRATONVM_NO_JIT_INLINE_PUTFIELD=1` must measure exactly zero. On BinTrees d=16
+it did — 3546/3541 ms on against 3525/3786 ms off, checksum `14985902` on all
+four runs. **A kill switch that cannot change a number is not a lever.**
+
+**What landed is not a re-run at the same question.** The old guard asked "is
+the receiver in a published young region", which is a *generational* question G1
+and ZGC do not answer. The collector now publishes three bytes
+(`gc::gen_heap::JIT_REF_STORE_GATES`, reached through
+`JitRuntimeHelpers::ref_store_pre_gate` / `_post_gate` / `_post_young_floor`),
+and each names a **prefix of a barrier helper's own control flow**:
+
+| inline test | the helper's own first act |
+|---|---|
+| `pre_active == 0` | `satb_pre_barrier` loads `mark_active` and returns |
+| `flags_byte < young_floor` | `note_ref_store_slow` compares `gc_age` to the promotion age and returns |
+| `post_active == 0` | `note_ref_store` loads `has_old_objects` and returns |
+
+So a skipped call is one that would have returned having done nothing. On any
+other answer the sequence calls the collector's **own** `write_barrier` — no
+remembered-set contract moves into the emitter, which is the mistake the
+previous inline store path made and the reason `inline_card_mark_available` is
+hard-`false`.
+
+Two properties make reading these inline safe. Each gate may be conservative but
+never permissive: publishers raise a mirror *before* the state it mirrors and
+lower it *after*, so it can only ever say "there may be work" when there is
+none. And the SATB flag is armed only inside the mark-start pause
+(`start_concurrent_mark` takes a `StopTheWorldToken`), so no mutator can sit
+between its inline test and its store while the flag flips. The young floor is
+pinned at `gc_age == 0` — the bound that needs no ordering argument at all,
+since the promotion age is clamped to at least 1 — and that is the case that
+matters, because in allocation-heavy code the receiver of a reference store is
+overwhelmingly an object allocated moments earlier.
+
+The gated path also drops the condition that the field's **old value be null**,
+which is what used to send every re-assignment of an already-set reference to
+the helper. With `pre_active` read directly, the old value stops mattering.
+
+`CRATONVM_JIT_GATED_REF_STORE=0` restores the helper path. A collector that
+publishes no plan (all three addresses zero) gets the previous emission byte for
+byte, which is what G1 and Generational get today.
+`CRATONVM_DBG=jit-method-stats` prints `compiled reference stores: gated=N
+declined=M` — both numbers always, because a zero on the left alone cannot
+distinguish "no plan published" from "this workload compiles no reference
+stores". On BinTrees d=16 under the default collector it reads `gated=2
+declined=0`, which is the engagement evidence the switch it replaces could not
+produce.
+
+**The throughput result is NEUTRAL, and it is stated here rather than left to
+be inferred from the mechanism.** Wall clock was unusable — the host ran at load
+20–63 with four other sessions' VMs on it, and a BinTrees arm swung 1600–5000
+ms — so the arms were priced in **CPU time**, which is what this host's own
+methodology calls for. Eight pairs, alternated with the order flipped on
+alternate pairs, `-Xmx4g`, BinTrees d=16:
+
+| arm | user CPU (s), 8 runs | median |
+|---|---|---:|
+| gated ON | 2.16 2.17 2.16 2.20 2.16 2.20 2.13 2.17 | 2.165 |
+| gated OFF | 2.14 2.19 2.13 2.12 2.21 2.21 2.14 2.17 | 2.165 |
+
+Identical. (System CPU ranged 0.83–2.11 on both arms — GC and page-fault noise,
+not attributable to either.)
+
+Two things explain that without contradicting the change. The census reads
+`gated=2 declined=0`: only two compiled sites in this workload take the
+sequence at all, so the sample is small. And BinTrees builds a tree that
+survives, so `has_old_objects` arms early and the surviving path still calls
+`write_barrier` — the young-receiver floor is what would elide it, and it
+covers only `gc_age == 0`.
+
+So what is established is engagement, correctness and the emitted sequence — a
+call plus six compares that could never pass, replaced by three byte tests —
+and what is **not** established is a throughput win on any workload measured so
+far. It is kept on because the removed compares are provably dead code and the
+off arm is a supported configuration, not because a number says so. A
+call-denser workload on a quiet host is the measurement that would settle it.
+
+### Call sites: argument staging moved to the cold path
+
+Both `emit_direct_cross_call` and `emit_inline_cache_call` opened by copying
+every outgoing argument into a contiguous staging region, then loaded the same
+frame slots again to marshal them into ABI registers — 3N memory operations per
+call where N does. The only reader of that region is the callee-deopt service,
+reached when a callee returns the deopt sentinel and otherwise never.
+
+The staging now happens on each reader's own cold side: inside
+`emit_inline_callee_deopt_service` past its `JNE .done`, and immediately before
+the shared hashed/vtable stub in the megamorphic region rather than ahead of the
+monomorphic guard. The resolving slow path already re-staged for itself, which
+is what made the copy at the top redundant even before this. The values are read
+out of the same frame slots in all three places, and nothing between the marshal
+and any of them writes those slots.
+
+**Known residual, not fixed here.** Because `needs_context` is checked as a
+runtime property of the cached entry, the argument marshalling is emitted twice
+per cache entry — ten copies at a site with one MIC and a four-entry PIC. That
+is a code-*size* cost rather than a per-execution one (each execution runs
+exactly one copy), and the clean fix is a uniform entry ABI, which changes how
+every compiled method receives its arguments. `needs_context` is an output of
+optimization and it moves the ABI; that is not a change to stack on top of a
+register-file change in the same pass.
+
+### Displacement widths
+
+Both backends hard-coded the disp32 ModRM form at sites where a disp8 is legal,
+each with a smallest-form encoder sitting next to the site that did not call it.
+`ir_lower`'s frame accessors (`load_reg_from_frame`, `lea_reg_from_frame`,
+`fp_load`, `fp_store`, `emit_xmm_frame_move`) now share one
+`emit_rbp_modrm_disp`, which is where the RBP-has-no-`mod=00` rule lives — three
+bytes on the instruction class that dominates every IR body. The guarded
+receiver check reads six table words at displacements 0..40 through RDX, every
+one of them a disp8, and paid disp32 on each: 18 bytes per unproven-receiver
+field access.
+
+### The operand-stack register cache, and why it is still pure-kernel-only
+
+`push_from_rax` parks a pushed value in a scratch register instead of storing it
+to the frame. It is gated on `pure_kernel` — no invokes, no MIC/PIC or indy
+sites, no field or static-field ops, no allocation, no typechecks, no inline
+sites, no speculative BCE guards — so one `getfield` anywhere in a method turns
+it off for the whole method and it never engages on application code.
+
+The comment at that gate blamed "the broad R8/R9 experiment regressed call-heavy
+methods because each call flushed live scratch values", which reads as a cost
+argument and is not one: a flush emits the store the frame push would have
+emitted anyway, only later.
+
+**The real blocker is a register collision.** `SCRATCH_REGS` is `[R8, R9]` and
+`ARG_REGS` is `[RCX, RDX, R8, R9]` on Win64, `[RDI, RSI, RDX, RCX, R8, R9]` on
+System V — R8 and R9 are argument registers on both. Every helper call
+marshalling three arguments writes R8; four writes R9. Only sites that call
+`flush_scratch_registers` first are safe, and the emitter has far more
+`emit_call_absolute` sites than flush sites. Under `pure_kernel` none of them is
+reachable, which is why the collision has never mattered. Turning the cache on
+broadly without that audit produces wrong code, measurably: with it default-on,
+`test_compile_fib` returned 20 for `fib(10)` and
+`test_getfield_putfield_roundtrip` returned garbage.
+
+Two things did change. `CRATONVM_JIT_OPERAND_CACHE=1` exists so the two arms can
+be measured in one binary, which the previous shape could not be. And a real
+defect underneath was fixed unconditionally: `StackSlot::Scratch` now carries
+the home word its push reserved and `flush_scratch_registers` stores into that
+instead of reserving another, so a straight-line stretch with several calls no
+longer grows the spill region once per call until `spill-range-exhausted` fails
+the compile.
+
+### Allocation in the optimizing tier — the bump landed; the gate is now a policy question
+
+This section used to say the optimizing tier lowered every `new` through
+`emit_new_object_stub` — three register loads and a `CALL` — while the
+single-pass backend had `emit_inline_tlab_new`, so an escaping allocation
+compiled *worse* after escape analysis had run on it. That is fixed:
+`runtime_lowering::emit_inline_tlab_new_ir` gives this tier the cursor load,
+the bump, the limit compare and the inline header writes, with the old stub as
+its slow path. It lives beside the stub because that module exists to be the
+one place both front ends share allocation, dispatch and monitor contracts.
+
+Three things in it are load-bearing and none of them is a copy of the
+single-pass sequence:
+
+* **The size comes from `class_layout`, not from arithmetic.**
+  `jit_post_tlab_init` derives the object's shape and total size from
+  `class_layout(class_id)` itself, so a caller that sizes the allocation as
+  `HEADER_SIZE + num_fields * SLOT_SIZE` while the class carries a registered
+  compact layout hands the helper a size mismatch and corrupts the heap. The
+  snapshot is taken from the same two functions the helper and the single-pass
+  emitter read, so all three agree by construction rather than by inspection.
+* **A layout can be replaced between compile and execution**, which is what the
+  guard emitted first is for: it compares the live field count against the one
+  this compile baked and diverts to the helper on a mismatch, before any state
+  exists to unwind.
+* **Every header write lands before the cursor commits**, and the mark word is
+  written unconditionally. Publishing the cursor first exposes an object whose
+  header is still whatever the TLAB slot held — `class_id = 0` to the GC
+  walker, which then mis-decodes it and steps into its neighbour. The mark word
+  stopped being padding when the 24 → 16 byte shrink folded `kind`,
+  `element_type`, `gc_age` and `gc_flags` into it; skipping it is the
+  2026-08-07 Spring Boot regression (`read_slot: corrupt Value cell` in 178 of
+  184 classes).
+
+Measured: the site census reads `inline-bump=2 stub-only=0` with the path on
+and `0 / 2` with `CRATONVM_JIT_IR_INLINE_TLAB=0`, the Binary Trees checksum is
+`674478` on every arm and matches HotSpot, and the regression suite is 85/85
+with `CRATONVM_JIT_C2_ALLOC_UPGRADE=1` forcing the new path.
+
+`CRATONVM_JIT_C2_ALLOC_UPGRADE` is still opt-in, and `IR_MAX_ALLOCATIONS` is
+still 16. That is now a *population* question rather than a codegen one —
+flipping it moves every allocation-bearing method to a different tier, which is
+a change that wants its own measurement — but the reason the gate could not be
+opened at all is gone.
+
+### The receiver null check nobody could prove away
+
+`getfield` on `this` re-tested `this` for null on every execution, including
+every iteration of a loop, for a value the JVM guarantees at the call site.
+Two independent gaps produced that, and both had to be closed:
+
+**The dataflow could not represent the fact.** `null_check_elim::analyze` seeded
+entry IN to `0` — nothing proven on entry — so a local became known non-null
+only by being dereferenced. That is enough for straight-line code and useless
+for a loop: the IN mask at a loop header is the meet of the entry path and the
+backedge, the backedge carries "local 0 non-null" because the body's own
+`getfield` proved it, the entry path carries nothing, and the intersection is
+empty. The fact died at the header on every iteration.
+
+**The getfield emitter never asked.** `emit_trusted_oop_receiver_check` emitted
+`TEST`/`JZ` unconditionally, while the array sites next door had consulted
+`is_local_nonnull` since round 11. The proof existed and had no consumer.
+
+`CRATONVM_JIT_THIS_NONNULL` seeds bit 0 when local 0 holds a receiver;
+`CRATONVM_JIT_RECEIVER_NULL_ELIM` lets the two `getfield` arms consult the
+result. They are separate switches because the blast radii differ — the seed
+widens a fact three consumers already read (inline array null-check elision,
+`ifnull`/`ifnonnull` branch elision, and the new one), while the consumer flag
+only adds the third — and one switch for both would have made them
+indistinguishable in a bisect.
+
+Instance-ness is **derived, and the derivation refuses rather than guesses**.
+`compile_with_param_slots` takes no `is_static`, but `method_key` already
+carries the descriptor and `num_params` is the argument count with `this`
+included, so the answer is which of `declared` / `declared + 1` the count
+equals. "Neither" answers `None`. Note the width convention: `count_param_slots`
+counts `J` and `D` as **one** argument each, unlike `compute_param_jvm_slots`,
+which counts them as two slots — reading the wrong one misclassifies every
+method with a `long` or `double` parameter.
+
+Scoped to `getfield` and deliberately to nothing else. `putfield`'s preceding
+push is the stored **value**, not the receiver — the exact shape of the Tomcat
+`MessageBytes.setString` miscompile that `opcode_dereferences_receiver` already
+documents — and `checkcast` does not throw on a null receiver at all, so its
+`JZ` targets a legal null path; eliding it would let a null fall into the
+`KIND_TAGS` byte compare and fault.
+
+#### Measured: it engages, and it does not show up in the clock
+
+Probe: `for (i = 0; i < 2000; i++) s += this.x;`, called 40,000 times — 80M
+executions of the elided check. Debug binary, Azure `vm1`, a shared host that
+was also running two fat-LTO release builds and an H2 suite.
+
+| Arm | census | checksum |
+|---|---|---|
+| both on | `elided=2 emitted=0` | 240000000 |
+| `CRATONVM_JIT_RECEIVER_NULL_ELIM=0` | `elided=0 emitted=2` | 240000000 |
+| `CRATONVM_JIT_THIS_NONNULL=0` | `elided=0 emitted=2` | 240000000 |
+
+Both halves are load-bearing and independently switchable — turning off either
+one returns the count to zero — and the answer matches HotSpot on every arm.
+
+Throughput, five interleaved reps per arm, CPU time (`%U + %S`; wall clock is
+meaningless on that host): medians **3.30 s on and 3.30 s off**, ranges
+3.01–3.33 and 3.13–3.39. **No detectable difference.** The loop does run
+compiled — the `--nojit` arm was still going after two minutes against 3.3
+seconds — so this is a measurement of compiled code, not of the interpreter.
+
+That is the expected result and it is worth stating rather than filing away:
+`TEST r,r; JZ rel32` is nine bytes and two well-predicted µops, and an
+out-of-order core hides them behind the load they guard. What the elision buys
+is **code size**, paid entirely at compile time, plus the fact that a check
+that is not emitted cannot be got wrong.
+
+Eliding by proof is strictly better than faulting, wherever the proof exists.
+Where it does not, there is the implicit null check.
+
+### The implicit null check — the receiver dereference is the check
+
+`CRATONVM_JIT_IMPLICIT_NULL_CHECK=1`, **default OFF**.
+
+Where the dataflow proves nothing, the compact `getfield` arm can drop
+`TEST RAX, RAX; JZ slow` anyway and let the receiver dereference that follows
+it fault. The signal handler translates that fault back into the arm's own slow
+path, which calls the helper that raises the `NullPointerException`. The load
+that would have been guarded *is* the guard.
+
+This is the HotSpot mechanism, and it is the one item of the JIT audit that did
+not land with the rest of its round. The reason was never the signal handler —
+it was lifetime, and it is worth writing down what each of the three hazards
+actually needed.
+
+**Signal safety.** The lookup runs inside the handler, so it cannot use the
+mutex `lookup_jit_method_name` uses. That function is only ever reached while
+the process is already dying, which is what makes a `try_lock` acceptable
+there; here the process is expected to *survive*, and a handler that blocks on
+a lock its own interrupted thread holds deadlocks. The table is a fixed array
+of atomics and the reader does nothing but loads — no allocation, no lock, and
+no call into anything that takes one.
+
+**Lifetime — the hazard that actually blocked it.** A `CompiledMethod`'s buffer
+is unmapped on drop and, in that function's own words, "the address is then
+reusable by the next `alloc_executable`". An entry that outlived its buffer
+would eventually match a PC belonging to *different* code, and the handler
+would resume execution at a stale address inside a live method. That is not a
+crash; it is silent, arbitrary control flow. Two things close it: `Drop` calls
+`implicit_null::unregister_range` beside the `unregister_jit_method_name` that
+exists for exactly the same reason, and **slots are never reused** — retiring
+stores `0` and leaks the slot, because reuse would let a reader that has
+already matched `fault_pc` read a `recover_pc` that a concurrent
+re-registration had since overwritten. Exhaustion *declines*: the site keeps
+its explicit check and `declined` counts it, so the feature turns itself off
+rather than turning unsound.
+
+**Mis-recovery.** A genuine backend bug also faults inside compiled code, and
+silently resuming from one would convert a diagnosable crash into corrupted
+state. Recovery requires all of: a memory-access fault; an `si_code` saying
+`si_addr` is an address at all rather than a union member left over from a
+`kill -SEGV`; a faulting address inside the **null page**; and an **exact**
+registered PC, not merely one inside some compiled method's range. The last two
+are what separate "a null receiver reached a load we chose not to guard" from
+"compiled code dereferenced garbage" — a wild pointer does not land in the
+first page.
+
+#### Fail-closed, twice, because the elision is far from the thing it depends on
+
+The compiler does not trust its own source. `bind_implicit_null_recovery`
+decodes the bytes at the site it declined to guard and requires
+`MOV r32, [RAX + disp32]` with `disp32` inside the same null-page constant the
+handler screens on — so the two agree by construction rather than by two people
+remembering the same number. A second backstop fails any compile that reaches
+the end with a site still unbound. Both discard the artifact and return the
+method to the interpreter.
+
+That is more machinery than the elision itself, and deliberately so: the
+elision happens in one function and the property it depends on — that the next
+instruction dereferences the receiver, and that the slow path is reached —
+lives several hundred lines away in the arm that called it. An edit that broke
+the coupling would not produce a red test, it would produce a crash on a null
+receiver in production.
+
+Only the compact arm opts in. The second `getfield` arm emits its `GC_FLAGS`
+read only under `compact_ref_fields_enabled()`, so it passes `false` rather
+than make the guarantee conditional.
+
+#### Measured
+
+An 800,000-call probe whose receiver is a *parameter* (so the dataflow proves
+nothing and the implicit path is the one taken), with five null calls in the
+middle:
+
+| Arm | census | answer |
+|---|---|---|
+| default (off) | `implicit=0 emitted=1`, `registered=0 recovered=0` | `sum=5600000 caught=5` |
+| `=1` | `implicit=1 emitted=0`, `registered=1 retired=1 recovered=5` | `sum=5600000 caught=5` |
+
+`recovered=5` is the whole feature in one number: five hardware faults, five
+exact-PC matches, five `RIP` redirects, five `NullPointerException`s. The
+400,000 iterations *after* the faults still sum correctly, so recovery does not
+leave the frame damaged, and `retired=1` shows the entry withdrawn when the
+artifact dropped. HotSpot returns the same two numbers.
+
+Note the second row needs `CRATONVM_C2_SUPERSEDE=0` to be reached at all: with
+the default policy the method tiers up before the null calls, the C1 artifact
+is dropped, and the optimizing tier's own explicit check handles them. That is
+worth knowing before reading a `recovered=0` as a broken feature — it is more
+often a measurement of which tier owned the method.
+
+**Throughput is unchanged.** A 120-million-call probe reading a field off a
+parameter, five interleaved reps of CPU time, `CRATONVM_C2_SUPERSEDE=0` so the
+arm under test is the one that runs: medians **5.68 s on and 5.55 s off**,
+ranges 5.22-5.78 and 5.12-5.87. Read that as no detectable difference rather
+than as a regression -- the fast path with the flag on is the fast path with it
+off minus two instructions, so it cannot actually be slower, and the overlap is
+the host.
+
+Which is exactly what the elision A/B above predicted: an implicit check
+removes the same `TEST`/`JZ` pair the proof-based elision removes, and that
+pair did not move the clock either. **The reason to have this is not speed.**
+It is that the sites where no proof exists are precisely the ones the elision
+cannot reach, and this is the only thing that covers them -- and that having it
+built, measured and switchable is worth more than an argument about whether it
+would have helped.
+
+#### The soak, 2026-09-02, and the default
+
+It was off pending a soak. The soak ran, it is clean, and it also produced the
+number that argues against flipping the default. Both halves are recorded
+because the second one is the useful one.
+
+**Correctness.** Roughly an hour of continuous execution plus two full
+regression-suite passes, all with `CRATONVM_JIT_IMPLICIT_NULL_CHECK=1`:
+
+| Arm | census | answer |
+|---|---|---|
+| 5M iterations, default tiering, `--Xmx 256m` | `registered=8 retired=8 recovered=0` | `sum=187500000 npes=19532` ✓ |
+| 3M iterations, `CRATONVM_C2_SUPERSEDE=0` | `registered=8 retired=8` **`recovered=11663`** | `sum=112500000 npes=11719` ✓ |
+| 5M iterations, flag OFF (control) | — | `sum=187500000 npes=19532` ✓ |
+| regression suite × 2 | — | **87 passed, 0 failed** each |
+
+The middle row is the one that exercises the mechanism: **11,663 of 11,719 null
+dereferences were hardware faults translated into `NullPointerException`s**,
+under GC pressure, with the checksum matching HotSpot exactly. The 56 that were
+not recovered are the ones taken before the method compiled. Every arm exited
+`rc=0`. CPU time was 962 s with the flag on against 1001 s off — read as
+identical on a shared host, not as a win.
+
+**Reach, which is the finding that matters.** The same census, pointed at real
+workloads, reads zero:
+
+* `RMapGcStress`, `RJitGc`, `RStringOps`: `elided=0 implicit=0 emitted=0`, and
+  `CALL sites emitted by arm:` empty. The compact `getfield` arm was not merely
+  declining — it was **never reached**, because those vectors compile no
+  `getfield` in this tier at all.
+* The soak probe had to be built to provoke it: 32 classes behind an interface,
+  so the call site is megamorphic and the readers cannot be inlined. Even then
+  **8 sites** registered, not 32.
+* The common shape — `this.field` — is now *proved* non-null by
+  `CRATONVM_JIT_THIS_NONNULL`, so it is elided outright and never reaches the
+  implicit path at all.
+
+So the population is: single-pass-compiled, compact-layout `getfield`, on a
+trusted-oop receiver the dataflow cannot prove — in practice a field read off a
+*parameter* in a method hot enough to compile but not inlined. That is a real
+set, and a small one.
+
+**The default is ON**, since 2026-09-02. Opt out with
+`CRATONVM_JIT_IMPLICIT_NULL_CHECK=0`.
+
+The engineering recommendation at the end of the soak was to leave it off, and
+it is worth recording that it was overruled deliberately rather than forgotten.
+The case for off was never correctness — the soak settles that — it was that
+none of the three things a default usually rests on were present: the
+throughput effect is unmeasurable, the reach is a handful of sites, and the
+failure mode is the only *silent* one in this backend. The case for on is that
+the mechanism is the one thing covering the sites the proof-based elision
+cannot reach, it has soaked clean across three full suite passes and ~12,000
+translated faults, and a feature that is only ever exercised behind an opt-in
+flag is a feature that decays.
+
+Both readings are defensible. What matters more than which one won is that the
+**kill switch stays**, and that anyone debugging an unexplained crash in
+compiled code knows to reach for it first: `=0` restores
+`emit_trusted_oop_receiver_check` at both arms unconditionally, registers
+nothing, and returns a fault in compiled code to the crash reporter exactly as
+before this existed. Same binary, one run, no rebuild. That is the property
+that makes a silent failure mode survivable, and it is worth more here than it
+is anywhere else in this file.
+
+**Where the residual risk actually is**, for whoever revisits this: the
+lifetime hazard is driven by `CompiledMethod` drops, and the soak exercised only
+8 of them per run. There is no production eviction path to lean on —
+`jit_code_cache_cap_reached` *refuses new compiles* rather than evicting, and
+`CachedMethods::evict_least_used` is called from tests only — so drops come from
+tier-up supersede and deopt. A soak that wanted to hammer address reuse would
+need a deopt storm, not a bigger heap or a longer loop.
+
 ### Summary table
 
 | Feature | Default | Opt-out / opt-in var |
@@ -246,6 +827,14 @@ receiver/type guard that deopts to the normal call path on mismatch:
 | BC `crypto/{engines,io,modes,paddings}` + `math/` JIT | **allowed** | — |
 | BC blanket ban (`asn1/`, `util/`, ...) | still banned | `CRATONVM_JIT_ALLOW_PACKAGES` |
 | Precise JIT stack maps | **ON** | `CRATONVM_NO_PRECISE_JIT_MAPS` |
+| IR-tier register residency (GP + FP files) | off — built and verified, flip wants a measurement | `CRATONVM_JIT_IR_LINEAR_SCAN=1` |
+| Gated inline reference stores | **ON** where a collector publishes a plan | `CRATONVM_JIT_GATED_REF_STORE=0` |
+| Operand-stack register cache beyond pure kernels | off (see the section above for the ARG_REGS collision) | `CRATONVM_JIT_OPERAND_CACHE=1` |
+| Optimizing tier for allocation-bearing methods | off (a tier-population change, no longer a codegen gap) | `CRATONVM_JIT_C2_ALLOC_UPGRADE` |
+| Inline TLAB bump in the optimizing tier | **ON** | `CRATONVM_JIT_IR_INLINE_TLAB=0` |
+| `this` seeded non-null at method entry | **ON** | `CRATONVM_JIT_THIS_NONNULL=0` |
+| `getfield` receiver null-check elision | **ON** | `CRATONVM_JIT_RECEIVER_NULL_ELIM=0` |
+| Implicit null check (fault + signal translation) | **ON** — soaked clean; the kill switch is the first move on any unexplained compiled-code crash | `CRATONVM_JIT_IMPLICIT_NULL_CHECK=0` |
 
 ### Performance — current status
 

@@ -248,6 +248,22 @@ stale `ObjectRef`.
 
 ---
 
+> **Status, 2026-09-02: wired.** Everything §7 lists as "requires the call
+> from …" has been made. `GcCriticalGuard` now wraps a `CriticalToken`
+> (`vm/src/runtime/offload.rs`); every collector goes through
+> `cratonvm_gc::vm_heap::gpu_coordination` before a cycle
+> (`VmHeap::collect_garbage`); the legacy counter wait is bounded; VM
+> teardown calls `Registry::shutdown_vm`; and the writeback reads its
+> target addresses back through the token after the collector's remap. Two
+> refinements over what §7 proposed: the collector waits only for
+> `Relocation::Forbidden` holders (`wait_for_relocation_clearance`), so a
+> keep-alive token held for the life of a kernel no longer holds
+> collection off at all; and `Registry::begin_moving_cycle` gates a
+> `Forbidden` acquisition from an unstopped thread (the completion
+> reaper) for the length of a moving cycle. `may_relocate` changed
+> accordingly: a keep-alive-only timeout permits the move. ZGC, which
+> consulted no GPU state before, is covered by the same wrapper.
+
 ## 4. The leak paths
 
 | # | Path | Status before | Status now |

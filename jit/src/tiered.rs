@@ -1295,6 +1295,67 @@ pub fn dump_method_stats_to_stderr() {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        // Why the compiled frames in this run's stack traces did or did not
+        // carry a line. Unconditional and including zeros, for the reason the
+        // rows above are: `(Unknown Source)` is what a trace prints for FOUR
+        // different refusals plus a kill switch, and nothing else in the system
+        // can tell them apart. An all-zero line means no stack trace this run
+        // crossed a compiled frame, which is itself the answer to "did this
+        // path engage at all". See `crate::compiled_frame_line_counts`.
+        //
+        // The two emitter-side censuses ride along because they answer the
+        // next question this one raises. `inline-map-at-return` separates an
+        // exact `native_pc_offset` hit from a miss -- the distinction whose
+        // absence let an emitter defect file oop maps 9-25 bytes past the
+        // return address while a fallback answered and nothing said which
+        // evidence produced it. `miss-edge-poison` says how many chains were
+        // deliberately given up so a frame could not be handed the callees of
+        // a splice that did not run. Both were `pub fn`s with no caller
+        // anywhere in the tree until now, which is the same defect this row
+        // exists to fix one level up.
+        eprintln!(
+            "[cratonvm] compiled-frame lines: {} | inline-map-at-return={:?}              miss-edge-poison={:?}",
+            crate::compiled_frame_line_counts()
+                .iter()
+                .zip(crate::FRAME_LINE_SLOT_NAMES.iter())
+                .map(|(c, n)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            crate::x64::inline_call_map_at_return_counts(),
+            crate::x64::inline_miss_edge_poison_counts(),
+        );
+        // What the operand-spill cursor did. `exhausted` is a REFUSED COMPILE:
+        // the method keeps running interpreted and the only thing that ever
+        // said so was a single-slot "last bail site" with no count, so "does
+        // this happen, and on what?" had no answer at all. A non-zero
+        // `flush-canonical` is the engagement counter for the canonical-home
+        // flush — a zero there beside a non-zero `flush-reserved` means that
+        // path never ran, which is a different finding from it running and not
+        // helping. `peak-words` is a MAX over compiles, never a sum.
+        eprintln!(
+            "[cratonvm] spill cursor: {}",
+            crate::spill_cursor_counts()
+                .iter()
+                .zip(crate::SPILL_CURSOR_SLOT_NAMES.iter())
+                .map(|(c, n)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        // And how often a compiled entry was dropped as the same activation as
+        // an interpreter frame. `call-opcode` is the row worth reading: that
+        // rule's revert shape is asserted by no test, because the only arm that
+        // ever claimed to isolate it used an environment variable that does not
+        // exist. A counter cannot say the rule is RIGHT; it can say whether it
+        // fires, and a permanent zero is itself a finding.
+        eprintln!(
+            "[cratonvm] stack-walk dedupe: {}",
+            crate::stack_walk_dedupe_counts()
+                .iter()
+                .zip(crate::DEDUPE_SLOT_NAMES.iter())
+                .map(|(c, n)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
     }
     // The unresumable-trap refusal's census, printed UNCONDITIONALLY and
     // including zeros — before the `DIAG_CORE` early return, like the rows
@@ -1404,6 +1465,65 @@ pub fn dump_method_stats_to_stderr() {
             .iter()
             .filter(|(_, _, fail, inelig, _, _)| *fail > 0 && !*inelig)
             .count(),
+    );
+    // The String-intrinsic pin's ENGAGEMENT census (`crate::string_intrinsic_pin_census`).
+    //
+    // A site count and an engagement count answer different questions, and the
+    // whole value of this line is that a ZERO is readable. An audit measured
+    // `String.charAt` at a flat 186-196 ns/char where a byte-identical body
+    // reaches 3.0 ns/char elsewhere in the same binary, and neither documented
+    // lever moved it: `CRATONVM_JIT_NO_STRING_INTRINSIC_PIN=1` gave 326.3/328.6
+    // ns/char against a default of 329.5/333.7. Switching the pin OFF costing
+    // nothing is exactly what "it was never on" looks like from the outside,
+    // and no timing can tell that apart from "it fired and did not help".
+    // `fired=0` can, in one line, at the end of any run.
+    //
+    // Those two numbers are pre-emitter and pre-2026-09-02 and must not be
+    // quoted as current: `java/lang/String` is final, so the method-entry
+    // door's devirtualisation was taking every String access site away from
+    // the intrinsic before the gate saw it, and BOTH arms of that A/B measured
+    // a program with no String intrinsic in it. The same rows read ~3.2
+    // ns/char once the rewrite yields. That is the line printed below this one.
+    //
+    // The other three counts are printed beside it because they are the
+    // candidate REASONS for a `fired=0`: no resolved `java/lang/String` field
+    // layout, no constant-pool invoke resolver at the door that asked, or the
+    // fail-closed rule declining on a missing resolver's behalf. All three
+    // production doors pass a resolver, so `blind-no-resolver` is EXPECTED to
+    // read zero — which is what makes a non-zero one worth the line: it would
+    // name a door nobody knew existed.
+    let (sp_fired, sp_no_layout, sp_no_resolver, sp_fail_closed) =
+        crate::string_intrinsic_pin_census();
+    eprintln!(
+        "[cratonvm] JIT String-intrinsic pin: fired={sp_fired} blind-no-layout={sp_no_layout} \
+         blind-no-resolver={sp_no_resolver} fail-closed={sp_fail_closed}"
+    );
+    // Beside the pin, because the two answer the halves of one question. The
+    // pin says whether a String-accessor method was kept OFF the optimizing
+    // tier; this says, for the ones that reached it, whether the expansion's
+    // `value`/`coder` reads are inline loads or `jit_getfield` helper CALLs.
+    // Before the rows existed, every expanded `charAt` paid two CALLs per
+    // character -- 917,203,334 of them on one `probes/CharAtCostCurve.java`
+    // run -- and nothing in this dump said so: `getfield helper calls` counted
+    // them without naming the source, and `emitted_charAt` reported the
+    // expansion as a success.
+    eprintln!(
+        "[cratonvm] JIT String-access inline rows: sites={}",
+        crate::string_access_compact_rows()
+    );
+    // Sites the `final`-class devirtualisation handed BACK to a call-site
+    // intrinsic (`crate::devirt_yielded_to_intrinsic_count`).
+    //
+    // Printed beside the pin because it answers the question the pin's four
+    // counters could not: `java/lang/String` is final, so before 2026-09-02
+    // every String access site was statically bound and left the invoke loop
+    // BEFORE the instance-intrinsic gate, which is `invoke_kind == 0 || == 2`.
+    // Not declined, not blind, not counted -- gone. `probes/CharAtDoorProbe`
+    // read 349.64 ns/char on the arm that took this path against 3.2-4.3 on
+    // four byte-identical siblings that did not.
+    eprintln!(
+        "[cratonvm] JIT devirt yielded to intrinsic: {}",
+        crate::devirt_yielded_to_intrinsic_count()
     );
     // Methods sealed out of compilation BEFORE any attempt, by reason. A
     // different and larger population than `hot_but_stuck` — a Spring Boot

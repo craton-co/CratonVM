@@ -2674,6 +2674,7 @@ pub fn execute(
                                 let entry = crate::jit::helpers::jit_integer_int_value_direct
                                     as *const ()
                                     as usize;
+                                cratonvm_jit::note_integer_int_value_direct_site();
                                 direct_calls_early.push((
                                     pc,
                                     crate::jit::JitDirectCall {
@@ -3232,6 +3233,90 @@ pub fn execute(
                     } else {
                         0
                     };
+                    // -- The String-intrinsic pin, ASKED at this door -- D1, 2026-09-01
+                    //
+                    // The third door. The measurement that found the pin
+                    // installed at ONE of three, and why the answer is inert at
+                    // the two that reach the single-pass backend directly, is
+                    // written out at the OSR door (`jit_bridge.rs`, at
+                    // `osr_string_pin_declines`); the topology is in
+                    // `compile_gate`'s "installed at ONE door" section.
+                    //
+                    // This door passes `string_layout: None` below -- "String
+                    // intrinsics land in a later wave" -- so the pin's honest
+                    // verdict here is `BlindNoLayout`: a site declared on a
+                    // String-family receiver, no layout resolved at this door,
+                    // and the rule FAILS OPEN (`false`, do not pin). That is
+                    // not a shortcut. Without a layout the single-pass backend
+                    // emits no intrinsic either, so pinning would cost the
+                    // method a C2 body and buy nothing back. The `None` is
+                    // passed deliberately rather than papered over: the whole
+                    // gain is that `blind-no-layout` becomes a MEASURED number
+                    // for this door instead of an invisible absence.
+                    //
+                    // Consequence, so nobody reads more into the counter than
+                    // it carries: with `layout == None` the pin can only answer
+                    // `false` here. `NoSite` and `BlindNoLayout` are `false` by
+                    // rule, and the `BlindNoResolver` fail-closed arm requires
+                    // `layout.is_some()`. So this ask changes no machine code
+                    // today; it is a census entry, not a decision. It becomes a
+                    // real decision the moment the `string_layout: None`
+                    // argument below becomes a resolved layout -- the `if` is
+                    // the tripwire for exactly that.
+                    //
+                    // A resolver IS supplied even though the layout is not,
+                    // because without one the verdict would be
+                    // `BlindNoResolver` -- the STRONGER blindness, which says
+                    // nothing about whether a layout would have mattered -- and
+                    // the narrower fact is the whole reason to ask here.
+                    //
+                    // COST: once per eager first-call compile, off any loop.
+                    // The resolver takes the `class_manager` read lock per site,
+                    // matching `c_invoke_resolver` in `jit_bridge.rs` and the
+                    // field-op loop above, which already takes it per field op;
+                    // `string_intrinsic_pin_verdict` asks nothing at all for a
+                    // method with no `invokevirtual`/`invokeinterface` site and
+                    // stops at the first String-family receiver otherwise. No
+                    // lock is held here -- the `early_is_static` probe above
+                    // took and released its own.
+                    let eager_pin_invoke_resolver =
+                        |cp_idx: u16| -> Option<(String, String, String)> {
+                            let cm = shared.classes.class_manager.read();
+                            let class = cm.get_class(class_id)?;
+                            let (class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
+                                Some(ConstantPoolEntry::MethodReference {
+                                    class_index,
+                                    name_and_type_index,
+                                    ..
+                                }) => (*class_index, *name_and_type_index),
+                                Some(ConstantPoolEntry::InterfaceMethodReference {
+                                    class_index,
+                                    name_and_type_index,
+                                    ..
+                                }) => (*class_index, *name_and_type_index),
+                                _ => return None,
+                            };
+                            let target_class = class.constant_pool.get_class_name(class_idx)?;
+                            let (mn, desc) = class.constant_pool.get_name_and_type(nat_idx)?;
+                            Some((target_class.to_string(), mn.to_string(), desc.to_string()))
+                        };
+                    let eager_string_pin_declines = admission.string_intrinsic_pin_declines(
+                        &scan.invoke_ops,
+                        Some(&eager_pin_invoke_resolver),
+                        // The SAME value handed to `compile_with_param_slots`
+                        // below as its `string_layout` argument. Asking about a
+                        // layout this compile does not use would make the
+                        // census describe a compile that did not happen.
+                        None,
+                    );
+                    if eager_string_pin_declines && crate::runtime::env_cache::dbg_jitc() {
+                        eprintln!(
+                            "[cratonvm-jitc] eager-first-call String-intrinsic pin declines the \
+                             optimizing tier for {class_name_arc}.{method_name_arc}{descriptor_arc} \
+                             -- unreachable while this door passes `string_layout: None`. If this \
+                             ever fires, the later wave landed and this ask is now a decision.",
+                        );
+                    }
                     let mut cm = crate::jit::x64::compile_with_param_slots(
                         &admission,
                         &padded,
@@ -3597,7 +3682,9 @@ pub fn execute(
                                         is_synchronized,
                                         is_static,
                                         force_native_cache: std::sync::OnceLock::new(),
+                                        descriptor_facts_cache: std::sync::OnceLock::new(),
                                         intercept_shape_cache: std::sync::OnceLock::new(),
+                                        interp_invocations: std::sync::atomic::AtomicU32::new(0),
                                         native_callback_cache: std::sync::OnceLock::new(),
                                         invoc_key: std::sync::OnceLock::new(),
                                         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -3665,12 +3752,20 @@ pub fn execute(
                                 // catch block. The `InternalError` fallback handles the
                                 // rt.jar-not-loaded boot path (no NPE class yet).
                                 let npe_routed = if crate::jit::helpers::take_jit_pending_npe() {
+                                    // Taken BEFORE the construction below, which is
+                                    // what re-captures the (now compiled-frame-free)
+                                    // stack. See `attach_snapshotted_npe_frames`.
+                                    let snapshot =
+                                        crate::jit::helpers::take_jit_pending_npe_compiled_frames();
                                     match crate::runtime::exceptions::throw_runtime_error(
                                         shared,
                                         thread,
                                         RuntimeError::NullPointerException { message: None },
                                     ) {
                                         MethodCallFailed::ExceptionThrown(exc) => {
+                                            crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                                                shared, &thread.frames, exc, snapshot,
+                                            );
                                             jit_early_exception = Some(exc);
                                             true
                                         }
@@ -3922,7 +4017,9 @@ pub fn execute(
                                             is_synchronized,
                                             is_static,
                                             force_native_cache: std::sync::OnceLock::new(),
+                                            descriptor_facts_cache: std::sync::OnceLock::new(),
                                             intercept_shape_cache: std::sync::OnceLock::new(),
+                                            interp_invocations: std::sync::atomic::AtomicU32::new(0),
                                             native_callback_cache: std::sync::OnceLock::new(),
                                             invoc_key: std::sync::OnceLock::new(),
                                             jit_probe_generation: std::sync::atomic::AtomicU64::new(
@@ -5238,6 +5335,128 @@ fn execute_frame_from_index(
     // arm's admission test to a register compare. Arming it mid-method is
     // observed on the next call/return, the accepted pgo-style tradeoff.
     let acmp_identity_trace = crate::runtime::env_cache::active_profiles_identity_trace();
+    // ── Back-edge poll word (2026-09-02) ─────────────────────────────────
+    //
+    // Every backward branch used to call `safepoint_check` UNCONDITIONALLY and
+    // then `continue` — straight into the loop-top poll thirty lines below,
+    // which asks `stw_requested` first and only calls `safepoint_check` if it
+    // is set. So the back-edge call was redundant with the very next thing the
+    // loop does, *except* for its tail: the async-exception drain, which is
+    // the only work at a back edge that the loop top does not repeat.
+    //
+    // That tail was not cheap. `take_async_exception` goes through
+    // `self_async_slot`: a thread-local `RefCell` borrow, an `Arc::clone`, a
+    // `swap(0, AcqRel)` and an `Arc` drop — three locked read-modify-writes
+    // per loop iteration, inside a function too large to inline (it carries
+    // the memwatch and blocked-access debug hooks). Measured with
+    // `probes/BackEdge.java` (two loops with identical total body-bytecode
+    // counts and an 8x difference in back-edge count, so the per-back-edge
+    // cost falls out of the difference): one interpreted backward branch cost
+    // 33-37 ns against HotSpot's template interpreter at 4.9 ns.
+    //
+    // Hoisting the slot handle turns the back-edge question into two relaxed
+    // loads and a predicted branch. See
+    // `ThreadRegistry::self_async_slot_handle` for why observing registration
+    // once per `execute_frame` entry is sound (same pgo-style tradeoff as
+    // `pgo_enabled` and `single_step_active` above).
+    let async_exception_slot = shared
+        .threads
+        .thread_registry
+        .self_async_slot_handle(thread.thread_id);
+    // The condition every back edge now tests before paying for
+    // `safepoint_check`. Written as a macro rather than a closure because the
+    // four call sites sit inside `&mut thread` borrows and a closure capturing
+    // `shared`/`async_exception_slot` would still have to be called in a
+    // position where `thread` is reborrowed.
+    //
+    // `CRATONVM_JIT_NO_BACKEDGE_POLL_GATE=1` (or `CRATONVM_JIT=-backedge-poll-
+    // gate`) makes the macro answer `true` unconditionally, restoring the
+    // unconditional call so the two arms can be priced inside one binary.
+    //
+    // ── The two diagnostics that must keep their sampling rate ──────────
+    //
+    // Skipping `safepoint_check` is equivalent to calling it only when the
+    // call would have been a no-op, and there are exactly two ways it is not:
+    // `memwatch::poll` and `blocked_access_debug`, both of which fire from
+    // inside it and neither of which the loop-top poll reaches. A memwatch is
+    // a *sampling* instrument — its own doc promises it "catches the
+    // corrupting write within one safepoint window" — so silently cutting its
+    // rate would weaken a diagnostic rather than speed anything up, and would
+    // do it invisibly.
+    //
+    // Both are startup-static gates, so folding them in costs one more `or`
+    // in the hoisted `bool` and nothing per back edge. An armed run keeps
+    // exactly the old poll frequency; the universal unarmed run keeps the two
+    // relaxed loads.
+    let backedge_poll_gate_off = crate::runtime::env_cache::no_backedge_poll_gate()
+        || crate::runtime::memwatch::is_watching()
+        || cratonvm_gc::blocked_access_debug::enabled();
+    // ── Quickened field / array arms (2026-09-02) ───────────────────────
+    // `Some(heap)` iff this frame may take the `getfield` / `putfield` and
+    // primitive `*aload` / `*astore` fast arms; see `field_fast` for the
+    // contract and for what turns them off. Hoisted per `execute_frame`
+    // entry like every other gate above (same pgo-style tradeoff).
+    let fast_field_zgc = field_fast::fast_field_zgc(shared);
+    // ── Stack-dump hook admission (2026-09-02) ──────────────────────────
+    // The dump hook at the top of the loop is a load of an atomic that
+    // NOTHING can set unless a watchdog or sampler was armed, and both are
+    // armed before Java starts running. A run with neither — every run that
+    // is not being debugged — skips the hook entirely on this hoisted bool.
+    // See `SharedVm::arm_stack_dump_watch` for why arming happens at spawn
+    // time rather than at fire time.
+    let stack_dump_possible = shared.stack_dump_watch_armed();
+    // ── Invoke fast door admission (2026-09-02) ─────────────────────────
+    // Off while anything the general dispatcher would have to observe per
+    // call is armed: PGO (it records call sites and receivers), the invoke
+    // traces, the frame trace, or a virtual thread. See
+    // `execute_invokevirtual_fast_door`.
+    let invoke_fast_door_on = !crate::runtime::env_cache::no_invoke_fast_door()
+        && !pgo_enabled
+        && !crate::runtime::env_cache::frame_trace()
+        && !crate::runtime::env_cache::dbg_h2trace()
+        && !crate::runtime::env_cache::dbg_loader_trace()
+        && !crate::runtime::env_cache::dbg_gse()
+        && !crate::runtime::env_cache::dbg_pbstart()
+        && !matches!(thread.kind, crate::threading::ThreadKind::Virtual);
+    // The same admission for the two non-virtual doors (`invokestatic`,
+    // `invokespecial`); they share every reason the virtual one stays off
+    // and add their own kill switch. See `interpreter::invoke_fast`.
+    let nonvirtual_fast_door_on =
+        invoke_fast_door_on && !crate::runtime::env_cache::no_nonvirtual_fast_door();
+    // ── OSR call floor (2026-09-02) ─────────────────────────────────────
+    // `try_osr_with_backoff` cannot do anything until `Frame::backward_count`
+    // reaches the smallest threshold `Frame::should_try_osr` accepts (the
+    // attempt backoff only raises it), so the four back-edge sites compare
+    // the count against this floor inline and make the out-of-line call only
+    // past it. A virtual thread or `CRATONVM_JIT_OSR=0` makes the call a
+    // guaranteed no-op, so the floor is `u32::MAX`; the arrival trace
+    // (`CRATONVM_DBG_OSR_FRAME_TRACE`) records every arrival inside the
+    // call, so it keeps the floor at 0 and the old call rate.
+    // `CRATONVM_JIT_NO_OSR_INLINE_GATE=1` restores the unconditional call.
+    let osr_call_floor: u32 = if crate::runtime::env_cache::no_osr_inline_gate()
+        || osr_frame_trace::enabled()
+    {
+        0
+    } else if matches!(thread.kind, crate::threading::ThreadKind::Virtual)
+        || !crate::runtime::env_cache::osr_backedge_enabled()
+    {
+        u32::MAX
+    } else {
+        crate::runtime::env_cache::tier_osr_backedge().unwrap_or(OSR_THRESHOLD)
+    };
+    macro_rules! backedge_poll_needed {
+        () => {
+            backedge_poll_gate_off
+                || shared
+                    .mem
+                    .gc_barrier
+                    .stw_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
+                || async_exception_slot
+                    .as_ref()
+                    .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed) != 0)
+        };
+    }
     // When a fast-path bytecode needs to throw a RuntimeError (AIOOBE, NPE, etc.),
     // it sets this to Some(...) and breaks out of the fast-path match instead of
     // returning directly. The main loop then converts it to a catchable Java exception.
@@ -5356,7 +5575,9 @@ fn execute_frame_from_index(
                     $frame.backward_count += 1;
 
                     let entry_pc = $frame.pc;
+                    let osr_due = $frame.backward_count >= osr_call_floor;
                     let _ = $frame;
+                    if osr_due {
                     match try_osr_with_backoff(
                         shared,
                         thread,
@@ -5372,7 +5593,10 @@ fn execute_frame_from_index(
                         }
                         OsrBackoffOutcome::Skip => {}
                     }
-                    safepoint_check(shared, thread);
+                    }
+                    if backedge_poll_needed!() {
+                        safepoint_check(shared, thread);
+                    }
                 }
             } else {
                 $frame.pc = $saved_pc + 3;
@@ -5382,25 +5606,91 @@ fn execute_frame_from_index(
     }
 
     loop {
-        // Route callee-thrown Java exceptions before the safepoint poll below.
-        // `pending_java_exception` is only a Rust local between the callee's
-        // return and this block; it is not present in any GC-scanned frame slot
-        // yet. Polling first can let STW reclaim the Throwable before a caller
-        // catch handler stores it.
-        if let Some((exc, invoke_pc)) = pending_java_exception.take() {
-            // The handler walk and its GC pin live in
-            // `exception_dispatch::unwind_to_handler` — shared with the
-            // `pending_runtime_error` arm below, which used to carry a
-            // byte-identical copy (ARCH-2026-08-04 A4a).
-            unwind_to_handler(
-                shared,
-                thread,
-                &mut frame_idx,
-                initial_frame_idx,
-                exc,
-                invoke_pc,
-            )?;
-            continue;
+        // Route a pending signal from the previous iteration's fast path —
+        // a callee-thrown Java exception, or a `RuntimeError` an arm could not
+        // throw in place — before the safepoint poll below. Both are only Rust
+        // locals at this point, not present in any GC-scanned frame slot, so
+        // polling first can let STW reclaim a Throwable before a caller's catch
+        // handler stores it.
+        //
+        // One branch, not two: `|` tests the OR of both discriminants, and the
+        // arms inside each `continue` or return, so the common path (neither
+        // set) pays a single predicted-not-taken test per bytecode.
+        if pending_java_exception.is_some() | pending_runtime_error.is_some() {
+            if let Some((exc, invoke_pc)) = pending_java_exception.take() {
+                // The handler walk and its GC pin live in
+                // `exception_dispatch::unwind_to_handler` — shared with the
+                // `pending_runtime_error` arm below, which used to carry a
+                // byte-identical copy (ARCH-2026-08-04 A4a).
+                unwind_to_handler(
+                    shared,
+                    thread,
+                    &mut frame_idx,
+                    initial_frame_idx,
+                    exc,
+                    invoke_pc,
+                )?;
+                continue;
+            }
+            // Handle any pending runtime error from the previous iteration's fast path.
+            if let Some((re, invoke_pc)) = pending_runtime_error.take() {
+                if aioobe2_dbg() {
+                    if let RuntimeError::ArrayIndexOutOfBoundsException { index, message } = &re {
+                        let f = &thread.frames[frame_idx];
+                        eprintln!(
+                            "[AIOOBE2] index={} message={} class={} method={}{} pc={}",
+                            index,
+                            message.as_deref().unwrap_or("<none>"),
+                            f.class_name(),
+                            f.method_name(),
+                            f.method_descriptor(),
+                            invoke_pc
+                        );
+                    }
+                }
+                // Normalize the operand-stack overflow BEFORE throwing, exactly as
+                // the decoded path's conversion does further down.
+                //
+                // That site calls itself "the only point that converts runtime
+                // errors into Java exceptions". It is not, and has not been for as
+                // long as the invoke fast paths have routed through here: this arm
+                // converts too. `ValueStack` reports an overflow as
+                // `NotImplemented { feature: "operand stack overflow" }`, which
+                // `throw_runtime_error` maps to an *uncatchable* internal error, so
+                // a stack overflow arriving through a fast-path arm hard-unwound
+                // the whole call stack instead of surfacing as a catchable
+                // `java.lang.StackOverflowError` that an in-method
+                // `catch (StackOverflowError)` / `catch (Throwable)` can observe.
+                // Two conversion points that disagree is one conversion point too
+                // many; until they are merged they must at least agree.
+                let re = match re {
+                    RuntimeError::NotImplemented { feature } if feature == "operand stack overflow" => {
+                        RuntimeError::StackOverflowError
+                    }
+                    other => other,
+                };
+                let exc_result = super::exceptions::throw_runtime_error(shared, thread, re);
+                match exc_result {
+                    MethodCallFailed::ExceptionThrown(exc) => {
+                        // Same walk as the `pending_java_exception` arm above, and
+                        // now literally the same code (ARCH-2026-08-04 A4a). The
+                        // two copies had already drifted in comments only, but the
+                        // GC pin they share is subtle enough that a fix landing in
+                        // one and not the other is a use-after-free reproducing on
+                        // just one of the two throw paths.
+                        unwind_to_handler(
+                            shared,
+                            thread,
+                            &mut frame_idx,
+                            initial_frame_idx,
+                            exc,
+                            invoke_pc,
+                        )?;
+                        continue;
+                    }
+                    other => return Err(other),
+                }
+            }
         }
 
         // T19.H1 — opportunistic stack-dump hook.
@@ -5434,7 +5724,10 @@ fn execute_frame_from_index(
         // three-bytecode callee behind an `invokevirtual` takes 54% of the
         // samples at its entry and one sample anywhere in its body, and that
         // share tracks the separately-timed invoke delta (290-417 ns).
-        if (!stack_dump_emitted || shared.stack_sample_mode()) && shared.stack_dump_pending() {
+        if stack_dump_possible
+            && (!stack_dump_emitted || shared.stack_sample_mode())
+            && shared.stack_dump_pending()
+        {
             shared.dump_current_thread_frames(thread);
             if shared.stack_sample_mode() {
                 shared.clear_stack_dump_request();
@@ -5467,66 +5760,6 @@ fn execute_frame_from_index(
             .load(std::sync::atomic::Ordering::Acquire)
         {
             safepoint_check(shared, thread);
-        }
-
-        // Handle any pending runtime error from the previous iteration's fast path.
-        if let Some((re, invoke_pc)) = pending_runtime_error.take() {
-            if aioobe2_dbg() {
-                if let RuntimeError::ArrayIndexOutOfBoundsException { index, message } = &re {
-                    let f = &thread.frames[frame_idx];
-                    eprintln!(
-                        "[AIOOBE2] index={} message={} class={} method={}{} pc={}",
-                        index,
-                        message.as_deref().unwrap_or("<none>"),
-                        f.class_name(),
-                        f.method_name(),
-                        f.method_descriptor(),
-                        invoke_pc
-                    );
-                }
-            }
-            // Normalize the operand-stack overflow BEFORE throwing, exactly as
-            // the decoded path's conversion does further down.
-            //
-            // That site calls itself "the only point that converts runtime
-            // errors into Java exceptions". It is not, and has not been for as
-            // long as the invoke fast paths have routed through here: this arm
-            // converts too. `ValueStack` reports an overflow as
-            // `NotImplemented { feature: "operand stack overflow" }`, which
-            // `throw_runtime_error` maps to an *uncatchable* internal error, so
-            // a stack overflow arriving through a fast-path arm hard-unwound
-            // the whole call stack instead of surfacing as a catchable
-            // `java.lang.StackOverflowError` that an in-method
-            // `catch (StackOverflowError)` / `catch (Throwable)` can observe.
-            // Two conversion points that disagree is one conversion point too
-            // many; until they are merged they must at least agree.
-            let re = match re {
-                RuntimeError::NotImplemented { feature } if feature == "operand stack overflow" => {
-                    RuntimeError::StackOverflowError
-                }
-                other => other,
-            };
-            let exc_result = super::exceptions::throw_runtime_error(shared, thread, re);
-            match exc_result {
-                MethodCallFailed::ExceptionThrown(exc) => {
-                    // Same walk as the `pending_java_exception` arm above, and
-                    // now literally the same code (ARCH-2026-08-04 A4a). The
-                    // two copies had already drifted in comments only, but the
-                    // GC pin they share is subtle enough that a fix landing in
-                    // one and not the other is a use-after-free reproducing on
-                    // just one of the two throw paths.
-                    unwind_to_handler(
-                        shared,
-                        thread,
-                        &mut frame_idx,
-                        initial_frame_idx,
-                        exc,
-                        invoke_pc,
-                    )?;
-                    continue;
-                }
-                other => return Err(other),
-            }
         }
 
         // ── Frame-pointer hoist, preamble (frame-arena.md §6.1) ──────────
@@ -5670,7 +5903,9 @@ fn execute_frame_from_index(
                                         frame.backward_count += 1;
 
                                         let entry_pc = frame.pc;
+                                        let osr_due = frame.backward_count >= osr_call_floor;
                                         let _ = frame;
+                                        if osr_due {
                                         match try_osr_with_backoff(
                                             shared,
                                             thread,
@@ -5687,7 +5922,10 @@ fn execute_frame_from_index(
                                             }
                                             OsrBackoffOutcome::Skip => {}
                                         }
-                                        safepoint_check(shared, thread);
+                                        }
+                                        if backedge_poll_needed!() {
+                                            safepoint_check(shared, thread);
+                                        }
                                     }
                                 } else {
                                     frame.pc = saved_pc + 5; // skip iload_X + iload_Y + if_icmplt(3)
@@ -6009,7 +6247,9 @@ fn execute_frame_from_index(
                         frame.backward_count += 1;
 
                         let entry_pc = frame.pc;
+                        let osr_due = frame.backward_count >= osr_call_floor;
                         let _ = frame; // drop borrow before try_osr
+                        if osr_due {
                         match try_osr_with_backoff(
                             shared,
                             thread,
@@ -6025,7 +6265,10 @@ fn execute_frame_from_index(
                             }
                             OsrBackoffOutcome::Skip => {}
                         }
-                        safepoint_check(shared, thread);
+                        }
+                        if backedge_poll_needed!() {
+                            safepoint_check(shared, thread);
+                        }
                     }
                     continue;
                 }
@@ -6133,7 +6376,7 @@ fn execute_frame_from_index(
                     // lreturn (0xad): a KIND_LONG slot is read bit-exact so a
                     // collision-shaped long return keeps its high bits.
                     let value = if opcode == 0xb0 {
-                        let ret = crate::jit::return_type(frame.method_descriptor());
+                        let ret = frame.return_tag();
                         coerce_value_for_return_validated(shared, cv.to_value(), ret)
                     } else {
                         decode_arg_kind_aware(cv, kind, desc_byte)
@@ -6963,6 +7206,12 @@ fn execute_frame_from_index(
                             continue;
                         }
                         // Widening: index conversion
+                        if let Some(zgc) = fast_field_zgc {
+                            if field_fast::array_load_prim(zgc, &mut frame.stack, arr_ref, index, opcode) {
+                                frame.pc = saved_pc + 1;
+                                continue;
+                            }
+                        }
                         match shared.mem.heap.get_array_element(arr_ref, index as usize) {
                             Ok(value) => {
                                 frame.stack.push_unchecked(value);
@@ -6998,6 +7247,23 @@ fn execute_frame_from_index(
                 // so the operand-stack tag-erasure cannot regress here.
                 0x4f..=0x52 | 0x54..=0x56 => {
                     let (cv, kind_of_popped) = frame.stack.pop_with_kind_unchecked();
+                    if let Some(zgc) = fast_field_zgc {
+                        if frame.stack.len() >= 2 {
+                            let idx_cv = frame.stack.peek_compact();
+                            let arr_cv = frame.stack.peek_compact_at(1);
+                            if let (Some(index), Some(aptr)) = (idx_cv.as_int(), arr_cv.as_object_ptr()) {
+                                // SAFETY: an `Object`-tagged operand-stack slot holds a
+                                // heap address; `array_store_prim` re-validates it.
+                                let arr_ref = unsafe { ObjectRef::from_raw(aptr as *mut u8) };
+                                if field_fast::array_store_prim(zgc, arr_ref, index, opcode, cv, kind_of_popped) {
+                                    frame.stack.pop_compact();
+                                    frame.stack.pop_compact();
+                                    frame.pc = saved_pc + 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     let value = match opcode {
                         0x50 => Value::Long(cv.as_long_unchecked()),
                         0x52 => {
@@ -7049,6 +7315,38 @@ fn execute_frame_from_index(
                             .set_array_element(arr_ref, index as usize, value) // Widening: index conversion
                         {
                             Ok(()) => {
+                                // Phase 10 #2: the host just wrote this
+                                // array, so any device buffer mirroring it
+                                // is stale.
+                                //
+                                // AUDIT 2026-09-02: this arm did not do
+                                // this, and it is the arm that RUNS. The
+                                // `Instruction::Iastore` arm in
+                                // `opcodes.rs` invalidates and so does
+                                // `jit::helpers::jit_iastore`, so the hole
+                                // was invisible to a reading of either —
+                                // but the fast dispatch loop handles every
+                                // x-astore before `opcodes.rs` is ever
+                                // consulted, and it left the GPU
+                                // input-residency cache holding a device
+                                // copy the host had moved on from. The
+                                // next submit computed from stale data:
+                                // silent wrong answers in the default
+                                // configuration, with `--gpu` and no other
+                                // flag.
+                                //
+                                // Found by `GpuRuntimeStress`, where four
+                                // of six scenarios diverged from HotSpot
+                                // and the two that passed were exactly the
+                                // two that never mutate an input between
+                                // submits.
+                                //
+                                // Costs one relaxed load and a not-taken
+                                // branch when nothing is cached, which is
+                                // every run that never submits a kernel —
+                                // see `input_cache::ADDR_FILTER`.
+                                #[cfg(feature = "gpu-offload")]
+                                crate::runtime::offload::input_cache::invalidate(arr_ref);
                                 frame.pc = saved_pc + 1;
                                 continue;
                             }
@@ -7192,6 +7490,61 @@ fn execute_frame_from_index(
                     let cp_index = ((b1 as u16) << 8) | (b2 as u16); // Cast: bytecode operand decoding
                     let _ = frame;
                     thread.frames[frame_idx].pc = saved_pc + 3;
+                    if invoke_fast_door_on {
+                        match execute_invokevirtual_fast_door(
+                            shared,
+                            thread,
+                            frame_idx,
+                            cp_index,
+                            false,
+                            fast_field_zgc,
+                        ) {
+                            Some(Ok(CachedCallResult::FramePushed)) => {
+                                frame_idx = thread.frames.len() - 1;
+                                continue;
+                            }
+                            Some(Ok(_)) => {
+                                continue;
+                            }
+                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e) {
+                                FastPathInvokeError::Runtime(re) => {
+                                    pending_runtime_error = Some((re, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Java(exc) => {
+                                    pending_java_exception = Some((exc, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Fatal(e) => return Err(e),
+                            },
+                            None => {}
+                        }
+                    }
+                    if nonvirtual_fast_door_on {
+                        match invoke_fast::execute_nonvirtual_fast_door(
+                            shared, thread, frame_idx, cp_index, false,
+                        ) {
+                            Some(Ok(CachedCallResult::FramePushed)) => {
+                                frame_idx = thread.frames.len() - 1;
+                                continue;
+                            }
+                            Some(Ok(_)) => {
+                                continue;
+                            }
+                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e) {
+                                FastPathInvokeError::Runtime(re) => {
+                                    pending_runtime_error = Some((re, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Java(exc) => {
+                                    pending_java_exception = Some((exc, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Fatal(e) => return Err(e),
+                            },
+                            None => {}
+                        }
+                    }
                     // PERF: consult the cheap thread-local inline cache FIRST.
                     // A warm monomorphic site hits here and dispatches with one
                     // class-id compare + arg decode + frame push — no locks, no
@@ -7278,6 +7631,31 @@ fn execute_frame_from_index(
                     let cp_index = ((b1 as u16) << 8) | (b2 as u16); // Cast: bytecode operand decoding
                     let _ = frame;
                     thread.frames[frame_idx].pc = saved_pc + 3;
+                    if nonvirtual_fast_door_on {
+                        match invoke_fast::execute_nonvirtual_fast_door(
+                            shared, thread, frame_idx, cp_index, true,
+                        ) {
+                            Some(Ok(CachedCallResult::FramePushed)) => {
+                                frame_idx = thread.frames.len() - 1;
+                                continue;
+                            }
+                            Some(Ok(_)) => {
+                                continue;
+                            }
+                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e) {
+                                FastPathInvokeError::Runtime(re) => {
+                                    pending_runtime_error = Some((re, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Java(exc) => {
+                                    pending_java_exception = Some((exc, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Fatal(e) => return Err(e),
+                            },
+                            None => {}
+                        }
+                    }
                     let cached_result = execute_invokevirtual_cached(
                         shared, thread, frame_idx, cp_index, saved_pc, true, false,
                     );
@@ -7329,19 +7707,34 @@ fn execute_frame_from_index(
                     // adapter before it allocates either wrapper in interpreter mode.
                     // The helper verifies both the lambda metadata and its concrete
                     // getter bytecode; a miss preserves the ordinary invoke path.
-                    let tdigest_kernel = frame.class_name() == "org/elasticsearch/tdigest/Dist"
-                        && matches!(frame.method_name(), "quantile" | "cdf")
-                        && frame.method_descriptor() == "(DILjava/util/function/Function;)D";
+                    //
+                    // ORDER MATTERS (2026-09-02). This recognizer is
+                    // workload-specific and this arm is EVERY `invokestatic` in
+                    // the VM. It used to open with
+                    // `frame.class_name() == "org/elasticsearch/tdigest/Dist"`,
+                    // so every static call in every program paid a `FrameInner`
+                    // match, an `Arc<str>` deref and a length compare before
+                    // reaching the dispatch it actually wanted.
+                    //
+                    // The operands are all pure, so `&&` may be reordered
+                    // freely, and the BYTECODE-SHAPE half is both cheaper and
+                    // far more selective: three byte loads from `code_ptr`,
+                    // which the preamble has already pulled into L1, against a
+                    // four-opcode window (`invokestatic; invokeinterface; …
+                    // checkcast; … invokevirtual`) that essentially no other
+                    // call site matches. The name tests now run only for a call
+                    // site that already looks exactly like the kernel.
+                    //
                     // SAFETY: `code_ptr` addresses this frame's bytecode and the
-                    // preceding length check proves every inspected offset is in bounds.
-                    if tdigest_kernel
-                        && saved_pc + 14 <= code_len
+                    // `saved_pc + 14 <= code_len` test proves offsets +3/+8/+11
+                    // are in bounds of the padded buffer.
+                    if saved_pc + 14 <= code_len
                         && unsafe { *code_ptr.add(saved_pc + 3) } == 0xb9
                         && unsafe { *code_ptr.add(saved_pc + 8) } == 0xc0
-                        // SAFETY: `saved_pc + 14 <= code_len` was checked
-                        // above, so offsets +3/+8/+11 are all in bounds of the
-                        // frame's padded bytecode buffer.
                         && unsafe { *code_ptr.add(saved_pc + 11) } == 0xb6
+                        && frame.class_name() == "org/elasticsearch/tdigest/Dist"
+                        && matches!(frame.method_name(), "quantile" | "cdf")
+                        && frame.method_descriptor() == "(DILjava/util/function/Function;)D"
                     {
                         let index = frame.stack.pop_unchecked();
                         let lambda = frame.stack.pop_unchecked();
@@ -7359,6 +7752,31 @@ fn execute_frame_from_index(
                     let cp_index = ((b1 as u16) << 8) | (b2 as u16); // Cast: bytecode operand decoding
                     let _ = frame;
                     thread.frames[frame_idx].pc = saved_pc + 3;
+                    if nonvirtual_fast_door_on {
+                        match invoke_fast::execute_invokestatic_fast_door(
+                            shared, thread, frame_idx, cp_index,
+                        ) {
+                            Some(Ok(CachedCallResult::FramePushed)) => {
+                                frame_idx = thread.frames.len() - 1;
+                                continue;
+                            }
+                            Some(Ok(_)) => {
+                                continue;
+                            }
+                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e) {
+                                FastPathInvokeError::Runtime(re) => {
+                                    pending_runtime_error = Some((re, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Java(exc) => {
+                                    pending_java_exception = Some((exc, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Fatal(e) => return Err(e),
+                            },
+                            None => {}
+                        }
+                    }
                     let cached_result =
                         execute_invokestatic_cached(shared, thread, frame_idx, cp_index, saved_pc);
                     match cached_result {
@@ -7409,6 +7827,36 @@ fn execute_frame_from_index(
                     let _ = frame;
                     // invokeinterface is 5 bytes: opcode(1) + index(2) + count(1) + 0(1)
                     thread.frames[frame_idx].pc = saved_pc + 5;
+                    if invoke_fast_door_on {
+                        match execute_invokevirtual_fast_door(
+                            shared,
+                            thread,
+                            frame_idx,
+                            cp_index,
+                            true,
+                            fast_field_zgc,
+                        ) {
+                            Some(Ok(CachedCallResult::FramePushed)) => {
+                                frame_idx = thread.frames.len() - 1;
+                                continue;
+                            }
+                            Some(Ok(_)) => {
+                                continue;
+                            }
+                            Some(Err(e)) => match classify_fastpath_invoke_error(shared, thread, e) {
+                                FastPathInvokeError::Runtime(re) => {
+                                    pending_runtime_error = Some((re, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Java(exc) => {
+                                    pending_java_exception = Some((exc, saved_pc));
+                                    continue;
+                                }
+                                FastPathInvokeError::Fatal(e) => return Err(e),
+                            },
+                            None => {}
+                        }
+                    }
                     let cached_result = execute_invokevirtual_cached(
                         shared, thread, frame_idx, cp_index, saved_pc, false, true,
                     );
@@ -7814,15 +8262,59 @@ fn execute_frame_from_index(
                 // these bodies read `frame.pc` back — `monitorenter` and
                 // `monitorexit` snapshot it, and the diagnostic blocks print
                 // it. Advancing after the call would change what they observe.
-                0xb2 | 0xb3 | 0xb4 | 0xb5 | 0xbb | 0xc0 | 0xc1 => {
+                // getfield / putfield — quickened arm first (`field_fast`), the
+                // full handler on any miss. The full handler refills the site.
+                0xb4 | 0xb5 => {
+                    let cp_index = ((b1 as u16) << 8) | (b2 as u16); // Cast: bytecode operand decoding
+                    if let Some(zgc) = fast_field_zgc {
+                        let hit = if opcode == 0xb4 {
+                            field_fast::getfield_fast(
+                                shared,
+                                zgc,
+                                &mut thread.fast_field_sites,
+                                frame,
+                                cp_index,
+                            )
+                        } else {
+                            field_fast::putfield_fast(
+                                zgc,
+                                &mut thread.fast_field_sites,
+                                frame,
+                                cp_index,
+                            )
+                        };
+                        if hit {
+                            frame.pc = saved_pc + 3;
+                            continue;
+                        }
+                    }
+                    let _ = frame;
+                    thread.frames[frame_idx].pc = saved_pc + 3;
+                    let outcome = if opcode == 0xb4 {
+                        op_getfield(shared, thread, frame_idx, cp_index)
+                    } else {
+                        op_putfield(shared, thread, frame_idx, cp_index)
+                    };
+                    if let Err(e) = outcome {
+                        match classify_fastpath_invoke_error(shared, thread, e) {
+                            FastPathInvokeError::Runtime(re) => {
+                                pending_runtime_error = Some((re, saved_pc));
+                            }
+                            FastPathInvokeError::Java(exc) => {
+                                pending_java_exception = Some((exc, saved_pc));
+                            }
+                            FastPathInvokeError::Fatal(e) => return Err(e),
+                        }
+                    }
+                    continue;
+                }
+                0xb2 | 0xb3 | 0xbb | 0xc0 | 0xc1 => {
                     let cp_index = ((b1 as u16) << 8) | (b2 as u16); // Cast: bytecode operand decoding
                     let _ = frame;
                     thread.frames[frame_idx].pc = saved_pc + 3;
                     let outcome = match opcode {
                         0xb2 => op_getstatic(shared, thread, frame_idx, cp_index),
                         0xb3 => op_putstatic(shared, thread, frame_idx, cp_index),
-                        0xb4 => op_getfield(shared, thread, frame_idx, cp_index),
-                        0xb5 => op_putfield(shared, thread, frame_idx, cp_index),
                         0xbb => op_new(shared, thread, frame_idx, cp_index),
                         0xc0 => op_checkcast(shared, thread, frame_idx, cp_index),
                         // 0xc1
@@ -8186,6 +8678,8 @@ fn execute_frame_from_index(
                             .record_backedge_borrowed(cid, mn, md, saved_pc);
                     }
                     thread.frames[frame_idx].backward_count += 1;
+                    let osr_due = thread.frames[frame_idx].backward_count >= osr_call_floor;
+                    if osr_due {
                     match try_osr_with_backoff(
                         shared,
                         thread,
@@ -8201,7 +8695,10 @@ fn execute_frame_from_index(
                         }
                         OsrBackoffOutcome::Skip => {}
                     }
-                    safepoint_check(shared, thread);
+                    }
+                    if backedge_poll_needed!() {
+                        safepoint_check(shared, thread);
+                    }
                 }
                 continue;
             }
@@ -8213,7 +8710,7 @@ fn execute_frame_from_index(
             Ok(InstructionResult::Return(value)) => {
                 // Slow-path return — check for stackless frames
                 if frame_idx > initial_frame_idx {
-                    let ret = crate::jit::return_type(thread.frames[frame_idx].method_descriptor());
+                    let ret = thread.frames[frame_idx].return_tag();
                     let value = value.map(|v| {
                         if ret == b'V' {
                             v
@@ -8493,13 +8990,16 @@ pub use constants::*;
 // `runtime::resolve::guard` enforces it.
 pub(crate) mod field_access;
 pub use field_access::*;
+mod field_fast;
+mod invoke_fast;
 // The interpreter's resolved constant pool: per-thread, lock-free site caches
 // for field and method constant-pool references. `pub` so `vm-cli` can print
 // the `CRATONVM_DBG=field-site` tally at exit.
 pub mod invoke_phases;
 pub mod site_cache;
 pub use site_cache::{
-    CastSiteCache, ClassSiteCache, FieldSiteCache, MethodSiteCache, MethodSiteInfo, ResolvedNewSite,
+    CastSiteCache, ClassSiteCache, FastFieldSite, FastFieldSiteCache, FieldSiteCache,
+    IfaceSelectSiteCache, MethodSiteCache, MethodSiteInfo, ResolvedNewSite,
 };
 // ---------------------------------------------------------------------------
 // Helper: Method invocation

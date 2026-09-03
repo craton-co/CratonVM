@@ -113,10 +113,42 @@ mod tests {
     }
 }
 
-/// A native is about to hand back an instance of a class `new` could not have
-/// produced. Report it ONCE per class, naming the native that asked.
+/// One recorded JVMS §6.5 violation: the offending class, whether it was an
+/// interface or abstract, and the native that asked for the shape.
 ///
-/// Returns whether this call was the one that reported.
+/// The requester is kept as an owned `String` rather than the
+/// `&'static Location` it came from because the row outlives the call: the
+/// census is read once, at exit, on another stack entirely.
+type UninstantiableRow = (String, &'static str, String);
+
+/// Every distinct offending class this process has seen, in first-seen order.
+///
+/// A plain `parking_lot::Mutex`, which is this crate's convention
+/// (`capability.rs`, `fd_table.rs`); the ordered wrappers are the other crate's
+/// ratchet and do not apply here. First-seen order rather than sorted, because
+/// the order the boot produced them in is the order a reader retracing that
+/// boot needs.
+static SEEN: std::sync::OnceLock<parking_lot::Mutex<Vec<UninstantiableRow>>> =
+    std::sync::OnceLock::new();
+
+/// `CRATONVM_DBG_LAYOUT_ALIAS=1` — restore the per-class row, with its
+/// `requester=`, at the moment the violation happens rather than at exit.
+///
+/// No flag of its own, deliberately. This is the same species the alias census
+/// covers — the VM's own model of a class disagreeing with what the image
+/// declares — and `layout_alias.rs` already reads exactly this name for it.
+/// Having to arm two flags to see two halves of one story is how half of it
+/// gets missed.
+fn uninstantiable_verbose() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LAYOUT_ALIAS").is_some())
+}
+
+/// A native is about to hand back an instance of a class `new` could not have
+/// produced. Record it ONCE per class, naming the native that asked.
+///
+/// Returns whether this call was the one that recorded — i.e. whether this
+/// class was new to the census.
 ///
 /// # Why this lives here rather than at the funnel that calls it
 ///
@@ -129,15 +161,38 @@ mod tests {
 /// has no business being the thing that raises that ceiling, and the predicate
 /// it needs (`ACC_INTERFACE` / `ACC_ABSTRACT`) is already here.
 ///
-/// # The shape is `layout_alias::observe`'s, deliberately
+/// # 2026-09-01: it counts here and reports at exit
 ///
-/// A plain `parking_lot::Mutex`, which is this crate's convention
-/// (`capability.rs`, `fd_table.rs`); the ordered wrappers are the other crate's
-/// ratchet and do not apply here. The guard lives for exactly one `insert` and
-/// is dropped before the `tracing::warn!` — the subscriber re-enters the VM, so
-/// warning under the guard would be the inversion this move exists to avoid.
+/// This used to `warn!` per class as the violation happened, and a stock
+/// `cratonvm Hello` — a one-line hello-world — paid three of them
+/// (`java/util/stream/IntStream` interface, `java/lang/invoke/MethodHandle`
+/// and `java/lang/invoke/VarHandle` abstract), each carrying the same
+/// four-line paragraph. HotSpot prints nothing on that program. Three copies
+/// of one paragraph during boot is the background a real warning then has to
+/// be noticed against, and every tool that reads this VM's stderr sees it.
 ///
-/// # Why a `warn!` and not a `--jdk-only` report row
+/// **Nothing is silenced.** The species stays a default-run report; it moved
+/// from three lines during boot to one line at exit that names every offending
+/// class, its kind and its requester — strictly more than any single line
+/// carried before, since a reader no longer has to correlate three records to
+/// learn how many distinct classes were involved. This is the shape
+/// `cratonvm_types::compact_value::coercion_census::exit_summary` established
+/// on the same day for the same measurement, and matching it matters: two
+/// censuses of VM-internal type damage that print in two different styles are
+/// two things to learn instead of one.
+///
+/// The violations themselves are UNCHANGED and still open. A previous
+/// investigation established, with a site census, that each of the three
+/// classes is minted from several files, that the `IntStream` interface name is
+/// load-bearing (two exact-match tables in `native-collections` key on the
+/// literal string), and that re-minting `MethodHandle`/`VarHandle` as concrete
+/// classes without a matching arm in
+/// `vm/src/runtime/interpreter/typecheck.rs` would turn a harmless wrong
+/// `getClass()` into a wrong `checkcast` on every lambda call — strictly worse.
+/// So this changes when and how the census is printed, and nothing about what
+/// it is counting.
+///
+/// # Why a census line and not a `--jdk-only` report row
 ///
 /// A new `JdkOnlyViolation` variant is a wire-format change: `kind()` is the
 /// documented `"kind"` field of every report row, `difftest`'s census tallies by
@@ -156,30 +211,100 @@ mod tests {
 /// compatible mode too, on runs whose report said `compatibility_classes: 0`.
 /// The predicate counts classes MINTED; this species is an allocation against a
 /// class that is perfectly real. Deduped by class name, so a segment-heavy
-/// workload pays one line per carrier rather than thousands.
+/// workload pays one census row per carrier rather than thousands.
 ///
-/// `#[track_caller]` all the way up the funnel, so the location reported is the
+/// `#[track_caller]` all the way up the funnel, so the location recorded is the
 /// NATIVE that asked for the shape, not this line and not the forwarder.
 #[track_caller]
 pub fn observe_uninstantiable_receiver(class_name: &str, flags: u16) -> bool {
     if flags & (ACC_INTERFACE | ACC_ABSTRACT) == 0 {
         return false;
     }
-    static SEEN: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    let seen = SEEN.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+    let kind = if flags & ACC_INTERFACE != 0 {
+        "interface"
+    } else {
+        "abstract"
+    };
+    let site = core::panic::Location::caller();
+    let requester = format!("{}:{}", site.file(), site.line());
     {
+        let seen = SEEN.get_or_init(|| parking_lot::Mutex::new(Vec::new()));
         let mut guard = seen.lock();
-        if !guard.insert(class_name.to_string()) {
+        if guard.iter().any(|(name, _, _)| name.as_str() == class_name) {
             return false;
         }
+        guard.push((class_name.to_string(), kind, requester.clone()));
     }
-    let site = core::panic::Location::caller();
-    tracing::warn!(
-        class = %class_name,
-        requester = %format!("{}:{}", site.file(), site.line()),
-        kind = if flags & ACC_INTERFACE != 0 { "interface" } else { "abstract" },
-        "a native allocated an instance of a class `new` could not produce (JVMS 6.5);          the definition-of-done screen's compatibility_classes counts classes MINTED and          cannot see this. Reported once per class."
-    );
+    // The guard above lives for exactly one push and is dropped before this:
+    // the `tracing` subscriber re-enters the VM, so emitting under it would be
+    // the lock inversion the move to this crate exists to avoid.
+    if uninstantiable_verbose() {
+        tracing::warn!(
+            class = %class_name,
+            requester = %requester,
+            kind = kind,
+            "a native allocated an instance of a class `new` could not produce (JVMS 6.5). \
+             One row per class; the whole census also prints once at exit."
+        );
+    }
     true
+}
+
+/// One line on the exit path naming every class this process handed back that
+/// `new` could not have produced, or nothing at all when there were none.
+///
+/// Not behind a debug flag, and not printed on an empty census — the two
+/// decisions answer different questions. Unconditional when non-empty, because
+/// a violation you have to know to ask for is how a run gets read without one.
+/// Silent when empty, because the whole point of the change is that a
+/// hello-world's stderr is empty, and because this census cannot certify a
+/// clean run anyway: it sees the natives that route through
+/// [`observe_uninstantiable_receiver`], so its ABSENCE is not a proof that
+/// nothing else minted an abstract receiver.
+///
+/// Idempotent — `Once`-guarded — because two exit arms call it: the
+/// `System.exit` shutdown trailer in `native-builtins::lang_system`, and
+/// `vm-cli`'s normal-return arm, which is the one a program returning from
+/// `main` takes instead.
+///
+/// `eprintln!` rather than `tracing::warn!`, matching the sibling censuses: a
+/// report that only appears when the subscriber's filter allows it is a report
+/// that a `RUST_LOG=error` run silently loses, and this one is the only place
+/// the species is stated on a default run.
+pub fn exit_summary() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let Some(seen) = SEEN.get() else {
+        return;
+    };
+    let rows: Vec<UninstantiableRow> = seen.lock().clone();
+    if rows.is_empty() {
+        return;
+    }
+    ONCE.call_once(|| {
+        let mut listed = String::new();
+        for (name, kind, requester) in &rows {
+            if !listed.is_empty() {
+                listed.push_str("; ");
+            }
+            listed.push_str(name);
+            listed.push_str(" (");
+            listed.push_str(kind);
+            listed.push_str(", requester=");
+            listed.push_str(requester);
+            listed.push(')');
+        }
+        eprintln!(
+            "[cratonvm] JVMS 6.5 uninstantiable-receiver census: {} class(es): {listed} \
+             -- a native handed back an instance of a class `new` could not have produced \
+             (JVMS 6.5 makes `new` on an INTERFACE or an ABSTRACT class an \
+             InstantiationError, so no bytecode in any image could have produced these \
+             receivers). The definition-of-done screen's compatibility_classes counts \
+             classes MINTED and cannot see this species: the allocation is against a class \
+             that is perfectly real. One row per class, first-seen order; \
+             CRATONVM_DBG_LAYOUT_ALIAS=1 reports each row as it happens instead. THIS \
+             COUNTS THE NATIVES THAT ROUTE THROUGH observe_uninstantiable_receiver: the \
+             absence of this line is not a clean run.",
+            rows.len()
+        );
+    });
 }

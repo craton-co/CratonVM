@@ -101,7 +101,7 @@ pub fn gc_scan_roots(out: &mut Vec<ObjectRef>) {
     }
 }
 
-pub fn gc_update_after_gc<S: std::hash::BuildHasher>(pointer_map: &HashMap<usize, usize, S>) {
+pub fn gc_update_after_gc(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }

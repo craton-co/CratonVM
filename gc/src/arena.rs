@@ -118,9 +118,32 @@ fn mask_last(mask: &[u64; SMALL_MASK_WORDS]) -> Option<usize> {
     None
 }
 
+/// The extents [`Arena::reset_deferring_zero`] left un-zeroed, as arena
+/// offsets: `[0, low_end)` below the old low cursor and `[high_start, len)`
+/// above the old high one.
+#[derive(Debug, Clone, Copy)]
+pub struct DeferredWipe {
+    low_end: usize,
+    high_start: usize,
+}
+
+impl DeferredWipe {
+    /// Bytes the wipe covers before committed-granule filtering.
+    pub fn extent_bytes(&self, capacity: usize) -> usize {
+        self.low_end.min(capacity) + capacity.saturating_sub(self.high_start)
+    }
+}
+
 pub struct Arena {
-    /// Backing storage. Pre-allocated to `capacity` bytes.
-    data: Vec<u8>,
+    /// Backing storage for `capacity` bytes.
+    ///
+    /// Reserved address space committed in 2 MiB granules as the cursors reach
+    /// them, or -- under `CRATONVM_GC_RESERVE=0`, on a platform whose syscalls
+    /// this crate does not declare, or when the OS refuses the reservation --
+    /// the wholly-committed `alloc_zeroed` block this used to be. See
+    /// [`crate::reservation`] for why the difference is visible in a process's
+    /// commit charge and its resident set but nowhere else.
+    data: crate::reservation::HeapStore,
     /// Next free byte offset within `data` (bump-allocation high-water mark).
     cursor: usize,
     /// Reclaimed regions below `cursor` SMALLER than [`LARGE_BLOCK_MIN`],
@@ -701,7 +724,7 @@ impl Arena {
         let capacity = capacity & !7;
         // We need the Vec to have length == capacity so we can
         // hand out pointers into it. We zero-initialize for safety.
-        let data = alloc_zeroed_heap(capacity, "arena");
+        let data = crate::reservation::HeapStore::new(capacity, "arena");
         let mut a = Self {
             data,
             cursor: 0,
@@ -806,6 +829,25 @@ impl Arena {
     /// Forget every recorded anchor without collecting them.
     pub fn clear_alloc_anchors(&mut self) {
         self.alloc_anchors.fill(usize::MAX);
+    }
+
+    /// The epoch's anchors as a strictly-increasing offset list, WITHOUT
+    /// consuming them (gc-genpause F1).
+    ///
+    /// [`Self::take_alloc_anchors`] is the sweep's reader and it drains, which
+    /// is right for a path that owns the epoch. The moving young cycle's
+    /// object-start walk wants the same grid a phase earlier and must not
+    /// disturb it -- a moving cycle can still divert to the non-moving sweep
+    /// mid-flight, and that sweep would then find the anchors gone and fall
+    /// back to a full sequential walk for no reason.
+    ///
+    /// Same contents, same order, same `usize::MAX`-means-empty encoding.
+    pub fn alloc_anchors_snapshot(&self) -> Vec<usize> {
+        self.alloc_anchors
+            .iter()
+            .copied()
+            .filter(|&v| v != usize::MAX)
+            .collect()
     }
 
     /// Route a block to its size tier. Does NOT touch `max_free_upper` — the
@@ -1149,9 +1191,7 @@ impl Arena {
                     self.push_block_routed(r);
                 }
                 self.note_region_leak("free-list", alloc_offset, alloc_size);
-                // SAFETY: `alloc_offset + alloc_size` lies within the consumed
-                // block, which came from a region inside the buffer.
-                return Some(unsafe { self.data.as_mut_ptr().add(alloc_offset) });
+                return self.hand_out(alloc_offset, alloc_size);
             }
             // No fit anywhere, and BOTH tiers were viewed in full (the
             // segregated small tier has no scan budget to hide behind any
@@ -1183,9 +1223,11 @@ impl Arena {
                     .high_cursor
                     .saturating_sub(self.remaining_high_reserve())
             {
-                // SAFETY: `aligned` is within `[0, self.data.len())` because
-                // `end <= self.data.len()` was just checked.
-                let ptr = unsafe { self.data.as_mut_ptr().add(aligned) };
+                // COMMIT BEFORE HANDING OUT. See `commit_bump`: the two
+                // cursors are the only places the arena's writable envelope
+                // grows, so committing here is what makes every FREE-LIST
+                // block below the cursor writable without a check of its own.
+                let ptr = self.hand_out(aligned, end - aligned)?;
                 self.cursor = end;
                 return Some(ptr);
             }
@@ -1217,9 +1259,7 @@ impl Arena {
                 self.free_list_after_bump += 1;
             }
             self.note_region_leak("free-list-retry", alloc_offset, alloc_size);
-            // SAFETY: `alloc_offset + alloc_size` lies within the consumed
-            // block, which came from a region inside the buffer.
-            return Some(unsafe { self.data.as_mut_ptr().add(alloc_offset) });
+            return self.hand_out(alloc_offset, alloc_size);
         }
 
         // LAST RESORT BEFORE OOM: merge adjacent holes and look once more.
@@ -1261,8 +1301,7 @@ impl Arena {
                     self.push_block_routed(r);
                 }
                 self.note_region_leak("free-list-coalesced", alloc_offset, alloc_size);
-                // SAFETY: as above — inside the consumed block.
-                return Some(unsafe { self.data.as_mut_ptr().add(alloc_offset) });
+                return self.hand_out(alloc_offset, alloc_size);
             }
         }
 
@@ -1289,8 +1328,7 @@ impl Arena {
         if !self.free_high.is_empty() {
             if let Some(off) = self.high_fit(alloc_size, align) {
                 self.note_region_leak("high-free-list-last-resort", off, alloc_size);
-                // SAFETY: inside the consumed block.
-                return Some(unsafe { self.data.as_mut_ptr().add(off) });
+                return self.hand_out(off, alloc_size);
             }
         }
 
@@ -1308,8 +1346,7 @@ impl Arena {
             let end = aligned.and_then(|a| a.checked_add(alloc_size));
             if let (Some(aligned), Some(end)) = (aligned, end) {
                 if end <= self.high_cursor {
-                    // SAFETY: `aligned < end <= high_cursor <= data.len()`.
-                    let ptr = unsafe { self.data.as_mut_ptr().add(aligned) };
+                    let ptr = self.hand_out(aligned, end - aligned)?;
                     self.cursor = end;
                     return Some(ptr);
                 }
@@ -1328,6 +1365,57 @@ impl Arena {
     /// `high_cursor == capacity`, so nothing is ever high — the low end
     /// behaves byte-for-byte as it did before the region existed.
     #[inline]
+    /// Turn an offset into a pointer the caller may WRITE to, committing
+    /// whatever granules the range needs.
+    ///
+    /// # Every hand-out goes through here, and that is the point
+    ///
+    /// The backing store commits lazily ([`crate::reservation`]), so a write
+    /// into an uncommitted granule faults rather than reading zero. A first
+    /// version committed only where the two CURSORS move, on the argument that
+    /// every free-list block lies inside `[0, cursor)` or
+    /// `[high_cursor, capacity)` and is therefore already committed.
+    ///
+    /// The argument is nearly true and the exception is a segfault:
+    /// `compact_high_to` publishes vacated spans onto the high free list, and
+    /// the high bump's descent leaves committed and uncommitted granules
+    /// interleaved inside the region it has passed over. `large_array_survives_gc`
+    /// found it as `STATUS_ACCESS_VIOLATION` -- which is what an induction over
+    /// an allocator with two cursors and three free lists earns.
+    ///
+    /// So the obligation is LOCAL: nine hand-out sites, one helper, and the
+    /// question "is this range writable?" is answered where the pointer is
+    /// produced rather than three functions away. The cost is a granule-bitmap
+    /// test -- a load and a not-taken branch for an already-committed small
+    /// object -- against a free-list scan that has already happened.
+    ///
+    /// `None` means the OS refused the commit, and the caller must treat that
+    /// as an allocation failure: returning the pointer anyway would hand out
+    /// memory that faults on first write.
+    #[must_use = "a refused commit must fail the allocation"]
+    #[inline]
+    fn hand_out(&mut self, offset: usize, size: usize) -> Option<*mut u8> {
+        if !self.data.commit_range(offset, size) {
+            return None;
+        }
+        // SAFETY: `commit_range` returned `true`, which it only does for a
+        // range wholly inside the reservation -- so `offset + size` is in
+        // bounds and the bytes are mapped read-write.
+        Some(unsafe { self.data.as_mut_ptr().add(offset) })
+    }
+
+    /// Hand whole granules of `[lo, hi)` back to the OS.
+    ///
+    /// **The caller must have proved the span holds nothing live and is on no
+    /// free list.** Both callers satisfy that by construction: they pass space
+    /// a cursor has just retracted past, which is un-bumped by definition.
+    fn decommit_span(&mut self, lo: usize, hi: usize) -> usize {
+        if hi <= lo {
+            return 0;
+        }
+        self.data.decommit_range(lo, hi - lo)
+    }
+
     fn is_high(&self, offset: usize) -> bool {
         offset >= self.high_cursor
     }
@@ -1367,9 +1455,7 @@ impl Arena {
         let alloc_size = size.checked_add(align - 1).map(|v| v & !(align - 1))?;
 
         if let Some(off) = self.high_fit(alloc_size, align) {
-            // SAFETY: `off + alloc_size` lies within the consumed block, which
-            // came from a region inside the buffer.
-            return Some(unsafe { self.data.as_mut_ptr().add(off) });
+            return self.hand_out(off, alloc_size);
         }
 
         // Bump path: descend. Align DOWN, because the allocation's base is
@@ -1377,10 +1463,12 @@ impl Arena {
         if let Some(base) = self.high_cursor.checked_sub(alloc_size) {
             let base = base & !(align - 1);
             if base >= self.cursor {
+                // The whole span the cursor passed over, not just this
+                // object: the descent leaves `[base, old_high_cursor)` inside
+                // the region, and `compact_high_to` may free-list any of it.
+                let ptr = self.hand_out(base, self.high_cursor - base)?;
                 self.high_cursor = base;
-                // SAFETY: `base >= self.cursor` and `base + alloc_size` is at
-                // most the old cursor, hence within the buffer.
-                return Some(unsafe { self.data.as_mut_ptr().add(base) });
+                return Some(ptr);
             }
         }
 
@@ -1389,8 +1477,7 @@ impl Arena {
         // same terms (both the free list and the bump space have said no).
         if self.high_pushed != 0 && self.coalesce_high() != 0 {
             if let Some(off) = self.high_fit(alloc_size, align) {
-                // SAFETY: as above — inside the consumed block.
-                return Some(unsafe { self.data.as_mut_ptr().add(off) });
+                return self.hand_out(off, alloc_size);
             }
         }
         None
@@ -1556,7 +1643,11 @@ impl Arena {
         self.free_high.swap_remove(idx);
         self.free_bytes_total -= block.size;
         self.high_max = self.free_high.iter().map(|b| b.size).max().unwrap_or(0);
+        let old_high = self.high_cursor;
         self.high_cursor += give;
+        // As the low retraction: `[old_high, high_cursor)` is un-bumped again
+        // and off the free list, so its whole granules go back to the OS.
+        self.decommit_span(old_high, self.high_cursor);
         if give < block.size {
             self.push_high(FreeBlock {
                 offset: block.offset + give,
@@ -1752,6 +1843,70 @@ impl Arena {
     /// reclaimed span itself so a later conservative root scan cannot
     /// observe a stale object header inside the hole.
     ///
+    /// Replace the whole LOW free list with `spans`, which must be
+    /// address-ordered, non-overlapping, non-adjacent, and below the low
+    /// cursor.
+    ///
+    /// The sweep used to hand this list over one dead object at a time, and
+    /// every consumer downstream then had to undo that: `coalesce_free_list`
+    /// sorted the whole list and merged neighbours, `retract_cursor_into_free_tail`
+    /// sorted it again to find the top block, `decommit_free_blocks` sorted it
+    /// again looking for granules, and `compact_low_to` sorted it once more.
+    /// Four or five full sorts and rebuilds per collection, all of them
+    /// recovering an ordering the sweep destroyed by walking objects instead
+    /// of address space.
+    ///
+    /// A sweep that computes free space as *the complement of the live set*
+    /// produces the merged, ordered list directly, so this installs it as it
+    /// stands: no sort, no coalesce pass, and `free_pushed` left at zero
+    /// because nothing is pending to merge.
+    ///
+    /// # Panics (debug only)
+    /// Debug-asserts the ordering and disjointness it relies on, and that
+    /// every span lies below the cursor.
+    /// Returns the bytes that were on the list this call replaced, which is
+    /// what a caller needs to tell "free now" from "freed by this cycle".
+    pub fn rebuild_low_free_list(&mut self, spans: &[(usize, usize)]) -> usize {
+        #[cfg(debug_assertions)]
+        {
+            let mut prev_end = 0usize;
+            for &(off, len) in spans {
+                assert!(len > 0, "an empty span is not a free block");
+                assert!(
+                    off >= prev_end,
+                    "spans must be ordered and disjoint: {off} starts below {prev_end}",
+                );
+                assert!(
+                    off + len <= self.cursor,
+                    "span {off}+{len} runs past the low cursor {}",
+                    self.cursor,
+                );
+                prev_end = off + len;
+            }
+        }
+        let was_free = self.clear_low_free_list();
+        for &(off, len) in spans {
+            if len == 0 {
+                continue;
+            }
+            if (off | len) & 7 != 0 {
+                warn_unaligned_block("rebuild", off, len);
+            }
+            self.max_free_upper = self.max_free_upper.max(len);
+            self.push_block_routed(FreeBlock {
+                offset: off,
+                size: len,
+            });
+        }
+        // Merged by construction, so nothing is pending and the backoff has
+        // nothing to back off from.
+        self.free_pushed = 0;
+        self.coalesce_threshold = COALESCE_THRESHOLD_MIN;
+        // The anchors index INTO the list this call just replaced.
+        self.clear_alloc_anchors();
+        was_free
+    }
+
     /// # Panics (debug only)
     /// Debug-asserts the block lies fully within the live (`< cursor`)
     /// region of the arena.
@@ -2069,7 +2224,7 @@ impl Arena {
 
     /// Drop every LOW-end block, leaving the high end untouched. The rebuild
     /// half of the two low-list operations above.
-    fn clear_low_free_list(&mut self) {
+    fn clear_low_free_list(&mut self) -> usize {
         let dropped: usize = self
             .free_small
             .iter()
@@ -2086,6 +2241,7 @@ impl Arena {
         self.free_large_blocks = 0;
         self.max_free_upper = 0;
         self.free_pushed = 0;
+        dropped
     }
 
     /// Snapshot of the current free list as `(offset, size)` pairs,
@@ -2224,7 +2380,8 @@ impl Arena {
         // Zero the vacated span. A slid-down survivor leaves its old bytes
         // behind verbatim, including a valid-looking `ObjectHeader`, and a
         // conservative scanner that met one would resurrect a corpse.
-        self.data[new_cursor..self.cursor].fill(0);
+        self.data.fill_zero(new_cursor, self.cursor);
+        let old_cursor = self.cursor;
         self.cursor = new_cursor;
         // Keep the holes the slide did not write into. A block is dropped if it
         // overlaps the destination window (a survivor may be sitting on it) or
@@ -2274,12 +2431,32 @@ impl Arena {
                 // resurrect a corpse. The whole span rather than the headers,
                 // because unlike the sweep this pass does not know where inside
                 // it the object grid fell.
-                self.data[s..e].fill(0);
+                self.data.fill_zero(s, e);
                 self.add_free_block(s, e - s);
             }
         }
         // Every recorded low object start just moved.
         self.clear_alloc_anchors();
+        // THE VACATED TAIL IS NOT HANDED BACK HERE, and the reason is a
+        // collision worth stating rather than a limit of the arena.
+        //
+        // `ZgcRealHeap::stamp_forwarding_words` writes a forwarding record into
+        // exactly this span -- `[new_cursor, old_cursor)` is the only part of
+        // the vacated region a slide can leave a record in, because everything
+        // below the new cursor now holds a different live object. Decommitting
+        // it here destroys those records the instant they are written, and on
+        // Windows a later read of one is a `STATUS_ACCESS_VIOLATION` rather
+        // than a miss. That is not hypothetical: it is what the first version
+        // of this line did, and `a_compiled_frame_forbids_relocation_only_...`
+        // found it.
+        //
+        // So the give-back moves to `Arena::decommit_unbumped_middle`, which
+        // the collector calls at the START of the NEXT collection -- by which
+        // point the records have served their purpose. A stale reference that
+        // survives a whole collection is unrepairable anyway, which is the same
+        // reasoning `ZgcRealHeap::prune_relocations` already applies to the
+        // table beside them.
+        let _ = old_cursor;
         reclaimed
     }
 
@@ -2347,7 +2524,7 @@ impl Arena {
                  {floor}..{}",
                 self.data.len()
             );
-            self.data[start..end].fill(0);
+            self.data.fill_zero(start, end);
         }
         // Rebuild this end's free list: everything wholly below `floor` is
         // kept verbatim, a straddler is truncated to its part below it, and
@@ -2398,16 +2575,55 @@ impl Arena {
         // (site 2 = from-space reset). Gated; no-op unless the env is set.
         crate::zero_forensics::record(2, 0, self.data.as_ptr() as usize, self.cursor);
         // Zero out used region for safety (prevents stale data reads)
-        self.data[..self.cursor].fill(0);
+        self.data.fill_zero(0, self.cursor);
         // The high region too, or a reset arena hands out bytes that still
         // hold a previous object's header — the exact hazard `reset`'s own
         // contract exists to close.
-        self.data[self.high_cursor..].fill(0);
+        { let n = self.data.len(); self.data.fill_zero(self.high_cursor, n); }
         self.cursor = 0;
         self.high_cursor = self.data.len();
         self.clear_free_list();
         // Every recorded object start just became zeroed bytes.
         self.clear_alloc_anchors();
+    }
+
+    /// [`Self::reset`] with the zeroing handed back to the caller.
+    ///
+    /// The metadata reset is identical (cursors, free list, anchors); what
+    /// this does NOT do is the `memset` of everything below the low cursor
+    /// and above the high one. The returned [`DeferredWipe`] names those
+    /// extents as OFFSETS, and [`Self::deferred_wipe_spans`] turns them into
+    /// absolute spans against the arena's backing at the time it is called —
+    /// so a `grow` between the two, which may move the backing (and carries
+    /// the committed bytes, stale contents included, with it), is handled by
+    /// asking late rather than early.
+    ///
+    /// The caller owns the contract `reset` used to discharge: until every
+    /// returned span is zeroed, nothing may read this arena's bytes as
+    /// objects. `GenerationalHeap` keeps the arena INACTIVE (the evacuated
+    /// semi-space is the next cycle's to-space, allocated into by no mutator)
+    /// and joins the wipe before the next collection touches it.
+    pub fn reset_deferring_zero(&mut self) -> DeferredWipe {
+        crate::zero_forensics::record(2, 0, self.data.as_ptr() as usize, self.cursor);
+        let wipe = DeferredWipe {
+            low_end: self.cursor,
+            high_start: self.high_cursor,
+        };
+        self.cursor = 0;
+        self.high_cursor = self.data.len();
+        self.clear_free_list();
+        self.clear_alloc_anchors();
+        wipe
+    }
+
+    /// The absolute `(addr, len)` spans a [`DeferredWipe`] must zero, over
+    /// the arena's CURRENT backing and only its committed granules (an
+    /// uncommitted granule already reads as zero and must not be written).
+    pub fn deferred_wipe_spans(&self, wipe: &DeferredWipe) -> Vec<(usize, usize)> {
+        let len = self.data.len();
+        let mut spans = self.data.committed_spans(0, wipe.low_end.min(len));
+        spans.extend(self.data.committed_spans(wipe.high_start.min(len), len));
+        spans
     }
 
     /// Reset the arena without zeroing memory.
@@ -2455,6 +2671,82 @@ impl Arena {
         self.data.len()
     }
 
+    /// The LOW bump tail as `(first free address, byte count)` — the span a
+    /// parallel evacuation may carve into per-worker buffers.
+    ///
+    /// # Why an evacuator cannot just call `alloc`
+    ///
+    /// [`Self::alloc`] takes `&mut self`, which is precisely what makes a
+    /// copying collector's copy phase single-threaded. Handing the un-bumped
+    /// tail out as two plain words lets N workers bump a shared atomic cursor
+    /// inside it instead, with the arena itself untouched until
+    /// [`Self::commit_parallel_evacuation`] publishes the result.
+    ///
+    /// The tail is returned rather than the whole arena on purpose: the free
+    /// list holds spans whose neighbours are live objects, and an evacuator
+    /// bumping through those would overwrite them.
+    ///
+    /// # This reports the tail; it does NOT make it writable
+    ///
+    /// The backing store commits lazily, so the span named here is RESERVED
+    /// and mostly not yet mapped. The caller must pass the bytes it will
+    /// actually use to [`Self::commit_parallel_evacuation_region`] before any
+    /// worker writes into it — this is the tenth hand-out site the `hand_out`
+    /// helper's note counts, and the only one that does not go through it,
+    /// because it hands out a span for N threads to sub-allocate rather than a
+    /// single object.
+    pub fn parallel_evacuation_region(&self) -> (usize, usize) {
+        (
+            self.data.as_ptr() as usize + self.cursor,
+            self.low_bump_headroom(),
+        )
+    }
+
+    /// Map the first `bytes` of the tail so N workers may write into it.
+    ///
+    /// Returns `false` if the OS refused the commit, which the caller must
+    /// treat exactly as `hand_out` does — as an allocation failure, here
+    /// meaning "run the serial copy phase instead". Returning `true` anyway
+    /// would hand the workers memory that faults on first write.
+    ///
+    /// # Why this is separate from the region query
+    ///
+    /// `bytes` is the evacuation's own reservation (survivors + per-worker
+    /// buffers + its abandoned-tail allowance), which is computed AFTER the
+    /// tail is known. Committing the whole tail instead would work and would
+    /// throw away what the lazy backing store is for: on a 128 MB to-space
+    /// whose cycle copies 400 KB, the difference is the whole arena.
+    #[must_use = "a refused commit must send the cycle down the serial path"]
+    pub fn commit_parallel_evacuation_region(&mut self, bytes: usize) -> bool {
+        debug_assert!(bytes <= self.low_bump_headroom());
+        self.data.commit_range(self.cursor, bytes)
+    }
+
+    /// Publish the outcome of a parallel evacuation: `bytes` were consumed
+    /// from the tail [`Self::parallel_evacuation_region`] handed out.
+    ///
+    /// The caller must already have made every byte below the new cursor
+    /// walkable — object copies, and a filler over every retired per-worker
+    /// buffer's tail (`gen_evac::install_gap_filler`). This method deliberately
+    /// does NOT take the gaps and push them on the free list instead: a free
+    /// block is invisible to `walk_objects` and friends, and this arena is
+    /// about to become the next cycle's FROM-space, where several walks
+    /// reconstruct the object grid without consulting the free list at all.
+    ///
+    /// # Panics
+    /// If `end_addr` is outside the tail that was handed out — below its start
+    /// would lose live copies, above it would put the cursor past the arena's
+    /// own capacity.
+    pub fn commit_parallel_evacuation(&mut self, end_addr: usize) {
+        let (start, len) = self.parallel_evacuation_region();
+        assert!(
+            end_addr >= start && end_addr <= start + len,
+            "parallel evacuation ended at {end_addr:#x}, outside the tail [{start:#x},{:#x})",
+            start + len,
+        );
+        self.cursor += end_addr - start;
+    }
+
     /// Retract the bump cursor into a free span that ends exactly at it,
     /// returning the bytes handed back to the un-bumped tail.
     ///
@@ -2482,6 +2774,28 @@ impl Arena {
     /// only the single highest block is considered. Returns 0 when that block
     /// does not reach the cursor (a live object sits above it), the ordinary
     /// mid-heap case.
+    /// Lower the low bump cursor to `new_cursor`, decommitting what that
+    /// gives back. Returns the bytes reclaimed.
+    ///
+    /// [`Self::retract_cursor_into_free_tail`] does the same thing by SEARCHING
+    /// for a free block that ends at the cursor, which means sorting the whole
+    /// low free list. A sweep that walked the address space already knows
+    /// where the last live object ends, so it can say so directly and the list
+    /// never has to carry -- or be sorted to find -- the tail span at all.
+    ///
+    /// Refuses to RAISE the cursor: this is a reclaim, and handing out bytes
+    /// above the cursor is the bump path.s job.
+    pub fn retract_cursor_to(&mut self, new_cursor: usize) -> usize {
+        if new_cursor >= self.cursor {
+            return 0;
+        }
+        let old_cursor = self.cursor;
+        let reclaimed = old_cursor - new_cursor;
+        self.cursor = new_cursor;
+        self.decommit_span(new_cursor, old_cursor);
+        reclaimed
+    }
+
     pub fn retract_cursor_into_free_tail(&mut self) -> usize {
         // LOW blocks only. Reading the whole list here would take the highest
         // block in the ARENA — which, once the large-object end has been used,
@@ -2501,8 +2815,104 @@ impl Arena {
         for (o, s) in blocks.iter().take(blocks.len() - 1) {
             self.add_free_block(*o, *s);
         }
+        let old_cursor = self.cursor;
         self.cursor = off;
+        // GIVE THE PAGES BACK. `[off, old_cursor)` was just proved free (it was
+        // one free-list block ending exactly at the cursor) and has been
+        // removed from the list, so it is un-bumped space that nothing can
+        // reach until a later bump commits it again. Whole granules only; the
+        // partial ones at either end still neighbour live data.
+        //
+        // This is the only thing on a non-compacting heap that returns memory
+        // to the OS: without it a process that peaks and then idles holds its
+        // peak forever, because `retract_cursor_into_free_tail` moved a number
+        // and nothing else.
+        self.decommit_span(off, old_cursor);
         size
+    }
+
+    /// Hand the un-bumped middle back to the OS.
+    ///
+    /// `[cursor, high_cursor)` is the space between the two ends: below the
+    /// low cursor is bump-allocated or free-listed, above the high cursor is
+    /// the large-object region, and the middle belongs to neither. Nothing can
+    /// reach it without moving a cursor, and a cursor move commits what it
+    /// passes over -- so releasing its whole granules is sound with no
+    /// liveness question asked.
+    ///
+    /// **Call at a safepoint, and after anything that reads a vacated span.**
+    /// See `compact_low_to` for the record this would otherwise destroy.
+    ///
+    /// Returns the bytes released. Zero on the wholly-committed fallback store,
+    /// and zero on a heap whose middle is smaller than a granule.
+    pub fn decommit_unbumped_middle(&mut self) -> usize {
+        let (lo, hi) = (self.cursor, self.high_cursor);
+        self.decommit_span(lo, hi)
+    }
+
+    /// Hand the whole granules inside every FREE-LIST block back to the OS.
+    ///
+    /// # Why the un-bumped middle is not enough
+    ///
+    /// [`Self::decommit_unbumped_middle`] releases the space between the two
+    /// cursors, which is the space no allocation has ever reached. It cannot
+    /// touch memory that WAS allocated and has since been freed -- and on a
+    /// heap whose peak was large objects, that is all of it: they are served
+    /// from the high end, the sweep returns them to the high free list, and
+    /// `retract_high_cursor_into_free_head` gives back only the excess over
+    /// the reserve. Measured on `probes/HeapGiveBack.java` at a 64 MiB peak:
+    /// the middle-only give-back returned **2 MiB of 64**.
+    ///
+    /// A free-list block is by definition not live, so its granules can go
+    /// back. The bytes come with no obligation either: every path that hands
+    /// one out again goes through [`Self::hand_out`], which commits before it
+    /// returns a pointer, and a re-committed granule reads as zero -- which is
+    /// what a caller of a reused block is entitled to and what `Arena::alloc`'s
+    /// consumers already zero for themselves.
+    ///
+    /// WHOLE granules only, rounded INWARD: a block's ends usually share a
+    /// granule with a live object, and rounding outward would take it too --
+    /// silently, because a decommitted page reads as zero rather than
+    /// faulting on the platforms that map it back on touch.
+    ///
+    /// **Call at a safepoint**, after the sweep has coalesced: the lists are
+    /// then a handful of maximal spans rather than one entry per dead object,
+    /// so this is a walk of tens rather than millions.
+    ///
+    /// Returns the bytes released.
+    pub fn decommit_free_blocks(&mut self) -> usize {
+        let mut released = 0usize;
+        let low: Vec<(usize, usize)> = self.low_blocks_sorted();
+        for (off, size) in low {
+            released += self.decommit_span(off, off + size);
+        }
+        let high: Vec<(usize, usize)> = self
+            .free_high
+            .iter()
+            .map(|b| (b.offset, b.size))
+            .collect();
+        for (off, size) in high {
+            released += self.decommit_span(off, off + size);
+        }
+        released
+    }
+
+    /// Is `offset` inside a granule that is currently committed, i.e. safe to
+    /// read?
+    ///
+    /// Always `true` on the wholly-committed fallback store. Used by the one
+    /// writer that deliberately puts something in a span the allocator has
+    /// retracted past -- see `ZgcRealHeap::stamp_forwarding_words`.
+    pub fn is_readable_at(&self, offset: usize) -> bool {
+        self.data.is_committed_at(offset)
+    }
+
+    /// Bytes of this arena's capacity that are actually committed.
+    ///
+    /// Equal to `capacity()` on the wholly-committed fallback store; below it,
+    /// often far below, on a reserving one.
+    pub fn committed_bytes(&self) -> usize {
+        self.data.committed_bytes()
     }
 
     /// Get the base pointer of the arena's backing storage.
@@ -2548,7 +2958,7 @@ impl Arena {
         );
         let old_base = self.data.as_ptr();
         let old_capacity = self.data.len();
-        self.data.resize(new_capacity, 0);
+        let _ = self.data.grow_to(new_capacity);
         // The high end anchors at capacity, so growing moves it. Safe for the
         // same reason the assert above allows the grow at all: `cursor == 0`
         // means the arena is empty, so there is nothing at the old top to

@@ -102,29 +102,20 @@ pub struct KernelSignature {
     /// thread computes the same value and racing on `ret_ptr` is benign).
     pub is_reduction: bool,
 
-    /// Annotation policy propagated from `@GpuKernel(admit =
-    /// ALLOW_DIV_BY_ZERO)`. Despite the name, this single flag gates two
-    /// independent lowering decisions — see the "AllowDivByZero-reuse"
-    /// note on `analyzer::classify`'s `0x72 | 0x73` arm and the doc
-    /// comment on `analyzer::Reason::FloatRemainder` for the full "why
-    /// one hint, not two" rationale:
+    /// Whether lowering may skip the explicit divisor-zero deopt guard
+    /// on `idiv`/`ldiv`/`irem`/`lrem`. Other guards, such as
+    /// signed-minimum divided by `-1`, remain in force.
     ///
-    /// - Integer `idiv`/`ldiv`/`irem`/`lrem`: when true, lowering skips
-    ///   only the explicit divisor-zero deopt guard. Other guards, such
-    ///   as signed-minimum divided by `-1`, remain in force.
-    /// - `frem`/`drem` (AUDIT 2026-07-11): the analyzer only admits
-    ///   these two opcodes at all under this hint — under `Strict` they
-    ///   still reject with `Reason::FloatRemainder` before ever reaching
-    ///   lowering. The div+truncate+fma identity
-    ///   (`lowering::emit::Emitter::frem_f32`/`drem_f64`) is bit-exact
-    ///   only while the quotient magnitude `|dividend / divisor|` stays
-    ///   within the type's exactly-representable-integer range (`<
-    ///   2^24` for `float`, `< 2^53` for `double`); this flag is the
-    ///   opt-in that accepts that approximation, reused rather than a
-    ///   dedicated `AdmissionHint` variant because it is already the
-    ///   "accept looser numeric edge-case semantics for a
-    ///   division-family opcode" opt-in and `frem`/`drem` are literally
-    ///   the floating counterparts of `irem`/`lrem`.
+    /// That is now ALL this field means. AUDIT 2026-09-02: it used to
+    /// gate a second, unrelated decision as well — whether `frem`/`drem`
+    /// were admitted at all — because `AdmissionHint` was a one-of and
+    /// there was nowhere to put a second opt-in. Keeping the two apart
+    /// took this comment and two others. The `frem`/`drem` decision now
+    /// has its own bit
+    /// ([`AdmissionFlags::approximate_float_remainder`](crate::annotations::AdmissionFlags::approximate_float_remainder))
+    /// and is made in the analyzer, at admission, so nothing about it
+    /// reaches the emitter and nothing about it reaches this field.
+    /// `@GpuKernel(admit = ALLOW_DIV_BY_ZERO)` still sets both bits.
     ///
     /// `lcmp`/`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg` do NOT consult this flag —
     /// unlike `frem`/`drem`, their `setp`+`selp` lowering

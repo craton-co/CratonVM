@@ -2089,6 +2089,31 @@ pub(crate) fn is_java_nio_access_native_override(
         && descriptor == "()Ljdk/internal/misc/VM$BufferPool;"
 }
 
+/// The three COUNTERS on `java.nio.Bits`' anonymous `VM$BufferPool`.
+///
+/// `Bits.RESERVED_MEMORY` / `TOTAL_CAPACITY` / `COUNT` are maintained by
+/// `Bits.reserveMemory`, which this VM never reaches: `ByteBuffer
+/// .allocateDirect` is force-overridden above, in every mode, by an allocator
+/// that keeps its own counters (`native-io`'s `direct_buffer::bits()`). The
+/// JDK's three therefore read zero forever, and the platform MBean server
+/// publishes exactly these objects — so `java.nio:type=BufferPool,name=direct`
+/// reported a perfect cache no matter what the VM was doing. MEASURED
+/// 2026-09-01, `probes/PoolRoutes.java`, both modes, both binaries.
+///
+/// `getName()` is deliberately NOT here: it is two instructions returning
+/// `"direct"` and the JDK's own answer is right.
+pub(crate) fn is_direct_buffer_pool_counter_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/nio/Bits$1"
+        && matches!(
+            (method_name, descriptor),
+            ("getCount", "()J") | ("getMemoryUsed", "()J") | ("getTotalCapacity", "()J")
+        )
+}
+
 pub(crate) fn is_stamped_lock_native_override(
     class_name: &str,
     method_name: &str,
@@ -4807,6 +4832,9 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     if is_java_nio_access_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
+    if is_direct_buffer_pool_counter_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
     if is_stamped_lock_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
@@ -5949,6 +5977,12 @@ pub(super) const INTERCEPT_SHAPE_CLASSLOADER_RESOURCE: u8 = 1 << 0;
 pub(super) const INTERCEPT_SHAPE_CLASS_REFLECTION: u8 = 1 << 1;
 /// This triple could reach the real-`HttpURLConnection` carrier exemption.
 pub(super) const INTERCEPT_SHAPE_HTTP_CARRIER: u8 = 1 << 2;
+/// One of the three name-matched intercepts in the cached virtual
+/// dispatcher (`ClassLoader.setDefaultAssertionStatus`, the surefire
+/// `LazyLauncher.discover` native, the reflective `Method.invoke` /
+/// `Constructor.newInstance` override). Consumed only by the invoke fast
+/// door, which declines any method with a non-zero shape.
+pub(super) const INTERCEPT_SHAPE_NAMED: u8 = 1 << 3;
 
 /// Classify a call site's triple against the three special-case arms of
 /// [`intercept_force_registered_native_cached`], once.
@@ -5973,7 +6007,35 @@ pub(super) fn intercept_shape_of(class_name: &str, method_name: &str, descriptor
     if http_carrier_declaring_class(class_name) {
         shape |= INTERCEPT_SHAPE_HTTP_CARRIER;
     }
+    if named_intercept_shape(class_name, method_name, descriptor) {
+        shape |= INTERCEPT_SHAPE_NAMED;
+    }
     shape
+}
+
+/// The name triples `intercept_classloader_set_default_assertion_status`,
+/// `surefire_lazy_launcher_discover_native` and
+/// `native_override_for_cached_reflect_invoke` match on.
+fn named_intercept_shape(class_name: &str, method_name: &str, descriptor: &str) -> bool {
+    matches!(
+        (class_name, method_name, descriptor),
+        (_, "setDefaultAssertionStatus", "(Z)V")
+            | (
+                _,
+                "discover",
+                "(Lorg/junit/platform/launcher/LauncherDiscoveryRequest;)Lorg/junit/platform/launcher/TestPlan;"
+            )
+            | (
+                "java/lang/reflect/Method",
+                "invoke",
+                "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"
+            )
+            | (
+                "java/lang/reflect/Constructor",
+                "newInstance",
+                "([Ljava/lang/Object;)Ljava/lang/Object;"
+            )
+    )
 }
 
 /// The name-keyed half of the `ClassLoader` null-resource re-target.

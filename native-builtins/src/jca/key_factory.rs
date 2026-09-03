@@ -724,6 +724,75 @@ fn der_spec_algorithm_oid(der: &[u8], is_private: bool) -> Option<Vec<u8>> {
 /// of both `PKCS8EncodedKeySpec` and `X509EncodedKeySpec` — real JDK classes
 /// with that field layout, already relied on elsewhere in this file, e.g.
 /// the PKCS#1-vs-PKCS#8 RSA sniff in `kf_generate_private`). A concrete algo
+
+/// The concrete curve an `XECPublicKeySpec`-family spec names, resolved through
+/// the spec's own `getParams()` accessor rather than by slot index.
+///
+/// These four specs are the `(params, value)` shape: the curve is a
+/// `NamedParameterSpec` and the key material is a `BigInteger` or a `byte[]`,
+/// so there is no encoded `AlgorithmIdentifier` to sniff an OID out of.
+/// `getParams()` is read by NAME because the two pairs disagree on its return
+/// type — `XEC*` declares `AlgorithmParameterSpec`, `EdEC*` declares
+/// `NamedParameterSpec` — and a slot index would depend on a real JDK class's
+/// field order, which is not this crate's to assume.
+///
+/// `None` means "not one of these specs, or the curve could not be read", and
+/// the caller falls through to the DER path unchanged.
+fn curve_algo_from_named_param_spec(
+    ctx: &mut dyn NativeContext,
+    algo: i32,
+    spec: ObjectRef,
+) -> Option<i32> {
+    let cls = ctx.class_name_of_id(ctx.class_id_of_object(spec))?;
+    let is_named_form = matches!(
+        cls.as_str(),
+        "java/security/spec/XECPublicKeySpec"
+            | "java/security/spec/XECPrivateKeySpec"
+            | "java/security/spec/EdECPublicKeySpec"
+            | "java/security/spec/EdECPrivateKeySpec"
+    );
+    if !is_named_form {
+        return None;
+    }
+    let pin = ctx.pin_native_root(spec);
+    let params = ["()Ljava/security/spec/AlgorithmParameterSpec;", "()Ljava/security/spec/NamedParameterSpec;"]
+        .into_iter()
+        .find_map(|desc| {
+            let spec = ctx.read_native_pin(pin, spec);
+            match ctx.invoke_virtual(spec, "getParams", desc, &[]) {
+                Ok(Some(Value::Object(Some(o)))) => Some(o),
+                _ => None,
+            }
+        });
+    let name = params.and_then(|p| {
+        let p_pin = ctx.pin_native_root(p);
+        let out = match ctx.invoke_virtual(p, "getName", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+            _ => None,
+        };
+        ctx.unpin_native_roots(p_pin);
+        out
+    });
+    ctx.unpin_native_roots(pin);
+    let name = name?;
+    // The curve NAME decides, and it must agree with the family the caller
+    // asked for: `KeyFactory.getInstance("XDH")` handed an `Ed25519` spec is a
+    // caller error, not a licence to sign with the wrong curve.
+    let resolved = match name.to_ascii_uppercase().as_str() {
+        "X25519" => ALGO_X25519,
+        "X448" => ALGO_X448,
+        "ED25519" => ALGO_ED25519,
+        "ED448" => ALGO_ED448,
+        _ => return None,
+    };
+    let family_matches = match algo {
+        ALGO_XDH_GENERIC => matches!(resolved, ALGO_X25519 | ALGO_X448),
+        ALGO_EDDSA_GENERIC => matches!(resolved, ALGO_ED25519 | ALGO_ED448),
+        _ => false,
+    };
+    family_matches.then_some(resolved)
+}
+
 /// (or an unrecognised/unparseable spec) passes through unchanged.
 fn resolve_curve_algo(
     ctx: &mut dyn NativeContext,
@@ -733,6 +802,23 @@ fn resolve_curve_algo(
 ) -> i32 {
     if algo != ALGO_XDH_GENERIC && algo != ALGO_EDDSA_GENERIC {
         return algo;
+    }
+    // The (params, value) SPEC FORMS first — `XECPublicKeySpec` and friends
+    // carry their curve as a `NamedParameterSpec`, not as DER, so the OID sniff
+    // below reads their field 0 as a byte array, finds an object that is not
+    // one, and hands the generic sentinel straight back. That is the whole of
+    //
+    //     KeyFactory.getInstance("XDH").generatePublic(
+    //         new XECPublicKeySpec(new NamedParameterSpec("X25519"), u))
+    //       InvalidKeySpecException: cannot generate a usable XDH public key
+    //       from the given KeySpec
+    //
+    // measured 2026-09-02, and it is the form `com.sun.crypto.provider.DHKEM`
+    // rebuilds a peer key with — so `KEM.getInstance("DHKEM")` worked on all
+    // three EC curves and failed on both XDH ones for a reason that had
+    // nothing to do with the KEM.
+    if let Some(resolved) = curve_algo_from_named_param_spec(ctx, algo, spec) {
+        return resolved;
     }
     let der = match ctx.get_field(spec, 0) {
         Value::Object(Some(arr)) => read_byte_array(ctx, arr),
@@ -1959,8 +2045,33 @@ fn kf_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 /// engines disagreed about one name. De-advertising it for `KeyFactory` only,
 /// and pinning the pair with that test, is what closed it.
 /// W7-63-jca-advertise-vs-serve.md.
+///
+/// # It is a DISJUNCTION, because `kf_get_instance` is
+///
+/// `kf_algo_idx(name) >= 0` was the whole answer until 2026-09-02, and by then
+/// it had stopped describing the engine: `kf_get_instance` falls to
+/// `find_service_provider` + `build_real_key_factory` whenever the index is
+/// negative, so any name with a service row naming a REAL implementation class
+/// is served by the platform's own factory. `HSS/LMS` is that shape — SUN
+/// advertises it, this crate has no Merkle-tree key factory, and
+/// `sun.security.provider.HSS$KeyFactoryImpl` is in the boot image.
+///
+/// A predicate narrower than the engine is not a safe conservatism here. This
+/// one gates a ratchet whose whole job is to keep the advertised set and the
+/// serviceable set equal, so understating the second half reds the test for
+/// names that work — which is what it did the first time a delegated
+/// `KeyFactory` row was seeded.
+///
+/// The `.Native` marker deliberately does not count: it is not a class, it
+/// means "a Rust engine answers this", and a marker row for a name with no
+/// index is exactly an advertisement with nothing behind it.
 pub(crate) fn get_instance_offers(name: &str) -> bool {
-    kf_algo_idx(name) >= 0
+    if kf_algo_idx(name) >= 0 {
+        return true;
+    }
+    crate::jca::provider_chain::find_service_provider("KeyFactory", name)
+        .and_then(|p| crate::jca::provider_chain::service_implementation_class("KeyFactory", &p, name))
+        .is_some()
 }
 
 /// The same question for `KeyPairGenerator`, without a provider argument.
@@ -3891,6 +4002,107 @@ fn kf_get_key_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
                 )
             })();
             ctx.unpin_native_roots(pin_key);
+            result
+        }
+        // The `(params, value)` XDH/EdDSA spec forms, built from the KEY's own
+        // accessors rather than by driving another SPI.
+        //
+        // These are the TAKE-APART direction of `curve_algo_from_named_param_spec`'s
+        // put-together, and they were both missing: `getKeySpec(key,
+        // XECPublicKeySpec.class)` answered `Unsupported key spec` on a VM
+        // whose `XDHPublicKeyImpl` carries `getU()` and `getParams()` and
+        // answers both correctly. Reading the key is provider-independent and
+        // needs no second factory — `getScalar()` returns `Optional<byte[]>`
+        // because a private key may have been destroyed, which is the one case
+        // that has to refuse rather than hand back an empty scalar.
+        "java.security.spec.XECPublicKeySpec" => {
+            let pin = ctx.pin_native_root(key);
+            let result = (|| {
+                let k = ctx.read_native_pin(pin, key);
+                let params = match ctx.invoke_virtual(
+                    k,
+                    "getParams",
+                    "()Ljava/security/spec/AlgorithmParameterSpec;",
+                    &[],
+                )? {
+                    Some(Value::Object(Some(o))) => o,
+                    _ => return Err(throw_invalid_key_spec(ctx, "Key is not an XDH public key")),
+                };
+                let params_pin = ctx.pin_native_root(params);
+                let k = ctx.read_native_pin(pin, key);
+                let u = match ctx.invoke_virtual(k, "getU", "()Ljava/math/BigInteger;", &[])? {
+                    Some(Value::Object(Some(o))) => o,
+                    _ => {
+                        ctx.unpin_native_roots(params_pin);
+                        return Err(throw_invalid_key_spec(ctx, "Key is not an XDH public key"));
+                    }
+                };
+                let params = ctx.read_native_pin(params_pin, params);
+                ctx.unpin_native_roots(params_pin);
+                ctx.new_object_initialized(
+                    "java/security/spec/XECPublicKeySpec",
+                    "(Ljava/security/spec/AlgorithmParameterSpec;Ljava/math/BigInteger;)V",
+                    &[Value::Object(Some(params)), Value::Object(Some(u))],
+                )
+            })();
+            ctx.unpin_native_roots(pin);
+            result
+        }
+        "java.security.spec.XECPrivateKeySpec" => {
+            let pin = ctx.pin_native_root(key);
+            let result = (|| {
+                let k = ctx.read_native_pin(pin, key);
+                let params = match ctx.invoke_virtual(
+                    k,
+                    "getParams",
+                    "()Ljava/security/spec/AlgorithmParameterSpec;",
+                    &[],
+                )? {
+                    Some(Value::Object(Some(o))) => o,
+                    _ => return Err(throw_invalid_key_spec(ctx, "Key is not an XDH private key")),
+                };
+                let params_pin = ctx.pin_native_root(params);
+                let k = ctx.read_native_pin(pin, key);
+                // `Optional<byte[]>` — EMPTY when the key has been destroyed,
+                // which must refuse rather than produce a zero-length scalar.
+                let scalar_opt =
+                    match ctx.invoke_virtual(k, "getScalar", "()Ljava/util/Optional;", &[])? {
+                        Some(Value::Object(Some(o))) => o,
+                        _ => {
+                            ctx.unpin_native_roots(params_pin);
+                            return Err(throw_invalid_key_spec(
+                                ctx,
+                                "Key is not an XDH private key",
+                            ));
+                        }
+                    };
+                let opt_pin = ctx.pin_native_root(scalar_opt);
+                let scalar = match ctx.invoke_virtual(
+                    scalar_opt,
+                    "orElse",
+                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[Value::Object(None)],
+                )? {
+                    Some(Value::Object(Some(arr))) => arr,
+                    _ => {
+                        ctx.unpin_native_roots(opt_pin);
+                        ctx.unpin_native_roots(params_pin);
+                        return Err(throw_invalid_key_spec(
+                            ctx,
+                            "XDH private key material is not available",
+                        ));
+                    }
+                };
+                ctx.unpin_native_roots(opt_pin);
+                let params = ctx.read_native_pin(params_pin, params);
+                ctx.unpin_native_roots(params_pin);
+                ctx.new_object_initialized(
+                    "java/security/spec/XECPrivateKeySpec",
+                    "(Ljava/security/spec/AlgorithmParameterSpec;[B)V",
+                    &[Value::Object(Some(params)), Value::Object(Some(scalar))],
+                )
+            })();
+            ctx.unpin_native_roots(pin);
             result
         }
         _ => Err(throw_invalid_key_spec(

@@ -12551,6 +12551,20 @@ pub fn register_essential_natives_with_shims(
                 let m_obj = ctx.read_native_pin(pin, m_obj);
                 ctx.set_field_by_name(m_obj, "descriptor", Value::Object(Some(desc)));
             }
+            // `Module.getClassLoader()` is real bytecode `getfield loader`, and
+            // the JDK keeps a module's answer in step with the answer every
+            // class in it gives: `java.sql.Connection.getClassLoader()` and
+            // `java.sql`'s own are BOTH the platform loader. A boot module's is
+            // `null`, which an unwritten field already reports, so only the
+            // platform side needs a write here.
+            if let Some(module_name) = module_name.as_deref() {
+                if let Some(platform) =
+                    crate::classloader::platform_loader_for_module(ctx, module_name)
+                {
+                    let m_obj = ctx.read_native_pin(pin, m_obj);
+                    ctx.set_field_by_name(m_obj, "loader", Value::Object(Some(platform)));
+                }
+            }
             let m_obj = ctx.read_native_pin(pin, m_obj);
             ctx.unpin_native_roots(pin);
             // Publish as the canonical mirror for this module name so future
@@ -17375,7 +17389,9 @@ pub fn register_essential_natives_with_shims(
         |_ctx, _args| -> MethodCallResult {
             Err(MethodCallFailed::from(
                 RuntimeError::NoSuchElementException {
-                    message: "Collections.emptyEnumeration()".to_string(),
+                    // A bare `new NoSuchElementException()` on the oracle;
+                    // empty is this crate's marker for a null message.
+                    message: String::new(),
                 },
             ))
         },
@@ -26520,9 +26536,10 @@ pub(crate) fn obj_arg(
             // we don't want to drown those in backtraces.
             if crate::nbflags().dbg_null_native {
                 eprintln!(
-                    "[obj_arg] null at idx={} args.len={}\n{}",
+                    "[obj_arg] null at idx={} args.len={} arg={:?}\n{}",
                     idx,
                     args.len(),
+                    args.get(idx),
                     std::backtrace::Backtrace::force_capture()
                 );
             }
@@ -26814,8 +26831,59 @@ fn getclass_backing_is_random_access(ctx: &mut dyn NativeContext, this: ObjectRe
         Some(cid) => cid,
         None => return false,
     };
-    let backing_cid = ctx.class_id_of_object(backing);
-    ctx.is_subclass(backing_cid, ra)
+    getclass_object_reaches(ctx, backing, ra, 0)
+}
+
+/// Does `obj` reach `target` as the object it STANDS FOR?
+///
+/// The plain `is_subclass` above is the whole answer for an ordinary receiver.
+/// It is not the answer for a wrapper of a wrapper —
+/// `Collections.unmodifiableList(List.of("a", "b"))` backs one
+/// `cratonvm/internal/UnmodifiableList` stamp with another, and every stamp
+/// declares only its FAMILY-level interfaces (`List`, `Collection`,
+/// `Serializable`), never `RandomAccess`, because that marker is a property of
+/// what the instance wraps. Asking the inner stamp's own hierarchy answers
+/// `false` for `List.of`, whose HotSpot display class
+/// (`ImmutableCollections$ListN`, via `AbstractImmutableList`) implements it.
+///
+/// So descend slot 0 (`UNMOD_FIELD_BACKING`): an unmodifiable view carries the
+/// marker exactly when the thing it wraps does.
+///
+/// This function is one half of a PAIR and must not move alone. The interpreter
+/// runs the identical rule in `interpreter::typecheck::object_reaches`, because
+/// the `instanceof`/`checkcast` opcodes cannot call in here — the receiver is a
+/// bare Rust local at that point and this side may load classes and safepoint.
+/// The two answer the same question about the same object through different
+/// machinery, and when they disagree the VM reports one class from `getClass()`
+/// and admits a different one at a cast. Change either and change both;
+/// `apps/probes/RandomAccessProbe` prints all three doors per row and an
+/// `agree=` column that goes false the moment they part.
+fn getclass_object_reaches(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+    target: cratonvm_types::ClassId,
+    depth: usize,
+) -> bool {
+    // A wrapper chain is a handful of links; the bound is a cycle guard, not a
+    // policy. (`alloc_unmod_wrapper` stores an object that already existed, so
+    // slot-0 nesting is acyclic by construction — this is insurance.)
+    if depth > 8 {
+        return false;
+    }
+    let cid = ctx.class_id_of_object(obj);
+    if ctx.is_subclass(cid, target) {
+        return true;
+    }
+    let is_stamp = ctx
+        .class_name_of_id(cid)
+        .is_some_and(|n| n.starts_with("cratonvm/internal/Unmodifiable"));
+    if !is_stamp {
+        return false;
+    }
+    match ctx.get_field(obj, 0) {
+        Value::Object(Some(inner)) => getclass_object_reaches(ctx, inner, target, depth + 1),
+        _ => false,
+    }
 }
 
 /// Whether the backing set of an unmodifiable-sorted-set wrapper (slot 0,
@@ -28137,6 +28205,30 @@ fn route_write_through_out(ctx: &mut dyn NativeContext, args: &[Value], bytes: &
 /// path through `String.getBytes(Charset)`, which is the JDK's own encoder and
 /// therefore right for every charset this VM can load, at the cost of one
 /// String allocation on a path that is by construction rare.
+/// The charset name a `PrintStream` with no usable `charset` field should be
+/// repaired to.
+///
+/// `System.out` / `System.err` answer their OWN stream encoding; every other
+/// `PrintStream` answers `Charset.defaultCharset()`, which JEP 400 pins to
+/// UTF-8. MEASURED on Temurin 25.0.3+9 under `LANG=C`, in ONE run:
+/// `System.out.charset()` is `US-ASCII` and `new PrintStream(baos).charset()`
+/// is `UTF-8`. A single constant here cannot be right for both.
+fn printstream_repair_encoding(ctx: &dyn NativeContext, this: Option<ObjectRef>) -> String {
+    if let Some(this) = this {
+        for (stream, key) in [("out", "stdout.encoding"), ("err", "stderr.encoding")] {
+            if let Some(canonical) = ctx.get_system_stream(stream) {
+                if std::ptr::eq(canonical.as_ptr(), this.as_ptr()) {
+                    return ctx
+                        .get_system_property(key)
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| "UTF-8".to_string());
+                }
+            }
+        }
+    }
+    "UTF-8".to_string()
+}
+
 fn printstream_encode(ctx: &mut dyn NativeContext, args: &[Value], text: &str) -> Option<Vec<u8>> {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -28148,9 +28240,28 @@ fn printstream_encode(ctx: &mut dyn NativeContext, args: &[Value], text: &str) -
     };
     let cid = ctx.class_id_of_object(cs);
     match ctx.class_name_arc_of_id(cid).as_deref() {
-        // The abstract stand-in `install_charset` stamps at bootstrap answers
-        // UTF-8 through `PrintStream.charset()`, so it means UTF-8 here too.
-        None | Some("sun/nio/cs/UTF_8") | Some("java/nio/charset/Charset") => None,
+        None | Some("sun/nio/cs/UTF_8") => None,
+        // The abstract stand-in a synthetic-JDK image falls back to. It used
+        // to be read as "UTF-8" unconditionally, which was true only while
+        // `install_charset` stamped a hard-coded UTF-8; now that the stamp
+        // carries the HOST's encoding, a stand-in named `US-ASCII` that still
+        // emitted UTF-8 bytes would be the one outcome worse than either
+        // honest answer — a stream lying about its own wire format. Its `name`
+        // slot is the only thing it has, so encode through the VM's own engine
+        // by that name.
+        Some("java/nio/charset/Charset") => {
+            let name = match ctx.get_field(cs, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            match cratonvm_native_api::charset::canonical_charset_name(&name) {
+                None | Some("UTF-8") => None,
+                Some(canon) => {
+                    let units: Vec<u16> = text.encode_utf16().collect();
+                    Some(cratonvm_native_api::charset::encode_chars_lossy(canon, &units))
+                }
+            }
+        }
         Some("sun/nio/cs/ISO_8859_1") => Some(
             text.chars()
                 .map(|c| if (c as u32) < 0x100 { c as u8 } else { b'?' })
@@ -30624,9 +30735,19 @@ pub(crate) const BUFFER_ADDRESS_SENTINEL: usize = 0x7fff_ffff_ffff_fffe;
 pub(crate) fn array_index_scale_for_name(name: &str) -> i32 {
     let bytes = name.as_bytes();
     if bytes.first() != Some(&b'[') {
-        // A NON-ARRAY class answers 0, which is what
-        // `sun.misc.Unsafe.arrayIndexScale`'s javadoc specifies and what
-        // callers guard on (`if (scale == 0) throw`). It answered the
+        // A NON-ARRAY class answers 0. NOT because the javadoc says so --
+        // it does not, and this comment claimed otherwise until 2026-09-02.
+        // JDK 25's javadoc reads "arrays of 'narrow' types will generally not
+        // work properly with accessors like getByte(Object, long), so the
+        // scale factor for such classes is reported as zero": that is about
+        // ARRAYS of narrow types, and it says nothing about a non-array.
+        //
+        // So 0 is this VM's CHOICE. The reason it is the right one: HotSpot
+        // intends a refusal here and fails to deliver it (see below), and
+        // reproducing a botched throw would make us wrong the day the JDK
+        // fixes it -- while 0 is the answer callers guard on
+        // (`if (scale == 0) throw`) and the safe direction for a caller doing
+        // address arithmetic. It answered the
         // catch-all 1 until 2026-08-29 -- a plausible basis for address
         // arithmetic over a class that has no elements, which in this family
         // is the dangerous direction.
@@ -36216,7 +36337,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             ("UTF_16LE", "UTF-16LE"),
         ];
         for (field_name, charset_name) in charsets {
-            let obj = charset_alloc(ctx, charset_name)?;
+            let obj = charset_concrete_or_synthetic(ctx, charset_name)?;
             ctx.set_static_field_by_name(
                 "java/nio/charset/StandardCharsets",
                 field_name,
@@ -36920,7 +37041,8 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                 // Abstract stand-in: replace it, and write the repair back so
                 // the direct `getfield charset` that real `PrintStream` bytecode
                 // performs sees the concrete one too.
-                let fixed = charset_concrete_or_synthetic(ctx, "UTF-8")?;
+                let want = printstream_repair_encoding(&*ctx, Some(this));
+                let fixed = charset_concrete_or_synthetic(ctx, &want)?;
                 ctx.set_field_by_name(this, "charset", Value::Object(Some(fixed)));
                 return Ok(Some(Value::Object(Some(fixed))));
             }
@@ -36930,7 +37052,8 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             // charset and then calls `newEncoder()` on it — abstract on the
             // fabricated base, so a stand-in here trades the NPE this override
             // exists to prevent for an `AbstractMethodError` one call later.
-            let cs = charset_concrete_or_synthetic(ctx, "UTF-8")?;
+            let want = printstream_repair_encoding(&*ctx, Some(this));
+            let cs = charset_concrete_or_synthetic(ctx, &want)?;
             ctx.set_field_by_name(this, "charset", Value::Object(Some(cs)));
             Ok(Some(Value::Object(Some(cs))))
         },
@@ -37260,8 +37383,12 @@ fn throw_unsupported_charset_exception(
 }
 
 fn native_charset_default(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let charset = charset_alloc(ctx, "UTF-8");
-    Ok(Some(Value::Object(Some(charset?))))
+    // CONCRETE, for the same reason `PrintStream.charset()` is: the caller's
+    // next move is `newEncoder()`, which is abstract on the fabricated base.
+    // JEP 400 pins this to UTF-8 regardless of the platform encoding — it
+    // follows `file.encoding`, not `native.encoding`.
+    let charset = charset_concrete_or_synthetic(ctx, "UTF-8")?;
+    Ok(Some(Value::Object(Some(charset))))
 }
 
 /// `Charset.availableCharsets()` — return a real-JDK TreeMap populated
@@ -37303,7 +37430,7 @@ fn native_charset_available_charsets(
     )?;
     let map_pin = ctx.pin_native_root(map);
     for name in charsets {
-        let value = charset_alloc(ctx, name)?;
+        let value = charset_concrete_or_synthetic(ctx, name)?;
         let value_pin = ctx.pin_native_root(value);
         let key = ctx.create_string(name);
         let map = ctx.read_native_pin(map_pin, map);
@@ -37400,22 +37527,34 @@ fn native_charset_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_std_charset_utf8(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(charset_alloc(ctx, "UTF-8")?))))
+    Ok(Some(Value::Object(Some(charset_concrete_or_synthetic(
+        ctx, "UTF-8",
+    )?))))
 }
 fn native_std_charset_utf16(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(charset_alloc(ctx, "UTF-16")?))))
+    Ok(Some(Value::Object(Some(charset_concrete_or_synthetic(
+        ctx, "UTF-16",
+    )?))))
 }
 fn native_std_charset_utf16be(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(charset_alloc(ctx, "UTF-16BE")?))))
+    Ok(Some(Value::Object(Some(charset_concrete_or_synthetic(
+        ctx, "UTF-16BE",
+    )?))))
 }
 fn native_std_charset_utf16le(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(charset_alloc(ctx, "UTF-16LE")?))))
+    Ok(Some(Value::Object(Some(charset_concrete_or_synthetic(
+        ctx, "UTF-16LE",
+    )?))))
 }
 fn native_std_charset_ascii(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(charset_alloc(ctx, "US-ASCII")?))))
+    Ok(Some(Value::Object(Some(charset_concrete_or_synthetic(
+        ctx, "US-ASCII",
+    )?))))
 }
 fn native_std_charset_latin1(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(charset_alloc(ctx, "ISO-8859-1")?))))
+    Ok(Some(Value::Object(Some(charset_concrete_or_synthetic(
+        ctx, "ISO-8859-1",
+    )?))))
 }
 
 /// Normalize a charset name to its canonical form, or return empty if unsupported.
@@ -45051,6 +45190,71 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
         "getEnumConstants",
         "()[Ljava/lang/Object;",
         native_class_get_enum_constants,
+    );
+    // Three JDK enums whose constants the synthetic model did not carry.
+    // `--synthetic-jdk` only, for the reason `native_enum_value_of` states: in
+    // real-JDK mode the real `<clinit>` and `values()` bytecode run and a
+    // registration here would only shadow them. `<clinit>` is additionally
+    // runtime-gated inside `publish_synthetic_enum_constants` on
+    // `is_class_synthetic_stub`, so a feature-enabled binary in real-JDK mode
+    // leaves the JDK's own interned constants alone.
+    //
+    // The constant lists live beside the publisher in `lang_class`, and must
+    // stay identical to `class_manager.rs`'s `enum_constant_fields` rows — that
+    // side declares the statics, this side fills them, and declared-but-unfilled
+    // is a NULL constant, which is worse than the `NoSuchFieldError` it
+    // replaces.
+    #[cfg(feature = "synthetic-jdk")]
+    {
+        registry.register(
+            "java/time/DayOfWeek",
+            "<clinit>",
+            "()V",
+            crate::lang_class::day_of_week_clinit,
+        );
+        registry.register(
+            "java/time/DayOfWeek",
+            "values",
+            "()[Ljava/time/DayOfWeek;",
+            crate::lang_class::day_of_week_values,
+        );
+        registry.register(
+            "java/net/http/HttpClient$Version",
+            "<clinit>",
+            "()V",
+            crate::lang_class::http_version_clinit,
+        );
+        registry.register(
+            "java/net/http/HttpClient$Version",
+            "values",
+            "()[Ljava/net/http/HttpClient$Version;",
+            crate::lang_class::http_version_values,
+        );
+        registry.register(
+            "java/net/http/HttpClient$Redirect",
+            "<clinit>",
+            "()V",
+            crate::lang_class::http_redirect_clinit,
+        );
+        registry.register(
+            "java/net/http/HttpClient$Redirect",
+            "values",
+            "()[Ljava/net/http/HttpClient$Redirect;",
+            crate::lang_class::http_redirect_values,
+        );
+    }
+
+    // `Enum.valueOf(Class, String)` — synthetic-JDK only. See
+    // `lang_class::native_enum_value_of`: `java/lang/Enum`'s natives were
+    // retired against the real-JDK suite, where the real bytecode serves them,
+    // and this mode has none. Registered here beside the constant source it
+    // shares so the two stay together.
+    #[cfg(feature = "synthetic-jdk")]
+    registry.register(
+        "java/lang/Enum",
+        "valueOf",
+        "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;",
+        crate::lang_class::native_enum_value_of,
     );
     // Package-private `Class.getEnumConstantsShared()` — backs
     // `EnumMap.getKeyUniverse` via `SharedSecrets.getJavaLangAccess()`.

@@ -313,6 +313,42 @@ pub type ClassSiteCache = SiteCache<ResolvedNewSite>;
 /// plain data (ids, an index and four flag bytes), so a hit clones no `Arc`.
 pub type FieldSiteCache = SiteCache<cratonvm_classloading::resolution::ResolvedField>;
 
+/// One quickened instance-field site (see `JvmThread::fast_field_sites`).
+///
+/// Everything the `getfield` / `putfield` fast arms need to touch the field
+/// of a receiver whose header matches `(receiver_class_id, num_slots)`
+/// without resolving, retargeting or looking up a layout. A receiver whose
+/// header does not match falls back to the full handler, which refills.
+#[derive(Clone, Copy, Debug)]
+pub struct FastFieldSite {
+    /// `ObjectHeader::class_id` the layout below was resolved for.
+    pub receiver_class_id: cratonvm_types::ClassId,
+    /// `ObjectHeader::num_slots()` of that receiver; the compact layout
+    /// registry is keyed by `(class_id, field_count)`.
+    pub num_slots: u32,
+    /// Byte offset of the field from the end of the object header: the
+    /// layout's own for a compact body, `field_index * SLOT_SIZE` for a
+    /// legacy one.
+    pub offset: u32,
+    /// Storage kind the compact layout assigned to the field, or `None` when
+    /// the receiver has a **legacy** body — one 16-byte tagged `Value` cell
+    /// per field, which is what `ZgcRealHeap::try_alloc_object` (the TLAB path
+    /// the interpreter allocates through) produces. This doubles as the
+    /// body-shape discriminant the fast arms re-check against the receiver's
+    /// `GC_FLAG_COMPACT`.
+    pub storage: Option<cratonvm_types::FieldStorageKind>,
+    /// `ResolvedField::field_index`, for the JVMTI watch check and the
+    /// slow-path barrier calls that take a slot index.
+    pub field_index: u32,
+    /// `ResolvedField::desc_byte` — the legacy arm converts the cell's
+    /// `Value` by descriptor exactly as `op_getfield` / `op_putfield` do.
+    pub desc_byte: u8,
+    /// `ResolvedField::is_reference`, for the same reason.
+    pub is_reference: bool,
+}
+
+pub type FastFieldSiteCache = SiteCache<FastFieldSite>;
+
 /// Per-thread resolved-method sites; see [`MethodSiteInfo`].
 pub type MethodSiteCache = SiteCache<MethodSiteInfo>;
 
@@ -349,6 +385,49 @@ pub type MethodSiteCache = SiteCache<MethodSiteInfo>;
 /// `proxy_instance_satisfies_target`, …) are name-based. So the cache
 /// accelerates the assignable case and leaves every refusal exactly as it was.
 pub type CastSiteCache = SiteCache<ClassId>;
+
+/// Per-thread memo for the **interface receiver-selection re-check**.
+///
+/// # What it removes
+///
+/// `execute_invokevirtual_cached`'s `VirtualBytecode` arm re-verifies, on every
+/// `invokeinterface` that hits the inline cache, that receiver-rooted
+/// maximally-specific resolution from the *actual* receiver class still selects
+/// the cached method's declaring class. The check exists for a real bug — a
+/// parent-interface default that stayed cached after it masked a covariant
+/// bridge on a receiver subinterface — but it was being answered with a
+/// `class_manager` read lock plus a full `find_method_recursive` hierarchy walk,
+/// **per call**.
+///
+/// `invokeinterface` and `invokevirtual` reach the same dispatcher and differ in
+/// exactly this block, which makes the cost directly attributable. Measured
+/// (`probes/Dispatch.java`, `--nojit`, min-of-7, arms interleaved):
+/// interface-over-virtual was **114 ns** on CratonVM against **3.4 ns** on
+/// HotSpot's template interpreter.
+///
+/// # What is stored, and why the value is a pair
+///
+/// Key: the call site, `(caller class, cp index)`. Value: the
+/// `(receiver class, selected declaring class)` pair the walk *verified*.
+///
+/// The key alone is not enough. One interface call site can see several
+/// concrete receiver classes, and the answer is a property of the receiver, not
+/// of the site. Storing the verified pair and comparing both halves on a hit
+/// means a site that rotates receivers simply misses and re-walks — today's
+/// behaviour, no worse — while a monomorphic site (the overwhelming majority)
+/// answers from an array index and two integer compares.
+///
+/// # Validity
+///
+/// Exactly [`SiteCache`]'s: `class_definition_epoch`, `resolution_epoch`, and
+/// the `any_class_redefined` latch. That set is not merely sufficient here, it
+/// is the precise one — a receiver class's superclass and superinterface chain
+/// is fixed at load time, so the walk's answer can only move when a class is
+/// redefined in place (the latch) or when `upgrade_synthetic_class` /
+/// `recompute_subclass_layouts` rewrites a class under an unchanged `ClassId`
+/// (the resolution epoch, which the invalidate hook bumps and which nothing
+/// else in the invoke-cache path observes).
+pub type IfaceSelectSiteCache = SiteCache<(ClassId, ClassId)>;
 
 /// `CRATONVM_DBG=field-site` — prove the site caches are actually firing before
 /// anyone times them.
@@ -423,14 +502,42 @@ pub mod site_stats {
     pub const JIT_LDC_HIT: usize = 19;
     pub const JIT_LDC_MISS: usize = 20;
     pub const JIT_LDC_FILL: usize = 21;
+    /// The interface receiver-selection re-check, answered from the memo
+    /// instead of a `class_manager` read lock plus a `find_method_recursive`
+    /// hierarchy walk. See [`super::IfaceSelectSiteCache`].
+    ///
+    /// A `hit` here is one avoided lock acquisition. `hit` at zero with
+    /// `miss` climbing on an interface-heavy workload means the call sites are
+    /// polymorphic enough that the memo's monomorphic slot thrashes, which is
+    /// a different finding from "the memo is not wired up".
+    pub const IFACE_SELECT_HIT: usize = 22;
+    pub const IFACE_SELECT_MISS: usize = 23;
+    pub const IFACE_SELECT_FILL: usize = 24;
+    /// The re-check was skipped outright because the receiver's own class is
+    /// the cached method's declaring class, which makes receiver-rooted
+    /// selection trivially agree. Counted apart from `IFACE_SELECT_HIT` so
+    /// "the memo is carrying the workload" stays distinguishable from "the
+    /// workload never needed the memo in the first place".
+    pub const IFACE_SELECT_TRIVIAL: usize = 25;
+    pub const FAST_GET_HIT: usize = 26;
+    pub const FAST_GET_MISS: usize = 27;
+    pub const FAST_GET_FILL: usize = 28;
+    pub const FAST_PUT_HIT: usize = 29;
+    pub const FAST_PUT_MISS: usize = 30;
+    pub const FAST_PUT_FILL: usize = 31;
+    pub const FAST_FIELD_UNUSABLE: usize = 32;
+    pub const DOOR_STATIC_HIT: usize = 33;
+    pub const DOOR_STATIC_MISS: usize = 34;
+    pub const DOOR_SPECIAL_HIT: usize = 35;
+    pub const DOOR_SPECIAL_MISS: usize = 36;
 
-    const N: usize = 22;
+    const N: usize = 37;
 
     #[allow(clippy::declare_interior_mutable_const)]
     const ZERO: AtomicU64 = AtomicU64::new(0);
     static COUNTS: [AtomicU64; N] = [ZERO; N];
 
-    pub(super) fn on() -> bool {
+    pub fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| {
             cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FIELD_SITE").is_some()
@@ -450,7 +557,7 @@ pub mod site_stats {
 
     fn report(when: &str) {
         eprintln!(
-            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={} | cast: hit={} miss={} fill={} reject_loader={} unusable={} | ldc: hit={} miss={} fill={} | jit-ldc: hit={} miss={} fill={}",
+            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={} | cast: hit={} miss={} fill={} reject_loader={} unusable={} | ldc: hit={} miss={} fill={} | jit-ldc: hit={} miss={} fill={} | iface-select: hit={} miss={} fill={} trivial={} | fast-field: get hit={} miss={} fill={} put hit={} miss={} fill={} unusable={} | door: static hit={} miss={} special hit={} miss={}",
             super::field_site_slots(),
             COUNTS[FIELD_HIT].load(Ordering::Relaxed),
             COUNTS[FIELD_MISS].load(Ordering::Relaxed),
@@ -474,6 +581,21 @@ pub mod site_stats {
             COUNTS[JIT_LDC_HIT].load(Ordering::Relaxed),
             COUNTS[JIT_LDC_MISS].load(Ordering::Relaxed),
             COUNTS[JIT_LDC_FILL].load(Ordering::Relaxed),
+            COUNTS[IFACE_SELECT_HIT].load(Ordering::Relaxed),
+            COUNTS[IFACE_SELECT_MISS].load(Ordering::Relaxed),
+            COUNTS[IFACE_SELECT_FILL].load(Ordering::Relaxed),
+            COUNTS[IFACE_SELECT_TRIVIAL].load(Ordering::Relaxed),
+            COUNTS[FAST_GET_HIT].load(Ordering::Relaxed),
+            COUNTS[FAST_GET_MISS].load(Ordering::Relaxed),
+            COUNTS[FAST_GET_FILL].load(Ordering::Relaxed),
+            COUNTS[FAST_PUT_HIT].load(Ordering::Relaxed),
+            COUNTS[FAST_PUT_MISS].load(Ordering::Relaxed),
+            COUNTS[FAST_PUT_FILL].load(Ordering::Relaxed),
+            COUNTS[FAST_FIELD_UNUSABLE].load(Ordering::Relaxed),
+            COUNTS[DOOR_STATIC_HIT].load(Ordering::Relaxed),
+            COUNTS[DOOR_STATIC_MISS].load(Ordering::Relaxed),
+            COUNTS[DOOR_SPECIAL_HIT].load(Ordering::Relaxed),
+            COUNTS[DOOR_SPECIAL_MISS].load(Ordering::Relaxed),
         );
     }
 

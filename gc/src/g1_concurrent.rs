@@ -83,7 +83,15 @@ const WORKER_STEP_BUDGET: usize = 256;
 /// Polling interval the worker uses when it observes an empty gray set
 /// but has not been told to stop. Park-with-timeout so SATB pushes that
 /// race past the `notify_work_available` signal still get picked up.
-const WORKER_POLL_MS: u64 = 5;
+///
+/// Ten-findings item 9b: this was 5 ms, and it was the PRIMARY wake — nothing
+/// on the mutator side notified a parked worker when a SATB buffer spilled,
+/// so a parked marker took the region guard and the SATB shards 200 times a
+/// second for the whole cycle to discover work it was never told about. The
+/// collector now wakes the workers itself (`G1Collector::wake_marker`, from
+/// the SATB spill, `push_gray_or_mark` and `remark`), and this is the
+/// fallback it was documented as.
+pub(crate) const WORKER_POLL_MS: u64 = 250;
 
 /// Shared state between the coordinator (typically the VM thread that
 /// initiated the GC cycle) and the background mark worker.
@@ -107,10 +115,16 @@ pub struct ConcurrentMarkState {
     /// Telemetry: total gray pointers processed (sum of step budgets).
     pub work_units_done: AtomicU64,
 
-    /// Park lock: the worker holds this while parked on `done_cvar`.
-    /// Mutex protects the "I'm parked" flag — coordinator must reacquire
-    /// the lock before signalling so the wake notification is not lost.
-    pub parked: Mutex<bool>,
+    /// Park lock: a worker holds this while parking on `done_cvar`.
+    /// The mutex protects the parked COUNT — the coordinator must reacquire
+    /// the lock before signalling so a wake notification is not lost.
+    ///
+    /// F-12 turned this from a bool into a count, because there are now N
+    /// workers and any subset of them may be parked. Nothing depends on the
+    /// count's exact value (the park is bounded by `WORKER_POLL_MS` regardless);
+    /// it exists so `notify_work_available` can skip the wake when nobody is
+    /// waiting, which is the whole point of the fast path.
+    pub parked: Mutex<usize>,
     /// Wake condition: coordinator notifies after pushing to the
     /// worklist OR after setting `should_stop`.
     pub done_cvar: Condvar,
@@ -123,7 +137,7 @@ impl ConcurrentMarkState {
             quiesced: AtomicBool::new(false),
             steps_performed: AtomicU64::new(0),
             work_units_done: AtomicU64::new(0),
-            parked: Mutex::new(false),
+            parked: Mutex::new(0),
             done_cvar: Condvar::new(),
         }
     }
@@ -144,20 +158,23 @@ impl ConcurrentMarkState {
         // Acquire the mutex so the wake races correctly with a worker
         // that was about to park: parking_lot's pattern is "lock, set
         // flag, wait" so we must lock to observe a consistent flag.
-        let mut parked = self.parked.lock();
-        if *parked {
-            *parked = false;
-            self.done_cvar.notify_one();
+        let parked = self.parked.lock();
+        if *parked > 0 {
+            // F-12 — `notify_all`, not `notify_one`. With several workers a
+            // single wake leaves the rest asleep on a gray set that now has
+            // work in it, and they would only find it on the 5 ms poll. A
+            // spurious wake costs one empty step; a missed one costs latency on
+            // every remaining worker.
+            self.done_cvar.notify_all();
         }
     }
 
     /// Coordinator → worker: stop ASAP.
     pub fn request_stop(&self) {
         self.should_stop.store(true, Ordering::Release);
-        // Also kick the cvar — if the worker is parked it must wake to
-        // observe the stop request.
-        let mut parked = self.parked.lock();
-        *parked = false;
+        // Also kick the cvar — every parked worker must wake to observe the
+        // stop request.
+        let _parked = self.parked.lock();
         self.done_cvar.notify_all();
     }
 
@@ -170,13 +187,13 @@ impl ConcurrentMarkState {
         if self.should_stop.load(Ordering::Acquire) {
             return;
         }
-        *parked = true;
+        *parked += 1;
         // wait_for: returns either on notify or on timeout. In either
         // case we re-check `should_stop` in the loop body.
         let _ = self
             .done_cvar
             .wait_for(&mut parked, Duration::from_millis(WORKER_POLL_MS));
-        *parked = false;
+        *parked = parked.saturating_sub(1);
     }
 }
 
@@ -195,7 +212,13 @@ impl Default for ConcurrentMarkState {
 /// safety net.
 pub struct ConcurrentMarkController {
     pub state: Arc<ConcurrentMarkState>,
-    handle: Option<JoinHandle<()>>,
+    /// F-12 — one handle per marking worker. Was a single `Option<JoinHandle>`;
+    /// `G1Collector::mark_worker_count()` decides how many there are, and a
+    /// worker's index in this vector is the deque index it owns for its life.
+    handles: Vec<JoinHandle<()>>,
+    /// Item 9b — kept so the wake handle installed at `spawn` can be
+    /// uninstalled when the cycle's workers are stopped.
+    g1: Arc<G1Collector>,
 }
 
 impl ConcurrentMarkController {
@@ -210,20 +233,30 @@ impl ConcurrentMarkController {
     /// bound on `spawn` is satisfied by the Arc.
     pub fn spawn(g1: Arc<G1Collector>) -> Self {
         let state = Arc::new(ConcurrentMarkState::new());
-        let worker_state = Arc::clone(&state);
-        let worker_g1 = Arc::clone(&g1);
-
-        let handle = std::thread::Builder::new()
-            .name("g1-concurrent-mark".to_string())
-            .spawn(move || {
-                Self::worker_loop(worker_g1, worker_state);
+        // Item 9b — let the collector wake these workers directly.
+        g1.install_mark_waker(Arc::clone(&state));
+        // F-12 — one thread per gray deque. The collector fixed the count at
+        // construction (`concurrent_mark_worker_count`, a quarter of the
+        // evacuation width, or 1 under `CRATONVM_G1_PARALLEL_MARK=0`), because
+        // a worker's id indexes the deque array.
+        let workers = g1.mark_worker_count();
+        let handles = (0..workers)
+            .map(|id| {
+                let worker_state = Arc::clone(&state);
+                let worker_g1 = Arc::clone(&g1);
+                std::thread::Builder::new()
+                    // Numbered so a stuck cycle is identifiable in a native
+                    // stack dump without cross-referencing thread ids, the same
+                    // way the evacuation pool names its workers.
+                    .name(format!("g1-concurrent-mark-{id}"))
+                    .spawn(move || {
+                        Self::worker_loop(worker_g1, worker_state, id);
+                    })
+                    .expect("g1-concurrent-mark thread spawn failed")
             })
-            .expect("g1-concurrent-mark thread spawn failed");
+            .collect();
 
-        Self {
-            state,
-            handle: Some(handle),
-        }
+        Self { state, handles, g1 }
     }
 
     /// Body of the background mark thread.
@@ -234,12 +267,13 @@ impl ConcurrentMarkController {
     /// - On exit (return), `should_stop` was observed `true` AND the
     ///   loop performed one final drain attempt so any straggler the
     ///   coordinator pushed before signalling stop is processed.
-    fn worker_loop(g1: Arc<G1Collector>, state: Arc<ConcurrentMarkState>) {
+    fn worker_loop(g1: Arc<G1Collector>, state: Arc<ConcurrentMarkState>, id: usize) {
         loop {
-            // Drain the gray set under the current budget. `concurrent_mark_step`
-            // returns true iff the worklist is empty AND no overflow rescan
-            // is pending — i.e. a fixed point was reached.
-            let drained = g1.concurrent_mark_step(WORKER_STEP_BUDGET);
+            // Drain this worker's share under the current budget.
+            // `concurrent_mark_step_worker` returns true iff the WHOLE gray set
+            // (seed queue and every deque) is empty, no peer is mid-scan, and
+            // no overflow rescan is pending — i.e. a global fixed point.
+            let drained = g1.concurrent_mark_step_worker(id, WORKER_STEP_BUDGET);
             state.steps_performed.fetch_add(1, Ordering::Relaxed);
             state
                 .work_units_done
@@ -252,7 +286,7 @@ impl ConcurrentMarkController {
                 // SATB entries onto the worklist between our last step
                 // and the stop signal. Honour them so the STW remark
                 // has less work to do.
-                let _ = g1.concurrent_mark_step(WORKER_STEP_BUDGET);
+                let _ = g1.concurrent_mark_step_worker(id, WORKER_STEP_BUDGET);
                 return;
             }
 
@@ -286,20 +320,37 @@ impl ConcurrentMarkController {
     /// Returns the join handle's result so an OOM panic in the worker
     /// surfaces here.
     pub fn request_stop_and_join(mut self) -> std::thread::Result<()> {
+        self.g1.clear_mark_waker();
         self.state.request_stop();
-        if let Some(h) = self.handle.take() {
-            return h.join();
+        // Join EVERY worker, and report the first panic rather than the last:
+        // a worker that unwound has left the cycle incomplete, and the
+        // coordinator is about to run the STW remark on that basis. Joining
+        // them all even after a failure is not optional — a live marker thread
+        // touching deques while the pause remaps them is the failure this
+        // whole join exists to prevent.
+        let mut first_error = None;
+        for handle in self.handles.drain(..) {
+            if let Err(payload) = handle.join() {
+                if first_error.is_none() {
+                    first_error = Some(payload);
+                }
+            }
         }
-        Ok(())
+        match first_error {
+            Some(payload) => Err(payload),
+            None => Ok(()),
+        }
     }
 
     /// Test/inspection helper: has the worker thread actually started?
     /// Used by the spawn/join test below.
     pub fn is_running(&self) -> bool {
-        self.handle
-            .as_ref()
-            .map(|h| !h.is_finished())
-            .unwrap_or(false)
+        self.handles.iter().any(|h| !h.is_finished())
+    }
+
+    /// How many marking workers this controller started.
+    pub fn worker_count(&self) -> usize {
+        self.handles.len()
     }
 
     /// True once the worker has marked to a fixed point (worklist drained, no
@@ -323,12 +374,11 @@ impl Drop for ConcurrentMarkController {
         // Best-effort cleanup if the user didn't call request_stop_and_join.
         // We can't block on join here (Drop is sync), but we can flip the
         // flag and let the OS reap the thread on exit.
+        self.g1.clear_mark_waker();
         self.state.request_stop();
-        if let Some(h) = self.handle.take() {
-            // Detach: don't block. Production code should call
-            // `request_stop_and_join` explicitly.
-            std::mem::drop(h);
-        }
+        // Detach every worker: don't block. Production code should call
+        // `request_stop_and_join` explicitly.
+        self.handles.clear();
     }
 }
 
@@ -350,6 +400,7 @@ mod tests {
         // SAFETY: single-threaded test harness; no mutator is running.
         unsafe { crate::collector::StopTheWorldToken::new() }
     }
+    use crate::heap::ArrayElementType;
     use cratonvm_types::{ClassId, Value};
     use std::collections::HashMap;
 
@@ -369,6 +420,42 @@ mod tests {
 
     /// Test #1 — the concurrent-mark thread spawns and joins cleanly.
     /// Verifies the basic thread-lifecycle skeleton: spawn → run → stop → join.
+    /// Item 9b: a seed pushed while every worker is parked is picked up by
+    /// the wake, not by the fallback poll. The bound is half the poll, so a
+    /// result inside it cannot have come from the timeout.
+    #[test]
+    fn a_seed_wakes_a_parked_marker_without_waiting_for_the_poll() {
+        let g1 = small_collector();
+        g1.start_concurrent_mark(&stw());
+        let controller = ConcurrentMarkController::spawn(Arc::clone(&g1));
+        for _ in 0..500 {
+            if controller.is_quiesced() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(controller.is_quiesced(), "the marker parks on an empty gray set");
+
+        let a = g1.alloc_object(ClassId::new(1), 0);
+        let t0 = std::time::Instant::now();
+        g1.remark(&stw(), &[a]);
+        let bound = Duration::from_millis(WORKER_POLL_MS / 2);
+        let mut marked = false;
+        while t0.elapsed() < bound {
+            if g1.dbg_is_marked(a.as_ptr() as usize) {
+                marked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        controller.request_stop_and_join().expect("worker joined");
+        assert!(
+            marked,
+            "the seed was not marked within {bound:?}; the parked worker was waiting \
+             for the {WORKER_POLL_MS} ms poll instead of the wake"
+        );
+    }
+
     #[test]
     fn concurrent_mark_thread_spawns_and_joins() {
         let g1 = small_collector();
@@ -624,6 +711,153 @@ mod tests {
                 assert!(found, "{} must live in some region", label);
             }
         });
+    }
+
+    /// A collector whose configuration lets `concurrent_mark_worker_count`
+    /// derive the machine's ergonomic (`gc_worker_threads: 0`), so the F-12
+    /// tests below actually get more than one marker on a real machine.
+    fn parallel_mark_collector() -> Arc<G1Collector> {
+        Arc::new(G1Collector::new(G1CollectorConfig {
+            heap_size: 64 * 1024 * 1024,
+            region_size: 1024 * 1024,
+            ..Default::default()
+        }))
+    }
+
+    /// F-12 — several markers must actually share the work, and the sharing
+    /// must come from STEALING when the seed queue cannot supply it.
+    ///
+    /// A wide graph is the case that isolates the stealing path: the gray set
+    /// starts as ONE root, so the seed queue has nothing to hand out. Whichever
+    /// worker pops the root pushes every child onto its OWN deque, and the only
+    /// route by which its peers can get any of that work is to steal it. A
+    /// marker that had per-worker deques but no stealing would pass every
+    /// correctness test in this file and read zero here.
+    ///
+    /// Verified capable of failing: making `take_marking_work` return `false`
+    /// instead of scanning peers (i.e. deques without stealing) leaves
+    /// `dbg_mark_steals()` at 0 and all the scanning on one worker.
+    #[test]
+    fn parallel_markers_steal_the_wide_frontier_from_each_other() {
+        const CHILDREN: usize = 40_000;
+        let g1 = parallel_mark_collector();
+        if g1.mark_worker_count() < 2 {
+            eprintln!("[F-12] parallel marking not exercised: 1 worker on this machine");
+            return;
+        }
+
+        // One root holding CHILDREN references, each child holding one more
+        // object, so a stolen entry is itself worth scanning.
+        let root = g1.alloc_array(ClassId::new(6), ArrayElementType::Reference, CHILDREN);
+        for i in 0..CHILDREN {
+            let child = g1.alloc_object(ClassId::new(7), 1);
+            let leaf = g1.alloc_object(ClassId::new(8), 0);
+            g1.set_field(child, 0, Value::Object(Some(leaf)));
+            g1.set_array_element(root, i, Value::Object(Some(child)))
+                .expect("array store");
+        }
+
+        g1.start_concurrent_mark(&stw());
+        g1.remark(&stw(), &[root]);
+
+        let controller = ConcurrentMarkController::spawn(Arc::clone(&g1));
+        for _ in 0..5_000 {
+            if controller.is_quiesced() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        controller.request_stop_and_join().expect("workers joined");
+
+        let scans = g1.dbg_mark_worker_scans();
+        let busy = scans.iter().filter(|&&n| n > 0).count();
+        let steals = g1.dbg_mark_steals();
+        assert!(
+            steals > 0,
+            "no worker ever stole: per-worker scans {scans:?}. A {CHILDREN}-wide frontier starts life on ONE worker's deque, so zero steals means the peers had no route to the work at all (F-12)"
+        );
+        assert!(
+            busy >= 2,
+            "only {busy} of {} markers scanned anything ({scans:?}) — the deques exist but the work never spread (F-12)",
+            scans.len()
+        );
+    }
+
+    /// F-12 — no marker may report convergence while work is still outstanding.
+    ///
+    /// A DEEP chain is the adversarial shape for a parallel terminator: at any
+    /// instant only one worker has anything to do, so every peer is repeatedly
+    /// asking "is it over?" about a cycle that has barely started. Marking is
+    /// otherwise indistinguishable from the serial case, so nothing but the
+    /// termination decision is under test here.
+    ///
+    /// The assertion is deliberately not "marking finished" — it is
+    /// "everything reachable was marked by the time the markers SAID they had
+    /// converged", read BEFORE the workers are stopped, because stopping them
+    /// performs a final drain that would repair a premature verdict and hide
+    /// it. The coordinator runs the STW remark and then cleanup on that
+    /// verdict, so a premature one frees a live chain.
+    ///
+    /// Verified capable of failing: making `gray_set_is_empty` consult only the
+    /// seed queue — which is exactly what the pre-F-12 code did, and the
+    /// obvious way to get this wrong, because the seed queue empties the moment
+    /// the first worker takes its chunk — leaves 61,856 of the 100,000 chain
+    /// objects unmarked at the reported convergence.
+    ///
+    /// The `mark_active` term of the same test could NOT be falsified this way,
+    /// and that is worth writing down rather than leaving as a passing test:
+    /// the window it closes is when a worker holds popped work in a local
+    /// vector (between a successful steal and extending its own deque), and a
+    /// batch holds the deque lock for 32 objects, so a peer probing emptiness
+    /// almost always samples a batch boundary where the deque is non-empty. The
+    /// term stays because the window is real, not because a test found it.
+    #[test]
+    fn a_deep_chain_is_fully_marked_before_the_markers_report_convergence() {
+        const LINKS: usize = 100_000;
+        let g1 = parallel_mark_collector();
+        if g1.mark_worker_count() < 2 {
+            eprintln!("[F-12] parallel termination not exercised: 1 worker on this machine");
+            return;
+        }
+
+        let head = g1.alloc_object(ClassId::new(21), 1);
+        let mut chain = vec![head];
+        let mut prev = head;
+        for _ in 1..LINKS {
+            let next = g1.alloc_object(ClassId::new(21), 1);
+            g1.set_field(prev, 0, Value::Object(Some(next)));
+            chain.push(next);
+            prev = next;
+        }
+
+        g1.start_concurrent_mark(&stw());
+        g1.remark(&stw(), &[head]);
+
+        let controller = ConcurrentMarkController::spawn(Arc::clone(&g1));
+        let mut converged = false;
+        for _ in 0..2_000 {
+            if controller.is_quiesced() {
+                converged = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Read the marks BEFORE stopping the workers: stopping performs a final
+        // drain, which would mark whatever a premature verdict had left behind
+        // and hide the very defect this test exists for.
+        let unmarked: Vec<usize> = chain
+            .iter()
+            .map(|o| o.as_ptr() as usize)
+            .filter(|&a| !g1.dbg_is_marked(a))
+            .collect();
+        controller.request_stop_and_join().expect("workers joined");
+
+        assert!(converged, "the markers never reported convergence");
+        assert!(
+            unmarked.is_empty(),
+            "{} of {LINKS} chain objects were still unmarked when the markers reported convergence — a worker declared a fixed point with gray work still outstanding (F-12)",
+            unmarked.len()
+        );
     }
 
     /// Test #5 — the worker observes `request_stop` even when there is

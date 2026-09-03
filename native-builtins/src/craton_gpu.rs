@@ -3162,10 +3162,14 @@ mod tests {
 
         // A second release of the same (already-released) handle must
         // not panic and must leave the array absent, matching
-        // `ResidencyTracker::release`'s documented idempotency
-        // (`vm/src/runtime/gpu_residency.rs`) and `releaseFuture`'s
-        // remove-is-a-no-op-on-missing-key shape used elsewhere in this
-        // file.
+        // `releaseFuture`'s remove-is-a-no-op-on-missing-key shape used
+        // elsewhere in this file.
+        //
+        // (This used to cite `ResidencyTracker::release` in
+        // `vm/src/runtime/gpu_residency.rs` as the convention being
+        // matched. That module was dead code -- nothing outside its own
+        // tests ever constructed one -- and was removed 2026-09-02. The
+        // resident store in this file is the only implementation.)
         builtin_release_array(&mut ctx, &[Value::Long(handle)]).unwrap();
         assert_eq!(
             builtin_array_is_resident(&mut ctx, &[Value::Long(handle)]).unwrap(),
@@ -3232,15 +3236,19 @@ pub mod dispatch_timing {
     }
 
     pub fn report() {
+        // The bridge's own engagement census, BEFORE the `calls == 0` gate:
+        // both lines are self-gating (silent for a run with no GPU work) and
+        // both count the `--gpu` auto-offload path, which never goes through
+        // `submitMethod` and so never moves `CALLS`. Until 2026-09-02 they sat
+        // behind the gate, so a transfer-floor or dot-product soak under
+        // `--gpu` printed no census at all -- a run whose pool served nothing
+        // read as a clean run.
+        cratonvm_types::gpu_event_census::exit_summary();
+        cratonvm_types::gpu_dispatch_memo_census::exit_summary();
         let calls = CALLS.load(Ordering::Relaxed);
         if calls == 0 {
             return;
         }
-        // The bridge's own engagement census, printed first because it is
-        // what says whether the two per-launch driver-call savings below
-        // are being served at all.
-        cratonvm_types::gpu_event_census::exit_summary();
-        cratonvm_types::gpu_dispatch_memo_census::exit_summary();
         let total: u64 = NANOS.iter().map(|n| n.load(Ordering::Relaxed)).sum();
         eprintln!(
             "[cratonvm] gpu dispatch: calls={calls} accounted={:.1} us/call",

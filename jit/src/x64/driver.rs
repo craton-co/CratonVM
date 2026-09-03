@@ -101,6 +101,73 @@ pub fn set_pending_local_handler_table(
     PENDING_LOCAL_HANDLER_CLASS.with(|c| c.set(declaring_class_id));
 }
 
+/// RAII scope for one compile's PC -> inline-chain recording session.
+///
+/// # Why a guard and not a paired call
+///
+/// `compile_with_param_slots` has on the order of forty `return None` bail
+/// paths — an unsupported opcode, a refused scan, a code buffer that overran,
+/// a lowering that ran past its budget — and a session left open on one of
+/// them is not merely a leak. `x64::inlining`'s rows are THREAD-LOCAL and
+/// keyed by a native code OFFSET, so the next compile scheduled on this
+/// worker thread would inherit rows naming offsets in a buffer that no longer
+/// exists and publish them on ITS artifact. A stack walk would then expand a
+/// frame into callees belonging to a method that was never compiled.
+///
+/// That is the same ABA hazard A18 refused a process-global registry keyed by
+/// the executable buffer's base address over (`.agent-requests/A18-jit-lib.txt`),
+/// arriving through a different door: an abandoned compile rather than a freed
+/// and remapped buffer. Auditing forty returns by hand and keeping them
+/// audited is exactly the discipline this codebase has repeatedly failed at —
+/// `compile_gate.rs` exists because a fourth compile door was added without
+/// one — so the close is delegated to `Drop`, which runs on every one of them
+/// including a panic unwind, and no bail path has to know the session exists.
+///
+/// # Why the success path may close it directly
+///
+/// `finish_inline_frame_recording` is IDEMPOTENT: it `replace(false)`s the
+/// recording flag and `mem::take`s the rows, so a second call sees no session,
+/// touches nothing and returns an empty map. The success path therefore
+/// assigns `cm.inline_frame_map` from a direct call and simply lets this guard
+/// drop afterwards; there is no arming/disarming bool to get wrong, and no
+/// state a double close could corrupt.
+///
+/// # Not reentrant, and does not need to be
+///
+/// The staging thread-locals at the top of this file already document
+/// "same-thread, synchronous compile, no nesting", and no path out of codegen
+/// re-enters `compile_with_param_slots` — the splice emitter walks the
+/// callee's bytecode inside THIS compile rather than starting another one. A
+/// nested compile would silently close the outer session; if one is ever
+/// added, this guard is where it has to be handled.
+struct InlineFrameSession;
+
+impl InlineFrameSession {
+    /// Discard whatever an abandoned compile left on this thread and open a
+    /// fresh session. One thread-local write, plus a cached flag read; with
+    /// `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` the session opens closed and every
+    /// hook in `x64::inlining` bails on its first read.
+    fn open() -> Self {
+        crate::x64::begin_inline_frame_recording();
+        // The NPE trap table rides the same session: it is described from the
+        // same splice-scope stack, and a table left over from an abandoned
+        // compile names sites in a DIFFERENT code buffer.
+        crate::x64::begin_npe_trap_recording();
+        InlineFrameSession
+    }
+}
+
+impl Drop for InlineFrameSession {
+    fn drop(&mut self) {
+        // A discarding close. `code_len = 0` truncates every row, which is the
+        // right answer for a bail: there is no artifact, so no row describes
+        // live machine code. On the success path this is the second call and
+        // does nothing.
+        let _ = crate::x64::finish_inline_frame_recording(0);
+        let _ = crate::x64::finish_npe_trap_recording();
+    }
+}
+
 /// Compile a JVM bytecode method to x86-64 machine code.
 ///
 /// When `needs_heap` is true, the compiled code expects a heap pointer as the
@@ -317,6 +384,21 @@ pub(super) fn spliced_bytecode_len(site: &crate::InlineSite) -> usize {
 /// for the body's own frame, plus `callee_code_len` to bound its operand depth.
 /// A nested body gets its own locals and its own operand stack on top of the
 /// body that splices it, so the reserves add.
+/// DEFAULT ON. Opt out with `CRATONVM_JIT_NO_INLINE_RESERVE_PATH=1`, which
+/// puts the inline spill reserve back on a SUM over every site.
+///
+/// The arm exists because this changes the frame layout of every method that
+/// inlines anything, and the previous change to a frame layout in this
+/// subsystem -- reserving the scratch home at push time, 2026-09-02 -- shipped
+/// a nondeterministic heap corruption that cost a rebuild per hypothesis to
+/// bisect because no flag could separate it in one binary.
+pub(super) fn inline_reserve_path_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_INLINE_RESERVE_PATH").is_none()
+    })
+}
+
 pub(super) fn spliced_stack_reserve(site: &crate::InlineSite) -> usize {
     let (_, param_span) = crate::compute_param_jvm_slots(&site.descriptor, site.callee_is_static);
     site.nested_sites
@@ -328,6 +410,31 @@ pub(super) fn spliced_stack_reserve(site: &crate::InlineSite) -> usize {
                 .saturating_add(site.callee_code_len),
             |a, b| a.saturating_add(b),
         )
+}
+
+/// What one site would need if concurrently-live splices were counted rather
+/// than all of them: its own frame plus the DEEPEST nested path under it,
+/// instead of the sum over every descendant.
+///
+/// Measurement only for now. A splice's epilogue rewinds `next_spill_offset`
+/// to `caller_post_pop_spill` on both the value-returning and the void return
+/// arm, and the outer walk runs `reset_spills()` at every instruction boundary
+/// on top of that -- so sibling splices demonstrably reuse the same words, and
+/// only a root-to-leaf chain is ever live at once. `spliced_stack_reserve` sums
+/// siblings anyway, which is what this exists to price.
+pub(super) fn spliced_stack_reserve_path(site: &crate::InlineSite) -> usize {
+    let (_, param_span) = crate::compute_param_jvm_slots(&site.descriptor, site.callee_is_static);
+    let own = site
+        .callee_max_locals
+        .max(param_span)
+        .saturating_add(site.callee_code_len);
+    let deepest = site
+        .nested_sites
+        .iter()
+        .map(|n| spliced_stack_reserve_path(&n.site))
+        .max()
+        .unwrap_or(0);
+    own.saturating_add(deepest)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -546,6 +653,18 @@ pub fn compile_with_param_slots(
     // A handler-local request is one-shot too, so a compile bailout cannot
     // accidentally arm the next unrelated method on this worker thread.
     let precise_exception_frames = PRECISE_EXCEPTION_FRAME_REQUEST.with(|c| c.take());
+    // Open the PC -> inline-chain recording session for this compile, with the
+    // one-shot `take`s above and for the same reason they are here: everything
+    // staged on this thread is claimed BEFORE any bail can leak it into the
+    // next method compiled on this worker. `open()` additionally discards
+    // anything an abandoned earlier compile left behind, so it is safe
+    // unconditionally and costs one thread-local write. Nothing above this
+    // point emits a byte of code, and nothing above it returns.
+    //
+    // The close is `InlineFrameSession`'s `Drop`, not a call at the end — see
+    // that type for why the ~40 bail paths below must not each be responsible
+    // for it.
+    let _inline_frame_session = InlineFrameSession::open();
     if crate::rbc6_emit_dbg() {
         eprintln!(
             "[rbc6-emit] driver took precise_exception_frames={precise_exception_frames}              exception_ranges={} protected_ranges_pending={}",
@@ -871,8 +990,86 @@ pub fn compile_with_param_slots(
         .chain(extra_guard_bodies())
         .map(|s| spliced_bytecode_len(s).saturating_mul(64))
         .sum();
+    // TWO per-bytecode coefficients, not one.
+    //
+    // 96 is calibrated on ordinary control-flow-heavy code, and it works there
+    // BECAUSE the `invoke_info.len() * 1024` term carries most of the weight:
+    // every method in the 2026-08-01 table above is invoke-dense, and in all of
+    // them the invoke term dominates. A method with almost no invokes gets
+    // nothing from that term, so 96 becomes the WHOLE estimate — and 96 is not
+    // enough for the one shape that emits the most machine code per bytecode:
+    // the large table initialiser.
+    //
+    // The witness is `java/lang/CharacterData00.<clinit>:()V`, which overran on
+    // every boot of every process (a stock `Hello` reproduces it). Its shape,
+    // read off `javap -c -p`: 4096 bytes of bytecode holding 2906 instructions,
+    // of which 635 `dup`, 324 `castore`, 313 `iconst_0`, 311 `iconst_1`, 309
+    // `aastore`, 290 `sipush`, 207 `newarray`, 206 `iconst_2`, 124 `bipush`,
+    // 104 `anewarray` — and SEVEN invokes in the entire method. Nothing but
+    // constant-push and array-store, at 1.41 bytecode BYTES per instruction
+    // where branchy code sits nearer 3; each of those one-byte opcodes still
+    // lowers to a spill/reload pair, and each store to a null check plus a
+    // bounds check. So the machine code per bytecode BYTE is far above what the
+    // 96 was fitted to, and no term in the old estimate noticed.
+    //
+    // Derivation, from that one measurement (`capacity=408576 wanted=473627`,
+    // which also pins `invoke_info.len() == 7` and `inline_extra == 0`:
+    // 4096*96 + 8192 + 7*1024 is exactly 408576):
+    //
+    //     needed per bytecode byte = (473627 - 8192 - 7*1024) / 4096 = 111.9
+    //
+    // 144 (= 1.5 * 96) covers that with 29% margin. The margin is deliberately
+    // modest rather than generous: `ExecutableBuffer::new` charges the WHOLE
+    // capacity to `COMMITTED_JIT_CODE_BYTES`, which is the quantity the
+    // code-cache cap bounds, so every byte over-estimated here is a byte the
+    // cap will not spend on some other method.
+    //
+    // TRUST THIS EXACTLY AS FAR AS ONE MEASUREMENT GOES. 111.9 is a single
+    // number from a single method. The only cross-check available without
+    // running the VM is `java/lang/CharacterDataLatin1.<clinit>`, the same
+    // shape — 3097 instructions in ~4718 bytes, ONE invoke. Scaling the
+    // witness's 163 machine bytes per bytecode INSTRUCTION (473627/2906) predicts
+    // ~107 bytes per bytecode byte for it: under 144, and also over 96, i.e. a
+    // second method the old coefficient was short for. That is a PREDICTION,
+    // not a measurement. If a third shape overruns at 144, re-derive from its
+    // own `wanted` instead of nudging this number.
+    //
+    // The predicate is deliberately cheap and honest — no bytecode walk, only
+    // `code_len` and the invoke list the caller already built. LARGE, because a
+    // small method's shortfall is cheap and the hint below self-corrects it in
+    // one retry; LOW INVOKE DENSITY, because that is precisely the condition
+    // under which the 1024-per-invoke term stops covering for 96. One invoke
+    // per 512 bytecode bytes puts the witness (7 invokes over 4096 bytes)
+    // inside and every method in the table above outside.
+    const BYTES_PER_BYTECODE: usize = 96;
+    const BYTES_PER_BYTECODE_TABLE_INIT: usize = 144;
+    const TABLE_INIT_MIN_CODE_LEN: usize = 2048;
+    const TABLE_INIT_BYTECODES_PER_INVOKE: usize = 512;
+    let table_init_shaped = code_len >= TABLE_INIT_MIN_CODE_LEN
+        && invoke_info
+            .len()
+            .saturating_mul(TABLE_INIT_BYTECODES_PER_INVOKE)
+            < code_len;
+    // ENGAGEMENT, not just a number: without this there is no way to tell a run
+    // where the second coefficient prevented an overflow from a run where the
+    // predicate never matched anything. Cheap — the env read is behind the
+    // shape test, so an ordinary method never performs it.
+    if table_init_shaped && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+        eprintln!(
+            "[cratonvm-jitc] code-buffer estimate: table-init shape \
+             method={} code_len={} invokes={} bytes_per_bytecode={}",
+            method_key,
+            code_len,
+            invoke_info.len(),
+            BYTES_PER_BYTECODE_TABLE_INIT
+        );
+    }
     let estimated_size = code_len
-        .saturating_mul(96)
+        .saturating_mul(if table_init_shaped {
+            BYTES_PER_BYTECODE_TABLE_INIT
+        } else {
+            BYTES_PER_BYTECODE
+        })
         .saturating_add(8192)
         .saturating_add(invoke_info.len().saturating_mul(1024))
         .saturating_add(inline_extra);
@@ -911,20 +1108,65 @@ pub fn compile_with_param_slots(
         .max()
         .unwrap_or(0);
     // Inlining allocates extra spill slots for each inlined callee's locals
-    // and operand stack ON TOP of the caller's `max_stack` (and, since the
-    // inline epilogue keeps the return value rather than reclaiming the callee
-    // locals, sequential inlines accumulate). `spill_size` is derived purely
-    // from `max_stack`, so without this reserve the inlined code writes past
-    // the spill region into the callee-saved / shadow area — corrupting live
-    // values (observed as a `ClassCastException: …$TaskOption not an enum` when
-    // a clobbered slot fed an enum-typed field). Reserve, per site,
-    // `callee_max_locals + callee_code_len` (the latter bounds the callee's own
-    // operand depth); the total is bounded by `MAX_INLINE_BUDGET`.
-    let inline_stack_reserve: usize = inline_sites
+    // and operand stack ON TOP of the caller's `max_stack`. `spill_size` is
+    // derived purely from `max_stack`, so without this reserve the inlined code
+    // writes past the spill region into the callee-saved / shadow area —
+    // corrupting live values (observed as a `ClassCastException: …$TaskOption
+    // not an enum` when a clobbered slot fed an enum-typed field). Reserve, per
+    // site, `callee_max_locals + callee_code_len` (the latter bounds the
+    // callee's own operand depth).
+    //
+    // This used to read "...and, since the inline epilogue keeps the return
+    // value rather than reclaiming the callee locals, sequential inlines
+    // accumulate", and summed the per-site figures on that basis. The epilogue
+    // reclaims now — see `inline_reserve_path_enabled` below for the evidence
+    // and for what replaced the sum.
+    let inline_stack_reserve_sum: usize = inline_sites
         .values()
         .chain(extra_guard_bodies())
         .map(spliced_stack_reserve)
         .sum();
+    let inline_stack_reserve_path: usize = inline_sites
+        .values()
+        .chain(extra_guard_bodies())
+        .map(spliced_stack_reserve_path)
+        .max()
+        .unwrap_or(0);
+    // Spend the concurrently-live figure, not the sum. DEFAULT ON; opt out
+    // with `CRATONVM_JIT_NO_INLINE_RESERVE_PATH=1`.
+    //
+    // The sum is what the comment above asks for, and it was right when it was
+    // written: the splicer used to keep the return value and leave the callee
+    // locals where they were. It does not any more. Both of the inline
+    // epilogue's return arms end with
+    // `self.next_spill_offset = caller_post_pop_spill`, and the outer walk
+    // calls `reset_spills()` at every instruction boundary on top of that, so
+    // sibling splices provably reuse the same words -- the void arm's own
+    // comment says the reclaim is load-bearing precisely for the NESTED case,
+    // where the mini-walk has no per-instruction reset. Only a root-to-leaf
+    // chain is ever live at once, which is what `spliced_stack_reserve_path`
+    // measures.
+    //
+    // Measured before the change: 280 words reserved against 7 needed on a
+    // 40-argument stress, 265 against 41 on CratonBench -- 2 KB of frame per
+    // compiled method to hold one 56-byte splice.
+    //
+    // Under-reserving here FAILS CLOSED. `callee_local_base`, the merge area
+    // and every callee operand push all go through `reserve_spill_slots`, which
+    // bounds against `spill_limit_offset` and bails the compile rather than
+    // writing past the region; the `exhausted` census column counts exactly
+    // that. So the worst case of this being wrong is inlining declined and a
+    // method left interpreted, visible in the census -- not a clobbered frame.
+    let inline_stack_reserve = if inline_reserve_path_enabled() {
+        inline_stack_reserve_path
+    } else {
+        inline_stack_reserve_sum
+    };
+    crate::note_inline_reserve(
+        inline_stack_reserve_sum as u64,
+        inline_stack_reserve_path as u64,
+        inline_stack_reserve as u64,
+    );
     let max_stack = max_stack
         .saturating_add(max_invoke_args)
         .saturating_add(inline_stack_reserve);
@@ -970,6 +1212,49 @@ pub fn compile_with_param_slots(
         .into_iter()
         .filter(|h| !bypassable_headers.contains(&h.loop_header))
         .collect();
+
+    // LICM: hoist the loop-invariant `arraylength` out of a counted loop's
+    // header. `CRATONVM_DISABLE_ARRAYLEN_LICM=1` is the kill switch — the
+    // hoist changes the emitted body of essentially every loop over an array
+    // in the VM, so it needs one, and the bisect it serves must reach the
+    // level the change is at (the emission, not the analysis).
+    let array_len_hoist_info = if cratonvm_types::flags::runtime_var_os(
+        "CRATONVM_DISABLE_ARRAYLEN_LICM",
+    )
+    .is_some()
+    {
+        Vec::new()
+    } else {
+        find_array_len_hoists(code, code_len, &loops)
+    };
+    // One filter, not the aaload hoist's two. There is no per-bci de-spec to
+    // apply because this pre-header speculates on nothing: it throws the NPE
+    // the body would have thrown rather than deopting, so there is no failed
+    // guard for a de-spec threshold to count.
+    //
+    // The bypassable-header veto DOES apply, and is the load-bearing one. A
+    // header reachable without running its own pre-header — a `goto` from
+    // outside into the loop, or an exception handler landing in the body —
+    // leaves the slot cold, and a cold slot here is a garbage LENGTH that a
+    // `bounds_safe_pcs` access then trusts, i.e. an unchecked out-of-bounds
+    // read rather than a wrong answer. Must run BEFORE `Compiler::new` pairs
+    // the offsets with the info by index.
+    let array_len_hoist_info: Vec<ArrayLenHoist> = array_len_hoist_info
+        .into_iter()
+        .filter(|h| !bypassable_headers.contains(&h.loop_header))
+        .collect();
+    if !array_len_hoist_info.is_empty()
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+    {
+        eprintln!(
+            "[JIT_GEN] arraylength-LICM hoists={} sites={:?}",
+            array_len_hoist_info.len(),
+            array_len_hoist_info
+                .iter()
+                .map(|h| (h.loop_header, h.array_local, h.sites.len()))
+                .collect::<Vec<_>>(),
+        );
+    }
 
     // LICM: find loop-invariant integer-arithmetic runs to hoist into the
     // loop pre-header. These are pure, non-faulting ALU expressions on
@@ -1035,7 +1320,16 @@ pub fn compile_with_param_slots(
     // proven non-null. Future null-check emission paths consult this
     // via `Compiler::is_local_nonnull(pc, local)` to skip redundant
     // `TEST reg, reg; JZ throw_npe` sequences.
-    let null_check_info = crate::null_check_elim::analyze(code, code_len);
+    //
+    // The receiver seed is derived here rather than passed in — see
+    // `null_check_elim::receiver_in_local_zero` for why, and for what the
+    // `None` (the two numbers disagree) case protects.
+    let null_check_info = {
+        let receiver = super::null_check_elim::this_nonnull_enabled()
+            && crate::null_check_elim::receiver_in_local_zero(method_key, num_params)
+                .unwrap_or(false);
+        crate::null_check_elim::analyze_with_receiver(code, code_len, receiver)
+    };
 
     // BCE: analyze loops for bounds check elimination
     // DBG (env-gated): CRATONVM_JIT_NO_BCE disables bounds-check elimination
@@ -1496,6 +1790,7 @@ pub fn compile_with_param_slots(
         static_field_info,
         hoist_info,
         arith_hoist_info,
+        array_len_hoist_info,
         alloc_result,
         !matrix_dot_loops.is_empty(),
         *helpers,
@@ -2027,6 +2322,24 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
         return None;
     }
 
+    // Backstop for the implicit null check. Every site recorded by
+    // `emit_trusted_oop_receiver_check_at` must have been bound to a recovery
+    // address by `bind_implicit_null_recovery` before the walk ended. One left
+    // pending means a receiver check was elided and the slow path it faults
+    // into was never emitted — the site would run unguarded and its
+    // NullPointerException would arrive as a SIGSEGV.
+    //
+    // That cannot happen through any path in the arm as written (the arm that
+    // opts in always reaches its guarded slow path), which is exactly why it
+    // is asserted rather than reasoned about: the property belongs to control
+    // flow several hundred lines away from the elision, and an edit that
+    // breaks it would produce a crash on a null receiver in production rather
+    // than a red test.
+    if compiler.has_unbound_implicit_null_sites() {
+        crate::note_jit_bail_site_at("implicit-null-unbound", compiler.dbg_last_pc, 0);
+        return None;
+    }
+
     // Patch branches (both forward and backward are handled). A `false`
     // return means some branch targeted a PC that was never emitted as an
     // instruction boundary (malformed/unverified bytecode) — reject the
@@ -2096,13 +2409,10 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
         // unnoticed (`resolvabletype-equals-jit-...`): the only
         // visible symptom was a flood of anonymous `try_patch_*: offset out of
         // bounds` warnings with no method attached to any of them.
-        tracing::warn!(
-            method = method_key,
-            code_len = code_len,
-            capacity = compiler.buf.capacity(),
-            wanted = compiler.buf.wanted(),
-            "JIT compile bailed: code buffer estimate too small; retrying at the measured size"
-        );
+        // The line itself is emitted BELOW, after the shortfall is recorded,
+        // because its LEVEL depends on whether this attempt just spent the last
+        // retry and `note_code_buffer_shortfall` is what bumps that count.
+        //
         // Remember the shortfall so the NEXT attempt at this method sizes its
         // buffer from a measurement instead of the heuristic.
         //
@@ -2124,6 +2434,49 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
             // and the retry was a bit-identical repeat — forever.
             compiler.buf.capacity(),
         );
+        // Level split: DEBUG while the bail is RECOVERABLE, WARN once it is not.
+        //
+        // This line used to be `warn!` unconditionally, and it fired on every
+        // boot of every process — `java/lang/CharacterData00.<clinit>:()V` on a
+        // stock `Hello` — for a condition the VM handles by itself on the next
+        // compile request. A warning that is always present is a warning nobody
+        // reads, and it sat directly next to the `codegen_failure_reason()` arm
+        // above, which is the one that really is permanent; keeping both at the
+        // same level is what made the two indistinguishable in a log before the
+        // reasons were split at all.
+        //
+        // Demoting is only safe because the bail stays COUNTED rather than
+        // becoming silent, which is the failure this site's original comment
+        // guards against: `note_jit_bail_site` below records it under
+        // `CODE_BUFFER_TOO_SMALL_SITE` (reported per method by
+        // `jit_bail_reason_for`), and `note_code_buffer_bail_cost` feeds the
+        // `code_buffer_bails=N (discarded_compile_ms=M)` fields of
+        // `tiered::dump_method_stats_to_stderr`. Nothing outside `docs/` parses
+        // the message text (checked across `ci/`, `scripts/`, `tools/`,
+        // `apps/`), so the wording of the recoverable arm is left alone for
+        // those write-ups to keep matching.
+        //
+        // The exhausted arm is a genuinely new fact and stays at `warn!`: after
+        // `MAX_CODE_BUFFER_RETRIES` doublings `try_compile` stops exempting this
+        // site from the permanent bail list, so the method is now interpreted
+        // for the life of the process and no later line will say so.
+        if crate::code_buffer_retries_exhausted(method_key) {
+            tracing::warn!(
+                method = method_key,
+                code_len = code_len,
+                capacity = compiler.buf.capacity(),
+                wanted = compiler.buf.wanted(),
+                "JIT compile bailed: retry budget spent on a short code buffer; stays interpreted"
+            );
+        } else {
+            tracing::debug!(
+                method = method_key,
+                code_len = code_len,
+                capacity = compiler.buf.capacity(),
+                wanted = compiler.buf.wanted(),
+                "JIT compile bailed: code buffer estimate too small; retrying at the measured size"
+            );
+        }
         crate::note_jit_bail_site(crate::CODE_BUFFER_TOO_SMALL_SITE);
         crate::note_code_buffer_bail_cost(compile_started.elapsed());
         return None;
@@ -2285,12 +2638,28 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     // into the artifact (which partially moves `compiler`).
     let frame_layout = compiler.frame_layout();
     let method_label = compiler.method_label.clone();
+    // Taken before `compiler.buf` moves into the artifact. Registration waits
+    // until `cm` exists, so a compile that bails before that registers
+    // nothing — and one that bails after is unregistered by
+    // `CompiledMethod::drop`, which retires the whole code range.
+    let implicit_null_sites = std::mem::take(&mut compiler.implicit_null_sites);
     let mut cm = if needs_heap {
         CompiledMethod::new_with_context(compiler.buf)
     } else {
         CompiledMethod::new(compiler.buf)
     };
     cm.has_dispatch = has_dispatch;
+    if !implicit_null_sites.is_empty() {
+        let base = cm.entry as usize;
+        for (fault_off, recover_off) in implicit_null_sites {
+            // A full table DECLINES. The site keeps its elided check, and the
+            // fault it would have caught then arrives as a crash instead of an
+            // NPE — so a decline is a real loss, not a graceful degradation,
+            // and that is why `implicit_null::counts` prints it rather than
+            // swallowing it.
+            let _ = crate::implicit_null::register(base + fault_off, base + recover_off);
+        }
+    }
 
     // RBC.5 — record the declaring classes of every getstatic/putstatic
     // site (already resolved into `static_field_info` by the caller) so the
@@ -2546,6 +2915,13 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
         shadow_missing.truncate(16);
         let scauses = crate::x64::safepoint::shadow_incomplete_cause::snapshot();
         let causes = crate::x64::safepoint::map_incomplete_cause::snapshot();
+        // A census that prints fewer causes than it has is a census that can
+        // report "no cause" for a real one. Adding a variant without adding a
+        // column is now a compile error rather than a silent column.
+        const _: () = assert!(
+            crate::x64::safepoint::map_incomplete_cause::COUNT == 8,
+            "map_incomplete_cause gained a variant: add a column to the              frameslot-detail line below, then bump this"
+        );
         eprintln!(
             "[oopcov] uncovered method={} frameslot={} shadow={} \
              shadow_missing_pcs={shadow_missing:?} \
@@ -2565,7 +2941,7 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
         eprintln!(
             "[oopcov]   frameslot-detail method={} precise_maps={} sp_id_slot_off={} inline_sites={} \
              safepoints={} mapped={} unmapped_pcs={:?} \
-             causes(marks_inexact={} oop_in_reg={} stack_deep={} local_deep={} staged_deep={} staged_unmappable={})",
+             causes(marks_inexact={} oop_in_reg={} stack_deep={} local_deep={} staged_deep={}              staged_unmappable={} inline_local_unmappable={} local_mask_unreached={})",
             compiler.method_key,
             compiler.precise_maps,
             compiler.sp_id_slot_off,
@@ -2579,6 +2955,15 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
             causes[3],
             causes[4],
             causes[5],
+            // The SEVENTH cause. `map_incomplete_cause::snapshot()` has returned
+            // `[usize; 7]` since `INLINE_LOCAL_UNMAPPABLE` was added, and this
+            // line printed six of them -- so a run whose only unnameable
+            // references were inline-scope locals showed `causes(... all zero)`
+            // and read as "no cause", which is the one reading a cause census
+            // must never produce. The 2026-08-30 diagnosis that concluded "One
+            // cause, `staged_unmappable`" was made from this line.
+            causes[6],
+            causes[7],
         );
     }
     // Shadow-stack — frame offsets + thread-struct offset, so the OSR trampoline
@@ -2610,6 +2995,26 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     // with it on tier-up or invalidation. Empty on every compile that armed no
     // local handlers.
     cm._jit_local_handler_sites = compiler.local_handler_sites;
+
+    // Close the recording session and hand the finished map to the artifact,
+    // beside the other compile-local state being published onto it above.
+    //
+    // `code_len()` is load-bearing, not decorative: `InlineFrameMap::from_rows`
+    // drops every row at an offset past the artifact's final code length, which
+    // is how a row recorded into a stretch the emitter later rewound is
+    // discarded instead of published against machine code that is no longer
+    // there. Read into a local first so the immutable borrow of `cm` is over
+    // before the field assignment, rather than relying on evaluation order.
+    //
+    // `_inline_frame_session`'s `Drop` still runs on the way out of this
+    // function; that second close is a no-op (see `InlineFrameSession`).
+    let inline_frame_code_len = cm.code_len();
+    cm.inline_frame_map = crate::x64::finish_inline_frame_recording(inline_frame_code_len);
+    // No `code_len` screen for the trap table, and it needs none: its keys are
+    // monotonic ids rather than code offsets, so a row a rewind orphaned is
+    // simply unreachable -- no surviving trampoline carries its key. See
+    // `x64::inlining::record_npe_trap_site`.
+    cm.npe_trap_map = crate::x64::finish_npe_trap_recording();
 
     Some(cm)
 }
