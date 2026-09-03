@@ -8693,12 +8693,47 @@ impl Compiler {
                             );
                         }
                         let (arg_slots, arg_oops) = self.pop_invoke_args(n);
-                        // A reference staged into an area no oop map can name (the
-                        // native-ABI outgoing-argument area, the direct-call service
-                        // slots, or an inlined callee's parameter locals). The
-                        // conservative scan covers those and the precise map cannot,
-                        // so this method must not claim precise coverage here.
-                        if arg_oops.iter().any(|&o| o) {
+                        // THE SAME CHANNEL THE TWO DIRECT-CALL SITES USE, for the one
+                        // invoke arm `CRATONVM_JIT_DIRECT_CALL_ARG_MAPS` did not reach.
+                        //
+                        // This arm used to raise `pending_staged_args_unmapped` for any
+                        // reference argument, on the stated grounds that the value had
+                        // been staged "into an area no oop map can name". At the
+                        // safepoint that consumes the flag it has not: `pop_invoke_args`
+                        // hands back the arguments' FRAME slots, the non-tail form's
+                        // stack-guard safepoint and recursive CALL are emitted below
+                        // this point, and `emit_stack_arg_setup` — the step that does
+                        // move them into the un-nameable outgoing-ABI area — runs later
+                        // still. So the slots are live, frame-resident and nameable
+                        // exactly where the refusal was being raised.
+                        //
+                        // Naming them is also what PUBLISHES them:
+                        // `collect_live_oop_homes` reads `pending_staged_arg_oops`, so
+                        // the shadow stack carries them and the band verifier stops
+                        // finding a movable word nothing published. See
+                        // `self_call_arg_maps_enabled` for the measurement.
+                        //
+                        // An argument whose home is NOT a frame slot still fails
+                        // closed: a register/scratch/xmm-resident reference is precisely
+                        // what a frame-slot map cannot describe.
+                        let staged_self_args_mark = self.pending_staged_arg_oops.len();
+                        if self_call_arg_maps_enabled() {
+                            let mut unnameable = false;
+                            for (i, slot) in arg_slots.iter().enumerate() {
+                                if !arg_oops.get(i).copied().unwrap_or(false) {
+                                    continue;
+                                }
+                                match slot {
+                                    StackSlot::Frame(off) => {
+                                        self.pending_staged_arg_oops.push(*off);
+                                    }
+                                    _ => unnameable = true,
+                                }
+                            }
+                            if unnameable {
+                                self.pending_staged_args_unmapped = true;
+                            }
+                        } else if arg_oops.iter().any(|&o| o) {
                             self.pending_staged_args_unmapped = true;
                         }
 
@@ -8725,6 +8760,19 @@ impl Compiler {
                             let pos = self.buf.pos();
                             self.buf.try_patch_i32(jmp_offset, rel).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                             let _ = pos;
+
+                            // THE TAIL FORM EMITS NO SAFEPOINT. The arguments were
+                            // just loaded into this method's own parameter locals,
+                            // which `local_oop_masks` names from here on, and
+                            // `reset_spills` below hands their old slots straight back
+                            // to the spill allocator. Anything left pending would be
+                            // consumed by a LATER, unrelated safepoint and would name a
+                            // slot the cursor has already given to something else —
+                            // the mirror of the defect this staging fixes. Truncating
+                            // to the mark drops exactly what this site pushed; no
+                            // safepoint can have run in between to take them.
+                            self.pending_staged_arg_oops
+                                .truncate(staged_self_args_mark);
 
                             // Skip the following xreturn — we already jumped
                             pc += 3; // invokestatic

@@ -2444,6 +2444,49 @@ pub(super) fn direct_call_arg_maps_enabled() -> bool {
     })
 }
 
+/// Name a SELF-RECURSIVE call's reference arguments in its safepoint map
+/// (`CRATONVM_JIT_SELF_CALL_ARG_MAPS`, **default-ON; `=0` restores the pre-fix
+/// arrangement**).
+///
+/// The sibling of [`direct_call_arg_maps_enabled`], for the one invoke arm that
+/// change did not reach. The 0xb8 self-recursive site pops its arguments and,
+/// if any of them is a reference, raises `pending_staged_args_unmapped` — which
+/// makes `map_incomplete` true at the next safepoint, takes that safepoint's
+/// `moving_young_coverage_complete` false through
+/// `relocation_coverage_complete`, and so takes `fully_shadow_covered` false
+/// for the WHOLE method.
+///
+/// It did not have to. The arguments this arm stages are still in ordinary
+/// frame slots at the safepoint that consumes the flag: the non-tail form emits
+/// its stack-guard safepoint (and then the recursive `CALL`) only AFTER
+/// `pop_invoke_args`, and `emit_stack_arg_setup` — the step that moves them
+/// into the un-nameable outgoing-ABI area — runs later still. A frame slot is
+/// exactly what `pending_staged_arg_oops` exists to name, so the honest answer
+/// at that safepoint is the slot, not a refusal.
+///
+/// MEASURED on `probes/OopMapSelfCall.java`: the two self-recursive methods are
+/// the ONLY two methods in the whole run whose coverage claim is false
+/// (`shadow=false shadow_missing_pcs=[45]` / `[23]`, both the self-call bci),
+/// and every one of the eight `scauses` reads zero — the refusal arrives
+/// through `map_incomplete`, whose own census names it `staged_unmappable`.
+///
+/// An argument whose home is NOT a frame slot still fails the safepoint closed:
+/// a register- or xmm-resident value is precisely what a frame-slot map cannot
+/// describe, and that is the case the flag was right about.
+pub(super) fn self_call_arg_maps_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SELF_CALL_ARG_MAPS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
 pub(super) fn spill_args_published_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();

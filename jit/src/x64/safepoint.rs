@@ -2103,6 +2103,74 @@ mod tests {
         crate::x64::set_moving_young_override(None);
     }
 
+    /// The SELF-RECURSIVE call arm must name its reference arguments rather
+    /// than refuse the safepoint.
+    ///
+    /// `CRATONVM_JIT_DIRECT_CALL_ARG_MAPS` gave the two direct-call arms a
+    /// nameable service range and stopped them raising
+    /// `pending_staged_args_unmapped`; the 0xb8 self-recursive arm kept
+    /// raising it for any reference argument, which makes `map_incomplete`
+    /// true at the next safepoint and so takes `fully_shadow_covered` false
+    /// for the whole method. Measured on `probes/OopMapSelfCall.java`: its two
+    /// self-recursive methods were the ONLY two uncovered methods in the run.
+    ///
+    /// This is the source-level half of that repair — that the arm reaches the
+    /// staging channel at all, and that it fails closed on a home a frame-slot
+    /// map genuinely cannot describe.
+    #[test]
+    fn the_self_recursive_arm_stages_its_reference_arguments() {
+        let src = include_str!("bytecode_walk.rs");
+        let at = src
+            .find("let staged_self_args_mark = self.pending_staged_arg_oops.len();")
+            .expect("the self-recursive arm must mark the staged-arg buffer");
+        let body = &src[at..at + 1400];
+        assert!(
+            body.contains("self_call_arg_maps_enabled()"),
+            "the repair must be behind its kill switch"
+        );
+        assert!(
+            body.contains("StackSlot::Frame(off) => {"),
+            "a frame-resident argument oop must be pushed to the staging buffer"
+        );
+        assert!(
+            body.contains("_ => unnameable = true,"),
+            "an argument with a non-frame home must still fail the safepoint closed"
+        );
+        // The legacy arm has to survive verbatim, or the kill switch does not
+        // bisect anything.
+        assert!(
+            body.contains("} else if arg_oops.iter().any(|&o| o) {"),
+            "`=0` must restore the unconditional refusal"
+        );
+    }
+
+    /// The TAIL form of that arm must un-stage what it staged.
+    ///
+    /// It emits no safepoint before the `JMP`, and `reset_spills` hands the
+    /// argument slots straight back to the spill allocator — so a staged
+    /// offset left pending there is taken by a later, unrelated safepoint and
+    /// names a slot something else now owns. That is the mirror of the defect
+    /// the staging fixes, and it is the reason the mark exists rather than a
+    /// bare `push`.
+    #[test]
+    fn the_tail_self_call_form_unstages_before_it_jumps() {
+        let src = include_str!("bytecode_walk.rs");
+        let at = src
+            .find("let staged_self_args_mark = self.pending_staged_arg_oops.len();")
+            .expect("the self-recursive arm must mark the staged-arg buffer");
+        let rest = &src[at..];
+        let trunc = rest
+            .find(".truncate(staged_self_args_mark);")
+            .expect("the tail form must truncate the staged-arg buffer back to the mark");
+        // The truncate belongs to the tail form: it must come before the
+        // `reset_spills()` that path ends with, and inside the same site.
+        let window = &rest[..trunc];
+        assert!(
+            window.contains("JMP rel32 back to body entry"),
+            "the truncate must sit on the TAIL path, after its JMP is emitted"
+        );
+    }
+
     /// A bare `Compiler` with no locals, no operand stack and no register
     /// assignments, so `collect_live_oop_homes` returns exactly what the staged
     /// buffer contributes and nothing else can be mistaken for it.
