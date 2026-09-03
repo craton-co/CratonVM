@@ -2578,6 +2578,40 @@ impl ZgcRealHeap {
                 // is.
                 self.pause_affordable_span.store(0, Ordering::Relaxed);
                 self.pause_overrun_span.store(0, Ordering::Relaxed);
+                // AND GIVE UP AFTER THE THIRD TIME.
+                //
+                // Re-engaging after an unreachable verdict repeats the
+                // discovery, and the discovery costs one UNCONSTRAINED cycle
+                // every time: inert means no budget, the next cycle walks the
+                // whole span, and the loop tightens back down to the same
+                // verdict. Measured at `-Xmx4096m` against a 100 ms target,
+                // 56 cycles and +101% wall for a p50 of 103.8 ms -- worse on
+                // both axes than not trying.
+                //
+                // The reason a target can be permanently unachievable is
+                // structural, and it is worth stating because it is not
+                // obvious from this function: THE PAUSE FLOOR IS THE ARENA'S
+                // HIGH-WATER MARK, not the live set. The bitmap sweep covers
+                // `[base, low_cursor)` and the cursor does not retract, so
+                // once any cycle has run the bump cursor out to 1.3 GiB every
+                // later pause pays a scan over that span whatever the budget
+                // is. No allocation trigger can undo it; only compaction and a
+                // cursor retraction can, and those are `CRATONVM_ZGC_RELOCATE`
+                // and `Arena::retract_cursor_to`.
+                //
+                // Three, not one: a single verdict can come from a transient
+                // live-set spike, and the reset above already makes the next
+                // attempt an honest one. Three consecutive failures to find
+                // ANY budget that meets the target is a property of the
+                // workload, not of a bad cycle.
+                if self
+                    .counters
+                    .pause_target_unreachable
+                    .load(Ordering::Relaxed)
+                    >= 3
+                {
+                    self.pause_target_ms.store(0, Ordering::Relaxed);
+                }
                 self.alloc_trigger_percent_bytes
             }
         };
@@ -20679,6 +20713,36 @@ pub(crate) mod tests {
             "and it must be COUNTED -- a loop holding the target and a loop \
              that has given up are different answers"
         );
+    }
+
+    /// Three unreachable verdicts and the loop stops trying for the run.
+    ///
+    /// Re-engaging repeats the discovery, and the discovery costs one
+    /// UNCONSTRAINED cycle each time. Measured at `-Xmx4096m` against a 100 ms
+    /// target the retry loop cost 56 cycles and +101% wall for a p50 of
+    /// 103.8 ms -- worse on both axes than never trying.
+    #[test]
+    fn three_unreachable_verdicts_stop_the_loop_for_the_run() {
+        const MIB: usize = 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(1024 * MIB);
+        heap.set_pause_target_ms(1);
+        // A 900 MiB live set against a 1 ms target: unachievable, every time.
+        // Each attempt takes several cycles to walk down to the verdict, and
+        // the reset makes the next attempt start fresh.
+        for _ in 0..200 {
+            heap.refresh_pause_target_budget(200_000_000, 900 * MIB, 100 * MIB);
+        }
+        let (target, affordable, budget, gave_up) = heap.pause_target_state();
+        assert_eq!(target, 0, "the loop disables itself rather than retrying forever");
+        assert_eq!(affordable, 0);
+        assert_eq!(budget, 0, "and the clause is the percentage form, which is off");
+        assert!(
+            (3..10).contains(&gave_up),
+            "it should stop at the third verdict, not keep counting: {gave_up}"
+        );
+        // And it stays stopped: further cycles change nothing.
+        heap.refresh_pause_target_budget(900_000_000, 900 * MIB, 100 * MIB);
+        assert_eq!(heap.pause_target_state().3, gave_up, "no further verdicts");
     }
 
     /// A pause target nobody can act on must leave the clause inert, not
