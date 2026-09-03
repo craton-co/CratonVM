@@ -582,6 +582,12 @@ pub fn run_shutdown_hooks(ctx: &mut dyn NativeContext, trigger: &str) {
          unjoined={unjoined} trigger={trigger}"
     );
     report_vector_intrinsics();
+    // The invoke cache's hit rate, when asked for. It is the acceptance
+    // criterion for pc-keying the cache key: a `put` and a `get` that
+    // disagree about a site's pc store and seek under different keys, and
+    // the ONLY symptom is a lower hit rate -- missing the cache is always
+    // safe, so no correctness test can see it.
+    cratonvm_classloading::resolution::invoke_cache_stats_summary();
     // The FFM element fast path's engagement, on the same exit path and
     // for the same reason as the censuses below: a JUnit runner or a
     // benchmark harness leaves through `System.exit`, so a line printed

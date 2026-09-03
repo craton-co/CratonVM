@@ -7498,6 +7498,7 @@ fn execute_frame_from_index(
                             cp_index,
                             false,
                             fast_field_zgc,
+                            saved_pc,
                         ) {
                             Some(Ok(CachedCallResult::FramePushed)) => {
                                 frame_idx = thread.frames.len() - 1;
@@ -7523,6 +7524,7 @@ fn execute_frame_from_index(
                     if nonvirtual_fast_door_on {
                         match invoke_fast::execute_nonvirtual_fast_door(
                             shared, thread, frame_idx, cp_index, false,
+                            saved_pc,
                         ) {
                             Some(Ok(CachedCallResult::FramePushed)) => {
                                 frame_idx = thread.frames.len() - 1;
@@ -7633,7 +7635,7 @@ fn execute_frame_from_index(
                     thread.frames[frame_idx].pc = saved_pc + 3;
                     if nonvirtual_fast_door_on {
                         match invoke_fast::execute_nonvirtual_fast_door(
-                            shared, thread, frame_idx, cp_index, true,
+                            shared, thread, frame_idx, cp_index, true, saved_pc,
                         ) {
                             Some(Ok(CachedCallResult::FramePushed)) => {
                                 frame_idx = thread.frames.len() - 1;
@@ -7755,6 +7757,7 @@ fn execute_frame_from_index(
                     if nonvirtual_fast_door_on {
                         match invoke_fast::execute_invokestatic_fast_door(
                             shared, thread, frame_idx, cp_index,
+                            saved_pc,
                         ) {
                             Some(Ok(CachedCallResult::FramePushed)) => {
                                 frame_idx = thread.frames.len() - 1;
@@ -7835,6 +7838,7 @@ fn execute_frame_from_index(
                             cp_index,
                             true,
                             fast_field_zgc,
+                            saved_pc,
                         ) {
                             Some(Ok(CachedCallResult::FramePushed)) => {
                                 frame_idx = thread.frames.len() - 1;

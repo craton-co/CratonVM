@@ -697,6 +697,58 @@ pub mod scalar_deopt_census {
 /// 9.8 us for it is not.
 ///
 /// Off unless `CRATONVM_GPU_TIME_DISPATCH=1`, the same switch as its twin.
+/// How many methods `--gpu` denied JIT admission.
+///
+/// AUDIT 2026-09-03. `vm::runtime::offload_jit_gate` refuses JIT and OSR
+/// admission to any method whose body contains an offload-eligible
+/// `invokestatic`, so the interpreter hook can still see that site. The
+/// consequence is that the WHOLE caller runs interpreted -- its loops, its
+/// arithmetic, everything -- and that is the largest cost `--gpu` imposes on
+/// a CPU-bound program. Measured on `GpuHookOverheadBench`, the same method:
+///
+/// ```text
+///   no --gpu (JIT admitted)                            10 ns/call
+///   --gpu, site promoted, hook reached only 514 times  6,139 ns/call
+/// ```
+///
+/// 600x, against 0.48 us for the hook itself and 0.75 for the lost invoke
+/// cache. Nothing counted it until this census existed.
+pub mod gpu_jit_gate_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static BLOCKED: AtomicU64 = AtomicU64::new(0);
+    static ADMITTED: AtomicU64 = AtomicU64::new(0);
+
+    /// One verdict, counted per DISTINCT method: the gate caches its
+    /// verdicts, so this counts first judgements rather than consultations,
+    /// which is the number that says how much of the program moved off the
+    /// JIT.
+    #[inline]
+    pub fn note_verdict(blocked: bool) {
+        if blocked {
+            BLOCKED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            ADMITTED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let blocked = BLOCKED.load(Ordering::Relaxed);
+        let admitted = ADMITTED.load(Ordering::Relaxed);
+        if blocked + admitted == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            eprintln!(
+                "[cratonvm] gpu jit gate: methods judged={} blocked_from_jit={blocked}                  admitted={admitted} ({:.1}% denied JIT, so the whole caller runs                  interpreted and its offload sites stay visible to the hook)",
+                blocked + admitted,
+                100.0 * blocked as f64 / (blocked + admitted) as f64,
+            );
+        });
+    }
+}
+
 pub mod gpu_refusal_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 
