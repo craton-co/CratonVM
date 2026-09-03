@@ -6480,6 +6480,25 @@ pub fn verify_active_coverage_into(heap: &VmHeap, roots: &mut Vec<ObjectRef>) ->
     // `fully_shadow_covered`, so an unmapped live oop under THAT claim is the
     // refutation that matters.
     let before_shadow = oop_map_audit::NEVER_MAPPED_WHILE_SHADOW_COVERED.load(Ordering::Relaxed);
+    // The map-SELECTION gap refutes the suppression exactly as a coverage gap
+    // does, and this gate used not to look at it.
+    //
+    // `WRONG_MAP` counts an in-band live object address named by SOME oop map
+    // of the owning method but NOT by the one its safepoint id selects — and
+    // the selected map is all the precise scan reads
+    // (`scan_active_oop_map_at_rbp` resolves one map through
+    // `find_oop_map_for_safepoint_id` and iterates only its `slot_offsets`).
+    // So such a word is invisible to the precise walk. Today that is harmless
+    // because the conservative backstop finds it anyway; the whole point of
+    // this gate is to decide whether the backstop may be SKIPPED, and on that
+    // question a wrong-map word strands its object just as completely as an
+    // unmapped one.
+    //
+    // Measured on the 2026-09-02 soak: `wrong_map` is non-zero on workloads
+    // whose `while_covered` is zero, so a gate reading only the coverage
+    // counters returns "proof holds" over frames it has just been shown hold
+    // unreachable-by-the-scan oops.
+    let before_wrong_map = oop_map_audit::WRONG_MAP.load(Ordering::Relaxed);
     scan_active_jit_frames(heap, roots);
     if oracle_force_refute() {
         note_coverage_oracle_refutation();
@@ -6487,6 +6506,7 @@ pub fn verify_active_coverage_into(heap: &VmHeap, roots: &mut Vec<ObjectRef>) ->
     }
     oop_map_audit::NEVER_MAPPED_WHILE_COVERED.load(Ordering::Relaxed) > before
         || oop_map_audit::NEVER_MAPPED_WHILE_SHADOW_COVERED.load(Ordering::Relaxed) > before_shadow
+        || oop_map_audit::WRONG_MAP.load(Ordering::Relaxed) > before_wrong_map
 }
 
 /// Whether the pre-suppression verification should run: only when the oracle is
@@ -7667,6 +7687,42 @@ mod coverage_oracle_gate_tests {
             "neither CRATONVM_DBG_VERIFY_OOP_MAPS nor the force switch is set \
              in the test environment, so the gate must not run"
         );
+    }
+
+    /// The refutation gate must watch the map-SELECTION counter, not only the
+    /// two coverage ones.
+    ///
+    /// `WRONG_MAP` counts a live in-band oop named by some map of the method
+    /// but not by the one its safepoint id selects, and the precise scan reads
+    /// only the selected map — so the suppression this gate licenses would
+    /// strand it. Measured on the 2026-09-02 soak, `HumongousHold` reports
+    /// `while_covered=0 wrong_map=160`: the two counters this gate used to read
+    /// were BOTH zero over frames holding 160 oops the precise walk cannot
+    /// reach.
+    ///
+    /// A source-level assertion because the gate needs live compiled frames to
+    /// run: what is pinned here is that the counter appears in the decision at
+    /// all, which is the thing that was missing.
+    #[test]
+    fn the_refutation_gate_reads_the_map_selection_counter() {
+        let src = include_str!("conservative_roots.rs");
+        let gate = src
+            .split("pub fn verify_active_coverage_into")
+            .nth(1)
+            .expect("the gate is defined in this file");
+        let body = &gate[..gate.find("
+}
+").expect("the gate has a body")];
+        for counter in [
+            "NEVER_MAPPED_WHILE_COVERED",
+            "NEVER_MAPPED_WHILE_SHADOW_COVERED",
+            "WRONG_MAP",
+        ] {
+            assert!(
+                body.contains(counter),
+                "verify_active_coverage_into must consult {counter}: a gate that                  skips one returns \"proof holds\" over frames the precise scan                  cannot cover"
+            );
+        }
     }
 
     /// The kill switch and the force switch read the keys they are documented
