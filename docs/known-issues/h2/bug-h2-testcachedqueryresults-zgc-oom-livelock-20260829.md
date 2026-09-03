@@ -1226,6 +1226,26 @@ frame" over any account that makes the box/unbox sequence itself the mechanism.
 unnamed root is found and fixed, re-run these arms; if the SIGSEGVs go, the
 credit ships and takes the class from 98304 to ~99978 with no OOMs.
 
+### 2026-09-03 (later): reproduced on a THIRD binary; the wide-locals fix does not help
+
+Rebuilt on dev with `fix/jit-precise-oop-maps-wide-locals-20260903` included
+(`2632fb2c1` confirmed an ancestor):
+
+| | credit + shadow scan | discharge-only control |
+|---|---|---|
+| best run | **`actual: 99977`**, 0 OOM, 0 NPE | did not complete in 1500 s, 14040 OOM |
+| `relocation_on_proven_jit` | 24 | — |
+| shadow scan | 104 windows, 4309 roots, 0 untrusted | — |
+| SIGSEGV | 2 / 3 (103 s, 119 s) | 0 |
+
+Third independent binary, same two facts: the credit clears the fragmentation
+-- 99977-99978 with ZERO OutOfMemoryError against a control that cannot finish
+-- and it still trips the open relocation defect on 2 runs in 3.
+
+"Methods above 64 locals had no precise oop maps at all" was the closest
+published candidate for the unnamed root, and fixing it changes nothing here.
+Ruled out, and recorded on that page too.
+
 ### Attribution closed 2026-09-03: it is dev's relocation defect, and the oracle does not see it
 
 | arm | SIGSEGV |
