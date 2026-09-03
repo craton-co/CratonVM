@@ -3587,6 +3587,45 @@ fn band_has_unpublished_word_with(
 /// [`band_has_unpublished_word_with`] plus the active map's live slots. See
 /// [`band_slot_is_verifiable_with_map`].
 #[allow(clippy::too_many_arguments)]
+/// The object screen for the band test: is the word an actual object HEADER, or
+/// merely a number that lands in the heap's address range?
+///
+/// `is_relocatable` answers the second question and the band test used to stop
+/// there, so any stack word whose bit pattern fell inside the arena counted as
+/// an unpublished oop. Every sibling instrument in this file screens with
+/// `is_object_address` first; audit §16-§18 measured what skipping it costs
+/// (hundreds to thousands of flagged words, `verifier_oop=0` on all of them).
+///
+/// Safe to read the header only because §18 bounded `MOVABLE_BOUNDS` to the
+/// COMMITTED prefix — under the previous reservation-wide envelope this
+/// dereference could touch a page that was never mapped.
+///
+/// `CRATONVM_MOVING_YOUNG_NO_BAND_OBJECT_SCREEN=1` restores the range-only
+/// test. It is the fail-OPEN direction (more words flagged, more cycles
+/// refusing to move), so it is the safe lever to reach for if a missed root is
+/// ever suspected here.
+#[inline]
+fn band_word_is_an_object(w: usize) -> bool {
+    if band_object_screen_disabled() {
+        return true;
+    }
+    if w == 0 || w & 0x7 != 0 {
+        return false;
+    }
+    // SAFETY: the caller has already established `w` is inside the published
+    // movable range, which §18 bounds by the committed prefix, so the header
+    // words are mapped. Alignment is checked just above.
+    unsafe { cratonvm_types::plausible_object_header_at(w as *const u8) }
+}
+
+fn band_object_screen_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BAND_OBJECT_SCREEN")
+            .is_some()
+    })
+}
+
 fn band_has_unpublished_word_with_map(
     rbp: usize,
     frame_size: usize,
@@ -3616,7 +3655,7 @@ fn band_has_unpublished_word_with_map(
         // SAFETY: aligned read inside the calling thread's own live compiled
         // frame, bounded by the frame size recorded at compile time.
         let w = unsafe { (addr as *const usize).read() };
-        if is_relocatable(w) && !published.contains(&w) {
+        if is_relocatable(w) && !published.contains(&w) && band_word_is_an_object(w) {
             return true;
         }
         addr += 8;

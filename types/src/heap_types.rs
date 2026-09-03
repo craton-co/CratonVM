@@ -763,6 +763,56 @@ pub fn primitive_array_kind_tags_byte(descriptor: &str) -> Option<u8> {
     Some((ObjectKind::Array as u8) | (elem << 2))
 }
 
+/// Does the word at `ptr` look like a real object HEADER, judged only from the
+/// header itself?
+///
+/// The heap-free half of `G1Collector::is_object_address`: that function is a
+/// range check (`is_addr_in_live_region`) followed by exactly these header
+/// tests, and only the range half needs a collector. Callers that already know
+/// the address is inside a live, **committed** heap range can use this to
+/// finish the job.
+///
+/// # Why this exists
+///
+/// `conservative_roots::band_has_unpublished_word_with_map` decides a compiled
+/// frame's spill word is an unpublished oop from `addr_is_movable(w)` alone —
+/// an address-RANGE test, where every sibling instrument in that file requires
+/// `is_object_address`. A word that merely lands in the heap's range is called
+/// a live reference, and audit §16-§18 measured what that costs: the analogous
+/// raw counters run to hundreds or thousands of words with `verifier_oop=0` on
+/// every one of them.
+///
+/// It could not be screened before, for two reasons that are now gone: there
+/// is no `&VmHeap` on that path (this function needs none), and the published
+/// range covered reserved-but-uncommitted pages where reading a header faults
+/// (§18 bounded it by the commit).
+///
+/// # Safety
+///
+/// `ptr` must be readable for `MARK_WORD_OFFSET + 8` bytes and 8-aligned. The
+/// caller owes that; there is no way to check it from here.
+#[inline]
+pub unsafe fn plausible_object_header_at(ptr: *const u8) -> bool {
+    // Same order and the same bounds as the collector's own screen, so the two
+    // cannot drift into disagreeing about what an object is.
+    let Some(kind) = object_kind_from_tag(unsafe { kind_tag_at(ptr) }) else {
+        return false;
+    };
+    if unsafe { array_element_type_from_tag(element_type_tag_at(ptr)) }.is_none() {
+        return false;
+    }
+    // A filler is not an object a root can name.
+    if matches!(kind, ObjectKind::HumongousFiller) {
+        return false;
+    }
+    const MAX_PLAUSIBLE_SLOTS: u32 = 1 << 24;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    match kind {
+        ObjectKind::Array => header.array_length() <= i32::MAX as u32,
+        _ => header.num_slots() <= MAX_PLAUSIBLE_SLOTS,
+    }
+}
+
 #[inline]
 pub fn object_kind_from_tag(tag: u8) -> Option<ObjectKind> {
     match tag {
@@ -1591,6 +1641,78 @@ impl ObjectHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The heap-free header screen accepts what the collector's own
+    /// `is_object_address` accepts and rejects the two things the band test was
+    /// calling live references: a filler, and a word that is merely a number.
+    #[test]
+    fn the_object_header_screen_separates_headers_from_numbers() {
+        let obj = ObjectHeader::new(
+            ClassId::new(7),
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            0,
+            3,
+        );
+        let ptr = &obj as *const ObjectHeader as *const u8;
+        assert!(
+            unsafe { plausible_object_header_at(ptr) },
+            "an ordinary object header must pass"
+        );
+
+        let arr = ObjectHeader::new(
+            ClassId::new(8),
+            ObjectKind::Array,
+            ArrayElementType::Long,
+            16,
+            16,
+        );
+        assert!(
+            unsafe { plausible_object_header_at(&arr as *const ObjectHeader as *const u8) },
+            "an array header must pass"
+        );
+
+        let filler = ObjectHeader::new(
+            ClassId::new(9),
+            ObjectKind::HumongousFiller,
+            ArrayElementType::Reference,
+            0,
+            0,
+        );
+        assert!(
+            !unsafe { plausible_object_header_at(&filler as *const ObjectHeader as *const u8) },
+            "a humongous filler is not an object a root can name"
+        );
+
+        // ...and the population the band test was flagging: plain integers
+        // whose value happens to land in the heap's address range.
+        //
+        // A FILTER, NOT A PROOF, and the test says so rather than pretending
+        // otherwise. The kind and element-type tags are a handful of bits, so
+        // some arbitrary words decode to a valid pair by chance; what this
+        // screen removes is the large majority, which is the difference
+        // between the band test's range-only question and a question about
+        // objects. Asserted as a rate over a spread, because an assertion on
+        // one hand-picked word would be a coin toss dressed as a property.
+        let mut rejected = 0usize;
+        const N: usize = 256;
+        for i in 0..N {
+            // Values with no relationship to a header layout.
+            let junk: [u64; 4] = [
+                0x1234_5678 ^ (i as u64),
+                (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                u64::MAX - i as u64,
+                i as u64,
+            ];
+            if !unsafe { plausible_object_header_at(junk.as_ptr() as *const u8) } {
+                rejected += 1;
+            }
+        }
+        assert!(
+            rejected * 4 >= N * 3,
+            "the screen must reject the large majority of arbitrary words              (rejected {rejected} of {N}); it is what separates \"a word in the              heap's range\" from \"an object\""
+        );
+    }
 
     // Helper to create a default ObjectHeader for testing.
     fn make_header() -> ObjectHeader {
