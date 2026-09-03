@@ -1204,18 +1204,36 @@ tiering inversion on this shape was never a null-check problem.
         resident=3 (fp=0 gp=3) demoted=0 splits=4 scan_spills=1 scan_reloads=1
 ```
 
-It runs, and it holds **three** of nine promoted candidates while **four are
-lost to live-range splits** — against a peak of eleven live values and a file
-of five GP registers (`IR_LOWER_LS_GPRS`). So the residual inversion has two
-named causes, in this order:
+It runs, and it holds **three** of nine promoted candidates — against a peak of
+eleven live values and a file of five GP registers (`IR_LOWER_LS_GPRS`).
 
-1. **Split handling in `allocate_linear_scan`.** Four candidates in a
-   twenty-three-node graph were split out of a register. A split value keeping
-   a register for its dominant range is the difference between this loop's
-   values living in `rbx`/`r12` and living in `[rbp-90h]`.
-2. **The optimizing tier does not unroll.** The baseline's 4x unroll amortises
+**Where the other six go was, until 2026-09-03, misreported.** The consumer's
+skip census read `split_or_spilled=5` beside the allocator's `splits=4`, and
+the two together said "four candidates lost to live-range splits". They were
+not. Printing the segment shapes showed four of the five refusals had **empty
+segment lists** — nodes the scan produced no interval for, which is every
+control and memory node in the graph, `Start` and `Proj` included — and one
+genuinely spilled. **There was no split value on this method to reclaim.**
+
+That miscount cost a day: split residency was designed, built, tested and
+measured against it, and its engagement counter read zero, which is how the
+mislabel was found. The census now separates `no_alloc`, `spilled` and
+`split_or_spilled`, so the next reader gets three numbers that mean three
+different things.
+
+So the named causes of the residual inversion are, in order:
+
+1. **The optimizing tier does not unroll.** The baseline's 4x unroll amortises
    the counter compare, the backedge and the safepoint poll over four
    iterations; the optimizing tier pays all three every iteration.
+2. **Six of nine promoted candidates never reach a register**, and with the
+   census fixed the question "why" is finally answerable rather than
+   guessable. Start with `single_use`, which is by far the largest bucket
+   (13 on this method) and is a policy — `ir_residency_pays_enabled` refuses a
+   value read fewer than twice — not a limitation.
+
+What it is **not**: splits, register pressure at the file's edge, code size
+(the optimizing tier emits *less* code here), or the null check.
 
 Neither is the null check, and neither is code size — the optimizing tier emits
 *less* code for this method (1,030 bytes against 1,579).
