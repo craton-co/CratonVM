@@ -582,6 +582,12 @@ pub fn run_shutdown_hooks(ctx: &mut dyn NativeContext, trigger: &str) {
          unjoined={unjoined} trigger={trigger}"
     );
     report_vector_intrinsics();
+    // The FFM element fast path's engagement, on the same exit path and
+    // for the same reason as the censuses below: a JUnit runner or a
+    // benchmark harness leaves through `System.exit`, so a line printed
+    // anywhere else appears in zero logs of the runs that matter. Silent
+    // unless the process touched a segment. See `ffm_fast::exit_summary`.
+    crate::ffm_fast::exit_summary();
     report_filechannel_fast_io();
     crate::craton_gpu::dispatch_timing::report();
     // The corrupt-cell census. HERE and not in `vm-cli`, because a JUnit runner
@@ -5691,6 +5697,45 @@ fn debug_string_field(body: &str, field: &str) -> Option<String> {
         from = after;
     }
     None
+}
+
+/// The FORMAT half of [`define_class_linkage_error`], for the callers that must
+/// not take the rest.
+///
+/// `MethodHandles.Lookup.define{,Hidden}Class` is specified with a SPLIT
+/// contract, and the split falls exactly on `VmError`'s Linkage/Runtime line:
+///
+/// * bytes that are not a well-formed ClassFile  -> `ClassFormatError`
+/// * bytes that name a class in a different package from the lookup class, or
+///   a lookup without the right mode -> `IllegalArgumentException`
+///
+/// So those doors cannot use `define_class_linkage_error`, which re-types
+/// EVERY recovered variant: the backend reports a define into `java.util` as
+/// `RuntimeError::SecurityException` (JVMS 5.3.5, and correct for the
+/// `ClassLoader` door), and handing that to Java would answer
+/// `SecurityException` where the JDK answers `IllegalArgumentException`. This
+/// returns `Some` only for the linkage/format family, leaving the caller's own
+/// `IllegalArgumentException` wrapper in place for everything else.
+///
+/// Measured, not assumed: `probes/DynClassGenSweep.java` carries a
+/// `define.lookupWrongPackage` row precisely so a change on this surface that
+/// over-reaches is visible as a regression rather than as a silent one.
+pub(crate) fn lookup_define_format_error(
+    class_name: &str,
+    method: &str,
+    msg: &str,
+) -> Option<MethodCallFailed> {
+    match typed_define_class_error(class_name, method, msg) {
+        Some(MethodCallFailed::InternalError(cratonvm_types::error::VmError::Linkage(e))) => {
+            Some(MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Linkage(e),
+            ))
+        }
+        // `typed_define_class_error` already re-homes every `ClassFile` variant
+        // onto a `Linkage` one (a `ClassFile` variant is UNCATCHABLE), so the
+        // arm above is the whole format family.
+        _ => None,
+    }
 }
 
 /// Turn a `define_class_full` failure string back into the typed JVM error the

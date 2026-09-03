@@ -46,6 +46,16 @@
 //!   and jump into the wrong method. Leaking is the cheap way to make that
 //!   unrepresentable rather than merely unlikely.
 //!
+//! [`unregister_range`] and [`register`] agree on the base address only because
+//! **the method entry IS the buffer base**. `CompiledMethod::drop` retires
+//! `[entry, entry + buffer.pos())` while registration keys sites off
+//! `cm.entry + fault_off`; `x64::driver` establishes the equality in as many
+//! words (`let entry_offset = 0; // prologue starts at offset 0`), and the
+//! OSR-trampoline purge in that same `Drop` already leans on it. Give the
+//! prologue a non-zero offset and every site below the new entry silently stops
+//! being retired — which is exactly the stale-entry hazard this design exists
+//! to prevent, arriving through the one door nobody would think to check.
+//!
 //! Retirement cannot race a fault in the method being retired, and the reason
 //! is an invariant this file borrows rather than establishes: a
 //! `CompiledMethod` is only dropped when **no frame of it is live** — the same

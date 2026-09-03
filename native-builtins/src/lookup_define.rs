@@ -66,8 +66,28 @@ const CLASS_FILE_MAGIC: [u8; 4] = [0xCA, 0xFE, 0xBA, 0xBE];
 // Common decode helpers
 // ---------------------------------------------------------------------------
 
-/// Decode a `byte[]` argument into a `Vec<u8>`. Returns
-/// `IllegalArgumentException` for null / non-array values.
+/// Decode a `byte[]` argument into a `Vec<u8>`, refusing it the way the JDK
+/// does.
+///
+/// # The refusal TYPE is the contract, not the message
+///
+/// `Lookup.defineClass` / `defineHiddenClass` /
+/// `defineHiddenClassWithClassData` are all specified to throw
+/// `NullPointerException` for a null `bytes` and `ClassFormatError` for bytes
+/// that are not a ClassFile. This helper answered `IllegalArgumentException` to
+/// both, at all three doors, in both modes.
+///
+/// That matters to exactly the code that runs through here.
+/// `ClassFormatError` is an `Error`; `IllegalArgumentException` is a
+/// `RuntimeException`. A bytecode generator guards its emit with
+/// `catch (ClassFormatError)` — because that is what the JVM throws — so ours
+/// sails past the handler and surfaces somewhere unrelated, which is the
+/// three-frames-from-the-defect shape the Groovy hunt spent a day on.
+///
+/// The refusal a caller MUST still see as `IllegalArgumentException` — bytes
+/// naming a class in another package — is not raised here; it comes back from
+/// the backend, and the call sites keep their `IllegalArgumentException`
+/// wrapper for it. See `lang_system::lookup_define_format_error`.
 fn decode_byte_array(
     ctx: &mut dyn NativeContext,
     val: Option<&Value>,
@@ -76,12 +96,15 @@ fn decode_byte_array(
     let arr = match val {
         Some(Value::Object(Some(a))) => *a,
         Some(Value::Object(None)) => {
-            return Err(RuntimeError::IllegalArgumentException {
-                message: format!("{err_prefix}: bytes must not be null"),
+            return Err(RuntimeError::NullPointerException {
+                message: Some(format!("{err_prefix}: bytes must not be null")),
             }
             .into());
         }
         _ => {
+            // NOT a Java-visible case: the argument is absent from the frame,
+            // which means our own dispatch handed us the wrong shape. Keep it
+            // distinguishable from the null the caller really passed.
             return Err(RuntimeError::IllegalArgumentException {
                 message: format!("{err_prefix}: missing bytes argument"),
             }
@@ -97,7 +120,8 @@ fn decode_byte_array(
         }
     }
     if out.len() < 4 || out[0..4] != CLASS_FILE_MAGIC {
-        return Err(RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::LinkageError::ClassFormatError {
+            class_name: String::new(),
             message: format!("{err_prefix}: not a valid class file (bad magic)"),
         }
         .into());
@@ -479,10 +503,27 @@ fn lk_define_class_b(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             let mirror = ctx.get_class_mirror(cid);
             Ok(Some(Value::Object(Some(mirror))))
         }
-        Err(msg) => Err(RuntimeError::IllegalArgumentException {
-            message: format!("Lookup.defineClass: {msg}"),
+        Err(msg) => {
+            // The backend's failure is a `Debug` rendering of the typed error
+            // it actually raised, so the FORMAT family can be recovered and
+            // re-thrown with its own type (`ClassFormatError`,
+            // `UnsupportedClassVersionError`, `VerifyError`). Anything else --
+            // notably the "prohibited package" refusal for bytes naming a class
+            // outside the lookup class's package -- keeps the
+            // `IllegalArgumentException` below, which is what the JDK specifies
+            // for that case.
+            if let Some(e) = crate::lang_system::lookup_define_format_error(
+                "",
+                "Lookup.defineClass",
+                &msg,
+            ) {
+                return Err(e);
+            }
+            Err(RuntimeError::IllegalArgumentException {
+                message: format!("Lookup.defineClass: {msg}"),
+            }
+            .into())
         }
-        .into()),
     }
 }
 
@@ -530,6 +571,7 @@ fn lk_define_hidden_class_full(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // (ordinal 0) / STRONG (ordinal 1, advisory only). Each element is
     // a synthetic ClassOption enum object whose field 0 holds its
     // ordinal — same convention as `classloader.rs::lk_define_hidden_class`.
+    check_options_not_null(args.get(3), "defineHiddenClass")?;
     let nestmate = parse_nestmate_option(ctx, args.get(3));
 
     // WP8.11.5: When NESTMATE is set, the hidden class joins the lookup
@@ -596,6 +638,21 @@ fn lk_define_hidden_class_full(ctx: &mut dyn NativeContext, args: &[Value]) -> M
                     message: format!("ExceptionInInitializerError for {hidden_name}: {msg}"),
                 }
                 .into());
+            }
+            // The backend's failure is a `Debug` rendering of the typed error
+            // it actually raised, so the FORMAT family can be recovered and
+            // re-thrown with its own type (`ClassFormatError`,
+            // `UnsupportedClassVersionError`, `VerifyError`). Anything else --
+            // notably the "prohibited package" refusal for bytes naming a class
+            // outside the lookup class's package -- keeps the
+            // `IllegalArgumentException` below, which is what the JDK specifies
+            // for that case.
+            if let Some(e) = crate::lang_system::lookup_define_format_error(
+                &hidden_name,
+                "defineHiddenClass",
+                &msg,
+            ) {
+                return Err(e);
             }
             return Err(RuntimeError::IllegalArgumentException {
                 message: format!("defineHiddenClass({hidden_name}): {msg}"),
@@ -687,6 +744,29 @@ fn class_option_is_nestmate(ctx: &mut dyn NativeContext, opt: ObjectRef) -> bool
 ///
 /// Returns `false` when the argument is null, missing, or not an array,
 /// matching the JDK's behaviour for an empty `ClassOption...` varargs.
+/// Refuse a null `ClassOption[]` the way the JDK does.
+///
+/// `defineHiddenClass(bytes, initialize, options)` throws
+/// `NullPointerException` when `options` is null -- a DIFFERENT argument from
+/// the bytes, and a different failure from a null element inside a present
+/// array. [`parse_nestmate_option`] treats null and empty alike and answers
+/// `false`, so a caller that passed `(ClassOption[]) null` while meaning
+/// `NESTMATE` got a hidden class in its OWN nest and no error at all: the
+/// symptom is a private-access `IllegalAccessError` from the generated class,
+/// nowhere near the call that dropped the option.
+fn check_options_not_null(
+    opts_arg: Option<&Value>,
+    method: &str,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    if matches!(opts_arg, Some(Value::Object(None))) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(format!("{method}: options must not be null")),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn parse_nestmate_option(ctx: &mut dyn NativeContext, opts_arg: Option<&Value>) -> bool {
     let options_arr = match opts_arg {
         Some(Value::Object(Some(arr))) => *arr,
@@ -774,6 +854,7 @@ fn lk_define_hidden_class_with_class_data(
     // WP8.11.5: NESTMATE option propagation, mirror of
     // `lk_define_hidden_class_full`. ClassOption[] is arg 4 here
     // (after [B, Object, Z); arg 3 in the plain variant).
+    check_options_not_null(args.get(4), "defineHiddenClassWithClassData")?;
     let nestmate = parse_nestmate_option(ctx, args.get(4));
     let lookup_name = lookup_class_name(ctx, this_lookup);
     let nest_host_class_name = if nestmate {
@@ -816,6 +897,21 @@ fn lk_define_hidden_class_with_class_data(
                     message: format!("ExceptionInInitializerError for {hidden_name}: {msg}"),
                 }
                 .into());
+            }
+            // The backend's failure is a `Debug` rendering of the typed error
+            // it actually raised, so the FORMAT family can be recovered and
+            // re-thrown with its own type (`ClassFormatError`,
+            // `UnsupportedClassVersionError`, `VerifyError`). Anything else --
+            // notably the "prohibited package" refusal for bytes naming a class
+            // outside the lookup class's package -- keeps the
+            // `IllegalArgumentException` below, which is what the JDK specifies
+            // for that case.
+            if let Some(e) = crate::lang_system::lookup_define_format_error(
+                &hidden_name,
+                "defineHiddenClassWithClassData",
+                &msg,
+            ) {
+                return Err(e);
             }
             return Err(RuntimeError::IllegalArgumentException {
                 message: format!("defineHiddenClassWithClassData({hidden_name}): {msg}"),
@@ -942,6 +1038,15 @@ mod tests {
         Value::Object(None)
     }
 
+    /// The EMPTY `ClassOption[]` a varargs call site actually passes. javac
+    /// emits `new ClassOption[0]` for `defineHiddenClass(bytes, initialize)`;
+    /// a null in that slot means the caller wrote `(ClassOption[]) null`, which
+    /// the JDK answers with NullPointerException. These tests used to pass a
+    /// null and so were exercising a frame shape no Java call site produces.
+    fn no_options(ctx: &mut MockNativeContext) -> cratonvm_types::ObjectRef {
+        ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0)
+    }
+
     /// Smallest valid class file prefix: magic + minor 0 + major 65 (JDK 21+).
     /// The mock's `define_class_from_bytes` only checks the magic; downstream
     /// linking / verification is skipped because of `skip_verification`.
@@ -978,7 +1083,19 @@ mod tests {
             &mut ctx,
             &[Value::Object(Some(lookup)), Value::Object(None)],
         );
-        assert!(r.is_err(), "expected IAE on null bytes");
+        // The TYPE is the contract here, and the previous assertion --
+        // `is_err()` with a message naming an exception it never checked --
+        // would have stayed green through the whole defect. `Lookup.defineClass`
+        // is specified to throw NullPointerException for null bytes.
+        assert!(
+            matches!(
+                r,
+                Err(MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Runtime(RuntimeError::NullPointerException { .. })
+                ))
+            ),
+            "null bytes must be NullPointerException, got {r:?}"
+        );
     }
 
     #[test]
@@ -994,7 +1111,54 @@ mod tests {
             &mut ctx,
             &[Value::Object(Some(lookup)), Value::Object(Some(bytes))],
         );
-        assert!(r.is_err(), "expected IAE on bad magic");
+        // Bad magic is a CLASS FORMAT problem, and `ClassFormatError` is an
+        // `Error`: a generator guarding its emit with `catch (ClassFormatError)`
+        // never sees an `IllegalArgumentException`, so the malformed class
+        // escapes and fails somewhere unrelated.
+        assert!(
+            matches!(
+                r,
+                Err(MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Linkage(
+                        cratonvm_types::error::LinkageError::ClassFormatError { .. }
+                    )
+                ))
+            ),
+            "bad magic must be ClassFormatError, got {r:?}"
+        );
+    }
+
+    /// A null `ClassOption[]` is a different argument from null bytes, and
+    /// `parse_nestmate_option` used to answer `false` for it -- silently
+    /// dropping a NESTMATE the caller asked for.
+    #[test]
+    fn define_hidden_class_rejects_null_options() {
+        let mut ctx = MockNativeContext::new();
+        let lookup = ctx.alloc_object(ClassId::new(1), 4);
+        let class_bytes = cafebabe_minimal();
+        let bytes = ctx.new_array(cratonvm_types::ArrayElementType::Byte, class_bytes.len());
+        for (i, b) in class_bytes.iter().enumerate() {
+            ctx.set_array_element(bytes, i, Value::Int(*b as i32));
+        }
+        let opts = no_options(&mut ctx);
+        let r = lk_define_hidden_class_full(
+            &mut ctx,
+            &[
+                Value::Object(Some(lookup)),
+                Value::Object(Some(bytes)),
+                Value::Int(0),
+                Value::Object(None),
+            ],
+        );
+        assert!(
+            matches!(
+                r,
+                Err(MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Runtime(RuntimeError::NullPointerException { .. })
+                ))
+            ),
+            "null options must be NullPointerException, got {r:?}"
+        );
     }
 
     #[test]
@@ -1024,13 +1188,14 @@ mod tests {
         for (i, b) in class_bytes.iter().enumerate() {
             ctx.set_array_element(bytes, i, Value::Int(*b as i32));
         }
+        let opts = no_options(&mut ctx);
         let r = lk_define_hidden_class_full(
             &mut ctx,
             &[
                 Value::Object(Some(lookup)),
                 Value::Object(Some(bytes)),
-                Value::Int(0),       // initialize = false
-                Value::Object(None), // no options
+                Value::Int(0), // initialize = false
+                Value::Object(Some(opts)),
             ],
         )
         .unwrap();
@@ -1047,6 +1212,7 @@ mod tests {
         for (i, b) in class_bytes.iter().enumerate() {
             ctx.set_array_element(bytes, i, Value::Int(*b as i32));
         }
+        let opts = no_options(&mut ctx);
         let _r = lk_define_hidden_class_with_class_data(
             &mut ctx,
             &[
@@ -1054,7 +1220,7 @@ mod tests {
                 Value::Object(Some(bytes)),
                 Value::Object(Some(payload)),
                 Value::Int(0),
-                Value::Object(None),
+                Value::Object(Some(opts)),
             ],
         )
         .unwrap();
@@ -1165,6 +1331,7 @@ mod tests {
 
         let opts_arr = make_options_array(&mut ctx, option_ordinals);
 
+        let opts = no_options(&mut ctx);
         let r = lk_define_hidden_class_full(
             &mut ctx,
             &[
@@ -1314,6 +1481,7 @@ mod tests {
             ctx.set_array_element(opts_arr, i, Value::Object(Some(opt)));
         }
 
+        let opts = no_options(&mut ctx);
         let r = lk_define_hidden_class_full(
             &mut ctx,
             &[
@@ -1386,6 +1554,7 @@ mod tests {
         let payload = ctx.alloc_object(ClassId::new(1), 1);
         let opts_arr = make_options_array(&mut ctx, &[0, 1]);
 
+        let opts = no_options(&mut ctx);
         let r = lk_define_hidden_class_with_class_data(
             &mut ctx,
             &[
@@ -1638,6 +1807,7 @@ mod tests {
             ctx.set_array_element(bytes_arr, i, Value::Int(*b as i32));
         }
         let opts_arr = make_options_array(&mut ctx, &[0]); // NESTMATE
+        let opts = no_options(&mut ctx);
         let r = lk_define_hidden_class_full(
             &mut ctx,
             &[
@@ -1676,6 +1846,7 @@ mod tests {
         for (i, b) in class_bytes.iter().enumerate() {
             ctx.set_array_element(bytes_arr, i, Value::Int(*b as i32));
         }
+        let opts = no_options(&mut ctx);
         let r = lk_define_hidden_class_with_class_data(
             &mut ctx,
             &[
@@ -1683,7 +1854,7 @@ mod tests {
                 Value::Object(Some(bytes_arr)),
                 Value::Object(Some(payload)),
                 Value::Int(0),
-                Value::Object(None),
+                Value::Object(Some(opts)),
             ],
         );
         assert!(r.is_ok(), "defineHiddenClassWithClassData must succeed");

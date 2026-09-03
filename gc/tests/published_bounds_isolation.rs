@@ -295,6 +295,55 @@ fn every_backend_registers_in_the_live_heap_registry() {
     assert_eq!(gen_heap::live_relocatable_heaps(), 0);
 }
 
+/// Precise root coverage — G1 publishes its arena envelope into
+/// `MOVABLE_BOUNDS`, and doing so must NOT make the store-side table live.
+///
+/// The verifier in `conservative_roots` classifies a compiled frame's spill
+/// band with `addr_is_movable`, the union of `JIT_REGION_BOUNDS` and
+/// `MOVABLE_BOUNDS`. G1 published NEITHER, so `movable_bounds_are_live()` was
+/// false and the verifier failed closed on `YOUNG_BOUNDS_UNPUBLISHED` before
+/// inspecting a frame — every G1 pause reporting `root coverage: incomplete`.
+///
+/// The second assertion is the one that must never regress: filling
+/// `JIT_REGION_BOUNDS` instead would have fixed the verifier and silently
+/// re-enabled the inline reference-store fast path that defect G1-2 closed.
+/// Two tables exist precisely so this fix cannot do that.
+#[test]
+fn g1_publishes_its_movable_envelope_without_making_region_bounds_live() {
+    let _serialise = LOCK.lock().unwrap();
+    assert_eq!(
+        gen_heap::live_relocatable_heaps(),
+        0,
+        "a peer test left a heap alive"
+    );
+
+    let g1 = G1Collector::new(G1CollectorConfig {
+        heap_size: 8 * 1024 * 1024,
+        ..Default::default()
+    });
+    let obj = g1.alloc_object(ClassId::new(1), 2);
+
+    assert!(
+        gen_heap::movable_bounds_published(),
+        "G1 relocates, so it must say what its relocating phase may move — or          the frame-band verifier is vacuous on this collector and every          coverage verdict it produces is unearned"
+    );
+    assert!(
+        gen_heap::addr_is_movable(obj.as_ptr() as usize),
+        "an object G1 allocated must classify as movable"
+    );
+    assert!(
+        !gen_heap::addr_in_published_young_regions(obj.as_ptr() as usize),
+        "G1-2: the STORE-side table must stay empty under G1. Publishing the          movable envelope must not make a young-region containment test answer          true, or the inline reference-store fast path comes back."
+    );
+
+    drop(g1);
+    assert!(
+        !gen_heap::movable_bounds_published(),
+        "a dropped collector must take its envelope with it"
+    );
+    assert_eq!(gen_heap::live_relocatable_heaps(), 0);
+}
+
 // ---------------------------------------------------------------------------
 // JIT_READ_BOUNDS — ZGC's arena envelope for the inline reference load
 // ---------------------------------------------------------------------------
