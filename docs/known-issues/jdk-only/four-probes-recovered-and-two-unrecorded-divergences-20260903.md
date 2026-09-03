@@ -81,7 +81,7 @@ force(0,8)              true                              UnsatisfiedLinkError
                                                           MappedMemoryUtils.force0
 ```
 
-Searched across `docs/known-issues/` and `docs/internal/`:
+Searched across the whole known-issues tree and the retired/internal one:
 
 * **`MappedMemoryUtils.force0` — recorded**, `W7-68-live-under-allocations.md`.
 * **`EPollSelectorProvider` — recorded**, in `H5-1`, `W7-9` and
