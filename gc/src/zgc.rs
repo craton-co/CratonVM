@@ -2416,7 +2416,14 @@ impl ZgcRealHeap {
         let affordable_span = target_ns.saturating_mul(1 << ZGC_PAUSE_COST_SHIFT) / next;
         let cap = self.heap_capacity();
         let budget = match affordable_span.checked_sub(live_bytes as u64) {
-            Some(b) if b as usize >= ZGC_ALLOC_TRIGGER_FLOOR => (b as usize).min(cap),
+            // Compared and converted in `u64`: `affordable_span` is derived
+            // from a saturating multiply and can legitimately exceed
+            // `usize::MAX` on a 32-bit host, where `as usize` would truncate a
+            // huge budget into a small one -- the one direction that turns an
+            // inert clause into a storm.
+            Some(b) if b >= ZGC_ALLOC_TRIGGER_FLOOR as u64 => {
+                usize::try_from(b).unwrap_or(usize::MAX).min(cap)
+            }
             // The target is not achievable at this live set -- either the live
             // set alone overruns it, or what it leaves is too small to be
             // worth a cycle. Go INERT, not tight: see the doc above for why
