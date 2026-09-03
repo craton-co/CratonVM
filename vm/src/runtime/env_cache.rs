@@ -1918,6 +1918,13 @@ cached_is_set!(no_nonvirtual_fast_door, "CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR");
 /// call in the buffers it left behind. Token:
 /// `CRATONVM_JIT=-frame-slot-reuse`.
 cached_is_set!(no_frame_slot_reuse, "CRATONVM_JIT_NO_FRAME_SLOT_REUSE");
+
+/// `CRATONVM_JIT_NO_FRAME_EMPLACE` -- build the callee's `Frame` on the Rust
+/// stack and move it into the frame stack, instead of constructing it in the
+/// slot. Only reachable when no slot is retired: the first call at a depth,
+/// and every call under `CRATONVM_JIT_NO_FRAME_SLOT_REUSE`. Token:
+/// `CRATONVM_JIT=-frame-emplace`.
+cached_is_set!(no_frame_emplace, "CRATONVM_JIT_NO_FRAME_EMPLACE");
 /// `CRATONVM_DBG_BYTECODE_DUMP` -- temporary raw-bytecode + mnemonic
 /// disassembly dump (2026-07-15, JRubyScriptTemplateTests round 3): see
 /// `push_frame_and_fire_entry`'s own doc comment for the full story --

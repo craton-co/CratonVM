@@ -177,13 +177,35 @@ pub(super) fn push_frame_verbatim(
         cached.max_locals as usize,
         (cached.max_stack as usize).max(16) + 8,
     );
-    let frame = Frame::new_pooled_cached_compact(
-        cached,
+    // No retired slot: the first call at this depth. Take the buffers from the
+    // pools and build the frame IN the slot rather than on the Rust stack --
+    // `push` would move ~220 bytes into the same place. The buffers are taken
+    // before the frame stack is borrowed, which is also what keeps the pools
+    // and `FrameStack` from wanting `&mut thread` at once.
+    if crate::runtime::env_cache::no_frame_emplace() {
+        let frame = Frame::new_pooled_cached_compact(
+            cached,
+            &slots[..total_args],
+            &mut thread.locals_pool,
+            &mut thread.stacks_pool,
+        );
+        push_frame_and_fire_entry(shared.vm_identity, thread, frame);
+        return CachedCallResult::FramePushed;
+    }
+    let parts = crate::runtime::frame::take_cached_compact_parts(
+        &cached,
         &slots[..total_args],
         &mut thread.locals_pool,
         &mut thread.stacks_pool,
     );
-    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
+    thread.frames.emplace_cached_compact(
+        cached,
+        parts.0,
+        parts.1,
+        parts.2,
+        parts.3,
+    );
+    fire_method_entry_after_push(shared.vm_identity, thread);
     CachedCallResult::FramePushed
 }
 
