@@ -139,6 +139,24 @@ Checked and excluded inside the door, so the next person does not repeat them:
 * **Overflow is guarded.** Every consumer refuses when
   `param_tags_overflow` is set or the arity disagrees with `param_tag_len`.
 
+**The frame install is not it (2026-09-03).** `push_frame_verbatim` does two
+separable things: it lays the arguments into the callee's locals, and it puts
+the frame into the stack — rebuilding the retired slot at that depth, or
+emplacing into the next one. The table above could not separate them, because
+`-invoke-fast-door` switches off all three doors at once and takes both halves
+with them. `CRATONVM_JIT_NO_FRAME_SLOT_REUSE=1 CRATONVM_JIT_NO_FRAME_EMPLACE=1`
+with the door forced ON removes the install half alone: the frame is built by
+value through `Frame::new_pooled_cached_compact` and pushed, exactly as it was
+before the 2026-09-02 frame-arena work. It fails **3/3**, same seed, same
+`op:1033`, same `(1810, null)`, in 9.3-11.8 s. So the frame install is
+excluded and the suspect is the argument transfer alone.
+
+That control was run because `perf/frame-emplace-general-dispatch-20260903`
+puts the same in-place install on the general dispatchers' path, where it
+serves every interpreted call rather than only the door's. Had the install
+been the cause, that change would have spread this wrong answer from a
+default-off path to all of them.
+
 What is left is the door's own transfer: `read_args_verbatim` validates each
 operand against the descriptor tag and stores `(CompactValue, tag)` pairs, and
 `push_frame_verbatim` builds the callee frame from them without going through
@@ -156,6 +174,7 @@ Each of these is 3 runs, same binary, same host:
 | `CRATONVM_ZGC_RELOCATE` | 3/3 |
 | `CRATONVM_JIT_GATED_REF_STORE` + `IR_GATED_REF_STORE` + `IR_REF_STORE` + `GC_JIT_REF_STORE_GATES` | 3/3 |
 | `CRATONVM_NO_JIT_INLINE_TLAB_NEW=1` | 3/3 |
+| `CRATONVM_JIT_NO_FRAME_SLOT_REUSE=1` + `CRATONVM_JIT_NO_FRAME_EMPLACE=1` | 3/3 |
 
 The ref-store family was the strongest guess — `829985d59 perf(jit): the
 single-pass reference store gets both cell shapes` is in the range, and a
