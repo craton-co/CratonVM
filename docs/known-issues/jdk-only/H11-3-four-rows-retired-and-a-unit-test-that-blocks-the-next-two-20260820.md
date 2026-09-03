@@ -124,6 +124,43 @@ records four instances of.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** §4's first bullet said "Nothing was
+> compiled. I did not run `cargo build`, `cargo check` or `cargo test` ... That
+> is a review, not a build." It has now been built.
+>
+> ```text
+> cargo check -p cratonvm-native-io --tests    Finished, no errors
+> ```
+>
+> `--tests`, not the bare form: the record's sibling `H7-1` §6a.1 records that
+> `cargo check -p X` builds the LIB only, so the bare command would not have
+> compiled the test trees at all.
+>
+> **The two things §4's review could only inspect by eye are now checked by the
+> compiler.** Brace balance at the two deletion sites — it compiles. And the five
+> callbacks whose only remaining reference is the concrete-class row are all
+> still referenced, so no `dead_code` warning appears:
+>
+> ```text
+> native_dis_read_int 4   native_dis_read_long 4   native_dos_write_int 4
+> native_dos_write_long 4   native_scanner_close 5     (references in native-io/src)
+> ```
+>
+> **The retirement this record proposed has since landed**, by the route §6's
+> out-of-file list needed: `c97e03ffe fix(native-io): retire the four
+> DataInput/DataOutput interface rows -- dispatch keys on the receiver, so they
+> served nobody`. `H8-1` §5.1's `Closeable`/`AutoCloseable` rows went the same
+> way on 2026-08-21, and `native-io/src/lib.rs:8902` preserves those two deleted
+> lines verbatim with the reasoning — including that **`H11-3` N1 wrote the
+> deletion out and could not make it because `vm/` was outside this lane's
+> bounds.** N1 is closed by someone else's two-file commit.
+>
+> **Everything else in §4 stands, and this note closes none of it:** no vector
+> was run against a binary containing these edits (§3's PASSes remain pre-change
+> baselines), `recv_is_bare_object` is still unwitnessed, compiled frames are
+> still uncovered, `H11-2` §3's `twin` column is still a heuristic, and the
+> `java/nio/ByteBuffer` contradiction with `H5-1` §3.4 is still unchased.
+
 ## 4. What I did NOT verify
 
 Stated plainly, because the rest of this record is confident:

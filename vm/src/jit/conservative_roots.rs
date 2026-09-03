@@ -4496,9 +4496,10 @@ pub struct InlinedLevel {
 /// cannot loop. What compiles there is leaf, straight-line, exception-free
 /// arithmetic that runs to its `ret`.
 ///
-/// `Arm64CompileResult::oop_maps` is unconditionally empty for the same
-/// generation of reasons (`compiled_methods_carry_no_oop_maps`), and its only
-/// writer fails closed, so there is no safepoint of any kind to name a bci at.
+/// `Arm64CompileResult::pending_oop_maps` is empty for the same generation of
+/// reasons (`compiled_methods_carry_no_oop_maps`) — as of 2026-09-03 the map
+/// WRITER is correct and its publication path works, but there is still no
+/// safepoint of any kind to call it at, and so none to name a bci at.
 /// A line number is downstream of a safepoint mechanism that backend does not
 /// have; giving it one is a consequence of building that mechanism, not a
 /// separate task. Three tests pin the premises, so a change that makes an
