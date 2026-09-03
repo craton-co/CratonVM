@@ -1270,11 +1270,68 @@ answer, and one of them was invisible until the control arm was believed.
    moves *where* a resource is released, check every path that releases it,
    including the one the kill switch turns back on.**
 
+#### The emplace, and why it needed its own switch to be visible
+
+The slot-reuse section above left one item: when **no** slot is retired, the
+door still built a `Frame` on the Rust stack and `push` moved ~220 bytes of it
+into the very slot it could have been written in.
+
+`Frame::new_pooled_cached_compact`'s buffer build is now factored into
+`build_cached_compact_parts`, shared with `FrameStack::emplace_cached_compact`
+so the by-value constructor and the emplace cannot drift. The emplace writes
+the struct literal through `ptr::write` **in the same function as the write**,
+so the destination is known at the point of construction and there is no
+intermediate to copy from; only the three buffer handles the caller just took
+from the pools travel.
+
+**That path is cold by default, and that is the whole measurement problem.**
+After slot reuse, a warm loop retires and rebuilds the same slot forever and
+never emplaces at all; the first call at each depth is one call in millions.
+So the change cannot be measured in the configuration that ships — not because
+it does nothing, but because the arm it governs almost never runs.
+
+`CRATONVM_JIT_NO_FRAME_SLOT_REUSE=1` forces it: with reuse off, the recycle
+harvests and trims, so every door call finds no retired slot and takes the
+emplace. That plus a switch on the emplace itself
+(`CRATONVM_JIT_NO_FRAME_EMPLACE`) isolates exactly the 220-byte move inside one
+binary. `probes/Dispatch.java` at 200k x 5, six interleaved passes, Azure at
+load 3.4 (`nocall` dead flat at 27-28 ns, which is what says the host was
+quiet):
+
+| arm | emplace | no-emplace |
+|---|---|---|
+| `nocall` (control) | 28 27 28 27 27 27 | 27 27 27 29 27 28 |
+| `static0` | 142 135 137 134 134 134 | 149 146 144 153 143 147 |
+| `static1` | 146 140 141 140 140 140 | 154 152 150 160 150 150 |
+| `static4` | 174 157 157 158 158 161 | 174 169 168 170 168 170 |
+| `virtual1` | 159 147 147 147 147 150 | 164 161 157 157 156 158 |
+| `special1` | 153 147 148 146 147 149 | 157 157 156 162 155 155 |
+| `iface1` | 164 150 149 159 156 151 | 164 170 163 170 160 159 |
+
+**~9-12 ns per call, 6/6 pairwise on `static0`/`static1`/`virtual1`/`special1`
+(5/6 and a tie on `static4` and `iface1`), and the no-call control does not
+move at all.** `static0` and `static1` do not even overlap: the emplace arm's
+worst pass beats the other arm's best.
+
+So the emplace is worth what the frame move costs, on the path where the frame
+move happens. What it buys in a default run is the first call at each depth
+plus every call in a workload whose retired slots keep being destroyed by
+interleaved by-value pushes — and it makes `CRATONVM_JIT_NO_FRAME_SLOT_REUSE`
+a much cheaper fallback than it was.
+
+**What it does not cover, deliberately.** The general dispatchers still push by
+value through `push_frame_and_fire_entry`, and because that harvests and trims
+the slot it would have reused, *every* non-door call takes the by-value build.
+Converting those is the same change again, but their call sites interleave the
+monitor-enter, the frame trace and the JVMTI entry event around the push in
+three different orders, and reordering that is not a change to make on the way
+past. It is the obvious next increment, and it is worth more than this one
+because it is not a cold path.
+
 #### What is left
 
-The fill, which is the oop-map half, and the `Frame` struct itself: a
-by-value push still moves ~220 bytes when no slot is retired (the first call
-at each depth). Emplacing it would take the remaining `frame_push` cycles.
+The fill, which is the oop-map half, and the general dispatchers' by-value
+push (see the note that closes the emplace section above).
 
 ## Exit criteria
 
