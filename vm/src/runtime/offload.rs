@@ -1519,6 +1519,12 @@ pub fn try_dispatch(
     // (`execute_invokestatic` calls `ensure_class_initialized_shared`
     // before reaching this hook), so the class is guaranteed in the
     // manager.
+    // Phase timing for the transparent door. `timed` is read once; every
+    // `mark` below is an `Instant::now()` pair only when it is on. See
+    // `cratonvm_types::gpu_offload_phase_census`.
+    let timed = cratonvm_types::gpu_offload_phase_census::enabled();
+    let entered = std::time::Instant::now();
+    let mut mark = entered;
     let cm = shared.classes.class_manager.read();
     let class_id = match cm.get_loaded_class_id(class_name) {
         Some(id) => id,
@@ -1536,6 +1542,10 @@ pub fn try_dispatch(
         Some(i) => i as u16,
         None => return Ok(DispatchOutcome::FallThrough),
     };
+    if timed {
+        cratonvm_types::gpu_offload_phase_census::add(0, mark.elapsed().as_nanos() as u64);
+        mark = std::time::Instant::now();
+    }
     // Hold the class-manager read lock for the full lookup_or_compile
     // call so we can pass the class's constant pool by reference rather
     // than cloning ~hundreds of entries. The cache itself takes no
@@ -1554,6 +1564,10 @@ pub fn try_dispatch(
         &class.constant_pool,
     );
     drop(cm);
+    if timed {
+        cratonvm_types::gpu_offload_phase_census::add(1, mark.elapsed().as_nanos() as u64);
+        mark = std::time::Instant::now();
+    }
 
     match outcome {
         LookupOutcome::Hit(kernel) => {
@@ -1608,6 +1622,14 @@ pub fn try_dispatch(
             // Synchronous: the submission is never registered and never
             // watched by the reaper; this call finalizes it and reads the
             // result off it directly. See `Completion::Caller`.
+            if timed {
+                cratonvm_types::gpu_offload_phase_census::note_call();
+                cratonvm_types::gpu_offload_phase_census::add(
+                    2,
+                    mark.elapsed().as_nanos() as u64,
+                );
+                mark = std::time::Instant::now();
+            }
             let submission = dispatch_method_sync(
                 shared,
                 class_name,
@@ -1615,7 +1637,34 @@ pub fn try_dispatch(
                 method_descriptor,
                 args,
             );
+            let dispatch_ns = if timed {
+                let n = mark.elapsed().as_nanos() as u64;
+                mark = std::time::Instant::now();
+                n
+            } else {
+                0
+            };
             let result = finalize_submission(shared, &submission);
+            if timed {
+                // `finalize_submission` reports its own two phases; what
+                // it spent outside them is negligible and lands in the
+                // unaccounted row.
+                let _ = mark;
+                // What `dispatch_method_sync` spent outside the phases it
+                // reported from the inside, split prologue/epilogue by
+                // the marks it left.
+                let inner = DISPATCH_INNER_NS.with(|c| c.replace(0));
+                let prologue = DISPATCH_PROLOGUE_NS.with(|c| c.replace(0));
+                cratonvm_types::gpu_offload_phase_census::add(6, prologue);
+                cratonvm_types::gpu_offload_phase_census::add(
+                    7,
+                    dispatch_ns.saturating_sub(inner).saturating_sub(prologue),
+                );
+                cratonvm_types::gpu_offload_phase_census::add(
+                    cratonvm_types::gpu_offload_phase_census::TOTAL,
+                    entered.elapsed().as_nanos() as u64,
+                );
+            }
             let submission = Some(submission);
             match result {
                 Ok(()) => {
@@ -4370,6 +4419,24 @@ pub fn dispatch_method_sync(
 }
 
 #[cfg(feature = "gpu-offload")]
+/// Nanoseconds `dispatch_method_inner` accounted to named phases on this
+/// thread, for the caller to subtract from its own measurement of the
+/// whole call.
+///
+/// A thread-local rather than a return value because `dispatch_method_inner`
+/// has eight call sites and returns a submission; threading a timing tuple
+/// through all of them would put the instrument in every signature. It is
+/// only ever written under `enabled()`, and the caller takes it with a
+/// `replace(0)` so a dispatch that did not report leaves nothing behind for
+/// the next one to absorb.
+#[cfg(feature = "gpu-offload")]
+thread_local! {
+    static DISPATCH_INNER_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Nanoseconds `dispatch_method_inner` spent BEFORE its device work:
+    /// the cache handle, the second class+method resolve, and the memo.
+    static DISPATCH_PROLOGUE_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn dispatch_method_inner(
     shared: &crate::vm::SharedVm,
     class_name: &str,
@@ -4382,6 +4449,8 @@ fn dispatch_method_inner(
     use cratonvm_types::{ArrayElementType, Value};
     use cuda_bridge::{KernelArgs, Stream as CudaStream};
     use std::sync::Arc;
+
+    let dispatch_entered = std::time::Instant::now();
 
     // 1. Resolve the cache.
     let cache = shared
@@ -4578,6 +4647,22 @@ fn dispatch_method_inner(
         mark = std::time::Instant::now();
     }
 
+    // Inner phase timing. `inner_ns` accumulates only the phases named
+    // below; the caller subtracts it from its own measurement of the
+    // whole call and reports the remainder as `dispatch_other`.
+    // See `cratonvm_types::gpu_offload_phase_census`.
+    let timed = cratonvm_types::gpu_offload_phase_census::enabled();
+    let mut inner_ns = 0u64;
+    let mut mark = std::time::Instant::now();
+    if timed {
+        // Steps 1-3 happened before this point: the cache handle, the
+        // SECOND class+method resolve (the first was `try_dispatch`'s)
+        // and the memo that exists to make it cheap.
+        DISPATCH_PROLOGUE_NS.with(|c| {
+            c.set(c.get() + mark.saturating_duration_since(dispatch_entered).as_nanos() as u64)
+        });
+    }
+
     // 4. From here on we need a real device context. The Failed-fast
     //    path is identical to dispatch_async's no-device branch.
     let ctx = match cache.device() {
@@ -4644,6 +4729,12 @@ fn dispatch_method_inner(
         },
     };
 
+    if timed {
+        let n = mark.elapsed().as_nanos() as u64;
+        cratonvm_types::gpu_offload_phase_census::add(3, n);
+        inner_ns += n;
+        mark = std::time::Instant::now();
+    }
     // 6. Open the MARSHAL window. The zero-copy upload hands the device
     //    the heap arena's own address and host-blocks until the DMA has
     //    retired (`gpu_marshal::zerocopy_enabled`), so for the length of
@@ -5116,6 +5207,12 @@ fn dispatch_method_inner(
     // global index.
     kernel_args = kernel_args.push_i32(0);
 
+    if timed {
+        let n = mark.elapsed().as_nanos() as u64;
+        cratonvm_types::gpu_offload_phase_census::add(4, n);
+        inner_ns += n;
+        mark = std::time::Instant::now();
+    }
     // 8. Phase 7 #1 — dispatch on the stream. The launch grid's
     //    element count comes from `max_array_len` (0 for a scalar-only
     //    kernel with no array args, or a truncated 2^31-1 — an array
@@ -5211,6 +5308,12 @@ fn dispatch_method_inner(
     );
     drop(token);
     drop(marshal_window);
+    if timed {
+        let n = mark.elapsed().as_nanos() as u64;
+        cratonvm_types::gpu_offload_phase_census::add(5, n);
+        inner_ns += n;
+        DISPATCH_INNER_NS.with(|c| c.set(c.get() + inner_ns));
+    }
     // 9. Known-issues followups #3 — the writebacks + GC-critical
     //    guard are handed to `dispatch_async` itself now, rather than
     //    attached by this caller after the call returns: attaching
@@ -5315,6 +5418,8 @@ pub fn finalize_submission(
         let is_chunked = writebacks
             .iter()
             .any(|wb| matches!(wb, MarshalWriteback::Chunked { .. }));
+        let finalize_timed = cratonvm_types::gpu_offload_phase_census::enabled();
+        let finalize_mark = std::time::Instant::now();
         if let Some(event) = submission.event.as_ref().filter(|_| !is_chunked) {
             if let Err(e) = event.synchronize() {
                 let mut status = submission.status.lock();
@@ -5330,6 +5435,15 @@ pub fn finalize_submission(
                 });
             }
         }
+        if finalize_timed {
+            // Phase 8: the host waiting for the DEVICE. Everything after
+            // this point is phase 9, the writeback itself.
+            cratonvm_types::gpu_offload_phase_census::add(
+                8,
+                finalize_mark.elapsed().as_nanos() as u64,
+            );
+        }
+        let writeback_mark = std::time::Instant::now();
         // 2. Open the WRITEBACK window: the downloads below land in the
         //    heap arena in place, so relocation is forbidden until they
         //    have retired. Taken BEFORE the addresses are read back, so
@@ -5435,6 +5549,12 @@ pub fn finalize_submission(
         drop(writeback_window);
         drop(writebacks);
         drop(gc_critical);
+        if finalize_timed {
+            cratonvm_types::gpu_offload_phase_census::add(
+                9,
+                writeback_mark.elapsed().as_nanos() as u64,
+            );
+        }
 
         // 4. Transition status.
         let mut status = submission.status.lock();
@@ -6589,6 +6709,19 @@ pub(crate) mod input_cache {
         let stats = crate::memory::addr_keyed::remap_and_sweep(table, pointer_map, &|addr| {
             heap.is_object_address(addr).is_some()
         });
+        // Counted BEFORE the early return, and counting the collections
+        // that changed nothing too. A run that reports `collections=25
+        // re-keyed=0` has been through 25 collections without one of
+        // them moving a cached array -- which is a different fact from
+        // `collections=0`, and telling them apart is the whole reason
+        // this is here. The `tracing::debug!` below cannot: `tracing`
+        // is built with `max_level_info`, so it is compiled out of
+        // every release binary.
+        cratonvm_types::gpu_residency_census::note_gc(
+            stats.moved as u64,
+            stats.retained as u64,
+            stats.dropped as u64,
+        );
         if stats.moved == 0 && stats.dropped == 0 {
             return;
         }

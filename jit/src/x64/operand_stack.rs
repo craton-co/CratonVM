@@ -42,42 +42,127 @@ pub fn spill_slots_cap() -> Option<usize> {
     })
 }
 
+/// Why a spill word is being taken.
+///
+/// A parameter rather than a convention, for the reason the frame-line census
+/// gives one function every verdict: the first cut of the spill census
+/// attributed three call sites by hand and left 22-30% of reservations in an
+/// unnamed remainder -- and an unnamed remainder is exactly where the inline
+/// reserve was hiding when it took 280 words to hold 7. With this, a new
+/// `reserve_spill_slots` call site does not compile until someone has said
+/// which column it belongs in, and `res-total` is the sum of the named columns
+/// by construction rather than by hope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpillReason {
+    /// The ordinary operand push.
+    Push,
+    /// `flush_scratch_registers` giving a register-resident operand a home.
+    Flush,
+    /// `invalidate_callee_saved` re-homing every entry that aliases a register.
+    Invalidate,
+    /// An inlined callee's local frame.
+    InlineLocals,
+    /// An inlined body's branch-merge area.
+    InlineMerge,
+    /// The direct-call argument-service copy.
+    CallService,
+    /// A helper's argument buffer or out-parameter (intrinsic dispatch, FFM,
+    /// the monitor receiver).
+    HelperArgs,
+}
+
+impl SpillReason {
+    fn column(self) -> usize {
+        match self {
+            SpillReason::Push => crate::SPILL_RES_PUSH,
+            SpillReason::Flush => crate::SPILL_RES_FLUSH,
+            SpillReason::Invalidate => crate::SPILL_RES_INVALIDATE,
+            SpillReason::InlineLocals => crate::SPILL_RES_INLINE_LOCALS,
+            SpillReason::InlineMerge => crate::SPILL_RES_INLINE_MERGE,
+            SpillReason::CallService => crate::SPILL_RES_CALL_SERVICE,
+            SpillReason::HelperArgs => crate::SPILL_RES_HELPER_ARGS,
+        }
+    }
+}
+
 impl Compiler {
-    pub(super) fn checked_spill_range_end(&mut self, start: i32, slots: usize) -> Option<i32> {
-        let bytes = slots.checked_mul(8).and_then(|n| i32::try_from(n).ok());
-        let Some(bytes) = bytes else {
-            self.fail("singlepass-codegen/spill-range-byte-count-overflow");
-            return None;
+    /// The arithmetic alone: where `slots` words starting at `start` would end,
+    /// or which bound they break.
+    ///
+    /// `&self`, deliberately. This is the half that both a COMMITTING
+    /// reservation and a PROBE need, and keeping it borrow-immutable is what
+    /// makes it impossible for the probe to condemn a compile — see
+    /// [`Self::spill_range_fits`] for the defect that came of the two sharing
+    /// one `&mut self` function.
+    fn spill_range_end(&self, start: i32, slots: usize) -> Result<i32, &'static str> {
+        let Some(bytes) = slots.checked_mul(8).and_then(|n| i32::try_from(n).ok()) else {
+            return Err("singlepass-codegen/spill-range-byte-count-overflow");
         };
         let Some(end) = start.checked_add(bytes) else {
-            self.fail("singlepass-codegen/spill-range-end-overflow");
-            return None;
+            return Err("singlepass-codegen/spill-range-end-overflow");
         };
         if start < self.base_spill_offset || end > self.spill_limit_offset {
-            crate::note_spill_cursor(crate::SPILL_REFUSED_EXHAUSTED, 1);
-            self.fail("singlepass-codegen/spill-range-exhausted");
-            return None;
+            return Err("singlepass-codegen/spill-range-exhausted");
         }
-        crate::note_spill_peak(
-            u64::try_from((end - self.base_spill_offset) / 8).unwrap_or(0),
-            u64::try_from((self.spill_limit_offset - end) / 8).unwrap_or(0),
-        );
-        Some(end)
+        Ok(end)
     }
 
-    pub(super) fn reserve_spill_slots(&mut self, slots: usize) -> Option<i32> {
-        // Every reservation, so the three attributed columns can be read as a
-        // fraction of a whole rather than as three numbers with an unknown
-        // remainder beside them.
-        crate::note_spill_cursor(crate::SPILL_RES_TOTAL, slots as u64);
+    /// Reserve-side: the range is about to be TAKEN, so a refusal fails the
+    /// compile and is counted.
+    pub(super) fn checked_spill_range_end(&mut self, start: i32, slots: usize) -> Option<i32> {
+        match self.spill_range_end(start, slots) {
+            Ok(end) => {
+                crate::note_spill_peak(
+                    u64::try_from((end - self.base_spill_offset) / 8).unwrap_or(0),
+                    u64::try_from((self.spill_limit_offset - end) / 8).unwrap_or(0),
+                );
+                Some(end)
+            }
+            Err(site) => {
+                if site == "singlepass-codegen/spill-range-exhausted" {
+                    crate::note_spill_cursor(crate::SPILL_REFUSED_EXHAUSTED, 1);
+                }
+                self.fail(site);
+                None
+            }
+        }
+    }
+
+    pub(super) fn reserve_spill_slots(&mut self, slots: usize, why: SpillReason) -> Option<i32> {
+        // One bump, into the column the caller named. `res-total` is derived
+        // from these at read time rather than counted alongside them, so the
+        // partition cannot drift and there is no second atomic to race with.
+        crate::note_spill_cursor(why.column(), slots as u64);
         let start = self.next_spill_offset;
         let end = self.checked_spill_range_end(start, slots)?;
         self.next_spill_offset = end;
         Some(start)
     }
 
-    pub(super) fn spill_range_fits(&mut self, start: i32, slots: usize) -> bool {
-        self.checked_spill_range_end(start, slots).is_some()
+    /// Ask-side: would this range fit? A QUESTION, with no answer that
+    /// condemns the compile.
+    ///
+    /// It used to call [`Self::checked_spill_range_end`], which meant a probe
+    /// that answered "no" set `self.failed` and named the bail site as
+    /// `spill-range-exhausted` — so `canonicalize_stack`, whose whole handling
+    /// of a negative answer is `return;`, silently condemned the method it was
+    /// asked about. Two of the three callers wanted exactly that outcome but
+    /// none of them said so, and the census could not tell a probe apart from a
+    /// reservation that was actually taken.
+    ///
+    /// So the refusal now belongs to the caller: each one calls `fail` with a
+    /// site name of its own. Every caller still fails the compile — this
+    /// changes no behaviour — but it says which one did, and a fourth caller
+    /// that genuinely wants to fall back can now do so.
+    ///
+    /// `&self` is the enforcement, not a style choice: a probe that cannot take
+    /// `&mut self` cannot call `fail`.
+    pub(super) fn spill_range_fits(&self, start: i32, slots: usize) -> bool {
+        let fits = self.spill_range_end(start, slots).is_ok();
+        if !fits {
+            crate::note_spill_cursor(crate::SPILL_RANGE_PROBE_DECLINED, 1);
+        }
+        fits
     }
 
     pub(super) fn set_spill_depth(&mut self, depth: usize) -> bool {
@@ -99,8 +184,7 @@ impl Compiler {
         if self.stack.is_empty() && self.stack_oop_marks.is_empty() {
             self.stack_oop_marks_exact = true;
         }
-        crate::note_spill_cursor(crate::SPILL_RES_PUSH, 1);
-        let offset = self.reserve_spill_slots(1)?;
+        let offset = self.reserve_spill_slots(1, SpillReason::Push)?;
         let slot = StackSlot::Frame(offset);
         self.stack.push(slot);
         self.stack_oop_marks.push(false);
@@ -582,6 +666,14 @@ impl Compiler {
         let base = self.base_spill_offset;
         let len = self.stack.len();
         if !self.spill_range_fits(base, len) {
+            // Fail, do not merely decline. Callers reaching a merge point rely
+            // on every path agreeing that position `i` lives at `base + i*8`;
+            // returning early without canonicalising leaves the paths
+            // disagreeing about the frame, which is a wrong-code body rather
+            // than a missed optimisation. The `fail` used to happen inside
+            // `spill_range_fits` and this early return was silently relying on
+            // it — same outcome, now stated here.
+            self.fail("singlepass-codegen/canonicalize-spill-exhausted");
             return;
         }
         // Pending relocations: (position, source). `None` source = the value
@@ -909,8 +1001,11 @@ impl Compiler {
     /// there is no dead word below the cursor to reclaim. Anyone reaching for
     /// this again should read `spill_cursor_counts()` first.
     fn flush_home(&mut self, _idx: usize) -> Option<i32> {
-        crate::note_spill_cursor(crate::SPILL_FLUSH_RESERVED, 1);
-        self.reserve_spill_slots(1)
+        // No hand-rolled bump here: `SpillReason::Flush` IS the
+        // `flush-reserved` column, and counting it twice is what the first
+        // fully-attributed run caught (CratonBench read 1722 where 861 was
+        // right, and `res-total` inherited the error).
+        self.reserve_spill_slots(1, SpillReason::Flush)
     }
 
     pub(super) fn flush_scratch_registers(&mut self) {
@@ -1044,7 +1139,7 @@ impl Compiler {
             // All scratch XMMs busy — fall back to frame spill.
             // Direct MOVQ [rbp-off], XMM0 — RCX is left untouched, which
             // helps callers that have RCX live across this flush.
-            let Some(off) = self.reserve_spill_slots(1) else {
+            let Some(off) = self.reserve_spill_slots(1, SpillReason::Flush) else {
                 return;
             };
             self.emit_movq_mem_rbp_from_xmm(off, 0);
@@ -1083,8 +1178,7 @@ impl Compiler {
             return;
         }
         // Spill the register value once
-        crate::note_spill_cursor(crate::SPILL_RES_INVALIDATE, 1);
-        let Some(off) = self.reserve_spill_slots(1) else {
+        let Some(off) = self.reserve_spill_slots(1, SpillReason::Invalidate) else {
             return;
         };
         self.emit_store_local(off, reg);

@@ -3,10 +3,26 @@
 **Status: FIXED on `dev` 2026-09-02 by `c9b4a7d18`, which reverted the
 mechanism.** This page is not that fix. It records a **second, independent
 symptom** of the same mechanism, found from the other end and by a different
-lane, because `c9b4a7d18` leaves the underlying frame-growth defect explicitly
-OPEN — "the frame-growth defect is left OPEN and documented at both sites, with
-the constraint any future fix has to respect" — and whoever re-lands the
-optimisation needs both symptoms, not one.
+lane, and it is kept because the two symptoms together are what make the
+revert's constraint legible: whatever touches `StackSlot::Scratch` must not
+move the spill cursor, because the OSR entry's local homes derive from the same
+frame layout.
+
+> **The "underlying frame-growth defect" this page was written to preserve does
+> not exist.** This page originally said `c9b4a7d18` left it "explicitly OPEN"
+> and that whoever re-lands the optimisation needs both symptoms. There is
+> nothing to re-land. The premise — that `flush_scratch_registers` reserves a
+> fresh word per flushed value, so a call-heavy stretch grows the spill region
+> once per call — was measured on 2026-09-02 on exactly that shape (one method,
+> 64 sequential calls, all 64 results live across every later one) and reads
+> `flush-calls=144 flush-reserved=1 peak-words=8 res-push=451 exhausted=0`,
+> unchanged under `CRATONVM_JIT_SPILL_SLOTS_CAP` at 16 and 8. There are only
+> two scratch registers, so at most two values ever need a flush word. A
+> canonical-home variant was built, shipped behind a kill switch, and withdrawn
+> with its engagement counter reading zero in every arm.
+>
+> This residual has been taken on twice on the strength of a comment rather
+> than a number. Read `spill_cursor_counts()` first.
 
 `apps/probes/SingleByteCharsets` is the regression probe for this half. It is
 green on `a9acf3ec2` and red on `8b84cd347`.

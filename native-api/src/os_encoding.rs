@@ -407,9 +407,17 @@ mod tests {
         if pinned("CRATONVM_NATIVE_ENCODING").is_some() {
             return;
         }
+        // `pinned`, not `std::env::var`. The rule
+        // `tools/flag-census/check-surface.sh` enforces has no test carve-out
+        // and should not grow one: every environment read in a core runtime
+        // crate enters through `flags::runtime_var`, which routes DECLARED VM
+        // flags to the immutable snapshot and everything else -- these locale
+        // names included -- to a live read. So the behaviour here is
+        // unchanged, and the rule stays a rule rather than a rule with an
+        // exception that the next reader has to check they are inside.
         let asks_for_c = ["LC_ALL", "LC_CTYPE", "LANG"]
             .iter()
-            .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+            .find_map(|k| pinned(k))
             .is_none_or(|v| v == "C" || v == "POSIX");
         if asks_for_c {
             return;

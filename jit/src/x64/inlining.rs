@@ -1592,7 +1592,9 @@ impl Compiler {
         // is at or below this — never above it. See `caller_post_pop_spill`.
         let caller_spill_pre_reserve = self.next_spill_offset;
         // Allocate callee locals in caller's spill area.
-        let Some(callee_local_base) = self.reserve_spill_slots(callee_locals_size) else {
+        let Some(callee_local_base) =
+            self.reserve_spill_slots(callee_locals_size, SpillReason::InlineLocals)
+        else {
             return false;
         };
 
@@ -1744,7 +1746,9 @@ impl Compiler {
         // Costs `MAX_INLINE_MERGE_DEPTH` slots for the whole splice whether or
         // not the body branches; that is the price of not having to know
         // whether it does before walking it.
-        let Some(merge_base) = self.reserve_spill_slots(MAX_INLINE_MERGE_DEPTH) else {
+        let Some(merge_base) =
+            self.reserve_spill_slots(MAX_INLINE_MERGE_DEPTH, SpillReason::InlineMerge)
+        else {
             self.next_spill_offset = callee_local_base;
             return false;
         };

@@ -1409,6 +1409,22 @@ fn the_spill_census_is_wired_to_the_cursor() {
         after[crate::SPILL_MIN_HEADROOM] < u64::MAX,
         "min-headroom is still its unset sentinel after a successful          reservation, so nothing is recording it"
     );
+    // `res-total` is DERIVED from the reason columns, so the partition needs no
+    // assertion -- it cannot be false. What can still break is a reservation
+    // reaching the cursor through a column nobody reads, which is what the
+    // `res-push` check above catches, and a stale name table, which this does.
+    assert_eq!(
+        crate::SPILL_RES_REASON_COLUMNS.len(),
+        7,
+        "a `SpillReason` variant was added or removed without updating the          columns that partition `res-total`"
+    );
+    for &c in crate::SPILL_RES_REASON_COLUMNS.iter() {
+        assert!(
+            c < crate::SPILL_CURSOR_SLOT_NAMES.len(),
+            "reason column {c} has no name in SPILL_CURSOR_SLOT_NAMES"
+        );
+    }
+
     assert_eq!(
         after[crate::SPILL_FLUSH_CANONICAL],
         0,

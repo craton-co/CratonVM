@@ -12557,10 +12557,47 @@ pub fn box_unbox_intrinsic_sites() -> (usize, usize) {
 /// on ONE binary, which is the only kind of A/B this tree accepts for a perf
 /// claim — a control built from a different commit has manufactured a
 /// double-digit "regression" on phases containing neither call.
+/// # DEFAULT-OFF since 2026-09-02: it SIGSEGVs under a relocating collector
+///
+/// `org.h2.test.store.TestRandomMapOps --Xmx 256m` on the shipped default dies
+/// of `SIGSEGV` in 25-183 s, **11 runs out of 11**, at a fault address that is
+/// always a page boundary -- the shape of a read through a reference into a
+/// page the collector has already vacated. Two switches each remove it, 3 runs
+/// of 1200 s clean apiece:
+///
+/// * `CRATONVM_ZGC_RELOCATE=0` -- no relocation, no crash;
+/// * `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` -- this family off, no crash.
+///
+/// A `git bisect` over the 200 commits between the last known-good tip and the
+/// crashing one (both endpoints re-verified in the SAME build profile, and only
+/// `SIGSEGV` counted as bad, because the `NullPointerException` and the
+/// fragmentation `OutOfMemoryError` on this workload both PRE-DATE the range)
+/// lands on `a910b7d9c` -- a MERGE whose two parents are both good, and whose
+/// relocation files are byte-identical to one of them. So the defect is the
+/// INTERACTION between this intrinsic and dev's relocation, not either alone.
+///
+/// The inline sequence pops the receiver off the simulated operand stack and
+/// then dereferences it three times -- the class-id guard at `[RAX]`, the
+/// GC-flags byte, and the payload load -- with no call and therefore no
+/// safepoint in between. That is sound only while the receiver in hand cannot
+/// go stale; under a moving collector it evidently can. Root-causing that is
+/// the follow-up, and it wants the receiver kept as a NAMED root across the
+/// sequence rather than held only in `RAX`.
+///
+/// Correctness first: the family is now opt-in, and the perf win it was
+/// measured for is recoverable the moment the sequence is made relocation-safe.
+/// Set `CRATONVM_JIT_BOX_UNBOX_INTRINSIC=1` to turn it back on for that work.
+///
+/// `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` still forces it off, so a script
+/// that already sets it keeps working and keeps meaning the same thing.
 fn box_unbox_intrinsic_disabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some()
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some() {
+            return true;
+        }
+        // Default OFF: enabled only when explicitly asked for.
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_BOX_UNBOX_INTRINSIC").is_none()
     })
 }
 
@@ -18664,12 +18701,17 @@ pub fn compiled_frame_line_counts() -> [u64; 8] {
 /// | 3 | `exhausted` | compiles refused `spill-range-exhausted` |
 /// | 4 | `past-limit` | compiles refused `spill-cursor-past-limit` |
 /// | 5 | `peak-words` | high-water mark of live spill words in any one compile (a MAX, not a sum) |
-/// | 6 | `res-push` | words reserved by `push_stack` — the ordinary operand push |
-/// | 7 | `res-invalidate` | words reserved by `invalidate_callee_saved` |
-/// | 8 | `res-total` | every word reserved, so the two attributed columns read as a fraction of a whole |
+/// | 6 | `res-push` | the ordinary operand push |
+/// | 7 | `res-invalidate` | `invalidate_callee_saved` re-homing register-aliased entries |
+/// | 8 | `res-total` | every word reserved. NOT a counter: it is DERIVED at read time as the sum of the seven reason columns, so the partition is structural. Counting it separately and asserting the sum could not work — the columns are process-global atomics and seven loads plus an eighth are never a consistent snapshot while other threads compile |
 /// | 9 | `min-headroom` | the FEWEST words left between a reservation's end and `spill_limit_offset`, over every compile (a MIN; `u64::MAX` means nothing reserved) |
 /// | 10 | `inline-reserve-sum` | largest per-compile inline reserve as `spill_size` computes it today: a SUM over every site (a MAX over compiles) |
 /// | 11 | `inline-reserve-path` | what the same compile would need if the reserve were a MAX over top-level sites and over each site's deepest nested PATH (a MAX over compiles) |
+/// | 13 | `res-inline-locals` | an inlined callee's local frame |
+/// | 14 | `res-inline-merge` | an inlined body's branch-merge area |
+/// | 15 | `res-call-service` | the direct-call argument-service copy |
+/// | 17 | `range-probe-declined` | a `spill_range_fits` PROBE answered no. Separate from `exhausted`, which counts only ranges that were actually being taken — the two used to be the same number, because the probe and the reservation shared one function |
+/// | 16 | `res-helper-args` | a helper's argument buffer or out-parameter (intrinsic dispatch, FFM, the monitor receiver) |
 /// | 12 | `inline-reserve-spent` | what `spill_size` ACTUALLY added (a MAX over compiles). The engagement counter: it equals column 10 with the switch off and column 11 with it on, and inferring which without measuring it is how an inert change ships |
 ///
 /// Column 2 is retired and reads zero. It was the engagement counter for a
@@ -18684,7 +18726,7 @@ pub fn compiled_frame_line_counts() -> [u64; 8] {
 /// method, so 19 words is nearly the whole budget for one method and a rounding
 /// error for another. A refusal count of zero plus a large minimum headroom is
 /// a much stronger statement than the refusal count on its own.
-static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 13] = [
+static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 18] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -18695,6 +18737,11 @@ static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 13] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(u64::MAX),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -18716,8 +18763,19 @@ pub const SPILL_PEAK_WORDS: usize = 5;
 pub const SPILL_RES_PUSH: usize = 6;
 /// Words reserved by `invalidate_callee_saved`.
 pub const SPILL_RES_INVALIDATE: usize = 7;
-/// Every word reserved, by any caller.
+/// Every word reserved, by any caller. Derived, never stored — see the table.
 pub const SPILL_RES_TOTAL: usize = 8;
+
+/// The seven columns that partition [`SPILL_RES_TOTAL`], in `SpillReason` order.
+pub const SPILL_RES_REASON_COLUMNS: [usize; 7] = [
+    SPILL_RES_PUSH,
+    SPILL_FLUSH_RESERVED,
+    SPILL_RES_INVALIDATE,
+    SPILL_RES_INLINE_LOCALS,
+    SPILL_RES_INLINE_MERGE,
+    SPILL_RES_CALL_SERVICE,
+    SPILL_RES_HELPER_ARGS,
+];
 /// Fewest words ever left between a reservation and the spill limit.
 pub const SPILL_MIN_HEADROOM: usize = 9;
 /// Largest per-compile inline reserve, summed over sites as today.
@@ -18726,9 +18784,22 @@ pub const SPILL_INLINE_RESERVE_SUM: usize = 10;
 pub const SPILL_INLINE_RESERVE_PATH: usize = 11;
 /// What `spill_size` actually added for inlining.
 pub const SPILL_INLINE_RESERVE_SPENT: usize = 12;
+/// An inlined callee's local frame.
+pub const SPILL_RES_INLINE_LOCALS: usize = 13;
+/// An inlined body's branch-merge area.
+pub const SPILL_RES_INLINE_MERGE: usize = 14;
+/// The direct-call argument-service copy.
+pub const SPILL_RES_CALL_SERVICE: usize = 15;
+/// A helper's argument buffer or out-parameter.
+pub const SPILL_RES_HELPER_ARGS: usize = 16;
+/// A `spill_range_fits` probe answered no. Not a reservation, not in the
+/// partition — a question, counted so making it answerable did not lose it.
+pub const SPILL_RANGE_PROBE_DECLINED: usize = 17;
+/// Alias: the flush's own reservation column, named for `SpillReason::Flush`.
+pub const SPILL_RES_FLUSH: usize = SPILL_FLUSH_RESERVED;
 
 /// Human names, parallel to the slot indices.
-pub const SPILL_CURSOR_SLOT_NAMES: [&str; 13] = [
+pub const SPILL_CURSOR_SLOT_NAMES: [&str; 18] = [
     "flush-calls",
     "flush-reserved",
     "flush-canonical",
@@ -18742,6 +18813,11 @@ pub const SPILL_CURSOR_SLOT_NAMES: [&str; 13] = [
     "inline-reserve-sum",
     "inline-reserve-path",
     "inline-reserve-spent",
+    "res-inline-locals",
+    "res-inline-merge",
+    "res-call-service",
+    "res-helper-args",
+    "range-probe-declined",
 ];
 
 /// Add `n` to one column. `peak-words` must not go through here — it is a
@@ -18780,11 +18856,15 @@ pub fn note_spill_peak(words: u64, headroom: u64) {
 }
 
 /// Read the census. See [`SPILL_CURSOR_COUNTS`] for the columns.
-pub fn spill_cursor_counts() -> [u64; 13] {
-    let mut out = [0u64; 13];
+pub fn spill_cursor_counts() -> [u64; 18] {
+    let mut out = [0u64; 18];
     for (i, slot) in SPILL_CURSOR_COUNTS.iter().enumerate() {
         out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
     }
+    // `res-total` is derived, not counted. Every reservation bumps exactly one
+    // reason column, so the sum IS the total by construction and no reservation
+    // can reach the cursor without landing in it.
+    out[SPILL_RES_TOTAL] = SPILL_RES_REASON_COLUMNS.iter().map(|&c| out[c]).sum();
     out
 }
 
