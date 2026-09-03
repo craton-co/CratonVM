@@ -5756,6 +5756,9 @@ pub fn remap_active_jit_frames(pointer_map: &cratonvm_types::PointerMap) {
                     let boundary_cm: &cratonvm_jit::CompiledMethod = unsafe { &*innermost_cm };
                     let (found, examined, n) =
                         remap_one_jit_frame(info.exact_rbp, boundary_cm, pointer_map);
+                        if stale_frame_word_check_enabled() {
+                            audit_stale_frame_words(info.exact_rbp, boundary_cm, pointer_map);
+                        }
                     dbg_frames += 1;
                     dbg_slots.set(dbg_slots.get() + n);
                     if found {
@@ -5830,6 +5833,9 @@ pub fn remap_active_jit_frames(pointer_map: &cratonvm_types::PointerMap) {
                         let cm: &cratonvm_jit::CompiledMethod =
                             unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
                         let (found, examined, n) = remap_one_jit_frame(parent_rbp, cm, pointer_map);
+                        if stale_frame_word_check_enabled() {
+                            audit_stale_frame_words(parent_rbp, cm, pointer_map);
+                        }
                         dbg_frames += 1;
                         dbg_slots.set(dbg_slots.get() + n);
                         if found {
@@ -5866,6 +5872,96 @@ pub fn remap_active_jit_frames(pointer_map: &cratonvm_types::PointerMap) {
 /// Returns (map_found, slots_examined, slots_rewritten) — the extra counts are
 /// for the CRATONVM_DBG_PRECISE diagnostic (distinguish "sp-id lookup miss"
 /// from "mapped slots hold only pinned oops").
+/// `CRATONVM_DBG_STALE_FRAME_WORDS=1` -- after a frame is remapped, report any
+/// word still holding an address this collection MOVED.
+///
+/// This asks the failing question directly. `CRATONVM_DBG_VERIFY_OOP_MAPS` asks
+/// "does the class file call this word a reference", and on the workloads that
+/// crash it answers `verifier_oop=0` for all 2.8 M candidates -- it cannot see
+/// the root. This asks "did we move the object this word points at and leave
+/// the word pointing at the old address", which is the defect itself: a stale
+/// reference in a live compiled frame is exactly what
+/// `bug-box-unbox-intrinsic-segv-under-relocation-20260902` concluded the fault
+/// is, and what its page-aligned faulting `rdi` looks like.
+///
+/// A hit is only a candidate, not proof: a DEAD copy of a moved pointer left in
+/// a spill slot is stale and harmless. What makes it actionable is the slot
+/// CLASS -- `classify_frame_slot` names the three storage classes the coverage
+/// model does not describe -- and the method label.
+pub fn stale_frame_word_check_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STALE_FRAME_WORDS").is_some()
+    })
+}
+
+pub mod stale_frame_audit {
+    use std::sync::atomic::AtomicU64;
+    /// Frames audited. The denominator: a zero `STALE` with a zero here means
+    /// the audit never ran, not that the frames were clean.
+    pub static FRAMES: AtomicU64 = AtomicU64::new(0);
+    /// Words still holding an address this collection moved.
+    pub static STALE: AtomicU64 = AtomicU64::new(0);
+    /// Of those, the ones in a slot class the coverage model does NOT describe
+    /// -- the predicted defect.
+    pub static STALE_UNMODELLED: AtomicU64 = AtomicU64::new(0);
+}
+
+/// Scan `[rbp - frame_size, rbp]` for words that still name a moved object.
+///
+/// Called AFTER `remap_one_jit_frame` has rewritten every slot the maps name,
+/// so anything left is by definition a slot no map named.
+fn audit_stale_frame_words(
+    rbp: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+    pointer_map: &cratonvm_types::PointerMap,
+) {
+    use std::sync::atomic::Ordering as AOrd;
+    let frame_size = cm.osr_frame_size;
+    if frame_size <= 0 {
+        return;
+    }
+    let frame_size = frame_size as usize;
+    const MAX_COMPILED_FRAME_BYTES: usize = 1024 * 1024;
+    if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
+        return;
+    }
+    stale_frame_audit::FRAMES.fetch_add(1, AOrd::Relaxed);
+    let lo = rbp - frame_size;
+    let mut a = (lo + 7) & !7usize;
+    while a <= rbp {
+        // SAFETY: inside a live compiled frame of THIS thread, bounded by the
+        // same frame-size check every other walk in this file applies.
+        let v = unsafe { (a as *const usize).read() };
+        if let Some(&moved_to) = pointer_map.get(&v) {
+            let off = (rbp - a) as i32;
+            let class = classify_frame_slot(off, &cm.frame_layout);
+            let unmodelled = matches!(
+                class,
+                "scalar-replacement-field"
+                    | "licm-ref-hoist"
+                    | "licm-arith-hoist"
+                    | "gpr-safepoint-spill"
+            );
+            stale_frame_audit::STALE.fetch_add(1, AOrd::Relaxed);
+            if unmodelled {
+                stale_frame_audit::STALE_UNMODELLED.fetch_add(1, AOrd::Relaxed);
+            }
+            static LOGGED: AtomicUsize = AtomicUsize::new(0);
+            if LOGGED.fetch_add(1, AOrd::Relaxed) < 40 {
+                eprintln!(
+                    "[STALE-FRAME-WORD] method={} slot=[rbp-{off:#x}] class={class}                      stale={v:#x} should_be={moved_to:#x} frame_size={frame_size}                      maps={} covered={} shadow_covered={}",
+                    cm.method_label,
+                    cm.oop_maps.len(),
+                    cm.fully_oop_covered,
+                    cm.fully_shadow_covered,
+                );
+            }
+        }
+        a += 8;
+    }
+}
+
 fn remap_one_jit_frame(
     rbp: usize,
     cm: &cratonvm_jit::CompiledMethod,
@@ -7476,6 +7572,9 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
             // its CompiledMethod metadata for the lifetime of an active frame.
             let innermost_cm: &cratonvm_jit::CompiledMethod = unsafe { &*innermost_cm };
             scan_active_oop_map_at_rbp(info.exact_rbp, innermost_cm, heap, out);
+            if pin_unnamed_frame_refs_enabled() {
+                pin_unnamed_frame_refs(info.exact_rbp, innermost_cm, heap);
+            }
         }
 
         let mut child_rbp = info.exact_rbp;
@@ -7503,6 +7602,9 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
             let parent_cm: &cratonvm_jit::CompiledMethod =
                 unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
             scan_active_oop_map_at_rbp(parent_rbp, parent_cm, heap, out);
+            if pin_unnamed_frame_refs_enabled() {
+                pin_unnamed_frame_refs(parent_rbp, parent_cm, heap);
+            }
             child_rbp = parent_rbp;
         }
     }
@@ -7640,6 +7742,136 @@ fn scan_compiled_frame_bands(
 /// A missing id or map deliberately scans nothing here: the caller's
 /// conservative compatibility backstop remains responsible for legacy and
 /// uncovered frames.
+/// `CRATONVM_JIT_PIN_UNNAMED_FRAME_REFS=1` -- pin every object a live compiled
+/// frame names in a slot its oop maps do NOT name.
+///
+/// The defect this closes, measured 2026-09-03 on
+/// `TestCachedQueryResults` with `CRATONVM_DBG_STALE_FRAME_WORDS=1`: one
+/// reference lives in SEVERAL slots of a frame at once -- a GPR safepoint
+/// spill, an operand spill and two below the locals boundary all held
+/// `0x1fef6b70878` -- while the map names only the canonical home. Relocation
+/// rewrites that home and every duplicate keeps pointing at the vacated page.
+/// Reading one is the page-aligned SIGSEGV of
+/// `bug-box-unbox-intrinsic-segv-under-relocation-20260902`.
+///
+/// Map SELECTION is not the problem and was ruled out first: `NO_MAP_FOR_SP_ID`
+/// and `NO_SP_ID_SLOT` are both zero on that workload, and dev's
+/// precise-oop-maps-for->64-locals fix changes nothing. The maps are found and
+/// correct; they simply do not enumerate every copy the register allocator made.
+///
+/// Why PIN rather than rewrite the duplicates. Rewriting every frame word whose
+/// value equals a moved object's base is a conservative WRITE: a primitive that
+/// happens to hold that bit pattern would be silently corrupted, which is worse
+/// than the crash it fixes. Pinning is conservative in the safe direction -- the
+/// object does not move, so every copy of the reference stays valid, named or
+/// not. It costs compaction, not correctness.
+pub fn pin_unnamed_frame_refs_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_PIN_UNNAMED_FRAME_REFS").is_some()
+    })
+}
+
+pub mod unnamed_ref_pins {
+    use std::sync::atomic::AtomicU64;
+    /// Frames scanned. The denominator: `PINNED=0` with `FRAMES=0` means the
+    /// pass never ran, not that there was nothing to pin.
+    pub static FRAMES: AtomicU64 = AtomicU64::new(0);
+    /// Objects pinned because a frame named them in an unmapped slot.
+    pub static PINNED: AtomicU64 = AtomicU64::new(0);
+    /// Of those, ones ALSO reachable from a slot the map does name -- i.e. a
+    /// genuine duplicate home, the shape this exists for.
+    pub static DUPLICATE_OF_MAPPED: AtomicU64 = AtomicU64::new(0);
+}
+
+/// Pin every object this frame names in a slot its maps do not.
+///
+/// Selection matches `remap_one_jit_frame` exactly -- the UNION of every map
+/// whose `bytecode_pc` equals the frame's stamped safepoint id, not the first
+/// one -- because a slot the remap WILL rewrite must not be pinned, and one it
+/// will not must be.
+fn pin_unnamed_frame_refs(rbp: usize, cm: &cratonvm_jit::CompiledMethod, heap: &VmHeap) {
+    use std::sync::atomic::Ordering as AOrd;
+    let sp_id_off = cm.sp_id_slot_off;
+    let frame_size = cm.osr_frame_size;
+    if sp_id_off <= 0 || frame_size <= 0 || rbp < sp_id_off as usize {
+        return;
+    }
+    let frame_size = frame_size as usize;
+    const MAX_COMPILED_FRAME_BYTES: usize = 1024 * 1024;
+    if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
+        return;
+    }
+    let id_addr = rbp - sp_id_off as usize;
+    if id_addr & 0x7 != 0 {
+        return;
+    }
+    // SAFETY: the safepoint id lives in the frame's reserved slot, written
+    // before the helper call that can trigger this scan.
+    let sp_id = unsafe { (id_addr as *const usize).read() } as u32;
+
+    // The offsets the remap will rewrite. Same 64-entry bound and same union
+    // as `remap_one_jit_frame`; past the bound we pin conservatively, which is
+    // the safe direction (an over-pin costs compaction).
+    let mut named: [i16; 64] = [0; 64];
+    let mut named_len = 0usize;
+    for map in cm.oop_maps.iter().filter(|m| m.bytecode_pc == sp_id) {
+        for &off in &map.frame_slot_offsets {
+            if named_len < named.len() && !named[..named_len].contains(&off) {
+                named[named_len] = off;
+                named_len += 1;
+            }
+        }
+    }
+
+    // The values the map DOES name, so a duplicate can be told from a lone
+    // unmapped reference. Diagnostic only -- both get pinned.
+    let mut mapped_vals: [usize; 64] = [0; 64];
+    let mut mapped_len = 0usize;
+    for &off in named[..named_len].iter() {
+        if off <= 0 || rbp < off as usize {
+            continue;
+        }
+        let a = rbp - off as usize;
+        if a & 0x7 != 0 {
+            continue;
+        }
+        // SAFETY: aligned slot inside this thread's live frame.
+        let v = unsafe { (a as *const usize).read() };
+        if mapped_len < mapped_vals.len() {
+            mapped_vals[mapped_len] = v;
+            mapped_len += 1;
+        }
+    }
+
+    unnamed_ref_pins::FRAMES.fetch_add(1, AOrd::Relaxed);
+    let lo = rbp - frame_size;
+    let mut a = (lo + 7) & !7usize;
+    let mut pins: Vec<usize> = Vec::new();
+    while a <= rbp {
+        let off = (rbp - a) as i64;
+        let is_named = off > 0
+            && off <= i16::MAX as i64
+            && named[..named_len].contains(&(off as i16));
+        if !is_named {
+            // SAFETY: aligned word inside this thread's live compiled frame,
+            // bounded by the recorded frame size.
+            let v = unsafe { (a as *const usize).read() };
+            if heap.is_object_address(v).is_some() {
+                pins.push(v);
+                unnamed_ref_pins::PINNED.fetch_add(1, AOrd::Relaxed);
+                if mapped_vals[..mapped_len].contains(&v) {
+                    unnamed_ref_pins::DUPLICATE_OF_MAPPED.fetch_add(1, AOrd::Relaxed);
+                }
+            }
+        }
+        a += 8;
+    }
+    if !pins.is_empty() {
+        cratonvm_gc::gc_quiescence::add_xt_cycle_pinned_jit_roots(&pins);
+    }
+}
+
 fn scan_active_oop_map_at_rbp(
     rbp: usize,
     cm: &cratonvm_jit::CompiledMethod,
