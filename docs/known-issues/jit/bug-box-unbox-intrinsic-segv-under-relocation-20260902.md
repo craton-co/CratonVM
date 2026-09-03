@@ -101,9 +101,28 @@ one dense block, so `objects_relocated` was 0 and the collector never had a
 reason to move them. A relocation defect cannot be exercised by a run that
 relocates nothing.
 
-So what the H2 workload has and this probe does not is the remaining lead.
-`TestRandomMapOps` is multi-threaded; this probe is not. That is the next thing
-to vary -- before any more edits to the emitter.
+`probes/BoxUnboxRelocMT.java` varies the one thing left -- thread count. Four
+mutator threads unboxing the same tables while a fifth fragments them, 30 s per
+run, **3 runs per arm, no crash and no wrong answer in any of them**:
+
+| arm | compaction cycles | objects relocated | null bails |
+|---|---|---|---|
+| intrinsic ON | 173 / 204 / 211 | 3.2M / 3.7M / 3.9M | ~300k |
+| intrinsic OFF | 150 / 226 / 281 | 2.7M / 4.1M / 5.0M | ~480k |
+
+Five million relocations with the family enabled, and nothing. So whatever H2
+does, it is not simply "unbox a relocating receiver on several threads".
+
+Two extraction traps this cost, both worth avoiding on the next attempt.
+`objects_relocated=` appears on more than one line, and grepping the whole log
+for the LAST one reports 0 while the summary line says 3.2M -- restrict to
+`zgc-features:` first. And at 6 threads the workload stops compacting
+altogether (`objects_relocated=0` in every run), so a thread count chosen for
+"more pressure" can quietly remove the very ingredient being tested.
+
+The lead that remains is what `TestRandomMapOps` does that this does not:
+receivers that are not `Long`/`Integer` from `valueOf`, a deopt from somewhere
+other than the null check, or an interaction with the map's own structure.
 
 ## The mitigation
 
