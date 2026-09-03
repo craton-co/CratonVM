@@ -16969,6 +16969,27 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
     /// cache. Called from `Native.releaseExecutor` so device
     /// buffers cached for plain JVM primitive arrays are freed when
     /// the Java `GpuExecutor` is closed.
+    fn gpu_release_submission(&mut self, handle: u64) {
+        #[cfg(feature = "gpu-offload")]
+        {
+            // Kill switch: the drain is new and default-on, and its
+            // absence is what the old behaviour was. See
+            // `CRATONVM_GPU_NO_SUBMISSION_DRAIN`.
+            use std::sync::OnceLock;
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            let on = *ENABLED.get_or_init(|| {
+                cratonvm_types::flags::runtime_var_os("CRATONVM_GPU_NO_SUBMISSION_DRAIN").is_none()
+            });
+            if on {
+                crate::runtime::offload::release_submission(handle);
+            }
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+        }
+    }
+
     fn gpu_clear_input_cache(&mut self) {
         #[cfg(feature = "gpu-offload")]
         {

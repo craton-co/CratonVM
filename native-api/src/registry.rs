@@ -4580,6 +4580,22 @@ pub trait NativeGpuAccess: NativeInvokeAccess {
     ///
     /// Default impl is a no-op (no GPU offload). The VM override
     /// calls `runtime::offload::device_cache::release(handle)`.
+    /// Drop the offload runtime's registry entry for one async
+    /// submission handle.
+    ///
+    /// The handle is the same one `gpu_future_synchronize` /
+    /// `gpu_future_await` take: the Java "future handle" IS the offload
+    /// submission handle. Default no-op so a host without the offload
+    /// runtime (or a `gpu-offload`-less build) needs no arm.
+    ///
+    /// Added 2026-09-02. `offload::SUBMISSIONS` had one insert and one
+    /// remove, and the remove had no production caller -- no Java
+    /// program, however correctly written, could drain the registry,
+    /// because `Native.releaseFuture` only removed from
+    /// `native-builtins`' own `state::futures` map. This is the missing
+    /// half of that path.
+    fn gpu_release_submission(&mut self, _handle: u64) {}
+
     fn gpu_release_array_cache(&mut self, _handle: u64) {}
 
     /// Phase 10 #1 — wipe the explicit-submit input-residency cache.
