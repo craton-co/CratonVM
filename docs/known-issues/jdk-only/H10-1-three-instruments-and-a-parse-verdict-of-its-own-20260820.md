@@ -36,6 +36,35 @@ five lanes). Lane H10, 2026-08-20.
 **What I did not run:** `cratonvm` in any mode, `cargo` anything, the
 regression suite's CratonVM half, and the two new CI jobs on GitHub.
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** "What I did not run" listed
+> `cratonvm` in any mode, `cargo` anything, and the regression suite's CratonVM
+> half. All three have now been run, on a build from this tree.
+>
+> **H10-A — its own vector passes.** `RJitMapTierDiff PASS`, in the `--jdk-only`
+> arm of a 125-vector run. The vector this lane added to see a tier differential
+> "no arm could see" is scheduled, runs, and is green.
+>
+> **H10-C — the parse verdict is the one that mattered, and it is closed.** §"the
+> committed baseline document" records `native-builtins/tests/stub_ratchet.rs`
+> as not having parsed since a merge, taking the whole `--test stub_ratchet`
+> binary and nine other tests with it. It parses and passes now, in BOTH
+> configurations, run separately:
+>
+> ```text
+> management     1645 SyntheticStub of 13897 total   baseline 1645, slack 0
+> no-management  1634 SyntheticStub of 13529 total   baseline 1634, slack 0
+> ```
+>
+> **`cargo` more broadly:** `jck_conformance` 3 passed — and that one is worth a
+> line, because `E33-R11` records the same command as having "ran zero tests, and
+> had since the `#![cfg]` was added". A guard that executed nothing looked
+> identical to a guard that passed; it now runs three.
+>
+> **STILL NOT RUN, and not this note's to run:** the two CI jobs on GitHub
+> (H10-B's blast-radius matrix and the merge parse check as scheduled jobs).
+> Those execute in GitHub Actions, not on this host, and a local run of the
+> scripts is not the same evidence as the jobs firing. That item stays open.
+
 ---
 
 ## 0. The corpus is 105 vectors now, and every published denominator is stale
