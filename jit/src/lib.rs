@@ -6151,6 +6151,13 @@ fn call_site_is_hot(
 fn c2_alloc_upgrade_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
+        // Still OPT-IN, and the reason moved rather than went away. The tier
+        // does now have an inline TLAB bump and gated inline reference stores,
+        // so the ORIGINAL reason (a promoted allocation compiling worse than
+        // its single-pass body) is answerable — but the bump has a defect that
+        // `RJitMapTierDiff` reproduces 4 runs in 10, and with the bump off the
+        // old reason applies again unchanged. See `ir_inline_tlab_enabled`
+        // for the repro and for what was ruled out.
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_C2_ALLOC_UPGRADE").is_some()
     })
 }
@@ -12591,6 +12598,20 @@ pub fn box_unbox_intrinsic_sites() -> (usize, usize) {
 /// `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` still forces it off, so a script
 /// that already sets it keeps working and keeps meaning the same thing.
 fn box_unbox_intrinsic_disabled() -> bool {
+    // Test-only force, consulted BEFORE the cache. The family is opt-in since
+    // it was found to SIGSEGV under relocation, so the matcher's own tests --
+    // which assert the POSITIVE case and say outright that every negative
+    // below it is vacuous without it -- cannot reach it through the
+    // environment: `OnceLock` fixes the answer at the first read, whichever
+    // test in the binary got there first. This is the same shape
+    // `ir_lower::ls_forced` uses, and it is thread-local so parallel tests
+    // cannot see each other's setting.
+    #[cfg(test)]
+    {
+        if let Some(forced) = box_unbox_forced() {
+            return !forced;
+        }
+    }
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
         if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some() {
@@ -12622,6 +12643,37 @@ fn box_unbox_intrinsic_disabled() -> bool {
 /// `AtomicIntFieldLayout::new(0, ..)` return `None` unless slot 0's compact
 /// storage is exactly 8 / 4 bytes wide, so a layout this load could not address
 /// never reaches codegen.
+#[cfg(test)]
+thread_local! {
+    /// `Some(true)` = force the box/unbox family ON for this thread's test,
+    /// `Some(false)` = force it OFF, `None` = ask the flags.
+    static BOX_UNBOX_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn box_unbox_forced() -> Option<bool> {
+    BOX_UNBOX_FORCE.with(|c| c.get())
+}
+
+/// RAII: force the box/unbox family ON for the current thread.
+#[cfg(test)]
+struct BoxUnboxForceOn;
+
+#[cfg(test)]
+impl BoxUnboxForceOn {
+    fn new() -> Self {
+        BOX_UNBOX_FORCE.with(|c| c.set(Some(true)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for BoxUnboxForceOn {
+    fn drop(&mut self) {
+        BOX_UNBOX_FORCE.with(|c| c.set(None));
+    }
+}
+
 pub fn try_resolve_box_unbox_intrinsic(
     class: &str,
     name: &str,
@@ -12631,6 +12683,30 @@ pub fn try_resolve_box_unbox_intrinsic(
     if box_unbox_intrinsic_disabled() {
         return None;
     }
+    box_unbox_intrinsic_shape(class, name, descriptor, guard_class_id)
+}
+
+/// Which triple maps to which intrinsic, and with what operand width —
+/// WITHOUT the enable gate.
+///
+/// Split out on 2026-09-02, when flipping the family's default to opt-in turned
+/// three matcher tests red: they assert that `Long.longValue()J` matches and
+/// that a dozen near-miss triples do not, and with the gate inside the matcher
+/// every one of those answers became `None`, so the positive case failed and
+/// every negative became vacuous.
+///
+/// Whether the family is ENABLED and whether a triple is one of the two it
+/// serves are separate questions, and only the second is what those tests are
+/// about. Keeping them separate means the tests go on guarding the match when
+/// the default flips back — which is the plan, once the relocation defect in
+/// `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`
+/// is closed.
+pub(crate) fn box_unbox_intrinsic_shape(
+    class: &str,
+    name: &str,
+    descriptor: &str,
+    guard_class_id: u32,
+) -> Option<(usize, usize, u8, u32)> {
     // ===== INTRINSIC REGION BEGIN: BOX_UNBOX =====
     match (class, name, descriptor) {
         ("java/lang/Long", "longValue", "()J") => {
@@ -12777,16 +12853,19 @@ mod atomic_accessor_intrinsic_tests {
     /// load for a method that is not a field read.
     #[test]
     fn box_unbox_matcher_is_exactly_two_triples() {
+        // The family is opt-in since it was found to SIGSEGV under relocation;
+        // force it on so these assertions test the matcher and not the gate.
+        let _on = BoxUnboxForceOn::new();
         // A real class id is needed: `AtomicLongFieldLayout::new` refuses 0, so
         // passing 0 would make every case below "None" for the wrong reason and
         // the test would pass without testing anything.
         const CID: u32 = 12345;
         assert!(
-            try_resolve_box_unbox_intrinsic("java/lang/Long", "longValue", "()J", CID).is_some(),
+            box_unbox_intrinsic_shape("java/lang/Long", "longValue", "()J", CID).is_some(),
             "the positive case must match, or every negative below is vacuous"
         );
         assert!(
-            try_resolve_box_unbox_intrinsic("java/lang/Integer", "intValue", "()I", CID).is_some()
+            box_unbox_intrinsic_shape("java/lang/Integer", "intValue", "()I", CID).is_some()
         );
         for (c, n, d) in [
             // Right class, wrong method — `Long.hashCode` is also a field read
@@ -12805,7 +12884,7 @@ mod atomic_accessor_intrinsic_tests {
             ("java/util/concurrent/atomic/AtomicLong", "longValue", "()J"),
         ] {
             assert!(
-                try_resolve_box_unbox_intrinsic(c, n, d, CID).is_none(),
+                box_unbox_intrinsic_shape(c, n, d, CID).is_none(),
                 "BOX_UNBOX matched {c}.{n}{d}, which it must not"
             );
         }
@@ -12817,9 +12896,9 @@ mod atomic_accessor_intrinsic_tests {
     /// leaving a `CALL` to a non-address.
     #[test]
     fn box_unbox_declines_an_unresolved_class_id() {
-        assert!(try_resolve_box_unbox_intrinsic("java/lang/Long", "longValue", "()J", 0).is_none());
+        assert!(box_unbox_intrinsic_shape("java/lang/Long", "longValue", "()J", 0).is_none());
         assert!(
-            try_resolve_box_unbox_intrinsic("java/lang/Integer", "intValue", "()I", 0).is_none()
+            box_unbox_intrinsic_shape("java/lang/Integer", "intValue", "()I", 0).is_none()
         );
     }
 
@@ -12831,11 +12910,14 @@ mod atomic_accessor_intrinsic_tests {
     /// `0x0123456789ABCDEF`.
     #[test]
     fn box_unbox_uses_the_matching_payload_width() {
+        // The family is opt-in since it was found to SIGSEGV under relocation;
+        // force it on so these assertions test the matcher and not the gate.
+        let _on = BoxUnboxForceOn::new();
         const CID: u32 = 12345;
         let (_, _, long_ret, _) =
-            try_resolve_box_unbox_intrinsic("java/lang/Long", "longValue", "()J", CID).unwrap();
+            box_unbox_intrinsic_shape("java/lang/Long", "longValue", "()J", CID).unwrap();
         let (_, _, int_ret, _) =
-            try_resolve_box_unbox_intrinsic("java/lang/Integer", "intValue", "()I", CID).unwrap();
+            box_unbox_intrinsic_shape("java/lang/Integer", "intValue", "()I", CID).unwrap();
         assert_eq!(long_ret, b'J');
         assert_eq!(int_ret, b'I');
         let l = AtomicLongFieldLayout::new(0, CID).unwrap();
@@ -12851,15 +12933,47 @@ mod atomic_accessor_intrinsic_tests {
     /// stack unbalanced.
     #[test]
     fn box_unbox_takes_no_arguments() {
+        // The family is opt-in since it was found to SIGSEGV under relocation;
+        // force it on so these assertions test the matcher and not the gate.
+        let _on = BoxUnboxForceOn::new();
         const CID: u32 = 12345;
         for (c, n, d) in [
             ("java/lang/Long", "longValue", "()J"),
             ("java/lang/Integer", "intValue", "()I"),
         ] {
-            let (_, num_params, _, guard) = try_resolve_box_unbox_intrinsic(c, n, d, CID).unwrap();
+            let (_, num_params, _, guard) = box_unbox_intrinsic_shape(c, n, d, CID).unwrap();
             assert_eq!(num_params, 0, "{c}.{n}{d}");
             assert_eq!(guard, CID, "{c}.{n}{d} must guard on the resolved class id");
         }
+    }
+
+    /// The family is OPT-IN, and the production entry point is what enforces
+    /// it.
+    ///
+    /// The matcher tests above deliberately call `box_unbox_intrinsic_shape`,
+    /// which has no gate — so without this, flipping the default back would
+    /// change nothing any test can see, and so would flipping it back by
+    /// accident. This is the one place the DEFAULT is asserted.
+    ///
+    /// It will need inverting when
+    /// `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`
+    /// is closed and the family goes default-on again. That is the point: the
+    /// flip should have to be deliberate.
+    #[test]
+    fn box_unbox_is_opt_in_until_the_relocation_defect_is_closed() {
+        const CID: u32 = 12345;
+        assert!(
+            box_unbox_intrinsic_shape("java/lang/Long", "longValue", "()J", CID).is_some(),
+            "the shape must match, or this test cannot tell the gate from a              matcher that stopped matching"
+        );
+        if std::env::var_os("CRATONVM_JIT_BOX_UNBOX_INTRINSIC").is_some() {
+            // Someone is running the root-cause work with the family on.
+            return;
+        }
+        assert!(
+            try_resolve_box_unbox_intrinsic("java/lang/Long", "longValue", "()J", CID).is_none(),
+            "the BOX_UNBOX family must stay opt-in while it SIGSEGVs under a              relocating collector (11/11 on H2 TestRandomMapOps)"
+        );
     }
 
     // ===== INTRINSIC REGION END: BOX_UNBOX =====

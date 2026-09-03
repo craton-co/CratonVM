@@ -8403,6 +8403,36 @@ pub(super) fn background_compile_task(
         };
     }
     let start = std::time::Instant::now();
+    // The body about to be REPLACED, measured before the publish overwrites it.
+    //
+    // Nothing compares a C2 body against the C1 body it supersedes before
+    // keeping it, and the open policy question that follows from that
+    // (`perf-01-sieve-ir-body-slower-than-c1`) is deliberately not answered
+    // here: the metrics a static comparison could use are all proxies, and the
+    // two that look obvious both misjudge the good cases — a bigger body is
+    // usually inlining or unrolling, and MORE call sites can be a callee's
+    // calls after its frame was inlined away. What is missing is not a rule
+    // but DATA, so this records the replacement instead of guessing at it.
+    let superseded_bytes: Option<usize> = (optimized
+        && crate::runtime::env_cache::dbg_jitc())
+    .then(|| {
+        let (class_id, _, _) = fetch_osr_compile_inputs(
+            &shared,
+            &task.method_key.class_name,
+            &task.method_key.method_name,
+            &task.method_key.descriptor,
+        )?;
+        let jit_cache = shared.jit.jit_cache.read();
+        jit_cache
+            .get(
+                &task.method_key.class_name,
+                &task.method_key.method_name,
+                &task.method_key.descriptor,
+                class_id,
+            )
+            .map(|cm| cm.code_bytes().len())
+    })
+    .flatten();
     // Real codegen + publish into the shared JIT cache. `try_jit_compile_callee`
     // is the by-name entry point shared with the JIT dispatch helpers; it stores
     // the compiled body under `(class, method, descriptor)` so the mutator's
@@ -8433,12 +8463,41 @@ pub(super) fn background_compile_task(
     if published && optimized {
         crate::classloading::bump_jit_supersede_epoch();
         if crate::runtime::env_cache::dbg_jitc() {
+            let replacement = {
+                let jit_cache = shared.jit.jit_cache.read();
+                fetch_osr_compile_inputs(
+                    &shared,
+                    &task.method_key.class_name,
+                    &task.method_key.method_name,
+                    &task.method_key.descriptor,
+                )
+                .and_then(|(class_id, _, _)| {
+                    jit_cache
+                        .get(
+                            &task.method_key.class_name,
+                            &task.method_key.method_name,
+                            &task.method_key.descriptor,
+                            class_id,
+                        )
+                        .map(|cm| cm.code_bytes().len())
+                })
+            };
+            // `c1=` is the body this one replaced, `c2=` the one that replaced
+            // it. Both, always: the question this line exists for is whether
+            // the optimizing tier is producing a BETTER body, and a size on
+            // its own answers nothing without the size it displaced.
             eprintln!(
-                "[cratonvm-jitc] c2-supersede published {}.{}{} (epoch={})",
+                "[cratonvm-jitc] c2-supersede published {}.{}{} (epoch={}) c1={} c2={}",
                 task.method_key.class_name,
                 task.method_key.method_name,
                 task.method_key.descriptor,
                 crate::classloading::jit_supersede_epoch(),
+                superseded_bytes
+                    .map(|b| b.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+                replacement
+                    .map(|b| b.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
             );
         }
     }
