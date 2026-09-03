@@ -872,6 +872,67 @@ pub mod gpu_dispatch_memo_census {
 /// it had nothing to do, so a zero in `rekeyed` can be read: no
 /// collections at all, versus collections that never moved a cached
 /// array.
+/// What the GPU submission registry did over the run.
+///
+/// `offload::SUBMISSIONS` had exactly one insert and one remove, and the
+/// remove had no production caller: every async submission stayed
+/// registered for the life of the process. The only account of that was
+/// a `tracing::warn!` fired once per doubling past 1024 live, which tells
+/// you a threshold was crossed and never how many leaked, nor whether a
+/// drain you just wired actually drains.
+///
+/// `live` at exit is the number that matters: on a program that releases
+/// every handle it takes, it should be zero.
+pub mod gpu_submission_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static REGISTERED: AtomicU64 = AtomicU64::new(0);
+    static RELEASED: AtomicU64 = AtomicU64::new(0);
+    static PEAK: AtomicU64 = AtomicU64::new(0);
+
+    /// One submission entered the registry; `live` is the table size
+    /// after the insert.
+    #[inline]
+    pub fn note_register(live: u64) {
+        REGISTERED.fetch_add(1, Ordering::Relaxed);
+        PEAK.fetch_max(live, Ordering::Relaxed);
+    }
+
+    /// One entry was actually removed. Not counted for a release call
+    /// naming a handle that was already gone -- the point is to measure
+    /// drains that happened, not drains that were attempted.
+    #[inline]
+    pub fn note_release() {
+        RELEASED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(registered, released, peak_live)`.
+    #[must_use]
+    pub fn totals() -> (u64, u64, u64) {
+        (
+            REGISTERED.load(Ordering::Relaxed),
+            RELEASED.load(Ordering::Relaxed),
+            PEAK.load(Ordering::Relaxed),
+        )
+    }
+
+    /// One line on the exit path, when this process registered anything.
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let (registered, released, peak) = totals();
+        if registered == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            let live = registered.saturating_sub(released);
+            eprintln!(
+                "[cratonvm] gpu submissions: registered={registered} released={released} \
+                 live_at_exit={live} peak_live={peak}"
+            );
+        });
+    }
+}
+
 pub mod gpu_residency_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 
