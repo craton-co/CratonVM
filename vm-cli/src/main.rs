@@ -282,6 +282,19 @@ fn maybe_dump_shutdown_reports() {
                     eprintln!("[cratonvm]     ref-store bail {name}: {count}");
                 }
             }
+            // The two arms the gated one falls through to. Printed even when
+            // the gated pair above is all zeros, because that combination is
+            // exactly the reading that looked like a hole on bt18 under the
+            // generational collector: `gated=2` emitted, nothing executed, and
+            // four hot stores being served inline by an arm no census knew
+            // about.
+            let (fresh_ctor, body) = cratonvm_jit::metrics::sp_ref_store_other_arm_counts();
+            if fresh_ctor != 0 || body != 0 {
+                eprintln!(
+                    "[cratonvm]   ref-store executions, other inline arms: \
+fresh-ctor={fresh_ctor} body={body}"
+                );
+            }
             // The OPTIMIZING tier's own pair, never folded into the one above.
             // Until 2026-09-02 that tier lowered every reference store to the
             // helper unconditionally, so it reported neither number -- and a

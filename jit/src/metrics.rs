@@ -3322,6 +3322,37 @@ pub const SP_REF_STORE_BAIL_NAMES: [&str; 3] = [
     "receiver-not-compact-RETIRED",
 ];
 
+/// Executions of the two OTHER single-pass inline reference-store arms —
+/// **opt-in**, `CRATONVM_DBG_SP_REF_STORE_TRACE=1`.
+///
+/// These are the arms the gated one falls through to, and until now neither
+/// appeared in any census. That is how `bt18` under the generational collector
+/// came to read `gated=2` with no executions at all and look like a hole: its
+/// four hot inlined stores were being served, inline and barrier-free, by the
+/// fresh-constructor arm — which counted nothing, at compile time or at run
+/// time.
+///
+/// `FRESH_CTOR` is `emit_inline_fresh_ctor_compact_ref_putfield`, taken when a
+/// `new`-produced receiver makes every barrier unnecessary; `BODY` is
+/// `emit_inline_body_compact_ref_putfield`, the general arm that additionally
+/// requires the field's old value to be null. Each has its own guards and
+/// falls back to the full helper on them.
+pub static SP_REF_STORE_FRESH_CTOR_TAKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Executions of the general inline body arm. See
+/// [`SP_REF_STORE_FRESH_CTOR_TAKEN`].
+pub static SP_REF_STORE_BODY_TAKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(fresh_ctor, body)` executions of the two non-gated inline arms.
+pub fn sp_ref_store_other_arm_counts() -> (u64, u64) {
+    (
+        SP_REF_STORE_FRESH_CTOR_TAKEN.load(std::sync::atomic::Ordering::Relaxed),
+        SP_REF_STORE_BODY_TAKEN.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// `(inline, barrier, helper)` dynamic path counts for the single-pass arm.
 /// All zero means the trace was off.
 pub fn sp_ref_store_path_counts() -> (u64, u64, u64) {

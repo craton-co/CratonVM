@@ -980,7 +980,7 @@ impl ZgcRealHeap {
     /// chunk reservations would not still be crossed afterwards, and the
     /// parked-live-set re-arm reasoning (`gc_rearm`) would be reading two
     /// different quantities on either side of the sweep.
-    pub(crate) fn alloc_tlab(&self, size: usize) -> Option<*mut u8> {
+    pub(crate) fn alloc_tlab(&self, size: usize, init: &dyn Fn(*mut u8)) -> Option<*mut u8> {
         if !self.tlab_enabled.load(Ordering::Relaxed) {
             return None;
         }
@@ -1007,6 +1007,15 @@ impl ZgcRealHeap {
         // the flags byte, so a bit set here would be silently erased. The four
         // callers that own the header write are where it happens; the per-chunk
         // blackening below is what makes it cheap there.
+        // The header BEFORE the registry insert, for the reason spelled out at
+        // the twin call in `ZgcRealHeap::alloc_raw`: registration is this
+        // heap's publication -- it is what `is_object_address` answers from and
+        // what `collect_garbage`'s snapshot enumerates -- so an address that is
+        // registered but not yet described is one the sweep can size at
+        // `HEADER_SIZE` and free. The chunk is zeroed by `tlab_refill`, so the
+        // window's reader sees an empty object rather than garbage, which
+        // bounds the damage without removing it.
+        init(addr as *mut u8);
         <Self as ZTlabHeapHooks>::register_allocations(
             self,
             std::slice::from_ref(&addr),
@@ -1021,10 +1030,14 @@ impl ZgcRealHeap {
     /// takes. The fallback is the pre-TLAB path byte-for-byte, so a heap with
     /// the kill switch off behaves exactly as it did before this change.
     #[inline]
-    pub(crate) fn alloc_raw_tlab(&self, size: usize) -> Option<*mut u8> {
-        match self.alloc_tlab(size) {
+    pub(crate) fn alloc_raw_tlab(&self, size: usize, init: impl Fn(*mut u8)) -> Option<*mut u8> {
+        // `Fn`, not `FnOnce`: the TLAB arm may decline (size, kill switch, a
+        // refill it cannot serve) WITHOUT having run the initializer, and the
+        // `alloc_raw` fallback then needs it. Only one of the two ever runs it,
+        // on the span it is about to publish.
+        match self.alloc_tlab(size, &init) {
             Some(ptr) => Some(ptr),
-            None => self.alloc_raw(size),
+            None => self.alloc_raw(size, &init),
         }
     }
 }

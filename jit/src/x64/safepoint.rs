@@ -93,6 +93,25 @@ pub mod map_incomplete_cause {
     /// classify the callee pc at all. See `Compiler::inline_oop_scopes`.
     pub static INLINE_LOCAL_UNMAPPABLE: AtomicUsize = AtomicUsize::new(0);
 
+    /// The local-oop dataflow could not describe this method's locals AT ALL,
+    /// so the map names none of them.
+    ///
+    /// `compute_local_oop_masks` returns EMPTY vectors above its supported local
+    /// count, and Stage 2 is wrapped in `if !self.local_oop_masks.is_empty()` --
+    /// so for such a method it contributed no slots, bumped no cause, and did
+    /// not set `map_incomplete`. The map shipped naming no reference locals
+    /// while `fully_oop_covered` stayed TRUE.
+    ///
+    /// This is a DIFFERENT statement from [`LOCAL_MASK_UNREACHED`], which is
+    /// about one pc inside a method the dataflow did run on. Here it never ran.
+    ///
+    /// MEASURED on `probes/OopMapWideLocals.java` (83 locals, 80 of them live
+    /// references across allocations that collect): `frameslot=true` with all
+    /// eight other causes ZERO and `mapped=409` of 409 safepoints, while the
+    /// SHADOW census read `locals64=409`. One half of the machinery knew and
+    /// the half that publishes the claim did not.
+    pub static LOCAL_MASK_UNSUPPORTED: AtomicUsize = AtomicUsize::new(0);
+
     /// The local-oop dataflow never reached this safepoint's pc, so the map
     /// names NO reference locals for it.
     ///
@@ -127,10 +146,11 @@ pub mod map_incomplete_cause {
     /// `causes(... all zero)` -- "no cause", from a cause census. The
     /// 2026-08-30 diagnosis that concluded "One cause, `staged_unmappable`"
     /// was made from that line.
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 9;
 
     /// `(marks_inexact, oop_in_register, stack_deep, local_deep, staged_deep,
-    /// staged_unmappable, inline_local_unmappable, local_mask_unreached)`.
+    /// staged_unmappable, inline_local_unmappable, local_mask_unreached,
+    /// local_mask_unsupported)`.
     pub fn snapshot() -> [usize; COUNT] {
         use std::sync::atomic::Ordering::Relaxed;
         [
@@ -142,6 +162,7 @@ pub mod map_incomplete_cause {
             STAGED_ARG_UNMAPPABLE.load(Relaxed),
             INLINE_LOCAL_UNMAPPABLE.load(Relaxed),
             LOCAL_MASK_UNREACHED.load(Relaxed),
+            LOCAL_MASK_UNSUPPORTED.load(Relaxed),
         ]
     }
 }
@@ -709,6 +730,46 @@ impl Compiler {
         self.local_oop_masks.get(self.cur_bc_pc).copied()
     }
 
+    /// Every JVM local slot holding a reference at the current safepoint,
+    /// across ALL windows -- the reader to use wherever the question is "which
+    /// locals", rather than "the low 64 bits".
+    ///
+    /// Returns `false` when no claim can be made (the dataflow did not reach
+    /// this pc, or refused the method outright). Every caller must treat that
+    /// as a REFUSAL and not as "no oop locals": that distinction is why
+    /// `local_oop_mask_at_current_pc` returns an `Option`, and widening the
+    /// analysis must not quietly lose it.
+    pub(super) fn for_each_oop_local_at_current_pc(&self, mut f: impl FnMut(usize)) -> bool {
+        let Some(w0) = self.local_oop_mask_at_current_pc() else {
+            return false;
+        };
+        let mut emit = |base: usize, mut mask: u64| {
+            while mask != 0 {
+                // Cast: count/index to usize
+                let k = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                f(base + k);
+            }
+        };
+        emit(0, w0);
+        if self.cur_bc_pc == ENTRY_POLL_BC_PC {
+            // The entry poll answers from `param_oop_mask`, a single `u64` over
+            // slots 0..63. A reference parameter at slot 64 or above needs that
+            // many slots of parameters ahead of it; the mask cannot express it,
+            // so refuse rather than claim coverage of a parameter nothing
+            // named. `compute_param_oop_mask` has the same width, so this is
+            // not a new limit -- only a newly honest one.
+            return self.num_params <= 64;
+        }
+        for w in 1..self.local_oop_windows {
+            let idx = w * self.local_oop_stride + self.cur_bc_pc;
+            if let Some(&m) = self.local_oop_masks.get(idx) {
+                emit(w * 64, m);
+            }
+        }
+        true
+    }
+
     /// A direct self-call may omit the blind all-GPR spill when this method's
     /// exact call-site state proves every surviving operand is already visible
     /// in a canonical frame slot.
@@ -943,7 +1004,11 @@ impl Compiler {
                 return false;
             }
         }
-        if self.num_locals > 64 {
+        // The analysis's own verdict, not a bare 64. Above 64 locals it now
+        // returns one word per 64 slots (see `wide_local_oop_maps_enabled`), and
+        // `None` means it refused the method outright -- which is what this
+        // cause has always been for.
+        if crate::x64::licm::local_oop_window_count(self.num_locals).is_none() {
             shadow_incomplete_cause::TOO_MANY_LOCALS.fetch_add(1, Relaxed);
             return false;
         }
@@ -961,7 +1026,7 @@ impl Compiler {
         if self.num_locals == 0 {
             return true;
         }
-        let ok = self.local_oop_mask_at_current_pc().is_some();
+        let ok = self.for_each_oop_local_at_current_pc(|_| {});
         if !ok {
             shadow_incomplete_cause::LOCAL_OOP_DATAFLOW_UNREACHED.fetch_add(1, Relaxed);
         }
@@ -1024,9 +1089,16 @@ impl Compiler {
         // moving coverage: on the non-moving path a register-local is flushed to
         // its frame slot by `emit_pre_safepoint_spill` and found conservatively.
         if complete {
-            let oop_mask = self.local_oop_mask_at_current_pc().unwrap_or(0);
-            for i in 0..self.num_locals {
-                if i >= 64 || (oop_mask & (1u64 << i)) == 0 {
+            // Every window, so a reference local above slot 63 is published on
+            // the shadow stack as well. Naming it in the map without publishing
+            // it here would leave the band verifier finding a movable word
+            // nothing published -- the pairing
+            // `a_staged_invoke_argument_is_published_on_the_shadow_stack_too`
+            // exists to pin.
+            let mut oop_locals: Vec<usize> = Vec::new();
+            self.for_each_oop_local_at_current_pc(|k| oop_locals.push(k));
+            for i in oop_locals {
+                if i >= self.num_locals {
                     continue;
                 }
                 if let Some(r) = self.reg_for_local(i) {
@@ -1620,6 +1692,34 @@ impl Compiler {
         // coverage of every live oop local (not just operand-stack temporaries).
         // Sound on the default path regardless of dataflow precision: the
         // consumer re-validates each slot via `heap.is_object_address`.
+        // THE LOCALS COULD NOT BE DESCRIBED AT ALL -- fail closed.
+        //
+        // `compute_local_oop_masks` hands back EMPTY vectors when the method's
+        // local count exceeds what it supports, and the Stage 2 block below is
+        // wrapped in `if !self.local_oop_masks.is_empty()`. So such a method
+        // contributed no slots, bumped no cause, and left `map_incomplete`
+        // alone: the map shipped naming none of its reference locals while the
+        // frame-slot coverage claim stayed TRUE. `probes/OopMapWideLocals.java`
+        // reads exactly that -- `frameslot=true`, all other causes zero, 409 of
+        // 409 safepoints "mapped", 80 live reference locals named by nothing.
+        //
+        // The SHADOW half already refused this method
+        // (`shadow_incomplete_cause::TOO_MANY_LOCALS`), which is why relocation
+        // was never actually unsafe here. But `fully_oop_covered` is spent
+        // separately -- `conservative_roots`' coverage PIN reads
+        // `!cm.fully_oop_covered` -- so the claim had a consumer of its own.
+        //
+        // Guarded on `num_locals > 0` because a method with no locals has
+        // nothing to describe and its empty vectors are the honest answer.
+        if self.precise_maps
+            && self.local_oop_masks.is_empty()
+            && self.num_locals > 0
+            && local_mask_fail_closed_enabled()
+        {
+            map_incomplete = true;
+            map_incomplete_cause::LOCAL_MASK_UNSUPPORTED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if !self.local_oop_masks.is_empty() {
             // Via the shared accessor: the METHOD-ENTRY poll must name its
             // reference parameters here too, or `moving_young_coverage_complete`
@@ -1634,11 +1734,14 @@ impl Compiler {
                 map_incomplete_cause::LOCAL_MASK_UNREACHED
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            if let Some(mut mask) = self.local_oop_mask_at_current_pc() {
-                while mask != 0 {
-                    // Cast: count/index to usize
-                    let k = mask.trailing_zeros() as usize;
-                    mask &= mask - 1; // clear lowest set bit
+            // ACROSS EVERY WINDOW, not just the low 64 slots. A method above
+            // 64 locals used to get no mask at all and so named none of its
+            // reference locals; it now gets one word per 64 slots, and this walk
+            // covers all of them. The accessor yields real JVM local indices, so
+            // `local_offset` is unchanged.
+            let mut oop_locals: Vec<usize> = Vec::new();
+            if self.for_each_oop_local_at_current_pc(|k| oop_locals.push(k)) {
+                for k in oop_locals {
                     let off = self.local_offset(k);
                     match i16::try_from(off) {
                         Ok(i16_off) => {
@@ -1820,7 +1923,16 @@ impl Compiler {
                 // `local_oop_mask_at_current_pc`), and left `None` when the
                 // masks are unavailable at all (`max_locals > 64`), which is
                 // the same "no claim" the dataflow itself makes there.
-                local_oop_mask: if self.local_oop_masks.is_empty() {
+                // Its contract is "bit `k` = local `k`", over ONE `u64`. A
+                // method needing more than one window cannot be described that
+                // way, and a TRUNCATED mask read as a complete one is exactly
+                // the false claim this exercise is about -- so publish `None`,
+                // the value that already means "no claim". `frame_slot_offsets`
+                // (Stage 2 above) still names every window's locals; only this
+                // DIAGNOSTIC oracle abstains.
+                local_oop_mask: if self.local_oop_masks.is_empty()
+                    || self.local_oop_windows > 1
+                {
                     None
                 } else {
                     self.local_oop_mask_at_current_pc()

@@ -2217,6 +2217,7 @@ pub(super) fn execute_invoke_kind(
                     cp_index,
                     rcv_cid,
                     &args[0],
+                    pc,
                 );
             }
         }
@@ -2507,7 +2508,7 @@ pub(super) fn execute_invoke_kind(
         CachedCallResult::FramePushed => {
             args_root_guard.refresh(&mut args);
             if is_special || private_virtual_target.is_some() {
-                populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
+                populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special, pc);
             } else if private_virtual_target.is_none() && loader_interface_override.is_none() {
                 if let Some(rcv_cid) = receiver_class_id {
                     populate_virtual_invoke_cache(
@@ -2517,6 +2518,7 @@ pub(super) fn execute_invoke_kind(
                         cp_index,
                         rcv_cid,
                         &args[0],
+                        pc,
                     );
                 }
             }
@@ -2525,7 +2527,7 @@ pub(super) fn execute_invoke_kind(
         CachedCallResult::Handled => {
             args_root_guard.refresh(&mut args);
             if is_special || private_virtual_target.is_some() {
-                populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
+                populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special, pc);
             } else if private_virtual_target.is_none() && loader_interface_override.is_none() {
                 if let Some(rcv_cid) = receiver_class_id {
                     populate_virtual_invoke_cache(
@@ -2535,6 +2537,7 @@ pub(super) fn execute_invoke_kind(
                         cp_index,
                         rcv_cid,
                         &args[0],
+                        pc,
                     );
                 }
             }
@@ -2628,7 +2631,7 @@ pub(super) fn execute_invoke_kind(
 
     // Populate cache for future fast-path hits
     if is_special || private_virtual_target.is_some() {
-        populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
+        populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special, pc);
     } else if private_virtual_target.is_none() {
         if let Some(rcv_cid) = receiver_class_id {
             populate_virtual_invoke_cache(
@@ -2638,6 +2641,7 @@ pub(super) fn execute_invoke_kind(
                 cp_index,
                 rcv_cid,
                 &args[0],
+                pc,
             );
         }
     }

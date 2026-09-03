@@ -1404,7 +1404,106 @@ impl<JitMethod> CachedInvokeTarget<JitMethod> {
 /// entry). Without the opcode bit, the virtual cache entry (with receiver
 /// class = concrete subclass) would hijack the invokespecial call and cause
 /// infinite recursion through the subclass override.
-type InvokeCacheKey = (ClassId, u16, bool);
+type InvokeCacheKey = (ClassId, u16, bool, u32);
+
+/// `CRATONVM_INVOKE_CACHE_PC_KEY=1` adds the call site's bytecode offset to
+/// the invoke-cache key.
+///
+/// # Why the cp index alone is not a call site
+///
+/// The key is `(caller class, cp index, is_special)`, which names the
+/// METHOD REFERENCE, not the place that calls it. Two call sites in one
+/// class that invoke the same method share a constant-pool entry and
+/// therefore share one cache entry. For invokestatic that is harmless --
+/// the target is the same either way -- but it makes two distinct sites
+/// indistinguishable to anything that wants to reason about a SITE:
+///
+/// * the GPU offload hook keeps an eligible site out of this cache so a
+///   later call with bigger arrays can still offload. Giving up on one site
+///   that always passes small arrays therefore silently disables offload
+///   for a sibling site calling the same kernel with big ones -- measured
+///   at an 18x regression on `GpuHookOverheadBench` before this existed;
+/// * `poly_entries` is a per-site inline cache. Two virtual sites sharing a
+///   cp index share one 8-entry list, so a site seeing one receiver class
+///   can be evicted by a sibling seeing eight others.
+///
+/// Off by default until measured: this is the interpreter's hottest map,
+/// and adding a field to its key costs hash and space on every invoke.
+/// `evict` stays reference-scoped in both modes (it drops every pc for the
+/// reference), because eviction answers "this target is stale", which is a
+/// property of the target and not of the site that found it.
+pub fn pc_key_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_INVOKE_CACHE_PC_KEY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// The pc component of a key: the real offset when pc-keying is on, and a
+/// constant `0` when it is off, which reproduces the pre-2026-09-03 key
+/// exactly rather than approximating it.
+#[inline]
+fn site_pc(pc: u32) -> u32 {
+    if pc_key_enabled() { pc } else { 0 }
+}
+
+// ---------------------------------------------------------------------------
+// Hit census — the only way to know the pc threading is RIGHT
+// ---------------------------------------------------------------------------
+//
+// Adding a component to this key has a failure mode that does not look like a
+// bug: if a site's `put` and its `get` are handed different pcs -- the invoke's
+// own offset in one and the already-advanced `pc` in the other -- the entry is
+// stored under one key and looked for under another, every lookup misses, and
+// the only symptom is that the interpreter got slower. A correctness test
+// cannot see it, because missing the cache is always SAFE: the slow path
+// recomputes the same answer.
+//
+// So the hit rate is the acceptance criterion for the change, not a nicety.
+// Turning pc-keying on must leave it essentially unchanged.
+
+static INVOKE_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static INVOKE_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `CRATONVM_INVOKE_CACHE_STATS=1` counts invoke-cache hits and misses.
+///
+/// Off by default and read once: this is the hottest map in the interpreter
+/// and two relaxed increments per invoke are not free.
+fn invoke_cache_stats_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_INVOKE_CACHE_STATS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+#[inline]
+fn note_invoke_lookup(hit: bool) {
+    if !invoke_cache_stats_enabled() {
+        return;
+    }
+    let c = if hit { &INVOKE_CACHE_HITS } else { &INVOKE_CACHE_MISSES };
+    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// One line at exit when `CRATONVM_INVOKE_CACHE_STATS=1` asked for it.
+pub fn invoke_cache_stats_summary() {
+    use std::sync::atomic::Ordering;
+    let hits = INVOKE_CACHE_HITS.load(Ordering::Relaxed);
+    let misses = INVOKE_CACHE_MISSES.load(Ordering::Relaxed);
+    if hits + misses == 0 {
+        return;
+    }
+    eprintln!(
+        "[cratonvm] invoke cache: lookups={} hits={hits} misses={misses}          ({:.2}% hit); pc-keyed={}",
+        hits + misses,
+        100.0 * hits as f64 / (hits + misses) as f64,
+        pc_key_enabled(),
+    );
+}
 
 /// Per-call-site cap on the polymorphic overflow cache (see `poly_entries`
 /// below). A handful of distinct receiver classes at one call site (the
@@ -1484,11 +1583,15 @@ impl<JitMethod: Clone> InvokeCache<JitMethod> {
         caller_class: ClassId,
         cp_index: u16,
         is_special: bool,
+        pc: u32,
     ) -> Option<&CachedInvokeTarget<JitMethod>> {
         // WP2.4-F1: O(1) generation check on hit, folded into the same probe.
-        self.entries
-            .get(&(caller_class, cp_index, is_special))
-            .filter(|t| !t.is_stale())
+        let found = self
+            .entries
+            .get(&(caller_class, cp_index, is_special, site_pc(pc)))
+            .filter(|t| !t.is_stale());
+        note_invoke_lookup(found.is_some());
+        found
     }
 
     pub fn put(
@@ -1496,10 +1599,11 @@ impl<JitMethod: Clone> InvokeCache<JitMethod> {
         caller_class: ClassId,
         cp_index: u16,
         is_special: bool,
+        pc: u32,
         target: CachedInvokeTarget<JitMethod>,
     ) {
         self.entries
-            .insert((caller_class, cp_index, is_special), target);
+            .insert((caller_class, cp_index, is_special, site_pc(pc)), target);
     }
 
     /// Second-chance lookup for a call site that just missed the primary
@@ -1514,9 +1618,10 @@ impl<JitMethod: Clone> InvokeCache<JitMethod> {
         caller_class: ClassId,
         cp_index: u16,
         is_special: bool,
+        pc: u32,
         receiver_class: ClassId,
     ) -> Option<CachedInvokeTarget<JitMethod>> {
-        let key = (caller_class, cp_index, is_special);
+        let key = (caller_class, cp_index, is_special, site_pc(pc));
         let entries = self.poly_entries.get_mut(&key)?;
         let idx = entries.iter().position(|(cid, _)| *cid == receiver_class)?;
         if entries[idx].1.is_stale() {
@@ -1540,10 +1645,11 @@ impl<JitMethod: Clone> InvokeCache<JitMethod> {
         caller_class: ClassId,
         cp_index: u16,
         is_special: bool,
+        pc: u32,
         receiver_class: ClassId,
         target: CachedInvokeTarget<JitMethod>,
     ) {
-        let key = (caller_class, cp_index, is_special);
+        let key = (caller_class, cp_index, is_special, site_pc(pc));
         let entries = self.poly_entries.entry(key).or_default();
         if let Some(slot) = entries.iter_mut().find(|(cid, _)| *cid == receiver_class) {
             slot.1 = target;
@@ -1570,10 +1676,24 @@ impl<JitMethod: Clone> InvokeCache<JitMethod> {
     /// so distrust everything cached at this call site, matching the
     /// pre-existing `entries` eviction's own scope.
     #[inline]
+    /// Drop every cached target for this method REFERENCE.
+    ///
+    /// Reference-scoped, not site-scoped, in both key modes: eviction says
+    /// "this target is stale" (a redefined class, a failed initialization),
+    /// which is a property of the target rather than of whichever site
+    /// noticed. With pc-keying on there may be several sites holding it, so
+    /// the map is scanned; eviction is a cold path (six callers, all on
+    /// staleness or error) and correctness here outranks its cost.
     pub fn evict(&mut self, caller_class: ClassId, cp_index: u16, is_special: bool) {
-        let key = (caller_class, cp_index, is_special);
-        self.entries.remove(&key);
-        self.poly_entries.remove(&key);
+        if !pc_key_enabled() {
+            let key = (caller_class, cp_index, is_special, 0);
+            self.entries.remove(&key);
+            self.poly_entries.remove(&key);
+            return;
+        }
+        let matches = |k: &InvokeCacheKey| k.0 == caller_class && k.1 == cp_index && k.2 == is_special;
+        self.entries.retain(|k, _| !matches(k));
+        self.poly_entries.retain(|k, _| !matches(k));
     }
 }
 

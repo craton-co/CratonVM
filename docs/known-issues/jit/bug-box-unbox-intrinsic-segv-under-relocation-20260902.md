@@ -219,13 +219,72 @@ sets it is unaffected.
 Correctness first: the measured speedup is recoverable the moment the sequence
 is made relocation-safe.
 
+## The repro is currently BLOCKED by an earlier failure (2026-09-02)
+
+Run on `dev@08a1711e5`, `livedbg`, quiet host, against H2 built at
+`apps/h2database/h2`. **It cannot reach the window this page measures in.**
+
+`TestRandomMapOps` dies of `seed:0 op:1033 java.lang.AssertionError: (1810,
+null)` after 11-22 s, having completed ZERO passes -- where HotSpot 25 on the
+same classpath completes at least nine. The SIGSEGV this page records appears at
+25-183 s. The run is over before that window opens.
+
+It is not this intrinsic. Five runs per arm at `--Xmx 256m`, three per arm at
+384m / 512m / 1g:
+
+| arm | outcome |
+|---|---|
+| `CRATONVM_JIT=box-unbox-intrinsic` (family ON) | AssertionError, 0 SIGSEGV |
+| shipped default (family OFF) | AssertionError, 0 SIGSEGV |
+| `CRATONVM_ZGC_RELOCATE=0` | AssertionError, unchanged |
+| `CRATONVM_JIT_NO_INLINE_FRAME_MAP=1` | AssertionError, unchanged |
+
+Same op, same values, every arm. And it is **deterministic**: `seed:0 op:1033
+(1810, null)` byte-identical across four consecutive runs.
+
+That contradicts two things this page and its sibling rest on. This page says
+the failures pre-dating the bisect range are a `NullPointerException` and a
+fragmentation `OutOfMemoryError`; the blocker is neither, so a bisect scored the
+way this page describes would now score every commit BAD for the wrong reason.
+And `h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md` says `--Xmx
+1g` and `4g` are "clean over 1500 s each" -- at 1g this fails in 13-15 s. That
+page also calls its defect one with "no reproducer worth bisecting yet". It has
+one now, and it is 13 seconds long.
+
+**Whoever takes this page next has to clear that first**, or bisect the SIGSEGV
+on a tree where `op:1033` does not fire.
+
+Not established, and measured to be unavailable rather than assumed away:
+**whether the blocker is JIT-dependent.** A `--nojit` arm ran the full 1500 s
+with no AssertionError -- and completed ZERO passes, where HotSpot completes one
+about every 15 s. `TestRandomMapOps` prints an `op:` line only when it FAILS, so
+a run that has not failed offers no evidence it ever reached op 1033. "1500 s
+clean under `--nojit`" is therefore not a result; it is a run that may simply
+be slower than the defect is deep. Scoring it as an arm would be the same
+mistake as the `objects_relocated=0` probe above.
+
+Making that arm answerable needs a progress signal the test does not currently
+emit -- a per-op counter, or a seeded run bounded to a few thousand ops.
+
 ## Reproducing
 
 ```
 cargo build --profile livedbg -p cratonvm-cli
-CRATONVM_JIT_BOX_UNBOX_INTRINSIC=1 cratonvm --java-home $JDK25 --Xmx 256m \
-  -c "$H2_CP" org.h2.test.store.TestRandomMapOps
+
+# The classpath file omits H2's own output dirs; both are needed.
+H=apps/h2database/h2
+CP="$H/target/test-classes:$H/target/classes:$(cat $H/craton-testcp.txt)"
+
+# Run from a scratch cwd: the test writes its database files beside you.
+CRATONVM_JIT=box-unbox-intrinsic cratonvm --java-home $JDK25 --Xmx 256m \
+  -cp "$CP" org.h2.test.store.TestRandomMapOps
 ```
 
 Under three minutes on a quiet host. A CONTENDED host hides it -- the same
 lever this repo has been bitten by before.
+
+`CRATONVM_JIT_BOX_UNBOX_INTRINSIC=1` still works but now warns; the supported
+spelling is the token above.
+
+**As of 2026-09-02 this does not reach the SIGSEGV** -- see "The repro is
+currently BLOCKED by an earlier failure".

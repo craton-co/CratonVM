@@ -6675,7 +6675,7 @@ pub fn verify_active_coverage_into(heap: &VmHeap, roots: &mut Vec<ObjectRef>) ->
     // whose `while_covered` is zero, so a gate reading only the coverage
     // counters returns "proof holds" over frames it has just been shown hold
     // unreachable-by-the-scan oops.
-    let before_wrong_map = oop_map_audit::WRONG_MAP.load(Ordering::Relaxed);
+    let before_wrong_map = oop_map_audit::WRONG_MAP_VERIFIER_OOP.load(Ordering::Relaxed);
     scan_active_jit_frames(heap, roots);
     if oracle_force_refute() {
         note_coverage_oracle_refutation();
@@ -6683,7 +6683,7 @@ pub fn verify_active_coverage_into(heap: &VmHeap, roots: &mut Vec<ObjectRef>) ->
     }
     oop_map_audit::NEVER_MAPPED_WHILE_COVERED.load(Ordering::Relaxed) > before
         || oop_map_audit::NEVER_MAPPED_WHILE_SHADOW_COVERED.load(Ordering::Relaxed) > before_shadow
-        || oop_map_audit::WRONG_MAP.load(Ordering::Relaxed) > before_wrong_map
+        || oop_map_audit::WRONG_MAP_VERIFIER_OOP.load(Ordering::Relaxed) > before_wrong_map
 }
 
 /// Whether the pre-suppression verification should run: only when the oracle is
@@ -6874,7 +6874,29 @@ pub mod oop_map_audit {
     /// In-band object addresses named by SOME map of the owning frame but not
     /// by the one its safepoint id selects. Not a codegen coverage gap — a
     /// map-selection gap, which strands the oop just as effectively.
+    ///
+    /// **Raw, and it over-reports.** A slot whose value merely LOOKS like a
+    /// heap address is counted here even when it is dead storage — an old
+    /// pointer left in a reusable local or spill slot after the value died,
+    /// which the precise map is right to omit and the conservative scan keeps
+    /// alive for nothing. Read [`WRONG_MAP_VERIFIER_OOP`] for the population
+    /// that is actually evidence.
     pub static WRONG_MAP: AtomicU64 = AtomicU64::new(0);
+    /// The subset of [`WRONG_MAP`] that the CLASS FILE's own type maps confirm
+    /// holds a reference at that bci — the same independent oracle
+    /// `NEVER_MAPPED` is split by, applied to the map-selection population that
+    /// had no verdict at all.
+    ///
+    /// This is the number a refutation may be built on. A non-zero reading is a
+    /// live reference the selected map omits; a zero reading over a large
+    /// `WRONG_MAP` says the raw counter was measuring dead slots.
+    pub static WRONG_MAP_VERIFIER_OOP: AtomicU64 = AtomicU64::new(0);
+    /// The rest of [`WRONG_MAP`]: the verifier says NOT a reference, or cannot
+    /// answer (an inlined frame, a slot outside the java-locals band, no type
+    /// maps for the method). Kept apart so a zero in
+    /// [`WRONG_MAP_VERIFIER_OOP`] beside a large count here is legible as
+    /// "asked and answered no", not "never asked".
+    pub static WRONG_MAP_VERIFIER_OTHER: AtomicU64 = AtomicU64::new(0);
     /// Object addresses BELOW the innermost compiled frame — interpreter,
     /// native and Rust frames the compiled method called into. Not the oop
     /// map's responsibility; counted so it can be subtracted rather than
@@ -7019,7 +7041,7 @@ pub mod oop_map_audit {
         eprintln!(
             "[cratonvm] oop-map audit: frames={} unreadable_frames={} words={} \
              never_mapped={} (while_covered={} of {} claiming; \
-             while_shadow_covered={} of {} claiming) wrong_map={} below_jit={}",
+             while_shadow_covered={} of {} claiming) wrong_map={}              (verifier_oop={} other={}) below_jit={}",
             FRAMES.load(Ordering::Relaxed),
             UNREADABLE_FRAMES.load(Ordering::Relaxed),
             WORDS.load(Ordering::Relaxed),
@@ -7029,6 +7051,8 @@ pub mod oop_map_audit {
             NEVER_MAPPED_WHILE_SHADOW_COVERED.load(Ordering::Relaxed),
             FRAMES_CLAIMING_SHADOW_COVERAGE.load(Ordering::Relaxed),
             WRONG_MAP.load(Ordering::Relaxed),
+            WRONG_MAP_VERIFIER_OOP.load(Ordering::Relaxed),
+            WRONG_MAP_VERIFIER_OTHER.load(Ordering::Relaxed),
             BELOW_JIT.load(Ordering::Relaxed),
         );
         // THE LINE TO READ FIRST. Everything above counts words that LOOK like
@@ -7244,6 +7268,17 @@ fn verify_precise_covers_conservative(
                         // covered by the map the collector will actually scan
                     } else if any.contains(&off16) {
                         audit::WRONG_MAP.fetch_add(1, AOrd::Relaxed);
+                        // Split it the way NEVER_MAPPED is split. Without this
+                        // the map-selection population has no verdict at all,
+                        // and a raw non-zero reading cannot distinguish a live
+                        // reference the selected map omits from an old pointer
+                        // lying dead in a reusable slot.
+                        match verifier_local_verdict(frame_cm, off, active_sp_id) {
+                            VerifierSlotVerdict::Oop => {
+                                audit::WRONG_MAP_VERIFIER_OOP.fetch_add(1, AOrd::Relaxed)
+                            }
+                            _ => audit::WRONG_MAP_VERIFIER_OTHER.fetch_add(1, AOrd::Relaxed),
+                        };
                     } else {
                         audit::NEVER_MAPPED.fetch_add(1, AOrd::Relaxed);
                         let class = classify_frame_slot(off, &frame_cm.frame_layout);
@@ -7877,6 +7912,14 @@ mod coverage_oracle_gate_tests {
     /// were BOTH zero over frames holding 160 oops the precise walk cannot
     /// reach.
     ///
+    /// It must read the VERIFIER-CONFIRMED subset, not the raw counter. The raw
+    /// one over-reports: a slot whose value merely looks like a heap address is
+    /// counted even when it is dead storage, which the precise map is right to
+    /// omit. Measured 2026-09-02, the class file's own type maps returned
+    /// `verifier_oop=0` over every never-mapped word on these workloads, so a
+    /// gate keyed on the raw count would refuse the suppression forever on
+    /// evidence that is not evidence.
+    ///
     /// A source-level assertion because the gate needs live compiled frames to
     /// run: what is pinned here is that the counter appears in the decision at
     /// all, which is the thing that was missing.
@@ -7893,7 +7936,7 @@ mod coverage_oracle_gate_tests {
         for counter in [
             "NEVER_MAPPED_WHILE_COVERED",
             "NEVER_MAPPED_WHILE_SHADOW_COVERED",
-            "WRONG_MAP",
+            "WRONG_MAP_VERIFIER_OOP",
         ] {
             assert!(
                 body.contains(counter),
