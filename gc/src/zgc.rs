@@ -1020,6 +1020,10 @@ struct ZgcCounters {
     /// Cycles that relocated the unpinned pages despite an incomplete coverage
     /// proof. See [`Self::coverage_incompleteness_is_page_pinnable`].
     relocation_on_page_pins: AtomicUsize,
+    /// The stop-the-world mark pool, kept ALIVE BETWEEN CYCLES so its worker
+    /// threads are spawned once rather than per collection. `(workers, pool)`:
+    /// a changed worker count rebuilds it. See `persistent_mark_pool`.
+    mark_pool: Mutex<Option<(usize, std::sync::Arc<mark::ZMarkCoordinator>)>>,
     /// `CRATONVM_ZGC_JIT_TLAB`: whether `refill_tlab` hands the VM thread's
     /// buffer a chunk. See `zgc/vm_tlab.rs`.
     vm_tlab_enabled: AtomicBool,
@@ -1922,6 +1926,7 @@ impl ZgcRealHeap {
                 conc_black_claims: AtomicUsize::new(0),
             tlab_retire_skipped_at_safepoint: AtomicUsize::new(0),
                 relocation_on_page_pins: AtomicUsize::new(0),
+                mark_pool: Mutex::new(None),
                 vm_tlab_enabled: AtomicBool::new(zgc_vm_tlab_enabled_by_default()),
                 jit_tlab_skip: Mutex::new(Vec::new()),
                 vm_tlab_refills: AtomicUsize::new(0),
@@ -3452,6 +3457,57 @@ impl ZgcRealHeap {
     /// rather than stats when the driver cannot certify one, and the caller
     /// falls back to the single-threaded marker. That fallback is not
     /// belt-and-braces: it is the only reason this adoption can be default-on.
+    /// `CRATONVM_ZGC_MARK_POOL_PERSISTENT`: keep the stop-the-world mark pool
+    /// alive between collections instead of spawning and joining its worker
+    /// threads on every one. Default on; `0` restores per-cycle construction.
+    ///
+    /// Measured cost of that construction, by
+    /// `measure_the_pool_construction_cost`: 270us at one worker, 420us at
+    /// two, 546us at four, 966us at eight -- per CYCLE. Worth removing, and
+    /// not on its own enough to make parallel marking beat the serial loop:
+    /// that gap is 1.6-4.0 ms and this is 10-18% of it. The rest is the
+    /// coordination protocol, which this does not touch.
+    ///
+    /// # What the end-to-end arm can and cannot show
+    ///
+    /// BinTreesClassic 16 at -Xmx128m, release, four workers, interleaved,
+    /// 8 cycles per run: mark_us mean 8238/9037/7526/6924 with the pool kept
+    /// against 8412/8604/10147/10319 without -- the right direction in 3 of 4
+    /// pairs, means 7.9 ms against 9.4 ms.
+    ///
+    /// Do not read that 1.5 ms as this change. The component measurement says
+    /// 546us is removed at four workers, and a run-to-run spread of 6.9-10.3
+    /// ms cannot resolve it: the arm is CONSISTENT with the saving and is not
+    /// evidence for its size. `measure_the_pool_construction_cost` is the
+    /// instrument that measures what this actually removes; the mark pause is
+    /// dominated by the coordination protocol and moves under it.
+    fn persistent_mark_pool(&self, workers: usize) -> Option<std::sync::Arc<mark::ZMarkCoordinator>> {
+        match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_MARK_POOL_PERSISTENT") {
+            Some(raw) => {
+                let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+                if matches!(v.as_str(), "0" | "off" | "false" | "no") {
+                    return None;
+                }
+            }
+            None => {}
+        }
+        let mut slot = self.counters.mark_pool.lock();
+        if let Some((cached_workers, pool)) = slot.as_ref() {
+            if *cached_workers == workers {
+                return Some(std::sync::Arc::clone(pool));
+            }
+        }
+        // Built with the INERT context, never the heap: a pool that outlives
+        // its cycles and held an `Arc` to the heap that owns it would keep
+        // that heap alive forever, and its own threads with it. The real
+        // context is bound per cycle by `begin_cycle_with`.
+        let inert: std::sync::Arc<dyn mark::ZMarkContext> =
+            std::sync::Arc::new(mark::ZInertMarkContext);
+        let pool = std::sync::Arc::new(mark::ZMarkCoordinator::new(inert, workers));
+        *slot = Some((workers, std::sync::Arc::clone(&pool)));
+        Some(pool)
+    }
+
     fn mark_with_controller_stw(
         &self,
         roots: &[u64],
@@ -3467,9 +3523,39 @@ impl ZgcRealHeap {
             Some(direct) => direct,
             None => std::sync::Arc::new(ZHeapMarkBridge { heap: self }),
         };
-        let coordinator = std::sync::Arc::new(mark::ZMarkCoordinator::new(ctx, workers));
-        coordinator.begin_cycle();
+        // The pool, kept from the last collection when it can be. The context
+        // is bound per cycle either way, so the two arms differ only in
+        // whether N threads are spawned and joined here.
+        // CLEARED ON EVERY EXIT, including a panic unwinding through. The
+        // context bound below may be a `ZHeapMarkBridge`, which holds a RAW
+        // POINTER to this heap and is sound only while it cannot outlive the
+        // borrow it was built from. A pool dropped at the end of this function
+        // gave that for free; a PERSISTENT one does not, and a missed
+        // `end_cycle` would leave the pointer in a pool that survives to the
+        // next cycle. A guard, not a reading of the control flow.
+        struct ClearCycleContext(Option<std::sync::Arc<mark::ZMarkCoordinator>>);
+        impl Drop for ClearCycleContext {
+            fn drop(&mut self) {
+                if let Some(pool) = self.0.take() {
+                    pool.end_cycle();
+                }
+            }
+        }
+        let coordinator = match self.persistent_mark_pool(workers) {
+            Some(pool) => {
+                pool.begin_cycle_with(ctx);
+                pool
+            }
+            None => {
+                let fresh = std::sync::Arc::new(mark::ZMarkCoordinator::new(ctx, workers));
+                fresh.begin_cycle();
+                fresh
+            }
+        };
         coordinator.push_roots(roots);
+        let _clear_ctx = ClearCycleContext(
+            self.persistent_mark_pool(workers).map(|_| std::sync::Arc::clone(&coordinator)),
+        );
 
         // One restart is budgeted rather than zero, for the reason the old
         // bespoke path gave: no mutator can race us, but budgeting zero would
@@ -16647,6 +16733,78 @@ pub(crate) mod tests {
     ///
     /// The knob still resolves and still caps, because the opt-in path is how
     /// C5 will be measured.
+    /// The pool must survive a collection and be the SAME pool next time --
+    /// that is the entire change, and nothing else in this suite reaches it,
+    /// because `CRATONVM_ZGC_PARMARK` is unset by default.
+    #[test]
+    fn the_mark_pool_is_kept_between_collections() {
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_MARK_POOL_PERSISTENT", Some("1"))],
+            || {
+                let heap = ZgcRealHeap::new_shared(4 * 1024 * 1024);
+                let first = heap.persistent_mark_pool(2).expect("a pool");
+                let second = heap.persistent_mark_pool(2).expect("the same pool");
+                assert!(
+                    std::sync::Arc::ptr_eq(&first, &second),
+                    "a second ask built a second pool; the threads are still \
+                     being spawned per cycle"
+                );
+                // A different worker count must be a different pool, or the
+                // requested parallelism is silently ignored.
+                let other = heap.persistent_mark_pool(3).expect("a pool");
+                assert!(!std::sync::Arc::ptr_eq(&first, &other));
+            },
+        );
+    }
+
+    /// THE SAFETY PROPERTY, and the reason the context is bound per cycle
+    /// rather than at construction.
+    ///
+    /// On this backend the mark context IS the heap. A pool that outlives its
+    /// cycles and held an `Arc` to that heap would make the two keep each
+    /// other alive: the heap would never drop, `ZgcRealHeap::drop` would never
+    /// run, and the pool's worker threads would never be joined -- a thread
+    /// leak per heap, which in a test binary that builds thousands of heaps is
+    /// not a slow leak but an exhausted process.
+    ///
+    /// The `Weak` is the whole assertion: if it still upgrades once the last
+    /// `Arc` is gone, something is holding the heap.
+    #[test]
+    fn a_heap_that_kept_a_mark_pool_still_drops() {
+        cratonvm_types::flags::with_thread_overrides(
+            &[
+                ("CRATONVM_ZGC_PARMARK", Some("2")),
+                ("CRATONVM_ZGC_MARK_POOL_PERSISTENT", Some("1")),
+                ("CRATONVM_ZGC_RELOCATE", Some("0")),
+            ],
+            || {
+                let weak = {
+                    let heap = ZgcRealHeap::new_shared(4 * 1024 * 1024);
+                    let weak = std::sync::Arc::downgrade(&heap);
+                    // A real driven collection, so the context is actually
+                    // bound and then released -- not merely constructed.
+                    for _ in 0..64 {
+                        heap.alloc_object(ClassId::new(5), 2);
+                    }
+                    let kept = heap.alloc_object(ClassId::new(5), 2);
+                    let stw = unsafe { StopTheWorldToken::new_unchecked() };
+                    let mut roots = vec![kept];
+                    heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+                    assert!(
+                        heap.persistent_mark_pool(2).is_some(),
+                        "the fixture built no pool, so this proves nothing"
+                    );
+                    weak
+                };
+                assert!(
+                    weak.upgrade().is_none(),
+                    "the heap outlived its last reference: the mark pool is still \
+                     holding it, so its worker threads will never be joined"
+                );
+            },
+        );
+    }
+
     #[test]
     fn marking_is_serial_by_default_and_parallelism_is_opt_in() {
         let heap = ZgcRealHeap::with_capacity(64 * 1024);
