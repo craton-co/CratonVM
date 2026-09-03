@@ -8954,6 +8954,20 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         false
     }
 
+    fn class_assignable_to_name(&self, class_id: ClassId, target_class_name: &str) -> Option<bool> {
+        // The SAME walk `typecheck::aastore_element_assignable` reaches for when
+        // its ClassId-comparing checks have run out — see the boundary's doc for
+        // why a reflective caller must not ask a narrower question than the
+        // bytecode does.
+        Some(
+            self.shared
+                .classes
+                .class_manager
+                .read()
+                .is_assignable_to_name(class_id, target_class_name),
+        )
+    }
+
     fn synthetic_implements_declared(&self, class_id: ClassId, target_class_name: &str) -> bool {
         // Via the `pub use typecheck::*` re-export in `interpreter.rs`, exactly
         // as `aastore_element_assignable` below reaches its predicate: one

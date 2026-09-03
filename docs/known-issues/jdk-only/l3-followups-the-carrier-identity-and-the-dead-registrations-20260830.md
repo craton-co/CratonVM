@@ -9,6 +9,23 @@ This page carries the two things that lane FOUND and does not own. Neither is a
 loose end of the original scope; both were produced by probes written to close
 it, and both still pose a question.
 
+> **STAYS IN `known-issues/`, and here is the test it passes.** `03d2bd990`
+> ("retire 107 closed records") swept this page into `internal/` on 2026-09-02
+> and it was moved back. The convention is that `internal/` is for records with
+> nothing open, and both sections below name something open with no owner
+> holding it:
+>
+> * §1 is a compatible-mode carrier whose remedy `alloc_immutable_wrapper`'s own
+>   doc assigns to `H0-2` §4 / `P4A` N1b -- ASSIGNED is not CLOSED, and 15 rows
+>   of `apps/probes/ImmutableSplProbe` still differ because of it;
+> * §2 is a work-list of thirteen registrations no dispatch door reaches, which
+>   `tools/dead-registration-census.py` now enumerates and nobody has yet
+>   deleted.
+>
+> The lane that produced them is closed; these are not. A retired page is
+> uncitable from outside `internal/` and reads as answered, which is the wrong
+> signal for both.
+
 ---
 
 ## 1. Every remaining differing row is a class NAME

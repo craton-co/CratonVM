@@ -7315,6 +7315,14 @@ impl Compiler {
                                 }
                             }
                             if !self.spill_range_fits(scratch_base, 5) {
+                                // Named here rather than inside the probe: this
+                                // is the arraycopy intrinsic's five scratch
+                                // homes, and a bail site of
+                                // `spill-range-exhausted` said only that some
+                                // range somewhere did not fit.
+                                self.fail(
+                                    "singlepass-codegen/arraycopy-scratch-spill-exhausted",
+                                );
                                 return false;
                             }
                             let s_src = scratch_base;
@@ -8427,6 +8435,12 @@ impl Compiler {
                             // may allocate and trigger GC transitively.
                             self.emit_oop_map_for_safepoint();
                             self.emit_stack_arg_cleanup(total_sub);
+                            // 2026-09-02: one sentinel compare on the hot
+                            // path; the callee-deopt check and the exception
+                            // check below keep their own compares on the cold
+                            // side (`merged_call_sentinel_enabled`).
+                            let merged_keep = merged_call_sentinel_enabled()
+                                .then(|| self.emit_call_sentinel_fast_skip());
                             if let (Some(info), Some(args_base)) = (info_ptr, service_args_base) {
                                 self.emit_inline_callee_deopt_check(
                                     info as *const crate::JitInvokeInfo,
@@ -8454,6 +8468,9 @@ impl Compiler {
                             // the stashed exception through the exception
                             // table instead.
                             self.emit_post_invoke_exception_check(ret_type);
+                            if let Some(keep) = merged_keep {
+                                self.patch_rel32_to_here(keep);
+                            }
 
                             // Reclaim the spill cursor to the popped-args depth
                             // before the result is pushed, exactly as the
@@ -11136,7 +11153,11 @@ impl Compiler {
                                 // the next bytecode re-allocates spill slots
                                 // from the same base.
                                 let scratch_slots = if is_byte_form { 2 } else { 4 };
-                                if !self.spill_range_fits(self.next_spill_offset, scratch_slots) {
+                                if !self.spill_range_fits(self.next_spill_offset, scratch_slots)
+                                {
+                                    self.fail(
+                                        "singlepass-codegen/intrinsic-pin-spill-exhausted",
+                                    );
                                     return false;
                                 }
                                 let s_recv = self.next_spill_offset;

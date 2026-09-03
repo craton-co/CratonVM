@@ -34,7 +34,7 @@ pub(super) fn execute_invokestatic(
     // resolution succeeds; this is the slow path, only reached on a cache
     // miss from execute_invokestatic_cached, so the instruction is
     // definitely executing by this point).
-    if crate::jit::profile::is_profiling_enabled() {
+    if crate::jit::profile::is_receiver_profiling_enabled() {
         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
         shared
             .jit
@@ -1363,7 +1363,7 @@ pub(super) fn execute_invokestatic_cached(
     // dispatch match below — every remaining path through this match
     // actually dispatches (Handled/FramePushed), so this is "the call site
     // fired," not "we merely consulted the cache."
-    if crate::jit::profile::is_profiling_enabled() {
+    if crate::jit::profile::is_receiver_profiling_enabled() {
         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
         shared
             .jit

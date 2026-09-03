@@ -28,7 +28,7 @@ static GATED_REF_STORE_SITES: std::sync::atomic::AtomicU64 = std::sync::atomic::
 static UNGATED_REF_STORE_SITES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-fn note_gated_ref_store() {
+pub(crate) fn note_gated_ref_store() {
     GATED_REF_STORE_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -1260,11 +1260,11 @@ impl Compiler {
             self.emit_load_local(RAX, self.jit_thread_slot_off);
             self.emit_test_r64_r64(RAX);
             let have_cached_thread = self.emit_jcc_rel32_patch(0x85); // JNE have_thread
-            self.emit_call_absolute(self.helpers.get_current_thread);
+            self.emit_fetch_current_thread_into_rax();
             self.emit_store_local(self.jit_thread_slot_off, RAX);
             self.patch_rel32_to_here(have_cached_thread);
         } else {
-            self.emit_call_absolute(self.helpers.get_current_thread);
+            self.emit_fetch_current_thread_into_rax();
         }
         self.emit_test_r64_r64(RAX);
         let null_thread_patch = self.emit_jcc_rel32_patch(0x84); // JE slow_path
