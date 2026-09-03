@@ -1271,6 +1271,77 @@ impl Frame {
         }
     }
 
+    /// Rebuild this frame in place as a call to `cached`, reusing its
+    /// `locals`, `local_kinds` and operand-stack buffers.
+    ///
+    /// This is [`Self::new_pooled_cached_compact`] with the allocation
+    /// question already answered: the frame is a retired slot of the thread's
+    /// `FrameStack` (see `FrameStack::push_cached_compact_reusing`), so its
+    /// four buffers are already here and none of them has to travel through
+    /// the thread's pools. Measured 2026-09-02, that churn — not the filling
+    /// of the buffers — is what `frame_build` and `ret_recycle` are mostly
+    /// made of.
+    ///
+    /// Every field is overwritten, so nothing of the retired frame survives
+    /// into the new one. The buffers' *contents* above what this writes are
+    /// not live: `locals` is sized and filled here exactly as the constructor
+    /// does, and the operand stack is empty with `len = 0`.
+    pub fn reset_cached_compact(
+        &mut self,
+        cached: Arc<CachedBytecodeMethod>,
+        args: &[(CompactValue, u8)],
+    ) {
+        let needed: usize = args
+            .iter()
+            .map(|(_, t)| if matches!(*t, b'J' | b'D') { 2 } else { 1 })
+            .sum();
+        let n = (cached.max_locals as usize).max(needed);
+        let eff_max_locals = u16::try_from(n).unwrap_or(u16::MAX);
+
+        self.locals.clear();
+        self.local_kinds.clear();
+        self.locals.reserve(n);
+        self.local_kinds.reserve(n);
+        for (cv, tag) in args {
+            self.locals.push(*cv);
+            match *tag {
+                b'J' => {
+                    self.local_kinds.push(LKIND_LONG);
+                    self.locals.push(CompactValue::uninitialized());
+                    self.local_kinds.push(LKIND_OTHER);
+                }
+                b'D' => {
+                    self.local_kinds.push(LKIND_DOUBLE);
+                    self.locals.push(CompactValue::uninitialized());
+                    self.local_kinds.push(LKIND_OTHER);
+                }
+                _ => self.local_kinds.push(LKIND_OTHER),
+            }
+        }
+        self.locals.resize(n, CompactValue::uninitialized());
+        self.local_kinds.resize(n, LKIND_OTHER);
+        debug_assert_eq!(self.locals.len(), n);
+        debug_assert_eq!(self.local_kinds.len(), n);
+
+        self.stack
+            .reset_in_place((cached.max_stack as usize).max(16) + 8);
+
+        self.class_id = cached.declaring_class_id;
+        self.pc = 0;
+        self.last_instr_pc = 0;
+        self.code = cached.code.clone();
+        self.max_stack = cached.max_stack;
+        self.max_locals = eff_max_locals;
+        self.method_index = None;
+        self.backward_count = 0;
+        self.osr_attempt_counts.clear();
+        self.monitor_on_exit = None;
+        self.seq = next_frame_seq();
+        self.exec_epoch = 0;
+        count_frame_kind(false);
+        self.inner = FrameInner::Cached(cached);
+    }
+
     pub fn reset_for_tail_call(
         &mut self,
         class_id: ClassId,
@@ -2494,6 +2565,18 @@ pub struct FrameStack {
     /// Backing storage. Never reallocated except through `grow_for`, which
     /// bumps `reloc_epoch`.
     buf: Vec<Frame>,
+    /// Logical top of stack. `buf.len()` is the **high-water mark**: the
+    /// slots in `depth..buf.len()` hold retired frames whose `locals`,
+    /// `local_kinds` and operand-stack buffers are kept allocated, so the
+    /// next call at that depth is built in them instead of routing a fresh
+    /// set through the thread's pools.
+    ///
+    /// Nothing above `depth` is live: every accessor on this type is
+    /// bounded by it, so the GC root scan, the stack walker and every
+    /// `frames[i]` see exactly the frames they saw before. A retired
+    /// frame's leftover contents are overwritten by
+    /// [`Frame::reset_cached_compact`] before the slot becomes live again.
+    depth: usize,
     /// Incremented every time the backing buffer is reallocated with live
     /// frames in it — i.e. every time frame addresses change. Wrapping is
     /// harmless: consumers only ever compare for equality across a short
@@ -2507,6 +2590,7 @@ impl FrameStack {
     pub const fn new() -> Self {
         Self {
             buf: Vec::new(),
+            depth: 0,
             reloc_epoch: 0,
         }
     }
@@ -2523,7 +2607,10 @@ impl FrameStack {
     /// How many more frames can be pushed with **no** frame moving.
     #[inline(always)]
     pub fn stable_headroom(&self) -> usize {
-        self.buf.capacity() - self.buf.len()
+        // Measured against the LIVE depth, not the allocation: a push
+        // overwrites a retired slot before it appends, so a retired slot is
+        // headroom.
+        self.buf.capacity() - self.depth
     }
 
     /// Guarantee that the next `additional` pushes will not move any frame.
@@ -2534,7 +2621,7 @@ impl FrameStack {
     /// across the pushes.
     #[inline(always)]
     pub fn reserve_stable(&mut self, additional: usize) {
-        if self.buf.len().saturating_add(additional) > self.buf.capacity() {
+        if self.depth.saturating_add(additional) > self.buf.capacity() {
             self.grow_for(additional);
         }
     }
@@ -2548,7 +2635,7 @@ impl FrameStack {
     fn grow_for(&mut self, additional: usize) {
         let len = self.buf.len();
         let cap = self.buf.capacity();
-        let needed = len.saturating_add(additional);
+        let needed = self.depth.saturating_add(additional);
         let target = if cap == 0 {
             // No frames exist yet, so nothing can move: no epoch bump.
             needed.max(FRAME_STACK_INITIAL_STABLE_CAP)
@@ -2571,7 +2658,7 @@ impl FrameStack {
     /// type-level docs. The pointer itself is always safe to obtain.
     #[inline(always)]
     pub fn frame_ptr(&mut self, idx: usize) -> *mut Frame {
-        if idx < self.buf.len() {
+        if idx < self.depth {
             // SAFETY: idx is in bounds, so the offset is inside the allocation.
             unsafe { self.buf.as_mut_ptr().add(idx) }
         } else {
@@ -2582,7 +2669,7 @@ impl FrameStack {
     /// Raw pointer to the top frame, or null when the stack is empty.
     #[inline(always)]
     pub fn current_ptr(&mut self) -> *mut Frame {
-        let len = self.buf.len();
+        let len = self.depth;
         if len == 0 {
             std::ptr::null_mut()
         } else {
@@ -2604,64 +2691,64 @@ impl FrameStack {
     /// [`Self::reserve_stable`] for that.
     #[inline(always)]
     pub fn current_mut(&mut self) -> Option<&mut Frame> {
-        self.buf.last_mut()
+        self.live_mut().last_mut()
     }
 
     // ── Drop-in `Vec<Frame>` surface ────────────────────────────────────
 
     #[inline(always)]
     pub fn len(&self) -> usize {
-        self.buf.len()
+        self.depth
     }
 
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
+        self.depth == 0
     }
 
     #[inline(always)]
     pub fn iter(&self) -> std::slice::Iter<'_, Frame> {
-        self.buf.iter()
+        self.live().iter()
     }
 
     #[inline(always)]
     pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Frame> {
-        self.buf.iter_mut()
+        self.live_mut().iter_mut()
     }
 
     #[inline(always)]
     pub fn first(&self) -> Option<&Frame> {
-        self.buf.first()
+        self.live().first()
     }
 
     #[inline(always)]
     pub fn last(&self) -> Option<&Frame> {
-        self.buf.last()
+        self.live().last()
     }
 
     #[inline(always)]
     pub fn last_mut(&mut self) -> Option<&mut Frame> {
-        self.buf.last_mut()
+        self.live_mut().last_mut()
     }
 
     #[inline(always)]
     pub fn get(&self, idx: usize) -> Option<&Frame> {
-        self.buf.get(idx)
+        self.live().get(idx)
     }
 
     #[inline(always)]
     pub fn get_mut(&mut self, idx: usize) -> Option<&mut Frame> {
-        self.buf.get_mut(idx)
+        self.live_mut().get_mut(idx)
     }
 
     #[inline(always)]
     pub fn as_slice(&self) -> &[Frame] {
-        &self.buf
+        self.live()
     }
 
     #[inline(always)]
     pub fn as_mut_slice(&mut self) -> &mut [Frame] {
-        &mut self.buf
+        self.live_mut()
     }
 
     /// Push a frame. Existing frames keep their addresses unless this call has
@@ -2679,24 +2766,56 @@ impl FrameStack {
             );
         }
         self.reserve_stable(1);
-        self.buf.push(frame);
+        if self.depth < self.buf.len() {
+            // Overwrite a retired slot. Its buffers are dropped with it;
+            // `push_frame_and_fire_entry` harvests them into the thread
+            // pools first, so the pooled constructors keep the recycling
+            // they have always relied on.
+            self.buf[self.depth] = frame;
+        } else {
+            self.buf.push(frame);
+        }
+        self.depth += 1;
     }
 
     /// Pop the top frame. Never moves any remaining frame.
     #[inline(always)]
     pub fn pop(&mut self) -> Option<Frame> {
+        if self.depth == 0 {
+            return None;
+        }
+        // A by-value pop hands the frame out, so the retired tail above it
+        // cannot stay behind: drop it and let the frame leave normally.
+        self.buf.truncate(self.depth);
+        self.depth -= 1;
         self.buf.pop()
     }
 
     /// Drop everything above depth `len`. Never moves any surviving frame.
     #[inline(always)]
     pub fn truncate(&mut self, len: usize) {
-        self.buf.truncate(len);
+        if len < self.depth {
+            self.depth = len;
+        }
+    }
+
+    /// `truncate`, and release the retired slots above it in the same step.
+    ///
+    /// This is the shape the pooled recycle path wants: it has just harvested
+    /// the top frame's buffers, so the husk must actually be dropped rather
+    /// than retired with nothing in it.
+    #[inline(always)]
+    pub fn truncate_hard(&mut self, len: usize) {
+        if len < self.depth {
+            self.depth = len;
+        }
+        self.buf.truncate(self.depth);
     }
 
     /// Drop every frame. Retains the (stable) capacity.
     #[inline(always)]
     pub fn clear(&mut self) {
+        self.depth = 0;
         self.buf.clear();
     }
 
@@ -2710,7 +2829,9 @@ impl FrameStack {
     #[inline]
     pub fn insert(&mut self, idx: usize, frame: Frame) {
         self.reserve_stable(1);
+        self.buf.truncate(self.depth);
         self.buf.insert(idx, frame);
+        self.depth += 1;
     }
 }
 
@@ -2731,18 +2852,86 @@ impl std::fmt::Debug for FrameStack {
     }
 }
 
+impl FrameStack {
+    /// The live frames, `0..depth`. Everything the rest of the VM can see.
+    #[inline(always)]
+    fn live(&self) -> &[Frame] {
+        &self.buf[..self.depth]
+    }
+
+    #[inline(always)]
+    fn live_mut(&mut self) -> &mut [Frame] {
+        let d = self.depth;
+        &mut self.buf[..d]
+    }
+
+    /// Retire the top frame without destroying it, keeping its buffers in the
+    /// slot for the next call at this depth. The frame stops being live the
+    /// instant `depth` drops.
+    #[inline(always)]
+    pub fn retire_top(&mut self) -> bool {
+        if self.depth == 0 {
+            return false;
+        }
+        self.depth -= 1;
+        true
+    }
+
+    /// Whether a retired slot is waiting at the current depth.
+    #[inline(always)]
+    pub fn has_retired_slot(&self) -> bool {
+        self.depth < self.buf.len()
+    }
+
+    /// The retired slot at the current depth, for harvesting its buffers
+    /// before an ordinary by-value push overwrites it.
+    #[inline(always)]
+    pub fn retired_slot_mut(&mut self) -> Option<&mut Frame> {
+        if self.depth < self.buf.len() {
+            let d = self.depth;
+            Some(&mut self.buf[d])
+        } else {
+            None
+        }
+    }
+
+    /// Rebuild the retired slot at the current depth as a frame for `cached`
+    /// and make it live, reusing its buffers. `false` when no slot is retired,
+    /// and the caller builds a frame the ordinary way.
+    #[inline]
+    pub fn push_cached_compact_reusing(
+        &mut self,
+        cached: Arc<CachedBytecodeMethod>,
+        args: &[(CompactValue, u8)],
+    ) -> bool {
+        if self.depth >= self.buf.len() {
+            return false;
+        }
+        let d = self.depth;
+        self.buf[d].reset_cached_compact(cached, args);
+        self.depth += 1;
+        true
+    }
+
+    /// Drop every retired slot, releasing their buffers.
+    pub fn trim_retired(&mut self) {
+        let d = self.depth;
+        self.buf.truncate(d);
+    }
+}
+
 impl std::ops::Deref for FrameStack {
     type Target = [Frame];
     #[inline(always)]
     fn deref(&self) -> &[Frame] {
-        &self.buf
+        self.live()
     }
 }
 
 impl std::ops::DerefMut for FrameStack {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut [Frame] {
-        &mut self.buf
+        self.live_mut()
     }
 }
 
@@ -2750,14 +2939,14 @@ impl<I: std::slice::SliceIndex<[Frame]>> std::ops::Index<I> for FrameStack {
     type Output = I::Output;
     #[inline(always)]
     fn index(&self, index: I) -> &Self::Output {
-        std::ops::Index::index(&*self.buf, index)
+        std::ops::Index::index(self.live(), index)
     }
 }
 
 impl<I: std::slice::SliceIndex<[Frame]>> std::ops::IndexMut<I> for FrameStack {
     #[inline(always)]
     fn index_mut(&mut self, index: I) -> &mut Self::Output {
-        std::ops::IndexMut::index_mut(&mut *self.buf, index)
+        std::ops::IndexMut::index_mut(self.live_mut(), index)
     }
 }
 
@@ -2766,7 +2955,7 @@ impl<'a> IntoIterator for &'a FrameStack {
     type IntoIter = std::slice::Iter<'a, Frame>;
     #[inline(always)]
     fn into_iter(self) -> Self::IntoIter {
-        self.buf.iter()
+        self.live().iter()
     }
 }
 
@@ -2775,7 +2964,7 @@ impl<'a> IntoIterator for &'a mut FrameStack {
     type IntoIter = std::slice::IterMut<'a, Frame>;
     #[inline(always)]
     fn into_iter(self) -> Self::IntoIter {
-        self.buf.iter_mut()
+        self.live_mut().iter_mut()
     }
 }
 
@@ -2783,15 +2972,20 @@ impl IntoIterator for FrameStack {
     type Item = Frame;
     type IntoIter = std::vec::IntoIter<Frame>;
     #[inline(always)]
-    fn into_iter(self) -> Self::IntoIter {
+    fn into_iter(mut self) -> Self::IntoIter {
+        // Retired slots are not frames anyone may see.
+        self.trim_retired();
         self.buf.into_iter()
     }
 }
 
 impl FromIterator<Frame> for FrameStack {
     fn from_iter<T: IntoIterator<Item = Frame>>(iter: T) -> Self {
+        let buf: Vec<Frame> = iter.into_iter().collect();
+        let depth = buf.len();
         Self {
-            buf: iter.into_iter().collect(),
+            buf,
+            depth,
             reloc_epoch: 0,
         }
     }
@@ -2800,8 +2994,10 @@ impl FromIterator<Frame> for FrameStack {
 impl From<Vec<Frame>> for FrameStack {
     #[inline]
     fn from(buf: Vec<Frame>) -> Self {
+        let depth = buf.len();
         Self {
             buf,
+            depth,
             reloc_epoch: 0,
         }
     }
@@ -2809,7 +3005,8 @@ impl From<Vec<Frame>> for FrameStack {
 
 impl From<FrameStack> for Vec<Frame> {
     #[inline]
-    fn from(fs: FrameStack) -> Vec<Frame> {
+    fn from(mut fs: FrameStack) -> Vec<Frame> {
+        fs.trim_retired();
         fs.buf
     }
 }

@@ -4424,19 +4424,17 @@ pub(super) fn execute_invokevirtual_fast_door(
             slots[i] = (cv, tag);
         }
     }
-    thread.frames[frame_idx].stack.discard_top(total_args);
-    thread.refill_pools_from_shared(
-        &shared.mem.operand_stack_pool,
-        &shared.mem.tag_pool,
-        cached.max_locals as usize,
-        (cached.max_stack as usize).max(16) + 8,
-    );
-    let frame = Frame::new_pooled_cached_compact(
+    // One push for all three doors (see `invoke_fast::push_frame_verbatim`),
+    // which is also what lets a virtual call reuse the retired frame slot the
+    // return left behind. This tail used to be a second copy of the same
+    // sequence, and the copy is exactly why the slot-reuse change reached the
+    // static doors first and left `virtual1` flat.
+    Some(Ok(invoke_fast::push_frame_verbatim(
+        shared,
+        thread,
+        frame_idx,
         cached,
-        &slots[..total_args],
-        &mut thread.locals_pool,
-        &mut thread.stacks_pool,
-    );
-    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
-    Some(Ok(CachedCallResult::FramePushed))
+        &slots,
+        total_args,
+    )))
 }
