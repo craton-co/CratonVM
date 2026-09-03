@@ -1218,3 +1218,100 @@ The stale half of the record is corrected in passing: the doc on
 the pin set comes from the scan. That describes the mechanism correctly but
 names the wrong cause — the defect was the vacuous proof, which is what this
 change fixes. The doc now says so, and says what a soak must answer instead.
+
+## 15. The precise-only soak: not clean, and the gate could not have said so (2026-09-02)
+
+*`perf/g1-precise-only-soak-20260902`, branched from `dev` at `221a383f2`.
+§14.4 said the defaults could not move until a soak answered the
+`fully_oop_covered` question. This is that soak. **The answer is no**, twice
+over, and one of the two refutations was invisible to the gate that decides
+whether to suppress.*
+
+### 15.1 How it was run
+
+144 release runs: 6 workloads × 2 collectors (G1 and Generational) × 4 reps ×
+2 modes, all with `CRATONVM_GC_PRECISE_ONLY_ROOTS=1
+CRATONVM_G1_PRECISE_ONLY_ROOTS=1`.
+
+The two modes answer different questions and neither answers both:
+
+* **ORACLE** adds `CRATONVM_DBG_VERIFY_OOP_MAPS=1`. In this mode
+  `verify_active_coverage_into` runs the FULL conservative scan anyway and only
+  asks whether the precise maps missed anything, so the suppression never
+  fires. It is a pure correctness experiment.
+* **LIVE** omits the oracle, so the suppression really happens and G1's pin set
+  really goes empty. It checks checksum, dangling references and exit code.
+
+**Every LIVE run passed** — right checksum, `dangling=0`, no crash marker. That
+is exactly why the ORACLE arm exists: a stranded oop only becomes a wrong answer
+if the object is also evacuated AND dereferenced, so a checksum soak of this
+change is a coin-flip dressed as evidence.
+
+### 15.2 What the oracle found
+
+`while_covered` is `NEVER_MAPPED_WHILE_COVERED` — the counter the code itself
+calls "the number that says whether the codegen's coverage bit is sound".
+`wrong_map` is an in-band live oop named by SOME map of the method but not by
+the one its safepoint id selects. Both numbers below are per run, and the two
+values per cell are the two collectors; all four reps agreed to within noise.
+
+| workload | `while_covered` | `wrong_map` |
+|---|---:|---:|
+| `G1CardChurn` | — (no claiming frames) | — |
+| `G1ChurnPauseProbe` | 36 / 128 | 12 / 64 |
+| `HumongousChurn 48 6000` | 16 / 32 | 22 / 34 |
+| `HumongousChurn 48 20000` | 52 / 102 | 58 / 104 |
+| **`HumongousHold`** | **0 / 0** | **160 / 139** |
+| `HumongousWide` | 6 / 23 | 12 / 45 |
+
+Two independent refutations:
+
+1. **The coverage bit is refuted directly** on 4 of 6 workloads —
+   live references in slots no map of the frame mentions. That is precisely what
+   `bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`
+   predicted, now measured rather than reasoned.
+2. **The map-SELECTION gap** on 5 of 6. `scan_active_oop_map_at_rbp` resolves
+   ONE map through `find_oop_map_for_safepoint_id` and iterates only its
+   `slot_offsets`, so a `wrong_map` word is invisible to the precise walk and
+   the suppression strands it exactly as an unmapped one.
+
+**Neither is G1-specific** — both collectors show both, at the same order of
+magnitude. §14.4 guessed this was a JIT-wide question; it is.
+
+### 15.3 The gate was blind to half of it
+
+Read the `HumongousHold` row again: `while_covered = 0`, `wrong_map = 160`.
+
+`verify_active_coverage_into` — the "verify first, then suppress" gate — used to
+return its verdict from `NEVER_MAPPED_WHILE_COVERED` and
+`NEVER_MAPPED_WHILE_SHADOW_COVERED` alone. On that workload both are zero, so
+the gate would have reported **"proof holds"** over frames it had just been
+shown hold 160 oops the precise scan cannot reach, and suppressed the backstop
+that was finding them.
+
+The gate now also consults `WRONG_MAP`. This has no production effect — both
+suppression switches remain opt-in and off — but it means the experiment fails
+closed instead of silently succeeding.
+`the_refutation_gate_reads_the_map_selection_counter` pins it.
+
+### 15.4 Verdict
+
+**The defaults do not move.** Not `CRATONVM_GC_PRECISE_ONLY_ROOTS`, not
+`CRATONVM_G1_PRECISE_ONLY_ROOTS`. §14's finding stands — G1's coverage proof is
+earned now rather than vacuous, and with the switches on G1 pins nothing — but
+"the proof is real" and "the maps are complete" are different claims, and this
+soak refutes the second.
+
+What would have to change before this is asked again, in order:
+
+1. **The map-selection gap** is the cheaper of the two and is a JIT fix, not a
+   collector one: either the precise scan unions every map that can be live at
+   the safepoint, or the emitter stops producing slots that only a
+   non-selected map names. `wrong_map` is the number to drive to zero.
+2. **The coverage gap** is the harder one and is what the 2026-08-20 bug page
+   is about. `while_covered` is the number, and it is non-zero on ordinary
+   workloads.
+
+Only when both read zero across a soak of this shape does the question become
+"should the defaults move", and even then the answer is a longer soak, not this
+one.
