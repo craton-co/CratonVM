@@ -7142,9 +7142,29 @@ fn verify_precise_covers_conservative(
                         if frame_cm.fully_oop_covered {
                             audit::NEVER_MAPPED_WHILE_COVERED.fetch_add(1, AOrd::Relaxed);
                             // The bit has been caught claiming coverage it does
-                            // not have. Latch it: `collect_roots` consults this
+                            // not have -- but only if the word really is an oop.
+                            // Latched, and `collect_roots` consults the latch
                             // before skipping the conservative backstop.
-                            note_coverage_oracle_refutation();
+                            //
+                            // GATED ON THE VERIFIER, for exactly the reason the
+                            // shadow latch below already gives: the raw counter
+                            // flags any in-band word that LOOKS like a heap
+                            // address, and an old pointer left in a reusable
+                            // slot after its value died looks exactly like one.
+                            // The two latches sat side by side with only the
+                            // second one gated, and the first one's cost was
+                            // measured on 2026-09-03: H2
+                            // (`org.h2.test.store.TestMVStoreTool`, 612
+                            // compiled frames) trips it 400 times with
+                            // `verifier_oop=0` on every one, and because the
+                            // latch is process-wide the run then reports
+                            // `root coverage: incomplete` on 100% of pauses --
+                            // where the same class without the oracle reports
+                            // 0.00%. A refusal that fires on shape rather than
+                            // evidence, and it fired on every real workload.
+                            if verdict == VerifierSlotVerdict::Oop {
+                                note_coverage_oracle_refutation();
+                            }
                         }
                         // ...and the same latch on the claim the MOVING path
                         // actually spends, but ONLY on a corroborated hit.

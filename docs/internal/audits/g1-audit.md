@@ -1395,3 +1395,91 @@ like a 82%-vs-45% win and was noise, and §15 recorded a counter that looked lik
 a refutation and was dead storage. Both were caught by asking for a second,
 independent reading — reps in the first case, the verifier's own type maps in
 the second. The instruments that can answer were already in the tree both times.
+
+## 17. The real-application soak: a false-positive latch, and the obligation that is actually blocking (2026-09-03)
+
+*`fix/g1-coverage-reason-census-20260903`. §16.3 said the open question was
+sample size and that a real soak needs applications rather than probes. This is
+that soak, on H2 and its own test suite. It found two things the probes could
+not, and the second one only became visible after the first was fixed.*
+
+### 17.1 §16 holds at scale
+
+`org.h2.test.store.TestMVStoreTool` at `-Xmx64m`, oracle armed — **612
+compiled frames and 14 798 in-band words**, against 14 frames on the probes:
+
+| counter | raw | verifier-confirmed |
+|---|---:|---:|
+| `never_mapped` | 400 | **0** (`not_oop=302`, `unknown=98`) |
+| `wrong_map` | 1 874 | **0** |
+
+Forty-four times the frame sample and still not one confirmed refutation. §16's
+conclusion — the raw counters measure dead pointers in reusable slots, which a
+precise map is right to omit — is not a small-sample artefact.
+
+### 17.2 A latch that fired on shape, on every real workload
+
+With the precise-only switches and the oracle on, H2 reported
+`root coverage: incomplete` on **100.00%** of pauses. The same class with the
+switches off reports **0.00%**. Enabling the suppression was *causing* the
+incompleteness.
+
+The cause is one ungated latch. At the audit site two refutation latches sit
+side by side:
+
+* the `fully_shadow_covered` one is gated on `verdict == Oop`, and its comment
+  gives the reason — "latching on the raw counter would have suppressed every
+  collection on every workload measured, since 5-6% of in-band words trip it";
+* the `fully_oop_covered` one, three lines above, was **not gated**. It latched
+  on the raw counter.
+
+`note_coverage_oracle_refutation` is process-wide, so 400 raw hits on H2 — all
+`verifier_oop=0` — latched the refutation for the rest of the run and every
+subsequent pause reported incomplete. The argument the tree had already written
+for the second latch applies verbatim to the first; it now has it.
+
+### 17.3 The reason was computed and thrown away
+
+`root_coverage_incomplete_reason()` returns WHICH obligation failed, and
+`record_g1_pause_coverage` was handed only `is_some()`. So a reader of
+`incomplete=58 (100.00%)` could not tell an unregistered JIT frame from an
+unpublished bounds table from an OSR shadow — which is why §14 read 0% on
+probes and §17 read 100% on H2 with no way to see that the two were different
+obligations.
+
+The `[GC] g1 root coverage:` line now carries the per-reason census, appended
+rather than on its own line so the rate cannot be read without it.
+
+### 17.4 What is actually blocking, named
+
+With the latch fixed, the same H2 run says:
+
+```
+g1 root coverage: pauses=243 incomplete=197 (81.07%)
+                  reasons: compiled-frame-oop-not-published=197
+```
+
+`UNPUBLISHED_FRAME_OOP`: a live compiled frame's own spill band holds a
+young-heap address the shadow stack never published, so nothing can rewrite
+that slot after a relocation. Not the coverage bit, not map selection, not the
+bounds table — a *shadow-stack publication* gap, and the one obligation
+`arch-2026-07-26/moving-young-corruption-rootcause.md` is named after.
+
+The pause count rising 33 → 243 in the same wall time is the other half of the
+same story: the old latch was refusing evacuation, so the run made less
+progress per pause.
+
+That is where precise root coverage actually stands on real code, and it is a
+more specific answer than §14, §15 or §16 could give. The defaults stay
+opt-in; `compiled-frame-oop-not-published` at 81% is the number the next
+attempt should drive down, and it is a shadow-stack question rather than a
+codegen or collector one.
+
+### 17.5 Two instruments, both of which had to be fixed to see this
+
+Neither result was visible before this section: the latch made every real
+workload report the same wrong reason, and the discarded reason code made the
+report unreadable even when it was right. §16.4 said a counter that flags a
+possible defect is not evidence of one; §17 adds the converse — an instrument
+that reports a real obligation under a wrong label hides the one finding worth
+having.
