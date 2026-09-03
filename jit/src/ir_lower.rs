@@ -11178,6 +11178,8 @@ fn plan_register_residency(
     // and `skip_phi` in particular is the one that decides whether this file
     // can ever reach a LOOP COUNTER -- which is a phi, at every loop header.
     let (mut skip_split, mut skip_bank, mut skip_home, mut skip_phi) = (0usize, 0, 0, 0);
+    // Split apart from `skip_split` on 2026-09-03: see the refusal below.
+    let (mut skip_no_alloc, mut skip_spilled) = (0usize, 0usize);
     // 2026-09-02, measured: promotion is not free, and two populations pay for
     // it without ever collecting.
     //
@@ -11230,11 +11232,32 @@ fn plan_register_residency(
         // spill, a reload, a home-slot stretch in the middle — is refused
         // rather than emitted: this wiring has no reload machinery, so a value
         // whose register goes away partway through must not be read from one.
+        //
+        // **The NO-SEGMENT case is counted separately, and that distinction is
+        // not cosmetic.** A node the scan produced no interval for was never a
+        // candidate — every control and memory node in the graph lands here,
+        // `Start` and `Proj` included — and folding it into the split count
+        // makes the file look like it is losing values to register pressure
+        // when it is only being handed nodes that hold no value at all.
+        //
+        // It read that way for real. On the loop the 2026-09-03 tier
+        // comparison found inverted, this line reported
+        // `split_or_spilled=5` beside the allocator's `splits=4`, and the two
+        // together said: four candidates lost to live-range splits. They were
+        // not. Four of the five had EMPTY segment lists and one was genuinely
+        // spilled; the method had no split value for the file to reclaim at
+        // all. A day of work aimed at split residency followed from that
+        // reading, and its engagement counter read zero — which is how the
+        // miscount was found.
         let reg = match segs.as_slice() {
+            [] => {
+                skip_no_alloc += 1;
+                continue;
+            }
             [seg] => match seg.reg {
                 Some(reg) => reg,
                 None => {
-                    skip_split += 1;
+                    skip_spilled += 1;
                     continue;
                 }
             },
@@ -11403,7 +11426,8 @@ fn plan_register_residency(
         eprintln!(
             "[ir-ls] skipped: split_or_spilled={skip_split} \
              wrong_bank_or_type={skip_bank} no_home={skip_home} phi={skip_phi} \
-             const={skip_const} single_use={skip_single_use}"
+             const={skip_const} single_use={skip_single_use} \
+             spilled={skip_spilled} no_alloc={skip_no_alloc}"
         );
     }
     if promoted == 0 {
