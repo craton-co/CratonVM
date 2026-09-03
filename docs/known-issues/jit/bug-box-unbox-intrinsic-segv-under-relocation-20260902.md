@@ -207,6 +207,20 @@ Note for anyone running it: the per-hit lines are capped at 64
 (`STEP3_LOG_CAP`), and both audit summary lines print only at normal exit, so a
 crashing arm produces no verdict.
 
+### Ruled out 2026-09-03: precise oop maps for >64 locals do NOT fix it
+
+`fix/jit-precise-oop-maps-wide-locals-20260903` ("methods above 64 locals had no
+precise oop maps at all") is the closest thing to an unnamed root in a compiled
+frame that has landed, and it is NOT this defect. Rebuilt on dev with that fix
+in (`2632fb2c1` confirmed an ancestor), the second trigger still SIGSEGVs
+**2 of 3** (103 s, 119 s), same page-aligned fault `rdi`.
+
+So the surviving candidates are unchanged: this page's own prediction of
+scalar-replacement, LICM-hoist or GPR-spill slots -- none of which the runtime
+oracle corroborates either (`verifier_oop=0`). Whatever names the stale
+reference, it is not a Java local above the 64 mark and not something the class
+file's type maps call a reference.
+
 ## The mitigation
 
 `box_unbox_intrinsic_disabled()` now defaults to disabled. Set
