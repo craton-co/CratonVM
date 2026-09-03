@@ -1759,6 +1759,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "verify-rset", on_key: Some("CRATONVM_GC_VERIFY_RSET"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "compact-ref-fields", on_key: Some("CRATONVM_COMPACT_REF_FIELDS"), off_key: None, off_word: None, since: "2026-06-22" },
     E { group: Group::GC, token: "pack-fields-by-width", on_key: Some("CRATONVM_PACK_FIELDS_BY_WIDTH"), off_key: None, off_word: None, since: "2026-08-06" },
+    E { group: Group::GC, token: "layout-scan-cache", on_key: Some("CRATONVM_GC_LAYOUT_SCAN_CACHE"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::GC, token: "compressed-oops", on_key: Some("CRATONVM_COMPRESSED_OOPS"), off_key: None, off_word: None, since: "2026-07-25" },
     E { group: Group::GC, token: "default-heap-ergonomics", on_key: Some("CRATONVM_DEFAULT_HEAP_ERGONOMICS"), off_key: None, off_word: None, since: "2026-06-17" },
     E { group: Group::GC, token: "default-heap-max-mb", on_key: Some("CRATONVM_DEFAULT_HEAP_MAX_MB"), off_key: None, off_word: None, since: "2026-06-17" },
@@ -2020,6 +2021,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "zgc-gen-promotion-age", on_key: Some("CRATONVM_ZGC_GEN_PROMOTION_AGE"), off_key: None, off_word: None, since: "2026-08-17" },
     E { group: Group::GC, token: "zgc-gen-minors-per-major", on_key: Some("CRATONVM_ZGC_GEN_MINORS_PER_MAJOR"), off_key: None, off_word: None, since: "2026-08-17" },
     E { group: Group::GC, token: "zgc-gen-nursery-percent", on_key: Some("CRATONVM_ZGC_GEN_NURSERY_PERCENT"), off_key: None, off_word: Some("0"), since: "2026-08-17" },
+    E { group: Group::GC, token: "zgc-alloc-trigger", on_key: Some("CRATONVM_ZGC_ALLOC_TRIGGER"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     // G2e/G2f (2026-08-17, widened to every cycle 2026-08-18). Default-ON kill
     // switches over the sweep's two per-dead-object costs, in the shape `zgc-relocate` established:
     // `0` restores the previous behaviour byte for byte, so the A/B is a re-run

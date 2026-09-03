@@ -14708,19 +14708,23 @@ impl G1Collector {
     /// build it, so [`Self::autobox_payload`] and every other backend's reader
     /// recognise it. Must be called BEFORE taking the `regions` lock — the
     /// allocation needs it.
-    fn autobox_for_reference_array(&self, array: ObjectRef, value: Value) -> Value {
+    ///
+    /// `None` means the wrapper could not be allocated: the heap is full. The
+    /// caller turns that into `ARRAY_STORE_OUT_OF_MEMORY` rather than letting
+    /// `alloc_object` `std::process::abort()` the VM — see that constant.
+    fn autobox_for_reference_array(&self, array: ObjectRef, value: Value) -> Option<Value> {
         if matches!(value, Value::Object(_)) {
-            return value;
+            return Some(value);
         }
         if self.get_header(array).element_type() != ArrayElementType::Reference {
-            return value;
+            return Some(value);
         }
-        let wrapper = self.alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1);
+        let wrapper = self.try_alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1)?;
         self.set_field(wrapper, 0, value);
         // Arm the process-wide wrapper latch — see the matching note in
         // `GenerationalHeap::set_array_element` and `crate::autobox`.
         crate::autobox::note_wrapper_created();
-        Value::Object(Some(wrapper))
+        Some(Value::Object(Some(wrapper)))
     }
 
     /// The primitive inside an auto-box wrapper, or `None` when `candidate` is
@@ -16045,7 +16049,7 @@ impl GarbageCollector for G1Collector {
         let header = self.get_header(obj);
         let len = header.array_length() as usize;
         if index >= len {
-            return Err(index as i32);
+            return Err(crate::heap::oob_index_code(index));
         }
         let element_type = header.element_type();
         let elem_size = crate::heap::element_byte_size(element_type);
@@ -16085,7 +16089,7 @@ impl GarbageCollector for G1Collector {
                     elem_size,
                     false,
                 ) {
-                    return Err(index as i32);
+                    return Err(crate::heap::oob_index_code(index));
                 }
             } else {
                 flat_read(&mut raw);
@@ -16121,11 +16125,13 @@ impl GarbageCollector for G1Collector {
         //
         // Boxed BEFORE the `regions` lock below: `alloc_object` takes that same
         // lock.
-        let value = self.autobox_for_reference_array(obj, value);
+        let Some(value) = self.autobox_for_reference_array(obj, value) else {
+            return Err(crate::heap::ARRAY_STORE_OUT_OF_MEMORY);
+        };
         let header = self.get_header(obj);
         let len = header.array_length() as usize;
         if index >= len {
-            return Err(index as i32);
+            return Err(crate::heap::oob_index_code(index));
         }
         let element_type = header.element_type();
         let elem_size = crate::heap::element_byte_size(element_type);
@@ -16236,7 +16242,7 @@ impl GarbageCollector for G1Collector {
             }
         };
         if !stored {
-            return Err(index as i32);
+            return Err(crate::heap::oob_index_code(index));
         }
 
         // C2c: RSet post-barrier for reference element stores of a non-null ref.

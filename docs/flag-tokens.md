@@ -902,7 +902,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-121 tokens.
+123 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -915,6 +915,7 @@ export inherited from a parent shell.
 | `verify-rset` | `CRATONVM_GC_VERIFY_RSET` |
 | `compact-ref-fields` | `CRATONVM_COMPACT_REF_FIELDS` |
 | `pack-fields-by-width` | `CRATONVM_PACK_FIELDS_BY_WIDTH` |
+| `layout-scan-cache` | `CRATONVM_GC_LAYOUT_SCAN_CACHE` |
 | `compressed-oops` | `CRATONVM_COMPRESSED_OOPS` |
 | `default-heap-ergonomics` | `CRATONVM_DEFAULT_HEAP_ERGONOMICS` |
 | `default-heap-max-mb` | `CRATONVM_DEFAULT_HEAP_MAX_MB` |
@@ -1017,6 +1018,7 @@ export inherited from a parent shell.
 | `zgc-gen-promotion-age` | `CRATONVM_ZGC_GEN_PROMOTION_AGE` |
 | `zgc-gen-minors-per-major` | `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` |
 | `zgc-gen-nursery-percent` | `CRATONVM_ZGC_GEN_NURSERY_PERCENT` |
+| `zgc-alloc-trigger` | `CRATONVM_ZGC_ALLOC_TRIGGER` |
 | `zgc-sweep-header-zero` | `CRATONVM_ZGC_SWEEP_HEADER_ZERO` |
 | `zgc-sweep-dead-runs` | `CRATONVM_ZGC_SWEEP_DEAD_RUNS` |
 | `zgc-mark-ctx-direct` | `CRATONVM_ZGC_MARK_CTX_DIRECT` |

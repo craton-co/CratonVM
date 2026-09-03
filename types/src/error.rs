@@ -1659,6 +1659,36 @@ impl RuntimeError {
         }
     }
 
+    /// The Java exception for an `Err` code out of a heap `set_array_element`
+    /// / `get_array_element`.
+    ///
+    /// That channel is a bare `i32` carrying two different conditions, and
+    /// only one of them is an index:
+    ///
+    /// * [`ARRAY_STORE_OUT_OF_MEMORY`] — the store needed an auto-box wrapper
+    ///   (a primitive `Value` into a reference array) and the heap could not
+    ///   allocate one. Before 2026-09-03 the backends allocated that wrapper
+    ///   through their INFALLIBLE `alloc_object`, which prints
+    ///   `FATAL: out of heap space` and `std::process::abort()`s — so this
+    ///   condition took the whole VM down with no stack trace and no chance
+    ///   for a `catch (OutOfMemoryError)` to run. It is an
+    ///   `OutOfMemoryError` and nothing else.
+    /// * anything else — an out-of-range index, in `0..=i32::MAX` by
+    ///   construction ([`oob_index_code`]), which is an AIOOBE exactly as
+    ///   [`RuntimeError::aioobe`] builds it.
+    ///
+    /// Every call site that turns an array-store `Err` into a Java exception
+    /// must come through here rather than calling `aioobe` directly, or the
+    /// heap-full case is reported to the program as a negative array index.
+    pub fn array_store_fault(code: i32, length: i32) -> Self {
+        if code == crate::ARRAY_STORE_OUT_OF_MEMORY {
+            return RuntimeError::OutOfMemoryError {
+                message: "Java heap space".to_string(),
+            };
+        }
+        RuntimeError::aioobe(code, length)
+    }
+
     /// An AIOOBE carrying a message that is not the array-access shape —
     /// `System.arraycopy`'s five (see [`arraycopy_message`]), and
     /// `java.util.Arrays`' `"Array index out of range: N"`.
