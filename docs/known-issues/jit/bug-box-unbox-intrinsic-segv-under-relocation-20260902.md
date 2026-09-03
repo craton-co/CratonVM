@@ -189,6 +189,24 @@ It also gives the root-cause hunt a second reproducer on a different workload,
 which the surviving run shows is otherwise well-behaved (99978/100000, zero
 OOM, zero NPE, 22 compaction cycles).
 
+### The second trigger behaves like this one on every switch, and the oracle is blind to both
+
+`CRATONVM_ZGC_RELOCATE=0` removes it: **0 / 3**, matching this page's own 0/3.
+The fault `rdi` is page-aligned in every crash (`0x232ECD30000`,
+`0x28DEA7B0000`, `0x1CA01BB0000`) -- this page's signature exactly.
+
+`CRATONVM_DBG_VERIFY_OOP_MAPS=1` does NOT find the root. It refutes
+`fully_oop_covered` immediately on both workloads, but reports
+`verifier_oop=0 verifier_not_oop=1222475 verifier_unknown=1582066` against a
+populated `name_index=(1237 names)`. Every one of 2.8 M never-mapped words is
+either confirmed not-a-reference or unknown; none is corroborated. So the
+unnamed root is not something this oracle can see as an oop -- which is itself a
+constraint on what it can be.
+
+Note for anyone running it: the per-hit lines are capped at 64
+(`STEP3_LOG_CAP`), and both audit summary lines print only at normal exit, so a
+crashing arm produces no verdict.
+
 ## The mitigation
 
 `box_unbox_intrinsic_disabled()` now defaults to disabled. Set

@@ -1226,6 +1226,52 @@ frame" over any account that makes the box/unbox sequence itself the mechanism.
 unnamed root is found and fixed, re-run these arms; if the SIGSEGVs go, the
 credit ships and takes the class from 98304 to ~99978 with no OOMs.
 
+### Attribution closed 2026-09-03: it is dev's relocation defect, and the oracle does not see it
+
+| arm | SIGSEGV |
+|---|---|
+| credit + shadow scan | 2 / 3 (185 s, 100 s) |
+| credit + shadow scan + `CRATONVM_ZGC_RELOCATE=0` | **0 / 3** |
+| `PUBLISH_ONLY` (plumbing, no credit) | 0 / 3 |
+| discharge only (control) | 0 / 3 |
+
+Relocation is REQUIRED -- the same 0/3 that
+`bug-box-unbox-intrinsic-segv-under-relocation-20260902` measured on that
+switch. And the fault signature matches that page's: `rdi` page-aligned at the
+fault (`0x232ECD30000`, `0x28DEA7B0000`, `0x1CA01BB0000`), which that page reads
+as "a read through a reference into a page the collector has already vacated".
+
+So this is that defect, reached by a second route. The credit is an exposer.
+
+**A negative worth recording for the root-cause hunt.** The obvious instrument
+does not find it. `CRATONVM_DBG_VERIFY_OOP_MAPS=1` REFUTES the codegen's
+`fully_oop_covered` bit within the first two log lines on both this class and
+`TestMultiThread` -- but its own corroborating verdict is empty:
+
+```
+oop-map audit: frames=2712711 words=47361242 never_mapped=2804541
+               (while_covered=2153089 of 2630854 claiming;
+                while_shadow_covered=1511211 of 2085086 claiming)
+oop-map audit: verifier_oop=0 verifier_not_oop=1222475 verifier_unknown=1582066
+               name_index=(1237 names, 0 collisions)
+```
+
+`verifier_oop=0` with a POPULATED name index (1237 names): the class files say
+not one of 2.8 M never-mapped words is a reference. The raw never-mapped count
+is the documented false positive -- primitives whose bits land on a live object
+header -- and the audit's own comment says only `verifier_oop` is a lead.
+
+Two traps this cost, worth not repeating:
+
+* the per-hit `[VERIFY-OOP-MAPS]` lines are capped at `STEP3_LOG_CAP` (64), so a
+  slot-class breakdown taken from the log is a sample of the first 64, NOT a
+  distribution over the 2.8 M. Read the audit summary for the population.
+* both audit lines print only at NORMAL exit, so a run that SIGSEGVs (`rc=139`)
+  or is killed at the cap (`rc=124`) yields no verdict at all. To get one on a
+  crashing arm the workload has to be made to exit -- or the verdict has to move
+  into the per-hit line.
+
+### Superseded: the retraction that preceded this measurement
 ### Superseded: the retraction that preceded this measurement
 
 The conclusion below is withdrawn. It is not known to be wrong; it is not
