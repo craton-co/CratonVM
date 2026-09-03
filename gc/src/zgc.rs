@@ -10831,7 +10831,12 @@ impl barrier::ZBarrierContext for ZgcRealHeap {
         // that had been left empty, keyed in offsets where `relocations` is
         // keyed in addresses, and the difference between the two was the only
         // reason it looked like a different table.
-        let base = self.arena.lock().base_ptr() as u64;
+        // `self.arena_base`, not `self.arena.lock().base_ptr()`: this is a
+        // BARRIER slow path, reached from an ordinary field or element read,
+        // and a barrier that takes the allocator lock is a barrier that can
+        // deadlock against any caller holding it. The field is fixed at
+        // construction and documented as safe to read without the lock.
+        let base = self.arena_base as u64;
         let from = base.checked_add(addr)? as usize;
         let to = self.counters.relocations.lock().get(&from).copied();
         match to {
