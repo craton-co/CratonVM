@@ -1181,7 +1181,52 @@ Both real, both fixed, neither shown to BE the crash:
 - `publish_self_jit_depth` used `with`, which PANICS on a destroyed
   thread-local, and `pop_jit_entry` can run during teardown — now `try_with`.
 
-### RETRACTED 2026-09-03 -- every crash binary predates dev's box/unbox fix
+### 2026-09-03 -- IT WORKS, and it is blocked on an open dev defect
+
+On merged dev (box/unbox intrinsic now default-OFF), credit + shadow scan,
+1500 s cap, 3 runs, against 2 discharge-only controls on the SAME binary:
+
+| | credit + shadow scan | discharge only (control) |
+|---|---|---|
+| best run | **`actual: 99978`** | did not complete |
+| ref-array OOM | **0** | **20000** |
+| NPE | 0 | 0 |
+| `relocation_skipped_jit` | **3** (was 877) | — |
+| `relocation_on_proven_jit` | **22** (was 2) | — |
+| compaction | 22 cycles, **519932 objects relocated** | — |
+| outcome | 1 completed, 2 SIGSEGV (185 s, 100 s) | 2 x rc=124 at the cap |
+
+99978 of 100000 with **zero** OutOfMemoryError is the best result this class has
+produced -- better than the unsafe `ASSUME_REWRITABLE` bypass (99952 with 48
+NPEs), and obtained by satisfying the obligation rather than skipping it. The
+fragmentation diagnosis is right and the mechanism now demonstrably clears it.
+
+It still SIGSEGVs 2 of 3, and the cause is very likely NOT this accounting:
+
+`known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`
+establishes, with `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` as the narrow
+switch (0/3), that **relocation under LIVE COMPILED FRAMES moves a reference the
+safepoint's oop map does not name** -- and that root cause is OPEN. That page
+also links it to `bug-h2-testrandommapops-small-heap-corruption-20260829.md`,
+"hunting an unnamed root in a compiled frame for days".
+
+Enabling relocation under live JIT frames is precisely and only what this credit
+does. So it is a powerful EXPOSER of that defect, and no arm on this workload
+can separate the two: every switch that removes the crash (`PUBLISH_ONLY`,
+credit-off, `RELOCATE_UNDER_PROVEN_JIT=0`) also removes relocation-under-JIT.
+
+**New fact for that page: the box/unbox intrinsic is not required.** Every run
+above had it DISABLED (merged-dev default; the enable flag appears nowhere in
+the logs). That page's crash needed both relocation and the intrinsic; this one
+needs only relocation under live JIT frames. So there is a second, independent
+trigger of the same shape -- which supports "an unnamed root in a compiled
+frame" over any account that makes the box/unbox sequence itself the mechanism.
+
+**Status: this work is BLOCKED on that defect, not refuted by it.** When the
+unnamed root is found and fixed, re-run these arms; if the SIGSEGVs go, the
+credit ships and takes the class from 98304 to ~99978 with no OOMs.
+
+### Superseded: the retraction that preceded this measurement
 
 The conclusion below is withdrawn. It is not known to be wrong; it is not
 supported by the evidence that was offered for it.
