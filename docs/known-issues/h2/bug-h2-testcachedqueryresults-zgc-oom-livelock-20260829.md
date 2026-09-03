@@ -1117,6 +1117,112 @@ CRATONVM_GC_STATS=1 timeout 900 <cratonvm-bin> --java-home /data/toolchain/jdk-2
     --Xmx 1g -c "$CP" org.h2.test.jdbc.TestCachedQueryResults
 ```
 
+## 2026-09-02 — `cross-thread-jit-peer` cannot be discharged by pinning
+
+`cross-thread-jit-peer` was 448 of the 877 relocation refusals left after the
+helper-window discharge, and it looked WRONG rather than merely unsatisfied: it
+refuses for blocked peers that never reach `publish_peer_jit_coverage_for_stw`,
+and those are exactly the peers the discharge now PINS. A pinned peer's objects
+cannot move, so — the argument went — its frames need no rewritability proof.
+
+That argument is false, and the class says so in the least ambiguous way
+available.
+
+### The measurement
+
+One binary, `CRATONVM_XT_PINNED_PEER_DEPTH` the only difference, no debug I/O:
+
+| arm | outcome |
+|---|---|
+| credit ON, 4 runs | **SIGSEGV at 138 s, 218 s, 95 s**; one reached the 600 s cap |
+| credit OFF, 3 runs | no crash — 3600 s, 601 s, 600 s |
+
+All three crashes at the SAME pc, inside compiled code. `accounted=true` on 10
+of 35 cycles, so relocation ran where it used to refuse and a compiled frame
+then used a pointer that had moved. On `TestMultiThread` the same credit is
+clean and moves `relocation_on_proven_jit` 3 → 5 — a smoke test is not a
+verdict here.
+
+### Why: a JIT frame's oops are not on the stack the pin covers
+
+`helper_window_pass` scans a frozen peer's register file and
+`[rsp, stack_base)`. It contained no mention of the shadow stack — and the
+shadow stack is where a JIT frame publishes its oops. It is a per-thread heap
+`Box<[usize]>`, a separate allocation.
+
+| peer state | shadow stack scanned | remapped |
+|---|---|---|
+| initiator | yes (`collect_roots`) | n/a |
+| cooperatively parked | yes (`root_snapshot`) | yes, on resume |
+| **blocked** | **no** | **no** — `apply_pending_blocked_fixups` never calls `shadow_stack.remap` |
+
+So a blocked peer's shadow-stack oops were unpinned, unremapped and possibly
+unmarked. `ShadowStack`'s own safety comment states the collector reads another
+thread's "only after that thread has **parked**"; a blocked peer never parks.
+
+### This qualifies the 2026-09-02 discharge entry above
+
+That entry reports the helper-window discharge as sound on the strength of
+`0 NPE`. The measurement was real; the conclusion was too broad. The discharge
+was safe **in conjunction with** `cross-thread-jit-peer` still refusing, which
+held `relocation_on_proven_jit` at 2 for a whole class run — the pin was barely
+exercised. Remove the backstop and it is exercised properly, and it fails. A
+near-zero relocation count is weak evidence for a safety claim, not vindication
+of one.
+
+### Two defects found in the credit itself
+
+Both real, both fixed, neither shown to BE the crash:
+
+- a recycled OS tid inherited a dead thread's published depth (the entry
+  outlives its owner and a recycled thread that never enters JIT never
+  overwrites it) — slots are now dropped by a TLS guard at thread exit and
+  reset on re-registration;
+- `publish_self_jit_depth` used `with`, which PANICS on a destroyed
+  thread-local, and `pop_jit_entry` can run during teardown — now `try_with`.
+
+### Under test
+
+`CRATONVM_XT_PEER_SHADOW_SCAN=1` gives the owner-published route to the missing
+coverage: each thread publishes its own `ShadowStack` ADDRESS (authoritative,
+no frame→`CompiledMethod` attribution, stable for the thread's lifetime) and the
+initiator reads `base`/`top` from it while the peer is blocked and therefore
+stable. Every field is validated before dereference, and an untrusted window
+REFUSES the pin rather than claiming coverage — that direction costs compaction,
+not correctness.
+
+The initiator cannot instead recover the window from the peer's frames:
+`shadow_window_from_frame` trusts a frame only when its cached `JvmThread` is
+the current thread's, and mis-attributing a `CompiledMethod` to a conservatively
+found frame is what SIGSEGV'd the band verifier on a `base` of
+`0x5555_0000_0004`.
+
+If that does not close it, pinning is the wrong instrument for blocked peers and
+the remaining route is to make a blocked peer remap its own JIT state on wake —
+rewritability rather than immobility — which is a much larger change to the
+blocked-wake path.
+
+### Acceptance test, unchanged
+
+`relocation_on_proven_jit > 0` with 0 OOM **and** 0 NPE **and** no crash,
+together. Not whether the `cross-thread-jit-peer` label disappears: the census is
+first-wins, so discharging one term merely exposes the next, and this is the same
+style of depth accounting that produced a false positive earlier on this page.
+
+### Bisect levers
+
+- `CRATONVM_XT_PINNED_PEER_DEPTH=1` — the credit (default OFF).
+- `CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY=1` — publish and deposit but credit
+  nothing; separates the publisher from the decision, which one flag otherwise
+  conflates.
+- `CRATONVM_XT_PEER_SHADOW_SCAN=1` — the candidate fix (default OFF).
+- `CRATONVM_DBG_XT_COVERAGE=1` prints `peer_depth= proven= pinned= accounted=`.
+  It is an ENGAGEMENT counter: `pinned=0` throughout means the credit never
+  engaged and everything downstream is vacuous. Do NOT leave it on while
+  measuring outcomes — 25113 lines of stderr pushed a 997 s control to the
+  3600 s cap and inflated its ref-array OOMs from 834 to 48132, because this
+  class's `FOR UPDATE WAIT 0.5` turns added latency into failures.
+
 ## Related
 
 - `fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
