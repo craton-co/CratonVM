@@ -364,7 +364,25 @@ fn scan_invokestatic_cp_indices(code: &[u8]) -> Vec<u16> {
 /// * the constant-pool index of every `invokestatic`, and
 /// * whether the method stores into a primitive array of a type the GPU
 ///   input cache can hold — `iastore` (0x4f), `lastore` (0x50),
-///   `fastore` (0x51), `dastore` (0x52).
+///   `fastore` (0x51), `dastore` (0x52), `bastore` (0x54) and
+///   `sastore` (0x56).
+///
+/// The last two were added 2026-09-02, with the offload path that made
+/// `short[]`/`byte[]` cacheable in the first place. While those widths
+/// could not be marshalled, nothing cached them and a compiled writer
+/// could not stale anything; the four-opcode set was exactly right. The
+/// moment they became offloadable it was under-inclusive, and the
+/// resulting divergence is reproducible: `GpuJitWriterStale` at
+/// n=8192/2000 rounds diverges from HotSpot on the short and byte
+/// checksums while the int one — whose writer this scan does refuse —
+/// stays correct.
+///
+/// `castore` (0x55) is deliberately NOT here. It writes `char[]`, which
+/// `is_marshallable_array_element` does not admit, so no `char[]` is
+/// ever cached and refusing its writers would cost compilation to
+/// protect nothing. `bastore` covers `boolean[]` as well as `byte[]`
+/// and that IS an over-approximation, but the opcode cannot distinguish
+/// them, and over-refusing is the safe direction.
 ///
 /// The second is what closes the JIT half of Phase 10 #2. See
 /// [`method_writes_primitive_array`].
@@ -381,10 +399,12 @@ fn scan_code(code: &[u8]) -> (Vec<u16>, bool) {
                 break;
             }
         }
-        // iastore / lastore / fastore / dastore. Reached only on a real
-        // instruction boundary, so an operand byte that happens to equal
-        // one of these cannot false-positive.
-        if (0x4f..=0x52).contains(&op) {
+        // iastore / lastore / fastore / dastore, plus bastore (0x54) and
+        // sastore (0x56) since `short[]`/`byte[]` became cacheable.
+        // Reached only on a real instruction boundary, so an operand
+        // byte that happens to equal one of these cannot false-positive.
+        // 0x55 (castore) is excluded on purpose — see the doc above.
+        if (0x4f..=0x52).contains(&op) || op == 0x54 || op == 0x56 {
             writes_array = true;
         }
         let len = match op {
@@ -695,6 +715,11 @@ mod tests {
             (0x50, "lastore"),
             (0x51, "fastore"),
             (0x52, "dastore"),
+            // Added 2026-09-02 with the offload path that made
+            // `short[]`/`byte[]` marshallable, and therefore cacheable.
+            // Until then this scan was right to ignore them.
+            (0x54, "bastore"),
+            (0x56, "sastore"),
         ] {
             // aload_0; iconst_0; iconst_1; <astore>; return
             let code = [0x2a, 0x03, 0x04, op, 0xb1];
@@ -706,11 +731,30 @@ mod tests {
     }
 
     #[test]
-    fn array_store_scan_ignores_reference_and_subword_stores() {
-        // aastore/bastore/castore/sastore never reach the input cache,
-        // which only holds int/long/float/double buffers. bastore has a
-        // helper hook anyway.
-        for op in [0x53u8, 0x54, 0x55, 0x56] {
+    fn array_store_scan_ignores_reference_and_char_stores() {
+        // What is left out, and why each one.
+        //
+        // `aastore` (0x53) stores references; the input cache holds only
+        // primitive buffers.
+        //
+        // `castore` (0x55) stores `char[]`, which
+        // `offload::is_marshallable_array_element` does not admit, so no
+        // `char[]` is ever cached and refusing its writers would cost
+        // compilation to protect nothing.
+        //
+        // This test used to also assert 0x54 and 0x56, on the reasoning
+        // that "bastore/castore/sastore never reach the input cache,
+        // which only holds int/long/float/double buffers -- bastore has
+        // a helper hook anyway". Both halves stopped being true on
+        // 2026-09-02: `short[]`/`byte[]` became marshallable and so
+        // cacheable, and `jit_bastore` in fact had NO invalidation hook
+        // (only `jit_iastore` did). A JIT-compiled `short[]`/`byte[]`
+        // writer then left the residency cache stale, reproducibly --
+        // `test_classes/gpu/GpuJitWriterStale.java` diverges from
+        // HotSpot on the short and byte checksums at n=8192 over 2000
+        // rounds while the int one, whose writer this scan does refuse,
+        // stays correct.
+        for op in [0x53u8, 0x55] {
             let code = [0x2a, 0x03, 0x04, op, 0xb1];
             assert!(!method_writes_primitive_array(&code), "opcode {op:#x}");
         }
