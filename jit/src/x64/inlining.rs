@@ -2882,14 +2882,21 @@ impl Compiler {
                             // on the collector's published plan.
                             // The fresh-constructor arm is preferred ONLY where
                             // it can actually run. It bails to a full helper
-                            // call unless the STORE-side region table holds live
-                            // bounds, and the generational collector never
-                            // publishes that table -- only G1 and ZGC call
-                            // `publish_movable_bounds`. So under the default
-                            // collector that specialization is dead, and every
-                            // constructor field store it owns was an
-                            // out-of-line `jit_putfield_object` that no census
-                            // counted. bt18 is made of exactly those stores.
+                            // call unless the STORE-side region table holds
+                            // live bounds, and the ONLY writer of
+                            // `JIT_REGION_BOUNDS` is
+                            // `GenerationalHeap::publish_region_bounds` -- G1
+                            // publishes the read-side table only and ZGC
+                            // neither, as `gen_heap.rs` says where it mirrors
+                            // them. (`publish_movable_bounds`, which G1 and ZGC
+                            // do call, writes a DIFFERENT table and has nothing
+                            // to do with this predicate; an earlier version of
+                            // this comment had the two collectors exactly
+                            // backwards.) So under ZGC that specialization is
+                            // dead and every constructor field store it owns
+                            // was an out-of-line `jit_putfield_object`; bt18 is
+                            // made of exactly those stores, which is where the
+                            // 136.6M inline stores below come from.
                             let fresh_ctor_arm_is_live = fresh_ctor_first_store
                                 && region_bounds_are_live(self.helpers.region_bounds_addr);
                             let gated_inlined = !fresh_ctor_arm_is_live

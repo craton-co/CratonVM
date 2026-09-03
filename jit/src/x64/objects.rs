@@ -966,6 +966,7 @@ impl Compiler {
         // Compact reference fields are bare 8-byte pointers.
         self.load_slot_to_reg(RDX, val_slot);
         self.emit_mov_mem_disp32_r64(RAX, RDX, cell_off);
+        self.emit_ref_store_path_trace(&crate::metrics::SP_REF_STORE_BODY_TAKEN);
         if g1 {
             // F-08. RCX is dead here (it last held the num_slots bound), so it
             // is the scratch; RAX and RDX are clobbered by the filter and the
@@ -1080,6 +1081,7 @@ impl Compiler {
 
         self.load_slot_to_reg(RDX, val_slot);
         self.emit_mov_mem_disp32_r64(RAX, RDX, cell_off);
+        self.emit_ref_store_path_trace(&crate::metrics::SP_REF_STORE_FRESH_CTOR_TAKEN);
         if g1 {
             // F-08 — RCX is untouched by this emitter, so it is free scratch.
             self.emit_g1_post_write_barrier_regs(RAX, RDX, RCX, obj_slot, val_slot);
