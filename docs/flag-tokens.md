@@ -721,6 +721,7 @@ export inherited from a parent shell.
 | `aastore-barrier-gate` | `CRATONVM_JIT_NO_AASTORE_BARRIER_GATE` |
 | `call-frame-dedupe` | `CRATONVM_JIT_NO_CALL_FRAME_DEDUPE` |
 | `strict-install-epoch` | `CRATONVM_JIT_STRICT_INSTALL_EPOCH` |
+| `supersede-epoch-skip-useless` | `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS` |
 | `kernel-reg-locals` | `CRATONVM_JIT_KERNEL_REG_LOCALS` |
 | `kernel-reg-osr` | `CRATONVM_JIT_KERNEL_REG_OSR` |
 | `leak-code` | `CRATONVM_JIT_LEAK_CODE` |

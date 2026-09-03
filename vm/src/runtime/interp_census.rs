@@ -150,6 +150,19 @@ fn dump(label: &str, c: &Census, top: usize) {
 pub fn report_at_exit() {
     dump("interp-frames", interp_census(), 60);
     dump("tierup-decline", decline_census(), 60);
+    // C1→C2 supersede engagement. `unchanged`/`first-publish` are the two
+    // outcomes that cannot invalidate anything, and `ic_evictions` is what the
+    // epoch bump actually costs — the number of `Jit` invoke-cache entries it
+    // threw away process-wide. Printed together because the second is the only
+    // thing that makes the first two worth acting on.
+    let (first_publish, unchanged, changed) =
+        crate::runtime::interpreter::jit_bridge::supersede_census();
+    if crate::runtime::env_cache::dbg_jitc() && first_publish + unchanged + changed > 0 {
+        eprintln!(
+            "[c2-supersede] publishes: first_publish={first_publish} unchanged={unchanged} changed={changed}; ic_evictions_from_epoch={}",
+            cratonvm_classloading::epoch_stale_evictions(),
+        );
+    }
     if direct_binds_enabled() {
         eprintln!(
             "[direct-binds] Integer.intValue: sites_bound={} served={} declined_to_dispatch={}",

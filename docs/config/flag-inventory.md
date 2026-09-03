@@ -1493,6 +1493,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_STATIC_BYTECODE_CALLEE` | JIT | `CRATONVM_JIT=static-bytecode-callee` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_STRICT_CALLEE_ROOTS` | JIT | `CRATONVM_JIT=strict-callee-roots` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_STRICT_INSTALL_EPOCH` | JIT | `CRATONVM_JIT=strict-install-epoch` | default-on | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS` | JIT | `CRATONVM_JIT=supersede-epoch-skip-useless` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_SYNC_METHODS` | JIT | `CRATONVM_JIT=sync-methods` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_THIS_NONNULL` | JIT | `CRATONVM_JIT=this-nonnull` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_THRESHOLD` | JIT | `CRATONVM_JIT=threshold` | opt-in | off | behaviour | snapshot | difftest, types, vm |
