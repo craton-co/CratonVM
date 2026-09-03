@@ -260,6 +260,77 @@ public class DynClassGenSweep {
             MethodHandles.lookup().defineHiddenClass(null, true);
             return "no-throw";
         });
+        // All FOUR doors that take class bytes, so a fix to one is not applied
+        // to the others on faith. HotSpot: bad magic is ClassFormatError at
+        // every door; a null array is NPE.
+        t("define.lookupBadMagic", () -> {
+            MethodHandles.lookup().defineClass(new byte[] { 1, 2, 3, 4 });
+            return "no-throw";
+        });
+        t("define.lookupNullBytes", () -> {
+            MethodHandles.lookup().defineClass(null);
+            return "no-throw";
+        });
+        t("define.lookupEmptyBytes", () -> {
+            MethodHandles.lookup().defineClass(new byte[0]);
+            return "no-throw";
+        });
+        t("define.hiddenEmptyBytes", () -> {
+            MethodHandles.lookup().defineHiddenClass(new byte[0], true);
+            return "no-throw";
+        });
+        // Correct MAGIC, truncated body. Distinguishes "we only check the four
+        // magic bytes" from "we report a parse failure the way the JDK does":
+        // both are ClassFormatError on HotSpot, and a fix that only touches the
+        // magic check leaves this one wrong.
+        t("define.lookupTruncated", () -> {
+            MethodHandles.lookup().defineClass(
+                new byte[] { (byte) 0xCA, (byte) 0xFE, (byte) 0xBA, (byte) 0xBE, 0, 0 });
+            return "no-throw";
+        });
+        t("define.hiddenTruncated", () -> {
+            MethodHandles.lookup().defineHiddenClass(
+                new byte[] { (byte) 0xCA, (byte) 0xFE, (byte) 0xBA, (byte) 0xBE, 0, 0 }, true);
+            return "no-throw";
+        });
+        // A null VARARGS array, which is a different argument from null bytes.
+        t("define.hiddenNullOptions", () -> {
+            byte[] b = classBytes(Base.class);
+            if (b == null) return "NO-BYTES";
+            MethodHandles.lookup().defineHiddenClass(b, true,
+                (MethodHandles.Lookup.ClassOption[]) null);
+            return "no-throw";
+        });
+        // The THIRD door of this family, which the rows above never reach.
+        t("define.wcdOk", () -> {
+            byte[] b = classBytes(Base.class);
+            if (b == null) return "NO-BYTES";
+            MethodHandles.Lookup l = MethodHandles.lookup()
+                .defineHiddenClassWithClassData(b, "cd", true);
+            return l.lookupClass().isHidden();
+        });
+        t("define.wcdBadMagic", () -> {
+            MethodHandles.lookup()
+                .defineHiddenClassWithClassData(new byte[] { 1, 2, 3, 4 }, "cd", true);
+            return "no-throw";
+        });
+        t("define.wcdNullBytes", () -> {
+            MethodHandles.lookup().defineHiddenClassWithClassData(null, "cd", true);
+            return "no-throw";
+        });
+        // The CONTROL for the rows above: one case where the JDK really does
+        // raise IllegalArgumentException, so a fix that turns every refusal on
+        // this surface into ClassFormatError is visibly wrong here.
+        t("define.lookupWrongPackage", () -> {
+            byte[] b;
+            try (java.io.InputStream in = ClassLoader
+                    .getSystemResourceAsStream("java/util/ArrayList.class")) {
+                if (in == null) return "NO-BYTES";
+                b = in.readAllBytes();
+            }
+            MethodHandles.lookup().defineClass(b);
+            return "no-throw";
+        });
     }
 
     // ---- a custom ClassLoader calling defineClass --------------------------
@@ -291,6 +362,14 @@ public class DynClassGenSweep {
             Loader l = new Loader();
             l.def(Base.class.getName(), b);
             l.def(Base.class.getName(), b);
+            return "no-throw";
+        });
+        t("loader.badMagic", () -> {
+            new Loader().def("X$Bad", new byte[] { 1, 2, 3, 4 });
+            return "no-throw";
+        });
+        t("loader.nullBytes", () -> {
+            new Loader().def("X$Null", null);
             return "no-throw";
         });
         t("loader.truncatedBytes", () -> {

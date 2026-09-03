@@ -6151,6 +6151,13 @@ fn call_site_is_hot(
 fn c2_alloc_upgrade_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
+        // Still OPT-IN, and the reason moved rather than went away. The tier
+        // does now have an inline TLAB bump and gated inline reference stores,
+        // so the ORIGINAL reason (a promoted allocation compiling worse than
+        // its single-pass body) is answerable — but the bump has a defect that
+        // `RJitMapTierDiff` reproduces 4 runs in 10, and with the bump off the
+        // old reason applies again unchanged. See `ir_inline_tlab_enabled`
+        // for the repro and for what was ruled out.
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_C2_ALLOC_UPGRADE").is_some()
     })
 }
@@ -12557,10 +12564,61 @@ pub fn box_unbox_intrinsic_sites() -> (usize, usize) {
 /// on ONE binary, which is the only kind of A/B this tree accepts for a perf
 /// claim — a control built from a different commit has manufactured a
 /// double-digit "regression" on phases containing neither call.
+/// # DEFAULT-OFF since 2026-09-02: it SIGSEGVs under a relocating collector
+///
+/// `org.h2.test.store.TestRandomMapOps --Xmx 256m` on the shipped default dies
+/// of `SIGSEGV` in 25-183 s, **11 runs out of 11**, at a fault address that is
+/// always a page boundary -- the shape of a read through a reference into a
+/// page the collector has already vacated. Two switches each remove it, 3 runs
+/// of 1200 s clean apiece:
+///
+/// * `CRATONVM_ZGC_RELOCATE=0` -- no relocation, no crash;
+/// * `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` -- this family off, no crash.
+///
+/// A `git bisect` over the 200 commits between the last known-good tip and the
+/// crashing one (both endpoints re-verified in the SAME build profile, and only
+/// `SIGSEGV` counted as bad, because the `NullPointerException` and the
+/// fragmentation `OutOfMemoryError` on this workload both PRE-DATE the range)
+/// lands on `a910b7d9c` -- a MERGE whose two parents are both good, and whose
+/// relocation files are byte-identical to one of them. So the defect is the
+/// INTERACTION between this intrinsic and dev's relocation, not either alone.
+///
+/// The inline sequence pops the receiver off the simulated operand stack and
+/// then dereferences it three times -- the class-id guard at `[RAX]`, the
+/// GC-flags byte, and the payload load -- with no call and therefore no
+/// safepoint in between. That is sound only while the receiver in hand cannot
+/// go stale; under a moving collector it evidently can. Root-causing that is
+/// the follow-up, and it wants the receiver kept as a NAMED root across the
+/// sequence rather than held only in `RAX`.
+///
+/// Correctness first: the family is now opt-in, and the perf win it was
+/// measured for is recoverable the moment the sequence is made relocation-safe.
+/// Set `CRATONVM_JIT_BOX_UNBOX_INTRINSIC=1` to turn it back on for that work.
+///
+/// `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` still forces it off, so a script
+/// that already sets it keeps working and keeps meaning the same thing.
 fn box_unbox_intrinsic_disabled() -> bool {
+    // Test-only force, consulted BEFORE the cache. The family is opt-in since
+    // it was found to SIGSEGV under relocation, so the matcher's own tests --
+    // which assert the POSITIVE case and say outright that every negative
+    // below it is vacuous without it -- cannot reach it through the
+    // environment: `OnceLock` fixes the answer at the first read, whichever
+    // test in the binary got there first. This is the same shape
+    // `ir_lower::ls_forced` uses, and it is thread-local so parallel tests
+    // cannot see each other's setting.
+    #[cfg(test)]
+    {
+        if let Some(forced) = box_unbox_forced() {
+            return !forced;
+        }
+    }
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some()
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some() {
+            return true;
+        }
+        // Default OFF: enabled only when explicitly asked for.
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_BOX_UNBOX_INTRINSIC").is_none()
     })
 }
 
@@ -12585,6 +12643,37 @@ fn box_unbox_intrinsic_disabled() -> bool {
 /// `AtomicIntFieldLayout::new(0, ..)` return `None` unless slot 0's compact
 /// storage is exactly 8 / 4 bytes wide, so a layout this load could not address
 /// never reaches codegen.
+#[cfg(test)]
+thread_local! {
+    /// `Some(true)` = force the box/unbox family ON for this thread's test,
+    /// `Some(false)` = force it OFF, `None` = ask the flags.
+    static BOX_UNBOX_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn box_unbox_forced() -> Option<bool> {
+    BOX_UNBOX_FORCE.with(|c| c.get())
+}
+
+/// RAII: force the box/unbox family ON for the current thread.
+#[cfg(test)]
+struct BoxUnboxForceOn;
+
+#[cfg(test)]
+impl BoxUnboxForceOn {
+    fn new() -> Self {
+        BOX_UNBOX_FORCE.with(|c| c.set(Some(true)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for BoxUnboxForceOn {
+    fn drop(&mut self) {
+        BOX_UNBOX_FORCE.with(|c| c.set(None));
+    }
+}
+
 pub fn try_resolve_box_unbox_intrinsic(
     class: &str,
     name: &str,
@@ -12740,6 +12829,9 @@ mod atomic_accessor_intrinsic_tests {
     /// load for a method that is not a field read.
     #[test]
     fn box_unbox_matcher_is_exactly_two_triples() {
+        // The family is opt-in since it was found to SIGSEGV under relocation;
+        // force it on so these assertions test the matcher and not the gate.
+        let _on = BoxUnboxForceOn::new();
         // A real class id is needed: `AtomicLongFieldLayout::new` refuses 0, so
         // passing 0 would make every case below "None" for the wrong reason and
         // the test would pass without testing anything.
@@ -12794,6 +12886,9 @@ mod atomic_accessor_intrinsic_tests {
     /// `0x0123456789ABCDEF`.
     #[test]
     fn box_unbox_uses_the_matching_payload_width() {
+        // The family is opt-in since it was found to SIGSEGV under relocation;
+        // force it on so these assertions test the matcher and not the gate.
+        let _on = BoxUnboxForceOn::new();
         const CID: u32 = 12345;
         let (_, _, long_ret, _) =
             try_resolve_box_unbox_intrinsic("java/lang/Long", "longValue", "()J", CID).unwrap();
@@ -12814,6 +12909,9 @@ mod atomic_accessor_intrinsic_tests {
     /// stack unbalanced.
     #[test]
     fn box_unbox_takes_no_arguments() {
+        // The family is opt-in since it was found to SIGSEGV under relocation;
+        // force it on so these assertions test the matcher and not the gate.
+        let _on = BoxUnboxForceOn::new();
         const CID: u32 = 12345;
         for (c, n, d) in [
             ("java/lang/Long", "longValue", "()J"),
@@ -18673,6 +18771,7 @@ pub fn compiled_frame_line_counts() -> [u64; 8] {
 /// | 13 | `res-inline-locals` | an inlined callee's local frame |
 /// | 14 | `res-inline-merge` | an inlined body's branch-merge area |
 /// | 15 | `res-call-service` | the direct-call argument-service copy |
+/// | 17 | `range-probe-declined` | a `spill_range_fits` PROBE answered no. Separate from `exhausted`, which counts only ranges that were actually being taken — the two used to be the same number, because the probe and the reservation shared one function |
 /// | 16 | `res-helper-args` | a helper's argument buffer or out-parameter (intrinsic dispatch, FFM, the monitor receiver) |
 /// | 12 | `inline-reserve-spent` | what `spill_size` ACTUALLY added (a MAX over compiles). The engagement counter: it equals column 10 with the switch off and column 11 with it on, and inferring which without measuring it is how an inert change ships |
 ///
@@ -18688,7 +18787,7 @@ pub fn compiled_frame_line_counts() -> [u64; 8] {
 /// method, so 19 words is nearly the whole budget for one method and a rounding
 /// error for another. A refusal count of zero plus a large minimum headroom is
 /// a much stronger statement than the refusal count on its own.
-static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 17] = [
+static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 18] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -18699,6 +18798,7 @@ static SPILL_CURSOR_COUNTS: [std::sync::atomic::AtomicU64; 17] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(u64::MAX),
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -18753,11 +18853,14 @@ pub const SPILL_RES_INLINE_MERGE: usize = 14;
 pub const SPILL_RES_CALL_SERVICE: usize = 15;
 /// A helper's argument buffer or out-parameter.
 pub const SPILL_RES_HELPER_ARGS: usize = 16;
+/// A `spill_range_fits` probe answered no. Not a reservation, not in the
+/// partition — a question, counted so making it answerable did not lose it.
+pub const SPILL_RANGE_PROBE_DECLINED: usize = 17;
 /// Alias: the flush's own reservation column, named for `SpillReason::Flush`.
 pub const SPILL_RES_FLUSH: usize = SPILL_FLUSH_RESERVED;
 
 /// Human names, parallel to the slot indices.
-pub const SPILL_CURSOR_SLOT_NAMES: [&str; 17] = [
+pub const SPILL_CURSOR_SLOT_NAMES: [&str; 18] = [
     "flush-calls",
     "flush-reserved",
     "flush-canonical",
@@ -18775,6 +18878,7 @@ pub const SPILL_CURSOR_SLOT_NAMES: [&str; 17] = [
     "res-inline-merge",
     "res-call-service",
     "res-helper-args",
+    "range-probe-declined",
 ];
 
 /// Add `n` to one column. `peak-words` must not go through here — it is a
@@ -18813,8 +18917,8 @@ pub fn note_spill_peak(words: u64, headroom: u64) {
 }
 
 /// Read the census. See [`SPILL_CURSOR_COUNTS`] for the columns.
-pub fn spill_cursor_counts() -> [u64; 17] {
-    let mut out = [0u64; 17];
+pub fn spill_cursor_counts() -> [u64; 18] {
+    let mut out = [0u64; 18];
     for (i, slot) in SPILL_CURSOR_COUNTS.iter().enumerate() {
         out[i] = slot.load(std::sync::atomic::Ordering::Relaxed);
     }

@@ -1440,6 +1440,20 @@ impl Compiler {
         }
     }
 
+    /// The hot half of a merged post-call sentinel check: `RAX != i64::MIN`
+    /// branches past BOTH the callee-deopt check and the exception check in
+    /// one compare (`merged_call_sentinel_enabled`). Returns the rel32 patch
+    /// the caller lands on `.keep`, after the two cold checks -- which keep
+    /// their own compares, and now run only when the callee actually returned
+    /// the sentinel. R10 is clobbered, as it already was by the exception
+    /// check.
+    pub(super) fn emit_call_sentinel_fast_skip(&mut self) -> usize {
+        self.buf.emit(&[0x49, 0xBA]); // MOV R10, imm64
+        self.buf.emit(&(i64::MIN as u64).to_le_bytes());
+        self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
+        self.emit_jcc_rel32_patch(0x85) // JNE .keep
+    }
+
     pub(super) fn emit_post_invoke_exception_check(&mut self, ret_type: u8) {
         // The simulated operand stack at this point is the state *after* the
         // instruction which made the fallible call: every invoke lowering has

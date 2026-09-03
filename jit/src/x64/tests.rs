@@ -16847,6 +16847,10 @@ fn the_method_entry_poll_knows_its_own_live_oop_locals() {
 fn s31_inline_reservations_count_nested_bodies() {
     use crate::x64::driver::{spliced_bytecode_len, spliced_stack_reserve};
 
+    // Named, not spelled 4: if `MAX_INLINE_MERGE_DEPTH` moves this test must
+    // move with it rather than becoming a silently disagreeing second copy.
+    const MERGE: usize = crate::x64::MAX_INLINE_MERGE_DEPTH;
+
     // Leaf: 3 bytes of bytecode, 2 locals, static ()I -> param_span 0.
     let leaf = make_inline_site(&[0x12, 0x05, 0xac], 2, 0, true, b'I');
     assert_eq!(
@@ -16856,8 +16860,8 @@ fn s31_inline_reservations_count_nested_bodies() {
     );
     assert_eq!(
         spliced_stack_reserve(&leaf),
-        2 + 3,
-        "a leaf site keeps the exact pre-existing per-site formula: \
+        2 + 3 + MERGE,
+        "a leaf site is locals/params + code_len + the branch-merge area, added 2026-09-02: \
          max(callee_max_locals, param_span) + callee_code_len"
     );
 
@@ -16885,11 +16889,12 @@ fn s31_inline_reservations_count_nested_bodies() {
         5 + 7 + 3,
         "the buffer estimate must count nested bodies transitively"
     );
-    // (6+5) + (4+7) + (2+3). A one-level walk would say 22.
+    // Each level plus its own merge area: every level of a chain is live at
+    // once and each reserves `MAX_INLINE_MERGE_DEPTH` words of its own.
     assert_eq!(
         spliced_stack_reserve(&outer),
-        (6 + 5) + (4 + 7) + (2 + 3),
-        "a nested body gets its own locals and operand stack on top of the \
+        (6 + 5 + MERGE) + (4 + 7 + MERGE) + (2 + 3 + MERGE),
+        "a nested body gets its own locals, operand stack AND merge area on top of the \
          body that splices it, so the reserves add transitively"
     );
 

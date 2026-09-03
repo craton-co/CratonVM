@@ -910,6 +910,7 @@ pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
         t.set(thread as *mut JvmThread);
         old
     });
+    cratonvm_jit::x64::publish_jit_thread_mirror(thread as *mut JvmThread as usize);
     // Suspend any borrow held by an outer JIT level: the nested JIT call about
     // to run is a child reborrow of `thread`, not an aliasing sibling, so it
     // must start its own borrow level. The outer borrow is frozen on the call
@@ -966,6 +967,7 @@ pub fn restore_jit_thread(scope: JitThreadScope) {
         report_shadow_overflow_once();
     }
     JIT_THREAD.with(|t| t.set(scope.prev_ptr));
+    cratonvm_jit::x64::publish_jit_thread_mirror(scope.prev_ptr as usize);
     #[cfg(debug_assertions)]
     restore_jit_borrow(scope.prev_borrow);
 }
@@ -1007,6 +1009,7 @@ fn report_shadow_overflow_once() {
 /// Clear the JIT thread pointer after JIT execution completes.
 pub fn clear_jit_thread() {
     JIT_THREAD.with(|t| t.set(std::ptr::null_mut()));
+    cratonvm_jit::x64::publish_jit_thread_mirror(0);
 }
 
 /// The consolidated out-of-band JIT→interpreter signal block — see the
@@ -6168,6 +6171,13 @@ pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize);
     *elem_ptr = val as u8;
+    // The host just wrote this array, so a GPU input-cache entry
+    // mirroring it is stale. `jit_iastore` has carried this since Phase
+    // 10 #2; this helper did not, because `byte[]` could not be
+    // marshalled and so was never cached. It became cacheable on
+    // 2026-09-02 and this line landed with the same change.
+    #[cfg(feature = "gpu-offload")]
+    crate::runtime::offload::input_cache::invalidate(cratonvm_types::ObjectRef::from_raw(ptr));
 }
 
 // SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap

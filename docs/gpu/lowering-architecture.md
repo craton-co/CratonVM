@@ -99,6 +99,80 @@ analyzer/emitter half of this; it does not remove the marshaller half,
 because that lives in the VM and is about heap layout rather than about
 lowering. It needs its own guard either way.
 
+### What a new element type costs: FOUR lists, not one
+
+Making `short[]`/`byte[]` offloadable on 2026-09-02 meant editing the
+marshaller. It should have meant editing four places, because four
+independent lists name "the element types the GPU path handles", and
+three of them are opcode or type enumerations that no compiler checks
+against each other:
+
+| list | where | what a stale entry does |
+|---|---|---|
+| admitted kernel params | `analyzer::ParamKind::from_field` | — (the source of truth) |
+| marshallable arrays | `offload::is_marshallable_array_element` | kernel compiles, dispatch refused, **silent** interpreter fallback |
+| cache-holdable stores | `offload_jit_gate::scan_code` opcodes | compiled writer leaves the residency cache **stale**: wrong values |
+| invalidating helpers | `jit::helpers::jit_*astore` | same |
+
+Only the first two were reconciled that day, by
+`analyzer_and_marshaller_admit_the_same_arrays`. The other two were
+found afterwards, by pricing the change rather than testing it:
+
+`offload_jit_gate` keeps an array-writing method out of the JIT while
+the residency cache is live, because the IR pipeline's inline store has
+no hook to invalidate from. Its scan listed `iastore`/`lastore`/
+`fastore`/`dastore` and not `bastore`/`sastore` — exactly right until
+those widths became cacheable, and a correctness hole the moment they
+did. `jit_bastore` compounded it: it never called `invalidate` at all,
+while `jit_iastore` always had.
+
+**How it surfaced is the transferable part.** Not a failing test — a
+timing table that made no sense. Measuring whether narrow types were
+worth offloading, the CPU control read ~330 µs for `short[]`/`byte[]`
+and ~16000 µs for `int[]`, for the same loop over the same element
+count. A 50x gap in a baseline that should not vary by width meant the
+baselines were not the same thing: `int[]`'s writer was being refused
+compilation and the narrow ones were not. The performance anomaly WAS
+the correctness bug, seen from the side.
+
+The `int[]` arm then became the control that named the cause: in one
+run, short and byte diverge from HotSpot while int stays correct, and
+the gate's opcode set is the only difference between them.
+
+**The lesson for the next element type.** Adding one is not a
+marshalling change; it is a change to every list above. The guard test
+covers the first two. `bench-gpu/jit-writer-stale.sh` covers the last
+two, and needs its writers HOT — at n=131072 over 400 rounds the defect
+does not reproduce, because the writer is never compiled and the gate is
+never consulted.
+
+### Is offloading a narrow type worth it?
+
+Measured on an RTX 2060, `scale` (one multiply-subtract per element),
+n=131072, against JIT-compiled CPU code — deliberately the worst case
+for arithmetic intensity:
+
+| type | hot (cache hit) | cold (input mutated each call) |
+|---|---|---|
+| `int[]` | 1.83x | ~1.2x |
+| `long[]` | 1.41x | **0.59–0.65** |
+| `float[]` | 2.23x | 1.41x |
+| `double[]` | 1.20x | 0.42–1.15 (noisy) |
+| `short[]` | 3.67x | 2.11x |
+| `byte[]` | 5.49x | 2.75–3.33x |
+
+The narrow types are the BEST case, not the worst: identical arithmetic
+over a quarter or an eighth of the bytes. The intuition that they might
+not pay — and that `--gpu-min-work` should scale its threshold with the
+element width — was backwards at the narrow end.
+
+It may still hold at the wide end. `long[]` is a consistent ~1.55x LOSS
+in cold mode (5/5 runs, tight spread) because `--gpu-min-work` counts
+ELEMENTS, so an 8-byte-per-element kernel is admitted on the same terms
+as a 1-byte one. That is one synthetic kernel at minimal arithmetic
+intensity and is not on its own grounds to change a default; `double[]`
+was too noisy to call. Recorded here as measured, not acted on.
+
 ### Symptom 2: pattern matching where analysis belongs
 
 `loop_recog` recognises exactly two shapes — a canonical counted loop
