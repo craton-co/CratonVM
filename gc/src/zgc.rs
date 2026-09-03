@@ -2376,7 +2376,15 @@ impl ZgcRealHeap {
             // budget the next pause cannot honour.
             return;
         }
-        let sample = (pause_ns << ZGC_PAUSE_COST_SHIFT) / span_bytes;
+        // `saturating_mul`, not `<<`. The shift is 20 bits and both operands
+        // come from outside this function -- a pathological
+        // `CRATONVM_ZGC_PAUSE_TARGET_MS` or a pause measured across a host
+        // suspend can overflow a `u64` shift, which panics in a debug build
+        // and wraps in a release one. Saturating gives `u64::MAX`, which the
+        // capacity clamp below turns into "the clause is inert" -- the same
+        // answer as no target at all, and the right one for a number nobody
+        // can act on.
+        let sample = pause_ns.saturating_mul(1 << ZGC_PAUSE_COST_SHIFT) / span_bytes;
         let prior = self.pause_ns_per_byte_scaled.load(Ordering::Relaxed);
         // 3:1 towards the prior. A `sample` of 0 is possible on a tiny span and
         // is meaningful (the pause was too cheap to resolve per byte), so it is
@@ -2395,7 +2403,7 @@ impl ZgcRealHeap {
         let target_ns = target_ms.saturating_mul(1_000_000);
         // `target / k`, in bytes: the whole span a pause of `target_ns` can
         // afford to walk.
-        let affordable_span = (target_ns << ZGC_PAUSE_COST_SHIFT) / next;
+        let affordable_span = target_ns.saturating_mul(1 << ZGC_PAUSE_COST_SHIFT) / next;
         let cap = self.heap_capacity();
         let budget = match affordable_span.checked_sub(live_bytes as u64) {
             Some(b) if b as usize > ZGC_ALLOC_TRIGGER_FLOOR => (b as usize).min(cap),
@@ -20291,7 +20299,7 @@ pub(crate) mod tests {
         assert_eq!(unreachable, 0, "a 100 MiB live set does not overrun 100 ms");
         // Verify against the law rather than a magic number: the budget plus
         // the live set is the span a target-length pause can afford.
-        let affordable = ((100u64 * 1_000_000) << ZGC_PAUSE_COST_SHIFT) / k;
+        let affordable = (100u64 * 1_000_000).saturating_mul(1 << ZGC_PAUSE_COST_SHIFT) / k;
         assert_eq!(
             budget,
             (affordable as usize - 100 * MIB).min(heap.heap_capacity()),
@@ -20350,6 +20358,39 @@ pub(crate) mod tests {
         // Likewise a pause the clock could not resolve.
         heap.refresh_pause_target_budget(0, 1024 * 1024, 1024 * 1024);
         assert_eq!(heap.pause_target_state().1, 0);
+    }
+
+    /// A pause target nobody can act on must leave the clause inert, not
+    /// overflow the fixed-point arithmetic.
+    ///
+    /// Both operands of the `<< 20` come from outside the collector: the
+    /// target from a flag, the pause from a clock that a host suspend can
+    /// stretch arbitrarily. A `u64` shift overflow panics in a debug build and
+    /// wraps in a release one, and a wrapped budget is a budget the trigger
+    /// will honour.
+    #[test]
+    fn an_absurd_pause_target_or_pause_cannot_overflow_the_budget() {
+        const MIB: usize = 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(64 * MIB);
+        // ~584 years, in milliseconds: `target_ns << 20` does not fit a u64.
+        heap.set_pause_target_ms(u64::MAX / 2_000_000);
+        heap.refresh_pause_target_budget(1_000_000, 8 * MIB, 8 * MIB);
+        let (_, _, budget, _) = heap.pause_target_state();
+        assert_eq!(
+            budget,
+            heap.heap_capacity(),
+            "an unreachable-large target clamps to capacity, which is inert"
+        );
+        // And the other operand: a pause the clock reports as ~584 years.
+        let heap = ZgcRealHeap::with_capacity(64 * MIB);
+        heap.set_pause_target_ms(100);
+        heap.refresh_pause_target_budget(u64::MAX / 2, 8 * MIB, 8 * MIB);
+        let (_, _, budget, unreachable) = heap.pause_target_state();
+        assert_eq!(
+            budget, ZGC_ALLOC_TRIGGER_FLOOR,
+            "an absurdly expensive pause floors the budget rather than wrapping"
+        );
+        assert!(unreachable > 0, "and reports that it could not meet the target");
     }
 
     /// The estimate is damped 3:1, so one anomalous pause cannot halve the
