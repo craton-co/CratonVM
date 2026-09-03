@@ -5044,7 +5044,15 @@ fn h1_tlab_object_header_has_nonzero_hash_at_allocation() {
     let ptr = storage.as_mut_ptr() as *mut u8;
 
     // Path 1: the TLAB fast path no longer mints a hash at allocation.
-    super::init_object_header(ptr, ClassId::new(0), 0);
+    //
+    // `body_size = 0, gc_flags = 0` is the LEGACY shape, which is what this
+    // test is about: `plan_tlab_object_shape` returns `(legacy_total, 0, 0)`
+    // when the compact path declines, and the compact arm returns
+    // `GC_FLAG_COMPACT` with a real packed body size instead. Both trailing
+    // arguments were added to `init_object_header` without updating this
+    // call, which broke `cargo test -p cratonvm-vm` (the lib itself still
+    // built, so only a test run showed it).
+    super::init_object_header(ptr, ClassId::new(0), 0, 0, 0);
 
     // SAFETY: we just wrote a valid ObjectHeader into `ptr`.
     let header = unsafe { std::ptr::read(ptr as *const ObjectHeader) };

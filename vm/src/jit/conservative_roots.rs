@@ -1232,7 +1232,21 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
         publish_self_jit_depth(remaining);
     }
     if pruned > 0 {
-        tracing::debug!(
+        // `info!`, not `debug!`. Under `release_max_level_info` a
+        // `debug!` is compiled out of every release binary, so a count of
+        // LEAKED JIT entries -- an anomaly worth knowing about -- could
+        // never reach anyone running a released VM.
+        //
+        // Promoted only after measuring the rate, because the objection to
+        // promoting an anomaly line is that it might flood. It does not:
+        // across the 88-vector regression suite, `GcStress` under ZGC /
+        // Generational / G1 at -Xmx96m (3, 16 and several collections
+        // respectively), and the GPU runtime-stress and residency-gc gates,
+        // this fired ZERO times. That measures "does not flood"; it does
+        // not prove the line can fire, which is true of any rare-anomaly
+        // report and is still strictly better than invisible-by-
+        // construction.
+        tracing::info!(
             "pruned {} leaked JIT entry/entries (returned frames below scanner \
              SP {:#x}); quiescence healed to live count",
             pruned,
