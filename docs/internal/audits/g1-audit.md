@@ -1315,3 +1315,83 @@ What would have to change before this is asked again, in order:
 Only when both read zero across a soak of this shape does the question become
 "should the defaults move", and even then the answer is a longer soak, not this
 one.
+
+## 16. §15 was wrong: there is no map-selection gap, and there was no coverage gap either (2026-09-03)
+
+*`fix/jit-oop-map-selection-20260902`. §15 read two raw counters as refutations
+of the precise-only suppression. The class file's own type maps say both
+populations are dead storage. This section corrects the record and fixes the
+instrument that produced it.*
+
+### 16.1 The correction
+
+`NEVER_MAPPED` and `WRONG_MAP` count in-band words **that look like heap
+addresses**. Looking like one is not being one: an old pointer left in a
+reusable local or spill slot after its value died still passes
+`heap.is_object_address`, and the precise map is *right* to omit it — that is
+the whole advantage a precise map has over a conservative scan, which keeps
+such garbage alive.
+
+The tree already had the independent answer and `NEVER_MAPPED` was already
+split by it: `verifier_local_verdict` asks the CLASS FILE's own type maps
+whether that local holds a reference at that bci. Read with that column, §15's
+table says the opposite of what §15 concluded:
+
+| workload | `never_mapped` | `verifier_oop` | `verifier_not_oop` | `wrong_map` | `wrong_map` `verifier_oop` |
+|---|---:|---:|---:|---:|---:|
+| `HumongousChurn 48 6000` | 16 | **0** | 16 | 22 | **0** |
+| `HumongousChurn 48 20000` | 52 | **0** | 52 | 58 | **0** |
+| `HumongousWide 64 400` | 6 | **0** | 6 | 12 | **0** |
+
+`verifier_unknown=0` throughout, so the oracle answered rather than declined.
+**Every flagged word in both populations is dead storage.** There is no
+map-selection gap on these workloads, and no coverage gap either.
+
+The stale-after-remap evidence §15.2 leaned on falls the same way. Under the
+suppression `HumongousChurn` leaves 15 `region=java-local verifiable=true`
+words stale against 0 without it — but a *dead* slot left stale is harmless,
+and what that experiment actually measured is the conservative scan needlessly
+retaining and rewriting dead values. It is a cost of the backstop, not a
+hazard of removing it.
+
+### 16.2 What that made the gate do
+
+§15 landed a change making `verify_active_coverage_into` refute on any
+`WRONG_MAP` increment. On this evidence that gate would have refused the
+suppression **forever**, on every workload, over words the class file says are
+not references. A gate keyed to a counter that cannot tell a live oop from dead
+storage is not a safety property; it is an off switch with a justification
+attached.
+
+`WRONG_MAP` is now split — `WRONG_MAP_VERIFIER_OOP` and
+`WRONG_MAP_VERIFIER_OTHER`, the same oracle `NEVER_MAPPED` has always used —
+and the gate reads the confirmed subset. The raw counters remain, reported
+beside their split, because the *ratio* is the interesting number: a large
+`wrong_map` with a zero `verifier_oop` is precisely the measurement of how much
+dead storage the conservative backstop is retaining.
+
+### 16.3 Where this leaves the defaults
+
+Still opt-in, but the reason has changed and is weaker than §15's.
+
+§15 said "the soak refutes the suppression". It does not; that reading was an
+artefact of an instrument that could not subtract dead slots. What can honestly
+be said now is only that **no refutation was found** on six probes covering 14
+compiled frames — a sample far too small to license a default, and much smaller
+than the `CRATONVM_GC_STRESS` populations the master switch's own doc cites.
+
+So the open question is no longer "is the coverage bit sound" — nothing here
+impugns it — but "has it been exercised over enough compiled code to trust",
+which is a soak of a different size than this one, on real applications rather
+than probes. `WRONG_MAP_VERIFIER_OOP` and the `while_covered` verifier column
+are the two numbers that soak should read, and neither should be read without
+the other.
+
+### 16.4 The lesson, since it cost two sections
+
+A counter that flags a *possible* defect is not evidence of one, and this file
+now has an instance in each direction: §12.3 recorded a single run that looked
+like a 82%-vs-45% win and was noise, and §15 recorded a counter that looked like
+a refutation and was dead storage. Both were caught by asking for a second,
+independent reading — reps in the first case, the verifier's own type maps in
+the second. The instruments that can answer were already in the tree both times.
