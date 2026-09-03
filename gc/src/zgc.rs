@@ -3467,6 +3467,20 @@ impl ZgcRealHeap {
     /// not on its own enough to make parallel marking beat the serial loop:
     /// that gap is 1.6-4.0 ms and this is 10-18% of it. The rest is the
     /// coordination protocol, which this does not touch.
+    ///
+    /// # What the end-to-end arm can and cannot show
+    ///
+    /// BinTreesClassic 16 at -Xmx128m, release, four workers, interleaved,
+    /// 8 cycles per run: mark_us mean 8238/9037/7526/6924 with the pool kept
+    /// against 8412/8604/10147/10319 without -- the right direction in 3 of 4
+    /// pairs, means 7.9 ms against 9.4 ms.
+    ///
+    /// Do not read that 1.5 ms as this change. The component measurement says
+    /// 546us is removed at four workers, and a run-to-run spread of 6.9-10.3
+    /// ms cannot resolve it: the arm is CONSISTENT with the saving and is not
+    /// evidence for its size. `measure_the_pool_construction_cost` is the
+    /// instrument that measures what this actually removes; the mark pause is
+    /// dominated by the coordination protocol and moves under it.
     fn persistent_mark_pool(&self, workers: usize) -> Option<std::sync::Arc<mark::ZMarkCoordinator>> {
         match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_MARK_POOL_PERSISTENT") {
             Some(raw) => {
