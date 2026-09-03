@@ -260,6 +260,22 @@ fn maybe_dump_shutdown_reports() {
         // collector because the path it disabled was already unreachable
         // (`region_bounds_are_live` is false under G1 and ZGC).
         {
+            // G1's inline post-write barrier (F-08, CRATONVM_G1_INLINE_BARRIER).
+            // Sites always; the run-time pair only under the ref-store trace.
+            // `sites=0` is the expected reading on every other collector and
+            // under the default configuration, which is exactly why it is
+            // printed rather than inferred.
+            {
+                let (sites, skipped, called) = cratonvm_jit::metrics::g1_inline_barrier_counts();
+                if sites != 0 {
+                    eprintln!("[cratonvm] G1 inline post-write barrier: sites={sites}");
+                    if skipped != 0 || called != 0 {
+                        eprintln!(
+                            "[cratonvm]   G1 barrier executions: skipped={skipped} called={called}"
+                        );
+                    }
+                }
+            }
             let (gated, declined) = cratonvm_jit::x64::ref_store_site_counts();
             eprintln!(
                 "[cratonvm] compiled reference stores: gated={gated} declined={declined}"
