@@ -277,6 +277,7 @@ mod emit;
 mod frames;
 mod operand_stack;
 pub use operand_stack::spill_slots_cap;
+pub(crate) use inlining::MAX_INLINE_MERGE_DEPTH;
 pub(crate) use operand_stack::SpillReason;
 pub mod safepoint;
 // ---------------------------------------------------------------------------
