@@ -274,7 +274,7 @@ pub const AUTOBOX_CLASS_ID: ClassId = ClassId::new(u32::MAX);
 /// the index is out of range, or the receiver is not an array at all.
 ///
 /// The channel is an `i32` while the index is a `usize`, and the four backends
-/// all wrote `Err(crate::heap::oob_index_code(index))`. That truncates: an index of `0x8000_0000`
+/// all wrote `Err(index as i32)`. That truncates: an index of `0x8000_0000`
 /// reports `i32::MIN`, and `RuntimeError::aioobe` then names a NEGATIVE index
 /// in the exception message for a store whose index was positive. Saturating
 /// instead is faithful for every index a real array can hold — `MAX_ARRAY_LENGTH`
